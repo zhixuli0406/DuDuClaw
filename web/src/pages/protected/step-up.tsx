@@ -50,14 +50,16 @@ function fromState(state: ProtectedStepUpState): StepUpStatus {
 
 export class StepUpUnavailable extends Error {}
 
-export function StepUpProvider({ children }: { children: ReactNode }) {
+export function StepUpProvider({ children, google = false }: { children: ReactNode; google?: boolean }) {
   const [status, setStatus] = useState<StepUpStatus>(INITIAL);
   const record = useCallback((state: ProtectedStepUpState) => setStatus(fromState(state)), []);
   const refresh = useCallback(async () => {
-    const next = fromState(await api.protectedMode.employeeList());
+    const state = google ? (await api.googleIdentity.delegation()).step_up : await api.protectedMode.employeeList();
+    if (!state) throw new StepUpUnavailable();
+    const next = fromState(state);
     setStatus(next);
     return next;
-  }, []);
+  }, [google]);
   const verify = useCallback(async (password: string, code: string) => {
     await api.protectedMode.stepUp(password, code);
     const next = await refresh();

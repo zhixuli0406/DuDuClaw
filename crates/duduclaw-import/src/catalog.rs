@@ -25,6 +25,17 @@ pub(crate) const SESSION_ORIGIN_PROOFS_V182: &str = include_str!("session-origin
 pub(crate) const SESSION_V182: &str = concat!(include_str!("session-v181.sql"), include_str!("session-origin-proofs-v182.sql"));
 pub(crate) const SESSION_V182_UPGRADED: &str =
     concat!(include_str!("session-v181-upgraded.sql"), include_str!("session-origin-proofs-v182.sql"));
+// RM-182 adds a pin timestamp and bounded references; neither is imported.
+pub(crate) const SESSION_V185: &str = concat!(include_str!("session-v185.sql"),
+    include_str!("session-origin-proofs-v182.sql"), include_str!("session-tool-refs-v185.sql"));
+pub(crate) const SESSION_V185_UPGRADED: &str = concat!(include_str!("session-v185-upgraded.sql"),
+    include_str!("session-origin-proofs-v182.sql"), include_str!("session-tool-refs-v185.sql"));
+pub(crate) const SESSION_V185_FROM_V181_UPGRADED: &str = concat!(include_str!("session-v181-upgraded.sql"),
+    "ALTER TABLE sessions ADD COLUMN pinned_updated_at INTEGER;\n",
+    include_str!("session-origin-proofs-v182.sql"), include_str!("session-tool-refs-v185.sql"));
+pub(crate) const SESSION_V185_FROM_V181: &str = concat!(include_str!("session-v181.sql"),
+    "ALTER TABLE sessions ADD COLUMN pinned_updated_at INTEGER;\n",
+    include_str!("session-origin-proofs-v182.sql"), include_str!("session-tool-refs-v185.sql"));
 pub(crate) const TASKS_V1793: &str = include_str!("tasks-v1793.sql");
 pub(crate) const TASKS_V180: &str = include_str!("tasks-v180.sql");
 pub(crate) const TASKS_V181: &str = include_str!("tasks-v181.sql");
@@ -91,10 +102,14 @@ impl Catalog {
 // Sessions v1.82 = either v1.81 shape plus the gateway-owned
 // `schedule_origin_proofs` table, which the reader never reads (its
 // authorizer denies it), so both map as V181.
-static SESSIONS: [Catalog; 6] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180),
+static SESSIONS: [Catalog; 10] = [Catalog::new(SchemaVersion::V1793, SESSION_V1793), Catalog::new(SchemaVersion::V180, SESSION_V180),
     Catalog::new(SchemaVersion::V181, SESSION_V181), Catalog::new(SchemaVersion::V181, SESSION_V181_UPGRADED),
     Catalog { version: SchemaVersion::V181, sql: SESSION_V182, label: "v1.82" },
-    Catalog { version: SchemaVersion::V181, sql: SESSION_V182_UPGRADED, label: "v1.82" }];
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V182_UPGRADED, label: "v1.82" },
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V185, label: "v1.85" },
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V185_UPGRADED, label: "v1.85" },
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V185_FROM_V181, label: "v1.85" },
+    Catalog { version: SchemaVersion::V181, sql: SESSION_V185_FROM_V181_UPGRADED, label: "v1.85" }];
 // Tasks: the v1.81 catalog is the v1.80.x one plus the `task_store_markers`
 // table of the goal-creator backfill. It has no readable content for the
 // importer (the authorizer denies that table), so it maps as V180.

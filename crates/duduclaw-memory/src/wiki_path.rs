@@ -16,24 +16,42 @@
 //!   that resolves outside the canonical wiki directory. Every failure to
 //!   resolve denies (fail closed); only a wiki directory that does not exist
 //!   yet is treated as "nothing to escape through".
-//! - [`read_wiki_file_nofollow`] reads one page without following a symlink
-//!   in the last component (`symlink_metadata` + `O_NOFOLLOW`, then `fstat`
-//!   on the opened handle), so a page swapped for a link between the check
-//!   and the read is refused instead of followed.
-//! - [`prepare_wiki_write_target`] and [`atomic_write_nofollow`] validate
-//!   before creating any directory, re-check after, and write the temp file
-//!   with `O_EXCL` so a planted `*.md.tmp` symlink is never written through.
-//!
-//! Residual race: a directory component swapped for a symlink after
-//! resolution and the open is not caught if a component of the resolved
-//! parent itself is replaced. The original alias is no longer traversed by
-//! the open; only the final component is opened with `O_NOFOLLOW`. Closing
-//! the remaining window needs
-//! `openat` walking per component; the writer of such a swap already has
-//! write access inside the wiki directory.
+//! - Reads and writes walk opened directory handles without following links.
+//!   Unix final opens, staging files and renames are relative to the verified
+//!   parent fd. Windows pins the chain and checks parent handle identities.
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+pub(crate) mod directory;
+use directory::{Directory, Kind, Open};
+
+/// Bound both one-page resolution and each scanner directory snapshot.
+pub const MAX_DIRECTORY_ENTRIES: usize = 10_000;
+
+pub(crate) struct FoldedNames(std::collections::HashMap<String, Option<std::ffi::OsString>>);
+
+impl FoldedNames {
+    pub(crate) fn new(names: &[std::ffi::OsString]) -> Self {
+        let mut map = std::collections::HashMap::new();
+        for name in names {
+            if let Some(text) = name.to_str() {
+                let key = duduclaw_core::wiki_auto_namespace::fold_segment(text);
+                map.entry(key).and_modify(|entry| *entry = None).or_insert_with(|| Some(name.clone()));
+            }
+        }
+        Self(map)
+    }
+
+    pub(crate) fn resolve(&self, name: &str) -> io::Result<std::ffi::OsString> {
+        match self.0.get(&duduclaw_core::wiki_auto_namespace::fold_segment(name)) {
+            Some(Some(name)) => Ok(name.clone()),
+            Some(None) => Err(denied("ambiguous wiki page spelling")),
+            None => Ok(name.into()),
+        }
+    }
+}
+
 
 /// The single filesystem-path → page-id boundary used by every wiki walker.
 /// Keep ids as strings; converting back to PathBuf lets later OS operations
@@ -95,39 +113,125 @@ pub struct ResolvedWikiPage {
     pub is_auto: bool,
     /// Whether the final component existed during resolution; opens recheck it.
     pub exists: bool,
+    root: Arc<Directory>,
+    parent: Arc<Directory>,
 }
 
-/// Resolve the parent chain (including Windows junctions) before classifying
-/// a page. A missing final component is accepted for writes and auto policy
-/// checks; ordinary reads return NotFound. Missing parents return NotFound.
-/// Opens use this resolved parent, retaining no-follow protection on the final name.
+impl ResolvedWikiPage {
+    /// The scanner has already refused ambiguous names in every ancestor.
+    pub(crate) fn from_scan(root: Arc<Directory>, parent: Arc<Directory>, id: String) -> io::Result<Self> {
+        require_canonical_id(&id)?;
+        validate_relative_wiki_read_path(&id).map_err(|e| invalid(&e))?;
+        finish_resolution(root, parent, &id, &id, false)
+    }
+
+    fn verify_parent(&self) -> io::Result<()> {
+        let current_root = Directory::root(&self.root.path)?;
+        let parent_id = Path::new(&self.id).parent().ok_or_else(|| invalid("missing parent"))?;
+        if !self.root.same(&current_root)? || !self.parent.same(&self.root.descend(parent_id, false)?)? {
+            return Err(denied("wiki parent directory changed"));
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> io::Result<&std::ffi::OsStr> {
+        self.full_path.file_name().ok_or_else(|| invalid("missing page name"))
+    }
+}
+
+/// Resolve every component without following links. Folded aliases must be
+/// unique, and every directory has an explicit listing budget.
 pub fn resolve_wiki_page(wiki_dir: &Path, id: &str, write: bool) -> io::Result<ResolvedWikiPage> {
     require_canonical_id(id)?;
     validate_relative_wiki_read_path(id).map_err(|e| invalid(&e))?;
-    let root = wiki_dir.canonicalize()?;
-    let lexical = root.join(id);
-    let parent = lexical.parent().ok_or_else(|| invalid("missing page parent"))?.canonicalize()?;
-    if !parent.starts_with(&root) { return Err(denied("resolved parent escapes wiki directory")); }
-    let full_path = parent.join(lexical.file_name().ok_or_else(|| invalid("missing page name"))?);
-    let resolved = page_id_from_relative_path(full_path.strip_prefix(&root)
-        .map_err(|_| denied("resolved path escapes wiki directory"))?)
-        .ok_or_else(|| invalid("invalid resolved wiki page id"))?;
-    require_canonical_id(&resolved)?;
-    let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(id)
-        || duduclaw_core::wiki_auto_namespace::is_auto_page_path(&resolved);
-    // Classify before checking existence so an auto alias cannot disclose
-    // whether a page exists by bypassing the auto policy on missing files.
-    let exists = match std::fs::symlink_metadata(&full_path) {
-        Ok(meta) => {
-            if is_link_metadata(&meta) || !meta.is_file() {
-                return Err(denied("wiki page is not a regular file"));
-            }
-            true
+    let root = Arc::new(Directory::root(wiki_dir)?);
+    resolve_from_root(root, id, write)
+}
+
+fn resolve_from_root(root: Arc<Directory>, id: &str, write: bool) -> io::Result<ResolvedWikiPage> {
+    let mut parent = root.descend(Path::new(""), false)?;
+    let parts: Vec<_> = id.split('/').collect();
+    let mut resolved_parts = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        let names = parent.names(MAX_DIRECTORY_ENTRIES, &mut || Ok(()))?;
+        let name = FoldedNames::new(&names).resolve(part)?;
+        resolved_parts.push(name.to_str().ok_or_else(|| invalid("non-UTF8 wiki name"))?.to_owned());
+        if index + 1 < parts.len() {
+            parent = parent.child(&name, false)?;
+        } else {
+            let resolved = resolved_parts.join("/");
+            require_canonical_id(&resolved)?;
+            return finish_resolution(root, Arc::new(parent), id, &resolved, write);
         }
+    }
+    Err(invalid("empty page id"))
+}
+
+fn finish_resolution(
+    root: Arc<Directory>, parent: Arc<Directory>, requested: &str, resolved: &str, write: bool,
+) -> io::Result<ResolvedWikiPage> {
+    require_canonical_id(resolved)?;
+    let name = Path::new(resolved).file_name().ok_or_else(|| invalid("missing page name"))?;
+    let is_auto = duduclaw_core::wiki_auto_namespace::is_auto_page_path(requested)
+        || duduclaw_core::wiki_auto_namespace::is_auto_page_path(resolved);
+    let exists = match parent.kind(name) {
+        Ok(Kind::File) => true,
+        Ok(_) => return Err(denied("wiki page is not a regular file")),
         Err(e) if (write || is_auto) && e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(e),
     };
-    Ok(ResolvedWikiPage { id: resolved, full_path, is_auto, exists })
+    let full_path = parent.path.join(name);
+    let page = ResolvedWikiPage { id: resolved.to_string(), full_path, is_auto, exists, root, parent };
+    page.verify_parent()?;
+    Ok(page)
+}
+
+/// A read operation's directory snapshots. Never retain this across operations
+/// or filesystem writes. Failed listings are cached too: a capped directory
+/// must not be listed again for every rejected page. Keys use on-disk names,
+/// so differently spelled requests share the same snapshot and held handle.
+pub struct WikiPageResolver {
+    root: io::Result<Arc<Directory>>,
+    directories: std::collections::HashMap<String, io::Result<(Arc<Directory>, FoldedNames)>>,
+}
+
+fn copied_error(error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), error.to_string())
+}
+
+impl WikiPageResolver {
+    pub fn new(wiki_dir: &Path) -> Self {
+        Self { root: Directory::root(wiki_dir).map(Arc::new), directories: Default::default() }
+    }
+
+    pub fn resolve(&mut self, id: &str) -> io::Result<ResolvedWikiPage> {
+        require_canonical_id(id)?;
+        validate_relative_wiki_read_path(id).map_err(|e| invalid(&e))?;
+        let root = self.root.as_ref().map_err(copied_error)?.clone();
+        let mut parent = root.clone();
+        let mut resolved_parts = Vec::new();
+        let parts: Vec<_> = id.split('/').collect();
+        for (index, part) in parts.iter().enumerate() {
+            let key = resolved_parts.join("/");
+            let snapshot = self.directories.entry(key).or_insert_with(|| {
+                let directory = if index == 0 { Ok(root.clone()) }
+                    else { parent.child(std::ffi::OsStr::new(&resolved_parts[index - 1]), false).map(Arc::new) }?;
+                let names = directory.names(MAX_DIRECTORY_ENTRIES, &mut || Ok(()))?;
+                Ok((directory, FoldedNames::new(&names)))
+            }).as_ref().map_err(copied_error)?;
+            parent = snapshot.0.clone();
+            let name = snapshot.1.resolve(part)?;
+            resolved_parts.push(name.to_str().ok_or_else(|| invalid("non-UTF8 wiki name"))?.to_owned());
+            if index + 1 == parts.len() {
+                return finish_resolution(root, parent, id, &resolved_parts.join("/"), false);
+            }
+        }
+        Err(invalid("empty page id"))
+    }
+
+    pub fn resolve_many(&mut self, ids: &[String]) -> Vec<io::Result<ResolvedWikiPage>> {
+        ids.iter().map(|id| self.resolve(id)).collect()
+    }
 }
 
 pub use duduclaw_core::fs_safety::is_link_metadata;
@@ -144,7 +248,7 @@ pub fn prepare_employee_wiki_write(wiki_dir: &Path, id: &str) -> io::Result<Reso
 }
 
 /// Authorize the lexical id and each resolved target BEFORE creating missing
-/// parents. Existing but unresolvable parents (including dangling links) deny.
+/// parents. Existing linked or unresolvable parents deny.
 /// This is separate from `resolve_wiki_page`, which never ignores a missing
 /// parent. Ordinary nested-folder creation remains available to writers.
 pub fn prepare_wiki_write_with_policy(
@@ -153,35 +257,21 @@ pub fn prepare_wiki_write_with_policy(
     require_canonical_id(id)?;
     validate_relative_wiki_path(id).map_err(|e| invalid(&e))?;
     authorize(id)?;
+    check_wiki_control_files(wiki_dir)?;
     std::fs::create_dir_all(wiki_dir)?;
-    let root = wiki_dir.canonicalize()?;
-    let mut parent = root.clone();
+    let root = Arc::new(Directory::root(wiki_dir)?);
+    let mut parent = root.descend(Path::new(""), false)?;
     let parts: Vec<_> = id.split('/').collect();
+    let mut resolved_parts = Vec::new();
     for (index, part) in parts.iter().take(parts.len() - 1).enumerate() {
-        let next = parent.join(part);
-        let resolved = match std::fs::symlink_metadata(&next) {
-            Ok(_) => next.canonicalize()?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                // This full prospective id was authorized at the previous step.
-                authorize(&page_id_from_relative_path(
-                    &next.strip_prefix(&root).map_err(|_| denied("parent escapes wiki"))?
-                        .join(parts[index + 1..].join("/")),
-                ).ok_or_else(|| invalid("invalid parent"))?)?;
-                std::fs::create_dir(&next)?;
-                next.canonicalize()?
-            }
-            Err(e) => return Err(e),
-        };
-        let relative = resolved.strip_prefix(&root)
-            .map_err(|_| denied("resolved parent escapes wiki directory"))?;
-        let prospective = relative.join(parts[index + 1..].join("/"));
-        let resolved_id = page_id_from_relative_path(&prospective)
-            .ok_or_else(|| invalid("invalid resolved page id"))?;
-        authorize(&resolved_id)?;
-        if !resolved.is_dir() { return Err(denied("page parent is not a directory")); }
-        parent = resolved;
+        let names = parent.names(MAX_DIRECTORY_ENTRIES, &mut || Ok(()))?;
+        let name = FoldedNames::new(&names).resolve(part)?;
+        resolved_parts.push(name.to_str().ok_or_else(|| invalid("invalid parent name"))?.to_owned());
+        let prospective = format!("{}/{}", resolved_parts.join("/"), parts[index + 1..].join("/"));
+        authorize(&prospective)?;
+        parent = parent.child(&name, true)?;
     }
-    let page = resolve_wiki_page(wiki_dir, id, true)?;
+    let page = resolve_from_root(root, id, true)?;
     authorize(&page.id)?;
     Ok(page)
 }
@@ -190,6 +280,13 @@ pub fn prepare_wiki_write_with_policy(
 /// persistence boundary; malformed ids have no fallback identity.
 pub fn persisted_page_id(path: &str) -> Option<String> {
     canonical_page_id(path)
+}
+
+/// Trust aliases use the same per-segment fold as filesystem resolution.
+/// This key is for comparison only; never persist it as an on-disk identity.
+pub fn folded_page_id(path: &str) -> Option<String> {
+    let id = persisted_page_id(path)?;
+    Some(id.split('/').map(duduclaw_core::wiki_auto_namespace::fold_segment).collect::<Vec<_>>().join("/"))
 }
 
 /// Compare an index link with a page id across old persisted separator forms.
@@ -361,8 +458,8 @@ pub fn read_wiki_file_nofollow(wiki_dir: &Path, rel: &str) -> io::Result<String>
     read_resolved_wiki_file_nofollow(&target)
 }
 
-/// Open the same resolved target that the caller classified. Never traverse
-/// the original directory alias a second time after authorization.
+/// Read the classified target through its held parent, verifying that the
+/// no-follow root-to-parent chain still has the same directory identities.
 pub fn read_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<String> {
     use std::io::Read;
     let mut file = open_resolved_wiki_file_nofollow(target)?;
@@ -374,7 +471,10 @@ pub fn read_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result
 /// Open a validated target once; callers use this handle for both metadata
 /// and bounded reads, so the size check and bytes refer to the same file.
 pub fn open_resolved_wiki_file_nofollow(target: &ResolvedWikiPage) -> io::Result<std::fs::File> {
-    duduclaw_core::fs_safety::open_regular_file_nofollow(&target.full_path)
+    target.verify_parent()?;
+    let file = target.parent.open(target.name()?, Open::Read)?;
+    target.verify_parent()?;
+    Ok(file)
 }
 
 /// Validate `rel`, confirm the target stays inside `wiki_dir`, then create
@@ -388,31 +488,60 @@ pub fn prepare_wiki_write_target(wiki_dir: &Path, rel: &str) -> io::Result<PathB
 
 /// Prepare once and return both the I/O path and the identity for metadata.
 pub fn prepare_wiki_write_page(wiki_dir: &Path, rel: &str) -> io::Result<ResolvedWikiPage> {
-    require_canonical_id(rel)?;
-    validate_relative_wiki_path(rel).map_err(|e| invalid(&e))?;
-    std::fs::create_dir_all(wiki_dir)?;
-    let full = wiki_dir.join(rel);
-    ensure_within_wiki_dir(wiki_dir, &full)?;
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent)?;
-        ensure_within_wiki_dir(wiki_dir, parent)?;
-    }
-    // The resolver below refuses a final symlink/reparse point or directory;
-    // a link swapped in later is replaced by rename, never followed.
-    match std::fs::symlink_metadata(&full) {
-        Ok(m) if m.is_dir() => return Err(denied("wiki page path is a directory")),
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    resolve_wiki_page(wiki_dir, rel, true)
+    prepare_wiki_write_with_policy(wiki_dir, rel, |_| Ok(()))
 }
 
-/// Write `content` to `full` through a temp file + rename. The temp file is
-/// removed first (removing a link removes the link, not its target) and
-/// created with `create_new` (`O_EXCL`), so a symlink planted at the temp
-/// name is never written through. `rename` replaces a link at `full` rather
-/// than following it.
+/// Create scaffold directories relative to the opened wiki root.
+pub fn create_wiki_directory(wiki_dir: &Path, relative: &str) -> io::Result<()> {
+    std::fs::create_dir_all(wiki_dir)?;
+    Directory::root(wiki_dir)?.descend(Path::new(relative), true)?;
+    Ok(())
+}
+
+/// Scaffold creation uses the same parent-handle boundary as page writes.
+pub fn create_wiki_control_file(wiki_dir: &Path, name: &str) -> io::Result<std::fs::File> {
+    let target = resolve_wiki_page(wiki_dir, name, true)?;
+    if target.id != name { return Err(denied("noncanonical control filename")); }
+    target.verify_parent()?;
+    target.parent.open(target.name()?, Open::CreateNew)
+}
+
+/// Atomic publication of the exact target that was classified and authorized.
+pub fn atomic_write_resolved_checked(
+    target: &ResolvedWikiPage, content: &str, verify: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    atomic_write_in(&target.parent, target.name()?, content, || {
+        verify()?;
+        target.verify_parent()
+    })
+}
+
+pub fn atomic_write_wiki_control_checked(
+    wiki_dir: &Path, name: &str, content: &str, verify: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    let target = resolve_wiki_page(wiki_dir, name, true)?;
+    if target.id != name { return Err(denied("noncanonical control filename")); }
+    atomic_write_resolved_checked(&target, content, verify)
+}
+
+/// Archive/restore must retain both verified parent handles through rename.
+pub fn rename_resolved_wiki_file(source: &ResolvedWikiPage, destination: &ResolvedWikiPage) -> io::Result<()> {
+    source.verify_parent()?;
+    destination.verify_parent()?;
+    if source.parent.kind(source.name()?)? != Kind::File { return Err(denied("source is not regular")); }
+    reject_nonregular_at(&destination.parent, destination.name()?)?;
+    source.parent.rename_to(source.name()?, &destination.parent, destination.name()?)
+}
+
+pub fn remove_resolved_wiki_file(target: &ResolvedWikiPage) -> io::Result<()> {
+    target.verify_parent()?;
+    reject_nonregular_at(&target.parent, target.name()?)?;
+    target.parent.remove(target.name()?)
+}
+
+/// Write through an exclusive staging file and a handle-relative rename.
+/// Wiki callers should retain their resolved target across authorization and
+/// call `atomic_write_resolved_checked` instead of resolving a path again.
 pub fn atomic_write_nofollow(full: &Path, content: &str) -> io::Result<()> {
     atomic_write_nofollow_checked(full, content, || Ok(()))
 }
@@ -424,32 +553,43 @@ pub fn atomic_write_nofollow_checked(
     content: &str,
     verify: impl Fn() -> io::Result<()>,
 ) -> io::Result<()> {
+    verify()?;
+    let parent = full.parent().ok_or_else(|| invalid("missing parent"))?;
+    let absolute = if parent.is_absolute() { parent.to_path_buf() } else { std::env::current_dir()?.join(parent) };
+    let parent = Directory::open_absolute(&absolute)?;
+    atomic_write_in(&parent, full.file_name().ok_or_else(|| invalid("missing name"))?, content, verify)
+}
+
+fn atomic_write_in(
+    parent: &Directory, name: &std::ffi::OsStr, content: &str,
+    verify: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
     use std::io::Write;
     verify()?;
-    let tmp = full.with_extension("md.tmp");
-    match std::fs::remove_file(&tmp) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    let write = (|| -> io::Result<()> {
+    reject_nonregular_at(parent, name)?;
+    // Unique, exclusive staging names avoid unlinking another writer's file.
+    let tmp = std::ffi::OsString::from(format!(".wiki-{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = parent.open(&tmp, Open::CreateNew)?;
+    let result = (|| {
         verify()?;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        reject_nonregular_at(parent, name)?;
         verify()?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        verify()
+        parent.rename(&tmp, name)
     })();
-    if let Err(e) = write {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+    if result.is_err() { let _ = parent.remove(&tmp); }
+    result
+}
+
+fn reject_nonregular_at(parent: &Directory, name: &std::ffi::OsStr) -> io::Result<()> {
+    match parent.kind(name) {
+        Ok(Kind::File) => Ok(()),
+        Ok(_) => Err(denied("target is not a regular file")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
-    std::fs::rename(&tmp, full).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
 }
 
 #[cfg(test)]
@@ -480,15 +620,11 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn missing_page_under_auto_alias_is_auto() {
+    fn missing_page_under_linked_auto_parent_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join("auto")).unwrap();
         std::os::unix::fs::symlink("auto", tmp.path().join("public-alias")).unwrap();
-        let target = resolve_wiki_page(tmp.path(), "public-alias/none.md", false).unwrap();
-        assert!(target.is_auto);
-        assert!(!target.exists);
-        assert_eq!(target.id, "auto/none.md");
-        assert_eq!(read_resolved_wiki_file_nofollow(&target).unwrap_err().kind(), io::ErrorKind::NotFound);
+        assert!(resolve_wiki_page(tmp.path(), "public-alias/none.md", false).is_err());
         assert!(prepare_employee_wiki_write(tmp.path(), "public-alias/none.md").is_err());
     }
 
@@ -512,7 +648,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolved_parent_classifies_auto_and_keeps_ordinary_links_working() {
+    fn linked_parents_are_refused_even_when_they_stay_inside_wiki() {
         use std::os::unix::fs::symlink;
         let tmp = tempfile::tempdir().unwrap();
         let wiki = tmp.path();
@@ -522,21 +658,16 @@ mod tests {
         std::fs::write(wiki.join("ordinary/page.md"), "ordinary").unwrap();
         symlink("auto", wiki.join("public-alias")).unwrap();
         symlink("ordinary", wiki.join("ordinary-alias")).unwrap();
-        let target = resolve_wiki_page(wiki, "public-alias/sop/secret.md", false).unwrap();
-        assert!(target.is_auto);
-        assert_eq!(target.id, "auto/sop/secret.md");
-        assert!(prepare_employee_wiki_write(wiki, "public-alias/sop/secret.md").is_err());
+        assert!(resolve_wiki_page(wiki, "public-alias/sop/secret.md", false).is_err());
         assert!(prepare_employee_wiki_write(wiki, "public-alias/new/secret.md").is_err());
         assert!(!wiki.join("auto/new").exists());
-        assert!(resolve_wiki_page(wiki, "ordinary/missing-parent/new.md", true).is_err());
-        let target = prepare_employee_wiki_write(wiki, "ordinary-alias/new/page.md").unwrap();
-        assert!(!target.is_auto);
-        assert_eq!(target.id, "ordinary/new/page.md");
-        atomic_write_nofollow(&target.full_path, "new ordinary").unwrap();
-        assert_eq!(read_wiki_file_nofollow(wiki, "ordinary-alias/new/page.md").unwrap(), "new ordinary");
-        // Either spelling being auto is enough, including an outward alias.
+        assert!(prepare_employee_wiki_write(wiki, "ordinary-alias/new/page.md").is_err());
+        assert!(!wiki.join("ordinary/new").exists());
+        let target = prepare_employee_wiki_write(wiki, "ordinary/new/page.md").unwrap();
+        atomic_write_resolved_checked(&target, "new ordinary", || Ok(())).unwrap();
+        assert_eq!(read_wiki_file_nofollow(wiki, "ordinary/new/page.md").unwrap(), "new ordinary");
         symlink("../ordinary", wiki.join("auto/outward")).unwrap();
-        assert!(resolve_wiki_page(wiki, "auto/outward/page.md", false).unwrap().is_auto);
+        assert!(resolve_wiki_page(wiki, "auto/outward/page.md", false).is_err());
         symlink("absent", wiki.join("dangling")).unwrap();
         assert!(resolve_wiki_page(wiki, "dangling/new.md", true).is_err());
         assert!(prepare_employee_wiki_write(wiki, "dangling/new.md").is_err());
@@ -569,14 +700,16 @@ mod tests {
             checks.set(next);
             // The fourth check is after writing and syncing the staged bytes.
             if next == 4 {
-                assert_eq!(std::fs::read_to_string(page.with_extension("md.tmp")).unwrap(), "replacement");
+                let staged = std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path())
+                    .find(|p| p.extension().is_some_and(|ext| ext == "tmp")).unwrap();
+                assert_eq!(std::fs::read_to_string(staged).unwrap(), "replacement");
                 Err(denied("authority revoked"))
             } else { Ok(()) }
         });
         assert!(result.is_err());
         assert_eq!(checks.get(), 4);
         assert_eq!(std::fs::read_to_string(&page).unwrap(), "original");
-        assert!(!page.with_extension("md.tmp").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         atomic_write_nofollow(&page, "host write").unwrap();
         assert_eq!(std::fs::read_to_string(&page).unwrap(), "host write");
     }
@@ -755,5 +888,250 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("wiki")).unwrap();
         let e = read_wiki_file_nofollow(&tmp.path().join("wiki"), "nope.md").unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
+    }
+}
+
+/// Preflight every control file before either writer mutates the wiki.
+/// Folded aliases are resolved exactly as page identities are.
+pub fn check_wiki_control_files(wiki_dir: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(wiki_dir) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+        Ok(meta) if is_link_metadata(&meta) || !meta.is_dir() => return Err(denied("linked wiki root")),
+        Ok(_) => {}
+    }
+    for name in crate::wiki_scan::RESERVED_FILES.iter().copied().chain(["_index.lock", ".scope.toml"]) {
+        let target = resolve_wiki_page(wiki_dir, name, true)?;
+        if target.exists {
+            // A control file with a different spelling must not create a
+            // second control identity on a case-sensitive filesystem.
+            if target.id != name { return Err(denied("noncanonical control filename")); }
+            open_resolved_wiki_file_nofollow(&target)?;
+        }
+    }
+    duduclaw_core::scope_policy::load(&wiki_dir.join(".scope.toml"))
+        .map_err(|e| denied(&e.to_string()))?;
+    Ok(())
+}
+
+/// Create/open an append or lock file without following links on any OS.
+pub fn open_control_file_nofollow(wiki_dir: &Path, name: &str, append: bool) -> io::Result<std::fs::File> {
+    let target = resolve_wiki_page(wiki_dir, name, true)?;
+    if target.id != name { return Err(denied("noncanonical control filename")); }
+    target.verify_parent()?;
+    let file = target.parent.open(target.name()?, if append { Open::Append } else { Open::Lock })?;
+    target.verify_parent()?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod rm209_identity_tests {
+    use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn control_handles_can_lock_and_append_without_overwriting() {
+        use std::io::{Seek, SeekFrom, Write};
+        use duduclaw_core::platform::flock_exclusive;
+        use fs2::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let lock = open_control_file_nofollow(root.path(), "_index.lock", false).unwrap();
+        flock_exclusive(&lock).unwrap();
+        FileExt::unlock(&lock).unwrap();
+
+        // Open both handles before either write: each append must use the
+        // current EOF, even if its cursor was explicitly moved to the start.
+        let first = open_control_file_nofollow(root.path(), "_log.md", true).unwrap();
+        let second = open_control_file_nofollow(root.path(), "_log.md", true).unwrap();
+        for (mut file, entry) in [(first, "first\n"), (second, "second\n")] {
+            flock_exclusive(&file).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(entry.as_bytes()).unwrap();
+            FileExt::unlock(&file).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(root.path().join("_log.md")).unwrap(), "first\nsecond\n");
+    }
+
+    #[test]
+    fn batch_resolution_matches_single_page_resolution_with_one_listing_per_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut ids = Vec::new();
+        for directory in ["MiXeD", "Other", "Other/NeStEd", "auto"] {
+            std::fs::create_dir_all(root.path().join(directory)).unwrap();
+            for index in 0..32 {
+                let id = format!("{directory}/PaGe{index}.md");
+                std::fs::write(root.path().join(&id), &id).unwrap();
+                ids.push(id.to_lowercase());
+                ids.push(format!("{}/PAGE{index}.md", directory.to_uppercase()));
+            }
+        }
+        ids.extend(["AUTO/not-yet.md", "mixed/missing.md", "../escape.md"].map(str::to_string));
+        let expected: Vec<_> = ids.iter().map(|id| resolve_wiki_page(root.path(), id, false)).collect();
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let actual = WikiPageResolver::new(root.path()).resolve_many(&ids);
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 5);
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            match (actual, expected) {
+                (Ok(actual), Ok(expected)) => {
+                    assert_eq!(actual.id, expected.id);
+                    assert_eq!(actual.full_path, expected.full_path);
+                    assert_eq!(actual.is_auto, expected.is_auto);
+                    assert_eq!(actual.exists, expected.exists);
+                    if actual.exists {
+                        assert_eq!(read_resolved_wiki_file_nofollow(&actual).unwrap(), read_resolved_wiki_file_nofollow(&expected).unwrap());
+                    }
+                }
+                (Err(actual), Err(expected)) => assert_eq!(actual.kind(), expected.kind()),
+                (actual, expected) => panic!("batch {actual:?} differs from single {expected:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn folded_filename_resolves_to_disk_identity_or_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        for (disk, aliases) in [
+            ("Bad.md", vec!["Bad.md", "bad.md", "BAD.md"]),
+            ("café.md", vec!["café.md", "cafe\u{301}.md", "CAFÉ.md"]),
+            ("tail.md", vec!["tail.md", "tail.md.", "tail.md "]),
+        ] {
+            std::fs::write(root.path().join(disk), "body").unwrap();
+            let actual = resolve_wiki_page(root.path(), disk, false).unwrap().id;
+            for alias in aliases {
+                match resolve_wiki_page(root.path(), alias, false) {
+                    Ok(page) => {
+                        assert_eq!(page.id, actual);
+                        assert_eq!(read_resolved_wiki_file_nofollow(&page).unwrap(), "body");
+                    }
+                    Err(error) => assert!(matches!(error.kind(), io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput)),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_fold_matches_are_refused_even_for_exact_spelling() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Bad.md"), "first").unwrap();
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(root.path().join("bad.md")) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                eprintln!("RM-209: skipping ambiguous-name test: filesystem does not allow both spellings");
+                return;
+            }
+            Err(error) => panic!("fixture: {error}"),
+        }
+        for name in ["Bad.md", "bad.md", "BAD.md"] {
+            assert!(resolve_wiki_page(root.path(), name, false).is_err());
+            assert!(resolve_wiki_page(root.path(), name, true).is_err());
+        }
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let ids = ["Bad.md", "bad.md", "BAD.md"].map(str::to_string);
+        assert!(WikiPageResolver::new(root.path()).resolve_many(&ids).iter().all(Result::is_err));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolved_open_refuses_link_swapped_after_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "safe").unwrap();
+        std::fs::write(outside.path().join("secret"), "private").unwrap();
+        let page = resolve_wiki_page(root.path(), "a.md", false).unwrap();
+        std::fs::remove_file(&page.full_path).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret"), &page.full_path).unwrap();
+        assert!(open_resolved_wiki_file_nofollow(&page).is_err());
+    }
+}
+
+#[cfg(test)]
+mod parent_race_tests {
+    use super::*;
+
+    #[test]
+    fn resolver_enforces_directory_entry_cap() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..MAX_DIRECTORY_ENTRIES {
+            std::fs::File::create(root.path().join(format!("{index}.md"))).unwrap();
+        }
+        assert!(resolve_wiki_page(root.path(), "0.md", false).is_ok());
+        let ids = ["0.md", "1.md", "2.md"].map(str::to_string);
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        assert!(WikiPageResolver::new(root.path()).resolve_many(&ids).iter().all(Result::is_ok));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1);
+        std::fs::File::create(root.path().join("over-limit.md")).unwrap();
+        let error = resolve_wiki_page(root.path(), "0.md", false).unwrap_err();
+        assert!(error.to_string().contains("directory entry limit"));
+        let before = directory::LISTING_COUNT.with(|count| count.get());
+        let results = WikiPageResolver::new(root.path()).resolve_many(&ids);
+        assert!(results.iter().all(|result| result.as_ref().unwrap_err().to_string().contains("directory entry limit")));
+        assert_eq!(directory::LISTING_COUNT.with(|count| count.get()) - before, 1, "failed snapshots are shared too");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swapped_parent_is_refused_by_read_and_write() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("notes")).unwrap();
+        std::fs::write(root.path().join("notes/page.md"), "inside").unwrap();
+        std::fs::write(outside.path().join("page.md"), "outside").unwrap();
+        let page = resolve_wiki_page(root.path(), "notes/page.md", false).unwrap();
+        let mut resolver = WikiPageResolver::new(root.path());
+        let cached = resolver.resolve("NOTES/page.md").unwrap();
+        std::fs::rename(root.path().join("notes"), root.path().join("held")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.path().join("notes")).unwrap();
+        assert!(read_resolved_wiki_file_nofollow(&page).is_err());
+        assert!(read_resolved_wiki_file_nofollow(&cached).is_err());
+        assert!(resolver.resolve("notes/page.md").is_err());
+        assert!(WikiPageResolver::new(root.path()).resolve("notes/page.md").is_err());
+        assert!(atomic_write_resolved_checked(&page, "attack", || Ok(())).is_err());
+        assert!(atomic_write_nofollow(&page.full_path, "attack").is_err());
+        assert!(prepare_wiki_write_page(root.path(), "notes/new/page.md").is_err());
+        assert!(!outside.path().join("new").exists());
+        assert_eq!(std::fs::read_to_string(outside.path().join("page.md")).unwrap(), "outside");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn swaps_during_staging_never_publish_outside_or_leave_temporary_files() {
+        for swap_at in [1, 2, 3] {
+            let root = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("notes")).unwrap();
+            let page = prepare_wiki_write_page(root.path(), "notes/new.md").unwrap();
+            let calls = std::cell::Cell::new(0);
+            let result = atomic_write_resolved_checked(&page, "attack", || {
+                calls.set(calls.get() + 1);
+                if calls.get() == swap_at {
+                    std::fs::rename(root.path().join("notes"), root.path().join("held"))?;
+                    std::os::unix::fs::symlink(outside.path(), root.path().join("notes"))?;
+                }
+                Ok(())
+            });
+            assert!(result.is_err(), "swap at check {swap_at}");
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+            assert_eq!(std::fs::read_dir(root.path().join("held")).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controls_refuse_swapped_root_for_create_append_lock_and_rename() {
+        let home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let wiki = home.path().join("wiki");
+        std::fs::create_dir(&wiki).unwrap();
+        let page = resolve_wiki_page(&wiki, "_index.md", true).unwrap();
+        std::fs::rename(&wiki, home.path().join("held")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), &wiki).unwrap();
+        assert!(create_wiki_control_file(&wiki, "_index.md").is_err());
+        assert!(open_control_file_nofollow(&wiki, "_log.md", true).is_err());
+        assert!(open_control_file_nofollow(&wiki, "_index.lock", false).is_err());
+        assert!(atomic_write_resolved_checked(&page, "attack", || Ok(())).is_err());
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

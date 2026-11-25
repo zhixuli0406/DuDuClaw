@@ -89,6 +89,7 @@ pub struct DelegateAttestation {
     pub employee_id: Option<String>,
     /// SR4 round 3 (N2): the employee incarnation when attested.
     pub employee_incarnation: Option<u32>,
+    pub employee_nonce: Option<String>,
 }
 
 /// Who and which employee an Admin attests (SR4 round 3).
@@ -136,13 +137,14 @@ pub struct AttestationState {
     pub attestation: DelegateAttestation,
     /// Any `email` change of the attested account after the attestation.
     pub email_changed_since: bool,
+    pub employee_changed_since: bool,
 }
 impl AttestationState {
     /// Still binding for `subject`, `user_id` and exactly this employee
     /// incarnation (exact equality). A row without an employee id (written
     /// before SR4 round 3) never binds.
     pub fn binds(&self, subject: &str, user_id: &str, employee_id: &str, incarnation: u32) -> bool {
-        !self.email_changed_since && self.attestation.subject == subject && self.attestation.user_id == user_id
+        !self.email_changed_since && !self.employee_changed_since && self.attestation.subject == subject && self.attestation.user_id == user_id
             && !user_id.is_empty() && !employee_id.is_empty()
             && self.attestation.employee_id.as_deref() == Some(employee_id)
             && self.attestation.employee_incarnation == Some(incarnation)
@@ -154,6 +156,7 @@ impl AttestationState {
 /// `UserDb::init_tables` after the credential change log exists.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     let failed = |e: rusqlite::Error| format!("google delegate attestation migration failed: {e}");
+    duduclaw_core::employee_incarnation::migrate(conn).map_err(failed)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS google_delegate_attestations (
             agent_id TEXT PRIMARY KEY,
@@ -172,12 +175,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         let rows = statement.query_map([], |row| row.get::<_, String>(1)).map_err(failed)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(failed)?
     };
-    for (column, kind) in [("employee_id", "TEXT"), ("employee_incarnation", "INTEGER")] {
+    for (column, kind) in [("employee_id", "TEXT"), ("employee_incarnation", "INTEGER"), ("employee_nonce", "TEXT")] {
         if !columns.iter().any(|existing| existing == column) {
             conn.execute_batch(&format!("ALTER TABLE google_delegate_attestations ADD COLUMN {column} {kind};"))
                 .map_err(failed)?;
         }
     }
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS google_attestation_owner_insert AFTER INSERT ON user_agent_bindings
+         WHEN NEW.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id = NEW.agent_name;
+         END;
+         CREATE TRIGGER IF NOT EXISTS google_attestation_owner_update AFTER UPDATE OF access_level, is_primary, user_id, agent_name ON user_agent_bindings
+         WHEN OLD.access_level = 'owner' OR NEW.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id IN (OLD.agent_name, NEW.agent_name);
+         END;
+         CREATE TRIGGER IF NOT EXISTS google_attestation_owner_delete AFTER DELETE ON user_agent_bindings
+         WHEN OLD.access_level = 'owner' BEGIN
+           DELETE FROM google_delegate_attestations WHERE agent_id = OLD.agent_name;
+         END;"
+    ).map_err(failed)?;
     Ok(())
 }
 
@@ -214,6 +231,7 @@ pub fn email_self_set(conn: &Connection, user_id: &str) -> Result<bool, String> 
 /// users.db transaction (the Shared tombstone / purge hook), audited with no
 /// actor and `reason`. A database without the table has nothing to remove.
 pub fn revoke_in_transaction(conn: &Connection, agent: &str, reason: &str) -> Result<bool, String> {
+    duduclaw_core::employee_incarnation::retire(conn, agent).map_err(|e| e.to_string())?;
     let exists: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='google_delegate_attestations')",
@@ -235,6 +253,14 @@ pub fn revoke_in_transaction(conn: &Connection, agent: &str, reason: &str) -> Re
 }
 
 impl UserDb {
+    pub fn google_employee_nonce(&self, agent: &str) -> Result<Option<String>, String> {
+        duduclaw_core::employee_incarnation::read(&self.conn(), agent).map_err(|e| e.to_string())
+    }
+
+    pub fn ensure_google_employee_nonce(&self, agent: &str) -> Result<String, String> {
+        duduclaw_core::employee_incarnation::ensure(&self.conn(), agent).map_err(|e| e.to_string())
+    }
+
     /// Record that `request.subject` (already normalized by the caller)
     /// belongs to the ONE users.db account whose login email `email_matches`
     /// (the caller's normalizer, compared by exact equality), for exactly
@@ -248,6 +274,16 @@ impl UserDb {
     /// has checked role, MFA and step-up).
     pub fn attest_google_delegate(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
         attested_by: &str) -> Result<Attested, String> {
+        self.attest_google_delegate_inner(request, email_matches, attested_by, false)
+    }
+
+    pub fn attest_google_delegate_owner(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
+        attested_by: &str) -> Result<Attested, String> {
+        self.attest_google_delegate_inner(request, email_matches, attested_by, true)
+    }
+
+    fn attest_google_delegate_inner(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
+        attested_by: &str, require_owner: bool) -> Result<Attested, String> {
         let AttestationRequest { agent_id, employee_id, employee_incarnation, subject, user_id: shown,
             acknowledge_self_set } = *request;
         if agent_id.is_empty() || subject.is_empty() || attested_by.is_empty() || shown.is_empty()
@@ -259,6 +295,16 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("attestation: {e}"))?;
+        let employee_nonce = Some(duduclaw_core::employee_incarnation::ensure(&tx, agent_id).map_err(|e| e.to_string())?);
+        if require_owner {
+            let selected: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.agent_name = ?1
+                 AND b.user_id = ?2 AND b.access_level = 'owner' AND (b.is_primary = 1 OR
+                 (SELECT COUNT(*) FROM user_agent_bindings WHERE agent_name = ?1 AND access_level = 'owner') = 1))",
+                params![agent_id, shown], |row| row.get(0),
+            ).map_err(|e| format!("attestation owner: {e}"))?;
+            if !selected { return Err(HOLDER_MISMATCH.into()); }
+        }
         let holders: Vec<(String, String, String, String)> = {
             let mut statement = tx
                 .prepare("SELECT id, email, status, display_name FROM users")
@@ -312,14 +358,15 @@ impl UserDb {
         tx.execute(
             "INSERT INTO google_delegate_attestations
                 (agent_id, subject, user_id, email_at_attestation, credential_seq, attested_by, attested_at,
-                 employee_id, employee_incarnation)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 employee_id, employee_incarnation, employee_nonce)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(agent_id) DO UPDATE SET subject=excluded.subject, user_id=excluded.user_id,
                 email_at_attestation=excluded.email_at_attestation, credential_seq=excluded.credential_seq,
                 attested_by=excluded.attested_by, attested_at=excluded.attested_at,
-                employee_id=excluded.employee_id, employee_incarnation=excluded.employee_incarnation",
+                employee_id=excluded.employee_id, employee_incarnation=excluded.employee_incarnation,
+                employee_nonce=excluded.employee_nonce",
             params![agent_id, subject, user_id, email, seq, attested_by, now, employee_id,
-                i64::from(employee_incarnation)],
+                i64::from(employee_incarnation), employee_nonce],
         )
         .map_err(|e| format!("attestation: {e}"))?;
         let detail = serde_json::json!({"agent_id": agent_id, "subject": subject, "user_id": user_id,
@@ -335,7 +382,7 @@ impl UserDb {
                 agent_id: agent_id.to_owned(), subject: subject.to_owned(), user_id: user_id.clone(),
                 email_at_attestation: email.clone(), credential_seq: seq, attested_by: attested_by.to_owned(),
                 attested_at: now, employee_id: Some(employee_id.to_owned()),
-                employee_incarnation: Some(employee_incarnation),
+                employee_incarnation: Some(employee_incarnation), employee_nonce,
             },
             display_name: display_name.clone(),
             email_self_set: self_set,
@@ -387,13 +434,13 @@ impl UserDb {
         let attestation = conn
             .query_row(
                 "SELECT agent_id, subject, user_id, email_at_attestation, credential_seq, attested_by, attested_at,
-                        employee_id, employee_incarnation
+                        employee_id, employee_incarnation, employee_nonce
                  FROM google_delegate_attestations WHERE agent_id = ?1",
                 params![agent_id],
                 |row| Ok(DelegateAttestation {
                     agent_id: row.get(0)?, subject: row.get(1)?, user_id: row.get(2)?,
                     email_at_attestation: row.get(3)?, credential_seq: row.get(4)?, attested_by: row.get(5)?,
-                    attested_at: row.get(6)?, employee_id: row.get(7)?,
+                    attested_at: row.get(6)?, employee_id: row.get(7)?, employee_nonce: row.get(9)?,
                     // An out-of-range incarnation never binds.
                     employee_incarnation: row.get::<_, Option<i64>>(8)?.and_then(|value| u32::try_from(value).ok()),
                 }),
@@ -408,7 +455,9 @@ impl UserDb {
                 |row| row.get(0),
             )
             .map_err(|e| format!("attestation: {e}"))?;
-        Ok(Some(AttestationState { attestation, email_changed_since }))
+        let live_nonce = duduclaw_core::employee_incarnation::read(&conn, agent_id).map_err(|e| e.to_string())?;
+        let employee_changed_since = live_nonce.is_none() || live_nonce != attestation.employee_nonce;
+        Ok(Some(AttestationState { attestation, email_changed_since, employee_changed_since }))
     }
 }
 
@@ -606,7 +655,8 @@ mod tests {
     fn sr4r3_migration_keeps_rows_without_employee() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE google_delegate_attestations (agent_id TEXT PRIMARY KEY, subject TEXT NOT NULL,
+            "CREATE TABLE user_agent_bindings (agent_name TEXT, user_id TEXT, access_level TEXT, is_primary INTEGER);
+             CREATE TABLE google_delegate_attestations (agent_id TEXT PRIMARY KEY, subject TEXT NOT NULL,
                 user_id TEXT NOT NULL, email_at_attestation TEXT NOT NULL, credential_seq INTEGER NOT NULL,
                 attested_by TEXT NOT NULL, attested_at TEXT NOT NULL);
              INSERT INTO google_delegate_attestations VALUES ('bot','a@customer.com','u','a@customer.com',0,'admin','t');",

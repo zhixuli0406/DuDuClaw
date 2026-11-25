@@ -665,14 +665,24 @@ async fn mcp_streamable_rejects_wrong_token() {
     let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
 
     let wrong = "ddc_dev_ffeeddccbbaa99887766554433221100";
-    let resp = app
-        .oneshot(post_mcp(
-            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
-            Some(wrong),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    // RM-134 bounds blocking authentication jobs process-wide. Other tests
+    // may occupy all slots; retry only the explicit temporary busy response.
+    for attempt in 0..20 {
+        let resp = app.clone()
+            .oneshot(post_mcp(
+                r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+                Some(wrong),
+            ))
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::SERVICE_UNAVAILABLE && attempt < 19 {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            continue;
+        }
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        return;
+    }
+    unreachable!();
 }
 
 /// Malformed JSON ⇒ 400 with JSON-RPC `-32700` (Parse error), not a 500 and

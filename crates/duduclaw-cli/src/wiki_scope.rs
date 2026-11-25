@@ -25,7 +25,7 @@
 //! ## Defaults / fail-safe
 //!
 //! - File absent       → every namespace `AgentWritable` (no semantic change vs. v1.10.1).
-//! - File malformed    → log warning, treat as absent (fail-safe; never blocks the gateway).
+//! - File malformed    → deny every write, including operator writes.
 //! - Namespace absent  → `AgentWritable` (only listed namespaces tighten).
 //!
 //! ## Hot-reload
@@ -135,6 +135,7 @@ impl std::fmt::Display for ScopeDeny {
 pub struct WikiScopePolicy {
     namespaces: BTreeMap<String, NamespaceMode>,
     loaded_from: Option<PathBuf>,
+    load_error: Option<String>,
 }
 
 impl WikiScopePolicy {
@@ -144,35 +145,19 @@ impl WikiScopePolicy {
         Self::default()
     }
 
-    /// Load from `<home_dir>/shared/wiki/.scope.toml`, returning an empty
-    /// policy on any failure (absent file / malformed TOML / read error).
-    /// Failures are logged at WARN level but never propagated.
+    /// Reload the root policy; missing is open, every load error denies writes.
     pub fn load_for(home_dir: &Path) -> Self {
-        let path = scope_file_path(home_dir);
-        Self::load_from(&path)
+        Self::load_from(&scope_file_path(home_dir))
     }
 
-    /// Load from an explicit path. Returns empty on absent/malformed file.
     pub fn load_from(path: &Path) -> Self {
-        match std::fs::read_to_string(path) {
-            Ok(raw) => match parse_toml(&raw) {
-                Ok(map) => Self {
-                    namespaces: map,
-                    loaded_from: Some(path.to_path_buf()),
-                },
-                Err(e) => {
-                    warn!(
-                        "Skipping malformed wiki scope policy at {:?}: {} \
-                         (treating as no policy — all namespaces writable)",
-                        path, e
-                    );
-                    Self::empty()
-                }
-            },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::empty(),
-            Err(e) => {
-                warn!("Failed to read wiki scope policy at {:?}: {}", path, e);
-                Self::empty()
+        let loaded = duduclaw_core::scope_policy::load(path).map_err(|e| e.to_string())
+            .and_then(|p| parse_toml(p.source.as_deref().unwrap_or("")).map(|namespaces| (namespaces, p.source.is_some())));
+        match loaded {
+            Ok((namespaces, present)) => Self { namespaces, loaded_from: present.then(|| path.to_path_buf()), load_error: None },
+            Err(error) => {
+                warn!(path = %path.display(), %error, "wiki writes denied");
+                Self { load_error: Some(error), ..Self::default() }
             }
         }
     }
@@ -197,6 +182,7 @@ impl WikiScopePolicy {
     /// Mode for a top-level namespace. Unlisted namespaces default to
     /// [`NamespaceMode::AgentWritable`].
     pub fn mode_for(&self, namespace: &str) -> NamespaceMode {
+        if self.load_error.is_some() { return NamespaceMode::Ambiguous; }
         let mut matches = self.namespaces.iter().filter(|(key, _)| {
             duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace)
         });
@@ -218,6 +204,9 @@ impl WikiScopePolicy {
     }
 
     fn check_namespace_write(&self, namespace: &str, caller: &WriterCapability) -> Result<(), ScopeDeny> {
+        if let Some(error) = &self.load_error {
+            return Err(ScopeDeny { namespace: namespace.into(), mode: "invalid_policy".into(), reason: error.clone() });
+        }
         let mode = self.mode_for(namespace);
         if self.namespaces.keys().any(|key| key != namespace
             && duduclaw_core::wiki_auto_namespace::segment_opens_as(key, namespace))
@@ -313,7 +302,7 @@ impl WikiScopePolicy {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.namespaces.is_empty()
+        self.load_error.is_none() && self.namespaces.is_empty()
     }
 }
 
@@ -396,7 +385,7 @@ struct NamespaceEntry {
 }
 
 fn parse_toml(raw: &str) -> Result<BTreeMap<String, NamespaceMode>, String> {
-    let mut parsed: toml::Table = toml::from_str(raw).map_err(|e| e.to_string())?;
+    let mut parsed = duduclaw_core::scope_policy::ScopePolicy::parse(raw).map_err(|e| e.to_string())?.table;
     let namespaces = match parsed.remove("namespaces") {
         None => toml::Table::new(),
         Some(toml::Value::Table(table)) => table,
@@ -456,6 +445,7 @@ mod tests {
             let policy = WikiScopePolicy {
                 namespaces: BTreeMap::from([(key.into(), NamespaceMode::AgentWritable)]),
                 loaded_from: None,
+                load_error: None,
             };
             assert!(policy.has_explicit_namespace("departments"));
             assert!(!policy.overrides_department_isolation());
@@ -463,6 +453,7 @@ mod tests {
         let mut policy = WikiScopePolicy {
             namespaces: BTreeMap::from([("departments".into(), NamespaceMode::AgentWritable)]),
             loaded_from: None,
+            load_error: None,
         };
         assert!(policy.overrides_department_isolation());
         policy.namespaces.insert("DEPARTMENTS".into(), NamespaceMode::AgentWritable);
@@ -500,6 +491,7 @@ mod tests {
             let policy = WikiScopePolicy {
                 namespaces: BTreeMap::from([("departments".into(), mode)]),
                 loaded_from: None,
+                load_error: None,
             };
             assert!(policy.overrides_department_isolation());
             for alias in ["DEPARTMENTS", "departments.", "depar\u{200d}tments"] {
@@ -553,6 +545,7 @@ mod tests {
         WikiScopePolicy {
             namespaces: map,
             loaded_from: None,
+            load_error: None,
         }
     }
 
@@ -653,6 +646,7 @@ mod tests {
         let policy = WikiScopePolicy {
             namespaces: BTreeMap::from([("policies".into(), NamespaceMode::OperatorOnly)]),
             loaded_from: None,
+            load_error: None,
         };
         for path in [r"policies\x.md", r".\policies\x.md", r"POLICIES\x.md", "policies./x.md", "../x.md"] {
             assert!(policy.check_write(path, &WriterCapability::for_agent("alice")).is_err(), "{path}");
@@ -687,12 +681,12 @@ mod tests {
     }
 
     #[test]
-    fn malformed_toml_yields_empty_policy_and_does_not_panic() {
+    fn malformed_toml_denies_writes_and_does_not_panic() {
         let tmp = TempDir::new().unwrap();
         write_policy(tmp.path(), "this is :: not = valid = toml ===");
         let p = WikiScopePolicy::load_for(tmp.path());
-        // Fail-safe: never blocks the gateway.
-        assert!(p.is_empty());
+        // A malformed policy denies all shared writes.
+        assert!(p.check_write("x.md", &WriterCapability::for_agent("alice")).is_err());
     }
 
     #[test]
@@ -900,5 +894,48 @@ mod tests {
         let p2 = WikiScopePolicy::load_for(tmp.path());
         assert!(p2.is_empty());
         assert!(p2.check_write("identity/x.md", &caller).is_ok());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_malformed_policy_denies_shared_writes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join(".scope.toml");
+    std::fs::write(&path, "not [ valid toml").unwrap();
+    let policy = WikiScopePolicy::load_from(&path);
+    assert!(policy.check_write("notes/a.md", &WriterCapability::for_agent("alice")).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_shared_writes_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { WikiScopePolicy::load_from(&path).check_write("notes/a.md", &WriterCapability::for_agent("alice")).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
     }
 }

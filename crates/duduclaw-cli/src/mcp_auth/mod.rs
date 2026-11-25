@@ -255,6 +255,7 @@ impl std::fmt::Display for AuthError {
 
 /// Validate: ^ddc_(prod|staging|dev)_[a-f0-9]{32}$
 fn is_valid_key_format(key: &str) -> bool {
+    if duduclaw_auth::member_keys::is_member_key(key) { return false; }
     let re = regex::Regex::new(r"^ddc_(prod|staging|dev)_[a-f0-9]{32}$").unwrap();
     re.is_match(key)
 }

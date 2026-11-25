@@ -53,7 +53,7 @@ pub(super) const METHOD: &str = "google.delegation.tenant_settings_set";
 /// Upper bound of designated service mailboxes.
 pub(crate) const MAX_SERVICE_MAILBOXES: usize = 64;
 /// Upper bound of tenant scopes (never more than the minted set).
-pub(crate) const MAX_TENANT_SCOPES: usize = crate::google_workspace::REQUIRED_SCOPES.len();
+pub(crate) const MAX_TENANT_SCOPES: usize = crate::google_workspace::REQUIRED_SCOPES.len() + crate::google_workspace::CHAT_READ_SCOPES.len();
 
 const NOT_ALLOWED: &str = "不允許此設定操作。";
 const ADMIN_REQUIRED: &str = "請以管理員帳號重新登入後再操作。";
@@ -143,7 +143,8 @@ pub(crate) fn validate(mailboxes: &[String], scopes: &[String], account_emails: 
     let mut tenant_scopes: Vec<String> = Vec::with_capacity(scopes.len());
     for scope in scopes {
         // Exact equality with a minted scope: no trimming or case folding.
-        if !crate::google_workspace::REQUIRED_SCOPES.contains(&scope.as_str()) {
+        if !crate::google_workspace::REQUIRED_SCOPES.contains(&scope.as_str())
+            && !crate::google_workspace::CHAT_READ_SCOPES.contains(&scope.as_str()) {
             return Err(format!("「{}」不是可使用的 Google 權限範圍。", shown(scope)));
         }
         if tenant_scopes.contains(scope) {

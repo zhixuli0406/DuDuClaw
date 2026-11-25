@@ -583,3 +583,61 @@ async fn google_chat_tools_list_uses_same_scope_and_identity_receipt_as_gmail() 
         assert!(!names.contains(&tool), "missing authenticated receipt: {tool}");
     }
 }
+
+#[tokio::test]
+async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
+    let tools = ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"];
+    for write in [false, true] {
+        let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+        let path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap()
+            .replace("google_workspace=true", "google_workspace=true\ngoogle_credential_path='oauth'");
+        std::fs::write(&path, config).unwrap();
+        if write {
+            let path = home.path().join("config.toml");
+            let config = std::fs::read_to_string(&path).unwrap().replace("scopes=['google:read']", "scopes=['google:read','google:write']");
+            std::fs::write(path, config).unwrap();
+        }
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let principal = call.principal().clone();
+        let names = with_authenticated_call(call, async {
+            crate::mcp::visible_tool_names(&principal, home.path(), "different-process-agent").await
+        }).await;
+        for tool in tools {
+            assert_eq!(names.contains(&tool), write, "{tool}: {names:?}");
+            assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(crate::mcp_auth::Scope::GoogleWrite));
+            let effect = if tool == "calendar_update_event" { duduclaw_core::ToolEffect::Send } else { duduclaw_core::ToolEffect::Modify };
+            assert_eq!(duduclaw_core::effect_of(tool), effect);
+            if !write {
+                let dispatcher = dispatcher(home.path()).await;
+                let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+                let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
+                    &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(159),
+                )).await;
+                // RM-134 hides tools outside the authenticated employee scope.
+                assert_eq!(result["error"]["code"], -32601, "{tool}: {result}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rm159_all_calendar_updates_use_the_existing_send_approval_policy() {
+    let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n[[capabilities.action_rules]]\neffect='send'\nverdict='block'");
+    let path = home.path().join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap().replace("scopes=['google:read']", "scopes=['google:read','google:write']");
+    std::fs::write(path, config).unwrap();
+    let dispatcher = dispatcher(home.path()).await;
+    for args in [json!({"event_id":"e","summary":"s"}),
+        json!({"event_id":"e","summary":"s","notify_attendees":false}),
+        json!({"event_id":"e","summary":"s","notify_attendees":true}),
+        json!({"event_id":"e","attendees":["a@example.test"]})] {
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let principal = call.principal().clone();
+        let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
+            &principal, &namespace(), &json!({"name":"calendar_update_event","arguments":args}), &json!(159),
+        )).await;
+        assert_eq!(result["error"]["code"], -32003, "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("action_rules"), "{result}");
+    }
+}

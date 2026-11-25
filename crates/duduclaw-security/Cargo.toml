@@ -42,3 +42,6 @@ default = []
 # `duduclaw-core`'s own optional `keyring` dependency; no new crate is added.
 # Off by default so the standard build links no native credential-store code.
 keychain = ["duduclaw-core/keychain"]
+
+[dev-dependencies]
+tempfile = "3"

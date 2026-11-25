@@ -61,7 +61,7 @@ pub(crate) enum SocketValidity {
 
 impl SocketValidity {
     pub(crate) fn from_error(error: &str) -> Self {
-        if error == INACTIVE_ACCOUNT_ERROR || error == "登入憑證已失效，請重新登入。" {
+        if matches!(error, "member key invalid" | "member keys disabled") || error == INACTIVE_ACCOUNT_ERROR || error == "登入憑證已失效，請重新登入。" {
             Self::Revoked
         } else {
             Self::Unavailable
@@ -160,6 +160,11 @@ pub(crate) fn resolve_live_context(
     cache: &LiveContextCache,
     jwt_ctx: &UserContext,
 ) -> Result<UserContext, String> {
+    if let Some(id) = jwt_ctx.member_key_id.as_deref() {
+        let live = db.member_key_context(id, &jwt_ctx.user_id)?;
+        if live.credential_epoch != jwt_ctx.credential_epoch { return Err("member key invalid".into()); }
+        return Ok(live);
+    }
     let generation = db.acl_generation();
     if let Ok(g) = generation {
         if let Some(hit) = cache.get(&jwt_ctx.user_id, g) {
@@ -196,6 +201,7 @@ pub(crate) fn resolve_live_context(
 /// A message checks expiry independently and does not read SQLite on a cache hit.
 pub(crate) fn resolve_socket_context(db: &UserDb, cache: &LiveContextCache,
     ctx: &UserContext, heartbeat: bool) -> Result<UserContext, String> {
+    if ctx.member_key_id.is_some() { return resolve_live_context(db, cache, ctx); }
     if !heartbeat {
         let entries = cache.lock();
         if let Some((_, live, at)) = entries.get(&ctx.user_id) {
@@ -236,6 +242,16 @@ pub(crate) fn read_failure_stats() -> (u64, u64) {
 
 impl MethodHandler {
     pub(crate) async fn socket_context(&self, ctx: &UserContext, heartbeat: bool) -> Result<UserContext, SocketValidity> {
+        if ctx.member_key_id.is_some() {
+            let db = self.user_db.read().await.clone().ok_or(SocketValidity::Unavailable)?;
+            let home = self.home_dir.clone();
+            let ctx = ctx.clone();
+            return match tokio::task::spawn_blocking(move || crate::member_keys::refresh(&home, &db, &ctx)).await {
+                Ok(Ok(live)) => Ok(live),
+                Ok(Err(e)) => Err(SocketValidity::from_error(&e)),
+                Err(_) => Err(SocketValidity::Unavailable),
+            };
+        }
         if ctx.user_id == "system" {
             return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
         }
@@ -254,6 +270,10 @@ impl MethodHandler {
 
     /// The context this RPC runs under. See the module docs.
     pub(crate) async fn live_context(&self, ctx: &UserContext) -> Result<UserContext, WsFrame> {
+        if ctx.member_key_id.is_some() {
+            return self.socket_context(ctx, true).await
+                .map_err(|_| WsFrame::error_response("", "member key invalid or unavailable"));
+        }
         if ctx.user_id == "system" {
             return Ok(crate::machine_employee::without_restricted_access(&self.home_dir, ctx.clone()));
         }

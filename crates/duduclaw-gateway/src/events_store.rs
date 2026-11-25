@@ -117,6 +117,13 @@ impl EventBusStore {
                  ts       TEXT NOT NULL
              );
 
+             CREATE TABLE IF NOT EXISTS person_notices (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 user_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+                 actor_id TEXT NOT NULL, kind TEXT NOT NULL, ts TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS person_notices_user ON person_notices(user_id, id);
+
              CREATE TABLE IF NOT EXISTS scrubbed_approval_events (
                  approval_id TEXT PRIMARY KEY NOT NULL
              );
@@ -147,6 +154,28 @@ impl EventBusStore {
                 .map_err(|e| format!("add column source: {e}"))?;
         }
         Ok(())
+    }
+
+    /// Private dashboard notices share the durable store, never the public
+    /// event stream. The authenticated reader supplies their own user id.
+    pub(crate) async fn person_notice(&self, user: &str, agent: &str, actor: &str, kind: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        conn.execute("INSERT INTO person_notices(user_id,agent_id,actor_id,kind,ts) VALUES (?1,?2,?3,?4,?5)",
+            params![user, agent, actor, kind, Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub(crate) async fn person_notices(&self, user: &str) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.conn.lock().await;
+        duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare("SELECT id,agent_id,actor_id,kind,ts FROM person_notices WHERE user_id=?1 ORDER BY id DESC LIMIT 50")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([user], |r| Ok(serde_json::json!({
+            "id":r.get::<_, i64>(0)?, "agent_id":r.get::<_, String>(1)?, "actor_id":r.get::<_, String>(2)?,
+            "kind":r.get::<_, String>(3)?, "timestamp":r.get::<_, String>(4)?
+        }))).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
     /// Append one event. Payload is an already-serialized JSON string.

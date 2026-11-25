@@ -62,3 +62,14 @@ describe('literal command and HTML help', () => {
     },
   );
 });
+
+describe('Google Chat onboarding placeholder help', () => {
+  it.each([['en', en], ['zh-TW', zhTW], ['ja-JP', jaJP]] as const)(
+    'keeps the placeholder literal in %s', (locale, messages) => {
+      const onError = vi.fn();
+      const intl = createIntl({ locale, messages, onError });
+      expect(intl.formatMessage({ id: 'channels.googlechat.unboundReply.help' })).toContain('{onboarding_url}');
+      expect(onError).not.toHaveBeenCalled();
+    },
+  );
+});

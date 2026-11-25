@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::KbResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// `<home>/knowledge`.
 pub fn knowledge_dir(home: &Path) -> PathBuf {
@@ -282,6 +282,27 @@ pub fn migrate(conn: &Connection) -> KbResult<()> {
             )?;
         }
     }
+    // Serialize the column check with ALTER, including concurrent gateway opens.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let has_opt_in: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('collections') WHERE name='owner_self_add')",
+        [], |r| r.get(0),
+    )?;
+    if !has_opt_in {
+        tx.execute("ALTER TABLE collections ADD COLUMN owner_self_add INTEGER NOT NULL DEFAULT 0 CHECK(owner_self_add IN (0,1))", [])?;
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS owner_self_add_log (
+        id INTEGER PRIMARY KEY, collection_id TEXT NOT NULL, actor_ai TEXT NOT NULL,
+        owner_id TEXT NOT NULL, source_summary TEXT NOT NULL, imported_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_self_add_hour ON owner_self_add_log(collection_id, imported_at);
+    CREATE TABLE IF NOT EXISTS knowledge_owner_card_deliveries (
+        approval_id TEXT NOT NULL, owner_id TEXT NOT NULL, channel TEXT NOT NULL,
+        destination TEXT NOT NULL, conversation TEXT NOT NULL,
+        PRIMARY KEY(approval_id, owner_id, channel, destination, conversation)
+    );")?;
+    tx.execute("UPDATE kb_meta SET value=?1 WHERE key='schema_version'", [SCHEMA_VERSION.to_string()])?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -308,6 +329,22 @@ pub fn generation(conn: &Connection) -> KbResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_collections_opt_out_and_reopen_preserves_owner_choice() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute("INSERT INTO kb_meta VALUES('schema_version', '1')", []).unwrap();
+        conn.execute("INSERT INTO collections(id, slug, name, created_by, created_at, updated_at)
+            VALUES('legacy', 'legacy', 'Legacy', 'owner', 'now', 'now')", []).unwrap();
+        migrate(&conn).unwrap();
+        let opted: bool = conn.query_row("SELECT owner_self_add FROM collections WHERE id='legacy'", [], |r| r.get(0)).unwrap();
+        assert!(!opted);
+        conn.execute("UPDATE collections SET owner_self_add=1 WHERE id='legacy'", []).unwrap();
+        migrate(&conn).unwrap();
+        let opted: bool = conn.query_row("SELECT owner_self_add FROM collections WHERE id='legacy'", [], |r| r.get(0)).unwrap();
+        assert!(opted);
+    }
 
     #[test]
     fn schema_is_idempotent_and_versioned() {

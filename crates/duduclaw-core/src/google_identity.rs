@@ -62,6 +62,10 @@ pub enum Selector {
     /// Act as this Workspace user through the delegation service account.
     /// Always lower-case.
     Delegate(String),
+    /// Gateway-selected, administrator-attested primary owner.
+    DelegateOwner,
+    /// Google is supplied by a separately configured external tool.
+    External,
     /// The employee's owner's own connected account (B2b).
     Owner,
     /// A named colleague's connected account (B2b).
@@ -81,6 +85,8 @@ impl Selector {
             "home" => return Ok(Self::Home),
             "none" => return Ok(Self::None),
             "owner" => return Ok(Self::Owner),
+            "delegate:owner" => return Ok(Self::DelegateOwner),
+            "external" => return Ok(Self::External),
             _ => {}
         }
         if let Some(email) = strip_prefix_ci(v, "delegate:") {
@@ -111,6 +117,8 @@ impl Selector {
             Self::Home => "home".into(),
             Self::None => "none".into(),
             Self::Delegate(e) => format!("delegate:{e}"),
+            Self::DelegateOwner => "delegate:owner".into(),
+            Self::External => "external".into(),
             Self::Owner => "owner".into(),
             Self::User(u) => format!("user:{u}"),
         }
@@ -122,6 +130,8 @@ impl Selector {
             Self::Home => "home",
             Self::None => "none",
             Self::Delegate(_) => "delegate",
+            Self::DelegateOwner => "delegate_owner",
+            Self::External => "external",
             Self::Owner => "owner",
             Self::User(_) => "user",
         }
@@ -263,7 +273,7 @@ impl<'de> serde::Deserialize<'de> for SectionRead {
     }
 }
 
-const AGENT_KEYS: &[&str] = &["identity", "fallback", "requesters"];
+const AGENT_KEYS: &[&str] = &["identity", "fallback", "requesters", "external_server"];
 
 /// Read `[google]` out of an `agent.toml` body. Strict: a file that is not
 /// TOML, a non-table `google`, an unknown key or a wrong-typed value is
@@ -297,10 +307,18 @@ pub fn section_from_table(section: &toml::Table) -> Result<AgentGoogleSection, S
         Some(v) if v == "home" => Fallback::Home,
         Some(_) => return Err("[google] fallback 只能是 none 或 home".into()),
     };
+    if let Some(name) = str_field("external_server")? {
+        if name.chars().count() > 120 || name.chars().any(char::is_control) {
+            return Err("external_server 最多 120 字，不可含控制字元".into());
+        }
+    }
+    if identity == Some(Selector::DelegateOwner) && fallback != Fallback::None {
+        return Err("delegate:owner 不允許改用公司共用帳號".into());
+    }
     let requesters = str_field("requesters")?
         .map(Requesters::parse)
         .transpose()?
-        .unwrap_or_default();
+        .unwrap_or(if identity == Some(Selector::DelegateOwner) { Requesters::OwnerOnly } else { Requesters::default() });
     Ok(AgentGoogleSection {
         identity,
         fallback,
@@ -495,6 +513,9 @@ pub enum Effective {
     Home,
     /// Google is off for this employee: tools hidden and refused.
     Disabled,
+    External,
+    /// Only the gateway can turn this selector into an attested subject.
+    DelegateOwner,
     /// Act as this Workspace user; only the gateway mints it.
     Delegate { email: String },
     /// A human's own connected Google account. The gateway enforces the
@@ -509,6 +530,8 @@ impl Effective {
         match self {
             Self::Home => "home",
             Self::Disabled => "none",
+            Self::External => "external",
+            Self::DelegateOwner => "delegate_owner",
             Self::Delegate { .. } => "delegate",
             Self::Personal { selector } => selector.kind(),
             Self::Invalid(_) => "invalid",
@@ -519,7 +542,7 @@ impl Effective {
     /// effective `none` hides them; a broken setting stays listed so the call
     /// can say what is wrong).
     pub fn tools_listed(&self) -> bool {
-        !matches!(self, Self::Disabled)
+        !matches!(self, Self::Disabled | Self::External)
     }
 }
 
@@ -548,6 +571,8 @@ fn effective_of(sel: &Selector) -> Effective {
     match sel {
         Selector::Home => Effective::Home,
         Selector::None => Effective::Disabled,
+        Selector::External => Effective::External,
+        Selector::DelegateOwner => Effective::DelegateOwner,
         Selector::Delegate(email) => Effective::Delegate {
             email: email.clone(),
         },

@@ -19,6 +19,7 @@ pub mod compat_runners;
 pub mod concurrency_gate;
 pub mod gateway_instance;
 pub mod google_identity;
+pub mod employee_incarnation;
 pub mod human_principal;
 pub mod config;
 pub mod container_engine;
@@ -77,6 +78,7 @@ pub mod spawn_admission;
 pub mod ns_guard;
 pub mod root_key;
 pub mod spawn_env;
+pub mod run_credential;
 pub mod subscription_risk;
 pub mod takeover_state;
 pub mod task_packet;
@@ -1546,3 +1548,6 @@ pub mod mcp_key_store;
 pub mod private_sqlite;
 
 pub mod mcp_start_status;
+
+pub mod scope_policy;
+pub mod scope_policy_checks;

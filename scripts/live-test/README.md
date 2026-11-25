@@ -5,6 +5,7 @@ production home (`~/.duduclaw`).
 
 | Script | What it does |
 |---|---|
+| `v185-acceptance.mjs [--port N] [--only avatar,memory,identity,wiki,member-key,self-add]` | Requires Node 22+ (global `WebSocket`), macOS `sandbox-exec`, `sqlite3`, `lsof`, and `DUDUCLAW_BIN` pointing to an already-built executable. Creates a disposable Enterprise upgrade fixture with a signed OEM license, isolated OS/product homes, local CLI shims and loopback-only networking. Checks avatar migration/idempotence, remembered MCP results/pinned notes, Claude/Codex run identity, wiki path refusals, member-key revocation and owner self-add/approval cards. Run instructions, fixture differences and evidence limits are below. `--test-helpers` runs without a gateway, subprocesses or listeners. |
 | `tui-control-room.sh [port]` | Requires Node 22+ and `DUDUCLAW_BIN` pointing to a built executable. Creates an isolated home with `make-home.sh`, starts a real loopback gateway (default port 18979), logs in with a local account JWT, checks `autonomy.pause` / `autonomy.resume` via the same `/ws` RPC shapes as the TUI and reads back `autonomy.status`. Runs the real `tui inbox --json`, checks freshness, stops its own gateway and retains artifacts. Run from an operator shell: AI-session markers are not removed. This implementation was not live-run in the restricted sandbox. |
 | `third-party-mcp.sh [port]` | Requires Node 22+, `lsof`, `DUDUCLAW_BIN` and `MCP_FIXTURE_BIN` (the Rust `third_party_mcp_fixture` example). Creates its own isolated home and loopback gateway (default 18983), installs a Rust stdio fixture, checks the install probe, then checks real chat and cron preparation with a local Claude shim. Both runs verify initialize/tools/list and the missing-token negative control. No model or external MCP service is used. Stops its own gateway and retains sanitised results and gateway logs. Not live-run during implementation. |
 | `make-home.sh <target-dir> [--port N]` | Creates an isolated DuDuClaw home: loopback `config.toml` (default port 18977) and two employees. `plain` has no tool allowlist (the old kind of test employee). `prod-shaped` is written like a production employee: `[capabilities] allowed_tools = ["mcp__duduclaw__*", "Read", "Write", "Edit", "Bash"]`, a `denied_tools` entry, `approval_required_tools`, all four `[permissions]` flags, `[budget]`, `[evolution] gvu_enabled = true`, a `CONTRACT.toml` and a `SOUL.md`. Refuses a non-empty target and any target inside `~/.duduclaw`. Writes no secrets. |
@@ -12,6 +13,93 @@ production home (`~/.duduclaw`).
 | `google-delegated-identity.mjs` (historical, paused) | Do not run during the narrowed EXT follow-up; use the ordinary baseline below. Retained for the original evidence. Creates its own temporary home, starts a real gateway and stdio MCP servers, and exchanges signed RSA assertions with a loopback fake Google. Requires a debug build with `--features live-test-mocks` and Node 22+. Credential protection uses an in-memory store; no real keychain, model or Google account is touched. Checks shared-account compatibility, two delegated subjects, same-process account changes, domain refusal, unsigned and unproven callers, provider rejection, explicit fallback, `none`, the master switch, audit redaction and offline gateway refusal. Artifacts remain in the printed temporary folder. |
 | `node google-personal-identity.mjs <guarded-binary-wrapper>` | Creates a fresh Enterprise home and a loopback OAuth/service mock. Requires Node 22+, a debug `live-test-mocks` binary and an OS sandbox wrapper that denies real credential/keychain access and all outbound traffic except loopback. Checks exact redirect/PKCE, same-session completion after JWT refresh, cross-session/user refusal, actual partial scopes, self-consent, primary Owner changes, per-call refresh/status checks, local disconnect before delayed revoke, grant coordination and encrypted/redacted storage. Reversible suspension is injected into the fresh fixture database because this base has no reversible status RPC; it verifies resolver revalidation, not a status-management API. Artifacts remain in the printed folder. This is isolated mock evidence, not real Google or OS-keychain acceptance. |
 | `python3 on-behalf-of.py <home> <binary>` | After booting and stopping the isolated gateway, calls the real `prod-shaped` stdio MCP server. Checks host identity stamping on tasks and queue rows, forged tool arguments, rejection auditing, enforce refusals and absent-principal behavior. Writes disposable test rows and temporarily changes the isolated delegation policy. It calls no model; runtime delivery, real channels and human acceptance require separate checks. |
+
+## v1.85 acceptance rerun
+
+Run from the repository root, outside the implementation sandbox:
+
+```bash
+# Build only if the executable needs rebuilding. This suite needs no special feature.
+cargo build -p duduclaw-cli --bin duduclaw
+node --check scripts/live-test/v185-acceptance.mjs
+node scripts/live-test/v185-acceptance.mjs --test-helpers
+DUDUCLAW_BIN="$PWD/target/debug/duduclaw" node scripts/live-test/v185-acceptance.mjs --port 18985
+```
+
+A debug binary built with `--features live-test-mocks` also works; it is not
+required for the RPC/MCP/identity paths exercised here. The suite does not
+invoke credential-protection enablement or the Google mock routes that require
+that feature. `/healthz.live_test_mocks` is recorded in `edition-*.json`.
+The first run's edition refusals came from the community license ceiling,
+not from the absence of `live-test-mocks`.
+
+The fixture follows `google-personal-identity.mjs`'s disposable Ed25519-signed
+OEM license setup: fingerprint the test machine under the same OS sandbox,
+keep the private signing key in memory, write only the disposable license,
+and pass its public key and `DUDUCLAW_EDITION=enterprise` to isolated children.
+The harness verifies `system.status.edition_profile` before scenarios. An env
+override alone cannot elevate a community license, even in a debug build
+(`duduclaw-core/src/types.rs`, `EditionProfile::resolve`). Login uses the
+loopback first-run claim once and `/api/login` on each boot; Personal-only
+`/api/session/local` is not used.
+
+This is an Enterprise **upgrade** fixture: it seeds a wholly pre-MFA,
+pre-avatar identity schema before the first boot, including when avatar is
+not selected (then only the bootstrap owner is seeded). The legacy MFA policy
+remains off through the documented upgrade path in `mfa.rs::read_boot_policy_state`
+and `boot_policy_legacy_store_allows_migration_then_reads_durable_policy`.
+It does not claim to test a brand-new Enterprise identity store's strict MFA
+onboarding default.
+
+The first macOS run exposed these harness errors:
+
+| Scenario | Evidence and correction |
+| --- | --- |
+| Avatar | `legacy-shape.json` has four binding fields; `google_identity.rs::migrate` deliberately adds `is_primary INTEGER NOT NULL DEFAULT 0`. `SELECT *` therefore always differs. Compare every existing user/binding field explicitly, require all added primary flags to be zero, retain avatar rules from `avatar.rs` migration tests, and still require cleared avatars/legacy fields/primary flags to survive the second boot unchanged. |
+| Memory | Both messages used the same socket, employee and `conv=memory-fixture`; `webchat.rs::compose_session_id` forms a stable bucket from those values. Logs show real `tasks_create`, pinned extraction into that exact bucket, and concurrent background CLI work. A single `identity-claude.json`/lease/release per runtime was shared with that work. Each request now has a unique prompt marker, directory, atomic lease and matching job id; the WebChat connection session id is echoed on every turn. Same-session, distinct-turn, pinned-note/reference and unrelated-session isolation checks remain mandatory. |
+| Claude identity | The retained `identity-claude.json` contains active human `fixture-admin`, a turn id and a full conversation session despite the reported missing fields. Its shared file could be overwritten after the failed assertion. Use per-request evidence, disable fixture autonomous evolution, and let only the matching prompt claim the job. Gateway-owned identity remains authoritative; no field is supplied or invented by the fixture. |
+| Codex identity | `gateway-migration.log` says native constraints cannot enforce `approval_required_tools: Bash`; the CLI fixture was never reached. The Codex fixture now uses an empty native approval list while keeping its MCP wildcard allowlist and `WebFetch` denial. The Claude fixture retains Bash approval. |
+| Wiki | `mcp.log` records successful `wiki_write` and `wiki_read`; the normal `concepts/acceptance.md` file exists. The next input, `../escape.md`, has no valid page id, so `mcp_dispatch.rs` returns JSON-RPC `-32602`, `Invalid wiki page id`, before the tool handler. Traversal/absolute-path tests now require that exact dispatcher refusal. Valid relative `.md` paths and symlink/control-file tests still exercise tool-layer refusals and verify no outside/target modification. |
+| Self-add / member key | `users.bind_agent` / `users.create` returned `enterprise_edition_required`. The isolated home now has a verified Enterprise entitlement and an ordinary owner session. No product authorization gate is bypassed. |
+
+The copied first-run `users.db` lacks the avatar column and `sessions.db`
+lacks the sessions table; no WAL sidecars were included. Those copies cannot
+prove the full post-migration row contents. The known binding-column mismatch
+is deterministic from source, but any additional legacy data changes must
+still fail the rerun. No product defect is established by the retained
+artifacts; the corrected live scenarios have not been rerun in the
+implementation sandbox.
+
+Each run prints its private `ARTIFACTS` directory and retains valid, redacted
+JSON observations, `legacy-after.json`, per-request `turn-*/{job,identity,chat-frames}.json`,
+`fixture-invocations.jsonl`, shim/MCP/gateway logs and standalone SQLite
+backups in `databases/{users,sessions}.db`. Preserve the whole directory;
+copying only a live WAL-mode `.db` loses committed data still in its WAL.
+Backups and the isolated home contain fixture account data and stay private.
+The harness stops its owned process groups, prints PASS/FAIL/SKIP and exits 1
+on failure. External DM delivery remains SKIP. Auto-install is off; the
+periodic check has no disable switch, so its outbound request is routed to an
+unreachable loopback proxy and confined by the inherited OS sandbox.
+
+The second run's member-key failure was a harness false negative after
+revocation, not an authentication failure: the retained audit records show
+key creation/use and `member_key.revoked` at `2026-11-25T01:07:51.149626Z`;
+the gateway logs show the authenticated member chat terminating immediately
+afterward at `01:07:51.150152Z`. The scenario had already passed chat
+`session_info`, HTTP `/api/me` and the revoke RPC before awaiting that close.
+`webchat/turns/socket_tests.rs::member_key_chat_socket_closes_after_revoke_expiry_epoch_or_admin`
+accepts EOF, a Close frame or a transport error on retirement. The harness
+previously conflated a transport error with malformed JSON and failed before
+observing the close event. It now requires actual closure within five seconds,
+accepts an abnormal close only during the expected refusal phase, and still
+rejects malformed JSON or subsequent chat/session data. Reconnect must also
+close; only an authentication-failure frame may precede that close. Successful
+evidence records both close codes and transport-error flags, and failures name
+the scenario phase. Pure helper cases cover these outcomes without opening a
+socket. This correction has not been live-rerun in the implementation sandbox.
+The old evidence did not retain the close code or distinguish transport errors
+from JSON errors; the transport diagnosis follows the shutdown path and the
+existing socket contract, and the rerun must capture those details.
 
 ## Why `prod-shaped` exists
 

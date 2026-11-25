@@ -436,8 +436,9 @@ mod multi_turn_tests {
     fn recap_prefix_with_pinned() {
         let pinned = "- Goal: build two teams\n- PM: daily 8:00 report";
         let msg = "開始建立團隊";
-        let result = format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}");
-        assert!(result.contains("<task_recap>"));
+        let result = format!("{}\n\n{msg}", crate::memory_reference::pinned_task_context(pinned));
+        assert!(result.contains("<pinned_task_data>"));
+        assert!(result.contains("untrusted reference data"));
         assert!(result.contains("build two teams"));
         assert!(result.ends_with("開始建立團隊"));
     }
@@ -450,7 +451,7 @@ mod multi_turn_tests {
         let effective = if pinned.is_empty() {
             msg.to_string()
         } else {
-            format!("<task_recap>\n{pinned}\n</task_recap>\n\n{msg}")
+            format!("{}\n\n{msg}", crate::memory_reference::pinned_task_context(pinned))
         };
         assert_eq!(effective, "hello");
     }

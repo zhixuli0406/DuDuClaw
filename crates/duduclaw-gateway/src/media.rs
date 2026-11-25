@@ -182,7 +182,7 @@ pub async fn save_attachment_in_base(
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) { let _ = directory.remove_file(name); }
         return Err(error);
     }
-    crate::knowledge::chat_attachments::note_saved(&path, filename);
+    crate::knowledge::chat_attachments::note_saved_bytes(&path, filename, data);
     Ok(path)
 }
 
@@ -194,7 +194,7 @@ pub(crate) async fn save_webchat_attachment_in_base(base_dir:&std::path::Path,da
         if let Some(name) = path.file_name().and_then(|n| n.to_str()) { let _ = directory.remove_file(name); }
         return Err(error);
     }
-    crate::knowledge::chat_attachments::note_saved(&path,filename);
+    crate::knowledge::chat_attachments::note_saved_bytes(&path,filename,data);
     Ok(path)
 }
 

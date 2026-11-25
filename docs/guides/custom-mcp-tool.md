@@ -5,6 +5,29 @@
 
 ---
 
+
+## Getting and verifying the caller identity
+
+An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
+
+This section covers gateway-managed runs. Standalone `duduclaw agent` terminal sessions do not register with this gateway registry. Installation/version/auth probes and the opt-in `/model` menu probe are not identity-bearing work turns.
+
+For local tools launched by DuDuClaw, read `DUDUCLAW_RUN_CREDENTIAL` and verify it with the local gateway on **each tool call**, or use the CLI below. Do not infer identity from cwd, a display name, tool arguments, or `DUDUCLAW_ON_BEHALF_OF`. Query only locally, never forward the credential. Do not put it in URLs, argv, logs, tool results or transcripts. The non-secret `DUDUCLAW_IDENTITY_URL` points to a dedicated listener on `127.0.0.1` with an ephemeral port, separate from the dashboard router. Only the gateway process holding `gateway.lock` starts it. The CLI reads this variable first, then `<gateway home>/run/identity-url` (owner-only, 0600 on Unix), and refuses non-loopback URLs. The URL is a routing hint, not identity proof.
+
+```sh
+duduclaw identity whoami --json
+
+```
+
+An active response contains `active: true`, `agent_id`, `principal`, `session_id`, `turn_id`, `task_id`, `runtime`, `issued_at` and `expires_at` (Unix seconds). A human principal is `{"type":"human","user_id":"…"}`; cron, heartbeat and task work use `{"type":"background","kind":"…"}`. Unverified requesters are background/unattributed, never an administrator. Session/task ids can be null. These are gateway records, not statements supplied by the model. Check the verified principal against your tool's own authorization rules; identity alone grants no permission.
+
+Malformed, unknown, expired and revoked credentials all return HTTP 200 with exactly `{"active":false}`; non-loopback peers, missing peer information and rate-limited requests receive the same refusal. Each valid credential has its own 600-query/minute bucket, bounded by the 8,192-entry registry; malformed/unknown requests share a separate bucket. Requests with `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`, `Via` or `Origin` also receive the uniform inactive response. Each request is limited to 1 KiB. The CLI exits non-zero for a missing/inactive credential or an unavailable gateway. Always deny when verification fails; do not cache an active result across calls.
+
+Each CLI attempt receives a fresh opaque `ddc_run_` credential made from 32 random bytes. The gateway retains only SHA-256 hashes, with at most 8,192 live entries. A guard revokes it when the attempt ends, errors or is cancelled; expiry is the run timeout plus 60 seconds, capped at six hours, and a gateway restart invalidates every credential. Local API tool loops retain a lease for the lifetime of their tool registry. `mcp-proxy` forwards this variable to local third-party servers while still stripping the older identity variables. Codex requires MCP `env_vars` support; the credential travels through the process environment, never its command line. Actual Codex shell/MCP propagation still needs live validation for the installed version.
+
+This prevents forging claims, not theft of another live bearer credential: processes sharing an OS user can potentially read one another's environment. Keep local tools trusted; use OS isolation for hostile workloads. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity. The existing `DUDUCLAW_AGENT_TOKEN` scheme and DuDuClaw MCP server identity verification are unchanged.
+
+
 ## Overview
 
 DuDuClaw exposes 200+ MCP tools (206 as of v1.56) via JSON-RPC 2.0 over stdin/stdout. This guide explains how to add custom tools that integrate with Claude Code.

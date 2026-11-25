@@ -1,82 +1,25 @@
-# DuDuClaw WebSocket RPC API
+# DuDuClaw dashboard RPC API
 
-DuDuClaw exposes a JSON-RPC 2.0 API over WebSocket at `ws://<host>:<port>/ws`.
+The gateway uses JSON text `WsFrame` messages over WebSocket at
+`ws://<host>:<port>/ws` (default port 18889). Member clients authenticate the
+first `connect` frame with a JWT access token obtained through HTTP login.
 
-## Quick Start
-
-```bash
-# Start the gateway
-duduclaw run
-
-# Connect via WebSocket (default: ws://localhost:18889/ws)
-```
-
-## Protocol
-
-All communication uses JSON-RPC 2.0 frames:
+Read the [draft member-facing compatibility contract](member-contract.md) for
+the actual transport, login and refresh flow, member method inventory, key
+response fields and two-minor-version compatibility promise. Its inventory
+is pending confirmation against the distributor's actual calls.
 
 ```json
-// Request
-{ "jsonrpc": "2.0", "method": "agents.list", "params": {}, "id": "1" }
-
-// Success response
-{ "jsonrpc": "2.0", "result": { "agents": [...] }, "id": "1" }
-
-// Error response
-{ "jsonrpc": "2.0", "error": { "code": -1, "message": "..." }, "id": "1" }
+{"type":"req","id":"connect-1","method":"connect","params":{"jwt":"<access_token>"}}
+{"type":"req","id":"me-1","method":"users.me","params":{}}
 ```
 
-## Authentication
+Responses use `type: "res"`, `ok` and either `payload` or `error`. This is not
+JSON-RPC 2.0, and member login does not use Ed25519 challenge signing.
+`/ws/chat` has a separate WebChat protocol described in the contract.
 
-1. Send `connect.challenge` to receive a challenge UUID.
-2. Sign with your Ed25519 private key.
-3. Send `connect` with the signed response.
-
-If `auth_token` is not configured, authentication is disabled.
-
-## Method Categories
-
-| Prefix | Description | Count |
-|--------|-------------|-------|
-| `agents.*` | Agent lifecycle and management | 12 |
-| `channels.*` | Channel management (11 platforms) | 5 |
-| `accounts.*` | OAuth/API account rotation and budgets | 6 |
-| `memory.*` | Cognitive memory search and browsing | 2 |
-| `skills.*` | Skill ecosystem discovery | 3 |
-| `cron.*` | Scheduled task management | 4 |
-| `system.*` | Status, config, diagnostics | 8 |
-| `license.*` | License activation and status | 3 |
-| `analytics.*` | Usage analytics and cost savings | 3 |
-| `referral.*` | Referral code system | 3 |
-| `security.*` | Audit logs, credentials | 1 |
-| `models.*` | Cloud + local model listing | 1 |
-| `logs.*` | Real-time log streaming | 2 |
-| `heartbeat.*` | Agent heartbeat scheduling | 2 |
-| `evolution.*` | Evolution engine status | 2 |
-| `browser.*` | Browser automation approval | 2 |
-| `billing.*` | Usage and billing history | 2 |
-| `marketplace.*` | Skill marketplace | 2 |
-| `partner.*` | Partner/reseller management | 4 |
-
-## OpenAPI Spec
-
-The full API specification is documented in [openapi.yaml](./openapi.yaml).
-
-While this is a WebSocket JSON-RPC API (not REST), the spec uses OpenAPI 3.1 format with `/rpc/<method>` pseudo-paths for tooling compatibility and discoverability.
-
-## Referral System
-
-Generate and share referral codes to earn rewards:
-
-| Referrals | Reward |
-|-----------|--------|
-| 1 | +500 bonus conversations |
-| 3 | 1 month Pro tier |
-| 10 | Permanent Pro tier |
-
-```bash
-# CLI usage
-duduclaw refer generate        # Generate your code
-duduclaw refer status          # Check progress
-duduclaw refer redeem DDCL-XXXX  # Redeem a code
-```
+[openapi.yaml](openapi.yaml) is a partial historical discovery reference,
+with selected sections maintained separately. Its `/rpc/<method>` paths are
+**pseudo-paths**, not HTTP endpoints. It is not an exhaustive method list or
+the member compatibility contract. Actual routing and permissions live in
+`crates/duduclaw-gateway/src/handlers/` and the gateway-owned namespace modules.

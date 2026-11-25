@@ -245,7 +245,7 @@ impl SourceSnapshot {
             return Err(changed());
         }
         let config_projection = projection(&home)?.0;
-        let policy = duduclaw_core::google_identity::effective_for(&home, Some(agent));
+        let policy = crate::google_identity::delegate_owner::effective_for(&home, Some(agent));
         let snapshot = Self {
             home_identity: directory_identity(&home)?,
             agent_identity: directory_identity(&dir)?,
@@ -276,7 +276,7 @@ impl SourceSnapshot {
             || directory_identity(&self.agent_dir)?
                 != self.agent_identity
             || projection(&self.home)?.0 != self.config_projection
-            || duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
+            || crate::google_identity::delegate_owner::effective_for(&self.home, Some(&self.agent))
                 != self.policy
             || crate::mcp_oauth::home_store::closed_readonly_control(&self.home)
                 .map_err(|_| changed())?
@@ -301,7 +301,7 @@ impl SourceSnapshot {
             || directory_identity(&self.agent_dir)?
                 != self.agent_identity
             || projection(&self.home)?.0 != self.config_projection
-            || duduclaw_core::google_identity::effective_for(&self.home, Some(&self.agent))
+            || crate::google_identity::delegate_owner::effective_for(&self.home, Some(&self.agent))
                 != self.policy
         {
             return Err(changed());

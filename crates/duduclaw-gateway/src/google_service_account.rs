@@ -273,6 +273,9 @@ fn cache() -> &'static RwLock<HashMap<String, CachedToken>> {
 }
 
 fn cache_key(client_email: &str, subject: &str, scopes: &[&str]) -> String {
+    let mut scopes = scopes.to_vec();
+    scopes.sort_unstable();
+    scopes.dedup();
     format!("{client_email}|{subject}|{}", scopes.join(" "))
 }
 
@@ -320,6 +323,14 @@ pub async fn mint_for_subject(
     cache_mode: CacheMode,
 ) -> Result<MintedToken, ServiceAccountError> {
     let cache_key = cache_key(&key.client_email, subject, scopes);
+    if cache_mode == CacheMode::Bypass {
+        // Retire prior reusable bearers for this exact issuer/subject. Owner
+        // delegation uses Bypass on every call and never populates this cache.
+        cache().write().await.retain(|stored, _| {
+            let mut fields = stored.split('|');
+            !(fields.next() == Some(key.client_email.as_str()) && fields.next() == Some(subject))
+        });
+    }
     if cache_mode == CacheMode::Use
         && let Some(hit) = cache().read().await.get(&cache_key)
     {
@@ -679,6 +690,7 @@ subject = "boss@customer.com"
 
     #[test]
     fn cache_key_separates_scopes_and_subjects() {
+        assert_eq!(cache_key("sa", "a@c.com", &["y", "x", "x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "b@c.com", &["x"]));
     }

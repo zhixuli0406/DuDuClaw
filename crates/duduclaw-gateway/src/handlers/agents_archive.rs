@@ -41,6 +41,9 @@ impl MethodHandler {
             }
         }
 
+        if let Err(e) = duduclaw_core::employee_incarnation::deleted(&self.home_dir, &agent_id) {
+            return WsFrame::error_response("", &format!("Failed to retire employee identity: {e}"));
+        }
         if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }

@@ -417,6 +417,18 @@ pub(super) async fn spawn_claude_cli_with_env(
         .filter(|id| !id.is_empty())
         .and_then(|agent| crate::knowledge::turn_requesters::register_current_turn(&agent));
 
+    let _run_identity = if protected { None } else {
+        // This directory is the gateway-resolved employee config, not a tool cwd.
+        let agent = crate::claude_runner::CHANNEL_REPLY_AGENT_ID.try_with(Clone::clone).ok()
+            .filter(|id| !id.is_empty())
+            .or_else(|| work_dir.and_then(|dir| dir.file_name()).and_then(|id| id.to_str()).map(str::to_owned))
+            .unwrap_or_else(|| "system".into());
+        let guard = crate::run_identity::issue(home_dir, &agent, "claude",
+            crate::runtime_config::claude_timeout_secs(home_dir, work_dir))?;
+        guard.apply(&mut cmd);
+        Some(guard)
+    };
+
     // Prevent "nested session" error when gateway was launched from a Claude Code session
     cmd.env_remove("CLAUDECODE");
     cmd.stdin(std::process::Stdio::null());
@@ -476,8 +488,8 @@ pub(super) async fn spawn_claude_cli_with_env(
                     guard.push_str(&String::from_utf8_lossy(&chunk[..n]));
                     // Keep only the last 2 KiB — we only need tail for diagnostics.
                     if guard.len() > 2048 {
-                        let cut = guard.len() - 2048;
-                        *guard = guard[cut..].to_string();
+                        let skip = guard.chars().count().saturating_sub(512);
+                        *guard = guard.chars().skip(skip).collect();
                     }
                 }
             }
@@ -624,6 +636,7 @@ pub(super) async fn spawn_claude_cli_with_env(
                     }
                     // Got a line — parse stream-json event
                     Ok(Some(line)) => {
+                        let line = duduclaw_core::run_credential::redact(&line).into_owned();
                         // Reset keepalive timer on every received line
                         keepalive.reset();
 
@@ -1084,7 +1097,7 @@ pub(super) async fn spawn_claude_cli_with_env(
     let stderr_tail: String = stderr_buf
         .lock()
         .ok()
-        .map(|g| g.chars().take(400).collect::<String>())
+        .map(|g| duduclaw_core::run_credential::redact(&g).chars().take(400).collect::<String>())
         .unwrap_or_default();
 
     // Compose the diagnostic summary that all error sites below embed.

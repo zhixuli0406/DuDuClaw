@@ -803,3 +803,6 @@ pub(crate) async fn placeholder_post_started(fake: &Fake) {
 
 pub(crate) fn chat_calls(fake: &Fake) -> Vec<(String, String, String, Value)> { fake.state.calls.lock().unwrap().clone() }
 pub(crate) fn chat_queries(fake: &Fake) -> Vec<(String, String)> { fake.state.queries.lock().unwrap().clone() }
+
+#[path = "e2e_gchat_shared_tests.rs"]
+mod shared_tests;

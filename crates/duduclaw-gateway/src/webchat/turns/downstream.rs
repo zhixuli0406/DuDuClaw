@@ -66,10 +66,10 @@ pub(in crate::webchat) fn unknown(request_id: Option<&str>) -> serde_json::Value
 }
 
 pub(in crate::webchat) async fn stop_request(
-    state: &WebChatState, credential: Option<&duduclaw_auth::jwt::Claims>, user: &str,
+    state: &WebChatState, credential: Option<&crate::webchat::ChatCredential>, user: &str,
     reference: &str, request_id: Option<&str>,
 ) -> serde_json::Value {
-    let validity = state.credential_validity(credential, true).await;
+    let validity = state.chat_credential_validity(credential, true).await;
     handle_request(&state.turns, &state.ctx.home_dir, user, reference, request_id, validity).await
 }
 

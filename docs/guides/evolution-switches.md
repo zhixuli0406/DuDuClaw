@@ -284,6 +284,7 @@ Not evolution toggles, but part of the same learn-and-verify surface:
 
 | Key | Default | Page |
 |---|---|---|
+| `config.toml [memory] pinned_task` | `"first_message"` | [16-session-memory-stack.md](../features/16-session-memory-stack.md) — one-to-one task reference; `off` disables it, employee settings can only narrow; 24-hour expiry |
 | `config.toml [memory] novelty_gate` | `true` | [memory-and-knowledge.md](./memory-and-knowledge.md) — rejects near-duplicate semantic memories |
 | `config.toml [memory] supersession_trust_guard` | `true` (v1.67.1) | [20-memory-intelligence.md](../features/20-memory-intelligence.md#supersession-trust-guard-v1671) — a lower-trust write cannot replace a more trusted current fact; distilled claims go to dashboard review |
 | `config.toml [dispatch] grounding_precheck_enabled` | `true` | [goal-loop.md](./goal-loop.md) — zero-LLM evidence check before the acceptance judge |

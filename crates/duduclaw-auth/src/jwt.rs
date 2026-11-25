@@ -262,6 +262,7 @@ mod tests {
 
     fn test_user() -> User {
         User {
+            avatar_agent_id: None,
             credential_epoch: 0,
             id: "user-123".to_string(),
             email: "test@example.com".to_string(),

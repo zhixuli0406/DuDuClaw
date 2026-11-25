@@ -240,6 +240,14 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_repair_primary_agents(params, ctx)).await
             }
+            "users.set_avatar" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_set_avatar(params, ctx)).await
+            }
+            "users.avatar_conflicts" => {
+                require_admin!();
+                boxed_frame(|| self.handle_users_avatar_conflicts(ctx)).await
+            }
             "users.set_primary_agent" => boxed_frame(|| self.handle_users_set_primary_agent(params, ctx)).await,
             "users.me" => boxed_frame(|| self.handle_users_me(ctx)).await,
             // Self-service: any logged-in user changes their OWN password. Not
@@ -375,7 +383,7 @@ impl MethodHandler {
             // employee's own identity needs Viewer access to that employee.
             "google.delegation.get" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_delegation_get()).await
+                boxed_frame(|| self.handle_google_delegation_get(ctx)).await
             }
             "google.delegation.import_key" => {
                 require_admin!();
@@ -411,7 +419,7 @@ impl MethodHandler {
             }
             "google.identity.test" => {
                 require_admin!();
-                boxed_frame(|| self.handle_google_identity_test(params)).await
+                boxed_frame(|| self.handle_google_identity_test(params, ctx)).await
             }
             "agents.google_identity_get" => {
                 let agent_id = params

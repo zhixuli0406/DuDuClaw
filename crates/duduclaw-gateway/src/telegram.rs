@@ -1541,7 +1541,7 @@ async fn process_telegram_message(
             (guard.text.clone(), Some(guard))
         } else {
             // Global/shared bot: route by the user→agent binding (WP9), or
-            // (RM-172) to the sender's primary employee in its own bucket.
+            // (RM-172) to the sender's avatar or primary employee in its own bucket.
             let route = shared_route.unwrap_or(SharedRoute::Unbound);
             reply_session = shared_route_session(&session_id, &route);
             let (text, guard, agent) = shared_route_reply(
@@ -2703,7 +2703,7 @@ async fn resolve_shared_route(
     }
 }
 
-/// RM-172: the dashboard 主要 AI 員工 (`users.primary_agent_id`) of the account
+/// RM-172/RM-212: the dashboard avatar (or bound legacy primary) of the account
 /// `user_id` is bound to through a **verified** Telegram `channel_identities`
 /// row, when that employee may still answer this account. `None` (route as
 /// before) for an unverified or missing identity, an inactive account, no or a
@@ -2712,47 +2712,7 @@ async fn resolve_shared_route(
 /// account (a main-role or gateway-default employee for a non-admin), or any
 /// lookup failure — never a refusal.
 async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<String> {
-    if user_id.is_empty() {
-        return None;
-    }
-    let home = ctx.home_dir.clone();
-    let sender_id = user_id.to_string();
-    let (sender, primary) = tokio::task::spawn_blocking(move || {
-        // Verified identity → active account, the same resolution `@` routing
-        // and the "who is asking" checks use; unverified rows stay unmapped.
-        let sender =
-            crate::trigger_route::access::for_channel_sender(&home, "telegram", &sender_id);
-        let account = match &sender.sender {
-            crate::trigger_route::Sender::Admin { user_id: Some(id) }
-            | crate::trigger_route::Sender::Account { user_id: id, .. } => id.clone(),
-            _ => return None,
-        };
-        let db = crate::decision_notify::open_user_db(&home).ok().flatten()?;
-        let primary = db.bound_primary_agent(&account).ok().flatten()?;
-        Some((sender, primary))
-    })
-    .await
-    .ok()
-    .flatten()?;
-    // Never the raw Telegram id in logs: a mapped sender is labelled by
-    // dashboard account (an unmapped one would be a per-home keyed digest).
-    let who = sender.audit_label(&ctx.home_dir, "telegram", user_id);
-    let sender =
-        sender.for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
-    let usable = {
-        let reg = ctx.registry.read().await;
-        reg.get(&primary)
-            .is_some_and(|agent| crate::webchat::access::primary_candidate(&sender, agent))
-    };
-    if usable {
-        tracing::debug!(
-            agent = primary.as_str(),
-            sender = %who,
-            route = "primary_agent",
-            "Telegram: shared bot routed to the sender's primary employee"
-        );
-    }
-    usable.then_some(primary)
+    crate::shared_app_route::member_agent_route(ctx, "telegram", user_id).await
 }
 
 /// The session the shared bot's reply for `route` is stored under: the

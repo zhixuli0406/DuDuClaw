@@ -124,3 +124,33 @@ Keep the supported system keychain with installation backups or moves, and do no
 The explicitly selected company credential path takes precedence; a failed selected path is reported. Older installations keep legacy source selection until an administrator saves a path. Apps Script covers Gmail, Calendar and Sheets, with seven data actions plus status. It does not support CC, event attendees, Meet or use as a remote MCP bearer. Account selection is not a health check. An operation that may already have reached Google must not be retried through another path automatically.
 
 Out-of-band credential changes cannot always be detected immediately. Timeouts and cancellation cannot force an already-running keychain or local disk operation to stop. Changes between checking settings and sending a request remain a limitation.
+
+
+## Company authorization and identity choices (v1.85)
+
+Delegation requests only the scopes for the tool's service: Gmail, Calendar, Docs, Sheets, Drive, Slides, Forms or Tasks. Tokens are cached separately by service account, subject and normalized scope set. A missing grant for another service does not block an already granted service. The connection test lists each scope separately as granted or not confirmed, then reports service access separately; a token does not prove that a data API or sample file is available.
+
+With `[google] chat_read = true`, delegation also supports `chat.spaces.readonly` and `chat.messages.readonly` (both under `https://www.googleapis.com/auth/`). Authorize those scopes in the Google Admin console and enable Google Chat API. The configuration default remains off. The setup wizard preselects Chat reading; it writes the choice only when an administrator saves it. Connected members missing either Chat scope or its local purpose see **Reconnect to add Google Chat** in **My connections**. Sending Chat messages as a person is not supported.
+
+To follow an AI employee's responsible member:
+
+1. Bind the member as an Owner; if there are several Owners, select the primary owner in **Employee → Connections**.
+2. Select **Company authorization: follow responsible member** (`identity = "delegate:owner"`). Configure allowed subject domains and import the sealed delegation key as above.
+
+   After a permission change, the call already in progress may still complete as the previous responsible member; all subsequent calls are checked again.
+3. In **Integrations → Google → Company authorization**, review the employee, current owner, login email and attestation status. Confirm each listed member's address using the attest action. This works outside protected mode too; it requires an active Admin and the existing password + authenticator step-up with a session-bound CSRF token. If the member set the address themselves, explicitly acknowledge that you independently verified it.
+4. Test the connection. Every call derives the subject from the current primary-owner binding and login account, never a tool argument. Missing attestation, changed ownership (including changing back), changed email, inactive owner or an unreadable account record refuses the call and requires administrator attention. `requesters` defaults to `owner_only`, with the existing requester rules for scheduled work; `fallback = "home"` is forbidden for this selector. Protected mode retains its stricter tenant-route and requester rules.
+
+The attestation uses `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}`. The server checks the displayed user id and email against the current owner and records the administrator, subject user and email in the audit logs. This company delegation does not create personal OAuth consent.
+
+For `owner` and `user:<id>`, the Admin **Test connection** button (`google.identity.test {agent_id}`) checks the connection, self-consent records, scope/purpose coverage, OAuth refresh and tokeninfo scope comparison. It does not call Gmail, Drive, Calendar or any other data endpoint. The test is audited with the actor and tested member, and the member receives a notice through their verified notification destinations. It does not supply consent, read data, or authorize AI use by itself.
+
+Use the following for a separately managed external Google tool:
+
+```toml
+[google]
+identity = "external"
+external_server = "Partner Google MCP" # optional, at most 120 characters
+```
+
+The connection tab displays **Provided by an external tool**. Native Google tools are hidden and refused, just as with `none`; this selector does not configure or authorize the external server. The name is display text only, with control characters rejected. Older parsers reject the unknown selector (and optional key), so they refuse native Google access rather than using the company account.

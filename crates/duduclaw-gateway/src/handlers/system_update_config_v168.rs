@@ -64,6 +64,7 @@ const PROTECTED_KEYS: &[&str] = &[
     "security.egress_guard",
     "security.recipient_guard",
     "security.mail_requester_approval",
+    "knowledge.owner_self_add",
     "security.chat_credentials",
     // RM-129: decides where OAuth providers send authorization codes.
     "dashboard.public_url",
@@ -113,6 +114,7 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         ("memory.novelty_gate", "novelty_gate_enabled"),
         ("miniapp.enabled", "miniapp_enabled"),
         ("external_status.enabled", "external_status_enabled"),
+        ("member_api_keys.enabled", "member_api_keys_enabled"),
         ("skills.gap_digest_enabled", "gap_digest_enabled"),
         ("logging.format", "log_format"),
     ];
@@ -416,6 +418,7 @@ fn apply_files(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -
 fn apply_simple_bools(table: &mut toml::Table, params: &Value, out: &mut V168Outcome) -> Result<(), String> {
     const KEYS: &[(&str, &[&str], &str)] = &[
         ("security.mail_requester_approval", &["security"], "mail_requester_approval"),
+        ("knowledge.owner_self_add", &["knowledge"], "owner_self_add"),
         ("night.llm_enabled", &["night"], "llm_enabled"),
         ("acp.trusted", &["acp"], "trusted"),
         ("integrations.github", &["integrations"], "github"),
@@ -848,6 +851,19 @@ mod tests {
         assert_eq!(p["rotation_strategy"], "priority", "flat name wins");
         assert_eq!(p["log_format"], "pretty");
     }
+    #[test]
+    fn owner_self_add_setting_is_boolean_immediate_and_audited() {
+        for enabled in [true, false] {
+            let (table, outcome) = apply(json!({"knowledge": {"owner_self_add": enabled}})).unwrap();
+            assert_eq!(table["knowledge"]["owner_self_add"].as_bool(), Some(enabled));
+            assert!(outcome.applied_immediate);
+            assert!(outcome.protected.iter().any(|c| c.key == "knowledge.owner_self_add"));
+        }
+        for invalid in [json!("true"), json!(1), json!([])] {
+            assert!(apply(json!({"knowledge.owner_self_add": invalid})).is_err());
+        }
+    }
+
     #[test]
     fn mail_requester_approval_setting_is_boolean_and_immediate() {
         for enabled in [true, false] {

@@ -11,6 +11,8 @@ import {
   RevokeConfirmDialog, formatTokenDate, formatTokenLastUsed, statusTokenErrorCode, statusTokenErrorMessage,
 } from '@/components/external-status/shared';
 
+import { MemberKeysSection } from '@/components/external-status/MemberKeysSection';
+
 const DATA_ROWS = ['inProgress', 'awaiting', 'doneToday', 'done7d', 'latest'] as const;
 
 /** My account → External access: the caller's own read-only `ddc_status_` credentials (RM-064). */
@@ -139,6 +141,8 @@ export function ExternalAccessPage() {
         <p className="text-xs text-muted-foreground">{t('data.noContent')}</p>
       </Card>
     </>}
+
+    <MemberKeysSection />
 
     {creating && <CreateDialog
       onClose={() => setCreating(false)}

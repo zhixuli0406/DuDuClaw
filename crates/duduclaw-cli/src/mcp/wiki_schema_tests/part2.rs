@@ -174,13 +174,13 @@ async fn shared_wiki_write_unaffected_when_no_scope_policy_present() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn shared_wiki_write_unaffected_when_scope_toml_is_malformed() {
+async fn shared_wiki_write_refused_when_scope_toml_is_malformed() {
     let tmp = TempDir::new();
     let agents_dir = tmp.path().join("agents");
     fs::create_dir_all(&agents_dir).unwrap();
     write_agent_toml(&agents_dir, "agnes");
 
-    // Fail-safe path: malformed file must never block legitimate writes.
+    // RM-209: an unreadable policy must refuse writes, never widen access.
     write_scope_policy(tmp.path(), "this is :: not = valid = toml ===");
 
     let args = serde_json::json!({
@@ -189,9 +189,10 @@ async fn shared_wiki_write_unaffected_when_scope_toml_is_malformed() {
     });
     let result = handle_shared_wiki_write(&args, tmp.path(), "agnes").await;
     assert!(
-        !result["isError"].as_bool().unwrap_or(false),
-        "malformed policy must fail-safe to writable, got: {result}"
+        result["isError"].as_bool().unwrap_or(false),
+        "malformed policy must fail closed, got: {result}"
     );
+    assert!(!tmp.path().join("shared/wiki/identity/discord-users.md").exists());
 }
 
 #[tokio::test(flavor = "current_thread")]

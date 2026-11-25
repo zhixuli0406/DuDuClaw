@@ -21,6 +21,8 @@ pub struct KnowledgeConfig {
     /// Master switch. Off ⇒ the MCP tools are neither listed nor callable and
     /// every RPC refuses.
     pub enabled: bool,
+    /// Explicit administrator opt-in; malformed or unreadable configuration is off.
+    pub owner_self_add: bool,
     pub max_source_bytes: u64,
     pub max_source_chars: usize,
     pub max_sources_per_collection: usize,
@@ -53,6 +55,7 @@ impl Default for KnowledgeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            owner_self_add: false,
             max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
             max_source_chars: DEFAULT_MAX_SOURCE_CHARS,
             max_sources_per_collection: 300,
@@ -98,6 +101,7 @@ impl KnowledgeConfig {
             return d;
         };
         Self {
+            owner_self_add: t.get("owner_self_add").and_then(toml::Value::as_bool).unwrap_or(false),
             enabled: t
                 .get("enabled")
                 .and_then(toml::Value::as_bool)
@@ -185,6 +189,19 @@ impl KnowledgeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_self_add_is_explicit_and_fail_closed() {
+        assert!(!KnowledgeConfig::default().owner_self_add);
+        for text in ["", "[knowledge]", "[knowledge]\nowner_self_add='true'", "[knowledge]\nowner_self_add=true\nbroken=["] {
+            assert!(!KnowledgeConfig::from_toml_str(text).owner_self_add);
+        }
+        assert!(KnowledgeConfig::from_toml_str("[knowledge]\nowner_self_add=true").owner_self_add);
+        let home = tempfile::tempdir().unwrap();
+        assert!(!KnowledgeConfig::from_home(home.path()).owner_self_add);
+        std::fs::create_dir(home.path().join("config.toml")).unwrap();
+        assert!(!KnowledgeConfig::from_home(home.path()).owner_self_add);
+    }
 
     #[test]
     fn missing_section_is_default() {

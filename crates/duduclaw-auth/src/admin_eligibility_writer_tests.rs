@@ -112,7 +112,7 @@ fn new_admin<'a>(email: &'a str) -> crate::NewUser<'a> {
 fn admin_member(email: &str, invite: bool) -> crate::members::NewMember {
     crate::members::NewMember {
         display_name: "Member".into(), email: email.into(), role: UserRole::Admin, department: None,
-        primary_agent_id: "helper".into(), invite,
+        avatar_agent_id: None, primary_agent_id: "helper".into(), invite,
         bindings: vec![crate::members::MemberBinding { agent_name: "helper".into(), access_level: crate::AccessLevel::Operator }],
     }
 }

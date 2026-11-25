@@ -94,10 +94,12 @@ impl Transport<'_, '_> {
                         .starts_with("/calendar/v3/calendars/primary/events")
                         || url.path().starts_with("/drive/v3/files")
                 }
-                Some("sheets.googleapis.com") => url.path().starts_with("/v4/spreadsheets/"),
+                Some("sheets.googleapis.com") => url.path().starts_with("/v4/spreadsheets/")
+                    || (self.template.tool() == "sheets_create" && url.path() == "/v4/spreadsheets"),
                 Some("forms.googleapis.com") => url.path().starts_with("/v1/forms/"),
                 Some("tasks.googleapis.com") => url.path().starts_with("/tasks/v1/"),
-                Some("docs.googleapis.com") => url.path().starts_with("/v1/documents/"),
+                Some("docs.googleapis.com") => url.path().starts_with("/v1/documents/")
+                    || (self.template.tool() == "docs_create" && url.path() == "/v1/documents"),
                 Some("slides.googleapis.com") => url.path().starts_with("/v1/presentations/"),
                 _ => false,
             };
@@ -229,7 +231,7 @@ impl Transport<'_, '_> {
                     | "sheets_append"
                     | "gtasks_create"
                     | "gtasks_complete"
-                    | "docs_append"
+                    | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event"
             )
         {
             return self.fail();

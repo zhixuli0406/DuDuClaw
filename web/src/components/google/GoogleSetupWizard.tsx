@@ -44,6 +44,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
   const [account, setAccount] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [chatRead, setChatRead] = useState(true);
   const [redirectUri, setRedirectUri] = useState('');
   const [requiredScopes, setRequiredScopes] = useState<string[]>([]);
   useEffect(() => {
@@ -133,6 +134,7 @@ export function GoogleSetupWizard({ open, onOpenChange }: { open: boolean; onOpe
         <p className="text-muted-foreground">{t('secrets')}</p>
       </div>}
       {progress.step === 2 && (oauth ? <IntegrationConnectPanel providerId="google" prefix="google" headerIcon={Mail} consoleUrl="https://console.cloud.google.com/auth/clients" consoleLabel="Google Cloud Console" clientIdPlaceholder="xxxxxxxx.apps.googleusercontent.com" clientSecretPlaceholder="GOCSPX-..." capabilities={CAPABILITIES} testing={progress.testing} hideRedirect onConnected={() => go(3)} /> : <GoogleCredentialPaths initialMode={progress.path === 'bridge' ? 'apps_script' : 'service_account'} onSaved={() => go(3)} />)}
+      {progress.step === 2 && <div className="space-y-2"><label className="flex items-center gap-2 text-sm"><Checkbox checked={chatRead} onCheckedChange={value => setChatRead(value === true)} />{intl.formatMessage({ id: 'google.chatRead.title' })}</label><Button variant="outline" disabled={busy} onClick={() => { setBusy(true); void api.googleCredentials.setChatRead(chatRead).catch(e => setError(formatError(e))).finally(() => setBusy(false)); }}>{intl.formatMessage({ id: 'google.wizard.saveChat' })}</Button></div>}
       {progress.step === 3 && <p className="text-sm">{t('connectedHint')}</p>}
       {progress.step === 4 && <div className="space-y-3">
         <Button disabled={busy} onClick={() => void (progress.path === 'bridge' ? verifyBridge() : verify())}>{busy ? t('checking') : t('runVerification')}</Button>

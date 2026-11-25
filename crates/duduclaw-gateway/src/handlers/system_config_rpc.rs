@@ -137,6 +137,7 @@ impl MethodHandler {
                                 "memory_privacy": memory_privacy,
                                 "miniapp_enabled": miniapp_enabled,
                                 "external_status_enabled": external_status_enabled,
+                                "member_api_keys_enabled": crate::member_keys::config(&self.home_dir).enabled,
                                 "daily_digest_enabled": digest_cfg.enabled,
                                 "daily_digest_at": digest_cfg.at.format("%H:%M").to_string(),
                                 "webchat_widget_key_set": webchat_widget_key_set,

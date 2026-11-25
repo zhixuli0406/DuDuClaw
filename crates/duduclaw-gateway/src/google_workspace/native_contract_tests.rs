@@ -32,15 +32,20 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
         ("docs_read", json!({"document_id":"d"})),
         ("docs_append", json!({"document_id":"d","text":"x"})),
         ("slides_read", json!({"presentation_id":"p"})),
+        ("docs_create", json!({"title":"Doc"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"old","replace":"new"})),
+        ("sheets_create", json!({"title":"Sheet"})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[["x"]]})),
+        ("calendar_update_event", json!({"event_id":"e","summary":"Updated"})),
         ("google_chat_spaces", json!({})),
         ("google_chat_messages", json!({"space":"spaces/AAA"})),
     ]
 }
 
 #[test]
-fn all_twenty_native_inputs_are_frozen_without_status_or_remote_aliases() {
+fn all_twenty_five_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 20);
+    assert_eq!(cases.len(), 25);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);
@@ -87,7 +92,7 @@ fn parse_goldens_preserve_trim_number_boolean_and_cell_rules() {
     let cases = valid_cases();
     let draft = NativeCallTemplate::prepare(cases[2].0, &cases[2].1).unwrap();
     assert!(
-        matches!(draft.parsed(), ParsedNativeArguments::GmailDraft { to, subject, .. } if to == "a@b.test" && subject == "主旨")
+        matches!(draft.parsed(), ParsedNativeArguments::GmailDraft { to, subject, .. } if to == " a@b.test " && subject == "主旨")
     );
     let cells = NativeCallTemplate::prepare(cases[6].0, &cases[6].1).unwrap();
     assert!(
@@ -170,4 +175,113 @@ fn calendar_create_timestamp_errors_keep_original_start_end_wording() {
             .unwrap(),
         "Invalid due: 'bad-due' is not a valid RFC-3339 timestamp (e.g. 2026-08-01T00:00:00Z)"
     );
+}
+
+#[test]
+fn google_write_inputs_validate_ids_types_limits_and_unicode() {
+    for (tool, args) in [
+        ("docs_create", json!({"title":" "})),
+        ("docs_create", json!({"title":"Doc","body":123})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":true})),
+        ("calendar_update_event", json!({"event_id":"e","calendar_id":"","summary":"s"})),
+        ("docs_replace_text", json!({"document_id":"../x","find":"old","replace":"new"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"","replace":"new"})),
+        ("docs_replace_text", json!({"document_id":"d","find":"old","replace":"new","match_case":"false"})),
+        ("sheets_create", json!({"title":"s","sheet_names":[123]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[1]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[{}]]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]],"value_input_option":"INVALID"})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[vec!["x";10001]]})),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"..","values":[[1]]})),
+        ("calendar_update_event", json!({"event_id":"e"})),
+        ("calendar_update_event", json!({"event_id":"x/y","summary":"s"})),
+        ("calendar_update_event", json!({"event_id":"e","summary":"s","notify_attendees":"true"})),
+        ("calendar_update_event", json!({"event_id":"e","start":"tomorrow"})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":"t"})),
+        ("gmail_create_draft", json!({"to":"a@b.test","subject":"s","body":"b","thread_id":"t","in_reply_to":"<id>\r\nBcc: other@example.test"})),
+    ] {
+        assert!(NativeCallTemplate::prepare(tool, &args).is_err(), "{tool}: {args}");
+    }
+    assert!(NativeCallTemplate::prepare("docs_create", &json!({"title":"文件🦀".repeat(1000),"body":"漢🦀".repeat(11000)})).is_err());
+    let template = NativeCallTemplate::prepare("sheets_update", &json!({"spreadsheet_id":"s","range":"A1","values":[vec!["x";10000]]})).unwrap();
+    assert!(template.validate_closed().is_ok());
+}
+
+#[test]
+fn every_bounded_text_field_rejects_overflow_and_preserves_the_exact_limit() {
+    let cases = [
+        ("docs_create", json!({"title":"Doc"}), "title", 1000),
+        ("docs_create", json!({"title":"Doc"}), "body", 20_000),
+        ("docs_replace_text", json!({"document_id":"d","find":"x","replace":"y"}), "find", 20_000),
+        ("docs_replace_text", json!({"document_id":"d","find":"x","replace":"y"}), "replace", 20_000),
+        ("sheets_create", json!({"title":"Sheet"}), "title", 1000),
+        ("sheets_create", json!({"title":"Sheet"}), "sheet_names", 100),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]}), "range", 1000),
+        ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[[1]]}), "values", 20_000),
+        ("calendar_update_event", json!({"event_id":"e"}), "summary", 20_000),
+        ("calendar_update_event", json!({"event_id":"e"}), "description", 20_000),
+        ("calendar_update_event", json!({"event_id":"e"}), "location", 20_000),
+        ("calendar_update_event", json!({"event_id":"e"}), "attendees", 320),
+        ("gmail_create_draft", json!({"to":"a@example.test","subject":"s","body":"b"}), "to", 1000),
+        ("gmail_create_draft", json!({"to":"a@example.test","subject":"s","body":"b"}), "cc", 1000),
+        ("gmail_create_draft", json!({"to":"a@example.test","subject":"s","body":"b"}), "subject", 1000),
+        ("gmail_create_draft", json!({"to":"a@example.test","subject":"s","body":"b"}), "body", 20_000),
+    ];
+    for (tool, base, field, max) in cases {
+        for over in [false, true] {
+            let size = max + usize::from(over);
+            let value = if matches!(field, "to" | "cc") {
+                // Five individually valid mailboxes, together exactly 1000/1001 chars.
+                let mut addresses = vec![format!("{}@b.test", "a".repeat(192)); 5];
+                addresses[0] = format!("{}@b.test", "a".repeat(193 + usize::from(over)));
+                addresses.join(",")
+            } else if field == "attendees" {
+                format!("{}@b.test", "a".repeat(size - 7))
+            } else { "🦀".repeat(size) };
+            assert_eq!(value.chars().count(), size);
+            let mut args = base.clone();
+            args[field] = match field {
+                "values" => json!([[value]]),
+                "sheet_names" | "attendees" => json!([value]),
+                _ => json!(value),
+            };
+            if over {
+                let error = NativeCallTemplate::prepare(tool, &args).err().expect("over-limit input refused");
+                assert!(error.contains(field) && error.contains(&max.to_string()), "{tool}/{field}: {error}");
+                assert!(super::validate_inputs(tool, &args).is_err());
+                continue;
+            }
+            let template = NativeCallTemplate::prepare(tool, &args).unwrap();
+            let actual: &str = match template.parsed() {
+                ParsedNativeArguments::DocsCreate { title, body } => if field == "title" { title } else { body.as_ref().unwrap() },
+                ParsedNativeArguments::DocsReplace { find, replace, .. } => if field == "find" { find } else { replace },
+                ParsedNativeArguments::SheetsCreate { title, sheet_names } => if field == "title" { title } else { &sheet_names.as_ref().unwrap()[0] },
+                ParsedNativeArguments::SheetsUpdate { range, values, .. } => if field == "range" { range.as_str() } else { values[0][0].as_str().unwrap() },
+                ParsedNativeArguments::CalendarUpdate { patch, .. } => if field == "attendees" { patch["attendees"][0]["email"].as_str().unwrap() } else { patch[field].as_str().unwrap() },
+                ParsedNativeArguments::GmailDraft { to, cc, subject, body, .. } => match field {
+                    "to" => to, "cc" => cc.as_ref().unwrap(), "subject" => subject, _ => body,
+                },
+                _ => panic!("unexpected tool {tool}"),
+            };
+            assert_eq!(actual, value, "{tool}/{field} must remain unchanged");
+            assert_eq!(template.digest(), duduclaw_core::google_identity::google_arguments_digest(&args));
+        }
+    }
+}
+
+#[test]
+fn gmail_recipient_headers_refuse_controls_and_validate_each_mailbox() {
+    for field in ["to", "cc"] {
+        for value in ["a@example.com\r\nBcc: x@example.com", "a@example.com\r", "a@example.com\n",
+            "a@exam\0ple.com", "a@example.com\t", "a@example.com\u{7f}", "a@example.com\u{85}",
+            "a@example.com,invalid", "invalid"] {
+            let mut args = json!({"to":"a@example.com","subject":"s","body":"b"});
+            args[field] = json!(value);
+            assert!(NativeCallTemplate::prepare("gmail_create_draft", &args).is_err(), "{field}: {value:?}");
+        }
+    }
+    let args = json!({"to":"Alice@example.com, bob@example.com","cc":"Carol@example.com","subject":"s","body":"b"});
+    let template = NativeCallTemplate::prepare("gmail_create_draft", &args).unwrap();
+    assert!(matches!(template.parsed(), ParsedNativeArguments::GmailDraft { to, cc: Some(cc), .. }
+        if to == "Alice@example.com, bob@example.com" && cc == "Carol@example.com"));
 }

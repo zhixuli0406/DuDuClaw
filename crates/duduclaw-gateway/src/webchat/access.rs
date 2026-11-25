@@ -29,7 +29,7 @@ fn parse_gateway_default(raw: &str) -> Result<String, String> {
 
 pub(super) fn assignment_error(reason: &str) -> ChatMessage {
     let mut frame = ChatMessage::error_coded(match reason {
-        "multiple_agents" => "你有多位可用的 AI 員工，請在側欄「AI 員工」的選單中設為主要；若看不到此選項，請聯絡管理員。",
+        "multiple_agents" => "你有多位可用的 AI 員工，請聯絡管理員設定 AI 分身；尚未設定分身時，也可在側欄選擇預設 AI 員工。",
         "unavailable" => "目前無法確認你的對話權限，請稍後再試。",
         _ => "尚未指派可對話的 AI 員工，請聯絡管理員。",
     }, "no_assigned_agent");
@@ -56,7 +56,7 @@ impl WebChatState {
         let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
         let db = self.user_db.clone();
         let uid = user.to_owned();
-        let primary = tokio::task::spawn_blocking(move || db.bound_primary_agent(&uid))
+        let primary = tokio::task::spawn_blocking(move || db.member_avatar_or_primary(&uid))
             .await.map_err(|_| "unavailable")?.map_err(|_| "unavailable")?;
         let reg = self.ctx.registry.read().await;
         let candidates: Vec<String> = reg.list().into_iter().filter_map(|a| {
@@ -242,7 +242,7 @@ pub(crate) fn assignment_text_allowed(
 
 /// Whether `agent` may be what a dashboard account talks to by default: the
 /// filter WebChat applies to a non-admin account's candidates (and so to its
-/// 主要 AI 員工) — live, the account may hand it work (Operator or above, or
+/// AI avatar or legacy primary) — live, the account may hand it work (Operator or above, or
 /// Admin), and the WebChat target rules allow it (no main-role or gateway
 /// default employee for non-admins; `sender` should carry
 /// [`SenderAccess::for_webchat`] so those rules apply). The Telegram shared

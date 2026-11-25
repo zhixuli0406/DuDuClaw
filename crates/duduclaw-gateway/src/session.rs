@@ -298,6 +298,9 @@ impl SessionManager {
         )
         .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
+        crate::session_tool_refs::migrate(conn)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+
         // Phase 4: Add hidden column for hide/restore mechanism (Sculptor, arXiv 2508.04664)
         let _ = conn.execute(
             "ALTER TABLE session_messages ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0",
@@ -316,6 +319,28 @@ impl SessionManager {
             "ALTER TABLE sessions ADD COLUMN pinned_instructions TEXT DEFAULT ''",
             [],
         );
+
+        // Nullable means an old pin has no known update time. Backfill from
+        // existing activity (never grant old pins a fresh 24-hour lease).
+        let pin_migration = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let has_pin_time: bool = {
+            let mut stmt = pin_migration.prepare("PRAGMA table_info(sessions)")
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            columns.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?
+                .iter().any(|name| name == "pinned_updated_at")
+        };
+        if !has_pin_time {
+            pin_migration.execute("ALTER TABLE sessions ADD COLUMN pinned_updated_at INTEGER", [])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+            pin_migration.execute("UPDATE sessions SET pinned_updated_at = CAST(strftime('%s', last_active) AS INTEGER)
+                WHERE COALESCE(pinned_instructions, '') != ''", [])
+                .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        }
+        pin_migration.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
 
         // #13 (2026-05-12): async summarization columns. The background
         // task in `session_summarizer_task::tick` writes Haiku-generated
@@ -1921,29 +1946,50 @@ impl SessionManager {
 
     // ── Instruction Pinning ────────────────────────────────────
 
-    /// Get pinned task instructions for a session.
-    ///
-    /// Returns empty string if no instructions are pinned.
-    pub async fn get_pinned(&self, session_id: &str) -> Result<String> {
-        let conn = self.acquire().await;
-        let result: std::result::Result<String, _> = conn.query_row(
-            "SELECT COALESCE(pinned_instructions, '') FROM sessions WHERE id = ?1",
+    /// Validate at read time without rewriting invalid legacy content.
+    /// The second value permits extraction only for an empty or expired pin.
+    pub async fn load_pinned_task(&self, session_id: &str) -> Result<(String, bool)> {
+        let mut conn = self.acquire().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        let result = tx.query_row(
+            "SELECT COALESCE(pinned_instructions, ''), pinned_updated_at FROM sessions WHERE id = ?1",
             params![session_id],
-            |row| row.get(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?)),
         );
-        match result {
-            Ok(s) => Ok(s),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
-            Err(e) => Err(DuDuClawError::Gateway(format!("get_pinned: {e}"))),
+        let (raw, updated) = match result {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok((String::new(), false)),
+            Err(e) => return Err(DuDuClawError::Gateway(format!("load_pinned_task: {e}"))),
+        };
+        let valid = crate::memory_reference::validate_pinned_task(&raw);
+        // Bad legacy output is left byte-for-byte intact, even if old.
+        let expired = valid.is_some() && updated.is_none_or(|at|
+            at <= chrono::Utc::now().timestamp() - 24 * 60 * 60);
+        if expired {
+            crate::isolation_label_stores::check_session_writable(&tx, session_id)
+                .map_err(DuDuClawError::Gateway)?;
+            tx.execute("UPDATE sessions SET pinned_instructions = '', pinned_updated_at = NULL WHERE id = ?1",
+                params![session_id]).map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
         }
+        let text = if expired { String::new() } else { valid.unwrap_or_default().to_string() };
+        let extraction_due = raw.is_empty() || expired;
+        tx.commit().map_err(|e| DuDuClawError::Gateway(e.to_string()))?;
+        Ok((text, extraction_due))
+    }
+
+    pub async fn get_pinned(&self, session_id: &str) -> Result<String> {
+        self.load_pinned_task(session_id).await.map(|(text, _)| text)
     }
 
     /// Set (or replace) pinned task instructions for a session.
     pub async fn set_pinned(&self, session_id: &str, instructions: &str) -> Result<()> {
         let conn = self.acquire().await;
         crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
+        let masked = duduclaw_security::credential_detect::mask(instructions);
+        let Some(instructions) = crate::memory_reference::validate_pinned_task(&masked) else { return Ok(()); };
         conn.execute(
-            "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2",
+            "UPDATE sessions SET pinned_instructions = ?1, pinned_updated_at = unixepoch() WHERE id = ?2",
             params![duduclaw_security::credential_detect::mask(instructions), session_id],
         )
         .map_err(|e| DuDuClawError::Gateway(format!("set_pinned: {e}")))?;
@@ -1964,9 +2010,11 @@ impl SessionManager {
     ) -> Result<bool> {
         let conn = self.acquire().await;
         crate::isolation_label_stores::check_session_writable(&conn, session_id).map_err(DuDuClawError::Gateway)?; // F6fb
+        let masked = duduclaw_security::credential_detect::mask(instructions);
+        let Some(instructions) = crate::memory_reference::validate_pinned_task(&masked) else { return Ok(false); };
         let changed = conn
             .execute(
-                "UPDATE sessions SET pinned_instructions = ?1 WHERE id = ?2 AND created_at = ?3",
+                "UPDATE sessions SET pinned_instructions = ?1, pinned_updated_at = unixepoch() WHERE id = ?2 AND created_at = ?3",
                 params![
                     duduclaw_security::credential_detect::mask(instructions),
                     session_id,
@@ -2722,7 +2770,7 @@ mod tests {
         // The detached pin extraction captures the incarnation it runs for.
         let old_generation = mgr.get_or_create(sid, "agent").await.unwrap().created_at;
         assert_eq!(mgr.turn_generation(sid).await.unwrap().as_deref(), Some(old_generation.as_str()));
-        mgr.set_pinned(sid, "old").await.unwrap();
+        mgr.set_pinned(sid, "Original task: build a server").await.unwrap();
         let stale = mgr.get_pinned(sid).await.unwrap();
         let archived = mgr.clear_for_user(sid).await.unwrap().expect("old row moved");
         let new_generation = mgr.get_or_create(sid, "agent").await.unwrap().created_at;
@@ -2732,7 +2780,7 @@ mod tests {
         // Regression (v1.83.0): the stale async result is rejected...
         assert!(!mgr.set_pinned_if_unchanged(sid, &stale, &old_generation).await.unwrap());
         assert_eq!(mgr.get_pinned(sid).await.unwrap(), "newer state");
-        assert_eq!(mgr.get_pinned(&archived).await.unwrap(), "old");
+        assert_eq!(mgr.get_pinned(&archived).await.unwrap(), "Original task: build a server");
         // ...a missing marker never matches...
         assert!(!mgr.set_pinned_if_unchanged(sid, "unbound", "").await.unwrap());
         // ...and a fresh write bound to the current incarnation succeeds.
@@ -3342,6 +3390,89 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].content, "msg1");
         assert_eq!(msgs[1].content, "msg3");
+    }
+
+    #[tokio::test]
+    async fn rm182_refusal_greeting_extraction_is_not_stored() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("rm182", "agent").await.unwrap();
+        let generation = mgr.turn_generation("rm182").await.unwrap().unwrap();
+        for output in ["I'm sorry, I can't help with that", "抱歉，我無法協助", "Hello!"] {
+            assert!(!mgr.set_pinned_if_unchanged("rm182", output, &generation).await.unwrap(),
+                "non-task extraction must not be persisted: {output}");
+            assert!(mgr.get_pinned("rm182").await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn rm182_invalid_legacy_pin_is_ignored_without_rewriting() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        mgr.get_or_create("legacy-pin", "agent").await.unwrap();
+        for invalid in ["I'm sorry, I can't help with that", "抱歉，我無法協助", "Hello!", " "] {
+            mgr.acquire().await.execute("UPDATE sessions SET pinned_instructions = ?1,
+                pinned_updated_at = unixepoch() - 90000 WHERE id = 'legacy-pin'", [invalid]).unwrap();
+            let (pin, due) = mgr.load_pinned_task("legacy-pin").await.unwrap();
+            assert!(pin.is_empty());
+            assert!(!due, "invalid legacy data is not replaced by extraction");
+            let raw: String = mgr.acquire().await.query_row("SELECT pinned_instructions FROM sessions WHERE id = 'legacy-pin'", [], |row| row.get(0)).unwrap();
+            assert_eq!(raw, invalid);
+        }
+    }
+
+    #[tokio::test]
+    async fn rm182_expired_pin_clears_then_reextracts_with_history() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let generation = mgr.get_or_create("expire-pin", "agent").await.unwrap().created_at;
+        mgr.append_message("expire-pin", "user", "old conversation history", 5).await.unwrap();
+        mgr.set_pinned("expire-pin", "Build a Rust server").await.unwrap();
+        mgr.acquire().await.execute("UPDATE sessions SET pinned_updated_at = unixepoch() - 86401 WHERE id = 'expire-pin'", []).unwrap();
+        let (pin, due) = mgr.load_pinned_task("expire-pin").await.unwrap();
+        assert!(pin.is_empty());
+        assert!(due);
+        let raw: String = mgr.acquire().await.query_row("SELECT pinned_instructions FROM sessions WHERE id = 'expire-pin'", [], |row| row.get(0)).unwrap();
+        assert!(raw.is_empty());
+        assert!(mgr.set_pinned_if_unchanged("expire-pin", "Create a weekly report", &generation).await.unwrap());
+        assert_eq!(mgr.load_pinned_task("expire-pin").await.unwrap(), ("Create a weekly report".into(), false));
+        assert!(!mgr.get_messages("expire-pin").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rm182_pin_timestamp_migration_is_idempotent_and_preserves_age() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let conn = Connection::open(tmp.path()).unwrap();
+            conn.execute_batch("CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, summary TEXT DEFAULT '',
+                total_tokens INTEGER DEFAULT 0, last_active TEXT NOT NULL,
+                model TEXT DEFAULT 'auto', created_at TEXT NOT NULL,
+                pinned_instructions TEXT DEFAULT '');
+                INSERT INTO sessions (id, agent_id, last_active, created_at, pinned_instructions)
+                VALUES ('migrated-pin', 'agent', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 'Create a weekly report');").unwrap();
+        }
+        for _ in 0..2 {
+            let mgr = SessionManager::new(tmp.path()).unwrap();
+            let at: i64 = mgr.acquire().await.query_row(
+                "SELECT pinned_updated_at FROM sessions WHERE id = 'migrated-pin'", [], |row| row.get(0)).unwrap();
+            assert_eq!(at, 1_577_836_800);
+        }
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        assert_eq!(mgr.load_pinned_task("migrated-pin").await.unwrap(), (String::new(), true));
+    }
+
+    #[tokio::test]
+    async fn rm182_empty_extraction_does_not_replace_pin() {
+        let tmp = NamedTempFile::new().unwrap();
+        let mgr = SessionManager::new(tmp.path()).unwrap();
+        let generation = mgr.get_or_create("empty-pin", "agent").await.unwrap().created_at;
+        mgr.set_pinned("empty-pin", "Create a weekly report").await.unwrap();
+        for invalid in ["", " ", "do it", "你好！", "無法提供這項服務"] {
+            assert!(!mgr.set_pinned_if_unchanged("empty-pin", invalid, &generation).await.unwrap());
+            mgr.set_pinned("empty-pin", invalid).await.unwrap();
+            assert_eq!(mgr.get_pinned("empty-pin").await.unwrap(), "Create a weekly report");
+        }
     }
 
     #[tokio::test]

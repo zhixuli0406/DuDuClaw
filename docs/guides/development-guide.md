@@ -53,6 +53,8 @@ Enable it in `agent.toml` (off by default, opt-in per agent):
 decision_continuity = true
 ```
 
+**Conversation task note** is configured in the files: `config.toml [memory] pinned_task = "first_message"` (default) or `"off"`. The same key in `agent.toml` may disable it but cannot override a global `"off"`. Off disables both extraction and injection on the next message. Unknown values act as off and warn once per process; unreadable or malformed settings also disable it. A valid note is used only in one-to-one conversations, as untrusted reference data, and expires 24 hours after its last update. Invalid old notes are ignored without rewriting their content. See [Session memory stack](../features/16-session-memory-stack.md).
+
 Detection is deterministic, costs zero LLM calls, and errs on the side of capturing
 too much rather than missing an option. A failed background capture never blocks the
 reply from being sent. See [RFC-24](../rfc/RFC-24-decision-continuity.md) for details.

@@ -191,6 +191,11 @@ pub(crate) async fn handle_tools_call(
             | "gtasks_create"
             | "gtasks_complete"
             | "docs_append"
+            | "docs_create"
+            | "docs_replace_text"
+            | "sheets_create"
+            | "sheets_update"
+            | "calendar_update_event"
             // Notion / GitHub write tools (page append, public issue comment).
             | "notion_page_append"
             | "github_issue_comment"
@@ -280,6 +285,12 @@ pub(crate) async fn handle_tools_call(
     } else {
         result
     };
+
+    // RM-182: only this native dispatcher sees provider-owned create ids.
+    // Third-party mcp-proxy results never enter this path.
+    if let Err(error) = crate::identity_cmd::record_native_tool_result(home_dir, tool_name, &result).await {
+        tracing::warn!(%error, "Could not retain conversation tool reference");
+    }
 
     // ── Tool call audit trail (L1 anti-hallucination) ──────────
     // External calls retain the authenticated client id. Internal delegation
@@ -1024,6 +1035,11 @@ impl GatewayHandler<'_> {
         // the identity route selects the authorized credential source.
         // Whole group sits behind the integration gate (hidden from tools/list
         // too); saving the user's chosen credentials enables it.
+        // Per-employee Google identity: `none` / `external` hide and refuses the whole
+        // group (same predicate as `tools/list`).
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
+            tool_error(google_caller.disabled_message(home_dir))
+        }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name)
             && !duduclaw_gateway::google_workspace::integration_enabled(home_dir) =>
         {
@@ -1031,11 +1047,6 @@ impl GatewayHandler<'_> {
                 "content": [{"type": "text", "text": "Google Workspace 整合尚未啟用。請操作者在 dashboard 的 整合 → Google 頁面完成連線或儲存憑證（會自動啟用），或手動在 config.toml 加上 [integrations] google_workspace = true。"}],
                 "isError": true
             })
-        }
-        // Per-employee Google identity: `none` hides and refuses the whole
-        // group (same predicate as `tools/list`).
-        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && !google_caller.tools_listed(home_dir) => {
-            tool_error("這位 AI 員工設定為不使用 Google。")
         }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.is_dedicated() => {
             google_caller
@@ -1070,6 +1081,12 @@ impl GatewayHandler<'_> {
         "drive_read" => handle_drive_read(&arguments, home_dir, google_caller).await,
         "docs_read" => handle_docs_read(&arguments, home_dir, google_caller).await,
         "docs_append" => handle_docs_append(&arguments, home_dir, google_caller).await,
+        "docs_create" => handle_docs_create(&arguments, home_dir, google_caller).await,
+        "docs_replace_text" => handle_docs_replace_text(&arguments, home_dir, google_caller).await,
+        "sheets_create" => handle_sheets_create(&arguments, home_dir, google_caller).await,
+        "sheets_update" => handle_sheets_update(&arguments, home_dir, google_caller).await,
+        "calendar_update_event" => handle_calendar_update_event(&arguments, home_dir, google_caller).await,
+
         "slides_read" => handle_slides_read(&arguments, home_dir, google_caller).await,
         "notion_status" => handle_notion_status(home_dir).await,
         "notion_search" => handle_notion_search(&arguments, home_dir).await,

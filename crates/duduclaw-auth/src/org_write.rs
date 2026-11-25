@@ -207,7 +207,7 @@ impl UserDb {
         }
         let since = crate::admin_eligibility::high_water(&tx).map_err(OrgError::Db)?;
         tx.execute(
-            "UPDATE users SET status = 'offboarded', manager_user_id = NULL, updated_at = ?1
+            "UPDATE users SET status = 'offboarded', manager_user_id = NULL, avatar_agent_id = NULL, updated_at = ?1
               WHERE id = ?2",
             params![Utc::now().to_rfc3339(), user_id],
         )

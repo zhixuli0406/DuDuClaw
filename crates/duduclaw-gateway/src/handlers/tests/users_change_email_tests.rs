@@ -32,6 +32,7 @@ async fn fixture(auto_login_off: bool) -> Fixture {
     let jwt = Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"));
     handler.set_user_db(db.clone(), jwt).await;
     let ctx = UserContext {
+        member_key_id: None,
         credential_epoch: owner.credential_epoch,
         user_id: owner.id.clone(),
         email: owner.email.clone(),
@@ -150,6 +151,7 @@ async fn other_accounts_always_need_password() {
         )
         .unwrap();
     let ctx = UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: other.id.clone(),
         email: other.email.clone(),
@@ -455,4 +457,71 @@ async fn unreadable_bindings_refuse_list_and_repair_without_exposing_sql_errors(
         }
         other => panic!("expected structured refusal: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn avatar_rpcs_require_admin_validate_agent_and_expose_both_preferences() {
+    let f = fixture(false).await;
+    f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    let agents = f._home.path().join("agents");
+    crate::trigger_route::tests::write_agent(&agents, "avatar-ai", "Avatar", "@avatar-ai", "specialist", "");
+    f.handler.registry().write().await.scan().await.unwrap();
+    let member = f.db.create_user("avatar-member@example.test", "Member", "password123", UserRole::Employee).unwrap();
+    f.db.bind_agent(&member.id, "avatar-ai", duduclaw_auth::AccessLevel::Operator).unwrap();
+    let mut employee = f.owner.clone();
+    employee.user_id = member.id.clone();
+    employee.email = member.email.clone();
+    employee.role = UserRole::Employee;
+    for method in ["users.set_avatar", "users.avatar_conflicts"] {
+        let refused = f.handler.handle(method, json!({"user_id": member.id, "agent_id": "avatar-ai"}), &employee).await;
+        assert!(matches!(refused, WsFrame::Response { ok: false, .. }));
+    }
+    let missing = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": "missing"}), &f.owner).await;
+    assert!(error_text(&missing).contains("invalid_setting"));
+    let saved = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": "avatar-ai"}), &f.owner).await;
+    assert_eq!(ok_payload(&saved)["avatar_agent_id"], "avatar-ai");
+    let other = f.db.create_user("other-avatar@example.test", "Other", "password123", UserRole::Employee).unwrap();
+    f.db.bind_agent(&other.id, "avatar-ai", duduclaw_auth::AccessLevel::Operator).unwrap();
+    let duplicate = f.handler.handle("users.set_avatar", json!({"user_id": other.id, "agent_id": "avatar-ai"}), &f.owner).await;
+    assert!(error_text(&duplicate).contains("avatar_agent_in_use"));
+    let me = ok_payload(&f.handler.handle("users.me", json!({}), &employee).await);
+    assert_eq!(me["user"]["avatar_agent_id"], "avatar-ai");
+    assert_eq!(me["user"]["primary_agent_id"], "avatar-ai");
+    let list = ok_payload(&f.handler.handle("users.list", json!({}), &f.owner).await);
+    let listed = list["users"].as_array().unwrap().iter().find(|u| u["id"] == member.id).unwrap();
+    assert_eq!(listed["avatar_agent_id"], "avatar-ai");
+    let refused = f.handler.handle("users.set_primary_agent", json!({"agent_id": null}), &employee).await;
+    assert!(error_text(&refused).contains("avatar_primary_locked"));
+    let cleared = f.handler.handle("users.set_avatar", json!({"user_id": member.id, "agent_id": null}), &f.owner).await;
+    assert!(ok_payload(&cleared)["avatar_agent_id"].is_null());
+    assert_eq!(f.db.configured_primary_agent(&member.id).unwrap().as_deref(), Some("avatar-ai"));
+    assert!(ok_payload(&f.handler.handle("users.avatar_conflicts", json!({}), &f.owner).await)["conflicts"].as_array().unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_avatar_assignment_checks_target_members_personal_owner() {
+    let f = fixture(false).await;
+    let member = f.db.create_user("personal-avatar@example.test", "Member", "password123", UserRole::Employee).unwrap();
+    let other = f.db.create_user("other-personal-avatar@example.test", "Other", "password123", UserRole::Employee).unwrap();
+    for (agent, owner) in [("member-personal", &member.id), ("other-personal", &other.id)] {
+        seed_agent(f._home.path(), agent);
+        crate::personal_visibility::tests::record_personal(f._home.path(), agent, owner);
+    }
+    crate::personal_visibility::tests::private_store(f._home.path());
+    f.handler.registry.write().await.scan().await.unwrap();
+
+    // Pass isolation explicitly instead of changing process-wide flags.
+    let saved = f.handler.handle_users_set_avatar_in_mode(
+        json!({"user_id": member.id, "agent_id": "member-personal"}), &f.owner, true,
+    ).await;
+    assert_eq!(ok_payload(&saved)["avatar_agent_id"], "member-personal");
+    assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().avatar_agent_id.as_deref(), Some("member-personal"));
+
+    let refused = f.handler.handle_users_set_avatar_in_mode(
+        json!({"user_id": member.id, "agent_id": "other-personal"}), &f.owner, true,
+    ).await;
+    assert!(error_text(&refused).contains("avatar_binding_required"));
+    assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().avatar_agent_id.as_deref(), Some("member-personal"));
+    assert!(f.db.get_user(&other.id).unwrap().unwrap().avatar_agent_id.is_none());
 }

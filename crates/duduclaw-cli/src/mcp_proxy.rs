@@ -481,7 +481,9 @@ pub fn upstream_env(
 ) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = inherited
         .into_iter()
-        .filter(|(k, _)| !is_private_upstream_env(k))
+        .filter(|(k, _)| k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL)
+            || k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_IDENTITY_URL)
+            || !is_private_upstream_env(k))
         .collect();
 
     let declared: Vec<(String, String)> = encoded
@@ -524,16 +526,35 @@ pub fn upstream_env_blob(
         .map_err(|_| format!("MCP server '{server}': upstream env file is unreadable"))
 }
 
+pub(crate) const STARTUP_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const STARTUP_REQUEST_MAX_BYTES: u64 = 64 * 1024;
+
 /// Answer the client's first request with a real MCP error on startup failure.
 /// The message is constructed from server/env names only, never credential data.
-async fn startup_error_frame<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+async fn startup_error_frame<R: std::io::Read + Send + 'static, W: AsyncWrite + Unpin>(
     input: R, output: &mut W, message: &str,
     reason: Option<duduclaw_core::mcp_start_status::ReasonCode>,
+    wait: Duration,
 ) {
-    use tokio::io::AsyncReadExt;
-    let mut input = BufReader::new(input.take(65536));
-    let mut line = String::new();
-    if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), input.read_line(&mut line)).await {
+    // Tokio stdin uses its blocking pool, whose shutdown waits for an in-flight
+    // read even after a timeout. Detach a dedicated OS thread instead: this is
+    // only used on terminal refusal paths, so no later reader needs this input.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let reader = std::thread::Builder::new().name("mcp-startup-refusal".into()).spawn(move || {
+        use std::io::BufRead;
+        let mut input = std::io::BufReader::new(input.take(STARTUP_REQUEST_MAX_BYTES));
+        let mut line = String::new();
+        let line = match input.read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            // A full buffer without a delimiter may be a truncated request.
+            Ok(n) if n as u64 == STARTUP_REQUEST_MAX_BYTES && !line.ends_with('\n') => None,
+            Ok(_) => Some(line),
+        };
+        let _ = tx.send(line);
+    });
+    let Ok(reader) = reader else { return };
+    drop(reader);
+    if let Ok(Ok(Some(line))) = tokio::time::timeout(wait, rx).await {
         if let Ok(frame) = serde_json::from_str::<Value>(&line) {
             if let Some(id) = frame.get("id") {
                 let _ = write_line(output, &startup_refusal_frame(id, message, reason)).await;
@@ -1179,6 +1200,7 @@ async fn write_queued_frame<W: AsyncWrite + Unpin>(
 }
 
 async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Result<()> {
+    let line = duduclaw_core::run_credential::redact(line);
     w.write_all(line.as_bytes()).await?;
     w.write_all(b"\n").await?;
     w.flush().await
@@ -1186,12 +1208,14 @@ async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, line: &str) -> std::io::Re
 
 /// Report only a fixed diagnostic. Identity verification is not repeated here:
 /// its existing verdict deliberately does not expose which credential failed.
-async fn report_startup_refusal(reason: duduclaw_core::mcp_start_status::ReasonCode) {
+async fn report_startup_refusal<R: std::io::Read + Send + 'static>(
+    reason: duduclaw_core::mcp_start_status::ReasonCode, input: R, wait: Duration,
+) {
     // Only the gateway may attribute and persist a startup result. This process
     // reports solely to its own stdio peer; environment claims are not evidence.
     report_startup_diagnostic(reason);
-    startup_error_frame(tokio::io::stdin(), &mut tokio::io::stdout(),
-        "MCP server startup refused", Some(reason)).await;
+    startup_error_frame(input, &mut tokio::io::stdout(),
+        "MCP server startup refused", Some(reason), wait).await;
 }
 
 fn report_startup_diagnostic(reason: duduclaw_core::mcp_start_status::ReasonCode) {
@@ -1235,6 +1259,22 @@ pub async fn run_mcp_proxy_scoped(
     args: &[String],
     spawn_scoped: bool,
 ) -> Result<i32> {
+    run_mcp_proxy_scoped_with_startup_input(
+        home_dir, server, command, args, spawn_scoped,
+        std::io::stdin(), STARTUP_REQUEST_TIMEOUT,
+    ).await
+}
+
+/// Inject only the refusal input; successful startup retains the normal stdio loop.
+pub(crate) async fn run_mcp_proxy_scoped_with_startup_input<R: std::io::Read + Send + 'static>(
+    home_dir: &Path,
+    server: &str,
+    command: &str,
+    args: &[String],
+    spawn_scoped: bool,
+    startup_input: R,
+    startup_timeout: Duration,
+) -> Result<i32> {
     use duduclaw_core::mcp_start_status::ReasonCode;
     // Checked before anything else starts: a refused spawn-scoped proxy
     // launches no upstream and initialises nothing.
@@ -1245,7 +1285,7 @@ pub async fn run_mcp_proxy_scoped(
         ) {
             Ok(blob) => Some(blob),
             Err(why) => {
-                report_startup_refusal(ReasonCode::SpawnScopeUnavailable).await;
+                report_startup_refusal(ReasonCode::SpawnScopeUnavailable, startup_input, startup_timeout).await;
                 return Err(DuDuClawError::Gateway(format!(
                     "mcp-proxy: MCP server '{server}' is not available here ({why})"
                 )));
@@ -1255,13 +1295,13 @@ pub async fn run_mcp_proxy_scoped(
         None
     };
     if server.trim().is_empty() {
-        report_startup_refusal(ReasonCode::ServerMissing).await;
+        report_startup_refusal(ReasonCode::ServerMissing, startup_input, startup_timeout).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: --server must be a non-empty server name".to_string(),
         ));
     }
     if command.trim().is_empty() {
-        report_startup_refusal(ReasonCode::CommandMissing).await;
+        report_startup_refusal(ReasonCode::CommandMissing, startup_input, startup_timeout).await;
         return Err(DuDuClawError::Gateway(
             "mcp-proxy: missing upstream command after `--`".to_string(),
         ));
@@ -1269,7 +1309,7 @@ pub async fn run_mcp_proxy_scoped(
 
     let default_agent = crate::mcp::get_default_agent_for_proxy(home_dir).await;
     if default_agent == duduclaw_core::UNTRUSTED_AGENT_ID {
-        report_startup_refusal(ReasonCode::IdentityRejected).await;
+        report_startup_refusal(ReasonCode::IdentityRejected, startup_input, startup_timeout).await;
         return Err(DuDuClawError::Gateway(
             "MCP caller identity rejected: refusing to start the upstream proxy".into(),
         ));
@@ -1310,7 +1350,7 @@ pub async fn run_mcp_proxy_scoped(
     let env_pairs = match resolved {
         Ok(pairs) => pairs,
         Err(message) => {
-            report_startup_refusal(ReasonCode::EnvironmentRejected).await;
+            report_startup_refusal(ReasonCode::EnvironmentRejected, startup_input, startup_timeout).await;
             return Err(DuDuClawError::Gateway(message));
         }
     };
@@ -1335,7 +1375,7 @@ pub async fn run_mcp_proxy_scoped(
             opt.map(Arc::new)
         }
         Err(e) => {
-            report_startup_refusal(ReasonCode::RedactionUnavailable).await;
+            report_startup_refusal(ReasonCode::RedactionUnavailable, startup_input, startup_timeout).await;
             tracing::error!(
                 server = %server,
                 error = %e,
@@ -1367,7 +1407,7 @@ pub async fn run_mcp_proxy_scoped(
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            report_startup_refusal(ReasonCode::UpstreamSpawnFailed).await;
+            report_startup_refusal(ReasonCode::UpstreamSpawnFailed, startup_input, startup_timeout).await;
             return Err(DuDuClawError::Gateway(format!("mcp-proxy: failed to spawn upstream '{command}': {e}")));
         }
     };
@@ -1376,7 +1416,7 @@ pub async fn run_mcp_proxy_scoped(
         None => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable, startup_input, startup_timeout).await;
             return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdin unavailable".into()));
         }
     };
@@ -1385,7 +1425,7 @@ pub async fn run_mcp_proxy_scoped(
         None => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            report_startup_refusal(ReasonCode::UpstreamIoUnavailable).await;
+            report_startup_refusal(ReasonCode::UpstreamIoUnavailable, startup_input, startup_timeout).await;
             return Err(DuDuClawError::Gateway("mcp-proxy: upstream stdout unavailable".into()));
         }
     };
@@ -2108,6 +2148,28 @@ mod tests {
         assert!(!map.contains_key(PROXY_UPSTREAM_ENV_DIR_VAR));
     }
 
+    #[test]
+    fn run_proof_is_forwarded_but_declared_identity_cannot_override_it() {
+        use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, ENV_IDENTITY_URL, RunCredential};
+        let credential = RunCredential::from_bytes(&[31; 32]);
+        let inherited = vec![(ENV_RUN_CREDENTIAL.into(), credential.expose().to_string()),
+            (ENV_IDENTITY_URL.into(), "http://127.0.0.1:12345/api/internal/identity/introspect".into()),
+            ("DUDUCLAW_AGENT_TOKEN".into(), "old-token".into()),
+            ("DUDUCLAW_AGENT_ID".into(), "alice".into()),
+            ("DUDUCLAW_ON_BEHALF_OF".into(), "user-1".into()),
+            ("DUDUCLAW_TURN_ID".into(), "turn-1".into())];
+        let declared = r#"{"duduclaw_run_credential":"forged","DUDUCLAW_IDENTITY_URL":"9999","DUDUCLAW_AGENT_TOKEN":"forged"}"#;
+        let pairs = upstream_env(inherited, Some(declared));
+        let map: HashMap<_, _> = pairs.iter().cloned().collect();
+        assert!(map.get(ENV_RUN_CREDENTIAL).is_some_and(|v| v == credential.expose()));
+        assert_eq!(map.get(ENV_IDENTITY_URL).map(String::as_str), Some("http://127.0.0.1:12345/api/internal/identity/introspect"));
+        assert_eq!(map.len(), 2);
+        let cmd = upstream_command("never-spawned", &[], pairs, false);
+        let env: HashMap<_, _> = cmd.as_std().get_envs().collect();
+        assert!(env.contains_key(std::ffi::OsStr::new(ENV_RUN_CREDENTIAL)));
+        assert!(!env.contains_key(std::ffi::OsStr::new("DUDUCLAW_AGENT_TOKEN")));
+    }
+
     /// A spawn-scoped proxy with no per-spawn directory starts nothing: the
     /// upstream command here would leave a marker file if it ran.
     #[cfg(unix)]
@@ -2118,12 +2180,14 @@ mod tests {
         let script = format!("touch {}", marker.display());
         // No DUDUCLAW_MCP_PROXY_ENV_DIR in this test process.
         assert!(std::env::var_os(PROXY_UPSTREAM_ENV_DIR_VAR).is_none());
-        let res = run_mcp_proxy_scoped(
+        let res = run_mcp_proxy_scoped_with_startup_input(
             tmp.path(),
             "masterlink",
             "/bin/sh",
             &["-c".to_string(), script],
             true,
+            std::io::empty(),
+            STARTUP_REQUEST_TIMEOUT,
         )
         .await;
         assert!(res.is_err());
@@ -2136,7 +2200,7 @@ mod tests {
         startup_error_frame(
             b"{\"jsonrpc\":\"2.0\",\"id\":\"request-1\",\"method\":\"initialize\"}\n".as_slice(),
             &mut output, "MCP server startup refused",
-            Some(duduclaw_core::mcp_start_status::ReasonCode::IdentityRejected)).await;
+            Some(duduclaw_core::mcp_start_status::ReasonCode::IdentityRejected), STARTUP_REQUEST_TIMEOUT).await;
         let frame: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(frame["jsonrpc"], "2.0");
         assert_eq!(frame["id"], "request-1");
@@ -2151,12 +2215,79 @@ mod tests {
 "#;
         let mut output = Vec::new();
         startup_error_frame(request.as_slice(), &mut output,
-            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started", None).await;
+            "MCP server 'server': unresolved env 'API_KEY'; upstream was not started", None, STARTUP_REQUEST_TIMEOUT).await;
         let frame: Value = serde_json::from_slice(&output).unwrap();
         assert_eq!(frame["id"], 17);
         assert_eq!(frame["error"]["code"], -32001);
         assert!(frame["error"]["message"].as_str().unwrap().contains("API_KEY"));
         assert!(!String::from_utf8(output).unwrap().contains("secret://"));
+    }
+
+    /// This reader cannot complete until the test explicitly releases it.
+    struct StalledStartupInput(std::sync::mpsc::Receiver<()>);
+
+    impl std::io::Read for StalledStartupInput {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.0.recv();
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn startup_refusal_timeout_preserves_error_and_allows_runtime_shutdown() {
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let wait = Duration::from_millis(20);
+                let started = Instant::now();
+                let stalled = run_mcp_proxy_scoped_with_startup_input(
+                    tmp.path(), "", "never-spawn", &[], false, StalledStartupInput(blocked), wait,
+                ).await.unwrap_err();
+                assert!(started.elapsed() >= wait);
+                let closed = run_mcp_proxy_scoped_with_startup_input(
+                    tmp.path(), "", "never-spawn", &[], false, std::io::empty(), STARTUP_REQUEST_TIMEOUT,
+                ).await.unwrap_err();
+                assert_eq!(stalled.to_string(), closed.to_string());
+                assert!(stalled.to_string().contains("--server must be a non-empty server name"));
+
+                // The same refusal still carries the fixed message/reason when
+                // a request id is available; a timeout cannot change the verdict.
+                let mut output = Vec::new();
+                startup_error_frame(b"{\"id\":1}\n".as_slice(), &mut output,
+                    "MCP server startup refused",
+                    Some(duduclaw_core::mcp_start_status::ReasonCode::ServerMissing),
+                    STARTUP_REQUEST_TIMEOUT).await;
+                let frame: Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(frame["error"]["code"], -32001);
+                assert_eq!(frame["error"]["message"], "MCP server startup refused");
+                assert_eq!(frame["error"]["data"]["reason_code"], "server_missing");
+            });
+            // The original reader is still blocked here. Runtime shutdown must
+            // finish before the test releases that reader, not just the future.
+            drop(runtime);
+            done.send(()).unwrap();
+        });
+        let completed = finished.recv_timeout(Duration::from_secs(1));
+        drop(release);
+        completed.expect("startup refusal and runtime shutdown must finish while input is stalled");
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_refusal_ignores_closed_garbage_and_oversized_input() {
+        let mut oversized = vec![b' '; STARTUP_REQUEST_MAX_BYTES as usize];
+        oversized.extend_from_slice(b"{\"id\":1}\n");
+        for input in [Vec::new(), b"not JSON\n".to_vec(), vec![0xff, b'\n'], oversized] {
+            let mut output = Vec::new();
+            startup_error_frame(std::io::Cursor::new(input), &mut output,
+                "MCP server startup refused",
+                Some(duduclaw_core::mcp_start_status::ReasonCode::IdentityRejected),
+                STARTUP_REQUEST_TIMEOUT).await;
+            assert!(output.is_empty(), "no request id means no protocol response");
+        }
     }
 
     // ── upstream env file (Codex, 2026-10-19) ───────────────────────

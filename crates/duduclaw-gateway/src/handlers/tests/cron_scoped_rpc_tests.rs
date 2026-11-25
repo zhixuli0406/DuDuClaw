@@ -9,6 +9,7 @@ fn payload(frame: WsFrame) -> Value {
 fn denied(frame: WsFrame) { assert!(matches!(frame, WsFrame::Response { ok: false, .. })); }
 fn employee(id: &str, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0, user_id: id.into(), email: format!("{id}@example.invalid"),
         role: UserRole::Employee, agent_access: access.iter().map(|(a,l)| (a.to_string(), *l)).collect(),
         must_change_password: false, team_access: Default::default(), acl_generation: 0,

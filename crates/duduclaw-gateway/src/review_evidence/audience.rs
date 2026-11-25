@@ -549,6 +549,7 @@ pub fn trusted_dashboard_principal(
         Default::default()
     };
     Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {
+        member_key_id: None,
         credential_epoch,
         user_id: principal.into(),
         email,

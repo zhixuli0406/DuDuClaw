@@ -432,7 +432,7 @@ impl UserDb {
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("team query error: {e}"))?;
         let rows = stmt
             .query_map(rusqlite::params![manager_id, depth_cap], |row| {
-                Ok((user_from_row(row)?, row.get::<_, i64>(12)?))
+                Ok((user_from_row(row)?, row.get::<_, i64>(13)?))
             })
             .map_err(|e| format!("team query error: {e}"))?;
         let mut members = Vec::new();

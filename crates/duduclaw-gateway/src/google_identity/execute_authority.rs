@@ -2,7 +2,7 @@
 //! the last pre-effect boundary. No change may silently select another account.
 use std::path::Path;
 
-use duduclaw_core::google_identity::{Effective, EffectiveIdentity, Fallback, effective_for};
+use duduclaw_core::google_identity::{Effective, EffectiveIdentity, Fallback};
 use sha2::{Digest, Sha256};
 
 use super::{ExecuteRequest, ExecuteState, Refusal};
@@ -222,7 +222,7 @@ impl Authority {
         {
             return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
         }
-        let selected = effective_for(home, Some(agent));
+        let selected = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
         if let Some(error) = resolve::refusal_for(&selected.effective) {
             return Err(error);
         }

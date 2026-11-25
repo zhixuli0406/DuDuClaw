@@ -164,10 +164,10 @@ fn employee_file_guard_covers_ledger_and_lock() {
 }
 #[test]
 fn channel_capability_and_wording() {
-    for channel in ["telegram", "discord", "slack", "line"] {
+    for channel in ["telegram", "discord", "slack", "line", "googlechat"] {
         assert!(crate::approval::supports_text_decisions(channel));
     }
-    for channel in ["googlechat", "webchat", "odoolivechat", "unknown"] {
+    for channel in ["webchat", "odoolivechat", "unknown"] {
         assert!(!crate::approval::supports_text_decisions(channel));
     }
     assert!(crate::approval::pending_confirmation_hint(true).contains("完整編號"));

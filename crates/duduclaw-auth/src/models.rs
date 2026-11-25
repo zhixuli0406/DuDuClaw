@@ -134,6 +134,8 @@ impl std::str::FromStr for AccessLevel {
 /// A user account record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct User {
+    #[serde(default)]
+    pub avatar_agent_id: Option<String>,
     /// Internal revocation counter; never changes the public user JSON.
     #[serde(skip)]
     pub credential_epoch: u64,

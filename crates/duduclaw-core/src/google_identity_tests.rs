@@ -307,3 +307,21 @@ fn e4_tenant_source_keys_parse_strictly() {
         assert!(parse_home_config(bad).is_err(), "{bad}");
     }
 }
+#[test]
+fn owner_delegation_and_external_round_trip_and_fail_closed() {
+    for value in ["delegate:owner", "external", "owner", "user:alice", "delegate:alice@c.test"] {
+        assert_eq!(Selector::parse(value).unwrap().to_config_value(), value);
+    }
+    let section = parse_agent_section("[google]\nidentity='delegate:owner'\n");
+    let identity = combine(&section, &Ok(HomeIdentityConfig::default()));
+    assert_eq!(identity.effective, Effective::DelegateOwner);
+    assert_eq!(identity.requesters, Requesters::OwnerOnly);
+    assert!(matches!(parse_agent_section("[google]\nidentity='delegate:owner'\nfallback='home'"), SectionRead::Invalid(_)));
+    let external = combine(&parse_agent_section("[google]\nidentity='external'\nexternal_server='供應商 MCP'"), &Ok(HomeIdentityConfig::default()));
+    assert_eq!(external.effective, Effective::External);
+    assert!(!external.effective.tools_listed());
+    assert!(Selector::parse("external-future").is_err());
+    assert!(matches!(combine(&parse_agent_section("[google]\nidentity='unknown-future'"), &Ok(HomeIdentityConfig::default())).effective, Effective::Invalid(_)));
+    let long = format!("[google]\nidentity='external'\nexternal_server='{}'", "字".repeat(121));
+    assert!(matches!(parse_agent_section(&long), SectionRead::Invalid(_)));
+}

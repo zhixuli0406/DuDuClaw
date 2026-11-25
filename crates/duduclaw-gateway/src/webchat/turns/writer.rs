@@ -12,7 +12,7 @@ pub(in crate::webchat) struct WritePermit {
     pub route: subscriptions::Route,
     pub deadline: tokio::time::Instant,
     pub home: PathBuf,
-    pub receiving_credential: Option<duduclaw_auth::jwt::Claims>,
+    pub receiving_credential: Option<crate::webchat::ChatCredential>,
     /// Set when the frame was withheld only because the ACL fence's wait
     /// budget ran out. No byte reached the socket, so the writer keeps
     /// serving the socket's other turns instead of treating it as dead.
@@ -53,12 +53,27 @@ impl<S: futures_util::Sink<Message> + Unpin> futures_util::Sink<Message> for Gua
         // synchronous decision, normally milliseconds. Each socket has its own
         // writer task, the wait is bounded, and the IMMEDIATE transaction must
         // span this write, so it cannot be moved off the worker in a small change.
+        // Never re-enter users.db from the delivery reservation callback.
+        // Key mutations bump acl_generation, fencing the gap to that reservation.
+        let key_valid = |credential: &crate::webchat::ChatCredential| match credential {
+            crate::webchat::ChatCredential::Member(_) => credential.valid_at_delivery(
+                &permit.home, &permit.users, chrono::Utc::now().timestamp().max(0) as u64),
+            _ => true,
+        };
+        if permit.receiving_credential.as_ref().is_some_and(|c| !key_valid(c))
+            || permit.route.origin_credential.as_ref().is_some_and(|c| !key_valid(c)) {
+            permit.route.source.refuse();
+            return Err(());
+        }
         let result = permit.users.with_acl_generation(permit.generation, || {
             permit.policy.with_current(|| {
                 permit.route.with_live(|| {
                     let now = chrono::Utc::now().timestamp().max(0) as u64;
-                    let valid = |claims: &duduclaw_auth::jwt::Claims| webchat_credential_expiry(&permit.home, claims)
-                        .is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry));
+                    let valid = |credential: &crate::webchat::ChatCredential| match credential {
+                        crate::webchat::ChatCredential::Jwt(claims) => webchat_credential_expiry(&permit.home, claims)
+                            .is_ok_and(|expiry| expiry.is_none_or(|expiry| now < expiry)),
+                        crate::webchat::ChatCredential::Member(_) => crate::member_keys::config(&permit.home).enabled,
+                    };
                     if permit.route.origin_credential.as_ref().is_some_and(|claims| !valid(claims)) {
                         permit.route.source.refuse();
                     }

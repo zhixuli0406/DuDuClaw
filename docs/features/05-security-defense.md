@@ -1,5 +1,13 @@
 # Security Defense
 
+
+## Per-run caller identity
+
+An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
+
+Local tools can verify `DUDUCLAW_RUN_CREDENTIAL` through a dedicated ephemeral `127.0.0.1` listener (never the dashboard router), discovered with `DUDUCLAW_IDENTITY_URL` or the owner-only `<gateway home>/run/identity-url` file, or `duduclaw identity whoami --json`. The gateway stores only hashes; run completion, cancellation, expiry or restart invalidates the proof. This does not prevent a same-OS-user process from stealing another live credential. Protected mode issues no run credential and uses its own capability records; existing agent tokens and MCP identity verification are unchanged. See [Getting and verifying the caller identity](../guides/custom-mcp-tool.md#getting-and-verifying-the-caller-identity).
+
+
 ## Native Linux isolation integration (planned for a later release)
 
 > **Not available in the current release.** The code for the per-employee Linux isolation architecture has been included since v1.81.0, but it cannot be installed or enabled on a customer host. The protected service still installs, updates and runs employees as in v1.80 (`sudo duduclaw service install --protected-linux`, `sudo /opt/duduclaw/bin/duduclaw service upgrade --protected-linux`). The paragraphs in this section, and the sections marked "planned for a later release" below, describe the development state of that planned release.
@@ -903,3 +911,30 @@ Non-Admin add/update scans the complete resulting name + task model prompt with 
 Employee cron uses UTC (also accepts zero-offset UTC/GMT aliases) or an IANA timezone whose UTC offset stays the same over the next two years, such as `Asia/Taipei`; with a constant offset, clock-time gaps equal elapsed time, so the 15-minute proof holds. A timezone with daylight saving or another offset change is refused on create, edit, resume or manual run, and the scheduler skips it, because DST can compress clock-time gaps. Such records remain readable and authorized users can pause/remove them; Admin manages other timezone schedules and must change a skipped one to UTC or a timezone without daylight saving.
 
 Human-origin MCP creation defaults to UTC and accepts an explicit timezone without daylight saving; unmarked Admin/background schedules keep local-timezone detection.
+
+### Wiki path and policy checks
+
+Page quarantine and auto-page visibility use the resolved on-disk filename. Equivalent spellings cannot bypass reserved-file redaction or write protection; ambiguous matches are refused. Page and policy reads use no-follow opens and validate the opened handle on Unix and Windows. Both writers refuse linked control files, including broken links, and scanning refuses linked roots and skips internal links.
+
+The shared root-policy loader caps `.scope.toml` at 64 KB and rejects malformed content and wrong field types. Load failures deny the affected access, including dashboard reads; a missing policy retains its previous meaning. Simulation grounding stops on a policy load error and recognizes `agent_allowlist` as protected. CLI doctor and the dashboard system check report policy errors and warn about ignored nested policies. See [Wiki knowledge layer](17-wiki-knowledge-layer.md) for scanning and recovery behavior.
+
+## Personal member API keys (1.85.0)
+
+External member applications can call from their own server using a personal
+`ddc_member_` key instead of renewing a browser access token every 30 minutes.
+Administrators enable the feature in **My account → External access**; it is off
+by default. Members create up to five keys with a required 1–365 day expiration
+(default 90 days). Accounts with MFA must complete fresh step-up verification.
+Admin accounts cannot create member keys.
+
+The plaintext is shown once, and only SHA-256 is stored. Keys inherit the
+member's live role and bindings, are restricted to the member contract, and
+cannot manage credentials, passwords, email, MFA, sessions or configuration.
+They never grant Admin access. Revocation, expiry, offboarding, password changes
+and MFA resets invalidate them, including existing connections on their next
+call or heartbeat. Each key is rate limited (120 calls/minute by default).
+Creation, revocation and write calls are audited; repeated use is aggregated.
+
+**Do not put this key in browser front-end code; call from your server.** See the
+[member API authentication reference](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
+for transport examples and the precise method restrictions.

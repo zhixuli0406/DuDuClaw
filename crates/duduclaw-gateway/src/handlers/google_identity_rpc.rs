@@ -10,7 +10,7 @@
 //! | `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}` / `google.delegation.revoke_attestation {agent_id, csrf_token}` | Admin + step-up | SR4: protected-mode attestation that a Shared employee's delegate subject is the listed person (`google_delegate_attestation_rpc.rs`) |
 //! | `agents.google_identity_get {agent_id}` | Viewer of the employee | the identity in effect and whether it can be used now |
 //! | `agents.google_identity_set {agent_id, identity, fallback?, requesters?}` | Admin | write `[google]` (B2a: `home`, `none`, `delegate:<email>`) |
-//! | `google.identity.test {agent_id}` | Admin | mint for the subject and read one profile; sends nothing |
+//! | `google.identity.test {agent_id}` | Admin (live re-check) | owner: mint + tokeninfo only; audited, with a durable member notice |
 //!
 //! No response ever carries key material or an access token.
 
@@ -37,6 +37,26 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
     );
 }
 
+/// Record every exit, including cancellation and refusals before selection.
+struct IdentityTestAudit<'a> {
+    home: &'a Path,
+    ctx: &'a UserContext,
+    agent: &'a str,
+    db: Option<Arc<UserDb>>,
+    outcome: &'static str,
+}
+
+impl Drop for IdentityTestAudit<'_> {
+    fn drop(&mut self) {
+        let detail = json!({"agent_id":self.agent,"outcome":self.outcome});
+        if let Some(db) = &self.db {
+            let _ = db.log_action(Some(&self.ctx.user_id), "google.identity_test_finished",
+                Some(self.agent), Some(&detail.to_string()), None);
+        }
+        sec_audit(self.home, "google_identity_test_finished", Severity::Warning, self.ctx, detail);
+    }
+}
+
 /// The identity of one employee as the dashboard shows it, plus whether it
 /// can be used right now (local checks only — no network, no unsealing).
 ///
@@ -44,10 +64,13 @@ fn sec_audit(home: &Path, event: &str, severity: Severity, ctx: &UserContext, de
 /// and creation time) — Admin path only (`google.delegation.get`).
 fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, include_holder: bool) -> Value {
     let section = gi::read_agent_section(home, agent);
-    let eff = gi::combine(&section, &gi::read_home_config(home));
+    let configured = gi::combine(&section, &gi::read_home_config(home));
+    let follows_owner = configured.effective == Effective::DelegateOwner;
+    let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     let (state, message) = match &eff.effective {
         Effective::Home => ("home", String::new()),
         Effective::Disabled => ("none", String::new()),
+        Effective::External => ("external", String::new()),
         Effective::Delegate { email } => match resolve::precheck(home, email, people) {
             Err(r) => ("blocked", r.message_zh),
             Ok(()) => match delegation_key::info(home) {
@@ -81,13 +104,14 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, 
                 .unwrap_or_default(),
         ),
     };
+    let owner = if follows_owner { people.user_db().and_then(|db| db.google_owner(agent).ok()) } else { None };
     let email = match &eff.effective {
         Effective::Delegate { email } => Some(email.clone()),
-        _ => None,
+        _ => owner.as_ref().map(|u| u.email.clone()),
     };
     let selected_person = match (&eff.effective, people.user_db()) {
         (Effective::Personal { selector }, Some(db)) => crate::google_personal::access::select_user(db, agent, selector).ok().map(|u| json!({"user_id":u.id,"name":u.display_name,"login_email":u.email})),
-        _ => None,
+        _ => owner.as_ref().map(|u| json!({"user_id":u.id,"name":u.display_name,"login_email":u.email})),
     };
     let owners = people.user_db().and_then(|db| db.get_agent_users(agent).ok().map(|bindings| bindings.into_iter()
         .filter(|b| b.access_level == AccessLevel::Owner).filter_map(|b| db.get_user(&b.user_id).ok().flatten().map(|u| json!({"user_id":u.id,"name":u.display_name,"email":u.email,"is_primary":b.is_primary}))).collect::<Vec<_>>()));
@@ -98,7 +122,9 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, 
         .and_then(|s| s.parse::<toml::Table>().ok()).and_then(|t| t.get("permissions").and_then(toml::Value::as_table).and_then(|p| p.get("allowed_channels")).cloned());
     json!({
         "agent_id": agent,
-        "kind": eff.effective.kind(),
+        "kind": configured.effective.kind(),
+        "external_server": duduclaw_core::agent_toml::read_effective_text(&home.join("agents").join(agent)).ok()
+            .and_then(|text| text.parse::<toml::Table>().ok()).and_then(|table| table.get("google")?.get("external_server")?.as_str().map(|name| duduclaw_core::truncate_chars(name, 120).to_string())),
         "email": email,
         "selected_person": selected_person,
         "owners": owners,
@@ -113,7 +139,9 @@ fn identity_view(home: &Path, agent: &str, people: &dyn requester_gate::People, 
         // SR4 items 1 / 2(iv): in protected mode, where the D-5 subject rule
         // applies, the subject's standing (attestation required, a staff
         // account claiming a service mailbox, …). `null` elsewhere.
-        "tenant_subject": if crate::runtime_readiness::is_protected_linux() {
+        "tenant_subject": if follows_owner {
+            crate::google_identity::delegate_owner::notice(home, agent, people.user_db(), include_holder)
+        } else if crate::runtime_readiness::is_protected_linux() {
             crate::google_identity::tenant_source::subject_notice(home, agent, people.user_db(), include_holder)
         } else {
             Value::Null
@@ -128,7 +156,11 @@ impl MethodHandler {
     }
 
     /// `google.delegation.get`.
-    pub(crate) async fn handle_google_delegation_get(&self) -> WsFrame {
+    pub(crate) async fn handle_google_delegation_get(&self, ctx: &UserContext) -> WsFrame {
+        let step_up = if let (Some(db), Ok(session)) = (self.user_db.read().await.clone(), crate::google_personal::session_for(&ctx.user_id)) {
+            let proof = db.migration_confirmation_session(&ctx.user_id, &session, ctx.credential_epoch, chrono::Utc::now().timestamp()).ok().flatten();
+            json!({"step_up_valid":proof.is_some(),"csrf_token":proof.map(|p| p.csrf),"mfa_enrolled":db.mfa_active(&ctx.user_id).unwrap_or(false)})
+        } else { json!({"step_up_valid":false,"csrf_token":null,"mfa_enrolled":false}) };
         let home = self.home_dir.clone();
         let protection = tokio::task::spawn_blocking({
             let home = home.clone();
@@ -170,6 +202,7 @@ impl MethodHandler {
         WsFrame::ok_response(
             "",
             json!({
+                "step_up": step_up,
                 "protection": protection,
                 "key": key,
                 "key_error": key_error,
@@ -194,7 +227,7 @@ impl MethodHandler {
                     "max_tenant_scopes": super::google_tenant_settings_rpc::MAX_TENANT_SCOPES,
                 },
                 "home_subject": crate::google_identity::home_subject(&home),
-                "required_scopes": crate::google_workspace::REQUIRED_SCOPES,
+                "required_scopes": crate::google_workspace::requested_scopes(&home),
                 "admin_console_path": ADMIN_CONSOLE_PATH,
                 "agents": agents,
                 "personal_connections": crate::person_credentials::all_metadata(&home).ok(),
@@ -412,7 +445,7 @@ impl MethodHandler {
         if let gi::SectionRead::Present(previous) = &before {
             // Omitted policy fields retain their previous restriction. An
             // ordinary identity/fallback edit must not widen owner_only.
-            if params.get("requesters").is_none() {
+            if params.get("requesters").is_none() && params.get("identity").and_then(Value::as_str) != Some("delegate:owner") {
                 params["requesters"] = json!(previous.requesters.as_str());
             }
             let unchanged_identity = previous.identity.as_ref().is_some_and(|identity| {
@@ -521,6 +554,7 @@ impl MethodHandler {
         let delegate_subject = |s: &gi::SectionRead| match s {
             gi::SectionRead::Present(p) => match &p.identity {
                 Some(Selector::Delegate(email)) => Some(email.clone()),
+                Some(Selector::DelegateOwner) => Some("delegate:owner".into()),
                 _ => None,
             },
             _ => None,
@@ -565,19 +599,87 @@ impl MethodHandler {
     }
 
     /// `google.identity.test {agent_id}`.
-    pub(crate) async fn handle_google_identity_test(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_google_identity_test(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let agent_id = params.get("agent_id").and_then(Value::as_str).unwrap_or("");
-        if !is_valid_agent_id(agent_id) {
+        let mut audit = IdentityTestAudit { home: &self.home_dir, ctx, agent: agent_id,
+            db: None, outcome: "cancelled" };
+        audit.db = self.user_db.read().await.clone();
+        audit.outcome = "audit_unavailable";
+        let Some(db) = audit.db.clone() else { return WsFrame::error_response("", "人員資料尚未就緒。"); };
+        let detail = json!({"agent_id":agent_id});
+        if db.log_action(Some(&ctx.user_id), "google.identity_test_attempt", Some(agent_id), Some(&detail.to_string()), None).is_err() {
+            return WsFrame::error_response("", "無法寫入測試稽核，未執行測試。");
+        }
+        audit.outcome = "admin_refused";
+        if self.mfa_require_current_admin(ctx).await.is_err() {
+            return WsFrame::error_response("", "請以管理員帳號重新登入。");
+        }
+        audit.outcome = "invalid_agent";
+        if !is_valid_agent_id(agent_id) || !self.home_dir.join("agents").join(agent_id).is_dir() {
             return WsFrame::error_response("", "Missing or invalid 'agent_id' parameter");
         }
+        audit.outcome = "selection_failed";
         let people = self.people().await;
-        let (email, steps) =
-            crate::google_identity::check::run(&self.home_dir, agent_id, people.as_ref()).await;
+        let configured = gi::effective_for(&self.home_dir, Some(agent_id));
+        let effective = crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(agent_id));
+        let target = match &configured.effective {
+            Effective::Personal { selector } => match crate::google_personal::access::select_user(&db, agent_id, selector) {
+                Ok(user) => Some(user), Err(r) => return WsFrame::error_response("", &r.message_zh),
+            },
+            Effective::DelegateOwner => {
+                if let Err(r) = crate::google_identity::delegate_owner::subject(&self.home_dir, agent_id, &db) {
+                    return WsFrame::error_response("", &r.message_zh);
+                }
+                match crate::google_identity::delegate_owner::owner(&db, agent_id) {
+                    Ok(user) if matches!(&effective.effective, Effective::Delegate { email } if gi::normalize_email(&user.email).ok().as_ref() == Some(email)) => Some(user),
+                    _ => return WsFrame::error_response("", "負責人已變更，請重新測試。"),
+                }
+            }
+            Effective::Delegate { email } => match people.by_email(email) {
+                Ok(Some(person)) => match db.get_user(&person.user_id) {
+                    Ok(Some(user)) => Some(user), _ => return WsFrame::error_response("", "無法確認受測成員。"),
+                },
+                Ok(None) => None, Err(r) => return WsFrame::error_response("", &r.message_zh),
+            },
+            _ => None,
+        };
+        if let Some(user) = &target {
+            audit.outcome = "notice_failed";
+            let detail = json!({"agent_id":agent_id,"tested_user_id":user.id,"tested_email":user.email});
+            let action = if matches!(&configured.effective, Effective::Personal { .. }) { "google.personal_identity_test" } else { "google.delegate_identity_test" };
+            if db.log_action(Some(&ctx.user_id), action, Some(&user.id), Some(&detail.to_string()), None).is_err() {
+                return WsFrame::error_response("", "無法寫入測試稽核，未執行測試。");
+            }
+            sec_audit(&self.home_dir, &action.replace('.', "_"), Severity::Warning, ctx, detail);
+            let kind = if matches!(&configured.effective, Effective::Delegate { .. }) { "google_identity_data_test" } else { "google_identity_test" };
+            let notice = async {
+                crate::events_store::EventBusStore::open(&self.home_dir)?
+                    .person_notice(&user.id, agent_id, &ctx.user_id, kind).await
+            }.await;
+            if notice.is_err() { return WsFrame::error_response("", "無法保存站內通知，未執行測試。"); }
+            // External delivery is best effort, after the durable notice and
+            // attempt audit, and before any refresh or delegated token mint.
+            let message = if kind == "google_identity_test" {
+                "管理員準備測試你的 Google 連線；只檢查連線與授權狀態，不會讀取郵件、檔案或日曆。"
+            } else { "管理員準備測試你的 Google 公司授權代表連線，包含唯讀資料存取檢查。" };
+            crate::notify_push::push_person_notice(&self.home_dir, &user.id, message).await;
+        }
+        audit.outcome = "identity_changed";
+        if self.mfa_require_current_admin(ctx).await.is_err()
+            || gi::effective_for(&self.home_dir, Some(agent_id)) != configured
+            || crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(agent_id)) != effective {
+            return WsFrame::error_response("", "管理員權限或身分已變更，請重新測試。");
+        }
+        let (email, steps) = if matches!(&configured.effective, Effective::Personal { .. }) {
+            let Some(user) = target else { return WsFrame::error_response("", "無法確認受測成員。"); };
+            let steps = crate::google_identity::personal_check::run(&self.home_dir, agent_id, &db, &user.id).await;
+            (Some(user.email), steps)
+        } else {
+            crate::google_identity::check::run_selected(&self.home_dir, agent_id, people.as_ref(), &configured, &effective).await
+        };
         let ok = steps.iter().all(|s| s.ok);
-        WsFrame::ok_response(
-            "",
-            json!({ "agent_id": agent_id, "email": email, "ok": ok, "steps": steps }),
-        )
+        audit.outcome = if ok { "ok" } else { "check_failed" };
+        WsFrame::ok_response("", json!({"agent_id":agent_id,"email":email,"ok":ok,"steps":steps}))
     }
 }
 
@@ -608,11 +710,12 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         Some(_) => return Err("fallback 只能是 none 或 home".into()),
     };
     let requesters = match params.get("requesters").and_then(Value::as_str) {
+        None if sel == Selector::DelegateOwner => Requesters::OwnerOnly,
         None => Requesters::default(),
         Some(r) => Requesters::parse(r)?,
     };
     if requesters == Requesters::Anyone
-        && matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_))
+        && matches!(sel, Selector::Delegate(_) | Selector::DelegateOwner | Selector::Owner | Selector::User(_))
         && params.get("confirm_anyone").and_then(Value::as_bool) != Some(true)
     {
         return Err("「任何人都能透過這位員工使用」需要明確確認（confirm_anyone: true）。公開訪客仍然一律不行。".into());
@@ -621,16 +724,24 @@ pub(crate) fn parse_identity_params(params: &Value) -> Result<toml::Table, Strin
         "identity".into(),
         toml::Value::String(sel.to_config_value()),
     );
-    if matches!(sel, Selector::Delegate(_) | Selector::Owner | Selector::User(_)) {
+    if sel == Selector::DelegateOwner && fallback != "none" { return Err("delegate:owner 不允許改用公司共用帳號。".into()); }
+    if matches!(sel, Selector::Delegate(_) | Selector::DelegateOwner | Selector::Owner | Selector::User(_)) {
         if fallback != "none" {
             t.insert("fallback".into(), toml::Value::String(fallback));
         }
-        if requesters != Requesters::default() {
+        if requesters != Requesters::default() || sel == Selector::DelegateOwner {
             t.insert(
                 "requesters".into(),
                 toml::Value::String(requesters.as_str().into()),
             );
         }
+    }
+    if let Some(value) = params.get("external_server") {
+        let name = value.as_str().ok_or("external_server 必須是字串")?.trim();
+        if name.chars().count() > 120 || name.chars().any(char::is_control) {
+            return Err("外部伺服器名稱最多 120 字，不可含控制字元。".into());
+        }
+        if sel == Selector::External && !name.is_empty() { t.insert("external_server".into(), toml::Value::String(name.into())); }
     }
     Ok(t)
 }

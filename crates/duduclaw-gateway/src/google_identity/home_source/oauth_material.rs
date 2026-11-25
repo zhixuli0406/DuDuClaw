@@ -418,12 +418,28 @@ fn service_account_config(
 pub async fn get_valid_google_token(
     home_dir: &Path,
 ) -> std::result::Result<String, GoogleAuthError> {
+    get_valid_google_token_with_scopes(home_dir, REQUIRED_SCOPES).await
+}
+
+pub async fn get_valid_google_token_for_tool(home_dir: &Path, tool: &str) -> std::result::Result<String, GoogleAuthError> {
+    let scopes = crate::google_identity::delegated_scopes::for_tool(home_dir, tool)
+        .map_err(|r| GoogleAuthError::ServiceAccount(r.message_zh))?;
+    get_valid_google_token_with_scopes(home_dir, scopes).await
+}
+
+pub async fn get_valid_google_token_for_endpoint(home_dir: &Path, endpoint: &str) -> std::result::Result<String, GoogleAuthError> {
+    let scopes = crate::google_identity::delegated_scopes::for_endpoint(home_dir, endpoint)
+        .map_err(|r| GoogleAuthError::ServiceAccount(r.message_zh))?;
+    get_valid_google_token_with_scopes(home_dir, scopes).await
+}
+
+async fn get_valid_google_token_with_scopes(home_dir: &Path, scopes: &[&str]) -> std::result::Result<String, GoogleAuthError> {
     if matches!(crate::google_workspace::selected_path(home_dir)?.as_str(), "apps_script" | "none") {
         return Err(GoogleAuthError::NotConnected { vault: home_dir.join(crate::mcp_oauth::TOKEN_FILE) });
     }
     match service_account_config(home_dir) {
         Ok(Some(cfg)) => {
-            return google_service_account::get_token(&cfg, REQUIRED_SCOPES)
+            return google_service_account::get_token(&cfg, scopes)
                 .await
                 .map_err(|e| GoogleAuthError::ServiceAccount(e.to_string()));
         }

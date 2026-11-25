@@ -5,6 +5,8 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { ExternalAccessPage } from './ExternalAccessPage';
 
+vi.mock('@/components/external-status/MemberKeysSection', () => ({ MemberKeysSection: () => null }));
+
 const SECRET = 'ddc_status_SECRETVALUE0123456789';
 const token = (over: Record<string, unknown> = {}) => ({
   id: 't1', name: 'Dept board', created_at: '2026-11-02T08:00:00Z', last_used_at: null, revoked_at: null, active: true, ...over,

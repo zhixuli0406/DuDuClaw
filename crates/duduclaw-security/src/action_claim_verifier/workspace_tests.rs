@@ -244,8 +244,9 @@ fn evidence_set_per_family() {
     let now = chrono::Utc::now();
     for (family, tools) in [
         (ClaimType::CalendarEventCreated, &["calendar_create_event"][..]),
-        (ClaimType::SheetWritten, &["sheets_append"][..]),
-        (ClaimType::DocWritten, &["docs_append"][..]),
+        (ClaimType::CalendarEventUpdated, &["calendar_update_event"][..]),
+        (ClaimType::SheetWritten, &["sheets_append", "sheets_create", "sheets_update"][..]),
+        (ClaimType::DocWritten, &["docs_append", "docs_create", "docs_replace_text"][..]),
         (ClaimType::TaskCreated, &["tasks_create", "gtasks_create"][..]),
     ] {
         assert_eq!(family.evidence_tools(), tools);
@@ -447,4 +448,14 @@ fn rotated_backup_is_read_when_live_file_is_small() {
     write_rows(&home.join("tool_calls.jsonl"), &[row(now, "sheets_read", 1)]);
     assert!(detect(&home, "已建立任務。", now).is_empty());
     std::fs::remove_dir_all(home).unwrap();
+}
+
+#[test]
+fn calendar_update_evidence_cannot_prove_event_creation() {
+    let now = chrono::Utc::now();
+    assert_eq!(types("已更新行事曆活動。"), vec![ClaimType::CalendarEventUpdated]);
+    assert_eq!(types("Calendar event updated."), vec![ClaimType::CalendarEventUpdated]);
+    let rows = vec![row(now, "calendar_update_event", 1)];
+    assert!(verify_workspace_claims(&[claim(ClaimType::CalendarEventUpdated)], &rows).is_empty());
+    assert_eq!(verify_workspace_claims(&[claim(ClaimType::CalendarEventCreated)], &rows).len(),1);
 }

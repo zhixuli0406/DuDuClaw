@@ -24,6 +24,8 @@ fn verify_live_io() -> Result<(), String> {
 pub mod keys {
     /// Dashboard-only Google Chat DM presentation preference.
     pub const DM_REPLY_PLACEMENT: &str = "dm_reply_placement";
+    /// Admin-only shared Google Chat app onboarding text.
+    pub const UNBOUND_REPLY: &str = "unbound_reply";
     /// Admin-only per-group retention policy; not exposed through channel_config.
     pub const GROUP_CONTEXT: &str = "group_context";
     /// Admin-only per-guild choices for Discord /agent. No global inheritance.
@@ -54,8 +56,9 @@ pub mod keys {
     /// admin-gated chat commands (`!STOP` / `!STOP ALL` / `!RESUME`).
     /// Missing or empty = NO admins on that channel (fail-closed).
     pub const ADMIN_USERS: &str = "admin_users";
-    /// WP9: whether this is a company shared bot where employees bind to their
-    /// own agent via a `/start <token>` deep-link. Values: "true" / "false".
+    /// Company shared-app routing. Telegram uses bind links / member targets;
+    /// Google Chat uses manually bound members in proven one-to-one DMs.
+    /// Admin-only. Values: "true" / "false".
     /// Default false = the global bot keeps its existing default-agent routing.
     /// When true, an unbound user on the shared bot is shown a bind-first
     /// guidance message instead of being answered by the default agent.
@@ -157,6 +160,7 @@ pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
         keys::DM_REPLY_PLACEMENT => {
             if !["main", "thread"].contains(&value) { return Err("dm_reply_placement must be main or thread".into()); }
         }
+        keys::UNBOUND_REPLY => crate::googlechat_shared::validate_unbound_reply(value)?,
         keys::DISCORD_AGENT_CHOICES => {
             let ids: Vec<String> = serde_json::from_str(value)
                 .map_err(|_| "discord_agent_choices must be an array of agent ids".to_string())?;
@@ -164,7 +168,7 @@ pub fn validate_setting_value(key: &str, value: &str) -> Result<(), String> {
                 return Err("discord_agent_choices accepts at most 25 valid agent ids".into());
             }
         }
-        keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
+        keys::SHARED_BOT_BINDING | keys::MENTION_ONLY | keys::AUTO_THREAD | keys::REQUIRE_PAIRING => {
             if value != "true" && value != "false" {
                 return Err(format!("{key} must be 'true' or 'false'"));
             }
@@ -505,6 +509,49 @@ impl ChannelSettingsManager {
         }))
     }
 
+    /// Apply all upserts/deletions atomically. Readers see the old snapshot
+    /// until commit; failed writes leave both SQLite and the cache unchanged.
+    pub async fn apply_batch(
+        &self,
+        channel_type: &str,
+        scope_id: &str,
+        changes: &[(&str, Option<String>)],
+    ) -> Result<(), String> {
+        let mut connection = self.conn.lock().await;
+        verify_live_io()?;
+        // Preserve the DB -> cache lock order used by snapshot publication.
+        let mut cache = self.cache.write().await;
+        verify_live_io()?;
+        let tx = connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let now = chrono::Utc::now().to_rfc3339();
+        for (key, value) in changes {
+            verify_live_io()?;
+            match value {
+                Some(value) => {
+                    tx.execute(
+                        "INSERT INTO channel_settings (channel_type, scope_id, key, value, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)
+                         ON CONFLICT(channel_type, scope_id, key) DO UPDATE SET value = ?4, updated_at = ?5",
+                        params![channel_type, scope_id, key, value, now],
+                    ).map_err(|e| e.to_string())?;
+                }
+                None => {
+                    tx.execute(
+                        "DELETE FROM channel_settings WHERE channel_type = ?1 AND scope_id = ?2 AND key = ?3",
+                        params![channel_type, scope_id, key],
+                    ).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        verify_live_io()?;
+        tx.commit().map_err(|e| e.to_string())?;
+        for (key, value) in changes {
+            cache.insert(Self::cache_key(channel_type, scope_id, key), value.clone());
+        }
+        Ok(())
+    }
+
     /// Set a setting value (upsert). Invalidates cache for this key.
     pub async fn set(
         &self,
@@ -694,6 +741,41 @@ async fn pause_after_settings_read() {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    #[tokio::test]
+    async fn rm148_batch_second_key_failure_rolls_back_database_and_cache() {
+        for first_value in [Some("true".to_string()), None] {
+            let (_db, mgr) = temp_db();
+            mgr.set("googlechat", "global", keys::SHARED_BOT_BINDING, "false").await.unwrap();
+            mgr.set("googlechat", "global", keys::UNBOUND_REPLY, "old reply").await.unwrap();
+            mgr.conn.lock().await.execute_batch(
+                "CREATE TRIGGER fail_unbound_reply BEFORE INSERT ON channel_settings
+                 WHEN NEW.key = 'unbound_reply'
+                 BEGIN SELECT RAISE(ABORT, 'second key failed'); END;",
+            ).unwrap();
+            let err = mgr.apply_batch("googlechat", "global", &[
+                (keys::SHARED_BOT_BINDING, first_value),
+                (keys::UNBOUND_REPLY, Some("new reply".into())),
+            ]).await.unwrap_err();
+            assert!(err.contains("second key failed"), "{err}");
+            // Check the warm cache before any fresh database read can replace it.
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("false"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await.as_deref(), Some("old reply"));
+            mgr.cache.write().await.clear();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("false"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await.as_deref(), Some("old reply"));
+            mgr.conn.lock().await.execute_batch("DROP TRIGGER fail_unbound_reply").unwrap();
+            mgr.apply_batch("googlechat", "global", &[
+                (keys::SHARED_BOT_BINDING, Some("true".into())),
+                (keys::UNBOUND_REPLY, None),
+            ]).await.unwrap();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("true"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await, None);
+            mgr.cache.write().await.clear();
+            assert_eq!(mgr.get("googlechat", "global", keys::SHARED_BOT_BINDING).await.as_deref(), Some("true"));
+            assert_eq!(mgr.get("googlechat", "global", keys::UNBOUND_REPLY).await, None);
+        }
+    }
 
     #[tokio::test]
     async fn stale_refresh_and_cache_miss_cannot_overwrite_completed_set_or_delete() {

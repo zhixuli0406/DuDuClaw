@@ -575,6 +575,17 @@ impl GenericCliRuntime {
         cmd
     }
 
+    fn prepare_run_command(&self, args: &[String], context: &RuntimeContext)
+        -> Result<(tokio::process::Command, crate::run_identity::RunGuard), String>
+    {
+        let mut cmd = self.prepare_command(args, context);
+        let agent = if context.agent_id.is_empty() && crate::runtime_dispatch::in_utility_call() { "system" } else { &context.agent_id };
+        let identity = crate::run_identity::issue(&context.home_dir, agent, self.spec.id,
+            crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref()))?;
+        identity.apply(&mut cmd);
+        Ok((cmd, identity))
+    }
+
     /// Run one turn. Split out from the trait method so the error type stays
     /// typed all the way to the boundary.
     async fn run(
@@ -646,7 +657,8 @@ impl GenericCliRuntime {
             );
         }
 
-        let mut cmd = self.prepare_command(&args, context);
+        let (mut cmd, _run_identity) = self.prepare_run_command(&args, context)
+            .map_err(|error| GenericCliError::Spawn { runtime: id, error })?;
 
         let stdin_prompt = self.spec.headless.prompt_via_stdin();
         cmd.stdin(if stdin_prompt {
@@ -1157,7 +1169,8 @@ mod tests {
             let runtime = GenericCliRuntime::with_program(spec, "fixture vendor");
             let context = ctx(home.path());
             let args = build_args(spec, "繁體中文 $HOME;\nnext", &context.model);
-            let command = runtime.prepare_command(&args, &context);
+            let (command, _identity) = runtime.prepare_run_command(&args, &context).unwrap();
+            let _proof = crate::run_identity::assert_command_identity(&command, true);
             let before = duduclaw_core::execution_gate::command_snapshot(&command);
             let prompt = "繁體中文 $HOME;\nnext";
             let (legacy_args, key): (Vec<&str>, &str) = match id {
@@ -1192,6 +1205,13 @@ mod tests {
             for (name, _) in std::env::vars_os() {
                 if name.to_string_lossy().to_ascii_uppercase().starts_with("DUDUCLAW_DELEGATION_") {
                     expected.env_remove(name);
+                }
+            }
+            for (name, value) in command.as_std().get_envs() {
+                if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
+                    || name == duduclaw_core::run_credential::ENV_IDENTITY_URL {
+                    if let Some(value) = value { expected.env(name, value); }
+                    else { expected.env_remove(name); }
                 }
             }
             assert_eq!(before, duduclaw_core::execution_gate::command_snapshot(&expected), "{id}");

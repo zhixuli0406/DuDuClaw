@@ -13,6 +13,7 @@ fn admin_ctx() -> UserContext {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),
         email: "m1@test.local".to_string(),
@@ -428,4 +429,44 @@ async fn pairing_revoke_requires_subject() {
         .handle("channels.pairing_revoke", json!({}), &admin_ctx())
         .await;
     assert!(!frame_ok(&frame), "{frame:?}");
+}
+
+#[tokio::test]
+async fn rm148_shared_googlechat_settings_are_admin_only_global_and_validated() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let settings = json!({"shared_bot_binding": true, "unbound_reply": "請聯絡管理員。{onboarding_url}"});
+    for role in [UserRole::Manager, UserRole::Employee] {
+        let mut user = manager_ctx();
+        user.role = role;
+        for (method, params) in [
+            ("channels.config_get", json!({"channel":"googlechat"})),
+            ("channels.config_set", json!({"channel":"googlechat", "settings":settings})),
+        ] {
+            assert!(!frame_ok(&handler.handle(method, params, &user).await));
+        }
+    }
+    let saved = handler.handle("channels.config_set", json!({"channel":"googlechat", "settings":settings}), &admin_ctx()).await;
+    assert!(frame_ok(&saved), "{saved:?}");
+    let read = handler.handle("channels.config_get", json!({"channel":"googlechat"}), &admin_ctx()).await;
+    let data = frame_data(&read);
+    assert_eq!(data["settings"]["shared_bot_binding"], true);
+    assert_eq!(data["settings"]["unbound_reply"], settings["unbound_reply"]);
+    for invalid in [json!({"shared_bot_binding":"true"}), json!({"unbound_reply":"{agent}"}), json!({"unbound_reply":"界".repeat(1001)})] {
+        assert!(!frame_ok(&handler.handle("channels.config_set", json!({"channel":"googlechat", "settings":invalid}), &admin_ctx()).await));
+    }
+    for params in [
+        json!({"channel":"telegram", "settings":settings}),
+        json!({"channel":"googlechat", "scope_id":"dm", "settings":settings}),
+    ] {
+        assert!(!frame_ok(&handler.handle("channels.config_set", params, &admin_ctx()).await));
+    }
+    for key in [crate::channel_settings::keys::SHARED_BOT_BINDING, crate::channel_settings::keys::UNBOUND_REPLY] {
+        assert!(!crate::channel_settings::CONFIG_KEYS.contains(&key));
+        assert!(!crate::channel_settings::MCP_ACCESS_KEYS.contains(&key));
+        assert!(!crate::channel_settings::MCP_STATUS_KEYS.contains(&key));
+    }
+    let mgr = handler.open_channel_settings().unwrap();
+    let exposed = mgr.get_mcp_config("googlechat", "global").await;
+    assert!(!exposed.iter().any(|(key, _)| matches!(key.as_str(), "shared_bot_binding" | "unbound_reply")));
 }

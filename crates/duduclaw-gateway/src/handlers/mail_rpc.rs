@@ -64,7 +64,7 @@ impl MethodHandler {
         let owner =
             crate::mail_worker::resolve_owner_agent(&self.home_dir, &self.registry, &cfg).await;
         if cfg.gmail_enabled {
-            match duduclaw_core::google_identity::effective_for(&self.home_dir, owner.as_deref())
+            match crate::google_identity::delegate_owner::effective_for(&self.home_dir, owner.as_deref())
                 .effective
             {
                 crate::google_identity::Effective::Home => {}

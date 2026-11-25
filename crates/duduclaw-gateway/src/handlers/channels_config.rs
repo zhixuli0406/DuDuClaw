@@ -91,13 +91,20 @@ impl MethodHandler {
         };
         let all = mgr.get_all(&channel, &scope_id).await;
         let scopes = mgr.list_scopes(&channel).await;
+        let mut settings = config_settings_to_json(&all);
+        if channel != "googlechat" || scope_id != "global" {
+            if let Some(object) = settings.as_object_mut() {
+                object.remove("shared_bot_binding");
+                object.remove("unbound_reply");
+            }
+        }
         WsFrame::ok_response(
             "",
             json!({
                 "success": true,
                 "channel": channel,
                 "scope_id": scope_id,
-                "settings": config_settings_to_json(&all),
+                "settings": settings,
                 "scopes": scopes,
             }),
         )
@@ -127,7 +134,7 @@ impl MethodHandler {
         };
         for key in settings_obj.keys() {
             if !crate::channel_settings::CONFIG_KEYS.contains(&key.as_str())
-                && !(channel == "googlechat" && scope_id == "global" && key == crate::channel_settings::keys::DM_REPLY_PLACEMENT) {
+                && !(channel == "googlechat" && scope_id == "global" && [crate::channel_settings::keys::DM_REPLY_PLACEMENT, crate::channel_settings::keys::SHARED_BOT_BINDING, crate::channel_settings::keys::UNBOUND_REPLY].contains(&key.as_str())) {
                 return WsFrame::error_response("", &format!("Unknown setting key: {key}"));
             }
         }
@@ -278,7 +285,8 @@ impl MethodHandler {
     /// Shared partial-update loop for `config_set`/`access_set`: validates
     /// every value before writing anything (so a bad field in a multi-field
     /// call can't leave a half-applied setting), converts to the store's
-    /// string encoding, and returns the applied changes for the audit event.
+    /// string encoding, commits one batch, and returns the applied changes
+    /// for the audit event.
     pub(crate) async fn apply_channel_settings(
         &self,
         mgr: &crate::channel_settings::ChannelSettingsManager,
@@ -307,28 +315,9 @@ impl MethodHandler {
             encoded.push((key.as_str(), Some(value_str)));
         }
 
-        let mut changes = Vec::with_capacity(encoded.len());
-        for (key, value_str) in encoded {
-            match &value_str {
-                None => {
-                    if let Err(e) = mgr.delete(channel, scope_id, key).await {
-                        return Err(WsFrame::error_response(
-                            "",
-                            &format!("Failed to clear {key}: {e}"),
-                        ));
-                    }
-                }
-                Some(v) => {
-                    if let Err(e) = mgr.set(channel, scope_id, key, v).await {
-                        return Err(WsFrame::error_response(
-                            "",
-                            &format!("Failed to set {key}: {e}"),
-                        ));
-                    }
-                }
-            }
-            changes.push(json!({ "key": key, "value": value_str }));
-        }
-        Ok(changes)
+        mgr.apply_batch(channel, scope_id, &encoded).await.map_err(|e| {
+            WsFrame::error_response("", &format!("Failed to update channel settings: {e}"))
+        })?;
+        Ok(encoded.into_iter().map(|(key, value)| json!({ "key": key, "value": value })).collect())
     }
 }

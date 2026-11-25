@@ -594,15 +594,15 @@ mod tests {
         drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
         let actual=Connection::open(path).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog (v1.82: the fresh v1.81 shape —
-        // v1.80.x plus the RM-173 archive_reason/user_cleared_at columns and the
-        // session_migrations marker table — plus the gateway-owned origin proof
-        // table); session-v1793/-v180/-v181.sql pin older releases.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v181.sql")).unwrap();
+        // RM-182 adds pinned_updated_at and session_tool_refs in v1.85.
+        // Older catalogs remain pinned for imports from previous releases.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/session-v185.sql")).unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/session-tool-refs-v185.sql")).unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql")).unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/channel-settings-v1793.sql")).unwrap();
         // The pinned text is the gateway's own schema.
         assert!(include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql")
+            .replace("\r\n", "\n")
             .contains(crate::recipient_guard::origin::SCHEMA));
         assert_eq!(schema(&actual),schema(&expected));
 
@@ -646,21 +646,28 @@ mod tests {
         let channel=include_str!("../../duduclaw-import/src/channel-settings-v1793.sql");
         // v1.82 adds the origin proof table on every start, fresh or upgraded.
         let proofs=include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql");
-        let upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),proofs,channel]);
-        let fresh=catalog(&[include_str!("../../duduclaw-import/src/session-v181.sql"),proofs,channel]);
-        for (release,start) in [("v1.80.x",include_str!("../../duduclaw-import/src/session-v180.sql")),
-            ("v1.79.3",include_str!("../../duduclaw-import/src/session-v1793.sql"))] {
+        let refs=include_str!("../../duduclaw-import/src/session-tool-refs-v185.sql");
+        let upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v185-upgraded.sql"),proofs,refs,channel]);
+        let from_v181=catalog(&[include_str!("../../duduclaw-import/src/session-v181.sql"),
+            "ALTER TABLE sessions ADD COLUMN pinned_updated_at INTEGER;",proofs,refs,channel]);
+        let from_v181_upgraded=catalog(&[include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),
+            "ALTER TABLE sessions ADD COLUMN pinned_updated_at INTEGER;",proofs,refs,channel]);
+        let fresh=catalog(&[include_str!("../../duduclaw-import/src/session-v185.sql"),proofs,refs,channel]);
+        for (release,start,expected) in [("v1.80.x",include_str!("../../duduclaw-import/src/session-v180.sql"),&upgraded),
+            ("v1.79.3",include_str!("../../duduclaw-import/src/session-v1793.sql"),&upgraded),
+            ("v1.81 fresh",include_str!("../../duduclaw-import/src/session-v181.sql"),&from_v181),
+            ("v1.81 upgraded",include_str!("../../duduclaw-import/src/session-v181-upgraded.sql"),&from_v181_upgraded)] {
             let home=tempfile::tempdir().unwrap();
             let path=home.path().join("sessions.db");
             Connection::open(&path).unwrap().execute_batch(start).unwrap();
             drop(crate::session::SessionManager::new(&path).unwrap());
             drop(crate::channel_settings::ChannelSettingsManager::from_session_db(&path).unwrap());
             let actual=schema(&Connection::open(&path).unwrap());
-            assert_eq!(actual,upgraded,"{release} store upgraded to v1.81");
+            assert_eq!(actual,*expected,"{release} store upgraded to v1.85");
             assert_ne!(actual,fresh,"{release}");
             // Reopening (the next start) changes nothing.
             drop(crate::session::SessionManager::new(&path).unwrap());
-            assert_eq!(schema(&Connection::open(&path).unwrap()),upgraded,"{release} reopened");
+            assert_eq!(schema(&Connection::open(&path).unwrap()),*expected,"{release} reopened");
         }
     }
 

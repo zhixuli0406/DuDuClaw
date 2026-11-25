@@ -424,14 +424,8 @@ impl MethodHandler {
             .join("shared")
             .join("wiki")
             .join(".scope.toml");
-        let scope_table = self.read_config_table(&scope_path).await;
-        if let Some(mode) = scp_namespace_mode(&scope_table, "odoo") {
-            if mode != "agent_writable" {
-                return (
-                    false,
-                    format!("wiki 'odoo' namespace is '{mode}' — schema not written"),
-                );
-            }
+        if let Err(error) = check_odoo_wiki_scope(&scope_path) {
+            return (false, error);
         }
 
         let store = duduclaw_memory::WikiStore::new_shared(&self.home_dir);
@@ -627,4 +621,47 @@ pub(crate) struct OdooScanTarget {
 }
 fn scan_failure(employee: &str, message: &str) -> Value {
     json!({"employee":employee,"status":"failed","message":message})
+}
+
+fn check_odoo_wiki_scope(path: &Path) -> Result<(), String> {
+    let policy = duduclaw_core::scope_policy::load(path).map_err(|e| e.to_string())?;
+    let entry = policy.namespace("odoo").map_err(|e| e.to_string())?;
+    let mode = entry.and_then(|entry| entry.get("mode")).and_then(|v| v.as_str()).unwrap_or("agent_writable");
+    if mode != "agent_writable" {
+        return Err(format!("wiki 'odoo' namespace is '{mode}' — schema not written"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_odoo_writer_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { check_odoo_wiki_scope(&path).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
+    }
 }

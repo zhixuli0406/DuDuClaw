@@ -27,6 +27,8 @@ pub struct NewMember {
     #[serde(default)]
     pub department: Option<String>,
     pub primary_agent_id: String,
+    #[serde(default)]
+    pub avatar_agent_id: Option<String>,
     pub bindings: Vec<MemberBinding>,
     pub invite: bool,
 }
@@ -63,6 +65,11 @@ impl NewMember {
             && binding.access_level.at_least(AccessLevel::Operator)) {
             return Err("member_invalid_primary");
         }
+        if let Some(avatar) = &self.avatar_agent_id {
+            if !self.bindings.iter().any(|b| b.agent_name == *avatar && b.access_level.at_least(AccessLevel::Operator)) {
+                return Err("member_invalid_avatar");
+            }
+        }
         Ok(())
     }
 }
@@ -93,15 +100,19 @@ impl UserDb {
                 Err(_) => return Err("member_storage_unavailable"),
             }
         }
+        if let Some(avatar) = &member.avatar_agent_id {
+            crate::avatar::check_available(&tx, "", avatar).map_err(|error|
+                if error == "avatar_agent_in_use" { "avatar_agent_in_use" } else { "member_storage_unavailable" })?;
+        }
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         let since = crate::admin_eligibility::high_water(&tx).map_err(|_| "member_storage_unavailable")?;
         tx.execute(
             "INSERT INTO users(id,email,display_name,password_hash,role,status,created_at,updated_at,
-             department,must_change_password,primary_agent_id)
-             VALUES(?1,?2,?3,'',?4,'active',?5,?5,?6,1,?7)",
+             department,must_change_password,primary_agent_id,avatar_agent_id)
+             VALUES(?1,?2,?3,'',?4,'active',?5,?5,?6,1,?7,?8)",
             params![id, member.email.trim(), member.display_name.trim(), member.role.to_string(), now,
-                member.department.as_deref().map(str::trim).filter(|d| !d.is_empty()), member.primary_agent_id],
+                member.department.as_deref().map(str::trim).filter(|d| !d.is_empty()), member.avatar_agent_id.as_deref().unwrap_or(&member.primary_agent_id), member.avatar_agent_id],
         ).map_err(|_| "member_storage_unavailable")?;
         for binding in &member.bindings {
             tx.execute(
@@ -149,7 +160,7 @@ mod tests {
     fn member(invite: bool) -> NewMember {
         NewMember {
             email: "member@test.invalid".into(), display_name: "新同仁".into(), role: UserRole::Employee,
-            department: Some("support".into()), primary_agent_id: "helper".into(), invite,
+            department: Some("support".into()), avatar_agent_id: None, primary_agent_id: "helper".into(), invite,
             bindings: vec![MemberBinding { agent_name: "helper".into(), access_level: AccessLevel::Operator },
                 MemberBinding { agent_name: "reader".into(), access_level: AccessLevel::Viewer }],
         }
@@ -157,6 +168,25 @@ mod tests {
     fn error(db: &UserDb, member: &NewMember, admin: &User) -> &'static str {
         db.create_member_at_epoch(member, &admin.id, admin.credential_epoch).err().unwrap()
     }
+    #[test]
+    fn member_avatar_is_optional_unique_and_synchronizes_primary_atomically() {
+        let (_dir, db, admin) = fixture();
+        let first = db.create_member_at_epoch(&member(false), &admin.id, 0).unwrap().user;
+        assert_eq!(db.avatar_agent(&first.id).unwrap(), None);
+        let mut input = NewMember { email: "avatar@test.invalid".into(), avatar_agent_id: Some("reader".into()),
+            ..member(false) };
+        input.bindings[1].access_level = AccessLevel::Operator;
+        let second = db.create_member_at_epoch(&input, &admin.id, 0).unwrap().user;
+        assert_eq!(second.avatar_agent_id.as_deref(), Some("reader"));
+        assert_eq!(db.configured_primary_agent(&second.id).unwrap().as_deref(), Some("reader"));
+        let duplicate = NewMember { email: "duplicate@test.invalid".into(), ..input };
+        assert_eq!(error(&db, &duplicate, &admin), "avatar_agent_in_use");
+        assert!(db.get_user_by_email("duplicate@test.invalid").unwrap().is_none());
+        let invalid = NewMember { email: "viewer@test.invalid".into(), avatar_agent_id: Some("reader".into()),
+            ..member(false) };
+        assert_eq!(error(&db, &invalid, &admin), "member_invalid_avatar");
+    }
+
     #[test]
     fn member_creation_commits_credentials_bindings_primary_and_audit_together() {
         let (_dir, db, admin) = fixture();

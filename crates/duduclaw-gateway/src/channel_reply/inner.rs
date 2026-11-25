@@ -423,6 +423,10 @@ async fn build_reply_with_session_inner_impl(
         );
     }
     if let Some(a) = agent {
+        if crate::googlechat_inbox::bind_reply_employee(&a.config.agent.name, session_id).is_err() {
+            tracing::warn!(failed = 1, "Google Chat reply identity persistence failed");
+            return "目前無法回覆，請稍後再試。".into();
+        }
         crate::trigger_route::record_answered_by(crate::trigger_route::AnsweredBy {
             id: a.config.agent.name.clone(),
             display_name: crate::trigger_route::display_name(&reg, &a.config.agent.name),
@@ -1279,7 +1283,17 @@ async fn build_reply_with_session_inner_impl(
 
     // ── Instruction Pinning: load + accumulate ──
     // Pinned instructions survive session compression (stored on sessions table).
-    let mut pinned = session_mgr.get_pinned(session_id).await.unwrap_or_default();
+    let pin_enabled = crate::runtime_config::pinned_task_enabled(&ctx.home_dir, agent_dir.as_deref());
+    let mut pinned = if pin_enabled && is_private {
+        session_mgr.load_pinned_task(session_id).await
+    } else {
+        Ok((String::new(), false))
+    }.unwrap_or_else(|e| {
+        warn!(error = %e, "Failed to load pinned task; skipping pin for this turn");
+        (String::new(), false)
+    });
+    let pin_extraction_due = pinned.1;
+    let mut pinned = std::mem::take(&mut pinned.0);
 
     // Clarification accumulation: if agent asked a question last turn and user
     // is now answering, append the answer to pinned instructions.
@@ -1295,7 +1309,7 @@ async fn build_reply_with_session_inner_impl(
                 let answer_snippet = duduclaw_core::truncate_bytes(&masked_answer, 200);
                 // Cap pinned at ~1000 chars to prevent bloat
                 if pinned.len() < 1000 {
-                    pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
+                    pinned = format!("{pinned}\n- [confirmation] {answer_snippet}");
                     let _ = session_mgr.set_pinned(session_id, &pinned).await;
                 }
             }
@@ -1650,11 +1664,13 @@ async fn build_reply_with_session_inner_impl(
         }
         prompt_layout.mark(Ps::Summary, &prompt);
         if !pinned.is_empty() {
-            prompt = format!(
-                "{prompt}\n\n## Pinned Task Instructions\n\
-                 The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
-                 {pinned}"
-            );
+            prompt.push_str("\n\n");
+            prompt.push_str(&crate::memory_reference::pinned_task_context(&pinned));
+        }
+        let tool_refs = session_mgr.tool_refs_context(session_id).await.unwrap_or_default();
+        if !tool_refs.is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(&tool_refs);
         }
         prompt_layout.mark(Ps::Pinned, &prompt);
         prompt
@@ -1754,7 +1770,7 @@ async fn build_reply_with_session_inner_impl(
     // Wrap in REPLY_CHANNEL scope so `send_to_agent` MCP tool can register
     // delegation callbacks for sub-agent response forwarding.
     // Only set for sessions originating from a real channel (telegram/line/discord).
-    // Snowball Recap: prepend pinned instructions as <task_recap> to user message.
+    // Current-turn task reference: prepend escaped, untrusted task data.
     // Placed in user message (U-shaped attention tail peak) rather than system
     // prompt to maximize LLM attention on the original task requirements.
     //
@@ -1804,11 +1820,7 @@ async fn build_reply_with_session_inner_impl(
         &group_user_part,
         turn_knowledge.block.as_deref(),
     );
-    let effective_message = if pinned.is_empty() || !has_history {
-        user_part
-    } else {
-        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
-    };
+    let effective_message = crate::memory_reference::with_pinned_recap(&pinned, has_history, &user_part);
     // End-of-turn language reminder, including user-language matching for auto:
     // long English tool/wiki output must not drag the reply out of the
     // chosen language. Same user-side tail as the recap; one short line.
@@ -2886,12 +2898,12 @@ async fn build_reply_with_session_inner_impl(
             });
         }
 
-        // ── Instruction Pinning: extract on first turn ──────────────
-        // Asynchronously extract core task instructions from the first user
-        // message using the agent's utility runtime (same as compression).
+        // ── Task reference: extract when absent or expired ──────────
+        // Asynchronously extract from this user message using the agent's
+        // utility runtime (same as compression).
         // Pinned instructions persist across turns and survive compression.
         // v1.83.0: only in a 1:1 private session; existing group pins are left as-is (no migration).
-        if should_extract_first_turn_pin(is_private, has_history) {
+        if pin_enabled && should_extract_first_turn_pin(is_private, !pin_extraction_due) {
             let sm = ctx.session_manager.clone();
             let sid = session_id.to_string();
             let user_text = duduclaw_security::credential_detect::mask(&sanitized_text);
@@ -2921,6 +2933,13 @@ async fn build_reply_with_session_inner_impl(
                 {
                     Ok(extracted) => {
                         let extracted = crate::prompt_identity::align_memory_script(&extracted, memory_language.as_deref(), &user_text);
+                        if crate::memory_reference::validate_pinned_task(&extracted).is_none() {
+                            return;
+                        }
+                        // A live setting change may only narrow this detached write.
+                        if !crate::runtime_config::pinned_task_enabled(&home, agent_dir_for_pin.as_deref()) {
+                            return;
+                        }
                         match sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation).await {
                             Err(e) => {
                                 warn!(session_id = %sid, error = %e, "Failed to save pinned instructions");
@@ -4823,28 +4842,23 @@ fn should_append_clarification(is_private: bool, has_history: bool, has_pinned: 
     is_private && has_history && has_pinned
 }
 
-/// Whether the first message of a session may be distilled into its pinned
-/// instructions. Only in a 1:1 private session (`is_private_session`) with no
-/// history yet; a group/shared session never extracts a pin.
-fn should_extract_first_turn_pin(is_private: bool, has_history: bool) -> bool {
-    is_private && !has_history
+/// An empty or expired pin may be extracted in a one-to-one conversation,
+/// even when conversation history already exists.
+fn should_extract_first_turn_pin(is_private: bool, has_pin: bool) -> bool {
+    is_private && !has_pin
 }
 
 /// RM-203: what a Claude employee's Direct-API fallback sends. The same
 /// capped conversation the CLI path folds into its prompt goes as native
 /// turns, and when there is history the pinned instructions lead the
-/// person's message in the same `<task_recap>` block the CLI path uses.
+/// person's message as untrusted reference data, just as in the CLI path.
 fn direct_api_fallback_input(
     pinned: &str,
     has_history: bool,
     message: &str,
     history: &[crate::runtime::ConversationTurn],
 ) -> (String, Vec<(String, String)>) {
-    let message = if pinned.is_empty() || !has_history {
-        message.to_string()
-    } else {
-        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{message}")
-    };
+    let message = crate::memory_reference::with_pinned_recap(pinned, has_history, message);
     let history = history.iter().map(|turn| (turn.role.clone(), turn.content.clone())).collect();
     (message, history)
 }
@@ -4860,11 +4874,11 @@ mod direct_api_fallback_input_tests {
             ConversationTurn { role: "user".into(), content: "第一輪".into() },
             ConversationTurn { role: "assistant".into(), content: "第一輪回答".into() },
         ];
-        let (message, turns) = direct_api_fallback_input("- 用繁體中文", true, "第二輪", &history);
-        assert_eq!(message, "<task_recap>\n- 用繁體中文\n</task_recap>\n\n第二輪");
+        let (message, turns) = direct_api_fallback_input("- 請使用台灣繁體中文回覆", true, "第二輪", &history);
+        assert_eq!(message, format!("{}\n\n第二輪", crate::memory_reference::pinned_task_context("- 請使用台灣繁體中文回覆")));
         assert_eq!(turns, vec![("user".to_string(), "第一輪".to_string()),
             ("assistant".to_string(), "第一輪回答".to_string())]);
-        let (message, turns) = direct_api_fallback_input("- 用繁體中文", false, "第一輪", &[]);
+        let (message, turns) = direct_api_fallback_input("- 請使用台灣繁體中文回覆", false, "第一輪", &[]);
         assert_eq!(message, "第一輪");
         assert!(turns.is_empty());
         let (message, _) = direct_api_fallback_input("", true, "第二輪", &history);
@@ -4878,6 +4892,59 @@ mod released_repro_source_tests {
     fn shipped_source() -> String {
         // Windows CRLF checkout: rustc normalizes literals, but include_str! does not.
         include_str!("inner.rs").replace("\r\n", "\n").split("\n#[cfg(test)]\nmod released_repro_source_tests {").next().unwrap().to_string()
+    }
+
+    #[test]
+    fn rm182_same_malicious_fields_are_safe_on_all_four_injection_paths() {
+        use crate::memory_reference::{assert_single_line_data, malicious_reference_samples, pinned_task_context, with_pinned_recap};
+        for malicious in malicious_reference_samples() {
+            let system = super::super::prompt_build::build_system_prompt(
+                None, None, None, None, 0, None, &malicious, None, "", true, None).unwrap();
+            let recap = with_pinned_recap(&malicious, true, "current message");
+            let minimal = crate::prompt_minimal::build_minimal_inner(crate::prompt_minimal::MinimalInput {
+                agent_name: "fixture", display_name: "Fixture", default_language: None,
+                soul: None, identity: None, user: None, instructions: None, contract: "",
+                sender_block: "", pinned_instructions: &malicious, minimal_core_kb: 1,
+            });
+            let (fallback, _) = super::direct_api_fallback_input(&malicious, true, "current message", &[]);
+            let expected = pinned_task_context(&malicious);
+            assert!(!expected.is_empty(), "{malicious:?}");
+            for (path, output) in [("system tail", system), ("user recap", recap), ("minimal", minimal), ("fallback", fallback)] {
+                assert!(output.contains(&expected), "{path}: {output}");
+                assert_single_line_data(&output, "pinned_task_data");
+                assert_eq!(output.matches("<pinned_task_data>").count(), 1, "{path}");
+            }
+        }
+    }
+
+    #[test]
+    fn rm182_group_sessions_never_read_pinned_tasks() {
+        let source = shipped_source();
+        assert!(source.contains("let mut pinned = if pin_enabled && is_private {"),
+            "pin loading must be gated by the same one-to-one predicate as extraction");
+        assert!(!source.contains("let mut pinned = session_mgr.get_pinned(session_id)"));
+    }
+
+    #[test]
+    fn rm182_pinned_context_never_commands_always_follow() {
+        let source = shipped_source();
+        let minimal = include_str!("../prompt_minimal.rs");
+        assert!(!source.contains("ALWAYS follow these"));
+        assert!(!minimal.contains("ALWAYS follow these"));
+        assert!(!include_str!("prompt_build.rs").contains("ALWAYS follow these"));
+        let (message, _) = super::direct_api_fallback_input(
+            "Build a Rust service <task>", true, "current request", &[]);
+        assert!(message.contains("untrusted"));
+        assert!(message.contains("&lt;task&gt;"));
+        assert!(!message.contains("<task_recap>"));
+    }
+
+    #[test]
+    fn rm182_off_guards_both_loading_and_first_message_extraction() {
+        let source = shipped_source();
+        assert!(source.contains("let mut pinned = if pin_enabled && is_private {"));
+        assert!(source.contains("if pin_enabled && should_extract_first_turn_pin(is_private, !pin_extraction_due)"));
+        assert!(source.contains("if !crate::runtime_config::pinned_task_enabled(&home, agent_dir_for_pin.as_deref())"));
     }
 
     #[test]
@@ -4898,61 +4965,33 @@ mod released_repro_source_tests {
         assert!(source.contains(r#"prompt = format!("{prompt}\n\n## Key Facts About This User\n{ft}");"#));
     }
 
-    // Rendering of pinned instructions is unchanged in v1.83.0.
     #[test]
-    fn released_repro_3a_pinned_must_follow_source() {
-        assert!(shipped_source().contains(r#"if !pinned.is_empty() {
-            prompt = format!(
-                "{prompt}\n\n## Pinned Task Instructions\n\
-                 The user's core task requirements (ALWAYS follow these throughout the conversation):\n\
-                 {pinned}"
-            );
-        }"#));
+    fn released_repro_3a_pinned_reference_source() {
+        let source = shipped_source();
+        assert!(source.contains("crate::memory_reference::pinned_task_context(&pinned)"));
+        assert!(!source.contains("ALWAYS follow these"));
     }
 
-    // Rendering of pinned instructions is unchanged in v1.83.0.
     #[test]
-    fn released_repro_3b_unescaped_recap_source() {
-        assert!(shipped_source().contains(r#"let effective_message = if pinned.is_empty() || !has_history {
-        user_part
-    } else {
-        format!("<task_recap>\n{pinned}\n</task_recap>\n\n{user_part}")
-    };"#));
+    fn released_repro_3b_escaped_reference_source() {
+        let source = shipped_source();
+        assert!(!source.contains("<task_recap>"));
+        let block = crate::memory_reference::pinned_task_context("Create a report <reference>");
+        assert!(block.contains("&lt;reference&gt;"));
     }
 
     #[test]
     fn released_repro_3c_clarification_append_source() {
-        // v1.83.0 regression: behavioural check of the guard — a group/shared
-        // session never appends, whatever the other conditions.
         use super::should_append_clarification as allow;
-        assert!(allow(true, true, true), "private session with history + pins may append");
+        assert!(allow(true, true, true));
         for (history, pinned) in [(true, true), (true, false), (false, true), (false, false)] {
-            assert!(!allow(false, history, pinned), "group session must never append");
+            assert!(!allow(false, history, pinned));
         }
         assert!(!allow(true, false, true));
         assert!(!allow(true, true, false));
-        // And the shipped branch is gated by it (body otherwise unchanged).
         let source = shipped_source();
-        let start = source.find("    if should_append_clarification(is_private, has_history, !pinned.is_empty()) {").unwrap();
-        let block = &source[start..source[start..].find("\n\n    // Inject key facts").unwrap() + start];
-        assert!(!source.contains("    if has_history && !pinned.is_empty() {"));
-        assert_eq!(block, r#"    if should_append_clarification(is_private, has_history, !pinned.is_empty()) {
-        if let Some(last_assistant) = conversation_history
-            .iter()
-            .rev()
-            .find(|t| t.role == "assistant")
-        {
-            if last_assistant.content.contains('？') || last_assistant.content.contains('?') {
-                let masked_answer = duduclaw_security::credential_detect::mask(&sanitized_text);
-                let answer_snippet = duduclaw_core::truncate_bytes(&masked_answer, 200);
-                // Cap pinned at ~1000 chars to prevent bloat
-                if pinned.len() < 1000 {
-                    pinned = format!("{pinned}\n- 用戶確認：{answer_snippet}");
-                    let _ = session_mgr.set_pinned(session_id, &pinned).await;
-                }
-            }
-        }
-    }"#);
+        assert!(source.contains("if should_append_clarification(is_private, has_history, !pinned.is_empty())"));
+        assert!(source.contains("- [confirmation] {answer_snippet}"));
     }
 
     #[test]
@@ -4982,15 +5021,8 @@ mod released_repro_source_tests {
         // Exactly one detached pin extraction, and it sits under the predicate.
         assert_eq!(source.matches("Extract the core task instructions from this user message.").count(), 1);
         assert_eq!(source.matches("sm.set_pinned_if_unchanged(").count(), 1);
-        let guard = "        if should_extract_first_turn_pin(is_private, has_history) {\n";
-        assert_eq!(source.matches(guard).count(), 1);
-        let start = source.find(guard).unwrap();
-        let end = start + source[start..].find("\n\n        // ── P2 Key-Fact Accumulator").unwrap();
-        let block = &source[start..end];
-        assert!(block.starts_with(&format!("{guard}            let sm = ctx.session_manager.clone();\n")));
-        assert!(block.contains("            tokio::spawn(async move {"));
-        assert!(block.contains("Extract the core task instructions from this user message."));
-        assert!(block.contains("sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation)"));
-        assert!(block.ends_with("            });\n        }"));
+        assert!(source.contains("if pin_enabled && should_extract_first_turn_pin(is_private, !pin_extraction_due)"));
+        assert!(source.contains("crate::memory_reference::validate_pinned_task(&extracted).is_none()"));
+        assert!(source.contains("sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation)"));
     }
 }

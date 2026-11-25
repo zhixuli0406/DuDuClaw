@@ -1109,6 +1109,9 @@ impl ExternalAcceptanceJudge {
         // same-family follow-up that needs its own decision + doc update,
         // not a silent fix.
         let mut cmd = self.prepare_command();
+        let home = self.config.home_dir.clone().unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+        let _run_identity = crate::run_identity::issue(&home, "system", "external-judge", self.config.timeout_secs)?;
+        _run_identity.apply(&mut cmd);
 
         let admission = duduclaw_core::autonomy_handoff::admit().await?;
         let mut child = duduclaw_core::execution_gate::spawn(&mut cmd,
@@ -1164,7 +1167,8 @@ impl ExternalAcceptanceJudge {
         // retry round on a platform defect) nor as "pass". Non-zero ⇒ Err ⇒
         // the MAV panel decides.
         if !status.success() {
-            let stderr = String::from_utf8_lossy(&stderr_bytes);
+            let stderr_raw = String::from_utf8_lossy(&stderr_bytes);
+            let stderr = duduclaw_core::run_credential::redact(&stderr_raw);
             let tail = duduclaw_core::truncate_bytes(stderr.trim(), 500);
             return Err(format!(
                 "external judge `{}` exited {} — stderr tail: {tail}",
@@ -1173,7 +1177,8 @@ impl ExternalAcceptanceJudge {
             ));
         }
 
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stdout_raw = String::from_utf8_lossy(&stdout_bytes);
+        let stdout = duduclaw_core::run_credential::redact(&stdout_raw);
         // WP-G1: mode read per decision from the config's home.
         let home = self.config.home_dir.as_deref();
         let mode = crate::dispatch_engine::StrictReplyParsing::from_home(home);

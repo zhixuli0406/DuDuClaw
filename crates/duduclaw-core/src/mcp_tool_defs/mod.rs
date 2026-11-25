@@ -124,6 +124,11 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("docs_replace_text", "match_case", "boolean"),
+    ("calendar_update_event", "notify_attendees", "boolean"),
+    ("calendar_update_event", "attendees", "array"),
+    ("sheets_create", "sheet_names", "array"),
+    ("sheets_update", "values", "array"),
     ("odoo_inventory_products", "storable_only", "boolean"),
     ("odoo_crm_leads", "limit", "integer"),
     ("odoo_crm_create_lead", "expected_revenue", "number"),
@@ -211,6 +216,12 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
+    if tool.name == "sheets_update" {
+        properties.get_mut("values").unwrap()["items"] = serde_json::json!({
+            "type":"array", "items":{"type":["string","number","boolean","null"]}
+        });
+        properties.get_mut("value_input_option").unwrap()["enum"] = serde_json::json!(["RAW","USER_ENTERED"]);
+    }
     if matches!(tool.name, "tasks_create" | "tasks_update") {
         properties.insert("cost_cap_cents".into(), serde_json::json!({
             "type": "integer", "minimum": 1, "maximum": i64::MAX,
@@ -484,3 +495,16 @@ pub const FORK_TOOLS: &[&str] = &[
     "terminate_branch",
     "fork_cost",
 ];
+
+#[cfg(test)]
+mod google_schema_tests {
+    use super::*;
+    #[test]
+    fn new_google_tools_declare_native_json_types() {
+        let schema = |name: &str| build_tool_schema(tools().find(|tool| tool.name == name).unwrap());
+        assert_eq!(schema("sheets_update")["inputSchema"]["properties"]["values"]["items"]["type"], "array");
+        assert_eq!(schema("sheets_create")["inputSchema"]["properties"]["sheet_names"]["items"]["type"], "string");
+        assert_eq!(schema("calendar_update_event")["inputSchema"]["properties"]["notify_attendees"]["type"], "boolean");
+        assert_eq!(schema("docs_replace_text")["inputSchema"]["properties"]["match_case"]["type"], "boolean");
+    }
+}

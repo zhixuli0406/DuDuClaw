@@ -26,9 +26,11 @@ import {
   Skeleton,
 } from '@/components/mds';
 
-type Choice = 'home' | 'delegate' | 'owner' | 'user' | 'mine' | 'none';
+type Choice = 'external' | 'delegate:owner' | 'home' | 'delegate' | 'owner' | 'user' | 'mine' | 'none';
 
 function choiceOf(v: AgentGoogleIdentity): Choice {
+  if (v.kind === 'external') return 'external';
+  if (v.kind === 'delegate_owner') return 'delegate:owner';
   if (v.kind === 'delegate') return 'delegate';
   if (v.kind === 'none') return 'none';
   if (v.kind === 'owner') return 'owner';
@@ -87,6 +89,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   const [editing, setEditing] = useState(false);
   const [choice, setChoice] = useState<Choice>('home');
   const [email, setEmail] = useState('');
+  const [externalServer, setExternalServer] = useState('');
   const [fallback, setFallback] = useState(false);
   const [selectedUser,setSelectedUser] = useState('');
   const [requesters,setRequesters] = useState<AgentGoogleIdentity['requesters']>('bound_people');
@@ -143,6 +146,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
     if (!view || !canSelectAgent(agentId)) return;
     setChoice(isAdmin ? choiceOf(view) : view.kind==='none' ? 'none' : 'mine');
     setEmail(view.email ?? '');
+    setExternalServer(view.external_server ?? '');
     setFallback(view.fallback === 'home');
     setSelectedUser(view.selected_person?.user_id ?? view.owners?.[0]?.user_id ?? '');
     setRequesters(view.requesters);
@@ -161,6 +165,8 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
       const v = await api.googleIdentity.set({
         agent_id: agentId,
         identity,
+        ...(choice === 'external' ? { external_server: externalServer } : {}),
+        ...(choice === 'delegate:owner' ? { fallback: 'none' as const, requesters, ...(anyoneConfirmed ? {confirm_anyone:true} : {}) } : {}),
         ...(choice === 'delegate'||personal ? {
           fallback: fallback ? 'home' : 'none',
           requesters,
@@ -213,7 +219,9 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
   if (!view) return <Skeleton className="h-40 w-full" />;
 
   const current =
-    view.kind === 'delegate'
+    view.kind === 'external' ? t('agentConnections.identity.external')
+      : view.kind === 'delegate_owner' ? t('agentConnections.identity.delegateOwner', { email: view.email ?? '—' })
+      : view.kind === 'delegate'
       ? t('agentConnections.identity.delegate', { email: view.email ?? '' })
       : view.kind === 'none'
         ? t('agentConnections.identity.none')
@@ -242,6 +250,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
         <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="text-muted-foreground">{t('agentConnections.current')}</span>
           <span className="font-medium" data-testid="agent-connections-current">{current}</span>
+          {view.kind === 'external' && view.external_server && <span>{view.external_server}</span>}
           {stateBadge}
         </div>
         {view.tenant_subject ? (
@@ -249,7 +258,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
         ) : view.message && (
           <p className="text-sm text-warning">{view.message}</p>
         )}
-        {['delegate','owner','user'].includes(view.kind) && (
+        {['delegate','delegate_owner','owner','user'].includes(view.kind) && (
           <p className="text-sm text-muted-foreground">
             {view.requesters === 'anyone'
               ? t('agentConnections.requesters.anyone')
@@ -270,7 +279,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
             <Button variant="outline" onClick={startEdit}>
               {t('agentConnections.change')}
             </Button>
-            {isAdmin&&view.kind === 'delegate' && (
+            {isAdmin&&['delegate','delegate_owner','owner','user'].includes(view.kind) && (
               <Button variant="outline" onClick={() => void runTest()} disabled={busy !== 'idle'}>
                 {busy === 'testing' ? <Loader2 className="size-4 animate-spin" /> : <CheckCircle2 className="size-4" />}
                 {t('agentConnections.test')}
@@ -286,15 +295,19 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
           <div className="space-y-3 rounded-lg border border-border p-3">
             <Segmented<Choice>
               value={choice}
-              onValueChange={setChoice}
+              onValueChange={value => { setChoice(value); if (value === 'delegate:owner') { setRequesters('owner_only'); setFallback(false); } }}
               aria-label={t('agentConnections.google.title')}
               options={isAdmin ? [
                 { value: 'home', label: t('agentConnections.choice.home') },
                 { value: 'delegate', label: t('agentConnections.choice.delegate') },
+                { value: 'delegate:owner', label: t('agentConnections.choice.delegateOwner') },
+                { value: 'external', label: t('agentConnections.identity.external') },
                 ...(enterprise ? [{value:'owner' as const,label:t('agentConnections.choice.owner')},{value:'user' as const,label:t('agentConnections.choice.user')}] : []),
                 { value: 'none', label: t('agentConnections.choice.none') },
               ] : [{value:'mine',label:t('agentConnections.choice.mine')},{value:'none',label:t('agentConnections.choice.none')}]}
             />
+            {choice === 'external' && <label className="block space-y-2 text-sm">{t('agentConnections.externalServer')}<Input maxLength={120} value={externalServer} onChange={e => setExternalServer(e.target.value)} /></label>}
+            {choice === 'delegate:owner' && <p className="text-sm text-muted-foreground">{t('agentConnections.delegateOwnerHint')}</p>}
             {choice === 'delegate' && (
               <div className="space-y-2">
                 <label className="text-xs font-medium" htmlFor="agent-google-email">
@@ -323,7 +336,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
               {isAdmin&&<label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={fallback} onChange={e=>setFallback(e.target.checked)}/>{t('agentConnections.fallback')}</label>}
               {!isAdmin&&<><p className="text-sm">{view.bound_people?.map(person=>`${person.name} (${person.email})`).join('、')}</p><p className="text-xs text-muted-foreground">{t('myConnections.channels',{channels:view.allowed_channels?.join('、')||t('myConnections.noChannels')})}</p><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={confirmed} onChange={e=>setConfirmed(e.target.checked)}/>{t('agentConnections.personalConfirm')}</label></>}
             </div>}
-            {['delegate','owner','user','mine'].includes(choice) && <div className="space-y-2"><label htmlFor="google-requesters" className="text-sm">{t('agentConnections.requesterLabel')}</label><select id="google-requesters" value={requesters} onChange={e=>setRequesters(e.target.value as AgentGoogleIdentity['requesters'])} className="ml-2 rounded border border-border bg-background p-2 text-sm">
+            {['delegate','delegate:owner','owner','user','mine'].includes(choice) && <div className="space-y-2"><label htmlFor="google-requesters" className="text-sm">{t('agentConnections.requesterLabel')}</label><select id="google-requesters" value={requesters} onChange={e=>setRequesters(e.target.value as AgentGoogleIdentity['requesters'])} className="ml-2 rounded border border-border bg-background p-2 text-sm">
               {isAdmin&&<option value="anyone">{t('agentConnections.requesters.anyone')}</option>}
               {(isAdmin||view.requesters!=='owner_only')&&<option value="bound_people">{t('agentConnections.requesters.bound')}</option>}
               <option value="owner_only">{t('agentConnections.requesters.ownerOnly',{email:view.selected_person?.login_email??email})}</option>
@@ -331,7 +344,7 @@ function AgentConnectionsScope({ agentId, actorScope }: { agentId: string; actor
             <div className="flex gap-2">
               <Button
                 onClick={() => void save()}
-                disabled={busy !== 'idle' || (choice === 'delegate' && !email.trim())||(choice==='user'&&!selectedUser)||(!isAdmin&&choice!=='none'&&!confirmed)||(['delegate','owner','user','mine'].includes(choice)&&requesters==='anyone'&&!anyoneConfirmed)}
+                disabled={busy !== 'idle' || (choice === 'delegate' && !email.trim())||(choice==='user'&&!selectedUser)||(!isAdmin&&choice!=='none'&&!confirmed)||(['delegate','delegate:owner','owner','user','mine'].includes(choice)&&requesters==='anyone'&&!anyoneConfirmed)}
               >
                 {busy === 'saving' && <Loader2 className="size-4 animate-spin" />}
                 {t('common.save')}

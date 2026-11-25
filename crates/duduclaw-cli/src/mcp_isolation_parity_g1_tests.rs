@@ -33,7 +33,7 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 263;
+const CATALOG_TOOLS: usize = 268;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -315,6 +315,42 @@ github = true
     let pending = pending_production_selectors();
     let manifests: Vec<BTreeMap<&'static str, ServiceState>> =
         employees.iter().map(|employee| employee.dispatcher.service_manifest().into_iter().collect()).collect();
+    // v1.85 Google writes use the existing account-bound connector route.
+    // EmployeeScope permits discovery, not account access: this fixture has no
+    // Google route, so both employees' installed providers must refuse selection.
+    // Keep the reviewed analogues, effects and grants explicit beside the pin.
+    use duduclaw_core::tool_effect::{effect_of_builtin, ToolEffect};
+    for (name, analogue, effect) in [
+        ("docs_create", "docs_append", ToolEffect::Modify),
+        ("docs_replace_text", "docs_append", ToolEffect::Modify),
+        ("sheets_create", "sheets_append", ToolEffect::Modify),
+        ("sheets_update", "sheets_append", ToolEffect::Modify),
+        ("calendar_update_event", "calendar_create_event", ToolEffect::Send),
+    ] {
+        let policy = policy_table::policy(name).expect("reviewed Google write policy");
+        let existing = policy_table::policy(analogue).unwrap();
+        assert_eq!(policy.route, existing.route, "{name}: route must match {analogue}");
+        assert_eq!(policy.required, existing.required, "{name}: grants must match {analogue}");
+        for tool in [name, analogue] {
+            assert!(tools.contains(&tool), "{tool}: reviewed tool absent from catalog");
+            assert_eq!(policy_table::policy(tool).unwrap().route, Route::Connector, "{tool}");
+            assert_eq!(policy_table::policy(tool).unwrap().required,
+                &[ResourceKind::Employee, ResourceKind::Connector], "{tool}");
+            assert_eq!(boundary_route(tool), Some(BoundaryRoute::Resource), "{tool}");
+            assert_eq!(provider_for_tool(tool), Some("google"), "{tool}");
+            assert_eq!(effect_of_builtin(tool), Some(effect), "{tool}");
+            assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(crate::mcp_auth::Scope::GoogleWrite), "{tool}");
+            assert!(!pending.contains(tool), "{tool}: existing connector selector is required");
+            assert!(crate::mcp_isolation_disposition::intentional_refusal(tool).is_none(), "{tool}");
+            for (index, employee) in employees.iter().enumerate() {
+                assert!(policy_table::eligible(&employee.context, tool), "{tool}: {} discovery", employee.kind);
+                assert_eq!(manifests[index].get(tool), Some(&ServiceState::Ready), "{tool}: {} factory", employee.kind);
+                let registry = employee.installed.registry();
+                assert!(matches!(LiveConnectorSelectionPolicy::candidates(registry.as_ref(), &employee.context, tool, "google"),
+                    Err(VerificationError::Unavailable)), "{tool}: {} without a Google route must fail closed", employee.kind);
+            }
+        }
+    }
     let mut unexplained = Vec::new();
     let mut differing = Vec::new();
     let mut offered_counts = [0usize; 2];

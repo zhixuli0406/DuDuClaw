@@ -482,11 +482,43 @@ pub(crate) async fn report_addon(state: &GoogleChatState) {
         Some(ADDON_DIAGNOSTIC.into()), Some(&state.ctx.event_tx)).await;
 }
 
+fn bound_chat_type(verified_http: bool, is_dm: bool) -> Option<&'static str> {
+    (verified_http && is_dm).then_some("jwt_http_dm")
+}
+
+/// Only the JWT-verified HTTP entry point calls this. Pub/Sub never records
+/// a decision DM or invokes the bound decision fastlane.
+async fn http_dm_decision(state: &Arc<GoogleChatState>, event: &serde_json::Value) -> Option<Result<String, String>> {
+    let space = event_space(event);
+    let principal = event.pointer("/message/sender/name").and_then(serde_json::Value::as_str)?;
+    let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], event).await;
+    let text = event.pointer("/message/argumentText").or_else(|| event.pointer("/message/text"))
+        .and_then(serde_json::Value::as_str).unwrap_or("");
+    if is_dm {
+        if let Ok(Some(db)) = crate::decision_notify::open_user_db(&state.ctx.home_dir) {
+            let _ = db.record_googlechat_dm(state.creds.client_email(), &space, principal);
+        }
+    }
+    crate::channel_decision_route::parse_strict_decision(text)?;
+    if !is_dm { return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())); }
+    let thread = reply_thread(state, event, is_dm).await;
+    let context = crate::approval::DecisionContext {
+        channel: "googlechat".into(), account_id: state.creds.client_email().to_string(),
+        conversation_id: thread.as_ref().map_or_else(|| space.clone(), |t| format!("{space}:{t}")),
+        principal_id: principal.to_string(),
+    };
+    crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(
+        crate::ccr_runtime::OneToOneAttestation::googlechat_dm(&space, principal),
+        crate::decision_notify::route_trusted_decision_fastlane_with_scope(&state.ctx, &context, text,
+            crate::decision_notify::DecisionAccessScope { channel_id: None, guild_id: None, session_id: None }),
+    ).await
+}
+
 /// Only the Pub/Sub worker supplies this event, rebuilt from spaces.messages.get.
 pub(crate) async fn process_pubsub_event(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
     let space = event_space(event);
     crate::agent_channels::gchat_spaces::record(&state.ctx.home_dir, &space, state.agent.as_deref());
-    handle_message(state, event).await;
+    handle_message(state, event, false).await;
 }
 
 async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {
@@ -527,6 +559,12 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 info!("Google Chat: MESSAGE from a non-human sender ignored");
                 return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
+            // Decisions must bypass the per-conversation model queue: the
+            // running turn may itself be waiting for this exact approval.
+            if let Some(result) = http_dm_decision(&state, &event).await {
+                let text = result.unwrap_or_else(|e| e);
+                return (StatusCode::OK, axum::Json(serde_json::json!({"text": text}))).into_response();
+            }
             let sender = event
                 .pointer("/message/sender/name")
                 .and_then(|v| v.as_str())
@@ -542,7 +580,7 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 state.ctx.home_dir, state.agent, state.creds.client_email(), name
             ]).to_string());
             let accepted = enqueue_once(dedupe_key.as_deref(), || state.ctx.googlechat_queue
-                .submit_in(&group, &conversation, async move { handle_message(&st, &queued).await }).is_ok());
+                .submit_in(&group, &conversation, async move { handle_message(&st, &queued, true).await }).is_ok());
             if !accepted
             {
                 let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], &event).await;
@@ -803,7 +841,7 @@ pub(crate) async fn reply_thread(state: &GoogleChatState, event: &serde_json::Va
     message.pointer("/thread/name").and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
-async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
+async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value, verified_http: bool) {
     let message = event.get("message").cloned().unwrap_or_default();
     // Defence in depth: every entry already requires a human sender.
     if !is_human_message(&message) {
@@ -843,6 +881,42 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         .unwrap_or("unknown")
         .to_string();
 
+    let session_id = format!("googlechat:{space}");
+    let route = crate::googlechat_shared::route(
+        &state.ctx, state.agent.is_some(), is_dm, &session_id, &sender_id, &text,
+    ).await;
+    let (routed_agent, own_turn, called_turn) = match route {
+        crate::googlechat_shared::Route::Legacy => (state.agent.clone(), state.agent.is_some(), false),
+        crate::googlechat_shared::Route::Avatar(agent) => (Some(agent), true, false),
+        crate::googlechat_shared::Route::Called { agent, via_trigger } => (Some(agent), false, via_trigger),
+        crate::googlechat_shared::Route::Direct(reply) => {
+            if !reply.trim().is_empty() {
+                let reply = crate::markdown_render::to_googlechat_text(&reply);
+                if post_message(&state.creds, &space, thread.as_deref(), &reply).await.is_err() {
+                    warn!(failed = 1, "Google Chat direct reply delivery failed");
+                }
+            }
+            return;
+        }
+        crate::googlechat_shared::Route::Unbound(reply) => {
+            // Keep blocked/taken-over conversations silent. Never forward an
+            // access-gate diagnostic or command response to an unbound sender.
+            if crate::channel_reply::check_user_access_gate(
+                &state.ctx, &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(&sender_id), &text,
+            ).await.is_none()
+                && !crate::takeover::is_target_paused(&state.ctx.home_dir, "googlechat", &space)
+                && !reply.trim().is_empty()
+                && crate::googlechat_shared::allow_unbound_reply(&state.ctx.home_dir, &sender_id)
+            {
+                if post_message(&state.creds, &space, thread.as_deref(), &reply).await.is_err() {
+                    warn!(failed = 1, "Google Chat unbound reply delivery failed");
+                }
+            }
+            return;
+        }
+    };
+
     let group_turn = crate::channel_reply::group_buffer::GroupTurn::capture(&state.ctx, message.pointer("/space/type").or_else(|| event.pointer("/space/type")).and_then(|v| v.as_str()).is_some_and(|kind| matches!(kind, "ROOM" | "SPACE" | "GROUP_CHAT")), "googlechat", "global", &space, thread.as_deref(), message.get("name").and_then(|v| v.as_str()).unwrap_or(""), &sender_id, &sender, if text.is_empty() { "[附件]" } else { &text }).await;
 
     let raw_text = message.get("argumentText").or_else(|| message.get("text"))
@@ -859,7 +933,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     let mut attachment_lines: Vec<String> = Vec::new();
     if !attachments.is_empty() {
         let attach_base =
-            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), state.agent.as_deref())
+            crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), routed_agent.as_deref())
                 .await;
         for att in &attachments {
             let filename = att.effective_filename();
@@ -912,15 +986,23 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     }
 
     // Resolve the durable identity before creating any visible placeholder.
-    let session_id = format!("googlechat:{space}");
-    let reply_session = match &state.agent {
-        Some(agent) => crate::trigger_route::called_session(&session_id, agent),
-        None => session_id.clone(),
+    let reply_session = match &routed_agent {
+        Some(agent) if own_turn || called_turn => crate::trigger_route::called_session(&session_id, agent),
+        _ => session_id.clone(),
     };
-    let employee_id = match &state.agent {
+    let employee_id = match &routed_agent {
         Some(agent) => agent.clone(),
         None => state.ctx.registry.read().await.main_agent()
             .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+    };
+    let (recovery_employee, recovery_session) = if routed_agent.is_none()
+        && !crate::chat_commands::is_command(&text)
+    {
+        crate::googlechat_shared::recovery_identity(
+            &state.ctx, &session_id, &sender_id, &input_text,
+        ).await
+    } else {
+        (employee_id.clone(), reply_session.clone())
     };
     // Fail closed: never create a placeholder when recovery cannot be persisted.
     let store = match crate::googlechat_inbox::Inbox::shared(&state.ctx.home_dir) {
@@ -928,7 +1010,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         Err(_) => { warn!(failed = 1, "Google Chat placeholder store unavailable"); return; }
     };
     let (name, registration) = match create_placeholder(
-        &state.creds, store, &space, thread.as_deref(), state.agent.clone(), employee_id, reply_session.clone(),
+        &state.creds, store, &space, thread.as_deref(), state.agent.clone(), recovery_employee, recovery_session,
     ).await {
         Ok(created) => created,
         Err(_) => { warn!(failed = 1, "Google Chat placeholder persistence failed"); return; }
@@ -1012,15 +1094,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
             let reply = match crate::chat_commands::command_preflight(&cmd, &state.ctx, &origin).await {
                 Some(reply) => reply,
                 None => {
-                    let agent_id = match &state.agent {
-                        Some(agent) => agent.clone(),
-                        None => {
-                            let reg = state.ctx.registry.read().await;
-                            reg.main_agent()
-                                .map(|a| a.config.agent.name.clone())
-                                .unwrap_or_default()
-                        }
-                    };
+                    let agent_id = employee_id.clone();
                     crate::chat_commands::handle_command_for_sender(
                         &cmd,
                         &state.ctx,
@@ -1075,22 +1149,37 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
     } else {
         None
     };
-    let (guarded, deliberate_silence) = crate::channel_reply::track_silence(group_turn.scope(crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(one_to_one, Box::pin(async { match &state.agent {
-        // Own app: deterministic routing to its employee, in the employee's
-        // bucket; the access gate and takeover still run on the space.
+    let trusted_target = if verified_http && is_dm {
+        match state.creds.token().await {
+            Ok(token) => crate::approval::TrustedReplyTarget::new(
+                crate::approval::DecisionContext {
+                    channel: "googlechat".into(), account_id: state.creds.client_email().to_string(),
+                    conversation_id: thread.as_ref().map_or_else(|| space.clone(), |t| format!("{space}:{t}")),
+                    principal_id: sender_id.clone(),
+                }, token, space.clone(), thread.clone(),
+            ).map(|target| target.with_chat_type(bound_chat_type(verified_http, is_dm))
+                .with_decision_access_scope(crate::decision_notify::DecisionAccessScope {
+                    channel_id: None, guild_id: None, session_id: None,
+                })),
+            Err(e) => Err(e),
+        }
+    } else { Err("Google Chat bound approvals require a verified HTTP DM".into()) };
+    let recovery_binding = registration.as_ref().map(|r| r.reply_binding());
+    let (guarded, deliberate_silence) = crate::googlechat_inbox::REPLY_BINDING.scope(
+        recovery_binding, crate::approval::scope_trusted_reply(trusted_target,
+        crate::channel_reply::track_silence(group_turn.scope(crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(one_to_one, Box::pin(async { match &routed_agent {
+        // Avatars use the same own-bot bucket as employee apps; explicit @
+        // calls retain their existing label and called-session semantics.
         Some(agent) => {
-            thinking
-                .scope(crate::trigger_route::as_own_bot_turn(
-                    crate::channel_reply::build_guarded_reply_for_agent(
-                        &input_text,
-                        &state.ctx,
-                        agent,
-                        &session_id,
-                        crate::ccr_runtime::reply_principal_for_sender(&sender_id),
-                        Some(on_progress),
-                    ),
-                ))
-                .await
+            let reply = crate::channel_reply::build_guarded_reply_for_agent(
+                &input_text, &state.ctx, agent, &session_id,
+                crate::ccr_runtime::reply_principal_for_sender(&sender_id), Some(on_progress),
+            );
+            if own_turn {
+                thinking.scope(crate::trigger_route::as_own_bot_turn(reply)).await
+            } else {
+                thinking.scope(crate::trigger_route::as_called_turn(called_turn, reply)).await
+            }
         }
         None => {
             thinking
@@ -1103,7 +1192,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
                 ))
                 .await
         }
-    } })))).await;
+    } })))))).await;
     let thinking_footer = thinking.finish().await;
     if !guarded.still_valid().await {
         report_delivery(delivery_target, deliver_reply(
@@ -1151,6 +1240,12 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value)
         }
         return;
     }
+    let reply = match guarded.answered_by.as_ref() {
+        Some(who) if called_turn && who.via_trigger => {
+            crate::trigger_route::with_reply_prefix(reply, &who.display_name)
+        }
+        _ => reply,
+    };
     let reply = crate::thinking::channel_presenter::with_footer(reply, thinking_footer.as_ref());
 
     let answered = DeliveryTarget {
@@ -1514,6 +1609,23 @@ pub async fn send_text_to_space_as(
         }
     }
     Ok(())
+}
+
+/// A knowledge approval card is already rendered as inert plain fields.
+/// Send its final payload directly; do not reinterpret previews as Markdown.
+pub(crate) async fn send_untrusted_card(
+    home_dir: &Path, space: &str, body: serde_json::Value,
+) -> Result<(), String> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err(GoogleChatSendError::InvalidTarget.user_message(home_dir));
+    }
+    let (creds, _) = sending_creds(home_dir, None, space).await?;
+    post_message_json(&creds, space, None, body, None).await
+        .map(|_| ())
+        .map_err(|status| match status {
+            Some(status) => GoogleChatSendError::Http { status },
+            None => GoogleChatSendError::Transport,
+        }.user_message(home_dir))
 }
 
 /// RM-192: whether the app a send to `space` as `agent` would use (the same
@@ -2904,4 +3016,16 @@ mod placeholder_lifecycle_tests {
         drop(active_registration);
     }
 
+}
+
+#[cfg(test)]
+mod kbadd_transport_tests {
+    #[test]
+    fn only_http_dm_can_attest_a_bound_private_audience() {
+        use crate::approval::ConversationAudience::{Private, MultiParty};
+        for (http, dm, expected) in [(true, true, Private), (true, false, MultiParty),
+            (false, true, MultiParty), (false, false, MultiParty)] {
+            assert_eq!(crate::approval::mail_requester::adapter_audience("googlechat", super::bound_chat_type(http, dm)), expected);
+        }
+    }
 }

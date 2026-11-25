@@ -26,6 +26,9 @@
 //! that names who can fix it.
 
 pub mod check;
+pub(crate) mod personal_check;
+pub(crate) mod delegated_scopes;
+pub(crate) mod delegate_owner;
 pub(crate) mod credential_registry;
 pub(crate) mod effect_authority;
 pub mod delegation_key;
@@ -45,6 +48,8 @@ pub(crate) mod tenant_source;
 pub(crate) mod route_test_probe;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::{start_data_endpoint_probe, data_endpoint_reads_for};
 
 use std::path::Path;
 
@@ -84,6 +89,9 @@ impl Refusal {
 /// Every refusal code this module emits.
 pub const REFUSAL_CODES: &[&str] = &[
     "no_verified_caller",
+    "external",
+    "attestation_required",
+    "identity_changed",
     "disabled",
     "not_available",
     "config_invalid",
@@ -168,7 +176,7 @@ pub fn audit_issue(
         }
         Ok(resolve::Resolved::UseHome { fallback, .. }) => (true, "home", "", *fallback, ""),
         Ok(resolve::Resolved::Personal { kind, email, .. }) => (true, *kind, email.as_str(), false, ""),
-        Err(r) => (false, duduclaw_core::google_identity::effective_for(home, Some(agent)).effective.kind(), "", false, r.code),
+        Err(r) => (false, crate::google_identity::delegate_owner::effective_for(home, Some(agent)).effective.kind(), "", false, r.code),
     };
     let summary = format!(
         "tool={tool} identity={identity}{}",
@@ -222,11 +230,11 @@ pub async fn gateway_backend_with_account(
     agent: Option<&str>,
     kind: &str,
 ) -> Result<(crate::google_workspace::GoogleBackend, Option<String>), GatewayBackendError> {
-    use crate::google_workspace::{GoogleBackend, resolve_backend};
+    use crate::google_workspace::{GoogleBackend, resolve_backend_for_tool};
     let agent = agent.filter(|a| !a.is_empty());
-    let eff = duduclaw_core::google_identity::effective_for(home, agent);
+    let eff = crate::google_identity::delegate_owner::effective_for(home, agent);
     match (&eff.effective, agent) {
-        (Effective::Home, _) => resolve_backend(home)
+        (Effective::Home, _) => resolve_backend_for_tool(home, kind)
             .await
             .map(|b| (b, None))
             .map_err(GatewayBackendError::Home),
@@ -245,7 +253,7 @@ pub async fn gateway_backend_with_account(
                 Ok(resolve::Resolved::Personal { token, email, .. }) => {
                     Ok((GoogleBackend::Direct(token.access_token), Some(email)))
                 }
-                Ok(resolve::Resolved::UseHome { .. }) => resolve_backend(home)
+                Ok(resolve::Resolved::UseHome { .. }) => resolve_backend_for_tool(home, kind)
                     .await
                     .map(|b| (b, None))
                     .map_err(GatewayBackendError::Home),
@@ -264,7 +272,7 @@ pub async fn gateway_backend_with_account(
 /// narrow to the admin and that person.
 pub fn delegate_email_of(home: &Path, agent: Option<&str>) -> Option<String> {
     let agent = agent.filter(|a| !a.is_empty())?;
-    match duduclaw_core::google_identity::effective_for(home, Some(agent)).effective {
+    match crate::google_identity::delegate_owner::effective_for(home, Some(agent)).effective {
         Effective::Delegate { email } => Some(email),
         _ => None,
     }

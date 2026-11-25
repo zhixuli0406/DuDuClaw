@@ -168,24 +168,13 @@ const GROUNDING_SEARCH_OVERFETCH: usize = 5;
 /// 1. **The calling agent's own local wiki is never consulted.** An agent
 ///    can always write there — it can never be trusted as independent
 ///    evidence about itself.
-/// 2. **The shared wiki is filtered to `.scope.toml`-protected namespaces
-///    only** (`read_only` / `operator_only` — see
-///    `duduclaw-cli/src/wiki_scope.rs` for the mode vocabulary; this reader
-///    is a deliberately minimal, self-contained duplicate of just the
-///    namespace-mode lookup, NOT the full write-policy engine, because
-///    `duduclaw-gateway` cannot depend on `duduclaw-cli` — the dependency
-///    edge runs the other way). Namespaces left at the default
-///    `agent_writable` (or `agent_allowlist`, which still lets *some*
-///    agent write it) remain agent-influenceable and are excluded.
+/// 2. **The shared wiki is filtered to declared protected namespaces**:
+///    `read_only` or `operator_only`. The shared core
+///    loader validates the root policy; this reader does not grant writes.
 ///
-/// Security posture is deliberately INVERTED from `WikiScopePolicy`'s own
-/// write-time default: that engine defaults an absent/malformed
-/// `.scope.toml` to `AgentWritable` (permissive, least-surprise for
-/// existing deployments' write path). Here, an absent/malformed policy
-/// file means "no namespace is provably protected" — so retrieval fails
-/// CLOSED: zero shared-wiki snippets, not "everything is fair game". An
-/// operator who wants ActionGuard grounding must explicitly lock the
-/// relevant namespace(s) in `.scope.toml`.
+/// Missing policy has no declared protected sources. Unreadable, linked or
+/// malformed policy is an error and stops grounding retrieval entirely.
+/// Neither state permits a fallback to unrestricted shared-wiki snippets.
 pub fn simulation_grounding_snippets(
     home_dir: &Path,
     agent_dir: &Path,
@@ -197,7 +186,7 @@ pub fn simulation_grounding_snippets(
         return Vec::new();
     }
 
-    let protected = protected_wiki_namespaces(home_dir);
+    let Ok(protected) = protected_wiki_namespaces(home_dir) else { return Vec::new(); };
     if protected.is_empty() {
         // No `.scope.toml`, or none of its entries are read_only/operator_only
         // ⇒ nothing is provably safe from agent self-write. Fail closed.
@@ -226,10 +215,8 @@ pub fn simulation_grounding_snippets(
 }
 
 /// The set of top-level shared-wiki namespaces locked to `read_only` or
-/// `operator_only` in `<home_dir>/shared/wiki/.scope.toml`. Empty on any
-/// absent/unreadable/malformed file, or a file with no namespace in either
-/// mode — every caller treats an empty set as "nothing is safe to
-/// retrieve" (fail-closed), never "everything is".
+/// `operator_only`. Missing means no declared protection. A load error is
+/// indeterminate protection and denies all grounding retrieval.
 ///
 /// Deliberately minimal and self-contained rather than importing
 /// `duduclaw_cli::wiki_scope::WikiScopePolicy`: `duduclaw-gateway` is a
@@ -237,27 +224,22 @@ pub fn simulation_grounding_snippets(
 /// unreachable from here. This only answers "is this namespace protected
 /// from agent self-write", nothing else the full policy engine handles
 /// (write enforcement, `agent_allowlist` membership, snapshots).
-pub(super) fn protected_wiki_namespaces(home_dir: &Path) -> std::collections::HashSet<String> {
-    let path = home_dir.join("shared").join("wiki").join(".scope.toml");
-    let Ok(raw) = std::fs::read_to_string(&path) else {
-        return std::collections::HashSet::new();
-    };
-    let Ok(table) = raw.parse::<toml::Table>() else {
-        return std::collections::HashSet::new();
-    };
+pub(super) fn protected_wiki_namespaces(home_dir: &Path) -> Result<std::collections::HashSet<String>, duduclaw_core::scope_policy::ScopePolicyError> {
+    let policy = duduclaw_core::scope_policy::load(&home_dir.join("shared/wiki/.scope.toml"))?;
+    let table = policy.table;
     let Some(namespaces) = table.get("namespaces").and_then(|v| v.as_table()) else {
-        return std::collections::HashSet::new();
+        return Ok(std::collections::HashSet::new());
     };
-    namespaces
+    Ok(namespaces
         .iter()
         .filter(|(_, entry)| {
             entry
                 .get("mode")
                 .and_then(|m| m.as_str())
-                .is_some_and(|m| m == "read_only" || m == "operator_only")
+                .is_some_and(|m| matches!(m, "read_only" | "operator_only"))
         })
         .map(|(name, _)| name.clone())
-        .collect()
+        .collect())
 }
 
 /// Extract the top-level namespace segment from a wiki-relative page path
@@ -394,3 +376,36 @@ pub fn pending_summary_for_channel(record: &ApprovalRecord) -> String {
 // `autopilot_engine` records rule fires. On approve, the caller re-reads
 // `record.payload` and re-dispatches (e.g. re-enqueue on `bus_queue.jsonl`
 // for a `bus_task`, re-run the MCP tool for an `mcp_tool`).
+
+#[cfg(test)]
+#[test]
+fn rm209_simulation_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { protected_wiki_namespaces(home.path()).is_ok() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
+    }
+}

@@ -106,16 +106,19 @@ fn client(budget: ResolveBudget<'_>) -> Result<reqwest::Client> {
         .build()
         .map_err(|_| Error::Io)
 }
-fn endpoint(_home: &Path) -> String {
+fn endpoint(_home: &Path) -> Result<String> {
     #[cfg(test)]
-    if let Some(url) = testing::endpoint(_home) {
-        return url;
+    {
+        // Every test refresh needs an owned endpoint, including legacy
+        // preflight while constructing a closed remote mount.
+        testing::endpoint(_home).ok_or(Error::Invalid)
     }
-    TOKEN_ENDPOINT.to_owned()
+    #[cfg(not(test))]
+    { Ok(TOKEN_ENDPOINT.to_owned()) }
 }
 fn endpoint_for_budget(home: &Path, budget: ResolveBudget<'_>) -> Result<String> {
     match budget {
-        ResolveBudget::Legacy => Ok(endpoint(home)),
+        ResolveBudget::Legacy => endpoint(home),
         ResolveBudget::Remote(..) | ResolveBudget::Preflight(_, _) => {
             #[cfg(test)]
             {

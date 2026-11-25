@@ -457,6 +457,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.remove", "people; names no employee"),
     ("users.offboard", "people; P1g default deny on a named hand-over target"),
     ("users.set_primary_agent", "P1g default deny: another person's Personal employee is refused (owner only)"),
+    ("users.set_avatar", "v1.85 avatar assignment: live Admin check; P1g default deny on agent_id, protected-mode owner match, and existing binding required; grants no employee access"),
     ("users.change_password", "the caller's own password"),
     ("users.change_email", "the caller's own address"),
     ("users.audit_log", "auth audit rows; P1g hidden rows drop those naming another person's Personal employee"),
@@ -705,6 +706,7 @@ fn fn_bodies(sources: &[String]) -> HashMap<String, String> {
     const ENDS: &[&str] = &["\n    }\n", "\n}\n", "\n    pub", "\n    fn ", "\n    async fn ", "\npub", "\nfn ", "\nasync fn "];
     let mut bodies: HashMap<String, String> = HashMap::new();
     for source in sources {
+        let source = source.replace("\r\n", "\n");
         let mut rest = source.as_str();
         while let Some(at) = rest.find("fn ") {
             let boundary = at == 0 || rest.as_bytes()[at - 1].is_ascii_whitespace();

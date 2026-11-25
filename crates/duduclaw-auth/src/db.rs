@@ -177,6 +177,23 @@ impl UserDb {
     /// Seed a newly created MFA policy table atomically with the verified
     /// installation default. Existing policy values are never overwritten.
     pub fn new_with_mfa_default(db_path: &Path, enforced: bool) -> Result<Self, String> {
+        // Create private databases before SQLite opens them so WAL/SHM inherit
+        // owner-only permissions. Never reopen an existing inode just to chmod:
+        // closing that descriptor would drop this process's SQLite locks.
+        if db_path != Path::new(":memory:") {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(db_path) {
+                Ok(_) => {},
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {},
+                Err(e) => return Err(format!("failed to create user db: {e}")),
+            }
+        }
         let mut pool = Vec::with_capacity(POOL_SIZE);
         for _ in 0..POOL_SIZE {
             let conn = Connection::open(db_path)
@@ -290,6 +307,14 @@ impl UserDb {
             );
             CREATE INDEX IF NOT EXISTS idx_chid_user ON channel_identities(user_id);
 
+            -- Only authenticated HTTP DM events may record these destinations.
+            CREATE TABLE IF NOT EXISTS verified_googlechat_dms (
+                account_id TEXT NOT NULL, space_id TEXT NOT NULL,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                principal_id TEXT NOT NULL, verified_at TEXT NOT NULL,
+                PRIMARY KEY(account_id, space_id)
+            );
+
             CREATE TABLE IF NOT EXISTS otp_challenges (
                 id TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL,
@@ -333,6 +358,7 @@ impl UserDb {
         crate::remembered_sessions::migrate(&conn)?;
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
+        crate::member_keys::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
@@ -379,6 +405,7 @@ impl UserDb {
             conn.execute("ALTER TABLE users ADD COLUMN primary_agent_id TEXT", [])
                 .map_err(|e| format!("failed to migrate users.primary_agent_id: {e}"))?;
         }
+        crate::avatar::migrate(&conn)?;
         crate::onboarding::migrate(&conn)?;
         crate::invitation_content::migrate(&conn)?;
         // `auth_meta.acl_generation` invalidates every cached live ACL: each
@@ -416,9 +443,14 @@ impl UserDb {
     /// NULL clears the preference; only an Owner/Operator binding may be selected.
     pub fn set_primary_agent(&self, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
         let conn = self.conn();
+        let has_avatar: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND avatar_agent_id IS NOT NULL)",
+            [user_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_avatar { return Err("avatar_primary_locked".into()); }
         let changed = conn.execute(
             "UPDATE users SET primary_agent_id = ?1, updated_at = ?2
-             WHERE id = ?3 AND status = 'active' AND
+             WHERE id = ?3 AND status = 'active' AND avatar_agent_id IS NULL AND
              (?1 IS NULL OR EXISTS(SELECT 1 FROM user_agent_bindings
                  WHERE user_id = ?3 AND agent_name = ?1
                    AND access_level IN ('owner', 'operator')))",
@@ -436,6 +468,11 @@ impl UserDb {
              AND (id = ?2 OR role = 'admin'))", params![actor, user_id], |r| r.get(0),
         ).map_err(|e| e.to_string())?;
         if !permitted { return Err("permission denied".into()); }
+        let has_avatar: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 AND avatar_agent_id IS NOT NULL)",
+            [user_id], |r| r.get(0),
+        ).map_err(|e| e.to_string())?;
+        if has_avatar { return Err("avatar_primary_locked".into()); }
         let now = Utc::now().to_rfc3339();
         let changed = tx.execute(
             "UPDATE users SET primary_agent_id = ?1, updated_at = ?2 WHERE id = ?3 AND status = 'active'
@@ -465,7 +502,7 @@ impl UserDb {
         let bindings = {
             let mut stmt = tx.prepare("SELECT u.id, u.display_name, b.agent_name
                 FROM users u JOIN user_agent_bindings b ON b.user_id = u.id
-                WHERE u.status = 'active' AND u.primary_agent_id IS NULL
+                WHERE u.status = 'active' AND u.primary_agent_id IS NULL AND u.avatar_agent_id IS NULL
                 AND b.access_level IN ('owner', 'operator') ORDER BY u.id, b.bound_at, b.rowid").map_err(|e| e.to_string())?;
             let rows = stmt.query_map([], |r| Ok(PrimaryAgentRepair {
                 user_id: r.get(0)?, display_name: r.get(1)?, agent_id: r.get(2)?,
@@ -574,6 +611,7 @@ impl UserDb {
         .map_err(|e| format!("failed to create user: {e}"))?;
 
         Ok(User {
+            avatar_agent_id: None,
             credential_epoch: 0,
             id,
             email: email.to_string(),
@@ -606,7 +644,7 @@ impl UserDb {
             conn.query_row(
                 &format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"),
                 params![email],
-                |row| Ok((user_from_row(row)?, row.get::<_, String>(12)?)),
+                |row| Ok((user_from_row(row)?, row.get::<_, String>(13)?)),
             )
         };
 
@@ -952,7 +990,7 @@ impl UserDb {
         bind_agent_in_transaction(&tx, user_id, agent_name, access_level, &now)?;
         if first_eligible && matches!(access_level, AccessLevel::Owner | AccessLevel::Operator) {
             let changed = tx.execute("UPDATE users SET primary_agent_id = ?1, updated_at = ?2
-                WHERE id = ?3 AND primary_agent_id IS NULL", params![agent_name, now, user_id]).map_err(|e| e.to_string())?;
+                WHERE id = ?3 AND primary_agent_id IS NULL AND avatar_agent_id IS NULL", params![agent_name, now, user_id]).map_err(|e| e.to_string())?;
             if changed > 0 {
                 tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, timestamp)
                     VALUES(?1, 'user.primary_agent_auto', ?2, ?3, ?4)",
@@ -2250,6 +2288,8 @@ pub fn remove_personal_agent_in_transaction(
     if !is_personal_agent_id(agent) { return Err(PersonalAgentError::InvalidAgent); }
     let Some(owner) = personal_agent_owner(tx, agent)? else { return Ok(false) };
     if owner != owner_user_id { return Err(PersonalAgentError::OwnerConflict); }
+    crate::google_delegate_attestation::revoke_in_transaction(tx, agent, "employee_retired")
+        .map_err(PersonalAgentError::Store)?;
     tx.execute(
         "INSERT INTO isolation_personal_agent_removals (agent_name, owner_user_id) VALUES (?1, ?2)",
         params![agent, owner_user_id],

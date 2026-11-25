@@ -177,14 +177,23 @@ impl GoogleCallContext {
     }
 
     /// SR4 item 5: the `scope` claim of a minted service-account assertion:
-    /// the pinned tenant scopes on the tenant lane (none ⇒ refused, nothing
-    /// to mint for), otherwise the full minted set (unchanged legacy lanes).
+    /// only the operation's service, intersected with the tenant allowlist
+    /// when pinned. Empty or insufficient scope sets refuse.
     pub(crate) fn assertion_scope(&self) -> Result<String, Refusal> {
-        match &self.tenant {
-            None => Ok(crate::google_workspace::REQUIRED_SCOPES.join(" ")),
-            Some(pin) if pin.scopes.is_empty() => Err(changed()),
-            Some(pin) => Ok(pin.scopes.join(" ")),
+        let scopes = match &self.purpose {
+            GooglePurpose::Dedicated { native_tool, .. } => super::delegated_scopes::for_tool(&self.home, native_tool)?,
+            GooglePurpose::ClosedRemote(bound) => bound.delegation_scopes(&self.home)?,
+            #[cfg(test)]
+            GooglePurpose::RemoteMcp { .. } => super::delegated_scopes::for_service(&self.home, "gmail")?,
+        };
+        let scopes: Vec<&str> = scopes.iter().copied().filter(|scope| self.tenant.as_ref()
+            .is_none_or(|pin| pin.scopes.iter().any(|allowed| allowed == scope))).collect();
+        if scopes.is_empty() { return Err(changed()); }
+        if let GooglePurpose::Dedicated { native_tool, .. } = &self.purpose {
+            let granted: Vec<String> = scopes.iter().map(|scope| (*scope).to_owned()).collect();
+            if !crate::google_personal::scopes::permitted(native_tool, &granted) { return Err(changed()); }
         }
+        Ok(scopes.join(" "))
     }
 
     /// M1 must capture the actual task-local requester before offloading and
@@ -581,6 +590,8 @@ pub(in crate::google_identity) async fn execute_immediate_native_pinned(
     args: serde_json::Value,
     tenant: Option<TenantPin>,
 ) -> Result<serde_json::Value, Refusal> {
+    crate::google_workspace::validate_native_tool_inputs(tool, &args)
+        .map_err(|message| Refusal::hard("native_arguments_invalid", message))?;
     // Initial admission keeps the public credential-refusal taxonomy. Once
     // captured, every later wait still rechecks the original source context.
     host_claim::live_key(home, agent, reference, tool)?;
@@ -723,7 +734,7 @@ impl GooglePreflightPermit<'_> {
         match &self.original {
             PreflightOriginal::Home => {
                 if !matches!(
-                    gi::effective_for(&self.context.home, Some(&self.context.agent)).effective,
+                    crate::google_identity::delegate_owner::effective_for(&self.context.home, Some(&self.context.agent)).effective,
                     gi::Effective::Home
                 ) {
                     return Err(changed());
@@ -737,7 +748,7 @@ impl GooglePreflightPermit<'_> {
                 self.context.purpose.scope_key(),
             )?,
             PreflightOriginal::Delegate { email, precheck } => {
-                let policy = gi::effective_for(&self.context.home, Some(&self.context.agent));
+                let policy = crate::google_identity::delegate_owner::effective_for(&self.context.home, Some(&self.context.agent));
                 if !matches!(&policy.effective,gi::Effective::Delegate{email:actual} if actual==email)
                 {
                     return Err(changed());

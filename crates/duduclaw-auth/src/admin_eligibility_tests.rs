@@ -83,7 +83,7 @@ fn admin_eligibility_log_written_on_every_change() {
     // An Admin created by an Admin through the member flow records its creator.
     let creator = db.get_user(actor).unwrap().unwrap();
     let member = crate::members::NewMember { display_name: "New".into(), email: "new-admin@example.test".into(),
-        role: UserRole::Admin, department: None, primary_agent_id: "main".into(), invite: false,
+        role: UserRole::Admin, department: None, avatar_agent_id: None, primary_agent_id: "main".into(), invite: false,
         bindings: vec![crate::members::MemberBinding { agent_name: "main".into(), access_level: crate::AccessLevel::Owner }] };
     if let Ok(created) = db.create_member_at_epoch(&member, &creator.id, creator.credential_epoch) {
         assert_eq!(last(&db, &created.user.id).actor_user_id.as_deref(), Some(actor));

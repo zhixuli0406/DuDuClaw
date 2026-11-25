@@ -529,7 +529,8 @@ pub(crate) fn authenticate_bearer_call(
     // RM-064: a `ddc_status_` credential belongs to the gateway's status
     // endpoint only. Refuse the type outright — it must never reach the
     // `[mcp_keys]` / OAuth lookups or any scope table.
-    if duduclaw_auth::status_tokens::is_status_token(raw_key) {
+    if duduclaw_auth::status_tokens::is_status_token(raw_key)
+            || duduclaw_auth::member_keys::is_member_key(raw_key) {
         return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
     }
 
@@ -610,7 +611,8 @@ fn authenticate_bearer_or_query(
                 None,
             ));
         }
-        if duduclaw_auth::status_tokens::is_status_token(raw_key) {
+        if duduclaw_auth::status_tokens::is_status_token(raw_key)
+            || duduclaw_auth::member_keys::is_member_key(raw_key) {
             return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
         }
         let principal = crate::mcp_auth::authenticate_with_key_refusal(raw_key, home_dir).map_err(|refusal| {
@@ -1338,6 +1340,37 @@ pub mod tests {
         assert!(
             status == StatusCode::UNAUTHORIZED || status == StatusCode::TOO_MANY_REQUESTS,
             "a status credential must never be served by /mcp: {status}"
+        );
+    }
+
+    #[tokio::test]
+    async fn member_credentials_are_refused_on_every_mcp_surface() {
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db
+            .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Employee)
+            .unwrap();
+        let raw = db.member_key_create(&user.id, "odoo", 90, user.credential_epoch).unwrap().secret;
+        let mut headers = HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
+        let resource = "http://127.0.0.1:8765/mcp";
+        for response in [
+            authenticate_bearer(&headers, home.path(), resource).unwrap_err(),
+            authenticate_bearer_or_query(&HeaderMap::new(), Some(&raw), home.path(), resource).unwrap_err(),
+        ] {
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().to_path_buf());
+        let router = build_router(&cfg, make_test_dispatcher());
+        let request = Request::builder().method("POST").uri("/mcp")
+            .header("authorization", format!("Bearer {raw}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)).unwrap();
+        let status = router.oneshot(request).await.unwrap().status();
+        assert!(
+            status == StatusCode::UNAUTHORIZED || status == StatusCode::TOO_MANY_REQUESTS,
+            "a member credential must never be served by /mcp: {status}"
         );
     }
 

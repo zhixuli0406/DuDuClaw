@@ -44,7 +44,7 @@ impl MethodHandler {
         let rules = duduclaw_core::agent_toml::load_action_rules(&agent_dir);
         let sections = duduclaw_core::agent_toml::load(&agent_dir);
         let google_enabled = crate::google_workspace::integration_enabled(&self.home_dir)
-            && duduclaw_core::google_identity::effective_for(&self.home_dir, Some(agent_id))
+            && crate::google_identity::delegate_owner::effective_for(&self.home_dir, Some(agent_id))
                 .effective
                 .tools_listed();
         let github_enabled = crate::github_workspace::integration_enabled(&self.home_dir);

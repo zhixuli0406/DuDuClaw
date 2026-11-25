@@ -3,7 +3,7 @@
 //! outlet to the generic MCP client. Every call captures its real requester.
 use std::path::{Path, PathBuf};
 
-use duduclaw_core::google_identity::{Effective, Fallback, effective_for};
+use duduclaw_core::google_identity::{Effective, Fallback};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use duduclaw_llm::{InterceptDecision, ToolInterceptor};
 use serde_json::Value;
@@ -15,6 +15,7 @@ pub(crate) struct GoogleMountGuard {
     home: PathBuf,
     agent: String,
     selected: Effective,
+    endpoint: String,
     fallback: bool,
     notice: Option<String>,
 }
@@ -36,7 +37,7 @@ pub(in crate::google_identity) fn requester(agent: &str) -> RequesterIdentity {
 impl GoogleMountGuard {
     /// Only the canonical employee directory selected by the gateway can
     /// prepare a person mount. An arbitrary path cannot nominate an employee.
-    pub(crate) async fn prepare(home: &Path, agent_dir: &Path) -> Result<(String, Self), Refusal> {
+    pub(crate) async fn prepare(home: &Path, agent_dir: &Path, endpoint: &str) -> Result<(String, Self), Refusal> {
         let home = home.canonicalize().map_err(|_| unavailable())?;
         let agents = home
             .join("agents")
@@ -52,7 +53,7 @@ impl GoogleMountGuard {
         if dir.parent() != Some(agents.as_path()) || !dir.join("agent.toml").is_file() {
             return Err(unavailable());
         }
-        let effective = effective_for(&home, Some(&agent));
+        let effective = super::delegate_owner::effective_for(&home, Some(&agent));
         let who = requester(&agent);
         let resolved = match &effective.effective {
             Effective::Home => resolve::Resolved::UseHome {
@@ -64,7 +65,7 @@ impl GoogleMountGuard {
                     return Err(Refusal::hard("disabled", "Google 整合尚未開啟。"));
                 }
                 let people = requester_gate::people_for(&home, None);
-                resolve::resolve_person(&home, &agent, &who, people.as_ref()).await?
+                resolve::resolve_person(&home, &agent, &who, people.as_ref(), endpoint).await?
             }
             other => return Err(resolve::refusal_for(other).unwrap_or_else(unavailable)),
         };
@@ -76,7 +77,7 @@ impl GoogleMountGuard {
             ),
             resolve::Resolved::Personal { .. } => return Err(unavailable()),
             resolve::Resolved::UseHome { fallback, notice } => (
-                crate::google_workspace::get_valid_google_token(&home)
+                crate::google_workspace::get_valid_google_token_for_endpoint(&home, endpoint)
                     .await
                     .map_err(|_| {
                         Refusal::hard("account_unavailable", "公司共用 Google 帳號暫時無法使用。")
@@ -89,6 +90,7 @@ impl GoogleMountGuard {
             home,
             agent,
             selected: effective.effective,
+            endpoint: endpoint.into(),
             fallback,
             notice,
         };
@@ -116,7 +118,7 @@ impl GoogleMountGuard {
         if !dir.join("agent.toml").is_file() {
             return Err(unavailable());
         }
-        let now = effective_for(&self.home, Some(&self.agent));
+        let now = super::delegate_owner::effective_for(&self.home, Some(&self.agent));
         if now.effective != self.selected || (self.fallback && now.fallback != Fallback::Home) {
             return Err(Refusal::hard(
                 "identity_changed",
@@ -126,6 +128,7 @@ impl GoogleMountGuard {
         match &now.effective {
             Effective::Home => Ok(()),
             Effective::Delegate { email } => {
+                super::delegated_scopes::for_endpoint(&self.home, &self.endpoint)?;
                 if !crate::google_workspace::integration_enabled(&self.home) {
                     return Err(Refusal::hard("disabled", "Google 整合尚未開啟。"));
                 }

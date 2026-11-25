@@ -45,25 +45,8 @@ fn read_live_page(store: &WikiStore, page_path: &str) -> Option<(crate::wiki::Wi
 
 fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
     let path = home.join("shared/wiki/.scope.toml");
-    match std::fs::symlink_metadata(&path) {
-        Ok(meta) if meta.file_type().is_symlink() || meta.len() > 64 * 1024 => return None,
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return None,
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(_) => return None,
-    };
-    if content.len() > 64 * 1024 {
-        return None;
-    }
-    let table: toml::Table = if content.trim().is_empty() {
-        toml::Table::new()
-    } else {
-        content.parse().ok()?
-    };
+    let policy = duduclaw_core::scope_policy::load(&path).ok()?;
+    let table = policy.table;
     let namespace = duduclaw_core::wiki_top_level_namespace(page_path);
     let namespaces = match table.get("namespaces") {
         Some(value) => Some(value.as_table()?),
@@ -90,7 +73,7 @@ fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
         Some(value) => value.as_str()?,
         None => "agent_writable",
     };
-    if !matches!(mode, "agent_writable" | "read_only" | "operator_only") {
+    if !matches!(mode, "agent_writable" | "read_only" | "operator_only" | "agent_allowlist") {
         return None;
     }
     let synced_from = match declared.and_then(|entry| entry.get("synced_from")) {
@@ -100,10 +83,13 @@ fn shared_policy_digest(home: &Path, page_path: &str) -> Option<String> {
     if mode == "read_only" && synced_from.trim().is_empty() {
         return None;
     }
-    Some(format!(
-        "{:x}",
-        Sha256::digest(format!("{mode}\0{synced_from}").as_bytes())
-    ))
+    let fingerprint = if mode == "agent_allowlist" {
+        format!("{mode}\0{synced_from}\0{:?}", declared.and_then(|entry| entry.get("agents")))
+    } else {
+        // Preserve existing source fingerprints for unchanged policy modes.
+        format!("{mode}\0{synced_from}")
+    };
+    Some(format!("{:x}", Sha256::digest(fingerprint.as_bytes())))
 }
 
 fn live_shared_page(home: &Path, page_path: &str) -> Option<LiveWikiPage> {
@@ -566,15 +552,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn causal_ingest_resolved_alias_uses_target_identity_and_auto_rules() {
+    fn causal_ingest_refuses_symlink_aliases_and_auto_sources() {
         use std::os::unix::fs::symlink;
         let (dir, store, page) = fixture();
         let wiki = page.parent().unwrap().parent().unwrap();
         symlink(wiki.join("sources"), wiki.join("alias")).unwrap();
         let canonical = store.import_agent_wiki_source("agent-a", "sources/queue.md").unwrap();
-        let alias = store.import_agent_wiki_source("agent-a", "alias/queue.md").unwrap();
-        assert_eq!(canonical.id, alias.id);
-        assert_eq!(alias.external_id, "sources/queue.md");
+        // RM-209 refuses symlinks even when their target stays inside the wiki.
+        assert!(store.import_agent_wiki_source("agent-a", "alias/queue.md").is_err());
+        assert_eq!(canonical.external_id, "sources/queue.md");
         std::fs::create_dir_all(wiki.join("auto")).unwrap();
         symlink(wiki.join("auto"), wiki.join("auto-alias")).unwrap();
         let raw = std::fs::read_to_string(&page).unwrap();
@@ -590,9 +576,8 @@ mod tests {
         std::fs::write(wiki.join("auto/queue.md"), &promoted).unwrap();
         crate::wiki_auto_registry::record_page(dir.path(), "agent-a", "auto/queue.md", &promoted, &[], true).unwrap();
         let direct = store.import_agent_wiki_source("agent-a", "auto/queue.md").unwrap();
-        let alias = store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").unwrap();
-        assert_eq!(direct.id, alias.id);
-        assert_eq!(alias.external_id, "auto/queue.md");
+        assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
+        assert_eq!(direct.external_id, "auto/queue.md");
         std::fs::write(wiki.join("auto/queue.md"), &raw).unwrap();
         assert!(store.import_agent_wiki_source("agent-a", "auto-alias/queue.md").is_err());
     }
@@ -1113,5 +1098,38 @@ mod tests {
             store.import_shared_wiki_source("sources/queue.md"),
             Err(CausalStoreError::NotFound)
         ));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn rm209_causal_digest_policy_matrix() {
+    let home = tempfile::tempdir().unwrap();
+    let wiki = home.path().join("shared/wiki");
+    std::fs::create_dir_all(&wiki).unwrap();
+    let path = wiki.join(".scope.toml");
+    let allowed = || { shared_policy_digest(home.path(), "notes/a.md").is_some() };
+    assert!(allowed(), "missing file retains no-policy behavior");
+    for raw in ["not [ valid toml", "namespaces = 42", "[namespaces.notes]\nvisible_to_departments = [7]", "[namespaces.notes]\nmode = false"] {
+        std::fs::write(&path, raw).unwrap();
+        assert!(!allowed(), "malformed policy must deny: {raw}");
+    }
+    std::fs::write(&path, "").unwrap();
+    assert!(allowed(), "empty valid policy");
+    std::fs::remove_file(&path).unwrap();
+    let target = home.path().join("target.toml");
+    std::fs::write(&target, "").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    #[cfg(windows)]
+    if let Err(error) = std::os::windows::fs::symlink_file(&target, &path) {
+        eprintln!("RM-209: skipping link cases: Windows symlink permission unavailable: {error}");
+        return;
+    }
+    #[cfg(any(unix, windows))]
+    {
+        assert!(!allowed(), "valid symlink must deny");
+        std::fs::remove_file(&target).unwrap();
+        assert!(!allowed(), "dangling symlink must deny");
     }
 }

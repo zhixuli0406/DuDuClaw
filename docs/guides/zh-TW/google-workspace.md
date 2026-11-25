@@ -1,10 +1,10 @@
 # Google Workspace 工具與安全模型
 
-設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十一個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十六個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
-二十一個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
+二十六個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
@@ -27,8 +27,15 @@
 | `drive_search` | read | 依**檔名與全文**搜尋 Drive（排除已丟到垃圾桶的檔案，最新的排在前面）。可選擇性用精確 MIME 篩選。 |
 | `drive_read` | read | 以文字形式讀取一份 Drive 檔案：Docs／Slides 匯出成純文字，Sheets 匯出成 CSV（**僅第一個工作表**），純文字類檔案照原樣讀取。二進位類型只回傳中繼資料與提示，絕不回傳二進位內容。 |
 | `docs_read` | read | 依文件內的順序讀取 Google Doc 的文字內容，包含表格儲存格文字。 |
-| `docs_append` | write | 把文字附加到一份 Doc 的**結尾**。僅能附加，沒有任何工具會改寫或刪除既有內容。 |
+| `docs_append` | write | 把文字附加到一份 Doc 的**結尾**。 |
+| `docs_create` | write | 在「我的雲端硬碟」根目錄建立文件，可附初始內文。 |
+| `docs_replace_text` | write | 取代文件中相符的文字，預設區分大小寫。 |
+| `sheets_create` | write | 建立試算表，可指定工作表名稱。 |
+| `sheets_update` | write | 更新最多 10,000 格，預設使用 RAW。 |
+| `calendar_update_event` | write | 編輯行事曆活動，可能變更與會者的行事曆，一律走 send 核准規則。 |
 | `slides_read` | read | 逐頁讀取簡報的文字內容（圖形、群組圖形、表格儲存格）。 |
+
+這五項寫入工具及 Gmail 回覆欄位（`thread_id`、`in_reply_to`、`references`）需要原生 REST。Apps Script Bridge 會隱藏不支援的工具及回覆欄位；切換後端會透過 `notifications/tools/list_changed` 通知客戶端更新清單。Gmail 的 `to` 與 `cc` 可用逗號分隔電子郵件地址，每欄最多 1,000 字元；每個地址都會驗證，並拒絕控制字元。
 
 寫入類工具的結果只寫 Google 實際回報的內容。`calendar_create_event` 只寫加入了幾位參與者（沒有時寫「Attendees: none」），不宣稱已通知任何人；沒有回傳活動代號時回報錯誤。`gmail_create_draft` 沒有回傳草稿代號時回報錯誤。`sheets_append` 只在 Google 回報時才顯示列數與儲存格數。透過 Apps Script 連線時，新增的列一律加在試算表的**第一個工作表**，結果會說明這點以及指定的範圍沒有被使用。Apps Script 的回覆必須符合該動作成功時的格式才算成功；空的回覆、`ok: false` 或任何錯誤欄位都會回報為工具錯誤並附上原因。
 
@@ -52,20 +59,46 @@
 - **讀取就只是讀取。** 屬於 read 類別的工具無法修改 Gmail 或 Calendar 中的
   任何內容。
 - **Forms、Drive、Slides 全部唯讀。** 沒有任何工具會建立或編輯表單、寫入
-  Drive、或修改簡報。只有 Gmail（草稿）、Calendar、Sheets、Docs（附加）
+  Drive、或修改簡報。只有 Gmail（草稿）、Calendar、Sheets、Docs
   和 Tasks 有寫入工具。
 - **最小權限原則。** Drive 申請的是 `drive.readonly`（絕不是 `drive` 或
-  `drive.file`，因為沒有任何工具會建立 Drive 檔案），Slides 申請
-  `presentations.readonly`。Docs 需要完整的 `documents` scope，純粹是因為
-  `docs_append` 需要寫入權限。
+  `drive.file`，文件與試算表建立使用各自服務的範圍），Slides 申請
+  `presentations.readonly`。Docs 的寫入工具沿用完整的 `documents` scope。
 - **可選的審批閘門。** 想更謹慎的話，可以把寫入類工具列進 agent 的
   `agent.toml [capabilities] approval_required_tools`，讓每一次草稿、
   活動或試算表寫入都要等待 HITL 審批：
 
   ```toml
   [capabilities]
-  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append"]
+  approval_required_tools = ["gmail_create_draft", "calendar_create_event", "sheets_append", "gtasks_create", "gtasks_complete", "docs_append", "docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"]
   ```
+
+## 建立與編輯 Google 內容
+
+以下原生工具沿用既有的 `documents`、`spreadsheets`、`calendar.events` OAuth 範圍，需要 `google:write`；只有 `google:read` 的員工看不到，也不能呼叫。個人連線還必須具備該服務的授權範圍。網域委派使用相同工具名稱。新工具與回覆草稿需要原生 REST 連線，Apps Script Bridge 不支援這些操作。
+
+| 原生工具 | 參數與行為 |
+|---|---|
+| `docs_create` | 必填 `title`，可選 `body`，在「我的雲端硬碟」根目錄建立文件。 |
+| `docs_replace_text` | `document_id`、非空白的 `find`、`replace`；`match_case` 預設為 `true`。取代所有相符文字，回傳 `occurrencesChanged`。 |
+| `sheets_create` | 必填 `title`，可選 `sheet_names` 陣列（最多 100 個名稱），在「我的雲端硬碟」根目錄建立試算表。 |
+| `sheets_update` | `spreadsheet_id`、A1 格式的 `range`、二維 `values` 陣列，每次最多 10,000 格。`value_input_option` 預設 `RAW`；要解析公式、日期或數字時可選 `USER_ENTERED`。 |
+| `calendar_update_event` | `event_id`、可選 `calendar_id`（預設 `primary`），以及至少一個更新欄位：`summary`、`description`、`location`、RFC3339 格式的 `start`／`end`、`attendees` 電子郵件陣列（`[]` 清空與會者）。每次呼叫都套用與 `calendar_create_event` 相同的 `send` 動作規則及核准路徑，因為 `sendUpdates=none` 仍可能變更與會者的行事曆。通知參數預設維持 `none`，`notify_attendees=true` 改為 `all`。 |
+
+文字最多 20,000 字元；標題最多 1,000 字元，工作表名稱最多 100 字元，A1 範圍最多 1,000 字元。超限輸入會在動作規則、核准或摘要綁定之前拒絕，不會截斷輸入。結果的 `structuredContent` 會包含可供後續呼叫使用的 `documentId` 或 `spreadsheetId` 與 `url`，行事曆則回傳 `id` 與 `htmlLink`。Google 回傳並顯示的內容會先經過注入檢查。建立含內文的文件需要兩次請求；若插入內文失敗，重試前先到雲端硬碟確認文件是否已建立。
+
+要在既有郵件討論串建立回覆草稿，請在 `gmail_create_draft` 原有參數之外提供 `thread_id` 與 `in_reply_to`（原信的 RFC `Message-ID`，例如 `<original@example.com>`），主旨維持原信主旨，可加回覆前綴。可選的 `references` 是包含原信 Message-ID 的 References 鏈，預設使用 `in_reply_to`。工具會設定 Gmail `threadId`、`In-Reply-To` 與 `References`；由呼叫端提供標頭，只有撰寫權限的連線也不必多申請讀取範圍。這項操作仍只存草稿，永遠不寄出。
+
+### 從客戶自架 Google MCP 遷移
+
+將 hcatwn-google 等自架伺服器的技能改用原生工具時，可先依下表對照。這些名稱沒有註冊成別名，遷移前還要核對各伺服器的參數格式。
+
+| 自架工具名稱 | DuDuClaw 原生名稱 |
+|---|---|
+| `calendar_list` | `calendar_list_events` |
+| `gmail_draft` | `gmail_create_draft` |
+
+新增文件、試算表與行事曆編輯流程請使用上方的原生工具名稱。其他自架伺服器可能採不同命名，請以該伺服器的工具清單為準。Google 官方遠端 MCP 保留 Google 自訂的名稱，屬於另一套整合。
 
 ## 讀取個人 Google Chat 對話（選擇啟用）
 
@@ -97,7 +130,7 @@
 2. **整合 → Google → 公司授權代表 → 匯入金鑰檔。** 選服務帳號的 JSON 金鑰檔。gateway 檢查後封存，存成 `<home>/protected/google-service-account.sealed`（只有擁有者能讀）。匯入後請刪掉原本的檔案。面板會顯示要交給超級管理員的用戶端 ID 和權限清單。
 3. **允許代表的網域。** 只有這些網域的同事能被代表（網域完全相同才算，子網域不算）。沒填時只允許和公司共用服務帳號 `subject` 同網域；兩者都沒有就一律不能代表。
 4. **員工頁 → 連線 → 變更 → 代表某位同事（網域委派）**，填同事的公司信箱後儲存。
-5. **測試連線**：用完整權限清單替這位同事取一次權杖，確認 Gmail 回報的是同一個信箱，再逐一服務各取一次權杖。Gmail、日曆、雲端硬碟與工作清單會讀取唯讀端點；試算表、文件、簡報與表單先找得到可讀的範例，再實際 GET 那個服務的資源。找不到範例就標示尚未驗證，不把成功取權杖算成資料可讀。不寄任何東西，也不使用或寫入權杖快取。
+5. **測試連線**：先逐項確認權限；Gmail 可用時確認回報的是同一個信箱，再逐一服務各取一次權杖。Gmail、日曆、雲端硬碟與工作清單會讀取唯讀端點；試算表、文件、簡報與表單先找得到可讀的範例，再實際 GET 那個服務的資源。找不到範例就標示尚未驗證，不把成功取權杖算成資料可讀。不寄任何東西，也不使用或寫入權杖快取。
 
 帳號卡片的「已設定，請測試連線」只表示本地設定已備妥，不能證明封存金鑰可解開或 Google 已接受授權。每次原生委派工具呼叫都會請 gateway 重查當下設定、發問者權限及帳號狀態；只有 gateway 快取簽發結果。
 
@@ -118,7 +151,7 @@ default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設
 allowed_subject_domains = ["customer.com"]
 ```
 
-沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 21 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 26 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
 
 ### 誰能透過這位員工使用這個帳號
 
@@ -149,7 +182,7 @@ allowed_subject_domains = ["customer.com"]
 
 ### 員工專用 API key 與 Google MCP 掛載（v1.76.0）
 
-通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 21 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
+通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 26 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
 
 這些呼叫仍受員工的工具允許／拒絕清單、動作規則、PolicyKernel、階段性授權與人工審批限制。等審批時，已接受的員工、工具與最終參數固定不變。金鑰失效、員工被移除或授權設定改變，只會拒絕，不會改用行程的其他身分或別的帳號。Google 操作由 gateway 執行，外部 MCP 用戶端拿到有大小限制的工具結果，不會拿到 Google bearer。
 
@@ -173,3 +206,33 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 **在本機用 AppleScript 讀 Mail.app／Calendar.app。** 行事曆這條路可行，也已經出貨（`os_calendar_today`），因為查一天的行程是個很小的查詢。信件不行：拿 macOS 15 上一個真實的 54,000 封信件的信箱來測，
 `Mail.inbox.messages.dateReceived()` 花了 17 秒，而
 `whose({dateReceived: …})` 和 `whose({readStatus: false})` 都沒能在 60～90 秒內回應。`inbox.messages` 回傳的順序也不是照時間排的，所以用便宜的索引存取拿到的可能是任意一封舊信。Spotlight 不會替信件建索引（`kMDItemKind == 'Mail Message'` 查不到任何東西），直接讀 `~/Library/Mail` 又需要完整磁碟取用權限（Full Disk Access）加上一套沒有文件、隨版本變動的 SQLite schema。Gmail 在這條路上就改走 Apps Script。
+
+
+## 公司授權與身分選項（v1.85）
+
+網域委派每次只要求工具所屬服務的權限：Gmail、日曆、文件、試算表、雲端硬碟、簡報、表單或工作清單。權杖依服務帳號、代表信箱及排序去重後的權限集合分開快取；其他服務缺少授權，不會阻止原本已授權的服務。測試連線會逐項列出 scope 已授權或尚未確認，再另外檢查各服務。取得權杖不代表資料 API 或範例檔案一定可讀。
+
+開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。目前不支援以本人名義傳送 Chat 訊息。
+
+讓公司授權跟隨 AI 員工的負責人：
+
+1. 將該成員綁定為 Owner；若有多位 Owner，先在「員工 → 連線」指定主要負責人。
+2. 選擇「公司授權：跟隨負責人」（`identity = "delegate:owner"`），並依前述步驟設定允許網域、匯入封存的服務帳號金鑰。
+
+   權限變更後，正在進行中的那一次呼叫仍可能以原負責人身分完成；之後的呼叫都會重新檢查。
+3. 到「整合 → Google → 公司授權代表」，逐列核對 AI 員工、目前負責人、登入信箱與認證狀態，再按確認信箱。一般模式也可操作，但必須是有效管理員，並完成既有的密碼、驗證器二次驗證與工作階段 CSRF 檢查。若信箱是成員自行修改，管理員還須勾選已另外查證的確認項目。
+4. 測試連線。每次呼叫都由 gateway 從目前主要負責人與登入帳號算出代表信箱，不採用工具參數。沒有認證、更換負責人（含換回原人）、變更信箱、負責人停權或資料讀取失敗，都會拒絕使用並要求管理員處理。`requesters` 預設 `owner_only`，排程沿用既有發問者規則；此身分不允許 `fallback = "home"`。受保護模式仍保留更嚴格的租戶路由與發問者限制。
+
+認證使用 `google.delegation.attest_subject {agent_id, subject, user_id, acknowledge_self_set?, csrf_token}`。伺服器會核對畫面上的成員 ID、信箱及目前負責人，稽核記錄操作者、受認證成員與信箱。公司授權不會替本人寫入個人 OAuth 同意。
+
+`owner` 與 `user:<id>` 現在也有管理員「測試連線」按鈕（`google.identity.test {agent_id}`）：只檢查連線紀錄、本人同意、權限與用途涵蓋的工具、OAuth refresh，以及 tokeninfo 的權限比對，不呼叫 Gmail、Drive、Calendar 或其他資料端點。測試會留下操作者與受測成員的稽核紀錄，並透過該成員已驗證的通知目的地通知本人；測試不代表本人同意，也不會自行授權 AI 使用。
+
+Google 由另外管理的外部工具提供時，可設定：
+
+```toml
+[google]
+identity = "external"
+external_server = "合作夥伴 Google MCP" # 選填，最多 120 字
+```
+
+連線分頁會顯示「由外部工具提供」。原生 Google 工具和 `none` 一樣不列出、不能呼叫；這個選項不會自動設定或授權外部伺服器。名稱只作文字顯示，不接受控制字元。舊版解析器遇到未知身分或欄位會拒絕原生 Google 存取，不會退回公司共用帳號。

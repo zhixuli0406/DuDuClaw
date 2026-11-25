@@ -193,7 +193,8 @@ async fn mcp_update_probe_is_admin_only() {
     use duduclaw_auth::{UserContext, models::UserRole};
     let home = tempfile::tempdir().unwrap();
     let h = handler_with_agent(home.path()).await;
-    let employee = UserContext { credential_epoch:0, user_id:"employee".into(), email:"employee@example.invalid".into(),
+    let employee = UserContext {
+            member_key_id: None, credential_epoch:0, user_id:"employee".into(), email:"employee@example.invalid".into(),
         role:UserRole::Employee, agent_access:Default::default(), must_change_password:false,
         team_access:Default::default(), acl_generation:0 };
     for action in ["add", "edit"] {

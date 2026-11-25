@@ -2,6 +2,19 @@
 //! (in-memory protected-key store; no keychain, no network).
 use super::*;
 
+#[test]
+fn owner_delegation_defaults_to_owner_only_and_external_name_is_bounded() {
+    let parse = super::super::google_identity_rpc::parse_identity_params;
+    let owner = parse(&json!({"identity":"delegate:owner"})).unwrap();
+    assert_eq!(owner["requesters"].as_str(), Some("owner_only"));
+    assert!(parse(&json!({"identity":"delegate:owner","fallback":"home"})).is_err());
+    assert!(parse(&json!({"identity":"delegate:owner","requesters":"anyone"})).is_err());
+    let external = parse(&json!({"identity":"external","external_server":"自訂 MCP"})).unwrap();
+    assert_eq!(external["external_server"].as_str(), Some("自訂 MCP"));
+    assert!(parse(&json!({"identity":"external","external_server":"字".repeat(121)})).is_err());
+    assert_eq!(crate::google_identity::resolve::refusal_for(&duduclaw_core::google_identity::Effective::External).unwrap().code, "external");
+}
+
 fn ok(frame: &WsFrame) -> Value {
     match frame {
         WsFrame::Response {
@@ -32,6 +45,7 @@ fn owner_of(agent: &str) -> UserContext {
     let mut access = std::collections::HashMap::new();
     access.insert(agent.to_string(), AccessLevel::Owner);
     UserContext {
+        member_key_id: None,
         credential_epoch: 0,
         user_id: "owner-1".into(),
         email: "owner@c.test".into(),
@@ -438,4 +452,60 @@ async fn personal_mail_read_access_survives_selector_changes_but_never_grants_se
         list["count"], 1,
         "mixed ledgers are filtered per receipt, never granted wholesale"
     );
+}
+
+#[tokio::test]
+async fn identity_test_rechecks_demoted_admin_for_every_selector_and_audits_all_exits() {
+    let (_dir, home) = home_with_agent("bot");
+    let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
+    let admin = db.create_user("test-admin@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    // Keep another administrator so demotion is an ordinary permitted write.
+    db.create_user("other-admin@c.test", "Other", "test-password", UserRole::Admin).unwrap();
+    let stale = db.live_user_context(&admin.id).unwrap().unwrap();
+    let handler = MethodHandler::new(home.clone()).await;
+    handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"diagnostic-fixture-signing-key-only"))).await;
+    db.update_user(&admin.id, None, Some(UserRole::Employee), None).unwrap();
+    let selectors = ["home", "none", "external", "owner", "user:missing", "delegate:owner", "delegate:a@c.test"];
+    for selector in selectors {
+        std::fs::write(home.join("agents/bot/agent.toml"), format!("[google]\nidentity='{selector}'\n")).unwrap();
+        let result = handler.handle_google_identity_test(json!({"agent_id":"bot"}), &stale).await;
+        assert!(err(&result).contains("管理員"), "{selector}: {result:?}");
+    }
+    let finished = db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 100).unwrap();
+    assert_eq!(finished.len(), selectors.len());
+    assert!(finished.iter().all(|row| row.detail.as_deref().unwrap().contains("admin_refused")));
+    db.update_user(&admin.id, None, Some(UserRole::Admin), None).unwrap();
+    for agent in ["", "../bot", "absent"] {
+        assert!(!err(&handler.handle_google_identity_test(json!({"agent_id":agent}), &stale).await).is_empty());
+    }
+    std::fs::write(home.join("agents/bot/agent.toml"), "[google]\nidentity='owner'\n").unwrap();
+    assert!(!err(&handler.handle_google_identity_test(json!({"agent_id":"bot"}), &stale).await).is_empty());
+    let finished = db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 100).unwrap();
+    assert_eq!(finished.len(), selectors.len() + 4);
+    assert_eq!(finished.iter().filter(|row| row.detail.as_deref().unwrap().contains("invalid_agent")).count(), 3);
+    assert_eq!(finished.iter().filter(|row| row.detail.as_deref().unwrap().contains("selection_failed")).count(), 1);
+    assert_eq!(db.query_audit_log(Some(&admin.id), Some("google.identity_test_attempt"), 100).unwrap().len(), selectors.len() + 4);
+}
+
+#[tokio::test]
+async fn identity_test_persistent_notice_failure_refuses_personal_refresh() {
+    let (_dir, home) = home_with_agent("bot");
+    let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
+    let admin = db.create_user("admin@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    let member = db.create_user("member@c.test", "Member", "test-password", UserRole::Employee).unwrap();
+    db.bind_agent(&member.id, "bot", AccessLevel::Owner).unwrap();
+    std::fs::write(home.join("agents/bot/agent.toml"), "[google]\nidentity='owner'\n").unwrap();
+    let handler = MethodHandler::new(home.clone()).await;
+    handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"diagnostic-fixture-signing-key-only"))).await;
+    let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+    let store = crate::events_store::EventBusStore::open(&home).unwrap();
+    rusqlite::Connection::open(home.join("events.db")).unwrap().execute_batch(
+        "CREATE TRIGGER refuse_notice BEFORE INSERT ON person_notices BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;"
+    ).unwrap();
+    let result = handler.handle_google_identity_test(json!({"agent_id":"bot"}), &ctx).await;
+    assert!(err(&result).contains("站內通知"), "refresh must not be attempted: {result:?}");
+    assert!(store.person_notices(&member.id).await.unwrap().is_empty());
+    assert!(crate::notify_push::person_notice_test::take(&home).is_empty());
+    let finished = db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 10).unwrap();
+    assert!(finished[0].detail.as_deref().unwrap().contains("notice_failed"));
 }

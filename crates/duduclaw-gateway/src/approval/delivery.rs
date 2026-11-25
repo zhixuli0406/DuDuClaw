@@ -219,6 +219,7 @@ impl TrustedReplyTarget {
         let mut body = match self.context.channel.as_str() {
             "telegram" => serde_json::json!({"chat_id":self.chat_id,"text":text}),
             "slack" => serde_json::json!({"channel":self.chat_id,"text":text}),
+            "googlechat" => serde_json::json!({"text":text}),
             "discord" => serde_json::json!({"content":text,"allowed_mentions":{"parse":[]}}),
             "line" => {
                 serde_json::json!({"to":self.chat_id,"messages":[{"type":"text","text":text}]})
@@ -232,6 +233,8 @@ impl TrustedReplyTarget {
                 }
             } else if self.context.channel == "slack" {
                 body["thread_ts"] = serde_json::json!(thread);
+            } else if self.context.channel == "googlechat" {
+                body["thread"] = serde_json::json!({"name": thread});
             }
         }
         body
@@ -272,6 +275,7 @@ impl ChannelSender for BoundDecisionSender {
             "line" => "line",
             "slack" => "slack",
             "discord" => "discord",
+            "googlechat" => "googlechat",
             _ => "unsupported",
         }
     }
@@ -306,6 +310,9 @@ impl ChannelSender for BoundDecisionSender {
                     ),
                 ))
                 .header("Authorization", format!("Bot {}", t.token)),
+            "googlechat" if crate::google_workspace::chat_read::valid_space(&t.chat_id) => self.http
+                .post(format!("https://chat.googleapis.com/v1/{}/messages", t.chat_id))
+                .bearer_auth(&t.token),
             _ => return Err(ChannelSendError("unsupported exact account route".into())),
         };
         req = req.json(&if self.watch_notice { t.watch_body(text) } else { t.body(text) });

@@ -1,0 +1,110 @@
+//! RM-213 credential entry and per-call gates. No cached config/credential authority.
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
+
+use duduclaw_auth::{UserContext, UserDb};
+use duduclaw_auth::member_keys::MemberKeyLookup;
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct Config {
+    pub enabled: bool,
+    pub rate_per_minute: u32,
+}
+impl Default for Config {
+    fn default() -> Self { Self { enabled: false, rate_per_minute: 120 } }
+}
+impl Config {
+    fn parse(text: &str) -> Option<Self> {
+        let root: toml::Table = toml::from_str(text).ok()?;
+        let config: Self = match root.get("member_api_keys") {
+            None => Self::default(),
+            Some(section) => section.clone().try_into().ok()?,
+        };
+        (config.rate_per_minute > 0 && config.rate_per_minute <= 60_000).then_some(config)
+    }
+}
+pub(crate) fn config(home: &Path) -> Config {
+    std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|s| Config::parse(&s)).unwrap_or_default()
+}
+
+pub(crate) fn authenticate(home: &Path, db: &UserDb, raw: &str) -> Result<UserContext, String> {
+    if !config(home).enabled { return Err("member keys disabled".into()); }
+    match db.member_key_lookup(raw)? {
+        MemberKeyLookup::Valid { token_id, user_id } => refresh_id(home, db, &token_id, &user_id),
+        _ => Err("member key invalid".into()),
+    }
+}
+fn refresh_id(home: &Path, db: &UserDb, id: &str, user: &str) -> Result<UserContext, String> {
+    if !config(home).enabled { return Err("member keys disabled".into()); }
+    db.member_key_context(id, user)
+        .map(|ctx| crate::machine_employee::without_restricted_access(home, ctx))
+}
+pub(crate) fn refresh(home: &Path, db: &UserDb, ctx: &UserContext) -> Result<UserContext, String> {
+    refresh_authority(home, db, ctx).map(|live| live.context)
+}
+pub(crate) fn refresh_authority(home: &Path, db: &UserDb, ctx: &UserContext)
+    -> Result<duduclaw_auth::member_keys::MemberKeyAuthority, String> {
+    let id = ctx.member_key_id.as_deref().ok_or("member key invalid")?;
+    if !config(home).enabled { return Err("member keys disabled".into()); }
+    let mut live = db.member_key_authority(id, &ctx.user_id)?;
+    live.context = crate::machine_employee::without_restricted_access(home, live.context);
+    if live.context.credential_epoch != ctx.credential_epoch { return Err("member key invalid".into()); }
+    Ok(live)
+}
+
+#[derive(Default)]
+struct Limiter { entries: HashMap<(std::path::PathBuf, String), (Instant, u32)> }
+impl Limiter {
+    fn allow(&mut self, home: &Path, id: &str, limit: u32, now: Instant) -> bool {
+        self.entries.retain(|_, (start, _)| now.duration_since(*start) < Duration::from_secs(60));
+        let key = (home.to_path_buf(), id.to_owned());
+        if self.entries.len() >= 4096 && !self.entries.contains_key(&key) { return false; }
+        let (_, count) = self.entries.entry(key).or_insert((now, 0));
+        if *count >= limit { return false; }
+        *count += 1;
+        true
+    }
+}
+static LIMITER: LazyLock<Mutex<Limiter>> = LazyLock::new(|| Mutex::new(Limiter::default()));
+
+/// Called once per RPC/HTTP operation/chat command, never for output frames.
+pub(crate) fn record_call(home: &Path, db: &UserDb, ctx: &UserContext, method: &str, write: bool) -> Result<(), String> {
+    let live = refresh(home, db, ctx)?;
+    let id = live.member_key_id.as_deref().ok_or("member key invalid")?;
+    let settings = config(home);
+    if !settings.enabled { return Err("member keys disabled".into()); }
+    let allowed = LIMITER.lock().map_err(|_| "member key limiter unavailable")?
+        .allow(home, id, settings.rate_per_minute, Instant::now());
+    db.member_key_record_call(id, &live.user_id, if allowed { "ok" } else { "rate_limited" }, 0, None, chrono::Utc::now())?;
+    if !allowed { return Err("member_key_rate_limited".into()); }
+    if write { db.member_key_record_write(id, &live.user_id, method)?; }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn config_fails_closed() {
+        for text in ["", "[member_api_keys]\nenabled='true'", "[member_api_keys]\nenabled=true\nrate_per_minute=0", "bad ["] {
+            assert!(!Config::parse(text).unwrap_or_default().enabled);
+        }
+        assert!(Config::parse("[member_api_keys]\nenabled=true").unwrap().enabled);
+        assert_eq!(Config::default().rate_per_minute, 120);
+    }
+    #[test]
+    fn per_key_rate_and_map_are_bounded() {
+        let mut limiter = Limiter::default();
+        let now = Instant::now();
+        assert!(limiter.allow(Path::new("a"), "one", 1, now));
+        assert!(!limiter.allow(Path::new("a"), "one", 1, now));
+        for i in 1..4096 { assert!(limiter.allow(Path::new("a"), &i.to_string(), 1, now)); }
+        assert!(!limiter.allow(Path::new("a"), "overflow", 1, now));
+        assert!(limiter.allow(Path::new("a"), "one", 1, now + Duration::from_secs(60)));
+    }
+}

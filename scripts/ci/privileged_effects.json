@@ -4,6 +4,30 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-gateway/src/run_identity.rs::tests::dedicated_listener_requires_lock_and_binds_only_ipv4_loopback",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command fixture verifying dedicated loopback identity and revocable runtime proofs; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity.rs::tests::runtime_env_and_pty_proofs_are_distinct_and_revoked",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command fixture verifying dedicated loopback identity and revocable runtime proofs; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
       "apis": {
         "command_constructor": 1
@@ -752,7 +776,7 @@
       "rationale": "Regression fixture: legacy command/PTY construction, native byte equivalence, backend lifecycle or protocol behavior; not a production execution entry."
     },
     {
-      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_mcp_proxy_scoped",
+      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_mcp_proxy_scoped_with_startup_input",
       "apis": {
         "backend_spawn": 1
       },
@@ -762,6 +786,18 @@
       "identity": "employee",
       "migration": "backend",
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::startup_error_frame",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "employee",
+      "migration": "not_process",
+      "rationale": "Named mcp-startup-refusal Rust thread reads the first request on a terminal MCP startup refusal path; no OS child process is launched."
     },
     {
       "symbol": "crates/duduclaw-cli/src/mcp_proxy.rs::run_proxy_io_monitored",

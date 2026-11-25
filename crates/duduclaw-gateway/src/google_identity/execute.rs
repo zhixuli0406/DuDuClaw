@@ -202,7 +202,7 @@ async fn serve(
         return pending.execute_native(request.arguments.clone()).await;
     }
     if matches!(
-        duduclaw_core::google_identity::effective_for(&state.home, Some(agent)).effective,
+        crate::google_identity::delegate_owner::effective_for(&state.home, Some(agent)).effective,
         duduclaw_core::google_identity::Effective::Personal { .. }
     ) {
         return Err(Refusal::hard(

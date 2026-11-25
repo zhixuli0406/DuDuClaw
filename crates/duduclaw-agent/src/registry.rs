@@ -76,6 +76,9 @@ impl AgentRegistry {
     ///
     /// Directories whose name starts with `_` (e.g. `_defaults`) are skipped.
     pub async fn scan(&mut self) -> Result<()> {
+        if let Some(home) = self.agents_dir.parent() {
+            duduclaw_core::employee_incarnation::reconcile(home)?;
+        }
         // Load global skills from sibling `skills/` directory
         let global_skills_dir = self.agents_dir.parent()
             .map(|home| home.join("skills"))

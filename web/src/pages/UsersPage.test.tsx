@@ -246,6 +246,28 @@ describe('UsersPage — primary AI', () => {
   } as UserDetail;
   const preview = [{ user_id: member.id, display_name: member.display_name, agent_id: 'first-ai' }];
 
+  it('lists shared-primary conflicts for administrators', async () => {
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [member] };
+      if (method === 'users.avatar_conflicts') return { conflicts: [{ agent_id: 'shared-ai', user_ids: ['member', 'another-member'] }] };
+      return { identities: [], departments: [], agents: [] };
+    });
+    renderWithProviders(<UsersPage />);
+    expect(await screen.findByText('AI avatar conflicts to resolve')).toBeInTheDocument();
+    expect(screen.getByText('shared-ai: Member, another-member')).toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.avatar_conflicts');
+  });
+
+  it('clears an assigned avatar with a separate save action', async () => {
+    const user = userEvent.setup();
+    renderWithProviders(<EditUserDialog user={{ ...member, avatar_agent_id: 'first-ai', primary_agent_id: 'first-ai' }} users={[member]} onClose={vi.fn()} onUpdated={vi.fn()} />);
+    await user.click(screen.getByRole('combobox', { name: 'AI avatar' }));
+    await user.click(await screen.findByRole('option', { name: 'None' }));
+    await user.click(screen.getByRole('button', { name: 'Set AI avatar' }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_avatar', { user_id: 'member', agent_id: null });
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'users.update')).toBe(false);
+  });
+
   it('previews the named members and repairs only after confirmation', async () => {
     const user = userEvent.setup();
     mockWsClient.call.mockImplementation(async (method: string) => {
@@ -257,24 +279,24 @@ describe('UsersPage — primary AI', () => {
     await user.click(await screen.findByRole('button', { name: 'Set to their first AI' }));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByText(/Member → first-ai/)).toBeInTheDocument();
-    expect(within(dialog).getByText('Personal AI for these members must be set by the members themselves.')).toBeInTheDocument();
+    expect(within(dialog).getByText('Some Personal AI employees cannot be assigned here. Contact an administrator to check.')).toBeInTheDocument();
     expect(mockWsClient.call).toHaveBeenCalledWith('users.repair_primary_agents', {});
     expect(mockWsClient.call).not.toHaveBeenCalledWith('users.repair_primary_agents', { preview_digest: 'digest-1' });
     await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
     expect(mockWsClient.call).toHaveBeenCalledWith('users.repair_primary_agents', { preview_digest: 'digest-1' });
   });
 
-  it('offers only eligible bindings and saves the selected primary for that member', async () => {
+  it('offers only eligible bindings and saves the selected avatar for that member', async () => {
     const user = userEvent.setup();
     const onUpdated = vi.fn();
     renderWithProviders(<EditUserDialog user={{ ...member, primary_personal_excluded: true, bindings: [...member.bindings, { user_id: 'member', agent_name: 'private-ai', access_level: 'owner', bound_at: '' }] }} users={[member]} onClose={vi.fn()} onUpdated={onUpdated} />);
-    await user.click(screen.getByRole('combobox', { name: 'Primary AI' }));
+    await user.click(screen.getByRole('combobox', { name: 'AI avatar' }));
     expect(screen.queryByRole('option', { name: 'viewer-ai' })).not.toBeInTheDocument();
     expect(screen.queryByRole('option', { name: 'private-ai' })).not.toBeInTheDocument();
-    expect(screen.getByText('Personal AI for these members must be set by the members themselves.')).toBeInTheDocument();
+    expect(screen.getByText('Some Personal AI employees cannot be assigned here. Contact an administrator to check.')).toBeInTheDocument();
     await user.click(await screen.findByRole('option', { name: 'first-ai' }));
-    await user.click(screen.getByRole('button', { name: 'Set primary AI' }));
-    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_primary_agent', { agent_id: 'first-ai', user_id: 'member' });
+    await user.click(screen.getByRole('button', { name: 'Set AI avatar' }));
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.set_avatar', { agent_id: 'first-ai', user_id: 'member' });
     expect(onUpdated).toHaveBeenCalled();
   });
 

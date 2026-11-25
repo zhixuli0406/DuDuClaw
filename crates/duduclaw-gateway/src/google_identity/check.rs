@@ -1,7 +1,8 @@
 //! `google.identity.test {agent_id}`: prove a delegate works without sending
 //! anything (design §7.3). Every step mints fresh (the cache is bypassed and
 //! never written), reads only GET endpoints, and reports one line per check.
-//! Document services use a Drive metadata lookup and then their own API.
+//! Explicit mailbox diagnostics use Drive metadata and service APIs.
+//! `delegate:owner` exits through OAuth tokeninfo only, without data reads.
 
 use std::path::Path;
 
@@ -12,11 +13,11 @@ use serde_json::Value;
 use super::requester_gate::People;
 use super::resolve::{mint_delegate, precheck, refusal_for};
 use crate::google_service_account::CacheMode;
-use crate::google_workspace::{self as gw, REQUIRED_SCOPES};
+use crate::google_workspace as gw;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Step {
-    pub id: &'static str,
+    pub id: String,
     pub label: &'static str,
     pub ok: bool,
     pub detail: String,
@@ -80,10 +81,50 @@ const SERVICES: &[(&str, &str, &[&str], Option<&str>)] = &[
 
 fn step(id: &'static str, label: &'static str, ok: bool, detail: impl Into<String>) -> Step {
     Step {
-        id,
+        id: id.into(),
         label,
         ok,
         detail: detail.into(),
+    }
+}
+
+/// Revalidate the configured identity around every diagnostic request. In
+/// particular an owner change or revoked attestation must stop further reads.
+struct DiagnosticIdentity<'a> {
+    home: &'a Path,
+    agent: &'a str,
+    email: &'a str,
+    expected: &'a gi::EffectiveIdentity,
+    configured: &'a gi::EffectiveIdentity,
+    people: &'a dyn People,
+}
+
+impl DiagnosticIdentity<'_> {
+    fn verify(&self) -> Result<(), super::Refusal> {
+        if gi::effective_for(self.home, Some(self.agent)) != *self.configured
+            || super::delegate_owner::effective_for(self.home, Some(self.agent)) != *self.expected {
+            return Err(super::Refusal::hard("identity_changed", "身分、負責人或信箱認證已變更，請管理員重新確認。"));
+        }
+        precheck(self.home, self.email, self.people)?;
+        if crate::runtime_readiness::is_protected_linux() {
+            protected_subject_gate(self.home, self.agent, self.people)
+                .map_err(|message| super::Refusal::hard("attestation_required", message))?;
+        }
+        Ok(())
+    }
+
+    async fn mint(&self, scopes: &[&str]) -> Result<crate::google_service_account::MintedToken, super::Refusal> {
+        self.verify()?;
+        let result = mint_delegate(self.home, self.email, scopes, CacheMode::Bypass).await;
+        self.verify()?;
+        result
+    }
+
+    async fn get(&self, token: &str, url: &str) -> Result<Value, String> {
+        self.verify().map_err(|r| r.message_zh)?;
+        let result = gw::api_get(token, url).await.map_err(|e| e.to_string());
+        self.verify().map_err(|r| r.message_zh)?;
+        result
     }
 }
 
@@ -91,6 +132,7 @@ fn step(id: &'static str, label: &'static str, ok: bool, detail: impl Into<Strin
 /// sample id is returned to the dashboard. No sample means unverified, never
 /// that issuing a token proved the service's data API works.
 async fn resource_probe(
+    identity: &DiagnosticIdentity<'_>,
     id: &str,
     discovery_token: &str,
     service_token: &str,
@@ -125,7 +167,7 @@ async fn resource_probe(
         .append_pair("q", &format!("trashed = false and mimeType = '{mime}'"))
         .append_pair("pageSize", "1")
         .append_pair("fields", "files(id)");
-    let files = gw::api_get(discovery_token, lookup.as_str())
+    let files = identity.get(discovery_token, lookup.as_str())
         .await
         .map_err(|_| "無法列出可用的驗證檔案；尚未確認服務資料存取。")?;
     let sample = files.get("files").and_then(Value::as_array).and_then(|rows| rows.first())
@@ -139,7 +181,7 @@ async fn resource_probe(
     {
         return Err("Google 回傳的驗證檔案識別碼無法辨識，尚未確認服務資料存取。".into());
     }
-    let result = gw::api_get(
+    let result = identity.get(
         service_token,
         &format!("{endpoint}/{sample}?fields={field}"),
     )
@@ -162,8 +204,14 @@ fn protected_subject_gate(home: &Path, agent: &str, people: &dyn People) -> Resu
 
 /// Run the checks for `agent`. Stops at the first check later ones depend on.
 pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<String>, Vec<Step>) {
+    let configured = gi::effective_for(home, Some(agent));
+    let effective = super::delegate_owner::effective_for(home, Some(agent));
+    run_selected(home, agent, people, &configured, &effective).await
+}
+
+pub(crate) async fn run_selected(home: &Path, agent: &str, people: &dyn People,
+    configured: &gi::EffectiveIdentity, eff: &gi::EffectiveIdentity) -> (Option<String>, Vec<Step>) {
     let mut out = Vec::new();
-    let eff = gi::effective_for(home, Some(agent));
     let email = match &eff.effective {
         Effective::Delegate { email } => email.clone(),
         Effective::Home => {
@@ -207,84 +255,73 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
         out.push(step("attestation", "管理員確認", true, "已符合受保護模式的代表規則"));
     }
 
-    let full = match mint_delegate(home, &email, REQUIRED_SCOPES, CacheMode::Bypass).await {
-        Ok(t) => {
-            out.push(step(
-                "authorize",
-                "授權清單完整",
-                true,
-                "用全部權限向 Google 取得權杖成功",
-            ));
-            t
-        }
-        Err(r) => {
-            let id = if r.code == "credential_protection" || r.code == "delegate_unavailable" {
-                "key"
-            } else {
-                "authorize"
-            };
-            let label = if id == "key" {
-                "服務帳號金鑰"
-            } else {
-                "授權清單完整"
-            };
-            out.push(step(id, label, false, r.message_zh));
+    let identity = DiagnosticIdentity { home, agent, email: &email, expected: eff, configured, people };
+    if configured.effective == Effective::DelegateOwner {
+        // No Workspace data endpoint is reachable from this branch.
+        let client_id = match super::delegation_key::info(home) {
+            Ok(Some(info)) => info.client_id,
+            _ => None,
+        };
+        let Some(client_id) = client_id else {
+            out.push(step("tokeninfo", "Google 權限", false, "無法確認服務帳號用戶端。"));
             return (Some(email), out);
-        }
-    };
-
-    match gw::api_get(
-        &full.access_token,
-        "https://gmail.googleapis.com/gmail/v1/users/me/profile",
-    )
-    .await
-    {
-        Ok(v) => {
-            let got = v
-                .get("emailAddress")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            if got == email {
-                out.push(step(
-                    "identity_match",
-                    "確認是這個人",
-                    true,
-                    format!("Google 回報的帳號是 {email}"),
-                ));
-            } else {
-                out.push(step(
-                    "identity_match",
-                    "確認是這個人",
-                    false,
-                    format!(
-                        "Google 回報的帳號（{}）和設定的 {email} 不一致，已停止。",
-                        duduclaw_core::truncate_chars(&got, 120)
-                    ),
-                ));
-                return (Some(email), out);
+        };
+        for &(service, scopes) in super::delegated_scopes::SERVICES {
+            if service == "chat" && !gw::chat_read_enabled(home) { continue; }
+            for scope in scopes {
+                let result: Result<(), String> = async {
+                    let token = identity.mint(&[*scope]).await.map_err(|r| r.message_zh)?;
+                    identity.verify().map_err(|r| r.message_zh)?;
+                    let granted = crate::google_personal::oauth::tokeninfo(&token.access_token, &client_id).await
+                        .map_err(|_| "無法確認 tokeninfo 權限或用戶端。".to_string())?;
+                    identity.verify().map_err(|r| r.message_zh)?;
+                    if !granted.iter().any(|s| s.as_str() == *scope) { return Err("Google 未回報要求的權限。".into()); }
+                    Ok(())
+                }.await;
+                out.push(Step { id: format!("scope:{scope}"), label: "Google 權限", ok: result.is_ok(),
+                    detail: result.err().unwrap_or_else(|| format!("{service}: {scope} — tokeninfo 已確認；未讀取資料。")) });
+                if identity.verify().is_err() { return (Some(email), out); }
             }
         }
-        Err(e) => {
-            out.push(step(
-                "identity_match",
-                "確認是這個人",
-                false,
-                format!(
-                    "讀取 Gmail 帳號資料失敗：{}",
-                    duduclaw_core::truncate_chars(&e.to_string(), 200)
-                ),
-            ));
+        return (Some(email), out);
+    }
+
+    // Each scope is independently requested so a missing Chat/Forms grant
+    // cannot prevent diagnostics for already authorized services.
+    for &(service, scopes) in super::delegated_scopes::SERVICES {
+        if service == "chat" && !gw::chat_read_enabled(home) { continue; }
+        for scope in scopes {
+            let result = identity.mint(&[*scope]).await;
+            out.push(Step { id: format!("scope:{scope}"), label: "Google 權限",
+                ok: result.is_ok(), detail: match result {
+                    Ok(_) => format!("{service}: {scope} — 已授權"),
+                    Err(r) => format!("{service}: {scope} — 未確認授權：{}", r.message_zh),
+                } });
+        }
+    }
+
+    if let Ok(token) = identity.mint(&["https://www.googleapis.com/auth/gmail.readonly"]).await {
+        match identity.get(&token.access_token, "https://gmail.googleapis.com/gmail/v1/users/me/profile").await {
+            Ok(value) => {
+                let matched = value.get("emailAddress").and_then(Value::as_str)
+                    .and_then(|raw| gi::normalize_email(raw).ok()).as_deref() == Some(email.as_str());
+                out.push(step("identity_match", "確認是這個人", matched,
+                    if matched { "Google 回報的帳號與委派主體相同。" } else { "Google 回報的帳號與委派主體不符，已停止測試。" }));
+                if !matched { return (Some(email), out); }
+            }
+            Err(_) => out.push(step("identity_match", "確認是這個人", false, "無法讀取 Gmail 帳號資料；其他服務會分別檢查。")),
         }
     }
 
     for &(id, label, scopes, probe) in SERVICES {
-        let result = match mint_delegate(home, &email, scopes, CacheMode::Bypass).await {
+        let result = match identity.mint(scopes).await {
             Err(r) => Err(r.message_zh),
             Ok(t) => match probe {
-                None => resource_probe(id, &full.access_token, &t.access_token).await,
-                Some(url) => gw::api_get(&t.access_token, url)
+                None => match identity.mint(&["https://www.googleapis.com/auth/drive.readonly"]).await {
+                    Ok(discovery) => resource_probe(&identity, id, &discovery.access_token, &t.access_token).await,
+                    Err(r) => Err(format!("檔案探索需要 Drive 權限：{}", r.message_zh)),
+                },
+                Some(url) => identity.get(&t.access_token, url)
                     .await
                     .map(|_| "可以使用".to_string())
                     .map_err(|e| {
@@ -299,6 +336,14 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
             Ok(d) => step(id, label, true, d),
             Err(d) => step(id, label, false, d),
         });
+    }
+    if gw::chat_read_enabled(home) {
+        let result = match identity.mint(gw::CHAT_READ_SCOPES).await {
+            Ok(token) => identity.get(&token.access_token, "https://chat.googleapis.com/v1/spaces?pageSize=1")
+                .await.map(|_| ()).map_err(|_| "Google Chat API 無法使用。".to_string()),
+            Err(r) => Err(r.message_zh),
+        };
+        out.push(step("chat", "Google Chat", result.is_ok(), result.err().unwrap_or_else(|| "可以讀取聊天室清單。".into())));
     }
     (Some(email), out)
 }

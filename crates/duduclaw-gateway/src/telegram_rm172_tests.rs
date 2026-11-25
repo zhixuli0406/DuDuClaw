@@ -381,3 +381,18 @@ async fn rm172_shared_bot_binding_mode_still_guides_an_unverified_user() {
         .unwrap();
     assert_eq!(route(&f, true).await.as_deref(), Some("<guide>"));
 }
+
+#[tokio::test]
+async fn rm212_shared_bot_uses_avatar_and_rechecks_its_binding() {
+    let f = fixture(true).await;
+    let admin = f.db.create_user("admin@rm212.test", "Admin", "password123", UserRole::Admin).unwrap();
+    f.db.bind_agent(&f.user_id, "sales-rep", AccessLevel::Operator).unwrap();
+    f.db.set_avatar_as(&admin.id, &f.user_id, Some("sales-rep")).unwrap();
+    assert_eq!(route(&f, true).await.as_deref(), Some("sales-rep"));
+    assert_eq!(route(&f, false).await, None, "groups retain their existing route");
+    f.db.unbind_agent(&f.user_id, "sales-rep").unwrap();
+    assert_eq!(route(&f, true).await, None, "an invalid avatar cannot route to another employee");
+    f.db.set_avatar_as(&admin.id, &f.user_id, None).unwrap();
+    f.db.set_primary_agent(&f.user_id, Some("finance")).unwrap();
+    assert_eq!(route(&f, true).await.as_deref(), Some("finance"));
+}

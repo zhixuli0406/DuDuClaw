@@ -105,6 +105,15 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
         ]
     );
     assert_eq!(ml["enabled"].as_bool(), Some(true));
+    for name in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
+        duduclaw_core::run_credential::ENV_IDENTITY_URL] {
+        let placeholder = format!("${{{name}:-}}");
+        for server in ["masterlink", "duduclaw"] {
+            assert_eq!(cfg["mcp_servers"][server]["env"][name].as_str(), Some(placeholder.as_str()));
+        }
+    }
+    assert!(!raw.contains(duduclaw_core::run_credential::PREFIX));
+
     assert_eq!(ml["env"]["DUDUCLAW_AGENT_TOKEN"].as_str(), Some("${DUDUCLAW_AGENT_TOKEN:-}"));
     assert_eq!(ml["env"]["DUDUCLAW_TURN_ID"].as_str(), Some("${DUDUCLAW_TURN_ID:-}"));
     assert_eq!(ml["env"][duduclaw_core::egress_guard::ENV_TURN_ALIAS].as_str(), Some("${DUDUCLAW_EGRESS_TURN_ID:-}"));
@@ -434,6 +443,28 @@ async fn a_symlinked_dot_grok_is_refused() {
         "{err}"
     );
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[test]
+fn live_run_identity_values_are_always_placeholders() {
+    use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, ENV_IDENTITY_URL, RunCredential};
+    let credential = RunCredential::from_bytes(&[29; 32]);
+    let server = ScopedServer {
+        command: "/opt/duduclaw".into(), args: vec!["mcp-proxy".into()],
+        proxy_env: BTreeMap::from([
+            (ENV_RUN_CREDENTIAL.into(), credential.expose().to_string()),
+            (ENV_IDENTITY_URL.into(), "http://127.0.0.1:12345/private-test".into()),
+        ]),
+        upstream_env: "{}".into(),
+    };
+    let entry = live_entry(&server);
+    let raw = toml::to_string(&entry).unwrap();
+    assert!(!raw.contains(credential.expose()));
+    assert!(!raw.contains("private-test"));
+    for name in [ENV_RUN_CREDENTIAL, ENV_IDENTITY_URL] {
+        let placeholder = format!("${{{name}:-}}");
+        assert_eq!(entry["env"][name].as_str(), Some(placeholder.as_str()));
+    }
 }
 
 #[test]

@@ -45,6 +45,14 @@ impl MethodHandler {
         caller: Option<&UserContext>,
         session: Option<&UserContext>,
     ) -> WsFrame {
+        // Also protect direct callers, before registry, locks or channel side effects.
+        if caller.is_some_and(|ctx| ctx.member_key_id.is_some())
+            || session.is_some_and(|ctx| ctx.member_key_id.is_some()) {
+            if let Err(message) = super::member_contract::member_key_agent_update_params(&params) {
+                return WsFrame::Response { id: String::new(), ok: false, payload: None,
+                    error: Some(json!({"code": "member_key_forbidden_field", "message": message})) };
+            }
+        }
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),

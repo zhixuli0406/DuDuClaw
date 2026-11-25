@@ -283,6 +283,9 @@ export interface ChannelStatus {
 /** W2-2 (E1) — a channel's behavior settings (`channels.config_get/set`). */
 export interface ChannelConfigSettings {
   dm_reply_placement: 'main' | 'thread';
+  /** Admin-only, Google Chat global scope. */
+  shared_bot_binding?: boolean;
+  unbound_reply?: string;
   mention_only: boolean;
   auto_thread: boolean;
   allowed_channels: string[];
@@ -2617,6 +2620,7 @@ export interface NewMemberInput {
   role: 'employee' | 'manager' | 'admin';
   department?: string;
   primary_agent_id: string;
+  avatar_agent_id?: string | null;
   bindings: Array<{ agent_name: string; access_level: 'operator' | 'viewer' }>;
   invite: boolean;
 }
@@ -2627,7 +2631,10 @@ export interface CreateMemberResult {
   error?: string;
 }
 
+export interface AvatarConflict { agent_id: string; user_ids: string[] }
+
 export interface UserInfo {
+  avatar_agent_id?: string | null;
   primary_agent_id?: string | null;
   id: string;
   email: string;
@@ -5656,6 +5663,19 @@ export interface McpKeyCreateResult {
 // ── RM-064: read-only status credentials (external work-status query) ──
 
 /** One `ddc_status_…` credential as listed. Never carries the secret. */
+export interface MemberKeyInfo {
+  id: string;
+  name: string;
+  created_at: string;
+  expires_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
+  active: boolean;
+  user_id?: string;
+  user_email?: string | null;
+}
+export interface MemberKeyCreated { key: MemberKeyInfo; secret: string }
+
 export interface StatusTokenInfo {
   id: string;
   name: string;
@@ -6283,8 +6303,9 @@ export interface GoogleCredentialsStatus {
 // ── Per-employee Google identity (B2a) ──
 // Which Google account each AI employee acts as. Never carries a key or a
 // token: the delegation key is sealed in the gateway.
-export type GoogleIdentityKind = 'home' | 'none' | 'delegate' | 'owner' | 'user' | 'invalid';
+export type GoogleIdentityKind = 'home' | 'none' | 'external' | 'delegate_owner' | 'delegate' | 'owner' | 'user' | 'invalid';
 export interface AgentGoogleIdentity {
+  external_server?: string | null;
   agent_id: string;
   kind: GoogleIdentityKind;
   identity?: string | null;
@@ -6299,7 +6320,7 @@ export interface AgentGoogleIdentity {
   fallback: 'none' | 'home';
   requesters: 'bound_people' | 'owner_only' | 'anyone';
   /** `ready` means locally configured, not a successful unseal or Google probe. */
-  state: 'home' | 'none' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
+  state: 'home' | 'none' | 'external' | 'ready' | 'blocked' | 'configured' | 'needs_reconnect' | 'not_connected' | 'awaiting_consent' | 'consent_declined' | 'person_inactive' | 'no_owner' | 'ambiguous_owner';
   /** zh-TW reason when blocked. */
   message: string;
   /** Protected mode only: the D-5 standing of a tenant-source subject (`null` elsewhere). */
@@ -6349,6 +6370,7 @@ export interface GoogleDelegationKeyInfo {
   key_id: string;
 }
 export interface GoogleDelegationStatus {
+  step_up?: ProtectedStepUpState;
   protection: CredentialProtectionStatus;
   key: GoogleDelegationKeyInfo | null;
   key_error: string | null;
@@ -6486,6 +6508,7 @@ export interface ProtectedWebsiteCredential {
 }
 // ── end v1.81 F5 part A types ────────────────────────────────────────────────
 export interface GoogleIdentitySetInput {
+  external_server?: string;
   agent_id: string;
   /** `home`, `none` or `delegate:<email>`. */
   identity: string;
@@ -6551,6 +6574,7 @@ export interface MyMemoryForgetResult {
 }
 
 export interface PersonalGoogleStatus {
+  notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
@@ -8295,6 +8319,7 @@ export const api = {
         // Structured [external_status] enabled (RM-064; absent ⇒ false).
         // Written back through `updateConfig({ external_status_enabled })`.
         external_status_enabled?: boolean;
+        member_api_keys_enabled?: boolean;
         // Structured [notify] daily_digest for the daily-digest toggle
         // (W2-8; absent ⇒ false/"09:00", matching `DigestConfig::default()`).
         daily_digest_enabled?: boolean;
@@ -9679,6 +9704,14 @@ export const api = {
       client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
   /** RM-064: the caller's own read-only status credentials. */
+  memberKeys: {
+    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa' }>,
+    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }) =>
+      client.call('me.member_keys.create', { name, expires_in_days, ...proof }) as Promise<MemberKeyCreated>,
+    revoke: (id: string) => client.call('me.member_keys.revoke', { id }) as Promise<{ revoked: boolean }>,
+    adminList: (cursor?: string, limit = 25) => client.call('member_keys.admin_list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null }>,
+    adminRevoke: (id: string) => client.call('member_keys.admin_revoke', { id }) as Promise<{ revoked: boolean }>,
+  },
   statusTokens: {
     list: () => client.call('me.status_tokens.list') as Promise<StatusTokenListResult>,
     create: (name: string) =>
@@ -9876,6 +9909,10 @@ export const api = {
       }>,
     repairPrimaryAgents: (previewDigest?: string) =>
       client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
+    avatarConflicts: () =>
+      client.call('users.avatar_conflicts') as Promise<{ conflicts: AvatarConflict[] }>,
+    setAvatar: (userId: string, agentId: string | null) =>
+      client.call('users.set_avatar', { user_id: userId, agent_id: agentId }) as Promise<{ avatar_agent_id: string | null }>,
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>

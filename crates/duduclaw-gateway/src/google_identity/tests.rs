@@ -11,7 +11,7 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 use serde_json::{Value, json};
 
 use super::requester_gate::{NoPeople, People, Person};
-use super::resolve::{Resolved, resolve_person};
+use super::resolve::Resolved;
 use super::*;
 
 #[path = "execute_tests.rs"]
@@ -158,6 +158,7 @@ async fn closed_refresh_endpoint(
     token_endpoint(headers, axum::Form(form)).await
 }
 async fn gmail_profile(headers: axum::http::HeaderMap) -> axum::Json<Value> {
+    service_reads().lock().unwrap().push((fixture_account(&headers), "gmail/profile".into()));
     let bearer = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -172,6 +173,12 @@ async fn gmail_profile(headers: axum::http::HeaderMap) -> axum::Json<Value> {
     axum::Json(json!({"emailAddress": reported}))
 }
 
+async fn owner_tokeninfo(axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>) -> axum::Json<Value> {
+    let subject = query.get("access_token").and_then(|s| s.strip_prefix("tok:")).unwrap_or("");
+    let scope = seen_for(subject).last().map(|s| s.scope.clone()).unwrap_or_default();
+    axum::Json(json!({"aud":"1234567890","scope":scope}))
+}
+
 async fn ok_json() -> axum::Json<Value> {
     axum::Json(json!({"items": []}))
 }
@@ -179,6 +186,14 @@ async fn ok_json() -> axum::Json<Value> {
 fn service_reads() -> &'static Mutex<Vec<(String, String)>> {
     static READS: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
     READS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub(crate) fn start_data_endpoint_probe() {
+    mock();
+}
+
+pub(crate) fn data_endpoint_reads_for(token: &str) -> usize {
+    service_reads().lock().unwrap().iter().filter(|(account, _)| account == token).count()
 }
 
 async fn service_endpoint(
@@ -259,6 +274,7 @@ fn mock() -> &'static str {
             rt.block_on(async move {
                 let app = axum::Router::new()
                     .route("/token", axum::routing::post(token_endpoint))
+                    .route("/owner-tokeninfo", axum::routing::get(owner_tokeninfo))
                     .route("/w3-refresh", axum::routing::post(closed_refresh_endpoint))
                     .route(
                         "/gmail.googleapis.com/gmail/v1/users/me/profile",
@@ -430,7 +446,7 @@ async fn resolve(
     req: &RequesterIdentity,
     people: &dyn People,
 ) -> Result<Resolved, Refusal> {
-    resolve_person(home.p(), agent, req, people).await
+    super::resolve::resolve_person_for_tool(home.p(), agent, req, people, "gmail_read").await
 }
 
 fn code(r: Result<Resolved, Refusal>) -> &'static str {
@@ -466,7 +482,7 @@ async fn home_and_absent_sections_stay_on_the_home_path() {
 }
 
 #[tokio::test]
-async fn delegate_mints_with_the_configured_subject_and_all_scopes() {
+async fn delegate_mints_with_the_configured_subject_and_service_scopes() {
     let home = Home::new();
     home.ready("bot", "alice.l2@c.test", "requesters='anyone'\n");
     let r = resolve(&home, "bot", &RequesterIdentity::Unknown, &NoPeople)
@@ -486,8 +502,27 @@ async fn delegate_mints_with_the_configured_subject_and_all_scopes() {
     assert_eq!(seen[0].iss, "duduclaw@proj.iam.gserviceaccount.test");
     assert_eq!(
         seen[0].scope,
-        crate::google_workspace::REQUIRED_SCOPES.join(" ")
+        super::delegated_scopes::for_tool(home.p(), "gmail_read").unwrap().join(" ")
     );
+}
+
+#[tokio::test]
+async fn delegate_cache_separates_services_and_chat_requires_the_switch() {
+    let home = Home::new();
+    home.ready("scope-bot", "scoped-cache@c.test", "requesters='anyone'\n");
+    for tool in ["gmail_read", "gmail_search", "sheets_read"] {
+        super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, tool).await.unwrap();
+    }
+    let requests = seen_for("scoped-cache@c.test");
+    assert_eq!(requests.len(), 2, "Gmail reuses its token; Sheets gets another scope set");
+    assert_eq!(requests[0].scope, super::delegated_scopes::for_tool(home.p(), "gmail_read").unwrap().join(" "));
+    assert_eq!(requests[1].scope, super::delegated_scopes::for_tool(home.p(), "sheets_read").unwrap().join(" "));
+    assert!(super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, "google_chat_messages").await.is_err());
+    assert_eq!(seen_for("scoped-cache@c.test").len(), 2);
+    let config = std::fs::read_to_string(home.p().join("config.toml")).unwrap();
+    std::fs::write(home.p().join("config.toml"), format!("{config}\n[google]\nchat_read=true\n")).unwrap();
+    super::resolve::resolve_person_for_tool(home.p(), "scope-bot", &RequesterIdentity::Unknown, &NoPeople, "google_chat_messages").await.unwrap();
+    assert_eq!(seen_for("scoped-cache@c.test").last().unwrap().scope, crate::google_workspace::CHAT_READ_SCOPES.join(" "));
 }
 
 #[tokio::test]
@@ -865,10 +900,11 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
     let (email, steps) = check::run(home.p(), "bot", &NoPeople).await;
     assert_eq!(email.as_deref(), Some("check@c.test"));
     assert!(steps.iter().all(|s| s.ok), "{steps:?}");
-    let ids: Vec<&str> = steps.iter().map(|s| s.id).collect();
+    let ids: Vec<&str> = steps.iter().map(|s| s.id.as_str()).collect();
     assert!(ids.contains(&"identity_match") && ids.contains(&"gmail") && ids.contains(&"tasks"));
-    // Full list once, then one mint per service (8) — all fresh (cache bypassed).
-    assert_eq!(seen_for("check@c.test").len(), 9);
+    // Each scope is checked independently; no request contains unrelated services.
+    assert!(steps.iter().any(|s| s.id == "scope:https://www.googleapis.com/auth/gmail.compose"));
+    assert!(seen_for("check@c.test").iter().all(|request| !request.scope.contains("chat.")));
     let urls: Vec<String> = service_reads()
         .lock()
         .unwrap()
@@ -896,7 +932,7 @@ async fn identity_test_reports_each_check_and_sends_nothing() {
 
     home.agent("ua", "[google]\nidentity='delegate:unauth-check@c.test'\n");
     let (_, steps) = check::run(home.p(), "ua", &NoPeople).await;
-    assert_eq!(steps.last().unwrap().id, "authorize");
+    assert!(steps.iter().any(|s| s.id.starts_with("scope:") && !s.ok));
     assert!(!steps.last().unwrap().ok);
 }
 
@@ -958,4 +994,148 @@ async fn delegate_status_and_unknown_tools_never_enter_token_work() {
     assert_eq!(route::serve(&state, "bot", "unknown_google_tool", &RequesterIdentity::Unknown)
         .await.unwrap_err().code, "scope_missing");
     assert_eq!(probe.counts(), [0, 0]);
+}
+
+
+async fn owner_incarnation_during_mint(rotate: bool, email: &str) {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    use std::sync::Arc;
+    let home = Home::new();
+    home.ready("bot", email, "");
+    home.agent("bot", "[google]\nidentity='delegate:owner'\n");
+    let db = Arc::new(UserDb::new(&home.p().join("users.db")).unwrap());
+    let owner = db.create_user(email, "Owner", "test-password", UserRole::Employee).unwrap();
+    let admin = db.create_user("admin-incarnation@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    db.bind_agent(&owner.id, "bot", AccessLevel::Owner).unwrap();
+    db.ensure_google_employee_nonce("bot").unwrap();
+    let attest = || {
+        let employee = delegate_owner::incarnation(home.p(), "bot").unwrap();
+        db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
+            agent_id:"bot", employee_id:&hex::encode(employee.0.0), employee_incarnation:employee.1,
+            subject:email, user_id:&owner.id, acknowledge_self_set:true,
+        }, &|value| value == email, &admin.id).unwrap();
+    };
+    attest();
+    let original_incarnation = delegate_owner::incarnation(home.p(), "bot").unwrap();
+    let original_identity = delegate_owner::effective_for(home.p(), Some("bot"));
+    assert_eq!(original_identity.effective, Effective::Delegate { email: email.into() });
+    let people = requester_gate::people_for(home.p(), Some(&db));
+    let requester = RequesterIdentity::DashboardUser { user_id: owner.id.clone() };
+    let (entered, release) = pause_mint(email);
+    let (result, ()) = tokio::join!(
+        resolve(&home, "bot", &requester, people.as_ref()),
+        async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
+            if rotate {
+                // Simulate deletion and recreation under the same employee label.
+                duduclaw_core::employee_incarnation::deleted(home.p(), "bot").unwrap();
+                duduclaw_core::employee_incarnation::created(home.p(), "bot").unwrap();
+                attest();
+                assert_ne!(delegate_owner::incarnation(home.p(), "bot"), Some(original_incarnation));
+            } else {
+                assert_eq!(delegate_owner::incarnation(home.p(), "bot"), Some(original_incarnation));
+            }
+            // The final effective identity alone cannot distinguish these cases.
+            assert_eq!(delegate_owner::effective_for(home.p(), Some("bot")), original_identity);
+            release.notify_one();
+        }
+    );
+    assert_eq!(seen_for(email).len(), 1, "the paused exchange must complete");
+    if rotate {
+        let refusal = result.expect_err("an old incarnation must never receive the minted bearer");
+        assert_eq!(refusal.code, "identity_changed");
+        assert!(!refusal.fallback_eligible);
+    } else {
+        let Resolved::Delegated { email: resolved_email, token } = result.unwrap() else {
+            panic!("unchanged incarnation must receive its delegated token");
+        };
+        assert_eq!(resolved_email, email);
+        assert_eq!(token.access_token, format!("tok:{email}"));
+    }
+}
+
+#[tokio::test]
+async fn owner_nonce_rotation_and_same_email_reattest_during_mint_refuses_bearer() {
+    owner_incarnation_during_mint(true, "owner-rotated-during-mint@c.test").await;
+}
+
+#[tokio::test]
+async fn owner_unchanged_nonce_during_mint_returns_bearer() {
+    owner_incarnation_during_mint(false, "owner-unchanged-during-mint@c.test").await;
+}
+
+#[tokio::test]
+async fn owner_diagnostic_records_audit_and_durable_notice_before_mint_without_data_reads() {
+    use duduclaw_auth::{AccessLevel, UserDb, UserRole};
+    use std::sync::Arc;
+    let home = Home::new();
+    let email = "owner-diagnostic@c.test";
+    home.ready("bot", email, "");
+    home.agent("bot", "[google]\nidentity='delegate:owner'\n");
+    let db = Arc::new(UserDb::new(&home.p().join("users.db")).unwrap());
+    let owner = db.create_user(email, "Owner", "test-password", UserRole::Employee).unwrap();
+    let admin = db.create_user("admin-diagnostic@c.test", "Admin", "test-password", UserRole::Admin).unwrap();
+    db.bind_agent(&owner.id, "bot", AccessLevel::Owner).unwrap();
+    db.ensure_google_employee_nonce("bot").unwrap();
+    let employee = delegate_owner::incarnation(home.p(), "bot").unwrap();
+    db.attest_google_delegate_owner(&duduclaw_auth::google_delegate_attestation::AttestationRequest {
+        agent_id:"bot", employee_id:&hex::encode(employee.0.0), employee_incarnation:employee.1,
+        subject:email, user_id:&owner.id, acknowledge_self_set:true,
+    }, &|value| value == email, &admin.id).unwrap();
+    let handler = Arc::new(crate::handlers::MethodHandler::new(home.p().to_path_buf()).await);
+    handler.set_user_db(db.clone(), Arc::new(duduclaw_auth::JwtConfig::new(b"diagnostic-fixture-signing-key-only"))).await;
+    let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+    let (entered, release) = pause_mint(email);
+    let task = {
+        let handler = handler.clone();
+        tokio::spawn(async move {
+            crate::google_personal::oauth::TEST_TOKENINFO_URL.scope(format!("{}/owner-tokeninfo", mock()), async {
+                handler.handle_google_identity_test(json!({"agent_id":"bot"}), &ctx).await
+            }).await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), entered.notified()).await.unwrap();
+    let attempts = db.query_audit_log(Some(&admin.id), Some("google.delegate_identity_test"), 10).unwrap();
+    assert_eq!(attempts.len(), 1, "audit is durable before the first token response");
+    let store = crate::events_store::EventBusStore::open(home.p()).unwrap();
+    let notices = store.person_notices(&owner.id).await.unwrap();
+    assert_eq!(notices.len(), 1, "notice is durable before mint completes");
+    assert_eq!(notices[0]["kind"], "google_identity_test");
+    assert!(store.person_notices(&admin.id).await.unwrap().is_empty());
+    assert!(crate::notify_push::person_notice_test::take(home.p()).iter().any(|(id, _)| id == &owner.id));
+    release.notify_one();
+    let result = task.await.unwrap();
+    let crate::protocol::WsFrame::Response { ok:true, payload:Some(value), .. } = result else { panic!("{result:?}"); };
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(data_endpoint_reads_for(email), 0);
+    assert!(!seen_for(email).is_empty());
+    assert!(value["steps"].as_array().unwrap().iter().any(|step| step["detail"].as_str().is_some_and(|s| s.contains("tokeninfo"))));
+    assert_eq!(db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 10).unwrap().len(), 1);
+
+    // A durable-notice failure must stop before the HTTP mint boundary.
+    rusqlite::Connection::open(home.p().join("events.db")).unwrap().execute_batch(
+        "CREATE TRIGGER refuse_notice BEFORE INSERT ON person_notices BEGIN SELECT RAISE(ABORT,'fixture write failure'); END;"
+    ).unwrap();
+    let before_failure = seen_for(email).len();
+    let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+    let refused = handler.handle_google_identity_test(json!({"agent_id":"bot"}), &ctx).await;
+    assert!(matches!(refused, crate::protocol::WsFrame::Response { ok:false, .. }));
+    assert_eq!(seen_for(email).len(), before_failure);
+    assert_eq!(store.person_notices(&owner.id).await.unwrap().len(), 1);
+    assert!(crate::notify_push::person_notice_test::take(home.p()).is_empty());
+    assert!(db.query_audit_log(Some(&admin.id), Some("google.identity_test_finished"), 10).unwrap()[0]
+        .detail.as_deref().unwrap().contains("notice_failed"));
+
+    // A second ordinary owner call must mint afresh; revocation then refuses
+    // even though Google would still consider the previous bearer valid.
+    let people = super::requester_gate::people_for(home.p(), Some(&db));
+    let requester = RequesterIdentity::DashboardUser { user_id: owner.id.clone() };
+    let before = seen_for(email).len();
+    for _ in 0..2 {
+        resolve::resolve_person_for_tool(home.p(), "bot", &requester, people.as_ref(), "gmail_read").await.unwrap();
+    }
+    assert_eq!(seen_for(email).len(), before + 2);
+    db.revoke_google_delegate_attestation("bot", &admin.id).unwrap();
+    assert!(resolve::resolve_person_for_tool(home.p(), "bot", &requester, people.as_ref(), "gmail_read").await.is_err());
+    assert_eq!(seen_for(email).len(), before + 2);
 }

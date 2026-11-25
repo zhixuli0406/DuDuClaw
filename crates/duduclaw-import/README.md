@@ -98,8 +98,12 @@ v1.80; the reader never selects it. The gateway test compares that v1.82 catalog
 `sessions.db` v1.82 is either pinned v1.81 shape (fresh / upgraded) plus the gateway-owned
 `schedule_origin_proofs` table (`session-origin-proofs-v182.sql`, the same text as
 `recipient_guard::origin::SCHEMA`; `SESSION_V182` / `SESSION_V182_UPGRADED` in `catalog.rs`).
-Both map as v1.81 and the proof table is never authorized for reading. The gateway tests
-compare both shapes with a fresh and an upgraded `SessionManager`.
+Both map as v1.81 and the proof table is never authorized for reading.
+The v1.85 session catalogs add RM-182's `pinned_updated_at` and bounded
+`session_tool_refs` table. Fresh stores and the three upgrade column-order variants
+are pinned separately; the gateway tests compare the fresh and upgraded schemas.
+They still use the v1.81 import mapping: pin timestamps and tool references are
+never imported as authority, and unknown schema objects are still refused.
 `approvals.db` likewise has a third catalog, `approvals-v181.sql`: the v1.80.x store plus
 the SR5 `approvals.employee_incarnation` column (a card bound to its employee's
 incarnation). v1.79.3, v1.80.x and v1.81 are accepted (exact match only;

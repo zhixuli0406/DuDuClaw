@@ -12,7 +12,7 @@ pub fn affected_agents(
     let mut affected = Vec::new();
     for binding in db.get_user_agents(user)? {
         let effective =
-            duduclaw_core::google_identity::effective_for(home, Some(&binding.agent_name));
+            crate::google_identity::delegate_owner::effective_for(home, Some(&binding.agent_name));
         if let duduclaw_core::google_identity::Effective::Personal { selector } =
             effective.effective
         {

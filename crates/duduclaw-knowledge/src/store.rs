@@ -21,6 +21,8 @@ pub struct Collection {
     pub department: Option<String>,
     pub sensitivity: String,
     pub embedding_policy: String,
+    #[serde(default)]
+    pub owner_self_add: bool,
     pub acl_revision: i64,
     pub created_by: String,
     pub created_at: String,
@@ -79,9 +81,11 @@ pub struct CollectionPatch {
     pub sensitivity: Option<String>,
     #[serde(default)]
     pub embedding_policy: Option<String>,
+    #[serde(default)]
+    pub owner_self_add: Option<bool>,
 }
 
-const COLS: &str = "id, slug, name, description, department, sensitivity, embedding_policy, acl_revision, created_by, created_at, updated_at";
+const COLS: &str = "id, slug, name, description, department, sensitivity, embedding_policy, acl_revision, created_by, created_at, updated_at, owner_self_add";
 
 fn row_to_collection(r: &Row<'_>) -> rusqlite::Result<Collection> {
     Ok(Collection {
@@ -96,6 +100,7 @@ fn row_to_collection(r: &Row<'_>) -> rusqlite::Result<Collection> {
         created_by: r.get(8)?,
         created_at: r.get(9)?,
         updated_at: r.get(10)?,
+        owner_self_add: r.get(11)?,
     })
 }
 
@@ -320,7 +325,17 @@ pub fn update_collection(
     patch: &CollectionPatch,
     expected_updated_at: &str,
 ) -> KbResult<Collection> {
-    let current = get_collection(conn, id)?.ok_or(KbError::PermissionDenied)?;
+    update_collection_checked(conn, id, patch, expected_updated_at, |_| Ok(()))
+}
+
+/// Keep collection authorization and mutation in one transaction.
+pub fn update_collection_checked(
+    conn: &mut Connection, id: &str, patch: &CollectionPatch, expected_updated_at: &str,
+    authorize: impl FnOnce(&rusqlite::Transaction<'_>) -> KbResult<()>,
+) -> KbResult<Collection> {
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    authorize(&tx)?;
+    let current = get_collection(&tx, id)?.ok_or(KbError::PermissionDenied)?;
     if current.updated_at != expected_updated_at {
         return Err(KbError::Conflict(
             "集合已被其他人修改，請重新載入後再儲存。".to_string(),
@@ -352,17 +367,19 @@ pub fn update_collection(
         None => current.embedding_policy.clone(),
     };
     let now = crate::now_rfc3339();
-    let changed = conn.execute(
-        "UPDATE collections SET name=?2, description=?3, department=?4, sensitivity=?5, embedding_policy=?6, updated_at=?7
+    let changed = tx.execute(
+        "UPDATE collections SET name=?2, description=?3, department=?4, sensitivity=?5, embedding_policy=?6, updated_at=?7, owner_self_add=?9
           WHERE id=?1 AND updated_at=?8",
-        params![id, name, description, department, sensitivity, embedding_policy, now, expected_updated_at],
+        params![id, name, description, department, sensitivity, embedding_policy, now, expected_updated_at, patch.owner_self_add.unwrap_or(current.owner_self_add)],
     )?;
     if changed == 0 {
         return Err(KbError::Conflict(
             "集合已被其他人修改，請重新載入後再儲存。".to_string(),
         ));
     }
-    get_collection(conn, id)?.ok_or(KbError::PermissionDenied)
+    let updated = get_collection(&tx, id)?.ok_or(KbError::PermissionDenied)?;
+    tx.commit()?;
+    Ok(updated)
 }
 
 /// Delete a collection after the caller typed its exact name. Returns the

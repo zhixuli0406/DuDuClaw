@@ -31,6 +31,7 @@ mod ccr_run_cmd; // Controlled four-arm CCR execution over recorded source bytes
 // `duduclaw compat windows-vm app`, no platform install does. Behind the
 // `app-compat` feature so the platform binary carries neither the subcommands
 // nor their deps; the OS recipe builds with `--features app-compat`.
+mod identity_cmd;
 mod credentials_cmd; // B2c: `duduclaw credentials status|authorize` — protected key in the OS keychain
 #[cfg(feature = "app-compat")]
 mod compat_cmd; // CP-1/A3: `duduclaw compat` — compat.d declarative runner registry CLI surface
@@ -457,6 +458,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Verify the gateway-issued identity of the current run.
+    Identity {
+        #[command(subcommand)]
+        command: identity_cmd::IdentityCommands,
+    },
     /// 設定通訊頻道（需要執行中的閘道與管理員登入）
     Channels {
         #[command(subcommand)]
@@ -4303,7 +4309,7 @@ pub async fn entry_point() {
         }
         return;
     }
-    if is_tui_command(&cli.command) || matches!(&cli.command, Commands::Channels { .. }) {
+    if is_tui_command(&cli.command) || matches!(&cli.command, Commands::Channels { .. } | Commands::Identity { .. }) {
         // The TUI owns the terminal. Never initialize a subscriber, log file,
         // log facade bridge or OTLP here, regardless of RUST_LOG. In particular
         // tungstenite TRACE payloads include the connect-frame JWT. Channel
@@ -4485,6 +4491,7 @@ fn is_read_only_survival_command(command: &Commands) -> bool {
 
 async fn run(cli: Cli) -> duduclaw_core::error::Result<()> {
     match cli.command {
+        Commands::Identity { command } => identity_cmd::run(&duduclaw_home(), command).await,
         Commands::Channels { command } => googlechat_cmd::run(&duduclaw_home(), command).await,
         Commands::Meeting { command } => meeting_cmd::run(&duduclaw_home(), command).await,
         Commands::Tui { command } => tui_cmd::run(&duduclaw_home(), command).await,
@@ -10906,6 +10913,7 @@ async fn cmd_doctor(fix_residue: bool) -> duduclaw_core::error::Result<()> {
     // write (they run as the operator's OS user at every spawn).
     checks.push(doctor_mcp_servers::mcp_servers_check(&home));
     checks.push(doctor_egress_leases::check(&home));
+    checks.extend(duduclaw_core::scope_policy_checks::checks(&home));
     let office_conflicts = duduclaw_agent::builtin_skills::office_script_conflicts(&home.join("skills"));
     checks.push((
         "辦公文件腳本".into(),
@@ -11305,6 +11313,8 @@ pub(crate) async fn scaffold_planned_agent_dir(
         .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     // Exclusive directory creation refuses a destination created after planning.
     std::fs::create_dir(&agent_dir).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    duduclaw_core::employee_incarnation::created(home, &s.name)
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     for dir in ["SKILLS", "memory", ".claude"] {
         std::fs::create_dir_all(agent_dir.join(dir))
             .map_err(|e| DuDuClawError::Agent(e.to_string()))?;

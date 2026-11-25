@@ -472,7 +472,7 @@ fn offboarding_personal_owner_with_transfer_refused_clearly() {
     // Binding a new member to the Personal employee is a coded refusal too.
     let admin = f.users.get_user(&f.bob).unwrap().unwrap();
     let member = NewMember { display_name: "New".into(), email: "new@example.test".into(), role: UserRole::Employee,
-        department: None, primary_agent_id: LABEL.into(), invite: false,
+        department: None, avatar_agent_id: None, primary_agent_id: LABEL.into(), invite: false,
         bindings: vec![MemberBinding { agent_name: LABEL.into(), access_level: AccessLevel::Operator }] };
     assert_eq!(f.users.create_member_at_epoch(&member, &admin.id, admin.credential_epoch).err(), Some("member_agent_personal"));
 

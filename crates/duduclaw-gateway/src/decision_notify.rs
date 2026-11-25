@@ -1383,6 +1383,11 @@ async fn apply_bound_request(
             return Err(DECISION_REFUSED.into());
         }
     };
+    if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+        if answer.is_some() { return Err(DECISION_REFUSED.into()); }
+        return crate::knowledge::add_source_chat::decide(home, &rec, context,
+            approve.ok_or(DECISION_REFUSED)?).await;
+    }
     if rec.binding.is_none() {
         if answer.is_some() {
             return Err("這筆舊請求不是可回答的問題".into());
@@ -1560,7 +1565,7 @@ pub(crate) async fn route_verified_bound_press(
                 return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
             }
         };
-        if row.binding.is_some() && !access_ok {
+        if (row.binding.is_some() || row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND) && !access_ok {
             return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
         }
         // Only the successfully parsed persisted row can identify a legacy
@@ -1620,6 +1625,9 @@ pub(crate) async fn route_trusted_decision_fastlane_with_scope(
             return refused();
         }
     };
+    if row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
+        return route_bound_text(&ctx.home_dir, context, text).await;
+    }
     let Some(binding) = &row.binding else {
         return refused();
     };

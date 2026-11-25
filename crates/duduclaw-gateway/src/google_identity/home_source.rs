@@ -27,7 +27,7 @@ pub(crate) use native_selection::{
     NativeHomeSelection, prepare_home_native_selection, read_home_native_selection, resolve_home_native_pinned,
     validate_home_native_material, validate_home_native_selection,
 };
-pub use oauth_material::get_valid_google_token;
+pub use oauth_material::{get_valid_google_token, get_valid_google_token_for_tool, get_valid_google_token_for_endpoint};
 pub(crate) use oauth_material::{
     HomeOAuthBearer, HomeOAuthCapture, HomeOAuthMaterialProof, HomeOAuthResolved,
     capture_from_store, resolve_home_oauth_pinned, resolve_home_oauth_pinned_mcp,

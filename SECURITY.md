@@ -337,3 +337,37 @@ for the released-image behavior and the unreleased integration boundary.
 The [outgoing data guard](docs/features/69-egress-guard.md) tracks pending private reads and completed reads with model-visible data (including error payloads) per turn at the platform MCP dispatch gate and third-party MCP proxy. Its default `shadow` mode only audits; select `ask` or `block` for enforcement. Claude CLI built-in tools, including `WebFetch` and `Bash` running `curl`, and non-Claude native tools are not covered. Prompt-supplied data and reads outside these MCP paths are not automatically marked. Tracking does not follow data copied across turns; turn taint has a six-hour TTL and is not persisted across restart. Active sink leases are persisted before admission in `<home>/egress_leases.db` (SQLite WAL, 0600 on Unix) and restored before loopback routes accept requests; restored leases fence their employee until acquisition plus six hours, or a fresh six hours when the clock moved backward. They cannot be released by old responses. An exclusive `egress_leases.lock` prevents two gateways from owning divergent lease ledgers; a second owner fails closed until it takes the lock and restores the store. An unreadable store fences every employee's private reads and new sinks in `ask`/`block` until recovery; `shadow` allows and audits. Store opening retries every five seconds, with at most one error log per minute. Failed inserts refuse enforcing-mode sinks; failed deletes retain their fences. Unknown or expired turns, including turns lost on restart, are treated as tainted; only a valid gateway-registered turn can be clean. This guard is not a network sandbox or an information-flow guarantee for the entire runtime.
 
 Outgoing approvals bind the full canonical arguments to one use. Purchase and Delete tools cannot be authorized by standing capability or workflow grants, including old stored grants. Other permission and denial gates continue to narrow access.
+
+### Personal member API keys
+
+`ddc_member_` is a separate, opt-in member credential type. It contains 32 bytes
+from OsRng, encoded as unpadded base64url; only SHA-256 is stored in `users.db`.
+The creation result has redacting Debug and no Serialize implementation. The
+secret is returned once by the browser-session management RPC. Every creation
+requires fresh authentication: the current password via the existing timing-safe
+verifier for non-MFA accounts, or the existing MFA step-up for enrolled accounts.
+Attempts share the login IP/email limiter; MFA replay and lockout checks remain.
+A JWT or refresh token (even with a valid session jti) is insufficient. An internal
+proof binds the user, jti, credential epoch and `me.member_keys.create`, expires
+within five minutes, and is consumed once before creation. No proof is accepted
+from the RPC caller. Admin accounts cannot create these keys.
+
+Keys never grant Admin authority. Each RPC revalidates the credential, expiry,
+active account, credential epoch and live role/bindings, then intersects the
+member contract with credential/step-up exclusions. Key-authenticated
+`agents.update` accepts only the contract's explicit non-secret field whitelist;
+unknown fields, credential sections, legacy aliases and generic configuration
+editors are rejected as an entire request before writes or channel side effects.
+File HTTP and WebChat retain
+normal ownership gates. Revocation, password changes, MFA reset, offboarding,
+expiry or a disabled/unreadable master switch stop further calls and close open
+sockets on their next check. MCP, status and JWT-only security endpoints refuse
+the member prefix. Use server-side secret storage, never browser bundles or URLs.
+Per-key limits use a bounded map; use is audited in ten-minute windows, while
+write attempts, creation and revocation are recorded individually without secrets.
+Creation revokes expired/old-epoch rows and purges revocations older than 90 days.
+Each owner is capped at five active keys and 50 total retained rows. Owner and
+admin lists use keyset pagination (default 25, maximum 100 rows per page).
+
+See [member authentication](docs/api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
+for the supported routes, configuration and method exclusions.

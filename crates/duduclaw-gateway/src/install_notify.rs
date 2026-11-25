@@ -745,6 +745,7 @@ mod tests {
 
     fn user(id: &str, role: UserRole, dept: Option<&str>) -> User {
         User {
+            avatar_agent_id: None,
             credential_epoch: 0,
             id: id.into(),
             email: format!("{id}@x"),
