@@ -691,6 +691,7 @@ mod tests {
         let expected_home_entries: HashSet<_> = [
             "config.toml.lock",
             "locks",
+            ".google-authority",
             duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE,
         ]
             .into_iter()
@@ -701,7 +702,10 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        let expected_locks_entries: HashSet<_> = ["gateway.lock"]
+        let expected_locks_entries: HashSet<_> = [
+            "gateway.lock",
+            duduclaw_core::agent_seats::SEAT_ADMISSION_LOCK,
+        ]
             .into_iter()
             .map(std::ffi::OsString::from)
             .collect();
