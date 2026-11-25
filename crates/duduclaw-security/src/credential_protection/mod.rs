@@ -322,6 +322,10 @@ fn pin_reset(account: &str) {
 /// Selection uses the OS and attested startup state, never a configurable
 /// backend or key path that an employee could redirect.
 pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
+    CredentialProtection::platform(_home).store
+}
+
+fn platform_store_for(_protection: &CredentialProtection) -> Box<dyn KeyStore> {
     #[cfg(target_os = "macos")]
     {
         Box::new(MacKeychainStore::default_keychain())
@@ -334,7 +338,7 @@ pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
     {
         use container_root::{ContainerRootStore, RefusedRootStore};
         if duduclaw_core::root_key::is_held() {
-            return Box::new(ContainerRootStore::attested(_home));
+            return Box::new(ContainerRootStore::attested(_protection.trusted_home.clone()));
         }
         if let Some(reason) = duduclaw_core::root_key::refused_reason() {
             return Box::new(RefusedRootStore(reason));
@@ -347,22 +351,28 @@ pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
     }
 }
 
+// The Linux store shares this exact lazy pin, including bootstrap and failures.
+#[cfg(unix)]
+type SharedHomePin = std::sync::Arc<OnceLock<Result<duduclaw_core::trusted_home::TrustedHome, String>>>;
+
 /// Protection for one DuDuClaw home, over one store.
 pub struct CredentialProtection {
     home: PathBuf,
     #[cfg(unix)]
-    trusted_home: OnceLock<Result<duduclaw_core::trusted_home::TrustedHome, String>>,
+    trusted_home: SharedHomePin,
     store: Box<dyn KeyStore>,
 }
 
 impl CredentialProtection {
     pub fn platform(home: &Path) -> Self {
-        Self::with_store(home, platform_store(home))
+        let mut protection = Self::with_store(home, Box::new(UnsupportedStore));
+        protection.store = platform_store_for(&protection);
+        protection
     }
 
     pub fn with_store(home: &Path, store: Box<dyn KeyStore>) -> Self {
         #[cfg(unix)]
-        let trusted_home = OnceLock::new();
+        let trusted_home = std::sync::Arc::new(OnceLock::new());
         #[cfg(unix)]
         let home = {
             let path = if home.is_absolute() { home.to_owned() } else {

@@ -1,23 +1,34 @@
 //! Descriptor-relative ciphertext IO. No symlink following or plaintext files.
 use std::ffi::CString;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
-use std::path::Path;
+use std::os::unix::fs::MetadataExt;
+use duduclaw_core::trusted_home::TrustedHome;
 use ring::rand::{SecureRandom, SystemRandom};
 use super::{FILE_NAME, MAX_BLOB, StoreError, unavailable};
 
-fn directory(path: &Path, create: bool) -> Result<File, StoreError> {
-    if create {
-        match std::fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => (),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(_) => return Err(unavailable()),
-        }
-    }
-    OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path).map_err(io_error)
+#[cfg(test)]
+thread_local! {
+    static AFTER_DIRECTORY_OPEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(super) fn after_directory_open(f: impl FnOnce() + 'static) {
+    AFTER_DIRECTORY_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(f)));
+}
+
+fn directory(home: &TrustedHome, create: bool) -> Result<TrustedHome, StoreError> {
+    // child_directory verifies the shared pin, then mkdirat/openat(O_NOFOLLOW)
+    // resolve only the single protected component beneath its retained FD.
+    let directory = home.child_directory("protected", create).map_err(io_error)?;
+    #[cfg(test)]
+    AFTER_DIRECTORY_OPEN.with(|hook| {
+        let hook = hook.borrow_mut().take();
+        if let Some(hook) = hook { hook(); }
+    });
+    Ok(directory)
 }
 
 fn io_error(e: io::Error) -> StoreError {
@@ -30,8 +41,9 @@ fn io_error(e: io::Error) -> StoreError {
 
 fn name() -> CString { CString::new(FILE_NAME).expect("fixed file name") }
 
-pub(super) fn read(path: &Path) -> Result<Vec<u8>, StoreError> {
-    let dir = directory(path, false)?;
+pub(super) fn read(home: &TrustedHome) -> Result<Vec<u8>, StoreError> {
+    let protected = directory(home, false)?;
+    let dir = protected.directory();
     let fd = unsafe { libc::openat(dir.as_raw_fd(), name().as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK) };
     if fd < 0 { return Err(io_error(io::Error::last_os_error())); }
     // SAFETY: openat returned a fresh descriptor, owned only by this File.
@@ -44,8 +56,9 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>, StoreError> {
     Ok(bytes)
 }
 
-pub(super) fn write(path: &Path, blob: &[u8]) -> Result<(), StoreError> {
-    let dir = directory(path, true)?;
+pub(super) fn write(home: &TrustedHome, blob: &[u8]) -> Result<(), StoreError> {
+    let protected = directory(home, true)?;
+    let dir = protected.directory();
     let mut random = [0u8; 16];
     SystemRandom::new().fill(&mut random).map_err(|_| unavailable())?;
     let suffix: String = random.iter().map(|b| format!("{b:02x}")).collect();
@@ -66,11 +79,12 @@ pub(super) fn write(path: &Path, blob: &[u8]) -> Result<(), StoreError> {
     result
 }
 
-pub(super) fn delete(path: &Path) -> Result<(), StoreError> {
-    let dir = match directory(path, false) {
+pub(super) fn delete(home: &TrustedHome) -> Result<(), StoreError> {
+    let protected = match directory(home, false) {
         Err(StoreError::NotFound) => return Ok(()),
         result => result?,
     };
+    let dir = protected.directory();
     if unsafe { libc::unlinkat(dir.as_raw_fd(), name().as_ptr(), 0) } == 0 {
         return dir.sync_all().map_err(|_| unavailable());
     }

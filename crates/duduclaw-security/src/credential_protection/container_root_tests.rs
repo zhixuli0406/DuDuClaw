@@ -1,10 +1,16 @@
-//! No Linux/root/keychain required: exercise the real account wrapping store.
+//! Exercise the real account wrapping store on Unix, without a launcher/keychain.
 use super::*;
 use super::container_root::{ContainerRootStore, RefusedRootStore};
 use super::tests::TempHome;
 
 fn protection(home: &TempHome, root: u8) -> CredentialProtection {
-    CredentialProtection::with_store(home.path(), Box::new(ContainerRootStore::new(home.path(), &[root; 32])))
+    protection_at(home.path(), root)
+}
+
+fn protection_at(home: &Path, root: u8) -> CredentialProtection {
+    let mut cp = CredentialProtection::with_store(home, Box::new(UnsupportedStore));
+    cp.store = Box::new(ContainerRootStore::new(cp.trusted_home.clone(), &[root; 32]));
+    cp
 }
 
 fn blob(home: &TempHome) -> PathBuf { home.path().join("protected/container-wrapped-key.json") }
@@ -135,10 +141,171 @@ fn refused_startup_is_unavailable_even_without_a_marker() {
 #[test]
 fn attested_store_has_no_wrapping_key_fallback() {
     let home = TempHome::new("attested-no-key");
-    let store = ContainerRootStore::attested(home.path());
-    let account = super::marker::account_for_home(home.path());
+    let cp = protection(&home, 7);
+    let store = ContainerRootStore::attested(cp.trusted_home.clone());
+    let account = cp.account();
     // The harness has no launcher key. A production store must not retain a
     // synthetic or stale wrapping key or write a new usable blob.
     assert!(matches!(store.write_new(&account, &[7; 32]), Err(StoreError::Unavailable(_))));
     assert!(!blob(&home).exists());
+}
+
+/// Retarget exactly after load_verified's home check, before the real store opens.
+struct RetargetOnRead {
+    store: ContainerRootStore,
+    alias: PathBuf,
+    target: PathBuf,
+}
+
+impl KeyStore for RetargetOnRead {
+    fn backend(&self) -> BackendKind { self.store.backend() }
+    fn level(&self) -> ProtectionLevel { self.store.level() }
+    fn read(&self, account: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        std::fs::remove_file(&self.alias).unwrap();
+        std::os::unix::fs::symlink(&self.target, &self.alias).unwrap();
+        self.store.read(account)
+    }
+    fn write_new(&self, account: &str, key: &[u8]) -> Result<(), StoreError> {
+        self.store.write_new(account, key)
+    }
+    fn delete(&self, account: &str) -> Result<(), StoreError> {
+        self.store.delete(account)
+    }
+}
+
+#[test]
+fn real_store_refuses_retarget_between_verification_and_key_access() {
+    use std::os::unix::fs::symlink;
+    for person_gate in [false, true] {
+        let parent = TempHome::new("container-check-race");
+        let first = TempHome::new("container-check-first");
+        let second = TempHome::new("container-check-second");
+        let alias = parent.path().join("alias");
+        symlink(first.path(), &alias).unwrap();
+        let mut cp = protection_at(&alias, 7);
+        cp.enable(false).unwrap();
+        first.hold_gateway_lock();
+        let account = cp.account();
+        let original = std::fs::read(blob(&first)).unwrap();
+        // Even a valid copy for A must never be opened through the redirected B.
+        std::fs::create_dir(second.path().join("protected")).unwrap();
+        std::fs::write(blob(&second), &original).unwrap();
+        cp.store = Box::new(RetargetOnRead {
+            store: ContainerRootStore::new(cp.trusted_home.clone(), &[7; 32]),
+            alias,
+            target: second.path().to_owned(),
+        });
+        if person_gate {
+            assert!(cp.person_identity_gate().is_err());
+        } else {
+            assert_eq!(cp.status().state, ProtectionState::KeyChanged);
+        }
+        assert_eq!(cp.account(), account);
+        assert!(cp.store.write_new(&account, &[8; 32]).is_err());
+        assert!(cp.store.delete(&account).is_err());
+        assert_eq!(std::fs::read(blob(&first)).unwrap(), original);
+        assert_eq!(std::fs::read(blob(&second)).unwrap(), original);
+        assert!(!second.path().join(".google-authority").exists());
+        assert!(!second.path().join("locks").exists());
+    }
+}
+
+#[test]
+fn real_store_keeps_io_on_pinned_directory_after_last_path_check() {
+    use std::os::unix::fs::symlink;
+    for operation in ["read", "write", "delete"] {
+        let parent = TempHome::new("container-open-race");
+        let first = TempHome::new("container-open-first");
+        let second = TempHome::new("container-open-second");
+        let alias = parent.path().join("alias");
+        symlink(first.path(), &alias).unwrap();
+        let cp = protection_at(&alias, 7);
+        cp.enable(false).unwrap();
+        let account = cp.account();
+        let original = std::fs::read(blob(&first)).unwrap();
+        std::fs::create_dir(second.path().join("protected")).unwrap();
+        std::fs::write(blob(&second), &original).unwrap();
+        let target = second.path().to_owned();
+        let link = alias.clone();
+        // Run after the protected directory is opened, immediately before key IO.
+        ContainerRootStore::after_directory_open(move || {
+            std::fs::remove_file(&link).unwrap();
+            symlink(&target, &link).unwrap();
+        });
+        match operation {
+            "read" => {
+                assert!(cp.store.read(&account).is_err());
+                assert_eq!(std::fs::read(blob(&first)).unwrap(), original);
+            }
+            "write" => {
+                cp.store.write_new(&account, &[8; 32]).unwrap();
+                assert_ne!(std::fs::read(blob(&first)).unwrap(), original);
+            }
+            "delete" => {
+                cp.store.delete(&account).unwrap();
+                assert!(!blob(&first).exists());
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(std::fs::read_link(&alias).unwrap(), second.path());
+        assert_eq!(std::fs::read(blob(&second)).unwrap(), original);
+        assert_eq!(cp.account(), account);
+        assert!(cp.check_home().is_err());
+    }
+}
+
+fn assert_missing_home_bootstrap(home: &Path, resolved: &Path) {
+    let cp = protection_at(home, 7);
+    let shared_pin = cp.trusted_home.clone();
+    assert!(shared_pin.get().is_none());
+    assert_eq!(cp.status().state, ProtectionState::NotEnabled);
+    assert!(shared_pin.get().is_none());
+    assert!(!resolved.exists());
+    // A store cannot use an account derived from the unresolved spelling.
+    assert!(cp.store.write_new(&cp.account(), &[9; 32]).is_err());
+    assert!(!resolved.exists());
+    duduclaw_core::config::create_home_dir(home).unwrap();
+    cp.enable(false).unwrap();
+    let pin = shared_pin.get().unwrap().as_ref().unwrap();
+    assert!(std::ptr::eq(pin, cp.trusted_home().unwrap()));
+    assert_eq!(pin.path(), std::fs::canonicalize(resolved).unwrap());
+    let account = marker::account_for_resolved_home(pin.path());
+    assert_eq!(cp.account(), account);
+    assert_eq!(cp.read_marker().unwrap().account, account);
+    let raw = std::fs::read(resolved.join("protected/container-wrapped-key.json")).unwrap();
+    let wrapped: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(wrapped["account"], account);
+    let bytes = cp.store.read(&account).unwrap();
+    assert_eq!(cp.status().state, ProtectionState::Ready);
+    duduclaw_core::gateway_instance::acquire(home).unwrap();
+    assert_eq!(cp.person_identity_gate().unwrap().key.as_slice(), bytes.as_slice());
+    // Reopening by the canonical spelling must derive the identical wrapping key.
+    let canonical = protection_at(pin.path(), 7);
+    assert_eq!(canonical.account(), account);
+    assert_eq!(canonical.store.read(&account).unwrap().as_slice(), bytes.as_slice());
+    cp.disable().unwrap();
+    assert!(!resolved.join("protected/container-wrapped-key.json").exists());
+}
+
+#[test]
+fn real_store_bootstraps_missing_home_from_relative_path() {
+    let parent = TempHome::new("container-relative-bootstrap");
+    let cwd = std::env::current_dir().unwrap();
+    let mut home = PathBuf::new();
+    for _ in cwd.ancestors().skip(1) { home.push(".."); }
+    home.push(parent.path().strip_prefix("/").unwrap());
+    home.push("missing/../new-home");
+    assert!(home.is_relative());
+    assert_missing_home_bootstrap(&home, &parent.path().join("new-home"));
+}
+
+#[test]
+fn real_store_bootstraps_missing_home_under_symlinked_parent() {
+    let parent = TempHome::new("container-symlink-bootstrap");
+    let real = parent.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = parent.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let home = alias.join("missing/../new-home");
+    assert_missing_home_bootstrap(&home, &real.join("new-home"));
 }
