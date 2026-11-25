@@ -29,7 +29,7 @@ const googleCases = [
   ['sheets_create', { title: 'Disposable fixture spreadsheet' }, 'Modify'],
   ['sheets_update', { spreadsheet_id: 'local-missing-sheet', range: 'A1', values: [['fixture']] }, 'Modify'],
   ['calendar_update_event', { calendar_id: 'primary', event_id: 'local-missing-event', summary: 'Fixture' }, 'Send'],
-  ['gmail_create_draft', { to: 'fixture@acceptance.invalid', subject: 'Fixture', body: 'Fixture', thread_id: 'local-missing-thread' }, 'Draft'],
+  ['gmail_create_draft', { to: 'fixture@acceptance.invalid', subject: 'Fixture', body: 'Fixture' }, 'Draft'],
 ];
 function check(value, message) { assert(value, message); }
 function sanitise(value) {

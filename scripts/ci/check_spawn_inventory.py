@@ -5,7 +5,8 @@ This is a conservative lexical guard, not a Rust type checker or authorization
 mechanism. It scans every crates/*/src/**/*.rs, including cfg(test) and platform
 branches. Literal/comment contents do not count. Constructors, known platform
 factories, PTY launches, raw exec/fork calls and process terminal methods are
-counted per enclosing function. An entry records the current identity separately
+counted per enclosing function, including known bound launch/collector wrappers.
+An entry records the current identity separately
 from the intended isolation migration; a pending entry is not an exemption.
 """
 from __future__ import annotations
@@ -24,6 +25,14 @@ RAW_LITERAL = re.compile(r'(?:br|cr|r)(#*)"')
 CHAR_LITERAL = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'")
 TOKEN = re.compile(r"[A-Za-z_][A-Za-z_0-9]*|::|->|[^\s]", re.ASCII)
 FACTORIES = {"command_for", "async_command_for"}
+# These process-only APIs remain spawn roots even through Self:: forwarding,
+# extracted collectors or unqualified imports. Keep their counts distinct from
+# the unbound APIs so a binding migration still requires inventory review.
+BOUND_SPAWN_APIS = {
+    "spawn_bound", "spawn_pty_bound", "spawn_class_bound",
+    "output_for_model_bound", "collect_codex_output_bound",
+    "spawn_and_handshake_bound", "spawn_with_binding",
+}
 RAW = {"fork", "vfork", "execve", "execveat", "execv", "execvp", "execl", "posix_spawn", "posix_spawnp", "clone", "clone3", "forkpty", "system", "popen"}
 
 
@@ -88,7 +97,7 @@ class Site:
 
 
 def scan_text(source: str, path: str) -> list[Site]:
-    if not any(word in source for word in ("execution_gate", "execution_blocking", "BackendChild", "PtyHandle", "Command", "spawn", "exec", "fork", "command_for", "openpty", "pty_system", "clone", "system", "popen")):
+    if not any(word in source for word in ("execution_gate", "execution_blocking", "BackendChild", "PtyHandle", "Command", "spawn", "exec", "fork", "command_for", "openpty", "pty_system", "clone", "system", "popen", *BOUND_SPAWN_APIS)):
         return []
     masked = mask_literals(source)
     matches = list(TOKEN.finditer(masked))
@@ -105,9 +114,12 @@ def scan_text(source: str, path: str) -> list[Site]:
                 aliases.add(tokens[i + 1])
 
     backend_aliases = {"execution_gate", "execution_blocking", "BackendChild", "PtyHandle"}
+    bound_aliases = {name: name for name in BOUND_SPAWN_APIS}
     for i, token in enumerate(tokens):
         if token in backend_aliases and tokens[i + 1:i + 2] == ["as"] and i + 2 < len(tokens):
             backend_aliases.add(tokens[i + 2])
+        if token in bound_aliases and tokens[i + 1:i + 2] == ["as"] and i + 2 < len(tokens):
+            bound_aliases[tokens[i + 2]] = bound_aliases[token]
 
     raw_aliases = {}
     raw_modules = {"libc", "unistd", "process"}
@@ -184,6 +196,8 @@ def scan_text(source: str, path: str) -> list[Site]:
                 effects["terminal_" + tokens[i + 2]] += 1
             elif token in backend_aliases and tokens[i + 1:i + 2] == ["::"] and tokens[i + 2:i + 3] in (["spawn"], ["spawn_class"], ["output"], ["status"], ["spawn_pty"]) and tokens[i + 3:i + 4] == ["("]:
                 effects["backend_" + tokens[i + 2]] += 1
+            elif token in bound_aliases and tokens[i + 1:i + 2] == ["("] and tokens[i - 1:i] != ["fn"]:
+                effects["backend_" + bound_aliases[token]] += 1
             elif token in FACTORIES and tokens[i + 1:i + 2] == ["("] and tokens[i - 1:i] != ["fn"]:
                 effects["platform_command_factory"] += 1
             elif token in RAW and i >= 2 and tokens[i - 2] in raw_modules and tokens[i - 1] == "::":

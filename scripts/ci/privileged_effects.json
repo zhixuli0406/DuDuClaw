@@ -4,7 +4,7 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
-      "symbol": "crates/duduclaw-gateway/src/run_identity.rs::tests::dedicated_listener_requires_lock_and_binds_only_ipv4_loopback",
+      "symbol": "crates/duduclaw-gateway/src/run_identity/tests.rs::dedicated_listener_requires_lock_and_publishes_only_local_ipc",
       "apis": {
         "command_constructor": 1
       },
@@ -13,10 +13,10 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Test-only command fixture verifying dedicated loopback identity and revocable runtime proofs; not a production spawn path."
+      "rationale": "Test-only command fixture verifying local IPC identity and revocable runtime proofs; not a production spawn path."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/run_identity.rs::tests::runtime_env_and_pty_proofs_are_distinct_and_revoked",
+      "symbol": "crates/duduclaw-gateway/src/run_identity/tests.rs::runtime_env_and_pty_proofs_are_distinct_and_revoked",
       "apis": {
         "command_constructor": 1
       },
@@ -25,7 +25,7 @@
       ],
       "identity": "test",
       "migration": "test_only",
-      "rationale": "Test-only command fixture verifying dedicated loopback identity and revocable runtime proofs; not a production spawn path."
+      "rationale": "Test-only command fixture verifying local IPC identity and revocable runtime proofs; not a production spawn path."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/claude_runner/work_outcome_tests.rs::background_idle_stops_pending_tool_and_keepalive_does_not_reset_it",
@@ -91,7 +91,7 @@
     {
       "symbol": "crates/duduclaw-agent/src/heartbeat.rs::execute_proactive_check",
       "apis": {
-        "backend_spawn": 1
+        "backend_spawn_bound": 1
       },
       "effects": [
         "process_spawn"
@@ -187,6 +187,7 @@
     {
       "symbol": "crates/duduclaw-cli-runtime/src/oneshot.rs::oneshot_pty_invoke",
       "apis": {
+        "backend_spawn_with_binding": 1,
         "command_constructor": 1
       },
       "effects": [
@@ -199,7 +200,7 @@
     {
       "symbol": "crates/duduclaw-cli-runtime/src/pty.rs::PtyHandle::spawn_with_handoff",
       "apis": {
-        "backend_spawn_pty": 1
+        "backend_spawn_with_binding": 1
       },
       "effects": [
         "process_spawn"
@@ -1512,7 +1513,7 @@
     {
       "symbol": "crates/duduclaw-core/src/process_tree.rs::BackendChild::spawn_class",
       "apis": {
-        "backend_spawn": 1
+        "backend_spawn_class_bound": 1
       },
       "identity": "gateway",
       "migration": "backend",
@@ -1854,7 +1855,7 @@
       "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
     },
     {
-      "symbol": "crates/duduclaw-execution/src/command.rs::spawn",
+      "symbol": "crates/duduclaw-execution/src/command.rs::spawn_bound",
       "apis": {
         "command_constructor": 1,
         "terminal_spawn": 1
@@ -1867,7 +1868,7 @@
       "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
     },
     {
-      "symbol": "crates/duduclaw-execution/src/command.rs::spawn_pty",
+      "symbol": "crates/duduclaw-execution/src/command.rs::spawn_pty_bound",
       "apis": {
         "terminal_spawn": 1
       },
@@ -1951,7 +1952,7 @@
       "rationale": "Regression fixture: legacy command/PTY construction, native byte equivalence, backend lifecycle or protocol behavior; not a production execution entry."
     },
     {
-      "symbol": "crates/duduclaw-execution/src/local.rs::ConsoleOnDrop::close_detached",
+      "symbol": "crates/duduclaw-execution/src/local/processes.rs::ConsoleOnDrop::close_detached",
       "apis": {
         "terminal_spawn": 1
       },
@@ -1987,7 +1988,7 @@
       "rationale": "LocalBackend implementation detail; selected only for explicitly local execution. Protected backend selection must not call this local process constructor."
     },
     {
-      "symbol": "crates/duduclaw-execution/src/local.rs::start_pipe",
+      "symbol": "crates/duduclaw-execution/src/local/processes.rs::start_pipe",
       "apis": {
         "terminal_spawn": 1
       },
@@ -1999,7 +2000,7 @@
       "rationale": "LocalBackend implementation detail; selected only for explicitly local execution. Protected backend selection must not call this local process constructor."
     },
     {
-      "symbol": "crates/duduclaw-execution/src/local.rs::start_pty",
+      "symbol": "crates/duduclaw-execution/src/local/processes.rs::start_pty",
       "apis": {
         "pty_native_pty_system": 1,
         "pty_openpty": 1,
@@ -2364,7 +2365,7 @@
     {
       "symbol": "crates/duduclaw-gateway/src/channel_reply/cli_env.rs::spawn_claude_cli_with_env",
       "apis": {
-        "backend_spawn_class": 1,
+        "backend_spawn_class_bound": 1,
         "platform_command_factory": 1
       },
       "effects": [
@@ -2426,7 +2427,7 @@
     {
       "symbol": "crates/duduclaw-gateway/src/claude_runner.rs::call_claude_streaming",
       "apis": {
-        "backend_spawn_class": 1
+        "backend_spawn_class_bound": 1
       },
       "identity": "employee",
       "migration": "backend",
@@ -3729,7 +3730,7 @@
     {
       "symbol": "crates/duduclaw-gateway/src/judge_mode.rs::ExternalAcceptanceJudge::judge_with_context",
       "apis": {
-        "backend_spawn": 1
+        "backend_spawn_bound": 1
       },
       "effects": [
         "process_spawn"
@@ -3940,7 +3941,7 @@
     {
       "symbol": "crates/duduclaw-gateway/src/process_group.rs::collect_output",
       "apis": {
-        "backend_spawn_class": 1
+        "backend_spawn_class_bound": 1
       },
       "identity": "employee",
       "migration": "backend",
@@ -4096,9 +4097,9 @@
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::collect_codex_output_with_input",
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::collect_codex_output_bound",
       "apis": {
-        "backend_spawn_class": 1,
+        "backend_spawn_class_bound": 1,
         "command_constructor": 1
       },
       "identity": "employee",
@@ -5015,7 +5016,7 @@
     {
       "symbol": "crates/duduclaw-llm/src/mcp_client.rs::McpClient::spawn_and_handshake",
       "apis": {
-        "backend_spawn_class": 1
+        "backend_spawn_and_handshake_bound": 1
       },
       "effects": [
         "process_spawn"
@@ -7387,6 +7388,358 @@
         "process_spawn"
       ],
       "rationale": "Windows regression test inspects the constructed work-root Command cwd and argv without spawning a child."
+    },
+    {
+      "symbol": "crates/duduclaw-auth/src/google_identity_tests.rs::primary_owner_change_is_seat_neutral_while_admission_is_held",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped Rust threads verify seat admission and authority coordination; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-auth/src/migration_seat_tests.rs::migration_reactivate_and_concurrent_create_share_admission",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped Rust threads verify seat admission and authority coordination; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-core/src/authority_coordinator.rs::tests::cross_process_writer_cannot_commit_before_response_headers",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::failed_spawn_and_child_drop_revoke",
+      "apis": {
+        "backend_spawn_bound": 2,
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::fixture",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::pty_binding_uses_the_client_pid",
+      "apis": {
+        "backend_spawn_pty_bound": 1,
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/spawn_binding.rs::tests::root_exit_revokes_even_while_guard_is_retained",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_seat_tests.rs::employee_contention",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped Rust threads verify seat admission and authority coordination; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/handlers/migration_authority_seat_tests.rs::migration_account_effects_take_admission_before_authority_during_concurrent_create",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "thread_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped Rust threads verify seat admission and authority coordination; no OS process is launched."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity/ipc_tests.rs::command",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity/ipc_tests.rs::legitimate_descendant_refuses_replaced_socket_or_impersonated_pipe_without_sending",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity/ipc_tests.rs::process_tree_fixture",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity/ipc_tests.rs::real_tree_allows_root_child_grandchild_and_denies_same_user_token_thief",
+      "apis": {
+        "terminal_spawn": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/run_identity.rs::start_listener_with",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio JoinSet serves bounded local identity IPC connections; it starts async tasks, not an OS child process."
+    },
+    {
+      "symbol": "crates/duduclaw-cli-runtime/src/pty.rs::PtyHandle::spawn_with_binding",
+      "apis": {
+        "backend_spawn_pty_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-core/src/execution_gate.rs::spawn_bound",
+      "apis": {
+        "backend_spawn_bound": 1
+      },
+      "identity": "gateway",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
+    },
+    {
+      "symbol": "crates/duduclaw-core/src/execution_gate.rs::spawn_pty_bound",
+      "apis": {
+        "backend_spawn_pty_bound": 1
+      },
+      "identity": "gateway",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
+    },
+    {
+      "symbol": "crates/duduclaw-core/src/process_tree.rs::BackendChild::spawn_class_bound",
+      "apis": {
+        "backend_spawn_bound": 1
+      },
+      "identity": "gateway",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::protected_launch_rejects_host_credential_before_spawning",
+      "apis": {
+        "backend_spawn_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::spawn_binds_before_return_and_root_exit_revokes_without_draining",
+      "apis": {
+        "backend_spawn_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command.rs::spawn",
+      "apis": {
+        "backend_spawn_bound": 1
+      },
+      "identity": "gateway",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command.rs::spawn_pty",
+      "apis": {
+        "backend_spawn_pty_bound": 1
+      },
+      "identity": "gateway",
+      "migration": "backend",
+      "effects": [
+        "process_spawn"
+      ],
+      "rationale": "Shared backend implementation/control adapter. Native process/PTY creation is confined to LocalBackend for non-protected execution; protected employee calls require Spawnd and trusted policy/capability lifecycle. Thread/task spawns are control actors, not employee subprocess bypasses."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/process_group.rs::output_for_model",
+      "apis": {
+        "backend_output_for_model_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::collect_codex_output_with_input",
+      "apis": {
+        "backend_collect_codex_output_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only command/process fixture verifying authority coordination, process-bound credentials or local IPC identity; not a production execution entry point."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::execute_codex_command_with_input",
+      "apis": {
+        "backend_collect_codex_output_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/generic_cli.rs::GenericCliRuntime::run",
+      "apis": {
+        "backend_output_for_model_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime/grok.rs::AgentRuntimeforGrokRuntime::execute",
+      "apis": {
+        "backend_output_for_model_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-llm/src/mcp_client/process_binding.rs::McpClient::connect_with_lease",
+      "apis": {
+        "backend_spawn_and_handshake_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-llm/src/mcp_client.rs::McpClient::spawn_and_handshake_bound",
+      "apis": {
+        "backend_spawn_class_bound": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "employee",
+      "migration": "backend",
+      "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
     }
   ]
 }
