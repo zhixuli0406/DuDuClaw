@@ -270,6 +270,10 @@ impl DeviceOps for SystemDeviceOps {
 
     async fn backup_create(&self, source_dir: &Path, dest_path: &Path) -> OpResult {
         let mut cmd = tokio::process::Command::new("tar");
+        // Authority lock identities and revocation epochs belong to this home.
+        for pattern in crate::backup_restore::AUTHORITY_BACKUP_EXCLUDES {
+            cmd.arg("--exclude").arg(pattern);
+        }
         cmd.arg("-czf")
             .arg(dest_path)
             // Browser sessions must reauthenticate after any restore.

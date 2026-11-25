@@ -213,6 +213,9 @@ impl CopyPolicy {
     pub fn is_excluded(&self, name: &OsStr) -> bool {
         let name = name.to_string_lossy();
         name.eq_ignore_ascii_case(crate::publication::PUBLICATION_LOCK_NAME)
+            // Applies to snapshot, native-clone cleanup and promotion, even
+            // with a custom policy: never carry a home's lock/epoch namespace.
+            || duduclaw_core::authority_coordinator::is_authority_namespace(&name)
             || name.eq_ignore_ascii_case("fork_resolution.lock.lock")
             || name.eq_ignore_ascii_case("fork_recovery")
             || glob_match_ci(".duduclaw-fork-locks-*", &name)
@@ -675,6 +678,10 @@ mod tests {
 
     #[test]
     fn presets() {
+        let custom = CopyPolicy::with_excludes(Vec::<String>::new());
+        for name in [".google-authority", ".GOOGLE-AUTHORITY. ", ".google-authority::$INDEX_ALLOCATION"] {
+            assert!(custom.is_excluded(OsStr::new(name)));
+        }
         let d = CopyPolicy::fork_default();
         assert!(d.is_excluded(OsStr::new(".env")));
         assert!(d.is_excluded(OsStr::new("id_ed25519")));

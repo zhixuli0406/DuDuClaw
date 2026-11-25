@@ -453,7 +453,9 @@ async fn tar_backup_excluding(
 ) -> std::io::Result<std::process::ExitStatus> {
     let mut cmd = tokio::process::Command::new("tar");
     cmd.arg("-czf").arg(dest_path);
-    for pattern in excludes {
+    // Authority lock identities and revocation epochs belong to this home.
+    for pattern in excludes.iter().map(String::as_str)
+        .chain(crate::backup_restore::AUTHORITY_BACKUP_EXCLUDES.iter().copied()) {
         cmd.arg("--exclude").arg(pattern);
     }
     cmd.arg("-C").arg(source_dir).arg(".");
@@ -737,6 +739,10 @@ mod tests {
         .unwrap();
         // A real sibling file so the archive isn't trivially empty.
         std::fs::write(home.join("agent.toml"), b"[agent]\nname=\"kiki\"\n").unwrap();
+        for name in [".google-authority", ".GOOGLE-AUTHORITY. "] {
+            std::fs::create_dir_all(home.join(name)).unwrap();
+            std::fs::write(home.join(name).join("epoch"), b"old epoch").unwrap();
+        }
 
         let cfg = BackupScheduleConfig::from_home(&home);
         let sched = BackupScheduler::new(home.clone());
@@ -755,6 +761,8 @@ mod tests {
         );
 
         let entries2 = list_tar_gz_entries(&backups_dir(&home).join(&filename2));
+        assert!(!entries2.iter().any(|path| Path::new(path).components().any(|part|
+            duduclaw_core::authority_coordinator::is_authority_namespace(&part.as_os_str().to_string_lossy()))));
 
         assert!(
             !entries2.iter().any(|e| e.contains(&filename1)),

@@ -36,6 +36,7 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use duduclaw_core::authority_coordinator::is_authority_namespace;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -351,6 +352,12 @@ fn extract_inner(
             });
         }
 
+        // Backups may be home-rooted or partition-rooted. Never materialize
+        // an archived authority namespace at either depth, even in staging.
+        if raw_path.components().any(|part|
+            is_authority_namespace(&part.as_os_str().to_string_lossy())) {
+            continue;
+        }
         let dest_path = dest_dir.join(&raw_path);
         if entry_type.is_dir() {
             std::fs::create_dir_all(&dest_path).map_err(|e| RestoreViolation::Io(e.to_string()))?;
@@ -763,11 +770,21 @@ pub enum RestoreSwapError {
 }
 
 // The singleton inode must stay at its original path on every platform.
+// Portable tar globs: case-insensitive names and Win32 trailing-dot/space/ADS
+// aliases. Shared by manual and scheduled backups; no GNU-only tar flags.
+pub(crate) const AUTHORITY_BACKUP_EXCLUDES: &[&str] = &[
+    "*/.[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY]",
+    "*/.[gG][oO][oO][gG][lL][eE]-[aA][uU][tT][hH][oO][rR][iI][tT][yY][. :]*",
+];
+
 // Ignore Windows aliases too, even when this restore runs on Unix.
 fn is_gateway_lock_directory(name: &std::ffi::OsStr) -> bool {
     name.to_str().is_some_and(|name| {
-        name.split(':').next().unwrap_or(name)
-            .trim_end_matches(['.', ' ']).to_uppercase().to_lowercase() == "locks"
+        let name = name.split(':').next().unwrap_or(name)
+            .trim_end_matches(['.', ' ']).to_uppercase().to_lowercase();
+        // Retain local lock identity and never roll back the epoch. On Windows,
+        // tar also loses private DACLs. Only the coordinator creates namespaces.
+        name == "locks" || is_authority_namespace(&name)
     })
 }
 
@@ -834,6 +851,14 @@ fn perform_pending_restore_swap_with_protection(
         })?;
     }
 
+    // Keep local lock identity; retire the epoch before replacing any data.
+    // Hold admission -> authority writer -> restore/config locks through swap.
+    let authority_exists = path_occupied(&home_dir.join(".google-authority"))
+        .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+    let _admission = authority_exists.then(|| duduclaw_core::agent_seats::SeatAdmission::acquire(home_dir))
+        .transpose().map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+    let _authority = authority_exists.then(|| duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home_dir).write())
+        .transpose().map_err(|e| RestoreSwapError::Io(e.to_string()))?;
     with_restore_lock(home_dir, || perform_pending_restore_swap_locked(home_dir, now_tag))
         .map_err(|e| RestoreSwapError::Io(e.to_string()))?
 }
@@ -1609,6 +1634,55 @@ mod tests {
             let other = std::fs::OpenOptions::new().read(true).write(true).open(&lock).unwrap();
             assert!(other.try_lock_exclusive().is_err(), "a second gateway must remain excluded");
             assert!(duduclaw_core::gateway_instance::held(home));
+        }
+    }
+
+    #[test]
+    fn restore_preserves_authority_locks_and_private_permissions() {
+        use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+        let input = tempfile::tempdir().unwrap();
+        let archive = input.path().join("old-export.tar.gz");
+        std::fs::write(&archive, build_tar_gz(&[
+            (".google-authority/epoch", b"old epoch"),
+            ("duduclaw/.GOOGLE-AUTHORITY. /intent", b"old lock"),
+            ("config.toml", b"[auth]\nmfa_enforced=true\n"),
+        ])).unwrap();
+        let extracted = input.path().join("extracted");
+        let extraction = extract_tar_gz_safely(&archive, &extracted, &RestoreLimits::default()).unwrap();
+        assert_eq!(extraction.files_written, 1);
+        assert!(!extracted.join(".google-authority").exists());
+        assert!(!extracted.join("duduclaw").exists());
+        for existing in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let authority = AuthorityCoordinator::new(home.path());
+            if existing { authority.initialize().unwrap(); }
+            let before = existing.then(|| authority.epoch().unwrap());
+            let staging = staging_dir(home.path());
+            // Model legacy staging, which would replace pinned files, restore
+            // an old epoch and, on Windows, lose private DACLs.
+            let archived = staging.join(".GOOGLE-AUTHORITY");
+            std::fs::create_dir_all(&archived).unwrap();
+            for name in ["intent", "resource", "epoch"] {
+                std::fs::write(archived.join(name), b"archived state").unwrap();
+            }
+            std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+            write_marker(home.path(), &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "old-export.tar.gz".into(),
+            }).unwrap();
+            let report = perform_pending_restore_swap(home.path(), "authority").unwrap().unwrap();
+            assert_eq!(report.entries_swapped, 1);
+            assert_eq!(std::fs::read_dir(home.path()).unwrap().filter(|entry|
+                is_authority_namespace(&entry.as_ref().unwrap().file_name().to_string_lossy())).count(), usize::from(existing));
+            assert!(!report.preserved_dir.join(".google-authority").exists());
+            if let Some(before) = before {
+                assert_ne!(authority.epoch().unwrap(), before);
+            } else {
+                assert!(!home.path().join(".google-authority").exists());
+            }
+            // Check original anchors and fresh Unix mode/uid/nlink or DACLs.
+            if existing { drop(authority.write().unwrap()); }
+            drop(AuthorityCoordinator::new(home.path()).write().unwrap());
+            assert!(is_gateway_lock_directory(std::ffi::OsStr::new(".GOOGLE-AUTHORITY. ")));
         }
     }
 

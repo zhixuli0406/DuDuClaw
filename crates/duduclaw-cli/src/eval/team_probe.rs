@@ -260,6 +260,10 @@ fn copy_tree_limited(
     std::fs::create_dir_all(dst).map_err(|e| e.to_string())?;
     for entry in std::fs::read_dir(src).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        // Each cloned home must initialize its own lock identities and epoch.
+        if duduclaw_core::authority_coordinator::is_authority_namespace(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
         let path = entry.path();
         let ty = entry.file_type().map_err(|e| e.to_string())?;
         let target = dst.join(entry.file_name());

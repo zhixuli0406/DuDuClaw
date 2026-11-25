@@ -29,6 +29,9 @@ const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles"]
 
 /// `true` if a top-level entry name should be excluded from the export.
 fn is_excluded(name: &str) -> bool {
+    // Authority state is local: archives would split lock identity, roll back
+    // revocation epochs, and lose private Windows DACLs on extraction.
+    if duduclaw_core::authority_coordinator::is_authority_namespace(name) { return true; }
     EXCLUDE_DIRS.contains(&name)
         || name.starts_with("backup_")
         || name.ends_with(".log")
@@ -110,6 +113,18 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
     }
     // Create only the empty root before locking; no employee data is written.
     duduclaw_core::config::create_home_dir(home).map_err(|e| io_err("import mkdir home", e))?;
+    // Preserve local lock identity and retire the epoch before replacing data.
+    // Admission precedes the authority writer, lifecycle/config locks and DB
+    // transactions. A fresh home has no authority namespace to invalidate.
+    let authority_exists = match fs::symlink_metadata(home.join(".google-authority")) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(io_err("import authority", e)),
+    };
+    let _admission = authority_exists.then(|| duduclaw_core::agent_seats::SeatAdmission::acquire(home))
+        .transpose().map_err(|e| io_err("import admission", e))?;
+    let _authority = authority_exists.then(|| duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home).write())
+        .transpose().map_err(|e| io_err("import authority", e))?;
     let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
         .map_err(|error| io_err("import", error))?;
     // The Admin toggle uses this same lock. Recheck after acquiring it and
@@ -871,6 +886,49 @@ mod tests {
     }
 
     #[test]
+    fn import_preserves_authority_locks_and_private_permissions() {
+        use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("old-export.tar.gz");
+        // Include Win32 aliases as an old or externally produced archive may.
+        ordered_archive(&archive, &[
+            (".GOOGLE-AUTHORITY. /intent", b"archived lock"),
+            (".google-authority/resource", b"archived lock"),
+            (".google-authority/epoch", b"archived epoch"),
+            ("agents/imported/SOUL.md", b"imported"),
+        ]);
+        for existing in [false, true] {
+            let home = root.path().join(if existing { "existing" } else { "fresh" });
+            fs::create_dir(&home).unwrap();
+            let authority = AuthorityCoordinator::new(&home);
+            // Keep the coordinator's anchor handles open, without a shared
+            // lease: the import must acquire its writer and retire the epoch.
+            if existing { authority.initialize().unwrap(); }
+            let before = existing.then(|| authority.epoch().unwrap());
+            import_archive(&archive, &home, false, true).unwrap();
+            assert_eq!(fs::read(home.join("agents/imported/SOUL.md")).unwrap(), b"imported");
+            if let Some(before) = before {
+                assert_ne!(authority.epoch().unwrap(), before);
+            } else {
+                assert!(!home.join(".google-authority").exists(), "archive must not create authority state");
+            }
+            // The original coordinator checks pinned identities; a fresh one
+            // validates Unix mode/uid/nlink or Windows DACLs before writing.
+            if existing { drop(authority.write().unwrap()); }
+            drop(AuthorityCoordinator::new(&home).write().unwrap());
+            let exported = root.path().join("export.tar.gz");
+            export_home(&home, &exported).unwrap();
+            let mut exported = tar::Archive::new(GzDecoder::new(File::open(exported).unwrap()));
+            for entry in exported.entries().unwrap() {
+                let entry = entry.unwrap();
+                assert!(!entry.path().unwrap().components().any(|part|
+                    duduclaw_core::authority_coordinator::is_authority_namespace(&part.as_os_str().to_string_lossy())));
+            }
+            assert!(is_excluded(".GOOGLE-AUTHORITY. "));
+        }
+    }
+
+    #[test]
     fn mfa_import_cannot_change_policy_before_moving_agents() {
         for (personal, restored) in [
             (true, "[auth]\nmfa_enforced=false\n"),
@@ -1201,6 +1259,9 @@ fn is_live_lock(path: &Path) -> bool {
     path.components().next().and_then(|part| part.as_os_str().to_str()).is_some_and(|name| {
         [duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE, "config.toml.lock", ".google-home-source.lock", "locks"]
             .iter().any(|lock| name.eq_ignore_ascii_case(lock))
+            // Old exports must not replace pinned lock files, roll back the
+            // epoch, or recreate files with inherited Windows DACLs.
+            || duduclaw_core::authority_coordinator::is_authority_namespace(name)
     })
 }
 

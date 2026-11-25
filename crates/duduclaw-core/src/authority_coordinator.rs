@@ -21,6 +21,14 @@ mod namespace;
 use namespace::{Namespace, INTENT, RESOURCE, EPOCH};
 use fs2::FileExt;
 
+/// Local authority state must never be archived, cloned or restored: replacing
+/// it splits lock identity, rolls back epochs and loses private Windows DACLs.
+/// Ignore Win32 aliases too, even when the copy or restore runs on Unix.
+pub fn is_authority_namespace(name: &str) -> bool {
+    name.split(':').next().unwrap_or(name)
+        .trim_end_matches(['.', ' ']).to_uppercase().to_lowercase() == namespace::DIRECTORY
+}
+
 #[derive(Clone)]
 pub struct AuthorityCoordinator {
     home: PathBuf,
