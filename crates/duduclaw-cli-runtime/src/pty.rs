@@ -143,10 +143,16 @@ impl PtyHandle {
     pub(crate) async fn spawn_with_handoff(
         cmd: PtyCommand, handed_off: impl FnOnce(),
     ) -> Result<Self, PtyError> {
+        Self::spawn_with_binding(cmd, None, handed_off).await
+    }
+
+    pub(crate) async fn spawn_with_binding(
+        cmd: PtyCommand, binding: Option<duduclaw_core::run_credential::SpawnBinding>, handed_off: impl FnOnce(),
+    ) -> Result<Self, PtyError> {
         let builder = command_builder(&cmd);
-        let mut child = duduclaw_core::execution_gate::spawn_pty(builder,
+        let mut child = duduclaw_core::execution_gate::spawn_pty_bound(builder,
             PtySize { rows: cmd.rows, columns: cmd.cols },
-            duduclaw_core::execution_gate::capture_class()).await
+            duduclaw_core::execution_gate::capture_class(), binding).await
             .map_err(|source| PtyError::SpawnChild { program: cmd.program.clone(), source })?;
         handed_off();
         let pid = child.id();

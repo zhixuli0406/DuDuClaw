@@ -8,6 +8,8 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use zeroize::Zeroizing;
 
 pub mod discovery;
+pub use duduclaw_execution::process_identity::{ProcessIdentity, RootProcess};
+pub use duduclaw_execution::spawn_binding::{SpawnBinding, MAX_ANCESTRY_DEPTH};
 
 pub const ENV_RUN_CREDENTIAL: &str = "DUDUCLAW_RUN_CREDENTIAL";
 /// Routing hint only; never an identity claim. Always use a literal loopback IP.
@@ -53,6 +55,10 @@ pub struct RunCredential(Zeroizing<String>);
 /// Only the gateway installs an issuer; an absent issuer denies the spawn.
 pub trait RunLease: Send + Sync {
     fn credential(&self) -> &RunCredential;
+    fn spawn_binding(&self) -> SpawnBinding;
+    fn bind_spawn(&self, root: RootProcess) -> std::io::Result<()> {
+        self.spawn_binding().bind_spawn(root)
+    }
     fn identity_url(&self) -> Option<&str> { None }
 }
 

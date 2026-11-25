@@ -695,8 +695,8 @@ impl GenericCliRuntime {
         let timeout_secs = crate::runtime_config::call_timeout_secs(context.agent_dir.as_deref());
         let output = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Registered(duduclaw_core::execution_gate::Text::new(id.to_string()).map_err(|_| GenericCliError::Spawn { runtime: id, error: "Invalid registered runtime id".into() })?),
-            crate::process_group::output_for_model(
-            &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs),
+            crate::process_group::output_for_model_bound(
+            &mut cmd, stdin_prompt.then_some(payload.as_bytes()), Duration::from_secs(timeout_secs), Some(_run_identity.spawn_binding()),
         )).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => GenericCliError::Timeout {
                 runtime: id, secs: timeout_secs,

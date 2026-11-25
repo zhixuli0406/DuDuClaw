@@ -44,6 +44,8 @@ pub struct OneshotInvocation {
     /// explicit allowlist (`duduclaw_core::spawn_env`) and set this `true`
     /// so the gateway's ambient vendor `*_API_KEY`s don't leak through.
     pub clear_env: bool,
+    /// Host-only capability; never inferred from the child environment.
+    pub spawn_binding: Option<duduclaw_core::run_credential::SpawnBinding>,
 }
 
 impl OneshotInvocation {
@@ -57,7 +59,13 @@ impl OneshotInvocation {
             cols: 200,
             deadline: Duration::from_secs(300),
             clear_env: false,
+            spawn_binding: None,
         }
+    }
+
+    pub fn spawn_binding(mut self, binding: duduclaw_core::run_credential::SpawnBinding) -> Self {
+        self.spawn_binding = Some(binding);
+        self
     }
 
     pub fn args<I, S>(mut self, args: I) -> Self
@@ -139,7 +147,7 @@ pub async fn oneshot_pty_invoke(invocation: OneshotInvocation) -> Result<Oneshot
 
     let admission = duduclaw_core::autonomy_handoff::admit().await
         .map_err(|error| PtyError::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)))?;
-    let pty = PtyHandle::spawn_with_handoff(pty_cmd, || admission.handed_off()).await?;
+    let pty = PtyHandle::spawn_with_binding(pty_cmd, invocation.spawn_binding, || admission.handed_off()).await?;
     let start = Instant::now();
     let result = drain_until_eof(&pty, invocation.deadline).await;
 
