@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 
 #[cfg(windows)]
-const FILENAME: &str = "identity-url";
+const FILENAME: &str = "identity-endpoint";
 const MAX_BYTES: u64 = 4096;
 
 fn denied() -> io::Error {
@@ -41,6 +41,9 @@ mod platform {
     }
 
     impl DiscoveryDirectory {
+        /// Duplicate the already validated directory, for relative IPC lifecycle operations.
+        pub fn try_clone_directory(&self) -> io::Result<File> { self.0.try_clone() }
+
         pub fn open(home: &Path, create: bool) -> io::Result<Self> {
             let home = OpenOptions::new().read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(home)?;
@@ -78,7 +81,7 @@ mod platform {
 
         pub fn read(&self) -> io::Result<String> {
             // O_NONBLOCK also ensures a planted FIFO cannot hang discovery.
-            let file = open_at(&self.0, c"identity-url", libc::O_RDONLY | libc::O_NONBLOCK)?;
+            let file = open_at(&self.0, c"identity-endpoint", libc::O_RDONLY | libc::O_NONBLOCK)?;
             private(&file.metadata()?, false)?;
             let mut text = String::new();
             file.take(MAX_BYTES + 1).read_to_string(&mut text)?;
@@ -96,7 +99,7 @@ mod platform {
                 file.sync_all()?;
                 // SAFETY: both names are single components in the same pinned dirfd.
                 if unsafe { libc::renameat(self.0.as_raw_fd(), name.as_ptr(),
-                    self.0.as_raw_fd(), c"identity-url".as_ptr()) } != 0 {
+                    self.0.as_raw_fd(), c"identity-endpoint".as_ptr()) } != 0 {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -110,7 +113,7 @@ mod platform {
 
         pub fn remove(&self) -> io::Result<()> {
             // SAFETY: the directory stays open; unlinkat does not follow the file.
-            if unsafe { libc::unlinkat(self.0.as_raw_fd(), c"identity-url".as_ptr(), 0) } != 0 {
+            if unsafe { libc::unlinkat(self.0.as_raw_fd(), c"identity-endpoint".as_ptr(), 0) } != 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -226,7 +229,7 @@ pub use platform::DiscoveryDirectory;
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
-    use crate::run_credential::IDENTITY_URL_FILE;
+    use crate::run_credential::IDENTITY_ENDPOINT_FILE;
 
     #[test]
     fn creates_private_directory_and_file_and_replaces_atomically() {
@@ -234,7 +237,7 @@ mod tests {
         let directory = DiscoveryDirectory::open(home.path(), true).unwrap();
         directory.write("first").unwrap();
         let run = std::fs::metadata(home.path().join("run")).unwrap();
-        let file = std::fs::metadata(home.path().join(IDENTITY_URL_FILE)).unwrap();
+        let file = std::fs::metadata(home.path().join(IDENTITY_ENDPOINT_FILE)).unwrap();
         assert!(run.is_dir());
         assert!(file.is_file());
         assert_eq!(run.mode() & 0o777, 0o700);
@@ -274,7 +277,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let directory = DiscoveryDirectory::open(home.path(), true).unwrap();
-        let file = home.path().join(IDENTITY_URL_FILE);
+        let file = home.path().join(IDENTITY_ENDPOINT_FILE);
         let target = outside.path().join("target");
         std::fs::write(&target, "attacker").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -300,11 +303,11 @@ mod tests {
         let original = home.path().join("original-run");
         std::fs::rename(home.path().join("run"), &original).unwrap();
         symlink(outside.path(), home.path().join("run")).unwrap();
-        std::fs::write(outside.path().join("identity-url"), "untouched").unwrap();
+        std::fs::write(outside.path().join("identity-endpoint"), "untouched").unwrap();
         directory.write("trusted").unwrap();
-        assert_eq!(std::fs::read_to_string(original.join("identity-url")).unwrap(), "trusted");
+        assert_eq!(std::fs::read_to_string(original.join("identity-endpoint")).unwrap(), "trusted");
         directory.remove().unwrap();
-        assert!(!original.join("identity-url").exists());
-        assert_eq!(std::fs::read_to_string(outside.path().join("identity-url")).unwrap(), "untouched");
+        assert!(!original.join("identity-endpoint").exists());
+        assert_eq!(std::fs::read_to_string(outside.path().join("identity-endpoint")).unwrap(), "untouched");
     }
 }

@@ -150,7 +150,7 @@ pub(crate) fn override_args(
 
         let mut forwarded = if supports_env_vars {
             vec![duduclaw_core::run_credential::ENV_RUN_CREDENTIAL.to_string(),
-                duduclaw_core::run_credential::ENV_IDENTITY_URL.to_string()]
+                duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT.to_string()]
         } else { Vec::new() };
         for (k, v) in &s.env {
             if !is_safe_config_key_segment(k) {

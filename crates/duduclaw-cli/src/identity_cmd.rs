@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use duduclaw_core::error::{DuDuClawError, Result};
-use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_RUN_CREDENTIAL, RunCredential};
+use duduclaw_core::run_credential::{ipc, ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_RUN_CREDENTIAL, RunCredential};
 use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
 
 #[derive(clap::Subcommand)]
@@ -20,20 +20,11 @@ pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
     require_run_identity_mode(duduclaw_core::execution_gate::isolation_required())?;
     let credential = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse)
         .ok_or_else(inactive)?;
-    let url = discover_url(home, std::env::var(ENV_IDENTITY_URL)).ok_or_else(inactive)?;
-    let client = reqwest::Client::builder().no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(5)).build().map_err(|_| inactive())?;
-    let mut response = client.post(url)
-        .json(&serde_json::json!({"credential": credential.expose()}))
-        .send().await.map_err(|_| inactive())?;
-    if response.status() != reqwest::StatusCode::OK { return Err(inactive()); }
-    let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| inactive())? {
-        if bytes.len().saturating_add(chunk.len()) > 16384 { return Err(inactive()); }
-        bytes.extend_from_slice(&chunk);
-    }
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| inactive())?;
+    if std::env::var_os(ENV_IDENTITY_URL).is_some() { return Err(inactive()); }
+    let endpoint = discover_endpoint(home, std::env::var(ENV_IDENTITY_ENDPOINT)).ok_or_else(inactive)?;
+    let value = ipc::request(&endpoint, &serde_json::json!({
+        "version": 1, "operation": "introspect", "credential": credential.expose(),
+    })).await.map_err(|_| inactive())?;
     if value.get("active").and_then(serde_json::Value::as_bool) != Some(true) {
         if json { println!("{{\"active\":false}}"); }
         return Err(inactive());
@@ -53,15 +44,13 @@ pub(crate) async fn run(home: &Path, command: IdentityCommands) -> Result<()> {
 pub(crate) async fn record_native_tool_result(home: &Path, tool: &str, result: &serde_json::Value) -> Result<()> {
     let Some(reference) = duduclaw_gateway::session_tool_refs::reference_from_result(tool, result) else { return Ok(()); };
     let Some(credential) = std::env::var(ENV_RUN_CREDENTIAL).ok().and_then(RunCredential::parse) else { return Ok(()); };
-    let Some(mut url) = discover_url(home, std::env::var(ENV_IDENTITY_URL)) else { return Ok(()); };
-    url.set_path(duduclaw_gateway::run_identity::TOOL_REFS_ROUTE);
+    if std::env::var_os(ENV_IDENTITY_URL).is_some() { return Ok(()); }
+    let Some(endpoint) = discover_endpoint(home, std::env::var(ENV_IDENTITY_ENDPOINT)) else { return Ok(()); };
     let unavailable = || DuDuClawError::Gateway("Conversation reference writer unavailable".into());
-    let client = reqwest::Client::builder().no_proxy().redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(5)).build().map_err(|_| unavailable())?;
-    let response = client.post(url).json(&serde_json::json!({
-        "credential": credential.expose(), "reference": reference,
-    })).send().await.map_err(|_| unavailable())?;
-    if !response.status().is_success() { return Err(unavailable()); }
+    let response = ipc::request(&endpoint, &serde_json::json!({
+        "version": 1, "operation": "tool-reference", "credential": credential.expose(), "reference": reference,
+    })).await.map_err(|_| unavailable())?;
+    if response["active"] != true { return Err(unavailable()); }
     Ok(())
 }
 
@@ -75,24 +64,26 @@ fn require_run_identity_mode(protected: bool) -> Result<()> {
 
 // Validate the final discovery target before sending a bearer proof. A present
 // but invalid environment override fails closed rather than using the file.
-fn discover_url(home: &Path, env: std::result::Result<String, std::env::VarError>) -> Option<reqwest::Url> {
+fn discover_endpoint(home: &Path, env: std::result::Result<String, std::env::VarError>) -> Option<String> {
     let raw = match env {
         Ok(value) => value,
         Err(std::env::VarError::NotPresent) => DiscoveryDirectory::open(home, false).ok()?.read().ok()?,
         Err(_) => return None,
     };
-    let url = reqwest::Url::parse(raw.trim()).ok()?;
-    if url.scheme() != "http" || url.host_str() != Some("127.0.0.1")
-        || url.port().is_none_or(|port| port == 0) || !url.username().is_empty() || url.password().is_some()
-        || url.path() != duduclaw_gateway::run_identity::ROUTE || url.query().is_some() || url.fragment().is_some() {
-        return None;
-    }
-    Some(url)
+    ipc::endpoint_path(&raw)?;
+    Some(raw)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_endpoint(name: &str) -> String {
+        #[cfg(unix)]
+        { format!("unix:v1:/tmp/{name}/s") }
+        #[cfg(windows)]
+        { format!(r"pipe:v1:\\.\pipe\duduclaw-identity-{name}") }
+    }
 
     #[test]
     fn reference_writer_never_uses_session_environment_claims() {
@@ -120,18 +111,17 @@ mod tests {
     #[test]
     fn discovery_prefers_env_then_file_and_refuses_nonlocal_targets() {
         let home = tempfile::tempdir().unwrap();
-        let url = format!("http://127.0.0.1:12345{}", duduclaw_gateway::run_identity::ROUTE);
-        let other = format!("http://127.0.0.1:12346{}", duduclaw_gateway::run_identity::ROUTE);
-        assert!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).is_none());
+        let url = test_endpoint("abc");
+        let other = test_endpoint("def");
+        assert!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).is_none());
         let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
         discovery.write(&url).unwrap();
-        assert_eq!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).unwrap().as_str(), url);
-        assert_eq!(discover_url(home.path(), Ok(other.clone())).unwrap().as_str(), other);
-        for raw in [String::new(), url.replace("127.0.0.1", "example.com"),
-            url.replace("127.0.0.1", "127.0.0.1.evil.example"), url.replace("http:", "https:"),
-            url.replace("127.0.0.1", "user@127.0.0.1"), format!("{url}?credential=x"),
-            format!("{url}#x"), url.replace("12345", "0")] {
-            assert!(discover_url(home.path(), Ok(raw)).is_none());
+        assert_eq!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).unwrap().as_str(), url);
+        assert_eq!(discover_endpoint(home.path(), Ok(other.clone())).unwrap().as_str(), other);
+        for raw in [String::new(), "http://127.0.0.1:12345/api/internal/identity/introspect".into(),
+            "https://example.com".into(), "unix:v2:/tmp/s".into(), "unix:v1:relative".into(),
+            format!(" {url}"), format!("{url}\0")] {
+            assert!(discover_endpoint(home.path(), Ok(raw)).is_none());
         }
     }
 
@@ -139,22 +129,22 @@ mod tests {
     #[test]
     fn discovery_ignores_unsafe_files_and_directories_but_keeps_env_override() {
         use std::os::unix::fs::{symlink, PermissionsExt};
-        use duduclaw_core::run_credential::IDENTITY_URL_FILE;
+        use duduclaw_core::run_credential::IDENTITY_ENDPOINT_FILE;
 
-        let url = format!("http://127.0.0.1:12345{}", duduclaw_gateway::run_identity::ROUTE);
+        let url = test_endpoint("abc");
         let home = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
         discovery.write(&url).unwrap();
-        let file = home.path().join(IDENTITY_URL_FILE);
+        let file = home.path().join(IDENTITY_ENDPOINT_FILE);
         let directory = home.path().join("run");
         let assert_ignored = || {
-            assert!(discover_url(home.path(), Err(std::env::VarError::NotPresent)).is_none());
-            assert_eq!(discover_url(home.path(), Ok(url.clone())).unwrap().as_str(), url);
+            assert!(discover_endpoint(home.path(), Err(std::env::VarError::NotPresent)).is_none());
+            assert_eq!(discover_endpoint(home.path(), Ok(url.clone())).unwrap().as_str(), url);
         };
 
-        std::fs::rename(&file, outside.path().join("identity-url")).unwrap();
-        symlink(outside.path().join("identity-url"), &file).unwrap();
+        std::fs::rename(&file, outside.path().join("identity-endpoint")).unwrap();
+        symlink(outside.path().join("identity-endpoint"), &file).unwrap();
         assert_ignored();
         std::fs::remove_file(&file).unwrap();
         discovery.write(&url).unwrap();

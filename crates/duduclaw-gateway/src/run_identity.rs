@@ -1,24 +1,19 @@
-//! RM-208: gateway-owned, memory-only run registry. No issuance HTTP API.
-//! An AI cannot claim another identity by changing environment variables,
-//! parameters, or its working directory. Processes sharing an OS user may
-//! borrow another active run's credential by reading its environment; the
-//! credential stops working when that run ends. Native Linux protected mode
-//! isolates employees as separate users and uses its own capability identity;
-//! it issues no run credential. Child environments only transport the proof.
+//! Gateway-owned run registry with kernel-authenticated local IPC peers.
+//! Tokens authorize only the bound process root and its live descendants.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::{Json, Router, body::to_bytes, extract::{ConnectInfo, Request, State}, routing::post};
+use duduclaw_core::run_credential::{RootProcess, ipc};
 use rand::RngCore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_RUN_CREDENTIAL, RunCredential, SpawnBinding};
+use duduclaw_core::run_credential::{ENV_IDENTITY_URL, ENV_IDENTITY_ENDPOINT, ENV_RUN_CREDENTIAL, RunCredential, SpawnBinding};
 use duduclaw_core::run_credential::discovery::DiscoveryDirectory;
 #[cfg(test)]
-use duduclaw_core::run_credential::IDENTITY_URL_FILE;
+use duduclaw_core::run_credential::IDENTITY_ENDPOINT_FILE;
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 pub const TOOL_REFS_ROUTE: &str = "/api/internal/identity/tool-reference";
@@ -93,7 +88,7 @@ pub struct RunGuard {
     registry: Arc<Registry>,
     hash: [u8; 32],
     credential: RunCredential,
-    identity_url: Option<String>,
+    identity_endpoint: Option<String>,
     binding: SpawnBinding,
 }
 
@@ -111,6 +106,10 @@ impl Drop for RunGuard {
     }
 }
 
+#[cfg(unix)]
+mod unix;
+#[cfg(windows)]
+mod windows;
 mod issuer;
 pub use issuer::RunIssuer;
 
@@ -120,20 +119,22 @@ impl RunGuard {
     pub fn apply(&self, cmd: &mut tokio::process::Command) {
         cmd.env(ENV_RUN_CREDENTIAL, self.credential.expose());
         cmd.env_remove(ENV_IDENTITY_URL);
-        if let Some(url) = &self.identity_url { cmd.env(ENV_IDENTITY_URL, url); }
+        cmd.env_remove(ENV_IDENTITY_ENDPOINT);
+        if let Some(url) = &self.identity_endpoint { cmd.env(ENV_IDENTITY_ENDPOINT, url); }
     }
 
     pub fn apply_pty(&self, env: &mut HashMap<String, String>) {
+        env.retain(|key, _| !key.eq_ignore_ascii_case(ENV_RUN_CREDENTIAL)
+            && !key.eq_ignore_ascii_case(ENV_IDENTITY_URL) && !key.eq_ignore_ascii_case(ENV_IDENTITY_ENDPOINT));
         env.insert(ENV_RUN_CREDENTIAL.to_string(), self.credential.expose().to_string());
-        env.remove(ENV_IDENTITY_URL);
-        if let Some(url) = &self.identity_url { env.insert(ENV_IDENTITY_URL.into(), url.clone()); }
+        if let Some(url) = &self.identity_endpoint { env.insert(ENV_IDENTITY_ENDPOINT.into(), url.clone()); }
     }
 }
 
 impl duduclaw_core::run_credential::RunLease for RunGuard {
     fn credential(&self) -> &RunCredential { &self.credential }
     fn spawn_binding(&self) -> SpawnBinding { self.binding.clone() }
-    fn identity_url(&self) -> Option<&str> { self.identity_url.as_deref() }
+    fn identity_endpoint(&self) -> Option<&str> { self.identity_endpoint.as_deref() }
 }
 
 pub fn install_background_issuer() -> Result<(), String> {
@@ -171,20 +172,20 @@ impl Registry {
         if runs.len() >= MAX_RUNS || runs.contains_key(&hash) {
             return Err("Run identity registry full".into());
         }
-        let identity_url = self.endpoint.lock().map_err(|_| "Run identity listener unavailable")?.clone();
+        let identity_endpoint = self.endpoint.lock().map_err(|_| "Run identity listener unavailable")?.clone();
         let deadline = Instant::now() + Duration::from_secs(ttl);
         let deadline = limit.map_or(deadline, |limit| limit.min(deadline));
         let binding = SpawnBinding::pending(deadline);
         runs.insert(hash, Entry { binding: binding.clone(), record, deadline, rate: (Instant::now(), 0) });
-        Ok(RunGuard { registry: self.clone(), hash, credential, identity_url, binding })
+        Ok(RunGuard { registry: self.clone(), hash, credential, identity_endpoint, binding })
     }
 
     #[cfg(test)]
     fn lookup(&self, credential: &RunCredential) -> Option<RunRecord> {
-        self.lookup_hash(digest(credential), true, false).ok().flatten()
+        self.lookup_hash(digest(credential), true, false, RootProcess::capture(std::process::id()).ok().as_ref()).ok().flatten()
     }
 
-    fn lookup_hash(&self, hash: [u8; 32], well_formed: bool, rate_limit: bool) -> Result<Option<RunRecord>, ()> {
+    fn lookup_hash(&self, hash: [u8; 32], well_formed: bool, rate_limit: bool, peer: Option<&RootProcess>) -> Result<Option<RunRecord>, ()> {
         #[cfg(test)]
         self.lookups.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = unix_now().map_err(|_| ())?;
@@ -198,17 +199,22 @@ impl Registry {
             runs.remove(&hash);
             return Ok(None);
         }
-        if !well_formed || entry.binding.root().is_none() { return Ok(None); }
+        if !well_formed { return Ok(None); }
+        let Some(root) = entry.binding.root() else { return Ok(None); };
+        let Some(peer) = peer else { return Ok(None); };
+        if !duduclaw_core::run_credential::is_descendant(peer, root)
+            || entry.binding.root() != Some(root) || entry.deadline <= Instant::now()
+            || entry.record.expires_at <= unix_now().map_err(|_| ())? { return Ok(None); }
         let entry = runs.get_mut(&hash).ok_or(())?;
         if rate_limit && !allow_bucket(&mut entry.rate) { return Err(()); }
         Ok(Some(entry.record.clone()))
     }
 
-    fn query(&self, credential: Option<&RunCredential>) -> Option<RunRecord> {
+    fn query(&self, credential: Option<&RunCredential>, peer: Option<&RootProcess>) -> Option<RunRecord> {
         // Always hash and look up one credential, even if parsing failed.
         let dummy = RunCredential::from_bytes(&[0; 32]);
         let hash = digest(credential.unwrap_or(&dummy));
-        match self.lookup_hash(hash, credential.is_some(), true) {
+        match self.lookup_hash(hash, credential.is_some(), true, peer) {
             Ok(Some(record)) => Some(record),
             Ok(None) => {
                 let Ok(mut rate) = self.invalid_rate.lock() else { return None; };
@@ -273,14 +279,14 @@ pub fn issue(home: &Path, agent: &str, runtime: &str, timeout: u64) -> Result<Ru
     registry().issue(record, timeout)
 }
 
-/// Owned by gateway startup, after acquiring this home's gateway.lock.
-/// Dropping it stops the listener and removes the discovery file.
+/// Owned by gateway startup after acquiring gateway.lock. Abort also drops all
+/// in-flight connections; revoke existing bindings immediately on shutdown.
 pub struct IdentityListener {
     task: tokio::task::JoinHandle<()>,
     discovery: DiscoveryDirectory,
     registry: Arc<Registry>,
-    #[cfg(test)]
-    address: std::net::SocketAddr,
+    #[cfg(unix)]
+    _socket_directory: unix::SocketDirectory,
 }
 
 impl Drop for IdentityListener {
@@ -288,6 +294,9 @@ impl Drop for IdentityListener {
         self.task.abort();
         let _ = self.discovery.remove();
         if let Ok(mut endpoint) = self.registry.endpoint.lock() { *endpoint = None; }
+        if let Ok(runs) = self.registry.runs.lock() {
+            for entry in runs.values() { entry.binding.revoke(); }
+        }
     }
 }
 
@@ -295,91 +304,130 @@ pub async fn start_listener(home: &Path) -> Result<IdentityListener, String> {
     start_listener_with(home, registry().clone()).await
 }
 
+const MAX_CONNECTIONS: usize = 64;
+
 async fn start_listener_with(home: &Path, registry: Arc<Registry>) -> Result<IdentityListener, String> {
     if !duduclaw_core::gateway_instance::held(home) {
         return Err("Run identity listener requires the gateway lock".into());
     }
     let sessions = Arc::new(crate::session::SessionManager::new(&home.join("sessions.db"))
         .map_err(|_| "Cannot open conversation reference store")?);
-    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await
-        .map_err(|_| "Cannot bind run identity listener")?;
-    let address = listener.local_addr().map_err(|_| "Cannot inspect run identity listener")?;
-    let url = format!("http://{address}{ROUTE}");
     let mut endpoint = registry.endpoint.lock().map_err(|_| "Run identity listener unavailable")?;
     if endpoint.is_some() { return Err("Run identity listener already started".into()); }
     let discovery = DiscoveryDirectory::open(home, true).map_err(|_| "Unsafe identity run directory")?;
-    discovery.write(&url).map_err(|_| "Cannot publish identity discovery file")?;
-    *endpoint = Some(url);
+    #[cfg(unix)]
+    let (listener, descriptor, socket_directory) = unix::SocketDirectory::bind(home, &discovery)
+        .map_err(|_| "Cannot bind local identity socket")?;
+    #[cfg(windows)]
+    let name = format!(r"\\.\pipe\duduclaw-identity-{}", uuid::Uuid::new_v4().simple());
+    #[cfg(windows)]
+    let listener = windows::create(&name, true).map_err(|_| "Cannot bind private identity pipe")?;
+    #[cfg(windows)]
+    let descriptor = format!("pipe:v1:{name}");
+    discovery.write(&descriptor).map_err(|_| "Cannot publish identity discovery file")?;
+    *endpoint = Some(descriptor);
     drop(endpoint);
-    let app = router_with(registry.clone()).merge(tool_refs_router(registry.clone(), sessions));
+    let state = registry.clone();
     let task = tokio::spawn(async move {
-        if axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.is_err() {
-            tracing::error!("Run identity listener stopped");
+        let mut connections = tokio::task::JoinSet::new();
+        #[cfg(windows)]
+        let mut listener = listener;
+        loop {
+            // A fixed cap on accepted connections/tasks, with no unbounded waiters.
+            if connections.len() >= MAX_CONNECTIONS {
+                connections.join_next().await;
+                continue;
+            }
+            tokio::select! {
+                _ = connections.join_next(), if !connections.is_empty() => {},
+                accepted = accept_local(&listener) => {
+                    #[cfg(unix)]
+                    let stream = match accepted { Ok(stream) => stream, Err(_) => break };
+                    #[cfg(windows)]
+                    let stream = {
+                        if accepted.is_err() { break; }
+                        // Create the replacement before dropping the connected instance;
+                        // there is never an unowned pipe-name gap.
+                        let next = match windows::create(&name, false) { Ok(pipe) => pipe, Err(_) => break };
+                        std::mem::replace(&mut listener, next)
+                    };
+                    let registry = state.clone();
+                    let sessions = sessions.clone();
+                    connections.spawn(async move {
+                        let _ = tokio::time::timeout(ipc::TIMEOUT, serve_connection(stream, registry, sessions)).await;
+                    });
+                }
+            }
         }
+        if let Ok(mut endpoint) = state.endpoint.lock() { *endpoint = None; }
+        if let Ok(runs) = state.runs.lock() { for entry in runs.values() { entry.binding.revoke(); } }
+        tracing::error!("Local run identity listener stopped");
     });
-    Ok(IdentityListener { task, discovery, registry, #[cfg(test)] address })
+    Ok(IdentityListener { task, discovery, registry, #[cfg(unix)] _socket_directory: socket_directory })
 }
 
-fn router_with(registry: Arc<Registry>) -> Router {
-    Router::new().route(ROUTE, post(handle)).with_state(registry)
+#[cfg(unix)]
+async fn accept_local(listener: &tokio::net::UnixListener) -> std::io::Result<tokio::net::UnixStream> {
+    listener.accept().await.map(|(stream, _)| stream)
+}
+#[cfg(windows)]
+async fn accept_local(listener: &tokio::net::windows::named_pipe::NamedPipeServer) -> std::io::Result<()> {
+    listener.connect().await
 }
 
-fn tool_refs_router(registry: Arc<Registry>, sessions: Arc<crate::session::SessionManager>) -> Router {
-    Router::new().route(TOOL_REFS_ROUTE, post(handle_tool_ref))
-        .layer(axum::Extension(sessions)).with_state(registry)
-}
+#[cfg(unix)]
+type LocalStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type LocalStream = tokio::net::windows::named_pipe::NamedPipeServer;
 
-fn local_request(request: &Request) -> bool {
-    request.extensions().get::<ConnectInfo<std::net::SocketAddr>>()
-        .is_some_and(|peer| crate::computer_use_sessions::auth::check_peer(peer.0).is_ok())
-        && !request.headers().keys().any(|name| {
-            let name = name.as_str().to_ascii_lowercase();
-            name.starts_with("x-forwarded-") || matches!(name.as_str(), "forwarded" | "x-real-ip" | "via" | "origin")
-        })
-}
-
-async fn handle_tool_ref(
-    State(registry): State<Arc<Registry>>,
-    axum::Extension(sessions): axum::Extension<Arc<crate::session::SessionManager>>,
-    request: Request,
-) -> axum::http::StatusCode {
-    use axum::http::StatusCode;
-    if !local_request(&request) { return StatusCode::FORBIDDEN; }
-    let mut value = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 4096)).await {
-        Ok(Ok(body)) => serde_json::from_slice::<serde_json::Value>(&body).ok(),
-        _ => None,
+async fn serve_connection(mut stream: LocalStream, registry: Arc<Registry>, sessions: Arc<crate::session::SessionManager>) {
+    #[cfg(unix)]
+    let peer = {
+        use std::os::fd::{AsRawFd, BorrowedFd};
+        // SAFETY: stream owns the descriptor throughout peer capture.
+        RootProcess::unix_peer(unsafe { BorrowedFd::borrow_raw(stream.as_raw_fd()) }).ok()
     };
-    let credential = value.as_mut().and_then(|v| v.get_mut("credential"))
-        .map(serde_json::Value::take).and_then(|v| match v {
-            serde_json::Value::String(raw) => RunCredential::parse(raw), _ => None,
-        });
-    let Some(run) = registry.query(credential.as_ref()) else { return StatusCode::FORBIDDEN; };
-    let reference = value.as_mut().and_then(|v| v.get_mut("reference"))
-        .map(serde_json::Value::take).and_then(|v| serde_json::from_value(v).ok());
-    let Some(reference) = reference else { return StatusCode::BAD_REQUEST; };
-    // Session/agent/issue-time claims in the request are never consulted.
-    match sessions.record_run_tool_reference(&run, reference).await {
-        Ok(true) => StatusCode::NO_CONTENT,
-        Ok(false) => StatusCode::FORBIDDEN,
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
+    #[cfg(windows)]
+    let peer = {
+        use std::os::windows::io::{AsRawHandle, BorrowedHandle};
+        RootProcess::pipe_peer(unsafe { BorrowedHandle::borrow_raw(stream.as_raw_handle()) }).ok()
+    };
+    let value = ipc::read_frame(&mut stream, ipc::MAX_REQUEST).await.unwrap_or(serde_json::Value::Null);
+    let response = dispatch(&registry, &sessions, peer.as_ref(), value).await;
+    if ipc::write_frame(&mut stream, &response, ipc::MAX_RESPONSE).await.is_ok() {
+        use tokio::io::AsyncReadExt;
+        // Not another request: bounded receipt acknowledgement for named-pipe drain.
+        let _ = stream.read_u8().await;
     }
+    // Exactly one frame. Dropping closes the stream, including after malformed input.
 }
 
-async fn handle(State(registry): State<Arc<Registry>>, request: Request) -> Json<serde_json::Value> {
-    let inactive = || Json(serde_json::json!({"active": false}));
-    if !local_request(&request) { return inactive(); }
-    // No body/error logging. Every body/parse failure still hashes a dummy
-    // proof and reaches the same registry lookup as an unknown credential.
-    let credential = match tokio::time::timeout(Duration::from_secs(2), to_bytes(request.into_body(), 1024)).await {
-        Ok(Ok(body)) => serde_json::from_slice::<serde_json::Value>(&body).ok()
-            .and_then(|mut value| value.get_mut("credential").map(serde_json::Value::take))
-            .and_then(|raw| match raw { serde_json::Value::String(raw) => RunCredential::parse(raw), _ => None }),
-        _ => None,
-    };
-    let Some(record) = registry.query(credential.as_ref()) else { return inactive(); };
-    let Ok(mut response) = serde_json::to_value(record) else { return inactive(); };
-    response["active"] = serde_json::json!(true);
-    Json(response)
+async fn dispatch(registry: &Registry, sessions: &crate::session::SessionManager,
+    peer: Option<&RootProcess>, mut value: serde_json::Value) -> serde_json::Value
+{
+    let inactive = || serde_json::json!({"active": false});
+    let credential = value.get_mut("credential").map(serde_json::Value::take)
+        .and_then(|raw| match raw { serde_json::Value::String(raw) => RunCredential::parse(raw), _ => None });
+    let Some(run) = registry.query(credential.as_ref(), peer) else { return inactive(); };
+    if value.get("version").and_then(serde_json::Value::as_u64) != Some(1) { return inactive(); }
+    match value.get("operation").and_then(serde_json::Value::as_str) {
+        Some("introspect") => {
+            let Ok(mut response) = serde_json::to_value(run) else { return inactive(); };
+            response["active"] = serde_json::json!(true);
+            response
+        },
+        Some("tool-reference") => {
+            let reference = value.get_mut("reference").map(serde_json::Value::take)
+                .and_then(|value| serde_json::from_value(value).ok());
+            let Some(reference) = reference else { return inactive(); };
+            if !matches!(sessions.record_run_tool_reference(&run, reference).await, Ok(true)) { return inactive(); }
+            // The asynchronous store operation must not extend the root/run lifetime.
+            let Some(credential) = credential.as_ref() else { return inactive(); };
+            if !matches!(registry.lookup_hash(digest(credential), true, false, peer), Ok(Some(_))) { return inactive(); }
+            serde_json::json!({"active": true})
+        },
+        _ => inactive(),
+    }
 }
 
 #[cfg(test)]
@@ -396,3 +444,6 @@ pub(crate) fn assert_command_identity(command: &tokio::process::Command, issued:
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod ipc_tests;

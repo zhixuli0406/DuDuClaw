@@ -568,7 +568,7 @@ fn split_env_overrides(
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut plain = serde_json::Map::new();
     let mut secret_names = vec![duduclaw_core::run_credential::ENV_RUN_CREDENTIAL.to_string(),
-        duduclaw_core::run_credential::ENV_IDENTITY_URL.to_string()];
+        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT.to_string()];
     let mut process_env: Vec<(String, String)> = Vec::new();
     for (k, v) in env {
         if !is_secret_env_name(k) {
@@ -2478,7 +2478,8 @@ pub(crate) mod tests {
         expected.args(["-c", "shell_environment_policy.inherit=\"all\""]);
         let _proof = crate::run_identity::assert_command_identity(&command, false);
         for name in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
-            duduclaw_core::run_credential::ENV_IDENTITY_URL] {
+            duduclaw_core::run_credential::ENV_IDENTITY_URL,
+            duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT] {
             if let Some(value) = captured_env(name) { expected.env(name, value); }
             else { expected.env_remove(name); }
         }
@@ -4241,7 +4242,7 @@ pub(crate) mod tests {
     fn only_the_known_env_keys_may_reach_the_codex_argv_on_the_env_vars_branch() {
         const KNOWN: &[&str] = &[
             "DUDUCLAW_RUN_CREDENTIAL",
-            "DUDUCLAW_IDENTITY_URL",
+            "DUDUCLAW_IDENTITY_ENDPOINT",
             "DUDUCLAW_AGENT_ID",
             "DUDUCLAW_AGENT_TOKEN",
             "DUDUCLAW_HOME",

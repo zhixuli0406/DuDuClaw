@@ -617,6 +617,9 @@ impl McpClient {
         binding: Option<duduclaw_core::run_credential::SpawnBinding>,
     ) -> Result<Self, McpError> {
         let mut cmd = stdio_command(command, args, envs, stderr, clear_env)?;
+        if binding.is_some() {
+            cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
+        }
 
         let mut child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Registered(

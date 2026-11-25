@@ -1,41 +1,40 @@
 use super::*;
-use axum::body::Body;
-use tower::ServiceExt;
 
 fn bind_fixture(lease: &RunGuard) {
     lease.binding.bind_spawn(duduclaw_core::run_credential::RootProcess::capture(std::process::id()).unwrap()).unwrap();
 }
 
-fn record() -> RunRecord {
+pub(super) fn record() -> RunRecord {
     RunRecord { agent_id: "alice".into(), employee_id: None, incarnation: None,
         principal: Principal::Human { user_id: "user-1".into() }, session_id: Some("session-1".into()),
         turn_id: "turn-1".into(), task_id: None, runtime: "claude".into(), issued_at: 0, issued_at_exact: chrono::Utc::now(), expires_at: 0 }
 }
 
 async fn query(registry: &Arc<Registry>, peer: Option<&str>, body: String) -> (u16, Vec<u8>) {
-    let mut request = axum::http::Request::post(ROUTE).body(Body::from(body)).unwrap();
-    if let Some(peer) = peer {
-        request.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
-    }
-    let response = router_with(registry.clone()).oneshot(request).await.unwrap();
-    let status = response.status().as_u16();
-    (status, to_bytes(response.into_body(), 16384).await.unwrap().to_vec())
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let sessions = crate::session::SessionManager::new(file.path()).unwrap();
+    let peer = peer.filter(|p| matches!(*p, "127.0.0.1:1234" | "[::1]:1234" | "[::ffff:127.0.0.1]:1234"))
+        .and_then(|_| RootProcess::capture(std::process::id()).ok());
+    let value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    let response = dispatch(registry, &sessions, peer.as_ref(), value).await;
+    (200, serde_json::to_vec(&response).unwrap())
 }
 
 fn body(credential: &RunCredential) -> String {
-    serde_json::json!({"credential": credential.expose()}).to_string()
+    serde_json::json!({"version": 1, "operation": "introspect", "credential": credential.expose()}).to_string()
 }
 
 async fn write_ref(registry: &Arc<Registry>, sessions: &Arc<crate::session::SessionManager>, credential: Option<&RunCredential>) -> axum::http::StatusCode {
     let payload = serde_json::json!({
+        "version": 1, "operation": "tool-reference",
         "credential": credential.map(RunCredential::expose),
         "DUDUCLAW_SESSION_ID": "other-session", "session_id": "other-session",
         "agent_id": "other-agent", "issued_at": u64::MAX,
         "reference": { "tool_name": "docs_create", "ref_kind": "google_doc", "ref_id": "doc-1", "label": "Document" }
     });
-    let mut request = axum::http::Request::post(TOOL_REFS_ROUTE).body(Body::from(payload.to_string())).unwrap();
-    request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
-    tool_refs_router(registry.clone(), sessions.clone()).oneshot(request).await.unwrap().status()
+    let peer = RootProcess::capture(std::process::id()).unwrap();
+    let response = dispatch(registry, sessions, Some(&peer), payload).await;
+    if response["active"] == true { axum::http::StatusCode::NO_CONTENT } else { axum::http::StatusCode::FORBIDDEN }
 }
 
 #[tokio::test]
@@ -73,75 +72,79 @@ async fn tool_ref_route_uses_only_live_run_session_and_rejects_pre_reset_runs() 
 }
 
 #[tokio::test]
-async fn tool_ref_route_rejects_nonlocal_and_forwarded_requests() {
+async fn both_operations_require_a_kernel_peer_and_protocol_version() {
     let file = tempfile::NamedTempFile::new().unwrap();
-    let sessions = Arc::new(crate::session::SessionManager::new(file.path()).unwrap());
+    let sessions = crate::session::SessionManager::new(file.path()).unwrap();
     let registry = Arc::new(Registry::default());
     let lease = registry.issue(record(), 60).unwrap();
     bind_fixture(&lease);
-    for (peer, header) in [("192.0.2.1:1234", None), ("127.0.0.1:1234", Some("origin")),
-        ("127.0.0.1:1234", Some("x-forwarded-for"))] {
-        let mut request = axum::http::Request::post(TOOL_REFS_ROUTE);
-        if let Some(header) = header { request = request.header(header, "untrusted"); }
-        let mut request = request.body(Body::from(body(&lease.credential))).unwrap();
-        request.extensions_mut().insert(ConnectInfo(peer.parse::<std::net::SocketAddr>().unwrap()));
-        let response = tool_refs_router(registry.clone(), sessions.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+    for operation in ["introspect", "tool-reference"] {
+        let value = serde_json::json!({"version": 1, "operation": operation, "credential": lease.credential.expose()});
+        assert_eq!(dispatch(&registry, &sessions, None, value).await["active"], false);
     }
-    assert_eq!(registry.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let peer = RootProcess::capture(std::process::id()).unwrap();
+    let value = serde_json::json!({"credential": lease.credential.expose(), "operation": "introspect"});
+    assert_eq!(dispatch(&registry, &sessions, Some(&peer), value).await["active"], false);
+    assert!(ipc::endpoint_path("http://127.0.0.1:42/api/internal/identity/introspect").is_none());
 }
 
 #[tokio::test]
-async fn proxy_headers_are_uniformly_inactive() {
-    let registry = Arc::new(Registry::default());
-    let lease = registry.issue(record(), 100).unwrap();
-    bind_fixture(&lease);
-    for header in ["Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Real-IP", "Via", "Origin",
-        "X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Prefix", "x-FoRwArDeD-pRoTo",
-        "X-fOrWaRdEd-PoRt", "x-FORWARDED-pReFiX", "X-Forwarded-Unknown"] {
-        let mut request = axum::http::Request::post(ROUTE)
-            .header(header, "untrusted").body(Body::from(body(&lease.credential))).unwrap();
-        request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
-        let response = router_with(registry.clone()).oneshot(request).await.unwrap();
-        assert_eq!(response.status(), axum::http::StatusCode::OK);
-        assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap().as_ref(), br#"{"active":false}"#);
-    }
-    assert_eq!(registry.lookups.load(std::sync::atomic::Ordering::Relaxed), 0);
-    // Only the anchored prefix is forbidden; unrelated header names work.
-    let mut request = axum::http::Request::post(ROUTE)
-        .header("custom-x-forwarded-proto", "untrusted").body(Body::from(body(&lease.credential))).unwrap();
-    request.extensions_mut().insert(ConnectInfo("127.0.0.1:1234".parse::<std::net::SocketAddr>().unwrap()));
-    let response = router_with(registry.clone()).oneshot(request).await.unwrap();
-    let value: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
-    assert_eq!(value["active"], true);
-}
-
-#[tokio::test]
-async fn dedicated_listener_requires_lock_and_binds_only_ipv4_loopback() {
+async fn dedicated_listener_requires_lock_and_publishes_only_local_ipc() {
+    #[cfg(unix)]
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    #[cfg(windows)]
     let home = tempfile::tempdir().unwrap();
     let registry = Arc::new(Registry::default());
     assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
-    assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+    assert!(!home.path().join(IDENTITY_ENDPOINT_FILE).exists());
     duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
     let listener = start_listener_with(home.path(), registry.clone()).await.unwrap();
-    assert_eq!(listener.address.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-    assert_ne!(listener.address.port(), 0);
-    let url = std::fs::read_to_string(home.path().join(IDENTITY_URL_FILE)).unwrap();
-    assert_eq!(url, format!("http://{}{}", listener.address, ROUTE));
+    let url = std::fs::read_to_string(home.path().join(IDENTITY_ENDPOINT_FILE)).unwrap();
+    assert!(ipc::endpoint_path(&url).is_some());
     #[cfg(unix)] {
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(home.path().join("run")).unwrap().permissions().mode() & 0o777, 0o700);
-        assert_eq!(std::fs::metadata(home.path().join(IDENTITY_URL_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::metadata(home.path().join(IDENTITY_ENDPOINT_FILE)).unwrap().permissions().mode() & 0o777, 0o600);
+        let socket = std::path::Path::new(ipc::endpoint_path(&url).unwrap());
+        assert_eq!(std::fs::metadata(socket.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
     }
     let lease = registry.issue(record(), 30).unwrap();
     bind_fixture(&lease);
     let mut command = tokio::process::Command::new("never-spawned");
     lease.apply(&mut command);
-    assert!(command.as_std().get_envs().any(|(key, value)| key == ENV_IDENTITY_URL
+    assert!(command.as_std().get_envs().any(|(key, value)| key == ENV_IDENTITY_ENDPOINT
         && value.and_then(|v| v.to_str()) == Some(url.as_str())));
     assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
     drop(listener);
-    assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+    assert!(!home.path().join(IDENTITY_ENDPOINT_FILE).exists());
+    #[cfg(unix)]
+    assert!(!std::path::Path::new(ipc::endpoint_path(&url).unwrap()).exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stale_socket_cleanup_never_follows_planted_symlinks() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let home = tempfile::tempdir_in("/tmp").unwrap();
+    let outside = tempfile::tempdir_in("/tmp").unwrap();
+    duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+    let discovery = DiscoveryDirectory::open(home.path(), true).unwrap();
+    let stale = home.path().join("run/i-1111111111111111");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::set_permissions(&stale, std::fs::Permissions::from_mode(0o700)).unwrap();
+    drop(std::os::unix::net::UnixListener::bind(stale.join("s")).unwrap());
+    std::fs::write(outside.path().join("s"), b"untouched").unwrap();
+    symlink(outside.path(), home.path().join("run/i-2222222222222222")).unwrap();
+    let planted = home.path().join("run/i-3333333333333333");
+    std::fs::create_dir(&planted).unwrap();
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o700)).unwrap();
+    symlink(outside.path().join("s"), planted.join("s")).unwrap();
+    let listener = start_listener_with(home.path(), Arc::new(Registry::default())).await.unwrap();
+    assert!(!stale.exists());
+    assert!(std::fs::symlink_metadata(planted.join("s")).unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read(outside.path().join("s")).unwrap(), b"untouched");
+    drop(listener);
+    drop(discovery);
 }
 
 #[cfg(unix)]
@@ -156,13 +159,13 @@ async fn listener_refuses_symlinked_or_group_writable_run_directory() {
     let run = home.path().join("run");
     symlink(outside.path(), &run).unwrap();
     assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
-    assert!(!outside.path().join("identity-url").exists());
+    assert!(!outside.path().join("identity-endpoint").exists());
     std::fs::remove_file(&run).unwrap();
     std::fs::create_dir(&run).unwrap();
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o770)).unwrap();
     assert!(start_listener_with(home.path(), registry.clone()).await.is_err());
     assert!(registry.endpoint.lock().unwrap().is_none());
-    assert!(!home.path().join(IDENTITY_URL_FILE).exists());
+    assert!(!home.path().join(IDENTITY_ENDPOINT_FILE).exists());
 }
 
 #[test]
@@ -199,8 +202,7 @@ fn protected_branches_do_not_issue_or_pass_run_credentials() {
 
 #[test]
 fn dashboard_does_not_mount_identity_introspection() {
-    // The identity router is private to this module; pin the dashboard
-    // assembly too, including accidental literal-path registration.
+    // Identity is IPC-only; reject accidental legacy HTTP route registration.
     let server = include_str!("../server.rs");
     assert!(!server.contains("run_identity::router"));
     assert!(!server.contains(ROUTE));
@@ -208,6 +210,7 @@ fn dashboard_does_not_mount_identity_introspection() {
 
 #[test]
 fn junk_and_other_runs_cannot_exhaust_a_valid_runs_bucket() {
+    let peer = RootProcess::capture(std::process::id()).unwrap();
     let registry = Arc::new(Registry::default());
     let first = registry.issue(record(), 100).unwrap();
     bind_fixture(&first);
@@ -215,17 +218,17 @@ fn junk_and_other_runs_cannot_exhaust_a_valid_runs_bucket() {
     bind_fixture(&second);
     let unknown = RunCredential::from_bytes(&[42; 32]);
     for _ in 0..RATE_PER_MINUTE {
-        assert!(registry.query(Some(&first.credential)).is_some());
-        assert!(registry.query(Some(&unknown)).is_none());
+        assert!(registry.query(Some(&first.credential), Some(&peer)).is_some());
+        assert!(registry.query(Some(&unknown), Some(&peer)).is_none());
     }
-    assert!(registry.query(Some(&first.credential)).is_none());
-    assert!(registry.query(None).is_none());
-    assert!(registry.query(Some(&second.credential)).is_some());
+    assert!(registry.query(Some(&first.credential), Some(&peer)).is_none());
+    assert!(registry.query(None, Some(&peer)).is_none());
+    assert!(registry.query(Some(&second.credential), Some(&peer)).is_some());
     assert_eq!(registry.invalid_rate.lock().unwrap().1, RATE_PER_MINUTE);
     assert_eq!(registry.runs.lock().unwrap().get(&second.hash).unwrap().rate.1, 1);
     registry.runs.lock().unwrap().get_mut(&first.hash).unwrap().rate.0 =
         Instant::now() - Duration::from_secs(61);
-    assert!(registry.query(Some(&first.credential)).is_some());
+    assert!(registry.query(Some(&first.credential), Some(&peer)).is_some());
     // Valid buckets live inside the bounded registry, not an unbounded
     // attacker-keyed map. Unknown requests share exactly one bucket.
     assert_eq!(registry.runs.lock().unwrap().len(), 2);
@@ -300,7 +303,7 @@ async fn errors_cancellation_expiry_and_restart_revoke() {
 }
 
 #[tokio::test]
-async fn all_inactive_http_responses_are_identical_and_peer_is_real() {
+async fn all_inactive_dispatch_responses_are_identical_and_peer_is_required() {
     let registry = Arc::new(Registry::default());
     let active = registry.issue(record(), 100).unwrap();
     bind_fixture(&active);
