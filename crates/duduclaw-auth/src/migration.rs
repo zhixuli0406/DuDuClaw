@@ -24,6 +24,22 @@ impl UserDb {
         validate(operation, email, display_name)?;
         // Lock order: seat admission -> authority writer lease -> users.db transaction.
         let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
+        self.migration_invite_user_with_seats(operation, digest, email, display_name, role, seats)
+    }
+
+    /// Caller holds admission before entering the proposal authority lock.
+    /// A missing cap permits no seat growth, without acquiring another lock.
+    pub fn migration_invite_user_admitted(&self, operation: &str, digest: &[u8; 32],
+        email: &str, display_name: &str, role: UserRole,
+        admission: &duduclaw_core::agent_seats::SeatAdmission, cap: Option<usize>) -> Result<User, String> {
+        validate(operation, email, display_name)?;
+        let seats = crate::avatar_seats::SeatChange::begin_admitted(self, admission, cap)?;
+        self.migration_invite_user_with_seats(operation, digest, email, display_name, role, seats)
+    }
+
+    fn migration_invite_user_with_seats(&self, operation: &str, digest: &[u8; 32],
+        email: &str, display_name: &str, role: UserRole,
+        seats: crate::avatar_seats::SeatChange<'_>) -> Result<User, String> {
         let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
@@ -87,6 +103,19 @@ impl UserDb {
         limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
         // Lock order: seat admission -> authority writer lease -> users.db transaction.
         let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
+        self.migration_user_disable_with_seats(operation, digest, seats)
+    }
+
+    /// Caller holds admission before entering the proposal authority lock.
+    /// A missing cap permits no seat growth, without acquiring another lock.
+    pub fn migration_user_disable_admitted(&self, operation: &str, digest: &[u8; 32],
+        admission: &duduclaw_core::agent_seats::SeatAdmission, cap: Option<usize>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin_admitted(self, admission, cap)?;
+        self.migration_user_disable_with_seats(operation, digest, seats)
+    }
+
+    fn migration_user_disable_with_seats(&self, operation: &str, digest: &[u8; 32],
+        seats: crate::avatar_seats::SeatChange<'_>) -> Result<(), String> {
         let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
@@ -165,10 +194,27 @@ impl UserDb {
     }
 
     pub fn migration_bind_shared_under(&self, operation: &str, digest: &[u8; 32], user_id: &str,
-        agent: &str, access: crate::AccessLevel, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        agent: &str, access: crate::AccessLevel,
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
         validate_binding(operation,agent)?;
         // Lock order: seat admission -> authority writer lease -> users.db transaction.
         let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
+        self.migration_bind_shared_with_seats(operation, digest, user_id, agent, access, seats)
+    }
+
+    /// Caller holds admission before entering the proposal authority lock.
+    /// A missing cap permits no seat growth, without acquiring another lock.
+    pub fn migration_bind_shared_admitted(&self, operation: &str, digest: &[u8; 32], user_id: &str,
+        agent: &str, access: crate::AccessLevel,
+        admission: &duduclaw_core::agent_seats::SeatAdmission, cap: Option<usize>) -> Result<(), String> {
+        validate_binding(operation,agent)?;
+        let seats = crate::avatar_seats::SeatChange::begin_admitted(self, admission, cap)?;
+        self.migration_bind_shared_with_seats(operation, digest, user_id, agent, access, seats)
+    }
+
+    fn migration_bind_shared_with_seats(&self, operation: &str, digest: &[u8; 32], user_id: &str,
+        agent: &str, access: crate::AccessLevel,
+        seats: crate::avatar_seats::SeatChange<'_>) -> Result<(), String> {
         let _authority = self.google_authority_write()?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;
@@ -210,6 +256,19 @@ impl UserDb {
         limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
         // Lock order: seat admission -> authority writer lease -> users.db transaction.
         let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
+        self.migration_binding_disable_with_seats(operation, digest, seats)
+    }
+
+    /// Caller holds admission before entering the proposal authority lock.
+    /// A missing cap permits no seat growth, without acquiring another lock.
+    pub fn migration_binding_disable_admitted(&self, operation: &str, digest: &[u8; 32],
+        admission: &duduclaw_core::agent_seats::SeatAdmission, cap: Option<usize>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin_admitted(self, admission, cap)?;
+        self.migration_binding_disable_with_seats(operation, digest, seats)
+    }
+
+    fn migration_binding_disable_with_seats(&self, operation: &str, digest: &[u8; 32],
+        seats: crate::avatar_seats::SeatChange<'_>) -> Result<(), String> {
         let _authority = self.google_authority_write()?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;

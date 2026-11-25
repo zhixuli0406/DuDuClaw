@@ -10,6 +10,7 @@ pub(crate) struct SeatChange<'a> {
     owned: Option<SeatAdmission>,
     borrowed: SeatLimit<'a>,
     before: usize,
+    offline: bool,
 }
 impl<'a> SeatChange<'a> {
     pub(crate) fn begin(db: &UserDb, limit: SeatLimit<'a>) -> Result<Self, String> {
@@ -23,7 +24,16 @@ impl<'a> SeatChange<'a> {
         } else { None };
         let before = db.home.as_deref().map(seat_holders).transpose()
             .map_err(|e| e.to_string())?.map_or(0, |rows| rows.len());
-        Ok(Self { owned, borrowed: limit, before })
+        Ok(Self { owned, borrowed: limit, before, offline: limit.is_none() })
+    }
+
+    /// Borrow an existing admission even without a resolved license cap. An
+    /// unknown cap keeps the offline no-growth rule and never re-acquires.
+    pub(crate) fn begin_admitted(db: &UserDb, admission: &'a SeatAdmission,
+        cap: Option<usize>) -> Result<Self, String> {
+        let mut change = Self::begin(db, Some((admission, cap.unwrap_or(0))))?;
+        if cap.is_none() { change.offline = true; }
+        Ok(change)
     }
 
     pub(crate) fn check(&self, conn: &rusqlite::Connection) -> Result<(), String> {
@@ -32,7 +42,7 @@ impl<'a> SeatChange<'a> {
         let after = seat_holders_in(admission.home(), conn).map_err(|e| e.to_string())?.len();
         // Without a caller-resolved license cap, never consume an additional
         // seat. Offline callers must use the explicit _under variant to do so.
-        let allowed = match self.borrowed {
+        let allowed = match self.borrowed.filter(|_| !self.offline) {
             Some((_, max)) => max == 0 || after <= max || after <= self.before,
             None => after <= self.before,
         };

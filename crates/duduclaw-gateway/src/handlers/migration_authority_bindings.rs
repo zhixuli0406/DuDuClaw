@@ -11,34 +11,33 @@ fn confirmed_employee(home:&Path,agent:&str)->Result<()> {
         && text(item,"employee_id").ok()==Some(agent)) {return Err(Error::Denied);}
     let path=home.join("agents").join(agent).join("agent.toml");validate_parents(home,&path)?;regular(&path)?;Ok(())
 }
-fn db(home:&Path)->Result<duduclaw_auth::UserDb>{regular(&home.join("users.db"))?;duduclaw_auth::UserDb::new(&home.join("users.db")).map_err(|_|Error::Storage)}
-pub(super) fn binding_plan(home:&Path,item:&ConfirmationItem)->Result<BindingPlan>{
+pub(super) fn binding_plan(home:&Path,item:&ConfirmationItem,db:&duduclaw_auth::UserDb)->Result<BindingPlan>{
     let agent=text(item,"employee_id")?;confirmed_employee(home,agent)?;
     let access=text(item,"binding_kind")?.strip_prefix("shared:").ok_or(Error::Denied)?.parse().map_err(|_|Error::Invalid)?;
-    let email=text(item,"owner_id")?;let user=db(home)?.get_user_by_email(email).map_err(|_|Error::Storage)?.ok_or(Error::Denied)?;
+    let email=text(item,"owner_id")?;let user=db.get_user_by_email(email).map_err(|_|Error::Storage)?.ok_or(Error::Denied)?;
     if user.status!=duduclaw_auth::UserStatus::Active || user.must_change_password || user.last_login.is_none(){return Err(Error::Denied);}
     Ok(BindingPlan{operation:operation(&item.binding),digest:item.binding.proposal_digest.0,user_id:user.id,email:email.into(),agent:agent.into(),access})
 }
 impl BindingPlan {
-    pub(super) fn check_absent(&self,home:&Path)->Result<()>{
-        if db(home)?.get_user_agents(&self.user_id).map_err(|_|Error::Storage)?.iter().any(|b|b.agent_name==self.agent){return Err(Error::Stale);}Ok(())
+    pub(super) fn check_absent(&self,db:&duduclaw_auth::UserDb)->Result<()>{
+        if db.get_user_agents(&self.user_id).map_err(|_|Error::Storage)?.iter().any(|b|b.agent_name==self.agent){return Err(Error::Stale);}Ok(())
     }
-    pub(super) fn publish(&self,home:&Path,cap:Option<usize>)->Result<()>{
-        confirmed_employee(home,&self.agent)?;
-        user_seat_write(home, cap, |db, limit| {
-            db.migration_bind_shared_under(&self.operation, &self.digest, &self.user_id, &self.agent, self.access, limit)
+    pub(super) fn publish(&self,authority:&GatewayAuthority)->Result<()>{
+        confirmed_employee(&authority.home,&self.agent)?;
+        authority.user_seat_write(|db, admission, cap| {
+            db.migration_bind_shared_admitted(&self.operation, &self.digest, &self.user_id, &self.agent, self.access, admission, cap)
                 .map_err(|_| Error::Apply)
         })
     }
-    pub(super) fn read_back(&self,home:&Path)->Result<()>{
+    pub(super) fn read_back(&self,home:&Path,db:&duduclaw_auth::UserDb)->Result<()>{
         confirmed_employee(home,&self.agent)?;
-        let db=db(home)?;let user=db.get_user(&self.user_id).map_err(|_|Error::Storage)?.ok_or(Error::Apply)?;
+        let user=db.get_user(&self.user_id).map_err(|_|Error::Storage)?.ok_or(Error::Apply)?;
         let binding=db.migration_binding_readback(&self.operation,&self.digest).map_err(|_|Error::Apply)?;
         if user.email!=self.email || binding.user_id!=self.user_id || binding.agent_name!=self.agent || binding.access_level!=self.access {return Err(Error::Apply);}Ok(())
     }
-    pub(super) fn disable(&self,home:&Path,cap:Option<usize>)->Result<()>{
-        user_seat_write(home, cap, |db, limit| {
-            db.migration_binding_disable_under(&self.operation, &self.digest, limit).map_err(|_| Error::Compensation)
+    pub(super) fn disable(&self,authority:&GatewayAuthority)->Result<()>{
+        authority.user_seat_write(|db, admission, cap| {
+            db.migration_binding_disable_admitted(&self.operation, &self.digest, admission, cap).map_err(|_| Error::Compensation)
         })
     }
 }
@@ -76,7 +75,7 @@ impl BindingPlan {
             category:ConfirmationCategory::UserAgentBinding,status:ConfirmationStatus::Pending,high_risk:true,
             fields:[("employee_id","sales"),("owner_id","new@example.test"),("binding_kind","shared:owner")].into_iter()
                 .map(|(name,value)|ProposalField{name:name.into(),value:ProposalValue::Text{value:value.into()}}).collect()};
-        assert!(binding_plan(home.path(),&item).is_ok());
+        assert!(binding_plan(home.path(),&item,&users).is_ok());
         assert!(matches!(authority.validate_fresh(&item),Err(Error::Denied)));
         assert!(users.get_user_agents(&user.id).unwrap().is_empty());
     }

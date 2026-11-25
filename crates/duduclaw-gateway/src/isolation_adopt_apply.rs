@@ -578,47 +578,59 @@ fn delete_marker(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), Adop
 /// Shared: exactly the selected bindings (users.db, after apply.db, M6).
 /// Idempotent for a resumed apply (F6fb item 1): bindings already equal to
 /// the selection are left as they are; any other binding refuses.
-fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> Result<(), AdoptError> {
+fn bind_members(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, target: &str, members: &Value) -> Result<(), AdoptError> {
     let selection = members.as_array().ok_or(AdoptError::MembersInvalid)?.iter().map(|member| Ok(duduclaw_auth::db::RestoredMember {
         user_id: member["user_id"].as_str().ok_or(AdoptError::MembersInvalid)?.to_owned(),
         access_level: member["access_level"].as_str().and_then(|level| level.parse().ok()).ok_or(AdoptError::MembersInvalid)?,
     })).collect::<Result<Vec<_>, AdoptError>>()?;
     if selection.is_empty() { return Ok(()); }
-    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(unavailable)?;
-    let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(unavailable)?.len();
-    // Lock order: seat admission -> authority writer lease -> users.db transaction.
-    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
-        .write().map_err(unavailable)?;
-    let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(unavailable)?;
-    let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
-    if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(AdoptError::NotSameTenant); }
-    let existing: Vec<(String, String)> = {
-        let mut query = tx.prepare("SELECT user_id,access_level FROM user_agent_bindings WHERE agent_name=?1 ORDER BY user_id")
-            .map_err(unavailable)?;
-        let rows = query.query_map([target], |r| Ok((r.get(0)?, r.get(1)?))).map_err(unavailable)?
-            .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
-        rows
-    };
-    if !existing.is_empty() {
-        let mut wanted: Vec<(String, duduclaw_auth::AccessLevel)> =
-            selection.iter().map(|member| (member.user_id.clone(), member.access_level)).collect();
-        wanted.sort_by(|a, b| a.0.cmp(&b.0));
-        let have: Vec<(String, Option<duduclaw_auth::AccessLevel>)> =
-            existing.into_iter().map(|(user, level)| (user, level.parse().ok())).collect();
-        let same = have.len() == wanted.len()
-            && have.iter().zip(&wanted).all(|((user, level), (want, wanted))| user == want && *level == Some(*wanted));
-        return if same { tx.finish().map_err(unavailable) } else { Err(AdoptError::MembersInvalid) };
-    }
-    duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, target, &selection).map_err(|_| AdoptError::MembersInvalid)?;
-    let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(unavailable)?.len();
-    if after > before { return Err(AdoptError::Unavailable); }
-    tx.commit().map_err(unavailable)
+    env.with_seat_write(home, |admission| {
+        let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(unavailable)?.len();
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+            .write().map_err(unavailable)?;
+        let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(unavailable)?;
+        let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
+        if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(AdoptError::NotSameTenant); }
+        let existing: Vec<(String, String)> = {
+            let mut query = tx.prepare("SELECT user_id,access_level FROM user_agent_bindings WHERE agent_name=?1 ORDER BY user_id")
+                .map_err(unavailable)?;
+            let rows = query.query_map([target], |r| Ok((r.get(0)?, r.get(1)?))).map_err(unavailable)?
+                .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
+            rows
+        };
+        if !existing.is_empty() {
+            let mut wanted: Vec<(String, duduclaw_auth::AccessLevel)> =
+                selection.iter().map(|member| (member.user_id.clone(), member.access_level)).collect();
+            wanted.sort_by(|a, b| a.0.cmp(&b.0));
+            let have: Vec<(String, Option<duduclaw_auth::AccessLevel>)> =
+                existing.into_iter().map(|(user, level)| (user, level.parse().ok())).collect();
+            let same = have.len() == wanted.len()
+                && have.iter().zip(&wanted).all(|((user, level), (want, wanted))| user == want && *level == Some(*wanted));
+            return if same { tx.finish().map_err(unavailable) } else { Err(AdoptError::MembersInvalid) };
+        }
+        duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, target, &selection).map_err(|_| AdoptError::MembersInvalid)?;
+        let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(unavailable)?.len();
+        if after > before { return Err(AdoptError::Unavailable); }
+        tx.commit().map_err(unavailable)
+    })
+}
+
+/// Directory removal changes the seat census too. Keep recovery/root work
+/// outside this local commit, just like member and receipt writes.
+fn undo_admitted(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, target: &str) -> Result<bool, AdoptError> {
+    let mut moved = false;
+    env.with_seat_write(home, |_| {
+        moved = fsops::undo(home, q, target)?;
+        Ok(())
+    })?;
+    Ok(moved)
 }
 
 /// Shared rollback (F6fb item 1): remove every member binding the adoption
 /// wrote on `target` (one users.db transaction, ACL bump). Refuses
 /// (`Inconsistent`) when a live row on the target is not this adoption's.
-fn unbind_members(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), AdoptError> {
+fn unbind_members(home: &Path, env: &AdoptEnv<'_>, target: &str, adopt: &AdoptRef) -> Result<(), AdoptError> {
     if let Some((receipt, _, _)) = lifecycle::confirmed_row(home, target).map_err(unavailable)? {
         if !receipt.disabled {
             let db = restore::open_apply(home)?;
@@ -630,11 +642,11 @@ fn unbind_members(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), Ado
     let bound: i64 = lifecycle::open_store(home, USERS_DB, Access::ReadOnly).map_err(unavailable)?
         .query_row("SELECT count(*) FROM user_agent_bindings WHERE agent_name=?1", [target], |r| r.get(0)).map_err(unavailable)?;
     if bound == 0 { return Ok(()); }
-    match lifecycle::remove_shared_bindings(home, target) {
+    env.with_seat_write(home, |admission| match lifecycle::remove_shared_bindings_under(home, target, admission) {
         Ok(_) => Ok(()),
         Err(lifecycle::LifecycleError::Stale) => Err(AdoptError::Inconsistent),
         Err(_) => Err(AdoptError::Unavailable),
-    }
+    })
 }
 
 /// F6fb item 5: after the commit, compensation moves the tree back only while
@@ -716,8 +728,8 @@ pub(crate) fn roll_back(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, reques
     }
     // F6fb item 1: a Shared adoption's member bindings go with it (before the
     // row changes, so a users.db failure leaves the row for a retry).
-    if let (Some(target), EmployeeKind::Shared) = (target, q.kind) { unbind_members(home, target, &adopt)?; }
-    let moved = match target { Some(target) => fsops::undo(home, q, target)?, None => false };
+    if let (Some(target), EmployeeKind::Shared) = (target, q.kind) { unbind_members(home, env, target, &adopt)?; }
+    let moved = match target { Some(target) => undo_admitted(home, env, q, target)?, None => false };
     if let Some(target) = target { delete_marker(home, target, &adopt)?; }
     {
         let mut db = restore::open_apply(home)?;
@@ -750,7 +762,7 @@ pub(crate) fn roll_forward(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, ado
     drop(db);
     require_zero(home, &q.label, target, Zero::AfterSave)?;
     // The crash may have come between `save()` and the member bindings.
-    if let Some(members) = &request.member_selection { bind_members(home, q, target, members)?; }
+    if let Some(members) = &request.member_selection { bind_members(home, env, q, target, members)?; }
     let _ = env;
     finish(home, q, request, receipt.employee, target, None)
 }
@@ -815,7 +827,7 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
         restore::audit_details(&request, json!({"target_label": target, "resumed": resumed})));
     // A retried step starts from a clean tree.
     if resumed {
-        if fsops::undo(home, &q, &target).map_err(|e| failed(home, env, &q, &request, &target, e))? {
+        if undo_admitted(home, env, &q, &target).map_err(|e| failed(home, env, &q, &request, &target, e))? {
             delete_marker(home, &target, &adopt)?;
         }
     }
@@ -836,7 +848,14 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     if settings_from_toml(&inputs.agent_toml).map_err(fail)? != settings { return Err(fail(AdoptError::SettingsChanged)); }
     // 2. The allowlist transform.
     let dirs = fsops::open_dirs(home, &q).map_err(fail)?;
-    fsops::transform(&dirs, &target, &inputs, &verified).map_err(fail)?;
+    env.with_seat_write(home, |admission| {
+        match admission.decide(env.agent_cap, 1, None) {
+            duduclaw_core::agent_seats::SeatDecision::Admitted => {}
+            duduclaw_core::agent_seats::SeatDecision::Full { .. } => return Err(Refusal::QuotaExceeded.into()),
+            duduclaw_core::agent_seats::SeatDecision::Unverifiable(_) => return Err(AdoptError::Unavailable),
+        }
+        fsops::transform(&dirs, &target, &inputs, &verified)
+    }).map_err(fail)?;
     if crash_at(AdoptHook::AfterMove) { return Err(AdoptError::Unavailable); }
     let agents = home.join("agents");
     (env.hooks)(&agents.join(&target)).map_err(|()| fail(AdoptError::Unavailable))?;
@@ -860,7 +879,7 @@ pub(crate) fn apply_item(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationIte
     if let Some(error) = refused.take() { return Err(fail(error)); }
     saved.map_err(|()| fail(AdoptError::Unavailable))?;
     if !ran.get() { return Err(fail(AdoptError::Inconsistent)); }
-    if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
+    if let Some(members) = &request.member_selection { bind_members(home, env, &q, &target, members).map_err(fail)?; }
     if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
     let commit_gate = |users: &Connection| recheck_commit(home, env, &q, &request, approver, self_approved, users);
     finish(home, &q, &request, receipt.employee, &target, Some(&commit_gate)).map_err(fail)?;
@@ -887,7 +906,7 @@ fn resume_after_save(home: &Path, env: &AdoptEnv<'_>, item: &ConfirmationItem, r
     let fail = |error: AdoptError| failed(home, env, &q, &request, &target, error);
     rekey_stores(home, &q, adopt, false).map_err(fail)?;
     require_zero(home, &q.label, &target, Zero::AfterSave).map_err(fail)?;
-    if let Some(members) = &request.member_selection { bind_members(home, &q, &target, members).map_err(fail)?; }
+    if let Some(members) = &request.member_selection { bind_members(home, env, &q, &target, members).map_err(fail)?; }
     if crash_at(AdoptHook::AfterSave) { return Err(AdoptError::Unavailable); }
     let commit_gate = |users: &Connection| recheck_commit(home, env, &q, &request, approver, self_approved, users);
     finish(home, &q, &request, employee, &target, Some(&commit_gate)).map_err(fail)?;

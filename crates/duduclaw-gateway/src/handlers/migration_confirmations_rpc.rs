@@ -145,7 +145,7 @@ impl MethodHandler {
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
                 let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
                     .with_step_up(Some(proof.verified_at)));
-                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
+                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_user_db(db.clone()).with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
                     .map_err(|_| "憑證更新尚未確認，請重新載入後重試。")?;
@@ -166,9 +166,9 @@ impl MethodHandler {
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
                 Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
                     .with_step_up(Some(proof.verified_at))), &user, Some(proof.verified_at));
-            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
+            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_user_db(db.clone()).with_agent_cap(user_agent_cap).with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let adopt_home = home.clone();
-            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
+            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_user_db(db.clone()).with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";
             match method.as_str() {
                 "migration.confirmations.approve" => {
@@ -182,12 +182,14 @@ impl MethodHandler {
                         if item.category == duduclaw_migration::contract::ConfirmationCategory::Employee {
                             // Reconcile any interrupted compensation, but never
                             // revive a permanently tombstoned UID on Retry.
-                            approval.authorize(&input.csrf_token, now as u64).map_err(|_| error)?;
-                            duduclaw_migration::confirmation::ProposalApplier::disable_and_read_back(&mut applier, &item).map_err(|_| error)?;
+                            applier.with_confirmation_admission(&mut store, &item.binding, |store, applier| {
+                                store.compensate_failed_employee(&item.binding, &approval, input.csrf_token, now as u64, applier)
+                            }).map_err(|_| error)?;
                             return Err("此員工配置已撤銷，舊身分不會重用。請重新建立員工配置提案，再逐筆確認。");
                         }
-                        store.retry(&item.binding, &approval, input.csrf_token, now as u64,
-                            &mut applier, &validator).map_err(|_| error)?;
+                        applier.with_confirmation_admission(&mut store, &item.binding, |store, applier| {
+                            store.retry(&item.binding, &approval, input.csrf_token, now as u64, applier, &validator)
+                        }).map_err(|_| error)?;
                     } else {
                         approval.authorize(&input.csrf_token, now as u64).map_err(|_| error)?;
                         if !matches!(item.status, ConfirmationStatus::Approved | ConfirmationStatus::Applying) {
@@ -199,7 +201,9 @@ impl MethodHandler {
                     if input.bindings.len() > 1 {
                         store.reject_pending(&input.bindings, &approval, input.csrf_token, now as u64).map_err(|_| error)?;
                     } else {
-                        store.reject(&input.bindings[0], &approval, input.csrf_token, now as u64, &mut applier).map_err(|_| error)?;
+                        applier.with_confirmation_admission(&mut store, &input.bindings[0], |store, applier| {
+                            store.reject(&input.bindings[0], &approval, input.csrf_token, now as u64, applier)
+                        }).map_err(|_| error)?;
                     }
                     return Ok(json!({ "readback_required": true }));
                 }
@@ -212,7 +216,9 @@ impl MethodHandler {
                     // remaining effects; their approved states remain resumable.
                     if db.migration_confirmation_session(&user, &session, epoch, chrono::Utc::now().timestamp())
                         .ok().flatten().is_none() { return Err("身分驗證已失效，請重新驗證後繼續。"); }
-                    match store.apply_next(binding, &mut applier) {
+                    match applier.with_confirmation_admission(&mut store, binding, |store, applier| {
+                        store.apply_next(binding, applier)
+                    }) {
                         Ok(item) if item.status == ConfirmationStatus::Applied => {
                             // F6g: an adoption committed inside this call — notice now, rescan below.
                             if crate::isolation_restore_rpc::adoption_committed(&adopt_home, &item, &user, chrono::Utc::now().timestamp()) {

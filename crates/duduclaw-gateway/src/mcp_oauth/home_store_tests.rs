@@ -741,7 +741,7 @@ mod start_tests;
 mod callback_tests;
 
 #[test]
-fn native_singleton_witness_is_exactly_the_existing_any_of_policy_for_all_http_tools() {
+fn native_scope_witness_matches_the_complete_policy_for_all_http_tools() {
     let candidates = [
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/gmail.modify",
@@ -749,6 +749,9 @@ fn native_singleton_witness_is_exactly_the_existing_any_of_policy_for_all_http_t
         "https://mail.google.com/",
         "https://www.googleapis.com/auth/calendar.events",
         "https://www.googleapis.com/auth/calendar.events.readonly",
+        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.calendarlist",
+        "https://www.googleapis.com/auth/calendar.readonly",
         "https://www.googleapis.com/auth/calendar",
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/spreadsheets.readonly",
@@ -782,19 +785,25 @@ fn native_singleton_witness_is_exactly_the_existing_any_of_policy_for_all_http_t
         }
         for granted in inputs {
             let expected = crate::google_personal::scopes::permitted(tool, &granted);
-            let witness = singleton_native_scope(tool, granted.clone());
+            let witness = native_scope_subset(tool, granted.clone());
             assert_eq!(witness.is_ok(), expected, "tool={tool}");
             if let Ok(witness) = witness {
                 let mut sorted = granted;
                 sorted.sort();
                 sorted.dedup();
-                let first = sorted
-                    .into_iter()
-                    .find(|s| {
-                        crate::google_personal::scopes::permitted(tool, std::slice::from_ref(s))
-                    })
-                    .unwrap();
-                assert_eq!(witness, first);
+                assert!(witness.iter().all(|scope| sorted.contains(scope)));
+                assert!(crate::google_personal::scopes::permitted(tool, &witness));
+                if let Some(first) = sorted.into_iter().find(|s| {
+                    crate::google_personal::scopes::permitted(tool, std::slice::from_ref(s))
+                }) {
+                    assert_eq!(witness, vec![first]);
+                } else {
+                    for index in 0..witness.len() {
+                        let mut reduced = witness.clone();
+                        reduced.remove(index);
+                        assert!(!crate::google_personal::scopes::permitted(tool, &reduced));
+                    }
+                }
             }
         }
     }
@@ -807,7 +816,7 @@ fn native_singleton_witness_is_exactly_the_existing_any_of_policy_for_all_http_t
         "unknown",
     ] {
         assert!(
-            singleton_native_scope(tool, candidates.iter().map(|s| s.to_string()).collect())
+            native_scope_subset(tool, candidates.iter().map(|s| s.to_string()).collect())
                 .is_err()
         );
     }

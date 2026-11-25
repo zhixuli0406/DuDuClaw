@@ -1,5 +1,5 @@
-//! Native exact-purpose metadata. The selected singleton witnesses the
-//! existing any-of policy; it never changes the OAuth grant itself.
+//! Native exact-purpose metadata. The selected scope subset witnesses the
+//! existing scope policy; it never changes the OAuth grant itself.
 use super::*;
 
 #[cfg(test)]
@@ -15,7 +15,7 @@ pub(crate) struct NativeHomeSelection {
 enum NativeHomePurpose {
     Http {
         tool: String,
-        singleton_scope: String,
+        required_scopes: Vec<String>,
     },
     MetadataStatus,
 }
@@ -54,11 +54,12 @@ impl NativeHomeSelection {
         }
         if let NativeHomePurpose::Http {
             tool,
-            singleton_scope,
+            required_scopes,
         } = &self.purpose
         {
             add(tool.capacity())?;
-            add(singleton_scope.capacity())?;
+            add(required_scopes.capacity().checked_mul(std::mem::size_of::<String>()).ok_or(Error::Invalid)?)?;
+            for scope in required_scopes { add(scope.capacity())?; }
         }
         Ok(bytes)
     }
@@ -69,8 +70,8 @@ impl NativeHomeSelection {
         let purpose = match &self.purpose {
             NativeHomePurpose::Http {
                 tool,
-                singleton_scope,
-            } => json!({"http_tool":tool,"scope":singleton_scope}),
+                required_scopes,
+            } => json!({"http_tool":tool,"scopes":required_scopes}),
             NativeHomePurpose::MetadataStatus => json!({"metadata_status":true}),
         };
         let bytes=serde_json::to_vec(&json!({"domain":"native-home-original-v1","home":self.receipt.canonical_home,
@@ -79,12 +80,12 @@ impl NativeHomeSelection {
             "source":self.receipt.source_stamp,"scopes":self.receipt.scopes,"purpose":purpose})).map_err(|_|Error::Invalid)?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
-    fn http_scope(&self, actual_tool: &str) -> Result<&str> {
+    fn http_scopes(&self, actual_tool: &str) -> Result<Vec<&str>> {
         match &self.purpose {
             NativeHomePurpose::Http {
                 tool,
-                singleton_scope,
-            } if tool == actual_tool => Ok(singleton_scope),
+                required_scopes,
+            } if tool == actual_tool => Ok(required_scopes.iter().map(String::as_str).collect()),
             _ => Err(Error::Invalid),
         }
     }
@@ -123,13 +124,14 @@ fn capture_home_native_selection(home: &Path, tool: &str, migrate: bool) -> Resu
                 NativeHomePurpose::MetadataStatus,
             )
         } else {
-            let scope = home_store::native_scope_witness(g, source, tool)?;
-            let receipt = selection(g, source, &[scope.as_str()], migrate)?;
+            let scopes = home_store::native_scope_witness(g, source, tool)?;
+            let required: Vec<&str> = scopes.iter().map(String::as_str).collect();
+            let receipt = selection(g, source, &required, migrate)?;
             (
                 receipt,
                 NativeHomePurpose::Http {
                     tool: tool.into(),
-                    singleton_scope: scope,
+                    required_scopes: scopes,
                 },
             )
         };
@@ -155,10 +157,10 @@ pub(crate) async fn resolve_home_native_pinned(
 ) -> Result<HomeOAuthResolved> {
     // MetadataStatus and a different native tool fail before entering C1,
     // including its local refresh mutex or any material/key/provider work.
-    let scope = original.http_scope(actual_tool)?;
+    let scopes = original.http_scopes(actual_tool)?;
     #[cfg(test)]
     testing::entered(home, 0);
-    resolve_home_oauth_pinned(home, &original.receipt, &[scope]).await
+    resolve_home_oauth_pinned(home, &original.receipt, &scopes).await
 }
 
 pub(crate) fn validate_home_native_material(
@@ -167,10 +169,10 @@ pub(crate) fn validate_home_native_material(
     actual_tool: &str,
     proof: &HomeOAuthMaterialProof,
 ) -> Result<()> {
-    let scope = original.http_scope(actual_tool)?;
+    let scopes = original.http_scopes(actual_tool)?;
     #[cfg(test)]
     testing::entered(home, 1);
-    validate_home_oauth_material(home, &original.receipt, proof, &[scope])
+    validate_home_oauth_material(home, &original.receipt, proof, &scopes)
 }
 
 /// Count real C1 call boundaries, not a replacement resolver or validator.
@@ -216,11 +218,11 @@ pub(super) async fn resolve_preflight<'a>(
     deadline: tokio::time::Instant,
     permit: &'a crate::google_identity::effect_authority::GooglePreflightPermit<'a>,
 ) -> Result<HomeOAuthResolved> {
-    let scope = selected.http_scope(tool)?;
+    let scopes = selected.http_scopes(tool)?;
     oauth_material::resolve_home_oauth_preflight(
         home,
         &selected.receipt,
-        &[scope],
+        &scopes,
         deadline,
         permit,
     )

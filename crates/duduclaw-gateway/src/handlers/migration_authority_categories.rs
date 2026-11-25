@@ -90,7 +90,7 @@ impl McpPlan {
     #[test]
     fn migration_authority_planted_admin_and_mcp_inactive_until_individual_confirmation() {
         let home=tempfile::tempdir().unwrap();
-        let db=duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let db=std::sync::Arc::new(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
         std::fs::create_dir_all(home.path().join("agents/sales")).unwrap();
         std::fs::write(home.path().join("agents/sales/agent.toml"),"name='sales'\n").unwrap();
         let old=tempfile::tempdir().unwrap();
@@ -110,7 +110,7 @@ impl McpPlan {
         assert!(db.get_user_by_email("planted@example.com").unwrap().is_none());
         assert!(!home.path().join("agents/sales/.mcp.json").exists());
         let mut store=ConfirmationStore::open_existing(&home.path().join("migration-confirmations.db")).unwrap();
-        let mut authority=GatewayAuthority::new(home.path().into()).unwrap();
+        let mut authority=GatewayAuthority::new(home.path().into()).unwrap().with_user_db(db.clone());
         let pending=store.list().unwrap();
         for item in &pending {assert_eq!(item.status,ConfirmationStatus::Pending);assert!(store.apply_next(&item.binding,&mut authority).is_err());}
         assert!(db.get_user_by_email("planted@example.com").unwrap().is_none());
@@ -119,7 +119,7 @@ impl McpPlan {
         assert!(store.approve(&pending.iter().map(|p|p.binding).collect::<Vec<_>>(),&session,[8;32],100,&authority).is_err());
         for item in pending {
             store.approve(&[item.binding],&session,[8;32],100,&authority).unwrap();
-            for _ in 0..3 {store.apply_next(&item.binding,&mut authority).unwrap();}
+            for _ in 0..3 {authority.with_confirmation_admission(&mut store,&item.binding,|store,a|store.apply_next(&item.binding,a)).unwrap();}
             authority.read_back(&item).unwrap();
         }
         let user=db.get_user_by_email("planted@example.com").unwrap().unwrap();assert_eq!(user.role,duduclaw_auth::UserRole::Admin);assert!(user.must_change_password);
