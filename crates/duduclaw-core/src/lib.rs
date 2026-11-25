@@ -1553,3 +1553,6 @@ pub mod scope_policy;
 pub mod scope_policy_checks;
 
 pub mod authority_coordinator;
+
+#[cfg(unix)]
+pub mod trusted_home;

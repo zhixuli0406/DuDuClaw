@@ -479,3 +479,143 @@ fn engine_socket_warning_is_persistent_without_lowering_the_account_gate() {
     let (cp, _) = protection(&home);
     assert!(cp.status().engine_socket_policy.is_none());
 }
+
+#[cfg(unix)]
+mod trusted_home_tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    struct NoKeyAccess;
+    impl KeyStore for NoKeyAccess {
+        fn backend(&self) -> BackendKind { BackendKind::MacosKeychain }
+        fn level(&self) -> ProtectionLevel { ProtectionLevel::AppBound }
+        fn read(&self, _: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> { panic!("unsafe home must not read keys") }
+        fn write_new(&self, _: &str, _: &[u8]) -> Result<(), StoreError> { panic!("unsafe home must not write keys") }
+        fn delete(&self, _: &str) -> Result<(), StoreError> { panic!("unsafe home must not delete keys") }
+    }
+
+    fn refuse(cp: &CredentialProtection) {
+        assert_eq!(cp.status().state, ProtectionState::Unavailable);
+        assert!(!cp.status().person_identity_allowed);
+        assert_eq!(cp.person_identity_gate().unwrap_err().code, "unsafe_home");
+        assert_eq!(cp.enable(false).unwrap_err().code, "unsafe_home");
+        assert_eq!(cp.authorize().unwrap_err().code, "unsafe_home");
+        assert_eq!(cp.disable().unwrap_err().code, "unsafe_home");
+    }
+
+    #[test]
+    fn symlink_in_writable_parent_is_refused_without_key_access() {
+        for mode in [0o770, 0o777] {
+            let parent = TempHome::new("unsafe-link-parent");
+            let home = TempHome::new("safe-link-target");
+            let alias = parent.path().join("alias");
+            symlink(home.path(), &alias).unwrap();
+            std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            let cp = CredentialProtection::with_store(&alias, Box::new(NoKeyAccess));
+            refuse(&cp);
+            assert!(duduclaw_core::gateway_instance::acquire(&alias).is_err());
+            assert!(!home.path().join(".google-authority").exists());
+            assert!(!home.path().join("locks").exists());
+        }
+    }
+
+    #[test]
+    fn symlink_to_writable_home_is_refused_even_without_authority_lease() {
+        for mode in [0o770, 0o777] {
+            let parent = TempHome::new("safe-link-parent");
+            let home = TempHome::new("writable-link-target");
+            let alias = parent.path().join("alias");
+            symlink(home.path(), &alias).unwrap();
+            let (mut existing, _) = protection(&home);
+            existing.enable(false).unwrap();
+            home.hold_gateway_lock();
+            existing.store = Box::new(NoKeyAccess);
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            refuse(&existing);
+            refuse(&CredentialProtection::with_store(&alias, Box::new(NoKeyAccess)));
+            refuse(&CredentialProtection::with_store(home.path(), Box::new(NoKeyAccess)));
+        }
+    }
+
+    #[test]
+    fn replacing_resolved_home_refuses_every_operation_without_split_locks() {
+        let parent = TempHome::new("replaced-home");
+        let path = parent.path().join("home");
+        std::fs::create_dir(&path).unwrap();
+        let cp = CredentialProtection::with_store(&path, Box::new(NoKeyAccess));
+        let pin = cp.trusted_home().unwrap().clone();
+        let authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::from_trusted_home(&pin);
+        let original = parent.path().join("original");
+        std::fs::rename(&path, &original).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        refuse(&cp);
+        assert!(authority.write().is_err());
+        assert!(pin.child_directory("locks", true).is_err());
+        assert!(pin.open_file(marker::MARKER_FILE, libc::O_WRONLY | libc::O_CREAT).is_err());
+        for directory in [&path, &original] {
+            assert!(!directory.join(".google-authority").exists());
+            assert!(!directory.join("locks").exists());
+            assert!(!directory.join(marker::MARKER_FILE).exists());
+        }
+    }
+
+    #[test]
+    fn replacing_gateway_home_cannot_reuse_the_old_registered_lease() {
+        let parent = TempHome::new("replaced-gateway-home");
+        let path = parent.path().join("home");
+        std::fs::create_dir(&path).unwrap();
+        duduclaw_core::gateway_instance::acquire(&path).unwrap();
+        let cp = CredentialProtection::with_store(&path, Box::new(NoKeyAccess));
+        std::fs::rename(&path, parent.path().join("original")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        refuse(&cp);
+        assert!(!duduclaw_core::gateway_instance::held(&path));
+        assert!(duduclaw_core::gateway_instance::acquire(&path).is_err());
+        assert!(!path.join("locks").exists());
+    }
+
+    #[test]
+    fn retargeting_owned_home_symlink_does_not_switch_accounts_or_locks() {
+        let parent = TempHome::new("retarget-home");
+        let first = TempHome::new("retarget-first");
+        let second = TempHome::new("retarget-second");
+        let alias = parent.path().join("alias");
+        symlink(first.path(), &alias).unwrap();
+        let mut cp = CredentialProtection::with_store(&alias, Box::new(MemoryKeyStore::app_bound()));
+        cp.enable(false).unwrap();
+        first.hold_gateway_lock();
+        assert!(cp.person_identity_gate().is_ok());
+        let account = cp.account();
+        cp.store = Box::new(NoKeyAccess);
+        std::fs::remove_file(&alias).unwrap();
+        symlink(second.path(), &alias).unwrap();
+        assert_eq!(cp.account(), account);
+        refuse(&cp);
+        assert!(!second.path().join(".google-authority").exists());
+        assert!(!second.path().join("locks").exists());
+    }
+
+    #[test]
+    fn missing_home_is_read_only_then_pins_once_after_bootstrap() {
+        let parent = TempHome::new("lazy-home");
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = parent.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let home = parent.path().join("missing/../alias/new-home");
+        let cp = CredentialProtection::with_store(&home, Box::new(MemoryKeyStore::app_bound()));
+        assert_eq!(cp.status().state, ProtectionState::NotEnabled);
+        assert!(!parent.path().join("missing").exists());
+        assert!(!real.join("new-home").exists());
+        duduclaw_core::config::create_home_dir(&home).unwrap();
+        cp.enable(false).unwrap();
+        assert_eq!(cp.status().state, ProtectionState::Ready);
+        assert_eq!(cp.account(), marker::account_for_home(&home));
+        duduclaw_core::gateway_instance::acquire(&home).unwrap();
+        assert!(cp.person_identity_gate().is_ok());
+        std::fs::rename(real.join("new-home"), real.join("old-home")).unwrap();
+        std::fs::create_dir(real.join("new-home")).unwrap();
+        refuse(&cp);
+    }
+
+}

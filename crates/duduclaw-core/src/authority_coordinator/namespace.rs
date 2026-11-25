@@ -16,7 +16,7 @@ mod platform {
     use super::*;
     use std::{ffi::CString, fs::{Metadata, OpenOptions}, os::{fd::{AsRawFd, FromRawFd}, unix::fs::{MetadataExt, OpenOptionsExt}}, path::PathBuf};
 
-    pub(super) struct Directory { home: File, directory: File, path: PathBuf }
+    pub(super) struct Directory { home: File, directory: File, path: PathBuf, trusted: Option<crate::trusted_home::TrustedHome> }
 
     fn validate(metadata: &Metadata, directory: bool, home: bool) -> io::Result<()> {
         // SAFETY: geteuid has no pointer arguments or preconditions.
@@ -57,7 +57,13 @@ mod platform {
 
     impl Directory {
         pub(super) fn open(path: &Path) -> io::Result<Self> {
-            let home = open_home(path)?;
+            Self::open_inner(path, open_home(path)?, None)
+        }
+        pub(super) fn open_trusted(trusted: &crate::trusted_home::TrustedHome) -> io::Result<Self> {
+            trusted.verify()?;
+            Self::open_inner(trusted.path(), trusted.directory().try_clone()?, Some(trusted.clone()))
+        }
+        fn open_inner(path: &Path, home: File, trusted: Option<crate::trusted_home::TrustedHome>) -> io::Result<Self> {
             let name = CString::new(DIRECTORY).map_err(|_| denied())?;
             // SAFETY: home is a pinned directory fd and name is one component.
             if unsafe { libc::mkdirat(home.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
@@ -67,9 +73,10 @@ mod platform {
             let directory = open_at(&home, DIRECTORY, libc::O_RDONLY | libc::O_DIRECTORY)?;
             validate(&directory.metadata()?, true, false)?;
             home.sync_all()?;
-            Ok(Self { home, directory, path: path.to_owned() })
+            Ok(Self { home, directory, path: path.to_owned(), trusted })
         }
         pub(super) fn file(&self, name: &str, create: bool) -> io::Result<File> {
+            if let Some(home) = &self.trusted { home.verify()?; }
             same(&self.home, &open_home(&self.path)?)?;
             let current = open_at(&self.home, DIRECTORY, libc::O_RDONLY | libc::O_DIRECTORY)?;
             validate(&current.metadata()?, true, false)?;
@@ -111,6 +118,13 @@ pub(super) struct Namespace {
 impl Namespace {
     pub(super) fn open(home: &Path) -> io::Result<Self> {
         let directory = platform::Directory::open(home)?;
+        Self::from_directory(directory)
+    }
+    #[cfg(unix)]
+    pub(super) fn open_trusted(home: &crate::trusted_home::TrustedHome) -> io::Result<Self> {
+        Self::from_directory(platform::Directory::open_trusted(home)?)
+    }
+    fn from_directory(directory: platform::Directory) -> io::Result<Self> {
         let mut epoch_created = false;
         let mut open = |name| match directory.file(name, true) {
             Ok(file) => { if name == EPOCH { epoch_created = true; } Ok(file) },

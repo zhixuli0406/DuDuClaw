@@ -350,6 +350,8 @@ pub fn platform_store(_home: &Path) -> Box<dyn KeyStore> {
 /// Protection for one DuDuClaw home, over one store.
 pub struct CredentialProtection {
     home: PathBuf,
+    #[cfg(unix)]
+    trusted_home: OnceLock<Result<duduclaw_core::trusted_home::TrustedHome, String>>,
     store: Box<dyn KeyStore>,
 }
 
@@ -359,26 +361,104 @@ impl CredentialProtection {
     }
 
     pub fn with_store(home: &Path, store: Box<dyn KeyStore>) -> Self {
-        // Pin the same physical home used by the key-store account and the
-        // gateway lock. The authority coordinator still validates ownership,
-        // permissions and lock identities; it never follows a symlink leaf.
         #[cfg(unix)]
-        let home = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-        // Windows must retain the original spelling for its reparse-point checks.
+        let trusted_home = OnceLock::new();
+        #[cfg(unix)]
+        let home = {
+            let path = if home.is_absolute() { home.to_owned() } else {
+                std::env::current_dir().map(|cwd| cwd.join(home)).unwrap_or_else(|_| home.to_owned())
+            };
+            match duduclaw_core::trusted_home::TrustedHome::resolve(&path) {
+                Ok(pin) => {
+                    let path = pin.path().to_owned();
+                    let _ = trusted_home.set(Ok(pin));
+                    path
+                }
+                // Read-only lookup must not create a missing home. Bootstrap
+                // may create it later; no identity exists to pin until then.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => path,
+                Err(e) => { let _ = trusted_home.set(Err(e.to_string())); path }
+            }
+        };
         #[cfg(not(unix))]
         let home = home.to_path_buf();
-        Self { home, store }
+        Self { home, #[cfg(unix)] trusted_home, store }
+    }
+
+    #[cfg(unix)]
+    fn trusted_home(&self) -> Result<&duduclaw_core::trusted_home::TrustedHome, ProtectionError> {
+        if self.trusted_home.get().is_none() {
+            match duduclaw_core::trusted_home::TrustedHome::resolve(&self.home) {
+                Ok(home) => { let _ = self.trusted_home.set(Ok(home)); }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(ProtectionError::new("home_missing", e.to_string()));
+                }
+                Err(e) => { let _ = self.trusted_home.set(Err(e.to_string())); }
+            }
+        }
+        let home = self.trusted_home.get().expect("resolved home result")
+            .as_ref().map_err(|e| ProtectionError::new("unsafe_home", e.clone()))?;
+        home.verify().map_err(|e| ProtectionError::new("unsafe_home", e.to_string()))?;
+        Ok(home)
+    }
+
+    fn check_home(&self) -> Result<(), ProtectionError> {
+        #[cfg(unix)]
+        self.trusted_home()?;
+        Ok(())
     }
 
     fn account(&self) -> String {
-        marker::account_for_home(&self.home)
+        #[cfg(unix)]
+        {
+            let path = self.trusted_home.get().and_then(|result| result.as_ref().ok())
+                .map(|home| home.path()).unwrap_or(&self.home);
+            marker::account_for_resolved_home(path)
+        }
+        #[cfg(not(unix))]
+        { marker::account_for_home(&self.home) }
+    }
+
+    fn authority(&self) -> Result<duduclaw_core::authority_coordinator::AuthorityCoordinator, ProtectionError> {
+        #[cfg(unix)]
+        { Ok(duduclaw_core::authority_coordinator::AuthorityCoordinator::from_trusted_home(self.trusted_home()?)) }
+        #[cfg(not(unix))]
+        { Ok(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)) }
+    }
+
+    fn read_marker(&self) -> Result<Marker, (ProtectionState, String)> {
+        if let Err(e) = self.check_home() {
+            if e.code == "home_missing" {
+                return read_marker_for(MarkerRead::Absent, self.store.as_ref(), &self.account());
+            }
+            return Err((ProtectionState::Unavailable, e.to_string()));
+        }
+        #[cfg(unix)]
+        let read = marker::read_pinned(self.trusted_home().map_err(|e| (ProtectionState::Unavailable, e.to_string()))?);
+        #[cfg(not(unix))]
+        let read = marker::read_marker(&self.home);
+        read_marker_for(read, self.store.as_ref(), &self.account())
+    }
+
+    fn write_marker(&self, m: &Marker) -> Result<(), String> {
+        #[cfg(unix)]
+        { marker::write_pinned(self.trusted_home().map_err(|e| e.to_string())?, m) }
+        #[cfg(not(unix))]
+        { marker::write_marker(&self.home, m) }
+    }
+
+    fn remove_marker(&self) -> Result<(), String> {
+        #[cfg(unix)]
+        { self.trusted_home().map_err(|e| e.to_string())?.remove_file(marker::MARKER_FILE).map_err(|e| e.to_string()) }
+        #[cfg(not(unix))]
+        { marker::remove_marker(&self.home) }
     }
 
     /// Current state. Reads the key once to verify it, then drops it.
     pub fn status(&self) -> ProtectionStatus {
         let platform_level = self.store.level();
         let backend = self.store.backend();
-        let marker = read_marker_for(&self.home, self.store.as_ref(), &self.account());
+        let marker = self.read_marker();
         let (state, key_id, enabled_at, extra) = match marker {
             Err((state, extra)) => (state, None, None, extra),
             Ok(m) => match self.load_verified(&m) {
@@ -422,7 +502,7 @@ impl CredentialProtection {
 
     /// [`CredentialProtection::enable`] plus what it replaced, for the audit.
     pub fn enable_detailed(&self, reset: bool) -> Result<Enabled, ProtectionError> {
-        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+        let _authority = self.authority()?
             .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         if let Some(reason) = self.store.refusal_reason() {
             return Err(ProtectionError::from_state(ProtectionState::Unavailable, self.store.backend(), reason));
@@ -448,6 +528,7 @@ impl CredentialProtection {
     }
 
     fn create_key(&self) -> Result<ProtectionStatus, ProtectionError> {
+        self.check_home()?;
         let account = self.account();
         let key = Zeroizing::new(
             CryptoEngine::generate_key()
@@ -459,7 +540,7 @@ impl CredentialProtection {
             .write_new(&account, &key[..])
             .map_err(|e| store_error(&e, self.store.backend()))?;
         let m = marker::new_marker(self.store.backend(), account.clone(), marker::key_id(&key[..]), canary);
-        if let Err(e) = marker::write_marker(&self.home, &m) {
+        if let Err(e) = self.write_marker(&m) {
             let _ = self.store.delete(&account);
             return Err(ProtectionError::new("marker_write_failed", format!("無法寫入記錄檔：{e}")));
         }
@@ -467,7 +548,7 @@ impl CredentialProtection {
         let status = self.status();
         if status.state != ProtectionState::Ready {
             let _ = self.store.delete(&account);
-            let _ = marker::remove_marker(&self.home);
+            let _ = self.remove_marker();
             pin_reset(&account);
             return Err(ProtectionError::new(
                 "verify_failed",
@@ -480,12 +561,12 @@ impl CredentialProtection {
     /// Remove the protected key and the marker. Everything sealed with it
     /// becomes unreadable.
     pub fn disable(&self) -> Result<(), ProtectionError> {
-        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+        let _authority = self.authority()?
             .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         self.with_op_lock(|| {
             let account = self.account();
             self.store.delete(&account).map_err(|e| store_error(&e, self.store.backend()))?;
-            marker::remove_marker(&self.home).map_err(|e| ProtectionError::new("marker_write_failed", e))?;
+            self.remove_marker().map_err(|e| ProtectionError::new("marker_write_failed", e))?;
             pin_reset(&account);
             Ok(())
         })
@@ -501,11 +582,11 @@ impl CredentialProtection {
     /// `duduclaw` executable the gateway uses, or the new ACL trusts the wrong
     /// one.
     pub fn authorize(&self) -> Result<ProtectionStatus, ProtectionError> {
-        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+        let _authority = self.authority()?
             .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         self.with_op_lock(|| {
             let account = self.account();
-            let m = read_marker_for(&self.home, self.store.as_ref(), &account)
+            let m = self.read_marker()
                 .map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
             let bytes = self.store.read_interactive(&account).map_err(|e| store_error(&e, self.store.backend()))?;
             let key = verify_bytes(&bytes, &m).map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
@@ -522,20 +603,37 @@ impl CredentialProtection {
     /// Serialize enable / disable / authorize across processes (the RPC and
     /// a terminal `authorize` may race) with `<home>/locks/credential_protection.lock`.
     fn with_op_lock<T>(&self, f: impl FnOnce() -> Result<T, ProtectionError>) -> Result<T, ProtectionError> {
-        let lock = self.home.join("locks").join("credential_protection");
-        duduclaw_core::with_file_lock(&lock, || Ok(f()))
-            .map_err(|e| ProtectionError::new("lock_failed", format!("無法取得憑證保護的操作鎖：{e}")))?
+        #[cfg(unix)]
+        {
+            let locks = self.trusted_home()?.child_directory("locks", true)
+                .map_err(|e| ProtectionError::new("lock_failed", e.to_string()))?;
+            let _guard = locks.lock_file("credential_protection.lock")
+                .map_err(|e| ProtectionError::new("lock_failed", e.to_string()))?;
+            self.check_home()?;
+            f()
+        }
+        #[cfg(not(unix))]
+        {
+            let lock = self.home.join("locks").join("credential_protection");
+            duduclaw_core::with_file_lock(&lock, || Ok(f()))
+                .map_err(|e| ProtectionError::new("lock_failed", format!("無法取得憑證保護的操作鎖：{e}")))?
+        }
     }
 
     /// The key itself — only for the process holding the gateway lock.
     pub fn load_key_for_gateway(&self) -> Result<ProtectedKey, ProtectionError> {
-        if !duduclaw_core::gateway_instance::held(&self.home) {
+        self.check_home()?;
+        #[cfg(unix)]
+        let held = duduclaw_core::gateway_instance::held_trusted(self.trusted_home()?);
+        #[cfg(not(unix))]
+        let held = duduclaw_core::gateway_instance::held(&self.home);
+        if !held {
             return Err(ProtectionError::new(
                 "not_gateway",
                 "只有 DuDuClaw 主程式能解開保護金鑰",
             ));
         }
-        let m = read_marker_for(&self.home, self.store.as_ref(), &self.account())
+        let m = self.read_marker()
             .map_err(|(state, extra)| ProtectionError::from_state(state, self.store.backend(), &extra))?;
         let key = self
             .load_verified(&m)
@@ -562,6 +660,7 @@ impl CredentialProtection {
     }
 
     fn load_verified(&self, m: &Marker) -> Result<VerifiedKey, (ProtectionState, String)> {
+        self.check_home().map_err(|e| (ProtectionState::Unavailable, e.to_string()))?;
         let bytes = self.store.read(&m.account).map_err(|e| state_of(&e))?;
         let key = verify_bytes(&bytes, m)?;
         if !pin_check(&m.account, &key.key_id) {
@@ -599,14 +698,14 @@ fn verify_bytes(bytes: &[u8], m: &Marker) -> Result<VerifiedKey, (ProtectionStat
 }
 
 /// Read the marker and check it belongs to this home and this platform.
-fn read_marker_for(home: &Path, store: &dyn KeyStore, account: &str) -> Result<Marker, (ProtectionState, String)> {
+fn read_marker_for(marker: MarkerRead, store: &dyn KeyStore, account: &str) -> Result<Marker, (ProtectionState, String)> {
     if store.backend() == BackendKind::None {
         return Err((ProtectionState::Unsupported, String::new()));
     }
     if let Some(reason) = store.refusal_reason() {
         return Err((ProtectionState::Unavailable, reason.into()));
     }
-    match marker::read_marker(home) {
+    match marker {
         MarkerRead::Absent => Err((ProtectionState::NotEnabled, String::new())),
         MarkerRead::Invalid(why) => Err((ProtectionState::Invalid, why)),
         MarkerRead::Present(m) if m.account != account || m.backend != store.backend() => Err((

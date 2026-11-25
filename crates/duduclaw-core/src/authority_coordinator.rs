@@ -22,6 +22,8 @@ use fs2::FileExt;
 #[derive(Clone)]
 pub struct AuthorityCoordinator {
     home: PathBuf,
+    #[cfg(unix)]
+    trusted_home: Option<crate::trusted_home::TrustedHome>,
     namespace: Arc<OnceLock<Result<Arc<Namespace>, String>>>,
 }
 pub struct SharedLease { _resource: File, _namespace: Arc<Namespace> }
@@ -40,11 +42,23 @@ fn wait(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
 }
 impl AuthorityCoordinator {
     pub fn new(home: &Path) -> Self {
-        Self { home: home.to_owned(), namespace: Arc::new(OnceLock::new()) }
+        Self { home: home.to_owned(), #[cfg(unix)] trusted_home: None, namespace: Arc::new(OnceLock::new()) }
+    }
+    #[cfg(unix)]
+    pub fn from_trusted_home(home: &crate::trusted_home::TrustedHome) -> Self {
+        Self { home: home.path().to_owned(), trusted_home: Some(home.clone()), namespace: Arc::new(OnceLock::new()) }
     }
     fn namespace(&self) -> io::Result<Arc<Namespace>> {
-        self.namespace.get_or_init(|| Namespace::open(&self.home).map(Arc::new)
-            .map_err(|e| e.to_string())).as_ref().cloned().map_err(|e| io::Error::other(e.clone()))
+        self.namespace.get_or_init(|| {
+            #[cfg(unix)]
+            let result = match &self.trusted_home {
+                Some(home) => Namespace::open_trusted(home),
+                None => Namespace::open(&self.home),
+            };
+            #[cfg(not(unix))]
+            let result = Namespace::open(&self.home);
+            result.map(Arc::new).map_err(|e| e.to_string())
+        }).as_ref().cloned().map_err(|e| io::Error::other(e.clone()))
     }
     /// Call on the blocking pool when used by an async handler.
     ///
@@ -270,4 +284,25 @@ mod tests {
         assert!(c.read().is_err());
         assert!(c.write().is_err());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_home_pin_survives_owned_links_and_refuses_replacement_before_open() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("real");
+        std::fs::create_dir(&path).unwrap();
+        let alias = parent.path().join("alias");
+        std::os::unix::fs::symlink("real", &alias).unwrap();
+        let pin = crate::trusted_home::TrustedHome::resolve(&alias).unwrap();
+        let c = AuthorityCoordinator::from_trusted_home(&pin);
+        c.initialize().unwrap();
+        assert_eq!(c.epoch().unwrap(), AuthorityCoordinator::new(&path).epoch().unwrap());
+        let before_open = AuthorityCoordinator::from_trusted_home(&pin);
+        std::fs::rename(&path, parent.path().join("old")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(before_open.write().is_err());
+        assert!(c.read().is_err());
+        assert!(!path.join(namespace::DIRECTORY).exists());
+    }
+
 }

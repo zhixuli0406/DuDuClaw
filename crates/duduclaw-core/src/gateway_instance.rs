@@ -34,11 +34,13 @@ const LOCK_FILE: &str = "gateway.lock";
 const HOLDER_FILE: &str = "gateway.lock.holder";
 const REFUSED_FILE: &str = "gateway.lock.refused";
 
+#[cfg(not(unix))]
 fn held_locks() -> &'static Mutex<HashMap<PathBuf, OwnerLock>> {
     static HELD: OnceLock<Mutex<HashMap<PathBuf, OwnerLock>>> = OnceLock::new();
     HELD.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(not(unix))]
 fn key(home: &Path) -> PathBuf {
     std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf())
 }
@@ -71,6 +73,7 @@ pub fn acquire_for_restore(home: &Path) -> Result<(), String> {
     acquire_inner(home, false)
 }
 
+#[cfg(not(unix))]
 fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
     // Canonicalize only after creation. A missing home under a relative or
     // symlinked parent otherwise gets a different registry key after locking,
@@ -152,6 +155,7 @@ fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
 }
 
 /// Whether this process holds the gateway lock of `home`.
+#[cfg(not(unix))]
 pub fn held(home: &Path) -> bool {
     held_locks()
         .lock()
@@ -342,4 +346,100 @@ mod tests {
             "a later successful start clears the marker"
         );
     }
+}
+
+#[cfg(unix)]
+struct TrustedGatewayLock {
+    home: crate::trusted_home::TrustedHome,
+    locks: crate::trusted_home::TrustedHome,
+    anchor: std::fs::File,
+    _lock: OwnerLock,
+}
+
+#[cfg(unix)]
+fn trusted_locks() -> &'static Mutex<HashMap<PathBuf, TrustedGatewayLock>> {
+    static HELD: OnceLock<Mutex<HashMap<PathBuf, TrustedGatewayLock>>> = OnceLock::new();
+    HELD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(unix)]
+impl TrustedGatewayLock {
+    fn matches(&self, home: &crate::trusted_home::TrustedHome) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        home.verify()?;
+        self.home.verify()?;
+        if !home.same_directory(&self.home) { return Ok(false); }
+        let file = self.locks.open_file(LOCK_FILE, libc::O_RDONLY)?;
+        let a = self.anchor.metadata()?;
+        let b = file.metadata()?;
+        Ok((a.dev(), a.ino()) == (b.dev(), b.ino()))
+    }
+}
+
+#[cfg(unix)]
+fn acquire_inner(home: &Path, record_refusal: bool) -> Result<(), String> {
+    use std::io::Write;
+    crate::config::create_home_dir(home).map_err(|e| e.to_string())?;
+    let home = crate::trusted_home::TrustedHome::resolve(home).map_err(|e| e.to_string())?;
+    let mut held = trusted_locks().lock().map_err(|_| "gateway lock registry poisoned")?;
+    if let Some(lock) = held.get(home.path()) {
+        return match lock.matches(&home) {
+            Ok(true) => Ok(()),
+            _ => Err("unsafe or replaced gateway home/lock".into()),
+        };
+    }
+    let locks = home.child_directory("locks", true).map_err(|e| e.to_string())?;
+    let result = (|| -> std::io::Result<std::fs::File> {
+        let file = locks.open_file(LOCK_FILE, libc::O_RDWR | libc::O_CREAT)?;
+        for attempt in 0..5 {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(e) => {
+                    let contended = e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == fs2::lock_contended_error().raw_os_error();
+                    if contended && attempt < 4 {
+                        std::thread::sleep(std::time::Duration::from_micros(62_500));
+                        continue;
+                    }
+                    if contended { return Err(std::io::Error::other("another gateway already runs on this data directory")); }
+                    return Err(e);
+                }
+            }
+        }
+        home.verify()?;
+        let mut holder = locks.open_file(HOLDER_FILE, libc::O_WRONLY | libc::O_CREAT)?;
+        holder.set_len(0)?;
+        writeln!(holder, "pid={} since={}", std::process::id(), chrono::Utc::now().to_rfc3339())?;
+        Ok(file)
+    })();
+    match result {
+        Ok(file) => {
+            let anchor = file.try_clone().map_err(|e| e.to_string())?;
+            let _ = locks.remove_file(REFUSED_FILE);
+            held.insert(home.path().to_owned(), TrustedGatewayLock { home, locks, anchor, _lock: OwnerLock::new(file) });
+            Ok(())
+        }
+        Err(e) => {
+            if record_refusal {
+                if let Ok(mut file) = locks.open_file(REFUSED_FILE, libc::O_WRONLY | libc::O_CREAT) {
+                    let _ = file.set_len(0);
+                    let _ = writeln!(file, "pid={} at={} reason={e}", std::process::id(), chrono::Utc::now().to_rfc3339());
+                }
+            }
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Check a gateway lease against the exact home pinned by the credential reader.
+#[cfg(unix)]
+pub fn held_trusted(home: &crate::trusted_home::TrustedHome) -> bool {
+    trusted_locks().lock().ok().and_then(|held| {
+        held.get(home.path()).map(|lock| lock.matches(home).unwrap_or(false))
+    }).unwrap_or(false)
+}
+
+#[cfg(unix)]
+pub fn held(home: &Path) -> bool {
+    crate::trusted_home::TrustedHome::resolve(home).map(|home| held_trusted(&home)).unwrap_or(false)
 }
