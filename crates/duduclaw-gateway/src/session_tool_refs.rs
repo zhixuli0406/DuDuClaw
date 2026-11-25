@@ -346,4 +346,43 @@ mod tests {
         assert!(conn.execute(insert, rusqlite::params_from_iter(&boundary)).is_ok());
     }
 
+
+    #[tokio::test]
+    async fn rm182_restart_preserves_thread_state_without_importing_legacy_group_or_dm_history() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("sessions.db");
+        let thread = |id: &str| crate::googlechat_conversation::GoogleChatConversation::from_event(
+            &json!({"space":{"name":"spaces/A"},"message":{"thread":{"name":format!("spaces/A/threads/{id}")}}}), false, false,
+        ).unwrap();
+        let a = thread("one");
+        let b = thread("two");
+        let old = "googlechat:spaces/A#agent:sales";
+        let dm = "googlechat:spaces/DM#agent:sales";
+        let current = a.session_for(Some("sales"));
+        {
+            let sm = crate::session::SessionManager::new(&path).unwrap();
+            for key in [old, dm, &current] {
+                sm.get_or_create(key, "sales").await.unwrap();
+                sm.append_message(key, "user", key, 1).await.unwrap();
+                sm.set_pinned(key, "PIN-RESTART").await.unwrap();
+                sm.record_tool_reference(key, "sales", "docs_create",
+                    &serde_json::json!({"_meta":{"duduclaw_created_ref":{"id":"doc-restart","label":"doc"}}})).await.unwrap();
+            }
+        }
+        // Reopening/repeating resolution is idempotent; no fan-out or data copy.
+        for _ in 0..2 {
+            let sm = crate::session::SessionManager::new(&path).unwrap();
+            for key in [old, dm, &current] {
+                assert_eq!(sm.history_snapshot(key).await.unwrap().messages.len(), 1);
+                assert_eq!(sm.get_pinned(key).await.unwrap(), "PIN-RESTART");
+                assert!(sm.tool_refs_context(key).await.unwrap().contains("doc-restart"));
+            }
+            let next = b.session_for(Some("sales"));
+            sm.get_or_create(&next, "sales").await.unwrap();
+            assert!(sm.history_snapshot(&next).await.unwrap().messages.is_empty());
+            assert!(sm.get_pinned(&next).await.unwrap().is_empty());
+            assert!(sm.tool_refs_context(&next).await.unwrap().is_empty());
+        }
+    }
+
 }

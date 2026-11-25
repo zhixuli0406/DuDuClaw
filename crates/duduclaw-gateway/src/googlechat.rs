@@ -488,10 +488,10 @@ fn bound_chat_type(verified_http: bool, is_dm: bool) -> Option<&'static str> {
 
 /// Only the JWT-verified HTTP entry point calls this. Pub/Sub never records
 /// a decision DM or invokes the bound decision fastlane.
-async fn http_dm_decision(state: &Arc<GoogleChatState>, event: &serde_json::Value) -> Option<Result<String, String>> {
-    let space = event_space(event);
+async fn http_dm_decision(state: &Arc<GoogleChatState>, event: &serde_json::Value, conversation: &crate::googlechat_conversation::GoogleChatConversation) -> Option<Result<String, String>> {
+    let space = conversation.space().to_owned();
     let principal = event.pointer("/message/sender/name").and_then(serde_json::Value::as_str)?;
-    let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], event).await;
+    let is_dm = conversation.is_dm();
     let text = event.pointer("/message/argumentText").or_else(|| event.pointer("/message/text"))
         .and_then(serde_json::Value::as_str).unwrap_or("");
     if is_dm {
@@ -501,10 +501,10 @@ async fn http_dm_decision(state: &Arc<GoogleChatState>, event: &serde_json::Valu
     }
     crate::channel_decision_route::parse_strict_decision(text)?;
     if !is_dm { return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())); }
-    let thread = reply_thread(state, event, is_dm).await;
+    let thread = conversation.delivery_thread();
     let context = crate::approval::DecisionContext {
         channel: "googlechat".into(), account_id: state.creds.client_email().to_string(),
-        conversation_id: thread.as_ref().map_or_else(|| space.clone(), |t| format!("{space}:{t}")),
+        conversation_id: thread.map_or_else(|| space.clone(), |t| format!("{space}:{t}")),
         principal_id: principal.to_string(),
     };
     crate::ccr_runtime::ATTESTED_ONE_TO_ONE.scope(
@@ -514,11 +514,18 @@ async fn http_dm_decision(state: &Arc<GoogleChatState>, event: &serde_json::Valu
     ).await
 }
 
-/// Only the Pub/Sub worker supplies this event, rebuilt from spaces.messages.get.
+#[cfg(test)]
 pub(crate) async fn process_pubsub_event(state: &Arc<GoogleChatState>, event: &serde_json::Value) {
+    if let Ok(conversation) = resolve_conversation(state, event).await {
+        process_pubsub_conversation(state, event, &conversation).await;
+    }
+}
+
+/// Only the Pub/Sub worker supplies this event, rebuilt from spaces.messages.get.
+pub(crate) async fn process_pubsub_conversation(state: &Arc<GoogleChatState>, event: &serde_json::Value, conversation: &crate::googlechat_conversation::GoogleChatConversation) {
     let space = event_space(event);
     crate::agent_channels::gchat_spaces::record(&state.ctx.home_dir, &space, state.agent.as_deref());
-    handle_message(state, event, false).await;
+    handle_message(state, event, conversation, false).await;
 }
 
 async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> axum::response::Response {
@@ -546,8 +553,7 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
     }
     match event_type {
         "MESSAGE" => {
-            // One sender's messages in a space are answered one at a time,
-            // in order (they used to run concurrently, B10).
+            // One thread is processed in order, including different senders.
             let space = event_space(&event);
             if space.is_empty() {
                 warn!("Google Chat: MESSAGE event without space name — refused");
@@ -559,33 +565,32 @@ async fn dispatch_transport_event(state: Arc<GoogleChatState>, body: Bytes) -> a
                 info!("Google Chat: MESSAGE from a non-human sender ignored");
                 return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
+            let verified_conversation = match resolve_conversation(&state, &event).await {
+                Ok(conversation) => conversation,
+                Err(_) => {
+                    warn!("Google Chat: invalid conversation refused");
+                    return (StatusCode::BAD_REQUEST, "bad request").into_response();
+                }
+            };
             // Decisions must bypass the per-conversation model queue: the
             // running turn may itself be waiting for this exact approval.
-            if let Some(result) = http_dm_decision(&state, &event).await {
+            if let Some(result) = http_dm_decision(&state, &event, &verified_conversation).await {
                 let text = result.unwrap_or_else(|e| e);
                 return (StatusCode::OK, axum::Json(serde_json::json!({"text": text}))).into_response();
             }
-            let sender = event
-                .pointer("/message/sender/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
             let st = state.clone();
             let queued = event.clone();
-            // The queue outlives each request. Include the app identity so
-            // two apps in one space do not block each other or share caps.
-            let (group, conversation) = queue_keys(state.agent.as_deref(), &space, &sender);
+            let queued_conversation = verified_conversation.clone();
+            let (group, conversation) = verified_conversation.queue_keys(state.agent.as_deref());
             let message_name = event.pointer("/message/name").and_then(|v| v.as_str()).filter(|name| !name.is_empty() && name.len() <= 1024);
             let dedupe_key = message_name.map(|name| serde_json::json!([
                 state.ctx.home_dir, state.agent, state.creds.client_email(), name
             ]).to_string());
             let accepted = enqueue_once(dedupe_key.as_deref(), || state.ctx.googlechat_queue
-                .submit_in(&group, &conversation, async move { handle_message(&st, &queued, true).await }).is_ok());
+                .submit_in(&group, &conversation, async move { handle_message(&st, &queued, &queued_conversation, true).await }).is_ok());
             if !accepted
             {
-                let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], &event).await;
-                let thread = reply_thread(&state, &event, is_dm).await;
-                notify_queue_full(&state, &group, &conversation, &space, thread.as_deref());
+                notify_queue_full(&state, &group, &conversation, &space, verified_conversation.delivery_thread());
                 // ACK and drop this event: the notice asks the user to resend.
                 return (StatusCode::OK, axum::Json(serde_json::json!({}))).into_response();
             }
@@ -778,17 +783,8 @@ pub(crate) fn is_human_message(message: &serde_json::Value) -> bool {
     message.pointer("/sender/type").and_then(|v| v.as_str()) == Some("HUMAN")
 }
 
-/// Queue keys shared by the HTTP and Pub/Sub paths: one per app+space and
-/// one per app+space+sender (also the throttle keys of the queue-full notice).
-pub(crate) fn queue_keys(agent: Option<&str>, space: &str, sender: &str) -> (String, String) {
-    (
-        serde_json::json!([agent, space]).to_string(),
-        serde_json::json!([agent, space, sender]).to_string(),
-    )
-}
-
 /// Tell the space its message was not accepted because the queue is full,
-/// at most once a minute per sender and once every 10 s per space. Both the
+/// at most once a minute per thread and once every 10 s per app/space. Both the
 /// HTTP endpoint and the Pub/Sub worker use this, with the same keys.
 /// Returns whether a notice was sent (spawned).
 pub(crate) fn notify_queue_full(
@@ -834,14 +830,21 @@ pub(crate) fn inbound_text(message: &serde_json::Value) -> String {
     text
 }
 
-pub(crate) async fn reply_thread(state: &GoogleChatState, event: &serde_json::Value, is_dm: bool) -> Option<String> {
-    let message = &event["message"];
+/// Resolve once before queue admission; queued work retains the same placement
+/// and DM classification even if settings change while another turn is running.
+pub(crate) async fn resolve_conversation(
+    state: &GoogleChatState, event: &serde_json::Value,
+) -> Result<crate::googlechat_conversation::GoogleChatConversation, &'static str> {
+    let space = event_space(event);
+    let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &event["message"], event).await;
     let always = state.ctx.channel_settings.get("googlechat", "global", "dm_reply_placement").await.as_deref() == Some("thread");
-    if is_dm && !always && message.get("threadReply").and_then(serde_json::Value::as_bool) != Some(true) { return None; }
-    message.pointer("/thread/name").and_then(serde_json::Value::as_str).map(str::to_owned)
+    crate::googlechat_conversation::GoogleChatConversation::from_event(event, is_dm, always)
 }
 
-async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value, verified_http: bool) {
+async fn handle_message(
+    state: &Arc<GoogleChatState>, event: &serde_json::Value,
+    conversation: &crate::googlechat_conversation::GoogleChatConversation, verified_http: bool,
+) {
     let message = event.get("message").cloned().unwrap_or_default();
     // Defence in depth: every entry already requires a human sender.
     if !is_human_message(&message) {
@@ -855,21 +858,9 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
         return;
     }
 
-    let space = message
-        .pointer("/space/name")
-        .or_else(|| event.pointer("/space/name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if space.is_empty() {
-        warn!("Google Chat: MESSAGE event without space name");
-        return;
-    }
-    // A `space.name` that differs from `message.space.name` (or any
-    // contradiction between the two objects) makes the turn shared here:
-    // `carried_kind` never combines fields across the two objects.
-    let is_dm =crate::googlechat_space_kind::is_one_to_one(&state.creds, &space, &message, event).await;
-    let thread = reply_thread(state, event, is_dm).await;
+    let space = conversation.space().to_owned();
+    let is_dm = conversation.is_dm();
+    let thread = conversation.delivery_thread().map(str::to_owned);
     let sender = message
         .pointer("/sender/displayName")
         .and_then(|v| v.as_str())
@@ -881,9 +872,9 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
         .unwrap_or("unknown")
         .to_string();
 
-    let session_id = format!("googlechat:{space}");
+    let session_id = conversation.session_key().to_owned();
     let route = crate::googlechat_shared::route(
-        &state.ctx, state.agent.is_some(), is_dm, &session_id, &sender_id, &text,
+        &state.ctx, state.agent.is_some(), conversation, &sender_id, &text,
     ).await;
     let (routed_agent, own_turn, called_turn) = match route {
         crate::googlechat_shared::Route::Legacy => (state.agent.clone(), state.agent.is_some(), false),
@@ -902,7 +893,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
             // Keep blocked/taken-over conversations silent. Never forward an
             // access-gate diagnostic or command response to an unbound sender.
             if crate::channel_reply::check_user_access_gate(
-                &state.ctx, &session_id,
+                &state.ctx, conversation.gate_session(),
                 crate::ccr_runtime::reply_principal_for_sender(&sender_id), &text,
             ).await.is_none()
                 && !crate::takeover::is_target_paused(&state.ctx.home_dir, "googlechat", &space)
@@ -987,7 +978,7 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
 
     // Resolve the durable identity before creating any visible placeholder.
     let reply_session = match &routed_agent {
-        Some(agent) if own_turn || called_turn => crate::trigger_route::called_session(&session_id, agent),
+        Some(agent) if own_turn || called_turn => conversation.session_for(Some(agent)),
         _ => session_id.clone(),
     };
     let employee_id = match &routed_agent {
@@ -999,11 +990,16 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
         && !crate::chat_commands::is_command(&text)
     {
         crate::googlechat_shared::recovery_identity(
-            &state.ctx, &session_id, &sender_id, &input_text,
+            &state.ctx, conversation, &sender_id, &input_text,
         ).await
     } else {
         (employee_id.clone(), reply_session.clone())
     };
+    // Session tool references and durable recovery have a 512-byte key budget.
+    if recovery_session.len() > 512 || reply_session.len() > 512 {
+        warn!("Google Chat: conversation bucket exceeds storage limit");
+        return;
+    }
     // Fail closed: never create a placeholder when recovery cannot be persisted.
     let store = match crate::googlechat_inbox::Inbox::shared(&state.ctx.home_dir) {
         Ok(store) => store,
@@ -1067,25 +1063,12 @@ async fn handle_message(state: &Arc<GoogleChatState>, event: &serde_json::Value,
     };
     if crate::chat_commands::is_command(&text) {
         if let Some(cmd) = crate::chat_commands::parse_command(&text, None) {
-            // The same access gate the reply pipeline runs (on the space, with
-            // the same laundered sender id), then the shared-space rule for
-            // clearing history: the session is shared by every member and
-            // thread of the space, so only a verified Admin/Manager may clear
-            // it there; a 1:1 DM keeps resetting its own conversation.
-            // The space type comes from the trusted event / read-back, else
-            // `spaces.get` (cached); unknown = shared. Only resolved for the
-            // commands the rule applies to.
-            let one_to_one = crate::chat_commands::clears_conversation(&cmd)
-                && crate::googlechat_space_kind::is_one_to_one(
-                    &state.creds,
-                    &space,
-                    &message,
-                    event,
-                )
-                .await;
+            // History is shared by this thread's participants. The permission
+            // and takeover scope is still the whole space; reset only this bucket.
+            let one_to_one = is_dm;
             let origin = crate::chat_commands::CommandOrigin {
                 channel: "googlechat",
-                gate_session: &session_id,
+                gate_session: conversation.gate_session(),
                 command_session: &reply_session,
                 sender: crate::ccr_runtime::reply_principal_for_sender(&sender_id),
                 text: &text,
@@ -2403,25 +2386,31 @@ mod access_notice_tests {
         let origin = src.find("shared: !one_to_one,").unwrap();
         assert!(resolve < origin);
         let pubsub = include_str!("googlechat_pubsub.rs");
-        assert!(pubsub.contains("crate::googlechat::process_pubsub_event(&st, &event)"));
+        assert!(pubsub.contains("crate::googlechat::process_pubsub_conversation(&st, &event, &queued_conversation)"));
+    }
+
+    fn conversation(space: &str, thread: &str) -> crate::googlechat_conversation::GoogleChatConversation {
+        crate::googlechat_conversation::GoogleChatConversation::from_event(
+            &json!({"space":{"name":space}, "message":{"thread":{"name":thread}}}), false, false,
+        ).unwrap()
     }
 
     #[test]
     fn queue_keys_match_both_transports() {
-        let (group, conversation) = queue_keys(Some("sales"), "spaces/A", "users/x");
-        let agent: Option<String> = Some("sales".into());
-        assert_eq!(group, json!([agent, "spaces/A"]).to_string());
-        assert_eq!(conversation, json!([agent, "spaces/A", "users/x"]).to_string());
-        assert_eq!(queue_keys(None, "spaces/A", "u").0, json!([null, "spaces/A"]).to_string());
+        let c = conversation("spaces/A", "spaces/A/threads/t");
+        let (group, key) = c.queue_keys(Some("sales"));
+        assert_eq!(group, json!(["sales", "spaces/A"]).to_string());
+        assert_eq!(key, c.session_key());
+        assert_eq!(c.queue_keys(None).1, key);
     }
 
     #[tokio::test]
     async fn queue_full_notice_is_throttled_per_sender_and_space() {
         let dir = tempfile::tempdir().unwrap();
         let state = test_state(dir.path());
-        let (group, alice) = queue_keys(None, "spaces/A", "users/alice");
-        let (_, bob) = queue_keys(None, "spaces/A", "users/bob");
-        let (other_group, carol) = queue_keys(None, "spaces/B", "users/carol");
+        let (group, alice) = conversation("spaces/A", "spaces/A/threads/a").queue_keys(None);
+        let (_, bob) = conversation("spaces/A", "spaces/A/threads/b").queue_keys(None);
+        let (other_group, carol) = conversation("spaces/B", "spaces/B/threads/c").queue_keys(None);
         assert!(notify_queue_full(&state, &group, &alice, "spaces/A", None));
         // Same sender again, and another sender in the same space within 10 s.
         assert!(!notify_queue_full(&state, &group, &alice, "spaces/A", None));
@@ -2434,7 +2423,7 @@ mod access_notice_tests {
     fn pubsub_queue_full_uses_the_shared_notice() {
         let src = include_str!("googlechat_pubsub.rs");
         assert!(src.contains("crate::googlechat::notify_queue_full(state, &group, &conversation"));
-        assert!(src.contains("crate::googlechat::queue_keys("));
+        assert!(src.contains("verified_conversation.queue_keys("));
     }
 
     #[test]

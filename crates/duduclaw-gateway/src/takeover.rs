@@ -307,6 +307,7 @@ pub async fn intercept(
     user_id: &str,
     text: &str,
 ) -> Option<Intercepted> {
+    let conversation = crate::googlechat_conversation::permission_session(session_id).unwrap_or(session_id);
     let home = ctx.home_dir.as_path();
     let cfg = TakeoverConfig::from_home(home);
     if !cfg.enabled {
@@ -322,13 +323,13 @@ pub async fn intercept(
     }
 
     let now = Utc::now();
-    let existing = takeover_state::active_at(home, session_id, now);
+    let existing = takeover_state::active_at(home, conversation, now);
     let manager = manager_display_name(home, &channel, user_id);
 
     match manager {
         Some(holder_name) => {
             let agent_id = crate::channel_reply::resolve_agent_for_session(ctx, session_id).await;
-            match begin_takeover(home, session_id, &agent_id, user_id, &holder_name, &cfg).await {
+            match begin_takeover(home, conversation, &agent_id, user_id, &holder_name, &cfg).await {
                 Ok(outcome) => {
                     record_turn(ctx, session_id, &agent_id, user_id, text).await;
                     if outcome.is_started() {
@@ -368,7 +369,8 @@ async fn holder_silence(
     user_id: &str,
     existing: Option<TakeoverRecord>,
 ) -> Option<Intercepted> {
-    let existing = existing.or_else(|| takeover_state::active(&ctx.home_dir, session_id))?;
+    let conversation = crate::googlechat_conversation::permission_session(session_id).unwrap_or(session_id);
+    let existing = existing.or_else(|| takeover_state::active(&ctx.home_dir, conversation))?;
     let agent_id = if existing.agent_id.trim().is_empty() {
         crate::channel_reply::resolve_agent_for_session(ctx, session_id).await
     } else {

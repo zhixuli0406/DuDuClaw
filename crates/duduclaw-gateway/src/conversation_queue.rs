@@ -7,8 +7,8 @@
 //! [`ConversationQueue`] keeps each conversation's messages in arrival order
 //! (the order of [`ConversationQueue::submit`] calls), one at a time;
 //! different conversations still run in parallel. Conversations can be
-//! grouped (Google Chat: one queue per space and sender, grouped by space),
-//! with a cap per conversation and a cap per group, so one sender cannot
+//! grouped (Google Chat: one queue per thread, grouped by app and space),
+//! with a cap per conversation and a cap per group, so one thread cannot
 //! fill the whole space. A full queue is reported to the caller, never
 //! dropped silently; [`NoticeThrottle`] keeps the caller's "queue full"
 //! notices from becoming a flood themselves.

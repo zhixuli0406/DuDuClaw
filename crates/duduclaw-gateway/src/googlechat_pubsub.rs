@@ -221,10 +221,16 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             }
         };
         let space = event.pointer("/message/space/name").and_then(Value::as_str).unwrap_or("");
-        let sender = event.pointer("/message/sender/name").and_then(Value::as_str).unwrap_or("");
-        // Same queue (and queue-full notice throttle) keys as the HTTP path.
-        let (group, conversation) = crate::googlechat::queue_keys(state.agent.as_deref(), space, sender);
-        let notice_event = event.clone();
+        let verified_conversation = match crate::googlechat::resolve_conversation(state, &event).await {
+            Ok(conversation) => conversation,
+            Err(_) => {
+                tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub invalid conversation dropped; no turn");
+                inbox.discard_pending(&stream, &row.id)?;
+                continue;
+            }
+        };
+        let (group, conversation) = verified_conversation.queue_keys(state.agent.as_deref());
+        let queued_conversation = verified_conversation.clone();
         let notice_space = space.to_string();
         let bind = crate::agent_channels::binding_lock().await;
         if !still_current(&state.ctx, state.agent.as_deref(), config).await { break; }
@@ -238,7 +244,7 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             }
             if !db.transition(&key, &id, "queued", "running").unwrap_or(false) { return; }
             drop(bind);
-            crate::googlechat::process_pubsub_event(&st, &event).await;
+            crate::googlechat::process_pubsub_conversation(&st, &event, &queued_conversation).await;
             if let Err(e) = db.transition(&key, &id, "running", "done") {
                 tracing::error!(error = e, "Google Chat inbox completion failed");
             }
@@ -248,9 +254,7 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
             inbox.transition(&stream, &row.id, "queued", "dropped")?;
             drop(bind);
             tracing::warn!(agent = ?state.agent, "Google Chat Pub/Sub queue full: ACK and drop; no turn");
-            let is_dm = crate::googlechat_space_kind::is_one_to_one(&state.creds, &notice_space, &notice_event["message"], &notice_event).await;
-            let thread = crate::googlechat::reply_thread(state, &notice_event, is_dm).await;
-            crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, thread.as_deref());
+            crate::googlechat::notify_queue_full(state, &group, &conversation, &notice_space, verified_conversation.delivery_thread());
         }
     }
     Ok(())
@@ -702,6 +706,20 @@ mod googlechat_pubsub_tests {
         pull(&h, &mut batch).await.unwrap();
         assert!(waiting.entered.try_recv().is_err());
         assert_eq!(h.fake.calls.lock().unwrap().iter().filter(|(method, _, _)| *method == Method::GET).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rm182_cross_space_thread_readback_is_acked_and_dropped_before_turn() {
+        let h = harness().await;
+        duduclaw_core::gateway_instance::acquire(h.home.path()).unwrap();
+        let mut waiting = e2e_seam::arm_waiting(h.home.path());
+        h.fake.message.lock().unwrap()["thread"] = json!({"name":"spaces/OTHER/threads/forged"});
+        pull(&h, &mut VecDeque::new()).await.unwrap();
+        assert_eq!(acked(&h), vec![json!({"ackIds":["ack-one"]})]);
+        assert!(waiting.entered.try_recv().is_err());
+        assert!(h.inbox.pending(&stream(&h.state, &h.config)).unwrap().is_empty());
+        assert!(h.inbox.stale_placeholders(chrono::Utc::now().timestamp() + 10).unwrap().is_empty());
+        assert!(h.state.ctx.session_manager.list_sessions(None, 20).await.unwrap().is_empty());
     }
 
     #[tokio::test]

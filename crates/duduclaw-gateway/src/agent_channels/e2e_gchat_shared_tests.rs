@@ -4,6 +4,17 @@ use crate::channel_settings::{keys, ChannelSettingsManager};
 use crate::googlechat_shared::{self, Route};
 use duduclaw_auth::{AccessLevel, UserDb, UserRole};
 
+async fn route_fixture(
+    ctx: &Arc<crate::channel_reply::ReplyContext>, own_app: bool, is_dm: bool,
+    session: &str, sender: &str, text: &str,
+) -> Route {
+    let space = session.strip_prefix("googlechat:").unwrap();
+    let c = crate::googlechat_conversation::GoogleChatConversation::from_event(
+        &json!({"space":{"name":space},"message":{"thread":{"name":format!("{space}/threads/T")}}}), is_dm, false,
+    ).unwrap();
+    googlechat_shared::route(ctx, own_app, &c, sender, text).await
+}
+
 struct SharedFixture {
     home: tempfile::TempDir,
     fake: Fake,
@@ -158,7 +169,7 @@ async fn rm148_binding_lookup_error_and_unavailable_avatar_fail_closed() {
             _ => f.db.set_user_status(&f.member, duduclaw_auth::UserStatus::Suspended).unwrap(),
         }
         for text in ["hello", "@sales hello", "@"] {
-            assert_eq!(googlechat_shared::route(
+            assert_eq!(route_fixture(
                 &f.state.ctx, false, true, "googlechat:spaces/FAILCLOSED", "users/42", text,
             ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()), "{failure}: {text}");
         }
@@ -177,7 +188,7 @@ async fn rm148_automatic_account_matching_cannot_select_an_avatar() {
     crate::googlechat_identity::test_support::link_google(f.home.path(), &[(&f.member, "123", "connected")]);
     let mut waiting = super::super::e2e_seam::arm_waiting(f.home.path());
     for text in ["hello", "@sales hello", "@dudu hello", "@"] {
-        assert_eq!(googlechat_shared::route(
+        assert_eq!(route_fixture(
             &f.state.ctx, false, true, "googlechat:spaces/AUTOMATCH", "users/123", text,
         ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()));
         turn(&f, &dm("spaces/AUTOMATCH", text, "users/123")).await;
@@ -200,22 +211,22 @@ async fn rm148_bound_mentions_and_pending_use_only_the_manual_access() {
     crate::googlechat_identity::test_support::set_derivation(f.home.path(), true);
     crate::googlechat_identity::test_support::link_google(f.home.path(), &[(&f.admin, "42", "connected")]);
     let conversation = "googlechat:spaces/MANUAL";
-    assert_eq!(googlechat_shared::route(
+    assert_eq!(route_fixture(
         &f.state.ctx, false, true, conversation, "users/42", "@sales hello",
     ).await, Route::Called { agent: "sales".into(), via_trigger: true });
-    assert!(matches!(googlechat_shared::route(
+    assert!(matches!(route_fixture(
         &f.state.ctx, false, true, conversation, "users/42", "@sales",
     ).await, Route::Direct(_)));
-    assert_eq!(googlechat_shared::route(
+    assert_eq!(route_fixture(
         &f.state.ctx, false, true, conversation, "users/42", "hello",
     ).await, Route::Called { agent: "sales".into(), via_trigger: true });
     // Revoking the manual identity must also block an already armed pick,
     // even while automatic Google-account recognition remains enabled.
-    assert!(matches!(googlechat_shared::route(
+    assert!(matches!(route_fixture(
         &f.state.ctx, false, true, conversation, "users/42", "@sales",
     ).await, Route::Direct(_)));
     f.db.unbind_channel_identity("googlechat", "users/42").unwrap();
-    assert_eq!(googlechat_shared::route(
+    assert_eq!(route_fixture(
         &f.state.ctx, false, true, conversation, "users/42", "hello",
     ).await, Route::Unbound(googlechat_shared::DEFAULT_UNBOUND_REPLY.into()));
 }
@@ -305,7 +316,7 @@ async fn rm148_recovery_tracks_actual_avatar_mention_and_channel_default() {
 #[tokio::test]
 async fn rm148_missing_setting_is_legacy_but_malformed_setting_is_unbound() {
     let f = shared_fixture().await;
-    let route = || googlechat_shared::route(&f.state.ctx, false, true, "googlechat:spaces/CONFIG", "users/42", "hello");
+    let route = || route_fixture(&f.state.ctx, false, true, "googlechat:spaces/CONFIG", "users/42", "hello");
     assert_eq!(route().await, Route::Legacy);
     f.state.ctx.channel_settings.set("googlechat", "global", keys::UNBOUND_REPLY, "{unknown}").await.unwrap();
     assert_eq!(route().await, Route::Legacy, "off ignores unused onboarding settings");
@@ -331,4 +342,55 @@ async fn rm148_shared_helper_honors_personal_restrictions_and_primary_fallback()
     assert_eq!(crate::shared_app_route::member_agent_route(
         &f.state.ctx, "googlechat", "users/42",
     ).await.as_deref(), Some("sales"));
+}
+
+#[tokio::test]
+async fn rm182_both_ingresses_use_thread_keys_for_shared_and_dedicated_apps() {
+    for http in [false, true] {
+        for own in [false, true] {
+            for is_dm in [false, true] {
+                let f = shared_fixture().await;
+                enabled(&f, true).await;
+                let state = if own {
+                    Arc::new(crate::googlechat::GoogleChatState {
+                        ctx: f.state.ctx.clone(), creds: f.state.creds.clone(), agent: Some("sales".into()),
+                    })
+                } else { f.state.clone() };
+                let agent = if own { "sales" } else if is_dm { "finance" } else { "dudu" };
+                for thread in ["one", "two"] {
+                    let mut event = if is_dm { dm("spaces/THREADS", "hello", "users/42") }
+                        else { message_event("spaces/THREADS", "hello") };
+                    event["message"]["thread"] = json!({"name":format!("spaces/THREADS/threads/{thread}")});
+                    event["message"]["threadReply"] = json!(true);
+                    let c = crate::googlechat::resolve_conversation(&state, &event).await.unwrap();
+                    let expected = c.session_for((own || is_dm).then_some(agent));
+                    if http {
+                        let response = crate::googlechat::dispatch_event(state.clone(), Bytes::from(event.to_string())).await;
+                        assert_eq!(response.status(), StatusCode::OK);
+                        wait_text(&f.fake, &format!("Bearer tok-{}", state.creds.client_email()), &expected).await;
+                    } else { crate::googlechat::process_pubsub_event(&state, &event).await; }
+                    let seen = observations(&f);
+                    assert_eq!(seen.len(), 1, "http={http}, own={own}, dm={is_dm}");
+                    assert_eq!(seen[0].agent, agent);
+                    assert_eq!(seen[0].session, expected);
+                    assert!(chat_calls(&f.fake).iter().any(|(method, _, _, body)| method == "POST"
+                        && body.pointer("/thread/name").and_then(Value::as_str) == c.delivery_thread()));
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn rm182_cross_space_thread_never_creates_placeholder_or_turn_on_either_ingress() {
+    let f = shared_fixture().await;
+    enabled(&f, true).await;
+    let mut event = dm("spaces/SAFE", "hello", "users/42");
+    event["message"]["thread"] = json!({"name":"spaces/OTHER/threads/forged"});
+    let response = crate::googlechat::dispatch_event(f.state.clone(), Bytes::from(event.to_string())).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    crate::googlechat::process_pubsub_event(&f.state, &event).await;
+    assert!(observations(&f).is_empty());
+    assert!(chat_calls(&f.fake).is_empty());
+    assert!(f.state.ctx.session_manager.list_sessions(None, 20).await.unwrap().is_empty());
 }

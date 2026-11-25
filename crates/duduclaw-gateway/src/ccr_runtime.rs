@@ -175,6 +175,10 @@ pub fn attests_one_to_one(session_id: &str, sender: &str) -> bool {
     let Some(attestation) = current_one_to_one_attestation() else {
         return false;
     };
+    if session_id.split_once(':').is_some_and(|(channel, _)| channel == "googlechat") {
+        return crate::googlechat_conversation::space_from_session(session_id)
+            .is_some_and(|space| attestation.matches("googlechat", space, sender));
+    }
     let base = crate::knowledge::chat_attachments::base_session(session_id);
     match base.split_once(':') {
         Some((channel, chat)) => attestation.matches(channel, chat, sender),
