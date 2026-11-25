@@ -54,6 +54,72 @@ fn restart_and_duplicate_completion_claim_only_one_continuation() {
     assert!(Store::open(home.path()).unwrap().ready_rows().unwrap().is_empty());
     assert!(restarted.oauth("oauth-state","alice","login-a").is_err());
 }
+
+fn ready_request(home:&Path) -> Request {
+    let store=Store::open(home).unwrap();
+    let ticket=store.issue(row(home)).unwrap();
+    let request=store.claim_ticket(&ticket,"alice","login-a").unwrap();
+    store.ready(&request,&json!({"credential_id":"c1"})).unwrap();
+    request
+}
+
+fn request_status(home:&Path,id:&str) -> String {
+    rusqlite::Connection::open(home.join("protected/google_authorization_requests.db")).unwrap()
+        .query_row("SELECT status FROM requests WHERE id=?1",[id],|r|r.get(0)).unwrap()
+}
+
+#[tokio::test(flavor="multi_thread",worker_threads=2)]
+async fn concurrent_resume_workers_only_claimant_performs_external_io() {
+    use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    let home=tempfile::tempdir().unwrap();
+    let request=ready_request(home.path());
+    let calls=Arc::new(AtomicUsize::new(0));
+    let barrier=Arc::new(tokio::sync::Barrier::new(2));
+    let mut workers=Vec::new();
+    for _ in 0..2 {
+        let home=home.path().to_path_buf();let id=request.id.clone();
+        let calls=calls.clone();let barrier=barrier.clone();
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            resume::claim_and_run(&home,&id,|| async {
+                assert_eq!(request_status(&home,&id),"claimed");
+                // Stands in for secret-manager/provider I/O, including Feishu
+                // token acquisition. The losing worker must never enter here.
+                calls.fetch_add(1,Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(())
+            }).await
+        }));
+    }
+    let first=workers.remove(0).await.unwrap();let second=workers.remove(0).await.unwrap();
+    assert_eq!(usize::from(first.is_ok())+usize::from(second.is_ok()),1);
+    assert_eq!(calls.load(Ordering::SeqCst),1);
+    assert_eq!(request_status(home.path(),&request.id),"done");
+}
+
+#[tokio::test]
+async fn sender_resolution_failure_after_claim_stops_without_retry_even_if_expired() {
+    for expire in [false,true] {
+        let home=tempfile::tempdir().unwrap();let request=ready_request(home.path());
+        let calls=std::sync::atomic::AtomicUsize::new(0);
+        let outcome=resume::claim_and_run(home.path(),&request.id,|| async {
+            assert_eq!(request_status(home.path(),&request.id),"claimed");
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            if expire {
+                rusqlite::Connection::open(home.path().join("protected/google_authorization_requests.db")).unwrap()
+                    .execute("UPDATE requests SET expires=0 WHERE id=?1",[&request.id]).unwrap();
+            }
+            Err("sender credential/token resolution failed".into())
+        }).await;
+        assert!(outcome.is_err());
+        assert_eq!(request_status(home.path(),&request.id),"stopped");
+        assert!(Store::open(home.path()).unwrap().ready_rows().unwrap().is_empty());
+        assert!(resume::claim_and_run(home.path(),&request.id,|| async {
+            calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);Ok(())
+        }).await.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst),1);
+    }
+}
 #[test]
 fn account_hint_cannot_replace_verified_sub_or_email() {
     let home=tempfile::tempdir().unwrap();let row=row(home.path());

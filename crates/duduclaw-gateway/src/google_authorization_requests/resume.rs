@@ -42,47 +42,60 @@ pub(crate) fn start(ctx:Arc<crate::channel_reply::ReplyContext>) {
 }
 
 async fn run(ctx:&Arc<crate::channel_reply::ReplyContext>,row:&Request,receipt:&Value) -> Result<(),String> {
-    let db=crate::decision_notify::open_user_db(&ctx.home_dir)?.ok_or(REFUSED)?;
-    ready(&ctx.home_dir,&db,row,receipt)?;
-    let target=match &row.source {
-        Some(source)=>Some(crate::approval::TrustedReplyTarget::restore_notice(&ctx.home_dir,source).await?),
-        None=>None,
-    };
-    if let Some(target)=&target {
-        if target.context.channel!=row.channel || target.context.principal_id!=row.sender
-            || target.context.conversation_id!=row.conversation { return Err(REFUSED.into()); }
+    // Pre-claim checks must remain local: no secret manager or provider calls.
+    if let Some(source)=&row.source {
+        let target=crate::approval::TrustedReplyTarget::validate_notice(source)?;
+        if target.channel!=row.channel || target.principal_id!=row.sender
+            || target.conversation_id!=row.conversation { return Err(REFUSED.into()); }
     }
-    let sender=if row.channel=="webchat" {
-        crate::channel_sender::create_webchat_sender(row.session_id.clone(),ctx.event_tx.clone())
-    } else if let Some(target)=&target { target.sender(ctx.http.clone()) }
-    else {
-        // This address is captured from verified ingress, not model output.
-        // Config hashes pin self-configuring adapters' bot account settings.
-        let target=crate::channel_sender::resolve_channel_target(&ctx.home_dir,&row.channel,&row.conversation).await?;
-        crate::channel_sender::create_sender_for_home(&ctx.home_dir,&target,ctx.http.clone())
-    };
-    ready(&ctx.home_dir,&db,row,receipt)?;
+    if row.conversation.is_empty() || row.sender.is_empty() { return Err(REFUSED.into()); }
     if ctx.session_manager.turn_generation(&row.session_id).await.map_err(|_|REFUSED)? != row.session_generation
         || ctx.session_manager.archived_at(&row.session_id).await.map_err(|_|REFUSED)?.is_some() { return Err(REFUSED.into()); }
-    Store::open(&ctx.home_dir)?.cas(&row.id,"ready","claimed")?;
-    let work=async {
-        // Re-enter the ordinary pipeline, including requester mapping,
-        // channel access, tool gates and independent outbound approvals.
-        let reply=crate::channel_reply::build_guarded_reply_for_agent(
-            &row.text,ctx,&row.agent,&row.session_id,&row.sender,None).await;
+    claim_and_run(&ctx.home_dir,&row.id,|| async {
+        let db=crate::decision_notify::open_user_db(&ctx.home_dir)?.ok_or(REFUSED)?;
         ready(&ctx.home_dir,&db,row,receipt)?;
-        if !reply.still_valid().await { return Err(REFUSED.into()); }
-        sender.send_text(&reply.text).await.map_err(|_|REFUSED.to_owned())?;
-        Store::open(&ctx.home_dir)?.cas(&row.id,"claimed","done")
-    };
-    let outcome=if row.channel=="webchat" {
-        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(row.user.clone(),Box::pin(work)).await
-    } else if let Some(target)=target {
-        crate::approval::scope_trusted_reply(Ok(target),Box::pin(work)).await
-    } else { Box::pin(work).await };
+        let target=match &row.source {
+            Some(source)=>Some(crate::approval::TrustedReplyTarget::restore_notice(&ctx.home_dir,source).await?),
+            None=>None,
+        };
+        let sender=if row.channel=="webchat" {
+            crate::channel_sender::create_webchat_sender(row.session_id.clone(),ctx.event_tx.clone())
+        } else if let Some(target)=&target { target.sender(ctx.http.clone()) }
+        else {
+            // Credential resolution (including Feishu's token request) is claimed work.
+            let target=crate::channel_sender::resolve_channel_target(&ctx.home_dir,&row.channel,&row.conversation).await?;
+            crate::channel_sender::create_sender_for_home(&ctx.home_dir,&target,ctx.http.clone())
+        };
+        ready(&ctx.home_dir,&db,row,receipt)?;
+        if ctx.session_manager.turn_generation(&row.session_id).await.map_err(|_|REFUSED)? != row.session_generation
+            || ctx.session_manager.archived_at(&row.session_id).await.map_err(|_|REFUSED)?.is_some() { return Err(REFUSED.into()); }
+        let work=async {
+            // Re-enter the ordinary pipeline, including requester mapping,
+            // channel access, tool gates and independent outbound approvals.
+            let reply=crate::channel_reply::build_guarded_reply_for_agent(
+                &row.text,ctx,&row.agent,&row.session_id,&row.sender,None).await;
+            ready(&ctx.home_dir,&db,row,receipt)?;
+            if !reply.still_valid().await { return Err(REFUSED.into()); }
+            sender.send_text(&reply.text).await.map_err(|_|REFUSED.to_owned())?;
+            Ok(())
+        };
+        if row.channel=="webchat" {
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(row.user.clone(),Box::pin(work)).await
+        } else if let Some(target)=target {
+            crate::approval::scope_trusted_reply(Ok(target),Box::pin(work)).await
+        } else { Box::pin(work).await }
+    }).await
+}
+
+/// The work future is only constructed after the single-use CAS succeeds.
+/// Every fallible operation after claim, including sender restoration, settles here.
+pub(super) async fn claim_and_run<F, Fut>(home:&Path,id:&str,work:F) -> Result<(),String>
+where F:FnOnce()->Fut, Fut:std::future::Future<Output=Result<(),String>> {
+    Store::open(home)?.cas(id,"ready","claimed")?;
+    let outcome=work().await.and_then(|()| Store::open(home)?.cas(id,"claimed","done"));
     if outcome.is_err() {
-        // Only the worker that claimed this row may settle its failed attempt.
-        if let Ok(store)=Store::open(&ctx.home_dir) { let _=store.cas(&row.id,"claimed","stopped"); }
+        // Failure settlement must also work if the ticket expired during I/O.
+        Store::open(home)?.stop_claimed(id)?;
     }
     outcome
 }

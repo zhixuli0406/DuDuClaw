@@ -152,6 +152,27 @@ pub(super) async fn build_reply_with_session_inner(
     crate::google_authorization_requests::turn::flush(&notice).await;
     let hint = notice.lock().ok().and_then(|mut value| value.text.take());
     match hint {
+        Some(hint) if crate::google_authorization_requests::render::ticket_url(&hint).is_some() => {
+            // The capability never enters the normal reply pipeline (contract,
+            // restoration, CCR, transcripts, or logs). Only the transport sees it.
+            let history = crate::google_authorization_requests::render::history_text(&reply);
+            if !crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await {
+                super::mark_authorization_link(hint);
+            }
+            // Early replies may not have appended an assistant row at all.
+            let (stored, generation) = super::CCR_TURN_DELIVERY.try_with(|delivery| (
+                delivery.assistant_message.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some(),
+                delivery.turn_generation.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            )).unwrap_or_default();
+            if !stored {
+                if let Ok(Some(current)) = ctx.session_manager.turn_generation(session_id).await {
+                    if let Ok(id) = super::append_turn_assistant(&ctx.session_manager,session_id,&history,0,generation.as_deref().or(Some(&current))).await {
+                        super::record_turn_assistant_message(session_id,id);
+                    }
+                }
+            }
+            history
+        }
         Some(hint) if reply.is_empty() => {
             if crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await {
                 super::mark_deliberate_silence();
