@@ -180,6 +180,22 @@ impl RootProcess {
         Ok(root)
     }
 
+    /// Authenticate the server from a connected client pipe before disclosing a proof.
+    #[cfg(windows)]
+    pub fn pipe_server(pipe: BorrowedHandle<'_>) -> io::Result<Self> {
+        use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+        let mut pid = 0;
+        // SAFETY: live client pipe handle and writable PID output.
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut pid) } == 0 || pid == 0 {
+            return Err(invalid());
+        }
+        let server = Self::capture(pid)?;
+        let mut again = 0;
+        if unsafe { GetNamedPipeServerProcessId(pipe.as_raw_handle(), &mut again) } == 0
+            || again != pid || !server.is_current() { return Err(invalid()); }
+        Ok(server)
+    }
+
     pub fn capture(pid: u32) -> io::Result<Self> {
         #[cfg(windows)]
         { Self::from_handle(open_process(pid)?.as_handle()) }

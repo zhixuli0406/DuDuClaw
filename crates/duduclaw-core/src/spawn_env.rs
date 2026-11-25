@@ -24,8 +24,8 @@
 //! are Anthropic/Claude-specific.
 //!
 //! RM-208 explicitly permits `DUDUCLAW_RUN_CREDENTIAL` to survive a child
-//! forwarding hop, alongside the non-secret `DUDUCLAW_IDENTITY_ENDPOINT` discovery
-//! hint. Every non-protected gateway AI spawn replaces the proof with a fresh
+//! forwarding hop, alongside the non-secret `DUDUCLAW_IDENTITY_ENDPOINT` routing
+//! hint and `DUDUCLAW_IDENTITY_SERVER` kernel peer pin. Every non-protected gateway AI spawn replaces the proof with a fresh
 //! lease; native Linux protected spawns use their own capability identity.
 //! All other credentials follow the rule below.
 //!
@@ -138,6 +138,7 @@ pub const AGENT_CLI_ENV_ALLOWLIST: &[&str] = &[
     // non-protected spawn sites overwrite this with a freshly issued credential.
     "DUDUCLAW_RUN_CREDENTIAL",
     "DUDUCLAW_IDENTITY_ENDPOINT",
+    "DUDUCLAW_IDENTITY_SERVER",
 ];
 
 /// macOS only: Cocoa `NSString`/Keychain Services initialization reads this

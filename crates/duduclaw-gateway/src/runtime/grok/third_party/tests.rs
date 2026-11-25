@@ -106,7 +106,8 @@ async fn a_third_party_server_is_registered_behind_a_spawn_scoped_proxy() {
     );
     assert_eq!(ml["enabled"].as_bool(), Some(true));
     for name in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
-        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT] {
+        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT,
+        duduclaw_core::run_credential::ENV_IDENTITY_SERVER] {
         let placeholder = format!("${{{name}:-}}");
         for server in ["masterlink", "duduclaw"] {
             assert_eq!(cfg["mcp_servers"][server]["env"][name].as_str(), Some(placeholder.as_str()));

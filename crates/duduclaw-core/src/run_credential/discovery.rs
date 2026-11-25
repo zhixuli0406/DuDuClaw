@@ -1,4 +1,4 @@
-//! Pinned, no-follow access to the local run identity discovery file.
+//! Pinned, no-follow operator diagnostics. Never a credential destination.
 
 use std::io;
 use std::path::Path;
@@ -126,10 +126,20 @@ mod platform {
     use super::*;
     use std::fs::{File, OpenOptions};
     use std::io::{Read, Write};
-    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use std::os::windows::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt},
+        io::{AsRawHandle, FromRawHandle}};
     use std::path::{Component, PathBuf};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE};
+    use std::ptr::{null, null_mut};
+    use crate::identity_token::windows as acl;
+    use windows_sys::Win32::{Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+            GetSecurityDescriptorControl, GetSecurityDescriptorDacl, IsValidAcl, IsValidSid,
+            PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, TOKEN_USER},
+        Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
+        Storage::FileSystem::{CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ALL_ACCESS,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC},
+        System::SystemServices::ACCESS_ALLOWED_ACE_TYPE};
 
     pub struct DiscoveryDirectory {
         path: PathBuf,
@@ -146,8 +156,57 @@ mod platform {
         Ok(())
     }
 
-    fn pin(path: &Path) -> io::Result<File> {
+    fn wide(path: &Path) -> io::Result<Vec<u16>> {
+        let value: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if value.contains(&0) { return Err(denied()); }
+        Ok(value.into_iter().chain(Some(0)).collect())
+    }
+
+    fn owner_descriptor() -> io::Result<acl::LocalAllocation> {
+        let user = acl::current_user()?;
+        // SAFETY: current_user returns aligned TOKEN_USER storage retaining the SID.
+        let sid = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut text = null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 { return Err(io::Error::last_os_error()); }
+        let _text = acl::LocalAllocation(text.cast());
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 { length += 1; }
+        let sid = String::from_utf16(unsafe { std::slice::from_raw_parts(text, length) })
+            .map_err(|_| denied())?;
+        // No inherited ACEs, SYSTEM or Administrators grants: only this user.
+        acl::descriptor(&format!("O:{sid}D:P(A;;FA;;;{sid})"))
+    }
+
+    fn owner_only(file: &File) -> io::Result<()> {
+        let user = acl::current_user()?;
+        acl::validate_acl(file, &user, true)?;
+        let mut dacl: *mut ACL = null_mut();
+        let mut raw = null_mut();
+        // SAFETY: live file handle and writable outputs; allocation freed below.
+        let status = unsafe { GetSecurityInfo(file.as_raw_handle(), SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION, null_mut(), null_mut(), &mut dacl, null_mut(), &mut raw) };
+        if status != 0 { return Err(io::Error::from_raw_os_error(status as i32)); }
+        let _descriptor = acl::LocalAllocation(raw);
+        let (mut control, mut revision) = (0, 0);
+        if unsafe { GetSecurityDescriptorControl(raw, &mut control, &mut revision) } == 0
+            || control & SE_DACL_PROTECTED == 0 || dacl.is_null()
+            || unsafe { IsValidAcl(dacl) } == 0 || unsafe { (*dacl).AceCount } != 1 { return Err(denied()); }
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 { return Err(denied()); }
+        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != 0
+            || (header.AceSize as usize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() { return Err(denied()); }
+        let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+        let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+        let current = unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if ace.Mask != FILE_ALL_ACCESS || unsafe { IsValidSid(sid) } == 0
+            || unsafe { EqualSid(sid, current) } == 0 { return Err(denied()); }
+        Ok(())
+    }
+
+    fn pin(path: &Path, update_acl: bool) -> io::Result<File> {
         let file = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .access_mode(GENERIC_READ | READ_CONTROL | if update_acl { WRITE_DAC } else { 0 })
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path)?;
         check(&file, true)?;
         Ok(file)
@@ -160,27 +219,45 @@ mod platform {
             let mut pins = Vec::new();
             for component in home.components() {
                 path.push(component.as_os_str());
-                if !matches!(component, Component::Prefix(_)) { pins.push(pin(&path)?); }
+                if !matches!(component, Component::Prefix(_)) { pins.push(pin(&path, false)?); }
             }
             path.push("run");
             if create {
-                match std::fs::create_dir(&path) {
-                    Ok(()) => (),
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
-                    Err(e) => return Err(e),
+                let security = owner_descriptor()?;
+                let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                    lpSecurityDescriptor: security.0, bInheritHandle: 0 };
+                let target = wide(&path)?;
+                // The directory is private from its first instant, even under a public home.
+                if unsafe { CreateDirectoryW(target.as_ptr(), &attributes) } == 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::AlreadyExists { return Err(error); }
                 }
+                let directory = pin(&path, true)?;
+                // Only tighten an existing directory with a trusted owner and no outsider writers.
+                acl::validate_acl(&directory, &acl::current_user()?, false)?;
+                let (mut present, mut defaulted, mut dacl) = (0, 0, null_mut());
+                if unsafe { GetSecurityDescriptorDacl(security.0, &mut present, &mut dacl, &mut defaulted) } == 0
+                    || present == 0 || dacl.is_null() { return Err(denied()); }
+                let status = unsafe { SetSecurityInfo(directory.as_raw_handle(), SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    null_mut(), null_mut(), dacl, null()) };
+                if status != 0 { return Err(io::Error::from_raw_os_error(status as i32)); }
+                owner_only(&directory)?;
+                pins.push(directory);
+            } else {
+                let directory = pin(&path, false)?;
+                owner_only(&directory)?;
+                pins.push(directory);
             }
-            pins.push(pin(&path)?);
-            // Preserve the current Windows ACL behavior (inherited ACLs;
-            // platform::set_owner_only is a no-op). Reparse points are rejected
-            // on opened handles, and all ancestors stay pinned during file I/O.
             Ok(Self { path, _pins: pins })
         }
 
         pub fn read(&self) -> io::Result<String> {
             let file = OpenOptions::new().read(true).share_mode(FILE_SHARE_READ)
+                .access_mode(GENERIC_READ | READ_CONTROL)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(self.path.join(FILENAME))?;
             check(&file, false)?;
+            owner_only(&file)?;
             let mut text = String::new();
             file.take(MAX_BYTES + 1).read_to_string(&mut text)?;
             if text.len() as u64 > MAX_BYTES { return Err(io::ErrorKind::InvalidData.into()); }
@@ -189,10 +266,17 @@ mod platform {
 
         pub fn write(&self, text: &str) -> io::Result<()> {
             let temporary = self.path.join(format!(".identity-{}.tmp", uuid::Uuid::new_v4()));
-            let mut file = OpenOptions::new().write(true).create_new(true)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(&temporary)?;
+            let security = owner_descriptor()?;
+            let attributes = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: security.0, bInheritHandle: 0 };
+            let target = wide(&temporary)?;
+            let raw = unsafe { CreateFileW(target.as_ptr(), GENERIC_WRITE | READ_CONTROL,
+                FILE_SHARE_READ, &attributes, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, null_mut()) };
+            if raw == INVALID_HANDLE_VALUE { return Err(io::Error::last_os_error()); }
+            let mut file = unsafe { File::from_raw_handle(raw) };
             let result = (|| {
                 check(&file, false)?;
+                owner_only(&file)?;
                 file.write_all(text.as_bytes())?;
                 file.sync_all()
             })();
@@ -206,6 +290,22 @@ mod platform {
         pub fn remove(&self) -> io::Result<()> {
             std::fs::remove_file(self.path.join(FILENAME))
         }
+    }
+
+    #[test]
+    fn windows_discovery_has_explicit_current_user_only_dacl() {
+        let home = tempfile::tempdir().unwrap();
+        // Exercise tightening the inherited ACL on a preexisting run directory.
+        std::fs::create_dir(home.path().join("run")).unwrap();
+        let directory = DiscoveryDirectory::open(home.path(), true).unwrap();
+        owner_only(directory._pins.last().unwrap()).unwrap();
+        for text in ["first", "replacement"] {
+            directory.write(text).unwrap();
+            // read validates the protected, single current-user ACE on the actual file.
+            assert_eq!(directory.read().unwrap(), text);
+        }
+        assert!(DiscoveryDirectory::open(home.path(), false).is_ok());
+        directory.remove().unwrap();
     }
 }
 

@@ -1210,7 +1210,8 @@ mod tests {
             for (name, value) in command.as_std().get_envs() {
                 if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
                     || name == duduclaw_core::run_credential::ENV_IDENTITY_URL
-                || name == duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT {
+                    || name == duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT
+                    || name == duduclaw_core::run_credential::ENV_IDENTITY_SERVER {
                     if let Some(value) = value { expected.env(name, value); }
                     else { expected.env_remove(name); }
                 }

@@ -568,7 +568,8 @@ fn split_env_overrides(
 ) -> (Vec<String>, Vec<(String, String)>) {
     let mut plain = serde_json::Map::new();
     let mut secret_names = vec![duduclaw_core::run_credential::ENV_RUN_CREDENTIAL.to_string(),
-        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT.to_string()];
+        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT.to_string(),
+        duduclaw_core::run_credential::ENV_IDENTITY_SERVER.to_string()];
     let mut process_env: Vec<(String, String)> = Vec::new();
     for (k, v) in env {
         if !is_secret_env_name(k) {
@@ -2479,7 +2480,8 @@ pub(crate) mod tests {
         let _proof = crate::run_identity::assert_command_identity(&command, false);
         for name in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
             duduclaw_core::run_credential::ENV_IDENTITY_URL,
-            duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT] {
+            duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT,
+            duduclaw_core::run_credential::ENV_IDENTITY_SERVER] {
             if let Some(value) = captured_env(name) { expected.env(name, value); }
             else { expected.env_remove(name); }
         }

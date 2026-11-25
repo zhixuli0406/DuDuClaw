@@ -162,6 +162,7 @@ pub fn is_proxy_private_env_key(name: &str) -> bool {
         || name == crate::run_credential::ENV_RUN_CREDENTIAL
         || name == crate::run_credential::ENV_IDENTITY_URL
         || name == crate::run_credential::ENV_IDENTITY_ENDPOINT
+        || name == crate::run_credential::ENV_IDENTITY_SERVER
 }
 
 fn has_private_env(def: &Value) -> bool {
