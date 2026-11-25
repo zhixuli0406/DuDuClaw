@@ -19,6 +19,18 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 const children = new Set(), sockets = new Set(), secrets = new Set();
 let context, failures = 0;
 const checks = [];
+const scenarioNames = ['avatar', 'memory', 'identity', 'wiki', 'member-key', 'self-add', 'avatar-seat', 'avatar-admin-read', 'google-local'];
+const googleCases = [
+  ['gmail_send_draft', { draft_id: 'local-missing-draft' }, 'Send'],
+  ['calendar_delete_event', { calendar_id: 'primary', event_id: 'local-missing-event' }, 'Delete'],
+  ['google_chat_send', { space: 'spaces/local-missing', text: 'Disposable fixture message' }, 'Send'],
+  ['docs_create', { title: 'Disposable fixture document' }, 'Modify'],
+  ['docs_replace_text', { document_id: 'local-missing-doc', find: 'before', replace: 'after' }, 'Modify'],
+  ['sheets_create', { title: 'Disposable fixture spreadsheet' }, 'Modify'],
+  ['sheets_update', { spreadsheet_id: 'local-missing-sheet', range: 'A1', values: [['fixture']] }, 'Modify'],
+  ['calendar_update_event', { calendar_id: 'primary', event_id: 'local-missing-event', summary: 'Fixture' }, 'Send'],
+  ['gmail_create_draft', { to: 'fixture@acceptance.invalid', subject: 'Fixture', body: 'Fixture', thread_id: 'local-missing-thread' }, 'Draft'],
+];
 function check(value, message) { assert(value, message); }
 function sanitise(value) {
   let text = String(value);
@@ -353,6 +365,72 @@ async function avatarScenario() {
   artifact('avatar-migration.json', { first, second: avatars(), added_binding_primary_flags: primary, legacy_fields_unchanged: true, cleared_avatar_preserved: true });
 }
 
+async function avatarSeatScenario() {
+  const initial = await context.admin.call('license.status');
+  check(initial.seat_limit === context.seatLimit && !initial.seat_unlimited, 'signed small seat limit was not applied');
+  check(Number.isInteger(initial.seats_used) && Number.isInteger(initial.avatars_exempt), 'seat/avatar counts unavailable');
+  check(initial.seats_used <= initial.seat_limit, 'fixture is already over its seat limit');
+  for (let used = initial.seats_used; used < initial.seat_limit; used++) {
+    await context.admin.call('agents.create', { name: `ordinary-seat-${used}` });
+    check((await context.admin.call('license.status')).seats_used === used + 1, 'ordinary creation did not consume exactly one seat');
+  }
+  const full = await context.admin.call('license.status');
+  const password = `Fixture-${randomBytes(24).toString('hex')}!`; secrets.add(password);
+  const member = await context.admin.call('users.create', { email: 'seat-member@acceptance.invalid',
+    display_name: 'Avatar seat member', password, role: 'employee' });
+  const uid = member.user?.id; check(uid, 'seat member creation returned no user');
+  // This is the dashboard's create-avatar-when-full path, not create + assign.
+  await context.admin.call('agents.create', { name: 'seat-avatar', avatar_for_user: uid });
+  check(sql("SELECT avatar_agent_id FROM users WHERE email='seat-member@acceptance.invalid'")[0]?.avatar_agent_id === 'seat-avatar', 'avatar was not assigned atomically');
+  check(sql("SELECT access_level FROM user_agent_bindings WHERE agent_name='seat-avatar'").some(row => row.access_level === 'owner'), 'avatar creation did not grant Owner access');
+  const withAvatar = await context.admin.call('license.status');
+  check(withAvatar.seats_used === full.seats_used && withAvatar.avatars_exempt === full.avatars_exempt + 1,
+    'license.status failed to separate exempt avatars from ordinary seats');
+  const unset = await context.admin.raw('users.set_avatar', { user_id: uid, agent_id: null });
+  const message = '此變更會超過 AI 員工名額上限，未儲存。請先刪除不再使用的 AI 員工或增加授權名額；封存仍佔名額。';
+  check(!unset.ok && unset.error?.code === 'agent_seat_limit_reached' && unset.error.message === message,
+    'unsetting an avatar at capacity did not return the documented seat error');
+  check(sql("SELECT avatar_agent_id FROM users WHERE email='seat-member@acceptance.invalid'")[0]?.avatar_agent_id === 'seat-avatar', 'refused unset changed the avatar');
+  const ordinary = await context.admin.raw('agents.create', { name: 'ordinary-over-cap' });
+  check(!ordinary.ok && ordinary.error?.code === 'agent_seat_limit_reached', 'ordinary creation at capacity was not refused by the seat gate');
+  check(!existsSync(join(context.home, 'agents/ordinary-over-cap')), 'refused creation published an employee directory');
+  const final = await context.admin.call('license.status');
+  check(final.seats_used === full.seats_used && final.avatars_exempt === withAvatar.avatars_exempt, 'refused mutations changed seat/avatar counts');
+  artifact('avatar-seat.json', { initial, full, with_avatar: withAvatar, unset_error: unset.error,
+    ordinary_error: ordinary.error, final, create_avatar_when_full: true, refused_changes_rolled_back: true });
+}
+
+function sourceEffect(name, source) {
+  // Source evidence only: the MCP wire advertises hints, not an effect enum.
+  const builtin = source.split('pub fn effect_of_builtin(')[1]?.split('\n}')[0] || '';
+  const arms = builtin.matchAll(/(?:"[a-z0-9_]+"\s*\|\s*)*"[a-z0-9_]+"\s*=>\s*(?:\{\s*)?(Read|Draft|Send|Publish|Purchase|Delete|Modify|Admin)\b/g);
+  for (const arm of arms) if (arm[0].includes(`"${name}"`)) return arm[1];
+  throw new Error(`no explicit source effect class for ${name}`);
+}
+async function googleLocalScenario() {
+  const client = await mcpClient({ label: 'google-offline-mcp' });
+  const effects = readFileSync(join(repo, 'crates/duduclaw-core/src/tool_effect.rs'), 'utf8');
+  const observations = [];
+  try {
+    for (const [name, args, effect] of googleCases) {
+      check(sourceEffect(name, effects) === effect, `${name} source effect class changed`);
+      // With no connection in this disposable home, discovery must hide these
+      // tools. Native-only send/delete and Chat-send opt-in are also gated.
+      check(!client.tools.some(tool => tool.name === name), `${name} advertised without a Google connection`);
+      let result, rpcError;
+      try { result = await client.call(name, args); }
+      catch (error) { if (!error.rpcError) throw error; rpcError = error.rpcError; }
+      const message = rpcError?.message || toolText(result || {});
+      check((rpcError?.code === -32003 || (!rpcError && result?.isError))
+        && /Google|google/.test(message)
+        && /未啟用|尚未|連線|停用|disabled|not (?:enabled|available|connected)|unavailable|connection|native|原生/i.test(message),
+      `${name} did not explicitly refuse unavailable Google access: ${message}`);
+      observations.push({ name, source_effect: effect, listed: false, refused: true, message });
+    }
+    artifact('google-local.json', { observations, effect_evidence: 'repository source only; not a binary effect-class assertion', real_google_verified: false });
+  } finally { await client.close(); }
+}
+
 async function wikiScenario() {
   const client = await mcpClient();
   const wiki = join(context.home, 'agents/prod-shaped/wiki'), outside = join(context.root, 'outside-wiki');
@@ -466,14 +544,15 @@ function fixtureAgentConfig(text, name, runtime) {
     // WebFetch, but use a representable native policy for this identity probe.
     .replace('approval_required_tools = ["Bash"]', runtime === 'codex' ? 'approval_required_tools = []' : 'approval_required_tools = ["Bash"]');
 }
-function disposableLicense(fingerprint, now = Date.now()) {
+function disposableLicense(fingerprint, now = Date.now(), maxAgents) {
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   const issuedAt = new Date(now).toISOString().replace(/\.000Z$/, 'Z');
   const expiresAt = new Date(now + 86400000).toISOString().replace(/\.000Z$/, 'Z');
   // Field order is License::canonical_payload, as in google-personal-identity.
   const payload = { version: 2, subscription_id: 'sub_v185_acceptance', customer_id: 'fixture', tier: 'oem',
     machine_fingerprint: fingerprint, issued_at: issuedAt, expires_at: expiresAt,
-    last_phone_home: issuedAt, public_key_id: 'v185_fixture', nfr: true };
+    last_phone_home: issuedAt, public_key_id: 'v185_fixture',
+    ...(maxAgents === undefined ? {} : { max_agents: maxAgents }), nfr: true };
   const signature = sign(null, Buffer.from(JSON.stringify(payload)), privateKey).toString('base64');
   return { payload, license: { ...payload, signature }, publicKey };
 }
@@ -483,10 +562,119 @@ function installEnterpriseLicense() {
   });
   check(!fingerprint.error && fingerprint.status === 0, `isolated license fingerprint failed: ${fingerprint.stderr || fingerprint.error?.message}`);
   const value = fingerprint.stdout.trim().split('\n')[0]; check(value, 'empty license fingerprint');
-  const fixture = disposableLicense(value);
+  const fixture = disposableLicense(value, Date.now(), context.seatLimit);
   writeFileSync(join(context.home, 'license.json'), JSON.stringify(fixture.license), { mode: 0o600 });
   context.fixtureEnv = { DUDUCLAW_EDITION: 'enterprise',
     DUDUCLAW_LICENSE_PUBKEY_V185_FIXTURE: Buffer.from(fixture.publicKey.export({ format: 'jwk' }).x, 'base64url').toString('hex') };
+}
+
+// The real CLI pins the kernel peer's PID and birth time before writing. This
+// raw client is only for adversarial frames to an already CLI-verified endpoint.
+function identityPath(endpoint) {
+  check(typeof endpoint === 'string' && endpoint.trim() === endpoint && !endpoint.includes('\0'), 'invalid identity endpoint');
+  if (process.platform === 'win32') {
+    check(/^pipe:v1:\\\\\.\\pipe\\duduclaw-identity-[a-fA-F0-9]+$/.test(endpoint), 'invalid local identity pipe');
+    return endpoint.slice('pipe:v1:'.length);
+  }
+  check(endpoint.startsWith('unix:v1:/'), 'identity endpoint must be unix:v1 with an absolute path');
+  return endpoint.slice('unix:v1:'.length);
+}
+function encodeIdentityFrame(value, limit = 4096) {
+  const body = Buffer.from(JSON.stringify(value));
+  check(body.length > 0 && body.length <= limit, 'identity request exceeds frame limit');
+  const header = Buffer.alloc(4); header.writeUInt32BE(body.length);
+  return Buffer.concat([header, body]);
+}
+function decodeIdentityFrame(bytes) {
+  check(bytes.length <= 16388, 'identity response exceeds frame limit');
+  if (bytes.length < 4) return null;
+  const length = bytes.readUInt32BE(0);
+  check(length > 0 && length <= 16384, 'invalid identity response length');
+  if (bytes.length < length + 4) return null;
+  check(bytes.length === length + 4, 'unexpected extra identity response frame');
+  const value = JSON.parse(bytes.subarray(4).toString('utf8'));
+  check(value && typeof value === 'object' && !Array.isArray(value) && typeof value.active === 'boolean', 'invalid identity response object');
+  return value;
+}
+function identityRequest(endpoint, credential, extra = {}) {
+  const path = identityPath(endpoint);
+  const frame = encodeIdentityFrame({ version: 1, operation: 'introspect', credential, ...extra });
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection(path);
+    let bytes = Buffer.alloc(0), settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (error) { socket.destroy(); reject(error); }
+      else { socket.end(Buffer.from([1])); resolve(value); }
+    };
+    const timer = setTimeout(() => finish(new Error('identity IPC timed out')), 4000);
+    socket.once('connect', () => socket.write(frame));
+    socket.on('error', error => finish(error));
+    socket.on('end', () => { if (!settled) finish(new Error('identity IPC ended before response')); });
+    socket.on('data', chunk => {
+      try {
+        check(bytes.length + chunk.length <= 16388, 'identity response exceeds frame limit');
+        bytes = Buffer.concat([bytes, chunk]);
+        const value = decodeIdentityFrame(bytes);
+        if (value) finish(null, value);
+      } catch (error) { finish(error); }
+    });
+  });
+}
+function identityCLI(env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('/bin/bash', ['-c', 'exec "$1" identity whoami --json', 'identity-fixture', context.binary], {
+      env, cwd: env.HOME, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    children.add(child);
+    let stdout = '', stderr = '', timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; child.kill('SIGKILL'); }, 10000);
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.once('error', error => { clearTimeout(timer); children.delete(child); reject(error); });
+    child.once('close', (status, signal) => {
+      clearTimeout(timer); children.delete(child);
+      if (timedOut || signal) { reject(new Error('identity CLI timed out or was killed')); return; }
+      resolve({ status, stdout, stderr });
+    });
+  });
+}
+function assertIdentityRefused(result) {
+  check(result.status !== 0 && /Run identity is missing, inactive or unavailable/.test(result.stderr), 'identity client did not explicitly refuse');
+  check(!result.stdout.trim() || JSON.parse(result.stdout).active === false, 'refused identity client disclosed active claims');
+}
+async function forgedServerProbe(env, dir) {
+  // A well-formed pin with the real gateway PID but a different generation.
+  // Redirect to a byte-counting endpoint to prove refusal precedes the frame.
+  const parts = env.DUDUCLAW_IDENTITY_SERVER.split(':');
+  check(/^v1:[1-9]\d*:[1-9]\d*$/.test(env.DUDUCLAW_IDENTITY_SERVER), 'missing server identity pin');
+  const forged = `v1:${parts[1]}:${BigInt(parts[2]) === 1n ? 2n : 1n}`;
+  assertIdentityRefused(await identityCLI({ ...env, DUDUCLAW_IDENTITY_SERVER: forged }));
+  const path = join(dir, 'pin.sock');
+  let received = 0, connected = false, closed;
+  const retired = new Promise(resolve => { closed = resolve; });
+  const peers = new Set();
+  const server = net.createServer(socket => {
+    connected = true; peers.add(socket);
+    socket.on('data', data => { received += data.length; });
+    socket.on('error', () => {});
+    socket.on('close', () => { peers.delete(socket); closed(); });
+  });
+  try {
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(path, resolve); });
+    const result = await identityCLI({ ...env, DUDUCLAW_IDENTITY_ENDPOINT: `unix:v1:${path}`,
+      DUDUCLAW_IDENTITY_SERVER: `v1:${process.pid}:1` });
+    assertIdentityRefused(result);
+    check(connected, 'forged-pin client never reached the byte-counting endpoint');
+    await Promise.race([retired, delay(2000).then(() => { throw new Error('forged-pin connection did not close'); })]);
+    check(received === 0, 'client sent bytes before rejecting the forged server identity');
+    return { refused: true, bytes_received: received };
+  } finally {
+    for (const socket of peers) socket.destroy();
+    await new Promise(resolve => server.close(resolve));
+    if (existsSync(path)) unlinkSync(path);
+  }
 }
 async function fixtureTurn(chat, runtime, job = {}, content = 'Check only the local run identity.', conv = `acceptance-${runtime}`) {
   const id = randomBytes(12).toString('hex'), marker = `fixture-request:${id}`;
@@ -517,6 +705,20 @@ async function fixtureTurn(chat, runtime, job = {}, content = 'Check only the lo
     lease = JSON.parse(readFileSync(leasePath, 'utf8')); secrets.add(lease.credential); unlinkSync(leasePath);
     record = JSON.parse(readFileSync(join(dir, 'identity.json'), 'utf8'));
     check(lease.job_id === id && record.job_id === id, 'CLI evidence belongs to a different fixture request');
+    if (job.probe_identity) {
+      // This child belongs to the harness, not the still-live CLI run tree.
+      const env = minimalEnv(context.home, lease.env);
+      assertIdentityRefused(await identityCLI(env));
+      const outsider = await identityRequest(lease.env.DUDUCLAW_IDENTITY_ENDPOINT, lease.env.DUDUCLAW_RUN_CREDENTIAL);
+      check(outsider.active === false, 'same-token non-descendant received an active identity');
+      writeFileSync(join(dir, 'check-live'), 'check\n', { mode: 0o600 });
+      await until(() => existsSync(join(dir, 'still-active.json')), 'descendant identity after outsider refusal');
+      const live = JSON.parse(readFileSync(join(dir, 'still-active.json'), 'utf8'));
+      check(live.active && live.turn_id === record.normal.turn_id, 'outsider refusal was measured after the run expired');
+      record.non_descendant_refused = true;
+      record.descendant_still_active_after_refusal = true;
+      artifact(`turn-${id}/identity.json`, record);
+    }
   } finally {
     writeFileSync(release, 'release\n', { mode: 0o600 });
     artifact(`turn-${id}/chat-frames.json`, chat.queue);
@@ -524,11 +726,16 @@ async function fixtureTurn(chat, runtime, job = {}, content = 'Check only the lo
       const done = await chat.take(terminal, 45000);
       check(done.type === 'assistant_done', 'shim turn did not finish');
       await until(async () => {
-        const response = await fetch(lease.url, { method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ credential: lease.credential }), signal: AbortSignal.timeout(2000) });
-        check(response.ok, 'identity listener unavailable during post-turn check');
-        return (await response.json()).active === false;
-      }, 'completed run credential revocation', 5000);
+        const response = await identityRequest(lease.env.DUDUCLAW_IDENTITY_ENDPOINT, lease.env.DUDUCLAW_RUN_CREDENTIAL);
+        return response.active === false;
+      }, 'post-turn identity inactivity', 5000);
+      // This request comes from outside the run tree. It proves post-turn
+      // refusal, but cannot isolate lease revocation from the ancestry gate.
+      if (record) {
+        record.post_turn_inactive = true;
+        record.revocation_independent_of_ancestry_verified = false;
+        artifact(`turn-${id}/identity.json`, record);
+      }
     }
   }
   check(record.normal.session_id === expectedSession, `foreground run session mismatch: expected ${expectedSession}, got ${record.normal.session_id}`);
@@ -537,7 +744,7 @@ async function fixtureTurn(chat, runtime, job = {}, content = 'Check only the lo
 async function identityScenario(runtime) {
   const chat = await openChat();
   try {
-    const record = await fixtureTurn(chat, runtime);
+    const record = await fixtureTurn(chat, runtime, { probe_identity: true });
     const expected = runtime === 'claude' ? 'prod-shaped' : 'codex-shaped';
     check(record.normal.active && record.normal.agent_id === expected && record.normal.runtime === runtime, 'wrong run employee/runtime');
     check(record.normal.turn_id && record.normal.session_id && record.normal.principal?.type === 'human', 'missing run/session/principal');
@@ -545,6 +752,8 @@ async function identityScenario(runtime) {
     check(record.normal.principal.user_id === owner, 'wrong run principal');
     for (const key of ['agent_id', 'turn_id', 'session_id', 'runtime']) check(record.normal[key] === record.forged[key], `forged environment changed ${key}`);
     check(record.argument_forgery_ignored && record.bad_credential_inactive, 'identity argument/credential negative control failed');
+    check(record.non_descendant_refused && record.forged_server?.refused && record.forged_server.bytes_received === 0,
+      'IPC ancestry/server-pin negative control failed');
   } finally { chat.close(); }
 }
 async function memoryScenario() {
@@ -613,6 +822,24 @@ async function selfAddScenario() {
     check(notices.every(row => row.owner_id === owner && !JSON.stringify(row).includes(other)
       && !JSON.stringify(row).includes(pasted)), 'Owner notice leaked body or targeted another member');
 
+    // Keep the verified Owner turn but inject an unregistered run_id in the
+    // real MCP client's environment. This covers the round-1 guard even when
+    // turn-first resolution would otherwise find the human Owner. It does not
+    // exercise the dispatch/cron/sub-agent schedulers themselves.
+    const runCards = [];
+    for (const kind of ['dispatch', 'cron', 'sub-agent']) {
+      const title = `Owner inherited ${kind} source`;
+      await fixtureTurn(chat, 'claude', { action: 'knowledge', collection: 'local-private',
+        text: `Unique ${kind} content must wait for an approval card.`, title,
+        run_id: `acceptance-${kind}-${randomBytes(12).toString('hex')}` }, 'Propose this inherited Owner source.', `knowledge-${kind}`);
+      const cards = await context.admin.call('knowledge.proposals.list');
+      const sourceRows = await context.admin.call('knowledge.sources.list', { collection_id: cid });
+      check(cards.proposals.some(item => item.collection_id === cid && item.title === title), `${kind} run_id did not take the approval-card path`);
+      check(!sourceRows.sources.some(source => source.title === title), `${kind} run_id auto-imported in an Owner turn`);
+      runCards.push({ kind, unregistered_run_id: true, approval_card: true, auto_imported: false });
+    }
+    check(noticeRows().length === notices.length, 'run_id call created an auto-import notification');
+
     const password = `Fixture-${randomBytes(24).toString('hex')}!`; secrets.add(password);
     const member = await context.admin.call('users.create', { email: 'kb-member@acceptance.invalid',
       display_name: 'Knowledge non-owner', password, role: 'employee' });
@@ -633,7 +860,8 @@ async function selfAddScenario() {
     artifact('knowledge-self-add.json', { owner_paste_imported: true, owner_paste_no_card: true,
       owner_tool_content_imported: true, owner_tool_content_no_card: true, owner_notifications_queued: notices,
       duplicate_notification_prevented: true, non_owner_not_imported: true,
-      non_owner_refused_or_pending: true, external_owner_dm_delivery_verified: false });
+      non_owner_refused_or_pending: true, owner_turn_with_run_id: runCards,
+      scheduler_execution_verified: false, external_owner_dm_delivery_verified: false });
   } finally { memberChat?.close(); chat.close(); await context.admin.call('users.set_avatar', { user_id: owner, agent_id: null }); }
 }
 
@@ -677,27 +905,23 @@ async function fixtureCLI(runtime, root, binary, args) {
   // A second claimant is a fixture error, not evidence from the desired turn.
   mkdirSync(join(dir, 'claimed'), { mode: 0o700 });
   const home = context.home;
-  const lookup = extra => {
-    const response = spawnSync('/bin/bash', ['-c', 'exec "$1" identity whoami --json', 'identity-fixture', binary], {
-      env: { ...process.env, ...extra, HOME: join(home, 'os-home'), DUDUCLAW_HOME: home },
-      cwd: join(home, 'os-home'), encoding: 'utf8', timeout: 10000,
-    });
+  const env = { ...process.env, HOME: join(home, 'os-home'), DUDUCLAW_HOME: home };
+  const lookup = async extra => {
+    const response = await identityCLI({ ...env, ...extra });
     check(response.status === 0, 'Bash identity whoami failed'); return JSON.parse(response.stdout);
   };
-  const normal = lookup({});
-  const forged = lookup({ DUDUCLAW_AGENT_ID: 'plain', DUDUCLAW_SESSION_ID: 'forged-session',
+  check(!('DUDUCLAW_IDENTITY_URL' in env), 'legacy HTTP identity environment must be absent');
+  const endpoint = env.DUDUCLAW_IDENTITY_ENDPOINT;
+  identityPath(endpoint);
+  const normal = await lookup({});
+  const forged = await lookup({ DUDUCLAW_AGENT_ID: 'plain', DUDUCLAW_SESSION_ID: 'forged-session',
     DUDUCLAW_TURN_ID: 'forged-turn', DUDUCLAW_ON_BEHALF_OF: 'user:forged', DUDUCLAW_RUNTIME: 'forged' });
-  const url = new URL(process.env.DUDUCLAW_IDENTITY_URL);
-  check(url.hostname === '127.0.0.1' && url.protocol === 'http:' && url.pathname === '/api/internal/identity/introspect', 'unsafe identity URL');
-  const introspect = async value => {
-    const response = await fetch(url, { method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(value), signal: AbortSignal.timeout(5000) });
-    check(response.ok, 'identity introspection failed'); return response.json();
-  };
-  const argument = await introspect({ credential: process.env.DUDUCLAW_RUN_CREDENTIAL, agent_id: 'plain', turn_id: 'forged', principal: { type: 'human', user_id: 'forged' } });
-  const bad = await introspect({ credential: `ddc_run_${'A'.repeat(43)}` });
+  const argument = await identityRequest(endpoint, env.DUDUCLAW_RUN_CREDENTIAL,
+    { agent_id: 'plain', turn_id: 'forged', principal: { type: 'human', user_id: 'forged' } });
+  const bad = await identityRequest(endpoint, `ddc_run_${'A'.repeat(43)}`);
   const observation = { job_id: job.id, normal, forged, argument_forgery_ignored: argument.agent_id === normal.agent_id && argument.turn_id === normal.turn_id
     && JSON.stringify(argument.principal) === JSON.stringify(normal.principal), bad_credential_inactive: bad.active === false };
+  if (job.probe_identity) observation.forged_server = await forgedServerProbe(env, dir);
   if (job.action === 'recall') {
     observation.saw_pinned_task = prompt.includes('<pinned_task_data>') && prompt.includes('Compile the local acceptance report.');
     observation.saw_task_reference = prompt.includes('<session_tool_refs_data>') && prompt.includes(job.task_id);
@@ -708,7 +932,8 @@ async function fixtureCLI(runtime, root, binary, args) {
     const source = args[index + 1];
     const registration = JSON.parse(source.startsWith('{') ? source : readFileSync(source, 'utf8'));
     const mcp = await mcpClient({ registration, extra: { DUDUCLAW_RUN_CREDENTIAL: process.env.DUDUCLAW_RUN_CREDENTIAL,
-      DUDUCLAW_IDENTITY_URL: url.href }, confined: false, label: `shim-mcp-${job.id}` });
+      DUDUCLAW_IDENTITY_ENDPOINT: endpoint, DUDUCLAW_IDENTITY_SERVER: env.DUDUCLAW_IDENTITY_SERVER,
+      ...(job.run_id ? { DUDUCLAW_DISPATCH_RUN_ID: job.run_id } : {}) }, confined: false, label: `shim-mcp-${job.id}` });
     try {
       if (job.action === 'task-create') {
         const result = await mcp.call('tasks_create', { kind: 'task', title: 'Local remembered result', description: 'Disposable local fixture task.', assigned_to: 'prod-shaped' });
@@ -731,9 +956,15 @@ async function fixtureCLI(runtime, root, binary, args) {
   artifact(`turn-${job.id}/identity.json`, observation);
   // The parent consumes and unlinks this private transport file before logging.
   const leasePath = join(dir, 'lease.json');
-  writeFileSync(`${leasePath}.tmp`, JSON.stringify({ job_id: job.id, credential: process.env.DUDUCLAW_RUN_CREDENTIAL, url: url.href, turn_id: normal.turn_id }), { mode: 0o600 });
+  writeFileSync(`${leasePath}.tmp`, JSON.stringify({ job_id: job.id, credential: env.DUDUCLAW_RUN_CREDENTIAL,
+    env: Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith('DUDUCLAW_'))), turn_id: normal.turn_id }), { mode: 0o600 });
   renameSync(`${leasePath}.tmp`, leasePath);
-  await until(() => existsSync(join(dir, 'release')), 'fixture release', 50000);
+  await until(async () => {
+    if (job.probe_identity && existsSync(join(dir, 'check-live')) && !existsSync(join(dir, 'still-active.json'))) {
+      artifact(`turn-${job.id}/still-active.json`, await lookup({}));
+    }
+    return existsSync(join(dir, 'release'));
+  }, 'fixture release', 50000);
   if (runtime === 'claude') console.log(JSON.stringify({ type: 'result', result: 'Local identity fixture passed.', is_error: false }));
   else {
     console.log(JSON.stringify({ type: 'thread.started', thread_id: 'local-fixture' }));
@@ -747,7 +978,7 @@ function parseOptions(args) {
   for (let index = 0; index < args.length; index++) {
     const key = args[index];
     if (key === '--help' || key === '-h') return { help: true };
-    check(key === '--port' || key === '--only', 'usage: v185-acceptance.mjs [--port N] [--only avatar,memory,identity,wiki,member-key,self-add]');
+    check(key === '--port' || key === '--only', `usage: v185-acceptance.mjs [--port N] [--only ${scenarioNames.join(',')}]`);
     const value = args[++index]; check(value, `${key} needs a value`);
     if (key === '--port') options.port = Number(value); else options.only = value.split(',');
   }
@@ -755,9 +986,9 @@ function parseOptions(args) {
   return options;
 }
 function selectedNames(values) {
-  if (!values) return new Set(['avatar', 'memory', 'identity', 'wiki', 'member-key', 'self-add']);
+  if (!values) return new Set(scenarioNames);
   // Legacy selectors are resolved from implementation annotations at runtime;
-  // public artifacts and source never embed internal work-item numbers.
+  // Existing selectors remain compatible; Google live gaps name their work items.
   const annotations = [
     ['avatar', 'crates/duduclaw-gateway/src/handlers/tests/member_contract_tests.rs', /RM-(\d+)'s avatar/],
     ['member-key', 'crates/duduclaw-gateway/src/member_keys.rs', /^\/\/! RM-(\d+)/m],
@@ -765,7 +996,7 @@ function selectedNames(values) {
     ['wiki', 'crates/duduclaw-memory/src/wiki_path.rs', /mod rm(\d+)_identity_tests/],
     ['memory', 'crates/duduclaw-gateway/src/channel_reply/inner.rs', /fn rm(\d+)_off_guards/],
   ];
-  const allowed = new Set(['avatar', 'memory', 'identity', 'wiki', 'member-key', 'self-add']);
+  const allowed = new Set(scenarioNames);
   const aliases = new Map(annotations.map(([name, path, pattern]) => {
     const match = readFileSync(join(repo, path), 'utf8').match(pattern);
     return [match ? `rm${match[1]}` : '', name];
@@ -774,16 +1005,27 @@ function selectedNames(values) {
 }
 async function main() {
   const options = parseOptions(process.argv.slice(2));
-  if (options.help) { console.log('DUDUCLAW_BIN=/absolute/path node scripts/live-test/v185-acceptance.mjs [--port N] [--only avatar,memory,identity,wiki,member-key,self-add]'); return; }
+  if (options.help) { console.log(`DUDUCLAW_BIN=/absolute/path node scripts/live-test/v185-acceptance.mjs [--port N] [--only ${scenarioNames.join(',')}]`); return; }
   check(Number(process.versions.node.split('.')[0]) >= 22 && typeof WebSocket === 'function', 'Node 22+ with global WebSocket required');
   const selected = selectedNames(options.only);
-  const root = realpathSync(mkdtempSync(join(tmpdir(), 'duduclaw-v185-')));
+  // macOS sockaddr_un has a 104-byte path budget; the default per-user
+  // TMPDIR plus home/run/i-<nonce>/s can exceed it before IPC even starts.
+  const root = realpathSync(mkdtempSync(join(process.platform === 'darwin' ? '/private/tmp' : tmpdir(), 'dv185-')));
   chmodSync(root, 0o700);
   context = { root, home: join(root, 'home'), port: options.port, base: `http://127.0.0.1:${options.port}`,
     binary: resolve(process.env.DUDUCLAW_BIN || ''), canary: `acceptance-${randomBytes(12).toString('hex')}`,
-    ownerEmail: 'owner@acceptance.invalid', ownerPassword: `Fixture-${randomBytes(24).toString('hex')}!`, leasePaths: new Set() };
+    ownerEmail: 'owner@acceptance.invalid', ownerPassword: `Fixture-${randomBytes(24).toString('hex')}!`, leasePaths: new Set(),
+    seatLimit: selected.has('avatar-seat') ? 6 : undefined };
   secrets.add(context.ownerPassword);
   console.log(`ARTIFACTS ${root}`);
+  if (selected.has('avatar-admin-read')) report('SKIP', 'avatar-admin-read',
+    'D4 requires native Linux protected isolation: personal_data_gate_under returns before avatar authorization/audit when isolation_active() is false; this macOS sandbox-exec fixture has no protected Personal employee. Admin sessions/memory reads, isolation.avatar_data_read audit and non-admin refusal require a native protected Linux run');
+  for (const [id, reason] of [
+    ['RM-159', 'Gmail draft send / Calendar deletion need real native Google credentials, provider-owned snapshots and per-call human confirmation; disposable home has no Google connection'],
+    ['RM-062', 'member-as-user Google Chat send needs real member OAuth/DWD authorization, Chat opt-in, personal confirmation and provider delivery evidence'],
+    ['RM-147', 'authorization link / OAuth / task resume needs a real member Google connection and a live issued ticket; no valid ticket is issued here, so landing GET non-consumption is not verified'],
+    ['RM-182', 'Google Doc/Sheet/draft/event IDs remembered across turns need real provider results; the memory scenario checks only a local tasks_create reference'],
+  ]) report('SKIP', id, reason);
   try {
     check(process.env.DUDUCLAW_BIN && existsSync(context.binary), 'set DUDUCLAW_BIN to an already-built executable');
     check(process.platform === 'darwin' && existsSync('/usr/bin/sandbox-exec'), 'macOS sandbox-exec required for guaranteed loopback/keychain isolation; run native Windows acceptance separately');
@@ -810,7 +1052,7 @@ async function main() {
     }
     context.policy = join(root, 'isolation.sb');
     const forbidden = [join(homedir(), '.duduclaw'), join(homedir(), 'Library/Keychains'), '/Library/Keychains', '/System/Library/Keychains'];
-    writeFileSync(context.policy, `(version 1)(allow default)\n(deny network*)\n(allow network-bind (local ip "localhost:*"))\n(allow network-inbound (local ip "localhost:*"))\n(allow network-outbound (remote ip "localhost:*"))\n(deny mach-lookup (global-name-regex #".*[Ss]ecurity.*" #".*secd.*"))\n(deny file-read* file-write* ${forbidden.map(path => `(subpath ${JSON.stringify(path)})`).join(' ')})\n`, { mode: 0o600 });
+    writeFileSync(context.policy, `(version 1)(allow default)\n(deny network*)\n(allow network-bind (local ip "localhost:*"))\n(allow network-inbound (local ip "localhost:*"))\n(allow network-outbound (remote ip "localhost:*"))\n(allow network* (subpath ${JSON.stringify(root)}))\n(deny mach-lookup (global-name-regex #".*[Ss]ecurity.*" #".*secd.*"))\n(deny file-read* file-write* ${forbidden.map(path => `(subpath ${JSON.stringify(path)})`).join(' ')})\n`, { mode: 0o600 });
     installEnterpriseLicense();
     // This suite upgrades a disposable pre-avatar store. Its existing legacy
     // MFA policy stays off by design (mfa::boot_policy legacy-store tests),
@@ -823,13 +1065,17 @@ async function main() {
     }
     if (!context.gateway) await boot('baseline');
     if (selected.has('memory')) await scenario('memory', 'real stdio task result and fixture-extracted pinned note remembered across turns', memoryScenario);
-    if (selected.has('identity')) for (const runtime of ['claude', 'codex']) await scenario(`identity-${runtime}`, 'real chat spawn, forged identity refusal and post-turn revocation', () => identityScenario(runtime));
+    if (selected.has('identity')) for (const runtime of ['claude', 'codex']) await scenario(`identity-${runtime}`, 'IPC whoami, live non-descendant refusal, forged server pin sends zero bytes and post-turn inactivity', () => identityScenario(runtime));
     if (selected.has('wiki')) await scenario('wiki', 'MCP normal I/O, traversal, absolute path, directory/control symlink refusals', wikiScenario);
     if (selected.has('self-add')) {
-      await scenario('self-add', 'Owner-turn pasted/tool content imports with durable Owner notices; non-owner turn cannot auto-import', selfAddScenario);
+      await scenario('self-add', 'Owner-turn imports with durable notices; inherited run_id calls require cards; non-owner cannot auto-import', selfAddScenario);
       report('SKIP', 'self-add-delivery', 'Owner auto-import notice persistence/dedup and non-owner refusal/card are checked locally; actual verified DM delivery requires a real external channel');
+      report('SKIP', 'self-add-schedulers', 'unregistered dispatch/cron/sub-agent run_id values are injected into a live Owner turn via real MCP; actual scheduler execution is disabled in this fixture');
     }
     if (selected.has('member-key')) await scenario('member-key', 'RPC key creation, member contract, chat authentication, revoke and reconnect refusal', memberKeyScenario);
+    if (selected.has('google-local')) await scenario('google-local', 'Google source effect classes and no-connection discovery/call refusal via prod-shaped MCP', googleLocalScenario);
+    // Run last: filling the small signed cap must not change earlier fixtures.
+    if (selected.has('avatar-seat')) await scenario('avatar-seat', 'full ordinary seats allow avatar creation; separate counts, unset/ordinary creation refusal', avatarSeatScenario);
   } catch (error) { report('FAIL', 'setup', 'isolated harness prerequisites/startup', error.message); }
   finally {
     // Copying only a live WAL-mode .db loses the migration and session rows.
@@ -855,8 +1101,9 @@ async function testHelpers() {
   assert.equal(parseOptions([]).port, 18985);
   assert.deepEqual(parseOptions(['--port', '18986', '--only', 'memory,wiki']), { port: 18986, only: ['memory', 'wiki'] });
   for (const args of [['--port', '18889'], ['--port', '0'], ['--port', 'bad'], ['--port'], ['--wat']]) assert.throws(() => parseOptions(args));
-  assert.equal(selectedNames().size, 6);
+  assert.equal(selectedNames().size, 9);
   assert.deepEqual([...selectedNames(['identity', 'wiki'])], ['identity', 'wiki']);
+  assert.deepEqual([...selectedNames(['avatar-seat', 'avatar-admin-read', 'google-local'])], ['avatar-seat', 'avatar-admin-read', 'google-local']);
   assert.throws(() => selectedNames(['unknown']));
   assert(!sanitise('ddc_run_ABC123').includes('ABC123'));
   const redacted = redactArtifact({ password_hash: 'hidden', must_change_password: 0, nested: [{ secret: 'hidden', active: true }] });
@@ -891,6 +1138,36 @@ async function testHelpers() {
   assert(!fixture.payload.issued_at.endsWith('.000Z'), 'whole-second dates must match Chrono canonical serialization');
   assert(verify(null, Buffer.from(JSON.stringify(fixture.payload)), fixture.publicKey, Buffer.from(fixture.license.signature, 'base64')));
   assert(!verify(null, Buffer.from(JSON.stringify({ ...fixture.payload, tier: 'business' })), fixture.publicKey, Buffer.from(fixture.license.signature, 'base64')));
+  const capped = disposableLicense('local-fixture-fingerprint', 1795560000000, 6);
+  assert.equal(capped.payload.max_agents, 6);
+  assert.deepEqual(Object.keys(capped.payload).slice(-2), ['max_agents', 'nfr']);
+  assert(verify(null, Buffer.from(JSON.stringify(capped.payload)), capped.publicKey, Buffer.from(capped.license.signature, 'base64')));
+  assert(!verify(null, Buffer.from(JSON.stringify({ ...capped.payload, max_agents: 7 })), capped.publicKey, Buffer.from(capped.license.signature, 'base64')));
+  const endpoint = process.platform === 'win32' ? 'pipe:v1:\\\\.\\pipe\\duduclaw-identity-abcdef' : 'unix:v1:/tmp/fixture/s';
+  assert(identityPath(endpoint));
+  for (const invalid of ['', 'http://127.0.0.1:18985/api/internal/identity/introspect', 'unix:v2:/tmp/s',
+    'unix:v1:relative', `${endpoint}\0`, ` ${endpoint}`]) assert.throws(() => identityPath(invalid));
+  const identity = { active: true, agent_id: '繁體中文🧪' };
+  const frame = encodeIdentityFrame(identity);
+  assert.equal(frame.readUInt32BE(0), Buffer.byteLength(JSON.stringify(identity)));
+  assert.deepEqual(decodeIdentityFrame(frame), identity);
+  for (let length = 0; length < frame.length; length++) assert.equal(decodeIdentityFrame(frame.subarray(0, length)), null);
+  assert.deepEqual(decodeIdentityFrame(encodeIdentityFrame({ active: false })), { active: false });
+  assert.throws(() => encodeIdentityFrame({ text: 'x'.repeat(4096) }));
+  for (const length of [0, 16385]) {
+    const header = Buffer.alloc(4); header.writeUInt32BE(length); assert.throws(() => decodeIdentityFrame(header));
+  }
+  assert.throws(() => decodeIdentityFrame(Buffer.concat([frame, Buffer.from([0])])));
+  for (const value of [[], null, { active: 'false' }, { missing: true }]) assert.throws(() => decodeIdentityFrame(encodeIdentityFrame(value)));
+  const refused = { status: 1, stdout: '{"active":false}', stderr: 'Security: Run identity is missing, inactive or unavailable' };
+  assertIdentityRefused(refused);
+  assertIdentityRefused({ ...refused, stdout: '' });
+  for (const wrong of [{ status: 0 }, { stderr: 'unrelated failure' }, { stdout: '{"active":true}' }]) {
+    assert.throws(() => assertIdentityRefused({ ...refused, ...wrong }));
+  }
+  const effects = readFileSync(join(repo, 'crates/duduclaw-core/src/tool_effect.rs'), 'utf8');
+  for (const [name, , effect] of googleCases) assert.equal(sourceEffect(name, effects), effect);
+  assert.throws(() => sourceEffect('unknown_google_tool', effects));
   // No network: drive the reader state through clean/abnormal retirement,
   // malformed JSON, continued data and errors that never actually close.
   const socketState = (extra = {}) => Object.assign(Object.create(Socket.prototype), {
@@ -912,7 +1189,7 @@ async function testHelpers() {
   await assert.rejects(socketState({ queue: [{ type: 'error', message: 'unrelated failure' }] }).expectRefusal(true), /unexpected chat data/);
   await assert.rejects(socketState({ queue: [authError, { type: 'session_info' }] }).expectRefusal(true), /unexpected chat data/);
   await assert.rejects(socketState({ queue: [{ type: 'assistant_message', content: 'still active' }] }).expectRefusal(), /unexpected chat data/);
-  console.log('PASS pure helper tests (options, redaction, wiki refusal layers, legacy preservation, session/job correlation, runtime fixture policy, signed license, member-key socket refusal)');
+  console.log('PASS pure helper tests (options/selectors, redaction, wiki refusal layers, legacy preservation, session/job correlation, runtime fixture policy, signed/capped license, IPC framing/endpoints/refusal, Google source effects, member-key socket refusal; no gateway, subprocesses or listeners)');
 }
 
 export { parseOptions, selectedNames, sanitise, testHelpers };
