@@ -454,7 +454,8 @@ pub(crate) async fn gate_direct_reply(
     user_id: &str,
     text: &str,
 ) -> Option<String> {
-    if let Some(reply) = check_user_access_gate(ctx, session_id, user_id, text).await {
+    let gate_session = crate::googlechat_conversation::permission_session(session_id).unwrap_or(session_id);
+    if let Some(reply) = check_user_access_gate(ctx, gate_session, user_id, text).await {
         return Some(reply);
     }
     if crate::odoo_livechat::is_public_visitor_session(session_id) {

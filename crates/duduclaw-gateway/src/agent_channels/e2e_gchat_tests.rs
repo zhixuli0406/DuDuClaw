@@ -205,6 +205,7 @@ pub(crate) fn googlechat_section(home: &Path, project: &str, sa_json: &str) -> S
 pub(crate) fn message_event(space: &str, text: &str) -> Value {
     json!({"type": "MESSAGE", "space": {"name": space, "type": "SPACE"}, "message": {
         "text": text, "argumentText": text, "space": {"name": space, "type": "SPACE"},
+        "thread": {"name": format!("{space}/threads/T")},
         "sender": {"name": "users/42", "type": "HUMAN", "displayName": "Human"}}})
 }
 
@@ -461,11 +462,11 @@ async fn each_app_reaches_only_its_employee_and_wrong_audiences_are_refused() {
     let as_a = wait_text(&fake, &format!("Bearer tok-{email_a}"), "OWN_BOT_REPLY").await;
     let as_b = wait_text(&fake, &format!("Bearer tok-{email_b}"), "OWN_BOT_REPLY").await;
     assert!(
-        as_a.contains("agent=sales session=googlechat:spaces/SHARED#agent:sales"),
+        as_a.contains("agent=sales session=googlechat:spaces/SHARED:thread:spaces/SHARED/threads/T#agent:sales"),
         "{as_a}"
     );
     assert!(
-        as_b.contains("agent=hr session=googlechat:spaces/SHARED#agent:hr"),
+        as_b.contains("agent=hr session=googlechat:spaces/SHARED:thread:spaces/SHARED/threads/T#agent:hr"),
         "{as_b}"
     );
     assert!(

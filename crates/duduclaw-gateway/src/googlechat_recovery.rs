@@ -114,6 +114,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rm182_restart_recovers_exact_thread_and_employee_bucket() {
+        let home = tempfile::tempdir().unwrap();
+        let mut expected = Vec::new();
+        {
+            let store = Inbox::shared(home.path()).unwrap();
+            for (i, thread) in ["one", "two"].into_iter().enumerate() {
+                let c = crate::googlechat_conversation::GoogleChatConversation::from_event(
+                    &serde_json::json!({"space":{"name":"spaces/A"},"message":{
+                        "thread":{"name":format!("spaces/A/threads/{thread}")}}}), false, false,
+                ).unwrap();
+                let mut pending = row(i, 10);
+                pending.session_id = c.session_for(Some("sales"));
+                pending.thread_name = c.delivery_thread().map(str::to_owned);
+                store.insert_placeholder(&pending).unwrap();
+                expected.push(pending);
+            }
+        }
+        let store = Inbox::shared(home.path()).unwrap();
+        let seen = std::sync::Mutex::new(Vec::new());
+        let counts = sweep(&store, 100_000, 5, tokio::time::Instant::now() + SWEEP_BUDGET, |row| {
+            seen.lock().unwrap().push(row);
+            async { Ok(()) }
+        }).await.unwrap();
+        assert_eq!(counts.deleted, 2);
+        assert_eq!(*seen.lock().unwrap(), expected);
+        assert!(store.stale_placeholders(100_001).unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn sweep_edits_and_deletes_success_and_gone_but_keeps_transient_until_expired() {
         let home = tempfile::tempdir().unwrap();
         let store = Inbox::shared(home.path()).unwrap();

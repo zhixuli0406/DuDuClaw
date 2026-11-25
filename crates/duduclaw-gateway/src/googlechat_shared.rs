@@ -49,10 +49,11 @@ pub(crate) enum Route {
 /// Called before attachments, placeholders, commands or model/session work.
 /// Unknown space kinds and employee-owned apps never enter shared DM routing.
 pub(crate) async fn route(
-    ctx: &Arc<ReplyContext>, own_app: bool, is_dm: bool,
-    conversation: &str, sender: &str, text: &str,
+    ctx: &Arc<ReplyContext>, own_app: bool,
+    verified: &crate::googlechat_conversation::GoogleChatConversation, sender: &str, text: &str,
 ) -> Route {
-    if own_app || !is_dm { return Route::Legacy; }
+    if own_app || !verified.is_dm() { return Route::Legacy; }
+    let conversation = verified.session_key();
     // Read SQLite on every message: dashboard writes use another connection.
     let rows = match ctx.channel_settings.read_global_rows_raw(
         "googlechat", &[keys::SHARED_BOT_BINDING, keys::UNBOUND_REPLY],
@@ -145,8 +146,9 @@ async fn decide_turn(
 }
 
 pub(crate) async fn recovery_identity(
-    ctx: &ReplyContext, conversation: &str, sender: &str, text: &str,
+    ctx: &ReplyContext, verified: &crate::googlechat_conversation::GoogleChatConversation, sender: &str, text: &str,
 ) -> (String, String) {
+    let conversation = verified.session_key();
     let (decision, fallback) = peek_turn(ctx, conversation, sender, text).await;
     match decision {
         crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger: true } => {
