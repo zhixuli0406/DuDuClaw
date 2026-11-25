@@ -5,8 +5,10 @@
 
 `duduclaw identity whoami --json` queries the current run's gateway-issued identity.
 It exits non-zero when the credential is missing, inactive or cannot be verified.
-Third-party local MCP servers receive `DUDUCLAW_RUN_CREDENTIAL` through the proxy;
-existing agent identity variables remain stripped. Check the identity for each
+Third-party local MCP servers receive `DUDUCLAW_RUN_CREDENTIAL`,
+`DUDUCLAW_IDENTITY_ENDPOINT` and `DUDUCLAW_IDENTITY_SERVER` through the proxy;
+existing agent identity variables remain stripped. The gateway answers only the
+run's CLI process and its descendants, so a server started outside the run is refused. Check the identity for each
 call and authorize it separately. See [Getting and verifying the caller identity](custom-mcp-tool.md#getting-and-verifying-the-caller-identity).
 
 ## Skill archive recovery

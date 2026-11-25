@@ -3,7 +3,7 @@
 
 ## ローカルの呼び出し元を検証する
 
-`duduclaw identity whoami --json` で gateway が発行した実行時の身分を照会できます。資格情報がない、無効、または検証できない場合は非ゼロで終了します。ローカルのサードパーティー MCP server は proxy から `DUDUCLAW_RUN_CREDENTIAL` を継承し、従来の身分変数は引き続き除去されます。呼び出しごとに検証し、ツール独自の規則で認可してください。[開発ガイド](custom-mcp-tool.md)を参照してください。
+`duduclaw identity whoami --json` で gateway が発行した実行時の身分を照会できます。資格情報がない、無効、または検証できない場合は非ゼロで終了します。ローカルのサードパーティー MCP server は proxy から `DUDUCLAW_RUN_CREDENTIAL`、`DUDUCLAW_IDENTITY_ENDPOINT`、`DUDUCLAW_IDENTITY_SERVER` を継承し、従来の身分変数は引き続き除去されます。gateway はその実行の CLI プロセスと子孫プロセスにだけ応答するため、実行の外で起動した server は拒否されます。呼び出しごとに検証し、ツール独自の規則で認可してください。[開発ガイド](custom-mcp-tool.md)を参照してください。
 
 
 ## スキルのアーカイブ復元

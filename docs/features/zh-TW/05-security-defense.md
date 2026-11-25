@@ -3,7 +3,9 @@
 
 ## 每次執行的呼叫者身分
 
-本機工具可用 `DUDUCLAW_RUN_CREDENTIAL` 向 loopback 端點查證，或執行 `duduclaw identity whoami --json`，確認是哪位 AI、代誰工作、屬於哪段對話。gateway 只存雜湊，執行結束、取消、過期或重啟即失效。工作目錄不是身分；未隔離環境中，AI 仍可使用自己的憑證，同一 OS 帳號的程序也可能竊取別張有效憑證。受保護模式保留自己的 capability records，舊 agent token 與 MCP 身分驗證不變。詳見[取得與查證呼叫者身分](../../guides/zh-TW/custom-mcp-tool.md)。
+AI 無法靠修改環境變數、參數或工作目錄冒用其他身分。gateway 管理的每次執行都有一張短效的 `DUDUCLAW_RUN_CREDENTIAL`。本機工具透過有版本號的本機 IPC 端點查證（`DUDUCLAW_IDENTITY_ENDPOINT`：僅擁有者可存取的私有目錄裡的 Unix socket，或僅限目前使用者、拒絕遠端連線的 named pipe），也可以執行 `duduclaw identity whoami --json`，確認是哪位 AI、代誰工作、屬於哪段對話。送出憑證前，用戶端會透過作業系統確認對方程序符合 `DUDUCLAW_IDENTITY_SERVER` 記錄的 gateway PID 與啟動時間。gateway 只回應核心辨識出的兩種呼叫者：本次執行啟動的 CLI 程序，以及它的子孫程序；每一層父程序都核對 PID 與啟動時間，最多 64 層。不在這棵程序樹裡的程序，即使拿到正確憑證也會被拒絕，所以在執行之外啟動的 daemon 用不了複製來的憑證。gateway 只存雜湊，執行結束、取消、過期或重啟即失效。舊的 `127.0.0.1` HTTP 端點與 `DUDUCLAW_IDENTITY_URL` 已移除，不會退回舊路徑。
+
+已知限制：Windows 上，同一帳號的程式若刻意指定父程序，可以通過祖先檢查。macOS，以及沒有 `SO_PEERPIDFD` 的 Linux 核心，仍有很短的 PID 重用空窗。注入合法子孫程序的程式碼、替其他程序轉送請求的子孫程序，或交給其他程序的已連線 handle，都等同該子孫程序本身。原生 Linux 受保護模式以不同帳號隔離員工，不簽發 run credential，使用自己的 capability records；舊 agent token 與 MCP 身分驗證不變。詳見[取得與查證呼叫者身分](../../guides/zh-TW/custom-mcp-tool.md)。
 
 
 ## 原生 Linux 隔離整合（預計在之後的版本提供）

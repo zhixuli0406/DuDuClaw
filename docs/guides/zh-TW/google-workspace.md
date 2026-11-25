@@ -1,10 +1,10 @@
 # Google Workspace 工具與安全模型
 
-設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十八個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十九個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
-二十八個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
+二十九個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
@@ -13,6 +13,7 @@
 | `gmail_read` | read | 完整讀取一封信：標頭、純文字內文（過長會截斷）、附件清單（只列檔名與大小，絕不下載）。 |
 | `google_chat_spaces` | read | 列出已連結帳號的聊天室、群聊與私訊，需先啟用 Chat 讀取。 |
 | `google_chat_messages` | read | 讀取近期 Chat 訊息，回傳經掃描的參考資料；附件只列名稱。 |
+| `google_chat_send` | send | 以提出要求的已驗證成員本人帳號，傳送文字到既有空間。須先開啟 `[google] chat_send = true`，每次傳送都要本人確認。見[以本人身分傳送 Google Chat](google-personal-connections.md#以本人身分傳送-google-chat)。 |
 | `gmail_send_draft` | send | 逐次確認後寄出草稿快照。 |
 | `calendar_delete_event` | delete | 逐次確認後刪除指定版本的活動，預設不通知參加者。 |
 | `gmail_create_draft` | write | 建立一封 Gmail **草稿**。此工具只存草稿；寄出需另外呼叫 `gmail_send_draft` 並逐次確認。 |
@@ -60,8 +61,8 @@
 - **讀取就只是讀取。** 屬於 read 類別的工具無法修改 Gmail 或 Calendar 中的
   任何內容。
 - **Forms、Drive、Slides 全部唯讀。** 沒有任何工具會建立或編輯表單、寫入
-  Drive、或修改簡報。只有 Gmail（草稿與核准寄出）、Calendar、Sheets、Docs
-  和 Tasks 有寫入工具。
+  Drive、或修改簡報。只有 Gmail（草稿與核准寄出）、Google Chat（本人確認後傳送）、
+  Calendar、Sheets、Docs 和 Tasks 有寫入工具。
 - **最小權限原則。** Drive 申請的是 `drive.readonly`（絕不是 `drive` 或
   `drive.file`，文件與試算表建立使用各自服務的範圍），Slides 申請
   `presentations.readonly`。Docs 的寫入工具沿用完整的 `documents` scope。
@@ -213,7 +214,7 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 
 網域委派每次只要求工具所屬服務的權限：Gmail、日曆、文件、試算表、雲端硬碟、簡報、表單或工作清單。權杖依服務帳號、代表信箱及排序去重後的權限集合分開快取；其他服務缺少授權，不會阻止原本已授權的服務。測試連線會逐項列出 scope 已授權或尚未確認，再另外檢查各服務。取得權杖不代表資料 API 或範例檔案一定可讀。
 
-開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。目前不支援以本人名義傳送 Chat 訊息。
+開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。以本人名義傳送 Chat 另須開放 `chat_send`，並由本人逐次確認，見[以本人身分傳送 Google Chat](google-personal-connections.md#以本人身分傳送-google-chat)。
 
 讓公司授權跟隨 AI 員工的負責人：
 

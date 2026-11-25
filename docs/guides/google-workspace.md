@@ -1,10 +1,10 @@
 # Google Workspace tools and security
 
-For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-eight tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
+For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-nine tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
-Twenty-eight agent-facing MCP tools, gated by two scopes (`google:read` /
+Twenty-nine agent-facing MCP tools, gated by two scopes (`google:read` /
 `google:write`):
 
 | Tool | Class | What it does |
@@ -14,6 +14,7 @@ Twenty-eight agent-facing MCP tools, gated by two scopes (`google:read` /
 | `gmail_read` | read | Read one message in full: headers, plain-text body (truncated if long), attachment manifest (filename + size only — never downloaded). |
 | `google_chat_spaces` | read | List the connected user's spaces, group chats and DMs; requires Chat read opt-in. |
 | `google_chat_messages` | read | Read recent Chat messages; scanned reference data, attachment names only. |
+| `google_chat_send` | send | Send text to an existing space as the verified requesting member. Off until `[google] chat_send = true`; the member confirms every send. See [Send Google Chat as yourself](google-personal-connections.md#send-google-chat-as-yourself). |
 | `gmail_send_draft` | send | Send an approved draft snapshot; a new confirmation is required every time. |
 | `calendar_delete_event` | delete | Delete an approved event version; notifications default to none. |
 | `gmail_create_draft` | write | Create a Gmail **draft**. Saves without sending; use `gmail_send_draft` with a separate confirmation to send. |
@@ -61,8 +62,8 @@ which is why they are served natively here.
 - **Read stays read.** The read-class tools cannot modify anything in Gmail or
   Calendar.
 - **Forms, Drive and Slides are read-only.** No tool creates or edits a form,
-  writes to Drive, or modifies a presentation. Only Gmail (draft and confirmed send), Calendar,
-  Sheets, Docs and Tasks have write tools.
+  writes to Drive, or modifies a presentation. Only Gmail (draft and confirmed send), Google Chat (confirmed
+  send as the member), Calendar, Sheets, Docs and Tasks have write tools.
 - **Least privilege.** Drive is requested `drive.readonly` (never `drive` or
   `drive.file` — Docs and Sheets creation uses their own service scopes) and Slides
   `presentations.readonly`. Docs uses the existing full `documents` scope for its write tools.
@@ -326,7 +327,7 @@ instead.
 
 Delegation requests only the scopes for the tool's service: Gmail, Calendar, Docs, Sheets, Drive, Slides, Forms or Tasks. Tokens are cached separately by service account, subject and normalized scope set. A missing grant for another service does not block an already granted service. The connection test lists each scope separately as granted or not confirmed, then reports service access separately; a token does not prove that a data API or sample file is available.
 
-With `[google] chat_read = true`, delegation also supports `chat.spaces.readonly` and `chat.messages.readonly` (both under `https://www.googleapis.com/auth/`). Authorize those scopes in the Google Admin console and enable Google Chat API. The configuration default remains off. The setup wizard preselects Chat reading; it writes the choice only when an administrator saves it. Connected members missing either Chat scope or its local purpose see **Reconnect to add Google Chat** in **My connections**. Sending Chat messages as a person is not supported.
+With `[google] chat_read = true`, delegation also supports `chat.spaces.readonly` and `chat.messages.readonly` (both under `https://www.googleapis.com/auth/`). Authorize those scopes in the Google Admin console and enable Google Chat API. The configuration default remains off. The setup wizard preselects Chat reading; it writes the choice only when an administrator saves it. Connected members missing either Chat scope or its local purpose see **Reconnect to add Google Chat** in **My connections**. Sending Chat messages as a person requires the separate `chat_send` opt-in and the member's confirmation for every send; see [Send Google Chat as yourself](google-personal-connections.md#send-google-chat-as-yourself).
 
 To follow an AI employee's responsible member:
 

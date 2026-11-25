@@ -1,10 +1,10 @@
 # Google Workspace ツールと安全モデル
 
-設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十八ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十九ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
-2つのスコープ(`google:read` / `google:write`)で管理される、28個のエージェント向け
+2つのスコープ(`google:read` / `google:write`)で管理される、29個のエージェント向け
 MCPツールです。
 
 | ツール | 分類 | 内容 |
@@ -14,6 +14,7 @@ MCPツールです。
 | `gmail_read` | read | 1件のメッセージを全文読み取る: ヘッダー、プレーンテキスト本文(長い場合は切り詰め)、添付ファイル一覧(ファイル名とサイズのみ、ダウンロードは行わない)。 |
 | `google_chat_spaces` | read | 接続したユーザーのスペース、グループチャット、DM を一覧表示。Chat 読み取りの有効化が必要。 |
 | `google_chat_messages` | read | 最近の Chat メッセージを検査済みの参照データとして読み取り。添付は名前のみ。 |
+| `google_chat_send` | send | 依頼した認証済みメンバー本人のアカウントで既存スペースにテキストを送信。`[google] chat_send = true` まで無効で、送信のたびに本人の確認が必要。[本人として Google Chat を送信する](google-personal-connections.md#本人として-google-chat-を送信する)を参照。 |
 | `gmail_send_draft` | send | 毎回確認して承認済みの下書きを送信。 |
 | `calendar_delete_event` | delete | 毎回確認して指定バージョンの予定を削除。通知の既定はなし。 |
 | `gmail_create_draft` | write | Gmailの**下書き**を作成する。送信は行わない。送信には `gmail_send_draft` の個別確認が必要。 |
@@ -64,7 +65,7 @@ MCPツールです。
   内容を一切変更できません。
 - **Forms、Drive、Slidesは読み取り専用です。** フォームの作成・編集、Driveへの
   書き込み、プレゼンテーションの変更を行うツールはありません。書き込み用ツールが
-  あるのはGmail(下書き・承認済み送信)、Calendar、Sheets、Docs、Tasksだけです。
+  あるのはGmail(下書き・承認済み送信)、Google Chat(本人確認後の送信)、Calendar、Sheets、Docs、Tasksだけです。
 - **最小権限。** Driveは`drive.readonly`のみを要求します(`drive`や
   `drive.file`は要求しません。DocsとSheetsの作成は各サービスのスコープを使います)。
   Slidesは`presentations.readonly`を要求します。Docsの書き込みツールは既存の完全な`documents`スコープを使います。
@@ -217,7 +218,7 @@ Agent Mail は最後に完了したポーリング時刻、アカウント利用
 
 ドメイン全体の委任では、ツールが属するサービス（Gmail、カレンダー、Docs、Sheets、Drive、Slides、Forms、Tasks）のスコープだけを要求します。トークンはサービスアカウント、代理対象、並べ替え・重複除去したスコープ集合ごとにキャッシュします。別サービスの未承認スコープが既存サービスを停止させることはありません。接続テストは各スコープの承認結果とサービスへのアクセス結果を分けて表示します。発行成功だけでは API やサンプルファイルへのアクセスを証明しません。
 
-`[google] chat_read = true` の場合、委任でも `chat.spaces.readonly` と `chat.messages.readonly`（接頭辞は `https://www.googleapis.com/auth/`）を使用できます。Google 管理コンソールで両方を承認し、Google Chat API を有効にしてください。設定の既定値はオフのままです。設定ウィザードでは Chat 読み取りを選択済みで表示しますが、管理者が保存するまで書き込みません。接続済みでも Chat のスコープまたはローカル用途が不足するメンバーには「Google Chat を追加するには再接続してください」と表示します。本人名義での Chat 送信は対象外です。
+`[google] chat_read = true` の場合、委任でも `chat.spaces.readonly` と `chat.messages.readonly`（接頭辞は `https://www.googleapis.com/auth/`）を使用できます。Google 管理コンソールで両方を承認し、Google Chat API を有効にしてください。設定の既定値はオフのままです。設定ウィザードでは Chat 読み取りを選択済みで表示しますが、管理者が保存するまで書き込みません。接続済みでも Chat のスコープまたはローカル用途が不足するメンバーには「Google Chat を追加するには再接続してください」と表示します。本人名義での Chat 送信には、別途 `chat_send` の許可と送信ごとの本人確認が必要です。[本人として Google Chat を送信する](google-personal-connections.md#本人として-google-chat-を送信する)を参照してください。
 
 AI 社員の担当者に組織の承認を連動させる手順：
 

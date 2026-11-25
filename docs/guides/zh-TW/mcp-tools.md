@@ -3,7 +3,7 @@
 
 ## 查證本機呼叫者
 
-`duduclaw identity whoami --json` 可查詢 gateway 核發的本次執行身分；憑證缺失、無效或無法查證時，以非零狀態結束。第三方本機 MCP server 可透過 proxy 繼承 `DUDUCLAW_RUN_CREDENTIAL`，舊身分變數仍會移除。請每次呼叫都查證，再依工具本身的規則授權。詳見[取得與查證呼叫者身分](custom-mcp-tool.md)。
+`duduclaw identity whoami --json` 可查詢 gateway 核發的本次執行身分；憑證缺失、無效或無法查證時，以非零狀態結束。第三方本機 MCP server 可透過 proxy 繼承 `DUDUCLAW_RUN_CREDENTIAL`、`DUDUCLAW_IDENTITY_ENDPOINT` 與 `DUDUCLAW_IDENTITY_SERVER`，舊身分變數仍會移除。gateway 只回應本次執行的 CLI 程序及其子孫程序，在執行之外啟動的 server 會被拒絕。請每次呼叫都查證，再依工具本身的規則授權。詳見[取得與查證呼叫者身分](custom-mcp-tool.md)。
 
 
 ## 技能封存還原
