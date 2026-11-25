@@ -704,7 +704,8 @@ mod tests {
             .collect();
         let expected_locks_entries: HashSet<_> = [
             "gateway.lock",
-            duduclaw_core::agent_seats::SEAT_ADMISSION_LOCK,
+            // The fs lock helper appends `.lock` to the seat admission path.
+            format!("{}.lock", duduclaw_core::agent_seats::SEAT_ADMISSION_LOCK),
         ]
             .into_iter()
             .map(std::ffi::OsString::from)
