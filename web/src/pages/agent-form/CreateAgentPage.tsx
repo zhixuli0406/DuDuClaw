@@ -27,7 +27,7 @@ import { RowText, RowSelect, FieldBlock } from './form-rows';
 import { TEMPLATE_KIND_ORDER } from './defaults';
 import { ModelSelect } from '@/components/shared/ModelSelect';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
-import { sanitizeErrorDetail } from '@/lib/error-message';
+import { agentCreateErrorMessage, agentCreateNamesPresent } from './createHelpers';
 import { seatLimitOf, type SeatLimitInfo } from '@/lib/seat-limit';
 import { SeatLimitNotice } from '@/components/shared/SeatLimitNotice';
 
@@ -155,23 +155,11 @@ export function CreateAgentPage() {
   const usingTemplate = templateRoleId !== '' && roleDetail !== null;
 
   const handleCreateError = (cause: unknown) => {
-    const detail = sanitizeErrorDetail(cause);
-    if (/^Agent name must be lowercase alphanumeric with hyphens, max 64 chars$/i.test(detail)) {
-      setError(intl.formatMessage({ id: 'agents.create.error' }));
-      return;
-    }
-    if (/^Agent '.+' already exists$/i.test(detail) || /^已有同名的 AI 員工\(.+\),請換一個名稱$/.test(detail)) {
-      setError(intl.formatMessage({ id: 'agents.create.errorExists' }));
-      return;
-    }
-    setError(intl.formatMessage(
-      { id: 'agents.create.errorServer' },
-      { detail: detail || intl.formatMessage({ id: 'common.error' }) },
-    ));
+    setError(agentCreateErrorMessage(cause, intl));
   };
 
   const handleSubmit = async () => {
-    if (!name.trim() || !displayName.trim() || (reportsTo && !canSelectAgent(reportsTo))) return;
+    if (!agentCreateNamesPresent(name, displayName) || (reportsTo && !canSelectAgent(reportsTo))) return;
     setError(null);
     setErrorState(null);
     setSeatLimit(null);
@@ -264,8 +252,7 @@ export function CreateAgentPage() {
   const canSubmit =
     !submitting &&
     !roleLoading &&
-    !!name.trim() &&
-    !!displayName.trim() &&
+    agentCreateNamesPresent(name, displayName) &&
     (usingTemplate || !!model);
 
   return (
