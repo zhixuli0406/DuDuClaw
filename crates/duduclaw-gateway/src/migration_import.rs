@@ -602,6 +602,7 @@ mod tests {
         expected.execute_batch(include_str!("../../duduclaw-import/src/channel-settings-v1793.sql")).unwrap();
         // The pinned text is the gateway's own schema.
         assert!(include_str!("../../duduclaw-import/src/session-origin-proofs-v182.sql")
+            .replace("\r\n", "\n")
             .contains(crate::recipient_guard::origin::SCHEMA));
         assert_eq!(schema(&actual),schema(&expected));
 

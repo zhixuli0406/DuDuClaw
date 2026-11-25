@@ -706,6 +706,7 @@ fn fn_bodies(sources: &[String]) -> HashMap<String, String> {
     const ENDS: &[&str] = &["\n    }\n", "\n}\n", "\n    pub", "\n    fn ", "\n    async fn ", "\npub", "\nfn ", "\nasync fn "];
     let mut bodies: HashMap<String, String> = HashMap::new();
     for source in sources {
+        let source = source.replace("\r\n", "\n");
         let mut rest = source.as_str();
         while let Some(at) = rest.find("fn ") {
             let boundary = at == 0 || rest.as_bytes()[at - 1].is_ascii_whitespace();

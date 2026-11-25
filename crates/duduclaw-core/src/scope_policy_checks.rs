@@ -77,6 +77,6 @@ fn rm209_doctor_reports_bad_root_and_ignored_nested_policy() {
     std::fs::write(wiki.join(".scope.toml"), "not [ valid toml").unwrap();
     std::fs::write(wiki.join("notes/.scope.toml"), "").unwrap();
     let output = checks(home.path());
-    assert!(output.iter().any(|check| check.1 == CheckStatus::Fail && check.2.contains("shared/wiki/.scope.toml")));
-    assert!(output.iter().any(|check| check.1 == CheckStatus::Warn && check.2.contains("notes/.scope.toml")));
+    assert!(output.iter().any(|check| check.1 == CheckStatus::Fail && check.2.replace('\\', "/").contains("shared/wiki/.scope.toml")));
+    assert!(output.iter().any(|check| check.1 == CheckStatus::Warn && check.2.replace('\\', "/").contains("notes/.scope.toml")));
 }

@@ -538,7 +538,7 @@ mod tests {
     fn protected_branches_do_not_issue_or_pass_run_credentials() {
         // Source-contract guard: protected launch implementations must remain
         // ahead of host command preparation and must not receive its env.
-        let channel = include_str!("channel_reply/cli_env.rs");
+        let channel = include_str!("channel_reply/cli_env.rs").replace("\r\n", "\n");
         assert!(channel.contains("let _run_identity = if protected { None } else {"));
         let protected = channel.split_once("let mut child = if protected {").unwrap().1
             .split_once("} else {").unwrap().0;
@@ -546,15 +546,16 @@ mod tests {
         assert!(!protected.contains("run_identity"));
         assert!(!protected.contains("env"));
 
-        let claude = include_str!("claude_runner.rs");
+        let claude = include_str!("claude_runner.rs").replace("\r\n", "\n");
         let branch = claude.split_once("if duduclaw_core::execution_gate::isolation_required() {").unwrap().1
             .split_once("let claude = duduclaw_core::which_claude()").unwrap().0;
         assert!(branch.contains("return call_claude_streaming"));
         assert!(!branch.contains("prepare_claude_cmd"));
         assert!(!branch.contains("run_identity::issue"));
         assert!(!branch.contains(".env("));
-        for source in [include_str!("runtime/codex.rs"), include_str!("runtime/grok.rs"),
-            include_str!("runtime/generic_cli.rs")] {
+        for source in [include_str!("runtime/codex.rs").replace("\r\n", "\n"),
+            include_str!("runtime/grok.rs").replace("\r\n", "\n"),
+            include_str!("runtime/generic_cli.rs").replace("\r\n", "\n")] {
             let execute = source.split_once("async fn execute(").unwrap().1;
             let branch = execute.split_once("if duduclaw_core::execution_gate::isolation_required() {").unwrap().1
                 .split_once("\n        }\n").unwrap().0;
