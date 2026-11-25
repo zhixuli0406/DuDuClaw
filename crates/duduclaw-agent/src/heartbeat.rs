@@ -1374,8 +1374,8 @@ async fn execute_proactive_check(
             }
             let child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,
-            duduclaw_core::execution_gate::spawn(&mut cmd,
-                duduclaw_core::execution_gate::ExecutionClass::Heartbeat)).await;
+            duduclaw_core::execution_gate::spawn_bound(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::Heartbeat, Some(_run_identity.spawn_binding()))).await;
             drop(admission);
             let output = match child {
                 Ok(child) => match tokio::time::timeout(

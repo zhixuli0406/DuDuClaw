@@ -131,7 +131,7 @@ pub async fn output(
     input: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, OutputError> {
-    collect_output(cmd, input, timeout, false).await
+    collect_output(cmd, input, timeout, false, None).await
 }
 
 /// Model spawn. One admission lease is held across `spawn` and released before
@@ -142,7 +142,14 @@ pub async fn output_for_model(
     input: Option<&[u8]>,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output, OutputError> {
-    let mut output = collect_output(cmd, input, timeout, true).await?;
+    output_for_model_bound(cmd, input, timeout, None).await
+}
+
+pub async fn output_for_model_bound(
+    cmd: &mut tokio::process::Command, input: Option<&[u8]>, timeout: std::time::Duration,
+    binding: Option<duduclaw_core::run_credential::SpawnBinding>,
+) -> Result<std::process::Output, OutputError> {
+    let mut output = collect_output(cmd, input, timeout, true, binding).await?;
     output.stdout = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&output.stdout)).into_owned().into_bytes();
     output.stderr = duduclaw_core::run_credential::redact(&String::from_utf8_lossy(&output.stderr)).into_owned().into_bytes();
     Ok(output)
@@ -153,6 +160,7 @@ async fn collect_output(
     input: Option<&[u8]>,
     timeout: std::time::Duration,
     admit: bool,
+    binding: Option<duduclaw_core::run_credential::SpawnBinding>,
 ) -> Result<std::process::Output, OutputError> {
     use tokio::io::AsyncWriteExt;
     use std::process::Stdio;
@@ -169,7 +177,7 @@ async fn collect_output(
     };
     let class = if admit { execution_class(ExecutionClass::EmployeeMain) }
         else { duduclaw_core::execution_gate::ExecutionClass::ModelProbe };
-    let mut managed = BackendChild::spawn_class(cmd, class).await.map_err(OutputError::Io)?;
+    let mut managed = BackendChild::spawn_class_bound(cmd, class, binding).await.map_err(OutputError::Io)?;
     if admission.is_some() {
         crate::autonomous_runtime::mark_handoff();
     }

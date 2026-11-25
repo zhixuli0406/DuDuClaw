@@ -459,8 +459,8 @@ pub(super) async fn spawn_claude_cli_with_env(
         let admission = crate::autonomous_runtime::admit_current().await?;
         let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
-        crate::process_group::BackendChild::spawn_class(&mut cmd, crate::process_group::execution_class(
-            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+        crate::process_group::BackendChild::spawn_class_bound(&mut cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain), _run_identity.as_ref().map(|lease| lease.spawn_binding())),
     ).await
         .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
         crate::autonomous_runtime::mark_handoff();

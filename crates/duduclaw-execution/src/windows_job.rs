@@ -46,12 +46,17 @@ impl WindowsJob {
     /// Attach a freshly CREATE_SUSPENDED child before resuming its initial
     /// thread. On error the caller must kill/reap the still-owned child; the
     /// job's drop kills any process already assigned before the failure.
-    pub fn assign_and_resume(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
+    pub fn assign(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
         let job = self.handle.as_ref().ok_or_else(|| io::Error::other("job already closed"))?;
         // SAFETY: both handles remain live for this call; no ownership transfers.
         if unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    /// Bind the process generation after `assign` and before calling `resume`.
+    pub fn resume(&self, process: BorrowedHandle<'_>) -> io::Result<()> {
         // SAFETY: the borrowed process handle remains valid throughout this call.
         let pid = unsafe { GetProcessId(process.as_raw_handle()) };
         if pid == 0 { return Err(io::Error::last_os_error()); }

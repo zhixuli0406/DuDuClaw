@@ -18,6 +18,7 @@ pub(super) async fn ready_python_client(python: &str, args: &[String]) -> McpCli
     assert_eq!(ready.as_deref(), Some("ready"));
     McpClient {
         transport: McpTransport::Stdio { child, stdin, stdout },
+        run_identity: None,
         next_id: AtomicI64::new(1), timeout: Duration::from_secs(60),
         label: python.into(), workflow_version: None,
         builtin_tool_timeouts: false, protocol_version: protocol::MODERN,
@@ -369,6 +370,7 @@ async fn oversized_stdio_without_newline_closes_client() {
     let stdout = BufReader::new(child.child().stdout.take().unwrap());
     let mut client = McpClient {
         transport: McpTransport::Stdio { child, stdin, stdout },
+        run_identity: None,
         next_id: AtomicI64::new(1), timeout: Duration::from_secs(10),
         label: "oversized-stdio-fixture".into(), workflow_version: None,
         builtin_tool_timeouts: false, protocol_version: protocol::MODERN,

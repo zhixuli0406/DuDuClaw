@@ -1286,11 +1286,20 @@ async fn collect_codex_output(
     collect_codex_output_with_input(cmd, timeout, None, None).await
 }
 
+#[cfg(test)]
 async fn collect_codex_output_with_input(
     cmd: &mut tokio::process::Command,
     timeout: std::time::Duration,
     input: Option<&[u8]>,
     work_root: Option<&owned_home::CheckedWorkRoot>,
+) -> Result<CodexOutput, String> {
+    collect_codex_output_bound(cmd, timeout, input, work_root, None).await
+}
+
+async fn collect_codex_output_bound(
+    cmd: &mut tokio::process::Command, timeout: std::time::Duration, input: Option<&[u8]>,
+    work_root: Option<&owned_home::CheckedWorkRoot>,
+    binding: Option<duduclaw_core::run_credential::SpawnBinding>,
 ) -> Result<CodexOutput, String> {
     if let Some(root) = work_root { root.reverify()?; }
     #[cfg(test)]
@@ -1331,8 +1340,8 @@ async fn collect_codex_output_with_input(
     if let Some(root) = work_root { root.reverify()?; }
     let mut managed = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Codex,
-        crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
-            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+        crate::process_group::BackendChild::spawn_class_bound(cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain), binding),
     ).await
         .map_err(|e| crate::process_group::backend_error(e, "Failed to spawn codex"))?;
     crate::autonomous_runtime::mark_handoff();
@@ -2000,8 +2009,8 @@ async fn execute_codex_command_with_input(
     // environment and its default KEY/SECRET/TOKEN exclusions intact.
     cmd.args(["-c", "shell_environment_policy.inherit=\"all\""]);
     let idle = crate::runtime_config::idle_timeout_secs(&context.home_dir, context.agent_dir.as_deref());
-    let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_with_input(
-        cmd, std::time::Duration::from_secs(timeout_secs), input, work_root,
+    let output = CODEX_IDLE_TIMEOUT.scope(idle, collect_codex_output_bound(
+        cmd, std::time::Duration::from_secs(timeout_secs), input, work_root, Some(_run_identity.spawn_binding()),
     )).await?;
 
     if let Some(status) = output.status {
