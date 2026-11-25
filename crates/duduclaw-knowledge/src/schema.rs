@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::KbResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// `<home>/knowledge`.
 pub fn knowledge_dir(home: &Path) -> PathBuf {
@@ -296,6 +296,11 @@ pub fn migrate(conn: &Connection) -> KbResult<()> {
         owner_id TEXT NOT NULL, source_summary TEXT NOT NULL, imported_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_self_add_hour ON owner_self_add_log(collection_id, imported_at);
+    CREATE TABLE IF NOT EXISTS owner_self_add_notices (
+        source_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, title TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0
+    );
     CREATE TABLE IF NOT EXISTS knowledge_owner_card_deliveries (
         approval_id TEXT NOT NULL, owner_id TEXT NOT NULL, channel TEXT NOT NULL,
         destination TEXT NOT NULL, conversation TEXT NOT NULL,

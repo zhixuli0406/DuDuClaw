@@ -29,7 +29,7 @@ use duduclaw_knowledge::requester::RequesterIdentity;
 type Key = (String, String);
 
 /// Gateway ingress data, captured before any model/tool execution. Never
-/// deserialized from a tool request. Absence means approval is required.
+/// deserialized from a tool request. Optional context, not self-add authority.
 #[derive(Debug, Clone)]
 pub(crate) struct InboundContent {
     pub text: String,

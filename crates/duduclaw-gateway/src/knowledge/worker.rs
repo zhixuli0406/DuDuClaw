@@ -168,6 +168,7 @@ async fn run_loop(home: PathBuf, extractor: ExtractorCmd) {
 
 /// Start the worker (call once, in the lock-holding gateway).
 pub fn spawn(home: PathBuf) {
+    super::owner_self_add_notify::spawn(home.clone());
     let extractor = match ExtractorCmd::current_exe() {
         Ok(e) => e,
         Err(e) => {

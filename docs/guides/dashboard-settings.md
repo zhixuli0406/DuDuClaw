@@ -991,7 +991,11 @@ The employee Connections tab supports `delegate:owner` (attested primary owner, 
 
 In **System → Security**, administrators can enable **Allow owners to enable AI self-add** (`[knowledge] owner_self_add`, default `false`). This does not enable automatic imports by itself. The actual collection Owner must enable **Let my AI add without approval** in the collection's Settings tab; the toggle is hidden while the master switch is off or the viewer is not an Owner.
 
-Only files, URLs, or text personally provided by the Owner in the same message can be added without approval; content the AI finds on web pages or in other tool results still requires approval.
+During the verified Owner's own turn, their assigned AI can add to its own opted-in collection without approval, regardless of content source: pasted text, URLs, current or earlier attachments, tool output, or an AI-written summary. Text must be nonempty; there is no eight-character minimum. System runs, delegated work and other members' turns do not qualify.
+
+Each new automatic import durably queues one Owner notification containing only the title and source reference, without document content or preview. Delivery retries to the Owner's verified DM; repeated submissions of the same source do not create another notification. Without a reachable verified DM, the notice remains pending.
+
+Known risk: enabling this option accepts a medium risk that content fetched during the Owner's turn, such as a web page, can steer the AI into adding material without an approval card. Owners can turn the collection switch off.
 
 Only a verified request from that Owner to their assigned avatar AI qualifies, with exactly those two principals in the collection ACL. The import transaction rechecks authorization and the limit of 10 automatic imports per collection per rolling hour. All other cases require approval. Turn identity is supplied by the gateway; callers cannot override it in tool arguments.
 
