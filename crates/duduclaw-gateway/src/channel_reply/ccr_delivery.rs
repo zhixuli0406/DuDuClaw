@@ -77,6 +77,17 @@ pub(super) async fn webchat_commit_allowed(agent: &str) -> bool {
 pub(super) async fn append_turn_assistant(
     sessions: &SessionManager, sid: &str, text: &str, tokens: u32, generation: Option<&str>,
 ) -> duduclaw_core::error::Result<i64> {
+    // Resolve queued host notices after tool effect scopes have ended, before
+    // persistence. The ticket stays in its notice cell; only fixed text is saved.
+    let notice = crate::google_authorization_requests::turn::NOTICE.try_with(Clone::clone).ok();
+    let history = if let Some(notice) = notice {
+        crate::google_authorization_requests::turn::flush(&notice).await;
+        let history = notice.lock().ok().and_then(|notice| notice.text.as_ref().filter(|text|
+            crate::google_authorization_requests::render::ticket_url(text).is_some())
+            .map(|_| crate::google_authorization_requests::render::history_text(text)));
+        history
+    } else { None };
+    let text = history.as_deref().unwrap_or(text);
     let pending = WEBCHAT_TURN_DELIVERY.try_with(|_| ()).is_ok();
     let result = sessions
         .append_delivery_message_in(sid, "assistant", text, tokens, None, pending, generation)
@@ -92,6 +103,8 @@ pub(super) async fn append_turn_assistant(
 
 /// Per-turn record of everything that must not outlive a refused CCR delivery.
 pub(crate) struct CcrTurnDelivery {
+    /// Sensitive capabilities are kept out of the raw/output pipeline entirely.
+    sensitive_notice: std::sync::Mutex<Option<SensitiveDelivery>>,
     /// `(session_id, row id)` of the assistant message already persisted by
     /// `build_reply_with_session_inner`.
     pub(super) assistant_message: std::sync::Mutex<Option<(String, i64)>>,
@@ -139,6 +152,7 @@ tokio::task_local! {
 impl Default for CcrTurnDelivery {
     fn default() -> Self {
         Self {
+            sensitive_notice: Default::default(),
             assistant_message: Default::default(),
             waiters: Default::default(),
             settled: Default::default(),
@@ -152,6 +166,18 @@ impl Default for CcrTurnDelivery {
             published: Default::default(),
         }
     }
+}
+
+/// Deliberately neither serializable nor Debug: transport-only capability.
+pub(super) enum SensitiveDelivery {
+    GoogleAuthorizationLink(String),
+}
+
+pub(super) fn mark_authorization_link(text: String) {
+    let _ = CCR_TURN_DELIVERY.try_with(|delivery| {
+        *delivery.sensitive_notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(SensitiveDelivery::GoogleAuthorizationLink(text));
+    });
 }
 
 /// Keep the session FIFO occupied until cancellation's spawned row revocations
@@ -180,6 +206,10 @@ pub(crate) async fn with_delivery_cleanup<F: std::future::Future>(future: F) -> 
 }
 
 impl CcrTurnDelivery {
+    pub(super) fn take_sensitive_notice(&self) -> Option<SensitiveDelivery> {
+        self.sensitive_notice.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
+    }
+
     pub(super) fn waits_for_turn_delivery(&self) -> bool {
         self.cleanup.is_some()
     }
@@ -417,9 +447,11 @@ impl TurnRollback {
 /// never run on a tokio worker thread. Any recheck that loses the lease also
 /// rolls the turn back — adapters do not have to do anything beyond the
 /// `still_valid` call they already make.
-#[derive(Debug)]
 pub struct GuardedReply {
     pub text: String,
+    /// Present only for sensitive delivery: the output pipeline's ticket-free
+    /// text. Every durable fallback must use this instead of transport text.
+    history_text: Option<String>,
     pub artifact: Option<serde_json::Value>,
     /// The employee that answered (absent when the turn never resolved one,
     /// e.g. a refused delivery).
@@ -436,6 +468,20 @@ pub struct GuardedReply {
     /// conversion that withholds the answer). Latches: once the turn is known
     /// not to have been delivered, no later check may report otherwise.
     pub(super) revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl std::fmt::Debug for GuardedReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GuardedReply")
+            .field("text", &self.history_text.as_deref().unwrap_or(&self.text))
+            .field("artifact", &self.artifact)
+            .field("answered_by", &self.answered_by)
+            .field("citations", &self.citations)
+            .field("guards", &self.guards)
+            .field("refused", &self.refused)
+            .field("rollback", &self.rollback)
+            .field("revoked", &self.revoked).finish()
+    }
 }
 
 /// Read-only source fence for the socket writer; refusal latches on the owning reply.
@@ -516,6 +562,7 @@ impl GuardedReply {
     ) -> Self {
         let reply = Self {
             text,
+            history_text: None,
             artifact,
             answered_by: None,
             citations: Vec::new(),
@@ -537,6 +584,15 @@ impl GuardedReply {
         Self::refused()
     }
 
+    pub(super) fn with_sensitive_delivery(mut self, notice: Option<SensitiveDelivery>) -> Self {
+        if self.refused { return self; }
+        if let Some(SensitiveDelivery::GoogleAuthorizationLink(text)) = notice {
+            let live = format!("{}\n\n{text}", self.text);
+            self.history_text = Some(std::mem::replace(&mut self.text, live));
+        }
+        self
+    }
+
     /// Attach the answering employee.
     pub(super) fn with_answered_by(mut self, who: Option<crate::trigger_route::AnsweredBy>) -> Self {
         self.answered_by = who;
@@ -552,6 +608,7 @@ impl GuardedReply {
     pub(super) fn refused() -> Self {
         Self {
             text: CCR_DELIVERY_REFUSED_TEXT.to_string(),
+            history_text: None,
             artifact: None,
             answered_by: None,
             citations: Vec::new(),
@@ -626,13 +683,15 @@ impl GuardedReply {
 
     /// RM-191: `Ok(true)` when `text` is exactly this turn's live-only fixed
     /// notice and `sid` has no session row yet (a brand-new conversation):
-    /// nothing is staged and publication is live only. `Ok(false)` sends
+    /// nothing is staged and publication is live only. A sensitive delivery
+    /// also takes this path with its separately retained safe history text.
+    /// `Ok(false)` sends
     /// every other case (no marker, other text, an existing conversation)
     /// down the ordinary staging path. A failed lookup refuses.
     async fn live_only_without_session(
         &self, sessions: &SessionManager, sid: &str, text: &str, delivery: &CcrTurnDelivery,
     ) -> Result<bool, ()> {
-        if delivery.live_only_text().as_deref() != Some(text) {
+        if self.history_text.is_none() && delivery.live_only_text().as_deref() != Some(text) {
             return Ok(false);
         }
         match sessions.turn_generation(sid).await {
@@ -664,6 +723,7 @@ impl GuardedReply {
     pub(crate) async fn persist_webchat(
         &self, sessions: &Arc<SessionManager>, sid: &str, text: &str,
     ) -> Result<(), ()> {
+        let text = self.history_text.as_deref().unwrap_or(text);
         if !self.still_valid().await { return Err(()); }
         let Some(rollback) = &self.rollback else {
             self.refuse_delivery();
@@ -789,7 +849,7 @@ impl GuardedReply {
             self.revoked.store(true, Ordering::SeqCst);
             (CCR_LEASE_UNSUPPORTED_TEXT.to_string(), None)
         } else {
-            (std::mem::take(&mut self.text), self.artifact.take())
+            (self.history_text.take().unwrap_or_else(|| std::mem::take(&mut self.text)), self.artifact.take())
         }
     }
 }

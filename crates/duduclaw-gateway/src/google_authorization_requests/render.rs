@@ -1,6 +1,17 @@
 //! Link buttons only open the Dashboard. There is no callback/action payload
 //! that could be mistaken for the member's authorization confirmation.
 use serde_json::{json,Value};
+pub(crate) const HISTORY_NOTICE: &str = "已傳送 Google 授權連結";
+
+pub(crate) fn ticket_url(text:&str) -> Option<&str> {
+    text.lines().last().filter(|line| line.split_once("#ticket=")
+        .is_some_and(|(_,ticket)|ticket.len()==64 && ticket.bytes().all(|b|b.is_ascii_hexdigit())))
+}
+
+pub(crate) fn history_text(text:&str) -> String {
+    if text.is_empty() { HISTORY_NOTICE.into() } else { format!("{text}\n\n{HISTORY_NOTICE}") }
+}
+
 pub(crate) fn markup(channel:&str,url:&str) -> Option<Value> {
     let label="開啟 Google 授權";
     match channel {

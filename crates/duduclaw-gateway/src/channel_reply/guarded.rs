@@ -392,18 +392,19 @@ pub(super) async fn attach_turn_rollback(
     delivery: Arc<CcrTurnDelivery>,
     ctx: &ReplyContext,
 ) -> GuardedReply {
+    let sensitive = delivery.take_sensitive_notice();
     if !delivery.waits_for_turn_delivery() && guards
         .iter()
         .all(duduclaw_llm::CcrDeliveryGuards::is_empty)
     {
         delivery.settle(&ctx.session_manager, true).await;
-        return GuardedReply::new(text, artifact, guards, None).await;
+        return GuardedReply::new(text, artifact, guards, None).await.with_sensitive_delivery(sensitive);
     }
     let rollback = TurnRollback {
         delivery,
         session_mgr: ctx.session_manager.clone(),
     };
-    GuardedReply::new(text, artifact, guards, Some(rollback)).await
+    GuardedReply::new(text, artifact, guards, Some(rollback)).await.with_sensitive_delivery(sensitive)
 }
 
 /// Build a session reply and retain its source leases through channel send.

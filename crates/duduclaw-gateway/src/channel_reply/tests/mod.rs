@@ -14,5 +14,6 @@ mod operator_direct_api;
 mod progress;
 mod prompt_and_sender;
 mod rotation;
+mod sensitive_authorization;
 
 pub(crate) mod compression_after_cancel;

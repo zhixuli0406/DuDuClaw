@@ -117,6 +117,10 @@ impl Store {
         let changed = self.conn.execute("UPDATE requests SET status=?3 WHERE id=?1 AND status=?2 AND expires>?4",params![id,from,to,chrono::Utc::now().timestamp()]).map_err(unavailable)?;
         if changed!=1 { return Err(REFUSED.into()); } Ok(())
     }
+    pub fn stop_claimed(&self, id: &str) -> Result<(),String> {
+        let changed=self.conn.execute("UPDATE requests SET status='stopped' WHERE id=?1 AND status='claimed'",[id]).map_err(unavailable)?;
+        if changed!=1 { return Err(REFUSED.into()); } Ok(())
+    }
     pub fn statuses(&self,user:&str) -> Result<Vec<serde_json::Value>,String> {
         let mut stmt=self.conn.prepare("SELECT id,payload,status,expires FROM requests WHERE user_id=?1 ORDER BY expires DESC LIMIT 20").map_err(unavailable)?;
         let rows=stmt.query_map([user],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).map_err(unavailable)?;
