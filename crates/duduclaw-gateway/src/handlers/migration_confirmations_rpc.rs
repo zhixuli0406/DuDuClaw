@@ -45,7 +45,12 @@ impl MethodHandler {
         let runtime = tokio::runtime::Handle::current();
         let live=Arc::new(LiveAuthority {registry:self.registry.clone(),context:ctx.clone(),handle:runtime.clone(),scheduler:self.cron_scheduler.read().await.clone()});
         // F6fb item 8: an adoption card enforces the licence cap at approval and apply.
+        // effective_agent_cap uses 0 when the license runtime is absent. That
+        // fallback must not authorize a migration to consume additional seats.
+        let user_cap_available = self.resolve_edition_profile().await.is_personal()
+            || crate::license_runtime::global().is_some();
         let agent_cap = self.effective_agent_cap().await;
+        let user_agent_cap = user_cap_available.then_some(agent_cap);
         // F6g: set when an apply committed an adoption (its tree is now under agents/).
         let adopted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let adopted_flag = adopted.clone();
@@ -140,7 +145,7 @@ impl MethodHandler {
                 let readback = Arc::new(GatewayAccountReadback::new(home.clone(), runtime));
                 let employee_backend = Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
                     .with_step_up(Some(proof.verified_at)));
-                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
+                let authority = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
                 let fingerprint = authority.rotate_secret(&item, &input.new_value).map_err(|_| "憑證更新尚未確認，請重新載入後用相同新值重試。")?;
                 store.record_rotation(&input.binding, "credential", fingerprint, &authority)
                     .map_err(|_| "憑證更新尚未確認，請重新載入後重試。")?;
@@ -161,9 +166,9 @@ impl MethodHandler {
             let employee_backend = super::migration_authority::retire::production_backend(home.clone(),
                 Arc::new(EmployeeAuthority::new(home.clone(), live.clone()).with_agent_cap(agent_cap)
                     .with_step_up(Some(proof.verified_at))), &user, Some(proof.verified_at));
-            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
+            let validator = GatewayAuthority::new(home.clone()).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback.clone()).with_live(live.clone()).with_backend(employee_backend.clone());
             let adopt_home = home.clone();
-            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
+            let mut applier = GatewayAuthority::new(home).map_err(|_| "套用服務尚未就緒。")?.with_agent_cap(user_agent_cap).with_runtime(readback).with_live(live.clone()).with_backend(employee_backend);
             let error = "項目已變更、尚未支援或套用失敗，請重新載入確認目前狀態。";
             match method.as_str() {
                 "migration.confirmations.approve" => {

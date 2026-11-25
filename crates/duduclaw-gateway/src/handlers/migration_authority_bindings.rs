@@ -23,9 +23,12 @@ impl BindingPlan {
     pub(super) fn check_absent(&self,home:&Path)->Result<()>{
         if db(home)?.get_user_agents(&self.user_id).map_err(|_|Error::Storage)?.iter().any(|b|b.agent_name==self.agent){return Err(Error::Stale);}Ok(())
     }
-    pub(super) fn publish(&self,home:&Path)->Result<()>{
+    pub(super) fn publish(&self,home:&Path,cap:Option<usize>)->Result<()>{
         confirmed_employee(home,&self.agent)?;
-        db(home)?.migration_bind_shared(&self.operation,&self.digest,&self.user_id,&self.agent,self.access).map_err(|_|Error::Apply)
+        user_seat_write(home, cap, |db, limit| {
+            db.migration_bind_shared_under(&self.operation, &self.digest, &self.user_id, &self.agent, self.access, limit)
+                .map_err(|_| Error::Apply)
+        })
     }
     pub(super) fn read_back(&self,home:&Path)->Result<()>{
         confirmed_employee(home,&self.agent)?;
@@ -33,8 +36,10 @@ impl BindingPlan {
         let binding=db.migration_binding_readback(&self.operation,&self.digest).map_err(|_|Error::Apply)?;
         if user.email!=self.email || binding.user_id!=self.user_id || binding.agent_name!=self.agent || binding.access_level!=self.access {return Err(Error::Apply);}Ok(())
     }
-    pub(super) fn disable(&self,home:&Path)->Result<()>{
-        db(home)?.migration_binding_disable(&self.operation,&self.digest).map_err(|_|Error::Compensation)
+    pub(super) fn disable(&self,home:&Path,cap:Option<usize>)->Result<()>{
+        user_seat_write(home, cap, |db, limit| {
+            db.migration_binding_disable_under(&self.operation, &self.digest, limit).map_err(|_| Error::Compensation)
+        })
     }
 }
 
