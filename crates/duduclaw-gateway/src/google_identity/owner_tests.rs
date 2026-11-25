@@ -2,6 +2,52 @@ use super::{owner_test_support::{Fixture, AGENT}, *};
 use serde_json::json;
 use duduclaw_core::authority_coordinator::AuthorityCoordinator;
 
+#[tokio::test]
+async fn notification_db_opens_preserve_pending_and_approval_waiting_owner_calls() {
+    for require_approval in [false, true] {
+        let f = Fixture::new();
+        if require_approval {
+            let _write = AuthorityCoordinator::new(f.home.path()).write().unwrap();
+            let path = f.home.path().join("agents").join(AGENT).join("agent.toml");
+            let mut config = std::fs::read_to_string(&path).unwrap();
+            config.push_str("\n[capabilities]\napproval_required_tools=['google_status']\n");
+            std::fs::write(path, config).unwrap();
+        }
+        // google_status exercises real prepare/execute validation without
+        // requiring a provider or credentials. The probe forbids network work.
+        let probe = route_test_probe::Guard::install(f.home.path());
+        let before = f.snapshot();
+        let mut request = json!({"kind":"employee_prepare", "tool":"google_status",
+            "arguments":{}, "turn_id":f.turn, "call_id":"notification-open"});
+        let body = serde_json::to_vec(&request).unwrap();
+        let (status, prepared) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+        assert_eq!(status, 200, "{prepared}");
+        let digest = prepared["result"]["approval_binding_digest"].clone();
+        assert!(digest.is_string());
+        let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+        let approval = if require_approval {
+            Some(broker.request(AGENT, "mcp_call", "owner notification fixture",
+                json!({"arguments":request["arguments"], "google_owner_binding":digest}), 300).await.unwrap())
+        } else { None };
+
+        drop(crate::decision_notify::open_user_db(f.home.path()).unwrap().unwrap());
+        assert!(crate::decision_notify::approver_links(f.home.path()).is_empty());
+        // approval_notify also uses the constructor directly.
+        drop(duduclaw_auth::UserDb::new(&f.home.path().join("users.db")).unwrap());
+        assert_eq!(before.epoch, AuthorityCoordinator::new(f.home.path()).epoch().unwrap());
+        drop(before.lease(f.home.path(), AGENT).await.unwrap());
+        if let Some(approval) = approval {
+            broker.decide(&approval, true, "fixture-admin").await.unwrap();
+        }
+        request["kind"] = json!("employee");
+        request["approval_binding_digest"] = digest;
+        let body = serde_json::to_vec(&request).unwrap();
+        let (status, result) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+        assert_eq!(status, 200, "approval={require_approval}: {result}");
+        assert_eq!(probe.counts(), [0, 0]);
+    }
+}
+
 #[test]
 fn owner_aba_and_revoke_reauth_never_restore_a_snapshot() {
     let f = Fixture::new();

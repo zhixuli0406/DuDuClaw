@@ -198,6 +198,22 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     Ok(())
 }
 
+pub(crate) fn migration_needed(conn: &Connection) -> Result<bool, String> {
+    for (kind, name) in [
+        ("table", "google_employee_incarnations"),
+        ("table", "google_delegate_attestations"),
+        ("trigger", "google_attestation_owner_insert"),
+        ("trigger", "google_attestation_owner_update"),
+        ("trigger", "google_attestation_owner_delete"),
+    ] {
+        if !crate::authority_migrations::schema_object_exists(conn, kind, name)? { return Ok(true); }
+    }
+    for column in ["employee_id", "employee_incarnation", "employee_nonce"] {
+        if !crate::user_row::has_column(conn, "google_delegate_attestations", column)? { return Ok(true); }
+    }
+    Ok(false)
+}
+
 fn audit(conn: &Connection, actor: Option<&str>, action: &str, agent: &str, detail: &serde_json::Value, now: &str)
     -> Result<(), String> {
     conn.execute(

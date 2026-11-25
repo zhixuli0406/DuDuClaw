@@ -47,6 +47,14 @@ impl AuthorityCoordinator {
             .map_err(|e| e.to_string())).as_ref().cloned().map_err(|e| io::Error::other(e.clone()))
     }
     /// Call on the blocking pool when used by an async handler.
+    ///
+    /// Acquiring this lease immediately and durably retires pending authority,
+    /// even if the later write fails or rolls back. It is not a read/init lock:
+    /// perform read-only migration/no-op checks BEFORE calling, recheck under
+    /// the lease, then begin SQLite and hold the lease through commit/rollback.
+    /// Publishing only after commit is unsafe without a recovery protocol:
+    /// SQLite/file commit could succeed but durable epoch publication fail.
+    /// Keeping publication first also covers writers spanning multiple stores.
     pub fn write(&self) -> io::Result<WriteLease> {
         let namespace = self.namespace()?;
         let intent = namespace.file(INTENT)?;

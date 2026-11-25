@@ -38,7 +38,26 @@ impl FirstFactor {
     }
 }
 
-pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
+pub(crate) fn migrate(db: &UserDb, conn: &Connection, enforced: bool) -> Result<()> {
+    db.migrate_google_authority_if_needed(conn, credential_migration_needed, |conn| {
+        if !crate::user_row::has_column(conn, "users", "credential_epoch")? {
+            conn.execute_batch("ALTER TABLE users ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT 0;")
+                .map_err(|e| e.to_string())?;
+        }
+        if crate::authority_migrations::schema_object_exists(conn, "table", "mfa_credentials")? {
+            conn.execute_batch("UPDATE users SET credential_epoch=1 WHERE credential_epoch=0
+                AND EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=users.id);")
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    })?;
+    db.migrate_google_authority_if_needed(conn, |conn| {
+        Ok(crate::authority_migrations::schema_object_exists(conn, "table", "mfa_enrollment_codes")?
+            && !crate::user_row::has_column(conn, "mfa_enrollment_codes", "challenge")?)
+    }, |conn| {
+        conn.execute_batch("ALTER TABLE mfa_enrollment_codes ADD COLUMN challenge TEXT;
+            DELETE FROM mfa_enrollment_codes;").map_err(|e| e.to_string())
+    })?;
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .map_err(|e| e.to_string())?;
     let conn = &*tx;
@@ -46,10 +65,6 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE lower(name)='mfa_policy_state')",
         [], |r| r.get(0),
     ).map_err(|e| e.to_string())?;
-    if !crate::user_row::has_column(conn, "users", "credential_epoch")? {
-        conn.execute_batch("ALTER TABLE users ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT 0;")
-            .map_err(|e| e.to_string())?;
-    }
     if !crate::user_row::has_column(conn, "channel_identities", "verified_at")? {
         conn.execute_batch("ALTER TABLE channel_identities ADD COLUMN verified_at INTEGER;")
             .map_err(|e| e.to_string())?;
@@ -74,15 +89,13 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
         token_hash TEXT PRIMARY KEY, session TEXT, code_hash TEXT, kind TEXT NOT NULL,
         verified INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS mfa_enrollment_codes (
-        user_id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL);
+        user_id TEXT PRIMARY KEY, code_hash TEXT NOT NULL, expires_at INTEGER NOT NULL, challenge TEXT);
         CREATE TABLE IF NOT EXISTS migration_dashboard_proofs (
         user_id TEXT NOT NULL, session_hash TEXT NOT NULL, epoch INTEGER NOT NULL,
         verified_at INTEGER NOT NULL, csrf BLOB NOT NULL,
         PRIMARY KEY(user_id,session_hash));
         CREATE TABLE IF NOT EXISTS migration_step_up_attempts (
         user_id TEXT PRIMARY KEY, window INTEGER NOT NULL, attempts INTEGER NOT NULL);
-        UPDATE users SET credential_epoch=1 WHERE credential_epoch=0
-            AND EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=users.id);
         CREATE TRIGGER IF NOT EXISTS mfa_password_epoch AFTER UPDATE OF password_hash ON users
         WHEN OLD.password_hash != NEW.password_hash
         BEGIN
@@ -93,10 +106,6 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
         END;",
     )
     .map_err(|e| e.to_string())?;
-    if !crate::user_row::has_column(conn, "mfa_enrollment_codes", "challenge")? {
-        conn.execute_batch("ALTER TABLE mfa_enrollment_codes ADD COLUMN challenge TEXT;
-            DELETE FROM mfa_enrollment_codes;") .map_err(|e|e.to_string())?;
-    }
     // Released v1.79.0-v1.79.2 created this table without seeding it.
     // Only migration may initialize that legacy empty state; readers stay strict.
     if !policy_exists {
@@ -116,6 +125,17 @@ pub(crate) fn migrate(conn: &Connection, enforced: bool) -> Result<()> {
     reset_outbox::migrate(conn)?;
     read_enforcement(conn)?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+// Read-only preflight; missing schema is distinct from an unreadable store.
+fn credential_migration_needed(conn: &Connection) -> Result<bool> {
+    if !crate::user_row::has_column(conn, "users", "credential_epoch")? { return Ok(true); }
+    if !crate::authority_migrations::schema_object_exists(conn, "table", "mfa_credentials")? {
+        return Ok(false);
+    }
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE credential_epoch=0
+        AND EXISTS(SELECT 1 FROM mfa_credentials WHERE user_id=users.id))", [], |r| r.get(0))
+        .map_err(|e| e.to_string())
 }
 
 // Read under the same immediate transaction as the credential mutation.

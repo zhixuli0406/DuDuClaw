@@ -21,7 +21,7 @@ pub struct Device {
     pub ip: Option<String>,
 }
 
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(db: &UserDb, conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS remembered_policy_state (
         id INTEGER PRIMARY KEY CHECK(id=1), days INTEGER NOT NULL CHECK(days BETWEEN 1 AND 365));
         INSERT OR IGNORE INTO remembered_policy_state(id,days) VALUES(1,180);
@@ -49,11 +49,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         BEGIN UPDATE remembered_families SET revoked=1 WHERE user_id=OLD.id; END;")
         .map_err(|e| e.to_string())?;
     // Unreleased prototype rows cannot authenticate generation credentials.
-    if !crate::user_row::has_column(conn, "remembered_families", "generation")? {
-        conn.execute_batch("ALTER TABLE remembered_families ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+    db.migrate_google_authority_if_needed(conn,
+        |conn| Ok(!crate::user_row::has_column(conn, "remembered_families", "generation")?),
+        |conn| conn.execute_batch("ALTER TABLE remembered_families ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
             UPDATE remembered_families SET revoked=1;
-            DELETE FROM remembered_tokens;").map_err(|e|e.to_string())?;
-    }
+            DELETE FROM remembered_tokens;").map_err(|e| e.to_string()),
+    )?;
     // Final delivery holds an ACL-generation lease. Device revocation must
     // invalidate that lease too, including logout and refresh-reuse detection.
     conn.execute_batch("CREATE TRIGGER IF NOT EXISTS remembered_delivery_change

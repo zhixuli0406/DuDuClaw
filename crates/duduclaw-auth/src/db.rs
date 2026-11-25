@@ -257,7 +257,6 @@ impl UserDb {
     }
 
     fn init_tables(&self, enforced: bool) -> Result<(), String> {
-        let _authority = self.google_authority_write()?;
         let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
@@ -355,9 +354,10 @@ impl UserDb {
             attempts INTEGER NOT NULL
         );").map_err(|e| format!("setup rate table failed: {e}"))?;
 
-        crate::google_identity::migrate(&conn)?;
-        crate::mfa::migrate(&conn, enforced)?;
-        crate::remembered_sessions::migrate(&conn)?;
+        self.migrate_google_authority_if_needed(&conn, crate::google_identity::migration_needed,
+            crate::google_identity::migrate)?;
+        crate::mfa::migrate(self, &conn, enforced)?;
+        crate::remembered_sessions::migrate(self, &conn)?;
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
@@ -427,7 +427,8 @@ impl UserDb {
         // SR5 item 4: every address an account ever held (trigger-written).
         crate::account_email_history::migrate(&conn)?;
         // SR4 item 1: Admin attestations of Google delegate subjects.
-        crate::google_delegate_attestation::migrate(&conn)?;
+        self.migrate_google_authority_if_needed(&conn, crate::google_delegate_attestation::migration_needed,
+            crate::google_delegate_attestation::migrate)?;
         // RM-135: first-Admin setup codes; its triggers read users and every
         // MFA factor table, so it runs after all of them exist.
         crate::mfa::bootstrap::migrate(&conn)?;
