@@ -9,6 +9,20 @@ use crate::user_row::{bump_acl_generation, has_column, load_user};
 use crate::AccessLevel;
 use crate::{User, UserDb, UserRole, UserStatus};
 
+pub(crate) fn migration_needed(conn: &Connection) -> Result<bool, String> {
+    if !has_column(conn, "user_agent_bindings", "is_primary")? { return Ok(true); }
+    for (kind, name) in [
+        ("index", "idx_bindings_primary"),
+        ("trigger", "google_primary_owner_insert"),
+        ("trigger", "google_primary_owner_update"),
+        ("table", "google_identity_consents"),
+    ] {
+        if !crate::authority_migrations::schema_object_exists(conn, kind, name)? { return Ok(true); }
+    }
+    Ok(false)
+}
+
+// Caller owns the authority lease and the immediate migration transaction.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     if !has_column(conn, "user_agent_bindings", "is_primary")? {
         conn.execute("ALTER TABLE user_agent_bindings ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1))", [])

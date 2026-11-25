@@ -2,6 +2,52 @@ use super::{owner_test_support::{Fixture, AGENT}, *};
 use serde_json::json;
 use duduclaw_core::authority_coordinator::AuthorityCoordinator;
 
+#[tokio::test]
+async fn notification_db_opens_preserve_pending_and_approval_waiting_owner_calls() {
+    for require_approval in [false, true] {
+        let f = Fixture::new();
+        if require_approval {
+            let _write = AuthorityCoordinator::new(f.home.path()).write().unwrap();
+            let path = f.home.path().join("agents").join(AGENT).join("agent.toml");
+            let mut config = std::fs::read_to_string(&path).unwrap();
+            config.push_str("\n[capabilities]\napproval_required_tools=['google_status']\n");
+            std::fs::write(path, config).unwrap();
+        }
+        // google_status exercises real prepare/execute validation without
+        // requiring a provider or credentials. The probe forbids network work.
+        let probe = route_test_probe::Guard::install(f.home.path());
+        let before = f.snapshot();
+        let mut request = json!({"kind":"employee_prepare", "tool":"google_status",
+            "arguments":{}, "turn_id":f.turn, "call_id":"notification-open"});
+        let body = serde_json::to_vec(&request).unwrap();
+        let (status, prepared) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+        assert_eq!(status, 200, "{prepared}");
+        let digest = prepared["result"]["approval_binding_digest"].clone();
+        assert!(digest.is_string());
+        let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+        let approval = if require_approval {
+            Some(broker.request(AGENT, "mcp_call", "owner notification fixture",
+                json!({"arguments":request["arguments"], "google_owner_binding":digest}), 300).await.unwrap())
+        } else { None };
+
+        drop(crate::decision_notify::open_user_db(f.home.path()).unwrap().unwrap());
+        assert!(crate::decision_notify::approver_links(f.home.path()).is_empty());
+        // approval_notify also uses the constructor directly.
+        drop(duduclaw_auth::UserDb::new(&f.home.path().join("users.db")).unwrap());
+        assert_eq!(before.epoch, AuthorityCoordinator::new(f.home.path()).epoch().unwrap());
+        drop(before.lease(f.home.path(), AGENT).await.unwrap());
+        if let Some(approval) = approval {
+            broker.decide(&approval, true, "fixture-admin").await.unwrap();
+        }
+        request["kind"] = json!("employee");
+        request["approval_binding_digest"] = digest;
+        let body = serde_json::to_vec(&request).unwrap();
+        let (status, result) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+        assert_eq!(status, 200, "approval={require_approval}: {result}");
+        assert_eq!(probe.counts(), [0, 0]);
+    }
+}
+
 #[test]
 fn owner_aba_and_revoke_reauth_never_restore_a_snapshot() {
     let f = Fixture::new();
@@ -24,6 +70,108 @@ async fn revocation_between_mint_and_send_denies_the_next_lease() {
     let snapshot = f.snapshot();
     f.db.revoke_google_delegate_attestation(AGENT, &f.admin).unwrap();
     assert!(snapshot.lease(f.home.path(), AGENT).await.is_err());
+}
+
+/// Deterministic ordering: prepare and capture authority, commit the real
+/// public writer, then execute the saved call. No sleeps or network access.
+async fn credential_writer_retires_pending_owner_call(writer: &str) {
+    struct UnusedCipher;
+    impl duduclaw_auth::mfa::MfaCipher for UnusedCipher {
+        fn encrypt(&self, _: &str) -> Result<String, String> { panic!("password proof needs no cipher") }
+        fn decrypt(&self, _: &str) -> Result<String, String> { panic!("password proof needs no cipher") }
+    }
+    let f = Fixture::new();
+    let now = chrono::Utc::now().timestamp();
+    // Arrange legacy/invited/bootstrap states before capturing authority.
+    let raw = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    let invite = if writer == "invite_password" {
+        raw.execute("UPDATE users SET password_hash='' WHERE id=?1", [&f.alice]).unwrap();
+        Some(f.db.issue_user_invite(&f.alice, &f.admin).unwrap())
+    } else { None };
+    if writer == "first_run_claim" {
+        raw.execute("UPDATE users SET bootstrap_owner=1,must_change_password=1 WHERE id=?1", [&f.alice]).unwrap();
+    }
+    if matches!(writer, "operator_mfa_reset" | "admin_mfa_reset") {
+        raw.execute("INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'fixture',0)", [&f.alice]).unwrap();
+        assert!(f.db.mfa_active(&f.alice).unwrap());
+    }
+    drop(raw);
+    let reauth = if writer == "admin_mfa_reset" {
+        Some(f.db.mfa_factor_password_challenge(&f.admin, "fixture-password", "owner-race", now).unwrap())
+    } else { None };
+    let probe = route_test_probe::Guard::install(f.home.path());
+    let before = f.snapshot();
+    let mut request = json!({"kind":"employee_prepare", "tool":"gmail_read",
+        "arguments":{"message_id":"m1"}, "turn_id":f.turn, "call_id":writer});
+    let body = serde_json::to_vec(&request).unwrap();
+    let (status, prepared) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+    assert_eq!(status, 200, "{writer}: {prepared}");
+    assert!(prepared["result"]["approval_binding_digest"].is_string());
+    match writer {
+        "self_revoke_all" => f.db.remember_revoke(&f.alice, None).unwrap(),
+        "admin_revoke_all" => {
+            let epoch = f.db.get_user(&f.admin).unwrap().unwrap().credential_epoch;
+            f.db.remember_admin_revoke_all(&f.admin, epoch, &f.alice).unwrap();
+        },
+        "operator_mfa_reset" => f.db.mfa_operator_reset("alice@c.test").unwrap(),
+        "admin_mfa_reset" => {
+            let proof = duduclaw_auth::mfa::AdminResetProof::Password {
+                reauth_token: reauth.as_deref().unwrap(), session: "owner-race",
+            };
+            f.db.mfa_admin_reset_checked(&f.admin, &f.alice, proof, &UnusedCipher, now).unwrap();
+        },
+        "invite_password" => assert_eq!(f.db.consume_user_invite(&invite.unwrap().token,
+            "replacement-password").unwrap().as_deref(), Some(f.alice.as_str())),
+        "first_run_claim" => assert!(f.db.claim_default_admin_with_email(
+            Some("claimed@c.test"), "replacement-password").unwrap()),
+        "user_epoch_only" => {
+            // Defense in depth: an epoch-only mutation must invalidate the
+            // snapshot even without a corresponding global epoch change.
+            rusqlite::Connection::open(f.home.path().join("users.db")).unwrap()
+                .execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&f.alice]).unwrap();
+        },
+        _ => panic!("unknown credential writer"),
+    }
+    assert!(f.db.get_user(&f.alice).unwrap().unwrap().credential_epoch > before.credential_epoch);
+    let epoch = AuthorityCoordinator::new(f.home.path()).epoch().unwrap();
+    if writer == "user_epoch_only" { assert_eq!(before.epoch, epoch); }
+    else { assert_ne!(before.epoch, epoch, "writer must publish under the authority lease"); }
+    assert!(before.lease(f.home.path(), AGENT).await.is_err());
+    request["kind"] = json!("employee");
+    request["approval_binding_digest"] = prepared["result"]["approval_binding_digest"].clone();
+    let body = serde_json::to_vec(&request).unwrap();
+    let (status, result) = f.post(execute::ROUTE, body.clone(), f.signed(&body)).await;
+    assert_eq!(status, 403, "{writer}: {result}");
+    assert_eq!(probe.counts(), [0, 0], "{writer}: pending call must neither mint nor send");
+}
+
+#[tokio::test]
+async fn owner_self_revoke_all_prevents_pending_send() {
+    credential_writer_retires_pending_owner_call("self_revoke_all").await;
+}
+#[tokio::test]
+async fn admin_revoke_all_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("admin_revoke_all").await;
+}
+#[tokio::test]
+async fn operator_mfa_reset_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("operator_mfa_reset").await;
+}
+#[tokio::test]
+async fn admin_mfa_reset_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("admin_mfa_reset").await;
+}
+#[tokio::test]
+async fn invite_password_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("invite_password").await;
+}
+#[tokio::test]
+async fn first_run_email_claim_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("first_run_claim").await;
+}
+#[tokio::test]
+async fn user_credential_epoch_alone_prevents_pending_owner_send() {
+    credential_writer_retires_pending_owner_call("user_epoch_only").await;
 }
 
 #[tokio::test]

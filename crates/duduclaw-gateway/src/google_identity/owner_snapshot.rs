@@ -1,5 +1,5 @@
 //! Immutable employee authority. The single durable epoch conservatively
-//! versions user, credential, attestation and policy mutations together.
+//! versions authority mutations; the user credential epoch is pinned separately.
 use std::path::Path;
 use duduclaw_core::google_identity::{self as gi, Effective};
 use duduclaw_core::authority_coordinator::{AuthorityCoordinator, SharedLease};
@@ -17,7 +17,7 @@ pub(crate) struct OwnerSnapshot {
     pub epoch: String,
     pub policy_digest: String,
     pub user_epoch: String,
-    pub credential_epoch: String,
+    pub credential_epoch: u64,
     pub policy_epoch: String,
 }
 pub(crate) fn changed() -> Refusal {
@@ -47,7 +47,7 @@ impl OwnerSnapshot {
             owner_generation: db.google_primary_owner_generation(agent).map_err(|_| changed())?,
             // The epoch changes for every re-attestation, even in the same clock tick.
             attestation_revision: format!("{}:{}:{}", epoch, attestation.credential_seq, attestation.attested_at),
-            user_epoch: epoch.clone(), credential_epoch: epoch.clone(), policy_epoch: epoch.clone(),
+            user_epoch: epoch.clone(), credential_epoch: owner.credential_epoch, policy_epoch: epoch.clone(),
             epoch,
             policy_digest: gi::google_arguments_digest(&serde_json::json!([config, employee])),
         })

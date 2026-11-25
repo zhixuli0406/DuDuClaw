@@ -56,6 +56,7 @@ impl UserDb {
     /// Epoch invalidation covers ordinary JWTs and already-connected sockets;
     /// remembered revocation is explicit as well as enforced by the trigger.
     pub fn remember_admin_revoke_all(&self, actor: &str, epoch: u64, target: &str) -> Result<()> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let target_user = if target.is_empty() || target.len() > 256 { None }
