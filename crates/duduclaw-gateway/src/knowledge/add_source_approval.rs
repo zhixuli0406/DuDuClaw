@@ -328,15 +328,19 @@ async fn propose_inner(
             super::owner_self_add::attach_users(&conn, &h)?;
             let new = source_input(&h, &data, json!({"auto_import": true}))?;
             let cfg = KnowledgeConfig::from_home(&h);
-            duduclaw_knowledge::sources::add_source_checked(&mut conn, &new, &cfg, |tx| {
+            duduclaw_knowledge::sources::add_source_checked_with_effect(&mut conn, &new, &cfg, |tx| {
                 if super::owner_self_add::human_id(&turn.requester()) != data["verified_requester"].as_str() {
                     return Err(KbError::PermissionDenied);
                 }
                 super::owner_self_add::authorize(tx, &h, &turn, &new)
+            }, |tx, source| {
+                let owner = data["verified_requester"].as_str().ok_or(KbError::PermissionDenied)?;
+                super::owner_self_add_notify::enqueue(tx, source, owner)
             })
         }).await;
         if let Ok(added) = imported {
             remove_sidecar(home, &payload);
+            super::owner_self_add_notify::notify();
             super::worker::notify();
             return Ok(match added {
                 Added::New(source) => {

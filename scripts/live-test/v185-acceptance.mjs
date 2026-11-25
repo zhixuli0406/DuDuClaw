@@ -576,6 +576,7 @@ async function selfAddScenario() {
   await context.admin.call('users.bind_agent', { user_id: owner, agent_name: 'prod-shaped', access_level: 'owner' });
   await context.admin.call('users.set_avatar', { user_id: owner, agent_id: 'prod-shaped' });
   const chat = await openChat();
+  let memberChat;
   try {
     const created = await context.admin.call('knowledge.collections.create', { name: 'Local private collection', slug: 'local-private' });
     const cid = created.collection.id;
@@ -595,13 +596,45 @@ async function selfAddScenario() {
     check(sources.sources?.some(source => source.title === 'Owner pasted source'), 'owner-pasted source was not imported');
     await fixtureTurn(chat, 'claude', { action: 'knowledge', collection: 'local-private', text: other, title: 'Tool-discovered source' }, 'Propose the other source discovered by the local tool.', 'knowledge-fixture');
     const pending = await context.admin.call('knowledge.proposals.list');
-    const card = pending.proposals.find(item => item.collection_id === cid && item.title === 'Tool-discovered source');
-    check(card && card.preview?.includes(other), 'non-pasted content did not create the expected approval card/preview');
+    check(pending.proposals.length === before.proposals.length, 'Owner tool-derived content unexpectedly required approval');
     const finalSources = await context.admin.call('knowledge.sources.list', { collection_id: cid });
-    check(!finalSources.sources.some(source => source.title === 'Tool-discovered source'), 'unapproved source became visible');
+    check(finalSources.sources.some(source => source.title === 'Tool-discovered source'), 'Owner tool-derived source was not imported');
+    await fixtureTurn(chat, 'claude', { action: 'knowledge', collection: 'local-private', text: other, title: 'Tool-discovered source' }, 'Add the same tool result again.', 'knowledge-fixture');
+    // This isolated fixture has no external DM token. Check the durable Owner
+    // notification handoff; real provider delivery is a separate live check.
+    const noticeRows = () => JSON.parse(system('/usr/bin/sqlite3', ['-readonly', '-json',
+      join(context.home, 'knowledge', 'knowledge.db'),
+      'SELECT source_id,owner_id,title,delivered FROM owner_self_add_notices']) || '[]');
+    await until(() => noticeRows().filter(row => finalSources.sources.some(source => source.id === row.source_id)).length === 2,
+      'durable Owner auto-import notifications');
+    const notices = noticeRows().filter(row => finalSources.sources.some(source => source.id === row.source_id));
+    check(notices.length === 2 && new Set(notices.map(row => row.source_id)).size === 2,
+      'duplicate import created duplicate Owner notifications');
+    check(notices.every(row => row.owner_id === owner && !JSON.stringify(row).includes(other)
+      && !JSON.stringify(row).includes(pasted)), 'Owner notice leaked body or targeted another member');
+
+    const password = `Fixture-${randomBytes(24).toString('hex')}!`; secrets.add(password);
+    const member = await context.admin.call('users.create', { email: 'kb-member@acceptance.invalid',
+      display_name: 'Knowledge non-owner', password, role: 'employee' });
+    check(member.user?.id, 'users.create returned no non-owner member');
+    await context.admin.call('users.bind_agent', { user_id: member.user.id, agent_name: 'prod-shaped', access_level: 'operator' });
+    const login = await http('/api/login', { email: 'kb-member@acceptance.invalid', password });
+    secrets.add(login.access_token); secrets.add(login.refresh_token);
+    memberChat = await openChat(login.access_token);
+    const negative = await fixtureTurn(memberChat, 'claude', { action: 'knowledge', collection: 'local-private',
+      text: 'A different member cannot auto-import this source.', title: 'Non-owner source', allow_knowledge_refusal: true },
+      'Add this source to the collection.', 'knowledge-non-owner');
+    const afterMember = await context.admin.call('knowledge.sources.list', { collection_id: cid });
+    const afterMemberCards = await context.admin.call('knowledge.proposals.list');
+    check(!afterMember.sources.some(source => source.title === 'Non-owner source'), 'non-owner turn auto-imported a source');
+    check(negative.knowledge_refused || afterMemberCards.proposals.some(item => item.collection_id === cid && item.title === 'Non-owner source'),
+      'non-owner turn neither refused nor filed an approval card');
+    check(noticeRows().length === notices.length, 'non-owner turn created an auto-import notification');
     artifact('knowledge-self-add.json', { owner_paste_imported: true, owner_paste_no_card: true,
-      other_content_pending: true, card_preview: true, unapproved_content_not_imported: true });
-  } finally { chat.close(); await context.admin.call('users.set_avatar', { user_id: owner, agent_id: null }); }
+      owner_tool_content_imported: true, owner_tool_content_no_card: true, owner_notifications_queued: notices,
+      duplicate_notification_prevented: true, non_owner_not_imported: true,
+      non_owner_refused_or_pending: true, external_owner_dm_delivery_verified: false });
+  } finally { memberChat?.close(); chat.close(); await context.admin.call('users.set_avatar', { user_id: owner, agent_id: null }); }
 }
 
 // A local CLI fixture, invoked only by the real runtime's spawn path. It does
@@ -682,8 +715,16 @@ async function fixtureCLI(runtime, root, binary, args) {
         const data = JSON.parse(toolOK(result, 'tasks_create'));
         observation.mcp_task_created = Boolean(data.task?.id); observation.task_id = data.task?.id;
       } else {
-        toolOK(await mcp.call('knowledge_add_source', { collection: job.collection, text: job.text, title: job.title }), 'knowledge_add_source');
-        observation.knowledge_tool_completed = true;
+        let result;
+        try { result = await mcp.call('knowledge_add_source', { collection: job.collection, text: job.text, title: job.title }); }
+        catch (error) {
+          check(job.allow_knowledge_refusal && error.rpcError, 'knowledge tool transport failed');
+          observation.knowledge_refused = true;
+        }
+        if (result) {
+          if (job.allow_knowledge_refusal && result.isError) observation.knowledge_refused = true;
+          else { toolOK(result, 'knowledge_add_source'); observation.knowledge_tool_completed = true; }
+        }
       }
     } finally { await mcp.close(); }
   }
@@ -785,8 +826,8 @@ async function main() {
     if (selected.has('identity')) for (const runtime of ['claude', 'codex']) await scenario(`identity-${runtime}`, 'real chat spawn, forged identity refusal and post-turn revocation', () => identityScenario(runtime));
     if (selected.has('wiki')) await scenario('wiki', 'MCP normal I/O, traversal, absolute path, directory/control symlink refusals', wikiScenario);
     if (selected.has('self-add')) {
-      await scenario('self-add', 'owner-pasted source imported, other content creates a local approval card', selfAddScenario);
-      report('SKIP', 'self-add-delivery', 'verified Telegram/Google Chat private-message card delivery requires a real external channel; local dashboard card is checked');
+      await scenario('self-add', 'Owner-turn pasted/tool content imports with durable Owner notices; non-owner turn cannot auto-import', selfAddScenario);
+      report('SKIP', 'self-add-delivery', 'Owner auto-import notice persistence/dedup and non-owner refusal/card are checked locally; actual verified DM delivery requires a real external channel');
     }
     if (selected.has('member-key')) await scenario('member-key', 'RPC key creation, member contract, chat authentication, revoke and reconnect refusal', memberKeyScenario);
   } catch (error) { report('FAIL', 'setup', 'isolated harness prerequisites/startup', error.message); }

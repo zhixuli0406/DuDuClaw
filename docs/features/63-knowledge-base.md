@@ -206,7 +206,11 @@ AI employees use `knowledge_add_source` with a file in their own `attachments/`,
 
 By default, every proposal requires approval. An administrator can enable **System → Security → Allow owners to enable AI self-add** (`[knowledge] owner_self_add = true`). The collection's actual Owner must then enable **Let my AI add without approval** in its settings. An administrator who is not that collection's Owner cannot set this opt-in. Both switches default to off.
 
-Only files, URLs, or text personally provided by the Owner in the same message can be added without approval; content the AI finds on web pages or in other tool results still requires approval.
+During the verified Owner's own turn, their assigned AI can add to its own opted-in collection without approval, regardless of content source: pasted text, URLs, current or earlier attachments, tool output, or an AI-written summary. Text must be nonempty; there is no eight-character minimum. System runs, delegated work and other members' turns do not qualify.
+
+Each new automatic import durably queues one Owner notification containing only the title and source reference, without document content or preview. Delivery retries to the Owner's verified DM; repeated submissions of the same source do not create another notification. Without a reachable verified DM, the notice remains pending.
+
+Known risk: enabling this option accepts a medium risk that content fetched during the Owner's turn, such as a web page, can steer the AI into adding material without an approval card. Owners can turn the collection switch off.
 
 Automatic import is limited to a collection whose complete ACL contains exactly one human Owner and that member's assigned avatar AI, with no additional user, AI, department or channel. The calling AI must be that avatar and the verified current requester must be the Owner. The source transaction rechecks these conditions, the active avatar assignment and both switches. A shared collection, changed ownership, unknown identity, read error, or the limit of **10 auto-imports per collection per rolling hour** falls back to an approval card. Existing proposal caps and source quotas still apply. URL imports use the same SSRF validation and DNS-pinned fetcher, now queued immediately without waiting for approval. The audit stores the AI, Owner, collection and source title, not the content.
 

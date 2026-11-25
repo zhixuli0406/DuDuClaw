@@ -205,6 +205,18 @@ pub fn add_source_checked(
     cfg: &KnowledgeConfig,
     authorize: impl FnOnce(&rusqlite::Transaction<'_>) -> KbResult<()>,
 ) -> KbResult<Added> {
+    add_source_checked_with_effect(conn, new, cfg, authorize, |_, _| Ok(()))
+}
+
+/// Like `add_source_checked`, with an atomic outbox/effect for NEW sources only.
+/// A failed effect rolls back the source, ingest job and authorization writes.
+pub fn add_source_checked_with_effect(
+    conn: &mut Connection,
+    new: &NewSource,
+    cfg: &KnowledgeConfig,
+    authorize: impl FnOnce(&rusqlite::Transaction<'_>) -> KbResult<()>,
+    effect: impl FnOnce(&rusqlite::Transaction<'_>, &Source) -> KbResult<()>,
+) -> KbResult<Added> {
     if new.bytes > cfg.max_source_bytes {
         return Err(KbError::Rejected {
             code: "too_large",
@@ -293,6 +305,7 @@ pub fn add_source_checked(
     // auto-import must never file an approval after a committed insert merely
     // because loading the response failed.
     let source = get_source(&tx, &id)?.ok_or(KbError::PermissionDenied)?;
+    effect(&tx, &source)?;
     tx.commit()?;
     Ok(Added::New(source))
 }

@@ -40,6 +40,7 @@
 pub mod add_source_approval;
 pub mod add_source_guard;
 pub(crate) mod owner_self_add;
+pub(crate) mod owner_self_add_notify;
 pub(crate) mod add_source_chat;
 pub mod agent_binding;
 pub mod agent_own;

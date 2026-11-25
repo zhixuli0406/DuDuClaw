@@ -5,10 +5,8 @@ use duduclaw_knowledge::{KbError, KbResult};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use rusqlite::{Connection, Transaction, params};
 use duduclaw_knowledge::sources::{NewSource, SourceKind};
-use unicode_normalization::UnicodeNormalization;
 
 pub const HOURLY_CAP: i64 = 10;
-const MIN_VERBATIM_TEXT_CHARS: usize = 8;
 
 #[derive(Clone)]
 pub(crate) struct Turn {
@@ -60,48 +58,27 @@ fn exact_shape(conn: &Connection, cid: &str, uid: &str, agent: &str) -> KbResult
         FROM collection_acl WHERE collection_id=?1", params![cid, uid, agent], |r| r.get(0))?)
 }
 
-fn normalized_text(text: &str) -> String {
-    text.trim().nfc().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Compare the effective source to the gateway's live inbound record, never
-/// the title, preview, tool arguments, or a model-supplied provenance claim.
-fn personally_provided(home: &Path, turn: &Turn, who: &RequesterIdentity, source: &NewSource) -> KbResult<()> {
-    let turn_id = turn.turn_id.as_deref().ok_or(KbError::PermissionDenied)?;
-    let (record_who, inbound) = super::turn_requesters::inbound(&turn.agent, turn_id)
-        .ok_or(KbError::PermissionDenied)?;
-    if &record_who != who { return Err(KbError::PermissionDenied); }
-    let matches = match source.kind {
-        SourceKind::Url => {
-            let url = source.url.as_deref().ok_or(KbError::PermissionDenied)?;
-            let expected = super::url_ingest::validate(url).map_err(|_| KbError::PermissionDenied)?;
-            source.blob_sha256 == duduclaw_knowledge::blob::url_identity(&expected)
-                && inbound.text.split(|c: char| c.is_whitespace()
-                    || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']' | '「' | '」' | '，' | '。'))
-                    .filter(|token| !token.is_empty())
-                    .any(|token| super::url_ingest::validate(token).is_ok_and(|url| url == expected))
+/// Validate the effective bytes/URL, independently of where the AI found it.
+/// Content provenance is not an authorization gate in a live Owner turn.
+fn source_integrity(home: &Path, source: &NewSource) -> KbResult<()> {
+    if source.kind == SourceKind::Url {
+        let url = source.url.as_deref().ok_or(KbError::PermissionDenied)?;
+        let url = super::url_ingest::validate(url).map_err(|_| KbError::PermissionDenied)?;
+        if source.blob_sha256 != duduclaw_knowledge::blob::url_identity(&url) {
+            return Err(KbError::PermissionDenied);
         }
-        SourceKind::File | SourceKind::Attachment => {
-            let bytes = std::fs::read(duduclaw_knowledge::blob::BlobStore::for_home(home)
-                .path_for(&source.blob_sha256)?)?;
-            duduclaw_knowledge::sha256_hex(&bytes) == source.blob_sha256
-                && inbound.attachment_hashes.iter().any(|hash| hash == &source.blob_sha256)
+    } else {
+        let bytes = std::fs::read(duduclaw_knowledge::blob::BlobStore::for_home(home)
+            .path_for(&source.blob_sha256)?)?;
+        if bytes.is_empty() || bytes.len() as u64 != source.bytes
+            || duduclaw_knowledge::sha256_hex(&bytes) != source.blob_sha256 {
+            return Err(KbError::PermissionDenied);
         }
-        SourceKind::Paste => {
-            let bytes = std::fs::read(duduclaw_knowledge::blob::BlobStore::for_home(home)
-                .path_for(&source.blob_sha256)?)?;
-            if duduclaw_knowledge::sha256_hex(&bytes) != source.blob_sha256 {
-                return Err(KbError::PermissionDenied);
-            }
-            let text = std::str::from_utf8(&bytes).map_err(|_| KbError::PermissionDenied)?;
-            let text = normalized_text(text);
-            // Substring containment is intentional here: the owner may wrap
-            // their literal source text in an instruction to add it.
-            text.chars().count() >= MIN_VERBATIM_TEXT_CHARS
-                && normalized_text(&inbound.text).contains(&text)
+        if source.kind == SourceKind::Paste
+            && std::str::from_utf8(&bytes).map_err(|_| KbError::PermissionDenied)?.trim().is_empty() {
+            return Err(KbError::PermissionDenied);
         }
-    };
-    if !matches { return Err(KbError::PermissionDenied); }
+    }
     Ok(())
 }
 
@@ -116,7 +93,7 @@ pub(crate) fn authorize(
     if !cfg.enabled || !cfg.owner_self_add { return Err(KbError::PermissionDenied); }
     let who = turn.requester();
     let uid = human_id(&who).ok_or(KbError::PermissionDenied)?;
-    personally_provided(home, turn, &who, source)?;
+    source_integrity(home, source)?;
     let opted: bool = tx.query_row("SELECT owner_self_add=1 FROM collections WHERE id=?1", [cid], |r| r.get(0))?;
     if !opted || !exact_shape(tx, cid, uid, &turn.agent)? { return Err(KbError::PermissionDenied); }
     let avatar: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM self_add_users.users u

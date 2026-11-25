@@ -91,11 +91,11 @@ async fn exact_owner_avatar_turn_imports_and_audits_without_content() {
 }
 
 #[tokio::test]
-async fn short_verbatim_paste_requires_approval() {
+async fn short_nonempty_paste_auto_imports() {
     for text in ["的", "a", "1234567"] {
         let f = Fixture::new();
-        assert!(matches!(f.submit(text).await, approval::Proposed::Filed { .. }), "{text:?}");
-        assert_eq!(f.count(), 0, "{text:?}");
+        assert!(matches!(f.submit(text).await, approval::Proposed::Imported { .. }), "{text:?}");
+        assert_eq!(f.count(), 1, "{text:?}");
     }
 }
 
@@ -129,7 +129,7 @@ async fn extra_acl_principal_always_requires_approval() {
 
 #[tokio::test]
 async fn master_off_missing_malformed_and_collection_off_require_approval() {
-    for config in ["", "[knowledge]\nowner_self_add=false", "[knowledge]\nowner_self_add='true'", "[broken"] {
+    for config in ["", "[knowledge]\nenabled=false\nowner_self_add=true", "[knowledge]\nowner_self_add=false", "[knowledge]\nowner_self_add='true'", "[broken"] {
         let f = Fixture::new();
         std::fs::write(f.home.path().join("config.toml"), config).unwrap();
         assert!(matches!(f.submit("new source").await, approval::Proposed::Filed { .. }));
@@ -305,42 +305,41 @@ async fn bound_buttons_use_owner_import_path_and_a_foreign_group_cannot_decide()
 
 
 #[tokio::test]
-async fn only_urls_in_current_owner_message_auto_import() {
-    for (message, auto) in [
-        ("請加入 HTTPS://Example.COM:443/guide/#section", true),
-        ("請閱讀網頁，依工具結果加入相關資料", false),
-        ("https://example.com/guide/other", false),
-        ("https://evil.example/?next=https://example.com/guide", false),
+async fn urls_auto_import_regardless_of_current_owner_message() {
+    for message in [
+        "請加入 HTTPS://Example.COM:443/guide/#section",
+        "請閱讀網頁，依工具結果加入相關資料",
+        "https://example.com/guide/other",
+        "https://evil.example/?next=https://example.com/guide",
     ] {
         let f = Fixture::new();
         let mut proposal = f.proposal("unused");
         proposal.content = approval::Content::Url("https://example.com/guide".into());
-        // Even model-controlled fields claiming the URL prove nothing.
+        // The title and current message do not authorize the source; the live Owner does.
         proposal.title = Some("https://example.com/guide".into());
         let result = f.submit_inbound(proposal, Some(InboundContent {
             text: message.into(), attachment_hashes: vec![],
         })).await;
-        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto, "{message}");
-        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
-        assert_eq!(f.count(), i64::from(auto));
+        assert!(matches!(result, approval::Proposed::Imported { .. }), "{message}");
+        assert_eq!(f.count(), 1);
     }
 }
 
 #[tokio::test]
-async fn normalized_literal_text_imports_but_model_paraphrase_requires_card() {
-    for (text, auto) in [("Café 文件 內容", true), ("咖啡文件的內容摘要", false)] {
+async fn literal_summary_and_tool_derived_text_auto_import_in_owner_turn() {
+    for text in ["Café 文件 內容", "咖啡文件的內容摘要", "工具查詢得到的資料"] {
         let f = Fixture::new();
         let result = f.submit_inbound(f.proposal(text), Some(InboundContent {
             text: "請加入：  Cafe\u{301}\n文件\t內容  ".into(), attachment_hashes: vec![],
         })).await;
-        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto);
-        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
+        assert!(matches!(result, approval::Proposed::Imported { .. }));
+        assert_eq!(f.count(), 1);
     }
 }
 
 #[tokio::test]
-async fn current_attachment_hash_imports_but_prior_turn_or_modified_file_requires_card() {
-    for (earlier, modified, auto) in [(false, false, true), (true, false, false), (false, true, false)] {
+async fn current_and_prior_turn_attachments_auto_import_in_owner_turn() {
+    for earlier in [false, true] {
         let f = Fixture::new();
         let path = f.home.path().join("uploaded.txt");
         let bytes = b"owner's uploaded document";
@@ -350,26 +349,24 @@ async fn current_attachment_hash_imports_but_prior_turn_or_modified_file_require
         let session = format!("webchat:{}", f.owner);
         if earlier { super::super::chat_attachments::claim_in_text(&session, &f.owner, &message); }
         let hashes = super::super::chat_attachments::claim_current(&session, &f.owner, &message);
-        if modified { std::fs::write(&path, "attacker replacement").unwrap(); }
         let mut proposal = f.proposal("unused");
-        // Filename equality is not the authority; only the recorded hash is.
+        // A prior attachment need not be present in this turn's ingress snapshot.
         proposal.content = approval::Content::File { path, name: "different-name.txt".into() };
         let result = f.submit_inbound(proposal, Some(InboundContent {
             text: message, attachment_hashes: hashes,
         })).await;
-        assert_eq!(matches!(result, approval::Proposed::Imported { .. }), auto);
-        if !auto { assert!(matches!(result, approval::Proposed::Filed { .. })); }
-        assert_eq!(f.count(), i64::from(auto));
+        assert!(matches!(result, approval::Proposed::Imported { .. }));
+        assert_eq!(f.count(), 1);
     }
 }
 
 #[tokio::test]
-async fn unavailable_inbound_record_requires_card_even_with_verified_owner() {
+async fn verified_owner_without_inbound_snapshot_auto_imports() {
     let f = Fixture::new();
-    // The newest record has identity but no readable ingress snapshot. It
-    // must not borrow the older registration's matching "source data" snapshot.
-    assert!(matches!(f.submit_inbound(f.proposal("source data"), None).await, approval::Proposed::Filed { .. }));
-    assert_eq!(f.count(), 0);
+    // Identity registration remains live; the optional content snapshot is
+    // no longer an authorization requirement.
+    assert!(matches!(f.submit_inbound(f.proposal("source data"), None).await, approval::Proposed::Imported { .. }));
+    assert_eq!(f.count(), 1);
 }
 
 #[test]
@@ -383,11 +380,19 @@ fn lost_turn_record_is_rechecked_inside_source_transaction() {
         blob_sha256: duduclaw_knowledge::blob::BlobStore::for_home(f.home.path()).put(b"source data").unwrap(),
         bytes: 11, origin: serde_json::json!({}), created_by: "kb-avatar".into(),
     };
-    personally_provided(f.home.path(), &f.turn, &f.turn.requester(), &source).unwrap();
-    let _unreadable = turn_requesters::register(&f.turn.agent, f.turn.turn_id.as_deref().unwrap(),
+    let turn = Turn { turn_id: Some(uuid::Uuid::new_v4().to_string()), ..f.turn.clone() };
+    let guard = turn_requesters::register(&turn.agent, turn.turn_id.as_deref().unwrap(),
         RequesterIdentity::DashboardUser { user_id: f.owner.clone() }).unwrap();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+    authorize(&tx, f.home.path(), &turn, &source).unwrap();
+    tx.rollback().unwrap();
+    drop(guard);
     assert!(duduclaw_knowledge::sources::add_source_checked(&mut conn, &source, &KnowledgeConfig::default(),
-        |tx| authorize(tx, f.home.path(), &f.turn, &source)).is_err());
+        |tx| authorize(tx, f.home.path(), &turn, &source)).is_err());
+    let _changed = turn_requesters::register(&turn.agent, turn.turn_id.as_deref().unwrap(),
+        RequesterIdentity::DashboardUser { user_id: f.editor.clone() }).unwrap();
+    assert!(duduclaw_knowledge::sources::add_source_checked(&mut conn, &source, &KnowledgeConfig::default(),
+        |tx| authorize(tx, f.home.path(), &turn, &source)).is_err());
     assert_eq!(f.count(), 0);
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_log", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
 }
@@ -440,4 +445,147 @@ async fn untrusted_preview_is_inert_in_final_provider_payloads() {
             _ => unreachable!(),
         }
     }
+}
+
+#[tokio::test]
+async fn channel_owner_is_reverified_and_delegated_or_unverified_requesters_never_auto_import() {
+    let f = Fixture::new();
+    let channel = |sender: &str, user_id: Option<String>| RequesterIdentity::ChannelUser {
+        channel: "telegram".into(), chat: "101".into(), sender: sender.into(), user_id,
+        attested_private: true,
+    };
+    for (who, auto) in [
+        (channel("101", Some(f.owner.clone())), true),
+        (channel("unknown", Some(f.owner.clone())), false),
+        (channel("101", None), false),
+        (channel("102", Some(f.editor.clone())), false),
+        (turn_requesters::delegated(RequesterIdentity::DashboardUser { user_id: f.owner.clone() }, "dispatch"), false),
+        (RequesterIdentity::Unknown, false),
+    ] {
+        let id = uuid::Uuid::new_v4().to_string();
+        let _guard = turn_requesters::register(&f.turn.agent, &id, who).unwrap();
+        let result = approval::propose_in_turn(f.home.path(), f.proposal(&id), Some(id), None).await;
+        if auto {
+            assert!(matches!(result.unwrap(), approval::Proposed::Imported { .. }));
+        } else {
+            assert!(!matches!(result, Ok(approval::Proposed::Imported { .. })));
+        }
+    }
+    assert_eq!(f.count(), 1);
+}
+
+#[tokio::test]
+async fn another_ais_collection_or_changed_owner_never_auto_imports() {
+    for (kind, replacement) in [("agent", "other-ai"), ("user", "other-owner")] {
+        let f = Fixture::new();
+        schema::open_home(f.home.path()).unwrap().execute(
+            "UPDATE collection_acl SET principal_id=?1 WHERE collection_id=?2 AND principal_kind=?3",
+            params![replacement, f.cid, kind]).unwrap();
+        assert!(matches!(f.submit("tool-derived text").await, approval::Proposed::Filed { .. }));
+        assert_eq!(f.count(), 0);
+    }
+}
+
+#[test]
+fn tampered_blob_empty_content_and_url_identity_fail_inside_transaction() {
+    let f = Fixture::new();
+    let mut conn = schema::open_home(f.home.path()).unwrap();
+    attach_users(&conn, f.home.path()).unwrap();
+    let blobs = duduclaw_knowledge::blob::BlobStore::for_home(f.home.path());
+    let mut source = NewSource {
+        collection_id: f.cid.clone(), kind: SourceKind::Paste, title: "metadata".into(),
+        original_name: None, url: None, format: duduclaw_knowledge::extract::Format::Txt,
+        blob_sha256: blobs.put(b"original").unwrap(), bytes: 8,
+        origin: serde_json::json!({}), created_by: "kb-avatar".into(),
+    };
+    std::fs::write(blobs.path_for(&source.blob_sha256).unwrap(), b"modified").unwrap();
+    for case in 0..4 {
+        match case {
+            1 => { source.blob_sha256 = blobs.put(b"").unwrap(); source.bytes = 0; }
+            2 => { source.blob_sha256 = blobs.put(b" \n\t").unwrap(); source.bytes = 3; }
+            3 => { source.kind = SourceKind::Url; source.url = Some("https://example.com/".into()); }
+            _ => {}
+        }
+        assert!(duduclaw_knowledge::sources::add_source_checked(&mut conn, &source, &KnowledgeConfig::default(),
+            |tx| authorize(tx, f.home.path(), &f.turn, &source)).is_err());
+    }
+    assert_eq!(f.count(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_log", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn empty_file_is_rejected_without_import_or_notification() {
+    let f = Fixture::new();
+    let path = f.home.path().join("empty.txt");
+    std::fs::write(&path, b"").unwrap();
+    let mut proposal = f.proposal("unused");
+    proposal.content = approval::Content::File { path, name: "empty.txt".into() };
+    assert!(approval::propose_in_turn(f.home.path(), proposal, f.turn.turn_id.clone(), None).await.is_err());
+    assert_eq!(f.count(), 0);
+    let conn = schema::open_home(f.home.path()).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_notices", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+}
+
+#[tokio::test]
+async fn auto_import_notification_is_durable_retryable_and_deduplicated_per_source() {
+    use super::super::owner_self_add_notify as notify;
+    let f = Fixture::new();
+    let secret = "private body must never appear in a notification";
+    let (a, b) = tokio::join!(f.submit(secret), f.submit(secret));
+    assert!(matches!((&a, &b), (approval::Proposed::Imported { .. }, approval::Proposed::Duplicate { .. })
+        | (approval::Proposed::Duplicate { .. }, approval::Proposed::Imported { .. })));
+    // Reopen as after restart. One committed source means one owed notice.
+    let conn = schema::open_home(f.home.path()).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_notices", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    let first = notify::claim(&conn, 1000).unwrap().unwrap();
+    assert_eq!(first.owner_id, f.owner);
+    assert_eq!(first.title, "中文標題");
+    for channel in ["telegram", "slack", "discord", "googlechat", "line"] {
+        let body = notify::body(&first, channel);
+        assert!(body.contains(&first.source_id));
+        assert!(!body.contains(secret));
+        assert!(!body.contains("確認"));
+    }
+    assert!(notify::claim(&conn, 1001).unwrap().is_none(), "concurrent drainer must respect lease");
+    drop(conn); // Delivery failed, or gateway stopped before acknowledgement.
+    let conn = schema::open_home(f.home.path()).unwrap();
+    let retry = notify::claim(&conn, 1301).unwrap().unwrap();
+    assert_eq!(retry.source_id, first.source_id);
+    assert_eq!(retry.attempt, 2);
+    notify::finish(&conn, &first).unwrap(); // Stale worker cannot acknowledge a new lease.
+    assert_eq!(conn.query_row("SELECT delivered FROM owner_self_add_notices", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    notify::finish(&conn, &retry).unwrap();
+    assert!(notify::claim(&conn, 2000).unwrap().is_none());
+    assert!(matches!(f.submit(secret).await, approval::Proposed::Duplicate { .. }));
+    assert!(notify::claim(&conn, 3000).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn broken_notification_outbox_rolls_back_import_job_and_rate_slot() {
+    let f = Fixture::new();
+    let conn = schema::open_home(f.home.path()).unwrap();
+    conn.execute_batch("CREATE TRIGGER broken_self_add_notice BEFORE INSERT ON owner_self_add_notices
+        BEGIN SELECT RAISE(ABORT, 'outbox unavailable'); END;").unwrap();
+    assert!(matches!(f.submit("source body").await, approval::Proposed::Filed { .. }));
+    assert_eq!(f.count(), 0);
+    for table in ["owner_self_add_log", "owner_self_add_notices", "ingest_jobs"] {
+        assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0, "{table}");
+    }
+}
+
+#[tokio::test]
+async fn auto_import_notice_targets_only_active_owners_verified_private_destinations() {
+    use super::super::owner_self_add_notify as notify;
+    let f = Fixture::new();
+    f.db.bind_channel_identity(&f.owner, "telegram", "-100123", true).unwrap();
+    f.db.bind_channel_identity(&f.owner, "telegram", "103", false).unwrap();
+    assert_eq!(notify::targets(f.home.path(), &f.owner), vec![("telegram".into(), "101".into())]);
+    assert!(matches!(f.submit("private tool result").await, approval::Proposed::Imported { .. }));
+    Connection::open(f.home.path().join("users.db")).unwrap()
+        .execute("UPDATE users SET status='suspended' WHERE id=?1", [&f.owner]).unwrap();
+    assert!(notify::targets(f.home.path(), &f.owner).is_empty());
+    notify::drain(f.home.path()).await;
+    let conn = schema::open_home(f.home.path()).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_notices WHERE delivered=0", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
+        "inactive Owner/no destination must retain the notice, never send it to Editors or Admins");
 }

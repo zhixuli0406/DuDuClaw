@@ -364,6 +364,27 @@ pub(crate) async fn push_plain_notice(
     text: &str,
     targets: Vec<(String, String)>,
 ) -> Receipt {
+    push_plain_notice_inner(home, notify_type, text, targets, true).await
+}
+
+/// An owning durable outbox handles quiet hours and retries itself. Keep its
+/// private notices there so the current recipient can be reverified on retry.
+pub(crate) async fn push_plain_notice_now(
+    home: &Path,
+    notify_type: &'static str,
+    text: &str,
+    targets: Vec<(String, String)>,
+) -> Receipt {
+    push_plain_notice_inner(home, notify_type, text, targets, false).await
+}
+
+async fn push_plain_notice_inner(
+    home: &Path,
+    notify_type: &'static str,
+    text: &str,
+    targets: Vec<(String, String)>,
+    defer: bool,
+) -> Receipt {
     let mut receipt = Receipt::empty();
     if targets.is_empty() {
         return receipt;
@@ -375,7 +396,7 @@ pub(crate) async fn push_plain_notice(
         tz: crate::notify_governance::NotifyTz::System,
     };
     for (channel, chat_id) in targets {
-        let outcome = if let Some(until) = policy.decide(level, chrono::Utc::now()) {
+        let outcome = if let Some(until) = defer.then(|| policy.decide(level, chrono::Utc::now())).flatten() {
             let queued = crate::notify_governance::enqueue(home, crate::notify_governance::DeferredNotice {
                 id: uuid::Uuid::new_v4().to_string(), agent_id: String::new(),
                 channel: channel.clone(), chat_id: chat_id.clone(),
