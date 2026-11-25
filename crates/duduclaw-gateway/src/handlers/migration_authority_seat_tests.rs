@@ -97,6 +97,10 @@ fn migration_account_effects_take_admission_before_authority_during_concurrent_c
     }
 }
 
+// These employee fixtures use the real receipt/lifecycle stores, whose
+// hardened open_existing is Unix-only. The production allocator is Linux-only;
+// the account admission test above remains cross-platform.
+#[cfg(unix)]
 struct EmployeeSeatBackend {
     home: PathBuf,
     waiting: mpsc::Sender<()>,
@@ -104,6 +108,7 @@ struct EmployeeSeatBackend {
     fail: bool,
     fail_compensation: bool,
 }
+#[cfg(unix)]
 impl MigrationAuthorityBackend for EmployeeSeatBackend {
     fn supports(&self, category: ConfirmationCategory) -> bool { category == ConfirmationCategory::Employee }
     fn validate(&self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
@@ -134,7 +139,9 @@ impl MigrationAuthorityBackend for EmployeeSeatBackend {
     }
 }
 
+#[cfg(unix)]
 struct EmployeeSeedSteps;
+#[cfg(unix)]
 impl ProposalApplier for EmployeeSeedSteps {
     fn stage(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
     fn publish(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
@@ -142,6 +149,7 @@ impl ProposalApplier for EmployeeSeedSteps {
     fn disable_and_read_back(&mut self, _: &ConfirmationItem) -> Result<()> { Ok(()) }
 }
 
+#[cfg(unix)]
 fn employee_contention(action: &str) {
     let applying = matches!(action, "apply" | "publish" | "readback");
     let home = crate::fs_safe::private_test_home().unwrap();
@@ -228,13 +236,17 @@ fn employee_contention(action: &str) {
 }
 
 #[test]
+#[cfg(unix)]
 fn migration_employee_apply_contention() {
     for action in ["apply", "publish", "readback"] { employee_contention(action); }
 }
 #[test]
+#[cfg(unix)]
 fn migration_employee_reject_contention() { employee_contention("reject"); }
 #[test]
+#[cfg(unix)]
 fn migration_employee_failed_compensation_contention() { employee_contention("failed_compensation"); }
 
 #[test]
+#[cfg(unix)]
 fn migration_employee_automatic_compensation_contention() { employee_contention("automatic_compensation"); }

@@ -69,7 +69,13 @@ async fn pty_binding_uses_the_client_pid() {
         ExecutionClass::EmployeeMain, false, Some(binding.clone())).await.unwrap();
     assert_eq!(Some(binding.root().unwrap().pid), child.id());
     assert_ne!(child.id(), Some(std::process::id()));
-    child.input.as_mut().unwrap().write_all(b"exit\n").await.unwrap();
+    // ConPTY translates Enter (CR) into a console line-input event. LF alone
+    // is not Enter there; pipes and Unix PTYs still use their existing LF.
+    #[cfg(windows)]
+    let input = b"exit\r";
+    #[cfg(not(windows))]
+    let input = b"exit\n";
+    child.input.as_mut().unwrap().write_all(input).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
     assert!(binding.root().is_none());
 }
