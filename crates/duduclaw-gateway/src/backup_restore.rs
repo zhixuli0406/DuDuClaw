@@ -352,9 +352,9 @@ fn extract_inner(
             });
         }
 
-        // Match the CLI: volume-dependent DOS aliases must never reach disk.
+        // Match the CLI: generated DOS tilde aliases must never reach disk.
         if cfg!(windows) && raw_path.components().any(|part|
-            duduclaw_core::fs_safety::is_dos_short_name(&part.as_os_str().to_string_lossy())) {
+            duduclaw_core::fs_safety::is_generated_dos_short_alias(&part.as_os_str().to_string_lossy())) {
             return Err(RestoreViolation::UnsafeEntry {
                 path: path_str,
                 reason: "dos_short_name_alias",

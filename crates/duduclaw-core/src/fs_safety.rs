@@ -4,9 +4,10 @@
 use std::io;
 use std::path::Path;
 
-/// Generated DOS 8.3 spellings cannot safely be mapped without the volume.
-/// Archive extractors on Windows refuse these aliases before writing.
-pub fn is_dos_short_name(name: &str) -> bool {
+/// Detect generated DOS 8.3 tilde aliases only.
+/// Arbitrary short names assigned via SetFileShortNameW are out of scope:
+/// assigning them requires an actor who can already write the namespace directly.
+pub fn is_generated_dos_short_alias(name: &str) -> bool {
     let name = name.split(':').next().unwrap_or(name).trim_end_matches(['.', ' ']);
     let (stem, extension) = name.rsplit_once('.').unwrap_or((name, ""));
     stem.chars().count() <= 8 && !stem.contains('.') && extension.chars().count() <= 3
@@ -15,12 +16,12 @@ pub fn is_dos_short_name(name: &str) -> bool {
 }
 
 #[test]
-fn dos_short_name_archive_aliases() {
+fn generated_dos_short_archive_aliases() {
     for name in ["GOOGLE~1", "GOOGL~12.AUT", "GO1234~1", "google~1. ", "GOOGLE~1::$INDEX_ALLOCATION", "CONFIG~1.TOM"] {
-        assert!(is_dos_short_name(name), "{name}");
+        assert!(is_generated_dos_short_alias(name), "{name}");
     }
     for name in [".google-authority", "notes~draft", "GOOGLE~", "~1", "toolong~1", "GOOGLE~1.long"] {
-        assert!(!is_dos_short_name(name), "{name}");
+        assert!(!is_generated_dos_short_alias(name), "{name}");
     }
 }
 
