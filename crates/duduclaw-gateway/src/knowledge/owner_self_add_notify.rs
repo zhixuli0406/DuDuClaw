@@ -1,9 +1,10 @@
 //! Source-keyed notification outbox, committed with each new auto-import.
 //! Started with the lock-holding knowledge worker; drains on wake and every 30 s.
 //! Failures/no verified destination retain the row for retry; a lease prevents
-//! concurrent drainers from sending it together. Sent rows stay for
-//! deduplication. Like the existing push outboxes, provider delivery is at-least-
-//! once across a crash between sending and acknowledging (no provider-wide
+//! concurrent drainers from sending it together. Sent rows and notices whose
+//! source/Owner authorization is gone stay terminal for deduplication, with a
+//! reason for discarded notices. Like the existing push outboxes, delivery is
+//! at-least-once across a crash between sending and acknowledging (no provider-wide
 //! idempotency key exists). No document body or preview is stored here.
 use std::path::Path;
 
@@ -39,6 +40,36 @@ pub(super) fn finish(conn: &Connection, notice: &Notice) -> KbResult<()> {
     Ok(())
 }
 
+fn discard(conn: &Connection, notice: &Notice, reason: &str) -> KbResult<()> {
+    conn.execute("UPDATE owner_self_add_notices SET delivered=1, terminal_reason=?3
+        WHERE source_id=?1 AND attempts=?2", params![notice.source_id, notice.attempt, reason])?;
+    Ok(())
+}
+
+/// Resolve the current source collection, never a collection cached at enqueue.
+fn owner_denial(conn: &Connection, source_id: &str, owner_id: &str) -> KbResult<Option<&'static str>> {
+    // Read the source and its ACL from the same database snapshot.
+    let tx = conn.unchecked_transaction()?;
+    let cid: Option<String> = tx.query_row("SELECT collection_id FROM sources WHERE id=?1",
+        [source_id], |r| r.get(0)).optional()?;
+    let Some(cid) = cid else { return Ok(Some("source_missing")); };
+    if !super::owner_self_add::is_direct_owner(&tx, &cid, owner_id)? {
+        return Ok(Some("recipient_not_owner"));
+    }
+    Ok(None)
+}
+
+async fn delivery_denial(home: &Path, notice: &Notice) -> Option<&'static str> {
+    let (h, source_id, owner_id) = (home.to_path_buf(), notice.source_id.clone(), notice.owner_id.clone());
+    match super::blocking(move || owner_denial(&schema::open_home(&h)?, &source_id, &owner_id)).await {
+        Ok(reason) => reason,
+        Err(e) => {
+            tracing::warn!(error = %e, source_id = %notice.source_id, "knowledge: self-add notice ownership check failed");
+            Some("ownership_check_failed")
+        }
+    }
+}
+
 pub(super) fn body(notice: &Notice, channel: &str) -> String {
     format!("你的 AI 已免核准將「{}」加入知識庫。來源：{}",
         crate::markdown_render::untrusted_preview(channel, &notice.title, 120), notice.source_id)
@@ -57,25 +88,34 @@ pub(super) fn targets(home: &Path, owner_id: &str) -> Vec<(String, String)> {
     targets
 }
 
-async fn deliver(home: &Path, notice: &Notice) -> bool {
+enum Delivery {
+    Sent,
+    Retry,
+    Discard(&'static str),
+}
+
+async fn deliver(home: &Path, notice: &Notice) -> Delivery {
+    if let Some(reason) = delivery_denial(home, notice).await { return Delivery::Discard(reason); }
     let quiet = crate::notify_governance::QuietPolicy {
         window: crate::notify_governance::load_global_window(home),
         tz: crate::notify_governance::NotifyTz::System,
     };
     // Keep quiet-hour notices in this outbox, not the unbound plain queue:
-    // recipient links and active status must be read again at actual delivery.
+    // recipient ownership, links and active status must be read again at delivery.
     if quiet.decide(crate::notify_governance::NotifyLevel::Confirm, chrono::Utc::now()).is_some() {
-        return false;
+        return Delivery::Retry;
     }
     let targets = targets(home, &notice.owner_id);
     // One notice per source, to the first reachable verified Owner DM. Never
     // substitute an Admin, an employee destination, or the originating group.
     for (channel, destination) in targets {
+        // Recheck for each target, including after a previous provider failed.
+        if let Some(reason) = delivery_denial(home, notice).await { return Delivery::Discard(reason); }
         let receipt = crate::notify_push::push_plain_notice_now(home, "knowledge.owner_self_add",
             &body(notice, &channel), vec![(channel, destination)]).await;
-        if receipt.outcome != crate::decision_notify::DeliverOutcome::Failed { return true; }
+        if receipt.outcome != crate::decision_notify::DeliverOutcome::Failed { return Delivery::Sent; }
     }
-    false
+    Delivery::Retry
 }
 
 pub(super) async fn drain(home: &Path) {
@@ -94,12 +134,16 @@ pub(super) async fn drain(home: &Path) {
         };
         // Bound the send below the lease. A failed/aborted attempt remains due
         // after the lease; switching off imports does not discard owed notices.
-        if tokio::time::timeout(std::time::Duration::from_secs(45), deliver(home, &notice))
-            .await.unwrap_or(false) {
-            let h = home.to_path_buf();
-            if let Err(e) = super::blocking(move || finish(&schema::open_home(&h)?, &notice)).await {
-                tracing::warn!(error = %e, "knowledge: self-add notice acknowledgement failed");
-            }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(45), deliver(home, &notice))
+            .await.unwrap_or(Delivery::Retry);
+        let h = home.to_path_buf();
+        let acknowledgement = match result {
+            Delivery::Sent => super::blocking(move || finish(&schema::open_home(&h)?, &notice)).await,
+            Delivery::Discard(reason) => super::blocking(move || discard(&schema::open_home(&h)?, &notice, reason)).await,
+            Delivery::Retry => continue,
+        };
+        if let Err(e) = acknowledgement {
+            tracing::warn!(error = %e, "knowledge: self-add notice acknowledgement failed");
         }
     }
 }
