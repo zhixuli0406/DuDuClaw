@@ -91,6 +91,55 @@ async fn exact_owner_avatar_turn_imports_and_audits_without_content() {
 }
 
 #[tokio::test]
+async fn dispatch_run_cannot_borrow_a_live_owner_turn_for_auto_import() {
+    let f = Fixture::new();
+    let turn_id = f.turn.turn_id.clone().unwrap();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    turn_requesters::remember_turn_origin(&turn_id,
+        RequesterIdentity::DashboardUser { user_id: f.owner.clone() });
+    let _run = duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some(turn_id.clone()), async {
+        turn_requesters::register_run(&f.turn.agent, &run_id, "dispatch")
+    }).await.unwrap();
+    assert_eq!(turn_requesters::lookup(&f.turn.agent, &run_id), Some(RequesterIdentity::System {
+        kind: "dispatch".into(), on_behalf_of: Some(f.owner.clone()),
+    }));
+    let result = approval::propose_in_turn(f.home.path(), f.proposal("delegated source"),
+        Some(turn_id), Some(run_id)).await.unwrap();
+    assert!(matches!(result, approval::Proposed::Filed { .. }));
+    assert_eq!(f.count(), 0);
+    let conn = schema::open_home(f.home.path()).unwrap();
+    for table in ["owner_self_add_log", "owner_self_add_notices", "ingest_jobs"] {
+        assert_eq!(conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0, "{table}");
+    }
+    // The same registered Owner turn remains eligible when called directly.
+    assert!(matches!(f.submit("direct owner source").await, approval::Proposed::Imported { .. }));
+    assert_eq!(f.count(), 1);
+}
+
+#[tokio::test]
+async fn background_runs_with_a_live_owner_turn_always_require_a_card() {
+    let f = Fixture::new();
+    for kind in ["cron", "heartbeat", "sub-agent"] {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let _run = turn_requesters::register_run(&f.turn.agent, &run_id, kind).unwrap();
+        let result = approval::propose_in_turn(f.home.path(), f.proposal(kind),
+            f.turn.turn_id.clone(), Some(run_id.clone())).await.unwrap();
+        assert!(matches!(result, approval::Proposed::Filed { .. }), "{kind}");
+        // A System registration cannot become a direct Owner turn even if
+        // supplied as the turn id without a separate run id.
+        let result = approval::propose_in_turn(f.home.path(), f.proposal(kind),
+            Some(run_id), None).await.unwrap();
+        assert!(matches!(result, approval::Proposed::Filed { .. }), "{kind}");
+    }
+    for run_id in ["unregistered-run", ""] {
+        let result = approval::propose_in_turn(f.home.path(), f.proposal("unknown run"),
+            f.turn.turn_id.clone(), Some(run_id.into())).await.unwrap();
+        assert!(matches!(result, approval::Proposed::Filed { .. }));
+    }
+    assert_eq!(f.count(), 0);
+}
+
+#[tokio::test]
 async fn short_nonempty_paste_auto_imports() {
     for text in ["的", "a", "1234567"] {
         let f = Fixture::new();
@@ -588,4 +637,77 @@ async fn auto_import_notice_targets_only_active_owners_verified_private_destinat
     let conn = schema::open_home(f.home.path()).unwrap();
     assert_eq!(conn.query_row("SELECT COUNT(*) FROM owner_self_add_notices WHERE delivered=0", [], |r| r.get::<_, i64>(0)).unwrap(), 1,
         "inactive Owner/no destination must retain the notice, never send it to Editors or Admins");
+}
+
+#[tokio::test]
+async fn auto_import_notice_is_terminal_when_owner_is_revoked_or_replaced() {
+    use super::super::owner_self_add_notify as notify;
+    for replace in [false, true] {
+        let f = Fixture::new();
+        assert!(matches!(f.submit("private source").await, approval::Proposed::Imported { .. }));
+        let conn = schema::open_home(f.home.path()).unwrap();
+        conn.execute("DELETE FROM collection_acl WHERE collection_id=?1 AND principal_kind='user' AND principal_id=?2",
+            params![f.cid, f.owner]).unwrap();
+        if replace { f.add_grant("user", &f.editor, "owner"); }
+        // The old Owner is still active and has a verified DM destination.
+        assert_eq!(notify::targets(f.home.path(), &f.owner), vec![("telegram".into(), "101".into())]);
+        notify::drain(f.home.path()).await;
+        let row: (i64, i64, String) = conn.query_row(
+            "SELECT delivered, attempts, terminal_reason FROM owner_self_add_notices", [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        assert_eq!(row, (1, 1, "recipient_not_owner".into()));
+        // Restoring ownership must not revive a discarded notice or send it
+        // to either the old or replacement Owner on a later drain.
+        f.add_grant("user", &f.owner, "owner");
+        notify::drain(f.home.path()).await;
+        assert!(notify::claim(&conn, i64::MAX - 300).unwrap().is_none());
+        assert_eq!(conn.query_row("SELECT attempts FROM owner_self_add_notices", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+}
+
+#[tokio::test]
+async fn auto_import_notice_for_a_deleted_source_is_terminal() {
+    use super::super::owner_self_add_notify as notify;
+    let f = Fixture::new();
+    let approval::Proposed::Imported { source_id, .. } = f.submit("deleted private source").await
+        else { panic!("auto-import required") };
+    let conn = schema::open_home(f.home.path()).unwrap();
+    conn.execute("DELETE FROM sources WHERE id=?1", [&source_id]).unwrap();
+    notify::drain(f.home.path()).await;
+    let row: (i64, String) = conn.query_row("SELECT delivered, terminal_reason FROM owner_self_add_notices", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(row, (1, "source_missing".into()));
+    assert!(notify::claim(&conn, i64::MAX - 300).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn auto_import_notice_rechecks_the_sources_current_collection() {
+    use super::super::owner_self_add_notify as notify;
+    let f = Fixture::new();
+    let approval::Proposed::Imported { source_id, .. } = f.submit("moved private source").await
+        else { panic!("auto-import required") };
+    let mut conn = schema::open_home(f.home.path()).unwrap();
+    let other = store::create_collection(&mut conn, &store::NewCollection {
+        name: "Other Owner".into(), ..Default::default()
+    }, &f.editor, &KnowledgeConfig::default()).unwrap();
+    conn.execute("UPDATE sources SET collection_id=?1 WHERE id=?2", params![other.id, source_id]).unwrap();
+    assert!(is_direct_owner(&conn, &f.cid, &f.owner).unwrap());
+    notify::drain(f.home.path()).await;
+    let row: (i64, String) = conn.query_row("SELECT delivered, terminal_reason FROM owner_self_add_notices", [],
+        |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(row, (1, "recipient_not_owner".into()));
+}
+
+#[tokio::test]
+async fn auto_import_notice_acl_read_failure_is_terminal() {
+    use super::super::owner_self_add_notify as notify;
+    let f = Fixture::new();
+    assert!(matches!(f.submit("private source").await, approval::Proposed::Imported { .. }));
+    let conn = schema::open_home(f.home.path()).unwrap();
+    conn.execute("ALTER TABLE collection_acl RENAME COLUMN role TO unreadable_role", []).unwrap();
+    notify::drain(f.home.path()).await;
+    let row: (i64, i64, String) = conn.query_row("SELECT delivered, attempts, terminal_reason FROM owner_self_add_notices", [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    assert_eq!(row, (1, 1, "ownership_check_failed".into()));
+    assert!(notify::claim(&conn, i64::MAX - 300).unwrap().is_none());
 }

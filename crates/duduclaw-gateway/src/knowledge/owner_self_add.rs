@@ -87,6 +87,10 @@ fn source_integrity(home: &Path, source: &NewSource) -> KbResult<()> {
 pub(crate) fn authorize(
     tx: &Transaction<'_>, home: &Path, turn: &Turn, source: &NewSource,
 ) -> KbResult<()> {
+    // A live Owner turn may also be inherited by a dispatched/delegated run.
+    // Turn-first requester resolution is not proof of direct execution: any
+    // run id (including an unregistered one) must use the approval-card path.
+    if turn.run_id.is_some() { return Err(KbError::PermissionDenied); }
     let cid = &source.collection_id;
     let summary = &source.title;
     let cfg = duduclaw_knowledge::limits::KnowledgeConfig::from_home(home);
