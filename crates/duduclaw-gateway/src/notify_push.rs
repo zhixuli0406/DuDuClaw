@@ -435,3 +435,13 @@ pub(crate) async fn push_exact_confirmation(
     target.sender(reqwest::Client::new()).send_text(body).await.ok()?;
     Some((target.context.channel.clone(), target.context.conversation_id.clone()))
 }
+
+/// A gateway-generated consent link uses the original authenticated bot,
+/// conversation and thread. Buttons open a URL; they never confirm consent.
+pub(crate) async fn push_google_authorization_notice(http: reqwest::Client, text: &str) -> bool {
+    let Some(url) = text.lines().last().filter(|line| line.split_once("#ticket=")
+        .is_some_and(|(_,ticket)|ticket.len()==64 && ticket.bytes().all(|b|b.is_ascii_hexdigit()))) else { return false; };
+    let Ok(Some(target))=crate::approval::CURRENT_TRUSTED_REPLY_TARGET.try_with(Clone::clone) else {return false;};
+    if crate::google_authorization_requests::render::markup(&target.context.channel,url).is_none() {return false;}
+    target.send_authorization_notice(http,text,url).await.is_ok()
+}

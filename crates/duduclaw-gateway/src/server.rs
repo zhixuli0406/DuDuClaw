@@ -3390,6 +3390,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             "/api/causal/alias/revoke",
             post(handle_causal_alias_revoke).layer(DefaultBodyLimit::max(16 * 1024)),
         )
+        .route("/api/me/google/authorization-request", get(handle_google_authorization_preview)
+            .post(handle_google_authorization_confirm).layer(DefaultBodyLimit::max(4096)))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route(
             crate::google_personal::flow::CALLBACK_PATH,
@@ -3642,7 +3644,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
 
     #[cfg(feature = "dashboard")]
     {
-        app = app.merge(duduclaw_dashboard::dashboard_router());
+        let dashboard_base = crate::deep_link::configured_public_base(&home_dir).ok().flatten()
+            .map(|url| url.path().trim_end_matches('/').to_owned()).unwrap_or_default();
+        app = app.merge(duduclaw_dashboard::dashboard_router_at(dashboard_base));
     }
 
     // Validate against the completed core router before opening the listener.
@@ -19945,4 +19949,68 @@ mod identity_key_startup_tests {
         assert!(prepare_identity_key(fresh.path()).is_err());
         assert!(!fresh.path().join("identity.key").exists());
     }
+}
+
+// RM-147: only normal session-bearing Dashboard JWTs, never admin tokens,
+// member keys, channel OTPs or the authorization ticket itself.
+fn google_authorization_caller(state: &AppState, headers: &axum::http::HeaderMap)
+    -> Result<(String,String), axum::response::Response> {
+    let ctx = knowledge_caller(state, headers)?;
+    let token = extract_bearer_token(headers).ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
+    let claims = state.jwt_config.verify_access_token(token)
+        .map_err(|_| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
+    let session = claims.jti.filter(|s| uuid::Uuid::parse_str(s).is_ok())
+        .ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
+    Ok((ctx.user_id,session))
+}
+async fn handle_google_authorization_preview(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap)
+    -> axum::response::Response {
+    use crate::google_authorization_requests::routes;
+    if state.handler.resolve_edition_profile().await.is_personal() {
+        return routes::private_response(axum::http::StatusCode::FORBIDDEN.into_response());
+    }
+    let response = match google_authorization_caller(&state,&headers) {
+        Err(response)=>response,
+        Ok((user,_))=> {
+            let ticket=headers.get("x-google-authorization-ticket").and_then(|v|v.to_str().ok()).unwrap_or("");
+            match routes::preview(&state.home_dir,&state.user_db,&user,ticket) {
+                Ok(value)=>Json(value).into_response(),
+                Err(_)=>(axum::http::StatusCode::FORBIDDEN,Json(serde_json::json!({"error":crate::google_authorization_requests::store::REFUSED}))).into_response(),
+            }
+        }
+    };
+    routes::private_response(response)
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GoogleAuthorizationConfirmation {
+    ticket: String,
+    acknowledge_google_data: bool,
+    confirm_shared_access: bool,
+}
+async fn handle_google_authorization_confirm(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap,
+    body: Result<Json<GoogleAuthorizationConfirmation>, axum::extract::rejection::JsonRejection>) -> axum::response::Response {
+    use crate::google_authorization_requests::routes;
+    if state.handler.resolve_edition_profile().await.is_personal() {
+        return routes::private_response(axum::http::StatusCode::FORBIDDEN.into_response());
+    }
+    let response=match google_authorization_caller(&state,&headers) {
+        Err(response)=>response,
+        Ok((user,session))=> {
+            let origin=headers.get(axum::http::header::ORIGIN).and_then(|v|v.to_str().ok()).unwrap_or("");
+            let allowed=allowed_origins_snapshot();
+            // A JSON-only POST, explicit bearer and verified Origin are all
+            // required. Cookies or a preview GET never confirm anything.
+            let origin_ok=routes::valid_origin(origin,&allowed);
+            match body {
+                Ok(Json(body)) if origin_ok => match routes::confirm(&state.home_dir,&state.user_db,&user,&session,
+                    &body.ticket,origin,body.acknowledge_google_data,body.confirm_shared_access).await {
+                    Ok(value)=>Json(value).into_response(),
+                    Err(_)=>(axum::http::StatusCode::FORBIDDEN,Json(serde_json::json!({"error":crate::google_authorization_requests::store::REFUSED}))).into_response(),
+                },
+                _=>axum::http::StatusCode::FORBIDDEN.into_response(),
+            }
+        }
+    };
+    routes::private_response(response)
 }

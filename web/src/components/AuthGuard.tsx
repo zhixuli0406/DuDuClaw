@@ -1,3 +1,4 @@
+import { googleAuthorizationReturn } from '@/lib/google-authorization';
 import { useEffect } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router';
 import { FormattedMessage } from 'react-intl';
@@ -108,7 +109,7 @@ export function AuthGuard() {
   }
 
   if (!isAuthenticated) {
-    const from = browserWatchReturn(`${location.pathname}${location.search}`);
+    const from = googleAuthorizationReturn(`${location.pathname}${location.hash}`) ?? browserWatchReturn(`${location.pathname}${location.search}`);
     return <Navigate to="/login" replace state={from ? { from } : undefined} />;
   }
 
@@ -129,7 +130,7 @@ export function AuthGuard() {
       <Navigate
         to={`${CHANGE_PASSWORD_PATH}?${CHANGE_PASSWORD_QUERY}`}
         replace
-        state={{ from: `${location.pathname}${location.search}` }}
+        state={{ from: googleAuthorizationReturn(`${location.pathname}${location.hash}`) ?? `${location.pathname}${location.search}` }}
       />
     );
   }

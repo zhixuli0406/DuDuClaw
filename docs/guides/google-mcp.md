@@ -141,3 +141,7 @@ Sources:
 [Developer Preview Program](https://developers.google.com/workspace/preview).
 
 The `google:chat` preset does not add Chat authorization scopes. The native Workspace scope list does not include Chat; configure separate suitable authorization before using that mount. The Google Chat channel uses `chat.bot` and is a separate connection.
+
+## Chat authorization links
+
+Missing personal access may produce a gateway-owned confirmation link. It requires the same member’s normal Dashboard login and explicit data-disclosure confirmation; it is not a login or SSO credential. No MCP tool accepts a ticket or selects the member, account, scopes or redirect. Authorization does not approve outbound sends. See [personal Google connections](google-personal-connections.md#confirm-google-access-from-a-conversation) for account checks, public URL requirements and continuation behavior. Official remote MCP service eligibility and existing capability gates still apply.

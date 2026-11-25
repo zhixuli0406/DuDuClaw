@@ -202,6 +202,14 @@ impl UserDb {
         allowed: bool,
         decided_by: &str,
     ) -> Result<(), String> {
+        self.set_google_consent_versioned(user_id, agent, allowed, decided_by, None)
+    }
+
+    /// Consent links must still name the exact ACL snapshot shown to the member.
+    pub fn set_google_consent_versioned(
+        &self, user_id: &str, agent: &str, allowed: bool, decided_by: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<(),String> {
         if user_id != decided_by {
             return Err("只有帳號本人可以同意或拒絕。".into());
         }
@@ -209,6 +217,11 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if let Some(expected) = expected_generation {
+            if crate::user_row::read_acl_generation(&tx)? != expected {
+                return Err("授權設定已變更，請重新確認。".into());
+            }
+        }
         let user = load_user(&tx, user_id)?
             .filter(|u| u.status == UserStatus::Active)
             .ok_or("帳號不存在或已停用。")?;

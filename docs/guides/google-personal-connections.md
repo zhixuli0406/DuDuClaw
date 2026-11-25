@@ -154,3 +154,13 @@ external_server = "Partner Google MCP" # optional, at most 120 characters
 ```
 
 The connection tab displays **Provided by an external tool**. Native Google tools are hidden and refused, just as with `none`; this selector does not configure or authorize the external server. The name is display text only, with control characters rejected. Older parsers reject the unknown selector (and optional key), so they refuse native Google access rather than using the company account.
+
+## Confirm Google access from a conversation
+
+When a verified member asks their AI employee to use a Google capability that lacks a personal connection or purpose, the gateway can offer a ten-minute authorization link. An unbound, conflicting or display-name-only channel identity cannot receive one. The link is **not a login credential or SSO link**: sign in to Dashboard with the same member account, read the data disclosure and employee-sharing notice, then press **Confirm and continue**. Merely opening the page, including a link preview, does not consume the request or start OAuth.
+
+For OAuth, use the Google account displayed on the page. An existing verified Google subject or administrator mailbox attestation must establish the expected identity; a self-edited login email is insufficient. Choosing a different Google account is rejected even if Google accepted the login. For company delegation, the page shows the delegated account, employee and required service permissions. Confirmation does not establish domain-wide delegation: the administrator's DWD grant and mailbox attestation must already be valid.
+
+External channels require an administrator-configured `[dashboard] public_url` using HTTPS and a non-loopback host. Its path prefix is preserved. Without a public URL, the message only directs you to **Dashboard → My Connections**; there are no localhost links or paste-back codes. WebChat can use a same-origin page. Telegram, Slack, Discord and LINE can show an open-link button; Google Chat uses a URL, and card clicks never confirm access.
+
+After successful confirmation, the gateway rechecks the original member, channel binding, employee access, conversation, account, purpose and configuration before continuing the original task. This does not approve an email, message or other outbound action. Check **My Connections → Chat authorization requests** for status. Queued continuations survive a gateway restart. Once continuation has started, an interruption is treated as uncertain and is not automatically replayed; ask again in the original conversation if needed. OAuth flows interrupted before completion must be restarted.

@@ -167,7 +167,11 @@ async fn handle(
     );
     match serve(&state, &caller.agent_id, &request.tool, &requester).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(r) => refuse(StatusCode::FORBIDDEN, r.code, &r.message_zh),
+        Err(r) => {
+            crate::google_authorization_requests::turn::missing(&state.home,&caller.agent_id,
+                request.turn_id.as_deref(),&request.tool,r.code).await;
+            refuse(StatusCode::FORBIDDEN, r.code, &r.message_zh)
+        },
     }
 }
 

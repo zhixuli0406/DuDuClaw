@@ -197,11 +197,16 @@ impl TrustedReplyTarget {
             target: self.clone(),
             http,
             watch_notice: false,
+            authorization_url: None,
         })
     }
     pub(crate) async fn send_watch_notice(&self, text: &str) -> Result<(), ChannelSendError> {
-        BoundDecisionSender { target: self.clone(), http: reqwest::Client::new(), watch_notice: true }
+        BoundDecisionSender { target: self.clone(), http: reqwest::Client::new(), watch_notice: true, authorization_url: None }
             .send_text(text).await
+    }
+    pub(crate) async fn send_authorization_notice(&self, http: reqwest::Client, text: &str, url: &str) -> Result<(), ChannelSendError> {
+        BoundDecisionSender { target: self.clone(), http, watch_notice: true,
+            authorization_url: Some(url.into()) }.send_text(text).await
     }
     fn watch_body(&self, text: &str) -> serde_json::Value {
         let mut body = self.body(text);
@@ -266,6 +271,7 @@ struct BoundDecisionSender {
     target: TrustedReplyTarget,
     http: reqwest::Client,
     watch_notice: bool,
+    authorization_url: Option<String>,
 }
 #[async_trait]
 impl ChannelSender for BoundDecisionSender {
@@ -315,7 +321,17 @@ impl ChannelSender for BoundDecisionSender {
                 .bearer_auth(&t.token),
             _ => return Err(ChannelSendError("unsupported exact account route".into())),
         };
-        req = req.json(&if self.watch_notice { t.watch_body(text) } else { t.body(text) });
+        let mut body = if self.watch_notice { t.watch_body(text) } else { t.body(text) };
+        if let Some(url) = &self.authorization_url {
+            if let Some(markup) = crate::google_authorization_requests::render::markup(&t.context.channel,url) {
+                let rendered = crate::channel_sender::card_message_payload(&t.context.channel,&t.chat_id,text,markup,true)
+                    .map_err(ChannelSendError)?;
+                if let (Some(dest),Some(source))=(body.as_object_mut(),rendered.as_object()) {
+                    dest.extend(source.clone());
+                }
+            }
+        }
+        req = req.json(&body);
         let response = req
             .send()
             .await

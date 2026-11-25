@@ -3,8 +3,8 @@
  * when it is served behind a reverse proxy prefix (e.g.
  * `https://example.com/agents/`).
  *
- * The SPA itself has no router basename, so the only reliable signal of a
- * prefix is a same-origin `<base href>` (injected by the proxy or the page).
+ * The gateway supplies a validated deployment prefix in a meta element.
+ * A same-origin `<base href>` remains supported for existing reverse proxies.
  * Without one, `document.baseURI` is just the current page URL and says
  * nothing about the prefix, so the path is `/`.
  *
@@ -18,7 +18,14 @@ export function dashboardBasePath(
   doc: Pick<Document, 'baseURI' | 'querySelector'> | undefined = typeof document === 'undefined' ? undefined : document,
   origin: string = typeof window === 'undefined' ? '' : window.location.origin,
 ): string {
-  if (!doc || !doc.querySelector('base[href]')) return '/';
+  if (!doc) return '/';
+  const configured = doc.querySelector('meta[name="duduclaw-base"]')?.getAttribute?.('content');
+  if (configured) {
+    const checked = `https://dashboard.invalid${configured}`;
+    if (!configured.startsWith('/') || configured.startsWith('//') || !isValidPublicUrl(checked)) return '/';
+    return `${new URL(checked).pathname.replace(/\/+$/, '')}/`;
+  }
+  if (!doc.querySelector('base[href]')) return '/';
   let url: URL;
   try {
     url = new URL(doc.baseURI);
@@ -76,4 +83,10 @@ export function dashboardBaseUrl(
   if (!origin) return '';
   const path = dashboardBasePath(doc, origin);
   return path === '/' ? origin : `${origin}${path}`;
+}
+
+/** Router basename and same-origin control-plane endpoints share one prefix. */
+export function dashboardBase(): string { return dashboardBasePath().replace(/\/+$/, ''); }
+export function dashboardEndpoint(path: string): string {
+  return path.startsWith('/') && !path.startsWith('//') ? `${dashboardBase()}${path}` : path;
 }
