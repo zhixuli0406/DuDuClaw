@@ -285,6 +285,8 @@ pub(super) fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySiz
     let read_stamp = last_read.clone();
     let (cancel, mut cancelled) = mpsc::channel(1);
     entry.cancel = Some(cancel.clone());
+    #[cfg(windows)]
+    let writer_cancel = cancel.clone();
     let budget = Arc::new(OutputBudget::new(output_limit, cancel));
     let reader_budget = budget.clone();
     let (read_done, read_completion) = oneshot::channel();
@@ -347,17 +349,35 @@ pub(super) fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySiz
     let (write_tx, mut write_rx) = mpsc::channel::<PtyWrite>(16);
     std::thread::spawn(move || {
         use std::io::Write;
-        if !prompt.is_empty() && writer.write_all(&prompt).is_err() { return; }
+        if !prompt.is_empty() {
+            let result = writer.write_all(&prompt);
+            if result.is_err() {
+                #[cfg(windows)]
+                if pty_write_timed_out(&result) {
+                    let _ = writer_cancel.try_send(RunOutcome::IsolationFailure);
+                }
+                return;
+            }
+        }
         while let Some(message) = write_rx.blocking_recv() {
             match message {
                 PtyWrite::Bytes(bytes, ack) => {
                     let result = writer.write(&bytes).and_then(|count| {
                         writer.flush()?;
                         Ok(count)
-                    }).map_err(|_| BackendError::Io);
+                    });
+                    #[cfg(windows)]
+                    let timed_out = pty_write_timed_out(&result);
+                    let result = result.map_err(|_| BackendError::Io);
                     let failed = result.is_err();
                     let _ = ack.send(result);
-                    if failed { break; }
+                    if failed {
+                        #[cfg(windows)]
+                        if timed_out {
+                            let _ = writer_cancel.try_send(RunOutcome::IsolationFailure);
+                        }
+                        break;
+                    }
                 },
                 PtyWrite::Close(ack) => { drop(writer); let _ = ack.send(()); return; },
             }
@@ -536,6 +556,27 @@ fn pty_send_stamped(tx: &mpsc::Sender<Result<Vec<u8>, BackendError>>, mut messag
                 std::thread::sleep(Duration::from_millis(5));
             },
         }
+    }
+}
+
+// Only the ConPTY startup-handshake timeout requires cancelling the child.
+#[cfg(windows)]
+fn pty_write_timed_out<T>(result: &std::io::Result<T>) -> bool {
+    matches!(result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+#[cfg(all(test, windows))]
+mod pty_write_tests {
+    use super::pty_write_timed_out;
+
+    #[test]
+    fn only_startup_timeout_requires_cancellation() {
+        use std::io::{Error, ErrorKind};
+        assert!(pty_write_timed_out(&Err::<(), _>(Error::from(ErrorKind::TimedOut))));
+        for kind in [ErrorKind::BrokenPipe, ErrorKind::UnexpectedEof, ErrorKind::Other] {
+            assert!(!pty_write_timed_out(&Err::<(), _>(Error::from(kind))));
+        }
+        assert!(!pty_write_timed_out(&Ok(())));
     }
 }
 

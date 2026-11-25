@@ -1,18 +1,26 @@
 //! Startup handshake for portable-pty's fixed INHERIT_CURSOR flag on Windows.
-use std::{io::{self, Read, Write}, sync::mpsc};
+use std::{io::{self, Read, Write}, sync::mpsc, time::Duration};
 
 type Writer = Box<dyn Write + Send>;
 const QUERY: &[u8] = b"\x1b[6n";
+// Allow slow conhost startup, but stay well below the model probe's 20 s budget.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Answer and consume only conhost's first cursor query, across read boundaries.
 /// portable-pty 0.9 has no flag override. Hold normal input until the cursor
 /// reply is flushed, so a prompt cannot fill the input pipe ahead of the reply.
 /// These halves own pipe handles only, never the master / pseudoconsole.
 pub fn startup_io(reader: Box<dyn Read + Send>, writer: Writer) -> (Box<dyn Read + Send>, Writer) {
+    startup_io_with_timeout(reader, writer, STARTUP_TIMEOUT)
+}
+
+fn startup_io_with_timeout(reader: Box<dyn Read + Send>, writer: Writer, timeout: Duration)
+    -> (Box<dyn Read + Send>, Writer)
+{
     let (ready, waiting) = mpsc::channel();
     (Box::new(StartupReader { reader, writer: Some(writer), ready: Some(ready),
         pending: Vec::new(), available: 0, eof: false }),
-        Box::new(StartupWriter { waiting, writer: None }))
+        Box::new(StartupWriter { waiting: Some(waiting), writer: None, timeout, failure: None }))
 }
 
 struct StartupReader {
@@ -58,13 +66,15 @@ impl Read for StartupReader {
             if let Some(index) = self.pending.windows(QUERY.len()).position(|bytes| bytes == QUERY) {
                 self.pending.drain(index..index + QUERY.len());
                 let mut writer = self.writer.take().unwrap();
-                if let Err(error) = writer.write_all(b"\x1b[1;1R").and_then(|()| writer.flush()) {
+                if writer.write_all(b"\x1b[1;1R").and_then(|()| writer.flush()).is_err() {
+                    // Input failure must not discard pending or future output.
+                    drop(writer);
                     self.ready.take();
-                    return Err(error);
+                } else {
+                    // Dropping the input half must not prevent the startup reply
+                    // or stop output draining; a closed receiver simply drops it.
+                    let _ = self.ready.take().unwrap().send(writer);
                 }
-                // Dropping the input half must not prevent the startup reply
-                // or stop output draining; a closed receiver simply drops it.
-                let _ = self.ready.take().unwrap().send(writer);
                 self.available = self.pending.len();
             } else {
                 let partial = (1..QUERY.len()).rev()
@@ -76,14 +86,30 @@ impl Read for StartupReader {
 }
 
 struct StartupWriter {
-    waiting: mpsc::Receiver<Writer>,
+    waiting: Option<mpsc::Receiver<Writer>>,
     writer: Option<Writer>,
+    timeout: Duration,
+    failure: Option<io::ErrorKind>,
 }
 impl StartupWriter {
     fn ready(&mut self) -> io::Result<&mut Writer> {
+        if let Some(kind) = self.failure {
+            return Err(io::Error::new(kind, "ConPTY startup input is unavailable"));
+        }
         if self.writer.is_none() {
-            self.writer = Some(self.waiting.recv().map_err(|_| io::Error::new(
-                io::ErrorKind::BrokenPipe, "ConPTY closed before its startup cursor query"))?);
+            // Consume the receiver even on failure: late readiness must never
+            // reopen input, and subsequent write/flush calls must fail fast.
+            match self.waiting.take().unwrap().recv_timeout(self.timeout) {
+                Ok(writer) => self.writer = Some(writer),
+                Err(error) => {
+                    let kind = match error {
+                        mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
+                        mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
+                    };
+                    self.failure = Some(kind);
+                    return Err(io::Error::new(kind, "ConPTY startup cursor handshake failed"));
+                },
+            }
         }
         Ok(self.writer.as_mut().unwrap())
     }
@@ -112,6 +138,60 @@ mod tests {
             Ok(buf.len())
         }
         fn flush(&mut self) -> io::Result<()> { Ok(()) }
+    }
+    struct ReplyFailure { on_flush: bool }
+    impl Write for ReplyFailure {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.on_flush { Ok(buf.len()) } else { Err(io::ErrorKind::BrokenPipe.into()) }
+        }
+        fn flush(&mut self) -> io::Result<()> { Err(io::ErrorKind::BrokenPipe.into()) }
+    }
+
+    #[test]
+    fn missing_query_times_out_once_while_reader_stays_open() {
+        let timeout = Duration::from_millis(50);
+        for flush_first in [false, true] {
+            // Keep the reader (and its readiness sender) open without a query
+            // or EOF, as when a running child remains silent.
+            let (reader, mut writer) = startup_io_with_timeout(
+                Box::new(Cursor::new(Vec::<u8>::new())), Box::new(io::sink()), timeout);
+            let start = std::time::Instant::now();
+            let error = if flush_first { writer.flush() } else { writer.write_all(b"prompt") }.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+            assert!(start.elapsed() >= timeout);
+            assert!(start.elapsed() < Duration::from_secs(1));
+            let again = std::time::Instant::now();
+            assert_eq!(writer.write(b"retry").unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert!(again.elapsed() < timeout, "failed input waited again");
+            drop(reader);
+        }
+    }
+
+    #[test]
+    fn failed_reply_preserves_pending_and_later_output_and_rejects_input() {
+        for on_flush in [false, true] {
+            let first = b"https://login.example/\x1b[6ncode: 1234\n";
+            let mut bytes = first.to_vec();
+            bytes.extend_from_slice(b"later output\x1b[6n");
+            let source = Fragmented { bytes: Cursor::new(bytes), size: first.len() };
+            let (mut reader, mut writer) = startup_io(Box::new(source), Box::new(ReplyFailure { on_flush }));
+            // Small destination reads also exercise delivery of buffered bytes
+            // after the input handle has been dropped.
+            let mut output = Vec::new();
+            let mut chunk = [0; 3];
+            let count = reader.read(&mut chunk).unwrap();
+            output.extend_from_slice(&chunk[..count]);
+            // Readiness must fail before later reads or EOF release the sender.
+            assert_eq!(writer.write(b"prompt").unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            assert_eq!(writer.flush().unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            loop {
+                let count = reader.read(&mut chunk).unwrap();
+                if count == 0 { break; }
+                output.extend_from_slice(&chunk[..count]);
+            }
+            assert_eq!(output, b"https://login.example/code: 1234\nlater output\x1b[6n");
+        }
     }
 
     #[test]

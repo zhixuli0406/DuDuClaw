@@ -806,16 +806,13 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         let low = snap.to_lowercase();
         if !sent {
             if low.contains("trust") && low.contains("folder") {
-                let _ = writer.write_all(b"\r");
-                let _ = writer.flush();
+                if writer.write_all(b"\r").and_then(|()| writer.flush()).is_err() { break; }
             }
             let ready = low.contains("shortcuts") || low.contains("try \"") || snap.contains('❯');
             if ready || start.elapsed() > Duration::from_secs(9) {
-                let _ = writer.write_all(b"/model");
-                let _ = writer.flush();
+                if writer.write_all(b"/model").and_then(|()| writer.flush()).is_err() { break; }
                 std::thread::sleep(Duration::from_millis(400));
-                let _ = writer.write_all(b"\r");
-                let _ = writer.flush();
+                if writer.write_all(b"\r").and_then(|()| writer.flush()).is_err() { break; }
                 sent = true;
             }
         } else if start.elapsed() > Duration::from_secs(17) {

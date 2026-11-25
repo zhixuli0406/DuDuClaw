@@ -893,7 +893,11 @@ impl AuthSession {
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)
             .and_then(|_| w.flush())
-            .map_err(|e| AuthError::Io(e.to_string()))
+            .map_err(|e| {
+                self.status.store(ST_FAILED, Ordering::Relaxed);
+                self.kill();
+                AuthError::Io(e.to_string())
+            })
     }
 
     /// Current status.
