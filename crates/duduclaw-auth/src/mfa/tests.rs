@@ -621,7 +621,7 @@ fn mfa_invalid_policy_refuses_self_disable_without_consuming_factor() {
         assert!(policy_enforced(&db.conn()).is_err(), "{rows}");
         assert!(record_enforcement(&mut db.conn(), false, 3030).is_err(), "{rows}");
         if !rows.is_empty() {
-            assert!(migrate(&db.conn(), false).is_err(), "{rows}");
+            assert!(migrate(&db, &db.conn(), false).is_err(), "{rows}");
         }
         assert!(db.bind_channel_identity_authorized(&id, "line", "untrusted", true, Some(&id)).is_err(), "{rows}");
         assert_eq!(db.conn().query_row("SELECT COUNT(*) FROM channel_identities WHERE user_id=?1", [&id], |r| r.get::<_, i64>(0)).unwrap(), 0);
@@ -638,7 +638,7 @@ fn mfa_schema_failure_rolls_back_policy_table_and_seed() {
     let (_dir, db, _) = setup();
     let conn = db.conn();
     conn.execute_batch("DROP TABLE mfa_policy_state; DROP INDEX idx_mfa_challenges_user; CREATE TABLE idx_mfa_challenges_user(id);").unwrap();
-    assert!(migrate(&conn, false).is_err());
+    assert!(migrate(&db, &conn, false).is_err());
     assert!(conn.prepare("SELECT * FROM mfa_policy_state").is_err());
 }
 

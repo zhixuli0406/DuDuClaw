@@ -579,13 +579,16 @@ fn delete_marker(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), Adop
 /// Idempotent for a resumed apply (F6fb item 1): bindings already equal to
 /// the selection are left as they are; any other binding refuses.
 fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> Result<(), AdoptError> {
-    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
-        .write().map_err(unavailable)?;
     let selection = members.as_array().ok_or(AdoptError::MembersInvalid)?.iter().map(|member| Ok(duduclaw_auth::db::RestoredMember {
         user_id: member["user_id"].as_str().ok_or(AdoptError::MembersInvalid)?.to_owned(),
         access_level: member["access_level"].as_str().and_then(|level| level.parse().ok()).ok_or(AdoptError::MembersInvalid)?,
     })).collect::<Result<Vec<_>, AdoptError>>()?;
     if selection.is_empty() { return Ok(()); }
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(unavailable)?;
+    let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(unavailable)?.len();
+    // Lock order: seat admission -> authority writer lease -> users.db transaction.
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(unavailable)?;
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(unavailable)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(AdoptError::NotSameTenant); }
@@ -607,6 +610,8 @@ fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> 
         return if same { tx.finish().map_err(unavailable) } else { Err(AdoptError::MembersInvalid) };
     }
     duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, target, &selection).map_err(|_| AdoptError::MembersInvalid)?;
+    let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(unavailable)?.len();
+    if after > before { return Err(AdoptError::Unavailable); }
     tx.commit().map_err(unavailable)
 }
 

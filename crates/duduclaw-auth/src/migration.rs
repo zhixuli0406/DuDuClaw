@@ -4,12 +4,26 @@ use crate::{UserDb, User, UserRole, UserStatus};
 use crate::user_row::{load_user, bump_acl_generation};
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
+#[cfg(test)]
+#[path = "migration_seat_tests.rs"]
+mod seat_tests;
+
 impl UserDb {
     /// The operation receipt and user are committed in the same transaction. A
     /// matching email is never considered an idempotency receipt.
     pub fn migration_invite_user(&self, operation: &str, digest: &[u8; 32],
         email: &str, display_name: &str, role: UserRole) -> Result<User, String> {
+        self.migration_invite_user_under(operation, digest, email, display_name, role, None)
+    }
+
+    /// Acquire seat admission before any authority writer lease and users.db
+    /// transaction. The caller may supply its already-held admission and cap.
+    pub fn migration_invite_user_under(&self, operation: &str, digest: &[u8; 32],
+        email: &str, display_name: &str, role: UserRole,
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<User, String> {
         validate(operation, email, display_name)?;
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
@@ -33,6 +47,7 @@ impl UserDb {
                 tx.execute("UPDATE migration_user_receipts SET disabled=0 WHERE operation=?1",[operation]).map_err(error)?;
                 bump_acl_generation(&tx).map_err(error)?;
                 user=load_user(&tx,&id).map_err(error)?.ok_or_else(||error(()))?;
+                seats.check(&tx)?;
                 tx.commit().map_err(error)?;
             }
             return Ok(user);
@@ -48,6 +63,7 @@ impl UserDb {
             params![operation, digest.as_slice(), id]).map_err(error)?;
         bump_acl_generation(&tx).map_err(error)?;
         let user = load_user(&tx, &id).map_err(error)?.ok_or_else(|| error(()))?;
+        seats.check(&tx)?;
         tx.commit().map_err(error)?;
         Ok(user)
     }
@@ -64,6 +80,13 @@ impl UserDb {
     /// Never deletes the account. Suspension and credential-epoch fencing revoke
     /// even a partially activated account; its operation remains tombstoned.
     pub fn migration_user_disable(&self, operation: &str, digest: &[u8; 32]) -> Result<(), String> {
+        self.migration_user_disable_under(operation, digest, None)
+    }
+
+    pub fn migration_user_disable_under(&self, operation: &str, digest: &[u8; 32],
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
@@ -82,6 +105,7 @@ impl UserDb {
         }
         let user = load_user(&tx, &id).map_err(error)?.ok_or_else(|| error(()))?;
         if user.status != UserStatus::Suspended { return Err(error(())); }
+        seats.check(&tx)?;
         tx.commit().map_err(error)
     }
 }
@@ -137,8 +161,15 @@ impl UserDb {
     /// Normal binding writer and durable receipt share one immediate transaction.
     pub fn migration_bind_shared(&self, operation:&str, digest:&[u8;32], user_id:&str,
         agent:&str, access:crate::AccessLevel) -> Result<(),String> {
-        let _authority = self.google_authority_write()?;
+        self.migration_bind_shared_under(operation, digest, user_id, agent, access, None)
+    }
+
+    pub fn migration_bind_shared_under(&self, operation: &str, digest: &[u8; 32], user_id: &str,
+        agent: &str, access: crate::AccessLevel, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
         validate_binding(operation,agent)?;
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;
         let user=load_user(&tx,user_id).map_err(error)?.ok_or_else(||error(()))?;
@@ -157,6 +188,7 @@ impl UserDb {
         tx.execute("INSERT INTO migration_binding_receipts(operation,digest,user_id,agent,access,bound_at,disabled)
             VALUES (?1,?2,?3,?4,?5,?6,0) ON CONFLICT(operation) DO UPDATE SET bound_at=excluded.bound_at,disabled=0",
             params![operation,digest.as_slice(),user_id,agent,access.to_string(),now]).map_err(error)?;
+        seats.check(&tx)?;
         tx.commit().map_err(error)
     }
     pub fn migration_binding_readback(&self,operation:&str,digest:&[u8;32])->Result<crate::UserAgentBinding,String>{
@@ -171,6 +203,13 @@ impl UserDb {
         Ok(crate::UserAgentBinding{user_id:user,agent_name:agent,access_level:level.parse().map_err(error)?,bound_at:bound,is_primary:primary})
     }
     pub fn migration_binding_disable(&self,operation:&str,digest:&[u8;32])->Result<(),String>{
+        self.migration_binding_disable_under(operation, digest, None)
+    }
+
+    pub fn migration_binding_disable_under(&self, operation: &str, digest: &[u8; 32],
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let _authority = self.google_authority_write()?;
         let mut conn=self.conn();let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         binding_schema(&tx)?;
@@ -185,6 +224,7 @@ impl UserDb {
             bump_acl_generation(&tx).map_err(error)?;
         }
         tx.execute("UPDATE migration_binding_receipts SET disabled=1 WHERE operation=?1",[operation]).map_err(error)?;
+        seats.check(&tx)?;
         tx.commit().map_err(error)
     }
 }

@@ -298,7 +298,7 @@ fn apply_locked(home: &Path, env: &RestoreEnv<'_>, tx: &Connection, request: &Re
         if move_back(&dirs, q).is_err() { return Step::Refused(Refusal::Inconsistent, "restoring"); }
         let removed = match &q.owner {
             Some(owner) => lifecycle::remove_personal_mirror_under(home, &q.label, owner, admission).map(|_| ()),
-            None => lifecycle::remove_shared_bindings(home, &q.label).map(|_| ()),
+            None => lifecycle::remove_shared_bindings_under(home, &q.label, admission).map(|_| ()),
         };
         if removed.is_err() { Step::Refused(Refusal::Inconsistent, "restoring") } else { Step::Refused(refusal, "sealed") }
     };
@@ -489,7 +489,7 @@ fn recover_restoring(home: &Path, env: &RestoreEnv<'_>, employee: EmployeeId, in
         }
         let removed = match &q.owner {
             Some(owner) => lifecycle::remove_personal_mirror_under(home, &q.label, owner, admission).map(|_| ()),
-            None => lifecycle::remove_shared_bindings(home, &q.label).map(|_| ()),
+            None => lifecycle::remove_shared_bindings_under(home, &q.label, admission).map(|_| ()),
         };
         match removed {
             Ok(()) => {}

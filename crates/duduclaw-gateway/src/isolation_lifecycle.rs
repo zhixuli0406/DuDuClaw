@@ -352,11 +352,22 @@ pub(crate) fn remove_personal_mirror_under(home: &Path, label: &str, owner: &str
 /// bump the ACL generation, in one users.db transaction. A Personal mirror
 /// for the label refuses (`Stale`, left untouched).
 pub(crate) fn remove_shared_bindings(home: &Path, label: &str) -> Result<usize, LifecycleError> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| LifecycleError::Unavailable)?;
+    remove_shared_bindings_under(home, label, &admission)
+}
+
+pub(crate) fn remove_shared_bindings_under(home: &Path, label: &str,
+    admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<usize, LifecycleError> {
+    if home != admission.home() { return Err(LifecycleError::Denied); }
+    let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(|_| LifecycleError::Unavailable)?.len();
+    // Lock order: caller-held seat admission -> authority writer lease -> users.db transaction.
     let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
         .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_shared_bindings_in_transaction(&tx, label).map_err(mirror_error)?;
+    let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(|_| LifecycleError::Unavailable)?.len();
+    if after > before { return Err(LifecycleError::Denied); }
     tx.commit().map_err(|_| LifecycleError::Unavailable)?;
     Ok(removed)
 }
@@ -571,7 +582,7 @@ pub(crate) fn tombstone_employee(home: &Path, label: &str, employee: EmployeeId,
     // 4. users.db.
     let users = match &owner {
         Some(owner) => remove_personal_mirror_under(home, label, owner, &admission).map(|_| ()),
-        None => remove_shared_bindings(home, label).map(|_| ()),
+        None => remove_shared_bindings_under(home, label, &admission).map(|_| ()),
     };
 
     // 5. Audit (also when the users.db step must be retried).
