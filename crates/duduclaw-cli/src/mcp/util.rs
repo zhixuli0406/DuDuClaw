@@ -352,7 +352,7 @@ pub(crate) fn meeting_audit_tool(tool_name: &str) -> bool {
 }
 
 pub(crate) fn audit_result_text(tool_name: &str, result: &Value) -> Option<String> {
-    if meeting_audit_tool(tool_name) || matches!(tool_name, "google_chat_spaces" | "google_chat_messages") { None } else { extract_tool_result_text(result) }
+    if meeting_audit_tool(tool_name) || matches!(tool_name, "google_chat_spaces" | "google_chat_messages" | "google_chat_send") { None } else { extract_tool_result_text(result) }
 }
 
 fn meeting_audit_arguments(args: &Value) -> Value {
@@ -369,7 +369,7 @@ fn meeting_audit_arguments(args: &Value) -> Value {
 pub(crate) fn audit_safe_arguments(tool_name: &str, args: &Value) -> Value {
     if meeting_audit_tool(tool_name) { return meeting_audit_arguments(args); }
     match tool_name {
-        "google_chat_spaces" | "google_chat_messages" => {
+        "google_chat_spaces" | "google_chat_messages" | "google_chat_send" => {
             let space = args.get("space").and_then(Value::as_str)
                 .filter(|s| duduclaw_gateway::google_workspace::chat_read::valid_space(s));
             serde_json::json!({"space":space})

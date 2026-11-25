@@ -152,7 +152,7 @@ default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設
 allowed_subject_domains = ["customer.com"]
 ```
 
-沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 28 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 29 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
 
 ### 誰能透過這位員工使用這個帳號
 
@@ -183,7 +183,7 @@ allowed_subject_domains = ["customer.com"]
 
 ### 員工專用 API key 與 Google MCP 掛載（v1.76.0）
 
-通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 28 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
+通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 29 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
 
 這些呼叫仍受員工的工具允許／拒絕清單、動作規則、PolicyKernel、階段性授權與人工審批限制。等審批時，已接受的員工、工具與最終參數固定不變。金鑰失效、員工被移除或授權設定改變，只會拒絕，不會改用行程的其他身分或別的帳號。Google 操作由 gateway 執行，外部 MCP 用戶端拿到有大小限制的工具結果，不會拿到 Google bearer。
 

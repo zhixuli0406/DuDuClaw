@@ -1790,6 +1790,18 @@ pub(super) async fn run<I: LocalIo>(template: &NativeCallTemplate, io: &mut I) -
                 _ => None,
             },
         }),
+        ParsedNativeArguments::ChatSend(args) => async {
+            let endpoint = chat_read::messages_endpoint(&args.space)
+                .map_err(|message| GoogleApiError::Api { status:400, message })?;
+            let mut query = vec![("requestId", template.meet_request_id().to_owned())];
+            if args.thread.is_some() { query.push(("messageReplyOption", "REPLY_MESSAGE_OR_FAIL".into())); }
+            let response = google_request(io, template, reqwest::Method::POST, &endpoint, &query, Some(&args.body())).await?;
+            let name = response["name"].as_str().filter(|name|
+                name.strip_prefix(&format!("{}/messages/", args.space)).is_some_and(|id|
+                    !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))))
+                .ok_or_else(|| GoogleApiError::Api { status:502, message:"result_unconfirmed".into() })?;
+            Ok(Outcome::Chat(json!({"status":"sent", "name":name, "request_id":template.meet_request_id()})))
+        }.await,
         ParsedNativeArguments::ChatSpaces(args) => chat_spaces(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::ChatMessages(args) => chat_messages(io, template, args).await.map(Outcome::Chat),
         ParsedNativeArguments::GmailSearch { query, max } => {

@@ -268,6 +268,8 @@ fn all_25_effect_tools_have_a_closed_native_template() {
             "google_status" => continue,
             "gmail_search" | "drive_search" => json!({"query":"test"}),
             "gmail_read" => json!({"message_id":"message"}),
+            "gmail_send_draft" => json!({"draft_id":"draft"}),
+            "calendar_delete_event" => json!({"event_id":"event"}),
             "gmail_create_draft" => json!({"to":"alice@c.test", "subject":"test", "body":"test"}),
             "calendar_create_event" => json!({"summary":"test", "start":"2026-11-25T10:00:00Z", "end":"2026-11-25T11:00:00Z"}),
             "calendar_update_event" => json!({"event_id":"event", "summary":"test"}),
@@ -282,6 +284,7 @@ fn all_25_effect_tools_have_a_closed_native_template() {
             "docs_append" => json!({"document_id":"doc", "text":"test"}),
             "docs_replace_text" => json!({"document_id":"doc", "find":"old", "replace":"new"}),
             "slides_read" => json!({"presentation_id":"slides"}),
+            "google_chat_send" => json!({"space":"spaces/AAAA","text":"text"}),
             "google_chat_messages" => json!({"space":"spaces/AAAA"}),
             "google_chat_spaces" | "calendar_list_events" | "gtasks_lists" | "gtasks_list" => json!({}),
             other => panic!("missing owner coverage fixture: {other}"),
@@ -290,7 +293,7 @@ fn all_25_effect_tools_have_a_closed_native_template() {
         template.validate_closed().unwrap_or_else(|e| panic!("{tool}: {e}"));
         count += 1;
     }
-    assert_eq!(count, 25);
+    assert_eq!(count, 28);
 }
 
 #[test]

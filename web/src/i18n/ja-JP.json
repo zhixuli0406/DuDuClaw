@@ -11732,5 +11732,16 @@
   "googleAuthorization.purpose.workspace": "用途：Google Workspace サービスとドライブの読み取り。",
   "agents.seats.summary": "AI 従業員枠：{used}／{limit}・AI 分身：{avatars}",
   "agents.seats.avatarExempt": "AI 分身は従業員枠を消費しません",
-  "agents.seats.avatarConditions": "有効なメンバー本人が所有する Personal AI が１人につき１体だけ対象です。共有 AI、操作権限のみの割り当て、アーカイブ済み AI は枠を消費します。"
+  "agents.seats.avatarConditions": "有効なメンバー本人が所有する Personal AI が１人につき１体だけ対象です。共有 AI、操作権限のみの割り当て、アーカイブ済み AI は枠を消費します。",
+  "google.chatSend.title": "Google Chat の送信",
+  "google.chatSend.hint": "初期設定はオフです。メンバーが送信権限を別途許可し、毎回本人が確認します。既存スペースへのテキスト送信のみ対応します。Google には本人が送信者として表示され、アプリ名も付きます。",
+  "myConnections.chatSend.enabled": "Chat 送信を許可済みです。送信ごとに確認が必要です。",
+  "myConnections.chatSend.missing": "Chat 送信は未許可です。",
+  "myConnections.chatSend.consent": "自分の Google Chat アカウントの送信権限を許可します。個別のメッセージ送信を承認するものではありません。",
+  "myConnections.chatSend.authorize": "Chat 送信を許可",
+  "myConnections.chatSend.confirmTitle": "あなたの Google アカウントで送信",
+  "myConnections.chatSend.egress": "全文を確認してください。確認すると、個人情報を含む可能性がある内容が上記スペースへ送信されます。Google にアプリ名も表示されます。",
+  "myConnections.chatSend.expires": "確認期限：{time}",
+  "myConnections.chatSend.confirm": "確認して送信",
+  "myConnections.chatSend.cancel": "キャンセル"
 }

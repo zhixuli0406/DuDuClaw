@@ -312,6 +312,16 @@ fn check_missing_home_identity_survives_enable(
         !missing_ancestor.exists(),
         "lookup must not create missing ancestors either"
     );
+    // D12 requires an existing owner-controlled home before taking authority.
+    // Lookup above remains read-only; bootstrap explicitly before enabling.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(home).unwrap();
     let enabled = cp.enable(false).unwrap();
     assert_eq!(enabled.state, ProtectionState::Ready);
     let canonical = home.canonicalize().unwrap();

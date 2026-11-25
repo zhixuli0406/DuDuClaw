@@ -95,6 +95,7 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
     ToolPolicy { name: "gmail_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
     ToolPolicy { name: "gmail_create_draft", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox, ResourceKind::Recipient] },
+    ToolPolicy { name: "google_chat_send", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox, ResourceKind::Recipient] }, // RM-062
     // Google Chat reads return private conversation content: same exact
     // account-bound mailbox authority as gmail_read, never a shared fallback.
     ToolPolicy { name: "google_chat_spaces", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
@@ -540,7 +541,8 @@ fn required_for_call(policy: &ToolPolicy, arguments: &Value) -> Result<Vec<Resou
             }
         }
     }
-    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient"] {
+    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient", "space"] {
+            if key == "space" && policy.name != "google_chat_send" { continue; }
         if object.get(key).is_some_and(|value| !value.is_null()) { add(ResourceKind::Recipient); }
     }
     if let Some(attachments) = object.get("attachments") {
@@ -682,7 +684,8 @@ fn check_selected_resources(policy: &ToolPolicy, arguments: &Value, resources: &
             return Err(VerificationError::BindingMismatch);
         }
     }
-    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient"] {
+    for key in ["to", "cc", "bcc", "attendees", "chat_id", "notify_chat_id", "target_agent", "recipient", "space"] {
+            if key == "space" && policy.name != "google_chat_send" { continue; }
         if let Some(value) = arguments.get(key).filter(|v| !v.is_null()) {
             let values: Vec<&Value> = match value.as_array() { Some(array) => array.iter().collect(), None => vec![value] };
             for value in values {

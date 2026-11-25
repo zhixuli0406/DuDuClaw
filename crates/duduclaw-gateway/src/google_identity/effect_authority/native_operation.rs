@@ -24,7 +24,7 @@ impl ClosedNativeFailure {
             may_have_sent,
         )
     }
-    pub(super) fn into_refusal(self) -> Refusal {
+    pub(in crate::google_identity) fn into_refusal(self) -> Refusal {
         match self {
             Self::Denied(error) => error,
             Self::Unconfirmed => Refusal::hard(

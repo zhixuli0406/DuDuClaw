@@ -615,8 +615,18 @@ async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
             if !write {
                 let dispatcher = dispatcher(home.path()).await;
                 let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+                // Valid inputs reach the scope gate instead of failing argument validation first.
+                let arguments = match tool {
+                    "docs_create" | "sheets_create" => json!({"title":"test"}),
+                    "docs_replace_text" => json!({"document_id":"doc","find":"old","replace":"new"}),
+                    "sheets_update" => json!({"spreadsheet_id":"sheet","range":"A1","values":[["cell"]]}),
+                    "calendar_update_event" => json!({"event_id":"event","summary":"test"}),
+                    "gmail_send_draft" => json!({"draft_id":"draft"}),
+                    "calendar_delete_event" => json!({"event_id":"event"}),
+                    _ => unreachable!(),
+                };
                 let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
-                    &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(159),
+                    &principal, &namespace(), &json!({"name":tool,"arguments":arguments}), &json!(159),
                 )).await;
                 // RM-134 hides tools outside the authenticated employee scope.
                 assert_eq!(result["error"]["code"], -32601, "{tool}: {result}");

@@ -34,6 +34,7 @@ pub(crate) async fn run(home: &Path, agent: &str, db: &duduclaw_auth::UserDb, us
         }.into());
         let covered: Vec<_> = scopes::TOKEN_TOOLS.iter().copied().filter(|tool| {
             scopes::permitted_for(tool, &record.metadata)
+                && (*tool != "google_chat_send" || crate::google_workspace::chat_send_enabled(home))
                 && (!matches!(*tool, "google_chat_spaces" | "google_chat_messages") || crate::google_workspace::chat_read_enabled(home))
         }).collect();
         add("tools", !covered.is_empty(), format!("已授權範圍與用途涵蓋的工具：{}", covered.join(", ")));

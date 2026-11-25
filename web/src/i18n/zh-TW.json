@@ -11732,5 +11732,16 @@
   "googleAuthorization.purpose.workspace": "用途：Google Workspace 服務與雲端硬碟讀取。",
   "agents.seats.summary": "AI 員工名額：{used}／{limit}・AI 分身：{avatars}",
   "agents.seats.avatarExempt": "AI 分身不佔名額",
-  "agents.seats.avatarConditions": "須為啟用成員本人擁有的個人 AI，且一人一分身；一般員工或僅有操作權限的 AI 仍佔名額，封存也佔名額。"
+  "agents.seats.avatarConditions": "須為啟用成員本人擁有的個人 AI，且一人一分身；一般員工或僅有操作權限的 AI 仍佔名額，封存也佔名額。",
+  "google.chatSend.title": "Google Chat 傳送",
+  "google.chatSend.hint": "預設關閉。開啟後，成員要另外授權傳送權限，每次仍須本人確認。僅支援既有空間的文字訊息，Google 會顯示本人為寄件者並附上應用程式名稱。",
+  "myConnections.chatSend.enabled": "已授權 Chat 傳送；每次仍需確認。",
+  "myConnections.chatSend.missing": "尚未授權 Chat 傳送。",
+  "myConnections.chatSend.consent": "我同意開放自己的 Google Chat 傳送權限；這不代表同意任何單次傳送。",
+  "myConnections.chatSend.authorize": "授權 Chat 傳送",
+  "myConnections.chatSend.confirmTitle": "以你的 Google 帳號傳送",
+  "myConnections.chatSend.egress": "請閱讀完整文字。確認後，這些內容（可能包含私人資料）會傳到上述空間；Google 會附上應用程式名稱。",
+  "myConnections.chatSend.expires": "確認期限：{time}",
+  "myConnections.chatSend.confirm": "確認傳送",
+  "myConnections.chatSend.cancel": "取消"
 }

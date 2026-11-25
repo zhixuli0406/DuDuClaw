@@ -11732,5 +11732,16 @@
   "googleAuthorization.purpose.workspace": "Purpose: Google Workspace services and Google Drive reading.",
   "agents.seats.summary": "AI employee seats: {used} / {limit} · AI avatars: {avatars}",
   "agents.seats.avatarExempt": "AI avatars do not use employee seats",
-  "agents.seats.avatarConditions": "Only one Personal AI owned by each active member qualifies. Shared or operator-only assignments and archived AI still use seats."
+  "agents.seats.avatarConditions": "Only one Personal AI owned by each active member qualifies. Shared or operator-only assignments and archived AI still use seats.",
+  "google.chatSend.title": "Google Chat sending",
+  "google.chatSend.hint": "Off by default. Members grant sending access separately and confirm every message themselves. Text only, existing spaces only. Google shows the member as sender with the app name.",
+  "myConnections.chatSend.enabled": "Chat sending is authorized; each message still needs confirmation.",
+  "myConnections.chatSend.missing": "Chat sending is not authorized.",
+  "myConnections.chatSend.consent": "I allow access to send with my Google Chat account. This does not approve any individual message.",
+  "myConnections.chatSend.authorize": "Authorize Chat sending",
+  "myConnections.chatSend.confirmTitle": "Send with your Google account",
+  "myConnections.chatSend.egress": "Read the full text. Confirming sends this content, which may include private data, to the space above. Google includes the app name.",
+  "myConnections.chatSend.expires": "Confirm before {time}",
+  "myConnections.chatSend.confirm": "Confirm send",
+  "myConnections.chatSend.cancel": "Cancel"
 }

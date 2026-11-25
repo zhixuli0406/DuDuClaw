@@ -290,6 +290,7 @@ fn f6fb_adoption_enforces_agent_cap() {
     // Another live employee takes the only seat.
     let other = applied(f.home(), 3, "bob-desk", &[("binding_kind", "shared"), ("tenant_id", f.tenant.as_str())]);
     save(f.home(), &other, &receipt(&other, 3, false)).unwrap();
+    write_tree(f.home(), "bob-desk");
     let capped = AdoptEnv { agent_cap: 1, ..env(&ax) };
     assert_eq!(validate_item(f.home(), &capped, &item, &plan.adopt, &f.bob).err(),
         Some(AdoptError::Restore(Refusal::QuotaExceeded)));

@@ -27,6 +27,7 @@ pub struct Pending {
     pub meeting_recordings: bool,
     pub drive_tools: bool,
     pub chat_read: bool,
+    pub chat_send: bool,
     pub expected_connection: Option<crate::person_credentials::Metadata>,
     pub google_data_consent: crate::google_data_consent::Evidence,
     pub created: Instant,

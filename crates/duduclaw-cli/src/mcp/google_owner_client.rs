@@ -19,7 +19,7 @@ fn env(name: &str) -> Option<String> {
 }
 pub(crate) async fn prepare(home: &Path, agent: &str, tool: &str, params: &mut Value) -> Result<Option<OwnerCall>, String> {
     if gi::native_google_scope(tool).is_none()
-        || gi::effective_for(home, Some(agent)).effective != gi::Effective::DelegateOwner {
+        || (tool != "google_chat_send" && gi::effective_for(home, Some(agent)).effective != gi::Effective::DelegateOwner) {
         return Ok(None);
     }
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
@@ -62,7 +62,7 @@ pub(crate) async fn execute(home: &Path, tool: &str, args: &Value) -> Value {
     let Some(call) = APPROVED.try_with(Clone::clone).ok().flatten() else { return super::tool_error(REFUSED); };
     if call.tool != tool || call.args_digest != gi::google_arguments_digest(args) { return super::tool_error(REFUSED); }
     match super::google_identity_client::post_at(home, &call.agent, &call.request("employee", args),
-        ROUTE, Duration::from_secs(125), 512 * 1024).await {
+        ROUTE, Duration::from_secs(if tool == "google_chat_send" { 425 } else { 125 }), 512 * 1024).await {
         Ok(value) => value.get("result").cloned().unwrap_or_else(|| super::tool_error("Google 結果無法確認。")),
         // Transport failure after dispatch never asserts non-execution.
         Err(error) => super::tool_error(&format!("Google 結果無法確認（result_unconfirmed）；請先檢查 Google，勿直接重試。{error}")),
@@ -74,7 +74,7 @@ mod tests {
     use super::*;
     #[test]
     fn all_26_native_tools_are_in_owner_lane() {
-        assert_eq!(gi::NATIVE_GOOGLE_TOOLS.len(), 26);
+        assert_eq!(gi::NATIVE_GOOGLE_TOOLS.len(), 29);
         for tool in gi::NATIVE_GOOGLE_TOOLS { assert!(gi::native_google_scope(tool).is_some()); }
     }
     #[tokio::test]

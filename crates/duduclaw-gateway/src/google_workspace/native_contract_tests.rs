@@ -40,14 +40,15 @@ fn valid_cases() -> Vec<(&'static str, Value)> {
         ("sheets_update", json!({"spreadsheet_id":"s","range":"A1","values":[["x"]]})),
         ("calendar_update_event", json!({"event_id":"e","summary":"Updated"})),
         ("google_chat_spaces", json!({})),
+        ("google_chat_send", json!({"space":"spaces/A","text":"final text"})),
         ("google_chat_messages", json!({"space":"spaces/AAA"})),
     ]
 }
 
 #[test]
-fn all_twenty_seven_native_inputs_are_frozen_without_status_or_remote_aliases() {
+fn all_twenty_eight_native_inputs_are_frozen_without_status_or_remote_aliases() {
     let cases = valid_cases();
-    assert_eq!(cases.len(), 27);
+    assert_eq!(cases.len(), 28);
     for (tool, arguments) in cases {
         let call = NativeCallTemplate::prepare(tool, &arguments).unwrap();
         assert_eq!(call.tool(), tool);
@@ -92,15 +93,18 @@ fn frozen_raw_digest_retains_unused_fields_and_representation_changes() {
 #[test]
 fn parse_goldens_preserve_trim_number_boolean_and_cell_rules() {
     let cases = valid_cases();
-    let draft = NativeCallTemplate::prepare(cases[2].0, &cases[2].1).unwrap();
+    let (tool, args) = cases.iter().find(|(tool, _)| *tool == "gmail_create_draft").unwrap();
+    let draft = NativeCallTemplate::prepare(tool, args).unwrap();
     assert!(
         matches!(draft.parsed(), ParsedNativeArguments::GmailDraft { to, subject, .. } if to == " a@b.test " && subject == "主旨")
     );
-    let cells = NativeCallTemplate::prepare(cases[6].0, &cases[6].1).unwrap();
+    let (tool, args) = cases.iter().find(|(tool, _)| *tool == "sheets_append").unwrap();
+    let cells = NativeCallTemplate::prepare(tool, args).unwrap();
     assert!(
         matches!(cells.parsed(), ParsedNativeArguments::SheetsAppend { values, .. } if values == &vec!["a".to_string(), "".to_string(), "3".to_string(), "true".to_string()])
     );
-    let tasks = NativeCallTemplate::prepare(cases[10].0, &cases[10].1).unwrap();
+    let (tool, args) = cases.iter().find(|(tool, _)| *tool == "gtasks_list").unwrap();
+    let tasks = NativeCallTemplate::prepare(tool, args).unwrap();
     assert!(
         matches!(tasks.parsed(), ParsedNativeArguments::TasksList { list_id, show_completed, max } if list_id == "@default" && !show_completed && *max == 7)
     );

@@ -208,7 +208,7 @@ mod tests {
     fn fixture() -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
-        std::fs::write(home.path().join("agents/alice/agent.toml"), "[agent]\nname='Alice'\n[capabilities]\nrecipients=['mail:alice@example.com']\n").unwrap();
+        std::fs::write(home.path().join("agents/alice/agent.toml"), "[agent]\nname='Alice'\nstatus='active'\n[capabilities]\nrecipients=['mail:alice@example.com']\n").unwrap();
         std::fs::write(home.path().join("config.toml"), "[security]\nrecipient_guard='ask'\n").unwrap();
         let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         users.ensure_google_employee_nonce("alice").unwrap();

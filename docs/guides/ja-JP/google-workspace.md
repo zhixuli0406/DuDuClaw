@@ -156,7 +156,7 @@ default_identity = "home"   # [google] のない社員が使うもの：home（�
 allowed_subject_domains = ["customer.com"]
 ```
 
-`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 28 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
+`[google]` のない社員は `default_identity` を使うので、既存のインストールの動作は変わりません。`none` は 29 個の Google ツールを隠して呼び出しも拒否します。不正な値は共用アカウントへ切り替えず拒否します。Enterprise では `owner` と `user:<id>` を使えますが、有効な直接 Owner と本人の明示的な同意が必要です。[個人 Google 接続（v1.76.0）](google-personal-connections.md)を参照してください。
 
 ### この社員を通じて誰がアカウントを使えるか
 
@@ -187,7 +187,7 @@ Web サイトの公開訪問者（WebChat ウィジェット、Odoo ライブチ
 
 ### 社員専用 API key と Google MCP マウント（v1.76.0）
 
-検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 28 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
+検証済みの社員専用 API key に `google:read` または `google:write` が明示されている場合、閉じた 29 個の Google ツールのうち対応するものを使えます。`admin` だけでは代用できず、実在する社員と読める設定が必要です。一般の外部キーに付与できる権限やほかの連携は変わりません。OAuth 認証からこの実行用の証明は作られません。社員に紐づかない正規の内部カスタム連携キーは、従来の Home 経路を保ちます。
 
 社員の許可／拒否ツール、動作ルール、PolicyKernel、期限付き権限、承認要求は引き続き適用されます。承認待ちの間も、受理した社員、ツール、最終引数は固定されます。キーの失効、社員の削除、権限変更は拒否となり、プロセスの別の身元や別アカウントには切り替わりません。gateway が Google 操作を実行し、外部 MCP クライアントにはサイズ制限付きの結果だけを返します。Google bearer は返しません。
 

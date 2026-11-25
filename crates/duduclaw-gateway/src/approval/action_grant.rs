@@ -245,6 +245,10 @@ pub async fn verify_and_consume(
     if !grant.matches_stored(stored) {
         return Err(GrantRefusal::Mismatch);
     }
+    if crate::google_identity::chat_send::is_member_card(&rec) {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::google_identity::chat_send::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
+    }
     // Bound mail decisions retain the execution snapshot through the actual
     // single-use claim, including current requester authority after approval.
     if rec.payload["name"] == "mail_send" && rec.payload.get("egress_guard").is_some() {

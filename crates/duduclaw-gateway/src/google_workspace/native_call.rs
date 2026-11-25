@@ -11,6 +11,7 @@ pub(crate) enum ParsedNativeArguments {
     CalendarUpdate { calendar: String, event: String, patch: Value, notify: bool },
     ChatSpaces(super::chat_read::SpacesArgs),
     ChatMessages(super::chat_read::MessagesArgs),
+    ChatSend(super::chat_send::SendArgs),
     GmailSearch {
         query: String,
         max: u32,
@@ -172,6 +173,7 @@ pub(crate) fn validate_inputs(tool: &str, args: &Value) -> Result<(), String> {
             }
         }
     }
+    if tool == "google_chat_send" { super::chat_send::parse(args)?; }
     let limits: &[(&str, usize)] = match tool {
         "docs_create" => &[("title", 1000), ("body", 20_000)],
         "docs_replace_text" => &[("find", 20_000), ("replace", 20_000)],
@@ -353,6 +355,7 @@ impl NativeCallTemplate {
                     notify: boolean(args, "notify_attendees", false)?,
                 }
             },
+            "google_chat_send" => ParsedNativeArguments::ChatSend(super::chat_send::parse(args)?),
             "google_chat_spaces" => ParsedNativeArguments::ChatSpaces(super::chat_read::spaces_args(args)?),
             "google_chat_messages" => ParsedNativeArguments::ChatMessages(super::chat_read::messages_args(args)?),
             "gmail_search" => ParsedNativeArguments::GmailSearch {
@@ -534,6 +537,10 @@ impl NativeCallTemplate {
     }
     pub(crate) fn time_window(&self) -> (&str, &str) {
         (&self.calendar_min, &self.calendar_max)
+    }
+    pub(crate) fn set_chat_request_id(&mut self, id: &str) {
+        assert_eq!(self.tool, "google_chat_send");
+        self.meet_request_id = id.to_owned();
     }
     pub(crate) fn meet_request_id(&self) -> &str {
         &self.meet_request_id

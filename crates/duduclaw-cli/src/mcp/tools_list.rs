@@ -963,6 +963,10 @@ pub(crate) async fn visible_tools_in_lane(
             !matches!(t.name, "google_chat_spaces" | "google_chat_messages")
                 || duduclaw_gateway::google_workspace::chat_read_tool_available(home_dir, t.name)
         })
+        .filter(|t| t.name != "google_chat_send" || (!dedicated_google
+            && duduclaw_gateway::google_workspace::chat_send_enabled(home_dir)
+            && matches!(duduclaw_core::google_identity::effective_for(home_dir, Some(effective_agent)).effective,
+                duduclaw_core::google_identity::Effective::Personal { .. } | duduclaw_core::google_identity::Effective::Delegate { .. } | duduclaw_core::google_identity::Effective::DelegateOwner)))
         .filter(|t| github_enabled || !GITHUB_WORKSPACE_TOOLS.contains(&t.name))
         // WP-D §13.7: hide the SQL connector from agents with no grant.
         .filter(|t| allow_db_sources || !DB_SOURCE_TOOLS.contains(&t.name))

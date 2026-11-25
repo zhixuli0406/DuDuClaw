@@ -189,7 +189,7 @@ allowed_subject_domains = ["customer.com"]
 ```
 
 An employee without `[google]` uses `default_identity`, so an existing
-installation behaves exactly as before. `none` hides the 28 Google tools
+installation behaves exactly as before. `none` hides the 29 Google tools
 from that employee and refuses calls to them. A value that cannot be read
 (a typo, an unknown key) refuses Google for that employee; it never turns
 into the shared account. Enterprise employees may use `owner` or `user:<id>`

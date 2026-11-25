@@ -121,6 +121,7 @@ impl Fixture {
             "me.google.connect_finish" => json!({"state": "missing-fixture-state"}),
             "me.google.connect_paste" => json!({"url": "invalid-fixture-callback"}),
             "me.google.disconnect" => json!({"confirm": false}),
+            "me.google.chat_confirm" => json!({"id":"missing", "approve":false}),
             "me.google.consents.set" => json!({"agent_id": "sales", "allowed": false}),
             "agents.list" | "chat.sessions.list" | "tasks.list" | "activity.list"
             | "decisions.list" | "skills.list" | "skills.recent" | "memory.browse"
@@ -128,7 +129,7 @@ impl Fixture {
             "users.me" | "about.get" | "onboarding.get" | "agents.callable" | "agents.org_chart"
             | "cron.list" | "cron.templates" | "reminders.list" | "assign_schedules.list"
             | "skills.shared" | "skills.leaderboard" | "shared_wiki.pages" | "me.memory.list"
-            | "dashboard.layout.get" | "me.status_tokens.list" | "me.google.status" => json!({}),
+            | "dashboard.layout.get" | "me.status_tokens.list" | "me.google.status" | "me.google.chat_confirmations" => json!({}),
             other => panic!("missing member contract fixture: {other}"),
         }
     }

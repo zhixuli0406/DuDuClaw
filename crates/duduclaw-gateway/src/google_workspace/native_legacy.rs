@@ -327,6 +327,7 @@ pub(crate) async fn handle(
     home: &Path,
     g: &dyn crate::google_identity::native_tools::NativeGoogleAccess,
 ) -> Value {
+    if tool == "google_chat_send" { return super::native_call::tool_error("Chat 傳送必須由 gateway 取得本人確認。 "); }
     if matches!(tool, "google_chat_spaces" | "google_chat_messages")
         && !super::chat_read_tool_available(home, tool)
     {
@@ -364,6 +365,7 @@ pub(crate) async fn handle(
         | ParsedNativeArguments::SheetsCreate { .. } | ParsedNativeArguments::SheetsUpdate { .. }
         | ParsedNativeArguments::GmailSend { .. } | ParsedNativeArguments::CalendarDelete { .. }
         | ParsedNativeArguments::CalendarUpdate { .. } => unreachable!("new native tools returned above"),
+        ParsedNativeArguments::ChatSend(_) => return super::native_call::tool_error("Chat 傳送需要本人確認。"),
         ParsedNativeArguments::ChatSpaces(args) => {
             let backend = match g.backend(home, tool).await { Ok(b) => b, Err(e) => return super::native_call::tool_error(&e) };
             match backend {

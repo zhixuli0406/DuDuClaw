@@ -76,6 +76,7 @@ export function GoogleIntegrationPage() {
   // than guessing, so a transient RPC failure never claims the integration is
   // off when it is on.
   const [enabled, setEnabled] = useState<boolean | null>(null);
+  const [chatSend, setChatSend] = useState<boolean | null>(null);
   const [chatRead, setChatRead] = useState<boolean | null>(null);
   const [chatIdentity, setChatIdentity] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -88,9 +89,11 @@ export function GoogleIntegrationPage() {
       const status = await api.googleCredentials.get();
       setEnabled(status.integration_enabled);
       setChatRead(status.chat_read === true);
+      setChatSend(status.chat_send === true);
       setChatIdentity(status.chat_identity_from_account === true);
     } catch {
       setEnabled(null);
+      setChatSend(null);
       setChatRead(null);
       setChatIdentity(null);
     }
@@ -168,6 +171,17 @@ export function GoogleIntegrationPage() {
         </Card>
       )}
 
+      {admin && chatSend !== null && <Card><CardContent className="space-y-3 py-4">
+        <label className="flex items-center gap-3 text-sm font-medium">
+          <input type="checkbox" checked={chatSend} disabled={busy} onChange={event => {
+            const next = event.target.checked;
+            setBusy(true);
+            void api.googleCredentials.setChatSend(next).then(result => setChatSend(result.chat_send))
+              .catch(error => toast.error(formatError(error))).finally(() => setBusy(false));
+          }}/>{t('google.chatSend.title', 'Google Chat 傳送')}
+        </label>
+        <p className="text-sm text-muted-foreground">{t('google.chatSend.hint', '使用本人帳號傳送文字，每次都要本人確認。')}</p>
+      </CardContent></Card>}
       {admin && chatRead !== null && <Card><CardContent className="space-y-3 py-4">
         <label className="flex items-center gap-2 text-sm font-medium">
           <input type="checkbox" checked={chatRead} disabled={busy} onChange={event => {

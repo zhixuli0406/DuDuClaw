@@ -145,3 +145,13 @@ The `google:chat` preset does not add Chat authorization scopes. The native Work
 ## Chat authorization links
 
 Missing personal access may produce a gateway-owned confirmation link. It requires the same member’s normal Dashboard login and explicit data-disclosure confirmation; it is not a login or SSO credential. No MCP tool accepts a ticket or selects the member, account, scopes or redirect. Authorization does not approve outbound sends. See [personal Google connections](google-personal-connections.md#confirm-google-access-from-a-conversation) for account checks, public URL requirements and continuation behavior. Official remote MCP service eligibility and existing capability gates still apply.
+
+## Send Google Chat as yourself
+
+`google_chat_send {space, text, thread?}` sends text to an existing space using the verified requesting member's own Google account. It requires `google:write` and is off until an administrator enables `[google] chat_send = true`. A home/shared account, another member, Apps Script, or a Chat app token (`chat.bot`) cannot substitute for the member.
+
+For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Incremental consent requests `https://www.googleapis.com/auth/chat.messages.create`; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
+
+Every send waits for the member's own single-use confirmation, valid for five minutes. The card shows the account, space resource name, thread and full final text, with a private-data warning. A verified private conversation can carry a short card; group requests and long messages use the member-only **My connections** page. Admin approval, an `allow` rule, Admin MCP scope and recipient allowlists cannot replace this confirmation. Any organisation-required egress approval still applies in addition. Editing the message, destination, account, credential or policy invalidates confirmation.
+
+The gateway keeps one request ID with the operation and never automatically resends an unknown outcome (`result_unconfirmed`). Check Google Chat before asking for a new send. Attachments and space creation are not supported; a specified thread must belong to the same space. Google displays the user as sender and also attributes the application by name. [Google Chat API reference](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).

@@ -30,6 +30,27 @@ impl MethodHandler {
         }
         let result: Result<Value, String> = async {
             match method {
+                "me.google.chat_confirmations" => {
+                    let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
+                    let rows = broker.list_by_kind("bound_action").await?;
+                    Ok(json!({"requests":rows.into_iter().filter(|r|
+                        r.status == crate::approval::ApprovalStatus::Pending
+                        && crate::google_identity::chat_send::may_decide(&self.home_dir, r, &ctx.user_id))
+                        .map(|r| crate::google_identity::chat_send::confirmation_display(&r)).collect::<Vec<_>>()}))
+                }
+                "me.google.chat_confirm" => {
+                    let _session = google_personal::session_for(&ctx.user_id)?;
+                    let id = params["id"].as_str().ok_or("Missing confirmation")?;
+                    let approve = params["approve"].as_bool().ok_or("Missing decision")?;
+                    let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
+                    let id = crate::approval::ApprovalId::from(id.to_owned());
+                    let rec = broker.get(&id).await?.ok_or("Confirmation missing")?;
+                    if !crate::google_identity::chat_send::may_decide(&self.home_dir, &rec, &ctx.user_id) {
+                        return Err("僅限提出要求的本人確認，或這則確認已失效。".into());
+                    }
+                    broker.decide_bound_dashboard(&id, ctx, approve).await?;
+                    Ok(json!({"decided":true}))
+                }
                 "me.google.status" => self.personal_google_status(&db, ctx).await,
                 "me.google.connect_start" => {
                     if params
@@ -45,8 +66,10 @@ impl MethodHandler {
                     let drive_tools = params.get("drive_tools")
                         .map(|value| value.as_bool().ok_or("請確認要開放的 Google 服務。"))
                         .transpose()?.unwrap_or(false);
-                    if meeting_recordings && drive_tools {
-                        return Err("請分別開放會議錄影或雲端硬碟工具，每次選擇一項服務。".into());
+                    let chat_send = params.get("chat_send").map(|v| v.as_bool().ok_or("請確認 Chat 傳送用途。"))
+                        .transpose()?.unwrap_or(false);
+                    if [meeting_recordings, drive_tools, chat_send].iter().filter(|v| **v).count() > 1 {
+                        return Err("請分別開放額外的 Google 服務，每次選擇一項。".into());
                     }
                     let session = google_personal::session_for(&ctx.user_id)?;
                     let origin = params
@@ -54,7 +77,9 @@ impl MethodHandler {
                         .and_then(Value::as_str)
                         .ok_or("請提供目前控制台的網址。")?;
                     let allowed = crate::server::allowed_origins_snapshot();
-                    if drive_tools {
+                    if chat_send {
+                        flow::start_chat_send(&self.home_dir, &db, &ctx.user_id, &session, origin, &allowed, true).await
+                    } else if drive_tools {
                         flow::start_drive_tools(&self.home_dir, &db, &ctx.user_id, &session, origin, &allowed, true).await
                     } else {
                         flow::start_with_meetings(&self.home_dir, &db, &ctx.user_id, &session, origin, &allowed, true, meeting_recordings).await
@@ -210,6 +235,7 @@ impl MethodHandler {
         Ok(
             json!({"authorization_requests":crate::google_authorization_requests::store::Store::open(&self.home_dir)?.statuses(&ctx.user_id)?,"notices":notices,"connection":own,"login_email":ctx.email,"client_configured":crate::mcp_oauth::get_client_config(&self.home_dir,"google").is_some(),
             "chat_read":crate::google_workspace::chat_read_enabled(&self.home_dir),
+            "chat_send":crate::google_workspace::chat_send_enabled(&self.home_dir),
             "integration_enabled":crate::google_workspace::integration_enabled(&self.home_dir),"requests":requests,"delegated":delegated,
             "requires_login":google_personal::session_for(&ctx.user_id).is_err(),"recent_usage":google_personal::history::recent(&self.home_dir,&ctx.user_id,&ctx.email)?}),
         )

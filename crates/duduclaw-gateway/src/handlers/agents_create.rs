@@ -379,33 +379,48 @@ impl MethodHandler {
         // the staging directory is removed and nothing appears.
         // Short synchronous file operations (as the upsert always was).
         let prior_org = duduclaw_core::org_store::load(&self.home_dir).get(name).cloned();
+        // Commit the org policy fence before the avatar's users transaction.
+        // Publishing below repeats the same upsert under this org lock, so it
+        // is a no-op and cannot open a second SQLite writer inside that tx.
+        let mut prepared_org = false;
+        let prepare = if avatar_db.is_some() && avatar_member.is_some() && caller.is_some() {
+            duduclaw_core::org_store::upsert(&org, name, org_entry.clone())
+                .map(|_| { prepared_org = true; }).map_err(|e| e.to_string())
+        } else { Ok(()) };
         let mut published = false;
-        let publish = |users: Option<&rusqlite::Connection>| {
-            // Mark before calling: publish may return an incarnation error
-            // after rename. Cleanup must also cover that failure.
-            published = true;
-            match users {
-                Some(conn) => staged.publish_in_users_transaction(&org, org_entry, conn),
-                None => staged.publish(&org, org_entry),
-            }.map(|_| ()).map_err(|e| e.to_string())
-        };
-        let result = match (avatar_db.as_ref(), avatar_member, caller) {
-            (Some(db), Some(member), Some(ctx)) => db.publish_new_avatar_under(
-                &ctx.user_id, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
-            ),
-            _ => publish(None).and_then(|()| seat_admission.recount(seat_cap)),
-        };
-        if let Err(e) = result {
-            if published {
-                // This directory was created by this request while admission
+        let result = prepare.and_then(|()| {
+            let publish = |users: Option<&rusqlite::Connection>| {
+                let result = match users {
+                    Some(conn) => staged.publish_in_users_transaction(&org, org_entry, conn),
+                    None => staged.publish(&org, org_entry),
+                };
+                // A nonce failure can happen after rename, while an authority
+                // refusal happens before it. Only compensate a published tree.
+                published = match std::fs::symlink_metadata(&agent_dir) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    _ => true,
+                };
+                result.map(|_| ()).map_err(|e| e.to_string())
+            };
+            match (avatar_db.as_ref(), avatar_member, caller) {
+                (Some(db), Some(member), Some(ctx)) => db.publish_new_avatar_under(
+                    &ctx.user_id, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
+                ),
+                _ => publish(None).and_then(|()| seat_admission.recount(seat_cap)),
+            }
+        });
+        if let Err(mut e) = result {
+            if published || prepared_org {
+                // These artifacts were created by this request while admission
                 // and org locks are held. Never touch a pre-existing agent.
-                let cleanup = std::fs::remove_dir_all(&agent_dir);
+                let cleanup = if published { std::fs::remove_dir_all(&agent_dir) } else { Ok(()) };
                 let authority = match prior_org {
                     Some(entry) => duduclaw_core::org_store::upsert(&org, name, entry).map(|_| ()),
                     None => duduclaw_core::org_store::remove(&org, name).map(|_| ()),
                 };
                 if cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) || authority.is_err() {
-                    return WsFrame::error_response("", "分身建立失敗，清理未完成；請管理員檢查 AI 資料。未取得名額豁免。");
+                    // Even when compensation fails, still restore a demoted main.
+                    e.push_str("；AI 建立失敗，清理未完成，請管理員檢查 AI 資料。未取得名額豁免。");
                 }
             }
             warn!(agent = %name, error = %e, "agents.create refused: org authority not committed");

@@ -360,15 +360,16 @@ fn users_error(error: duduclaw_auth::db::PersonalAgentError) -> Refusal {
 /// epoch bumps.
 fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str, admission: &duduclaw_core::agent_seats::SeatAdmission)
     -> Result<Approval, Refusal> {
-    // Lock order: caller-held seat admission -> authority writer lease -> users.db transaction.
-    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
-        .write().map_err(unavailable)?;
     let restore_avatar_grant = q.owner.is_some() && q.principal_snapshot["avatar_seat_grant"].as_bool() == Some(true);
     if restore_avatar_grant {
         // Tombstoning revoked the old nonce. Only the immutable snapshot can
         // authorize carrying the protected kind to this restored incarnation.
         duduclaw_core::employee_incarnation::created(home, &q.label).map_err(unavailable)?;
     }
+    // Nonce rotation above owns its own authority lease. Acquire the users
+    // mutation lease afterward, never recursively while rotating the nonce.
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(unavailable)?;
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(from_lifecycle)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(Refusal::TenantMismatch); }

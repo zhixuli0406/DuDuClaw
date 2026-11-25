@@ -30,7 +30,7 @@ impl MethodHandler {
             let Some(enabled) = value.as_bool() else {
                 return WsFrame::error_response("", "Google Chat 身分比對設定必須是布林值。");
             };
-            if params.get("enabled").is_some() || params.get("chat_read").is_some() {
+            if params.get("enabled").is_some() || params.get("chat_read").is_some() || params.get("chat_send").is_some() {
                 return WsFrame::error_response("", "請分別更新 Google 整合、Chat 讀取與 Chat 身分比對設定。");
             }
             return match crate::googlechat_identity::set_derivation_enabled(&self.home_dir, enabled) {
@@ -47,6 +47,18 @@ impl MethodHandler {
                     }
                     WsFrame::ok_response("", json!({"chat_identity_from_account": enabled, "changed": changed}))
                 }
+                Err(error) => WsFrame::error_response("", &error),
+            };
+        }
+        if let Some(value) = params.get("chat_send") {
+            let Some(enabled) = value.as_bool() else {
+                return WsFrame::error_response("", "Google Chat 傳送設定必須是布林值。");
+            };
+            if params.get("enabled").is_some() || params.get("chat_read").is_some() {
+                return WsFrame::error_response("", "請分別更新 Google 整合與 Chat 傳送設定。");
+            }
+            return match crate::google_workspace::set_chat_send_enabled(&self.home_dir, enabled) {
+                Ok(changed) => WsFrame::ok_response("", json!({"chat_send": enabled, "changed": changed})),
                 Err(error) => WsFrame::error_response("", &error),
             };
         }
@@ -115,6 +127,7 @@ impl MethodHandler {
                 "integration_enabled":
                     crate::google_workspace::integration_enabled(&self.home_dir),
                 "chat_read": crate::google_workspace::chat_read_enabled(&self.home_dir),
+                "chat_send": crate::google_workspace::chat_send_enabled(&self.home_dir),
                 // Display only, not a gate: an unreadable or malformed setting
                 // shows as off here, while every gate treats it as an error and
                 // fails closed (`googlechat_identity::derivation_enabled`).

@@ -746,6 +746,12 @@ fn handler_names_employee(body: &str) -> bool {
         || EMPLOYEE_KEYS.iter().any(|key| body.contains(&format!(".get(\"{key}\")")) || body.contains(&format!(", \"{key}\")")))
 }
 
+fn handler_chain_names_employee(name: &str, bodies: &HashMap<String, String>, seen: &mut BTreeSet<String>) -> bool {
+    if !seen.insert(name.to_owned()) { return false; }
+    bodies.get(name).is_some_and(|body| handler_names_employee(body)
+        || self_calls(body).iter().any(|call| handler_chain_names_employee(call, bodies, seen)))
+}
+
 fn namespace(method: &str) -> &str {
     method.split('.').next().unwrap_or(method)
 }
@@ -771,7 +777,7 @@ fn p1e_every_dashboard_arm_is_gated_or_allowlisted() {
         for arm in dispatch_arms(source) {
             let takes = arm.body.contains("params");
             let names = arm_names_employee(&arm.body)
-                || self_calls(&arm.body).iter().any(|call| bodies.get(call).is_some_and(|b| handler_names_employee(b)));
+                || self_calls(&arm.body).iter().any(|call| handler_chain_names_employee(call, &bodies, &mut BTreeSet::new()));
             for method in arm.methods {
                 let entry = found.entry(method).or_default();
                 entry.0 |= takes;
