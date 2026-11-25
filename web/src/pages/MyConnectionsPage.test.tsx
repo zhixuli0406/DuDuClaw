@@ -89,7 +89,7 @@ describe('MyConnectionsPage', () => {
     expect(connect).toBeEnabled();
     await user.click(connect);
     await waitFor(()=>expect(start).toHaveBeenCalledTimes(1));
-    expect(start).toHaveBeenCalledWith(true, false, false);
+    expect(start).toHaveBeenCalledWith(true, false, false, false);
   });
 
   it('requires a separate consent before requesting recording scopes', async () => {
@@ -104,7 +104,7 @@ describe('MyConnectionsPage', () => {
     expect(authorize).toBeDisabled();
     await user.click(screen.getByRole('checkbox', { name: /agree to these additional recording import permissions/i }));
     await user.click(authorize);
-    await waitFor(() => expect(start).toHaveBeenCalledWith(true, true, false));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, true, false, false));
   });
 
   it('requires an independent broad Drive consent and does not request recording scopes with it', async () => {
@@ -119,7 +119,7 @@ describe('MyConnectionsPage', () => {
     expect(authorize).toBeDisabled();
     await user.click(screen.getByRole('checkbox', { name: /allow read-only access to all Drive files my Google account can access/i }));
     await user.click(authorize);
-    await waitFor(() => expect(start).toHaveBeenCalledWith(true, false, true));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, false, true, false));
   });
 
   it('shows that Anyone includes external tools while public visitors remain excluded',async()=>{

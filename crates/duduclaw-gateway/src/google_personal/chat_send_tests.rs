@@ -65,6 +65,26 @@ fn ctx(f: &Fixture) -> duduclaw_auth::UserContext {
     ctx
 }
 
+async fn confirmation_handler(home: &std::path::Path, db: std::sync::Arc<duduclaw_auth::UserDb>) -> crate::handlers::MethodHandler {
+    let handler = crate::handlers::MethodHandler::new(home.to_owned()).await;
+    // set_user_db resolves and publishes the edition used by Personal OAuth.
+    // Install the signed fixture license before that first resolution.
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    handler.set_user_db(db, std::sync::Arc::new(duduclaw_auth::JwtConfig::new(b"isolated-fixture-signing-key-only"))).await;
+    assert!(crate::team_edition::team_grants_enabled(home));
+    handler
+}
+
+#[tokio::test]
+async fn chat_send_rpc_fixture_keeps_personal_oauth_available() {
+    // No OAuth server: exercise the setup that runs before token resolution.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    let db = std::sync::Arc::new(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
+    crate::team_edition::record(&home, duduclaw_core::EditionProfile::Enterprise);
+    let _handler = confirmation_handler(&home, db).await;
+}
+
 #[tokio::test]
 async fn chat_send_incremental_consent_refuses_changed_sub_missing_scope_and_switch() {
     let f = Fixture::new(); f.connect().await;
@@ -200,7 +220,8 @@ async fn chat_send_display_rpc_preserves_raw_approval_digest_and_sent_bytes() {
     assert_ne!(digest, duduclaw_core::google_identity::google_arguments_digest(&display_args));
     let sent = Arc::new(Mutex::new(Vec::new()));
     let observed = sent.clone();
-    let router = axum::Router::new().route("/v1/spaces/A/messages", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+    // The owned transport preserves the Google host as a path prefix.
+    let router = axum::Router::new().route("/chat.googleapis.com/v1/spaces/A/messages", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
         observed.lock().unwrap().push(body);
         async { axum::Json(json!({"name":"spaces/A/messages/M"})) }
     }));
@@ -208,9 +229,7 @@ async fn chat_send_display_rpc_preserves_raw_approval_digest_and_sent_bytes() {
     let base = format!("http://{}/", listener.local_addr().unwrap());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
     let _transport = testing::install(&f.home, &base);
-    let handler = crate::handlers::MethodHandler::new(f.home.clone()).await;
-    handler.set_user_db(f.db.clone(), Arc::new(duduclaw_auth::JwtConfig::new(b"isolated-fixture-signing-key-only"))).await;
-    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    let handler = confirmation_handler(&f.home, f.db.clone()).await;
     let snapshot = Snapshot::capture(&f.home, "bot", &who(&f)).unwrap();
     let execution = chat_send::execute(&f.home, "bot", &args, who(&f), turn, snapshot, uuid::Uuid::new_v4().to_string());
     let confirmation = async {
@@ -283,7 +302,7 @@ async fn chat_send_revocation_at_transport_boundary_and_unknown_outcome_never_re
         let turn = if revoke { "chat-race" } else { "chat-unknown" };
         let hits = Arc::new(AtomicUsize::new(0));
         let observed = hits.clone();
-        let router = axum::Router::new().route("/v1/spaces/A/messages", axum::routing::post(move || {
+        let router = axum::Router::new().route("/chat.googleapis.com/v1/spaces/A/messages", axum::routing::post(move || {
             observed.fetch_add(1, Ordering::SeqCst);
             async { axum::Json(json!({"provider_reply":"missing message resource"})) }
         }));
@@ -315,7 +334,7 @@ async fn chat_send_revocation_at_transport_boundary_and_unknown_outcome_never_re
         };
         let (result, ()) = tokio::join!(execution, confirmation);
         let error = result.unwrap_err();
-        assert_eq!(hits.load(Ordering::SeqCst), if revoke { 0 } else { 1 });
+        assert_eq!(hits.load(Ordering::SeqCst), if revoke { 0 } else { 1 }, "revoke={revoke}: {error:?}");
         if !revoke { assert_eq!(error.code, "result_unconfirmed"); }
         server.abort();
     }

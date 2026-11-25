@@ -106,8 +106,11 @@ async fn sender_resolution_failure_after_claim_stops_without_retry_even_if_expir
             assert_eq!(request_status(home.path(),&request.id),"claimed");
             calls.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
             if expire {
+                // Expire during claimed I/O without crossing the one-day
+                // retention cutoff, which intentionally deletes old rows.
                 rusqlite::Connection::open(home.path().join("protected/google_authorization_requests.db")).unwrap()
-                    .execute("UPDATE requests SET expires=0 WHERE id=?1",[&request.id]).unwrap();
+                    .execute("UPDATE requests SET expires=?2 WHERE id=?1",
+                        rusqlite::params![&request.id,chrono::Utc::now().timestamp()-1]).unwrap();
             }
             Err("sender credential/token resolution failed".into())
         }).await;

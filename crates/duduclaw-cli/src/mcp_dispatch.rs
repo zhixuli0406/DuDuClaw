@@ -5288,6 +5288,9 @@ effect = "forbid"
         "gmail_read",
         "google_chat_spaces",
         "google_chat_messages",
+        // Send effect + google:write scope; the gateway also requires the
+        // account member's one-shot confirmation, not a [permissions] flag.
+        "google_chat_send",
         "gmail_search",
         "goals_create",
         "goals_list",
@@ -5503,6 +5506,14 @@ effect = "forbid"
             .filter(|t| !all.contains(**t))
             .collect();
         assert!(stale.is_empty(), "no such tool: {stale:?}");
+        for (tool, effect) in [
+            ("google_chat_send", duduclaw_core::ToolEffect::Send),
+            ("gmail_send_draft", duduclaw_core::ToolEffect::Send),
+            ("calendar_delete_event", duduclaw_core::ToolEffect::Delete),
+        ] {
+            assert_eq!(duduclaw_core::effect_of(tool), effect, "{tool}");
+            assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(Scope::GoogleWrite), "{tool}");
+        }
     }
 
     #[tokio::test]
