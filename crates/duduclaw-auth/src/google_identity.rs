@@ -91,6 +91,11 @@ fn bump_primary_owner_generation(conn: &Connection, agent: &str) -> Result<(), S
 }
 
 impl UserDb {
+    pub(crate) fn google_authority_write(&self) -> Result<Option<duduclaw_core::authority_coordinator::WriteLease>, String> {
+        self.authority_home.as_deref().map(|home| duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+            .write()).transpose().map_err(|e| format!("Google authority barrier: {e}"))
+    }
+
     /// Durable version of this agent's primary-owner writes. It is separate
     /// from the global ACL cache generation and advances even for A→B→A.
     pub fn google_primary_owner_generation(&self, agent: &str) -> Result<u64, String> {
@@ -142,6 +147,7 @@ impl UserDb {
         user_id: &str,
         actor: &str,
     ) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

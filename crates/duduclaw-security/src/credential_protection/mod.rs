@@ -414,6 +414,8 @@ impl CredentialProtection {
 
     /// [`CredentialProtection::enable`] plus what it replaced, for the audit.
     pub fn enable_detailed(&self, reset: bool) -> Result<Enabled, ProtectionError> {
+        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+            .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         if let Some(reason) = self.store.refusal_reason() {
             return Err(ProtectionError::from_state(ProtectionState::Unavailable, self.store.backend(), reason));
         }
@@ -470,6 +472,8 @@ impl CredentialProtection {
     /// Remove the protected key and the marker. Everything sealed with it
     /// becomes unreadable.
     pub fn disable(&self) -> Result<(), ProtectionError> {
+        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+            .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         self.with_op_lock(|| {
             let account = self.account();
             self.store.delete(&account).map_err(|e| store_error(&e, self.store.backend()))?;
@@ -489,6 +493,8 @@ impl CredentialProtection {
     /// `duduclaw` executable the gateway uses, or the new ACL trusts the wrong
     /// one.
     pub fn authorize(&self) -> Result<ProtectionStatus, ProtectionError> {
+        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&self.home)
+            .write().map_err(|e| ProtectionError::new("authority_unavailable", e.to_string()))?;
         self.with_op_lock(|| {
             let account = self.account();
             let m = read_marker_for(&self.home, self.store.as_ref(), &account)

@@ -386,3 +386,5 @@ pub(crate) mod recipient_gate;
 
 #[cfg(test)]
 mod tool_pruning_tests;
+
+pub(crate) mod google_owner_client;

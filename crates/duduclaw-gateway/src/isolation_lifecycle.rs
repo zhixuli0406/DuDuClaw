@@ -282,6 +282,8 @@ pub(crate) type UsersGate<'a> = dyn Fn(&Connection) -> Result<(), ()> + 'a;
 /// the mirror).
 pub(crate) fn record_personal_mirror_gated(home: &Path, label: &str, owner: &str, gate: Option<&UsersGate<'_>>)
     -> Result<bool, LifecycleError> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     if let Some(gate) = gate {
@@ -314,6 +316,8 @@ pub(crate) fn run_users_gate(home: &Path, gate: &UsersGate<'_>) -> Result<(), Li
 /// (and, per A3, every binding of the agent). `Ok(false)` when absent;
 /// `Stale` when another owner is recorded (left untouched).
 pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> Result<bool, LifecycleError> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_personal_agent_in_transaction(&tx, label, owner).map_err(mirror_error)?;
@@ -326,6 +330,8 @@ pub(crate) fn remove_personal_mirror(home: &Path, label: &str, owner: &str) -> R
 /// bump the ACL generation, in one users.db transaction. A Personal mirror
 /// for the label refuses (`Stale`, left untouched).
 pub(crate) fn remove_shared_bindings(home: &Path, label: &str) -> Result<usize, LifecycleError> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|_| LifecycleError::Unavailable)?;
     let mut users = open_store(home, USERS_DB, Access::ReadWrite)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| LifecycleError::Unavailable)?;
     let removed = duduclaw_auth::db::remove_shared_bindings_in_transaction(&tx, label).map_err(mirror_error)?;

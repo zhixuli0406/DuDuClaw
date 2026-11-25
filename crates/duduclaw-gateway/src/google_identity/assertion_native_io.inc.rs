@@ -176,10 +176,20 @@ impl Transport<'_, '_> {
         {
             return Err(self.fail());
         }
+        let lease = match self.view.permit.acquire_native_lease().await {
+            Ok(lease) => lease,
+            Err(error) => {
+                self.failure = Some(ClosedNativeFailure::validation(error, self.may_have_sent));
+                return Err(Self::marker());
+            }
+        };
         self.at("before_send")?;
         self.requests += 1;
         self.may_have_sent = true;
-        let pending = self.client.execute(request).await;
+        self.view.permit.native_sent();
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(30), self.client.execute(request)).await;
+        drop(lease);
+        let pending = match pending { Ok(pending) => pending, Err(_) => return Err(self.fail()) };
         self.at("after_send")?;
         let mut response = match pending {
             Ok(r) => r,
@@ -194,6 +204,7 @@ impl Transport<'_, '_> {
         }
         let mut bytes = Vec::new();
         loop {
+            self.at("before_chunk")?;
             let next = response.chunk().await;
             self.at("after_chunk")?;
             match next {

@@ -258,6 +258,7 @@ impl UserDb {
     }
 
     pub fn ensure_google_employee_nonce(&self, agent: &str) -> Result<String, String> {
+        let _authority = self.google_authority_write()?;
         duduclaw_core::employee_incarnation::ensure(&self.conn(), agent).map_err(|e| e.to_string())
     }
 
@@ -284,6 +285,7 @@ impl UserDb {
 
     fn attest_google_delegate_inner(&self, request: &AttestationRequest<'_>, email_matches: &dyn Fn(&str) -> bool,
         attested_by: &str, require_owner: bool) -> Result<Attested, String> {
+        let _authority = self.google_authority_write()?;
         let AttestationRequest { agent_id, employee_id, employee_incarnation, subject, user_id: shown,
             acknowledge_self_set } = *request;
         if agent_id.is_empty() || subject.is_empty() || attested_by.is_empty() || shown.is_empty()
@@ -407,6 +409,7 @@ impl UserDb {
 
     /// Remove `agent_id`'s attestation (audited). `Ok(false)`: there was none.
     pub fn revoke_google_delegate_attestation(&self, agent_id: &str, actor: &str) -> Result<bool, String> {
+        let _authority = self.google_authority_write()?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn

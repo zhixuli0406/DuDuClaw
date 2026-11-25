@@ -76,6 +76,7 @@ impl NewMember {
 
 impl UserDb {
     pub fn create_member_at_epoch(&self, member: &NewMember, actor: &str, epoch: u64) -> Result<CreatedMember, &'static str> {
+        let _authority = self.google_authority_write().map_err(|_| "Google authority unavailable")?;
         member.validate()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)

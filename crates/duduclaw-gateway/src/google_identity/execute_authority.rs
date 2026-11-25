@@ -54,6 +54,7 @@ mod tests {
             std::fs::write(home.path().join("config.toml"), &raw).unwrap();
             let state = ExecuteState::new(home.path().to_path_buf(), None);
             let request = ExecuteRequest {
+                owner_prepare: false, owner_binding_digest: None,
                 tool: "google_status".into(),
                 selection_stamp: None,
                 arguments: json!({}),

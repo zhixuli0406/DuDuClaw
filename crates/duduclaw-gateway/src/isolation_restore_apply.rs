@@ -357,6 +357,8 @@ fn users_error(error: duduclaw_auth::db::PersonalAgentError) -> Refusal {
 /// epoch bumps.
 fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str)
     -> Result<Approval, Refusal> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(unavailable)?;
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(from_lifecycle)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(Refusal::TenantMismatch); }

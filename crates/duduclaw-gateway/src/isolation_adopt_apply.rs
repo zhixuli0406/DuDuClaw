@@ -579,6 +579,8 @@ fn delete_marker(home: &Path, target: &str, adopt: &AdoptRef) -> Result<(), Adop
 /// Idempotent for a resumed apply (F6fb item 1): bindings already equal to
 /// the selection are left as they are; any other binding refuses.
 fn bind_members(home: &Path, q: &Quarantined, target: &str, members: &Value) -> Result<(), AdoptError> {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(unavailable)?;
     let selection = members.as_array().ok_or(AdoptError::MembersInvalid)?.iter().map(|member| Ok(duduclaw_auth::db::RestoredMember {
         user_id: member["user_id"].as_str().ok_or(AdoptError::MembersInvalid)?.to_owned(),
         access_level: member["access_level"].as_str().and_then(|level| level.parse().ok()).ok_or(AdoptError::MembersInvalid)?,

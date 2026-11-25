@@ -904,6 +904,8 @@ impl McpDispatcher {
             obj.remove("recipient_guard");
             obj.remove("reason");
             obj.remove("action_grant");
+            obj.remove("google_owner_binding");
+            obj.remove("google_owner_account");
             obj.remove("action_rule_matches");
         }
         if principal.is_external {
@@ -1379,6 +1381,13 @@ impl McpDispatcher {
             );
             return jsonrpc_response(id, removed);
         }
+
+        let owner_call = if !dedicated_google && crate::mcp_isolation::current().is_none() {
+            match crate::mcp::google_owner_client::prepare(&self.home_dir, gate_agent, tool_name, &mut params_owned).await {
+                Ok(call) => call,
+                Err(message) => return jsonrpc_error(id, -32003, &message),
+            }
+        } else { None };
 
         // Execute parsing opens/migrates approvals.db, so it too must follow
         // caller admission. Preserve the signed metadata until parse succeeds.
@@ -1989,6 +1998,11 @@ impl McpDispatcher {
             );
             params_owned["action_grant"] = grant.to_json();
         }
+        if let Some(call) = &owner_call {
+            if let Err(message) = call.validate(&params_owned) {
+                return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+            }
+        }
         let google_approval_payload = if let Some(lane) = google_lane.as_mut() {
             match lane
                 .final_approval_payload(&self.home_dir, &params_owned, self.redaction.as_deref())
@@ -2130,6 +2144,7 @@ impl McpDispatcher {
                 caller_is_admin,
             )),
         );
+        let handler = crate::mcp::google_owner_client::APPROVED.scope(owner_call, handler);
         if let Some(lease) = &sink_lease { lease.dispatched(); }
         let execution = async {
             if let Some(call) = &workflow {

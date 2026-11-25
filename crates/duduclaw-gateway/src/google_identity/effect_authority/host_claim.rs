@@ -175,6 +175,7 @@ impl OriginalAccountUnion {
 }
 
 struct DedicatedBinding {
+    owner_snapshot: Option<crate::google_identity::owner_snapshot::OwnerSnapshot>,
     agent: String,
     reference: CredentialRef,
     tool: String,
@@ -202,7 +203,7 @@ impl DedicatedBinding {
         home: &Path,
         users: Option<&Arc<UserDb>>,
     ) -> Result<GoogleCallContext, Refusal> {
-        GoogleCallContext::dedicated(
+        let mut context = GoogleCallContext::dedicated(
             home,
             &self.agent,
             people_for(home, users),
@@ -211,10 +212,13 @@ impl DedicatedBinding {
                 .clone()
                 .unwrap_or_else(|| self.original_digest.clone()),
             self.reference.clone(),
-        )
+        )?;
+        context.owner_snapshot = self.owner_snapshot.clone();
+        context.validate()?;
+        Ok(context)
     }
     fn projection(&self) -> Value {
-        json!({"agent":self.agent,"credential_ref":self.reference,"tool":self.tool,"original_digest":self.original_digest,"created_at":self.created_unix,"expires_at":self.expires_at})
+        json!({"owner_snapshot":self.owner_snapshot,"agent":self.agent,"credential_ref":self.reference,"tool":self.tool,"original_digest":self.original_digest,"created_at":self.created_unix,"expires_at":self.expires_at})
     }
     fn storage_weight(&self) -> Result<usize, Refusal> {
         let mut n = std::mem::size_of_val(self);
@@ -539,6 +543,7 @@ impl SelectionStore {
         live_key(home, agent, reference, tool)?;
         let id = uuid::Uuid::new_v4().to_string();
         let bound = DedicatedBinding {
+            owner_snapshot: crate::google_identity::owner_snapshot::OwnerSnapshot::optional(home, agent)?,
             agent: agent.into(),
             reference: reference.clone(),
             tool: tool.into(),
@@ -739,6 +744,7 @@ impl ClaimedSelection {
         if !self
             .bound
             .matches(&context.agent, credential_ref, native_tool, clock)
+            || self.bound.owner_snapshot != context.owner_snapshot
             || !self.original.live()
             || self.bound.final_digest.as_deref() != Some(final_arguments_digest.as_str())
         {
@@ -967,6 +973,7 @@ pub(super) async fn prepare_immediate(
     let claim = ClaimedSelection {
         original: OriginalAccountUnion::Immediate(prepared),
         bound: DedicatedBinding {
+            owner_snapshot: context.owner_snapshot.clone(),
             agent: context.agent.clone(),
             reference: credential_ref.clone(),
             tool: native_tool.clone(),

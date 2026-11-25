@@ -238,6 +238,9 @@ impl GoogleIsolationBridge {
                 let source = tenant.as_ref().filter(|source| source.kind() == TenantSourceKind::Delegate
                     && source.subject() == email.as_str()).ok_or(VerificationError::BindingMismatch)?;
                 let (route, digest) = self.tenant_selection(context, &routes, &requester, source, people.as_ref(), tool)?;
+                let owner = super::owner_snapshot::OwnerSnapshot::optional(&self.home, &self.agent)
+                    .map_err(|_| VerificationError::BindingMismatch)?;
+                let digest = if let Some(owner) = owner { gi::google_arguments_digest(&json!({"source":digest,"owner":owner})) } else { digest };
                 return Ok((route, digest, Some(source.clone())));
             }
             // A configured service account replaces home OAuth on the home
@@ -277,7 +280,12 @@ impl GoogleIsolationBridge {
         let tool = call.name();
         let args = call.arguments();
         Self::refuse_identity_arguments(args)?;
+        let owner = super::owner_snapshot::OwnerSnapshot::optional(&self.home, &self.agent)
+            .map_err(|_| VerificationError::BindingMismatch)?;
         let (route, digest, tenant) = self.decide(call.context(), tool)?;
+        if let Some(snapshot) = &owner {
+            snapshot.validate(&self.home, &self.agent).map_err(|_| VerificationError::BindingMismatch)?;
+        }
         if route.product.account() != selected.account() || route.generation() != selected.generation()
             || route.kind() != selected.kind() {
             return Err(VerificationError::BindingMismatch);
@@ -287,6 +295,25 @@ impl GoogleIsolationBridge {
         // (it refuses a config it re-reads that differs from this decision).
         self.pin_source(tool, route.clone(), digest)?;
         let tenant = tenant.as_ref().map(TenantPin::of);
+        if let Some(snapshot) = owner.as_ref() {
+            selected.recheck()?;
+            let who = self.requester(call.context())?.identity().clone();
+            let progress = std::sync::atomic::AtomicUsize::new(0);
+            let result = super::effect_authority::employee::execute_isolated(&self.home, &self.agent, who,
+                super::requester_gate::people_for(&self.home, self.users.as_ref()), tool, args,
+                snapshot, tenant, &progress).await;
+            let steps = progress.load(std::sync::atomic::Ordering::SeqCst);
+            duduclaw_security::audit::append_tool_call_with_extras(&self.home, &self.agent, "google_execute", tool,
+                result.is_ok(), &[("run_id", json!(call.context().record().run)),
+                ("call_id", json!(call.context().record().id)), ("owner_id", json!(snapshot.owner_id)),
+                ("authority_epoch", json!(snapshot.epoch)), ("args_digest", json!(gi::google_arguments_digest(args))),
+                ("step_count", json!(steps)), ("outcome", json!(if steps == 0 { "not_sent" } else if result.is_ok() { "confirmed" } else { "may_have_sent" }))]);
+            return match result {
+                Ok(value) => Ok(value),
+                Err(error) if error.code == "result_unconfirmed" => Ok(crate::google_workspace::native_call::tool_error(&error.message_zh)),
+                Err(_) => Err(VerificationError::Unavailable),
+            };
+        }
         let stamp = self.selections.select_dedicated_async(&self.home, self.users.as_ref(), &self.agent,
             &self.reference, tool, args, Clock::now()).await.map_err(|_| VerificationError::Unavailable)?;
         selected.recheck()?;
@@ -319,7 +346,7 @@ impl GoogleIsolationBridge {
         } else {
             selected.recheck()?;
             super::effect_authority::execute_immediate_native_pinned(&self.home, self.users.as_ref(), &self.agent,
-                &self.reference, tool, args.clone(), tenant).await.map_err(|_| VerificationError::Unavailable)
+                &self.reference, tool, args.clone(), tenant, owner).await.map_err(|_| VerificationError::Unavailable)
         }
     }
 }

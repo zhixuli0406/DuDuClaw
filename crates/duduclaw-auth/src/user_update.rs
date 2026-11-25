@@ -137,6 +137,7 @@ impl UserDb {
     /// admin eligibility log, in the same transaction (F6 S1/S2: a role
     /// change records who promoted or demoted the account).
     pub fn apply_user_update_as(&self, actor: Option<&str>, user_id: &str, update: &UserUpdate<'_>) -> Result<(), UserWriteError> {
+        let _authority = self.google_authority_write().map_err(UserWriteError::Other)?;
         // Hash before taking the write lock: argon2 is slow on purpose.
         let password_hash = update.password.map(hash_password).transpose().map_err(UserWriteError::Other)?;
         let mut conn = self.conn();
@@ -156,6 +157,7 @@ impl UserDb {
     /// the `credential_changes` row is marked owner-authenticated in the
     /// same transaction (F6d), so a later Personal restore accepts it.
     pub fn change_own_password(&self, user_id: &str, new_password: &str) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let password_hash = hash_password(new_password)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| format!("update error: {e}"))?;
