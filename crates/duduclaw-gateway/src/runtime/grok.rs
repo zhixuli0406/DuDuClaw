@@ -1199,7 +1199,7 @@ impl GrokRuntime {
         );
         // Run-specific values must never be persisted in shared TOML.
         for key in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
-            duduclaw_core::run_credential::ENV_IDENTITY_URL] {
+            duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT] {
             env.insert(key.into(), toml::Value::String(format!("${{{key}:-}}")));
         }
         let mut table = toml::map::Map::new();
@@ -1356,7 +1356,8 @@ mod tests {
             .env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
         for (name, value) in command.as_std().get_envs() {
             if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
-                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL {
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT {
                 if let Some(value) = value { expected.env(name, value); }
                 else { expected.env_remove(name); }
             }

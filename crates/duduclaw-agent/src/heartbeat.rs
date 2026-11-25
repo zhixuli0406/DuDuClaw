@@ -1369,8 +1369,9 @@ async fn execute_proactive_check(
             };
             cmd.env(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL, _run_identity.credential().expose());
             cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
-            if let Some(url) = _run_identity.identity_url() {
-                cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_URL, url);
+            cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT);
+            if let Some(url) = _run_identity.identity_endpoint() {
+                cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT, url);
             }
             let child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,

@@ -33,7 +33,7 @@ impl SpawnBinding {
         Ok(())
     }
 
-    /// Phase 2 must additionally authenticate the IPC peer and walk its ancestry.
+    /// The IPC handler must additionally authenticate the peer and walk its ancestry.
     /// A bound root alone is not proof that a bearer is that root's descendant.
     pub fn root(&self) -> Option<ProcessIdentity> {
         let mut inner = self.0.lock().ok()?;
