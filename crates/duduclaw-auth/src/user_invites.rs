@@ -162,6 +162,7 @@ impl UserDb {
         if password.len() > 1024 { return Err("password_too_long".to_owned()); }
         if self.user_invite_email(token)?.is_none() { return Ok(None); }
         let password_hash = hash_password(password)?;
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| "invitation storage unavailable")?;

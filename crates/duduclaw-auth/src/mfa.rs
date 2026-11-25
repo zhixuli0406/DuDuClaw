@@ -543,6 +543,7 @@ impl UserDb {
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
         if enrollment.is_none() { return Err(DENIED.into()); }
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -660,6 +661,7 @@ impl UserDb {
         now: i64,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>,
     ) -> Result<T> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -720,6 +722,7 @@ impl UserDb {
     /// Host break-glass recovery for any account.
     /// The CLI must enforce its AI-session and Bash-lane guards before calling.
     pub fn mfa_operator_reset(&self, email: &str) -> Result<()> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -748,6 +751,7 @@ impl UserDb {
     #[cfg(test)]
     pub(crate) fn mfa_admin_reset(&self, actor: &str, user: &str, code: &str, cipher: &dyn MfaCipher, now: i64) -> Result<()> {
         if actor == user { return Err("不能重設自己的雙因素驗證。".into()); }
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)

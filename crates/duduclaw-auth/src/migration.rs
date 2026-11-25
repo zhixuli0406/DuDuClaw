@@ -10,6 +10,7 @@ impl UserDb {
     pub fn migration_invite_user(&self, operation: &str, digest: &[u8; 32],
         email: &str, display_name: &str, role: UserRole) -> Result<User, String> {
         validate(operation, email, display_name)?;
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS migration_user_receipts (

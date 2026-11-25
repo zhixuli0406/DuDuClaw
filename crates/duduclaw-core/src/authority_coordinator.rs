@@ -1,6 +1,6 @@
 //! Cross-process authority barrier for delegate:owner (D12).
 //!
-//! Lock order is intent -> resource -> application/SQLite locks. Readers take
+//! Lock order is seat admission -> intent -> resource -> SQLite. Readers take
 //! intent exclusively only while acquiring a shared resource lease. Writers
 //! hold intent shared until their exclusive resource lease ends: once any
 //! writer has registered, new readers cannot overtake it. No lock file is ever
@@ -8,32 +8,25 @@
 //! invalidate old calls, but can never resurrect them). No DB transaction is
 //! held by a reader across network I/O. Out-of-band file/SQL writes are outside
 //! this protocol. A sent request can still complete remotely after revocation.
-use std::fs::{File, OpenOptions};
+//! The private namespace excludes other accounts; it is not a sandbox against
+//! another process running as the same OS user.
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+mod namespace;
+use namespace::{Namespace, INTENT, RESOURCE, EPOCH};
 use fs2::FileExt;
 
 #[derive(Clone)]
-pub struct AuthorityCoordinator { home: PathBuf }
-pub struct SharedLease { _resource: File }
-pub struct WriteLease { _resource: File, _intent: File }
-
-fn open(home: &Path, name: &str) -> io::Result<File> {
-    let path = home.join(name);
-    if std::fs::symlink_metadata(&path).is_ok_and(|m| !m.is_file() || m.file_type().is_symlink()) {
-        return Err(io::Error::other("invalid authority lock file"));
-    }
-    let mut opts = OpenOptions::new();
-    opts.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)] {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = opts.open(path)?;
-    if !file.metadata()?.is_file() { return Err(io::Error::other("invalid authority file")); }
-    Ok(file)
+pub struct AuthorityCoordinator {
+    home: PathBuf,
+    namespace: Arc<OnceLock<Result<Arc<Namespace>, String>>>,
 }
+pub struct SharedLease { _resource: File, _namespace: Arc<Namespace> }
+pub struct WriteLease { _resource: File, _intent: File, _namespace: Arc<Namespace> }
+
 fn wait(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     let until = Instant::now() + Duration::from_secs(35);
     loop {
@@ -46,56 +39,58 @@ fn wait(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     }
 }
 impl AuthorityCoordinator {
-    pub fn new(home: &Path) -> Self { Self { home: home.to_owned() } }
+    pub fn new(home: &Path) -> Self {
+        Self { home: home.to_owned(), namespace: Arc::new(OnceLock::new()) }
+    }
+    fn namespace(&self) -> io::Result<Arc<Namespace>> {
+        self.namespace.get_or_init(|| Namespace::open(&self.home).map(Arc::new)
+            .map_err(|e| e.to_string())).as_ref().cloned().map_err(|e| io::Error::other(e.clone()))
+    }
     /// Call on the blocking pool when used by an async handler.
     pub fn write(&self) -> io::Result<WriteLease> {
-        let intent = open(&self.home, ".google-authority.intent")?;
+        let namespace = self.namespace()?;
+        let intent = namespace.file(INTENT)?;
         wait(|| FileExt::try_lock_shared(&intent))?;
-        let resource = open(&self.home, ".google-authority.resource")?;
+        let resource = namespace.file(RESOURCE)?;
         wait(|| FileExt::try_lock_exclusive(&resource))?;
-        let mut epoch = open(&self.home, ".google-authority.epoch")?;
+        let mut epoch = namespace.file(EPOCH)?;
         // Random durable generations prevent ABA, including revoke/re-auth.
         epoch.seek(SeekFrom::Start(0))?;
         epoch.write_all(uuid::Uuid::new_v4().simple().to_string().as_bytes())?;
         epoch.set_len(32)?;
         epoch.sync_all()?;
-        #[cfg(unix)] File::open(&self.home)?.sync_all()?;
-        Ok(WriteLease { _resource: resource, _intent: intent })
+        namespace.sync()?;
+        Ok(WriteLease { _resource: resource, _intent: intent, _namespace: namespace })
     }
     pub fn read(&self) -> io::Result<SharedLease> {
-        let intent = open(&self.home, ".google-authority.intent")?;
-        let resource = open(&self.home, ".google-authority.resource")?;
+        let namespace = self.namespace()?;
+        let intent = namespace.file(INTENT)?;
+        let resource = namespace.file(RESOURCE)?;
         wait(|| {
             FileExt::try_lock_exclusive(&intent)?;
             let result = FileExt::try_lock_shared(&resource);
             FileExt::unlock(&intent)?;
             result
         })?;
-        Ok(SharedLease { _resource: resource })
+        Ok(SharedLease { _resource: resource, _namespace: namespace })
     }
     pub async fn shared(&self) -> io::Result<SharedLease> {
         let coordinator = self.clone();
         tokio::task::spawn_blocking(move || coordinator.read()).await.map_err(io::Error::other)?
     }
     pub fn initialize(&self) -> io::Result<()> {
-        match std::fs::symlink_metadata(self.home.join(".google-authority.epoch")) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => { drop(self.write()?); Ok(()) },
-            Err(e) => Err(e),
-            Ok(_) => self.epoch().map(|_| ()),
-        }
+        let namespace = self.namespace()?;
+        let lease = self.read()?;
+        let empty_new = namespace.epoch_created && namespace.file(EPOCH)?.metadata()?.len() == 0;
+        if !empty_new { return self.epoch().map(|_| ()); }
+        drop(lease);
+        // Concurrent initializers serialize through the writer barrier. An
+        // extra initial generation can only invalidate, never restore a call.
+        drop(self.write()?);
+        Ok(())
     }
     pub fn epoch(&self) -> io::Result<String> {
-        let path = self.home.join(".google-authority.epoch");
-        if !std::fs::symlink_metadata(&path)?.file_type().is_file() {
-            return Err(io::Error::other("invalid authority epoch file"));
-        }
-        let mut opts = OpenOptions::new();
-        opts.read(true);
-        #[cfg(unix)] {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        let mut file = opts.open(path)?;
+        let mut file = self.namespace()?.file(EPOCH)?;
         let mut value = String::new();
         (&mut file).take(33).read_to_string(&mut value)?;
         if value.len() != 32 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -125,11 +120,11 @@ mod tests {
         drop(c.write().unwrap());
         let old = c.epoch().unwrap();
         let headers = c.read().unwrap();
-        let intent = open(home.path(), ".google-authority.intent").unwrap();
+        let intent = c.namespace().unwrap().file(INTENT).unwrap();
         FileExt::lock_shared(&intent).unwrap();
-        let reader_intent = open(home.path(), ".google-authority.intent").unwrap();
+        let reader_intent = c.namespace().unwrap().file(INTENT).unwrap();
         assert!(FileExt::try_lock_exclusive(&reader_intent).is_err());
-        let writer_resource = open(home.path(), ".google-authority.resource").unwrap();
+        let writer_resource = c.namespace().unwrap().file(RESOURCE).unwrap();
         assert!(FileExt::try_lock_exclusive(&writer_resource).is_err());
         drop(headers);
         FileExt::try_lock_exclusive(&writer_resource).unwrap();
@@ -142,7 +137,8 @@ mod tests {
     fn cross_process_writer_child() {
         let Some(home) = std::env::var_os("DUDUCLAW_AUTHORITY_TEST_HOME") else { return; };
         let home = PathBuf::from(home);
-        let intent = open(&home, ".google-authority.intent").unwrap();
+        let c = AuthorityCoordinator::new(&home);
+        let intent = c.namespace().unwrap().file(INTENT).unwrap();
         FileExt::lock_shared(&intent).unwrap();
         std::fs::write(home.join("writer-registered"), b"ready").unwrap();
         drop(AuthorityCoordinator::new(&home).write().unwrap());
@@ -167,11 +163,103 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(epoch, c.epoch().unwrap());
-        let reader = open(home.path(), ".google-authority.intent").unwrap();
+        let reader = c.namespace().unwrap().file(INTENT).unwrap();
         assert!(FileExt::try_lock_exclusive(&reader).is_err());
         drop(headers);
         assert!(child.wait().unwrap().success());
         assert_ne!(epoch, c.epoch().unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn regular_file_replacement_cannot_split_a_live_authority_lease() {
+        use std::os::unix::fs::OpenOptionsExt;
+        for name in [INTENT, RESOURCE, EPOCH] {
+            let home = tempfile::tempdir().unwrap();
+            let c = AuthorityCoordinator::new(home.path());
+            c.initialize().unwrap();
+            let headers = c.read().unwrap();
+            let path = home.path().join(namespace::DIRECTORY).join(name);
+            std::fs::rename(&path, path.with_extension("old")).unwrap();
+            // Even a private, regular replacement cannot change this
+            // coordinator's pinned lock/epoch identity.
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                .open(&path).unwrap();
+            assert!(c.namespace().unwrap().file(name).is_err(), "{name}");
+            drop(headers);
+            assert!(c.write().is_err(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_home_refuses_replacement_even_for_a_new_coordinator() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let c = AuthorityCoordinator::new(home.path());
+        c.initialize().unwrap();
+        let headers = c.read().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o770)).unwrap();
+        let path = home.path().join(namespace::DIRECTORY).join(RESOURCE);
+        std::fs::rename(&path, path.with_extension("old")).unwrap();
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).unwrap();
+        assert!(AuthorityCoordinator::new(home.path()).write().is_err());
+        assert!(c.read().is_err());
+        drop(headers);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_authority_files_are_refused_on_startup_and_reopen() {
+        for name in [INTENT, RESOURCE, EPOCH] {
+            let home = tempfile::tempdir().unwrap();
+            let c = AuthorityCoordinator::new(home.path());
+            c.initialize().unwrap();
+            let path = home.path().join(namespace::DIRECTORY).join(name);
+            std::fs::hard_link(path, home.path().join("alias")).unwrap();
+            assert!(c.namespace().unwrap().file(name).is_err(), "{name}");
+            assert!(AuthorityCoordinator::new(home.path()).initialize().is_err(), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_home_directory_and_file_permissions_fail_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [0o770, 0o707, 0o777] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(AuthorityCoordinator::new(home.path()).initialize().is_err());
+            assert!(!home.path().join(namespace::DIRECTORY).exists());
+        }
+        let home = tempfile::tempdir().unwrap();
+        let c = AuthorityCoordinator::new(home.path());
+        c.initialize().unwrap();
+        for name in [INTENT, RESOURCE, EPOCH] {
+            let path = home.path().join(namespace::DIRECTORY).join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(c.namespace().unwrap().file(name).is_err());
+            assert!(AuthorityCoordinator::new(home.path()).initialize().is_err());
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        std::fs::set_permissions(home.path().join(namespace::DIRECTORY), std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(c.read().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_home_and_replaced_directory_are_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let link = parent.path().join("home");
+        std::os::unix::fs::symlink(home.path(), &link).unwrap();
+        assert!(AuthorityCoordinator::new(&link).initialize().is_err());
+        let c = AuthorityCoordinator::new(home.path());
+        c.initialize().unwrap();
+        let directory = home.path().join(namespace::DIRECTORY);
+        std::fs::rename(&directory, home.path().join("old-authority")).unwrap();
+        AuthorityCoordinator::new(home.path()).initialize().unwrap();
+        assert!(c.read().is_err());
+        assert!(c.write().is_err());
+    }
 }

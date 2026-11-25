@@ -312,6 +312,7 @@ impl UserDb {
     pub fn mfa_admin_reset_recorded(&self, attempt_id: &str, proof_label: &str, actor: &str, target: &str,
         proof: AdminResetProof<'_>, cipher: &dyn MfaCipher, now: i64) -> (Refused<AdminResetOutcome>, bool) {
         use AdminResetRefusal::*;
+        let Ok(_authority) = self.google_authority_write() else { return (Err(Unavailable), false) };
         let mut conn = self.conn();
         let Ok(mut tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate) else { return (Err(Unavailable), false) };
         if !matches!(reset_outbox::has_room(&tx), Ok(true)) { return (Err(Unavailable), false); }

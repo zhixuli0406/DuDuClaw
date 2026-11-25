@@ -54,6 +54,7 @@ impl UserDb {
     #[cfg(test)]
     pub(crate) fn mfa_admin_reset_reauth(&self, actor: &str, user: &str, token: &str, session: &str, now: i64) -> Result<()> {
         if actor==user {return Err("不能重設自己的兩步驟驗證。".into());}
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         check_reauth(&tx,actor,token,session,now)?;
@@ -156,6 +157,7 @@ impl UserDb {
     /// token issuance share the same transaction, including recovery codes.
     pub fn mfa_email_verify_and_issue<T>(&self, token: &str, code: &str, enrollment: bool, now: i64,
         issue: impl FnOnce(&crate::User,&[(String,crate::AccessLevel)],Vec<String>)->Result<T>) -> Result<T> {
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since=crate::credential_changes::high_water(&tx)?;
@@ -198,6 +200,7 @@ impl UserDb {
 
     pub fn mfa_email_remove_and_issue<T>(&self,user:&str,token:&str,session:&str,now:i64,_policy_exempt:bool,
         issue:impl FnOnce(&crate::User,&[(String,crate::AccessLevel)],Vec<String>)->Result<T>)->Result<T> {
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since=crate::credential_changes::high_water(&tx)?;

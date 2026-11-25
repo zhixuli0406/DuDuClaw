@@ -257,6 +257,7 @@ impl UserDb {
     }
 
     fn init_tables(&self, enforced: bool) -> Result<(), String> {
+        let _authority = self.google_authority_write()?;
         let conn = self.conn();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS users (
@@ -901,6 +902,7 @@ impl UserDb {
     ) -> Result<bool, String> {
         let hash = hash_password(new_password)?;
         let now = Utc::now().to_rfc3339();
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
