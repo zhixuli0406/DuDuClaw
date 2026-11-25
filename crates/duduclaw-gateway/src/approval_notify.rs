@@ -538,8 +538,10 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
             }
         }
         let uid = rec.payload["chat_snapshot"]["member"].as_str()?;
+        let body = duduclaw_security::credential_protection::sanitize_output_text(
+            "有一則 Google Chat 訊息等待你本人確認。請開啟儀表板「我的連線」閱讀完整內容，五分鐘內確認或取消。");
         crate::notify_push::push_person_notice(home_dir, uid,
-            "有一則 Google Chat 訊息等待你本人確認。請開啟儀表板「我的連線」閱讀完整內容，五分鐘內確認或取消。").await;
+            &body).await;
         return None;
     }
     if is_dashboard_only_record(Some(home_dir), rec) {

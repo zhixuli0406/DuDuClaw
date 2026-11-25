@@ -157,6 +157,108 @@ async fn chat_send_full_text_is_bound_and_foreign_account_edits_invalidate() {
 }
 
 #[tokio::test]
+async fn chat_send_card_escapes_controls_in_all_display_fields() {
+    let f = fixture().await;
+    let _turn = register(&f, "chat-display").await;
+    let (broker, id, _) = card(&f, "chat-display").await;
+    let mut rec = broker.get(&id).await.unwrap().unwrap();
+    let raw = "繁體中文 👋\u{202e}\u{2066}\u{200b}\u{1}\n\r\t";
+    let escaped = "繁體中文 👋\\u{202e}\\u{2066}\\u{200b}\\u{1}\\u{a}\\u{d}\\u{9}";
+    // Exercise the display boundary even for names rejected by argument parsing.
+    rec.agent_id = raw.into();
+    rec.payload["chat_snapshot"]["account"] = json!(raw);
+    for field in ["space", "thread", "text"] { rec.payload["arguments"][field] = json!(raw); }
+    let original = rec.payload.clone();
+    let body = chat_send::card_body(&rec);
+    let display = chat_send::confirmation_display(&rec);
+    assert!(body.contains(escaped));
+    for field in ["employee", "account", "space", "thread", "text_display"] {
+        assert_eq!(display[field], escaped);
+    }
+    assert!(display.get("text").is_none());
+    for control in ['\u{202e}', '\u{2066}', '\u{200b}', '\u{1}', '\r', '\t'] {
+        assert!(!body.contains(control));
+        for field in ["employee", "account", "space", "thread", "text_display"] {
+            assert!(!display[field].as_str().unwrap().contains(control));
+        }
+    }
+    assert_eq!(rec.payload, original);
+}
+
+#[tokio::test]
+async fn chat_send_display_rpc_preserves_raw_approval_digest_and_sent_bytes() {
+    use std::sync::{Arc, Mutex};
+    use crate::google_workspace::native_call::testing;
+    let f = fixture().await;
+    let turn = "chat-display-send";
+    let _turn = register(&f, turn).await;
+    let raw = "私人 👋\u{202e}\u{2066}\u{200b}\u{1}\n\r\t文字";
+    let escaped = "私人 👋\\u{202e}\\u{2066}\\u{200b}\\u{1}\\u{a}\\u{d}\\u{9}文字";
+    let args = json!({"space":"spaces/A", "thread":"spaces/A/threads/T", "text":raw});
+    let digest = duduclaw_core::google_identity::google_arguments_digest(&args);
+    let mut display_args = args.clone(); display_args["text"] = json!(escaped);
+    assert_ne!(digest, duduclaw_core::google_identity::google_arguments_digest(&display_args));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let observed = sent.clone();
+    let router = axum::Router::new().route("/v1/spaces/A/messages", axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+        observed.lock().unwrap().push(body);
+        async { axum::Json(json!({"name":"spaces/A/messages/M"})) }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+    let _transport = testing::install(&f.home, &base);
+    let handler = crate::handlers::MethodHandler::new(f.home.clone()).await;
+    handler.set_user_db(f.db.clone(), Arc::new(duduclaw_auth::JwtConfig::new(b"isolated-fixture-signing-key-only"))).await;
+    handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+    let snapshot = Snapshot::capture(&f.home, "bot", &who(&f)).unwrap();
+    let execution = chat_send::execute(&f.home, "bot", &args, who(&f), turn, snapshot, uuid::Uuid::new_v4().to_string());
+    let confirmation = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let broker = ApprovalBroker::open(&f.home).unwrap();
+            loop {
+                if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter().find(|r| chat_send::is_member_card(r)) {
+                    let original = rec.payload.clone();
+                    let payload_hash = rec.binding.as_ref().unwrap().payload_hash.clone();
+                    let grant = ActionGrant::build("bot", TOOL, &original);
+                    assert_eq!(original["arguments"]["text"].as_str().unwrap().as_bytes(), raw.as_bytes());
+                    assert_eq!(duduclaw_core::google_identity::google_arguments_digest(&original["arguments"]), digest);
+                    assert!(chat_send::card_body(&rec).contains(escaped));
+                    let response = handler.handle_personal_google_rpc("me.google.chat_confirmations", json!({}), &ctx(&f)).await;
+                    // Inspect decoded strings: JSON encoding would hide raw controls from a serialized check.
+                    let crate::protocol::WsFrame::Response { ok:true, payload:Some(response), .. } = response else {
+                        panic!("expected member confirmation response");
+                    };
+                    assert_eq!(response["requests"].as_array().unwrap().len(), 1);
+                    let display = &response["requests"][0];
+                    assert_eq!(display["text_display"], escaped);
+                    assert!(display.get("text").is_none());
+                    for control in ['\u{202e}', '\u{2066}', '\u{200b}', '\u{1}', '\n', '\r', '\t'] {
+                        assert!(!display["text_display"].as_str().unwrap().contains(control));
+                    }
+                    let stored = broker.get(&rec.id).await.unwrap().unwrap();
+                    assert_eq!(stored.payload, original);
+                    assert_eq!(stored.binding.as_ref().unwrap().payload_hash, payload_hash);
+                    assert_eq!(crate::approval::payload_hash(&stored.payload), payload_hash);
+                    assert!(grant.matches_stored(&stored.payload["action_grant"]));
+                    stored.binding.as_ref().unwrap().validate(&stored.payload).unwrap();
+                    broker.decide_bound_dashboard(&rec.id, &ctx(&f), true).await.unwrap();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.expect("member confirmation created");
+    };
+    let (result, ()) = tokio::join!(execution, confirmation);
+    server.abort();
+    assert_ne!(result.unwrap()["isError"], true);
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["text"].as_str().unwrap().as_bytes(), raw.as_bytes());
+    assert_eq!(sent[0]["thread"]["name"], "spaces/A/threads/T");
+}
+
+#[tokio::test]
 async fn chat_send_group_requires_member_page_and_expired_card_refuses() {
     let f = fixture().await;
     let _turn = register(&f, "chat-group").await;

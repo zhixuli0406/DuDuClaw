@@ -247,8 +247,21 @@ pub(crate) fn decided_by_member(home: &Path, rec: &crate::approval::ApprovalReco
         || (binding.conversation_audience == crate::approval::ConversationAudience::Private
             && rec.decided_by.as_deref() == Some(format!("{}:{}", binding.decision_context.channel, binding.decision_context.principal_id).as_str()))
 }
+// Display-only projection. Never replace the raw arguments bound by the grant
+// and execution binding or used by the native transport with these strings.
+pub(crate) fn confirmation_display(rec: &crate::approval::ApprovalRecord) -> Value {
+    use duduclaw_security::credential_protection::sanitize_output_text;
+    let text = |value: &Value| sanitize_output_text(value.as_str().unwrap_or(""));
+    json!({"id":rec.id.as_str(), "employee":sanitize_output_text(&rec.agent_id),
+        "account":text(&rec.payload["chat_snapshot"]["account"]),
+        "space":text(&rec.payload["arguments"]["space"]),
+        "thread":rec.payload["arguments"]["thread"].as_str().map(sanitize_output_text),
+        "text_display":text(&rec.payload["arguments"]["text"]),
+        "expires_at":rec.binding.as_ref().map(|b| &b.expires_at)})
+}
 pub(crate) fn card_body(rec: &crate::approval::ApprovalRecord) -> String {
+    let display = confirmation_display(rec);
     format!("以你的 Google 帳號傳送\n帳號：{}\n空間：{}\n討論串：{}\n完整文字：\n{}\n\n這段文字可能包含私人資料，確認後會傳到上述空間。Google 會附上應用程式名稱。\n五分鐘內有效，僅限本人決定。\n確認 {}\n取消 {}",
-        rec.payload["chat_snapshot"]["account"].as_str().unwrap_or(""), rec.payload["arguments"]["space"].as_str().unwrap_or(""),
-        rec.payload["arguments"]["thread"].as_str().unwrap_or("新訊息"), rec.payload["arguments"]["text"].as_str().unwrap_or(""), rec.id, rec.id)
+        display["account"].as_str().unwrap_or(""), display["space"].as_str().unwrap_or(""),
+        display["thread"].as_str().unwrap_or("新訊息"), display["text_display"].as_str().unwrap_or(""), rec.id, rec.id)
 }

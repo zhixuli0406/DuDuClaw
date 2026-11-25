@@ -12,6 +12,26 @@ const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('renders only the escaped Chat confirmation display text', async () => {
+    const raw = '私人\u202e\u2066\u200b\u0001\n文字';
+    const textDisplay = '私人\\u{202e}\\u{2066}\\u{200b}\\u{1}\\u{a}文字';
+    // An unexpected legacy raw field must never become a rendering fallback.
+    const request = {
+      id: 'chat-confirmation', employee: 'helper', account: 'alice@example.com',
+      space: 'spaces/A\\u{200b}', thread: 'spaces/A/threads/T\\u{2066}',
+      text_display: textDisplay, text: raw, expires_at: '2099-11-25T00:00:00Z',
+    };
+    vi.spyOn(api.personalGoogle, 'chatConfirmations').mockResolvedValue({ requests: [request] });
+    const { container } = renderWithProviders(<MyConnectionsPage />);
+    const preview = await screen.findByText(textDisplay);
+    expect(preview.tagName).toBe('PRE');
+    expect(preview.textContent).toBe(textDisplay);
+    expect(screen.getByText('spaces/A\\u{200b} spaces/A/threads/T\\u{2066}')).toBeInTheDocument();
+    for (const control of ['\u202e', '\u2066', '\u200b', '\u0001']) {
+      expect(container.textContent).not.toContain(control);
+    }
+  });
+
   it('shows persisted administrator test notices even without a connected account', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, connection: null, notices: [
       { id: 1, agent_id: 'helper', actor_id: 'admin', kind: 'google_identity_test', timestamp: '2026-11-25T00:00:00Z' },

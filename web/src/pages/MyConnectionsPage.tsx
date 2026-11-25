@@ -110,7 +110,7 @@ export function MyConnectionsPage() {
     </CardContent></Card>
     {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">
       <p>{request.employee} · {request.account}</p><p className="break-all">{request.space} {request.thread ?? ''}</p>
-      <pre className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 font-sans text-sm">{request.text}</pre>
+      <pre className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 font-sans text-sm">{request.text_display}</pre>
       <p className="text-sm">{t('myConnections.chatSend.egress')}</p><p>{t('myConnections.chatSend.expires', {time:new Date(request.expires_at).toLocaleString(intl.locale)})}</p>
       <div className="flex gap-2"><Button disabled={busy||Date.parse(request.expires_at)<=Date.now()} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,true);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.confirm')}</Button>
       <Button variant="outline" disabled={busy} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,false);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.cancel')}</Button></div>

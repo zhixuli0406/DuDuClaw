@@ -8937,7 +8937,7 @@ export const api = {
       }>,
   },
   personalGoogle: {
-    chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text: string; expires_at: string }[] }>,
+    chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
     confirmChat: (id: string, approve: boolean) => client.call('me.google.chat_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
     start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false, chatSend = false) => client.call('me.google.connect_start', { redirect_origin: dashboardBaseUrl(), acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}), ...(chatSend ? { chat_send: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,

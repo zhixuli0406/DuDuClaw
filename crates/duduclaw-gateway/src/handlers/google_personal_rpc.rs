@@ -36,10 +36,7 @@ impl MethodHandler {
                     Ok(json!({"requests":rows.into_iter().filter(|r|
                         r.status == crate::approval::ApprovalStatus::Pending
                         && crate::google_identity::chat_send::may_decide(&self.home_dir, r, &ctx.user_id))
-                        .map(|r| json!({"id":r.id.as_str(), "employee":r.agent_id,
-                            "account":r.payload["chat_snapshot"]["account"], "space":r.payload["arguments"]["space"],
-                            "thread":r.payload["arguments"]["thread"], "text":r.payload["arguments"]["text"],
-                            "expires_at":r.binding.as_ref().map(|b| &b.expires_at)})).collect::<Vec<_>>()}))
+                        .map(|r| crate::google_identity::chat_send::confirmation_display(&r)).collect::<Vec<_>>()}))
                 }
                 "me.google.chat_confirm" => {
                     let _session = google_personal::session_for(&ctx.user_id)?;
