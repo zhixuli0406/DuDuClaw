@@ -11,6 +11,8 @@ import { AddMembersPage } from './users/AddMembersPage';
 import { OrgChartView } from './users/OrgChartView';
 import { OrgHistorySettings } from './users/OrgHistorySettings';
 import { EditUserDialog } from './users/UserFormDialogs';
+import { CreateAvatarDialog } from './users/CreateAvatarDialog';
+import { useAgentsStore } from '@/stores/agents-store';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
 import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
 import {
@@ -20,6 +22,7 @@ import {
   RoleDetails,
   StatusBadge,
   UserActions,
+  UserAvatarStatus,
   useAgentDisplayName,
 } from './users/UserRowParts';
 import { listChannelIdentities, unbindChannelIdentity, type ChannelIdentity } from '@/lib/channel-identity-api';
@@ -61,6 +64,7 @@ export function UsersPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [showBind, setShowBind] = useState<string | null>(null);
   const [showEdit, setShowEdit] = useState<UserDetail | null>(null);
+  const [createAvatarFor, setCreateAvatarFor] = useState<UserDetail | null>(null);
   const [showOffboard, setShowOffboard] = useState<UserDetail | null>(null);
   const [showRemove, setShowRemove] = useState<UserDetail | null>(null);
   // WP-B (2026-08-12 IA audit §2-1) — per-user channel identity ("驗證身分",
@@ -70,6 +74,12 @@ export function UsersPage() {
   const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
   const [view, setView] = useState<UsersView>('list');
   const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
+  const avatarAction = (user: UserDetail) => isAdmin && user.status === 'active'
+    && (user.role === 'employee' || user.role === 'manager') && !user.avatar_agent_id ? (
+      <Button variant="outline" size="sm" onClick={() => setCreateAvatarFor(user)}>
+        {intl.formatMessage({ id: 'users.avatar.create' })}
+      </Button>
+    ) : null;
   const actionsFor = (user: UserDetail) => ({
     onEdit: () => setShowEdit(user),
     ...(isAdmin && user.status === 'active' && (user.invite_eligible === true || inviteStates[user.id] === 'pending' || inviteStates[user.id] === 'expired') ? { onInvite: () => setInviteUser(user) } : {}),
@@ -269,7 +279,8 @@ export function UsersPage() {
                 </div>
                 <div className="flex flex-col gap-0.5">
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
-                  <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.label' })}: {user.avatar_agent_id ? agentName(user.avatar_agent_id) : intl.formatMessage({ id: 'users.manager.none' })}</span>
+                  <UserAvatarStatus user={user} agentName={agentName} />
+                  {avatarAction(user)}
                 </div>
                 <div className="space-y-1">
                   <p className="text-xs font-medium text-muted-foreground">
@@ -322,10 +333,11 @@ export function UsersPage() {
                 <ListGridCell className="flex-col items-start gap-0.5">
                   <RoleBadge role={user.role} />
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
-                  <span className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.label' })}: {user.avatar_agent_id ? agentName(user.avatar_agent_id) : intl.formatMessage({ id: 'users.manager.none' })}</span>
+                  <UserAvatarStatus user={user} agentName={agentName} />
                 </ListGridCell>
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
                   <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />
+                  {avatarAction(user)}
                 </ListGridCell>
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
                   <IdentityChips
@@ -349,6 +361,15 @@ export function UsersPage() {
       )}
 
       {inviteLink && <InviteLinkDialog link={inviteLink} onClose={() => setInviteLink(null)} />}
+      {isAdmin && createAvatarFor && <CreateAvatarDialog
+        user={createAvatarFor}
+        onClose={() => setCreateAvatarFor(null)}
+        onCreated={() => {
+          setCreateAvatarFor(null);
+          void fetchUsers();
+          void useAgentsStore.getState().fetchAgents();
+        }}
+      />}
       {inviteUser && <Dialog open onOpenChange={open => !open && !inviting && setInviteUser(null)}>
         <DialogContent><DialogHeader><DialogTitle>{intl.formatMessage({ id: 'users.invite.resend' })}</DialogTitle></DialogHeader>
           <InviteEmailPreview email={inviteUser.email} />
