@@ -191,7 +191,9 @@ impl Directory {
             options.custom_flags(0x0020_0000 | 0x0200_0000).share_mode(3);
             match mode {
                 Open::Read => { options.read(true); },
-                Open::Append => { options.append(true).create(true); },
+                // LockFileEx needs GENERIC_READ or GENERIC_WRITE; append-only
+                // access lacks both. Keep append semantics and add GENERIC_READ.
+                Open::Append => { options.read(true).append(true).create(true); },
                 Open::Lock => { options.write(true).create(true); },
                 Open::CreateNew => { options.write(true).create_new(true); },
             }

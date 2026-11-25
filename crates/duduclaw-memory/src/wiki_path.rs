@@ -928,6 +928,31 @@ pub fn open_control_file_nofollow(wiki_dir: &Path, name: &str, append: bool) -> 
 mod rm209_identity_tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn control_handles_can_lock_and_append_without_overwriting() {
+        use std::io::{Seek, SeekFrom, Write};
+        use duduclaw_core::platform::flock_exclusive;
+        use fs2::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let lock = open_control_file_nofollow(root.path(), "_index.lock", false).unwrap();
+        flock_exclusive(&lock).unwrap();
+        FileExt::unlock(&lock).unwrap();
+
+        // Open both handles before either write: each append must use the
+        // current EOF, even if its cursor was explicitly moved to the start.
+        let first = open_control_file_nofollow(root.path(), "_log.md", true).unwrap();
+        let second = open_control_file_nofollow(root.path(), "_log.md", true).unwrap();
+        for (mut file, entry) in [(first, "first\n"), (second, "second\n")] {
+            flock_exclusive(&file).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(entry.as_bytes()).unwrap();
+            FileExt::unlock(&file).unwrap();
+        }
+        assert_eq!(std::fs::read_to_string(root.path().join("_log.md")).unwrap(), "first\nsecond\n");
+    }
+
     #[test]
     fn batch_resolution_matches_single_page_resolution_with_one_listing_per_directory() {
         let root = tempfile::tempdir().unwrap();
