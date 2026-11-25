@@ -413,6 +413,7 @@ impl ConfirmationStore {
         if item.status != ConfirmationStatus::Failed || item.category != ConfirmationCategory::Employee {
             return Err(ConfirmationError::Denied);
         }
+        if step(&tx, binding)? == Some(3) { return Ok(()); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
         drop(guard);
