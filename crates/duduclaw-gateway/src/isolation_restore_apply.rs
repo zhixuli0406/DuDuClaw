@@ -149,6 +149,7 @@ pub(crate) fn approve(home: &Path, env: &RestoreEnv<'_>, request_id: &str, appro
         Err(refusal) => return Err(settle(home, &request, refusal, None, env.now)),
     };
     if crash_at(HookPoint::BeforeTx1) { return Err(Refusal::Unavailable); }
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(unavailable)?;
     // 2. tx1.
     {
         let mut db = open_apply(home)?;
@@ -165,7 +166,7 @@ pub(crate) fn approve(home: &Path, env: &RestoreEnv<'_>, request_id: &str, appro
     let applying = RestoreRequest { state: "applying".into(), approver: Some(approver.to_owned()), ..request };
     audit(home, "isolation.employee_restore_approved", &q.label, Severity::Info, audit_details(&applying, json!({})));
     // 3. tx2, then 4.
-    let restored = apply_tx2(home, env, &applying, &q, approver, &dir, &verified)?;
+    let restored = apply_tx2(home, env, &applying, &q, approver, &dir, &verified, &admission)?;
     post_commit(home, env, &q, restored)
 }
 
@@ -228,11 +229,11 @@ fn move_back(dirs: &Dirs, q: &Quarantined) -> Result<(), Refusal> {
 
 #[cfg(unix)]
 fn apply_tx2(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str,
-    dir: &crate::fs_safe::SafeDir, verified: &quarantine::Sealed) -> Result<Restored, Refusal> {
+    dir: &crate::fs_safe::SafeDir, verified: &quarantine::Sealed, admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<Restored, Refusal> {
     let mut db = open_apply(home)?;
     db.execute_batch("PRAGMA synchronous=FULL;").map_err(unavailable)?;
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
-    match apply_locked(home, env, &tx, request, q, approver, dir, verified) {
+    match apply_locked(home, env, &tx, request, q, approver, dir, verified, admission) {
         Ok(restored) => {
             tx.commit().map_err(unavailable)?;
             if crash_at(HookPoint::AfterCommit) { return Err(Refusal::Unavailable); }
@@ -256,14 +257,15 @@ fn apply_tx2(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Qu
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn apply_locked(home: &Path, env: &RestoreEnv<'_>, tx: &Connection, request: &RestoreRequest, q: &Quarantined, approver: &str,
-    dir: &crate::fs_safe::SafeDir, verified: &quarantine::Sealed) -> Result<Restored, Step> {
+    dir: &crate::fs_safe::SafeDir, verified: &quarantine::Sealed, admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<Restored, Step> {
     let (receipt, encoded) = check_apply_db(tx, q, Stage::Apply(&request.request_id), env.now)
         .map_err(|r| Step::Refused(r, "sealed"))?;
     // F6fa: what `check_outside` read before tx1, again under the apply.db
     // writer lock this transaction holds — a proposal apply (which must take
     // it to save a confirmed row) cannot add a live employee before the
     // commit, and staging (which takes it too) cannot add an open proposal.
-    check_quota_in(tx, env.agent_cap).map_err(|r| Step::Refused(r, "sealed"))?;
+    // Recount after restoring pending Personal ownership/bindings in
+    // restore_users, under the shared admission held through this apply.
     check_no_open_proposal(home, &q.label).map_err(|r| Step::Refused(r, "sealed"))?;
     let root = q.root.ok_or(Step::Refused(Refusal::NotSealed, "sealed"))?;
     let dirs = open_dirs(home).map_err(|r| Step::Refused(r, "sealed"))?;
@@ -289,15 +291,16 @@ fn apply_locked(home: &Path, env: &RestoreEnv<'_>, tx: &Connection, request: &Re
     if route_digest(&routes) != request.route_digest { return Err(back(Refusal::RoutesChanged, "sealed")); }
     check_store_marks(home, env, q).map_err(|r| back(r, "sealed"))?;
     // c. users.db (after the apply.db lock, M6).
-    let approval = restore_users(home, env, request, q, approver).map_err(|r| back(r, "sealed"))?;
+    let approval = restore_users(home, env, request, q, approver, admission).map_err(|r| back(r, "sealed"))?;
     if crash_at(HookPoint::AfterUsers) { return Err(Step::Crash); }
     // d. The confirmed row live again, incarnation + 1 (one row, exact match).
     let undo = |refusal: Refusal| {
+        if move_back(&dirs, q).is_err() { return Step::Refused(Refusal::Inconsistent, "restoring"); }
         let removed = match &q.owner {
-            Some(owner) => lifecycle::remove_personal_mirror(home, &q.label, owner).map(|_| ()),
+            Some(owner) => lifecycle::remove_personal_mirror_under(home, &q.label, owner, admission).map(|_| ()),
             None => lifecycle::remove_shared_bindings(home, &q.label).map(|_| ()),
         };
-        if removed.is_err() { Step::Refused(Refusal::Inconsistent, "restoring") } else { back(refusal, "sealed") }
+        if removed.is_err() { Step::Refused(Refusal::Inconsistent, "restoring") } else { Step::Refused(refusal, "sealed") }
     };
     let next = q.incarnation.checked_add(1).ok_or_else(|| undo(Refusal::Inconsistent))?;
     let live = Receipt { disabled: false, ..receipt };
@@ -355,8 +358,14 @@ fn users_error(error: duduclaw_auth::db::PersonalAgentError) -> Refusal {
 /// transaction as the writes) and, for a self-approval, its users.db audit
 /// row, then the mirror or the selected bindings with the ACL and policy
 /// epoch bumps.
-fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str)
+fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q: &Quarantined, approver: &str, admission: &duduclaw_core::agent_seats::SeatAdmission)
     -> Result<Approval, Refusal> {
+    let restore_avatar_grant = q.owner.is_some() && q.principal_snapshot["avatar_seat_grant"].as_bool() == Some(true);
+    if restore_avatar_grant {
+        // Tombstoning revoked the old nonce. Only the immutable snapshot can
+        // authorize carrying the protected kind to this restored incarnation.
+        duduclaw_core::employee_incarnation::created(home, &q.label).map_err(unavailable)?;
+    }
     let mut users = lifecycle::open_store(home, USERS_DB, Access::ReadWrite).map_err(from_lifecycle)?;
     let tx = users.transaction_with_behavior(TransactionBehavior::Immediate).map_err(unavailable)?;
     if duduclaw_auth::isolation::read_isolation_tenant(&tx).map_err(unavailable)? != q.tenant { return Err(Refusal::TenantMismatch); }
@@ -376,6 +385,11 @@ fn restore_users(home: &Path, env: &RestoreEnv<'_>, request: &RestoreRequest, q:
         None => { duduclaw_auth::db::restore_shared_bindings_in_transaction(&tx, &q.label, &shared_selection(request, q)?)
             .map_err(users_error)?; }
     }
+    if restore_avatar_grant {
+        duduclaw_auth::avatar_seats::grant_personal_incarnation(&tx, &q.label, q.owner.as_deref().ok_or(Refusal::Inconsistent)?)
+            .map_err(unavailable)?;
+    }
+    admission.recount_in(&tx, env.agent_cap).map_err(|_| Refusal::QuotaExceeded)?;
     tx.commit().map_err(unavailable)?;
     Ok(approval)
 }
@@ -409,13 +423,14 @@ fn post_commit(home: &Path, env: &RestoreEnv<'_>, q: &Quarantined, restored: Res
 /// nothing else then runs for the label.
 #[cfg(unix)]
 pub(crate) fn recover_label(home: &Path, env: &RestoreEnv<'_>, label: &str) -> Result<Recovered, Refusal> {
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(unavailable)?;
     let expired = expire_requests(home, env.now)?;
     let rows = { let db = open_apply(home)?; rows_for_label(&db, label)? };
     let mut recovered = Recovered { expired, ..Recovered::default() };
     for (employee, incarnation, seal) in rows {
         match seal.as_str() {
             "restoring" => {
-                let (request, forward) = recover_restoring(home, env, employee, incarnation)?;
+                let (request, forward) = recover_restoring(home, env, employee, incarnation, &admission)?;
                 if forward { recovered.rolled_forward.extend(request); } else {
                     recovered.rolled_back.extend(request);
                     recovered.resealed.push(reseal(home, employee, incarnation)?);
@@ -434,7 +449,7 @@ pub(crate) fn recover_label(_: &Path, _: &RestoreEnv<'_>, _: &str) -> Result<Rec
 /// One `restoring` row. Returns the request id it settled and whether it
 /// rolled forward.
 #[cfg(unix)]
-fn recover_restoring(home: &Path, env: &RestoreEnv<'_>, employee: EmployeeId, incarnation: u32)
+fn recover_restoring(home: &Path, env: &RestoreEnv<'_>, employee: EmployeeId, incarnation: u32, admission: &duduclaw_core::agent_seats::SeatAdmission)
     -> Result<(Option<String>, bool), Refusal> {
     let (q, applying) = {
         let db = open_apply(home)?;
@@ -470,7 +485,7 @@ fn recover_restoring(home: &Path, env: &RestoreEnv<'_>, employee: EmployeeId, in
             }
         }
         let removed = match &q.owner {
-            Some(owner) => lifecycle::remove_personal_mirror(home, &q.label, owner).map(|_| ()),
+            Some(owner) => lifecycle::remove_personal_mirror_under(home, &q.label, owner, admission).map(|_| ()),
             None => lifecycle::remove_shared_bindings(home, &q.label).map(|_| ()),
         };
         match removed {

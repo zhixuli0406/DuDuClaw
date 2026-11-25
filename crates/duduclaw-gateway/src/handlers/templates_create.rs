@@ -375,7 +375,13 @@ impl MethodHandler {
             }
         }
         drop(org);
-        // Published: the next admission counts this employee.
+        // Verify the effective artifact before either the own or batch
+        // admission can be released.
+        if let Some(admission) = own_admission.as_ref().or(batch_admission) {
+            if let Err(error) = admission.recount(self.effective_agent_cap().await) {
+                return WsFrame::error_response("", &error);
+            }
+        }
         drop(own_admission);
 
         // Same protections as agents.create: file-guard hook + registry rescan.

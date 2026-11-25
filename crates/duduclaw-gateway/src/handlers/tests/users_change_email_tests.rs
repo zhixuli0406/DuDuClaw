@@ -525,3 +525,56 @@ async fn protected_avatar_assignment_checks_target_members_personal_owner() {
     assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().avatar_agent_id.as_deref(), Some("member-personal"));
     assert!(f.db.get_user(&other.id).unwrap().unwrap().avatar_agent_id.is_none());
 }
+
+#[tokio::test]
+async fn avatar_seats_create_when_full_recount_and_refuse_exemption_loss() {
+    let f = fixture(false).await;
+    let member = f.db.create_user("seat-avatar@test.example", "Member", "password123", UserRole::Employee).unwrap();
+    let before = duduclaw_core::agent_seats::seat_holders(f._home.path()).unwrap().len();
+    f.handler.set_agent_cap_fixture(Some(before + 1)).await;
+    ok_payload(&f.handler.handle_agents_create(json!({"name":"ordinary-seat"})).await);
+    let created = f.handler.handle_agents_create_as(json!({
+        "name":"personal-avatar", "avatar_for_user":member.id,
+    }), Some(&f.owner)).await;
+    ok_payload(&created);
+    assert_eq!(f.db.avatar_agent(&member.id).unwrap().as_deref(), Some("personal-avatar"));
+    assert_eq!(f.db.check_agent_access(&member.id, "personal-avatar").unwrap(), Some(duduclaw_auth::AccessLevel::Owner));
+    let status = ok_payload(&f.handler.handle_license_status(true).await);
+    assert_eq!(status["seats_used"], before + 1);
+    assert_eq!(status["avatars_exempt"], 1);
+    f.db.bind_agent(&member.id, "ordinary-seat", duduclaw_auth::AccessLevel::Owner).unwrap();
+    let generation = f.db.acl_generation().unwrap();
+    for (method, args) in [
+        ("users.set_avatar", json!({"user_id":member.id,"agent_id":null})),
+        ("users.set_avatar", json!({"user_id":member.id,"agent_id":"ordinary-seat"})),
+        ("users.unbind_agent", json!({"user_id":member.id,"agent_name":"personal-avatar"})),
+        ("users.remove", json!({"user_id":member.id})),
+        ("users.offboard", json!({"user_id":member.id})),
+        ("agents.archive", json!({"agent_id":"personal-avatar"})),
+    ] {
+        let frame = f.handler.handle(method, args, &f.owner).await;
+        assert!(matches!(frame, WsFrame::Response {ok:false, ..}), "{method}: {frame:?}");
+        assert!(serde_json::to_string(&frame).unwrap().contains("名額"), "{frame:?}");
+        assert_eq!(f.db.acl_generation().unwrap(), generation, "{method} must roll back");
+    }
+    assert_eq!(f.db.get_user(&member.id).unwrap().unwrap().status, duduclaw_auth::UserStatus::Active);
+    assert_eq!(duduclaw_core::agent_seats::seat_holders(f._home.path()).unwrap().len(), before + 1);
+    ok_payload(&f.handler.handle_users_set_avatar(json!({
+        "user_id":member.id,"agent_id":null,"delete_avatar":true,
+    }), &f.owner).await);
+    assert_eq!(f.db.avatar_agent(&member.id).unwrap(), None);
+    assert_eq!(ok_payload(&f.handler.handle_license_status(true).await)["avatars_exempt"], 0);
+}
+
+#[tokio::test]
+async fn avatar_create_requires_admin_and_rolls_back_a_failed_assignment() {
+    let f = fixture(false).await;
+    f.handler.set_agent_cap_fixture(Some(1)).await;
+    let params = json!({"name":"no-avatar", "avatar_for_user":"missing-member"});
+    let no_actor = f.handler.handle_agents_create(params.clone()).await;
+    assert!(matches!(no_actor, WsFrame::Response {ok:false, ..}));
+    let no_member = f.handler.handle_agents_create_as(params, Some(&f.owner)).await;
+    assert!(matches!(no_member, WsFrame::Response {ok:false, ..}));
+    assert!(!f._home.path().join("agents/no-avatar").exists());
+    assert!(f.db.get_agent_users("no-avatar").unwrap().is_empty());
+}

@@ -17,6 +17,7 @@ use crate::user_row::{
 
 /// SQLite-backed user database with connection pool.
 pub struct UserDb {
+    pub(crate) home: Option<std::path::PathBuf>,
     pool: Vec<Mutex<Connection>>,
     pub(crate) remember_key: ring::hmac::Key,
 }
@@ -177,6 +178,11 @@ impl UserDb {
     /// Seed a newly created MFA policy table atomically with the verified
     /// installation default. Existing policy values are never overwritten.
     pub fn new_with_mfa_default(db_path: &Path, enforced: bool) -> Result<Self, String> {
+        let home = if db_path == Path::new(":memory:") { None }
+            else { Some(db_path.parent().ok_or("user database has no home")?.to_path_buf()) };
+        // RM-212 migration participates in the same lock as creates and imports.
+        let admission = home.as_deref().map(duduclaw_core::agent_seats::SeatAdmission::acquire)
+            .transpose().map_err(|e| e.to_string())?;
         // Create private databases before SQLite opens them so WAL/SHM inherit
         // owner-only permissions. Never reopen an existing inode just to chmod:
         // closing that descriptor would drop this process's SQLite locks.
@@ -203,8 +209,13 @@ impl UserDb {
             pool.push(Mutex::new(conn));
         }
         let remember_key = crate::remembered_sessions::load_key(db_path, &pool[0].lock().unwrap())?;
-        let db = Self { pool, remember_key };
+        let db = Self { pool, remember_key, home };
         db.init_tables(enforced)?;
+        if let Some(admission) = &admission {
+            // Backfill only adds assignments: it cannot increase seats. Still
+            // recount the effective artifact before releasing admission.
+            duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(|e| e.to_string())?;
+        }
         Ok(db)
     }
 
@@ -240,7 +251,7 @@ impl UserDb {
         let mut key = [0u8; 32];
         ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key)
             .map_err(|_| "failed to create an ephemeral key".to_string())?;
-        Ok(Self { pool: vec![Mutex::new(conn)], remember_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key) })
+        Ok(Self { home: db_path.parent().map(Path::to_path_buf), pool: vec![Mutex::new(conn)], remember_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key) })
     }
 
     pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -417,6 +428,7 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         migrate_isolation_personal_agents(&conn)?;
+        crate::avatar_seats::migrate_grants(&conn, self.home.as_deref())?;
         crate::isolation::initialize_tenant(&conn)?;
         // Last: its triggers read users and every MFA table (F6 S1/S16).
         crate::admin_eligibility::migrate(&conn)?;
@@ -815,6 +827,11 @@ impl UserDb {
     /// [`Self::set_user_status`] attributed to the acting Admin in the
     /// admin eligibility log (same transaction, F6 S1/S2).
     pub fn set_user_status_as(&self, actor: Option<&str>, user_id: &str, status: UserStatus) -> Result<(), String> {
+        self.set_user_status_as_under(actor, user_id, status, None)
+    }
+
+    pub fn set_user_status_as_under(&self, actor: Option<&str>, user_id: &str, status: UserStatus, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
@@ -833,6 +850,7 @@ impl UserDb {
         }
         if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor)?; }
         bump_acl_generation(&tx).map_err(|e| format!("update error: {e}"))?;
+        seats.check(&tx)?;
         tx.commit().map_err(|e| format!("update error: {e}"))
     }
 
@@ -962,24 +980,30 @@ impl UserDb {
     // ── Agent Bindings ───────────────────────────────────────
 
     /// Bind a user to an agent with a given access level.
-    pub fn bind_agent(
-        &self,
-        user_id: &str,
-        agent_name: &str,
-        access_level: AccessLevel,
-    ) -> Result<(), String> {
+    pub fn bind_agent(&self, user_id: &str, agent_name: &str, access_level: AccessLevel) -> Result<(), String> {
+        self.bind_agent_under(user_id, agent_name, access_level, None)
+    }
+
+    pub fn bind_agent_under(&self, user_id: &str, agent_name: &str, access_level: AccessLevel, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| format!("bind error: {e}"))?;
         bind_agent_in_transaction(&tx, user_id, agent_name, access_level, &now)?;
+        seats.check(&tx)?;
         tx.commit().map_err(|e| format!("bind error: {e}"))
     }
 
     /// Interactive binding only; migration, restore and Personal provisioning
     /// use the preference-free shared writer instead.
     pub fn bind_agent_as(&self, actor: &str, user_id: &str, agent_name: &str, access_level: AccessLevel) -> Result<(), String> {
+        self.bind_agent_as_under(actor, user_id, agent_name, access_level, None)
+    }
+
+    pub fn bind_agent_as_under(&self, actor: &str, user_id: &str, agent_name: &str, access_level: AccessLevel, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let now = Utc::now().to_rfc3339();
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
@@ -997,11 +1021,17 @@ impl UserDb {
                     params![actor, user_id, serde_json::json!({"primary_agent_id": agent_name}).to_string(), now]).map_err(|e| e.to_string())?;
             }
         }
+        seats.check(&tx)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
     /// Unbind a user from an agent.
     pub fn unbind_agent(&self, user_id: &str, agent_name: &str) -> Result<(), String> {
+        self.unbind_agent_under(user_id, agent_name, None)
+    }
+
+    pub fn unbind_agent_under(&self, user_id: &str, agent_name: &str, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1012,6 +1042,7 @@ impl UserDb {
         )
         .map_err(|e| format!("unbind error: {e}"))?;
         bump_acl_generation(&tx).map_err(|e| format!("unbind error: {e}"))?;
+        seats.check(&tx)?;
         tx.commit().map_err(|e| format!("unbind error: {e}"))
     }
 

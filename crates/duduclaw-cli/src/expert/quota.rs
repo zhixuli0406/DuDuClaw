@@ -34,7 +34,8 @@ use super::import_error::import_err;
 
 /// Employees currently holding a licence seat (RM-149): the shared rule in
 /// [`duduclaw_core::agent_seats::seat_holders`] — every employee directory
-/// with an `agent.toml` whose status is not `deleted`. A listing error is
+/// with an `agent.toml` whose status is not `deleted`, except verified
+/// Personal avatars. Archived profiles still count. A listing error is
 /// returned so the import can refuse (fail closed).
 pub fn seat_holders(home: &Path) -> std::io::Result<Vec<duduclaw_core::agent_seats::AgentSeat>> {
     duduclaw_core::agent_seats::seat_holders(home)
@@ -65,7 +66,7 @@ pub fn check(max: usize, current: usize, adding: usize) -> std::result::Result<(
 }
 
 /// The cap in force for this import (`0` = unlimited).
-async fn import_cap(home: &Path, gateway_cap: Option<usize>) -> usize {
+pub(super) async fn import_cap(home: &Path, gateway_cap: Option<usize>) -> usize {
     let disk = duduclaw_gateway::license_runtime::agent_cap_from_disk(home).await;
     stricter(disk.max, gateway_cap.unwrap_or(0))
 }
@@ -162,6 +163,33 @@ mod tests {
         assert_eq!(stricter(0, 3), 3);
         assert_eq!(stricter(4, 0), 4);
         assert_eq!(stricter(4, 3), 3);
+    }
+
+    #[tokio::test]
+    async fn import_recounts_avatar_provenance_and_cannot_reuse_its_seat() {
+        let h = tempfile::tempdir().unwrap();
+        let db = duduclaw_core::private_sqlite::open(h.path(), "users.db", duduclaw_core::private_sqlite::Access::Create)
+            .unwrap().unwrap();
+        db.execute_batch("CREATE TABLE users(id TEXT,status TEXT,avatar_agent_id TEXT);
+            CREATE TABLE user_agent_bindings(user_id TEXT,agent_name TEXT,access_level TEXT);
+            CREATE TABLE isolation_personal_agents(agent_name TEXT,owner_user_id TEXT);
+            CREATE TABLE avatar_seat_grants(agent_name TEXT,owner_user_id TEXT,nonce TEXT);
+            CREATE TABLE google_employee_incarnations(agent_id TEXT PRIMARY KEY,nonce TEXT);
+            INSERT INTO users VALUES('member','active','avatar');
+            INSERT INTO user_agent_bindings VALUES('member','avatar','owner');
+            INSERT INTO isolation_personal_agents VALUES('avatar','member');
+            INSERT INTO avatar_seat_grants VALUES('avatar','member','original');
+            INSERT INTO google_employee_incarnations VALUES('avatar','original');").unwrap();
+        agent(h.path(), "avatar");
+        let admission = admit(h.path(), Some(1), 1, 0).await.unwrap();
+        agent(h.path(), "imported");
+        admission.recount(1).unwrap();
+        assert_eq!(count_agents(h.path()), 1);
+        // A replacement cannot subtract an avatar from the ordinary holders.
+        assert!(check_under(&admission, Some(1), 1, 0).await.is_err());
+        duduclaw_core::employee_incarnation::created(h.path(), "avatar").unwrap();
+        assert_eq!(count_agents(h.path()), 2);
+        assert!(admission.recount(1).is_err());
     }
 
     #[test]

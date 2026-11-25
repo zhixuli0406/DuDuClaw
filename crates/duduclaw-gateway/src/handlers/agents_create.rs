@@ -41,6 +41,23 @@ impl MethodHandler {
         params: Value,
         caller: Option<&UserContext>,
     ) -> WsFrame {
+        let avatar_member = match params.get("avatar_for_user") {
+            None => None,
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+            _ => return WsFrame::error_response("", "avatar_for_user 必須是成員 ID。"),
+        };
+        let avatar_db = if avatar_member.is_some() {
+            let Some(db) = self.user_db.read().await.clone() else {
+                return WsFrame::error_response("", "無法讀取成員資料，未建立分身。");
+            };
+            if !caller.is_some_and(|ctx| super::user_invites_rpc::live_admin(&db, ctx)) {
+                return WsFrame::error_response("", "只有管理員可以為成員建立 AI 分身。");
+            }
+            if params.get("role").and_then(Value::as_str).unwrap_or("specialist") != "specialist" {
+                return WsFrame::error_response("", "AI 分身必須使用 specialist 角色。");
+            }
+            Some(db)
+        } else { None };
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let display_name = params
             .get("display_name")
@@ -187,10 +204,12 @@ impl MethodHandler {
         // the cross-process seat admission lock, which is held until the
         // directory is published below (lock order: seat admission, then
         // the org lock, then agent.toml locks).
-        let seat_admission = match self.admit_agent_seats(1, None).await {
+        let seat_admission = match self.admit_agent_seats(usize::from(avatar_member.is_none()), None).await {
             Ok(admission) => admission,
             Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
         };
+
+        let seat_cap = self.effective_agent_cap().await;
 
         // Create agent directory and files. Own the agents-dir path and release
         // the read guard immediately — the post-create registry rescan below
@@ -359,7 +378,36 @@ impl MethodHandler {
         // failure (corrupt / newer store, a cycle) refuses the whole create:
         // the staging directory is removed and nothing appears.
         // Short synchronous file operations (as the upsert always was).
-        if let Err(e) = staged.publish(&org, org_entry) {
+        let prior_org = duduclaw_core::org_store::load(&self.home_dir).get(name).cloned();
+        let mut published = false;
+        let publish = |users: Option<&rusqlite::Connection>| {
+            // Mark before calling: publish may return an incarnation error
+            // after rename. Cleanup must also cover that failure.
+            published = true;
+            match users {
+                Some(conn) => staged.publish_in_users_transaction(&org, org_entry, conn),
+                None => staged.publish(&org, org_entry),
+            }.map(|_| ()).map_err(|e| e.to_string())
+        };
+        let result = match (avatar_db.as_ref(), avatar_member, caller) {
+            (Some(db), Some(member), Some(ctx)) => db.publish_new_avatar_under(
+                &ctx.user_id, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
+            ),
+            _ => publish(None).and_then(|()| seat_admission.recount(seat_cap)),
+        };
+        if let Err(e) = result {
+            if published {
+                // This directory was created by this request while admission
+                // and org locks are held. Never touch a pre-existing agent.
+                let cleanup = std::fs::remove_dir_all(&agent_dir);
+                let authority = match prior_org {
+                    Some(entry) => duduclaw_core::org_store::upsert(&org, name, entry).map(|_| ()),
+                    None => duduclaw_core::org_store::remove(&org, name).map(|_| ()),
+                };
+                if cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) || authority.is_err() {
+                    return WsFrame::error_response("", "分身建立失敗，清理未完成；請管理員檢查 AI 資料。未取得名額豁免。");
+                }
+            }
             warn!(agent = %name, error = %e, "agents.create refused: org authority not committed");
             // RM-027 round 5: the create did not happen, so the main it
             // demoted is put back (still under the org lock).
@@ -435,6 +483,7 @@ impl MethodHandler {
 /// dashboard client on a step-up retry and is transport, not data.
 pub(crate) const AGENTS_CREATE_FIELDS: &[&str] = &[
     "name",
+    "avatar_for_user",
     "display_name",
     "role",
     "trigger",

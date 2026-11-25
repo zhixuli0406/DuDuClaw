@@ -419,6 +419,11 @@ export function LicensePage() {
                 </span>
               </SettingsRow>
             )}
+            {typeof snapshot.avatars_exempt === 'number' && (
+              <SettingsRow label={intl.formatMessage({ id: 'agents.seats.avatarExempt' })}>
+                <span className="text-sm" data-testid="license-avatars-exempt">{intl.formatNumber(snapshot.avatars_exempt)}</span>
+              </SettingsRow>
+            )}
             <SettingsRow
               label={
                 <span className="flex items-center gap-1.5">

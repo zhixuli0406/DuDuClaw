@@ -1144,7 +1144,7 @@
   "agents.create.personaPlaceholder": "例：あなたは当社のサポート担当です。製品の質問に、簡潔で丁寧に答えてください。",
   "agents.seatLimit.title": "AI スタッフの枠がいっぱいです",
   "agents.seatLimit.summary": "ライセンスの上限は {max} 人で、現在 {current} 人が枠を使っています。",
-  "agents.seatLimit.hint": "アーカイブしたスタッフも枠を使います。削除すると枠が空きます。",
+  "agents.seatLimit.hint": "条件を満たす AI 分身は枠を使いません。アーカイブしたスタッフも枠を使います。削除すると枠が空きます。",
   "agents.seatLimit.listLabel": "現在枠を使っている AI スタッフ",
   "agents.seatLimit.status.active": "稼働中",
   "agents.seatLimit.status.paused": "一時停止",
@@ -11705,5 +11705,8 @@
   "memberKeys.error.member_key_invalid_expiry": "有効期間は 1～365 日にしてください。",
   "memberKeys.error.member_key_admin_forbidden": "管理者は本人キーを作成できません。メンバーアカウントを使用してください。",
   "memberKeys.error.member_key_limit_reached": "有効なキーが 5 個あります。古いキーを失効してください。",
-  "memberKeys.error.member_key_step_up_required": "現在のパスワード、または新しい MFA コードかリカバリーコードを入力してください。"
+  "memberKeys.error.member_key_step_up_required": "現在のパスワード、または新しい MFA コードかリカバリーコードを入力してください。",
+  "agents.seats.summary": "AI 従業員枠：{used}／{limit}・AI 分身：{avatars}",
+  "agents.seats.avatarExempt": "AI 分身は従業員枠を消費しません",
+  "agents.seats.avatarConditions": "有効なメンバー本人が所有する Personal AI が１人につき１体だけ対象です。共有 AI、操作権限のみの割り当て、アーカイブ済み AI は枠を消費します。"
 }

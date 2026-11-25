@@ -315,6 +315,22 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         )),
         other => other,
     };
+    let dispatched = match dispatched {
+        Ok(record) => match ctx.recount_seats().await {
+            Ok(()) => Ok(record),
+            Err(error) => {
+                // Replacements use their existing journal below. A fresh
+                // import has no old version: quarantine only its own newly
+                // published agents while admission is still held.
+                if state.retired.is_none() {
+                    quarantine_failed_seat_import(home, &record.agents)
+                        .map_err(|cleanup| cfg_err(format!("{error}；新匯入 AI 的隔離未完成：{cleanup}")))?;
+                }
+                Err(error)
+            }
+        },
+        Err(error) => Err(error),
+    };
     let record = match dispatched.and_then(|r| {
         if dry_run { Ok(r) } else { super::write_record(home, &r).map(|()| r) }
     }) {
@@ -385,6 +401,40 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
 
     drop(cleanup);
     Ok(())
+}
+
+fn quarantine_failed_seat_import(home: &Path, agents: &[String]) -> std::io::Result<()> {
+    if agents.is_empty() { return Ok(()); }
+    let backup = home.join("agents/_trash").join(format!("seat-refusal-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&backup)?;
+    duduclaw_core::org_store::with_org_lock(home, |org| {
+        for id in agents {
+            if !crate::is_valid_agent_id(id) { return Err(std::io::Error::other("invalid imported agent id")); }
+            std::fs::rename(home.join("agents").join(id), backup.join(id))?;
+            duduclaw_core::employee_incarnation::deleted(home, id)?;
+            duduclaw_core::org_store::remove(org, id)?;
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod seat_recount_tests {
+    use super::*;
+
+    #[test]
+    fn refused_fresh_import_keeps_data_outside_counted_roster() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agents/imported");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("agent.toml"), "[agent]\nname='imported'\nstatus='active'\n").unwrap();
+        let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home.path()).unwrap();
+        quarantine_failed_seat_import(home.path(), &["imported".into()]).unwrap();
+        admission.recount(1).unwrap();
+        assert!(duduclaw_core::agent_seats::seat_holders(home.path()).unwrap().is_empty());
+        let backup = std::fs::read_dir(home.path().join("agents/_trash")).unwrap().next().unwrap().unwrap().path();
+        assert!(backup.join("imported/agent.toml").is_file());
+    }
 }
 
 fn format_label(f: Format) -> &'static str {

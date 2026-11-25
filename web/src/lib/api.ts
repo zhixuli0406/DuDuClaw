@@ -2567,6 +2567,8 @@ export interface LicenseSnapshot {
   seat_unlimited?: boolean;
   /** Employees holding a seat (archived included); `null` when uncountable. */
   seats_used?: number | null;
+  /** Active, unique Personal avatars excluded from seats_used. */
+  avatars_exempt?: number | null;
 }
 
 /** Result of `license.sync`: the refreshed snapshot plus what happened. */
@@ -6428,6 +6430,8 @@ export interface ProtectedProposeInput {
   label: string;
   display_name?: string;
   binding_kind: 'personal' | 'shared';
+  /** Personal proposals only; creates and assigns a new exempt avatar. */
+  as_avatar?: boolean;
   owner_id?: string;
   request_id?: string;
 }
@@ -7079,6 +7083,8 @@ export const api = {
     create: (params: {
       name: string;
       display_name: string;
+      /** Admin-only, atomically create a Personal avatar for an active member. */
+      avatar_for_user?: string;
       role?: string;
       trigger?: string;
       /** Persona written to SOUL.md (canonical field). Scanned; a rejected
@@ -9911,8 +9917,8 @@ export const api = {
       client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
     avatarConflicts: () =>
       client.call('users.avatar_conflicts') as Promise<{ conflicts: AvatarConflict[] }>,
-    setAvatar: (userId: string, agentId: string | null) =>
-      client.call('users.set_avatar', { user_id: userId, agent_id: agentId }) as Promise<{ avatar_agent_id: string | null }>,
+    setAvatar: (userId: string, agentId: string | null, deleteAvatar = false) =>
+      client.call('users.set_avatar', { user_id: userId, agent_id: agentId, ...(deleteAvatar ? { delete_avatar: true } : {}) }) as Promise<{ avatar_agent_id: string | null }>,
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>

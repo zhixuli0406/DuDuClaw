@@ -14,6 +14,14 @@ impl MethodHandler {
     /// RM-149: the registry no longer loads it after the rescan this write
     /// triggers, it frees its licence seat, and `agents.unarchive` refuses it.
     pub(crate) async fn handle_agents_remove(&self, params: Value) -> WsFrame {
+        let admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        self.remove_agent_under(params, &admission).await
+    }
+
+    pub(super) async fn remove_agent_under(&self, params: Value, admission: &duduclaw_core::agent_seats::SeatAdmission) -> WsFrame {
         let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => return WsFrame::error_response("", "Missing 'agent_id' parameter"),
@@ -44,7 +52,7 @@ impl MethodHandler {
         if let Err(e) = duduclaw_core::employee_incarnation::deleted(&self.home_dir, &agent_id) {
             return WsFrame::error_response("", &format!("Failed to retire employee identity: {e}"));
         }
-        if let Err(e) = self.offboard_agent_toml(&agent_id, "deleted").await {
+        if let Err(e) = self.offboard_agent_toml_under(&agent_id, "deleted", admission).await {
             return WsFrame::error_response("", &format!("Failed to soft-delete agent: {e}"));
         }
         crate::mcp_start::clear(&self.home_dir, &agent_id, None);
@@ -119,9 +127,41 @@ impl MethodHandler {
     /// `evolution.enabled = false`) in one atomic `agent.toml` write. Shared by
     /// archive + soft-delete so an off-boarded agent never keeps ticking.
     pub(crate) async fn offboard_agent_toml(&self, agent_id: &str, status: &str) -> Result<(), String> {
+        let admission = self.acquire_seat_admission().await.map_err(|e| e.to_string())?;
+        self.offboard_agent_toml_under(agent_id, status, &admission).await
+    }
+
+    async fn offboard_agent_toml_under(&self, agent_id: &str, status: &str,
+        admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<(), String> {
+        let cap = self.effective_agent_cap().await;
+        let seat = duduclaw_core::agent_seats::resolve_agent_seat(admission.home(), agent_id)
+            .map_err(|e| e.to_string())?.ok_or("找不到 AI 員工，未變更狀態。")?;
+        if status == "archived" && seat.is_avatar_exempt() {
+            if let Some(error) = self.seat_refusal_under(admission, 1, None).await {
+                return Err(error["message"].as_str().unwrap_or(duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL).into());
+            }
+        }
+        let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(|e| e.to_string())?.len();
+        let original = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let saved = original.clone();
         let status = status.to_string();
-        self.update_agent_toml(agent_id, move |table| offboard_freeze_table(table, &status))
-            .await?;
+        self.update_agent_toml(agent_id, move |table| {
+            *saved.lock().unwrap() = Some(table.clone());
+            offboard_freeze_table(table, &status)
+        }).await?;
+        // Reductions remain possible after a license downgrade. Only an
+        // increase must fit, and unreadable effective state must roll back.
+        let recount = duduclaw_core::agent_seats::seat_holders(admission.home())
+            .map_err(|e| e.to_string()).and_then(|rows| {
+                if cap != 0 && rows.len() > cap && rows.len() > before {
+                    Err(duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL.into())
+                } else { Ok(()) }
+            });
+        if let Err(error) = recount {
+            let prior = original.lock().unwrap().take().ok_or("無法回復 AI 狀態。")?;
+            self.update_agent_toml(agent_id, move |table| { *table = prior; Ok(()) }).await?;
+            return Err(error);
+        }
         // Its own knowledge collection (資料來源 tab) is archived with it:
         // nobody reads it through a share until the employee is restored.
         self.kb_own_offboard(agent_id).await;
@@ -249,7 +289,8 @@ impl MethodHandler {
         // refused only when the others alone already fill the cap (e.g. the
         // licence was lowered while it was archived). Its own seat is matched
         // on the resolved directory.
-        if let Some(refusal) = self.seat_refusal_under(&admission, 1, Some(&seat.id)).await {
+        let adding = usize::from(!duduclaw_core::agent_seats::archived_avatar_will_exempt(admission.home(), &seat));
+        if let Some(refusal) = self.seat_refusal_under(&admission, adding, Some(&seat.id)).await {
             return super::agents_basic::seat_refusal_frame(refusal);
         }
         // Written into the resolved directory (the status is re-checked on
@@ -260,6 +301,12 @@ impl MethodHandler {
             unarchive_restore_table(table)
         })
         .await;
+        if res.is_ok() {
+            // Restoring an archived avatar can only release its former seat.
+            if let Err(error) = duduclaw_core::agent_seats::seat_holders(admission.home()) {
+                return WsFrame::error_response("", &format!("無法確認還原後的名額：{error}"));
+            }
+        }
         drop(admission);
         if let Err(e) = res {
             return WsFrame::error_response("", &format!("Failed to unarchive agent: {e}"));
