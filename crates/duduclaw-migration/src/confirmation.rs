@@ -68,9 +68,26 @@ pub trait ProposalValidator {
 /// atomic replacement; read_back verifies effective state. disable must revoke all
 /// partial effects (including UID tombstones) and verify their disabled state.
 /// Calls run after a durable intent commits, without a SQLite writer transaction.
-/// Adapters must enforce bounded RPC timeouts. A per-proposal process lock keeps
-/// apply and compensation mutually exclusive; receipt commits use an intent CAS.
+/// Adapters must enforce bounded RPC timeouts. A per-proposal operation lock
+/// keeps apply and compensation mutually exclusive; receipt commits use an
+/// intent CAS and a separate proposal commit lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProposalEffect { Stage, Publish, ReadBack, Disable }
+pub use effects::ProposalLock;
+
 pub trait ProposalApplier {
+    /// The operation lock still excludes competing effects. The default keeps
+    /// the proposal lock around the adapter; seat-aware adapters split remote
+    /// work from commits and take admission before `proposal.run` instead.
+    fn apply_effect(&mut self, item: &ConfirmationItem, effect: ProposalEffect, proposal: &ProposalLock) -> Result<()> {
+        proposal.run(|| match effect {
+            ProposalEffect::Stage => self.stage(item),
+            ProposalEffect::Publish => self.publish(item),
+            ProposalEffect::ReadBack => self.read_back(item),
+            ProposalEffect::Disable => self.disable_and_read_back(item),
+        })
+    }
+
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()>;
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()>;
     fn read_back(&mut self, item: &ConfirmationItem) -> Result<()>;
@@ -328,12 +345,14 @@ impl ConfirmationStore {
     }
 
     /// Advances one durable effect: intent -> commit -> adapter -> receipt CAS.
-    /// The proposal lock is released by process death, unlike a stale lease that
+    /// The operation lock is released by process death, unlike a stale lease that
     /// could permit a still-running publisher to race compensation. Other
     /// proposals remain writable throughout an external call.
     pub fn apply_next(&mut self, binding: &ProposalBinding,
         adapter: &mut dyn ProposalApplier) -> Result<ConfirmationItem> {
-        let _guard = effects::lock(&self.conn, binding)?;
+        let proposal = ProposalLock::new(&self.conn, binding);
+        let _operation = proposal.operation()?;
+        let guard = proposal.acquire()?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Applied { return Ok(item); }
@@ -347,9 +366,10 @@ impl ConfirmationStore {
         save(&tx, &item)?;
         let intent = effects::intent(&tx, &item, next)?;
         tx.commit()?;
-        let result = match next {
-            0 => adapter.stage(&item), 1 => adapter.publish(&item), _ => adapter.read_back(&item),
-        };
+        drop(guard);
+        let effect = match next { 0 => ProposalEffect::Stage, 1 => ProposalEffect::Publish, _ => ProposalEffect::ReadBack };
+        let result = adapter.apply_effect(&item, effect, &proposal);
+        let guard = proposal.acquire()?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, next, &intent)?;
         if result.is_err() {
@@ -358,7 +378,9 @@ impl ConfirmationStore {
             audit(&tx, &item, "failed_compensation_pending", None)?;
             let intent = effects::intent(&tx, &item, 3)?;
             tx.commit()?;
-            let disabled = adapter.disable_and_read_back(&item).is_ok();
+            drop(guard);
+            let disabled = adapter.apply_effect(&item, ProposalEffect::Disable, &proposal).is_ok();
+            let _guard = proposal.acquire()?;
             let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             effects::consume(&tx, &item, 3, &intent)?;
             if disabled {
@@ -382,22 +404,26 @@ impl ConfirmationStore {
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier,
         validator: &dyn ProposalValidator) -> Result<()> {
         session.check(&csrf, now)?;
-        let _guard = effects::lock(&self.conn, binding)?;
+        let proposal = ProposalLock::new(&self.conn, binding);
+        let _operation = proposal.operation()?;
+        let guard = proposal.acquire()?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status != ConfirmationStatus::Failed { return Err(ConfirmationError::Denied); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
+        drop(guard);
         // F6 §3.12 (R14): a retire is forward only. Its compensation is a
         // read-back that succeeds only while the root never started, so a
         // retry never depends on it: the same retire operation resumes
         // (spawnd replays it idempotently from the recorded phase).
         if item.category != ConfirmationCategory::EmployeeRetire {
-            adapter.disable_and_read_back(&item).map_err(|_| ConfirmationError::Compensation)?;
+            adapter.apply_effect(&item, ProposalEffect::Disable, &proposal).map_err(|_| ConfirmationError::Compensation)?;
         }
         // Disable before absence validation. Both calls are outside the writer.
         // A validation failure leaves Failed and can safely repeat compensation.
         validator.validate_fresh(&item)?;
+        let _guard = proposal.acquire()?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         effects::consume(&tx, &item, 3, &intent)?;
         receipt(&tx, &item, 3)?;
@@ -411,7 +437,9 @@ impl ConfirmationStore {
     pub fn reject(&mut self, binding: &ProposalBinding, session: &ApprovalSession,
         csrf: [u8; 32], now: u64, adapter: &mut dyn ProposalApplier) -> Result<()> {
         session.check(&csrf, now)?;
-        let _guard = effects::lock(&self.conn, binding)?;
+        let proposal = ProposalLock::new(&self.conn, binding);
+        let _operation = proposal.operation()?;
+        let guard = proposal.acquire()?;
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut item = required(&tx, binding)?;
         if item.status == ConfirmationStatus::Rejected { return Ok(()); }
@@ -434,7 +462,10 @@ impl ConfirmationStore {
         if item.status == ConfirmationStatus::Rejected { tx.commit()?; return Ok(()); }
         let intent = effects::intent(&tx, &item, 3)?;
         tx.commit()?;
-        if let Err(error) = adapter.disable_and_read_back(&item) {
+        drop(guard);
+        let disabled = adapter.apply_effect(&item, ProposalEffect::Disable, &proposal);
+        let _guard = proposal.acquire()?;
+        if let Err(error) = disabled {
             if !forward_only { return Err(ConfirmationError::Compensation); }
             let _ = error;
             // Nothing sticks in Rejecting: restore the prior state. A crash
@@ -522,7 +553,9 @@ impl ConfirmationStore {
     /// never an imported assertion. Adapter verification is mandatory.
     pub fn record_rotation(&mut self, binding: &ProposalBinding, field: &str,
         new_fingerprint: Sha256Digest, validator: &dyn RotationVerifier) -> Result<()> {
-        let _guard = effects::lock(&self.conn, binding)?;
+        let proposal = ProposalLock::new(&self.conn, binding);
+        let _operation = proposal.operation()?;
+        let _guard = proposal.acquire()?;
         let item = required(&self.conn, binding)?;
         if item.status != ConfirmationStatus::Applied { return Err(ConfirmationError::Denied); }
         let old = item.fields.iter().find(|f| f.name == field).ok_or(ConfirmationError::Invalid)?;

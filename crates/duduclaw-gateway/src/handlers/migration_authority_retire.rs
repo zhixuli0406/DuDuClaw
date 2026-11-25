@@ -57,6 +57,10 @@ impl CompositeBackend {
     }
 }
 impl MigrationAuthorityBackend for CompositeBackend {
+    fn employee_effect(&self, item: &ConfirmationItem, effect: ProposalEffect, commit: &employee::EmployeeCommit<'_>) -> Result<()> {
+        self.for_item(item.category)?.employee_effect(item, effect, commit)
+    }
+
     /// The Shared-employee readback belongs to the Employee backend only.
     fn readback_shared_employee(&self, agent: &str) -> Result<()> {
         self.for_item(ConfirmationCategory::Employee)?.readback_shared_employee(agent)

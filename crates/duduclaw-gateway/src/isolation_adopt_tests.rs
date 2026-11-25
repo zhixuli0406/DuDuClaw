@@ -61,14 +61,15 @@ fn new_ax() -> Ax {
 }
 fn env(ax: &Ax) -> AdoptEnv<'_> {
     // The card's step-up proof, verified at this call (N2: freshness from it).
-    AdoptEnv { root: &ax.root, routes: &ax.routes, runs: &NoLiveRuns, rule: &AnyAdmin, hooks: &ok_hooks, agent_cap: 0,
+    AdoptEnv { seat_write: None, root: &ax.root, routes: &ax.routes, runs: &NoLiveRuns, rule: &AnyAdmin, hooks: &ok_hooks, agent_cap: 0,
         actor: "admin-user", step_up_verified_at: u64::try_from(ax.now).ok(), now: ax.now }
 }
 
 /// The production save with the adoption commit's users.db gate (N1).
 fn save_gated(home: &Path, item: &ConfirmationItem, receipt: &Receipt, gate: &dyn Fn(&Connection) -> Result<(), ()>)
     -> Result<(), ()> {
-    crate::handlers::save_confirmed_receipt_gated(home, item, receipt, Some(gate)).map_err(|_| ())
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| ())?;
+    crate::handlers::save_confirmed_receipt_gated(home, item, receipt, Some(gate), &admission).map_err(|_| ())
 }
 
 fn agent_toml(label: &str) -> String {

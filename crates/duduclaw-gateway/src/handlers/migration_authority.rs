@@ -2,7 +2,7 @@
 //! Durable plans are encrypted and never exposed by confirmation RPCs.
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
-use duduclaw_migration::confirmation::{ConfirmationError as Error, ProposalValidator, ProposalApplier, RotationVerifier, secret_fingerprint};
+use duduclaw_migration::confirmation::{ConfirmationError as Error, ProposalValidator, ProposalApplier, RotationVerifier, ProposalEffect, ProposalLock, secret_fingerprint};
 use duduclaw_migration::{contract::*, ids::Sha256Digest};
 use duduclaw_security::crypto::CryptoEngine;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -55,6 +55,9 @@ pub(crate) trait MigrationAuthorityBackend: Send + Sync {
     /// Read the immutable principal and confirmed UID/quota allocation from the
     /// live B/D/H registry. A proposal label or Applied row is not this proof.
     fn readback_shared_employee(&self, _agent: &str) -> Result<()> { Err(Error::Denied) }
+    /// Employee remote work runs outside admission; every local seat commit
+    /// must use this orchestrator and pass its admission to the write helpers.
+    fn employee_effect(&self, _item: &ConfirmationItem, _effect: ProposalEffect, _commit: &employee::EmployeeCommit<'_>) -> Result<()> { Err(Error::Denied) }
     fn supports(&self, category: ConfirmationCategory) -> bool;
     fn validate(&self, item: &ConfirmationItem) -> Result<()>;
     fn stage(&self, item: &ConfirmationItem) -> Result<()>;
@@ -82,6 +85,7 @@ pub(crate) struct GatewayAuthority {
     agent_cap: Option<usize>,
     users: Option<std::sync::Arc<duduclaw_auth::UserDb>>,
     user_admission: Option<duduclaw_core::agent_seats::SeatAdmission>,
+    employee_confirmation: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
@@ -117,7 +121,7 @@ impl GatewayAuthority {
             CREATE TABLE IF NOT EXISTS secrets (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS config_publications (operation TEXT NOT NULL, digest BLOB NOT NULL,
                 phase TEXT NOT NULL, identity BLOB NOT NULL, PRIMARY KEY(operation,phase));").map_err(|_| Error::Storage)?;
-        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default(), agent_cap: None, users: None, user_admission: None })
+        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default(), agent_cap: None, users: None, user_admission: None, employee_confirmation: false })
     }
     pub(crate) fn with_user_db(mut self, db: std::sync::Arc<duduclaw_auth::UserDb>) -> Self {
         self.users = Some(db); self
@@ -130,6 +134,16 @@ impl GatewayAuthority {
         store: &mut duduclaw_migration::confirmation::ConfirmationStore, binding: &ProposalBinding,
         run: impl FnOnce(&mut duduclaw_migration::confirmation::ConfirmationStore, &mut Self) -> Result<T>) -> Result<T> {
         let item = store.list()?.into_iter().find(|item| item.binding == *binding).ok_or(Error::Stale)?;
+        if self.employee_confirmation || self.user_admission.is_some() { return Err(Error::Denied); }
+        if item.category == ConfirmationCategory::Employee {
+            // Employee effects include remote/async work. The store retains
+            // operation exclusion while EmployeeCommit takes admission before
+            // each local proposal-locked commit, never across a remote wait.
+            self.employee_confirmation = true;
+            let result = run(store, self);
+            self.employee_confirmation = false;
+            return result;
+        }
         let needs_admission = matches!(item.category, ConfirmationCategory::User | ConfirmationCategory::UserAgentBinding);
         if needs_admission {
             if self.users.is_none() || self.user_admission.is_some() { return Err(Error::Denied); }
@@ -401,6 +415,20 @@ impl ProposalValidator for GatewayAuthority {
     }
 }
 impl ProposalApplier for GatewayAuthority {
+    fn apply_effect(&mut self, item: &ConfirmationItem, effect: ProposalEffect, proposal: &ProposalLock) -> Result<()> {
+        if item.category == ConfirmationCategory::Employee {
+            if !self.employee_confirmation { return Err(Error::Denied); }
+            let commit = employee::EmployeeCommit { home: &self.home, proposal };
+            return bridge::operation(|| self.backend.as_ref().ok_or(Error::Denied)?.employee_effect(item, effect, &commit));
+        }
+        proposal.run(|| match effect {
+            ProposalEffect::Stage => self.stage(item),
+            ProposalEffect::Publish => self.publish(item),
+            ProposalEffect::ReadBack => self.read_back(item),
+            ProposalEffect::Disable => self.disable_and_read_back(item),
+        })
+    }
+
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
         bridge::operation(|| {
         self.validate_fresh(item)?;

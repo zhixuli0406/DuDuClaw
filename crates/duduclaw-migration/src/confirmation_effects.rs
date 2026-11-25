@@ -9,18 +9,41 @@ pub(super) fn schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Locks live outside SQLite and are never unlinked (unlinking an acquired lock
-/// would permit two owners). A crash releases the kernel lock automatically.
-/// In-memory stores cannot be reopened by another process and use &mut exclusivity.
-pub(super) fn lock(conn: &Connection, binding: &ProposalBinding) -> Result<Option<File>> {
-    let Some(path) = conn.path().filter(|p| !p.is_empty()) else { return Ok(None); };
-    let mut suffix = String::from("proposal-");
-    for byte in binding.operation_id.proposal_id.0 {
-        use std::fmt::Write;
-        write!(&mut suffix, "{byte:02x}").map_err(|_| ConfirmationError::Storage)?;
+/// A commit lock, separate from the operation lock that serializes remote
+/// effects. Seat writers acquire admission BEFORE calling `run`. Lock files
+/// are never unlinked; process death releases both locks. In-memory stores use
+/// the caller's exclusive `&mut ConfirmationStore` instead.
+pub struct ProposalLock { path: Option<std::path::PathBuf> }
+impl ProposalLock {
+    pub(super) fn new(conn: &Connection, binding: &ProposalBinding) -> Self {
+        let path = conn.path().filter(|p| !p.is_empty()).map(|path| {
+            let mut suffix = String::from("proposal-");
+            for byte in binding.operation_id.proposal_id.0 {
+                use std::fmt::Write;
+                write!(&mut suffix, "{byte:02x}").expect("write to string");
+            }
+            suffix.push_str(".lock");
+            std::path::Path::new(path).with_extension(suffix)
+        });
+        Self { path }
     }
-    suffix.push_str(".lock");
-    let path = std::path::Path::new(path).with_extension(suffix);
+    pub fn run<T>(&self, run: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self.acquire()?;
+        run()
+    }
+    pub(super) fn acquire(&self) -> Result<Option<File>> {
+        let Some(path) = &self.path else { return Ok(None); };
+        lock_path(path)
+    }
+    pub(super) fn operation(&self) -> Result<Option<File>> {
+        let Some(path) = &self.path else { return Ok(None); };
+        // Nonblocking exclusion only: no seat writer waits on this lock. Keep
+        // it across remote calls so apply and compensation cannot interleave.
+        lock_path(&path.with_extension("operation.lock"))
+    }
+}
+
+fn lock_path(path: &std::path::Path) -> Result<Option<File>> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)] {
