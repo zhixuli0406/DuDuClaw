@@ -21,6 +21,8 @@ pub mod onboarding;
 pub mod invitation_content;
 mod user_row;
 mod authority_migrations;
+#[cfg(test)]
+mod test_support;
 
 pub use acl::UserContext;
 pub use db::{busy_timeout_at_least, AclDeliveryError, UserDb, ACL_DELIVERY_WAIT};

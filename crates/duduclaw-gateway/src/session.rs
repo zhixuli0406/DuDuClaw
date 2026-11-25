@@ -2616,6 +2616,17 @@ impl SessionManager {
 mod publish_contention_tests;
 
 #[cfg(test)]
+fn test_users_home() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().unwrap()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
@@ -2832,7 +2843,8 @@ mod tests {
     #[tokio::test]
     async fn webchat_pending_publication_requires_current_acl_and_final_fence() {
         let tmp = NamedTempFile::new().unwrap();
-        let user_file = NamedTempFile::new().unwrap();
+        let users_home = test_users_home();
+        let user_file = NamedTempFile::new_in(users_home.path()).unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
         let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
         mgr.get_or_create("webchat:owned", "worker").await.unwrap();
@@ -2856,7 +2868,8 @@ mod tests {
     #[tokio::test]
     async fn compression_preserves_pending_and_newly_published_replies() {
         let tmp = NamedTempFile::new().unwrap();
-        let user_file = NamedTempFile::new().unwrap();
+        let users_home = test_users_home();
+        let user_file = NamedTempFile::new_in(users_home.path()).unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
         let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
         mgr.get_or_create("webchat:owned", "worker").await.unwrap();
@@ -2881,7 +2894,8 @@ mod tests {
     #[tokio::test]
     async fn webchat_scrubbed_pending_reply_cannot_be_published() {
         let tmp = NamedTempFile::new().unwrap();
-        let user_file = NamedTempFile::new().unwrap();
+        let users_home = test_users_home();
+        let user_file = NamedTempFile::new_in(users_home.path()).unwrap();
         let mgr = SessionManager::new(tmp.path()).unwrap();
         let users = duduclaw_auth::UserDb::new(user_file.path()).unwrap();
         mgr.get_or_create("webchat:owned", "worker").await.unwrap();

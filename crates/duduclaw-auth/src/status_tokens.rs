@@ -589,12 +589,7 @@ impl UserDb {
 mod tests {
     use super::*;
     use crate::models::{UserRole, UserStatus};
-    use tempfile::NamedTempFile;
-
-    fn db() -> (UserDb, NamedTempFile) {
-        let tmp = NamedTempFile::new().unwrap();
-        (UserDb::new(tmp.path()).unwrap(), tmp)
-    }
+    use crate::test_support::test_db as db;
 
     fn user(db: &UserDb, name: &str) -> String {
         db.create_user(&format!("{name}@test.invalid"), name, "isolated-password", UserRole::Employee)

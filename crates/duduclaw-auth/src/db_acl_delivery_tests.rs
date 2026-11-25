@@ -2,15 +2,9 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
-use tempfile::NamedTempFile;
+use crate::test_support::test_db;
 
 const THREADS: usize = 8;
-
-fn test_db() -> (UserDb, NamedTempFile) {
-    let tmp = NamedTempFile::new().unwrap();
-    let db = UserDb::new(tmp.path()).unwrap();
-    (db, tmp)
-}
 
 /// Half of the callers use a second pool on the same file, so the waits cover
 /// both the in-process slot and SQLite's cross-connection write reservation.

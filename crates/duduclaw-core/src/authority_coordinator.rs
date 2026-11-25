@@ -8,6 +8,8 @@
 //! invalidate old calls, but can never resurrect them). No DB transaction is
 //! held by a reader across network I/O. Out-of-band file/SQL writes are outside
 //! this protocol. A sent request can still complete remotely after revocation.
+//! Intent/resource files are lock-only; epoch I/O uses a separate, unlocked
+//! file because Windows byte-range locks also exclude I/O on other handles.
 //! The private namespace excludes other accounts; it is not a sandbox against
 //! another process running as the same OS user.
 use std::fs::File;
@@ -34,7 +36,11 @@ fn wait(mut attempt: impl FnMut() -> io::Result<()>) -> io::Result<()> {
     loop {
         match attempt() {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock && Instant::now() < until =>
+            // fs2 returns ERROR_LOCK_VIOLATION on Windows, which Rust does
+            // not classify as WouldBlock. Only retry actual lock contention.
+            Err(e) if (e.kind() == io::ErrorKind::WouldBlock
+                || e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+                && Instant::now() < until =>
                 std::thread::sleep(Duration::from_millis(5)),
             Err(e) => return Err(e),
         }
@@ -125,6 +131,43 @@ impl AuthorityCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wait_retries_platform_lock_contention_but_propagates_other_errors() {
+        let mut attempts = 0;
+        wait(|| {
+            attempts += 1;
+            if attempts == 1 { Err(fs2::lock_contended_error()) } else { Ok(()) }
+        }).unwrap();
+        assert_eq!(attempts, 2);
+        let error = wait(|| Err(io::Error::from(io::ErrorKind::PermissionDenied))).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn epoch_io_is_separate_from_live_lock_handles() {
+        let home = tempfile::tempdir().unwrap();
+        let c = AuthorityCoordinator::new(home.path());
+        c.initialize().unwrap();
+        let other = AuthorityCoordinator::new(home.path());
+        let old = c.epoch().unwrap();
+        let writer = c.write().unwrap();
+        // Publication happens under the exclusive lease, but the epoch file
+        // itself must remain readable through another coordinator's handle.
+        let published = other.epoch().unwrap();
+        assert_ne!(old, published);
+        drop(writer);
+        let reader = c.read().unwrap();
+        let other_reader = other.read().unwrap();
+        assert_eq!(other.epoch().unwrap(), published);
+        for name in [INTENT, RESOURCE] {
+            assert_eq!(c.namespace().unwrap().file(name).unwrap().metadata().unwrap().len(), 0);
+        }
+        drop(other_reader);
+        drop(reader);
+        drop(other.write().unwrap());
+        assert_ne!(c.epoch().unwrap(), published);
+    }
+
     #[test]
     fn every_write_retires_epoch_including_failed_mutation() {
         let home = tempfile::tempdir().unwrap();

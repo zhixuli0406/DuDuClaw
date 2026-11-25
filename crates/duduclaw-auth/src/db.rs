@@ -1376,13 +1376,7 @@ pub(crate) fn verify_password_hash(password: &str, stored_hash: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
-
-    fn test_db() -> (UserDb, NamedTempFile) {
-        let tmp = NamedTempFile::new().unwrap();
-        let db = UserDb::new(tmp.path()).unwrap();
-        (db, tmp)
-    }
+    use crate::test_support::{test_db, TestDbPath};
 
     #[test]
     fn acl_delivery_generation_orders_cross_connection_writes() {
@@ -1714,7 +1708,7 @@ mod tests {
     /// marks the placeholder-email row as the owner, exactly once.
     #[test]
     fn migration_backfills_bootstrap_owner_on_legacy_db() {
-        let tmp = NamedTempFile::new().unwrap();
+        let tmp = TestDbPath::new();
         {
             let conn = rusqlite::Connection::open(tmp.path()).unwrap();
             conn.execute_batch(

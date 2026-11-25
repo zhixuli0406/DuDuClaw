@@ -6,13 +6,7 @@
 use super::*;
 use crate::models::{AccessLevel, UserRole, UserStatus};
 use crate::org_write::Reparent;
-use tempfile::NamedTempFile;
-
-fn test_db() -> (UserDb, NamedTempFile) {
-    let tmp = NamedTempFile::new().unwrap();
-    let db = UserDb::new(tmp.path()).unwrap();
-    (db, tmp)
-}
+use crate::test_support::{test_db, TestDbPath};
 
 fn person(db: &UserDb, name: &str, role: UserRole) -> String {
     db.create_user(&format!("{name}@test.invalid"), name, "isolated-test-password", role)
@@ -525,7 +519,7 @@ fn claim_bumps_the_generation() {
 
 #[test]
 fn legacy_database_gains_manager_column_and_generation() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = TestDbPath::new();
     {
         let conn = rusqlite::Connection::open(tmp.path()).unwrap();
         conn.execute_batch(
@@ -650,7 +644,7 @@ fn offboard_transfer_keeps_the_higher_binding_level() {
 
 #[test]
 fn concurrent_opposite_assignments_cannot_both_win() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = TestDbPath::new();
     let setup = UserDb::new(tmp.path()).unwrap();
     for round in 0..20 {
         let a = person(&setup, &format!("a{round}"), UserRole::Manager);

@@ -187,8 +187,7 @@ mod tests {
 
     #[test]
     fn observing_a_setting_retains_the_window_until_reenabled() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = UserDb::new(file.path()).unwrap();
+        let (db, _home) = crate::test_support::test_db();
         let mut events = Vec::new();
         let a = db
             .observe_team_history(true, 100, |old, new, since| {
@@ -227,8 +226,7 @@ mod tests {
 
     #[test]
     fn failed_activation_audit_rolls_back_the_window() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = UserDb::new(file.path()).unwrap();
+        let (db, _home) = crate::test_support::test_db();
         assert!(
             db.observe_team_history(true, 100, |_, _, _| Err("audit unavailable".into()))
                 .is_err()
@@ -255,8 +253,7 @@ mod tests {
 
     #[test]
     fn rm173_boundary_moves_only_on_an_enabled_window_and_rolls_back_with_audit() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = UserDb::new(file.path()).unwrap();
+        let (db, _home) = crate::test_support::test_db();
         let a = admin(&db);
         assert!(db.set_team_history_since(&a, 50, |_, _| Ok(())).is_err(), "off window");
         db.observe_team_history(true, 100, |_, _, _| Ok(())).unwrap();
@@ -276,8 +273,7 @@ mod tests {
 
     #[test]
     fn rm173_boundary_move_requires_a_live_admin_in_the_transaction() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = UserDb::new(file.path()).unwrap();
+        let (db, _home) = crate::test_support::test_db();
         db.observe_team_history(true, 100, |_, _, _| Ok(())).unwrap();
         let mgr = db
             .create_user("m@test.invalid", "m", "isolated-test-password", crate::UserRole::Manager)
@@ -299,8 +295,7 @@ mod tests {
 
     #[test]
     fn malformed_state_and_invalid_time_do_not_enable_visibility() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let db = UserDb::new(file.path()).unwrap();
+        let (db, _home) = crate::test_support::test_db();
         assert!(db.observe_team_history(true, 0, |_, _, _| Ok(())).is_err());
         db.conn()
             .execute(
