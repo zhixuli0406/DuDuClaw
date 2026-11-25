@@ -931,6 +931,8 @@ Admin は「ユーザー → 編集 → AI分身」で、そのメンバーの�
 
 `users.set_avatar {user_id, agent_id: string|null}` と `users.avatar_conflicts {}` はAdmin専用です。競合は `{conflicts: [{agent_id, user_ids}]}` で返します。AIの存在、現在の紐付け、重複を確認し、監査記録と接続中の設定更新を行います。`users.me`、`users.list`、ログイン／セッションのユーザーデータには nullable な `avatar_agent_id` を追加し、既存の `primary_agent_id` 出力は維持します。メンバー追加RPCでは `avatar_agent_id` は任意です。画面のフォームは選択した分身と操作権限を同時に作成します。
 
+ネイティブ Linux の社員分離が有効な場合、管理者は、メンバーに現在割り当てられている AI 分身の会話と記憶を、追加のパスワードや TOTP 確認なしで直接閲覧できます。会話一覧、会話・記憶の検索、関連するリアルタイム更新も対象です。管理者による閲覧ごとに、閲覧者、分身、所属メンバー、操作を監査記録に残し、記録できなければ閲覧を拒否します。他のメンバーの権限は増えません。現在の分身ではない個人専用社員には、引き続き5分以内のパスワード＋TOTP 確認と `step_up_csrf` が必要です。分身の解除、有効な所有者の紐付けの喪失、分身状態の読み取り失敗が起きた場合は、直ちに厳しい従来の規則へ戻ります。書き込み、会話の復元、仕事の割り当て、設定、ファイル、Wiki の権限は変わりません。
+
 `users.set_primary_agent {agent_id: string|null, user_id?: string}` は互換性のため維持します。分身があるアカウントには `avatar_primary_locked` と中国語・英語の説明を返し、管理者による変更が必要です。分身のないアカウントは従来どおりで、サイドバーの「既定のAIスタッフに設定」を利用できます。他人の設定には現在有効なAdmin権限が必要です。
 
 従来のメインAI修復は分身の指定とは別です。最初の対話的なオーナー／操作権限の紐付けは空のメイン設定を補えますが、migration、restore、個人スタッフの作成では補いません。Admin専用の `users.repair_primary_agents` は `{}` で `{members, preview_digest, excluded_personal_count, changed:false}` を取得し、`{preview_digest}` で書き込みトランザクション内の同じ順序付き一覧を確認して適用します。分身は設定しません。保護モードでは個人専用スタッフを修復候補から除外し、管理者が代行できない紐付けも選択肢から除外します。`users.list` は紐付けを読めない場合に一覧全体を拒否します。`users.update` は `primary_agent_id` と `avatar_agent_id` を受け付けないため、専用メソッドを使ってください。

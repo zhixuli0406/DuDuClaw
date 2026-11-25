@@ -318,7 +318,9 @@ impl PushGate {
                     .and_then(Value::as_str)
                     .filter(|a| !a.is_empty())
                 {
-                    Some(agent) if !live.has_agent_access(agent, AccessLevel::Viewer) => {
+                    Some(agent) if !live.has_agent_access(agent, AccessLevel::Viewer)
+                        && !super::personal_push::avatar_candidate(&self.home, crate::runtime_readiness::isolation_active(),
+                            &live.user_id, &event, agent) => {
                         self.drop_event(&event, "no binding")
                     }
                     Some(agent) if !live.is_admin() && crate::machine_employee::requires_admin_for_id(&self.home, agent) => {

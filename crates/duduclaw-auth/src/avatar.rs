@@ -1,4 +1,4 @@
-//! Member avatar assignment does not grant any additional employee access.
+//! Authoritative member avatar assignments; dashboard read policy lives in the gateway.
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::{UserDb, user_row::{bump_acl_generation, has_column}};
@@ -27,6 +27,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     tx.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_avatar
         ON users(avatar_agent_id) WHERE avatar_agent_id IS NOT NULL", []).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
+}
+
+/// Resolve a CURRENT avatar from RM-212 authority, never from a profile flag or
+/// the legacy primary preference. Callers must fall back to stricter rules on
+/// errors. A Personal avatar must belong to the same member as its owner.
+pub fn current_personal_avatar_member_in(conn: &Connection, agent: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT u.id FROM users u
+        JOIN isolation_personal_agents p ON p.agent_name = u.avatar_agent_id AND p.owner_user_id = u.id
+        WHERE u.avatar_agent_id = ?1 AND u.status = 'active'
+        AND (SELECT COUNT(*) FROM users a WHERE a.avatar_agent_id = ?1) = 1
+        AND EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.user_id = u.id
+            AND b.agent_name = ?1 AND b.access_level = 'owner')",
+        [agent], |r| r.get(0)).optional()
 }
 
 impl UserDb {
