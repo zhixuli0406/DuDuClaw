@@ -2,6 +2,8 @@
 pub mod io;
 pub mod command;
 #[cfg(windows)]
+pub mod conpty;
+#[cfg(windows)]
 mod windows_job;
 pub mod local;
 pub mod process_identity;

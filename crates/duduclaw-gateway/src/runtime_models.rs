@@ -767,8 +767,11 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
     let mut child = pair.slave.spawn_command(cmd).ok()?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().ok()?;
-    let mut writer = pair.master.take_writer().ok()?;
+    let reader = pair.master.try_clone_reader().ok()?;
+    let writer = pair.master.take_writer().ok()?;
+    #[cfg(windows)]
+    let (reader, writer) = duduclaw_execution::conpty::startup_io(reader, writer);
+    let (mut reader, mut writer) = (reader, writer);
 
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
     let done = Arc::new(AtomicBool::new(false));

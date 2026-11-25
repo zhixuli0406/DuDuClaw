@@ -739,7 +739,11 @@ mod tests {
         .unwrap();
         // A real sibling file so the archive isn't trivially empty.
         std::fs::write(home.join("agent.toml"), b"[agent]\nname=\"kiki\"\n").unwrap();
-        for name in [".google-authority", ".GOOGLE-AUTHORITY. "] {
+        for name in [
+            ".google-authority",
+            #[cfg(unix)]
+            ".GOOGLE-AUTHORITY. ",
+        ] {
             std::fs::create_dir_all(home.join(name)).unwrap();
             std::fs::write(home.join(name).join("epoch"), b"old epoch").unwrap();
         }

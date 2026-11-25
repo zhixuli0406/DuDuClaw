@@ -243,8 +243,11 @@ pub(super) fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySiz
     let binding_lifetime = RevokeOnDrop(entry.binding.clone());
     let pair = portable_pty::native_pty_system().openpty(pty_size(size)).map_err(|_| BackendError::Io)?;
     // Obtain all fallible handles before creating the process.
-    let mut reader = pair.master.try_clone_reader().map_err(|_| BackendError::Io)?;
-    let mut writer = pair.master.take_writer().map_err(|_| BackendError::Io)?;
+    let reader = pair.master.try_clone_reader().map_err(|_| BackendError::Io)?;
+    let writer = pair.master.take_writer().map_err(|_| BackendError::Io)?;
+    #[cfg(windows)]
+    let (reader, writer) = crate::conpty::startup_io(reader, writer);
+    let (mut reader, mut writer) = (reader, writer);
     let mut child = pair.slave.spawn_command(command).map_err(|_| BackendError::Io)?;
     let pid = child.process_id();
     if let Some(binding) = &entry.binding {

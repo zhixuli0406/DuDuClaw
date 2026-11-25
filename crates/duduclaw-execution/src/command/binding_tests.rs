@@ -69,13 +69,64 @@ async fn pty_binding_uses_the_client_pid() {
         ExecutionClass::EmployeeMain, false, Some(binding.clone())).await.unwrap();
     assert_eq!(Some(binding.root().unwrap().pid), child.id());
     assert_ne!(child.id(), Some(std::process::id()));
-    // ConPTY translates Enter (CR) into a console line-input event. LF alone
-    // is not Enter there; pipes and Unix PTYs still use their existing LF.
+    // Own only the I/O halves: retaining a child/control handle here would
+    // keep the PTY alive while waiting for EOF after the client exits.
     #[cfg(windows)]
-    let input = b"exit\r";
+    let drain = {
+        let mut output = child.output.take().unwrap();
+        let mut input = child.input.take().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buffer = [0; 8192];
+            let mut pending = Vec::new();
+            let mut sent_exit = false;
+            loop {
+                let count = output.read(&mut buffer).await.unwrap();
+                if count == 0 { break; }
+                pending.extend_from_slice(&buffer[..count]);
+                if pending.windows(4).any(|bytes| bytes == b"\x1b[6n") {
+                    input.write_all(b"\x1b[1;1R").await.unwrap();
+                }
+                // The backend consumes its startup DSR. Also handle a visible DSR
+                // before Enter, including a query split across output reads.
+                let partial = (1..4).find(|&len| pending.ends_with(&b"\x1b[6n"[..len])).unwrap_or(0);
+                if !sent_exit && partial == 0 {
+                    input.write_all(b"exit\r").await.unwrap();
+                    sent_exit = true;
+                }
+                pending = pending[pending.len() - partial..].to_vec();
+            }
+        })
+    };
     #[cfg(not(windows))]
-    let input = b"exit\n";
-    child.input.as_mut().unwrap().write_all(input).await.unwrap();
+    child.input.as_mut().unwrap().write_all(b"exit\n").await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), child.wait()).await.unwrap().unwrap();
     assert!(binding.root().is_none());
+    #[cfg(windows)]
+    tokio::time::timeout(Duration::from_secs(10), drain).await.unwrap().unwrap();
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pty_startup_answers_cursor_query_without_terminal_emulation() {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = portable_pty::CommandBuilder::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", FIXTURE, "--nocapture"]);
+    cmd.env(FIXTURE_ENV, "1");
+    let mut child = spawn_pty(cmd, PtySize { rows: 24, columns: 80 },
+        ExecutionClass::EmployeeMain, false).await.unwrap();
+    let mut output = child.output.take().unwrap();
+    let drain = tokio::spawn(async move {
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).await.unwrap();
+        bytes
+    });
+    // No terminal emulator answers DSR here; even immediate input must follow
+    // the backend's cursor reply, rather than racing it at ConPTY startup.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        child.input.as_mut().unwrap().write_all(b"exit\r").await.unwrap();
+        assert!(child.wait().await.unwrap().success());
+        let bytes = drain.await.unwrap();
+        assert!(!bytes.windows(4).any(|bytes| bytes == b"\x1b[6n"));
+    }).await.unwrap();
 }
