@@ -712,7 +712,7 @@ fn strip_ansi_lossy(s: &str) -> String {
 // ── PTY probe (opt-in, default OFF) ──────────────────────────────────────
 
 /// Drive an interactive `claude` REPL, send `/model`, capture the menu, kill.
-/// Fully bounded (≤20s) and always kills the child. Returns raw PTY output.
+/// Kills/reaps the child and bounds the final reader wait. Returns raw PTY output.
 async fn probe_claude_pty(home_dir: &Path) -> Option<Vec<RuntimeModel>> {
     let program =
         duduclaw_core::which_claude().or_else(|| duduclaw_core::which_claude_in_home(home_dir))?;
@@ -729,7 +729,6 @@ async fn probe_claude_pty(home_dir: &Path) -> Option<Vec<RuntimeModel>> {
 
 fn pty_capture_model_menu(program: &str) -> Option<String> {
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -774,12 +773,12 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
     let (mut reader, mut writer) = (reader, writer);
 
     let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let done = Arc::new(AtomicBool::new(false));
     let buf_r = buf.clone();
-    let done_r = done.clone();
     let reader_thread = std::thread::spawn(move || {
         let mut tmp = [0u8; 8192];
-        while !done_r.load(Ordering::Relaxed) {
+        // Keep draining through master close: ClosePseudoConsole can block
+        // while conhost flushes its final output.
+        loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => {
@@ -823,18 +822,65 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         }
     }
 
-    done.store(true, Ordering::Relaxed);
     let _ = child.kill();
     let _ = child.wait();
     drop(writer);
-    let _ = reader_thread.join();
+    // As in local/processes.rs ConsoleOnDrop, close ConPTY after the child
+    // exits, on a fresh thread because ClosePseudoConsole itself can block.
+    // The reader owns only pipe handles and keeps draining until EOF/error.
+    #[cfg(windows)]
+    {
+        let master = pair.master;
+        let _ = std::thread::Builder::new().spawn(move || drop(master));
+    }
+    #[cfg(not(windows))]
+    drop(pair.master);
+    if !join_reader_with_timeout(reader_thread, Duration::from_secs(2)) {
+        warn!("runtime_models: PTY reader teardown timed out; returning captured output");
+    }
 
     Some(snapshot(&buf))
+}
+
+/// Detach a stuck reader instead of blocking the probe indefinitely.
+fn join_reader_with_timeout(reader: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !reader.is_finished() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    let _ = reader.join();
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reader_join_detaches_when_reader_stays_blocked() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let reader = std::thread::spawn(move || { let _ = blocked.recv(); });
+            let joined = join_reader_with_timeout(reader, Duration::from_millis(20));
+            let _ = result_tx.send(joined);
+        });
+        // Keep the reader blocked until the caller has returned. An unbounded
+        // join fails this test without hanging the test process forever.
+        assert!(!result_rx.recv_timeout(Duration::from_secs(2)).expect("reader join exceeded its bound"));
+        drop(release);
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn reader_join_accepts_a_finished_reader() {
+        let reader = std::thread::spawn(|| {});
+        assert!(join_reader_with_timeout(reader, Duration::from_secs(2)));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
