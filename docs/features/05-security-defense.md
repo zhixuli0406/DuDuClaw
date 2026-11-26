@@ -936,5 +936,5 @@ call or heartbeat. Each key is rate limited (120 calls/minute by default).
 Creation, revocation and write calls are audited; repeated use is aggregated.
 
 **Do not put this key in browser front-end code; call from your server.** See the
-[member API authentication reference](../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
+[member API authentication reference](../api/member-contract.md#personal-member-api-keys-1850)
 for transport examples and the precise method restrictions.

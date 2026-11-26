@@ -920,4 +920,4 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 逐筆留稽核，重複使用則按時間彙總。
 
 **不要把金鑰放進瀏覽器前端程式碼，請由你的伺服器呼叫。**
-完整用法與限制見[成員 API 驗證說明](../../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)。
+完整用法與限制見[成員 API 驗證說明](../../api/member-contract.md#personal-member-api-keys-1850)。
