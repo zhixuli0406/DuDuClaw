@@ -703,7 +703,7 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         let expected_locks_entries: HashSet<_> = [
-            "gateway.lock",
+            String::from("gateway.lock"),
             // The fs lock helper appends `.lock` to the seat admission path.
             format!("{}.lock", duduclaw_core::agent_seats::SEAT_ADMISSION_LOCK),
         ]
