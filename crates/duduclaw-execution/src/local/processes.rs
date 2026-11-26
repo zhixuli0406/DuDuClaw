@@ -58,6 +58,19 @@ impl Drop for PtyOnDrop {
     fn drop(&mut self) { if let Some(mut killer) = self.0.take() { let _ = killer.kill(); } }
 }
 
+#[cfg(not(windows))]
+fn finish_unix_binding<T, E>(binding: &SpawnBinding, bound: std::io::Result<()>,
+    try_wait: impl FnOnce() -> Result<Option<T>, E>) -> std::io::Result<bool>
+{
+    bound.map(|()| false).or_else(|error| {
+        if !matches!(try_wait(), Ok(Some(_))) { return Err(error); }
+        // Our child has exited, so its output/status remain valid. Revoke before
+        // continuing so descendants cannot use an inherited run credential.
+        binding.revoke();
+        Ok(true)
+    })
+}
+
 pub(super) fn start_pipe(entry: &mut Entry, mut command: Command, prompt: Vec<u8>,
     completion: watch::Sender<Option<RunOutcome>>, runtime_ms: u64, output_limit: u64) -> Result<(), BackendError>
 {
@@ -99,6 +112,9 @@ pub(super) fn start_pipe(entry: &mut Entry, mut command: Command, prompt: Vec<u8
     if let Some(binding) = &entry.binding {
         let bound = pid.ok_or_else(|| std::io::Error::other("child PID missing"))
             .and_then(RootProcess::capture).and_then(|root| binding.bind_spawn(root));
+        let bound = finish_unix_binding(binding, bound, || child.try_wait()).map(|recovered| {
+            if recovered { kill_group(pid); }
+        });
         if let Err(error) = bound {
             entry.spawn_error = Some(error);
             kill_group(pid);
@@ -259,7 +275,12 @@ pub(super) fn start_pty(entry: &mut Entry, command: CommandBuilder, size: PtySiz
             });
         #[cfg(not(windows))]
         let root = pid.ok_or_else(|| std::io::Error::other("PTY client PID missing")).and_then(RootProcess::capture);
-        if let Err(error) = root.and_then(|root| binding.bind_spawn(root)) {
+        let bound = root.and_then(|root| binding.bind_spawn(root));
+        #[cfg(not(windows))]
+        let bound = finish_unix_binding(binding, bound, || child.try_wait()).map(|recovered| {
+            if recovered { kill_group(pid); }
+        });
+        if let Err(error) = bound {
             entry.spawn_error = Some(error);
             kill_group(pid);
             let _ = child.kill();
@@ -563,6 +584,45 @@ fn pty_send_stamped(tx: &mpsc::Sender<Result<Vec<u8>, BackendError>>, mut messag
 #[cfg(windows)]
 fn pty_write_timed_out<T>(result: &std::io::Result<T>) -> bool {
     matches!(result, Err(error) if error.kind() == std::io::ErrorKind::TimedOut)
+}
+
+#[cfg(all(test, unix))]
+mod binding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exited_before_binding_preserves_output_and_revokes() {
+        let binding = SpawnBinding::pending(Instant::now() + Duration::from_secs(30));
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "printf 'output\\n'; printf 'error\\n' >&2; exit 7"])
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        // Synchronize on exit without sleeps; inject the capture/bind failure
+        // so this exercises the recovery even on platforms with different identities.
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
+        let bound = Err(std::io::Error::other("process identity unavailable or exited"));
+        assert!(finish_unix_binding(&binding, bound, || child.try_wait()).unwrap());
+        assert!(binding.root().is_none());
+        assert!(binding.bind_spawn(RootProcess::capture(std::process::id()).unwrap()).is_err());
+        let output = child.wait_with_output().await.unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(output.stdout, b"output\n");
+        assert_eq!(output.stderr, b"error\n");
+    }
+
+    #[test]
+    fn unconfirmed_exit_preserves_binding_error() {
+        for status in [Ok(None::<()>), Err(std::io::Error::other("wait failed"))] {
+            let binding = SpawnBinding::pending(Instant::now() + Duration::from_secs(30));
+            let bound = Err(std::io::Error::other("binding failed"));
+            let result: std::io::Result<bool> = finish_unix_binding(&binding, bound, || status);
+            let error = result.unwrap_err();
+            assert_eq!(error.to_string(), "binding failed");
+            // The caller's existing failure path retains responsibility for
+            // killing the child and dropping its revocation guard.
+            drop(RevokeOnDrop(Some(binding.clone())));
+            assert!(binding.bind_spawn(RootProcess::capture(std::process::id()).unwrap()).is_err());
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
