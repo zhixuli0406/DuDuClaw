@@ -4420,14 +4420,15 @@
         "command_constructor": 1,
         "pty_native_pty_system": 1,
         "pty_openpty": 1,
-        "terminal_spawn_command": 1
+        "terminal_spawn_command": 1,
+        "terminal_spawn": 1
       },
       "effects": [
         "process_spawn"
       ],
       "identity": "gateway",
       "migration": "gateway_exception",
-      "rationale": "Model-list discovery probe under a PTY; no employee task prompt is passed."
+      "rationale": "Model-list discovery probe under a PTY; no employee task prompt is passed. The additional terminal_spawn is std::thread::Builder::spawn for closing the Windows ConPTY master off-thread while the reader drains output, not another child process."
     },
     {
       "symbol": "crates/duduclaw-gateway/src/runtime_models.rs::run_probe",
@@ -7740,6 +7741,70 @@
       "identity": "employee",
       "migration": "backend",
       "rationale": "Typed ExecutionBackend handoff; original native Command/PTY builder retained by LocalBackend. Protected launch requires trusted immutable policy/input/capability context and uses daemon run handles; missing context is refused without gateway execution."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/portability.rs::tests::import_rejects_existing_authority_directory_link",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only Windows cmd /D /C mklink /J fixture creates an authority-directory junction to verify import rejection; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-cli/src/portability.rs::tests::import_rejects_last_link_destination_before_publishing_or_moving_data",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only Windows cmd /D /C mklink /J fixture verifies a final junction destination is rejected before import publishes or moves data; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/command/binding_tests.rs::pty_startup_answers_cursor_query_without_terminal_emulation",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only PTY child fixture verifies the Windows ConPTY startup cursor query is answered without a terminal emulator; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/backup_restore.rs::tests::authority_backup_excludes_cover_home_and_parent_roots",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_output": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only Unix tar invocation verifies authority paths are excluded when backing up either the home or its parent; not a production spawn path."
+    },
+    {
+      "symbol": "crates/duduclaw-execution/src/local/processes.rs::binding_tests::exited_before_binding_preserves_output_and_revokes",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only Unix shell fixture prints stdout/stderr and exits before binding recovery, verifying output/status preservation and permanent credential revocation; not a production spawn path."
     }
   ]
 }
