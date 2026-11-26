@@ -40,17 +40,17 @@ fn native_preparation_uses_actual_granted_readonly_alternative_not_client_reques
     let selected = prepare_home_native_selection(d.path(), "sheets_read").unwrap();
     let NativeHomePurpose::Http {
         tool,
-        singleton_scope,
+        required_scopes,
     } = &selected.purpose
     else {
         panic!("expected HTTP metadata purpose");
     };
     assert_eq!(tool, "sheets_read");
     assert_eq!(
-        singleton_scope,
-        "https://www.googleapis.com/auth/spreadsheets.readonly"
+        required_scopes,
+        &["https://www.googleapis.com/auth/spreadsheets.readonly"]
     );
-    assert_eq!(selected.receipt.scopes(), &[singleton_scope.clone()]);
+    assert_eq!(selected.receipt.scopes(), required_scopes.as_slice());
     let after = rows(d.path());
     assert_eq!(before[1], after[1]);
     for field in [
@@ -170,14 +170,14 @@ async fn disappearing_witness_is_not_replaced_with_another_legal_alternative() {
     ]);
     let selected = prepare_home_native_selection(d.path(), "sheets_read").unwrap();
     let NativeHomePurpose::Http {
-        singleton_scope, ..
+        required_scopes, ..
     } = &selected.purpose
     else {
         panic!("HTTP metadata");
     };
     assert_eq!(
-        singleton_scope,
-        "https://www.googleapis.com/auth/spreadsheets"
+        required_scopes,
+        &["https://www.googleapis.com/auth/spreadsheets"]
     );
     change_scopes(
         d.path(),
@@ -206,12 +206,12 @@ fn scope_order_and_duplicates_do_not_change_the_prepared_singleton_witness() {
     ]);
     let selected = prepare_home_native_selection(d.path(), "gmail_read").unwrap();
     let NativeHomePurpose::Http {
-        singleton_scope, ..
+        required_scopes, ..
     } = &selected.purpose
     else {
         panic!("HTTP metadata");
     };
-    assert_eq!(singleton_scope, "https://mail.google.com/");
+    assert_eq!(required_scopes, &["https://mail.google.com/"]);
     change_scopes(
         d.path(),
         &[
@@ -300,4 +300,21 @@ fn isolation_metadata_selection_is_read_only_and_refuses_legacy_unprepared_rows(
     assert!(read_home_native_selection(d.path(), "gmail_read").is_err());
     assert_eq!(before, std::fs::read(d.path().join(crate::mcp_oauth::TOKEN_FILE)).unwrap());
     assert!(!d.path().join(".keyfile").exists());
+}
+
+#[test]
+fn calendar_delete_pins_both_required_scopes_and_refuses_either_disappearing() {
+    let event = "https://www.googleapis.com/auth/calendar.events";
+    let list = "https://www.googleapis.com/auth/calendar.calendarlist.readonly";
+    for remaining in [event, list] {
+        let d = fixture(&[event, list, "https://www.googleapis.com/auth/gmail.readonly"]);
+        let selected = prepare_home_native_selection(d.path(), "calendar_delete_event").unwrap();
+        assert_eq!(selected.http_scopes("calendar_delete_event").unwrap(), vec![list, event]);
+        assert_eq!(selected.receipt.scopes(), &[list.to_owned(), event.to_owned()]);
+        validate_home_native_selection(d.path(), &selected, "calendar_delete_event").unwrap();
+        assert!(selected.http_scopes("calendar_list_events").is_err());
+        change_scopes(d.path(), &[remaining]);
+        assert!(validate_home_native_selection(d.path(), &selected, "calendar_delete_event").is_err());
+        assert!(prepare_home_native_selection(d.path(), "calendar_delete_event").is_err());
+    }
 }

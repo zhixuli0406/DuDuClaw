@@ -176,7 +176,7 @@ pub(crate) fn system_operation_permitted(home: &Path, principal: Option<&str>) -
         super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
         super::PrincipalState::Human(_) | super::PrincipalState::Unknown => return false,
     };
-    let Ok(Some(db)) = crate::decision_notify::open_user_db(home) else { return false; };
+    let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return false; };
     db.get_user(&id).ok().flatten().is_some_and(|u| {
         u.role == duduclaw_auth::UserRole::Admin
             && matches!(u.status, duduclaw_auth::models::UserStatus::Active)

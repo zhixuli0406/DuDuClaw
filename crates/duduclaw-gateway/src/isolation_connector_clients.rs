@@ -289,12 +289,15 @@ impl NativeConnectorExecutor {
         let tool = call.name();
         let args = call.arguments();
         let result = match tool {
+            "gmail_send_draft" | "calendar_delete_event" => {
+                crate::google_workspace::native_legacy::handle_confirmed_connector(tool, args, &self.policy.home, &self.policy.agent, &token.token).await
+            }
             "google_status" | "notion_status" | "github_status" => tool_text(json!({"account":selected.account(),
                 "provider":selected.provider(),"configured":true,"provider_verified":false})),
             "gmail_search" | "gmail_read" | "gmail_create_draft" | "calendar_list_events" | "calendar_create_event" |
             // Google Chat reads keep native_legacy's admin opt-in gate, the
             // Direct-OAuth-only backend rule and its content-free audit.
-            "google_chat_spaces" | "google_chat_messages" |
+            "google_chat_spaces" | "google_chat_messages" | "google_chat_send" |
             "sheets_read" | "sheets_append" | "forms_get" | "forms_list_responses" | "gtasks_lists" | "gtasks_list" |
             "gtasks_create" | "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "slides_read" => {
                 let access = FixedGoogleAccess { selected, credential: &token, tool };

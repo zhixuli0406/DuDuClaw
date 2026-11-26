@@ -1,3 +1,4 @@
+import { AgentSeatSummary } from '@/components/shared/AgentSeatSummary';
 import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { chatEntryLabel } from '@/lib/task-entry-visibility';
 import { useVisibleAgents, type VisibleAgent } from '@/lib/data-scope';
@@ -181,6 +182,8 @@ export function AgentsPage() {
         description={intl.formatMessage({ id: 'nav.agents.desc' })}
         action={isAdmin ? hireButton : undefined}
       />
+
+      {isAdmin && <AgentSeatSummary refreshKey={agents} />}
 
       {/* Scope control row. */}
       <div className="flex h-12 shrink-0 items-center gap-2 border-b border-surface-border px-4">

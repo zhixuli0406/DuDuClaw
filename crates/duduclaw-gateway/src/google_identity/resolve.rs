@@ -149,6 +149,9 @@ pub async fn resolve_person(
     endpoint: &str,
 ) -> Result<Resolved, Refusal> {
     let scopes = super::delegated_scopes::for_endpoint(home, endpoint)?;
+    if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,"google_remote_mcp").await {
+        return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
+    }
     resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes)).await
 }
 
@@ -159,7 +162,18 @@ pub async fn resolve_person_for_tool(
     people: &dyn People,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,tool).await {
+        // A missing own-account purpose pauses this live human turn before
+        // any configured home-account fallback can execute the task.
+        return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
+    }
     resolve_person_scoped(home, agent, requester, people, tool, None).await
+}
+
+/// Scopes originate only in the gateway's pinned employee context.
+pub(crate) async fn resolve_employee_scoped(home: &Path, agent: &str, requester: &RequesterIdentity,
+    people: &dyn People, tool: &str, scopes: &[&str]) -> Result<Resolved, Refusal> {
+    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes)).await
 }
 
 async fn resolve_person_scoped(

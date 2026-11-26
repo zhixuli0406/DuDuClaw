@@ -236,3 +236,77 @@ async fn p1b_approval_card_of_personal_employee_is_metadata_only() {
     }
     assert!(!card.to_string().contains("secret"), "{card}");
 }
+
+#[test]
+fn d4_avatar_reads_are_audited_and_writes_do_not_use_the_exception() {
+    let h = home();
+    crate::personal_visibility::tests::assign_avatar(&h);
+    for method in ["memory.browse", "memory.search", "memory.get_at", "chat.sessions.history", "chat.sessions.list", "search.query"] {
+        assert_eq!(visibility::audit_avatar_read(h.path(), &h.admin, PERSONAL, method), Ok(Some(h.alice.clone())));
+    }
+    let rows = h.db.query_audit_log(Some(&h.admin), Some("isolation.avatar_data_read"), 50).unwrap();
+    assert_eq!(rows.len(), 6);
+    for row in rows {
+        let detail: Value = serde_json::from_str(row.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["admin_user_id"], h.admin);
+        assert_eq!(detail["avatar_agent_id"], PERSONAL);
+        assert_eq!(detail["member_user_id"], h.alice);
+        assert!(detail["method"].is_string());
+        assert!(detail["category"].is_string());
+    }
+    for method in ["memory.forget", "memory.invalidate_origin", "playbook.retire", "chat.sessions.restore",
+        "agents.update", "users.bind_agent", "tasks.assign", "wiki.read", "agent_files.get", "unknown.read"] {
+        assert_eq!(visibility::avatar_read_category(method), None, "{method}");
+        assert_eq!(visibility::audit_avatar_read(h.path(), &h.admin, PERSONAL, method), Ok(None));
+    }
+    assert_eq!(visibility::audit_avatar_read(h.path(), &h.bob, PERSONAL, "memory.browse"), Ok(None));
+    h.db.set_avatar_as(&h.admin, &h.alice, None).unwrap();
+    assert_eq!(visibility::audit_avatar_read(h.path(), &h.admin, PERSONAL, "memory.browse"), Ok(None));
+    let target = Target { method: "memory.browse", category: DataCategory::Memory, agent: PERSONAL };
+    assert_eq!(authorize_break_glass(&h.db, None, &h.admin, None, chrono::Utc::now().timestamp(), &target, &h.alice),
+        Err(STEP_UP_REQUIRED));
+}
+
+#[test]
+fn d4_avatar_read_audit_failure_denies_access() {
+    let h = home();
+    crate::personal_visibility::tests::assign_avatar(&h);
+    rusqlite::Connection::open(h.path().join("users.db")).unwrap().execute_batch(
+        "CREATE TRIGGER refuse_avatar_audit BEFORE INSERT ON auth_audit_log
+         WHEN NEW.action='isolation.avatar_data_read' BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;"
+    ).unwrap();
+    assert_eq!(visibility::audit_avatar_read(h.path(), &h.admin, PERSONAL, "memory.browse"), Err(AUDIT_FAILED));
+}
+
+#[tokio::test]
+async fn d4_protected_gate_keeps_proof_fallback_and_non_admin_refusal() {
+    let h = home();
+    let handler = MethodHandler::new(h.path().into()).await;
+    let db = std::sync::Arc::new(UserDb::new(&h.path().join("users.db")).unwrap());
+    handler.set_user_db(db, std::sync::Arc::new(JwtConfig::new(b"d4-test-secret-at-least-32-bytes!!"))).await;
+    let admin = h.db.live_user_context(&h.admin).unwrap().unwrap();
+    let bob = h.db.live_user_context(&h.bob).unwrap().unwrap();
+    for avatar in [false, true, false] {
+        h.db.set_avatar_as(&h.admin, &h.alice, avatar.then_some(PERSONAL)).unwrap();
+        for method in ["memory.browse", "chat.sessions.history"] {
+            let category = visibility::avatar_read_category(method).unwrap();
+            let result = handler.personal_data_gate_under(&admin, Target { method, category, agent: PERSONAL }, None, true).await;
+            assert_eq!(result, if avatar { Ok(()) } else { Err(STEP_UP_REQUIRED) });
+            assert_eq!(handler.personal_data_gate_under(&bob, Target { method, category, agent: PERSONAL }, None, true).await,
+                Err(NOT_ALLOWED));
+        }
+    }
+    crate::personal_visibility::tests::assign_avatar(&h);
+    for (method, category) in [("memory.forget", DataCategory::Memory), ("chat.sessions.restore", DataCategory::Sessions),
+        ("agents.update", DataCategory::Config)] {
+        assert_eq!(handler.personal_data_gate_under(&admin, Target { method, category, agent: PERSONAL }, None, true).await,
+            Err(if category.is_write() { STEP_UP_REQUIRED_WRITE } else { STEP_UP_REQUIRED }));
+    }
+    rusqlite::Connection::open(h.path().join("users.db")).unwrap()
+        .execute("ALTER TABLE users RENAME COLUMN avatar_agent_id TO unreadable_avatar", []).unwrap();
+    for method in ["memory.browse", "chat.sessions.history"] {
+        assert_eq!(handler.personal_data_gate_under(&admin, Target {
+            method, category: visibility::avatar_read_category(method).unwrap(), agent: PERSONAL,
+        }, None, true).await, Err(STEP_UP_REQUIRED));
+    }
+}

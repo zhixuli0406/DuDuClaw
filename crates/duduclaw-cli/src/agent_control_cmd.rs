@@ -92,6 +92,8 @@ fn run_with_markers(home: &Path, agent: &str, action: Action, markers: &[&str]) 
 
     #[cfg(test)]
     crate::profile_edit_test_hook::run();
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home)
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     let written = duduclaw_gateway::agent_files::external::edit_agent_toml(
         home,
         agent,
@@ -104,6 +106,10 @@ fn run_with_markers(home: &Path, agent: &str, action: Action, markers: &[&str]) 
                         .get_mut("agent")
                         .and_then(|v| v.as_table_mut())
                         .ok_or("agent.toml missing [agent] section")?;
+                    let current = section.get("status").and_then(toml::Value::as_str).unwrap_or("active");
+                    if !matches!(current, "active" | "paused" | "terminated") {
+                        return Err("已封存、已刪除或狀態不明的 AI 員工，請使用還原流程。".into());
+                    }
                     let status = if matches!(action, Action::Pause) {
                         "paused"
                     } else {
@@ -131,6 +137,8 @@ fn run_with_markers(home: &Path, agent: &str, action: Action, markers: &[&str]) 
         audit_refusal(home, agent, action, "write_failed");
         return Err(DuDuClawError::Agent(e));
     }
+    admission.recount(0).map_err(DuDuClawError::Agent)?;
+    drop(admission);
 
     let mut detail = json!({"action": action.name(), "source": "cli", "actor": UNVERIFIED_ACTOR});
     match action {

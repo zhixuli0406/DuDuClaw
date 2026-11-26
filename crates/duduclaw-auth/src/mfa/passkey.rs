@@ -188,6 +188,7 @@ impl UserDb {
     pub fn mfa_passkey_register_finish<T>(&self, id: &str, token: &str, session: Option<&str>, origin: &str, credential: Value, now: i64, exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>) -> Result<T> {
         let rp = relying_party(origin)?;
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since = crate::credential_changes::high_water(&tx)?;
@@ -265,6 +266,7 @@ impl UserDb {
     #[allow(clippy::too_many_arguments)]
     pub fn mfa_passkey_delete<T>(&self, user: &str, id: &str, reauth: &str, session: &str, now: i64, _exempt: bool,
         issue: impl FnOnce(&crate::User, &[(String, crate::AccessLevel)], Vec<String>) -> Result<T>) -> Result<T> {
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since = crate::credential_changes::high_water(&tx)?;

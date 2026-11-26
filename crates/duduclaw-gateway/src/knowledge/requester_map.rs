@@ -63,10 +63,19 @@ pub fn map_requester_attested(
     }
     // A called employee's bucket (`<session>#agent:<id>`) is the same
     // conversation: privacy and grants follow the base session.
+    let original_session_id = session_id;
     let session_id = super::chat_attachments::base_session(session_id);
     let Some((channel, chat)) = session_id.split_once(':') else {
         return RequesterIdentity::Unknown;
     };
+    // A thread session does not change the attested DM's original space.
+    // Parse the full canonical key before accepting any space/sender proof.
+    let chat = if channel == "googlechat" {
+        let Some(space) = crate::googlechat_conversation::space_from_session(original_session_id) else {
+            return RequesterIdentity::Unknown;
+        };
+        space
+    } else { chat };
     if chat.is_empty() || session_id.chars().any(char::is_control) {
         return RequesterIdentity::Unknown;
     }
@@ -317,6 +326,26 @@ mod tests {
             gchat_bound,
         );
         assert!(attested(&r) && human_ctx(&r, &Dir).is_private);
+    }
+
+    #[tokio::test]
+    async fn rm182_dm_thread_attestation_and_requester_keep_original_space_and_exact_sender() {
+        use crate::ccr_runtime::{ATTESTED_ONE_TO_ONE, conversation_is_one_to_one};
+        let a = dm_attestation("spaces/DM1", "users/111");
+        let key = "googlechat:spaces/DM1:thread:spaces/DM1/threads/t#agent:hr-bot";
+        let r = map_requester_attested(key, "users/111", None, Some(&a), gchat_bound);
+        assert!(attested(&r) && human_ctx(&r, &Dir).is_private);
+        assert!(matches!(r, RequesterIdentity::ChannelUser { ref chat, .. } if chat == "spaces/DM1"));
+        assert!(!attested(&map_requester_attested(key, "users/222", None, Some(&a), gchat_bound)));
+        for forged in ["googlechat:spaces/DM1:thread:spaces/OTHER/threads/t",
+            "googlechat:spaces/DM1:thread:spaces/DM1/threads/t#agent:bad#agent:hr-bot"] {
+            assert_eq!(map_requester_attested(forged, "users/111", None, Some(&a), gchat_bound), RequesterIdentity::Unknown);
+        }
+        ATTESTED_ONE_TO_ONE.scope(Some(a), async {
+            assert!(conversation_is_one_to_one(key, "users/111"));
+            assert!(!conversation_is_one_to_one(key, "users/222"));
+            assert!(!conversation_is_one_to_one("googlechat:spaces/DM1:thread:spaces/OTHER/threads/t", "users/111"));
+        }).await;
     }
 
     #[test]

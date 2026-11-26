@@ -16,6 +16,9 @@
 //!   the employee, the owner and the data category has been written to
 //!   `users.db` (`auth_audit_log`, action [`READ_ACTION`]); a failed audit
 //!   write refuses. Every other caller is refused.
+//! - D4: current avatars allow audited Admin conversation/memory reads without
+//!   step-up, on an explicit read-only allowlist. Unset/unreadable state restores
+//!   the old rule. Wiki/files, writes, settings and delegation are unchanged.
 //! - Cross-agent listings (`chat.sessions.list`, `search.query` without
 //!   `agent_id`) hide Personal employees the caller does not own.
 //! - **P1b (work record, [`DataCategory::Work`]).** `activity.list`,
@@ -404,9 +407,14 @@ impl MethodHandler {
         target: Target<'_>,
         csrf: Option<[u8; 32]>,
     ) -> Result<(), &'static str> {
-        if !crate::runtime_readiness::isolation_active() {
-            return Ok(());
-        }
+        self.personal_data_gate_under(ctx, target, csrf, crate::runtime_readiness::isolation_active()).await
+    }
+
+    /// Explicit mode for isolated tests; production always uses the runtime flag.
+    pub(super) async fn personal_data_gate_under(
+        &self, ctx: &UserContext, target: Target<'_>, csrf: Option<[u8; 32]>, protected: bool,
+    ) -> Result<(), &'static str> {
+        if !protected { return Ok(()); }
         let home = self.home_dir.clone();
         let (user, admin, agent) = (ctx.user_id.clone(), ctx.is_admin(), target.agent.to_owned());
         let reader = tokio::task::spawn_blocking(move || {
@@ -420,6 +428,13 @@ impl MethodHandler {
             Reader::Refused => return Err(NOT_ALLOWED),
             Reader::BreakGlass { owner } => owner,
         };
+        // D4 is read-only and checks the live RM-212 assignment. Unknown or
+        // unreadable avatar state falls back to the existing step-up below.
+        // A search with explicit proof retains the full original source set.
+        if !(target.method == "search.query" && csrf.is_some())
+            && self.personal_avatar_read(ctx, target.method, target.agent).await? {
+            return Ok(());
+        }
         let db = self.user_db.read().await.clone().ok_or(UNAVAILABLE)?;
         let session = crate::google_personal::session_for(&ctx.user_id).ok();
         let (admin_id, epoch) = (ctx.user_id.clone(), ctx.credential_epoch);
@@ -441,6 +456,34 @@ impl MethodHandler {
         // P1g: the audited step-up admits this employee to the ACL for the
         // rest of THIS request only (never for delegation).
         visibility::record_break_glass(&ctx.user_id, target.agent);
+        Ok(())
+    }
+
+    async fn personal_avatar_read(&self, ctx: &UserContext, method: &str, agent: &str)
+        -> Result<bool, &'static str> {
+        if !ctx.is_admin() || visibility::avatar_read_category(method).is_none() { return Ok(false); }
+        let (home, user, employee, operation) =
+            (self.home_dir.clone(), ctx.user_id.clone(), agent.to_owned(), method.to_owned());
+        let member = tokio::task::spawn_blocking(move ||
+            visibility::audit_avatar_read(&home, &user, &employee, &operation))
+            .await.map_err(|_| UNAVAILABLE)??;
+        if let Some(member) = member {
+            visibility::record_avatar_read(&ctx.user_id, agent, &member);
+            Ok(true)
+        } else { Ok(false) }
+    }
+
+    /// Cross-agent session/search reads admit only audited current avatars.
+    /// Other listings keep their original hidden set.
+    pub(super) async fn personal_avatar_list_reads(&self, ctx: &UserContext, method: &str, protected: bool)
+        -> Result<(), &'static str> {
+        if !protected || !ctx.is_admin() || !matches!(method, "chat.sessions.list" | "search.query") {
+            return Ok(());
+        }
+        let (home, user) = (self.home_dir.clone(), ctx.user_id.clone());
+        let hidden = tokio::task::spawn_blocking(move || visibility::hidden_from(&home, true, &user))
+            .await.map_err(|_| UNAVAILABLE)?.map_err(|_| UNAVAILABLE)?;
+        for agent in hidden { self.personal_avatar_read(ctx, method, &agent).await?; }
         Ok(())
     }
 
@@ -469,6 +512,9 @@ impl MethodHandler {
         }
         let refuse = |message: &str| WsFrame::error_response("", message);
         let csrf = take_step_up(params);
+        if param_text(params, "agent_id").is_none() {
+            self.personal_avatar_list_reads(ctx, method, true).await.map_err(refuse)?;
+        }
         if let (Some(category), Some(agent)) = (category, param_text(params, "agent_id")) {
             self.personal_data_gate(ctx, Target { method, category, agent: &agent }, csrf)
                 .await
@@ -592,10 +638,12 @@ impl MethodHandler {
             return Ok(Default::default());
         }
         let (home, user) = (self.home_dir.clone(), ctx.user_id.clone());
-        tokio::task::spawn_blocking(move || visibility::hidden_from(&home, true, &user))
+        let mut hidden = tokio::task::spawn_blocking(move || visibility::hidden_from(&home, true, &user))
             .await
             .map_err(|_| UNAVAILABLE)?
-            .map_err(|_| UNAVAILABLE)
+            .map_err(|_| UNAVAILABLE)?;
+        hidden.retain(|agent| !visibility::avatar_read_granted(&self.home_dir, &ctx.user_id, agent));
+        Ok(hidden)
     }
 }
 
@@ -606,3 +654,7 @@ mod tests;
 #[cfg(all(test, unix))]
 #[path = "personal_p1e_tests.rs"]
 mod p1e_tests;
+
+#[cfg(all(test, unix))]
+#[path = "personal_avatar_rpc_tests.rs"]
+mod avatar_rpc_tests;

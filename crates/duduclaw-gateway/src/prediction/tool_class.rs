@@ -175,7 +175,7 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
         "skill_security_scan" | "skill_synthesis_run" => ToolClass::Exec,
 
         // ── Google Workspace / Notion / GitHub external APIs ──
-        "gmail_create_draft"
+        "gmail_send_draft" | "calendar_delete_event" | "gmail_create_draft"
         | "gmail_read"
         | "gmail_search"
         | "calendar_create_event"
@@ -364,6 +364,8 @@ mod tests {
         "sheets_create",
         "sheets_update",
         "calendar_update_event",
+        "calendar_delete_event",
+        "gmail_send_draft",
         "docs_read",
         "drive_read",
         "drive_search",

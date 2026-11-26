@@ -117,6 +117,8 @@ async fn token(
         );
     }
     let (account, scope) = match who {
+        "chat-send-alice" => ("alice", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
+        "chat-send-bob" => ("bob", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
         "chat-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", crate::google_workspace::CHAT_READ_SCOPES.join(" "))),
         "meeting-downgrade" => ("alice", format!("openid email {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE)),
         "meeting-extra-drive" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {} {} {}", meeting_access::DRIVE_SCOPE, meeting_access::MEET_SCOPE, oauth::DRIVE_TOOLS_SCOPE)),

@@ -388,7 +388,9 @@ pub(crate) async fn handle_create_agent(
         return tool_error(&format!("Error: AI 員工沒有建立：{e}"));
     }
     drop(org);
-    // Published: the next admission counts this employee.
+    // Recount the published artifact under the same cross-process lock.
+    let cap = duduclaw_gateway::license_runtime::agent_cap_from_disk(home_dir).await;
+    if let Err(error) = seat_admission.recount(cap.max) { return tool_error(&error); }
     drop(seat_admission);
 
     // Install agent-file-guard PreToolUse hook so the newly-created agent

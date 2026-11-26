@@ -375,6 +375,15 @@ impl ApprovalBroker {
             require_credential_free_payload(value)?;
         }
         let rec = self.get(id).await?.ok_or("request not found")?;
+        if crate::google_identity::chat_send::is_member_card(&rec) {
+            let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
+            if !crate::google_identity::chat_send::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
+            if let Some(ctx) = dashboard {
+                if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+            } else if rec.binding.as_ref().is_none_or(|b| b.conversation_audience != super::ConversationAudience::Private) {
+                return Err("Confirm privately in My Connections".into());
+            }
+        }
         if rec.payload.get("egress_guard").is_some() {
             if let Some(ctx) = dashboard {
                 self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
@@ -480,6 +489,13 @@ impl ApprovalBroker {
         approve: bool,
     ) -> Result<(), String> {
         let rec = self.get(id).await?.ok_or("request missing")?;
+        if crate::google_identity::chat_send::is_member_card(&rec) {
+            let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
+            if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+            let context = rec.binding.as_ref().ok_or("binding missing")?.decision_context.clone();
+            return self.resolve_bound(id, &context, RequestKind::Approval,
+                if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied }, None, Some(ctx)).await;
+        }
         let activation =
             rec.action_kind == WORKFLOW_ACTIVATION_KIND || is_activation_payload(&rec.payload);
         self.require_current_dashboard_role(

@@ -188,8 +188,14 @@ pub(crate) fn proposal_ref(item: &ConfirmationItem) -> Result<Option<AdoptRef>, 
     }
 }
 
+/// Synchronous seat writes supplied by the confirmation orchestrator. Remote
+/// root probes and hooks must never run inside this callback.
+pub(crate) type SeatWrite<'a> = dyn Fn(&mut dyn FnMut(&duduclaw_core::agent_seats::SeatAdmission)
+    -> Result<(), AdoptError>) -> Result<(), AdoptError> + 'a;
+
 /// Collaborators of every adoption step.
 pub(crate) struct AdoptEnv<'a> {
+    pub(crate) seat_write: Option<&'a SeatWrite<'a>>,
     /// The schema-2 allocation socket (authoritative `NotFound`, F6l).
     pub(crate) root: &'a dyn RetireRoot,
     pub(crate) routes: &'a dyn RouteSource,
@@ -212,6 +218,14 @@ pub(crate) struct AdoptEnv<'a> {
 }
 
 impl AdoptEnv<'_> {
+    pub(crate) fn with_seat_write(&self, home: &Path,
+        mut write: impl FnMut(&duduclaw_core::agent_seats::SeatAdmission) -> Result<(), AdoptError>) -> Result<(), AdoptError> {
+        if let Some(commit) = self.seat_write { return commit(&mut write); }
+        // Boot recovery and standalone callers hold no confirmation lock.
+        let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(unavailable)?;
+        write(&admission)
+    }
+
     /// The restore engine's view (its root probe, store marks and rule are
     /// never consulted by the checks adoption reuses).
     pub(crate) fn restore(&self) -> RestoreEnv<'_> {
@@ -236,7 +250,7 @@ pub(crate) fn with_production_env<T>(home: &Path, actor: &str, now: i64, run: im
 pub(crate) fn with_production_env_capped<T>(home: &Path, actor: &str, agent_cap: usize, now: i64,
     run: impl FnOnce(&AdoptEnv<'_>) -> T) -> T {
     let routes = restore::CatalogRoutes(home);
-    let env = AdoptEnv { root: &retire::SpawndRetireRoot, routes: &routes, runs: &quarantine::SpawndRunStopper,
+    let env = AdoptEnv { seat_write: None, root: &retire::SpawndRetireRoot, routes: &routes, runs: &quarantine::SpawndRunStopper,
         rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule, hooks: &no_hooks, agent_cap, actor,
         step_up_verified_at: None, now };
     run(&env)
@@ -431,7 +445,8 @@ fn check_outside(home: &Path, env: &AdoptEnv<'_>, q: &Quarantined, target: &str)
         Refusal::LabelTaken => AdoptError::LabelNotFree,
         other => other.into(),
     })?;
-    restore::check_quota(home, env.agent_cap)?;
+    // Adoption creates a new employee without carrying avatar provenance.
+    restore::check_quota(home, env.agent_cap, false)?;
     crate::isolation_label_stores::check_label_not_quarantined(home, target, Some((q.employee, q.incarnation)))
         .map_err(|refusal| match refusal {
             crate::isolation_label_stores::GateRefusal::Unavailable => AdoptError::Unavailable,
@@ -812,7 +827,7 @@ pub(crate) fn validate_item(home: &Path, env: &AdoptEnv<'_>, item: &Confirmation
     }
     if request.state == "requested" {
         // F6fb item 8: the new id is one more live employee (licence cap).
-        restore::check_quota(home, env.agent_cap)?;
+        restore::check_quota(home, env.agent_cap, false)?;
         require_root_gone(home, env, &q)?;
         let inputs = sealed_inputs(home, &q, &target)?;
         if apply::settings_from_toml(&inputs.agent_toml)? != settings { return Err(AdoptError::SettingsChanged); }

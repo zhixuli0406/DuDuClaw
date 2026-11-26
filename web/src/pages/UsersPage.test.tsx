@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, within } from '@testing-library/react';
+import { screen, within, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -20,6 +20,15 @@ beforeEach(() => {
 });
 
 describe('UsersPage', () => {
+  it('shows authoritative seats separately from exempt avatars', async () => {
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'license.status'
+      ? { seats_used: 5, seat_limit: 5, avatars_exempt: 2 }
+      : { users: [], departments: [], agents: [] }));
+    renderWithProviders(<UsersPage />);
+    expect(await screen.findByText('AI employee seats: 5 / 5 · AI avatars: 2')).toBeInTheDocument();
+    expect(screen.getByText('AI avatars do not use employee seats')).toBeInTheDocument();
+  });
+
   it('renders the users heading', () => {
     renderWithProviders(<UsersPage />);
 
@@ -41,6 +50,125 @@ describe('UsersPage', () => {
 
     expect(screen.getByRole('heading', { name: 'Add members' })).toBeInTheDocument();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  });
+});
+
+describe('UsersPage — create a member avatar', () => {
+  const member: UserDetail = {
+    id: 'member', email: 'member@example.com', display_name: 'Member', role: 'employee', status: 'active',
+    avatar_agent_id: null, created_at: '', updated_at: '', bindings: [],
+  };
+  const newAvatar = { name: 'created-avatar', display_name: 'Member avatar', status: 'active' };
+  let currentMember: UserDetail;
+  let created: boolean;
+  let createError: unknown;
+
+  beforeEach(() => {
+    currentMember = { ...member };
+    created = false;
+    createError = null;
+    useAgentsStore.setState({ agents: [], loaded: true, loading: false });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [currentMember] };
+      if (method === 'license.status') return { seats_used: 5, seat_limit: 5, avatars_exempt: created ? 1 : 0 };
+      if (method === 'models.list') return { models: [{ id: 'local-model', label: 'Local model', type: 'local' }] };
+      if (method === 'agents.list') return { agents: created ? [newAvatar] : [] };
+      if (method === 'agents.create') {
+        if (createError) throw createError;
+        created = true;
+        currentMember = { ...currentMember, avatar_agent_id: newAvatar.name };
+        return { success: true, agent: newAvatar };
+      }
+      return { users: [], departments: [], agents: [], identities: [], conflicts: [], statuses: {} };
+    });
+  });
+
+  it.each([
+    ['admin', 'employee', 'active', null, true],
+    ['admin', 'manager', 'active', null, true],
+    ['manager', 'employee', 'active', null, false],
+    ['employee', 'employee', 'active', null, false],
+    ['admin', 'admin', 'active', null, false],
+    ['admin', 'employee', 'suspended', null, false],
+    ['admin', 'employee', 'offboarded', null, false],
+    ['admin', 'employee', 'active', 'existing-avatar', false],
+  ])('gates creation for viewer=%s, member role=%s, status=%s, avatar=%s', async (viewer, role, status, avatar, visible) => {
+    useAuthStore.setState({ user: { id: 'viewer', role: viewer } as never });
+    currentMember = { ...member, role, status, avatar_agent_id: avatar } as UserDetail;
+    renderWithProviders(<UsersPage />);
+    await screen.findByText('Member');
+    expect(screen.queryByRole('button', { name: 'Create AI avatar' }) !== null).toBe(visible);
+  });
+
+  async function openDialog() {
+    const user = userEvent.setup();
+    renderWithProviders(<UsersPage />);
+    await user.click(await screen.findByRole('button', { name: 'Create AI avatar' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Create AI avatar' });
+    await within(dialog).findByRole('option', { name: 'Local model' });
+    return { user, dialog };
+  }
+
+  it('creates with avatar_for_user at full capacity, then refreshes the avatar badge and seats', async () => {
+    const { user, dialog } = await openDialog();
+    expect(screen.getByText('AI employee seats: 5 / 5 · AI avatars: 0')).toBeInTheDocument();
+    expect(within(dialog).getByText('AI avatars do not use licensed seats and can only be used by this member.')).toBeInTheDocument();
+    const name = within(dialog).getByRole('textbox', { name: 'Display Name' });
+    expect(name).toHaveValue('Member’s AI avatar');
+    expect(within(dialog).getByRole('button', { name: 'Confirm' })).toBeDisabled();
+    await user.selectOptions(within(dialog).getByLabelText('Model'), 'local-model');
+    await user.clear(name);
+    await user.type(name, '  ');
+    expect(within(dialog).getByRole('button', { name: 'Confirm' })).toBeDisabled();
+    await user.clear(name);
+    await user.type(name, ' Member avatar ');
+    // Enter submits the form through the same path as the confirm button.
+    await user.type(name, '{Enter}');
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('agents.create', {
+      name: expect.stringMatching(/^avatar-[a-f0-9]{32}$/),
+      display_name: 'Member avatar', avatar_for_user: 'member', role: 'specialist', model_preferred: 'local-model',
+    }));
+    expect(await screen.findByText('AI employee seats: 5 / 5 · AI avatars: 1')).toBeInTheDocument();
+    expect((await screen.findByText('AI avatar: Member avatar')).closest('[data-slot="badge"]')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Create AI avatar' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'agents.create')).toHaveLength(1);
+  });
+
+  it.each([
+    new Error('成員必須啟用且尚未設定 AI 分身。'),
+    '這位成員已有 AI 分身。',
+    { code: 'edition_not_allowed', message: 'Edition not allowed', message_zh_TW: '目前版本無法建立 AI 分身。' },
+  ])('shows the server explanation and leaves the dialog open on refusal (%j)', async failure => {
+    createError = failure;
+    const { user, dialog } = await openDialog();
+    await user.selectOptions(within(dialog).getByLabelText('Model'), 'local-model');
+    await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
+    const expected = typeof failure === 'string' ? failure : failure instanceof Error ? failure.message : failure.message_zh_TW;
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(expected);
+    expect(within(dialog).getByRole('button', { name: 'Confirm' })).toBeEnabled();
+    expect(created).toBe(false);
+  });
+
+  it('cancels with the keyboard without creating an avatar', async () => {
+    const { user, dialog } = await openDialog();
+    within(dialog).getByRole('button', { name: 'Cancel' }).focus();
+    await user.keyboard('{Enter}');
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+    expect(mockWsClient.call.mock.calls.some(([method]) => method === 'agents.create')).toBe(false);
+  });
+
+  it('offers the same action on mobile cards', async () => {
+    const original = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query.includes('max-width'), media: query,
+      addEventListener: () => {}, removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia;
+    try {
+      renderWithProviders(<UsersPage />);
+      const card = (await screen.findByText('Member')).closest('li')!;
+      expect(within(card).getByRole('button', { name: 'Create AI avatar' })).toBeEnabled();
+    } finally { window.matchMedia = original; }
   });
 });
 

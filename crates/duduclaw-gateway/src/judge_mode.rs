@@ -1114,8 +1114,8 @@ impl ExternalAcceptanceJudge {
         _run_identity.apply(&mut cmd);
 
         let admission = duduclaw_core::autonomy_handoff::admit().await?;
-        let mut child = duduclaw_core::execution_gate::spawn(&mut cmd,
-            duduclaw_core::execution_gate::ExecutionClass::Judge).await
+        let mut child = duduclaw_core::execution_gate::spawn_bound(&mut cmd,
+            duduclaw_core::execution_gate::ExecutionClass::Judge, Some(_run_identity.spawn_binding())).await
             .map_err(|e| format!("spawn external judge `{}` failed: {e}", self.program()))?;
         admission.handed_off();
 

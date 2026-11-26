@@ -166,6 +166,12 @@ impl SecureDirectory {
         }
     }
 
+    /// Authority epochs distinguish a newly created file from corrupt existing
+    /// state. Both paths retain the private DACL and no-delete-sharing checks.
+    pub(crate) fn open_authority_file(&self, filename: &str, create_new: bool) -> io::Result<File> {
+        self.file(filename, true, create_new, false, true)
+    }
+
     /// Bounded reads refuse unsafe permissions before exposing any bytes.
     pub fn read(&self, filename: &str) -> io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
         let file = match self.file(filename, false, false, false, false) {

@@ -315,7 +315,11 @@ impl BackendChild {
         Self::spawn_class(cmd, crate::execution_gate::ExecutionClass::EmployeeMain).await
     }
     pub async fn spawn_class(cmd: &mut tokio::process::Command, class: crate::execution_gate::ExecutionClass) -> std::io::Result<Self> {
-        let child = crate::execution_gate::spawn(cmd, class).await?;
+        Self::spawn_class_bound(cmd, class, None).await
+    }
+    pub async fn spawn_class_bound(cmd: &mut tokio::process::Command, class: crate::execution_gate::ExecutionClass,
+        binding: Option<crate::run_credential::SpawnBinding>) -> std::io::Result<Self> {
+        let child = crate::execution_gate::spawn_bound(cmd, class, binding).await?;
         let pid = child.id();
         Ok(Self { child, report: CleanupReport::capture(), pid })
     }

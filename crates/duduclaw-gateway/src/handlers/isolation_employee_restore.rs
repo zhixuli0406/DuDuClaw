@@ -185,7 +185,7 @@ pub(super) fn with_env<T>(home: &Path, actor: &str, rule: &LogRule, cap: usize, 
 pub(super) fn with_adopt_env<T>(home: &Path, actor: &str, cap: usize, now: i64,
     f: impl FnOnce(&crate::isolation_adopt::AdoptEnv<'_>) -> T) -> T {
     let routes = CatalogRoutes(home);
-    let env = crate::isolation_adopt::AdoptEnv { root: &crate::isolation_retire::SpawndRetireRoot, routes: &routes,
+    let env = crate::isolation_adopt::AdoptEnv { seat_write: None, root: &crate::isolation_retire::SpawndRetireRoot, routes: &routes,
         runs: &crate::isolation_quarantine::SpawndRunStopper, rule: &duduclaw_auth::admin_approval_rule::EligibilityLogRule,
         hooks: &crate::isolation_adopt::no_hooks, agent_cap: cap, actor,
         // Filing never approves: no step-up for the rule (N2).

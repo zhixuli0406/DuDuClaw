@@ -1116,14 +1116,30 @@ impl StagedAgentDir {
     /// refused — [`upsert`]), then publish the directory by `rename`. On any
     /// failure the row is put back as it was, the staging directory removed,
     /// and the error returned — the employee never appears.
-    pub fn publish(mut self, org: &OrgMutationGuard, entry: OrgEntry) -> io::Result<PathBuf> {
+    pub fn publish(self, org: &OrgMutationGuard, entry: OrgEntry) -> io::Result<PathBuf> {
+        self.publish_with_identity(org, entry, None)
+    }
+
+    /// Avatar provisioning already owns users.db's write transaction. Rotate
+    /// its identity there instead of deadlocking on a second connection.
+    pub fn publish_in_users_transaction(self, org: &OrgMutationGuard, entry: OrgEntry,
+        users: &rusqlite::Connection) -> io::Result<PathBuf> {
+        if users.is_autocommit() { return Err(io::Error::other("avatar publication needs a users transaction")); }
+        self.publish_with_identity(org, entry, Some(users))
+    }
+
+    fn publish_with_identity(mut self, org: &OrgMutationGuard, entry: OrgEntry,
+        users: Option<&rusqlite::Connection>) -> io::Result<PathBuf> {
         if std::fs::symlink_metadata(&self.target).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 format!("agent '{}' already exists", self.agent_id),
             ));
         }
-        crate::employee_incarnation::deleted(org.home(), &self.agent_id)?;
+        match users {
+            Some(conn) => crate::employee_incarnation::retire(conn, &self.agent_id).map_err(io::Error::other)?,
+            None => crate::employee_incarnation::deleted(org.home(), &self.agent_id)?,
+        }
         let prior = load(org.home()).get(&self.agent_id).cloned();
         upsert(org, &self.agent_id, entry)?;
         if let Err(e) = std::fs::rename(&self.staging, &self.target) {
@@ -1141,7 +1157,10 @@ impl StagedAgentDir {
             return Err(e);
         }
         self.published = true;
-        crate::employee_incarnation::created(org.home(), &self.agent_id)?;
+        match users {
+            Some(conn) => { crate::employee_incarnation::ensure(conn, &self.agent_id).map_err(io::Error::other)?; }
+            None => crate::employee_incarnation::created(org.home(), &self.agent_id)?,
+        }
         Ok(self.target.clone())
     }
 }

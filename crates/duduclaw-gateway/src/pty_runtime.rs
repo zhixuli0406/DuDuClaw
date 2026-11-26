@@ -110,6 +110,14 @@ pub async fn invoke_oneshot(
     deadline: Duration,
     clear_env: bool,
 ) -> Result<OneshotOutput, PtyError> {
+    invoke_oneshot_bound(program, args, env_vars, work_dir, deadline, clear_env, None).await
+}
+
+pub async fn invoke_oneshot_bound(
+    program: impl Into<String>, args: Vec<String>, env_vars: HashMap<String, String>,
+    work_dir: Option<PathBuf>, deadline: Duration, clear_env: bool,
+    binding: Option<duduclaw_core::run_credential::SpawnBinding>,
+) -> Result<OneshotOutput, PtyError> {
     let program = program.into();
     let (program, args) = if duduclaw_core::ns_guard::is_active() {
         std::env::current_exe()
@@ -123,6 +131,7 @@ pub async fn invoke_oneshot(
         .envs(env_vars)
         .deadline(deadline)
         .clear_env(clear_env);
+    inv.spawn_binding = binding;
     if let Some(cwd) = work_dir {
         inv = inv.cwd(cwd);
     }

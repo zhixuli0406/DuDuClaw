@@ -26,6 +26,11 @@ async fn race(method: &str, promote_role: bool, stale_admin: bool) {
     let f = fixture().await;
     let manager = prepare(&f).await;
     let who = if stale_admin { &f.admin } else { &manager };
+    // Establish ownership before the pending status update holds seat admission.
+    if stale_admin {
+        UserDb::new(&f.home.join("users.db")).unwrap()
+            .bind_agent(&who.user_id, "a1", AccessLevel::Owner).unwrap();
+    }
     let path = f.home.join("agents/a1/agent.toml");
     let lock = crate::agent_files::file_mutex(&f.home, "a1", &crate::agent_files::FileKey::AgentToml);
     let held = lock.lock().await;
@@ -49,8 +54,6 @@ async fn race(method: &str, promote_role: bool, stale_admin: bool) {
     if stale_admin {
         // Keep valid ownership and Manager role so only the fresh main gate
         // refuses: a stale cached Admin must not bypass it.
-        let db = UserDb::new(&f.home.join("users.db")).unwrap();
-        db.bind_agent(&who.user_id, "a1", AccessLevel::Owner).unwrap();
         rusqlite::Connection::open(f.home.join("users.db")).unwrap()
             .execute("UPDATE users SET role='manager' WHERE id=?1", [&who.user_id]).unwrap();
     }

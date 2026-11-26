@@ -16,7 +16,7 @@ pub(super) fn validate_settings(params: &Value, allowed: &[&str]) -> Result<(), 
     for (key, value) in object {
         if !allowed.contains(&key.as_str()) { return Err(setting_error(key, "unsupported key")); }
         let valid = match key.as_str() {
-            "invite" | "confirm" => value.is_boolean(),
+            "invite" | "confirm" | "delete_avatar" => value.is_boolean(),
             "department" | "manager_user_id" | "agent_id" => value.is_string() || value.is_null(),
             _ => value.is_string(),
         };
@@ -39,6 +39,11 @@ pub(super) fn validate_settings(params: &Value, allowed: &[&str]) -> Result<(), 
 }
 
 fn avatar_error(code: &str) -> WsFrame {
+    if code == duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL {
+        return super::agents_basic::seat_refusal_frame(json!({
+            "code": duduclaw_core::agent_seats::SEAT_LIMIT_ERROR_CODE, "message": code,
+        }));
+    }
     let (code, zh, en) = match code {
         "avatar_primary_locked" => ("avatar_primary_locked", "已有 AI 分身，請聯絡管理員變更。", "An AI avatar is assigned. Contact an administrator to change it."),
         "avatar_agent_in_use" => ("avatar_agent_in_use", "這位 AI 已是其他成員的分身。", "This AI is already another member's avatar."),
@@ -368,13 +373,18 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        let seat_admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        let seat_cap = self.effective_agent_cap().await;
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => return setting_error("user_id", "user_id is required"),
         };
 
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
-        match db.set_user_status_as(Some(ctx.user_id.as_str()), user_id, duduclaw_auth::UserStatus::Suspended) {
+        match db.set_user_status_as_under(Some(ctx.user_id.as_str()), user_id, duduclaw_auth::UserStatus::Suspended, Some((&seat_admission, seat_cap))) {
             Ok(()) => {
                 let cleanup_error = crate::google_personal::lifecycle::disconnect(&self.home_dir, &db, user_id, &ctx.user_id, true).await.err();
                 if let Ok(agents) = &google_affected_agents { crate::google_personal::lifecycle::notify_affected(&self.home_dir, &ctx.user_id, agents); }
@@ -392,12 +402,22 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_bind_agent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        self.bind_user_agent_under(params, ctx, &admission).await
+    }
+
+    pub(super) async fn bind_user_agent_under(&self, params: Value, ctx: &UserContext,
+        seat_admission: &duduclaw_core::agent_seats::SeatAdmission) -> WsFrame {
         if let Err(frame) = validate_settings(&params, &["user_id", "agent_name", "access_level"]) { return frame; }
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        let seat_cap = self.effective_agent_cap().await;
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => return setting_error("user_id", "user_id is required"),
@@ -439,7 +459,7 @@ impl MethodHandler {
             Ok(value) => value == Some(AccessLevel::Owner),
             Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
         };
-        match db.bind_agent_as(&ctx.user_id, user_id, agent_name, access_level) {
+        match db.bind_agent_as_under(&ctx.user_id, user_id, agent_name, access_level, Some((seat_admission, seat_cap))) {
             Ok(()) => {
                 if was_owner || access_level == AccessLevel::Owner {
                     if let Err(error) =
@@ -471,6 +491,11 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        let seat_admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        let seat_cap = self.effective_agent_cap().await;
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => return setting_error("user_id", "user_id is required"),
@@ -484,7 +509,7 @@ impl MethodHandler {
             Ok(value) => value == Some(AccessLevel::Owner),
             Err(_) => return WsFrame::error_response("", "無法確認原有負責人，未變更綁定。"),
         };
-        match db.unbind_agent(user_id, agent_name) {
+        match db.unbind_agent_under(user_id, agent_name, Some((&seat_admission, seat_cap))) {
             Ok(()) => {
                 if was_owner {
                     if let Err(error) =
@@ -516,6 +541,11 @@ impl MethodHandler {
             None => return WsFrame::error_response("", "user system not initialized"),
         };
 
+        let seat_admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        let seat_cap = self.effective_agent_cap().await;
         let user_id = match params.get("user_id").and_then(|v| v.as_str()) {
             Some(id) => id,
             None => return setting_error("user_id", "user_id is required"),
@@ -543,7 +573,7 @@ impl MethodHandler {
             }
         }
         let google_affected_agents = crate::google_personal::lifecycle::affected_agents(&self.home_dir, &db, user_id);
-        let outcome = match db.offboard_user(user_id, transfer_to, Some(&ctx.user_id)) {
+        let outcome = match db.offboard_user_under(user_id, transfer_to, Some(&ctx.user_id), Some((&seat_admission, seat_cap))) {
             Ok(outcome) => outcome,
             Err(duduclaw_auth::OrgError::UserNotFound) => {
                 return WsFrame::error_response("", "failed to offboard user: user not found");
@@ -587,7 +617,7 @@ impl MethodHandler {
     }
 
     pub(super) async fn handle_users_set_avatar_in_mode(&self, params: Value, ctx: &UserContext, protected: bool) -> WsFrame {
-        if let Err(frame) = validate_settings(&params, &["user_id", "agent_id"]) { return frame; }
+        if let Err(frame) = validate_settings(&params, &["user_id", "agent_id", "delete_avatar", "step_up_csrf"]) { return frame; }
         let Some(target) = params.get("user_id").and_then(Value::as_str) else {
             return setting_error("user_id", "required");
         };
@@ -598,6 +628,31 @@ impl MethodHandler {
         };
         let Some(db) = self.user_db.read().await.clone() else { return avatar_error("avatar_unavailable"); };
         if !super::user_invites_rpc::live_admin(&db, ctx) { return avatar_error("avatar_admin_required"); }
+        let seat_admission = match self.acquire_seat_admission().await {
+            Ok(guard) => guard,
+            Err(error) => return super::agents_basic::seat_refusal_frame(error),
+        };
+        let seat_cap = self.effective_agent_cap().await;
+        let delete_avatar = match params.get("delete_avatar") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) if agent.is_none() => true,
+            _ => return setting_error("delete_avatar", "must be boolean; deletion requires agent_id: null"),
+        };
+        if delete_avatar {
+            let current = match db.avatar_agent(target) {
+                Ok(Some(id)) => id,
+                _ => return avatar_error("avatar_unavailable"),
+            };
+            // Full normal deletion (credentials, incarnation and lifecycle),
+            // sharing this admission. A deleted AI consumes no extra seat.
+            let mut deletion = json!({"agent_id": current});
+            if let Some(csrf) = params.get("step_up_csrf") { deletion["step_up_csrf"] = csrf.clone(); }
+            // Direct delegation must retain the same Personal write gate as
+            // dispatching agents.remove (including native Admin step-up).
+            if let Err(frame) = self.personal_gates_for_params("agents.remove", &mut deletion, ctx).await { return frame; }
+            let removed = self.remove_agent_under(deletion, &seat_admission).await;
+            if !matches!(removed, WsFrame::Response { ok: true, .. }) { return removed; }
+        }
         let registry = self.registry.read().await;
         if let Some(id) = agent {
             if registry.get(id).is_none() { return setting_error("agent_id", "AI employee does not exist"); }
@@ -609,7 +664,7 @@ impl MethodHandler {
                 }
             }
         }
-        match db.set_avatar_as(&ctx.user_id, target, agent) {
+        match db.set_avatar_as_under(&ctx.user_id, target, agent, Some((&seat_admission, seat_cap))) {
             Ok(()) => WsFrame::ok_response("", json!({"avatar_agent_id": agent})),
             Err(error) => avatar_error(&error),
         }

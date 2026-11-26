@@ -8,13 +8,19 @@
 
 ## 呼び出し元の身分を取得・検証する（Getting and verifying the caller identity）
 
-An AI cannot claim another identity by changing environment variables, parameters, or its working directory. On installs where all AI employees run as the same operating-system user, a process that can read other processes' environments could borrow another run's credential while that run is active; the credential stops working when the run ends. Native Linux protected mode isolates employees as separate users. In protected mode no run credential is issued: it keeps its own capability records, and `duduclaw identity whoami` reports that protected mode uses its own capability identity.
-
 この節は gateway が管理する実行を対象とします。単独の `duduclaw agent` ターミナルセッションはこの gateway registry に未接続です。インストール・バージョン・認証状態の確認と、任意の `/model` メニュー確認も身分付きの作業ターンではありません。
 
-AI は環境変数、引数、作業ディレクトリを変更して別の身分を名乗ることはできません。すべての AI 従業員が同じ OS ユーザーで動く環境では、他のプロセスの環境変数を読めるプロセスが、別の実行中の資格情報を借用できる場合があります。その実行が終了すると資格情報は無効になります。ネイティブ Linux の保護モードは従業員を別々の OS ユーザーに隔離します。保護モードでは run credential を発行せず、独自の capability records を使います。`duduclaw identity whoami` は、このモードが独自の capability identity を使うことを明示します。
+AI は環境変数、引数、作業ディレクトリを変更して別の身分を名乗ることはできません。gateway が管理する実行ごとに短期間有効な資格情報を発行し、gateway が照会に応答するのは、その実行のために起動した CLI プロセスか、その子孫プロセスからの照会だけです。ネイティブ Linux の保護モードは従業員を別々の OS ユーザーに隔離します。保護モードでは run credential を発行せず、独自の capability records を使います。`duduclaw identity whoami` は、このモードが独自の capability identity を使うことを明示します。
 
-DuDuClaw が起動したローカルツールは `DUDUCLAW_RUN_CREDENTIAL` を読み、ツールを呼び出すたびにローカル gateway で検証してください。下記の CLI も利用できます。cwd、表示名、ツール引数、`DUDUCLAW_ON_BEHALF_OF` は証明になりません。**照会はローカルのみ。資格情報を転送しないでください。** URL、argv、ログ、ツール結果、会話記録にも含めないでください。非機密の `DUDUCLAW_IDENTITY_URL` は dashboard とは別の listener を指し、`127.0.0.1` の一時ポートだけを使用します。起動できるのは `gateway.lock` を保持するプロセスだけです。CLI はこの変数を優先し、未設定なら `<gateway home>/run/identity-url`（所有者のみ、Unix では 0600）を読み、非 loopback URL を拒否します。URL は接続先のヒントであり、身分証明ではありません。
+DuDuClaw が起動したローカルツールは `DUDUCLAW_RUN_CREDENTIAL` を読み、ツールを呼び出すたびにローカル gateway で検証してください。下記の CLI も利用できます。cwd、表示名、ツール引数、`DUDUCLAW_ON_BEHALF_OF` は証明になりません。**照会はローカルのみ。資格情報を転送しないでください。** URL、argv、ログ、ツール結果、会話記録にも含めないでください。
+
+gateway は機密でない変数を 2 つ設定します。`DUDUCLAW_IDENTITY_ENDPOINT` はバージョン付きのローカル IPC エンドポイントです。Unix では `unix:v1:<絶対パス>` で、ソケットは `<gateway home>/run/` 配下の非公開ディレクトリ（所有者のみ、権限 0700）に置きます。Windows では `pipe:v1:\\.\pipe\duduclaw-identity-<hex>` で、この名前付きパイプの DACL は現在のユーザーだけを許可し、リモートクライアントを拒否します。`DUDUCLAW_IDENTITY_SERVER`（`v1:<pid>:<起動時刻>`）は gateway のプロセス身分です。クライアントは資格情報を 1 バイトでも書き込む前に、接続先がどのプロセスかを OS に問い合わせ、PID とプロセス起動時刻の両方が一致しなければ中止します。エンドポイントを起動するのは `gateway.lock` を保持する gateway プロセスだけです。`<gateway home>/run/identity-endpoint` は運用者の診断用で、CLI はこのファイルからエンドポイントやサーバー身分を取得しません。以前の `127.0.0.1` の HTTP listener と `DUDUCLAW_IDENTITY_URL` は廃止され、フォールバックもありません。gateway は起動のたびにこの変数を除去し、まだ設定されている実行では CLI が inactive として扱います。
+
+**照会できるプロセス。** gateway は接続ごとに呼び出し元の PID をカーネルから取得します（Unix ソケットの peer credentials、Windows では名前付きパイプのクライアント PID）。要求の内容は使いません。続いて呼び出し元から親をたどり、この実行のために起動した CLI プロセスまで、途中の各プロセスの PID と起動時刻を確認します。親が子より後に起動していることはあり得ず、親子関係は最大 64 段までです。途中のすべてのプロセスと、この実行の CLI プロセス自体がまだ動作している必要があります。このツリー外の呼び出し元は、正しいトークンを提示しても拒否されます。具体的には次のとおりです。
+
+- この実行の CLI が直接、または `mcp-proxy` 経由で起動したカスタム MCP サーバー、hook、スクリプトは子孫プロセスなので身分を検証できます。ツールが子プロセスとして実行する `duduclaw identity whoami` も同様です。
+- 実行の外で起動したデーモンやサービス（launchd や systemd のユニット、自分で先に起動したサーバー、別の実行に属するプロセス）は子孫ではないため、資格情報を環境変数にコピーしても `{"active":false}` を受け取ります。この実行が起動したプロセスの中で検証し、そのようなサービスには資格情報ではなく検証結果だけを渡してください。
+- 親から切り離されて親が付け替えられたプロセス（二重 fork 後に init や launchd に引き取られたデーモンなど）はたどれなくなり、拒否されます。この実行の CLI プロセスが終了すると、すべての子孫プロセスで資格情報は使えなくなります。
 
 ```sh
 duduclaw identity whoami --json
@@ -23,11 +29,19 @@ duduclaw identity whoami --json
 
 有効な応答には `active: true`、`agent_id`、`principal`、`session_id`、`turn_id`、`task_id`、`runtime`、`issued_at`、`expires_at`（Unix 秒）が含まれます。人間は `{"type":"human","user_id":"…"}`、cron・heartbeat・task は `{"type":"background","kind":"…"}` です。未確認の依頼者は background／unattributed で、管理者にはなりません。session と task は null の場合があります。モデルの申告ではなく gateway の登録情報です。検証結果をツール独自の権限規則に照合してください。身分確認だけでは権限は付与されません。
 
-形式不正、不明、期限切れ、失効済みはすべて HTTP 200 と `{"active":false}` を返します。非 loopback、接続元不明、レート制限超過も同じ拒否応答です。有効な資格情報ごとに毎分 600 回の独立したバケットを持ち、registry の最大 8,192 件に収まります。形式不正・不明な要求は別の共通バケットを使います。`Forwarded`、`X-Forwarded-For`、`X-Forwarded-Host`、`X-Real-IP`、`Via`、`Origin` がある要求も同じ inactive 応答です。リクエストは最大 1 KiB です。資格情報がない場合、無効な場合、gateway に接続できない場合は CLI が非ゼロで終了します。検証失敗時は拒否し、有効という結果を次の呼び出しに持ち越さないでください。
+形式不正、不明、期限切れ、失効済みの資格情報、実行のプロセスツリー外の呼び出し元、接続元情報の欠落、レート制限超過は、すべて `{"active":false}` だけを返します。有効な資格情報ごとに毎分 600 回の独立したバケットを持ち、registry の最大 8,192 件に収まります。形式不正・不明な要求は別の共通バケットを使います。資格情報がない・無効、`DUDUCLAW_IDENTITY_ENDPOINT` または `DUDUCLAW_IDENTITY_SERVER` がない・形式不正、サーバー身分の不一致、gateway に接続できない場合は CLI が非ゼロで終了します。検証失敗時は拒否し、有効という結果を次の呼び出しに持ち越さないでください。
 
-CLI の各試行に、32 ランダムバイトから生成した新しい `ddc_run_` 資格情報を発行します。gateway は SHA-256 ハッシュのみを最大 8,192 件保持します。終了・エラー・キャンセルで guard が失効させ、有効期限は実行タイムアウト＋60 秒、最長 6 時間です。gateway 再起動ですべて無効になります。ローカル API ツールループの lease は tool registry の終了まで保持します。`mcp-proxy` は新しい変数をローカルのサードパーティーサーバーへ渡し、従来の身分変数は引き続き除去します。Codex は MCP `env_vars` 対応が必要で、資格情報を argv に含めません。各バージョンの shell／MCP 継承は実機検証が必要です。
+CLI を実行できないツール向けのプロトコルは、1 接続につき 1 要求で、HTTP、リダイレクト、プロキシ、持続接続には対応しません。4 バイトのビッグエンディアン長に続けて JSON オブジェクト 1 つ `{"version":1,"operation":"introspect","credential":"ddc_run_…"}`（最大 4 KiB）を送り、同じ形式の JSON 応答（最大 16 KiB）を 1 つ読み取ってから、受信確認として 1 バイトの `0x01` を書き込みます。やり取り全体は 3 秒以内に終える必要があります。最初のバイトを書き込む前に、上記のサーバー身分確認を必ず行ってください。使用するプラットフォームや言語でそれができない場合は CLI を使ってください。
 
-この保証は申告の偽造を防ぐもので、同じ OS ユーザーのプロセスによる有効な bearer 資格情報の窃取は防げません。ローカルツールは信頼できるものを使い、敵対的な処理には OS 隔離を使用してください。保護モードでは run credential を発行せず、独自の capability records を使います。`duduclaw identity whoami` は、このモードが独自の capability identity を使うことを明示します。既存の `DUDUCLAW_AGENT_TOKEN` と DuDuClaw MCP server の身分検証は変更しません。
+CLI の各試行に、32 ランダムバイトから生成した新しい `ddc_run_` 資格情報を発行します。gateway は SHA-256 ハッシュのみを最大 8,192 件保持します。資格情報は、gateway が起動したプロセスに結び付けた後で初めて使えるようになります。終了・エラー・キャンセルで guard が失効させ、有効期限は実行タイムアウト＋60 秒、最長 6 時間です。gateway 再起動ですべて無効になります。ローカル API ツールループでは、起動する stdio MCP サーバーごとに、そのサーバープロセスに結び付いた資格情報を発行します。`mcp-proxy` は資格情報、`DUDUCLAW_IDENTITY_ENDPOINT`、`DUDUCLAW_IDENTITY_SERVER` をローカルのサードパーティーサーバーへ渡し、`DUDUCLAW_IDENTITY_URL` を含む従来の身分変数は引き続き除去します。Codex は MCP `env_vars` 対応が必要で、資格情報を argv に含めません。各バージョンの shell／MCP 継承は実機検証が必要です。
+
+**制限。** プロセスツリーの確認は申告の偽造を防ぎ、無関係なプロセスがコピーした資格情報を使うことも防ぎます。次の場合は保証の対象外です。
+
+- Windows では、同じアカウントで動くプログラムがプロセス作成時に意図的に親プロセスを指定すると（`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`）、祖先チェックを通過できます。名前付きパイプは PID しか返さないため、PID の取得からそのプロセスを開くまでの短い隙間も残ります。
+- macOS と、`SO_PEERPIDFD`（6.5 で追加）のない Linux カーネルでは、カーネルが固定されたプロセスハンドルではなく PID を返すため、PID 再利用のわずかな隙間が残ります。
+- 正規の子孫プロセスに注入されたコード、他のプロセスの要求を中継する正規の子孫プロセス、他のプロセスに渡された接続済みのソケットやパイプのハンドルは、いずれもその子孫プロセスとして扱われます。
+
+ローカルツールは信頼できるものを使い、敵対的な処理には OS 隔離を使用してください。保護モードでは run credential を発行せず、独自の capability records を使います。`duduclaw identity whoami` は、このモードが独自の capability identity を使うことを明示します。既存の `DUDUCLAW_AGENT_TOKEN` と DuDuClaw MCP server の身分検証は変更しません。
 
 
 ## Overview

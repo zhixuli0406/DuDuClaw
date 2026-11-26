@@ -10,6 +10,8 @@ pub mod lifecycle;
 pub(crate) mod meeting_access;
 #[cfg(test)]
 mod mail_tests;
+#[cfg(test)]
+mod chat_send_tests;
 pub mod oauth;
 pub mod owner_change;
 pub mod pending;

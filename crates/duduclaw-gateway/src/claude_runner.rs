@@ -2065,10 +2065,8 @@ fn finish_mcp_tool_registry(
     agent_id: &str,
     home: &Path,
     registry: Option<duduclaw_llm::ToolRegistry>,
-    identity: crate::run_identity::RunGuard,
 ) -> Option<duduclaw_llm::ToolRegistry> {
     let mut registry = registry?;
-    registry.hold_run_identity(Box::new(identity));
     let observer = crate::credential_declaration::ToolObservation::new(home, agent_id);
     if registry.register_client_boundary(0, std::sync::Arc::new(observer)).is_err() {
         warn!("credential observation unavailable for internal MCP tools");
@@ -2159,21 +2157,17 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
     .await?;
 
     let run_identity = crate::run_identity::issue(&home_dir, agent_id, "api-tool-loop",
-        crate::runtime_config::call_timeout_secs(Some(&agent_dir)))?;
-    let with_identity = |env: &[(String, String)]| {
-        let mut env: std::collections::HashMap<String, String> = env.iter().cloned().collect();
-        run_identity.apply_pty(&mut env);
-        env.into_iter().collect::<Vec<_>>()
-    };
+        crate::runtime_config::call_timeout_secs(Some(&agent_dir)))?.into_issuer()?;
 
     // Connect the internal duduclaw MCP server (always client 0 → wins name
     // collisions against any external server).
     let connect_internal = || async {
-        duduclaw_llm::McpClient::connect(
+        duduclaw_llm::McpClient::connect_with_lease(
             &bin.to_string_lossy(),
             &["mcp-server".to_string()],
-            &with_identity(&mcp_client_envs_in(agent_id, &home_dir)),
+            &mcp_client_envs_in(agent_id, &home_dir),
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+            Box::new(run_identity.issue().map_err(duduclaw_llm::McpError::Spawn)?), false,
         )
         .await.map(|mut client| {
             client.enable_builtin_tool_timeouts();
@@ -2205,7 +2199,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 None
             }
         };
-        return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry, run_identity));
+        return Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry));
     }
 
     let mut clients = vec![(
@@ -2236,11 +2230,12 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
                 .await
             }
             None => {
-                duduclaw_llm::McpClient::connect_scrubbed(
+                duduclaw_llm::McpClient::connect_with_lease(
                     &ext.command,
                     &ext.args,
-                    &with_identity(&ext.env),
+                    &ext.env,
                     duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+                    Box::new(run_identity.issue()?), true,
                 )
                 .await
             }
@@ -2269,11 +2264,12 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
         // A child of the agent-CLI allowlisted environment, not the
         // gateway's: a third-party server never sees the operator's other
         // vendor keys (same base env as under the Claude CLI).
-        match duduclaw_llm::McpClient::connect_scrubbed(
+        match duduclaw_llm::McpClient::connect_with_lease(
             &server.command,
             &server.args,
-            &with_identity(&server.env),
+            &server.env,
             duduclaw_llm::DEFAULT_MCP_TIMEOUT,
+            Box::new(run_identity.issue()?), true,
         )
         .await
         {
@@ -2343,7 +2339,7 @@ pub(crate) async fn build_mcp_tool_registry_checked_in(
             .ok()
         }
     };
-    Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry, run_identity))
+    Ok(finish_mcp_tool_registry(agent_id, &home_dir, registry))
 }
 
 /// Where a direct-API key came from — the pure output of [`choose_key_source`].
@@ -3977,6 +3973,7 @@ async fn call_claude_streaming(
     idle_timeout_secs: u64,
     max_turns: u64,
     mcp_observer: Option<(&Path, &str)>,
+    binding: Option<duduclaw_core::run_credential::SpawnBinding>,
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -4012,8 +4009,8 @@ async fn call_claude_streaming(
         let admission = crate::autonomous_runtime::admit_current().await?;
         let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
-        crate::process_group::BackendChild::spawn_class(cmd, crate::process_group::execution_class(
-            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain)),
+        crate::process_group::BackendChild::spawn_class_bound(cmd, crate::process_group::execution_class(
+            duduclaw_core::execution_gate::ExecutionClass::EmployeeMain), binding),
     ).await
         .map_err(|e| crate::process_group::backend_error(e, "claude CLI spawn error"))?;
         crate::autonomous_runtime::mark_handoff();
@@ -4943,7 +4940,9 @@ mod role_cache_ttl_tests {
         let _proof = crate::run_identity::assert_command_identity(&command, true);
         for (name, value) in command.as_std().get_envs() {
             if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
-                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL {
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_SERVER {
                 if let Some(value) = value { expected.env(name, value); }
                 else { expected.env_remove(name); }
             }
@@ -5149,7 +5148,7 @@ async fn call_claude_with_env(
         let system_prompt = duduclaw_core::turn_limits::budget_prompt(system_prompt, 50)
             .replace(crate::direct_api::CACHE_SPLIT_MARKER, "");
         let mut marker = tokio::process::Command::new("root-selected-claude");
-        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs, crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), 50, Some((&home, &observer_agent))).await;
+        return call_claude_streaming(&mut marker, None, Some((agent_dir, prompt, &system_prompt, model)), hard_max_timeout_secs, crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), 50, Some((&home, &observer_agent)), None).await;
     }
     let claude = duduclaw_core::which_claude().ok_or("Claude CLI not found")?;
     // `_cmd_guards` holds the `--system-prompt-file` and (RFC-23 §13.6)
@@ -5190,7 +5189,7 @@ async fn call_claude_with_env(
         .and_then(|(_, value)| value.to_str().and_then(|n| n.parse::<u64>().ok()))
         .filter(|n| *n > 0).ok_or("Claude command has no valid applied step budget")?;
     call_claude_streaming(&mut cmd, None, None, hard_max_timeout_secs,
-        crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), applied_max_turns, Some((&home, &observer_agent))).await
+        crate::runtime_config::idle_timeout_secs(&home, identity.config_dir.or(work_dir)), applied_max_turns, Some((&home, &observer_agent)), Some(_cmd_guards.identity.spawn_binding())).await
 }
 
 pub(crate) fn protected_claude_options_refusal() -> String {
@@ -6679,7 +6678,7 @@ mod process_tree_cancellation_tests {
         let mut cmd = tokio::process::Command::new("/bin/sh");
         cmd.current_dir(dir.path())
             .args(["-c", "/bin/sleep 300 & echo $! > grandchild.pid; wait"]);
-        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None, 1800, 900, 50, None).await });
+        let task = tokio::spawn(async move { super::call_claude_streaming(&mut cmd, None, None, 1800, 900, 50, None, None).await });
         let pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(pid) = std::fs::read_to_string(dir.path().join("grandchild.pid"))

@@ -1,4 +1,4 @@
-//! Member avatar assignment does not grant any additional employee access.
+//! Authoritative member avatar assignments; dashboard read policy lives in the gateway.
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use crate::{UserDb, user_row::{bump_acl_generation, has_column}};
@@ -29,6 +29,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+/// Resolve a CURRENT avatar from RM-212 authority, never from a profile flag or
+/// the legacy primary preference. Callers must fall back to stricter rules on
+/// errors. A Personal avatar must belong to the same member as its owner.
+pub fn current_personal_avatar_member_in(conn: &Connection, agent: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT u.id FROM users u
+        JOIN isolation_personal_agents p ON p.agent_name = u.avatar_agent_id AND p.owner_user_id = u.id
+        WHERE u.avatar_agent_id = ?1 AND u.status = 'active'
+        AND (SELECT COUNT(*) FROM users a WHERE a.avatar_agent_id = ?1) = 1
+        AND EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.user_id = u.id
+            AND b.agent_name = ?1 AND b.access_level = 'owner')",
+        [agent], |r| r.get(0)).optional()
+}
+
 impl UserDb {
     pub fn avatar_agent(&self, user_id: &str) -> Result<Option<String>, String> {
         self.conn().query_row("SELECT avatar_agent_id FROM users WHERE id = ?1", [user_id], |r| r.get(0))
@@ -53,6 +66,11 @@ impl UserDb {
     /// The gateway also checks that the agent exists in its live registry.
     /// This write never creates or elevates a binding.
     pub fn set_avatar_as(&self, actor: &str, user_id: &str, agent_id: Option<&str>) -> Result<(), String> {
+        self.set_avatar_as_under(actor, user_id, agent_id, None)
+    }
+
+    pub fn set_avatar_as_under(&self, actor: &str, user_id: &str, agent_id: Option<&str>, limit: crate::avatar_seats::SeatLimit<'_>) -> Result<(), String> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users
@@ -74,6 +92,7 @@ impl UserDb {
             params![actor, user_id, serde_json::json!({"avatar_agent_id": agent_id}).to_string(), now],
         ).map_err(|e| e.to_string())?;
         bump_acl_generation(&tx).map_err(|e| e.to_string())?;
+        seats.check(&tx)?;
         tx.commit().map_err(|e| e.to_string())
     }
 
@@ -247,5 +266,75 @@ mod tests {
         assert_eq!(db.avatar_conflicts().unwrap().len(), 1);
         db.set_avatar_as(&admin.id, &b.id, Some("other")).unwrap();
         assert!(db.avatar_conflicts().unwrap().is_empty());
+    }
+}
+
+impl UserDb {
+    /// Admin-only creation of a NEW Personal avatar. The callback publishes the
+    /// staged directory under the already-held seat/org locks. The caller must
+    /// remove its newly published directory if recount or commit fails.
+    pub fn publish_new_avatar_under(
+        &self, actor: &str, member: &str, agent: &str,
+        admission: &duduclaw_core::agent_seats::SeatAdmission, max: usize,
+        publish: impl FnOnce(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.home.as_deref() != Some(admission.home()) {
+            return Err("分身名額資料來源不一致，未建立。".into());
+        }
+        if duduclaw_core::agent_seats::resolve_agent_seat(admission.home(), agent)
+            .map_err(|e| e.to_string())?.is_some() {
+            return Err("只能為成員建立新的 Personal AI，不能將一般員工改為免計名額分身。".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1
+            AND role='admin' AND status='active')", [actor], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !admin { return Err("avatar_admin_required".into()); }
+        let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1
+            AND status='active' AND avatar_agent_id IS NULL)", [member], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if !eligible { return Err("成員必須啟用且尚未設定 AI 分身。".into()); }
+        let stale: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name=?1)
+            OR EXISTS(SELECT 1 FROM isolation_personal_agents WHERE agent_name=?1)
+            OR EXISTS(SELECT 1 FROM users WHERE avatar_agent_id=?1)", [agent], |r| r.get(0)).map_err(|e| e.to_string())?;
+        if stale { return Err("此 AI 名稱仍有身分紀錄，請使用新的名稱。".into()); }
+        publish(&tx)?;
+        crate::db::insert_personal_agent_in_transaction(&tx, agent, member).map_err(|e| e.to_string())?;
+        let now = Utc::now().to_rfc3339();
+        crate::db::bind_agent_in_transaction(&tx, member, agent, crate::AccessLevel::Owner, &now)
+            .map_err(|e| e.to_string())?;
+        check_available(&tx, member, agent)?;
+        tx.execute("UPDATE users SET avatar_agent_id=?1, primary_agent_id=?1, updated_at=?2 WHERE id=?3",
+            params![agent, now, member]).map_err(|e| e.to_string())?;
+        tx.execute("INSERT INTO auth_audit_log(user_id,action,target,detail,timestamp)
+            VALUES(?1,'user.create_avatar',?2,?3,?4)", params![actor, member, agent, now]).map_err(|e| e.to_string())?;
+        bump_acl_generation(&tx).map_err(|e| e.to_string())?;
+        crate::avatar_seats::grant_personal_incarnation(&tx, agent, member)?;
+        admission.recount_in(&tx, max)?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+}
+
+impl UserDb {
+    /// Compensation after an avatar's newly-created configuration was removed
+    /// because the protected proposal could not record its creation marker.
+    pub fn discard_absent_avatar_under(&self, member: &str, agent: &str,
+        admission: &duduclaw_core::agent_seats::SeatAdmission) -> Result<(), String> {
+        if self.home.as_deref() != Some(admission.home())
+            || duduclaw_core::agent_seats::resolve_agent_seat(admission.home(), agent)
+                .map_err(|e| e.to_string())?.is_some() {
+            return Err("avatar cleanup requires its absent configuration".into());
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        crate::db::remove_personal_agent_in_transaction(&tx, agent, member).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE users SET avatar_agent_id=CASE WHEN avatar_agent_id=?1 THEN NULL ELSE avatar_agent_id END,
+            primary_agent_id=CASE WHEN primary_agent_id=?1 THEN NULL ELSE primary_agent_id END WHERE id=?2",
+            params![agent,member]).map_err(|e| e.to_string())?;
+        tx.execute("DELETE FROM avatar_seat_grants WHERE agent_name=?1 AND owner_user_id=?2", params![agent,member])
+            .map_err(|e| e.to_string())?;
+        duduclaw_core::employee_incarnation::retire(&tx, agent).map_err(|e| e.to_string())?;
+        bump_acl_generation(&tx).map_err(|e| e.to_string())?;
+        admission.recount_in(&tx, 0)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 }

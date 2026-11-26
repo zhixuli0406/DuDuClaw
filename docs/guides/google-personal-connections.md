@@ -130,7 +130,7 @@ Out-of-band credential changes cannot always be detected immediately. Timeouts a
 
 Delegation requests only the scopes for the tool's service: Gmail, Calendar, Docs, Sheets, Drive, Slides, Forms or Tasks. Tokens are cached separately by service account, subject and normalized scope set. A missing grant for another service does not block an already granted service. The connection test lists each scope separately as granted or not confirmed, then reports service access separately; a token does not prove that a data API or sample file is available.
 
-With `[google] chat_read = true`, delegation also supports `chat.spaces.readonly` and `chat.messages.readonly` (both under `https://www.googleapis.com/auth/`). Authorize those scopes in the Google Admin console and enable Google Chat API. The configuration default remains off. The setup wizard preselects Chat reading; it writes the choice only when an administrator saves it. Connected members missing either Chat scope or its local purpose see **Reconnect to add Google Chat** in **My connections**. Sending Chat messages as a person is not supported.
+With `[google] chat_read = true`, delegation also supports `chat.spaces.readonly` and `chat.messages.readonly` (both under `https://www.googleapis.com/auth/`). Authorize those scopes in the Google Admin console and enable Google Chat API. The configuration default remains off. The setup wizard preselects Chat reading; it writes the choice only when an administrator saves it. Connected members missing either Chat scope or its local purpose see **Reconnect to add Google Chat** in **My connections**. Sending Chat messages as a person requires the separate opt-in and confirmation described below.
 
 To follow an AI employee's responsible member:
 
@@ -154,3 +154,23 @@ external_server = "Partner Google MCP" # optional, at most 120 characters
 ```
 
 The connection tab displays **Provided by an external tool**. Native Google tools are hidden and refused, just as with `none`; this selector does not configure or authorize the external server. The name is display text only, with control characters rejected. Older parsers reject the unknown selector (and optional key), so they refuse native Google access rather than using the company account.
+
+## Confirm Google access from a conversation
+
+When a verified member asks their AI employee to use a Google capability that lacks a personal connection or purpose, the gateway can offer a ten-minute authorization link. An unbound, conflicting or display-name-only channel identity cannot receive one. The link is **not a login credential or SSO link**: sign in to Dashboard with the same member account, read the data disclosure and employee-sharing notice, then press **Confirm and continue**. Merely opening the page, including a link preview, does not consume the request or start OAuth.
+
+For OAuth, use the Google account displayed on the page. An existing verified Google subject or administrator mailbox attestation must establish the expected identity; a self-edited login email is insufficient. Choosing a different Google account is rejected even if Google accepted the login. For company delegation, the page shows the delegated account, employee and required service permissions. Confirmation does not establish domain-wide delegation: the administrator's DWD grant and mailbox attestation must already be valid.
+
+External channels require an administrator-configured `[dashboard] public_url` using HTTPS and a non-loopback host. Its path prefix is preserved. Without a public URL, the message only directs you to **Dashboard → My Connections**; there are no localhost links or paste-back codes. WebChat can use a same-origin page. Telegram, Slack, Discord and LINE can show an open-link button; Google Chat uses a URL, and card clicks never confirm access.
+
+After successful confirmation, the gateway rechecks the original member, channel binding, employee access, conversation, account, purpose and configuration before continuing the original task. This does not approve an email, message or other outbound action. Check **My Connections → Chat authorization requests** for status. Queued continuations survive a gateway restart. Once continuation has started, an interruption is treated as uncertain and is not automatically replayed; ask again in the original conversation if needed. OAuth flows interrupted before completion must be restarted.
+
+## Send Google Chat as yourself
+
+`google_chat_send {space, text, thread?}` sends text to an existing space using the verified requesting member's own Google account. It requires `google:write` and is off until an administrator enables `[google] chat_send = true`. A home/shared account, another member, Apps Script, or a Chat app token (`chat.bot`) cannot substitute for the member.
+
+For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Incremental consent requests `https://www.googleapis.com/auth/chat.messages.create`; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
+
+Every send waits for the member's own single-use confirmation, valid for five minutes. The card shows the account, space resource name, thread and full final text, with a private-data warning. A verified private conversation can carry a short card; group requests and long messages use the member-only **My connections** page. Admin approval, an `allow` rule, Admin MCP scope and recipient allowlists cannot replace this confirmation. Any organisation-required egress approval still applies in addition. Editing the message, destination, account, credential or policy invalidates confirmation.
+
+The gateway keeps one request ID with the operation and never automatically resends an unknown outcome (`result_unconfirmed`). Check Google Chat before asking for a new send. Attachments and space creation are not supported; a specified thread must belong to the same space. Google displays the user as sender and also attributes the application by name. [Google Chat API reference](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).

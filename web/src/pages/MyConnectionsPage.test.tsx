@@ -12,6 +12,26 @@ const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_
 beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
+  it('renders only the escaped Chat confirmation display text', async () => {
+    const raw = '私人\u202e\u2066\u200b\u0001\n文字';
+    const textDisplay = '私人\\u{202e}\\u{2066}\\u{200b}\\u{1}\\u{a}文字';
+    // An unexpected legacy raw field must never become a rendering fallback.
+    const request = {
+      id: 'chat-confirmation', employee: 'helper', account: 'alice@example.com',
+      space: 'spaces/A\\u{200b}', thread: 'spaces/A/threads/T\\u{2066}',
+      text_display: textDisplay, text: raw, expires_at: '2099-11-25T00:00:00Z',
+    };
+    vi.spyOn(api.personalGoogle, 'chatConfirmations').mockResolvedValue({ requests: [request] });
+    const { container } = renderWithProviders(<MyConnectionsPage />);
+    const preview = await screen.findByText(textDisplay);
+    expect(preview.tagName).toBe('PRE');
+    expect(preview.textContent).toBe(textDisplay);
+    expect(screen.getByText('spaces/A\\u{200b} spaces/A/threads/T\\u{2066}')).toBeInTheDocument();
+    for (const control of ['\u202e', '\u2066', '\u200b', '\u0001']) {
+      expect(container.textContent).not.toContain(control);
+    }
+  });
+
   it('shows persisted administrator test notices even without a connected account', async () => {
     vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, connection: null, notices: [
       { id: 1, agent_id: 'helper', actor_id: 'admin', kind: 'google_identity_test', timestamp: '2026-11-25T00:00:00Z' },
@@ -69,7 +89,7 @@ describe('MyConnectionsPage', () => {
     expect(connect).toBeEnabled();
     await user.click(connect);
     await waitFor(()=>expect(start).toHaveBeenCalledTimes(1));
-    expect(start).toHaveBeenCalledWith(true, false, false);
+    expect(start).toHaveBeenCalledWith(true, false, false, false);
   });
 
   it('requires a separate consent before requesting recording scopes', async () => {
@@ -84,7 +104,7 @@ describe('MyConnectionsPage', () => {
     expect(authorize).toBeDisabled();
     await user.click(screen.getByRole('checkbox', { name: /agree to these additional recording import permissions/i }));
     await user.click(authorize);
-    await waitFor(() => expect(start).toHaveBeenCalledWith(true, true, false));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, true, false, false));
   });
 
   it('requires an independent broad Drive consent and does not request recording scopes with it', async () => {
@@ -99,7 +119,7 @@ describe('MyConnectionsPage', () => {
     expect(authorize).toBeDisabled();
     await user.click(screen.getByRole('checkbox', { name: /allow read-only access to all Drive files my Google account can access/i }));
     await user.click(authorize);
-    await waitFor(() => expect(start).toHaveBeenCalledWith(true, false, true));
+    await waitFor(() => expect(start).toHaveBeenCalledWith(true, false, true, false));
   });
 
   it('shows that Anyone includes external tools while public visitors remain excluded',async()=>{

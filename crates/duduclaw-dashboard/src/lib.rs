@@ -6,16 +6,21 @@ use axum::{
     routing::get,
 };
 use rust_embed::Embed;
+use axum::Extension;
 
 #[derive(Embed)]
 #[folder = "dist/"]
 struct Asset;
 
 /// Returns the Axum router for serving the dashboard SPA.
-pub fn dashboard_router() -> Router {
+pub fn dashboard_router() -> Router { dashboard_router_at(String::new()) }
+
+/// Prefix comes only from the gateway's validated administrator public URL.
+pub fn dashboard_router_at(base_path: String) -> Router {
     Router::new()
         .route("/assets/{*path}", get(static_handler))
         .fallback(get(index_handler))
+        .layer(Extension(base_path))
 }
 
 /// Common security headers for all dashboard responses (MW-H7).
@@ -24,22 +29,26 @@ fn security_headers(builder: axum::http::response::Builder) -> axum::http::respo
         .header("X-Content-Type-Options", "nosniff")
         .header("X-Frame-Options", "DENY")
         .header("X-XSS-Protection", "1; mode=block")
-        .header("Referrer-Policy", "strict-origin-when-cross-origin")
+        .header("Referrer-Policy", "no-referrer")
         .header(
             "Content-Security-Policy",
             "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:;",
         )
 }
 
-async fn index_handler() -> impl IntoResponse {
+async fn index_handler(Extension(base): Extension<String>) -> impl IntoResponse {
     match Asset::get("index.html") {
         Some(content) => {
             let html = std::str::from_utf8(content.data.as_ref())
                 .unwrap_or("")
                 .to_string();
+            let escaped=base.replace('&', "&amp;").replace('"', "&quot;").replace('<', "&lt;").replace('>', "&gt;");
+            let html=html.replace("/assets/", &format!("{escaped}/assets/"))
+                .replace("<head>", &format!("<head><meta name=\"duduclaw-base\" content=\"{escaped}\">"));
             security_headers(Response::builder())
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-store")
                 .body(axum::body::Body::from(html))
                 .unwrap()
         }

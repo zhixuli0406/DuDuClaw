@@ -337,9 +337,17 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
         key_fields: &[],
     },
     MemberContractMethod {
+        name: "me.google.chat_confirmations", since: "1.85.0", kind: MemberContractKind::Read,
+        summary_en: "Read only your pending Google Chat confirmations", key_fields: &["requests"],
+    },
+    MemberContractMethod {
+        name: "me.google.chat_confirm", since: "1.85.0", kind: MemberContractKind::Write,
+        summary_en: "Confirm or cancel your single Google Chat send", key_fields: &["decided"],
+    },
+    MemberContractMethod {
         name: "me.google.status", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read personal Google connection and consent status (Enterprise)",
-        key_fields: &["connection", "login_email", "client_configured", "chat_read", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
+        key_fields: &["connection", "login_email", "client_configured", "chat_read", "chat_send", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
     },
     MemberContractMethod {
         name: "me.google.connect_start", since: "1.85.0", kind: MemberContractKind::Write,
@@ -421,7 +429,7 @@ pub(crate) fn member_key_agent_update_params(params: &serde_json::Value) -> Resu
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
     let excluded = matches!(method, "users.change_password" | "users.change_email"
-        | "me.google.disconnect" | "me.google.consents.set")
+        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])

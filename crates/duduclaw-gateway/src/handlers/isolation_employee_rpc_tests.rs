@@ -1094,3 +1094,15 @@ async fn f5_tombstone_preview_reports_size_and_has_no_side_effects() {
     tombstone(f.home(), Some(&proof(now)), &f.bob, input, now).unwrap();
     assert_eq!(tombstone_preview(f.home(), &employee).err(), Some(ALREADY_TOMBSTONED));
 }
+
+#[test]
+fn avatar_proposal_requires_personal_binding_and_keeps_step_up_gate() {
+    let f = fixture();
+    let now = 1_800_000_000;
+    let shared = || propose_input(json!({"label":"avatar-team","binding_kind":"shared","as_avatar":true,"csrf_token":CSRF}));
+    assert!(prepare_propose(f.home(), &f.users, None, &f.bob, shared(), now).is_err());
+    assert_eq!(prepare_propose(f.home(), &f.users, Some(&proof(now)), &f.bob, shared(), now).err(), Some(BINDING_INVALID));
+    let personal = propose_input(json!({"label":"avatar-personal","binding_kind":"personal",
+        "owner_id":f.alice,"as_avatar":true,"csrf_token":CSRF}));
+    assert!(prepare_propose_capped(f.home(), &f.users, Some(&proof(now)), &f.bob, personal, now, 1).is_ok());
+}

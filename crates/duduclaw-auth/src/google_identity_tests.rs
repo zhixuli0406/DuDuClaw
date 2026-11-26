@@ -183,3 +183,33 @@ fn primary_generation_overflow_refuses_without_mutation() {
     assert_eq!(db.acl_generation().unwrap(), acl_before);
     assert_eq!(db.google_owner("bot").unwrap().id, alice.id);
 }
+
+#[test]
+fn primary_owner_change_is_seat_neutral_while_admission_is_held() {
+    use duduclaw_core::agent_seats::{SeatAdmission, avatar_exemptions_in, seat_holders};
+    let home = tempfile::tempdir().unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let admin = db.create_user("admin@neutral.test", "Admin", "fixture-password-only", UserRole::Admin).unwrap();
+    let member = person(&db, "member@neutral.test");
+    let admission = SeatAdmission::acquire(home.path()).unwrap();
+    db.publish_new_avatar_under(&admin.id, &member.id, "avatar", &admission, 1, |_| {
+        let dir = home.path().join("agents/avatar");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join("agent.toml"), "[agent]\nname='avatar'\nstatus='active'\n").map_err(|e| e.to_string())
+    }).unwrap();
+    let exemptions = avatar_exemptions_in(&db.conn()).unwrap();
+    assert!(exemptions.contains("avatar"));
+    let generation = db.google_primary_owner_generation("avatar").unwrap();
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| { send.send(db.set_google_primary_owner("avatar", &member.id, &admin.id)).unwrap(); });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(2));
+        // Release on failure too, so a regression cannot leave the thread stuck.
+        drop(admission);
+        result.expect("seat-neutral primary owner write waited for admission").unwrap();
+    });
+    assert_eq!(db.google_owner("avatar").unwrap().id, member.id);
+    assert_eq!(db.google_primary_owner_generation("avatar").unwrap(), generation + 1);
+    assert_eq!(avatar_exemptions_in(&db.conn()).unwrap(), exemptions);
+    assert!(seat_holders(home.path()).unwrap().is_empty());
+}

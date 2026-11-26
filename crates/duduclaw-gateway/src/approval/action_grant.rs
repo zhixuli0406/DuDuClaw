@@ -16,7 +16,7 @@
 //!   the call proceeds. A second use, a changed row or a lost claim refuses.
 //!
 //! Which calls are bound ([`binding_applies`]): tools whose effect class is
-//! `send`, `publish` or `purchase`, and every call that reached human approval because
+//! `send`, `publish`, `purchase` or `delete`, and every call that reached human approval because
 //! an `[capabilities] action_rules` rule said `ask`. Everything else keeps
 //! the previous behaviour (a fresh request per call, not consumed).
 
@@ -51,7 +51,7 @@ pub fn binding_applies(tool: &str, routed_by_action_rule_ask: bool) -> bool {
     routed_by_action_rule_ask
         || matches!(
             duduclaw_core::effect_of(tool),
-            ToolEffect::Send | ToolEffect::Publish | ToolEffect::Purchase
+            ToolEffect::Send | ToolEffect::Publish | ToolEffect::Purchase | ToolEffect::Delete
         )
 }
 
@@ -245,6 +245,10 @@ pub async fn verify_and_consume(
     if !grant.matches_stored(stored) {
         return Err(GrantRefusal::Mismatch);
     }
+    if crate::google_identity::chat_send::is_member_card(&rec) {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::google_identity::chat_send::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
+    }
     // Bound mail decisions retain the execution snapshot through the actual
     // single-use claim, including current requester authority after approval.
     if rec.payload["name"] == "mail_send" && rec.payload.get("egress_guard").is_some() {
@@ -374,6 +378,8 @@ mod action_grant_tests {
     #[test]
     fn sends_publications_purchases_rules_and_egress_requests_are_bound() {
         assert!(binding_applies("mail_send", false));
+        assert!(binding_applies("calendar_delete_event", false));
+        assert!(binding_applies("gmail_send_draft", false));
         assert!(binding_applies("wiki_share", false));
         assert!(binding_applies_for_request("web_extract", false, true));
         assert!(!binding_applies_for_request("web_extract", false, false));
@@ -437,4 +443,26 @@ mod action_grant_tests {
         let rec = broker.get(&id).await.unwrap().unwrap();
         assert_eq!(rec.status, ApprovalStatus::Invalidated);
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn google_delete_grant_refuses_changed_version_account_and_replay() {
+    use serde_json::json;
+    let home = tempfile::tempdir().unwrap();
+    let broker = ApprovalBroker::open(home.path()).unwrap();
+    let mut payload = json!({"name":"calendar_delete_event","arguments":{
+        "account":"sender@example.com","calendar":"primary","event_id":"e1","etag":"v1","operation":"calendar_delete_event"}});
+    let grant = ActionGrant::build("alice", "calendar_delete_event", &payload);
+    payload[ACTION_GRANT_KEY] = grant.to_json();
+    let id = broker.request("alice", "mcp_call", "Delete snapshot", payload.clone(), 60).await.unwrap();
+    broker.decide(&id, true, "dashboard:admin").await.unwrap();
+    for (key, value) in [("etag", "v2"), ("account", "other@example.com")] {
+        let mut changed = payload.clone();
+        changed["arguments"][key] = json!(value);
+        let changed = ActionGrant::build("alice", "calendar_delete_event", &changed);
+        assert_eq!(verify_and_consume(&broker, &id, &changed).await, Err(GrantRefusal::Mismatch));
+    }
+    verify_and_consume(&broker, &id, &grant).await.unwrap();
+    assert_eq!(verify_and_consume(&broker, &id, &grant).await, Err(GrantRefusal::NotApproved));
 }

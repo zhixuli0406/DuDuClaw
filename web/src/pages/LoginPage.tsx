@@ -1,3 +1,4 @@
+import { googleAuthorizationReturn } from '@/lib/google-authorization';
 import { useState, useEffect, type FormEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { browserWatchReturn } from '@/lib/browser-watch-return';
@@ -18,7 +19,8 @@ export function LoginPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const location = useLocation();
-  const returnTo = browserWatchReturn((location.state as { from?: unknown } | null)?.from) ?? '/';
+  const from = (location.state as { from?: unknown } | null)?.from;
+  const returnTo = googleAuthorizationReturn(from) ?? browserWatchReturn(from) ?? '/';
   const brandName = useEffectiveName();
   const companyName = useCompanyName();
   const company = useCompanyStore((state) => state.company);

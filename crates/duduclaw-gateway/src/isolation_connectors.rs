@@ -570,10 +570,10 @@ fn verify_private_files(home: &Path) -> Result<(), CatalogError> {
 pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
     Some(match tool {
         "google_status" | "gmail_search" | "gmail_read" | "gmail_create_draft" |
-        "google_chat_spaces" | "google_chat_messages" |
+        "google_chat_spaces" | "google_chat_messages" | "google_chat_send" |
         "calendar_list_events" | "calendar_create_event" | "sheets_read" | "sheets_append" |
         "forms_get" | "forms_list_responses" | "gtasks_lists" | "gtasks_list" | "gtasks_create" |
-        "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "slides_read" => "google",
+        "gtasks_complete" | "drive_search" | "drive_read" | "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "gmail_send_draft" | "calendar_delete_event" | "calendar_update_event" | "slides_read" => "google",
         "notion_status" | "notion_search" | "notion_page_read" | "notion_page_append" => "notion",
         "github_status" | "github_search_issues" | "github_issue_read" | "github_pr_read" | "github_issue_comment" => "github",
         "odoo_connect" | "odoo_status" | "odoo_crm_leads" | "odoo_crm_create_lead" | "odoo_crm_update_stage" |

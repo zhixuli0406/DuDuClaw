@@ -284,10 +284,19 @@ security model are in
 
 > **→ Full guide:** [docs/guides/docker.md](./docker.md) — covers the three CLI auth setups, port details, volume backups, watchtower, and troubleshooting.
 
+The mounted `~/.duduclaw` directory must be owned by UID 1000 inside the container and not writable by group or other users, or the gateway will refuse it. Set it up before starting Compose:
+
+```bash
+mkdir -p ~/.duduclaw
+sudo chown 1000:1000 ~/.duduclaw
+sudo chmod 700 ~/.duduclaw
+```
+
 ```bash
 cd /path/to/DuDuClaw
 docker compose up -d
 ```
+
 
 ```yaml
 # docker-compose.yml

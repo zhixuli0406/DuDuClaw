@@ -126,7 +126,7 @@ A bounded persistent inbox deduplicates by event type and Chat message resource 
 
 Chat commands (`/new`, `/reset`, `/compact`, `/pair`, `/status`, …) pass the same access check as ordinary messages, on the same space. A blocked sender gets no answer; an unpaired sender gets the pairing hint.
 
-A space has one conversation shared by all its members and threads (an employee's own Chat app keeps its own conversation in the same space). Who may clear or compress a shared conversation (`/new`, `/reset`, `/compact`):
+Each thread in a space or group chat has its own conversation, shared by the people in that thread. Each employee keeps a separate conversation within that thread, including when reached through the company app. `/new`, `/reset` and `/compact` act only on the current thread and employee; access checks, pairing and human takeover still apply to the whole space. Who may clear or compress a shared conversation:
 
 | Installation | 1:1 DM with the app | Space, group chat (group DM) or unknown type |
 |---|---|---|
@@ -227,6 +227,8 @@ To retain ordinary group discussion, an Admin must enable each group in Channels
 
 ### Google Chat replies and preview links
 
-Direct messages reply in the main view by default. Messages written inside a thread (`threadReply = true`) stay in that thread; space replies keep their existing thread behavior. In **Channels → Google Chat → Behavior → DM reply placement**, choose **Main view** (default) or **Always in thread**. Only dashboard administrators can change this preference. It is stored in the channel settings database; do not add it to `config.toml`. Conversation sessions still cover the whole space.
+Direct messages reply in the main view by default. Messages written inside a thread (`threadReply = true`) stay in that thread; space replies keep their existing thread behavior. In **Channels → Google Chat → Behavior → DM reply placement**, choose **Main view** (default) or **Always in thread**. Only dashboard administrators can change this preference. It is stored in the channel settings database; do not add it to `config.toml`. Ordinary DM messages keep the continuous main conversation. A thread reply, or **Always in thread**, uses that thread’s separate conversation. Messages in spaces and group chats always use their thread’s conversation, with turns processed in order across senders. Both HTTP and Pub/Sub use the same rules. Threads remain shared conversations and do not read or capture private pinned task notes.
+
+After upgrading, existing mixed space history stays available as legacy history; new threads start empty, without copying old task notes or recently created item references. Ordinary DM history keeps its existing conversation. A missing group thread or a thread belonging to another space is refused.
 
 Google Docs/Sheets smart-chip links are included as untrusted message text, with duplicate links removed (up to 10 HTTPS links, each at most 2048 bytes; control characters are rejected). The gateway does not fetch these links. Chat read tools return a `links` array under the scanned data envelope. Missing names use readable placeholders; resource names and stored attachment paths are machine fields and must not be shown to users. Attachments retain their original filenames. No additional OAuth scopes are required.

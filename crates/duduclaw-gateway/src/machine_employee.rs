@@ -130,7 +130,7 @@ pub(crate) fn check_loaded(home: &Path, agent: &LoadedAgent, principal: Option<&
 pub(crate) fn refusal_for_known_target(home: &Path, user_id: &str, target: &str) -> Option<&'static str> {
     let principal = format!("user:{user_id}");
     if check_target(home, target, Some(&principal)).is_ok() { return None; }
-    let db = crate::decision_notify::open_user_db(home).ok().flatten()?;
+    let db = crate::decision_notify::open_user_db_read_only(home).ok().flatten()?;
     let mut access = db.effective_access(user_id).ok().flatten()?;
     if access.role == duduclaw_auth::UserRole::Admin { return None; }
     if !crate::team_edition::team_grants_enabled(home) { access.team.clear(); }

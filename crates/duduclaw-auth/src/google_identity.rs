@@ -9,6 +9,20 @@ use crate::user_row::{bump_acl_generation, has_column, load_user};
 use crate::AccessLevel;
 use crate::{User, UserDb, UserRole, UserStatus};
 
+pub(crate) fn migration_needed(conn: &Connection) -> Result<bool, String> {
+    if !has_column(conn, "user_agent_bindings", "is_primary")? { return Ok(true); }
+    for (kind, name) in [
+        ("index", "idx_bindings_primary"),
+        ("trigger", "google_primary_owner_insert"),
+        ("trigger", "google_primary_owner_update"),
+        ("table", "google_identity_consents"),
+    ] {
+        if !crate::authority_migrations::schema_object_exists(conn, kind, name)? { return Ok(true); }
+    }
+    Ok(false)
+}
+
+// Caller owns the authority lease and the immediate migration transaction.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
     if !has_column(conn, "user_agent_bindings", "is_primary")? {
         conn.execute("ALTER TABLE user_agent_bindings ADD COLUMN is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1))", [])
@@ -91,6 +105,11 @@ fn bump_primary_owner_generation(conn: &Connection, agent: &str) -> Result<(), S
 }
 
 impl UserDb {
+    pub(crate) fn google_authority_write(&self) -> Result<Option<duduclaw_core::authority_coordinator::WriteLease>, String> {
+        self.authority_home.as_deref().map(|home| duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+            .write()).transpose().map_err(|e| format!("Google authority barrier: {e}"))
+    }
+
     /// Durable version of this agent's primary-owner writes. It is separate
     /// from the global ACL cache generation and advances even for A→B→A.
     pub fn google_primary_owner_generation(&self, agent: &str) -> Result<u64, String> {
@@ -142,6 +161,10 @@ impl UserDb {
         user_id: &str,
         actor: &str,
     ) -> Result<(), String> {
+        // Seat-neutral: avatar_exemptions_in reads binding membership/access,
+        // user status/avatar and incarnation grants, never is_primary. Keep
+        // this async-handler write free of the blocking seat admission wait.
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -196,6 +219,14 @@ impl UserDb {
         allowed: bool,
         decided_by: &str,
     ) -> Result<(), String> {
+        self.set_google_consent_versioned(user_id, agent, allowed, decided_by, None)
+    }
+
+    /// Consent links must still name the exact ACL snapshot shown to the member.
+    pub fn set_google_consent_versioned(
+        &self, user_id: &str, agent: &str, allowed: bool, decided_by: &str,
+        expected_generation: Option<u64>,
+    ) -> Result<(),String> {
         if user_id != decided_by {
             return Err("只有帳號本人可以同意或拒絕。".into());
         }
@@ -203,6 +234,11 @@ impl UserDb {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        if let Some(expected) = expected_generation {
+            if crate::user_row::read_acl_generation(&tx)? != expected {
+                return Err("授權設定已變更，請重新確認。".into());
+            }
+        }
         let user = load_user(&tx, user_id)?
             .filter(|u| u.status == UserStatus::Active)
             .ok_or("帳號不存在或已停用。")?;

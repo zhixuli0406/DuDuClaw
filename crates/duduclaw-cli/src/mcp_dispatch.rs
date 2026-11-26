@@ -904,6 +904,8 @@ impl McpDispatcher {
             obj.remove("recipient_guard");
             obj.remove("reason");
             obj.remove("action_grant");
+            obj.remove("google_owner_binding");
+            obj.remove("google_owner_account");
             obj.remove("action_rule_matches");
         }
         if principal.is_external {
@@ -1379,6 +1381,13 @@ impl McpDispatcher {
             );
             return jsonrpc_response(id, removed);
         }
+
+        let owner_call = if !dedicated_google && crate::mcp_isolation::current().is_none() {
+            match crate::mcp::google_owner_client::prepare(&self.home_dir, gate_agent, tool_name, &mut params_owned).await {
+                Ok(call) => call,
+                Err(message) => return jsonrpc_error(id, -32003, &message),
+            }
+        } else { None };
 
         // Execute parsing opens/migrates approvals.db, so it too must follow
         // caller admission. Preserve the signed metadata until parse succeeds.
@@ -1989,6 +1998,11 @@ impl McpDispatcher {
             );
             params_owned["action_grant"] = grant.to_json();
         }
+        if let Some(call) = &owner_call {
+            if let Err(message) = call.validate(&params_owned) {
+                return crate::mcp::egress_gate::cancel_before_dispatch(private_read.take(), jsonrpc_error(id, -32003, &message)).await;
+            }
+        }
         let google_approval_payload = if let Some(lane) = google_lane.as_mut() {
             match lane
                 .final_approval_payload(&self.home_dir, &params_owned, self.redaction.as_deref())
@@ -2130,6 +2144,7 @@ impl McpDispatcher {
                 caller_is_admin,
             )),
         );
+        let handler = crate::mcp::google_owner_client::APPROVED.scope(owner_call, handler);
         if let Some(lease) = &sink_lease { lease.dispatched(); }
         let execution = async {
             if let Some(call) = &workflow {
@@ -5248,6 +5263,8 @@ effect = "forbid"
         "sheets_create",
         "sheets_update",
         "calendar_update_event",
+        "gmail_send_draft",
+        "calendar_delete_event",
 
         "docs_read",
         "drive_read",
@@ -5271,6 +5288,9 @@ effect = "forbid"
         "gmail_read",
         "google_chat_spaces",
         "google_chat_messages",
+        // Send effect + google:write scope; the gateway also requires the
+        // account member's one-shot confirmation, not a [permissions] flag.
+        "google_chat_send",
         "gmail_search",
         "goals_create",
         "goals_list",
@@ -5466,7 +5486,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            268,
+            271,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -5486,6 +5506,14 @@ effect = "forbid"
             .filter(|t| !all.contains(**t))
             .collect();
         assert!(stale.is_empty(), "no such tool: {stale:?}");
+        for (tool, effect) in [
+            ("google_chat_send", duduclaw_core::ToolEffect::Send),
+            ("gmail_send_draft", duduclaw_core::ToolEffect::Send),
+            ("calendar_delete_event", duduclaw_core::ToolEffect::Delete),
+        ] {
+            assert_eq!(duduclaw_core::effect_of(tool), effect, "{tool}");
+            assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(Scope::GoogleWrite), "{tool}");
+        }
     }
 
     #[tokio::test]

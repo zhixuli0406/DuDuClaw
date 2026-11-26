@@ -43,6 +43,10 @@ pub(crate) async fn handle_agent_remove(params: &Value, home_dir: &Path, caller:
 }
 
 fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
+    let admission = match duduclaw_core::agent_seats::SeatAdmission::acquire(home_dir) {
+        Ok(guard) => guard,
+        Err(error) => return tool_error(&format!("名額鎖無法取得，未移除 AI：{error}")),
+    };
     // The removal drops an authority record: the global org lock first,
     // then the lifecycle barrier (RM-027 round 3 lock order).
     let org = match duduclaw_core::org_store::lock_org_mutations(home_dir) {
@@ -114,6 +118,7 @@ fn remove_agent_locked(home_dir: &Path, agent_id: &str, caller: &str) -> Value {
             "isError": true
         });
     }
+    if let Err(error) = admission.recount(0) { return tool_error(&error); }
 
     // WP22 T1 — drop the authoritative record only *after* the agent is really
     // gone. This is the one write that must not go store-first: had the trash

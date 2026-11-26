@@ -25,7 +25,9 @@ use std::time::Duration;
 
 use crate::google_apps_script;
 pub mod chat_read;
+pub mod chat_send;
 pub(crate) mod native_call;
+pub(crate) mod native_confirmation;
 pub(crate) mod native_legacy;
 
 /// Provider id in the `mcp_oauth` vault.
@@ -188,6 +190,16 @@ pub const CHAT_READ_SCOPES: &[&str] = &[
     "https://www.googleapis.com/auth/chat.messages.readonly",
 ];
 
+/// RM-062 scope is requested only for a Chat send, never all Google tools.
+pub const CHAT_SEND_SCOPES: &[&str] = &["https://www.googleapis.com/auth/chat.messages.create"];
+
+pub fn chat_send_enabled(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("google")?.get("chat_send")?.as_bool())
+        .unwrap_or(false)
+}
+
 pub fn chat_read_enabled(home: &Path) -> bool {
     std::fs::read_to_string(home.join("config.toml")).ok()
         .and_then(|raw| raw.parse::<toml::Table>().ok())
@@ -225,6 +237,29 @@ pub fn set_chat_read_enabled(home: &Path, enabled: bool) -> Result<bool, String>
             };
             if previous == enabled { return Ok(current.to_owned()); }
             google.insert("chat_read", toml_edit::value(enabled));
+            changed = true;
+            Ok(doc.to_string())
+        },
+    )?;
+    Ok(changed)
+}
+
+pub fn set_chat_send_enabled(home: &Path, enabled: bool) -> Result<bool, String> {
+    let path = home.join("config.toml");
+    let raw = crate::handlers::config_commit::read_text_or_empty(&path)?;
+    let mut changed = false;
+    crate::handlers::config_commit::commit_rendered_locked(
+        &path, &crate::handlers::config_commit::content_hash(&raw), |current| {
+            let mut doc: toml_edit::DocumentMut = current.parse()
+                .map_err(|_| "config.toml 格式錯誤，未變更設定。".to_string())?;
+            let google = doc.as_table_mut().entry("google").or_insert(toml_edit::table())
+                .as_table_mut().ok_or("google 必須是設定表格。")?;
+            let previous = match google.get("chat_send") {
+                None => false,
+                Some(value) => value.as_bool().ok_or("chat_send 必須是布林值。")?,
+            };
+            if previous == enabled { return Ok(current.to_owned()); }
+            google.insert("chat_send", toml_edit::value(enabled));
             changed = true;
             Ok(doc.to_string())
         },
@@ -588,7 +623,7 @@ pub enum GoogleBackend {
 
 /// Shared by discovery and dispatch; this checks backend features, not scopes.
 pub fn backend_supports_tool(native_rest: bool, tool: &str, reply_draft: bool) -> bool {
-    native_rest || !(matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event")
+    native_rest || !(matches!(tool, "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "google_chat_send" | "gmail_send_draft" | "calendar_delete_event" | "calendar_update_event")
         || (tool == "gmail_create_draft" && reply_draft))
 }
 
@@ -597,7 +632,7 @@ pub fn backend_supports_tool(native_rest: bool, tool: &str, reply_draft: bool) -
 pub fn native_rest_available(home: &Path, agent: Option<&str>) -> bool {
     use duduclaw_core::google_identity::{Effective, effective_for};
     match effective_for(home, agent).effective {
-        Effective::Personal { .. } | Effective::Delegate { .. } => true,
+        Effective::Personal { .. } | Effective::Delegate { .. } | Effective::DelegateOwner => true,
         Effective::Home => selected_path(home).is_ok_and(|path| matches!(path.as_str(), "oauth" | "service_account")),
         _ => false,
     }
@@ -1569,7 +1604,7 @@ mod tests {
         ] {
             std::fs::write(home.path().join("config.toml"), config).unwrap();
             assert_eq!(native_rest_available(home.path(), None), native, "{config}");
-            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"] {
+            for tool in ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "gmail_send_draft", "calendar_delete_event", "calendar_update_event"] {
                 assert_eq!(backend_supports_tool(native, tool, false), native, "{tool}");
             }
             assert!(backend_supports_tool(native, "gmail_create_draft", false));

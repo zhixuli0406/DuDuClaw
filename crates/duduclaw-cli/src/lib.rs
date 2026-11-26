@@ -11409,6 +11409,15 @@ pub(crate) async fn scaffold_agent_dir(
     if let Some(e) = reserved_agent_name_error(&s.name) {
         return Err(e);
     }
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire_async(home).await
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    let cap = duduclaw_gateway::license_runtime::agent_cap_from_disk(home).await;
+    match admission.decide(cap.max, 1, None) {
+        duduclaw_core::agent_seats::SeatDecision::Admitted => {},
+        duduclaw_core::agent_seats::SeatDecision::Full { .. } => return Err(DuDuClawError::Agent(
+            duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL.into())),
+        duduclaw_core::agent_seats::SeatDecision::Unverifiable(error) => return Err(DuDuClawError::Agent(error.to_string())),
+    }
     let agent_dir = home.join("agents").join(&s.name);
     if agent_dir.exists() {
         return Err(DuDuClawError::Agent(format!(
@@ -11564,6 +11573,9 @@ pub(crate) async fn scaffold_agent_dir(
     // user (0600 on Unix; no-op on Windows, see platform::set_owner_only).
     duduclaw_core::platform::set_owner_only(&mcp_json_path).ok();
 
+    duduclaw_core::employee_incarnation::created(home, &s.name)
+        .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    admission.recount(cap.max).map_err(DuDuClawError::Agent)?;
     Ok(agent_dir)
 }
 

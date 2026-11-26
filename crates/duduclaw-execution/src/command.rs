@@ -1,6 +1,7 @@
 //! Native-command adapter. Local builders are moved intact; protected launches
 //! require host-owned policy and capability context and never execute the builder.
 use std::{ffi::OsString, future::Future, io, path::PathBuf, process::{ExitStatus, Output}, sync::Arc};
+use crate::spawn_binding::SpawnBinding;
 use duduclaw_isolation::{bounded::Text, execution::*, ids::EmployeeId};
 use tokio::{io::{AsyncReadExt}, process::Command, sync::watch};
 
@@ -160,6 +161,7 @@ pub struct RunControl {
     run: RunHandle,
     result: watch::Receiver<Option<Result<RunOutcome, BackendError>>>,
     local_pid: Option<u32>,
+    binding: Option<SpawnBinding>,
     executor: tokio::runtime::Handle,
 }
 impl RunControl {
@@ -178,8 +180,12 @@ impl RunControl {
             result.changed().await.map_err(|_| error(BackendError::Unavailable))?;
         }
     }
-    pub async fn kill(&self) -> io::Result<()> { self.backend.kill(self.run).await.map_err(error) }
+    pub async fn kill(&self) -> io::Result<()> {
+        if let Some(binding) = &self.binding { binding.revoke(); }
+        self.backend.kill(self.run).await.map_err(error)
+    }
     pub fn start_kill(&self) -> io::Result<()> {
+        if let Some(binding) = &self.binding { binding.revoke(); }
         if self.is_finished() { return Ok(()); }
         let backend = self.backend.clone();
         let run = self.run;
@@ -251,9 +257,9 @@ fn reader(source: Box<dyn RunReader>) -> ChildStdout { crate::io::AsyncReader::n
 fn writer(sink: Box<dyn RunWriter>) -> ChildStdin { crate::io::AsyncWriter::new(sink) }
 
 fn monitor(backend: Arc<dyn ExecutionBackend>, run: RunHandle,
-    lifecycle: Option<Arc<dyn ProtectedLaunch>>, local_pid: Option<u32>) -> RunControl {
+    lifecycle: Option<Arc<dyn ProtectedLaunch>>, local_pid: Option<u32>, binding: Option<SpawnBinding>) -> RunControl {
     let (sender, result) = watch::channel(None);
-    let control = RunControl { backend: backend.clone(), run, result, local_pid, executor: tokio::runtime::Handle::current() };
+    let control = RunControl { backend: backend.clone(), run, result, local_pid, binding, executor: tokio::runtime::Handle::current() };
     tokio::spawn(async move {
         // This monitor is the host observer, not the employee waiter. Source
         // handles belong to another spawnd client; protected() checks the trusted
@@ -298,6 +304,15 @@ pub async fn local_command_roundtrip(command: Command) -> io::Result<NativeComma
 }
 
 pub async fn spawn(command: &mut Command, class: ExecutionClass, required: bool) -> io::Result<Child> {
+    spawn_bound(command, class, required, None).await
+}
+
+pub async fn spawn_bound(command: &mut Command, class: ExecutionClass, required: bool,
+    binding: Option<SpawnBinding>) -> io::Result<Child> {
+    if required && binding.is_some() {
+        if let Some(binding) = &binding { binding.revoke(); }
+        return Err(error(BackendError::Denied));
+    }
     if required && !crate::selection::gateway_exception(class) {
         #[cfg(target_os = "linux")]
         {
@@ -310,13 +325,14 @@ pub async fn spawn(command: &mut Command, class: ExecutionClass, required: bool)
             activate(&backend, run, lifecycle.as_ref(), prepared.mcp).await?;
             prepared.armed = false;
             return Ok(Child { stdin: Some(writer(streams.stdin)), stdout: Some(reader(streams.stdout)),
-                stderr: Some(reader(streams.stderr)), control: monitor(backend, run, Some(lifecycle), None), reaped: false });
+                stderr: Some(reader(streams.stderr)), control: monitor(backend, run, Some(lifecycle), None, None), reaped: false });
         }
         #[cfg(not(target_os = "linux"))]
         { return Err(error(BackendError::Unavailable)); }
     }
     let backend = Arc::new(crate::LocalBackend::new());
     let run = backend.reserve(EmployeeId([0; 16])).await.map_err(error)?;
+    backend.register_binding(run, binding.clone()).map_err(error)?;
     // Moving, not rebuilding, preserves env_clear, OS strings, stdio and hooks.
     let command = std::mem::replace(command, Command::new("unused-consumed-command"));
     backend.register_command(run, command).map_err(error)?;
@@ -328,11 +344,20 @@ pub async fn spawn(command: &mut Command, class: ExecutionClass, required: bool)
     let errors = backend.native_io_errors(run).ok_or_else(|| error(BackendError::Protocol))?;
     Ok(Child { stdin: Some(writer(streams.stdin).with_native_error(errors.stdin)),
         stdout: Some(reader(streams.stdout).with_native_error(errors.stdout)),
-        stderr: Some(reader(streams.stderr).with_native_error(errors.stderr)), control: monitor(backend, run, None, pid), reaped: false })
+        stderr: Some(reader(streams.stderr).with_native_error(errors.stderr)), control: monitor(backend, run, None, pid, binding), reaped: false })
 }
 
 pub async fn spawn_pty(command: portable_pty::CommandBuilder, size: PtySize,
     class: ExecutionClass, required: bool) -> io::Result<PtyChild> {
+    spawn_pty_bound(command, size, class, required, None).await
+}
+
+pub async fn spawn_pty_bound(command: portable_pty::CommandBuilder, size: PtySize,
+    class: ExecutionClass, required: bool, binding: Option<SpawnBinding>) -> io::Result<PtyChild> {
+    if required && binding.is_some() {
+        if let Some(binding) = &binding { binding.revoke(); }
+        return Err(error(BackendError::Denied));
+    }
     if required && !crate::selection::gateway_exception(class) {
         #[cfg(target_os = "linux")]
         {
@@ -345,19 +370,20 @@ pub async fn spawn_pty(command: portable_pty::CommandBuilder, size: PtySize,
             activate(&backend, run, lifecycle.as_ref(), prepared.mcp).await?;
             prepared.armed = false;
             return Ok(PtyChild { input: Some(writer(streams.input)), output: Some(reader(streams.output)),
-                control: monitor(backend, run, Some(lifecycle), None), reaped: false });
+                control: monitor(backend, run, Some(lifecycle), None, None), reaped: false });
         }
         #[cfg(not(target_os = "linux"))]
         { return Err(error(BackendError::Unavailable)); }
     }
     let backend = Arc::new(crate::LocalBackend::new());
     let run = backend.reserve(EmployeeId([0; 16])).await.map_err(error)?;
+    backend.register_binding(run, binding.clone()).map_err(error)?;
     backend.register_pty(run, command, size).map_err(error)?;
     backend.spawn(local_policy(run, class, true)).await.map_err(error)?;
     let streams = backend.take_pty(run).await.map_err(error)?;
     let pid = backend.local_pid(run);
     Ok(PtyChild { input: Some(writer(streams.input)), output: Some(reader(streams.output)),
-        control: monitor(backend, run, None, pid), reaped: false })
+        control: monitor(backend, run, None, pid, binding), reaped: false })
 }
 
 #[cfg(target_os = "linux")]
@@ -654,3 +680,6 @@ mod tests {
         assert_eq!(child.wait_with_output().await.unwrap().stdout, vec![0xff, b'x']);
     }
 }
+
+#[cfg(test)]
+mod binding_tests;

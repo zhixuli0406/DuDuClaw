@@ -86,7 +86,7 @@ fn e2e_frame_ok(frame: &WsFrame) -> bool {
 /// the gateway over loopback or a LAN/bridge address; `authenticate_jwt`
 /// never looks at the connection's source address at all, unlike
 /// `local_session::evaluate`'s Personal+loopback auto-login escape hatch.
-async fn handler_with_flagged_admin() -> (MethodHandler, UserContext, Arc<UserDb>, String) {
+async fn handler_with_flagged_admin() -> (tempfile::TempDir, MethodHandler, UserContext, Arc<UserDb>, String) {
     let home = tempfile::tempdir().unwrap();
     let db_path = home.path().join("users.db");
     let db = UserDb::new(&db_path).expect("open user db");
@@ -119,7 +119,7 @@ async fn handler_with_flagged_admin() -> (MethodHandler, UserContext, Arc<UserDb
         team_access: Default::default(),
         acl_generation: 0,
     };
-    (handler, ctx, db, one_time_password)
+    (home, handler, ctx, db, one_time_password)
 }
 
 /// Case 1 from the TODO's acceptance list: a LAN-reachable, flagged
@@ -128,7 +128,7 @@ async fn handler_with_flagged_admin() -> (MethodHandler, UserContext, Arc<UserDb
 /// build a ctx with `must_change_password = false`).
 #[tokio::test]
 async fn flagged_caller_can_change_password_and_unlock() {
-    let (handler, ctx, db, one_time_password) = handler_with_flagged_admin().await;
+    let (_home, handler, ctx, db, one_time_password) = handler_with_flagged_admin().await;
 
     let frame = handler
         .handle(
@@ -161,7 +161,7 @@ async fn flagged_caller_can_change_password_and_unlock() {
 /// permission-denied indistinguishable from an ordinary ACL failure.
 #[tokio::test]
 async fn flagged_caller_is_blocked_from_everything_else() {
-    let (handler, ctx, _db, _pw) = handler_with_flagged_admin().await;
+    let (_home, handler, ctx, _db, _pw) = handler_with_flagged_admin().await;
 
     for method in [
         "agents.list",
@@ -202,7 +202,7 @@ async fn flagged_caller_is_blocked_from_everything_else() {
 /// existing "prove you know the current password" check.
 #[tokio::test]
 async fn wrong_current_password_is_still_rejected() {
-    let (handler, ctx, db, _pw) = handler_with_flagged_admin().await;
+    let (_home, handler, ctx, db, _pw) = handler_with_flagged_admin().await;
 
     let frame = handler
         .handle(

@@ -144,9 +144,47 @@ pub(super) async fn build_reply_with_session_inner(
 ) -> String {
     // Keep the instrumented future small even for callers that bypass the
     // guarded entry points: debug task-local poll frames copy their futures.
-    Box::pin(build_reply_with_session_inner_impl(
-        text, ctx, agent_override, session_id, user_id, on_progress,
-    )).await
+    let notice = std::sync::Arc::new(std::sync::Mutex::new(crate::google_authorization_requests::turn::Notice::default()));
+    let reply = crate::google_authorization_requests::turn::NOTICE.scope(notice.clone(),
+        Box::pin(build_reply_with_session_inner_impl(
+            text, ctx, agent_override, session_id, user_id, on_progress,
+        ))).await;
+    crate::google_authorization_requests::turn::flush(&notice).await;
+    let hint = notice.lock().ok().and_then(|mut value| value.text.take());
+    match hint {
+        Some(hint) if crate::google_authorization_requests::render::ticket_url(&hint).is_some() => {
+            // The capability never enters the normal reply pipeline (contract,
+            // restoration, CCR, transcripts, or logs). Only the transport sees it.
+            let history = crate::google_authorization_requests::render::history_text(&reply);
+            if !crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await {
+                super::mark_authorization_link(hint);
+            }
+            // Early replies may not have appended an assistant row at all.
+            let (stored, generation) = super::CCR_TURN_DELIVERY.try_with(|delivery| (
+                delivery.assistant_message.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some(),
+                delivery.turn_generation.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
+            )).unwrap_or_default();
+            if !stored {
+                if let Ok(Some(current)) = ctx.session_manager.turn_generation(session_id).await {
+                    if let Ok(id) = super::append_turn_assistant(&ctx.session_manager,session_id,&history,0,generation.as_deref().or(Some(&current))).await {
+                        super::record_turn_assistant_message(session_id,id);
+                    }
+                }
+            }
+            history
+        }
+        Some(hint) if reply.is_empty() => {
+            if crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await {
+                super::mark_deliberate_silence();
+                String::new()
+            } else { live_only_notice(hint) }
+        }
+        Some(hint) => {
+            if crate::notify_push::push_google_authorization_notice(ctx.http.clone(),&hint).await { reply }
+            else { format!("{reply}\n\n{hint}") }
+        }
+        None => reply,
+    }
 }
 
 async fn build_reply_with_session_inner_impl(
@@ -157,6 +195,9 @@ async fn build_reply_with_session_inner_impl(
     user_id: &str,
     on_progress: Option<ProgressCallback>,
 ) -> String {
+    // Google Chat permissions and human takeover stay space-wide, while the
+    // session passed below retains its validated thread for history/pins/refs.
+    let gate_session = crate::googlechat_conversation::permission_session(session_id).unwrap_or(session_id);
     // ── User access gate (allowlist / blocklist / pairing) ──
     // Single enforcement point for all channels. Open-by-default: returns
     // None unless the operator configured access settings for this channel.
@@ -166,9 +207,9 @@ async fn build_reply_with_session_inner_impl(
         .flatten()
         .and_then(|target| target.user_access_policy().cloned());
     let early_reply = if let Some(policy) = &normal_policy {
-        check_user_access_gate_with_policy(ctx, session_id, user_id, text, policy).await
+        check_user_access_gate_with_policy(ctx, gate_session, user_id, text, policy).await
     } else {
-        check_user_access_gate(ctx, session_id, user_id, text).await
+        check_user_access_gate(ctx, gate_session, user_id, text).await
     };
     if let Some(early_reply) = early_reply {
         return early_reply;
@@ -221,7 +262,7 @@ async fn build_reply_with_session_inner_impl(
     // and the `/takeover` status text is written for operators.
     let public_visitor = crate::odoo_livechat::is_public_visitor_session(session_id);
     if let Some(tk) = crate::chat_commands::parse_takeover(text).filter(|_| !public_visitor) {
-        return crate::chat_commands::handle_takeover(ctx, session_id, user_id, &tk).await;
+        return crate::chat_commands::handle_takeover(ctx, gate_session, user_id, &tk).await;
     }
 
     // ── W3-1 human takeover (D1/D2/D5) ──
@@ -433,6 +474,21 @@ async fn build_reply_with_session_inner_impl(
             via_trigger,
             session_id: session_id.to_string(),
         });
+    }
+
+    let authorization_generation = ctx.session_manager.turn_generation(session_id).await;
+    let _authorization_turn = agent.and_then(|a| authorization_generation.ok().and_then(|generation|
+        crate::google_authorization_requests::turn::register(&ctx.home_dir, &a.config.agent.name,
+            &turn_id, text, session_id, ctx.session_manager.clone(),generation)));
+    if let Some(a) = agent {
+        if let Some(tool) = crate::google_authorization_requests::hinted_tool(text) {
+            crate::google_authorization_requests::turn::missing(
+                &ctx.home_dir, &a.config.agent.name, Some(&turn_id), tool, "not_connected").await;
+            if crate::google_authorization_requests::turn::NOTICE.try_with(|n| n.lock().is_ok_and(|v|v.text.is_some())).unwrap_or(false) {
+                // The host pauses before the model can substitute another account.
+                return live_only_notice(String::new());
+            }
+        }
     }
 
     if let Some(a) = agent {
@@ -1103,6 +1159,8 @@ async fn build_reply_with_session_inner_impl(
     // The WebChat staged-reply fallback (`GuardedReply::persist_webchat`)
     // binds its write to the same generation.
     super::record_turn_generation(turn_generation.as_deref());
+    crate::google_authorization_requests::turn::bind_generation(
+        &ctx.home_dir,&agent_id,&turn_id,turn_generation.clone());
 
     // ── Phase 3: Check if previous trajectory should get feedback ──
     // The current user message may contain feedback (positive/negative) for

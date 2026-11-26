@@ -6,6 +6,8 @@ The per-employee isolation architecture (planned for a later release) separates 
 
 **What you can install today:** `service install --protected-linux` does not install spawnd, egress or the separate updater, and nothing creates the migration plan. Until the isolation fresh bootstrap lands (planned for a later release), the protected service is the v1.80 single-binary gateway service described in [Single-binary protected service (current releases)](#single-binary-protected-service-current-releases). The per-employee Linux isolation described in this guide does not apply to it.
 
+When native Linux employee isolation is active, admins can read a member's currently assigned AI avatar conversations and memory directly, without an extra password or TOTP check. This includes conversation lists, conversation/memory search and their live updates. Every such Admin read records who read it, the avatar, its member and the operation; if the audit cannot be written, access is refused. Other members gain no access. A Personal employee that is not currently an avatar still requires the five-minute password + TOTP proof and `step_up_csrf`. Removing the avatar assignment, losing its active owner binding, or being unable to read avatar state restores those stricter rules immediately. Writes, conversation restore, delegation, settings, files and Wiki access keep their existing rules.
+
 ## What changes for customers
 
 The changes below apply once the isolation architecture is available. They do not apply to current installations.

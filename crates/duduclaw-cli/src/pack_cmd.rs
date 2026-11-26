@@ -1308,6 +1308,13 @@ reports_to = "front"
             duduclaw_security::audit_chain::verify_chain(&root.join("security_audit.jsonl")).unwrap(),
             duduclaw_security::audit_chain::ChainVerifyResult::Intact { lines_checked: 4 },
         );
+        // D12 gives every installation an independent revocation generation.
+        // Validate the live namespace before normalizing only its random epoch.
+        let epoch = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(root).epoch().unwrap();
+        let (_, bytes) = out.iter_mut().find(|(path, _)| path == ".google-authority/epoch")
+            .expect("installation must initialize its authority epoch");
+        assert_eq!(bytes.as_slice(), epoch.as_bytes());
+        *bytes = b"<authority-epoch>".to_vec();
         normalize_history_snapshot(&mut out);
         out.sort();
         out

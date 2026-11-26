@@ -3,7 +3,7 @@
 
 ## ローカルの呼び出し元を検証する
 
-`duduclaw identity whoami --json` で gateway が発行した実行時の身分を照会できます。資格情報がない、無効、または検証できない場合は非ゼロで終了します。ローカルのサードパーティー MCP server は proxy から `DUDUCLAW_RUN_CREDENTIAL` を継承し、従来の身分変数は引き続き除去されます。呼び出しごとに検証し、ツール独自の規則で認可してください。[開発ガイド](custom-mcp-tool.md)を参照してください。
+`duduclaw identity whoami --json` で gateway が発行した実行時の身分を照会できます。資格情報がない、無効、または検証できない場合は非ゼロで終了します。ローカルのサードパーティー MCP server は proxy から `DUDUCLAW_RUN_CREDENTIAL`、`DUDUCLAW_IDENTITY_ENDPOINT`、`DUDUCLAW_IDENTITY_SERVER` を継承し、従来の身分変数は引き続き除去されます。gateway はその実行の CLI プロセスと子孫プロセスにだけ応答するため、実行の外で起動した server は拒否されます。呼び出しごとに検証し、ツール独自の規則で認可してください。[開発ガイド](custom-mcp-tool.md)を参照してください。
 
 
 ## スキルのアーカイブ復元
@@ -203,8 +203,8 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 |---|---|---|
 | 外部クライアント許可リスト | `principal.is_external` | 従来の許可リスト 7 ツールと、明示的に付与した scope のツールのみ。続けて次の行の scope 規則が適用されます |
 | 社員でない呼び出し元の scope | `principal.scopes`。`admin` を持たず AI 社員でもないキー（gateway 内部キーでも、社員ごとのキーでも、gateway が社員用に起動したプロセスでもない）に適用 | キーが最低 scope を持つツールだけを掲載。プロセス自身のエージェントとして動くツール（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` と三つの統合状態の参照など）は掲載せず、すべての外部キーにも掲載しません。呼び出しはディスパッチゲートが同じ規則で拒否します（`process_agent_tool`）。[mcp-standalone.md](mcp-standalone.md) を参照 |
-| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 21 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
-| Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 21 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
+| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 29 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
+| Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 29 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
 | `os_native` | `agent.toml [capabilities]` | `os_*` 自動化 6 ツールを非表示 |
@@ -419,7 +419,7 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 ### `create_agent` — ペルソナと枠（v1.82.0）
 
-ペルソナは `soul_md` に入れます（`soul` は旧名。空文字は渡していないものとして扱い、両方に異なる内容がある場合のみエラー）。テンプレート作成と同じ SOUL.md の安全チェックを通り、チェックに通らない場合や SOUL.md を書き込めない場合は呼び出し全体が失敗し、ディスクには何も残りません。拒否メッセージは理由の種類（HTML コメント、不可視文字、隠しコンテンツ、プロンプトインジェクションの言い回し）を示しますが、内容は引用しません。ツールが読まない引数は拒否されず、返答の「Ignored arguments (no effect)」に並びます（最大 20 個、各 64 文字まで、残りは「… and N more」）。ライセンスの枠は状態が `deleted` でないすべての社員を数え（アーカイブした社員も枠を使います）、枠がいっぱいで拒否するときは上限と使用中の枠数だけを返し、枠を使っている社員は一覧しません（管理者はダッシュボードで確認できます）。枠の確認と作成は一つの手順で、ダッシュボードやエキスパートパックのインポートと同じロックを使うため、同時に作成しても上限を超えません。社員は自分の `[agent] status` をファイル操作ツールで変更できず、`agent_update` もアーカイブ済み・削除済みの社員の `status` は変更できません。アーカイブ・復元・削除はダッシュボードで行います。あとからペルソナを変えるには[作成後に社員のペルソナを変更する](dashboard-settings.md#作成後に社員のペルソナを変更するv1820)を参照してください。
+ペルソナは `soul_md` に入れます（`soul` は旧名。空文字は渡していないものとして扱い、両方に異なる内容がある場合のみエラー）。テンプレート作成と同じ SOUL.md の安全チェックを通り、チェックに通らない場合や SOUL.md を書き込めない場合は呼び出し全体が失敗し、ディスクには何も残りません。拒否メッセージは理由の種類（HTML コメント、不可視文字、隠しコンテンツ、プロンプトインジェクションの言い回し）を示しますが、内容は引用しません。ツールが読まない引数は拒否されず、返答の「Ignored arguments (no effect)」に並びます（最大 20 個、各 64 文字まで、残りは「… and N more」）。ライセンスの枠は削除済み社員と、有効なメンバー本人が Owner として所有する検証済み Personal 分身を除いて数え（１人１体。アーカイブした AI は枠を使います）、枠がいっぱいで拒否するときは上限と使用中の枠数だけを返し、枠を使っている社員は一覧しません（管理者はダッシュボードで確認できます）。枠の確認と作成は一つの手順で、ダッシュボードやエキスパートパックのインポートと同じロックを使うため、同時に作成しても上限を超えません。社員は自分の `[agent] status` をファイル操作ツールで変更できず、`agent_update` もアーカイブ済み・削除済みの社員の `status` は変更できません。アーカイブ・復元・削除はダッシュボードで行います。あとからペルソナを変えるには[作成後に社員のペルソナを変更する](dashboard-settings.md#作成後に社員のペルソナを変更するv1820)を参照してください。
 
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask` — 継続タスクのツール
 
@@ -538,3 +538,25 @@ Google Chat の社員専用アプリのセクションは共通アプリより�
 Google Chat は既存の選択順序に従い、社員専用の Chat アプリ、スペースに記録されたアプリ、または共通アプリを使用します。選ばれたアプリには、そのスペースへの送信権限が必要です。受信者保護は継続され、保存済みの検証された会話は作成元として扱います。別の通知先を指定しても、この扱いは適用されません。ユーザーに紐付けられていない送信者は、スケジュールを作成しただけでは検証済みの作成元として扱われません。
 
 定期実行の一覧と詳細は、実行結果 `last_status` と通知結果 `last_delivery_status` を別々に返します。通知結果は `delivered`、`delivery_failed`、`delivery_refused`（上記の送信時確認で拒否）、または未送信の空値です。失敗時の `last_delivery_reason` は固定コード `notification_delivery_failed`、拒否時は `origin_unproven`、`origin_proof_invalid`、`origin_public_visitor`、`origin_state_unreadable`、`origin_account_inactive`、`origin_access_revoked`、`origin_identity_unbound`、`origin_conversation_changed` のいずれかです。これらは直近の実行についての情報です。リマインダーは従来の `delivered` / `failed` を使い、一覧に `error` も表示します（拒否されたリマインダーは `failed` で、`error` に同じコードが入ります）。送信失敗を配信済みとして記録することはありません。
+
+### 毎回確認する Gmail 送信と Calendar 削除
+
+`gmail_send_draft {"draft_id":"r…"}` と `calendar_delete_event {"event_id":"…","calendar_id":"primary","notify_attendees":false}` は `google:write` と gateway のネイティブ REST 実行が必要です。Apps Script は両ツールを非表示にし、直接呼び出しも拒否します。bearer だけを渡す従来の Home 経路も非表示・拒否となります。社員専用 Google 接続か、gateway のアカウントに紐づくコネクターを使用してください。
+
+呼び出すたびに新しい確認カードが必要です。`allow`、Admin 権限、永続ワークフロー権限でも省略できず、`block` は引き続き拒否します。送信カードは Google から取得した送信元、To／Cc／Bcc、件名、本文プレビュー、添付ファイル名とサイズを表示します。承認はアカウント、社員の世代、下書き ID、操作、MIME ハッシュに紐づきます。gateway は再確認して承認済み MIME を送信し、内容やアカウントの変更時は再承認が必要です。宛先ポリシーは全 To／Cc／Bcc を確認し、曖昧なアドレス構文を拒否します。
+
+削除カードは予定名、タイムゾーン付き開始・終了、参加者、カレンダー、繰り返し全体の削除、通知設定を表示します。承認したバージョンを `If-Match` で確認し、変更時は再承認を要求します。`calendar_id` の既定は `primary`、通知は明示的に `sendUpdates=none` です。`notify_attendees=true` のときだけ `all` を使用します。空の HTTP 204 は成功です。削除時は既存の `calendar.calendarlist.readonly`（または上位の Calendar スコープ）で、プライマリカレンダーのアカウントと選択したカレンダーの名前・タイムゾーンも取得します。
+
+MIME 全体は gateway のメモリに保持し、承認には必要なプレビューとハッシュを保存します。拒否・期限切れ・使用済み・不一致の承認では変更しません。書き込みのタイムアウトや結果不明時は `result_unconfirmed` を返します。自動再送は行わず、再試行の前に Google で結果を確認してください。確認期限は 90 秒です。
+
+通信契約は [Gmail 下書き](https://developers.google.com/workspace/gmail/api/guides/drafts)と [Calendar の条件付き変更](https://developers.google.com/workspace/calendar/api/guides/version-resources)に従います。
+
+## 本人として Google Chat を送信する
+
+`google_chat_send {space, text, thread?}` は、依頼した認証済みメンバー自身の Google アカウントで既存スペースにテキストを送信します。`google:write` が必要で、管理者が `[google] chat_send = true` を有効にするまでは使用できません。共有アカウント、他のメンバー、Apps Script、Chat アプリの `chat.bot` トークンへの切り替えは行いません。
+
+個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意の最小スコープは `https://www.googleapis.com/auth/chat.messages.create` です。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
+
+毎回本人の確認が必要です。確認は５分間有効で１回限りです。カードにはアカウント、スペースのリソース名、スレッド、送信する全文と個人情報の送信に関する注意が表示されます。短文は認証済みの個別チャットで確認でき、グループからの依頼や長文は本人だけが開ける「自分の接続」ページで確認します。管理者の承認、`allow` ルール、Admin MCP scope、宛先許可リストでは代替できません。組織の外部送信承認も別途適用されます。本文、宛先、アカウント、認証情報、ポリシーが変わると再確認が必要です。
+
+Gateway は操作ごとに固定の request ID を保存します。結果が不明な場合は `result_unconfirmed` を返し、自動再送しません。新たに送信を依頼する前に Google Chat を確認してください。添付ファイルやスペースの作成には対応していません。指定スレッドは同じスペース内のものに限ります。Google では本人が送信者として表示され、アプリ名も付きます。[Google Chat API](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

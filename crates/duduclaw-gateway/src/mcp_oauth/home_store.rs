@@ -95,18 +95,32 @@ pub(crate) fn normalized_scopes(mut scopes: Vec<String>) -> Result<Vec<String>> 
     scopes.dedup();
     Ok(scopes)
 }
-/// A deterministic witness for the existing native any-of policy. This is
-/// nonsecret metadata, not a bearer restriction or a selection authority.
-fn singleton_native_scope(tool: &str, actual: Vec<String>) -> Result<String> {
+/// A deterministic sufficient subset of the granted scopes. Some native
+/// operations require a conjunction (Calendar delete also reads CalendarList).
+/// Keep the first sufficient singleton for existing any-of policies.
+fn native_scope_subset(tool: &str, actual: Vec<String>) -> Result<Vec<String>> {
     if tool == "google_status"
         || duduclaw_core::google_identity::native_google_scope(tool).is_none()
     {
         return Err(Error::Invalid);
     }
-    normalized_scopes(actual)?
-        .into_iter()
-        .find(|scope| crate::google_personal::scopes::permitted(tool, std::slice::from_ref(scope)))
-        .ok_or(Error::Invalid)
+    let mut scopes = normalized_scopes(actual)?;
+    if !crate::google_personal::scopes::permitted(tool, &scopes) {
+        return Err(Error::Invalid);
+    }
+    if let Some(scope) = scopes.iter()
+        .find(|scope| crate::google_personal::scopes::permitted(tool, std::slice::from_ref(scope))) {
+        return Ok(vec![scope.clone()]);
+    }
+    // Remove only redundant grants; never manufacture a broader scope or
+    // discard one required by the tool's complete policy.
+    for index in (0..scopes.len()).rev() {
+        let removed = scopes.remove(index);
+        if !crate::google_personal::scopes::permitted(tool, &scopes) {
+            scopes.insert(index, removed);
+        }
+    }
+    Ok(scopes)
 }
 
 /// Select from the actual row while the SourceOwner holds its source/config/
@@ -115,14 +129,14 @@ pub(crate) fn native_scope_witness(
     g: &SourceGuard,
     source: &ObservedSource,
     tool: &str,
-) -> Result<String> {
+) -> Result<Vec<String>> {
     transaction(g, |rows| {
         let raw = rows.google().ok_or(Error::NotReady)?;
         let scopes: Vec<String> =
             serde_json::from_value(raw.get("scopes").cloned().ok_or(Error::Invalid)?)
                 .map_err(|_| Error::Invalid)?;
-        let witness = singleton_native_scope(tool, scopes)?;
-        rows.require_oauth_scopes(std::slice::from_ref(&witness), source, host_time_now(g))?;
+        let witness = native_scope_subset(tool, scopes)?;
+        rows.require_oauth_scopes(&witness, source, host_time_now(g))?;
         Ok(witness)
     })
 }

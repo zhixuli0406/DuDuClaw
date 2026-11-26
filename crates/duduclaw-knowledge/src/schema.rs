@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::KbResult;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// `<home>/knowledge`.
 pub fn knowledge_dir(home: &Path) -> PathBuf {
@@ -296,11 +296,24 @@ pub fn migrate(conn: &Connection) -> KbResult<()> {
         owner_id TEXT NOT NULL, source_summary TEXT NOT NULL, imported_at INTEGER NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_self_add_hour ON owner_self_add_log(collection_id, imported_at);
+    CREATE TABLE IF NOT EXISTS owner_self_add_notices (
+        source_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, title TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+        terminal_reason TEXT
+    );
     CREATE TABLE IF NOT EXISTS knowledge_owner_card_deliveries (
         approval_id TEXT NOT NULL, owner_id TEXT NOT NULL, channel TEXT NOT NULL,
         destination TEXT NOT NULL, conversation TEXT NOT NULL,
         PRIMARY KEY(approval_id, owner_id, channel, destination, conversation)
     );")?;
+    let has_terminal_reason: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('owner_self_add_notices') WHERE name='terminal_reason')",
+        [], |r| r.get(0),
+    )?;
+    if !has_terminal_reason {
+        tx.execute("ALTER TABLE owner_self_add_notices ADD COLUMN terminal_reason TEXT", [])?;
+    }
     tx.execute("UPDATE kb_meta SET value=?1 WHERE key='schema_version'", [SCHEMA_VERSION.to_string()])?;
     tx.commit()?;
     Ok(())
@@ -329,6 +342,27 @@ pub fn generation(conn: &Connection) -> KbResult<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_self_add_notices_gain_a_durable_terminal_reason() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(DDL).unwrap();
+        conn.execute_batch("INSERT INTO kb_meta VALUES('schema_version', '3');
+            CREATE TABLE owner_self_add_notices (
+                source_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, title TEXT NOT NULL,
+                delivered INTEGER NOT NULL DEFAULT 0 CHECK(delivered IN (0,1)),
+                attempts INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO owner_self_add_notices(source_id, owner_id, title) VALUES('source', 'owner', 'title');").unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(conn.query_row("SELECT terminal_reason FROM owner_self_add_notices", [],
+            |r| r.get::<_, Option<String>>(0)).unwrap(), None);
+        conn.execute("UPDATE owner_self_add_notices SET delivered=1, terminal_reason='recipient_not_owner'", []).unwrap();
+        migrate(&conn).unwrap();
+        let row: (i64, String) = conn.query_row("SELECT delivered, terminal_reason FROM owner_self_add_notices", [],
+            |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(row, (1, "recipient_not_owner".into()));
+    }
 
     #[test]
     fn legacy_collections_opt_out_and_reopen_preserves_owner_choice() {

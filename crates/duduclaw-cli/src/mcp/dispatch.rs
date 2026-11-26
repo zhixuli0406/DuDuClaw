@@ -195,6 +195,8 @@ pub(crate) async fn handle_tools_call(
             | "docs_replace_text"
             | "sheets_create"
             | "sheets_update"
+            | "gmail_send_draft"
+            | "calendar_delete_event"
             | "calendar_update_event"
             // Notion / GitHub write tools (page append, public issue comment).
             | "notion_page_append"
@@ -353,6 +355,19 @@ pub(crate) async fn handle_tools_call(
             Some(&audit_arguments),
             result_text_for_grounding.as_deref(),
         );
+    }
+
+    // Native confirmed-send receipt: only this handler's completed output may
+    // back a sent claim; the employee's narration and input never do.
+    if tool_name == "gmail_send_draft" && result.get("isError").and_then(Value::as_bool) != Some(true) {
+        if let Some(message_id) = result.pointer("/_meta/duduclaw_sent_message_id").and_then(Value::as_str) {
+            let actual_agent = if isolated { default_agent.to_string() }
+                else { resolve_audit_agent(home_dir, Some(principal), default_agent) };
+            duduclaw_security::audit::append_tool_call_with_extras(
+                home_dir, &actual_agent, tool_name, "Gmail send confirmed", true,
+                &[("sent", serde_json::json!(true)), ("message_id", serde_json::json!(message_id))],
+            );
+        }
     }
 
     // Provider-owned metadata, separate from rendered text and model arguments.
@@ -1048,12 +1063,16 @@ impl GatewayHandler<'_> {
                 "isError": true
             })
         }
+        name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.owner_execution(home_dir) => {
+            google_caller.execute_owner(home_dir, name, &arguments).await
+        }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.is_dedicated() => {
             google_caller
                 .execute_dedicated(home_dir, name, &arguments)
                 .await
         }
         "google_status" => handle_google_status(home_dir, google_caller).await,
+        "google_chat_send" => crate::mcp::google_owner_client::execute(home_dir, tool_name, &arguments).await,
         "google_chat_spaces" => handle_google_chat_spaces(&arguments, home_dir, google_caller).await,
         "google_chat_messages" => handle_google_chat_messages(&arguments, home_dir, google_caller).await,
         "gmail_search" => handle_gmail_search(&arguments, home_dir, google_caller).await,
@@ -1085,6 +1104,8 @@ impl GatewayHandler<'_> {
         "docs_replace_text" => handle_docs_replace_text(&arguments, home_dir, google_caller).await,
         "sheets_create" => handle_sheets_create(&arguments, home_dir, google_caller).await,
         "sheets_update" => handle_sheets_update(&arguments, home_dir, google_caller).await,
+        "gmail_send_draft" => handle_gmail_send_draft(&arguments, home_dir, google_caller).await,
+        "calendar_delete_event" => handle_calendar_delete_event(&arguments, home_dir, google_caller).await,
         "calendar_update_event" => handle_calendar_update_event(&arguments, home_dir, google_caller).await,
 
         "slides_read" => handle_slides_read(&arguments, home_dir, google_caller).await,

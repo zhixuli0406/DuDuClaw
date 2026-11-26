@@ -711,12 +711,7 @@ mod tests {
     use super::*;
     use crate::models::UserRole;
 
-    fn db() -> UserDb {
-        // In-memory-ish: a temp file per test (UserDb requires a path).
-        let dir = std::env::temp_dir().join(format!("otp-test-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        UserDb::new(&dir.join("auth.db")).unwrap()
-    }
+    use crate::test_support::test_db as db;
 
     fn make_user(db: &UserDb) -> User {
         db.create_user("boss@example.com", "Boss", "pw-unused-123456", UserRole::Admin)
@@ -740,7 +735,7 @@ mod tests {
 
     #[test]
     fn request_otp_returns_none_without_verified_channel() {
-        let db = db();
+        let (db, _home) = db();
         let _u = make_user(&db);
         // No channel bound yet.
         assert!(db.request_otp("boss@example.com").unwrap().is_none());
@@ -750,7 +745,7 @@ mod tests {
 
     #[test]
     fn happy_path_request_and_verify() {
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         db.bind_channel_identity(&u.id, "telegram", "tg-99887766", true).unwrap();
 
@@ -765,7 +760,7 @@ mod tests {
 
     #[test]
     fn code_is_single_use() {
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         db.bind_channel_identity(&u.id, "telegram", "tg-1234567", true).unwrap();
         let ch = db.request_otp("boss@example.com").unwrap().unwrap();
@@ -776,7 +771,7 @@ mod tests {
 
     #[test]
     fn wrong_code_invalidates_after_five_attempts() {
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         db.bind_channel_identity(&u.id, "telegram", "tg-7654321", true).unwrap();
         let ch = db.request_otp("boss@example.com").unwrap().unwrap();
@@ -792,13 +787,13 @@ mod tests {
 
     #[test]
     fn unknown_challenge_is_not_found() {
-        let db = db();
+        let (db, _home) = db();
         assert_eq!(db.verify_otp("no-such-id", "123456"), Err(OtpError::NotFound));
     }
 
     #[test]
     fn rate_limit_caps_live_challenges() {
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         db.bind_channel_identity(&u.id, "telegram", "tg-5555555", true).unwrap();
         for _ in 0..OTP_RATE_MAX {
@@ -812,7 +807,7 @@ mod tests {
 
     #[test]
     fn setup_token_only_on_empty_then_claims_admin() {
-        let db = db();
+        let (db, _home) = db();
         // Zero users → token issued.
         let token = db.issue_setup_token(false).unwrap().expect("token");
         // Non-force with an existing user → None.
@@ -825,7 +820,7 @@ mod tests {
 
     #[test]
     fn cannot_hijack_verified_channel_of_another_user() {
-        let db = db();
+        let (db, _home) = db();
         let victim = db
             .create_user("victim@example.com", "Victim", "pw-unused-123456", UserRole::Employee)
             .unwrap();
@@ -849,7 +844,7 @@ mod tests {
 
     #[test]
     fn verified_only_lookup_ignores_pending_bindings() {
-        let db = db();
+        let (db, _home) = db();
         let u = db
             .create_user("u@example.com", "U", "pw-unused-123456", UserRole::Employee)
             .unwrap();
@@ -903,7 +898,7 @@ mod tests {
 
     #[test]
     fn otp_is_never_targeted_at_a_googlechat_binding() {
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         // Bound first, so it is the oldest verified identity.
         db.bind_channel_identity(&u.id, "googlechat", "users/1234567890", true).unwrap();
@@ -918,7 +913,7 @@ mod tests {
 
     #[test]
     fn non_admin_cannot_bind_or_unbind_googlechat_for_themselves() {
-        let db = db();
+        let (db, _home) = db();
         let _admin = make_user(&db);
         let emp = db
             .create_user("emp@example.com", "Emp", "pw-unused-123456", UserRole::Employee)
@@ -943,7 +938,7 @@ mod tests {
 
     #[test]
     fn admin_unbind_only_removes_the_named_users_binding() {
-        let db = db();
+        let (db, _home) = db();
         let admin = make_user(&db);
         let a = db
             .create_user("a@example.com", "A", "pw-unused-123456", UserRole::Employee)
@@ -969,7 +964,7 @@ mod tests {
 
     #[test]
     fn googlechat_id_has_at_most_one_verified_owner() {
-        let db = db();
+        let (db, _home) = db();
         let admin = make_user(&db);
         let a = db
             .create_user("a@example.com", "A", "pw-unused-123456", UserRole::Employee)
@@ -994,7 +989,7 @@ mod tests {
     fn binding_requires_an_active_target_account() {
         use crate::models::UserStatus;
         for status in [UserStatus::Suspended, UserStatus::Offboarded] {
-            let db = db();
+            let (db, _home) = db();
             let admin = make_user(&db);
             let t = db
                 .create_user("t@example.com", "T", "pw-unused-123456", UserRole::Employee)
@@ -1017,7 +1012,7 @@ mod tests {
             }
         }
         // A deleted (never existing) account.
-        let db = db();
+        let (db, _home) = db();
         let admin = make_user(&db);
         assert_eq!(
             db.bind_channel_identity_authorized("no-such-user", "googlechat", "users/1", true, Some(&admin.id))
@@ -1033,7 +1028,7 @@ mod tests {
         for c in ["telegram", "line", "discord", "slack", "whatsapp", "feishu", "teams"] {
             assert!(is_dm_destination_channel(c), "{c}");
         }
-        let db = db();
+        let (db, _home) = db();
         let u = make_user(&db);
         db.bind_channel_identity(&u.id, "googlechat", "users/31337", true).unwrap();
         assert!(db.verified_dm_destinations_for_user(&u.id).unwrap().is_empty());
@@ -1121,7 +1116,7 @@ mod tests {
 
     #[test]
     fn setup_new_token_revokes_old_and_failed_insert_rolls_back() {
-        let db = db();
+        let (db, _home) = db();
         let old = db.issue_setup_token(false).unwrap().unwrap();
         let current = db.issue_setup_token(false).unwrap().unwrap();
         assert!(db.claim_setup_token(&old, "first@example.com", "First").is_err());
@@ -1133,7 +1128,7 @@ mod tests {
 
     #[test]
     fn setup_first_admin_claim_refuses_intervening_user() {
-        let db = db();
+        let (db, _home) = db();
         let token = db.issue_setup_token(false).unwrap().unwrap();
         make_user(&db);
         assert!(db.claim_setup_token(&token, "root@example.com", "Root").is_err());
@@ -1141,7 +1136,7 @@ mod tests {
 
     #[test]
     fn setup_expiry_and_attempt_limits_fail_closed() {
-        let db = db();
+        let (db, _home) = db();
         let token = db.issue_setup_token(false).unwrap().unwrap();
         db.conn().execute("UPDATE setup_tokens SET expires_at = ?1", [Utc::now().to_rfc3339()]).unwrap();
         assert!(db.claim_setup_token(&token, "root@example.com", "Root").is_err());
@@ -1157,14 +1152,14 @@ mod tests {
 
     #[test]
     fn break_glass_force_issues_even_with_users() {
-        let db = db();
+        let (db, _home) = db();
         make_user(&db);
         assert!(db.issue_setup_token(false).unwrap().is_none());
         assert!(db.issue_setup_token(true).unwrap().is_some());
     }
     #[test]
     fn migration_first_admin_claim_sets_password_atomically_and_rejects_replay() {
-        let db = db();
+        let (db, _home) = db();
         let token = db.issue_setup_token(false).unwrap().unwrap();
         assert!(db.claim_first_admin_setup_token(&token, "first@example.com", "First", "short").is_err());
         let user = db.claim_first_admin_setup_token(&token, "first@example.com", "First", "new-password-123").unwrap();

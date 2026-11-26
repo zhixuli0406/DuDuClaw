@@ -194,6 +194,14 @@ impl UserDb {
         transfer_to: Option<&str>,
         actor: Option<&str>,
     ) -> Result<OffboardOutcome, OrgError> {
+        self.offboard_user_under(user_id, transfer_to, actor, None)
+    }
+
+    pub fn offboard_user_under(&self, user_id: &str, transfer_to: Option<&str>, actor: Option<&str>,
+        limit: crate::avatar_seats::SeatLimit<'_>) -> Result<OffboardOutcome, OrgError> {
+        let seats = crate::avatar_seats::SeatChange::begin(self, limit).map_err(OrgError::Db)?;
+        // Lock order: seat admission -> authority writer lease -> users.db transaction.
+        let _authority = self.google_authority_write().map_err(OrgError::Db)?;
         let mut conn = self.conn();
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -227,6 +235,7 @@ impl UserDb {
         }
         if let Some(actor) = actor { crate::admin_eligibility::stamp_actor(&tx, since, actor).map_err(OrgError::Db)?; }
         bump_acl_generation(&tx).map_err(db_err)?;
+        seats.check(&tx).map_err(OrgError::Db)?;
         tx.commit().map_err(db_err)?;
         Ok(outcome)
     }

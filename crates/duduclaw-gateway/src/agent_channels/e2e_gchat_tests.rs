@@ -205,6 +205,7 @@ pub(crate) fn googlechat_section(home: &Path, project: &str, sa_json: &str) -> S
 pub(crate) fn message_event(space: &str, text: &str) -> Value {
     json!({"type": "MESSAGE", "space": {"name": space, "type": "SPACE"}, "message": {
         "text": text, "argumentText": text, "space": {"name": space, "type": "SPACE"},
+        "thread": {"name": format!("{space}/threads/T")},
         "sender": {"name": "users/42", "type": "HUMAN", "displayName": "Human"}}})
 }
 
@@ -330,6 +331,66 @@ async fn bot_sender_on_the_http_path_never_starts_a_turn() {
         .query_row("SELECT COUNT(*) FROM session_messages WHERE content LIKE '%BOT_ECHO_TEXT%'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(echoed, 0, "a BOT sender must not create a turn");
+}
+
+#[tokio::test]
+async fn queue_keys_preserve_thread_order_and_app_independence() {
+    use crate::googlechat_conversation::GoogleChatConversation;
+    let home = tempfile::tempdir().unwrap();
+    let event = message_event("spaces/QUEUED", "first");
+    let conversation = GoogleChatConversation::from_event(&event, false, false).unwrap();
+    let queue = crate::conversation_queue::ConversationQueue::default();
+    let (group, key) = conversation.queue_keys(Some("sales"));
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let first = conversation.clone();
+    let first_home = home.path().to_owned();
+    queue.submit_in(&group, &key, async move {
+        let _lease = first.turn_lease(&first_home, true).await.unwrap();
+        entered.send(()).unwrap(); wait.await.unwrap();
+    }).unwrap();
+    started.await.unwrap();
+    let (second, mut second_started) = tokio::sync::oneshot::channel();
+    let second_home = home.path().to_owned();
+    queue.submit_in(&group, &key, async move {
+        let _lease = conversation.turn_lease(&second_home, true).await.unwrap();
+        second.send(()).unwrap();
+    }).unwrap();
+    for (app, thread) in [("hr", "T"), ("sales", "OTHER")] {
+        let mut independent = event.clone();
+        independent["message"]["thread"]["name"] = json!(format!("spaces/QUEUED/threads/{thread}"));
+        let conversation = GoogleChatConversation::from_event(&independent, false, false).unwrap();
+        let (group, key) = conversation.queue_keys(Some(app));
+        let (done, finished) = tokio::sync::oneshot::channel();
+        let independent_home = home.path().to_owned();
+        queue.submit_in(&group, &key, async move {
+            let _lease = conversation.turn_lease(&independent_home, true).await.unwrap();
+            done.send(()).unwrap();
+        }).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), finished).await.unwrap().unwrap();
+    }
+    assert!(matches!(second_started.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), second_started).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn thread_lease_preserves_shared_app_order() {
+    use crate::googlechat_conversation::GoogleChatConversation;
+    let home = tempfile::tempdir().unwrap();
+    let event = message_event("spaces/ORDER", "first");
+    let thread = GoogleChatConversation::from_event(&event, false, false).unwrap();
+    let mut other = event.clone();
+    other["message"]["thread"]["name"] = json!("spaces/ORDER/threads/OTHER");
+    let other_thread = GoogleChatConversation::from_event(&other, false, false).unwrap();
+    for own_app in [false, true] {
+        let first = thread.turn_lease(home.path(), own_app).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(20), thread.turn_lease(home.path(), !own_app)).await.is_err());
+        let independent = tokio::time::timeout(Duration::from_secs(2), other_thread.turn_lease(home.path(), false)).await.unwrap().unwrap();
+        drop(independent);
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), thread.turn_lease(home.path(), !own_app)).await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]
@@ -461,11 +522,11 @@ async fn each_app_reaches_only_its_employee_and_wrong_audiences_are_refused() {
     let as_a = wait_text(&fake, &format!("Bearer tok-{email_a}"), "OWN_BOT_REPLY").await;
     let as_b = wait_text(&fake, &format!("Bearer tok-{email_b}"), "OWN_BOT_REPLY").await;
     assert!(
-        as_a.contains("agent=sales session=googlechat:spaces/SHARED#agent:sales"),
+        as_a.contains("agent=sales session=googlechat:spaces/SHARED:thread:spaces/SHARED/threads/T#agent:sales"),
         "{as_a}"
     );
     assert!(
-        as_b.contains("agent=hr session=googlechat:spaces/SHARED#agent:hr"),
+        as_b.contains("agent=hr session=googlechat:spaces/SHARED:thread:spaces/SHARED/threads/T#agent:hr"),
         "{as_b}"
     );
     assert!(

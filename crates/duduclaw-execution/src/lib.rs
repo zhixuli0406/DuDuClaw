@@ -2,8 +2,12 @@
 pub mod io;
 pub mod command;
 #[cfg(windows)]
+pub mod conpty;
+#[cfg(windows)]
 mod windows_job;
 pub mod local;
+pub mod process_identity;
+pub mod spawn_binding;
 pub mod selection;
 pub mod workspace;
 pub mod program_helper;

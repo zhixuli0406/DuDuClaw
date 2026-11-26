@@ -2567,6 +2567,8 @@ export interface LicenseSnapshot {
   seat_unlimited?: boolean;
   /** Employees holding a seat (archived included); `null` when uncountable. */
   seats_used?: number | null;
+  /** Active, unique Personal avatars excluded from seats_used. */
+  avatars_exempt?: number | null;
 }
 
 /** Result of `license.sync`: the refreshed snapshot plus what happened. */
@@ -6288,6 +6290,7 @@ export interface GoogleServiceProbe {
 
 export interface GoogleCredentialsStatus {
   chat_read?: boolean;
+  chat_send?: boolean;
   /** `config.toml [google] chat_identity_from_account` (RM-152, default off). */
   chat_identity_from_account?: boolean;
   /** `config.toml [integrations] google_workspace` — the master gate. */
@@ -6428,6 +6431,8 @@ export interface ProtectedProposeInput {
   label: string;
   display_name?: string;
   binding_kind: 'personal' | 'shared';
+  /** Personal proposals only; creates and assigns a new exempt avatar. */
+  as_avatar?: boolean;
   owner_id?: string;
   request_id?: string;
 }
@@ -6574,8 +6579,10 @@ export interface MyMemoryForgetResult {
 }
 
 export interface PersonalGoogleStatus {
+  authorization_requests?: { id: string; agent: string; purpose: string; status: string }[];
   notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
+  chat_send?: boolean;
   connection: { owner_id: string; account_email: string; granted_scopes: string[]; local_purposes?: string[]; status: 'connected' | 'needs_reconnect' | 'suspended'; connected_at: string } | null;
   login_email: string;
   client_configured: boolean;
@@ -7079,6 +7086,8 @@ export const api = {
     create: (params: {
       name: string;
       display_name: string;
+      /** Admin-only, atomically create a Personal avatar for an active member. */
+      avatar_for_user?: string;
       role?: string;
       trigger?: string;
       /** Persona written to SOUL.md (canonical field). Scanned; a rejected
@@ -8883,6 +8892,7 @@ export const api = {
    * `get` never returns the stored bridge secret — only whether one is set.
    */
   googleCredentials: {
+    setChatSend: (enabled: boolean) => client.call('google.integration.set', { chat_send: enabled }) as Promise<{ chat_send: boolean; changed: boolean }>,
     setChatRead: (chatRead: boolean) => client.call('google.integration.set', { chat_read: chatRead }) as Promise<{ chat_read: boolean; changed: boolean }>,
     setChatIdentityFromAccount: (enabled: boolean) =>
       client.call('google.integration.set', { chat_identity_from_account: enabled }) as Promise<{ chat_identity_from_account: boolean; changed: boolean }>,
@@ -8934,8 +8944,10 @@ export const api = {
       }>,
   },
   personalGoogle: {
+    chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
+    confirmChat: (id: string, approve: boolean) => client.call('me.google.chat_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
-    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false) => client.call('me.google.connect_start', { redirect_origin: dashboardBaseUrl(), acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    start: (acknowledgeGoogleData: boolean, meetingRecordings = false, driveTools = false, chatSend = false) => client.call('me.google.connect_start', { redirect_origin: dashboardBaseUrl(), acknowledge_google_data: acknowledgeGoogleData, ...(meetingRecordings ? { meeting_recordings: true } : {}), ...(driveTools ? { drive_tools: true } : {}), ...(chatSend ? { chat_send: true } : {}) }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
     finish: (state: string) => client.call('me.google.connect_finish', { state }),
     paste: (url: string) => client.call('me.google.connect_paste', { url }),
     disconnect: () => client.call('me.google.disconnect', { confirm: true }).then(notifyDisconnectForget) as Promise<{provider_revoked:boolean;provider_note:string|null}>,
@@ -9911,8 +9923,8 @@ export const api = {
       client.call('users.repair_primary_agents', previewDigest !== undefined ? { preview_digest: previewDigest } : {}) as Promise<PrimaryAgentRepairPreview>,
     avatarConflicts: () =>
       client.call('users.avatar_conflicts') as Promise<{ conflicts: AvatarConflict[] }>,
-    setAvatar: (userId: string, agentId: string | null) =>
-      client.call('users.set_avatar', { user_id: userId, agent_id: agentId }) as Promise<{ avatar_agent_id: string | null }>,
+    setAvatar: (userId: string, agentId: string | null, deleteAvatar = false) =>
+      client.call('users.set_avatar', { user_id: userId, agent_id: agentId, ...(deleteAvatar ? { delete_avatar: true } : {}) }) as Promise<{ avatar_agent_id: string | null }>,
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>

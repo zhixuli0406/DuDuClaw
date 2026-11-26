@@ -99,6 +99,17 @@ export function RoleDetails({ user, managerName }: { user: UserDetail; managerNa
   );
 }
 
+export function UserAvatarStatus({ user, agentName }: { user: UserDetail; agentName: (id: string) => string }) {
+  const intl = useIntl();
+  const label = intl.formatMessage({ id: 'users.avatar.label' });
+  return user.avatar_agent_id ? (
+    <Badge variant="secondary" className="max-w-full" title={agentName(user.avatar_agent_id)}>
+      <ActorAvatar actorType="agent" name={agentName(user.avatar_agent_id)} size="xs" />
+      <span className="truncate">{label}: {agentName(user.avatar_agent_id)}</span>
+    </Badge>
+  ) : <span className="text-xs text-muted-foreground">{label}: {intl.formatMessage({ id: 'users.manager.none' })}</span>;
+}
+
 /** The AI employees bound to `user`, by display name, each with an unbind
  *  button. */
 export function BindingChips({

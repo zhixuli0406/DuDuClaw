@@ -207,6 +207,38 @@ class SpawnInventoryTests(unittest.TestCase):
         ''')
         self.assertEqual(sites[0].apis, {"backend_spawn_class": 1})
 
+    def test_bound_spawn_and_pty_calls_are_inventoried(self):
+        sites = self.scan('''async fn launch() {
+            execution_gate::spawn_bound(cmd, EmployeeMain, binding).await;
+        }
+        async fn launch_pty() {
+            execution_gate::spawn_pty_bound(builder, size, EmployeeMain, binding).await;
+        }''')
+        self.assertEqual([(site.symbol, site.apis) for site in sites], [
+            (self.path + "::launch", {"backend_spawn_bound": 1}),
+            (self.path + "::launch_pty", {"backend_spawn_pty_bound": 1}),
+        ])
+        self.assertEqual(check(sites, self.registry(sites)), [])
+        self.assertTrue(any("unclassified" in error for error in check(sites, self.registry([]))))
+        unbound = self.scan('''async fn launch() { execution_gate::spawn(cmd, EmployeeMain).await; }
+            async fn launch_pty() { execution_gate::spawn_pty(builder, size, EmployeeMain).await; }''')
+        self.assertEqual(len(check(sites, self.registry(unbound))), 2)
+        self.assertTrue(all("changed process effects" in error
+                            for error in check(sites, self.registry(unbound))))
+
+    def test_bound_wrappers_and_collectors_are_inventoried(self):
+        for api in ("spawn_bound", "spawn_pty_bound", "spawn_class_bound",
+                    "output_for_model_bound", "collect_codex_output_bound",
+                    "spawn_and_handshake_bound", "spawn_with_binding"):
+            for prefix in ("", "Self::", "BackendChild::", "crate::process_group::"):
+                with self.subTest(api=api, prefix=prefix):
+                    sites = self.scan(f'async fn launch() {{ {prefix}{api}(cmd, binding).await; }}')
+                    self.assertEqual(len(sites), 1)
+                    self.assertEqual(sites[0].apis, {"backend_" + api: 1})
+            sites = self.scan(f'use source::{api} as launch_child; async fn run() {{ launch_child(cmd); }}')
+            self.assertEqual(sites[0].apis, {"backend_" + api: 1})
+            self.assertEqual(self.scan(f'async fn {api}() {{ /* {api}(cmd) */ }}'), [])
+
     def test_authorized_backend_dispatch_remains_inventoried(self):
         sites = self.scan('async fn execute(backend: Backend) { backend.spawn_authorized(policy, authority).await; }')
         self.assertEqual(sites[0].apis, {"terminal_spawn_authorized": 1})

@@ -482,7 +482,8 @@ pub fn upstream_env(
     let mut out: Vec<(String, String)> = inherited
         .into_iter()
         .filter(|(k, _)| k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL)
-            || k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_IDENTITY_URL)
+            || k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT)
+            || k.eq_ignore_ascii_case(duduclaw_core::run_credential::ENV_IDENTITY_SERVER)
             || !is_private_upstream_env(k))
         .collect();
 
@@ -2150,20 +2151,22 @@ mod tests {
 
     #[test]
     fn run_proof_is_forwarded_but_declared_identity_cannot_override_it() {
-        use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, ENV_IDENTITY_URL, RunCredential};
+        use duduclaw_core::run_credential::{ENV_RUN_CREDENTIAL, ENV_IDENTITY_ENDPOINT, ENV_IDENTITY_SERVER, RunCredential};
         let credential = RunCredential::from_bytes(&[31; 32]);
         let inherited = vec![(ENV_RUN_CREDENTIAL.into(), credential.expose().to_string()),
-            (ENV_IDENTITY_URL.into(), "http://127.0.0.1:12345/api/internal/identity/introspect".into()),
+            (ENV_IDENTITY_SERVER.into(), "v1:123:456".into()),
+            (ENV_IDENTITY_ENDPOINT.into(), "http://127.0.0.1:12345/api/internal/identity/introspect".into()),
             ("DUDUCLAW_AGENT_TOKEN".into(), "old-token".into()),
             ("DUDUCLAW_AGENT_ID".into(), "alice".into()),
             ("DUDUCLAW_ON_BEHALF_OF".into(), "user-1".into()),
             ("DUDUCLAW_TURN_ID".into(), "turn-1".into())];
-        let declared = r#"{"duduclaw_run_credential":"forged","DUDUCLAW_IDENTITY_URL":"9999","DUDUCLAW_AGENT_TOKEN":"forged"}"#;
+        let declared = r#"{"duduclaw_run_credential":"forged","DUDUCLAW_IDENTITY_ENDPOINT":"9999","duduclaw_identity_server":"v1:999:999","DUDUCLAW_AGENT_TOKEN":"forged"}"#;
         let pairs = upstream_env(inherited, Some(declared));
         let map: HashMap<_, _> = pairs.iter().cloned().collect();
         assert!(map.get(ENV_RUN_CREDENTIAL).is_some_and(|v| v == credential.expose()));
-        assert_eq!(map.get(ENV_IDENTITY_URL).map(String::as_str), Some("http://127.0.0.1:12345/api/internal/identity/introspect"));
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(ENV_IDENTITY_ENDPOINT).map(String::as_str), Some("http://127.0.0.1:12345/api/internal/identity/introspect"));
+        assert_eq!(map.get(ENV_IDENTITY_SERVER).map(String::as_str), Some("v1:123:456"));
+        assert_eq!(map.len(), 3);
         let cmd = upstream_command("never-spawned", &[], pairs, false);
         let env: HashMap<_, _> = cmd.as_std().get_envs().collect();
         assert!(env.contains_key(std::ffi::OsStr::new(ENV_RUN_CREDENTIAL)));

@@ -290,6 +290,7 @@ fn f6fb_adoption_enforces_agent_cap() {
     // Another live employee takes the only seat.
     let other = applied(f.home(), 3, "bob-desk", &[("binding_kind", "shared"), ("tenant_id", f.tenant.as_str())]);
     save(f.home(), &other, &receipt(&other, 3, false)).unwrap();
+    write_tree(f.home(), "bob-desk");
     let capped = AdoptEnv { agent_cap: 1, ..env(&ax) };
     assert_eq!(validate_item(f.home(), &capped, &item, &plan.adopt, &f.bob).err(),
         Some(AdoptError::Restore(Refusal::QuotaExceeded)));
@@ -321,4 +322,224 @@ fn f6fb2_adoption_refuses_google_reauth_factor() {
     let filed = file_adoption(f.home(), &env(&ax), EMP, 0, None,
         Filer::Personal(Some(OwnerProof { user_id: &f.alice, factor: "totp" }))).unwrap();
     assert_eq!(filed.kind, RequestKind::PersonalAdopt);
+}
+
+// Use the real gateway effect dispatch and EmployeeCommit; only the remote
+// allocator and adoption collaborators are fixtures.
+struct CompensationBackend {
+    home: std::path::PathBuf,
+    approver: String,
+    race: bool,
+    allocated: std::sync::atomic::AtomicBool,
+    actions: Mutex<Vec<Action>>,
+}
+
+fn assert_remote_unlocked(home: &Path, item: &ConfirmationItem) {
+    use duduclaw_core::agent_seats::SeatAdmission;
+    assert!(SeatAdmission::try_acquire(home).unwrap().is_some());
+    let path = home.join(CONFIRMATIONS_DB).with_extension(format!("proposal-{}.lock", proposal_key(item)));
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+    assert!(lock.try_lock().is_ok(), "remote wait holds proposal lock");
+    // The separate operation lock still excludes a competing apply.
+    assert!(matches!(store(home).apply_next(&item.binding, &mut Accept), Err(ConfirmationError::Stale)));
+}
+
+struct LastSeatRoot<'a> { home: &'a Path, item: &'a ConfirmationItem }
+impl RetireRoot for LastSeatRoot<'_> {
+    fn exchange(&self, _: &Request) -> Result<Answer, ()> {
+        use duduclaw_core::agent_seats::{SeatAdmission, SeatDecision, seat_holders};
+        assert_remote_unlocked(self.home, self.item);
+        // validate_item checked the cap before this remote root probe. While
+        // its reply is pending, an independent admitted create takes the seat.
+        let home = self.home.to_path_buf();
+        std::thread::spawn(move || {
+            let admission = SeatAdmission::try_acquire(&home).unwrap().expect("remote wait holds admission");
+            assert!(matches!(admission.decide(1, 1, None), SeatDecision::Admitted));
+            let dir = home.join("agents/concurrent");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), "[agent]\nname='concurrent'\nstatus='active'\n").unwrap();
+            admission.recount(1).unwrap();
+            assert_eq!(seat_holders(&home).unwrap().len(), 1);
+        }).join().unwrap();
+        Ok(Answer::Refused(Code::NotFound))
+    }
+}
+
+impl crate::handlers::MigrationAuthorityBackend for CompensationBackend {
+    fn supports(&self, category: ConfirmationCategory) -> bool { category == ConfirmationCategory::Employee }
+    fn validate(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { Ok(()) }
+    fn stage(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { panic!("legacy stage") }
+    fn publish(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { panic!("legacy publish") }
+    fn read_back(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { panic!("legacy readback") }
+    fn disable(&self, _: &ConfirmationItem) -> Result<(), ConfirmationError> { panic!("legacy disable") }
+    fn employee_effect(&self, item: &ConfirmationItem, effect: duduclaw_migration::confirmation::ProposalEffect,
+        commit: &crate::handlers::EmployeeCommit<'_>) -> Result<(), ConfirmationError> {
+        use duduclaw_core::agent_seats::SeatAdmission;
+        use duduclaw_migration::confirmation::ProposalEffect;
+        use std::sync::atomic::Ordering::SeqCst;
+        assert_remote_unlocked(&self.home, item);
+        if effect == ProposalEffect::Disable {
+            assert_eq!(item.status, Status::Failed);
+            let db = Connection::open(self.home.join(CONFIRMATIONS_DB)).unwrap();
+            let intent: (i64, Vec<u8>, i64) = db.query_row(
+                "SELECT action,digest,length(token) FROM migration_effect_intents WHERE id=?1 AND revision=?2",
+                params![item.binding.operation_id.proposal_id.0.as_slice(), item.binding.operation_id.revision],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+            assert_eq!(intent, (3, item.binding.proposal_digest.0.to_vec(), 16));
+        }
+        let action = match effect {
+            ProposalEffect::Stage => Action::Allocate,
+            ProposalEffect::Disable => Action::Disable,
+            _ => Action::ReadBack,
+        };
+        let mut actions = self.actions.lock().unwrap();
+        actions.push(action);
+        let disables = actions.iter().filter(|a| matches!(a, Action::Disable)).count();
+        drop(actions);
+        match effect {
+            ProposalEffect::Stage => self.allocated.store(true, SeqCst),
+            ProposalEffect::Disable => {
+                if !self.race && disables == 1 { return Err(ConfirmationError::Apply); }
+                self.allocated.store(false, SeqCst);
+            }
+            _ => return Err(ConfirmationError::Apply),
+        }
+        let new = receipt(item, 9, effect == ProposalEffect::Disable);
+        let ax = new_ax();
+        let root = LastSeatRoot { home: &self.home, item };
+        let seat_write = |write: &mut dyn FnMut(&SeatAdmission) -> Result<(), AdoptError>| {
+            let mut result = Ok(());
+            commit.run(|admission| { result = write(admission); Ok(()) }).map_err(|_| AdoptError::Unavailable)?;
+            result
+        };
+        let mut env = AdoptEnv { agent_cap: 1, seat_write: Some(&seat_write), ..env(&ax) };
+        if self.race && effect == ProposalEffect::Stage { env.root = &root; }
+        if effect == ProposalEffect::Stage {
+            let mut persist = |gate: &dyn Fn(&Connection) -> Result<(), ()>| {
+                commit.run(|admission| crate::handlers::save_confirmed_receipt_gated(
+                    &self.home, item, &new, Some(gate), admission)).map_err(|_| ())
+            };
+            let result = apply_item(&self.home, &env, item, &new, &self.approver, &mut persist);
+            if self.race { assert_eq!(result.err(), Some(AdoptError::Restore(Refusal::QuotaExceeded))); return Err(ConfirmationError::Apply); }
+            return result.map(|_| ()).map_err(|_| ConfirmationError::Apply);
+        }
+        commit.run(|admission| crate::handlers::save_confirmed_receipt_gated(&self.home, item, &new, None, admission))?;
+        compensate_item(&self.home, &env, item).map_err(|_| ConfirmationError::Compensation)
+    }
+}
+
+fn compensation_journal(home: &Path, item: &ConfirmationItem, complete: bool) {
+    let db = Connection::open(home.join(CONFIRMATIONS_DB)).unwrap();
+    let id = item.binding.operation_id.proposal_id.0.as_slice();
+    let intents: i64 = db.query_row("SELECT count(*) FROM migration_effect_intents WHERE id=?1", [id], |r| r.get(0)).unwrap();
+    assert_eq!(intents, 0);
+    let entry: Option<(Vec<u8>, i64)> = db.query_row("SELECT digest,step FROM migration_apply WHERE id=?1 AND revision=?2",
+        params![id, item.binding.operation_id.revision], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
+    assert_eq!(entry, Some((item.binding.proposal_digest.0.to_vec(), if complete { 3 } else { 0 })));
+    let event = if complete { "failed_disabled" } else { "compensation_failed" };
+    let events: i64 = db.query_row("SELECT count(*) FROM migration_confirmation_audit WHERE proposal_id=?1 AND event=?2",
+        params![id, event], |r| r.get(0)).unwrap();
+    assert_eq!(events, 1);
+}
+
+#[test]
+fn adoption_last_seat_taken_during_remote_wait_is_compensated() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering::SeqCst}};
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    let ax = new_ax();
+    let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
+    let (_, item) = propose(&f, &ax, &request);
+    let mut store = store(f.home());
+    let session = ApprovalSession::from_verified_session(true, true, Some(100), [2; 32], RequestId([3; 16]));
+    store.approve(&[item.binding], &session, [2; 32], 100, &Accept).unwrap();
+    let backend = Arc::new(CompensationBackend { home: f.home().into(), approver: f.bob.clone(), race: true,
+        allocated: AtomicBool::new(false), actions: Mutex::new(Vec::new()) });
+    let mut authority = crate::handlers::GatewayAuthority::new(f.home().into()).unwrap().with_backend(backend.clone());
+    let result = authority.with_confirmation_admission(&mut store, &item.binding, |s, a| s.apply_next(&item.binding, a));
+    assert!(matches!(result, Err(ConfirmationError::Apply)));
+    assert_eq!(status(&store, &item), Status::Failed);
+    assert!(!backend.allocated.load(SeqCst));
+    assert!(matches!(backend.actions.lock().unwrap().as_slice(), [Action::Allocate, Action::Disable]));
+    assert_eq!(duduclaw_core::agent_seats::seat_holders(f.home()).unwrap().len(), 1);
+    assert!(!f.home().join("agents/alice-next").exists());
+    assert!(quarantined(f.home(), "SOUL.md"));
+    assert_eq!(seal_of(f.home()), "sealed");
+    assert_eq!(stored(f.home(), &request.request_id).state, "failed");
+    assert!(crate::isolation_lifecycle::confirmed_row(f.home(), "alice-next").unwrap().unwrap().0.disabled);
+    assert_eq!(bindings(f.home(), "alice-next"), 0);
+    compensation_journal(f.home(), &item, true);
+}
+
+#[test]
+fn adoption_failed_employee_retry_finishes_compensation_without_reallocation() {
+    use std::sync::{Arc, atomic::{AtomicBool, Ordering::SeqCst}};
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    let ax = new_ax();
+    let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
+    let (_, item) = propose(&f, &ax, &request);
+    let mut store = store(f.home());
+    let session = ApprovalSession::from_verified_session(true, true, Some(100), [2; 32], RequestId([3; 16]));
+    store.approve(&[item.binding], &session, [2; 32], 100, &Accept).unwrap();
+    let backend = Arc::new(CompensationBackend { home: f.home().into(), approver: f.bob.clone(), race: false,
+        allocated: AtomicBool::new(false), actions: Mutex::new(Vec::new()) });
+    let mut authority = crate::handlers::GatewayAuthority::new(f.home().into()).unwrap().with_backend(backend.clone());
+    authority.with_confirmation_admission(&mut store, &item.binding, |s, a| s.apply_next(&item.binding, a)).unwrap();
+    let result = authority.with_confirmation_admission(&mut store, &item.binding, |s, a| s.apply_next(&item.binding, a));
+    assert!(matches!(result, Err(ConfirmationError::Compensation)));
+    assert!(backend.allocated.load(SeqCst));
+    assert!(!crate::isolation_lifecycle::confirmed_row(f.home(), "alice-next").unwrap().unwrap().0.disabled);
+    assert_eq!(bindings(f.home(), "alice-next"), 1);
+    assert!(f.home().join("agents/alice-next/SOUL.md").exists());
+    assert_eq!(seal_of(f.home()), "adopted");
+    compensation_journal(f.home(), &item, false);
+    authority.with_confirmation_admission(&mut store, &item.binding, |s, a| {
+        s.compensate_failed_employee(&item.binding, &session, [2; 32], 100, a)
+    }).unwrap();
+    assert_eq!(status(&store, &item), Status::Failed);
+    assert!(!backend.allocated.load(SeqCst));
+    assert!(matches!(backend.actions.lock().unwrap().as_slice(), [Action::Allocate, Action::ReadBack, Action::Disable, Action::Disable]));
+    assert!(crate::isolation_lifecycle::confirmed_row(f.home(), "alice-next").unwrap().unwrap().0.disabled);
+    assert_eq!(bindings(f.home(), "alice-next"), 0);
+    assert!(!f.home().join("agents/alice-next").exists());
+    assert!(quarantined(f.home(), "SOUL.md") && quarantined(f.home(), "SKILLS"));
+    assert_eq!(seal_of(f.home()), "sealed");
+    assert_eq!(stored(f.home(), &request.request_id).state, "failed");
+    assert!(marker(&Connection::open(f.home().join(APPLY_DB)).unwrap(), "alice-next").unwrap().is_none());
+    assert!(duduclaw_core::agent_seats::seat_holders(f.home()).unwrap().is_empty());
+    compensation_journal(f.home(), &item, true);
+}
+
+#[test]
+fn adoption_uncountable_at_transform_fails_closed() {
+    use duduclaw_core::agent_seats::SeatAdmission;
+    let f = fixture();
+    tombstoned_full(&f, "soul");
+    let ax = new_ax();
+    let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
+    let (_, item) = propose(&f, &ax, &request);
+    let injected = std::cell::Cell::new(false);
+    let seat_write = |write: &mut dyn FnMut(&SeatAdmission) -> Result<(), AdoptError>| {
+        let admission = SeatAdmission::acquire(f.home()).unwrap();
+        if injected.replace(true) { return write(&admission); }
+        // Inject a listing failure only for the admission check, after the
+        // transform opened its directory descriptors. Restore before rollback.
+        let agents = f.home().join("agents");
+        let held = f.home().join("agents-count-test");
+        std::fs::rename(&agents, &held).unwrap();
+        std::fs::write(&agents, "not a directory").unwrap();
+        let result = write(&admission);
+        std::fs::remove_file(&agents).unwrap();
+        std::fs::rename(&held, &agents).unwrap();
+        result
+    };
+    let capped = AdoptEnv { agent_cap: 1, seat_write: Some(&seat_write), ..env(&ax) };
+    let mut persist = |_: &dyn Fn(&Connection) -> Result<(), ()>| -> Result<(), ()> { panic!("uncountable adoption saved") };
+    assert_eq!(apply_item(f.home(), &capped, &item, &receipt(&item, 9, false), &f.bob, &mut persist).err(), Some(AdoptError::Unavailable));
+    assert!(injected.get());
+    assert!(!f.home().join("agents/alice-next").exists());
+    assert!(quarantined(f.home(), "SOUL.md"));
+    assert_eq!(seal_of(f.home()), "sealed");
+    assert_eq!(stored(f.home(), &request.request_id).state, "failed");
 }

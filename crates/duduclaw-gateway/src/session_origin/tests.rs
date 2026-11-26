@@ -119,13 +119,17 @@ fn a_webchat_principal_never_owns_a_non_webchat_session() {
 #[test]
 fn every_messaging_channel_and_its_buckets_are_channel() {
     for ch in CHANNELS {
+        // Google Chat session ids contain validated space/thread resources.
+        let (chat, thread) = if *ch == "googlechat" {
+            ("spaces/CHAT1", "thread:spaces/CHAT1/threads/T9")
+        } else { ("chat-1", "thread-9") };
         for sid in [
-            format!("{ch}:chat-1"),
-            format!("{ch}:chat-1:thread-9"),
-            // A called employee's bucket and a per-employee bot bucket
-            // (`telegram:555#agent:sales`).
-            format!("{ch}:chat-1#agent:sales"),
-            format!("{ch}:chat-1#agent:sales#conv:2"),
+            format!("{ch}:{chat}"),
+            format!("{ch}:{chat}:{thread}"),
+            // A called employee's bucket and a per-employee bot bucket.
+            format!("{ch}:{chat}#agent:sales"),
+            if *ch == "googlechat" { format!("{ch}:{chat}:{thread}#agent:sales") }
+            else { format!("{ch}:{chat}#agent:sales#conv:2") },
         ] {
             assert_eq!(
                 origin_of(&sid, None),
@@ -134,6 +138,7 @@ fn every_messaging_channel_and_its_buckets_are_channel() {
             );
         }
     }
+    assert_eq!(origin_of("googlechat:chat-1", None).kind(), OriginKind::Unknown);
     assert_eq!(
         origin_of("discord:thread:42", None).kind(),
         OriginKind::Channel

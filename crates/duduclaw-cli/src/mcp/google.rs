@@ -3,7 +3,7 @@ use super::*;
 pub(crate) use duduclaw_gateway::google_identity::native_tools::{
     handle_google_chat_spaces, handle_google_chat_messages,
     arg_u32, arg_u64, handle_calendar_create_event, handle_calendar_list_events,
-    handle_docs_create, handle_docs_replace_text, handle_sheets_create, handle_sheets_update, handle_calendar_update_event,
+    handle_gmail_send_draft, handle_calendar_delete_event, handle_docs_create, handle_docs_replace_text, handle_sheets_create, handle_sheets_update, handle_calendar_update_event,
     handle_docs_append, handle_docs_read, handle_drive_read, handle_drive_search, handle_forms_get,
     handle_forms_list_responses, handle_gmail_create_draft, handle_gmail_read, handle_gmail_search,
     handle_gtasks_complete, handle_gtasks_create, handle_gtasks_list, handle_gtasks_lists,

@@ -167,7 +167,11 @@ async fn handle(
     );
     match serve(&state, &caller.agent_id, &request.tool, &requester).await {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(r) => refuse(StatusCode::FORBIDDEN, r.code, &r.message_zh),
+        Err(r) => {
+            crate::google_authorization_requests::turn::missing(&state.home,&caller.agent_id,
+                request.turn_id.as_deref(),&request.tool,r.code).await;
+            refuse(StatusCode::FORBIDDEN, r.code, &r.message_zh)
+        },
     }
 }
 
@@ -187,7 +191,10 @@ pub(crate) async fn serve(
         );
         return outcome;
     }
-    if !crate::google_personal::scopes::token_tool(tool) {
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
+        .shared().await.map_err(|_| super::owner_snapshot::changed())?;
+    refuse_owner_token(&state.home, agent)?;
+    if tool == "google_chat_send" || !crate::google_personal::scopes::token_tool(tool) {
         let outcome = Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
         audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
         return outcome.map(|_| Value::Null);
@@ -211,11 +218,9 @@ pub(crate) async fn serve(
     let outcome =
         resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
+    refuse_owner_token(&state.home, agent)?;
     match outcome? {
-        // RM-147: once this bearer reaches the CLI, an in-flight call may
-        // finish as the former owner after an authority change. Subsequent
-        // calls recheck; delegate:owner never caches its bearer. See the
-        // delegate:owner limitation in docs/guides/google-workspace.md.
+        // Only fixed delegation reaches the bearer route. Owner calls use execute.
         Resolved::Delegated { email, token } => Ok(json!({
             "ok": true,
             "mode": "delegate",
@@ -281,4 +286,12 @@ fn status_metadata(
         other => Err(super::resolve::refusal_for(other)
             .unwrap_or_else(|| Refusal::hard("config_invalid", "Google 設定錯誤。"))),
     }
+}
+
+fn refuse_owner_token(home: &std::path::Path, agent: &str) -> Result<(), Refusal> {
+    if duduclaw_core::google_identity::effective_for(home, Some(agent)).effective
+        == duduclaw_core::google_identity::Effective::DelegateOwner {
+        return Err(Refusal::hard("owner_execution_required", "負責人的 Google 操作必須由主程式執行；請更新 CLI。"));
+    }
+    Ok(())
 }

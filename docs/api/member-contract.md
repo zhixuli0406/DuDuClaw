@@ -194,7 +194,9 @@ cannot use `users.set_primary_agent` to replace it.
 | `me.status_tokens.list` | Read | List personal external-status credentials | `enabled`, `max_active`, `endpoint_path`, `tokens` | 1.85.0 |
 | `me.status_tokens.create` | Write | Create a personal status-only credential when enabled | — | 1.85.0 |
 | `me.status_tokens.revoke` | Write | Revoke a personal status-only credential | — | 1.85.0 |
-| `me.google.status` | Read | Read personal Google connection and consent status (Enterprise) | `connection`, `login_email`, `client_configured`, `chat_read`, `integration_enabled`, `requests`, `delegated`, `requires_login`, `recent_usage` | 1.85.0 |
+| `me.google.chat_confirmations` | Read | Read only your pending Google Chat confirmations | `requests` | 1.85.0 |
+| `me.google.chat_confirm` | Write | Confirm or cancel your single Google Chat send | `decided` | 1.85.0 |
+| `me.google.status` | Read | Read personal Google connection and consent status (Enterprise) | `connection`, `login_email`, `client_configured`, `chat_read`, `chat_send`, `integration_enabled`, `requests`, `delegated`, `requires_login`, `recent_usage` | 1.85.0 |
 | `me.google.connect_start` | Write | Start personal Google authorization (Enterprise) | — | 1.85.0 |
 | `me.google.connect_finish` | Write | Finish personal Google authorization (Enterprise) | — | 1.85.0 |
 | `me.google.connect_paste` | Write | Finish Google authorization using a pasted callback (Enterprise) | — | 1.85.0 |
@@ -332,7 +334,7 @@ Dashboard-token authentication and JWT-only account/security endpoints.
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 **current** role/bindings, and all existing handler gates. Credential management,
 `users.change_password`, `users.change_email`, `mfa.*`, `sessions.*`, `config.*`,
-`me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set` and
+`me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set`, `me.google.chat_confirm` and
 step-up operations are excluded. Unknown methods are denied. The compatibility
 table includes browser-only methods; its presence alone is not a key grant.
 

@@ -22,10 +22,12 @@
 //! timeout (≤5s for `--help`, ≤10s for the HTTP API), and uses
 //! `kill_on_drop(true)` so a hung probe is reaped rather than leaked. The
 //! optional `pty_probe` source (default OFF) is the only path that intentionally
-//! drives an interactive session, and it is fully bounded + killed.
+//! drives an interactive session; capture and teardown waits are bounded, and
+//! stalled teardown disables further PTY probes until process restart.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -711,12 +713,75 @@ fn strip_ansi_lossy(s: &str) -> String {
 
 // ── PTY probe (opt-in, default OFF) ──────────────────────────────────────
 
+const PTY_CAPTURE_LIMIT: usize = 1024 * 1024;
+const PTY_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+static PTY_PROBE_STATE: PtyProbeState = PtyProbeState::new();
+
+struct PtyProbeState {
+    running: AtomicBool,
+    disabled: AtomicBool,
+}
+
+impl PtyProbeState {
+    const fn new() -> Self {
+        Self { running: AtomicBool::new(false), disabled: AtomicBool::new(false) }
+    }
+
+    fn try_acquire(&self) -> Option<PtyProbeGuard<'_>> {
+        self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).ok()?;
+        let guard = PtyProbeGuard(self);
+        // Check after acquiring: the previous holder may just have tripped it.
+        if self.disabled.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(guard)
+        }
+    }
+
+    fn check_teardown(&self, completed: bool, reason: &str) {
+        // Only the active probe trips this flag, before releasing its guard.
+        // Never reset it: restarting the process is required to probe again.
+        if !completed && !self.disabled.swap(true, Ordering::AcqRel) {
+            warn!(%reason, "runtime_models: PTY probes disabled until process restart");
+        }
+    }
+}
+
+struct PtyProbeGuard<'a>(&'a PtyProbeState);
+
+impl Drop for PtyProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+    }
+}
+
+#[derive(Default)]
+struct PtyCapture {
+    bytes: Vec<u8>,
+    closed: bool,
+}
+
+impl PtyCapture {
+    fn append(&mut self, bytes: &[u8]) {
+        if !self.closed {
+            let len = bytes.len().min(PTY_CAPTURE_LIMIT.saturating_sub(self.bytes.len()));
+            self.bytes.extend_from_slice(&bytes[..len]);
+        }
+    }
+}
+
 /// Drive an interactive `claude` REPL, send `/model`, capture the menu, kill.
-/// Fully bounded (≤20s) and always kills the child. Returns raw PTY output.
+/// Kills/reaps the child and bounds the final reader wait. Returns raw PTY output.
 async fn probe_claude_pty(home_dir: &Path) -> Option<Vec<RuntimeModel>> {
+    // Shared by RPC, cache-miss and periodic discovery. Do not queue probes.
+    let guard = PTY_PROBE_STATE.try_acquire()?;
     let program =
         duduclaw_core::which_claude().or_else(|| duduclaw_core::which_claude_in_home(home_dir))?;
-    let raw = tokio::task::spawn_blocking(move || pty_capture_model_menu(&program))
+    let raw = tokio::task::spawn_blocking(move || {
+        // Keep single-flight even if the awaiting request is cancelled.
+        let _guard = guard;
+        pty_capture_model_menu(&program)
+    })
         .await
         .ok()??;
     let models = parse_claude_pty_model_menu(&raw);
@@ -729,7 +794,6 @@ async fn probe_claude_pty(home_dir: &Path) -> Option<Vec<RuntimeModel>> {
 
 fn pty_capture_model_menu(program: &str) -> Option<String> {
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -767,21 +831,24 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
     let mut child = pair.slave.spawn_command(cmd).ok()?;
     drop(pair.slave);
 
-    let mut reader = pair.master.try_clone_reader().ok()?;
-    let mut writer = pair.master.take_writer().ok()?;
+    let reader = pair.master.try_clone_reader().ok()?;
+    let writer = pair.master.take_writer().ok()?;
+    #[cfg(windows)]
+    let (reader, writer) = duduclaw_execution::conpty::startup_io(reader, writer);
+    let (mut reader, mut writer) = (reader, writer);
 
-    let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let done = Arc::new(AtomicBool::new(false));
+    let buf = Arc::new(Mutex::new(PtyCapture::default()));
     let buf_r = buf.clone();
-    let done_r = done.clone();
     let reader_thread = std::thread::spawn(move || {
         let mut tmp = [0u8; 8192];
-        while !done_r.load(Ordering::Relaxed) {
+        // Keep draining through master close: ClosePseudoConsole can block
+        // while conhost flushes its final output.
+        loop {
             match reader.read(&mut tmp) {
                 Ok(0) => break,
                 Ok(n) => {
                     if let Ok(mut b) = buf_r.lock() {
-                        b.extend_from_slice(&tmp[..n]);
+                        b.append(&tmp[..n]);
                     }
                 }
                 Err(_) => break,
@@ -789,9 +856,9 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         }
     });
 
-    let snapshot = |buf: &Arc<Mutex<Vec<u8>>>| -> String {
+    let snapshot = |buf: &Arc<Mutex<PtyCapture>>| -> String {
         buf.lock()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map(|b| String::from_utf8_lossy(&b.bytes).into_owned())
             .unwrap_or_default()
     };
 
@@ -803,16 +870,13 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         let low = snap.to_lowercase();
         if !sent {
             if low.contains("trust") && low.contains("folder") {
-                let _ = writer.write_all(b"\r");
-                let _ = writer.flush();
+                if writer.write_all(b"\r").and_then(|()| writer.flush()).is_err() { break; }
             }
             let ready = low.contains("shortcuts") || low.contains("try \"") || snap.contains('❯');
             if ready || start.elapsed() > Duration::from_secs(9) {
-                let _ = writer.write_all(b"/model");
-                let _ = writer.flush();
+                if writer.write_all(b"/model").and_then(|()| writer.flush()).is_err() { break; }
                 std::thread::sleep(Duration::from_millis(400));
-                let _ = writer.write_all(b"\r");
-                let _ = writer.flush();
+                if writer.write_all(b"\r").and_then(|()| writer.flush()).is_err() { break; }
                 sent = true;
             }
         } else if start.elapsed() > Duration::from_secs(17) {
@@ -823,18 +887,142 @@ fn pty_capture_model_menu(program: &str) -> Option<String> {
         }
     }
 
-    done.store(true, Ordering::Relaxed);
     let _ = child.kill();
     let _ = child.wait();
     drop(writer);
-    let _ = reader_thread.join();
+    // As in local/processes.rs ConsoleOnDrop, close ConPTY after the child
+    // exits, on a fresh thread because ClosePseudoConsole itself can block.
+    // The reader owns only pipe handles and keeps draining until EOF/error.
+    #[cfg(windows)]
+    let close_completion = {
+        let master = pair.master;
+        let (master_tx, master_rx) = std::sync::mpsc::channel();
+        let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+        // Transfer ownership only AFTER spawn succeeds: a failed spawn drops
+        // its closure on this thread, which must never close ConPTY inline.
+        match std::thread::Builder::new().spawn(move || {
+            if let Ok(master) = master_rx.recv() {
+                drop(master);
+                let _ = closed_tx.send(());
+            }
+        }) {
+            Ok(_) => match master_tx.send(master) {
+                Ok(()) => Some(closed_rx),
+                Err(error) => {
+                    std::mem::forget(error.0);
+                    PTY_PROBE_STATE.check_teardown(false, "PTY master close handoff failed");
+                    None
+                }
+            },
+            Err(_) => {
+                std::mem::forget(master);
+                PTY_PROBE_STATE.check_teardown(false, "PTY master close thread spawn failed");
+                None
+            }
+        }
+    };
+    #[cfg(not(windows))]
+    drop(pair.master);
+    PTY_PROBE_STATE.check_teardown(
+        join_reader_with_timeout(reader_thread, PTY_TEARDOWN_TIMEOUT),
+        "PTY reader teardown timed out",
+    );
+    #[cfg(windows)]
+    if let Some(completion) = close_completion {
+        PTY_PROBE_STATE.check_teardown(
+            completion.recv_timeout(PTY_TEARDOWN_TIMEOUT).is_ok(),
+            "PTY master close did not report completion within timeout",
+        );
+    }
 
-    Some(snapshot(&buf))
+    // Serialize close with append so a detached reader can only drain/discard
+    // after this point, even if it already read a chunk before we closed.
+    let captured = buf.lock().map(|mut b| {
+        b.closed = true;
+        String::from_utf8_lossy(&b.bytes).into_owned()
+    }).unwrap_or_default();
+    Some(captured)
+}
+
+/// Detach a stuck reader instead of blocking the probe indefinitely.
+fn join_reader_with_timeout(reader: std::thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while !reader.is_finished() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    let _ = reader.join();
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pty_probe_single_flight_releases_on_drop() {
+        let state = PtyProbeState::new();
+        let first = state.try_acquire().expect("first probe should acquire");
+        assert!(state.try_acquire().is_none());
+        drop(first);
+        assert!(state.try_acquire().is_some());
+    }
+
+    #[test]
+    fn pty_probe_timeout_disables_future_probes() {
+        let state = PtyProbeState::new();
+        let guard = state.try_acquire().unwrap();
+        state.check_teardown(true, "finished reader");
+        assert!(!state.disabled.load(std::sync::atomic::Ordering::Acquire));
+        state.check_teardown(false, "simulated reader timeout");
+        drop(guard);
+        assert!(state.try_acquire().is_none());
+        // A later completion must not reset the breaker.
+        state.check_teardown(true, "late completion");
+        assert!(state.try_acquire().is_none());
+    }
+
+    #[test]
+    fn pty_capture_caps_output_and_discards_after_close() {
+        let mut capture = PtyCapture::default();
+        capture.append(b"prefix");
+        capture.append(&vec![b'x'; PTY_CAPTURE_LIMIT]);
+        assert_eq!(capture.bytes.len(), PTY_CAPTURE_LIMIT);
+        assert!(capture.bytes.starts_with(b"prefix"));
+        capture.append(b"discarded");
+        assert_eq!(capture.bytes.len(), PTY_CAPTURE_LIMIT);
+
+        let mut capture = PtyCapture::default();
+        capture.append(b"before close");
+        capture.closed = true;
+        capture.append(b"discarded after close");
+        assert_eq!(capture.bytes, b"before close");
+    }
+
+    #[test]
+    fn reader_join_detaches_when_reader_stays_blocked() {
+        let (release, blocked) = std::sync::mpsc::channel::<()>();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let caller = std::thread::spawn(move || {
+            let reader = std::thread::spawn(move || { let _ = blocked.recv(); });
+            let joined = join_reader_with_timeout(reader, Duration::from_millis(20));
+            let _ = result_tx.send(joined);
+        });
+        // Keep the reader blocked until the caller has returned. An unbounded
+        // join fails this test without hanging the test process forever.
+        assert!(!result_rx.recv_timeout(Duration::from_secs(2)).expect("reader join exceeded its bound"));
+        drop(release);
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn reader_join_accepts_a_finished_reader() {
+        let reader = std::thread::spawn(|| {});
+        assert!(join_reader_with_timeout(reader, Duration::from_secs(2)));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

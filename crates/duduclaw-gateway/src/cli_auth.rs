@@ -710,7 +710,7 @@ impl AuthSession {
             .slave
             .spawn_command(cmd)
             .map_err(|e| AuthError::Spawn(e.to_string()))?;
-        let mut reader = pair
+        let reader = pair
             .master
             .try_clone_reader()
             .map_err(|e| AuthError::Pty(e.to_string()))?;
@@ -718,6 +718,9 @@ impl AuthSession {
             .master
             .take_writer()
             .map_err(|e| AuthError::Pty(e.to_string()))?;
+        #[cfg(windows)]
+        let (reader, writer) = duduclaw_execution::conpty::startup_io(reader, writer);
+        let mut reader = reader;
 
         let (output_tx, _rx) = broadcast::channel::<Vec<u8>>(1024);
         let output_snapshot = Arc::new(Mutex::new(Vec::new()));
@@ -890,7 +893,11 @@ impl AuthSession {
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)
             .and_then(|_| w.flush())
-            .map_err(|e| AuthError::Io(e.to_string()))
+            .map_err(|e| {
+                self.status.store(ST_FAILED, Ordering::Relaxed);
+                self.kill();
+                AuthError::Io(e.to_string())
+            })
     }
 
     /// Current status.

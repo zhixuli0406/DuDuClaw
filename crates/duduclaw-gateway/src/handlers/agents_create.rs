@@ -41,6 +41,23 @@ impl MethodHandler {
         params: Value,
         caller: Option<&UserContext>,
     ) -> WsFrame {
+        let avatar_member = match params.get("avatar_for_user") {
+            None => None,
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.as_str()),
+            _ => return WsFrame::error_response("", "avatar_for_user 必須是成員 ID。"),
+        };
+        let avatar_db = if avatar_member.is_some() {
+            let Some(db) = self.user_db.read().await.clone() else {
+                return WsFrame::error_response("", "無法讀取成員資料，未建立分身。");
+            };
+            if !caller.is_some_and(|ctx| super::user_invites_rpc::live_admin(&db, ctx)) {
+                return WsFrame::error_response("", "只有管理員可以為成員建立 AI 分身。");
+            }
+            if params.get("role").and_then(Value::as_str).unwrap_or("specialist") != "specialist" {
+                return WsFrame::error_response("", "AI 分身必須使用 specialist 角色。");
+            }
+            Some(db)
+        } else { None };
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let display_name = params
             .get("display_name")
@@ -187,10 +204,12 @@ impl MethodHandler {
         // the cross-process seat admission lock, which is held until the
         // directory is published below (lock order: seat admission, then
         // the org lock, then agent.toml locks).
-        let seat_admission = match self.admit_agent_seats(1, None).await {
+        let seat_admission = match self.admit_agent_seats(usize::from(avatar_member.is_none()), None).await {
             Ok(admission) => admission,
             Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
         };
+
+        let seat_cap = self.effective_agent_cap().await;
 
         // Create agent directory and files. Own the agents-dir path and release
         // the read guard immediately — the post-create registry rescan below
@@ -359,7 +378,51 @@ impl MethodHandler {
         // failure (corrupt / newer store, a cycle) refuses the whole create:
         // the staging directory is removed and nothing appears.
         // Short synchronous file operations (as the upsert always was).
-        if let Err(e) = staged.publish(&org, org_entry) {
+        let prior_org = duduclaw_core::org_store::load(&self.home_dir).get(name).cloned();
+        // Commit the org policy fence before the avatar's users transaction.
+        // Publishing below repeats the same upsert under this org lock, so it
+        // is a no-op and cannot open a second SQLite writer inside that tx.
+        let mut prepared_org = false;
+        let prepare = if avatar_db.is_some() && avatar_member.is_some() && caller.is_some() {
+            duduclaw_core::org_store::upsert(&org, name, org_entry.clone())
+                .map(|_| { prepared_org = true; }).map_err(|e| e.to_string())
+        } else { Ok(()) };
+        let mut published = false;
+        let result = prepare.and_then(|()| {
+            let publish = |users: Option<&rusqlite::Connection>| {
+                let result = match users {
+                    Some(conn) => staged.publish_in_users_transaction(&org, org_entry, conn),
+                    None => staged.publish(&org, org_entry),
+                };
+                // A nonce failure can happen after rename, while an authority
+                // refusal happens before it. Only compensate a published tree.
+                published = match std::fs::symlink_metadata(&agent_dir) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    _ => true,
+                };
+                result.map(|_| ()).map_err(|e| e.to_string())
+            };
+            match (avatar_db.as_ref(), avatar_member, caller) {
+                (Some(db), Some(member), Some(ctx)) => db.publish_new_avatar_under(
+                    &ctx.user_id, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
+                ),
+                _ => publish(None).and_then(|()| seat_admission.recount(seat_cap)),
+            }
+        });
+        if let Err(mut e) = result {
+            if published || prepared_org {
+                // These artifacts were created by this request while admission
+                // and org locks are held. Never touch a pre-existing agent.
+                let cleanup = if published { std::fs::remove_dir_all(&agent_dir) } else { Ok(()) };
+                let authority = match prior_org {
+                    Some(entry) => duduclaw_core::org_store::upsert(&org, name, entry).map(|_| ()),
+                    None => duduclaw_core::org_store::remove(&org, name).map(|_| ()),
+                };
+                if cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) || authority.is_err() {
+                    // Even when compensation fails, still restore a demoted main.
+                    e.push_str("；AI 建立失敗，清理未完成，請管理員檢查 AI 資料。未取得名額豁免。");
+                }
+            }
             warn!(agent = %name, error = %e, "agents.create refused: org authority not committed");
             // RM-027 round 5: the create did not happen, so the main it
             // demoted is put back (still under the org lock).
@@ -435,6 +498,7 @@ impl MethodHandler {
 /// dashboard client on a step-up retry and is transport, not data.
 pub(crate) const AGENTS_CREATE_FIELDS: &[&str] = &[
     "name",
+    "avatar_for_user",
     "display_name",
     "role",
     "trigger",

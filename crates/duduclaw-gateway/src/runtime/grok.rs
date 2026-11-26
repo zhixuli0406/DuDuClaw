@@ -659,8 +659,8 @@ impl AgentRuntime for GrokRuntime {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
         let output = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Grok,
-            crate::process_group::output_for_model(
-            &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()),
+            crate::process_group::output_for_model_bound(
+            &mut cmd, None, deadline.saturating_duration_since(tokio::time::Instant::now()), Some(_run_identity.spawn_binding()),
         )).await.map_err(|e| match e {
             crate::process_group::OutputError::Timeout => grok_hard_timeout(timeout_secs),
             crate::process_group::OutputError::Io(e) => crate::process_group::backend_error(e, "Failed to run grok"),
@@ -1007,7 +1007,7 @@ impl GrokRuntime {
         }
         let out = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Grok,
-            crate::pty_runtime::invoke_oneshot(
+            crate::pty_runtime::invoke_oneshot_bound(
             self.grok_path.clone(),
             args.to_vec(),
             env,
@@ -1021,6 +1021,7 @@ impl GrokRuntime {
             // the Claude spawn paths this WP fixed; flagged as a follow-up
             // candidate, not silently left unmentioned.
             false,
+            Some(_run_identity.spawn_binding()),
         ))
         .await
         .map_err(|e| grok_pty_error(e, timeout_secs))?;
@@ -1198,7 +1199,8 @@ impl GrokRuntime {
         );
         // Run-specific values must never be persisted in shared TOML.
         for key in [duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
-            duduclaw_core::run_credential::ENV_IDENTITY_URL] {
+            duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT,
+            duduclaw_core::run_credential::ENV_IDENTITY_SERVER] {
             env.insert(key.into(), toml::Value::String(format!("${{{key}:-}}")));
         }
         let mut table = toml::map::Map::new();
@@ -1355,7 +1357,9 @@ mod tests {
             .env_remove(duduclaw_core::mcp_proxy_rewrite::PROXY_UPSTREAM_ENV_DIR_VAR);
         for (name, value) in command.as_std().get_envs() {
             if name == duduclaw_core::run_credential::ENV_RUN_CREDENTIAL
-                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL {
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_URL
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT
+                || name == duduclaw_core::run_credential::ENV_IDENTITY_SERVER {
                 if let Some(value) = value { expected.env(name, value); }
                 else { expected.env_remove(name); }
             }

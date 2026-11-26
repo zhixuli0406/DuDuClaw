@@ -59,7 +59,11 @@ pub fn marker_path(home: &Path) -> PathBuf {
 /// from a file, so nothing on disk can point the gateway at another item.
 pub fn account_for_home(home: &Path) -> String {
     let canonical = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let hash = digest(&SHA256, canonical.to_string_lossy().as_bytes());
+    account_for_resolved_home(&canonical)
+}
+
+pub(super) fn account_for_resolved_home(home: &Path) -> String {
+    let hash = digest(&SHA256, home.to_string_lossy().as_bytes());
     format!("home-{}", short_hex(hash.as_ref()))
 }
 
@@ -112,7 +116,11 @@ pub fn read_marker(home: &Path) -> MarkerRead {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return MarkerRead::Absent,
         Err(e) => return MarkerRead::Invalid(sanitize_output_text(&format!("cannot read marker: {e}"))),
     };
-    match serde_json::from_slice::<Marker>(&bytes) {
+    parse_marker(&bytes)
+}
+
+fn parse_marker(bytes: &[u8]) -> MarkerRead {
+    match serde_json::from_slice::<Marker>(bytes) {
         Ok(m) if m.version == MARKER_VERSION => {
             if m.key_id.len() != ID_HEX_LEN || !m.key_id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
                 return MarkerRead::Invalid("marker key_id must be 16 lowercase hexadecimal characters".into());
@@ -175,4 +183,34 @@ fn write_owner_only(path: &Path, body: &[u8]) -> Result<(), String> {
     file.write_all(body).map_err(|e| format!("marker write: {e}"))?;
     file.sync_all().map_err(|e| format!("marker sync: {e}"))?;
     duduclaw_core::platform::set_owner_only(path).map_err(|e| format!("marker chmod: {e}"))
+}
+
+#[cfg(unix)]
+pub(super) fn read_pinned(home: &duduclaw_core::trusted_home::TrustedHome) -> MarkerRead {
+    use std::io::Read;
+    let result = (|| -> std::io::Result<Vec<u8>> {
+        let mut file = home.open_file(MARKER_FILE, libc::O_RDONLY)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })();
+    match result {
+        Ok(bytes) => parse_marker(&bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => MarkerRead::Absent,
+        Err(e) => MarkerRead::Invalid(sanitize_output_text(&format!("cannot read marker: {e}"))),
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn write_pinned(home: &duduclaw_core::trusted_home::TrustedHome, marker: &Marker) -> Result<(), String> {
+    let body = serde_json::to_vec_pretty(marker).map_err(|e| e.to_string())?;
+    let tmp = format!(".{MARKER_FILE}.tmp-{}", random_suffix()?);
+    let result = (|| -> std::io::Result<()> {
+        let mut file = home.open_file(&tmp, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+        home.rename_file(&tmp, MARKER_FILE)
+    })();
+    if result.is_err() { let _ = home.remove_file(&tmp); }
+    result.map_err(|e| e.to_string())
 }

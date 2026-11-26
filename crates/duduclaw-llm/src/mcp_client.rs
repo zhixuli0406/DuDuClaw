@@ -507,6 +507,7 @@ enum McpTransport {
 /// next is issued (the tool loop dispatches sequentially), so a simple
 /// read-until-matching-id loop suffices without a background reader task.
 pub struct McpClient {
+    run_identity: Option<Box<dyn duduclaw_core::run_credential::RunLease>>,
     transport: McpTransport,
     next_id: AtomicI64,
     timeout: Duration,
@@ -528,6 +529,8 @@ pub trait McpInputHandler: Send + Sync {
     fn capabilities(&self) -> Value;
     async fn respond(&self, request: &Value) -> Result<Value, McpError>;
 }
+
+mod process_binding;
 
 impl McpClient {
     /// The host may opt its own DuDuClaw server into per-tool deadlines.
@@ -605,13 +608,24 @@ impl McpClient {
         stderr: std::process::Stdio,
         clear_env: bool,
     ) -> Result<Self, McpError> {
+        Self::spawn_and_handshake_bound(command, args, envs, timeout, stderr, clear_env, None).await
+    }
+
+    async fn spawn_and_handshake_bound(
+        command: &str, args: &[String], envs: &[(String, String)], timeout: Duration,
+        stderr: std::process::Stdio, clear_env: bool,
+        binding: Option<duduclaw_core::run_credential::SpawnBinding>,
+    ) -> Result<Self, McpError> {
         let mut cmd = stdio_command(command, args, envs, stderr, clear_env)?;
+        if binding.is_some() {
+            cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
+        }
 
         let mut child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Registered(
                 duduclaw_core::execution_gate::Text::new("tool-loop-mcp".into()).expect("constant runtime id")),
-            ManagedChild::spawn_class(&mut cmd,
-            duduclaw_core::execution_gate::ExecutionClass::ToolLoopMcp)).await
+            ManagedChild::spawn_class_bound(&mut cmd,
+            duduclaw_core::execution_gate::ExecutionClass::ToolLoopMcp, binding)).await
             .map_err(|e| McpError::Spawn(e.to_string()))?;
         let stdin = child.child()
             .stdin
@@ -628,6 +642,7 @@ impl McpClient {
                 stdin,
                 stdout: BufReader::new(stdout),
             },
+            run_identity: None,
             next_id: AtomicI64::new(1),
             timeout,
             label: command.to_string(),
@@ -678,6 +693,7 @@ impl McpClient {
                 scoped: None,
                 legacy: None,
             },
+            run_identity: None,
             next_id: AtomicI64::new(1),
             timeout,
             label: "remote-http".into(),
@@ -715,6 +731,7 @@ impl McpClient {
                 scoped: Some(ScopedHttpAuthority { bearer, lease }),
                 legacy: None,
             },
+            run_identity: None,
             next_id: AtomicI64::new(1),
             timeout: recipe.operation_timeout,
             label: "scoped-http".into(),
@@ -1348,7 +1365,6 @@ pub trait ClientCallBoundary: Send + Sync {
 /// name, the earlier client owns it and a warning is logged; the later one's
 /// tool is dropped from both the routing table and `tool_defs()`.
 pub struct ToolRegistry {
-    run_identity: Option<Box<dyn duduclaw_core::run_credential::RunLease>>,
     clients: Vec<Mutex<RegistryClient>>,
     /// tool name → index into `clients`.
     routes: HashMap<String, usize>,
@@ -1437,11 +1453,6 @@ impl ToolFilter {
 }
 
 impl ToolRegistry {
-    /// Hold the host run lease until all tools for the API run are dropped.
-    pub fn hold_run_identity(&mut self, lease: Box<dyn duduclaw_core::run_credential::RunLease>) {
-        self.run_identity = Some(lease);
-    }
-
     /// Build a registry from already-connected clients, discovering each
     /// server's tools via `tools/list` and resolving name collisions.
     pub async fn from_clients(clients: Vec<McpClient>) -> Result<Self, McpError> {
@@ -1478,7 +1489,6 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
-            run_identity: None,
         })
     }
 
@@ -1576,7 +1586,6 @@ impl ToolRegistry {
             client_notices: HashMap::new(),
             scoped_operation_timeouts,
             closed_client_indices,
-            run_identity: None,
         };
         // Cloning/filtering schemas and dropping discovery inputs are part
         // of discovery admission, before the final original-deadline check.
@@ -2277,7 +2286,6 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
-            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),
@@ -2324,7 +2332,6 @@ pathlib.Path(sys.argv[1]).write_text('guarded')
             client_notices: HashMap::new(),
             scoped_operation_timeouts: HashMap::new(),
             closed_client_indices: HashSet::new(),
-            run_identity: None,
         };
         let scope = CcrScope {
             tenant_id: "local".into(),

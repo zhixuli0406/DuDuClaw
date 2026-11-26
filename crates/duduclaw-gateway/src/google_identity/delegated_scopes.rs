@@ -23,9 +23,13 @@ pub(crate) fn for_service(home: &Path, service: &str) -> Result<&'static [&'stat
 }
 
 pub(crate) fn for_tool(home: &Path, tool: &str) -> Result<&'static [&'static str], super::Refusal> {
+    if tool == "google_chat_send" {
+        return if crate::google_workspace::chat_send_enabled(home) { Ok(crate::google_workspace::CHAT_SEND_SCOPES) }
+            else { Err(super::Refusal::hard("scope_missing", crate::google_workspace::chat_send::GUIDANCE)) };
+    }
     let service = match tool {
-        "gmail_search" | "gmail_read" | "gmail_create_draft" | "mail_poll" => "gmail",
-        "calendar_list_events" | "calendar_create_event" | "calendar_update_event" => "calendar",
+        "gmail_search" | "gmail_read" | "gmail_send_draft" | "gmail_create_draft" | "mail_poll" => "gmail",
+        "calendar_list_events" | "calendar_create_event" | "calendar_delete_event" | "calendar_update_event" => "calendar",
         "docs_read" | "docs_append" | "docs_create" | "docs_replace_text" => "docs",
         "sheets_read" | "sheets_append" | "sheets_create" | "sheets_update" => "sheets",
         "drive_search" | "drive_read" => "drive",
@@ -55,6 +59,18 @@ pub(crate) fn for_endpoint(home: &Path, endpoint: &str) -> Result<&'static [&'st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chat_send_scope_is_independent_and_fail_closed() {
+        let home = tempfile::tempdir().unwrap();
+        for config in ["", "[google]\nchat_read=true", "[google]\nchat_send='true'", "[broken"] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            assert!(for_tool(home.path(), "google_chat_send").is_err());
+        }
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_send=true").unwrap();
+        assert_eq!(for_tool(home.path(), "google_chat_send").unwrap(), crate::google_workspace::CHAT_SEND_SCOPES);
+        assert!(for_tool(home.path(), "google_chat_messages").is_err());
+        assert!(!for_tool(home.path(), "gmail_read").unwrap().contains(&crate::google_workspace::CHAT_SEND_SCOPES[0]));
+    }
     #[test]
     fn scopes_are_per_service_and_chat_is_opt_in() {
         let home = tempfile::tempdir().unwrap();

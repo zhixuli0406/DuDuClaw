@@ -6,6 +6,21 @@ use duduclaw_migration::ids::RequestId;
 use duduclaw_isolation::capability::EmployeeBinding;
 use crate::isolation_lifecycle::{self as lifecycle, LifecycleError};
 use std::sync::Arc;
+use duduclaw_core::agent_seats::SeatAdmission;
+
+/// The only confirmation seat-write boundary. Remote work runs before/after
+/// this scope; the operation lock remains held by ConfirmationStore throughout.
+pub(crate) struct EmployeeCommit<'a> {
+    pub(super) home: &'a Path,
+    pub(super) proposal: &'a ProposalLock,
+}
+impl EmployeeCommit<'_> {
+    pub(crate) fn run<T>(&self, write: impl FnOnce(&SeatAdmission) -> Result<T>) -> Result<T> {
+        let admission = SeatAdmission::acquire(self.home).map_err(|_| Error::Storage)?;
+        self.proposal.run(|| write(&admission))
+    }
+}
+
 
 pub(crate) struct EmployeeAuthority { home:PathBuf, live:Arc<LiveAuthority>, agent_cap:usize, step_up_verified_at:Option<u64> }
 impl EmployeeAuthority {
@@ -51,7 +66,6 @@ impl EmployeeAuthority {
         })?
     }
     fn exchange(&self,item:&ConfirmationItem,action:Action)->Result<Receipt>{exchange(item,action)}
-    fn save(&self,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {save_confirmed_receipt(&self.home,item,receipt)}
     /// F6g: the live Admin while the card is Pending, else the actor of the
     /// approval record (same rule as the retire card).
     fn approver(&self,item:&ConfirmationItem)->Result<String> {
@@ -74,7 +88,7 @@ impl EmployeeAuthority {
         let env=crate::isolation_adopt::AdoptEnv { root:&crate::isolation_retire::SpawndRetireRoot, routes:&routes,
             runs:&crate::isolation_quarantine::SpawndRunStopper, rule:&duduclaw_auth::admin_approval_rule::EligibilityLogRule,
             hooks:&hooks, agent_cap:self.agent_cap, actor, step_up_verified_at:self.step_up_verified_at,
-            now:chrono::Utc::now().timestamp() };
+            now:chrono::Utc::now().timestamp(), seat_write:None };
         run(&env)
     }
 }
@@ -93,16 +107,22 @@ fn adopt_error(e:crate::isolation_adopt::AdoptError)->Error {
 /// apply.db writer lock is held and before the confirmed row; a mirror
 /// failure refuses the step and leaves no confirmed row. Compensation
 /// removes the mirror only after the disabled row is durable.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn save_confirmed_receipt(home:&Path,item:&ConfirmationItem,receipt:&Receipt)->Result<()> {
-    save_confirmed_receipt_gated(home,item,receipt,None)
+    // Non-confirmation callers have no proposal lock. Confirmation effects
+    // must use EmployeeCommit and call the admitted helper directly.
+    let admission = SeatAdmission::acquire(home).map_err(|_| Error::Storage)?;
+    save_confirmed_receipt_gated(home,item,receipt,None,&admission)
 }
-/// [`save_confirmed_receipt`]; security round 3 N1: `gate` runs inside the
+/// The caller supplies admission acquired before the proposal lock. Security
+/// round 3 N1: `gate` runs inside the
 /// users.db write transaction that writes the Personal mirror, before it (or,
 /// with no mirror to write, in its own users.db IMMEDIATE transaction), while
 /// the apply.db writer lock is held (M6). A refusal writes neither the mirror
 /// nor the confirmed row.
 pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,receipt:&Receipt,
-    gate:Option<&lifecycle::UsersGate<'_>>)->Result<()> {
+    gate:Option<&lifecycle::UsersGate<'_>>,admission:&SeatAdmission)->Result<()> {
+        if admission.home() != home { return Err(Error::Denied); }
         let spec=allocation::specification(item).map_err(|_|Error::Invalid)?;
         // The root copies the principal from this confirmed proposal only.
         if receipt.binding!=item.binding || receipt.label!=spec.label || receipt.principal_binding!=spec.binding {return Err(Error::Stale);}
@@ -124,7 +144,7 @@ pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,rec
             _ => None,
         };
         if let (Some(owner),false)=(personal_owner,receipt.disabled) {
-            lifecycle::record_personal_mirror_gated(home,&receipt.label,owner,gate).map_err(lifecycle_error)?;
+            lifecycle::record_personal_mirror_under(home,&receipt.label,owner,gate,admission).map_err(lifecycle_error)?;
         } else if let Some(gate)=gate {
             lifecycle::run_users_gate(home,gate).map_err(lifecycle_error)?;
         }
@@ -142,11 +162,12 @@ pub(crate) fn save_confirmed_receipt_gated(home:&Path,item:&ConfirmationItem,rec
         tx.commit().map_err(|_|Error::Storage)?;
         if let (Some(owner),true)=(personal_owner,receipt.disabled) {
             // Another owner's mirror (Stale) is not this allocation's to remove.
-            match lifecycle::remove_personal_mirror(home,&receipt.label,owner) {
+            match lifecycle::remove_personal_mirror_under(home,&receipt.label,owner,admission) {
                 Ok(_)|Err(LifecycleError::Stale)=>{}
                 Err(e)=>return Err(lifecycle_error(e)),
             }
         }
+        admission.recount(0).map_err(|_| Error::Storage)?;
         Ok(())
 }
 fn label_hold_error(e:crate::isolation_label_stores::GateRefusal)->Error {
@@ -168,29 +189,45 @@ fn exchange(item:&ConfirmationItem,action:Action)->Result<Receipt>{
 impl MigrationAuthorityBackend for EmployeeAuthority {
     fn supports(&self,category:ConfirmationCategory)->bool{cfg!(target_os="linux") && category==ConfirmationCategory::Employee}
     fn validate(&self,item:&ConfirmationItem)->Result<()>{if !self.supports(item.category){return Err(Error::Denied)}self.validate_current(item)}
-    fn stage(&self,item:&ConfirmationItem)->Result<()>{
-        self.validate(item)?;
-        let receipt=self.exchange(item,Action::Allocate)?;
-        if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some() {
-            // F6g §3.10 steps 4–5: transform, re-key, marker, confirmed row, commit.
-            let approver=self.approver(item)?;
-            // Security round 3 N1: the commit's owner/approval re-check runs in
-            // the users.db write transaction of the Personal mirror.
-            let mut save=|gate:&dyn Fn(&Connection)->std::result::Result<(),()>|
-                save_confirmed_receipt_gated(&self.home,item,&receipt,Some(gate)).map_err(|_|());
-            return self.with_adopt_env(&approver,|env| crate::isolation_adopt::apply_item(&self.home,env,item,&receipt,&approver,&mut save))
-                .map(|_|()).map_err(adopt_error);
+    // No fallback acquisition is allowed under ConfirmationStore's proposal
+    // lock. Only the split effect entry point below can perform these writes.
+    fn stage(&self,_:&ConfirmationItem)->Result<()>{Err(Error::Denied)}
+    fn publish(&self,_:&ConfirmationItem)->Result<()>{Err(Error::Denied)}
+    fn read_back(&self,_:&ConfirmationItem)->Result<()>{Err(Error::Denied)}
+    fn disable(&self,_:&ConfirmationItem)->Result<()>{Err(Error::Denied)}
+    fn employee_effect(&self,item:&ConfirmationItem,effect:ProposalEffect,commit:&EmployeeCommit<'_>)->Result<()> {
+        if !self.supports(item.category) { return Err(Error::Denied); }
+        if effect != ProposalEffect::Disable { self.validate(item)?; }
+        let action = match effect {
+            ProposalEffect::Stage => Action::Allocate,
+            ProposalEffect::Publish | ProposalEffect::ReadBack => Action::ReadBack,
+            ProposalEffect::Disable => Action::Disable,
+        };
+        let receipt = self.exchange(item,action)?;
+        let adopting = crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Invalid)?.is_some();
+        // Adoption's member writes use the same ordering as receipt writes.
+        // Its root probes, hook installation and rollback recovery stay outside.
+        let seat_write = |write: &mut dyn FnMut(&SeatAdmission) -> std::result::Result<(),crate::isolation_adopt::AdoptError>| {
+            let mut result = Ok(());
+            commit.run(|admission| { result = write(admission); Ok(()) })
+                .map_err(|_| crate::isolation_adopt::AdoptError::Unavailable)?;
+            result
+        };
+        if adopting && effect == ProposalEffect::Stage {
+            let approver = self.approver(item)?;
+            let mut save = |gate:&dyn Fn(&Connection)->std::result::Result<(),()>|
+                commit.run(|admission| save_confirmed_receipt_gated(&self.home,item,&receipt,Some(gate),admission)).map_err(|_|());
+            return self.with_adopt_env(&approver,|env| {
+                let env = crate::isolation_adopt::AdoptEnv { seat_write: Some(&seat_write), ..*env };
+                crate::isolation_adopt::apply_item(&self.home,&env,item,&receipt,&approver,&mut save)
+            }).map(|_|()).map_err(adopt_error);
         }
-        self.save(item,&receipt)
-    }
-    fn publish(&self,item:&ConfirmationItem)->Result<()>{self.validate(item)?;let receipt=self.exchange(item,Action::ReadBack)?;self.save(item,&receipt)}
-    fn read_back(&self,item:&ConfirmationItem)->Result<()>{self.publish(item)}
-    fn disable(&self,item:&ConfirmationItem)->Result<()>{
-        let receipt=self.exchange(item,Action::Disable)?;self.save(item,&receipt)?;
-        // F6g §3.10 step 6: the moved entries go back, the row needs a reseal.
-        if crate::isolation_adopt::proposal_ref(item).map_err(|_|Error::Compensation)?.is_some() {
-            let actor=self.live.context.user_id.clone();
-            self.with_adopt_env(&actor,|env| crate::isolation_adopt::compensate_item(&self.home,env,item)).map_err(|_|Error::Compensation)?;
+        commit.run(|admission| save_confirmed_receipt_gated(&self.home,item,&receipt,None,admission))?;
+        if adopting && effect == ProposalEffect::Disable {
+            self.with_adopt_env(&self.live.context.user_id,|env| {
+                let env = crate::isolation_adopt::AdoptEnv { seat_write: Some(&seat_write), ..*env };
+                crate::isolation_adopt::compensate_item(&self.home,&env,item)
+            }).map_err(|_|Error::Compensation)?;
         }
         Ok(())
     }

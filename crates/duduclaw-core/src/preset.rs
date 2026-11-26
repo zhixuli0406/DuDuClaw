@@ -614,8 +614,9 @@ fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
 }
 
 fn mutate_bindings<T>(home: &Path, f: impl FnOnce(&mut PresetBindingStore) -> T) -> io::Result<T> {
-    let path = bindings_path(home);
     crate::config::create_home_dir(home)?;
+    let _authority = crate::authority_coordinator::AuthorityCoordinator::new(home).write()?;
+    let path = bindings_path(home);
     with_file_lock(&path, || {
         let mut store = match std::fs::read_to_string(&path) {
             Ok(content) => match parse_bindings(&content) {

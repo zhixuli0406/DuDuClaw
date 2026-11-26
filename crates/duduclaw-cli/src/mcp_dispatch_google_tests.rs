@@ -586,7 +586,7 @@ async fn google_chat_tools_list_uses_same_scope_and_identity_receipt_as_gmail() 
 
 #[tokio::test]
 async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
-    let tools = ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event"];
+    let tools = ["docs_create", "docs_replace_text", "sheets_create", "sheets_update", "calendar_update_event", "gmail_send_draft", "calendar_delete_event"];
     for write in [false, true] {
         let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
         let path = home.path().join("config.toml");
@@ -606,13 +606,27 @@ async fn rm159_write_listing_and_dispatch_match_explicit_employee_scopes() {
         for tool in tools {
             assert_eq!(names.contains(&tool), write, "{tool}: {names:?}");
             assert_eq!(crate::mcp_auth::tool_requires_scope(tool), Some(crate::mcp_auth::Scope::GoogleWrite));
-            let effect = if tool == "calendar_update_event" { duduclaw_core::ToolEffect::Send } else { duduclaw_core::ToolEffect::Modify };
+            let effect = match tool {
+                "calendar_update_event" | "gmail_send_draft" => duduclaw_core::ToolEffect::Send,
+                "calendar_delete_event" => duduclaw_core::ToolEffect::Delete,
+                _ => duduclaw_core::ToolEffect::Modify,
+            };
             assert_eq!(duduclaw_core::effect_of(tool), effect);
             if !write {
                 let dispatcher = dispatcher(home.path()).await;
                 let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+                // Valid inputs reach the scope gate instead of failing argument validation first.
+                let arguments = match tool {
+                    "docs_create" | "sheets_create" => json!({"title":"test"}),
+                    "docs_replace_text" => json!({"document_id":"doc","find":"old","replace":"new"}),
+                    "sheets_update" => json!({"spreadsheet_id":"sheet","range":"A1","values":[["cell"]]}),
+                    "calendar_update_event" => json!({"event_id":"event","summary":"test"}),
+                    "gmail_send_draft" => json!({"draft_id":"draft"}),
+                    "calendar_delete_event" => json!({"event_id":"event"}),
+                    _ => unreachable!(),
+                };
                 let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
-                    &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(159),
+                    &principal, &namespace(), &json!({"name":tool,"arguments":arguments}), &json!(159),
                 )).await;
                 // RM-134 hides tools outside the authenticated employee scope.
                 assert_eq!(result["error"]["code"], -32601, "{tool}: {result}");

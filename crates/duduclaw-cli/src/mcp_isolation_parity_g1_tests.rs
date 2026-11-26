@@ -33,7 +33,7 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 268;
+const CATALOG_TOOLS: usize = 271;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -315,11 +315,36 @@ github = true
     let pending = pending_production_selectors();
     let manifests: Vec<BTreeMap<&'static str, ServiceState>> =
         employees.iter().map(|employee| employee.dispatcher.service_manifest().into_iter().collect()).collect();
+    for (name, effect, required) in [
+        ("gmail_send_draft", duduclaw_core::ToolEffect::Send, &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox][..]),
+        ("calendar_delete_event", duduclaw_core::ToolEffect::Delete, &[ResourceKind::Employee, ResourceKind::Connector][..]),
+    ] {
+        let policy = policy_table::policy(name).unwrap();
+        assert_eq!(policy.route, Route::Connector);
+        assert_eq!(policy.required, required);
+        assert_eq!(provider_for_tool(name), Some("google"));
+        assert_eq!(duduclaw_core::effect_of(name), effect);
+        assert_eq!(crate::mcp_auth::tool_requires_scope(name), Some(crate::mcp_auth::Scope::GoogleWrite));
+        assert!(!pending.contains(name));
+    }
     // v1.85 Google writes use the existing account-bound connector route.
     // EmployeeScope permits discovery, not account access: this fixture has no
     // Google route, so both employees' installed providers must refuse selection.
     // Keep the reviewed analogues, effects and grants explicit beside the pin.
     use duduclaw_core::tool_effect::{effect_of_builtin, ToolEffect};
+    // RM-062: both Shared and Personal workers require account AND exact space grants.
+    let chat = policy_table::policy("google_chat_send").unwrap();
+    assert_eq!(chat.route, Route::Connector);
+    assert_eq!(chat.required, &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox, ResourceKind::Recipient]);
+    assert_eq!(effect_of_builtin("google_chat_send"), Some(ToolEffect::Send));
+    assert_eq!(crate::mcp_auth::tool_requires_scope("google_chat_send"), Some(crate::mcp_auth::Scope::GoogleWrite));
+    for (index, employee) in employees.iter().enumerate() {
+        assert!(policy_table::eligible(&employee.context, "google_chat_send"), "{} discovery", employee.kind);
+        assert_eq!(manifests[index].get("google_chat_send"), Some(&ServiceState::Ready));
+        let registry = employee.installed.registry();
+        assert!(matches!(LiveConnectorSelectionPolicy::candidates(registry.as_ref(), &employee.context,
+            "google_chat_send", "google"), Err(VerificationError::Unavailable)));
+    }
     for (name, analogue, effect) in [
         ("docs_create", "docs_append", ToolEffect::Modify),
         ("docs_replace_text", "docs_append", ToolEffect::Modify),

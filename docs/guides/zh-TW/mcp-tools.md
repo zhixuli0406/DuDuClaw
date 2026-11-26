@@ -3,7 +3,7 @@
 
 ## 查證本機呼叫者
 
-`duduclaw identity whoami --json` 可查詢 gateway 核發的本次執行身分；憑證缺失、無效或無法查證時，以非零狀態結束。第三方本機 MCP server 可透過 proxy 繼承 `DUDUCLAW_RUN_CREDENTIAL`，舊身分變數仍會移除。請每次呼叫都查證，再依工具本身的規則授權。詳見[取得與查證呼叫者身分](custom-mcp-tool.md)。
+`duduclaw identity whoami --json` 可查詢 gateway 核發的本次執行身分；憑證缺失、無效或無法查證時，以非零狀態結束。第三方本機 MCP server 可透過 proxy 繼承 `DUDUCLAW_RUN_CREDENTIAL`、`DUDUCLAW_IDENTITY_ENDPOINT` 與 `DUDUCLAW_IDENTITY_SERVER`，舊身分變數仍會移除。gateway 只回應本次執行的 CLI 程序及其子孫程序，在執行之外啟動的 server 會被拒絕。請每次呼叫都查證，再依工具本身的規則授權。詳見[取得與查證呼叫者身分](custom-mcp-tool.md)。
 
 
 ## 技能封存還原
@@ -191,8 +191,8 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 |---|---|---|
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個舊白名單工具加上明確授予 scope 的工具，接著再套下一列的 scope 規則 |
 | 非員工呼叫者的 scope | `principal.scopes`，適用於不持有 `admin`、也不是 AI 員工的金鑰（不是 gateway 內部金鑰、不是單一員工金鑰、也不是 gateway 為員工啟動的行程） | 只列金鑰持有其最低 scope 的工具；替行程本身的 agent 動作的工具（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` 與三個整併狀態查詢等）不列，對所有外部金鑰也不列；呼叫時 dispatch 閘依同一條規則拒絕（`process_agent_tool`）。見 [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 21 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
-| Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 21 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
+| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 29 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
+| Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 29 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
 | `os_native` | `agent.toml [capabilities]` | 隱藏 6 個 `os_*` 自動化工具 |
@@ -400,7 +400,7 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 ### `create_agent`：人格設定與名額（v1.82.0）
 
-人格設定放在 `soul_md`（`soul` 是舊名稱；空字串視同沒給，兩個都有內容且不同才會被拒絕）。內容會經過和板模建立相同的 SOUL.md 安全檢查；檢查沒過或 SOUL.md 寫不進去，整個呼叫都會失敗，磁碟上不留任何東西；拒絕訊息會說明原因類別（HTML 註解、不可見字元、隱藏內容、提示注入句型），但不引用內容。工具沒有讀的參數不會被拒絕，回覆會在「Ignored arguments (no effect)」列出（最多 20 個名稱、每個最多 64 字，其餘以「… and N more」表示）。授權名額計算所有狀態不是 `deleted` 的員工（已封存的員工仍佔名額）；額滿拒絕時只回覆上限與目前已使用的名額數，不列出佔用名額的員工（管理員可在儀表板看到清單）。名額檢查與建立是同一個步驟，和儀表板、專家包匯入共用同一把鎖，同時建立也不會超過上限。員工不能用檔案工具修改自己的 `[agent] status`，`agent_update` 也不能變更已封存或已刪除員工的 `status`；封存、恢復與刪除只能在儀表板操作。之後要改人格設定，見[建立之後修改員工的人格設定](dashboard-settings.md#建立之後修改員工的人格設定v1820)。
+人格設定放在 `soul_md`（`soul` 是舊名稱；空字串視同沒給，兩個都有內容且不同才會被拒絕）。內容會經過和板模建立相同的 SOUL.md 安全檢查；檢查沒過或 SOUL.md 寫不進去，整個呼叫都會失敗，磁碟上不留任何東西；拒絕訊息會說明原因類別（HTML 註解、不可見字元、隱藏內容、提示注入句型），但不引用內容。工具沒有讀的參數不會被拒絕，回覆會在「Ignored arguments (no effect)」列出（最多 20 個名稱、每個最多 64 字，其餘以「… and N more」表示）。授權名額排除已刪除員工，以及啟用成員本人擁有、經驗證的 Personal AI 分身（一人一分身；已封存的 AI 仍佔名額）；額滿拒絕時只回覆上限與目前已使用的名額數，不列出佔用名額的員工（管理員可在儀表板看到清單）。名額檢查與建立是同一個步驟，和儀表板、專家包匯入共用同一把鎖，同時建立也不會超過上限。員工不能用檔案工具修改自己的 `[agent] status`，`agent_update` 也不能變更已封存或已刪除員工的 `status`；封存、恢復與刪除只能在儀表板操作。之後要改人格設定，見[建立之後修改員工的人格設定](dashboard-settings.md#建立之後修改員工的人格設定v1820)。
 
 ### `responsibility_get` / `responsibility_followup` / `responsibility_ask`：持續任務工具
 
@@ -517,3 +517,25 @@ Google Chat 員工專用應用程式區段優先於共用應用程式。若該�
 Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App 或共用 App，選中的 App 仍須有權在該空間發訊。收件人防護持續生效：已保存且驗證過的來源對話視為來源；另外指定的對象不會取得這項豁免。尚未綁定使用者的通道，不會只因建立排程就取得已驗證來源的豁免。
 
 例行工作清單與明細會分別回報工作與通知結果：`last_status` 是工作執行狀態；`last_delivery_status` 為 `delivered`（已送達）、`delivery_failed`（傳送失敗）、`delivery_refused`（傳送前的確認未通過），未嘗試傳送時為空。失敗時 `last_delivery_reason` 為固定代碼 `notification_delivery_failed`；未通過確認時為 `origin_unproven`、`origin_proof_invalid`、`origin_public_visitor`、`origin_state_unreadable`、`origin_account_inactive`、`origin_access_revoked`、`origin_identity_unbound`、`origin_conversation_changed` 其中之一。這些欄位記錄最近一次執行。提醒清單沿用 `delivered`／`failed` 狀態，並在有錯誤時列出 `error`（未通過確認的提醒為 `failed`，`error` 帶相同代碼）；傳送失敗不會記成已送達。
+
+### 逐次確認寄信與刪除活動
+
+`gmail_send_draft {"draft_id":"r…"}` 與 `calendar_delete_event {"event_id":"…","calendar_id":"primary","notify_attendees":false}` 需要 `google:write` 及 gateway 原生 REST 執行。Apps Script 不顯示這兩個工具，也拒絕直接呼叫。只傳遞 bearer 的舊版 Home 執行路徑同樣隱藏並拒絕；請使用員工專用 Google 連線或 gateway 中綁定帳號的連接器。
+
+每次呼叫都要確認新卡片。`allow`、Admin 權限與持久工作流程授權無法免除；`block` 仍會拒絕。寄信卡片直接取自 Google，顯示寄件帳號、To／Cc／Bcc、主旨、內文預覽及附件檔名與大小。核准綁定帳號、員工生命週期、草稿 ID、操作與 MIME 指紋。gateway 重新檢查草稿後，寄出核准快照中的 MIME；內容或帳號改變就要重新確認。收件人政策會檢查全部 To／Cc／Bcc，支援顯示名稱加信箱，無法明確解析的格式會拒絕。
+
+刪除活動卡片顯示標題、含時區的起訖時間、參加者、日曆、是否刪除整個重複系列及通知選項。核准綁定活動版本，刪除時以 `If-Match` 檢查；活動變更就要重新確認。`calendar_id` 預設為 `primary`，明確使用 `sendUpdates=none`；只有 `notify_attendees=true` 才用 `all`。HTTP 204 空白回應代表成功。刪除活動也會使用既有的 `calendar.calendarlist.readonly`（或更完整的日曆範圍），讀取主要日曆帳號與所選日曆的名稱、時區。
+
+完整 MIME 只留在 gateway 記憶體，核准資料保存必要預覽與指紋。拒絕、逾期、已使用或內容不符的核准都不能變更 Google。寫入逾時或結果不明會回報 `result_unconfirmed`，請先到 Google 檢查，工具不會自動重送。確認期限為 90 秒。
+
+傳輸行為依循 [Gmail 草稿契約](https://developers.google.com/workspace/gmail/api/guides/drafts)與 [Calendar 條件式修改](https://developers.google.com/workspace/calendar/api/guides/version-resources)。
+
+## 以本人身分傳送 Google Chat
+
+`google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
+
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+
+每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
+
+Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

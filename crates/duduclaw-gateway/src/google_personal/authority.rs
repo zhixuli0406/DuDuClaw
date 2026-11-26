@@ -207,6 +207,9 @@ impl PersonalSelection {
             .google_primary_owner_generation(agent)
             .map_err(store_error)?;
         let allow_soft = |error: Refusal| -> Result<String, Refusal> {
+            if crate::google_authorization_requests::turn::queue_missing(&home,agent,who,tool,error.code) {
+                return Err(Refusal { fallback_eligible: false, ..error });
+            }
             if error.fallback_eligible && effective.fallback == gi::Fallback::Home {
                 Ok(error.code.to_owned())
             } else {

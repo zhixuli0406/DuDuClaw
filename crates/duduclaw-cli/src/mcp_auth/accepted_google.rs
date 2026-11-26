@@ -10,6 +10,7 @@ pub(crate) struct GoogleLane {
     prepared: bool,
     initial_identity: Option<Effective>,
     selection: Option<GoogleSelectionStamp>,
+    owner_binding: Option<String>,
     original_arguments: Option<Value>,
     final_arguments: Option<Value>,
     mapping_receipt: Option<duduclaw_redaction::vault::MappingReceipt>,
@@ -29,6 +30,7 @@ pub(crate) fn accept_google_lane(
         prepared: false,
         initial_identity: None,
         selection: None,
+        owner_binding: None,
         original_arguments: None,
         final_arguments: None,
         mapping_receipt: None,
@@ -43,6 +45,7 @@ pub(crate) struct AcceptedGoogleCall {
     tool: String,
     arguments: Value,
     selection: Option<GoogleSelectionStamp>,
+    owner_binding: Option<String>,
 }
 impl std::fmt::Debug for AcceptedGoogleCall {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -76,6 +79,7 @@ impl GoogleLane {
         let mut payload = params.clone();
         let obj = payload.as_object_mut().ok_or_else(changed)?;
         obj.remove(gi::GOOGLE_ACCOUNT_APPROVAL_KEY);
+        if let Some(binding) = &self.owner_binding { obj.insert("google_owner_binding".into(), serde_json::json!(binding)); }
         if let Some(stamp) = &self.selection {
             obj.insert(
                 gi::GOOGLE_ACCOUNT_APPROVAL_KEY.into(),
@@ -87,7 +91,8 @@ impl GoogleLane {
     fn check_identity(&self, home: &Path) -> Result<(), String> {
         let current = gi::effective_for(home, Some(self.agent())).effective;
         if !self.prepared
-            || (self.selection.is_some() && self.initial_identity.as_ref() != Some(&current))
+            || ((self.selection.is_some() || self.owner_binding.is_some()) && self.initial_identity.as_ref() != Some(&current))
+            || (self.owner_binding.is_none() && self.prepared && current == Effective::DelegateOwner)
             || (self.selection.is_none() && matches!(current, Effective::Personal { .. }))
         {
             return Err(changed());
@@ -162,6 +167,11 @@ impl GoogleLane {
             let identity = gi::effective_for(home, Some(self.agent())).effective;
             self.initial_identity = Some(identity.clone());
             self.original_arguments = Some(args.clone());
+            if identity == Effective::DelegateOwner {
+                let selected = crate::mcp::google_execute_client::prepare_owner(home, self.agent(), self.reference()?, &self.tool, &args).await?;
+                self.owner_binding = Some(selected.get("owner_binding_digest").and_then(Value::as_str)
+                    .filter(|s| gi::google_digest_well_formed(s)).ok_or_else(changed)?.to_owned());
+            }
             if matches!(identity, Effective::Personal { .. }) {
                 self.pin_mapping(&args, layer)?;
                 let selected = crate::mcp::google_selection_client::select(
@@ -216,6 +226,7 @@ impl GoogleLane {
         }
         self.check_identity(home)?;
         self.check_mapping(layer)?;
+        if self.owner_binding.is_some() && self.original_arguments.as_ref() != Some(&args) { return Err(changed()); }
         if let Some(stamp) = &self.selection {
             // Only unchanged args or the exact value recorded immediately
             // after trusted restoration may receive the final binding.
@@ -278,10 +289,12 @@ impl GoogleLane {
             tool: self.tool,
             arguments,
             selection: self.selection,
+            owner_binding: self.owner_binding,
         }
     }
 }
 impl AcceptedGoogleCall {
+    pub(crate) fn owner_binding(&self) -> Option<&str> { self.owner_binding.as_deref() }
     pub(crate) fn principal(&self) -> &Principal {
         self.receipt.principal()
     }

@@ -39,6 +39,8 @@ fn approve(store: &mut ConfirmationStore, item: &ConfirmationItem) {
 struct Adapter {
     effects: BTreeSet<(String, u8)>,
     allocated: usize,
+    disable_calls: usize,
+    fail_disable: bool,
     live: bool,
     fail: Option<u8>,
     crash: Option<u8>,
@@ -58,7 +60,11 @@ impl ProposalApplier for Adapter {
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 0) }
     fn publish(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 1) }
     fn read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 2) }
-    fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> { self.effect(item, 3) }
+    fn disable_and_read_back(&mut self, item: &ConfirmationItem) -> Result<()> {
+        self.disable_calls += 1;
+        if self.fail_disable { return Err(ConfirmationError::Compensation); }
+        self.effect(item, 3)
+    }
 }
 
 #[test]
@@ -277,6 +283,46 @@ fn apply_failure_disables_effects_and_retry_reuses_binding() {
         for _ in 0..3 { store.apply_next(&item.binding, &mut adapter).unwrap(); }
         assert_eq!(adapter.allocated, 1); assert!(!store.incomplete().unwrap());
     }
+}
+
+#[test]
+fn completed_automatic_employee_compensation_is_not_repeated_on_retry() {
+    let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    approve(&mut store, &item);
+    let mut adapter = Adapter { fail: Some(0), ..Default::default() };
+    assert!(matches!(store.apply_next(&item.binding, &mut adapter), Err(ConfirmationError::Apply)));
+    assert_eq!(step(&store.conn, &item.binding).unwrap(), Some(3));
+    assert_eq!(adapter.disable_calls, 1);
+    let events: String = store.conn.query_row("SELECT group_concat(event) FROM migration_confirmation_audit",
+        [], |r| r.get(0)).unwrap();
+    store.compensate_failed_employee(&item.binding, &session(), [7; 32], 101, &mut adapter).unwrap();
+    assert_eq!(adapter.disable_calls, 1);
+    assert_eq!(store.list().unwrap()[0].status, ConfirmationStatus::Failed);
+    assert_eq!(store.conn.query_row("SELECT group_concat(event) FROM migration_confirmation_audit",
+        [], |r| r.get::<_, String>(0)).unwrap(), events);
+}
+
+#[test]
+fn completed_employee_compensation_retry_is_not_repeated_on_another_retry() {
+    let mut store = store(); let item = stage(&mut store, 1, ConfirmationCategory::Employee);
+    approve(&mut store, &item);
+    let mut adapter = Adapter { fail: Some(0), fail_disable: true, ..Default::default() };
+    assert!(matches!(store.apply_next(&item.binding, &mut adapter), Err(ConfirmationError::Compensation)));
+    assert_ne!(step(&store.conn, &item.binding).unwrap(), Some(3));
+    assert_eq!(adapter.disable_calls, 1);
+    adapter.fail_disable = false;
+    store.compensate_failed_employee(&item.binding, &session(), [7; 32], 101, &mut adapter).unwrap();
+    assert_eq!(step(&store.conn, &item.binding).unwrap(), Some(3));
+    assert_eq!(adapter.disable_calls, 2);
+    let audit_counts = |store: &ConfirmationStore| store.conn.query_row(
+        "SELECT COUNT(*), SUM(event='failed_disabled') FROM migration_confirmation_audit",
+        [], |r| Ok((r.get::<_, u64>(0)?, r.get::<_, u64>(1)?))).unwrap();
+    let counts = audit_counts(&store);
+    assert_eq!(counts.1, 1);
+    store.compensate_failed_employee(&item.binding, &session(), [7; 32], 101, &mut adapter).unwrap();
+    assert_eq!(adapter.disable_calls, 2);
+    assert_eq!(audit_counts(&store), counts);
+    assert_eq!(store.list().unwrap()[0].status, ConfirmationStatus::Failed);
 }
 
 #[test]

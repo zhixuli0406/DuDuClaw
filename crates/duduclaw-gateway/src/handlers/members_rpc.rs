@@ -54,6 +54,11 @@ impl MethodHandler {
                     Err(_) => { results.push(json!({"index":index,"error":"member_invite_url_required"})); continue; }
                 }
             } else { None };
+            let admission = match self.acquire_seat_admission().await {
+                Ok(guard) => guard,
+                Err(_) => { results.push(json!({"index":index,"error":"member_storage_unavailable"})); continue; }
+            };
+            let cap = self.effective_agent_cap().await;
             let registry = self.registry.read().await;
             if member.bindings.iter().any(|binding| registry.get(&binding.agent_name).is_none()) {
                 results.push(json!({"index":index,"error":"member_agent_unavailable"})); continue;
@@ -68,7 +73,7 @@ impl MethodHandler {
             let work = db.clone();
             let actor = ctx.user_id.clone();
             let epoch = ctx.credential_epoch;
-            let created = tokio::task::spawn_blocking(move || work.create_member_at_epoch(&member, &actor, epoch)).await;
+            let created = tokio::task::spawn_blocking(move || work.create_member_at_epoch_under(&member, &actor, epoch, Some((&admission, cap)))).await;
             drop(registry);
             match created {
                 Ok(Ok(created)) => {

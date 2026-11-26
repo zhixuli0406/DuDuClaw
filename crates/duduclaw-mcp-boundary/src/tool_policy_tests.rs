@@ -772,3 +772,20 @@ fn h12a_skill_extract_requires_exactly_one_own_namespace_wiki() {
         assert!(!eligible(&context(name, resources), name));
     }
 }
+
+#[test]
+fn chat_send_requires_exact_space_recipient_and_account_grants() {
+    let resources = vec![employee(), ResourceGrant::Connector { account:text("google-alice"),
+        binding:EmployeeBinding::Personal(text("owner")) }, ResourceGrant::Mailbox { id:text("mail") },
+        ResourceGrant::Recipient { id:text("spaces/A") }];
+    let ctx = context("google_chat_send", resources.clone());
+    assert!(authorize(&ctx, "google_chat_send", &json!({"space":"spaces/A", "text":"hello"}), &Fixed(resources.clone())).is_ok());
+    for space in ["spaces/AB", "spaces/B", "spaces/A/messages/escape", "spaces/A "] {
+        assert!(authorize(&ctx, "google_chat_send", &json!({"space":space,"text":"hello"}), &Fixed(resources.clone())).is_err());
+    }
+    for index in 1..resources.len() {
+        let mut missing = resources.clone(); missing.remove(index);
+        let ctx = context("google_chat_send", missing.clone());
+        assert!(authorize(&ctx, "google_chat_send", &json!({"space":"spaces/A","text":"hello"}), &Fixed(missing)).is_err());
+    }
+}

@@ -30,6 +30,10 @@ pub fn arg_u32(args: &Value, key: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+pub async fn handle_google_chat_send(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("google_chat_send", args, home, g).await
+}
+
 pub async fn handle_google_chat_spaces(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
     crate::google_workspace::native_legacy::handle("google_chat_spaces", args, home, g).await
 }
@@ -233,4 +237,12 @@ pub async fn handle_sheets_update(args: &Value, home_dir: &Path, g: &dyn NativeG
 
 pub async fn handle_calendar_update_event(args: &Value, home_dir: &Path, g: &dyn NativeGoogleAccess) -> Value {
     crate::google_workspace::native_legacy::handle("calendar_update_event", args, home_dir, g).await
+}
+
+// Legacy bearer-only entry points cannot manufacture a gateway approval identity.
+pub async fn handle_gmail_send_draft(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("gmail_send_draft", args, home, g).await
+}
+pub async fn handle_calendar_delete_event(args: &Value, home: &Path, g: &dyn NativeGoogleAccess) -> Value {
+    crate::google_workspace::native_legacy::handle("calendar_delete_event", args, home, g).await
 }

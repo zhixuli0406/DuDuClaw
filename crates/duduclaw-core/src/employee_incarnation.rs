@@ -95,6 +95,7 @@ fn update(home: &Path, agent: &str, create: bool) -> io::Result<()> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         _ => {},
     }
+    let _authority = crate::authority_coordinator::AuthorityCoordinator::new(home).write()?;
     let marker = tombstone(home, agent);
     let mut retired = false;
     let result = (|| -> io::Result<()> {

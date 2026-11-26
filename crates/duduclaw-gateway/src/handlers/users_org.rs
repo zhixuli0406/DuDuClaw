@@ -70,6 +70,12 @@ fn org_error_message(e: &OrgError) -> &'static str {
 /// forced-password-change gates. Database detail goes to the log, not the
 /// client.
 pub(crate) fn org_error_frame(e: &OrgError) -> WsFrame {
+    if matches!(e, OrgError::Db(detail) if detail == duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL) {
+        return super::agents_basic::seat_refusal_frame(json!({
+            "code": duduclaw_core::agent_seats::SEAT_LIMIT_ERROR_CODE,
+            "message": duduclaw_core::agent_seats::AVATAR_SEAT_REFUSAL,
+        }));
+    }
     if let OrgError::Db(detail) = e {
         tracing::warn!(error = %detail, "reporting-line write failed");
     }

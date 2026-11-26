@@ -81,16 +81,23 @@ impl Transport<'_, '_> {
             Ok(u) => u,
             Err(_) => return Err(self.fail()),
         };
-        let valid = url.scheme() == "https"
+        let valid = crate::google_workspace::native_confirmation::endpoint_allowed(self.template, &url)
+            && url.scheme() == "https"
             && url.username().is_empty()
             && url.password().is_none()
             && url.fragment().is_none()
             && url.port().is_none_or(|p| p == 443)
             && match url.host_str() {
-                Some("chat.googleapis.com") => url.path() == "/v1/spaces" || url.path().starts_with("/v1/spaces/"),
+                Some("chat.googleapis.com") => match self.template.parsed() {
+                    crate::google_workspace::native_call::ParsedNativeArguments::ChatSend(args) =>
+                        crate::google_identity::chat_send::has_permit(self.template)
+                        && crate::google_workspace::chat_send::endpoint_allowed(original, &args.space),
+                    _ => url.path() == "/v1/spaces" || url.path().starts_with("/v1/spaces/"),
+                },
                 Some("gmail.googleapis.com") => url.path().starts_with("/gmail/v1/users/me/"),
                 Some("www.googleapis.com") => {
-                    url.path()
+                    crate::google_workspace::native_confirmation::calendar_endpoint(self.template, &url)
+                        || url.path()
                         .starts_with("/calendar/v3/calendars/primary/events")
                         || url.path().starts_with("/drive/v3/files")
                 }
@@ -162,6 +169,7 @@ impl Transport<'_, '_> {
             .request(step.method().clone(), endpoint)
             .bearer_auth(self.view.material.access.as_str())
             .query(step.query());
+        if let Some(etag) = step.if_match() { builder = builder.header(reqwest::header::IF_MATCH, etag); }
         if let Some(body) = step.body() {
             builder = builder.json(body);
         }
@@ -224,10 +232,13 @@ impl Transport<'_, '_> {
         Ok((status, bytes))
     }
     fn status_error(&mut self, status: u16, bytes: &[u8]) -> GoogleApiError {
+        if self.template.tool() == "calendar_delete_event" && status == 412 {
+            return GoogleApiError::Api { status, message: "Event changed; request a new confirmation.".into() };
+        }
         if self.template.tool().ends_with("create_draft")
             || matches!(
                 self.template.tool(),
-                "calendar_create_event"
+                "gmail_send_draft" | "calendar_delete_event" | "calendar_create_event"
                     | "sheets_append"
                     | "gtasks_create"
                     | "gtasks_complete"

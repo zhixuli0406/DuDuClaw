@@ -1369,13 +1369,15 @@ async fn execute_proactive_check(
             };
             cmd.env(duduclaw_core::run_credential::ENV_RUN_CREDENTIAL, _run_identity.credential().expose());
             cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_URL);
-            if let Some(url) = _run_identity.identity_url() {
-                cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_URL, url);
+            cmd.env_remove(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT);
+            cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_SERVER, _run_identity.identity_server().unwrap_or(""));
+            if let Some(url) = _run_identity.identity_endpoint() {
+                cmd.env(duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT, url);
             }
             let child = duduclaw_core::execution_gate::with_runtime(
             duduclaw_core::execution_gate::RuntimeKind::Claude,
-            duduclaw_core::execution_gate::spawn(&mut cmd,
-                duduclaw_core::execution_gate::ExecutionClass::Heartbeat)).await;
+            duduclaw_core::execution_gate::spawn_bound(&mut cmd,
+                duduclaw_core::execution_gate::ExecutionClass::Heartbeat, Some(_run_identity.spawn_binding()))).await;
             drop(admission);
             let output = match child {
                 Ok(child) => match tokio::time::timeout(

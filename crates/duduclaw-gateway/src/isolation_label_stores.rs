@@ -618,7 +618,12 @@ fn member_binding_count(home: &Path, label: &str) -> Result<u64, StoreError> {
 /// removed here (only the lifecycle's own paths may, `db.rs` contract):
 /// `Err`, so the label stays held until the tombstone's step 5 retry.
 fn member_binding_purge(home: &Path, label: &str) -> Result<Vec<String>, StoreError> {
+    // Lock order: seat admission -> authority writer lease -> users.db transaction.
+    let admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home).map_err(|_| StoreError::Unavailable)?;
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+        .write().map_err(|_| StoreError::Unavailable)?;
     if member_binding_count(home, label)? == 0 { return Ok(Vec::new()); }
+    let before = duduclaw_core::agent_seats::seat_holders(admission.home()).map_err(|_| StoreError::Unavailable)?.len();
     let Some(mut db) = sqlite::open(home, "users.db", Access::ReadWrite)? else { return Ok(Vec::new()) };
     let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| StoreError::Unavailable)?;
     let users: Vec<String> = {
@@ -629,6 +634,8 @@ fn member_binding_purge(home: &Path, label: &str) -> Result<Vec<String>, StoreEr
         users
     };
     duduclaw_auth::db::remove_shared_bindings_in_transaction(&tx, label).map_err(|_| StoreError::Unavailable)?;
+    let after = duduclaw_core::agent_seats::seat_holders_in(admission.home(), &tx).map_err(|_| StoreError::Unavailable)?.len();
+    if after > before { return Err(StoreError::Unavailable); }
     tx.commit().map_err(|_| StoreError::Unavailable)?;
     Ok(users.into_iter().map(|user| format!("binding:{user}")).collect())
 }

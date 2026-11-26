@@ -954,11 +954,19 @@ pub(crate) async fn visible_tools_in_lane(
                 || crate::mcp_auth::dedicated_google_tool_allowed(home_dir, principal, t.name)
         })
         .filter(|t| google_enabled || !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
+        // These effects require a gateway-owned approval context. Bearer-only
+        // legacy Home callers cannot supply one and must not discover them.
+        .filter(|t| !matches!(t.name, "gmail_send_draft" | "calendar_delete_event")
+            || dedicated_google || crate::mcp_isolation::current().is_some())
         .filter(|t| duduclaw_gateway::google_workspace::backend_supports_tool(google_native_rest, t.name, false))
         .filter(|t| {
             !matches!(t.name, "google_chat_spaces" | "google_chat_messages")
                 || duduclaw_gateway::google_workspace::chat_read_tool_available(home_dir, t.name)
         })
+        .filter(|t| t.name != "google_chat_send" || (!dedicated_google
+            && duduclaw_gateway::google_workspace::chat_send_enabled(home_dir)
+            && matches!(duduclaw_core::google_identity::effective_for(home_dir, Some(effective_agent)).effective,
+                duduclaw_core::google_identity::Effective::Personal { .. } | duduclaw_core::google_identity::Effective::Delegate { .. } | duduclaw_core::google_identity::Effective::DelegateOwner)))
         .filter(|t| github_enabled || !GITHUB_WORKSPACE_TOOLS.contains(&t.name))
         // WP-D §13.7: hide the SQL connector from agents with no grant.
         .filter(|t| allow_db_sources || !DB_SOURCE_TOOLS.contains(&t.name))

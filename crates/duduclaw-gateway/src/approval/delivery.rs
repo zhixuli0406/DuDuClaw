@@ -15,7 +15,35 @@ pub(crate) struct TrustedReplyTarget {
     decision_access_scope: Option<(Option<String>, Option<String>, Option<String>)>,
     user_access_policy: Option<crate::channel_reply::UserAccessPolicy>,
 }
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredNoticeTarget {
+    context: DecisionContext,
+    chat_id: String,
+    thread_id: Option<String>,
+    token_sha256: String,
+}
+
+impl StoredNoticeTarget {
+    fn parse(value: &serde_json::Value) -> Result<Self, String> {
+        let saved: Self = serde_json::from_value(value.clone()).map_err(|_| "通知目的地無法辨識。")?;
+        // Reuse only the local transport checks. Never resolve credentials here.
+        TrustedReplyTarget::new(saved.context.clone(), "validation-only".into(),
+            saved.chat_id.clone(), saved.thread_id.clone())?;
+        if saved.token_sha256.len() != 64 || !saved.token_sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("通知帳號無法辨識。".into());
+        }
+        Ok(saved)
+    }
+}
+
 impl TrustedReplyTarget {
+    /// Validate persisted address syntax without credentials or external I/O.
+    pub(crate) fn validate_notice(value: &serde_json::Value) -> Result<DecisionContext, String> {
+        Ok(StoredNoticeTarget::parse(value)?.context)
+    }
+
     /// Persist only the exact transport address and a token digest. The
     /// credential itself remains in its configured secret store.
     pub(crate) fn notice_descriptor(&self) -> serde_json::Value {
@@ -30,17 +58,7 @@ impl TrustedReplyTarget {
     /// Background notifications never switch bot accounts after restart.
     pub(crate) async fn restore_notice(home: &std::path::Path, value: &serde_json::Value) -> Result<Self, String> {
         use sha2::{Digest, Sha256};
-        #[derive(serde::Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Stored {
-            context: DecisionContext,
-            chat_id: String,
-            thread_id: Option<String>,
-            token_sha256: String,
-        }
-        let saved: Stored = serde_json::from_value(value.clone()).map_err(|_| "通知目的地無法辨識。")?;
-        saved.context.validate()?;
-        if saved.token_sha256.len() != 64 { return Err("通知帳號無法辨識。".into()); }
+        let saved = StoredNoticeTarget::parse(value)?;
         for token in crate::config_crypto::channel_dm_token_candidates(home, &saved.context.channel).await {
             if hex::encode(Sha256::digest(token.as_bytes())) == saved.token_sha256 {
                 return Self::new(saved.context, token, saved.chat_id, saved.thread_id);
@@ -197,11 +215,16 @@ impl TrustedReplyTarget {
             target: self.clone(),
             http,
             watch_notice: false,
+            authorization_url: None,
         })
     }
     pub(crate) async fn send_watch_notice(&self, text: &str) -> Result<(), ChannelSendError> {
-        BoundDecisionSender { target: self.clone(), http: reqwest::Client::new(), watch_notice: true }
+        BoundDecisionSender { target: self.clone(), http: reqwest::Client::new(), watch_notice: true, authorization_url: None }
             .send_text(text).await
+    }
+    pub(crate) async fn send_authorization_notice(&self, http: reqwest::Client, text: &str, url: &str) -> Result<(), ChannelSendError> {
+        BoundDecisionSender { target: self.clone(), http, watch_notice: true,
+            authorization_url: Some(url.into()) }.send_text(text).await
     }
     fn watch_body(&self, text: &str) -> serde_json::Value {
         let mut body = self.body(text);
@@ -266,6 +289,7 @@ struct BoundDecisionSender {
     target: TrustedReplyTarget,
     http: reqwest::Client,
     watch_notice: bool,
+    authorization_url: Option<String>,
 }
 #[async_trait]
 impl ChannelSender for BoundDecisionSender {
@@ -315,7 +339,17 @@ impl ChannelSender for BoundDecisionSender {
                 .bearer_auth(&t.token),
             _ => return Err(ChannelSendError("unsupported exact account route".into())),
         };
-        req = req.json(&if self.watch_notice { t.watch_body(text) } else { t.body(text) });
+        let mut body = if self.watch_notice { t.watch_body(text) } else { t.body(text) };
+        if let Some(url) = &self.authorization_url {
+            if let Some(markup) = crate::google_authorization_requests::render::markup(&t.context.channel,url) {
+                let rendered = crate::channel_sender::card_message_payload(&t.context.channel,&t.chat_id,text,markup,true)
+                    .map_err(ChannelSendError)?;
+                if let (Some(dest),Some(source))=(body.as_object_mut(),rendered.as_object()) {
+                    dest.extend(source.clone());
+                }
+            }
+        }
+        req = req.json(&body);
         let response = req
             .send()
             .await
@@ -366,6 +400,10 @@ mod tests {
         assert_eq!(descriptor["thread_id"], "7");
         assert_eq!(descriptor["context"]["account_id"], "bot-A");
         let home = tempfile::tempdir().unwrap();
+        // Local validation succeeds with no configured credentials. Restoration
+        // remains a separate, fallible operation reserved for claimed work.
+        let local = TrustedReplyTarget::validate_notice(&descriptor).unwrap();
+        assert_eq!(local.conversation_id, "chat:7");
         assert!(TrustedReplyTarget::restore_notice(home.path(), &descriptor).await.is_err());
     }
     #[test]

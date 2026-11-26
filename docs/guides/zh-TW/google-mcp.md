@@ -127,3 +127,17 @@ approval_required_tools = ["create_event", "update_doc", "create_file"]
 [Developer Preview Program](https://developers.google.com/workspace/preview)。
 
 `google:chat` 預設集不會增加 Chat 授權。原生 Workspace 權限清單沒有 Chat，掛載前要另行配置適當授權。Google Chat 頻道使用 `chat.bot`，是另一條連線。
+
+## 聊天授權連結
+
+缺少本人連線或用途時，可由閘道提供確認連結。連結要求同一位成員正常登入 Dashboard，並明確確認資料說明；它不是登入憑證或 SSO。MCP 工具不能接收 ticket，也不能指定成員、帳號、授權範圍或返回網址。Google 授權不代表核准對外傳送。帳號檢查、公開網址與續行規則見[Google 個人連線指南](google-personal-connections.md#從聊天確認-google-授權)。官方 remote MCP 的使用資格與既有能力閘仍須符合。
+
+## 以本人身分傳送 Google Chat
+
+`google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
+
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+
+每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
+
+Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。

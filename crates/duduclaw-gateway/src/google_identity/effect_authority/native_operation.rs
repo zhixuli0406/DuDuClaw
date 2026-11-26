@@ -24,7 +24,7 @@ impl ClosedNativeFailure {
             may_have_sent,
         )
     }
-    fn into_refusal(self) -> Refusal {
+    pub(in crate::google_identity) fn into_refusal(self) -> Refusal {
         match self {
             Self::Denied(error) => error,
             Self::Unconfirmed => Refusal::hard(
@@ -144,10 +144,19 @@ impl GoogleEffectAuthority {
     }
     async fn execute_native(
         self,
-        template: NativeCallTemplate,
+        mut template: NativeCallTemplate,
     ) -> Result<Value, ClosedNativeFailure> {
         self.validate_native_template(&template)
             .map_err(|e| ClosedNativeFailure::validation(e, false))?;
+        if matches!(template.tool(), "gmail_send_draft" | "calendar_delete_event") {
+            let account = match &self.material.claim {
+                MaterialClaim::Dedicated(claim) => claim.audit_account().to_owned(),
+                _ => String::new(),
+            };
+            template.bind_confirmation(crate::google_workspace::native_confirmation::HostContext::new(
+                &self.material.context.home, &self.material.context.agent, account,
+            ).map_err(|_| ClosedNativeFailure::refused(false))?);
+        }
         let fallback = match &self.material.claim {
             MaterialClaim::Dedicated(claim) => claim.is_home_fallback(),
             _ => false,

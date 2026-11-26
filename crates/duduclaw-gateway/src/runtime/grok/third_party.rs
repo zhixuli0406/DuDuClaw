@@ -262,7 +262,8 @@ pub(crate) fn live_entry(s: &ScopedServer) -> toml::Value {
     // Values are resolved from this spawn, never written into this shared file.
     for key in [duduclaw_core::ENV_AGENT_TOKEN, duduclaw_core::ENV_TRUST_TURN_ID, duduclaw_core::egress_guard::ENV_TURN_ALIAS,
         duduclaw_core::run_credential::ENV_RUN_CREDENTIAL,
-        duduclaw_core::run_credential::ENV_IDENTITY_URL] {
+        duduclaw_core::run_credential::ENV_IDENTITY_ENDPOINT,
+        duduclaw_core::run_credential::ENV_IDENTITY_SERVER] {
         env.insert(key.into(), toml::Value::String(format!("${{{key}:-}}")));
     }
     env.insert(

@@ -21,7 +21,7 @@ pub struct Device {
     pub ip: Option<String>,
 }
 
-pub(crate) fn migrate(conn: &Connection) -> Result<()> {
+pub(crate) fn migrate(db: &UserDb, conn: &Connection) -> Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS remembered_policy_state (
         id INTEGER PRIMARY KEY CHECK(id=1), days INTEGER NOT NULL CHECK(days BETWEEN 1 AND 365));
         INSERT OR IGNORE INTO remembered_policy_state(id,days) VALUES(1,180);
@@ -49,11 +49,12 @@ pub(crate) fn migrate(conn: &Connection) -> Result<()> {
         BEGIN UPDATE remembered_families SET revoked=1 WHERE user_id=OLD.id; END;")
         .map_err(|e| e.to_string())?;
     // Unreleased prototype rows cannot authenticate generation credentials.
-    if !crate::user_row::has_column(conn, "remembered_families", "generation")? {
-        conn.execute_batch("ALTER TABLE remembered_families ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
+    db.migrate_google_authority_if_needed(conn,
+        |conn| Ok(!crate::user_row::has_column(conn, "remembered_families", "generation")?),
+        |conn| conn.execute_batch("ALTER TABLE remembered_families ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;
             UPDATE remembered_families SET revoked=1;
-            DELETE FROM remembered_tokens;").map_err(|e|e.to_string())?;
-    }
+            DELETE FROM remembered_tokens;").map_err(|e| e.to_string()),
+    )?;
     // Final delivery holds an ACL-generation lease. Device revocation must
     // invalidate that lease too, including logout and refresh-reuse detection.
     conn.execute_batch("CREATE TRIGGER IF NOT EXISTS remembered_delivery_change
@@ -174,6 +175,7 @@ impl UserDb {
     pub fn remember_create<T>(&self, user_id: &str, epoch: u64, login_session: &str, label: &str, ip: Option<&str>, days: u16,
         now: i64, policy_exempt: bool, issue: impl FnOnce(&User, &[(String, AccessLevel)], &str) -> Result<T>) -> Result<(T, String, i64)> {
         if uuid::Uuid::parse_str(login_session).is_err() || !(1..=365).contains(&days) || now < 0 { return Err(DENIED.into()); }
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let user = active(&tx, user_id, epoch, policy_exempt)?;
@@ -201,6 +203,7 @@ impl UserDb {
         issue: impl FnOnce(&User, &[(String, AccessLevel)], &str) -> Result<T>) -> Result<(T,String,i64)> {
         if now<0 || secret.len()>160 { return Err(DENIED.into()); }
         let (family,generation,mac) = parts(secret)?;
+        let _authority = self.google_authority_write()?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let row: Option<(String,u64,i64,bool,u64)> = tx.query_row(
@@ -243,6 +246,7 @@ impl UserDb {
             .map_err(|e|e.to_string())?.collect::<std::result::Result<Vec<_>,_>>().map_err(|e|e.to_string())
     }
     pub fn remember_revoke(&self,user:&str,family:Option<&str>)->Result<()> {
+        let _authority = self.google_authority_write()?;
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         tx.execute("UPDATE remembered_families SET revoked=1 WHERE user_id=?1 AND (?2 IS NULL OR id=?2)",params![user,family]).map_err(|e|e.to_string())?;
@@ -255,6 +259,7 @@ impl UserDb {
     }
     pub fn remember_logout(&self,secret:&str)->Result<()> {
         let (family,generation,mac) = parts(secret)?;
+        let _authority = self.google_authority_write()?;
         let conn=self.conn();
         if !authentic(&self.remember_key,family,generation,&mac) { return Err(DENIED.into()); }
         conn.execute("UPDATE remembered_families SET revoked=1 WHERE id=?1",[family]).map_err(|e|e.to_string())?;

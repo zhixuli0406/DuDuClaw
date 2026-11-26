@@ -100,9 +100,9 @@ Do not mention, quote, or comment on this note or its source.
 
 DuDuClaw 原生工具成功建立 Gmail 草稿、Calendar 事件、內建任務、Google Tasks、Google Docs 或 Google Sheets 後，只保留結構化識別碼與簡短標籤。`docs_create` 保留回傳的 `documentId` 與標題；`sheets_create` 保留回傳的 `spreadsheetId` 與標題。讀取、附加、更新工具、第三方 MCP 結果與工具回傳全文不保留。
 
-MCP 伺服器將 `DUDUCLAW_RUN_CREDENTIAL` 與限長後的參照欄位送到 gateway 的獨立 loopback 寫入端點。對話與所屬員工只採用 gateway 的有效執行紀錄，忽略 `DUDUCLAW_SESSION_ID`。沒有有效憑證，或對話建立時間晚於憑證的精確簽發時間（包含同一秒內重設），一律拒絕寫入。識別碼只接受 `[A-Za-z0-9_\-.:/]+`，最長 256 字元；不合法時整筆捨棄，不修改識別碼。SQLite 也限制欄位長度與工具／種類配對；遷移會保留有效舊資料。下一輪以逸出後的不可信資料框提供參照，每段對話最多 20 筆，保留 24 小時，各欄位都有長度上限。重設對話後，不會注入上一代對話的參照。工具參照獨立於 `pinned_task` 設定。
+MCP 伺服器將 `DUDUCLAW_RUN_CREDENTIAL` 與限長後的參照欄位經由 gateway 的本機身分端點（`DUDUCLAW_IDENTITY_ENDPOINT`，先依 `DUDUCLAW_IDENTITY_SERVER` 確認 gateway 程序）送出；gateway 只接受本次執行的 CLI 程序或其子孫程序寫入。對話與所屬員工只採用 gateway 的有效執行紀錄，忽略 `DUDUCLAW_SESSION_ID`。沒有有效憑證，或對話建立時間晚於憑證的精確簽發時間（包含同一秒內重設），一律拒絕寫入。識別碼只接受 `[A-Za-z0-9_\-.:/]+`，最長 256 字元；不合法時整筆捨棄，不修改識別碼。SQLite 也限制欄位長度與工具／種類配對；遷移會保留有效舊資料。下一輪以逸出後的不可信資料框提供參照，每段對話最多 20 筆，保留 24 小時，各欄位都有長度上限。重設對話後，不會注入上一代對話的參照。工具參照獨立於 `pinned_task` 設定。
 
-MCP 子程序必須繼承有效執行憑證才能寫入參照。原生受保護模式不簽發此憑證，因此這條寫入路徑會略過參照；各 runtime 到 MCP 子程序的憑證傳遞仍待實測。
+MCP 子程序必須繼承有效執行憑證與兩個身分變數，而且仍是本次執行 CLI 程序的子孫程序，才能寫入參照。原生受保護模式不簽發此憑證，因此這條寫入路徑會略過參照；各 runtime 到 MCP 子程序的憑證傳遞仍待實測。
 
 ---
 

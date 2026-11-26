@@ -262,7 +262,7 @@ impl Resolved {
         use ParsedNativeArguments::*;
         let pending = match template.parsed() {
             DocsCreate { .. } | DocsReplace { .. } | SheetsCreate { .. }
-            | SheetsUpdate { .. } | CalendarUpdate { .. } => Err(GoogleApiError::Api {
+            | SheetsUpdate { .. } | CalendarUpdate { .. } | GmailSend { .. } | CalendarDelete { .. } => Err(GoogleApiError::Api {
                 status: 400,
                 message: "這項 Google 工具需要原生 REST 連線；Apps Script Bridge 不支援這項操作。".into(),
             }),

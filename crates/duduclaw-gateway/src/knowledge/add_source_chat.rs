@@ -8,7 +8,7 @@ use super::add_source_approval as approval;
 
 /// A verified identity is still not a group address. Refuse unknown transport
 /// shapes rather than showing a preview at an arbitrary configured destination.
-fn private_destination(channel: &str, id: &str) -> bool {
+pub(crate) fn private_destination(channel: &str, id: &str) -> bool {
     match channel {
         "telegram" | "discord" => id.parse::<u64>().is_ok_and(|id| id > 0),
         "line" => id.strip_prefix('U').is_some_and(|rest|

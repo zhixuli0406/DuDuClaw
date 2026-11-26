@@ -29,6 +29,9 @@ const EXCLUDE_DIRS: &[&str] = &["models", "logs", "target", "computer_profiles"]
 
 /// `true` if a top-level entry name should be excluded from the export.
 fn is_excluded(name: &str) -> bool {
+    // Authority state is local: archives would split lock identity, roll back
+    // revocation epochs, and lose private Windows DACLs on extraction.
+    if duduclaw_core::authority_coordinator::is_authority_namespace(name) { return true; }
     EXCLUDE_DIRS.contains(&name)
         || name.starts_with("backup_")
         || name.ends_with(".log")
@@ -110,6 +113,16 @@ pub fn import_archive(archive: &Path, home: &Path, force: bool, personal: bool) 
     }
     // Create only the empty root before locking; no employee data is written.
     duduclaw_core::config::create_home_dir(home).map_err(|e| io_err("import mkdir home", e))?;
+    // Preserve local lock identity and retire the epoch before replacing data.
+    // Admission precedes the authority writer, lifecycle/config locks and DB
+    // transactions. Always initialize/fence fresh homes too: a concurrent
+    // initializer must not escape retirement through an existence check.
+    // The pre-pass needs the lifecycle/config locks below, so a refused
+    // archive still retires the epoch before validation, but imports no data.
+    let _admission = duduclaw_core::agent_seats::SeatAdmission::acquire(home)
+        .map_err(|e| io_err("import admission", e))?;
+    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home).write()
+        .map_err(|e| io_err("import authority", e))?;
     let _barrier = duduclaw_core::autonomy_gate::exclusive_barrier(home)
         .map_err(|error| io_err("import", error))?;
     // The Admin toggle uses this same lock. Recheck after acquiring it and
@@ -287,8 +300,9 @@ fn apply_import_snapshot_with_limits(
     snapshot.rewind().map_err(|e| io_err("import snapshot rewind", e))?;
     let mut ar = tar::Archive::new(GzDecoder::new(snapshot));
     let entries = ar.entries().map_err(|e| io_err("import unpack", e))?;
-    // Validation and every policy refusal have already completed. Publish strict
-    // policy durably before moving agents or replacing any identity data.
+    // The policy/destination pre-pass has completed on this same snapshot.
+    // Publish strict policy durably before moving agents or replacing identity
+    // data; per-entry destination checks below still guard subsequent changes.
     if decision.publish_before_unpack {
         publish_import_config(home, &decision.prepared_config)?;
     }
@@ -301,10 +315,14 @@ fn apply_import_snapshot_with_limits(
     }
     let mut targets = HashSet::new();
     let mut budget = ImportBudget::default();
+    let canonical_home = fs::canonicalize(home).map_err(|e| io_err("import destination", e))?;
     for entry in entries {
         let mut entry = entry.map_err(|e| io_err("import unpack", e))?;
         budget.check(&entry, limits)?;
         let path = checked_import_entry(&entry, &mut targets)?;
+        // Validate the actual spelling tar writes, not the lowercased policy key.
+        let raw_path = entry.path().map_err(|e| io_err("import destination", e))?;
+        check_import_destination(home, &canonical_home, &raw_path)?;
         if is_live_lock(&path) || (decision.publish_before_unpack && path == Path::new("config.toml")) {
             continue;
         }
@@ -312,6 +330,31 @@ fn apply_import_snapshot_with_limits(
             return Err(io_err("import unpack", "archive entry escaped home"));
         }
         after_unpack(&path)?;
+    }
+    Ok(())
+}
+
+/// Refuse pre-existing links at every depth, including the home and final entry.
+fn check_import_destination(home: &Path, canonical_home: &Path, path: &Path) -> Result<()> {
+    let mut destination = home.to_path_buf();
+    for component in std::iter::once(std::path::Component::CurDir).chain(path.components()) {
+        match component {
+            std::path::Component::CurDir => {},
+            std::path::Component::Normal(name) => destination.push(name),
+            _ => return Err(io_err("import destination", "invalid archive path")),
+        }
+        let metadata = match fs::symlink_metadata(&destination) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(io_err("import destination", error)),
+        };
+        if duduclaw_core::fs_safety::is_link_metadata(&metadata) {
+            return Err(io_err("import destination", "existing symlink or reparse point"));
+        }
+        let resolved = fs::canonicalize(&destination).map_err(|e| io_err("import destination", e))?;
+        if !resolved.starts_with(canonical_home) {
+            return Err(io_err("import destination", "existing path escaped home"));
+        }
     }
     Ok(())
 }
@@ -591,7 +634,7 @@ mod tests {
             }
         }
         for path in ["nested/file:stream", "nested:stream/file", "nested/.../file", "nested/   /file", "nested\\file",
-            "CONFIG~1.TOM", "USERS~1.DB-", "nested/AGENTS~1/file"] {
+            "CONFIG~1.TOM", "USERS~1.DB-", "nested/AGENTS~1/file", "GOOGLE~1/epoch", "nested/GO1234~1/epoch"] {
             if !cfg!(windows) && (path.contains(':') || path.contains('~')) { continue; }
             ordered_archive(&archive, &[(path, b"")]);
             assert!(import_archive(&archive, &home, false, true).is_err(), "{path}");
@@ -648,6 +691,7 @@ mod tests {
         let expected_home_entries: HashSet<_> = [
             "config.toml.lock",
             "locks",
+            ".google-authority",
             duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE,
         ]
             .into_iter()
@@ -658,7 +702,11 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
             .collect();
-        let expected_locks_entries: HashSet<_> = ["gateway.lock"]
+        let expected_locks_entries: HashSet<_> = [
+            String::from("gateway.lock"),
+            // The fs lock helper appends `.lock` to the seat admission path.
+            format!("{}.lock", duduclaw_core::agent_seats::SEAT_ADMISSION_LOCK),
+        ]
             .into_iter()
             .map(std::ffi::OsString::from)
             .collect();
@@ -868,6 +916,178 @@ mod tests {
         assert!(duduclaw_auth::mfa::read_enforcement(&conn).unwrap());
         drop(conn);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn import_preserves_authority_locks_and_private_permissions() {
+        use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join("old-export.tar.gz");
+        // Include Win32 aliases as an old or externally produced archive may.
+        ordered_archive(&archive, &[
+            (".GOOGLE-AUTHORITY. /intent", b"archived lock"),
+            (".google-authority/resource", b"archived lock"),
+            (".google-authority/epoch", b"archived epoch"),
+            ("agents/imported/SOUL.md", b"imported"),
+        ]);
+        for existing in [false, true] {
+            let home = root.path().join(if existing { "existing" } else { "fresh" });
+            if existing { duduclaw_core::config::create_home_dir(&home).unwrap(); }
+            let authority = AuthorityCoordinator::new(&home);
+            // Keep the coordinator's anchor handles open, without a shared
+            // lease: the import must acquire its writer and retire the epoch.
+            if existing { authority.initialize().unwrap(); }
+            let before = existing.then(|| authority.epoch().unwrap());
+            import_archive(&archive, &home, false, true).unwrap();
+            assert_eq!(fs::read(home.join("agents/imported/SOUL.md")).unwrap(), b"imported");
+            assert!(home.join(".google-authority").is_dir());
+            assert_ne!(fs::read(home.join(".google-authority/epoch")).unwrap(), b"archived epoch");
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(fs::metadata(&home).unwrap().permissions().mode() & 0o022, 0);
+            }
+            if let Some(before) = before {
+                assert_ne!(authority.epoch().unwrap(), before);
+            }
+            // The original coordinator checks pinned identities; a fresh one
+            // validates Unix mode/uid/nlink or Windows DACLs before writing.
+            if existing { drop(authority.write().unwrap()); }
+            drop(AuthorityCoordinator::new(&home).write().unwrap());
+            let exported = root.path().join("export.tar.gz");
+            export_home(&home, &exported).unwrap();
+            let mut exported = tar::Archive::new(GzDecoder::new(File::open(exported).unwrap()));
+            for entry in exported.entries().unwrap() {
+                let entry = entry.unwrap();
+                assert!(!entry.path().unwrap().components().any(|part|
+                    duduclaw_core::authority_coordinator::is_authority_namespace(&part.as_os_str().to_string_lossy())));
+            }
+            assert!(is_excluded(".GOOGLE-AUTHORITY. "));
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn import_rejects_existing_authority_directory_link() {
+        use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        duduclaw_core::config::create_home_dir(&home).unwrap();
+        let authority = AuthorityCoordinator::new(&home);
+        authority.initialize().unwrap();
+        // Mixed case ensures validation uses tar's actual path spelling.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".google-authority", home.join("Alias")).unwrap();
+        #[cfg(windows)] {
+            // Directory junctions do not require symlink privilege/admin.
+            let output = std::process::Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(home.join("Alias")).arg(home.join(".google-authority"))
+                .output().expect("run mklink /J for the junction regression");
+            assert!(output.status.success(), "mklink /J failed: {output:?}");
+        }
+        let archive = root.path().join("alias.tar.gz");
+        ordered_archive(&archive, &[("Alias/epoch", b"archived epoch"), ("later", b"must not write")]);
+        let before = authority.epoch().unwrap();
+        let error = import_archive(&archive, &home, false, true).unwrap_err();
+        assert!(error.to_string().contains("existing symlink or reparse point"), "{error}");
+        assert_ne!(authority.epoch().unwrap(), before);
+        assert!(!home.join("later").exists());
+
+        // Observe the exact bumped value at the unpack boundary, then prove
+        // that a refusal cannot replace it with archive-controlled bytes.
+        let _admission = duduclaw_core::agent_seats::SeatAdmission::acquire(&home).unwrap();
+        let _writer = authority.write().unwrap();
+        let bumped = fs::read(home.join(".google-authority/epoch")).unwrap();
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        let mut snapshot = File::open(&archive).unwrap();
+        assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
+        assert_eq!(fs::read(home.join(".google-authority/epoch")).unwrap(), bumped);
+        assert!(!home.join("later").exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn import_rejects_last_link_destination_before_publishing_or_moving_data() {
+        use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        duduclaw_core::config::create_home_dir(&home).unwrap();
+        let authority = AuthorityCoordinator::new(&home);
+        authority.initialize().unwrap();
+        write(&home.join("config.toml"), "# Keep original bytes\n[auth]\nmfa_enforced=true\n");
+        write(&home.join("agents/kept/SOUL.md"), "original agent");
+        drop(duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap());
+        let mut conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        duduclaw_auth::mfa::record_enforcement(&mut conn, true, 123).unwrap();
+        drop(conn);
+        let archived_db = root.path().join("archived.db");
+        drop(duduclaw_auth::UserDb::new(&archived_db).unwrap());
+        let db_bytes = fs::read(archived_db).unwrap();
+        let archive = root.path().join("last-alias.tar.gz");
+        let valid_entries: &[(&str, &[u8])] = &[
+            ("users.db", &db_bytes),
+            ("config.toml", b"[auth]\nmfa_enforced=true\n"),
+            ("agents/new/SOUL.md", b"imported agent"),
+        ];
+        ordered_archive(&archive, valid_entries);
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        assert!(validate_import_policy(&mut snapshot, &home, true).unwrap().publish_before_unpack);
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(".google-authority", home.join("Alias")).unwrap();
+        #[cfg(windows)] {
+            let output = std::process::Command::new("cmd")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(home.join("Alias")).arg(home.join(".google-authority"))
+                .output().expect("run mklink /J for the junction regression");
+            assert!(output.status.success(), "mklink /J failed: {output:?}");
+        }
+        let mut entries = valid_entries.to_vec();
+        entries.push(("Alias/epoch", b"archived epoch"));
+        ordered_archive(&archive, &entries);
+        let originals: Vec<_> = ["users.db", "config.toml", "agents/kept/SOUL.md"]
+            .into_iter().map(|path| (path, fs::read(home.join(path)).unwrap())).collect();
+        let before = fs::read(home.join(".google-authority/epoch")).unwrap();
+        let error = import_archive(&archive, &home, true, true).unwrap_err();
+        assert!(error.to_string().contains("existing symlink or reparse point"), "{error}");
+        for (path, bytes) in originals {
+            assert_eq!(fs::read(home.join(path)).unwrap(), bytes, "{path}");
+        }
+        assert_eq!(fs::read_dir(home.join("agents")).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(home.join("agents/kept")).unwrap().count(), 1);
+        assert!(!home.join("agents/new").exists());
+        assert!(!home.join("agents.pre-import").exists());
+        // Admission -> authority writer -> lifecycle/config lock order is
+        // unchanged: retirement is the only change to these persisted inputs.
+        let bumped = fs::read(home.join(".google-authority/epoch")).unwrap();
+        assert_ne!(bumped, before);
+        assert_ne!(bumped, b"archived epoch");
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        assert!(validate_import_policy(&mut snapshot, &home, true).is_err());
+        assert_eq!(fs::read(home.join(".google-authority/epoch")).unwrap(), bumped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_rejects_existing_links_at_every_destination_depth() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        duduclaw_core::config::create_home_dir(&home).unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"original").unwrap();
+        fs::create_dir(home.join("nested")).unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("nested/alias")).unwrap();
+        std::os::unix::fs::symlink(outside.join("keep"), home.join("final")).unwrap();
+        std::os::unix::fs::symlink(outside.join("missing"), home.join("dangling")).unwrap();
+        for path in ["nested/alias/keep", "final", "dangling"] {
+            let archive = root.path().join("input.tar.gz");
+            ordered_archive(&archive, &[(path, b"archive"), ("later", b"must not write")]);
+            let error = import_archive(&archive, &home, false, true).unwrap_err();
+            assert!(error.to_string().contains("existing symlink or reparse point"), "{error}");
+            assert_eq!(fs::read(outside.join("keep")).unwrap(), b"original");
+            assert!(!outside.join("missing").exists());
+            assert!(!home.join("later").exists());
+        }
     }
 
     #[test]
@@ -1201,6 +1421,9 @@ fn is_live_lock(path: &Path) -> bool {
     path.components().next().and_then(|part| part.as_os_str().to_str()).is_some_and(|name| {
         [duduclaw_core::autonomy_gate::ADMISSION_LOCK_FILE, "config.toml.lock", ".google-home-source.lock", "locks"]
             .iter().any(|lock| name.eq_ignore_ascii_case(lock))
+            // Old exports must not replace pinned lock files, roll back the
+            // epoch, or recreate files with inherited Windows DACLs.
+            || duduclaw_core::authority_coordinator::is_authority_namespace(name)
     })
 }
 
@@ -1231,10 +1454,7 @@ fn canonical_import_path(path: &Path) -> Result<PathBuf> {
         // Existing Windows files may also be reachable through generated 8.3
         // names. Their mappings depend on the destination volume, so refuse
         // the short-name spelling instead of trying to resolve it during unpack.
-        let (short_stem, extension) = name.rsplit_once('.').unwrap_or((&name, ""));
-        if cfg!(windows) && short_stem.chars().count() <= 8 && !short_stem.contains('.') && extension.chars().count() <= 3
-            && short_stem.rsplit_once('~').is_some_and(|(prefix, digits)|
-                !prefix.is_empty() && !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())) {
+        if cfg!(windows) && duduclaw_core::fs_safety::is_generated_dos_short_alias(&name) {
             return Err(io_err("import policy", "DOS short-name archive alias"));
         }
         canonical.push(name);
@@ -1285,6 +1505,7 @@ fn validate_import_policy_with_limits(
     let mut targets = HashSet::new();
     let mut budget = ImportBudget::default();
     let mut restored_config = None;
+    let canonical_home = fs::canonicalize(home).map_err(|e| io_err("import destination", e))?;
     let mut replaces_identity = false;
     let mut personal = personal;
     let mut license_seen = false;
@@ -1294,6 +1515,10 @@ fn validate_import_policy_with_limits(
         let mut entry = entry.map_err(|e| io_err("import policy", e))?;
         budget.check(&entry, limits)?;
         let path = checked_import_entry(&entry, &mut targets)?;
+        // Check every logical entry before any publication, agents move or
+        // extraction, including skipped live locks. Use tar's actual spelling.
+        let raw_path = entry.path().map_err(|e| io_err("import destination", e))?;
+        check_import_destination(home, &canonical_home, &raw_path)?;
         if is_live_lock(&path) { continue; }
         if path.to_str().is_some_and(|name| IDENTITY_FILES.contains(&name)) {
             replaces_identity = true;

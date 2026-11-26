@@ -17,6 +17,17 @@ pub async fn spawn_pty(command: portable_pty::CommandBuilder, size: PtySize, cla
     duduclaw_execution::command::spawn_pty(command, size, class, isolation_required()).await
 }
 
+/// Bind a host-issued run capability inside the backend, before reaping/resume.
+pub async fn spawn_bound(cmd: &mut tokio::process::Command, class: ExecutionClass,
+    binding: Option<crate::run_credential::SpawnBinding>) -> std::io::Result<Child> {
+    duduclaw_execution::command::spawn_bound(cmd, class, isolation_required(), binding).await
+}
+
+pub async fn spawn_pty_bound(command: portable_pty::CommandBuilder, size: PtySize, class: ExecutionClass,
+    binding: Option<crate::run_credential::SpawnBinding>) -> std::io::Result<PtyChild> {
+    duduclaw_execution::command::spawn_pty_bound(command, size, class, isolation_required(), binding).await
+}
+
 pub async fn output(cmd: &mut tokio::process::Command, class: ExecutionClass) -> std::io::Result<std::process::Output> {
     cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     spawn(cmd, class).await?.wait_with_output().await

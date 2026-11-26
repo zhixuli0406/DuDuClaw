@@ -250,32 +250,14 @@ pub(crate) fn check_target_absent(home: &Path, label: &str) -> Result<(), Refusa
     { let _ = (home, label); Err(Refusal::Unavailable) }
 }
 
-/// L2: the agent cap counts live confirmed employees; the restored one
-/// would be one more.
-pub(crate) fn check_quota(home: &Path, cap: usize) -> Result<(), Refusal> {
+/// Preliminary filesystem admission; the pending restored identity is
+/// always recounted under the shared seat lock before committing.
+pub(crate) fn check_quota(home: &Path, cap: usize, may_exempt: bool) -> Result<(), Refusal> {
     if cap == 0 { return Ok(()); }
-    let live = lifecycle::confirmed_entries(home, MAX_CONFIRMED).map_err(from_lifecycle)?.iter().filter(|e| !e.disabled).count();
-    if live >= cap { Err(Refusal::QuotaExceeded) } else { Ok(()) }
-}
-
-/// L2 inside the apply transaction (F6fa item 2): the live confirmed
-/// employees counted on the caller's apply.db connection, which holds the
-/// writer lock, so no proposal apply can add one between this count and the
-/// restore's commit.
-pub(crate) fn check_quota_in(db: &Connection, cap: usize) -> Result<(), Refusal> {
-    if cap == 0 { return Ok(()); }
-    let bound = i64::try_from(MAX_CONFIRMED.saturating_add(1)).map_err(unavailable)?;
-    let mut statement = db.prepare("SELECT label,receipt FROM confirmed_employees ORDER BY label LIMIT ?1").map_err(unavailable)?;
-    let rows = statement.query_map([bound], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))).map_err(unavailable)?
-        .collect::<Result<Vec<_>, _>>().map_err(unavailable)?;
-    if rows.len() > MAX_CONFIRMED { return Err(Refusal::Unavailable); }
-    let mut live = 0usize;
-    for (label, encoded) in rows {
-        let receipt: Receipt = serde_json::from_str(&encoded).map_err(unavailable)?;
-        if receipt.label != label { return Err(Refusal::Unavailable); }
-        if !receipt.disabled { live += 1; }
-    }
-    if live >= cap { Err(Refusal::QuotaExceeded) } else { Ok(()) }
+    let used = duduclaw_core::agent_seats::seat_holders(home).map_err(unavailable)?.len();
+    // Equality may still admit a Personal avatar. The pending restored state
+    // is recounted inside restore_users before its transaction commits.
+    if used > cap || (!may_exempt && used == cap) { Err(Refusal::QuotaExceeded) } else { Ok(()) }
 }
 
 /// Every check that reads outside apply.db (users.db, confirmations, the
@@ -287,7 +269,7 @@ pub(crate) fn check_outside(home: &Path, env: &RestoreEnv<'_>, q: &Quarantined) 
     check_users(home, q)?;
     check_no_open_proposal(home, &q.label)?;
     check_target_absent(home, &q.label)?;
-    check_quota(home, env.agent_cap)?;
+    check_quota(home, env.agent_cap, q.owner.is_some() && q.principal_snapshot["avatar_seat_grant"].as_bool() == Some(true))?;
     check_store_marks(home, env, q)?;
     match restore_precheck(home, &q.label, q.employee, env.root).map_err(from_lifecycle)? {
         RootClass::Ok => {}

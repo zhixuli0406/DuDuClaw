@@ -9,7 +9,8 @@ const MESSAGES: usize = 8;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_publications_of_different_messages_all_publish() {
     let sessions_file = NamedTempFile::new().unwrap();
-    let users_file = NamedTempFile::new().unwrap();
+    let users_home = test_users_home();
+    let users_file = NamedTempFile::new_in(users_home.path()).unwrap();
     let mgr = Arc::new(SessionManager::new(sessions_file.path()).unwrap());
     // Two pools on one users.db: both the in-process slots and SQLite's
     // cross-connection write reservation are contended.
@@ -45,7 +46,8 @@ async fn concurrent_publications_of_different_messages_all_publish() {
 #[tokio::test]
 async fn publication_busy_past_the_budget_is_contention_and_a_real_change_is_not() {
     let sessions_file = NamedTempFile::new().unwrap();
-    let users_file = NamedTempFile::new().unwrap();
+    let users_home = test_users_home();
+    let users_file = NamedTempFile::new_in(users_home.path()).unwrap();
     let mgr = SessionManager::new(sessions_file.path()).unwrap();
     let users = UserDb::new(users_file.path()).unwrap();
     let policy = crate::webchat::access::TargetPolicy::test_admin();

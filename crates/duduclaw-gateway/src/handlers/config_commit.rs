@@ -364,6 +364,14 @@ fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)
     commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None)
 }
 fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
+    let authority_home = match path.file_name().and_then(|n| n.to_str()) {
+        Some("config.toml") => path.parent(),
+        Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
+        _ => None,
+    };
+    let _authority = authority_home.map(|home|
+        duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home).write()
+    ).transpose().map_err(|e| e.to_string())?;
     let outcome = duduclaw_core::with_file_lock(path, || {
         verify_live_io()?;
         let current = match std::fs::read_to_string(path) {

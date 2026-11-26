@@ -2,7 +2,7 @@
 //! Durable plans are encrypted and never exposed by confirmation RPCs.
 use std::path::{Path, PathBuf};
 use std::io::{Read, Write};
-use duduclaw_migration::confirmation::{ConfirmationError as Error, ProposalValidator, ProposalApplier, RotationVerifier, secret_fingerprint};
+use duduclaw_migration::confirmation::{ConfirmationError as Error, ProposalValidator, ProposalApplier, RotationVerifier, ProposalEffect, ProposalLock, secret_fingerprint};
 use duduclaw_migration::{contract::*, ids::Sha256Digest};
 use duduclaw_security::crypto::CryptoEngine;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -55,6 +55,9 @@ pub(crate) trait MigrationAuthorityBackend: Send + Sync {
     /// Read the immutable principal and confirmed UID/quota allocation from the
     /// live B/D/H registry. A proposal label or Applied row is not this proof.
     fn readback_shared_employee(&self, _agent: &str) -> Result<()> { Err(Error::Denied) }
+    /// Employee remote work runs outside admission; every local seat commit
+    /// must use this orchestrator and pass its admission to the write helpers.
+    fn employee_effect(&self, _item: &ConfirmationItem, _effect: ProposalEffect, _commit: &employee::EmployeeCommit<'_>) -> Result<()> { Err(Error::Denied) }
     fn supports(&self, category: ConfirmationCategory) -> bool;
     fn validate(&self, item: &ConfirmationItem) -> Result<()>;
     fn stage(&self, item: &ConfirmationItem) -> Result<()>;
@@ -78,6 +81,11 @@ pub(crate) struct GatewayAuthority {
     runtime: Option<std::sync::Arc<dyn MigrationConfigReadback>>,
     live: Option<std::sync::Arc<LiveAuthority>>,
     connector_env: connectors::ConnectorEnv,
+    // None is offline, never an unlimited license.
+    agent_cap: Option<usize>,
+    users: Option<std::sync::Arc<duduclaw_auth::UserDb>>,
+    user_admission: Option<duduclaw_core::agent_seats::SeatAdmission>,
+    employee_confirmation: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag="kind", deny_unknown_fields)]
@@ -113,8 +121,47 @@ impl GatewayAuthority {
             CREATE TABLE IF NOT EXISTS secrets (operation TEXT PRIMARY KEY, digest BLOB NOT NULL, value BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS config_publications (operation TEXT NOT NULL, digest BLOB NOT NULL,
                 phase TEXT NOT NULL, identity BLOB NOT NULL, PRIMARY KEY(operation,phase));").map_err(|_| Error::Storage)?;
-        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default() })
+        Ok(Self { home, db, key, backend: None, runtime: None, live: None, connector_env: connectors::ConnectorEnv::default(), agent_cap: None, users: None, user_admission: None, employee_confirmation: false })
     }
+    pub(crate) fn with_user_db(mut self, db: std::sync::Arc<duduclaw_auth::UserDb>) -> Self {
+        self.users = Some(db); self
+    }
+    /// Account/binding effects must acquire admission before ConfirmationStore
+    /// takes the proposal authority lock, including retry/reject compensation.
+    /// The pool is initialized by the caller before this scope; opening UserDb
+    /// here or in an adapter would recursively acquire schema admission.
+    pub(crate) fn with_confirmation_admission<T>(&mut self,
+        store: &mut duduclaw_migration::confirmation::ConfirmationStore, binding: &ProposalBinding,
+        run: impl FnOnce(&mut duduclaw_migration::confirmation::ConfirmationStore, &mut Self) -> Result<T>) -> Result<T> {
+        let item = store.list()?.into_iter().find(|item| item.binding == *binding).ok_or(Error::Stale)?;
+        if self.employee_confirmation || self.user_admission.is_some() { return Err(Error::Denied); }
+        if item.category == ConfirmationCategory::Employee {
+            // Employee effects include remote/async work. The store retains
+            // operation exclusion while EmployeeCommit takes admission before
+            // each local proposal-locked commit, never across a remote wait.
+            self.employee_confirmation = true;
+            let result = run(store, self);
+            self.employee_confirmation = false;
+            return result;
+        }
+        let needs_admission = matches!(item.category, ConfirmationCategory::User | ConfirmationCategory::UserAgentBinding);
+        if needs_admission {
+            if self.users.is_none() || self.user_admission.is_some() { return Err(Error::Denied); }
+            self.user_admission = Some(duduclaw_core::agent_seats::SeatAdmission::acquire(&self.home)
+                .map_err(|_| Error::Storage)?);
+        }
+        let result = run(store, self);
+        self.user_admission = None;
+        result
+    }
+    fn user_seat_write<T>(&self,
+        write: impl FnOnce(&duduclaw_auth::UserDb, &duduclaw_core::agent_seats::SeatAdmission, Option<usize>) -> Result<T>) -> Result<T> {
+        // No fallback acquisition under a proposal lock, including offline mode.
+        let db = self.users.as_ref().ok_or(Error::Denied)?;
+        let admission = self.user_admission.as_ref().ok_or(Error::Denied)?;
+        write(db, admission, self.agent_cap)
+    }
+    pub(crate) fn with_agent_cap(mut self, cap: Option<usize>) -> Self { self.agent_cap = cap; self }
     pub(crate) fn with_live(mut self,live:std::sync::Arc<LiveAuthority>)->Self {self.live=Some(live);self}
     /// Root allocator / audit actor used by the Connector category (tests inject fixtures).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -180,9 +227,10 @@ impl GatewayAuthority {
             .map_err(|_| Error::Storage)?;
         Ok(())
     }
-    fn user_db(&self) -> Result<duduclaw_auth::UserDb> {
-        regular(&self.home.join("users.db"))?;
-        duduclaw_auth::UserDb::new(&self.home.join("users.db")).map_err(|_| Error::Storage)
+    fn user_db(&self) -> Result<&duduclaw_auth::UserDb> {
+        // Initialization itself acquires admission, so adapters must only use
+        // the pool opened before the confirmation operation.
+        self.users.as_deref().ok_or(Error::Denied)
     }
     fn config_plan(&self, item: &ConfirmationItem, resolve_secret: bool) -> Result<Plan> {
         let (relative, section, mut value) = config_value(item)?;
@@ -351,7 +399,7 @@ impl ProposalValidator for GatewayAuthority {
                 }
                 self.config_plan(item, false).map(|_| ())
             }
-            ConfirmationCategory::UserAgentBinding => {self.require_shared_employee(item)?;bindings::binding_plan(&self.home,item).map(|_|())},
+            ConfirmationCategory::UserAgentBinding => {self.require_shared_employee(item)?;bindings::binding_plan(&self.home,item,self.user_db()?).map(|_|())},
             ConfirmationCategory::DataSourceAuthorization => {self.require_shared_employee(item)?;data_grants::grant_plan(&self.home,item,self.live.as_ref().ok_or(Error::Denied)?).map(|_|())},
             ConfirmationCategory::Schedule => {self.require_shared_employee(item)?;schedules::schedule_plan(&self.home,item,self.live.as_ref().ok_or(Error::Denied)?).map(|_|())},
             ConfirmationCategory::ChannelBinding => {self.require_shared_employee(item)?;self.live.as_ref().ok_or(Error::Denied)?;channels::channel_plan(&self.home,item).map(|_|())},
@@ -367,6 +415,20 @@ impl ProposalValidator for GatewayAuthority {
     }
 }
 impl ProposalApplier for GatewayAuthority {
+    fn apply_effect(&mut self, item: &ConfirmationItem, effect: ProposalEffect, proposal: &ProposalLock) -> Result<()> {
+        if item.category == ConfirmationCategory::Employee {
+            if !self.employee_confirmation { return Err(Error::Denied); }
+            let commit = employee::EmployeeCommit { home: &self.home, proposal };
+            return bridge::operation(|| self.backend.as_ref().ok_or(Error::Denied)?.employee_effect(item, effect, &commit));
+        }
+        proposal.run(|| match effect {
+            ProposalEffect::Stage => self.stage(item),
+            ProposalEffect::Publish => self.publish(item),
+            ProposalEffect::ReadBack => self.read_back(item),
+            ProposalEffect::Disable => self.disable_and_read_back(item),
+        })
+    }
+
     fn stage(&mut self, item: &ConfirmationItem) -> Result<()> {
         bridge::operation(|| {
         self.validate_fresh(item)?;
@@ -378,7 +440,7 @@ impl ProposalApplier for GatewayAuthority {
         }
         let plan = match item.category {
             ConfirmationCategory::Department => Plan::Department(departments::department_plan(&self.home,item)?),
-            ConfirmationCategory::UserAgentBinding => {let plan=bindings::binding_plan(&self.home,item)?;plan.check_absent(&self.home)?;Plan::Binding(plan)},
+            ConfirmationCategory::UserAgentBinding => {let plan=bindings::binding_plan(&self.home,item,self.user_db()?)?;plan.check_absent(self.user_db()?)?;Plan::Binding(plan)},
             ConfirmationCategory::DataSourceAuthorization => Plan::DataGrant(data_grants::grant_plan(&self.home,item,self.live.as_ref().ok_or(Error::Denied)?)?),
             ConfirmationCategory::Schedule => Plan::Schedule(schedules::schedule_plan(&self.home,item,self.live.as_ref().ok_or(Error::Denied)?)?),
             ConfirmationCategory::ChannelBinding => Plan::Channel(channels::channel_plan(&self.home,item)?),
@@ -399,7 +461,7 @@ impl ProposalApplier for GatewayAuthority {
         bridge::operation(|| {
         let Some(plan) = self.plan(item)? else { return self.backend.as_ref().ok_or(Error::Denied)?.publish(item); };
         match plan {
-            Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.publish(&self.home)},
+            Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.publish(self)},
             Plan::DataGrant(plan) => {self.require_shared_employee(item)?;plan.publish(&self.home,self.live.as_ref().ok_or(Error::Denied)?)},
             Plan::Schedule(plan) => {self.require_shared_employee(item)?;plan.publish(&self.home,self.live.as_ref().ok_or(Error::Denied)?)},
             Plan::Channel(plan) => {self.require_shared_employee(item)?;plan.publish(&self.home)},
@@ -413,7 +475,10 @@ impl ProposalApplier for GatewayAuthority {
                 }
                 plan.publish(&self.home)
             }
-            Plan::User {email,display,role} => self.user_db()?.migration_invite_user(&operation(&item.binding),&item.binding.proposal_digest.0,&email,&display,role).map(|_|()).map_err(|_| Error::Apply),
+            Plan::User {email,display,role} => self.user_seat_write(|db, admission, cap| {
+                db.migration_invite_user_admitted(&operation(&item.binding), &item.binding.proposal_digest.0,
+                    &email, &display, role, admission, cap).map(|_| ()).map_err(|_| Error::Apply)
+            }),
             Plan::Config {relative,before,after} => self.publish_config(item,&relative,&before,&after),
             Plan::Connector(plan) => plan.publish(&self.home,item,&self.connector_env,&self.connector_actor()?),
         }
@@ -423,7 +488,7 @@ impl ProposalApplier for GatewayAuthority {
         bridge::operation(|| {
         let Some(plan) = self.plan(item)? else { return self.backend.as_ref().ok_or(Error::Denied)?.read_back(item); };
         match plan {
-            Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home)},
+            Plan::Binding(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home,self.user_db()?)},
             Plan::DataGrant(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home,self.live.as_ref().ok_or(Error::Denied)?,false)},
             Plan::Schedule(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home,self.live.as_ref().ok_or(Error::Denied)?)},
             Plan::Channel(plan) => {self.require_shared_employee(item)?;plan.read_back(&self.home,self.live.as_ref().ok_or(Error::Denied)?)},
@@ -447,7 +512,7 @@ impl ProposalApplier for GatewayAuthority {
             return match &self.backend { Some(b) if b.supports(item.category) => b.disable(item), _ if Self::built_in_supports(item.category) => Ok(()), _ => Err(Error::Compensation) };
         };
         match plan {
-            Plan::Binding(plan) => plan.disable(&self.home),
+            Plan::Binding(plan) => plan.disable(self),
             Plan::DataGrant(plan) => plan.disable(&self.home,self.live.as_ref().ok_or(Error::Denied)?),
             Plan::Schedule(plan) => plan.disable(&self.home,self.live.as_ref().ok_or(Error::Denied)?),
             Plan::Channel(plan) => plan.disable(&self.home,self.live.as_ref().ok_or(Error::Denied)?),
@@ -455,7 +520,10 @@ impl ProposalApplier for GatewayAuthority {
             Plan::Mcp(plan) => plan.disable(&self.home),
             Plan::Profile(plan) => plan.disable(&self.home,self.live.as_ref().ok_or(Error::Denied)?),
             Plan::Department(plan) => plan.disable(&self.home),
-            Plan::User {..} => self.user_db()?.migration_user_disable(&operation(&item.binding),&item.binding.proposal_digest.0).map_err(|_| Error::Compensation),
+            Plan::User {..} => self.user_seat_write(|db, admission, cap| {
+                db.migration_user_disable_admitted(&operation(&item.binding), &item.binding.proposal_digest.0, admission, cap)
+                    .map_err(|_| Error::Compensation)
+            }),
             Plan::Config {relative,before,after} => self.disable_config(item,&relative,&before,&after),
             Plan::Connector(plan) => plan.disable(&self.home,item,&self.connector_actor().map_err(|_|Error::Compensation)?),
         }
@@ -476,6 +544,7 @@ impl RotationVerifier for GatewayAuthority {
         })
     }
 }
+
 fn operation(binding: &ProposalBinding) -> String { format!("{}-{:x}",hex::encode(binding.operation_id.proposal_id.0),binding.operation_id.revision) }
 fn text<'a>(item: &'a ConfirmationItem, name: &str) -> Result<&'a str> {
     match item.fields.iter().find(|f| f.name == name).map(|f| &f.value) {
@@ -605,6 +674,49 @@ mod tests {
             fields:fields.iter().map(|(k,v)|ProposalField {name:(*k).into(),value:ProposalValue::Text {value:(*v).into()}}).collect()}
     }
     #[test]
+    fn migration_authority_compensation_enforces_known_and_offline_seat_limits() {
+        use duduclaw_core::agent_seats::{SeatAdmission, seat_holders};
+        for cap in [None, Some(1), Some(2)] {
+            let home = tempfile::tempdir().unwrap();
+            let db = std::sync::Arc::new(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
+            let mut authority = GatewayAuthority::new(home.path().into()).unwrap().with_user_db(db.clone()).with_agent_cap(cap);
+            let mut store = duduclaw_migration::confirmation::ConfirmationStore::from_connection(Connection::open_in_memory().unwrap()).unwrap();
+            let fields = item(ConfirmationCategory::User, &[("name", "avatar@example.test"), ("display_name", "Avatar"), ("role", "admin")]).fields;
+            let proposal = store.stage_proposal(ProposalOperationId { proposal_id: RequestId([7;16]), revision: 1 },
+                ConfirmationCategory::User, fields, &authority).unwrap();
+            let plan = Plan::User { email: "avatar@example.test".into(), display: "Avatar".into(), role: duduclaw_auth::UserRole::Admin };
+            authority.save_plan(&proposal, &plan).unwrap();
+            authority.with_confirmation_admission(&mut store, &proposal.binding, |_, a| a.publish(&proposal)).unwrap();
+            let user = db.migration_user_readback(&operation(&proposal.binding), &proposal.binding.proposal_digest.0).unwrap();
+            let admission = SeatAdmission::acquire(home.path()).unwrap();
+            db.publish_new_avatar_under(&user.id, &user.id, "avatar", &admission, 1, |_| {
+                let dir = home.path().join("agents/avatar");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                std::fs::write(dir.join("agent.toml"), "[agent]\nname='avatar'\nstatus='active'\n").map_err(|e| e.to_string())
+            }).unwrap();
+            let dir = home.path().join("agents/ordinary");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), "[agent]\nname='ordinary'\nstatus='active'\n").unwrap();
+            drop(admission);
+            let generation = db.acl_generation().unwrap();
+            let result = authority.with_confirmation_admission(&mut store, &proposal.binding, |_, a| a.disable_and_read_back(&proposal));
+            if cap == Some(2) {
+                result.unwrap();
+                assert_eq!(seat_holders(home.path()).unwrap().len(), 2);
+                assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, duduclaw_auth::UserStatus::Suspended);
+                authority.with_confirmation_admission(&mut store, &proposal.binding, |_, a| a.publish(&proposal)).unwrap();
+                authority.read_back(&proposal).unwrap();
+                assert_eq!(seat_holders(home.path()).unwrap().len(), 1);
+            } else {
+                assert!(matches!(result, Err(Error::Compensation)));
+                assert_eq!(db.acl_generation().unwrap(), generation);
+                assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, duduclaw_auth::UserStatus::Active);
+                authority.read_back(&proposal).unwrap();
+                assert_eq!(seat_holders(home.path()).unwrap().len(), 1);
+            }
+        }
+    }
+    #[test]
     #[cfg(target_os="linux")]
     fn migration_authority_department_stages_then_publishes_and_compensates() {
         let home=tempfile::tempdir().unwrap();
@@ -698,3 +810,7 @@ impl GatewayAuthority {
         if self.db.execute("UPDATE plans SET plan=?3 WHERE operation=?1 AND digest=?2",params![operation(&item.binding),item.binding.proposal_digest.0.as_slice(),encrypted]).map_err(|_|Error::Storage)?!=1 {return Err(Error::Stale);}Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "migration_authority_seat_tests.rs"]
+mod seat_tests;

@@ -7,7 +7,9 @@
 //! when it is about a Personal employee the subscriber does not own — the
 //! same set `personal_visibility::hidden_from` hides from its listings (so an
 //! Admin who is not the owner, a manager, and the legacy `system` context get
-//! nothing; the owner gets everything as before). Nothing is stripped to an
+//! nothing; the owner gets everything as before). D4 permits an Admin's
+//! current-avatar session/memory notifications only, with an audit per frame.
+//! Nothing is stripped to an
 //! id: the event is simply not sent. The ownership mirror is read fresh per
 //! frame; unreadable ⇒ withheld.
 //!
@@ -89,6 +91,13 @@ pub(super) fn frame_subjects(home: &Path, frame: &PreparedPush, parsed: &Value) 
     Ok(subjects)
 }
 
+/// Only session/memory notifications may bypass the ordinary Personal ACL.
+/// This is a candidate check; `withheld` still requires the audit before send.
+pub(super) fn avatar_candidate(home: &Path, protected: bool, user: &str, event: &str, agent: &str) -> bool {
+    protected && matches!(event, "chat.sessions.updated" | "memory.changed")
+        && visibility::current_admin_avatar_member(home, user, agent).is_some()
+}
+
 /// `true` when `frame` must not reach the subscriber `user_id`: it is about
 /// a Personal employee `user_id` does not own, or it could be (no subject,
 /// not on [`NO_EMPLOYEE_DATA`]) and `user_id` has such employees hidden.
@@ -118,5 +127,14 @@ pub(super) fn withheld(home: &Path, protected: bool, user_id: &str, frame: &Prep
     if hidden.is_empty() {
         return false;
     }
-    subjects.is_empty() || subjects.iter().any(|agent| hidden.contains(agent))
+    if subjects.is_empty() { return true; }
+    for agent in subjects.iter().filter(|agent| hidden.contains(*agent)) {
+        if !avatar_candidate(home, true, user_id, event, agent) { return true; }
+        // No cached subscription grant: unset/reassignment/error is effective
+        // on the next frame, and each delivered read is individually audited.
+        if !matches!(visibility::audit_avatar_read(home, user_id, agent, &format!("push:{event}")), Ok(Some(_))) {
+            return true;
+        }
+    }
+    false
 }

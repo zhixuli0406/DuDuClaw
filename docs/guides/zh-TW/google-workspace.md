@@ -1,10 +1,10 @@
 # Google Workspace 工具與安全模型
 
-設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十六個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十九個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
-二十六個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
+二十九個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
@@ -13,7 +13,10 @@
 | `gmail_read` | read | 完整讀取一封信：標頭、純文字內文（過長會截斷）、附件清單（只列檔名與大小，絕不下載）。 |
 | `google_chat_spaces` | read | 列出已連結帳號的聊天室、群聊與私訊，需先啟用 Chat 讀取。 |
 | `google_chat_messages` | read | 讀取近期 Chat 訊息，回傳經掃描的參考資料；附件只列名稱。 |
-| `gmail_create_draft` | write | 建立一封 Gmail **草稿**。永不寄出，寄信永遠是人工動作。 |
+| `google_chat_send` | send | 以提出要求的已驗證成員本人帳號，傳送文字到既有空間。須先開啟 `[google] chat_send = true`，每次傳送都要本人確認。見[以本人身分傳送 Google Chat](google-personal-connections.md#以本人身分傳送-google-chat)。 |
+| `gmail_send_draft` | send | 逐次確認後寄出草稿快照。 |
+| `calendar_delete_event` | delete | 逐次確認後刪除指定版本的活動，預設不通知參加者。 |
+| `gmail_create_draft` | write | 建立一封 Gmail **草稿**。此工具只存草稿；寄出需另外呼叫 `gmail_send_draft` 並逐次確認。 |
 | `calendar_list_events` | read | 列出主行事曆的活動（預設列出未來 7 天）。 |
 | `calendar_create_event` | write | 建立一個真實、對外可見的活動；可選擇附上 Google Meet 連結。 |
 | `sheets_read` | read | 讀取試算表中某個儲存格範圍（接受試算表 ID 或完整的表單網址）。最多回傳 200 列已格式化的值。 |
@@ -54,13 +57,12 @@
 
 ### 安全設計
 
-- **草稿永不寄出。** `gmail_create_draft` 只會存草稿，沒有任何「寄出」工具，
-  寄信永遠是人的決定。
+- **寄信需要逐次確認。** `gmail_create_draft` 只存草稿；`gmail_send_draft` 每次都要人確認卡片才會寄出。
 - **讀取就只是讀取。** 屬於 read 類別的工具無法修改 Gmail 或 Calendar 中的
   任何內容。
 - **Forms、Drive、Slides 全部唯讀。** 沒有任何工具會建立或編輯表單、寫入
-  Drive、或修改簡報。只有 Gmail（草稿）、Calendar、Sheets、Docs
-  和 Tasks 有寫入工具。
+  Drive、或修改簡報。只有 Gmail（草稿與核准寄出）、Google Chat（本人確認後傳送）、
+  Calendar、Sheets、Docs 和 Tasks 有寫入工具。
 - **最小權限原則。** Drive 申請的是 `drive.readonly`（絕不是 `drive` 或
   `drive.file`，文件與試算表建立使用各自服務的範圍），Slides 申請
   `presentations.readonly`。Docs 的寫入工具沿用完整的 `documents` scope。
@@ -151,7 +153,7 @@ default_identity = "home"   # 沒寫 [google] 的員工用什麼：home（預設
 allowed_subject_domains = ["customer.com"]
 ```
 
-沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 26 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
+沒寫 `[google]` 的員工用 `default_identity`，所以既有安裝的行為完全不變。`none` 會讓這位員工看不到 29 個 Google 工具，呼叫也會被拒。讀不懂的值（打錯字、不認得的欄位）會讓這位員工的 Google 工具全部拒絕，絕不會變成公司共用帳號。企業版可用 `owner` 與 `user:<id>`，但指定人必須是有效的直接 Owner，且本人明確同意；見[連結自己的 Google（v1.76.0）](google-personal-connections.md)。
 
 ### 誰能透過這位員工使用這個帳號
 
@@ -182,7 +184,7 @@ allowed_subject_domains = ["customer.com"]
 
 ### 員工專用 API key 與 Google MCP 掛載（v1.76.0）
 
-通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 26 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
+通過驗證、綁定真實員工的專用 API key，明確帶有 `google:read` 或 `google:write` 時，可以使用 29 個原生 Google 工具中相應的工具。只有 `admin` 不算；員工設定也必須可讀。一般外部金鑰可申請的權限與其他連接器不變，OAuth 驗證不會產生這條執行路徑需要的憑證。沒有綁定員工的合法內部整合金鑰，仍保留原本的公司共用帳號路徑。
 
 這些呼叫仍受員工的工具允許／拒絕清單、動作規則、PolicyKernel、階段性授權與人工審批限制。等審批時，已接受的員工、工具與最終參數固定不變。金鑰失效、員工被移除或授權設定改變，只會拒絕，不會改用行程的其他身分或別的帳號。Google 操作由 gateway 執行，外部 MCP 用戶端拿到有大小限制的工具結果，不會拿到 Google bearer。
 
@@ -196,7 +198,7 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 
 ### 限制
 
-- `gmail.compose` 讓拿到存取權杖的人可以寄信。工具只會存草稿，但有不受限 shell 的員工可以拿它替自己那位同事取得的權杖直接呼叫 Google。
+- `gmail.compose` 讓拿到存取權杖的人可以寄信。建立草稿工具只存草稿，寄出工具另需逐次確認；有不受限 shell 的員工可以拿它替自己那位同事取得的權杖直接呼叫 Google。
 - 有 shell 的員工和 gateway 是同一個作業系統帳號，見[安全防護](../../features/zh-TW/05-security-defense.md#指定人的憑證放系統金鑰圈v1760)中金鑰圈的限制。
 - 還沒在真的 Workspace 上驗證：管理控制台的實際流程、Google 真正的錯誤字串、關閉 Gmail 的組織單位，以及 Google 自家遠端 MCP 端點收不收委派權杖。
 
@@ -212,7 +214,7 @@ Agent Mail 另記錄最近完成收信檢查的時間、該次檢查的帳號不
 
 網域委派每次只要求工具所屬服務的權限：Gmail、日曆、文件、試算表、雲端硬碟、簡報、表單或工作清單。權杖依服務帳號、代表信箱及排序去重後的權限集合分開快取；其他服務缺少授權，不會阻止原本已授權的服務。測試連線會逐項列出 scope 已授權或尚未確認，再另外檢查各服務。取得權杖不代表資料 API 或範例檔案一定可讀。
 
-開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。目前不支援以本人名義傳送 Chat 訊息。
+開啟 `[google] chat_read = true` 後，公司授權也支援 `chat.spaces.readonly` 與 `chat.messages.readonly`（完整前綴都是 `https://www.googleapis.com/auth/`）。請在 Google 管理控制台加入這兩項範圍，並啟用 Google Chat API。設定預設仍為關閉；整合精靈預先勾選 Chat 讀取，管理員按儲存後才寫入。已連結但缺少任一 Chat 權限或本地用途的成員，會在「我的連線」看到「重新連結以加入 Google Chat」。以本人名義傳送 Chat 另須開放 `chat_send`，並由本人逐次確認，見[以本人身分傳送 Google Chat](google-personal-connections.md#以本人身分傳送-google-chat)。
 
 讓公司授權跟隨 AI 員工的負責人：
 
@@ -236,3 +238,15 @@ external_server = "合作夥伴 Google MCP" # 選填，最多 120 字
 ```
 
 連線分頁會顯示「由外部工具提供」。原生 Google 工具和 `none` 一樣不列出、不能呼叫；這個選項不會自動設定或授權外部伺服器。名稱只作文字顯示，不接受控制字元。舊版解析器遇到未知身分或欄位會拒絕原生 Google 存取，不會退回公司共用帳號。
+
+### 逐次確認寄信與刪除活動
+
+`gmail_send_draft {"draft_id":"r…"}` 與 `calendar_delete_event {"event_id":"…","calendar_id":"primary","notify_attendees":false}` 需要 `google:write` 及 gateway 原生 REST 執行。Apps Script 不顯示這兩個工具，也拒絕直接呼叫。只傳遞 bearer 的舊版 Home 執行路徑同樣隱藏並拒絕；請使用員工專用 Google 連線或 gateway 中綁定帳號的連接器。
+
+每次呼叫都要確認新卡片。`allow`、Admin 權限與持久工作流程授權無法免除；`block` 仍會拒絕。寄信卡片直接取自 Google，顯示寄件帳號、To／Cc／Bcc、主旨、內文預覽及附件檔名與大小。核准綁定帳號、員工生命週期、草稿 ID、操作與 MIME 指紋。gateway 重新檢查草稿後，寄出核准快照中的 MIME；內容或帳號改變就要重新確認。收件人政策會檢查全部 To／Cc／Bcc，支援顯示名稱加信箱，無法明確解析的格式會拒絕。
+
+刪除活動卡片顯示標題、含時區的起訖時間、參加者、日曆、是否刪除整個重複系列及通知選項。核准綁定活動版本，刪除時以 `If-Match` 檢查；活動變更就要重新確認。`calendar_id` 預設為 `primary`，明確使用 `sendUpdates=none`；只有 `notify_attendees=true` 才用 `all`。HTTP 204 空白回應代表成功。刪除活動也會使用既有的 `calendar.calendarlist.readonly`（或更完整的日曆範圍），讀取主要日曆帳號與所選日曆的名稱、時區。
+
+完整 MIME 只留在 gateway 記憶體，核准資料保存必要預覽與指紋。拒絕、逾期、已使用或內容不符的核准都不能變更 Google。寫入逾時或結果不明會回報 `result_unconfirmed`，請先到 Google 檢查，工具不會自動重送。確認期限為 90 秒。
+
+傳輸行為依循 [Gmail 草稿契約](https://developers.google.com/workspace/gmail/api/guides/drafts)與 [Calendar 條件式修改](https://developers.google.com/workspace/calendar/api/guides/version-resources)。

@@ -1551,3 +1551,8 @@ pub mod mcp_start_status;
 
 pub mod scope_policy;
 pub mod scope_policy_checks;
+
+pub mod authority_coordinator;
+
+#[cfg(unix)]
+pub mod trusted_home;
