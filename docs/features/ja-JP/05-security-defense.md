@@ -925,4 +925,4 @@ AI 社員へのアクセス権を読み取り、メンバー機能一覧の認�
 個別に監査され、繰り返し利用は時間枠ごとに集計されます。
 
 **キーをブラウザーのフロントエンドコードに入れず、サーバーから呼び出してください。**
-詳細は[メンバー API 認証仕様](../../api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)を参照してください。
+詳細は[メンバー API 認証仕様](../../api/member-contract.md#personal-member-api-keys-1850)を参照してください。

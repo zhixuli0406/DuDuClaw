@@ -322,6 +322,7 @@ unknown fields. Updating the contract table or snapshots cannot replace this
 coexistence window.
 
 Existing live role, binding, record-ownership, privacy, edition and feature
-checks still apply. The contract does not grant access or introduce member API
-keys. When changing a listed name or field, update the contract metadata,
+checks still apply. The contract itself grants no access; personal member API
+keys are covered in its [Personal member API keys](../api/member-contract.md#personal-member-api-keys-1850)
+section. When changing a listed name or field, update the contract metadata,
 compatibility tests, documentation and deprecation record in the same change.
