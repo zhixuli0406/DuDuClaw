@@ -372,6 +372,7 @@ impl UserDb {
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
+        crate::odoo_credentials::migrate(&conn)?;
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
