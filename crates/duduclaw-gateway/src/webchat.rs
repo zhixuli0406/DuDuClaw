@@ -1527,36 +1527,14 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     sid = &sid_owned;
                                 }
 
-                                // The connection's own id can also name a persisted conversation.
-                                // Sessions observed as new on this socket remain exempt on later turns.
-                                let existing_conversation = if is_resume {
-                                    !new_sessions.contains(sid)
-                                } else if matches!(credential.as_ref(), Some(ChatCredential::Member(_))) {
-                                    match state.ctx.session_manager.session_agent(sid).await {
-                                        Ok(Some(_)) => !new_sessions.contains(sid),
-                                        Ok(None) => {
-                                            if !subscribe_only && new_sessions.len() < MAX_SOCKET_NEW_SESSIONS {
-                                                new_sessions.insert(sid.to_owned());
-                                            }
-                                            // At capacity, retain the strict lookup on future turns.
-                                            false
-                                        }
-                                        Err(_) => {
-                                            sink.frame(ChatMessage::error("conversation not found")).await;
-                                            continue;
-                                        }
-                                    }
-                                } else { false };
-                                // Target resolution may await; narrowings must take effect before subscribing.
-                                if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
-                                    if subscribe_only {
-                                        let _ = sink.send(subscription_unavailable(sid, conv_nonce.as_deref())).await;
-                                    } else {
-                                        sink.frame(ChatMessage::error("conversation not found")).await;
-                                    }
-                                    continue;
-                                }
                                 if subscribe_only {
+                                    // Subscriptions do not route or establish new-session provenance.
+                                    if !new_sessions.contains(sid)
+                                        && !state.member_conversation_allowed(credential.as_ref()).await
+                                    {
+                                        let _ = sink.send(subscription_unavailable(sid, conv_nonce.as_deref())).await;
+                                        continue;
+                                    }
                                     subscription.subscribe(sid, conv_nonce.clone());
                                     let _ = sink.send(Message::Text(serde_json::json!({"type":"subscribed", "session_id":sid, "conv":conv_nonce}).to_string().into())).await;
                                     continue;
@@ -1662,6 +1640,25 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 };
                                 let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
+                                // Only the final routed id can establish socket-local provenance.
+                                // An @ call may replace a new selected session with an old one.
+                                let existing_conversation = if matches!(credential.as_ref(), Some(ChatCredential::Member(_))) {
+                                    match state.ctx.session_manager.session_agent(sid).await {
+                                        Ok(Some(_)) => !new_sessions.contains(sid),
+                                        Ok(None) => {
+                                            if new_sessions.len() < MAX_SOCKET_NEW_SESSIONS {
+                                                new_sessions.insert(sid.to_owned());
+                                            }
+                                            // At capacity, retain the strict lookup on future turns.
+                                            false
+                                        }
+                                        Err(_) => {
+                                            turn_sink.frame(ChatMessage::error("conversation not found")).await;
+                                            continue;
+                                        }
+                                    }
+                                } else { false };
+
                                 if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
                                     turn_sink.frame(ChatMessage::error("conversation not found")).await;
                                     continue;

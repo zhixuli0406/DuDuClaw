@@ -202,6 +202,53 @@ async fn member_key_new_conversation_roundtrip(include_conversations: bool) {
     socket.close(None).await.unwrap();
 }
 
+#[tokio::test]
+async fn member_key_routed_existing_conversation_requires_history_permission() {
+    let _serial = SOCKET_TEST_LOCK.lock().await;
+    for include_conversations in [false, true] {
+        let mut fixture = Fixture::start(true).await.unwrap();
+        std::fs::write(fixture._home.path().join("config.toml"),
+            "[member_api_keys]\nenabled=true\n").unwrap();
+        let (user, _) = fixture.employee("routed-key", &["finance", "sales"], Some("finance")).await;
+        let epoch = fixture.state.user_db.get_user(&user).unwrap().unwrap().credential_epoch;
+        let key = fixture.state.user_db.member_key_create(&user, "routed", 1, epoch,
+            include_conversations, &[]).unwrap();
+        let mut socket = fixture.open().await.unwrap();
+        send(&mut socket, json!({"type":"auth", "member_key":key.secret})).await;
+        let info = frame(&mut socket).await;
+        assert_eq!(info["type"], "session_info");
+        let base = info["session_id"].as_str().unwrap();
+        let conv = "routed-history";
+        let selected_sid = compose_session_id(base, Some("finance"), Some(conv));
+        let routed_sid = compose_session_id(base, Some("sales"), Some(conv));
+        assert!(fixture.state.ctx.session_manager.session_agent(&selected_sid).await.unwrap().is_none());
+        fixture.state.ctx.session_manager.get_or_create_with_origin(&routed_sid, "sales",
+            &SessionOrigin::webchat_user(&user)).await.unwrap();
+
+        // A new finance bucket must not grant access to the existing sales bucket.
+        send(&mut socket, json!({"type":"user_message", "content":"@sales Hello",
+            "agent":"finance", "conv":conv, "msg_id":"routed"})).await;
+        if include_conversations {
+            let pending = fixture.entered().await;
+            assert_eq!(pending.session_id, routed_sid);
+            pending.release.send(()).unwrap();
+            member_reply_done(&mut socket, conv, "routed", &routed_sid).await;
+            fixture.turn_count(0).await;
+        } else {
+            loop {
+                let refusal = frame(&mut socket).await;
+                if refusal["type"] == "session_info" { continue; }
+                assert_eq!(refusal["type"], "error", "{refusal}");
+                assert_eq!(refusal["message"], "conversation not found");
+                break;
+            }
+            assert!(fixture.gate.entered.try_recv().is_err(), "routed history must not dispatch");
+        }
+        assert!(fixture.state.ctx.session_manager.session_agent(&selected_sid).await.unwrap().is_none());
+        socket.close(None).await.unwrap();
+    }
+}
+
 // Non-admin target refreshes may precede the response on both new and resumed turns.
 async fn member_reply_done(socket: &mut Socket, conv: &str, msg: &str, sid: &str) {
     loop {
