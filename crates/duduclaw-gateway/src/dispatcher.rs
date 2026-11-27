@@ -5053,14 +5053,15 @@ mod tests {
     async fn bus_delegation_lane_is_honoured_and_never_coalesced_away() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().to_path_buf();
-        for (name, extra) in [("reader", ""), ("coder", "[runtime]\nprovider = \"grok\"\n")] {
-            let dir = home.join("agents").join(name);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(
-                dir.join("agent.toml"),
-                format!("[agent]\nname = \"{name}\"\nstatus = \"active\"\nrole = \"worker\"\nreports_to = \"\"\n{extra}"),
-            )
-            .unwrap();
+        for (name, provider, model) in [
+            ("reader", "claude", "claude-sonnet-4-6"),
+            ("coder", "grok", "grok-4.3"),
+        ] {
+            crate::trigger_route::tests::write_agent(&home.join("agents"), name, name,
+                &format!("@{name}"), "specialist", &format!("[runtime]\nprovider = \"{provider}\"\n"));
+            let path = home.join("agents").join(name).join("agent.toml");
+            let config = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(path, config.replace("claude-haiku-4-5", model)).unwrap();
         }
         let line = |id: &str, agent: &str, lane: Option<&str>| {
             let mut v = serde_json::json!({
@@ -5086,6 +5087,7 @@ mod tests {
         crate::model_call_probe::set_dry_run(true);
         let queue_path = home.join("bus_queue.jsonl");
         let registry = Arc::new(RwLock::new(AgentRegistry::new(home.join("agents"))));
+        registry.write().await.scan().await.unwrap();
         let mut answered = Vec::new();
         for (id, agent, lane, expect_call, expect_lane) in [
             ("l1", "reader", Some("explore"), true, Some(true)),

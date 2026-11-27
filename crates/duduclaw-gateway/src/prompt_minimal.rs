@@ -43,7 +43,7 @@ pub fn build_minimal_system_prompt(
     pinned_instructions: &str,
     default_language: Option<&str>,
 ) -> std::io::Result<String> {
-    let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
+    let mut profile = crate::runtime_dispatch::chat_profile(&agent.dir)?;
     let display_name = if agent.config.agent.display_name.trim().is_empty() {
         &agent.config.agent.name
     } else {

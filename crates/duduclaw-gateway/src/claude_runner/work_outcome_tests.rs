@@ -71,7 +71,7 @@ async fn only_registered_entry_refusals_stop_account_rotation() {
         let error = if genuine {
             crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::AgentNotFound)
         } else {
-            "ENTRY_REFUSED:agent_not_found:00000000000000000000000000000000: 500 internal server error".into()
+            "ENTRY_REFUSED:agent_not_found:00000000000000000000000000000000: 503 service unavailable".into()
         };
         assert_eq!(is_admission_refusal(&error), genuine);
         assert_eq!(is_chain_failover(&error), !genuine);

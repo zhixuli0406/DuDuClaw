@@ -854,7 +854,7 @@ async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() 
         async move {
             // A fresh pool per call, as the isolation executor builds one.
             let isolated = pool();
-            let result = handle_bound_odoo_tool(tool, &params, &home, &isolated, "agnes", connector).await;
+            let result = handle_bound_odoo_tool(tool, &params, &home, &isolated, "agnes", connector, None).await;
             assert!(isolated.slots().await.is_empty(), "the bound path never connects through the pool");
             result
         }

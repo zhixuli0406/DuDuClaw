@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 const PREFIXES: &[&str] = &[
     "cron.", "reminders.", "assign_schedules.", "heartbeat.", "autopilot.",
-    "ticks.", "skills.", "cost.", "budget.", "billing.", "analytics.", "install_requests.",
+    "ticks.", "skills.", "skill_trust.", "cost.", "budget.", "billing.", "analytics.", "install_requests.",
 ];
 
 // Include dispatch, forwarding handlers and method-name gates, not config-key
@@ -23,6 +23,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("autopilot_rpc.rs", include_str!("../handlers/autopilot_rpc.rs")),
     ("skills_manage_rpc.rs", include_str!("../handlers/skills_manage_rpc.rs")),
     ("skills_rpc.rs", include_str!("../handlers/skills_rpc.rs")),
+    ("skill_trust_rpc.rs", include_str!("../handlers/skill_trust_rpc.rs")),
     ("skills_list_rpc.rs", include_str!("../handlers/skills_list_rpc.rs")),
     ("skills_recent_rpc.rs", include_str!("../handlers/skills_recent_rpc.rs")),
     ("skills_install_target.rs", include_str!("../handlers/skills_install_target.rs")),
@@ -131,4 +132,12 @@ fn method_scan_includes_nested_runs_but_not_prose_or_prefixes() {
     assert!(is_method_name("autopilot.runs.cancel"));
     assert!(!is_method_name("skills.recent."));
     assert!(!is_method_name("autopilot."));
+}
+
+#[test]
+fn skill_trust_methods_are_admin_only() {
+    for method in ["skill_trust.get", "skill_trust.pin", "skill_trust.unpin"] {
+        assert!(is_method_name(method));
+        assert_eq!(coverage_for(method), Some((Skills, AdminOnly)));
+    }
 }

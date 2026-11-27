@@ -79,7 +79,7 @@ fn methods(f: &Fixture, channel: &str, exempt: &[&str], enabled_methods: &[&str]
     f.config(true, channel, exempt);
     let path = f.env.home.join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap()
-        .replace("[approval.chat_admin]", "googlechat_project_number='1'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
+        .replace("[approval.chat_admin]", "googlechat_project_number='123456789012'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
     std::fs::write(path, format!("{raw}step_up_methods={}\n", serde_json::to_string(enabled_methods).unwrap())).unwrap();
     if channel == "googlechat" {
         f.db().bind_channel_identity(&f.user, "googlechat", "users/123", true).unwrap();
@@ -141,7 +141,9 @@ async fn t1_t2_decision_entry_point_matrix() {
                     for entry in ["dashboard", "tap", "web", "totp"] {
                         let f = Fixture::files_org().await;
                         let key = if *kind == "other_outgoing" { "egress_guard" } else { kind };
-                        methods(&f, channel, if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &[key] } else { &[] }, enabled_methods);
+                        let keys = [key];
+                        let selected: &[&str] = if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &keys } else { &[] };
+                        methods(&f, channel, selected, enabled_methods);
                         let id = request(&f, kind).await;
                         let rec = f.env.broker.get(&id).await.unwrap().unwrap();
                         let before = effect(&f, &id, kind).await;
@@ -317,7 +319,9 @@ async fn linked_card(kind: &str, exempt: bool) -> PressFixture {
     let f = Fixture::files_org().await;
     f.config(false, "telegram", &[]);
     handshake(&f, true).await;
-    payload(settings(&f, true, if exempt { &[kind] } else { &[] }, true).await);
+    let kinds = [kind];
+    let selected: &[&str] = if exempt { &kinds } else { &[] };
+    payload(settings(&f, true, selected, true).await);
     let id = request(&f, kind).await;
     let rec = f.env.broker.get(&id).await.unwrap().unwrap();
     let receipt = {

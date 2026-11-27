@@ -562,7 +562,7 @@ async fn repeated_max_turns_results_never_become_infrastructure_failures() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn entry_refusal_remains_needs_human_for_observer_without_retry() {
-    let home = home_with_agent("worker", "[model]\npreferred='claude-sonnet-4-6'\n[capabilities]\nautonomy_level='observer'\n");
+    let home = home_with_agent("worker", "[runtime]\nprovider='unknown-runtime'\n[model]\npreferred='claude-sonnet-4-6'\n[capabilities]\nautonomy_level='observer'\n");
     let (store, _) = open_stores(home.path()).await;
     let error = crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::Config(
         crate::runtime_config::RuntimeSettingsError::UnknownProvider));

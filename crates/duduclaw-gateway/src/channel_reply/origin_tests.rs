@@ -322,6 +322,8 @@ async fn broken_employee_can_stop_resume_and_query_failsafe_before_config_gate()
     use duduclaw_security::failsafe::FailsafeLevel;
     let model_calls_before = crate::model_call_probe::calls();
     let (home, ctx, _registry, calls) = misaligned_worker("").await;
+    ctx.channel_settings.set("discord", "global", crate::channel_settings::keys::ADMIN_USERS,
+        r#"["owned-user"]"#).await.unwrap();
     let path = home.path().join("agents/worker/agent.toml");
     // Cover both a readable mismatch and a file that cannot be parsed.
     for broken in [false, true] {
@@ -340,6 +342,11 @@ async fn broken_employee_can_stop_resume_and_query_failsafe_before_config_gate()
             assert!(!reply.contains("model_provider_mismatch"), "{reply}");
             assert!(!reply.contains("agent_config_unreadable"), "{reply}");
             assert_eq!(failsafe.get_level(sid).await, expected, "{text}");
+            for denied in ["!STOP", "!STOP ALL", "!RESUME"] {
+                let reply = build_reply_for_agent(denied, &ctx, "worker", sid, "non-admin", None).await;
+                assert!(reply.contains("只有管理員"), "{denied}: {reply}");
+                assert_eq!(failsafe.get_level(sid).await, expected, "{denied}: no state change");
+            }
             // Inline STOP ALL must retain the old scope-only restriction.
             assert_eq!(failsafe.get_level("__global__").await, FailsafeLevel::L0Normal);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -458,7 +465,9 @@ pub(crate) async fn owned_claude_fallback(fallback: &str) -> (
     let path = home.path().join("agents/worker/agent.toml");
     let text = std::fs::read_to_string(&path).unwrap()
         .replace("preferred='gpt-5.4'", "preferred='claude-does-not-exist'")
-        .replace("provider='claude'", &format!("provider='claude'\nfallback='{fallback}'"));
+        .replace("provider='claude'", &if fallback.is_empty() {
+            "provider='claude'".to_string()
+        } else { format!("provider='claude'\nfallback='{fallback}'") });
     std::fs::write(&path, format!("{text}\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n")).unwrap();
     ctx.registry.write().await.scan().await.unwrap();
     let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();

@@ -4862,7 +4862,7 @@ effect = "forbid"
         std::fs::write(home.path().join("config.toml"),
             "[general]\ndefault_agent = 'dudu'\n[delegation]\npolicy = 'open'\n").unwrap();
         write_acting_agent_toml(&home,
-            "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\ncan_create_agents = true\n");
+            "[agent]\nname = 'dudu'\nrole = 'main'\nstatus = 'active'\n[permissions]\ncan_create_agents = true\n");
         let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password",
             duduclaw_auth::UserRole::Admin).unwrap();
@@ -4877,17 +4877,24 @@ effect = "forbid"
         use crate::mcp::main_principal_gate::{refusal, restricted, REFUSAL};
         let (home, _, human) = main_principal_fixture();
         let dispatcher = make_dispatcher(&home).await;
+        // A real, unpaused employee key reaches the main-principal gate; a shared
+        // internal key without an employee identity fails background admission first.
+        let mut principal = internal_principal();
+        principal.client_id = "dudu".into();
+        duduclaw_core::autonomy_gate::resume(home.path(), None).unwrap();
+        crate::mcp::check_background_caller(home.path(),
+            crate::mcp::record_actor_for(home.path(), &principal.client_id, "dudu"), "create_agent").unwrap();
         let argument_marker = "main-principal-refusal-private-soul-marker";
         // Explicit true and the unwritten main-role default are both narrowed.
         for permission in ["can_create_agents = true", ""] {
             write_acting_agent_toml(&home, &format!(
-                "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\n{permission}\n"));
+                "[agent]\nname = 'dudu'\nrole = 'main'\nstatus = 'active'\n[permissions]\n{permission}\n"));
             let turn = restricted(home.path(), "dudu", Some(&human));
             assert!(turn);
             assert_eq!(refusal(turn, "memory_search"), None);
             for tool in ["create_agent", "agent_create", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
                 let result = dispatcher.dispatch_admitted_for_principal(
-                    &internal_principal(), &make_ns_ctx(false),
+                    &principal, &make_ns_ctx(false),
                     &make_params(tool, serde_json::json!({
                         "on_behalf_of": "user:forged-admin",
                         "soul_md": argument_marker,
@@ -4899,7 +4906,7 @@ effect = "forbid"
             }
         }
         let read = dispatcher.dispatch_admitted_for_principal(
-            &internal_principal(), &make_ns_ctx(false),
+            &principal, &make_ns_ctx(false),
             &make_params("memory_search", serde_json::json!({"query":"missing"})),
             &serde_json::json!(14217), None, Some(&human),
         ).await;
