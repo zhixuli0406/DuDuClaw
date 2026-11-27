@@ -38,12 +38,12 @@ impl ConnectorProviderRegistry {
     }
     /// Full parity is an install/startup condition, never an optimistic label.
     pub fn require_complete(&self) -> Result<(), VerificationError> {
-        if POLICIES.iter().filter(|p| p.route == Route::Connector)
-            .any(|p| !self.ready(p.name)) { return Err(VerificationError::Unavailable); }
+        if !self.missing_tools().is_empty() { return Err(VerificationError::Unavailable); }
         Ok(())
     }
     pub fn missing_tools(&self) -> Vec<&'static str> {
-        POLICIES.iter().filter(|p| p.route == Route::Connector && !self.ready(p.name))
+        POLICIES.iter().filter(|p| p.route == Route::Connector
+            && !crate::isolation_connectors::intentionally_refused_connector(p.name) && !self.ready(p.name))
             .map(|p| p.name).collect()
     }
     fn ready(&self, tool: &str) -> bool {
@@ -114,7 +114,8 @@ mod tests {
     fn whole_provider_registration_is_atomic_and_policy_inventory_is_complete() {
         let mut registry = ConnectorProviderRegistry::default();
         assert!(registry.register_provider("database", Arc::new(AdapterStub), Arc::new(AdapterStub)).is_err());
-        assert_eq!(registry.missing_tools().len(), POLICIES.iter().filter(|p| p.route == Route::Connector).count());
+        assert_eq!(registry.missing_tools().len(), POLICIES.iter().filter(|p| p.route == Route::Connector
+            && !crate::isolation_connectors::intentionally_refused_connector(p.name)).count());
         assert!(!registry.ready("db_sources"), "partial registration must not leak into readiness");
         assert!(registry.register_provider("unrecognized", Arc::new(AdapterStub), Arc::new(AdapterStub)).is_err());
         struct Complete;
@@ -134,6 +135,10 @@ mod tests {
         }
         assert!(registry.missing_tools().is_empty());
         assert!(registry.require_complete().is_ok());
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert!(!registry.missing_tools().contains(tool));
+            assert!(!registry.ready(tool), "intentional coverage must not enable execution");
+        }
         assert!(registry.register_provider("google", Arc::new(Complete), Arc::new(Complete)).is_err());
     }
 

@@ -240,7 +240,7 @@ impl ToolPolicy {
             })));
         }
         self.global.feature_allows_model(model).map_err(|module| format!(
-            "公司目前沒有開啟這項 Odoo 功能（{module}）；Odoo feature_gate: module is switched off。"))
+            "公司目前沒有開啟這項 Odoo 功能模組（{module}）；Odoo feature_gate: module '{module}' is switched off。"))
     }
 
     fn engine_model(&self, tool: &str, model: &str, method: &str) -> bool {
@@ -305,6 +305,59 @@ impl ToolPolicy {
             "odoo_crm_update_stage" => vec![("crm.stage", "search_read")],
             _ => vec![],
         }
+    }
+
+    /// Refuse locally before asking the gateway to select an identity. This
+    /// does not select an account or authorize I/O; check_call repeats policy
+    /// against the actual decision before connection.
+    pub fn data_preconnect(&self, tool: &str, params: &Value,
+        registered: Option<AgentOdooConfig>) -> Result<(), String> {
+        let mut local = self.clone();
+        if let Some(agent) = registered { local.agent = agent; }
+        let (_, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
+        if let (Some(model), Some(method)) = (model, method) {
+            // Preserve the established diagnostic for the immutable metadata fence.
+            if fixed_refusal(&OdooOp { tool: ToolKind::Generic, model, method,
+                verb: method_verb(method) }) == Some(FixedRefusal::F2) {
+                return Err(super::odoo::blocklist_denial_message(model, duduclaw_odoo::BlockDenial::SystemReadOnly));
+            }
+            local.common_tool(tool, model, method)?;
+            if method == "search_read" { local.common(model, "fields_get")?; }
+        }
+        for (model, method) in local.auxiliary(tool) { local.common(model, method)?; }
+        // A possible Follow identity must still be decided by the gateway.
+        // Isolation has no personal handoff and always intersects Engine gates.
+        if crate::mcp_isolation::current().is_some() || !local.prospective_follow() {
+            if tool == "odoo_execute" && let Some(method) = method {
+                if super::odoo::blocked_odoo_method(method) {
+                    return Err(super::odoo::method_denial_message(method));
+                }
+            }
+            if let Some((verb, model)) = super::odoo::classify_odoo_call(tool, params) {
+                crate::odoo_pool::check_action_permission(Some(&local.agent), verb, &model)
+                    .map_err(|reason| format!("Odoo permission denied: {reason}"))?;
+                if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview") {
+                    let kind = if matches!(verb, "read" | "search") {
+                        duduclaw_odoo::AccessKind::Read
+                    } else { duduclaw_odoo::AccessKind::Mutate };
+                    let unblock = local.agent.unblock_models.as_ref().unwrap_or(&local.global.unblock_models);
+                    duduclaw_odoo::check_blocklist(&model, kind, unblock)
+                        .map_err(|denial| super::odoo::blocklist_denial_message(&model, denial))?;
+                }
+            }
+            for (model, _) in local.auxiliary(tool) {
+                crate::odoo_pool::check_action_permission(Some(&local.agent), "search", model)
+                    .map_err(|reason| format!("Odoo permission denied: {reason}"))?;
+            }
+        }
+        if !local.identities.has_agent_credential
+            && !local.identities.owner_has_personal_credential
+            && !(local.agent.act_as_requester && local.identities.requester_has_personal_credential)
+            && !local.access.company_key_agents.iter().any(|id| id == &local.agent_id) {
+            return Err(format!("Odoo not connected. {}", not_connected_message(
+                local.identities.avatar_has_owner || local.agent.act_as_requester)));
+        }
+        local.precheck(tool, params)
     }
 
     pub fn precheck(&self, tool: &str, params: &Value) -> Result<(), String> {
