@@ -58,9 +58,14 @@ pub async fn start_drive_tools(
 pub(crate) async fn start_authorization_request(
     home: &Path, db: &UserDb, user: &str, session: &str, origin: &str,
     allowed: &[String], request: &crate::google_authorization_requests::store::Request,
+    acknowledge_write: bool,
 ) -> Result<Value,String> {
+    crate::google_authorization_requests::validate(home,db,request)?;
+    if request.user != user || (request.purpose == "drive_write" && !acknowledge_write) {
+        return Err(crate::google_authorization_requests::store::REFUSED.into());
+    }
     start_consent(home,db,user,session,origin,allowed,true,false,
-        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,false,Some(request)).await
+        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,request.purpose == "drive_write",Some(request)).await
 }
 
 pub async fn start_chat_send(home: &Path, db: &UserDb, user: &str, session: &str, origin: &str, allowed: &[String], acknowledge: bool) -> Result<Value, String> {
@@ -217,10 +222,13 @@ pub async fn finish(
     let pending = pending::take(home, state, user, session)?;
     crate::google_data_consent::require_current(Some(&pending.google_data_consent))?;
     if pending.drive_write {
-        if authorization_request.is_some() {
+        if authorization_request.as_ref().is_some_and(|r| r.purpose != "drive_write") {
             return Err("這次 Google 連結已失效，請重新開始。".into());
         }
-        return finish_drive_write(home, db, user, &pending).await;
+        return finish_drive_write(home, db, user, &pending, authorization_request).await;
+    }
+    if authorization_request.as_ref().is_some_and(|r| r.purpose == "drive_write") {
+        return Err(crate::google_authorization_requests::store::REFUSED.into());
     }
     let grant_lease = super::grants::acquire(home).await?;
     let tokens = oauth::exchange(
@@ -371,6 +379,7 @@ pub async fn finish(
 /// the whole project, including the member's ordinary connection.
 async fn finish_drive_write(
     home: &Path, db: &UserDb, user: &str, pending: &pending::Pending,
+    authorization_request: Option<crate::google_authorization_requests::store::Request>,
 ) -> Result<Value, String> {
     if pending.meeting_recordings || pending.drive_tools || pending.chat_read || pending.chat_send {
         return Err("請每次選擇一項 Google 額外服務。".into());
@@ -437,7 +446,17 @@ async fn finish_drive_write(
         oauth_client_id: pending.client_id.clone(),
         google_data_consent: Some(pending.google_data_consent.clone()),
     };
+    if let Some(request) = &authorization_request {
+        crate::google_authorization_requests::validate(home, db, request)?;
+        if request.google_sub.as_deref() != Some(metadata.google_sub.as_str())
+            || !crate::google_authorization_requests::account_matches(request, &metadata.google_sub, &metadata.account_email) {
+            return Err(crate::google_authorization_requests::store::REFUSED.into());
+        }
+    }
     write_store::connect(home, &key, metadata.clone(), &tokens.secret, pending.epoch)?;
+    if let Some(request) = authorization_request {
+        crate::google_authorization_requests::routes::complete(home, db, request, None)?;
+    }
     let detail = json!({"google_email": metadata.account_email,
         "scope_count": metadata.granted_scopes.len(),
         "scope_digest": scope_digest(&metadata.granted_scopes)}).to_string();

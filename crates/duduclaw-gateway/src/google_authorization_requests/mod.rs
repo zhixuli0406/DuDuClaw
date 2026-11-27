@@ -17,6 +17,7 @@ pub(crate) const DASHBOARD_HINT: &str = "請登入 Dashboard，開啟「我的�
 
 /// Closed host mapping: a model cannot choose scopes, subjects or URLs.
 fn purpose(tool: &str) -> Option<&'static str> {
+    if gi::is_drive_write_tool(tool) { return Some("drive_write"); }
     if !crate::google_personal::scopes::token_tool(tool) { return None; }
     Some(match tool {
         "drive_search" | "drive_read" => "drive_tools",
@@ -78,6 +79,11 @@ fn require_attested(home:&Path, db:&UserDb, user:&str, agent:&str, email:&str) -
 }
 
 pub(crate) fn validate(home: &Path, db: &UserDb, row: &Request) -> Result<(),String> {
+    if purpose(&row.tool) != Some(row.purpose.as_str()) { return Err(REFUSED.into()); }
+    if row.purpose == "drive_write" && (row.mode != "oauth" || row.google_sub.as_deref().is_none_or(str::is_empty)
+        || !crate::google_workspace::drive_write_policy::load(home).any_enabled()) {
+        return Err(REFUSED.into());
+    }
     if row.home!=home.canonicalize().map_err(|_|REFUSED)? || row.expires<=chrono::Utc::now().timestamp()
         || db.acl_generation()?!=row.acl_version || config_version(home,&row.agent)?!=row.config_version {
         return Err(REFUSED.into());
@@ -114,11 +120,30 @@ pub(crate) fn account_matches(row:&Request, sub:&str, email:&str) -> bool {
         && row.google_sub.as_ref().is_none_or(|expected| expected==sub)
 }
 
+/// Read the persisted write artifact, never ordinary-vault metadata supplied by a caller.
+pub(super) fn write_metadata(home: &Path, row: &Request) -> Result<crate::person_credentials::write_store::Metadata,String> {
+    let metadata = crate::person_credentials::write_store::get(home,"user",&row.user)?
+        .ok_or(REFUSED)?.metadata;
+    if row.purpose != "drive_write" || row.mode != "oauth"
+        || row.google_sub.as_deref() != Some(metadata.google_sub.as_str())
+        || !account_matches(row,&metadata.google_sub,&metadata.account_email)
+        || metadata.status != crate::person_credentials::Status::Connected
+        || !metadata.granted_scopes.iter().any(|s| s == crate::google_personal::oauth::DRIVE_WRITE_SCOPE)
+        || crate::google_data_consent::require_current(metadata.google_data_consent.as_ref()).is_err() {
+        return Err(REFUSED.into());
+    }
+    Ok(metadata)
+}
+
 /// Metadata-only capability probe. Never mints or refreshes a token, and never
 /// falls back to another person's account when the member lacks a purpose.
 fn needs_connection(home:&Path,db:&UserDb,row:&Request) -> Result<bool,String> {
     if db.google_consent(&row.user,&row.agent)?==Some(false) { return Err(REFUSED.into()); }
     if row.mode=="delegate" { return Ok(db.google_consent(&row.user,&row.agent)?!=Some(true)); }
+    if row.purpose == "drive_write" {
+        return Ok(write_metadata(home, row).is_err()
+            || db.google_consent(&row.user,&row.agent)?!=Some(true));
+    }
     let record=crate::person_credentials::get(home,&row.user)?;
     Ok(record.is_none_or(|r| !crate::google_personal::scopes::permitted_for(&row.tool,&r.metadata))
         || db.google_consent(&row.user,&row.agent)?!=Some(true))
@@ -127,6 +152,9 @@ fn needs_connection(home:&Path,db:&UserDb,row:&Request) -> Result<bool,String> {
 pub(crate) fn issue_for_turn(home:&Path,db:&UserDb,agent:&str,tool:&str,text:&str,session_id:&str,
     requester:&RequesterIdentity,source:Option<serde_json::Value>,session_generation:Option<String>) -> Result<Option<String>,String> {
     let purpose=purpose(tool).ok_or(REFUSED)?;
+    if purpose=="drive_write" && !crate::google_workspace::drive_write_policy::load(home).any_enabled() {
+        return Err(REFUSED.into());
+    }
     let (channel,sender,conversation,user)=match requester {
         RequesterIdentity::DashboardUser {user_id} => ("webchat".to_owned(),user_id.clone(),session_id.to_owned(),user_id.clone()),
         RequesterIdentity::ChannelUser {channel,chat,sender,user_id:Some(id),..} => {
@@ -160,7 +188,8 @@ pub(crate) fn issue_for_turn(home:&Path,db:&UserDb,agent:&str,tool:&str,text:&st
     let Some(base)=url::landing_base(home,&channel)? else { return Ok(Some(DASHBOARD_HINT.into())); };
     let ticket=Store::open(home)?.issue(row)?;
     // Fragment is never sent in HTTP URLs, referrers, access logs or preview requests.
-    Ok(Some(render::notice(&format!("{base}#ticket={ticket}"))))
+    let link=format!("{base}#ticket={ticket}");
+    Ok(Some(render::notice(&link)))
 }
 
 /// Host capability hints also work when tools/list hides missing capabilities.

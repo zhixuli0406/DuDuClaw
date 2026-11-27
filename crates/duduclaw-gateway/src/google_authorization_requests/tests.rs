@@ -198,7 +198,7 @@ async fn confirmation_requires_both_disclosures_before_consuming_ticket() {
     let home=tempfile::tempdir().unwrap();let db=UserDb::new(&home.path().join("users.db")).unwrap();
     let ticket=Store::open(home.path()).unwrap().issue(row(home.path())).unwrap();
     for (data,shared) in [(false,false),(true,false),(false,true)] {
-        assert!(routes::confirm(home.path(),&db,"alice",&uuid::Uuid::new_v4().to_string(),&ticket,"https://example.com",data,shared).await.is_err());
+        assert!(routes::confirm(home.path(),&db,"alice",&uuid::Uuid::new_v4().to_string(),&ticket,"https://example.com",data,shared,false).await.is_err());
         assert!(Store::open(home.path()).unwrap().preview(&ticket,"alice").is_ok());
     }
 }
@@ -274,4 +274,51 @@ fn csrf_origins_are_explicit_and_url_components_cannot_spoof_an_allowed_host() {
         "https://user@dashboard.example", "https://dashboard.example/path", "https://dashboard.example?next=evil"] {
         assert!(!routes::valid_origin(origin,&allowed),"{origin}");
     }
+}
+
+fn enable_drive_write(home:&Path) {
+    use crate::google_workspace::drive_write_policy as policy;
+    let mut enabled=policy::DriveWritePolicy::all_off();
+    enabled.create=true;
+    let ack=policy::sign(&enabled,"admin","admin@c.test",chrono::Utc::now());
+    let mut config:toml::Value=std::fs::read_to_string(home.join("config.toml")).unwrap().parse().unwrap();
+    config.as_table_mut().unwrap().entry("google").or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut().unwrap().insert("drive_write".into(),policy::render_section(&enabled,&ack));
+    std::fs::write(home.join("config.toml"),toml::to_string(&config).unwrap()).unwrap();
+}
+
+#[test]
+fn drive_write_purpose_tool_matrix_and_disabled_policy_refuse() {
+    let (home,db,mut request)=member_fixture();
+    request.purpose="drive_write".into();
+    request.tool="drive_create_file".into();
+    assert!(validate(home.path(),&db,&request).is_err());
+    enable_drive_write(home.path());
+    request.config_version=config_version(home.path(),"bot").unwrap();
+    for tool in ["drive_create_file","drive_update_file","drive_move_file","drive_trash_file",
+        "drive_copy_file","docs_insert_text","docs_format","sheets_add_sheet","sheets_add_note"] {
+        assert_eq!(purpose(tool),Some("drive_write"),"{tool}");
+        request.tool=tool.into();
+        validate(home.path(),&db,&request).unwrap();
+        request.purpose="drive_tools".into();
+        assert!(validate(home.path(),&db,&request).is_err());
+        request.purpose="drive_write".into();
+    }
+    for tool in ["drive_read","drive_search","gmail_search","google_remote_mcp","unknown"] {
+        request.tool=tool.into();
+        assert!(validate(home.path(),&db,&request).is_err());
+    }
+}
+
+#[tokio::test]
+async fn drive_write_confirmation_requires_explicit_write_ack_without_consuming_ticket() {
+    let (home,db,mut request)=member_fixture();
+    enable_drive_write(home.path());
+    request.purpose="drive_write".into();request.tool="drive_create_file".into();
+    request.config_version=config_version(home.path(),"bot").unwrap();
+    let user=request.user.clone();
+    let ticket=Store::open(home.path()).unwrap().issue(request).unwrap();
+    assert!(routes::confirm(home.path(),&db,&user,&uuid::Uuid::new_v4().to_string(),
+        &ticket,"http://127.0.0.1:18889",true,true,false).await.is_err());
+    assert!(Store::open(home.path()).unwrap().preview(&ticket,&user).is_ok());
 }

@@ -142,11 +142,16 @@ fn policy_check(policy: &policy::DriveWritePolicy, action: DriveWriteAction) -> 
     }
     Ok(())
 }
-fn readiness_check(home: &Path, route: &IdentityRoute) -> Result<(), Refusal> {
+fn readiness_check(home: &Path, route: &IdentityRoute, agent: &str, tool: &str,
+    who: &RequesterIdentity, turn: Option<&str>) -> Result<(), Refusal> {
     match credential::readiness(home, route) {
         Readiness::Ready => Ok(()),
-        // RM-147's closed purpose table does not support drive_write yet.
-        Readiness::NeedsMemberConsent { .. } => Err(Refusal::hard("drive_write_needs_member_consent", "請到「我的連線」連結雲端硬碟寫入")),
+        Readiness::NeedsMemberConsent { user_id } => {
+            let message=crate::google_authorization_requests::turn::drive_write_notice(
+                home,agent,turn,who,&user_id,tool)
+                .unwrap_or_else(|| "請到「我的連線」連結雲端硬碟寫入".into());
+            Err(Refusal::hard("drive_write_needs_member_consent",message))
+        }
         Readiness::NeedsHomeConsent => Err(Refusal::hard("drive_write_needs_home_consent", "公司 Google 帳號需要重新連結雲端硬碟寫入，請聯絡管理員。")),
         Readiness::NeedsAdminScope => Err(crate::google_identity::resolve::drive_write_admin_scope_missing()),
         Readiness::Unsupported => Err(Refusal::hard("drive_write_unsupported_identity", "這種 Google 連線方式不支援雲端硬碟寫入。")),
@@ -162,13 +167,13 @@ impl Snapshot {
         let policy = policy::load(home);
         policy_check(&policy, action)?;
         let route = credential::resolve_route(home, agent)?;
-        readiness_check(home, &route)?;
         let mode = policy.approval_for(action);
         credential::requester_check(&route, who, mode != ApprovalMode::None)?;
         if turn.is_none() && run.is_none() { return Err(changed()); }
         for id in [turn.as_deref(), run.as_deref()].into_iter().flatten() {
             if crate::knowledge::turn_requesters::lookup(agent, id).as_ref() != Some(who) { return Err(changed()); }
         }
+        readiness_check(home, &route, agent, tool, who, turn.as_deref())?;
         let (kind, account, record) = match &route {
             IdentityRoute::Personal { owner_user_id, account_email } => ("personal", account_email.clone(),
                 Some(crate::person_credentials::write_store::get(home, "user", owner_user_id)

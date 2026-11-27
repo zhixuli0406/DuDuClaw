@@ -228,3 +228,37 @@ async fn write_finish_rechecks_policy_client_user_and_ordinary_connection() {
         assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
     }
 }
+
+#[tokio::test]
+async fn authorization_request_drive_write_finishes_only_in_write_vault() {
+    use crate::google_authorization_requests::{self as requests, store::Store};
+    use duduclaw_knowledge::requester::RequesterIdentity;
+    let f=Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let ordinary=std::fs::read(vault::path(&f.home)).unwrap();
+    let who=RequesterIdentity::DashboardUser {user_id:f.alice.id.clone()};
+    let notice=requests::issue_for_turn(&f.home,&f.db,"bot","drive_create_file","Create a file",
+        "webchat:write-test",&who,None,None).unwrap().unwrap();
+    let ticket=notice.split_once("#ticket=").unwrap().1;
+    let preview=requests::routes::preview(&f.home,&f.db,&f.alice.id,ticket).unwrap();
+    assert_eq!(preview["purpose"],"drive_write");
+    assert!(preview["services"].as_array().unwrap().iter().any(|s| s==oauth::DRIVE_WRITE_SCOPE));
+    let session=uuid::Uuid::new_v4().to_string();
+    let start=requests::routes::confirm(&f.home,&f.db,&f.alice.id,&session,ticket,
+        "http://127.0.0.1:18889",true,true,true).await.unwrap();
+    let state=start["state"].as_str().unwrap();
+    let request=Store::open(&f.home).unwrap().oauth(state,&f.alice.id,&session).unwrap().unwrap();
+    let old=vault::get(&f.home,&f.alice.id).unwrap().unwrap().metadata;
+    assert!(requests::routes::complete(&f.home,&f.db,request,Some(&old)).is_err());
+    assert!(Store::open(&f.home).unwrap().ready_rows().unwrap().is_empty());
+    pending::receive_code(&f.home,state,"write-alice").unwrap();
+    flow::finish(&f.home,&f.db,&f.alice.id,&session,state).await.unwrap();
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(),ordinary);
+    let write=write_store::get(&f.home,"user",&f.alice.id).unwrap().unwrap().metadata;
+    assert_eq!(write.google_sub,"sub-alice");
+    let ready=Store::open(&f.home).unwrap().ready_rows().unwrap();
+    assert_eq!(ready.len(),1);
+    assert_eq!(ready[0].1["credential_id"],write.credential_id);
+    assert_eq!(ready[0].1["purpose"],"drive_write");
+}
