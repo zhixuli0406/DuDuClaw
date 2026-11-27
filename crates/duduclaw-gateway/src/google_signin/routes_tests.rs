@@ -53,9 +53,9 @@ impl Fixture {
     async fn request(&self, method: &str, path: &str, body: &str, cookie: Option<&str>) -> Response {
         let app = Router::new()
             .route("/api/login/methods", get(methods))
-            .route("/api/login/google/start", post(start))
+            .route("/api/login/google/start", post(start).layer(axum::extract::DefaultBodyLimit::max(4096)))
             .route("/api/login/google/callback", get(callback))
-            .route("/api/login/google/complete", post(complete))
+            .route("/api/login/google/complete", post(complete).layer(axum::extract::DefaultBodyLimit::max(4096)))
             .with_state(self.state.clone());
         let mut request = Request::builder().method(method).uri(path)
             .header(header::CONTENT_TYPE, "application/json")
@@ -474,21 +474,57 @@ async fn state_and_ticket_expiry() {
 #[tokio::test]
 async fn public_handlers_rate_limit() {
     let f = Fixture::new(false, false, Some(BASE), false, "admin").await;
-    for _ in 0..5 {
+    for _ in 0..30 {
         assert_eq!(f.request("POST", "/api/login/google/start", "{}", None).await.status(), StatusCode::NOT_FOUND);
     }
     assert_eq!(f.request("POST", "/api/login/google/start", "{}", None).await.status(), StatusCode::TOO_MANY_REQUESTS);
-    for _ in 0..5 {
+    for _ in 0..30 {
         assert_eq!(f.request("POST", "/api/login/google/complete", r#"{"ticket":"unknown"}"#, None).await.status(), StatusCode::OK);
     }
     let response = f.request("POST", "/api/login/google/complete", r#"{"ticket":"unknown"}"#, None).await;
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(response.headers().get_all(header::SET_COOKIE).iter().count(), 2);
     let provider = Provider::new().await;
-    for _ in 0..6 {
+    for _ in 0..31 {
         let response = oauth::TEST_ENDPOINT_BASE.scope(provider.base.clone(),
             f.request("GET", "/api/login/google/callback?state=unknown&code=unused", "", None)).await;
         assert_expired(&response);
     }
     provider.assert_no_outbound();
+}
+
+#[tokio::test]
+async fn start_limiter_allows_thirty_then_refuses() {
+    let f = Fixture::ready().await;
+    for _ in 0..30 {
+        let flow = f.start().await;
+        // Release pending capacity so this test isolates the request budget.
+        assert!(take_pending(&flow.query["state"]).is_some());
+    }
+    assert_eq!(f.request("POST", "/api/login/google/start", "{}", None).await.status(),
+        StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn pending_per_ip_cap() {
+    let mut f = Fixture::ready().await;
+    for _ in 0..8 { f.start().await; }
+    assert_eq!(f.request("POST", "/api/login/google/start", "{}", None).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE);
+    // Keep the same home and pending states, changing only the connected peer.
+    f.peer = SocketAddr::from(([203, 0, 113, 214], 12000));
+    f.start().await;
+}
+
+#[tokio::test]
+async fn google_limiter_independent_of_password_limiter() {
+    let f = Fixture::ready().await;
+    for key in [EMAIL, "google-start"] {
+        for _ in 0..5 { assert!(crate::server::check_login_rate_limit(f.peer.ip(), key)); }
+        assert!(!crate::server::check_login_rate_limit(f.peer.ip(), key));
+    }
+    f.start().await;
+    for key in [EMAIL, "google-start"] {
+        crate::server::reset_login_rate_limit(f.peer.ip(), key);
+    }
 }

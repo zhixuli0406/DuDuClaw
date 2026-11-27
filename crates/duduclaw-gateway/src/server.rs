@@ -74,7 +74,7 @@ static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (
 const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// The address the login limiter keys on for a peer `ip`.
-fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn login_throttle_ip(ip: IpAddr) -> IpAddr {
     if ip.is_loopback() {
         LOOPBACK_THROTTLE_IP
     } else {
@@ -3004,9 +3004,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
         .route("/api/login/methods", get(crate::google_signin::routes::methods))
-        .route("/api/login/google/start", post(crate::google_signin::routes::start))
+        .route("/api/login/google/start", post(crate::google_signin::routes::start).layer(DefaultBodyLimit::max(4096)))
         .route("/api/login/google/callback", get(crate::google_signin::routes::callback))
-        .route("/api/login/google/complete", post(crate::google_signin::routes::complete))
+        .route("/api/login/google/complete", post(crate::google_signin::routes::complete).layer(DefaultBodyLimit::max(4096)))
         .route("/api/invite/check", post(server_invites::check_invite))
         .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))

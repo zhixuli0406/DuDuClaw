@@ -1,7 +1,7 @@
 //! Public Google login: browser-bound, single-use state and completion tickets.
 use super::{config, oidc};
 use crate::google_personal::oauth;
-use crate::server::{AppState, check_login_rate_limit, reset_login_rate_limit, server_mfa};
+use crate::server::{AppState, login_throttle_ip, server_mfa};
 use axum::{
     Json,
     extract::{ConnectInfo, RawQuery, State, rejection::JsonRejection},
@@ -13,7 +13,7 @@ use duduclaw_auth::{UserDb, UserStatus, mfa::FirstFactor,
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, path::{Path, PathBuf},
+use std::{collections::HashMap, net::{IpAddr, SocketAddr}, path::{Path, PathBuf},
     sync::{Arc, LazyLock, Mutex}, time::{Duration, Instant}};
 use zeroize::Zeroize;
 
@@ -22,8 +22,39 @@ const LOGIN_PATH: &str = "/login";
 const STATE_TTL: Duration = Duration::from_secs(600);
 const TICKET_TTL: Duration = Duration::from_secs(120);
 const MAX_PENDING: usize = 128;
+const MAX_PENDING_PER_IP: usize = 8;
 const MAX_TICKETS: usize = 256;
+const GOOGLE_RATE_WINDOW: Duration = Duration::from_secs(900);
+const GOOGLE_RATE_LIMIT: u32 = 30;
+const MAX_GOOGLE_RATE_ENTRIES: usize = 10000;
 type Hash = [u8; 32];
+
+static GOOGLE_RATE_LIMITER: LazyLock<Mutex<HashMap<(IpAddr, &'static str), (Instant, u32)>>> =
+    LazyLock::new(Default::default);
+
+fn check_google_rate_limit(ip: IpAddr, route: &'static str) -> bool {
+    let ip = login_throttle_ip(ip);
+    let Ok(mut map) = GOOGLE_RATE_LIMITER.lock() else { return false; };
+    let now = Instant::now();
+    if map.len() >= MAX_GOOGLE_RATE_ENTRIES {
+        map.retain(|_, (at, _)| now.duration_since(*at) < GOOGLE_RATE_WINDOW);
+        if map.len() >= MAX_GOOGLE_RATE_ENTRIES && !map.contains_key(&(ip, route)) {
+            return false;
+        }
+    }
+    let entry = map.entry((ip, route)).or_insert((now, 0));
+    if now.duration_since(entry.0) >= GOOGLE_RATE_WINDOW { *entry = (now, 0); }
+    if entry.1 >= GOOGLE_RATE_LIMIT { return false; }
+    entry.1 += 1;
+    true
+}
+
+fn reset_google_rate_limit(ip: IpAddr) {
+    let ip = login_throttle_ip(ip);
+    if let Ok(mut map) = GOOGLE_RATE_LIMITER.lock() {
+        for route in ["start", "callback", "complete"] { map.remove(&(ip, route)); }
+    }
+}
 
 fn hash(value: &str) -> Hash { Sha256::digest(value.as_bytes()).into() }
 fn same_hash(a: &Hash, b: &Hash) -> bool {
@@ -32,6 +63,7 @@ fn same_hash(a: &Hash, b: &Hash) -> bool {
 
 struct Pending {
     home: PathBuf,
+    ip: IpAddr,
     cookie_sha256: Hash,
     nonce_sha256: Hash,
     verifier: String,
@@ -150,7 +182,7 @@ pub(crate) async fn start(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     body: Result<Json<StartBody>, JsonRejection>,
 ) -> Response {
-    if !check_login_rate_limit(addr.ip(), "google-start") { return error(StatusCode::TOO_MANY_REQUESTS); }
+    if !check_google_rate_limit(addr.ip(), "start") { return error(StatusCode::TOO_MANY_REQUESTS); }
     if body.is_err() { return error(StatusCode::BAD_REQUEST); }
     let Ok(available) = availability(&state).await else { return error(StatusCode::NOT_FOUND); };
     let (Ok(state_value), Ok(nonce), Ok(verifier), Ok(cookie_value)) =
@@ -160,13 +192,17 @@ pub(crate) async fn start(
     let authorization_url = oidc::authorization_url(&available.client.client_id, &redirect_uri,
         &state_value, &nonce, &oidc::pkce_challenge_s256(&verifier), &available.settings.allowed_hd,
         oidc::SigninPurpose::Login, None);
-    let pending = Pending { home: state.home_dir.clone(), cookie_sha256: hash(&cookie_value),
+    let ip = login_throttle_ip(addr.ip());
+    let pending = Pending { home: state.home_dir.clone(), ip, cookie_sha256: hash(&cookie_value),
         nonce_sha256: hash(&nonce), verifier, redirect_uri, client_id: available.client.client_id,
         settings_revision: available.settings.revision, secure: available.secure, created: Instant::now() };
     {
         let Ok(mut map) = PENDING.lock() else { return error(StatusCode::SERVICE_UNAVAILABLE); };
         map.retain(|_, value| value.created.elapsed() < STATE_TTL);
         if map.len() >= MAX_PENDING || map.contains_key(&hash(&state_value)) {
+            return error(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if map.values().filter(|pending| pending.ip == ip).count() >= MAX_PENDING_PER_IP {
             return error(StatusCode::SERVICE_UNAVAILABLE);
         }
         map.insert(hash(&state_value), pending);
@@ -219,7 +255,7 @@ pub(crate) async fn callback(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if !check_login_rate_limit(addr.ip(), "google-callback") { return expired(&state.home_dir); }
+    if !check_google_rate_limit(addr.ip(), "callback") { return expired(&state.home_dir); }
     let Some((state_value, code, provider_error)) = callback_values(query.as_deref().unwrap_or_default())
         else { return expired(&state.home_dir); };
     // Consume before checking the cookie, settings, or contacting any provider.
@@ -339,7 +375,7 @@ pub(crate) async fn complete(
 async fn complete_inner(state: &Arc<AppState>, addr: SocketAddr, headers: &HeaderMap,
     body: Result<Json<CompleteBody>, JsonRejection>) -> Response
 {
-    if !check_login_rate_limit(addr.ip(), "google-complete") { return error(StatusCode::TOO_MANY_REQUESTS); }
+    if !check_google_rate_limit(addr.ip(), "complete") { return error(StatusCode::TOO_MANY_REQUESTS); }
     let Ok(Json(body)) = body else { return error(StatusCode::BAD_REQUEST); };
     let Some(ticket) = take_ticket(&body.ticket) else { return result("expired"); };
     if ticket.home != state.home_dir
@@ -365,9 +401,7 @@ async fn complete_inner(state: &Arc<AppState>, addr: SocketAddr, headers: &Heade
         Ok(tokens) => tokens,
         Err(_) => return server_mfa::require_after_first_factor(state, &user, FirstFactor::GoogleOidc).await,
     };
-    reset_login_rate_limit(addr.ip(), "google-start");
-    reset_login_rate_limit(addr.ip(), "google-callback");
-    reset_login_rate_limit(addr.ip(), "google-complete");
+    reset_google_rate_limit(addr.ip());
     let _ = state.user_db.update_last_login(&user.id);
     let _ = state.user_db.log_action(Some(&user.id), "login", None,
         Some(r#"{"method":"google"}"#), Some(&addr.ip().to_string()));
