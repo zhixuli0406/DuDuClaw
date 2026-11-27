@@ -542,7 +542,8 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
     ("evolution", DD),
     ("forward", DD),
     ("belief", DD),
-    ("cost", "cost and token metadata per employee; P1g default deny + hidden rows"),
+    ("cost", "cost and token metadata per employee; P1g default deny + hidden rows; \
+        department_summary / department_recent exclude owner_only_denied employees before queries and totals"),
     ("db_sources", "P1g default deny: data-source grants of another person's Personal employee are refused; P1h \
         (N5): grants.list leaves hidden employees out and grants.set merges their grants back unnamed"),
     ("odoo", "P1g default deny: per-employee Odoo configuration of another person's Personal employee is refused"),

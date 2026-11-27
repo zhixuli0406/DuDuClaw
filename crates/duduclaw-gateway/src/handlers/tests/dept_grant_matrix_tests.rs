@@ -113,13 +113,6 @@ fn assert_scoped_rpc_outcome(label: &str, frame: WsFrame, allowed: bool) {
     else { assert_permission_denied(label, frame); }
 }
 
-#[tokio::test]
-#[ignore = "only cost rows remain pending their grant wiring"]
-async fn scoped_method_matrix_rows_pending_wiring() {
-    // Add cost rows using assert_scoped with record setup
-    // hooks and, for filtered list methods, a payload visibility assertion.
-    panic!("only cost matrix rows remain pending their wiring package");
-}
 
 fn scoped_payload(label: &str, frame: WsFrame) -> Value {
     match frame {
@@ -529,4 +522,194 @@ async fn skills_install_request_audits_grant_and_routes_only_to_admin() {
     assert!(store.decide(&request.id, &f.mgr_b.user_id, "manager", None, true, "").await.is_err());
     assert_eq!(schedule_grant_audits(&f), vec![(f.mgr_a.user_id.clone(), "a1".into(),
         json!({"group": "skills", "action": "request_install", "method": "skills.install_request"}))]);
+}
+
+
+async fn seed_matrix_cost(f: &Fixture) {
+    use crate::cost_telemetry::{CostTelemetry, RequestType, TokenUsage};
+    let telemetry = CostTelemetry::new(&f.home.join("matrix-cost.db")).unwrap();
+    for (agent, cost) in [("a1", 10), ("a2", 20), ("b1", 100), ("main", 1000)] {
+        telemetry.record_priced(agent, RequestType::Chat, "matrix-model",
+            &TokenUsage { input_tokens: cost * 10, output_tokens: cost,
+                cache_read_tokens: cost * 5, ..Default::default() },
+            cost, false, None).await.unwrap();
+    }
+    assert!(f.h.cost_telemetry_fixture.set(telemetry).is_ok());
+}
+
+#[tokio::test]
+async fn cost_department_scoped_matrix() {
+    for method in ["cost.department_summary", "cost.department_recent"] {
+        assert!(matches!(coverage_for(method), Some((_, Coverage::Scoped(_)))));
+        for case in ["allowed", "other_department", "no_grants", "employee", "member_key",
+            "other_origin", "moved_department"] {
+            let f = fixture().await;
+            seed_matrix_cost(&f).await;
+            let mut ctx = match case {
+                "no_grants" => f.mgr_b.clone(),
+                "employee" => f.emp.clone(),
+                _ => f.mgr_a.clone(),
+            };
+            match case {
+                "member_key" => ctx.origin = ContextOrigin::MemberKey,
+                "other_origin" => ctx.origin = ContextOrigin::Other,
+                "moved_department" => {
+                    let path = f.home.join("agents/a1/agent.toml");
+                    let raw = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(path, raw.replace("department = 'sales'", "department = 'mfg'")).unwrap();
+                }
+                _ => {}
+            }
+            let department = if case == "other_department" { "mfg" } else { "sales" };
+            let label = format!("{method} [{case}]");
+            let frame = Box::pin(f.h.handle(method, json!({"department": department}), &ctx)).await;
+            if matches!(case, "allowed" | "moved_department") {
+                let payload = scoped_payload(&label, frame);
+                let key = if method == "cost.department_summary" { "agents" } else { "records" };
+                let mut ids: Vec<_> = payload[key].as_array().unwrap().iter()
+                    .map(|row| row["agent_id"].as_str().unwrap()).collect();
+                ids.sort_unstable();
+                let expected = if case == "allowed" { vec!["a1", "a2"] } else { vec!["a2"] };
+                assert_eq!(ids, expected, "{label}");
+                if case == "moved_department" && key == "agents" {
+                    assert_eq!(payload["totals"]["total_cost_millicents"], 20);
+                }
+            } else {
+                assert_permission_denied(&label, frame);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn department_cost_excludes_other_departments() {
+    let f = fixture().await;
+    seed_matrix_cost(&f).await;
+    let payload = scoped_payload("cost.department_summary", Box::pin(f.h.handle(
+        "cost.department_summary", json!({"department": "sales"}), &f.mgr_a)).await);
+    assert_eq!(payload["available"], true);
+    assert_eq!(payload["department"], "sales");
+    assert_eq!(payload["days"], 30);
+    let rows = payload["agents"].as_array().unwrap();
+    assert_eq!(rows.iter().map(|r| r["agent_id"].as_str().unwrap()).collect::<Vec<_>>(), vec!["a1", "a2"]);
+    assert!(rows.iter().all(|r| r["display_name"].is_string()));
+    for field in ["total_requests", "total_input_tokens", "total_output_tokens",
+        "total_cost_millicents", "total_cache_savings_millicents"] {
+        let sum: u64 = rows.iter().map(|r| r[field].as_u64().unwrap()).sum();
+        assert_eq!(payload["totals"][field].as_u64(), Some(sum), "{field}");
+    }
+    let efficiency: f64 = rows.iter().map(|r| r["avg_cache_efficiency"].as_f64().unwrap()).sum();
+    assert_eq!(payload["totals"]["avg_cache_efficiency"].as_f64(), Some(efficiency));
+    assert_eq!(payload["totals"]["total_cost_millicents"], 30);
+    let recent = scoped_payload("cost.department_recent", Box::pin(f.h.handle(
+        "cost.department_recent", json!({"department": "sales", "limit": 1}), &f.mgr_a)).await);
+    let records = recent["records"].as_array().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["agent_id"], "a2");
+    for field in ["request_type", "model", "input_tokens", "cache_read_tokens", "cache_creation_tokens",
+        "output_tokens", "cache_efficiency", "cost_millicents", "cache_savings_millicents", "created_at"] {
+        assert!(records[0].get(field).is_some(), "{field}");
+    }
+}
+
+#[tokio::test]
+async fn cost_by_model_scoped_matrix() {
+    assert_scoped("cost.by_model", |agent| json!({"agent_id": agent}),
+        |f, _| Box::pin(seed_matrix_cost(f)), assert_scoped_rpc_outcome).await;
+    let f = fixture().await;
+    seed_matrix_cost(&f).await;
+    for params in [json!({}), json!({"agent_id": ""}), json!({"agent_id": " a1 "}),
+        json!({"agent_id": "b1"})] {
+        assert_permission_denied("cost.by_model", Box::pin(f.h.handle("cost.by_model", params, &f.mgr_a)).await);
+    }
+    let payload = scoped_payload("cost.by_model", Box::pin(f.h.handle(
+        "cost.by_model", json!({"agent_id": "a1"}), &f.mgr_a)).await);
+    assert_eq!(payload["agent_id"], "a1");
+    assert_eq!(payload["by_model"][0]["cost_millicents"], 10);
+    assert_success("cost.by_model", Box::pin(f.h.handle("cost.by_model", json!({}), &f.admin)).await);
+}
+
+#[tokio::test]
+async fn department_cost_validates_department_and_preserves_admin_scope() {
+    let f = fixture().await;
+    seed_matrix_cost(&f).await;
+    for method in ["cost.department_summary", "cost.department_recent"] {
+        for ctx in [&f.mgr_a, &f.admin] {
+            for params in [json!({}), json!({"department": null}), json!({"department": 7}),
+                json!({"department": ""}), json!({"department": " sales "}), json!({"department": "../sales"})] {
+                let frame = Box::pin(f.h.handle(method, params, ctx)).await;
+                assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{method}: {frame:?}");
+            }
+            for department in ["missing", "Sales", "sale"] {
+                assert_permission_denied(method, Box::pin(f.h.handle(method,
+                    json!({"department": department}), ctx)).await);
+            }
+        }
+        let key = if method == "cost.department_summary" { "agents" } else { "records" };
+        for (department, expected) in [("sales", vec!["a1", "a2", "main"]), ("mfg", vec!["b1"])] {
+            let payload = scoped_payload(method, Box::pin(f.h.handle(method,
+                json!({"department": department}), &f.admin)).await);
+            let mut ids: Vec<_> = payload[key].as_array().unwrap().iter()
+                .map(|row| row["agent_id"].as_str().unwrap()).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, expected);
+        }
+    }
+    for (days, expected) in [(0, 1), (999, 90)] {
+        let payload = scoped_payload("cost.department_summary", Box::pin(f.h.handle(
+            "cost.department_summary", json!({"department": "sales", "days": days}), &f.mgr_a)).await);
+        assert_eq!(payload["days"], expected);
+    }
+    let payload = scoped_payload("cost.department_recent", Box::pin(f.h.handle(
+        "cost.department_recent", json!({"department": "sales", "limit": 0}), &f.mgr_a)).await);
+    assert_eq!(payload["records"].as_array().unwrap().len(), 1);
+    std::fs::write(f.home.join("org.toml"), "malformed !").unwrap();
+    for ctx in [&f.mgr_a, &f.admin] {
+        for method in ["cost.department_summary", "cost.department_recent"] {
+            assert_permission_denied(method, Box::pin(f.h.handle(method,
+                json!({"department": "sales"}), ctx)).await);
+        }
+    }
+}
+
+
+#[tokio::test]
+async fn department_cost_empty_scope_never_falls_back_to_global() {
+    let f = fixture().await;
+    seed_matrix_cost(&f).await;
+    for id in ["a1", "a2"] {
+        let path = f.home.join("agents").join(id).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, raw.replace("department = 'sales'", "department = 'mfg'")).unwrap();
+    }
+    for (method, key) in [("cost.department_summary", "agents"), ("cost.department_recent", "records")] {
+        let payload = scoped_payload(method, Box::pin(f.h.handle(method,
+            json!({"department": "sales"}), &f.mgr_a)).await);
+        assert_eq!(payload["available"], true);
+        assert!(payload[key].as_array().unwrap().is_empty());
+        if key == "agents" {
+            assert_eq!(payload["totals"]["total_requests"], 0);
+            assert_eq!(payload["totals"]["total_cost_millicents"], 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn department_cost_recent_default_and_upper_limit() {
+    use crate::cost_telemetry::{RequestType, TokenUsage};
+    let f = fixture().await;
+    seed_matrix_cost(&f).await;
+    let telemetry = f.h.cost_telemetry_fixture.get().unwrap();
+    for _ in 0..201 {
+        telemetry.record_priced("a1", RequestType::Chat, "matrix-model",
+            &TokenUsage::default(), 1, false, None).await.unwrap();
+    }
+    for (params, expected) in [(json!({"department": "sales"}), 50),
+        (json!({"department": "sales", "limit": 999}), 200)] {
+        let payload = scoped_payload("cost.department_recent", Box::pin(f.h.handle(
+            "cost.department_recent", params, &f.mgr_a)).await);
+        let rows = payload["records"].as_array().unwrap();
+        assert_eq!(rows.len(), expected);
+        assert!(rows.iter().all(|row| row["agent_id"] == "a1"));
+    }
 }

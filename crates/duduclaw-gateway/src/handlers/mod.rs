@@ -335,6 +335,9 @@ pub struct MethodHandler {
     /// Test seam: the agent cap `effective_agent_cap` returns (RM-149 tests).
     #[cfg(test)]
     agent_cap_fixture: RwLock<Option<usize>>,
+    /// Isolated cost ledger for RPC tests; production keeps the singleton.
+    #[cfg(test)]
+    cost_telemetry_fixture: std::sync::OnceLock<crate::cost_telemetry::CostTelemetry>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
