@@ -96,8 +96,29 @@ fn parse(body: &str) -> Value {
     serde_json::from_str(body).unwrap_or(Value::Null)
 }
 
-#[tokio::test]
-async fn http_modern_discover_list_and_call() {
+// The library's cfg(test) helper is unavailable to integration tests.
+// Match test_support::run_on_big_stack for the large debug dispatch poll frame.
+fn run_on_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn http_modern_discover_list_and_call() {
+    run_on_big_stack(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(http_modern_discover_list_and_call_body());
+    });
+}
+
+async fn http_modern_discover_list_and_call_body() {
     let home = http_home();
     let h = |m: &'static str| vec![("MCP-Protocol-Version", MODERN), ("Mcp-Method", m)];
 

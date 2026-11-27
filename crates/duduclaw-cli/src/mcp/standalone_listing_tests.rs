@@ -484,8 +484,18 @@ mod dispatch_gate {
     /// Every process-agent tool an external key's scopes would otherwise let
     /// through is refused with -32003 and an audit row, and the employee's
     /// state is untouched.
-    #[tokio::test(flavor = "current_thread")]
-    async fn external_key_cannot_call_process_agent_tools() {
+    #[test]
+    fn external_key_cannot_call_process_agent_tools() {
+        crate::test_support::run_on_big_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(external_key_cannot_call_process_agent_tools_body());
+        });
+    }
+
+    async fn external_key_cannot_call_process_agent_tools_body() {
         let (tmp, d) = setup();
         let ext = principal("standalone-claude-code", STANDALONE, true);
         for (tool, args) in [
@@ -539,8 +549,18 @@ mod dispatch_gate {
 
     /// Employee callers are unaffected: the gateway-internal key acting for
     /// `dudu`, and a per-agent key whose client id is an employee.
-    #[tokio::test(flavor = "current_thread")]
-    async fn employee_callers_still_reach_process_agent_tools() {
+    #[test]
+    fn employee_callers_still_reach_process_agent_tools() {
+        crate::test_support::run_on_big_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(employee_callers_still_reach_process_agent_tools_body());
+        });
+    }
+
+    async fn employee_callers_still_reach_process_agent_tools_body() {
         let (tmp, d) = setup();
         let internal = principal(
             duduclaw_gateway::mcp_internal_key::INTERNAL_CLIENT_ID,
@@ -568,6 +588,10 @@ mod dispatch_gate {
     /// passed in (the dispatch gate reads it from the environment).
     #[test]
     fn internal_key_refusal_follows_scope_listing() {
+        crate::test_support::run_on_big_stack(internal_key_refusal_follows_scope_listing_body);
+    }
+
+    fn internal_key_refusal_follows_scope_listing_body() {
         use super::super::process_agent_tool_refused as refused;
         let scoped = principal("standalone-x", STANDALONE, false);
         assert!(refused("working_state_set", &scoped, false, false));
@@ -595,8 +619,18 @@ mod dispatch_gate {
 
     /// An external key cannot write the shared wiki as the process agent,
     /// and reads it with no department.
-    #[tokio::test(flavor = "current_thread")]
-    async fn external_key_shared_wiki_is_read_only_and_department_free() {
+    #[test]
+    fn external_key_shared_wiki_is_read_only_and_department_free() {
+        crate::test_support::run_on_big_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(external_key_shared_wiki_is_read_only_and_department_free_body());
+        });
+    }
+
+    async fn external_key_shared_wiki_is_read_only_and_department_free_body() {
         let (tmp, d) = setup();
         let ext = principal("standalone-claude-code", STANDALONE, true);
         let page = "---\ntitle: X\ncreated: 2026-10-07\nupdated: 2026-10-07\ntags: [a]\n\
