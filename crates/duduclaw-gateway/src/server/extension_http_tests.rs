@@ -36,7 +36,7 @@ async fn extension_http_real_jwt_live_role_password_and_suspension() {
     let (tx, _) = broadcast::channel(16);
     let (event_tx, _) = broadcast::channel(16);
     let state = Arc::new(AppState {
-        auth: AuthManager::new(None), handler, tx, event_tx,
+        auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
         prepared_events: Default::default(), user_db: user_db.clone(), jwt_config,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
         home_dir: home.clone(),

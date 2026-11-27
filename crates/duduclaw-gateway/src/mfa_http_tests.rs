@@ -52,7 +52,7 @@ async fn fixture_policy(
     let (event_tx, _) = broadcast::channel(4);
     let state = Arc::new(AppState {
         auth: AuthManager::new(None),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
         prepared_events: Default::default(),

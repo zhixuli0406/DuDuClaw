@@ -222,6 +222,7 @@ pub mod doctor_probes;
 pub mod extension;
 pub mod external_status;
 pub(crate) mod member_keys;
+pub mod person_key_route;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
