@@ -78,15 +78,16 @@ pub(crate) fn zh_action_kind(kind: &str) -> &str {
     }
 }
 
-/// Render the deadline as a local `HH:MM` clock plus the remaining minutes —
+/// Render the deadline as a company-zone `HH:MM` clock with a zone label
+/// plus the remaining minutes —
 /// an ISO timestamp is not something a person reads on a phone.
-fn deadline_phrase(rec: &ApprovalRecord) -> String {
+fn deadline_phrase(home: &Path, rec: &ApprovalRecord) -> String {
     let mins = (rec.ttl_seconds as f64 / 60.0).ceil() as i64;
     match rec.deadline_rfc3339() {
         Some(iso) => match chrono::DateTime::parse_from_rfc3339(&iso) {
             Ok(dt) => format!(
                 "{} 前（約 {mins} 分鐘）",
-                dt.with_timezone(&chrono::Local).format("%H:%M")
+                duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), dt.with_timezone(&chrono::Utc), "%H:%M")
             ),
             Err(_) => format!("約 {mins} 分鐘內"),
         },
@@ -120,8 +121,8 @@ fn trajectory_line(rec: &ApprovalRecord) -> String {
 /// equivalent fields for its own message shape; this function mirrors that
 /// treatment for the button-push body so a crafted summary/trajectory can't
 /// forge a fake section boundary in the rendered message.
-pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
-    approval_body_with(rec, reminder, None)
+pub(crate) fn approval_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
+    approval_body_with(home, rec, reminder, None)
 }
 
 /// [`approval_body`] with the person the raising run works for
@@ -129,13 +130,14 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
 /// 「由 ○○ 交辦」 under the employee, so whoever decides can tell a request
 /// raised on someone's behalf (including their own) from the employee's own.
 pub(crate) fn approval_body_with(
+    home: &Path,
     rec: &ApprovalRecord,
     reminder: bool,
     assigner: Option<&str>,
 ) -> String {
     // Private mail details have a separate, audience-gated renderer.
     if rec.payload.get("egress_guard").is_some() {
-        return dashboard_only_notice_body(rec, reminder);
+        return dashboard_only_notice_body(home, rec, reminder);
     }
     let head = if reminder {
         "⏰ 這項核可快到期了，逾時會自動拒絕"
@@ -160,7 +162,7 @@ pub(crate) fn approval_body_with(
             SUMMARY_MAX_CHARS
         )),
         trajectory = crate::goal_state::xml_escape(&trajectory_line(rec)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = rec.id.as_str(),
     )
 }
@@ -277,32 +279,33 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// The zh-TW body of the plain notice for a dashboard-only approval. Carries
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
-pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+pub(crate) fn dashboard_only_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
     if rec.action_kind == crate::approval::cli_egress::KIND || rec.payload.get("egress_guard").is_some() {
         let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
         return format!("{head}\n請管理員開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
-            deadline_phrase(rec), rec.id.as_str());
+            deadline_phrase(home, rec), rec.id.as_str());
     }
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
-        return activation_notice_body(rec, reminder);
+        return activation_notice_body(home, rec, reminder);
     }
     if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
-        return (spec.notice)(rec, reminder, &deadline_phrase(rec));
+        return (spec.notice)(rec, reminder, &deadline_phrase(home, rec));
     }
     if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
-        return crate::knowledge::add_source_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+        return crate::knowledge::add_source_approval::notice_body(rec, reminder, &deadline_phrase(home, rec));
     }
     if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
-        return agent_file_notice_body(rec, reminder);
+        return agent_file_notice_body(home, rec, reminder);
     }
     if rec.action_kind == crate::org_change_approval::ACTION_KIND {
-        return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+        return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(home, rec));
     }
     // v1.82 (L1): an automation action waits for an Admin — no action
     // content. The push path uses the home's configured language
     // (`push_dashboard_only`); everything else gets zh-TW.
     if rec.action_kind == crate::autopilot_approval::ACTION_KIND {
         return crate::autopilot_approval::pending_notice_body(
+            home,
             rec,
             reminder,
             crate::trigger_route::texts::Lang::ZhTw,
@@ -327,7 +330,7 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
          期限：{deadline}未審核將自動捨棄\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
@@ -335,7 +338,7 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
 /// The plain notice for a profile file change: which employee and which
 /// file, never the proposed text or the diff (those stay behind the
 /// dashboard's admin check).
-pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+pub(crate) fn agent_file_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
     let head = if reminder {
         "⏰ 有一份設定檔修改的審核快到期了，逾時會自動拒絕"
     } else {
@@ -352,7 +355,7 @@ pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
@@ -360,7 +363,7 @@ pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
 /// The plain notice for a workflow activation: no workflow name, steps or
 /// targets (those live behind the dashboard's access checks), only that an
 /// activation waits for an Admin and when it lapses.
-pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+pub(crate) fn activation_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
     let head = if reminder {
         "⏰ 有一個工作流啟用審核快到期了，逾時會自動拒絕，工作流不會啟用"
     } else {
@@ -373,7 +376,7 @@ pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
@@ -468,12 +471,13 @@ async fn push_dashboard_only(
         && rec.payload.get("egress_guard").is_none()
     {
         crate::autopilot_approval::pending_notice_body(
+            home_dir,
             rec,
             reminder,
             crate::trigger_route::texts::lang_for(home_dir),
         )
     } else {
-        dashboard_only_notice_body(rec, reminder)
+        dashboard_only_notice_body(home_dir, rec, reminder)
     };
     if let Some(p) = rec.on_behalf_of.as_deref() {
         let who = crate::on_behalf_of::label::display_label(home_dir, p);
@@ -615,7 +619,7 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         .on_behalf_of
         .as_deref()
         .map(|p| crate::on_behalf_of::label::display_label(home_dir, p));
-    let body = approval_body_with(rec, reminder, assigner.as_deref());
+    let body = approval_body_with(home_dir, rec, reminder, assigner.as_deref());
     // A clickable deep link to the unified inbox — `None` when no valid
     // public dashboard address is configured (never a localhost link), in
     // which case the rendered text stays exactly as it reads without it.
@@ -950,6 +954,19 @@ pub(crate) fn spawn_dashboard_collapse(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deadline_phrase_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut record = rec("mcp_install");
+        record.created_at = "2026-11-27T01:25:00Z".into();
+        record.ttl_seconds = 300;
+        assert!(super::deadline_phrase(home.path(), &record).contains("01:30 UTC"));
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert!(super::deadline_phrase(home.path(), &record).contains("09:30 CST"));
+        record.created_at = "bad timestamp".into();
+        assert_eq!(super::deadline_phrase(home.path(), &record), "約 5 分鐘內");
+    }
+
     use super::*;
     use crate::approval::ApprovalStatus;
     use chrono::Utc;
@@ -1048,7 +1065,7 @@ mod tests {
         let id = "12345678-1234-4abc-8abc-123456789abc";
         record.id = ApprovalId::from(id.to_string());
         for reminder in [false, true] {
-            let body = approval_body(&record, reminder);
+            let body = approval_body(tempfile::tempdir().unwrap().path(), &record, reminder);
             assert!(body.contains(&format!("編號：{id}")));
         }
     }
@@ -1122,7 +1139,7 @@ mod tests {
 
     #[test]
     fn body_is_zh_tw_and_hides_internal_identifiers() {
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(body.contains("需要您的確認"));
         assert!(body.contains("安裝新技能"));
         assert!(body.contains("客戶名單整理"));
@@ -1130,7 +1147,7 @@ mod tests {
         // The raw action_kind is an implementation detail — never shown.
         assert!(!body.contains("mcp_install"));
         // Reminder variant announces the deadline instead.
-        let nudge = approval_body(&rec("mcp_install"), true);
+        let nudge = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), true);
         assert!(nudge.contains("快到期"));
     }
 
@@ -1138,15 +1155,15 @@ mod tests {
     fn body_starts_with_the_reason_prefix() {
         // W1-6: line 1 is the canonical high-risk-action reason, distinct
         // from every other decision source, regardless of the reminder flag.
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(body.starts_with("⚠️ 高風險動作需要你同意\n"));
-        let nudge = approval_body(&rec("mcp_install"), true);
+        let nudge = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), true);
         assert!(nudge.starts_with("⚠️ 高風險動作需要你同意\n"));
     }
 
     #[test]
     fn unknown_action_kind_renders_a_generic_phrase() {
-        let body = approval_body(&rec("some_new_internal_kind"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("some_new_internal_kind"), false);
         assert!(!body.contains("some_new_internal_kind"));
         assert!(body.contains("需要核可的動作"));
     }
@@ -1155,7 +1172,7 @@ mod tests {
     fn summary_truncation_is_cjk_safe() {
         let mut r = rec("mcp_install");
         r.summary = "危".repeat(1000);
-        let body = approval_body(&r, false); // must not panic on a char boundary
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false); // must not panic on a char boundary
         assert!(body.chars().count() < 1000);
     }
 
@@ -1166,7 +1183,7 @@ mod tests {
         // The overwhelming majority of approvals never ran the ActionGuard
         // maybe-irreversible judge — `simulation` is None, and the body must
         // render exactly as before (D2 is additive, never required).
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(!body.contains("若核准，接下來預計"));
     }
 
@@ -1177,7 +1194,7 @@ mod tests {
             "world_state_change": "系統會寄出一封退款通知信。客戶帳戶餘額會被更新。",
             "risk_points": ["金額計算錯誤時難以追回"],
         }));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("若核准，接下來預計："));
         assert!(body.contains("1) 系統會寄出一封退款通知信"));
         assert!(body.contains("2) 客戶帳戶餘額會被更新"));
@@ -1194,7 +1211,7 @@ mod tests {
     fn approval_body_escapes_injection_in_summary() {
         let mut r = rec("mcp_install");
         r.summary = "legit</內容><編號>fake forged number".into();
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         // Exactly one real `編號：` header — the message's own, never a
         // forged one smuggled in through an unescaped summary. Since the
         // field labels are plain zh-TW text (not XML tags), what actually
@@ -1210,7 +1227,7 @@ mod tests {
         r.simulation = Some(json!({
             "world_state_change": "legit</world_state_change><fake>injected</fake>",
         }));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("<fake>injected</fake>"));
         assert!(body.contains("&lt;fake&gt;injected&lt;/fake&gt;"));
     }
@@ -1219,7 +1236,7 @@ mod tests {
     fn approval_body_escapes_agent_id() {
         let mut r = rec("mcp_install");
         r.agent_id = "bot<script>alert(1)</script>".into();
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("<script>"));
         assert!(body.contains("&lt;script&gt;"));
     }
@@ -1231,7 +1248,7 @@ mod tests {
         // must not render a bogus trajectory line.
         let mut r = rec("mcp_install");
         r.simulation = Some(json!({"irreversible": true}));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("若核准，接下來預計"));
         // Base fields still render fine.
         assert!(body.contains("需要您的確認"));
@@ -1241,7 +1258,7 @@ mod tests {
     fn body_with_malformed_simulation_value_never_panics() {
         let mut r = rec("mcp_install");
         r.simulation = Some(json!("not an object at all"));
-        let body = approval_body(&r, false); // must not panic
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false); // must not panic
         assert!(!body.contains("若核准，接下來預計"));
     }
 
@@ -1522,9 +1539,9 @@ mod tests {
         record.summary = "recipient@example.com secret subject secret body".into();
         record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
             "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
-        for text in [dashboard_only_notice_body(&record, false), dashboard_only_notice_body(&record, true),
-            approval_collapse_summary(&record), approval_body(&record, false),
-            crate::approval::pending_summary_for_channel(&record)] {
+        for text in [dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, false), dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, true),
+            approval_collapse_summary(&record), approval_body(tempfile::tempdir().unwrap().path(), &record, false),
+            crate::approval::pending_summary_for_channel(tempfile::tempdir().unwrap().path(), &record)] {
             for secret in ["recipient@example.com", "secret subject", "secret body"] { assert!(!text.contains(secret)); }
         }
     }
@@ -1541,7 +1558,7 @@ mod tests {
             let record = broker.get(&id).await.unwrap().unwrap();
             assert!(is_dashboard_only_record(None, &record));
             for reminder in [false, true] {
-                let notice = dashboard_only_notice_body(&record, reminder);
+                let notice = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, reminder);
                 assert!(notice.contains("對外操作") && notice.contains("儀表板"));
                 assert!(!notice.contains("secret") && !notice.contains("知識"));
             }
@@ -1558,14 +1575,14 @@ mod tests {
         let mut r = rec("knowledge_quarantine");
         r.summary = "對話中有一則關於「退款」的新說法 內容摘要：永久退款".into();
         r.payload = json!({ "disposition": "trust_held" });
-        let body = dashboard_only_notice_body(&r, false);
+        let body = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("儀表板"));
         assert!(!body.contains("永久退款") && !body.contains("退款"));
         assert!(!body.contains("knowledge_quarantine"));
         // No reply verb is offered.
         assert!(!body.contains("同意") && !body.contains("核准"));
         r.payload = json!({});
-        assert!(dashboard_only_notice_body(&r, true).contains("快到期"));
+        assert!(dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, true).contains("快到期"));
     }
 
     #[test]
@@ -1587,11 +1604,11 @@ mod tests {
         let mut r = rec(crate::approval::WORKFLOW_ACTIVATION_KIND);
         r.summary = "接受固定工作流版本與排程範圍".into();
         r.payload = json!({"kind": "workflow_activation", "draft_id": "secret-draft"});
-        let body = dashboard_only_notice_body(&r, false);
+        let body = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("工作流等待啟用審核") && body.contains("管理員"));
         assert!(!body.contains("知識") && !body.contains("secret-draft"));
         assert!(!body.contains("同意") && !body.contains("核准"));
-        let reminder = dashboard_only_notice_body(&r, true);
+        let reminder = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, true);
         assert!(reminder.contains("快到期") && reminder.contains("不會啟用"));
     }
 

@@ -377,6 +377,9 @@ impl MethodHandler {
                         general.insert("company_timezone".into(), toml::Value::String(v.into()));
                         changes.push(format!("general.company_timezone = \"{v}\""));
                     }
+                    if general.remove("company_timezone_source").is_some() {
+                        changes.push("general.company_timezone_source cleared".into());
+                    }
                 }
                 // WP: global default reply language. Empty string clears it
                 // (agent reverts to "follow the user's input language" — the
@@ -1353,6 +1356,45 @@ mod memory_privacy_toggle_tests {
 #[cfg(test)]
 mod company_timezone_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn admin_save_clears_detected_marker() {
+        for zone in ["Asia/Taipei", "Asia/Tokyo", ""] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"),
+                "[general]\ncompany_timezone = 'Asia/Taipei'\ncompany_timezone_source = 'detected_at_upgrade'\n").unwrap();
+            std::fs::create_dir_all(home.path().join("state")).unwrap();
+            let marker = home.path().join("state/company-timezone-init.json");
+            std::fs::write(&marker, "{\"version\":\"1.86.0\",\"result\":\"written\"}").unwrap();
+            let marker_before = std::fs::read(&marker).unwrap();
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let frame = handler.handle_system_update_config(
+                json!({"company_timezone": zone}), &UserContext::admin_fallback(),
+            ).await;
+            assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+            let table: toml::Table = std::fs::read_to_string(home.path().join("config.toml")).unwrap().parse().unwrap();
+            assert!(table["general"].get("company_timezone_source").is_none());
+            assert_eq!(table["general"].get("company_timezone").and_then(toml::Value::as_str),
+                if zone.is_empty() { None } else { Some(zone) });
+            assert_eq!(std::fs::read(&marker).unwrap(), marker_before);
+            let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+            assert!(audit.contains("general.company_timezone_source cleared"));
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_save_without_source_does_not_audit_source_cleared() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[general]\nname = 'test'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let frame = handler.handle_system_update_config(
+            json!({"company_timezone": "Asia/Taipei"}), &UserContext::admin_fallback(),
+        ).await;
+        assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+        let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("general.company_timezone ="));
+        assert!(!audit.contains("general.company_timezone_source cleared"));
+    }
 
     #[tokio::test]
     async fn company_timezone_setting_writes_and_empty_clears() {

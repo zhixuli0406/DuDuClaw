@@ -340,9 +340,9 @@ fn xml_escape(s: &str) -> String {
 /// buttons; a text-only channel matches the reply against the existing
 /// `is_confirmation_reply` / `is_denial_reply` word lists and calls
 /// [`ApprovalBroker::decide`].
-pub fn pending_summary_for_channel(record: &ApprovalRecord) -> String {
+pub fn pending_summary_for_channel(home: &Path, record: &ApprovalRecord) -> String {
     if record.payload.get("egress_guard").is_some() {
-        return crate::approval_notify::dashboard_only_notice_body(record, false);
+        return crate::approval_notify::dashboard_only_notice_body(home, record, false);
     }
     let agent = xml_escape(&record.agent_id);
     let kind = xml_escape(&record.action_kind);

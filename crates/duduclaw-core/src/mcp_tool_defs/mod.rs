@@ -302,6 +302,28 @@ mod registration_tests {
     use super::{build_tool_schema, tools, EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS};
 
     #[test]
+    fn company_timezone_schedule_and_reminder_descriptions() {
+        let description = |tool: &str, param: &str| {
+            tools().find(|t| t.name == tool).unwrap().params.iter()
+                .find(|p| p.name == param).unwrap().description
+        };
+        let schedule = description("tasks_create", "schedule");
+        assert!(schedule.contains("company time zone"));
+        assert!(schedule.contains("RFC3339 instant with an offset"));
+        let zone = description("tasks_create", "cron_timezone");
+        for rule in ["administrator's company time zone", "UTC if unset", "member-origin", "daylight saving", "Explicit zones kept", "member DST zones refused"] {
+            assert!(zone.contains(rule), "{zone}");
+        }
+        let reminder = description("create_reminder", "time");
+        assert!(reminder.contains("with an offset"));
+        assert!(reminder.contains("company time zone local time"));
+        for text in [schedule, zone, reminder] {
+            assert!(text.len() <= 200, "description exceeds prompt budget: {text}");
+        }
+        assert!(tools().find(|t| t.name == "create_reminder").unwrap().description.len() <= 200);
+    }
+
+    #[test]
     fn odoo_schemas_declare_numeric_and_boolean_parameters() {
         for (tool, param, ty) in PARAM_TYPES.iter().filter(|(tool, _, _)| tool.starts_with("odoo_")) {
             let definition = tools().find(|definition| definition.name == *tool).unwrap();

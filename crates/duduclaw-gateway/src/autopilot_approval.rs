@@ -622,11 +622,11 @@ pub(crate) async fn push_admin_notice(home: &Path, rule_id: &str, body: &str) ->
 /// that an automation action waits for an administrator to review it in the
 /// dashboard, until when, and the card number — never the rule's action,
 /// prompt, message, target or the rule name.
-pub(crate) fn pending_notice_body(rec: &ApprovalRecord, reminder: bool, lang: Lang) -> String {
+pub(crate) fn pending_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool, lang: Lang) -> String {
     let deadline = rec
         .expires_at_epoch()
         .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string());
+        .map(|dt| duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), dt, "%H:%M"));
     let id = duduclaw_core::truncate_chars(rec.id.as_str(), 8);
     match lang {
         Lang::ZhTw => format!(
@@ -910,6 +910,23 @@ mod tests {
         assert_eq!(latest_execution_at(now, 3600), "2026-11-13T11:15:00Z");
     }
 
+    #[test]
+    fn pending_notice_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut rec = pending_card();
+        rec.created_at = "2026-11-27T00:30:00Z".into();
+        rec.ttl_seconds = 3600;
+        for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
+            assert!(pending_notice_body(home.path(), &rec, false, lang).contains("01:30 UTC"));
+        }
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
+            assert!(pending_notice_body(home.path(), &rec, false, lang).contains("09:30 CST"));
+        }
+        rec.created_at = "bad timestamp".into();
+        assert!(!pending_notice_body(home.path(), &rec, false, Lang::En).contains("before "));
+    }
+
     fn pending_card() -> ApprovalRecord {
         ApprovalRecord {
             id: crate::approval::ApprovalId::new(),
@@ -938,10 +955,11 @@ mod tests {
     /// each language, and is not the knowledge-review text.
     #[test]
     fn pending_notice_body_carries_no_action_content() {
+        let home = tempfile::tempdir().unwrap();
         let rec = pending_card();
         for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
             for reminder in [false, true] {
-                let body = pending_notice_body(&rec, reminder, lang);
+                let body = pending_notice_body(home.path(), &rec, reminder, lang);
                 for secret in ["季報", "plain", "secret-rule", "task_created", "gate"] {
                     assert!(!body.contains(secret), "{lang:?}: {body}");
                 }
@@ -949,12 +967,12 @@ mod tests {
                 assert!(body.contains(&duduclaw_core::truncate_chars(rec.id.as_str(), 8)));
             }
         }
-        assert!(pending_notice_body(&rec, false, Lang::ZhTw).contains("自動化規則的動作"));
-        assert!(pending_notice_body(&rec, false, Lang::En).contains("automation action"));
-        assert!(pending_notice_body(&rec, false, Lang::Ja).contains("自動化ルールの動作"));
-        assert!(pending_notice_body(&rec, true, Lang::ZhTw).contains("快到期"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::ZhTw).contains("自動化規則的動作"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::En).contains("automation action"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::Ja).contains("自動化ルールの動作"));
+        assert!(pending_notice_body(home.path(), &rec, true, Lang::ZhTw).contains("快到期"));
         // The dashboard-only notice dispatcher routes this kind to it.
-        let body = crate::approval_notify::dashboard_only_notice_body(&rec, false);
+        let body = crate::approval_notify::dashboard_only_notice_body(home.path(), &rec, false);
         assert!(body.contains("自動化規則的動作") && !body.contains("知識"), "{body}");
     }
 }

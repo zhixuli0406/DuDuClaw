@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useRef, useState } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useIntl } from 'react-intl';
@@ -21,11 +22,11 @@ function errorMessage(error: unknown): string {
 
 type DecisionTranslator = (id: string, values?: Record<string, string | number>) => string;
 
-function dateTime(value: string | number, locale: string): string {
+function dateTime(value: string | number, locale: string, t: DecisionTranslator): string {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat(locale, {
-    dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC',
-  }).format(date);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const time = formatDateTime(date, { locale, zone: 'UTC', dateStyle: 'medium', timeStyle: 'short' });
+  return t('decisionLab.utcTime', { time });
 }
 
 function syntheticPilotIdentity(snapshotId: string): { seed: number; days: number } | null {
@@ -38,6 +39,7 @@ function syntheticPilotIdentity(snapshotId: string): { seed: number; days: numbe
 }
 
 export function DecisionLabPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const navigate = useNavigate();
   const location = useLocation();
@@ -535,9 +537,9 @@ export function DecisionLabPage() {
         {overview && <>
           <p className="rounded-md border px-3 py-2 text-sm" role="status">{intl.formatMessage({ id: 'decisionLab.loadedScope' }, { tenant: overview.tenant_id, acl: overview.acl })}</p>
           <section aria-label={t('decisionLab.overview')} className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <MetricCard label={t('decisionLab.status')} value={overview.status} detail={intl.formatMessage({ id: 'decisionLab.generatedAt' }, { time: dateTime(overview.generated_at_utc, intl.locale) })} />
+            <MetricCard label={t('decisionLab.status')} value={overview.status} detail={intl.formatMessage({ id: 'decisionLab.generatedAt' }, { time: formatDateTime(overview.generated_at_utc, { locale: intl.locale, zone: 'UTC', dateStyle: 'medium', timeStyle: 'short' }) })} />
             <MetricCard label={t('decisionLab.invalidatedInputs')} value={String(overview.invalidated_inputs)} />
-            <MetricCard label={t('decisionLab.ticketActive')} value={String(overview.ticket_sources.active)} detail={intl.formatMessage({ id: 'decisionLab.nextExpiry' }, { time: overview.ticket_sources.next_expiry_utc ? dateTime(overview.ticket_sources.next_expiry_utc, intl.locale) : t('decisionLab.none') })} />
+            <MetricCard label={t('decisionLab.ticketActive')} value={String(overview.ticket_sources.active)} detail={intl.formatMessage({ id: 'decisionLab.nextExpiry' }, { time: overview.ticket_sources.next_expiry_utc ? dateTime(overview.ticket_sources.next_expiry_utc, intl.locale, t) : t('decisionLab.none') })} />
             <MetricCard label={t('decisionLab.ticketOther')} value={`${overview.ticket_sources.expired} / ${overview.ticket_sources.revoked}`} detail={t('decisionLab.expiredRevoked')} />
           </section>
 
@@ -592,8 +594,8 @@ export function DecisionLabPage() {
               <Button disabled={busy || !shadowPolicyId.trim()} onClick={loadShadowMonitor}>{t('decisionLab.shadowLoad')}</Button>
             </div>
             {shadowMonitor && <div className="space-y-3" aria-label={t('decisionLab.shadowTitle')}>
-              <p className="text-xs text-muted-foreground">{t('decisionLab.shadowAssessedAt')}: {dateTime(shadowMonitor.assessed_at_utc, intl.locale)} · {shadowMonitor.policy.queue_id ?? t('decisionLab.sourceUnmarked')}</p>
-              <p className="text-xs text-muted-foreground">{t('decisionLab.shadowWindow')}: {dateTime(shadowMonitor.policy.effective_from_utc, intl.locale)} – {dateTime(shadowMonitor.policy.effective_until_utc, intl.locale)}</p>
+              <p className="text-xs text-muted-foreground">{t('decisionLab.shadowAssessedAt')}: {dateTime(shadowMonitor.assessed_at_utc, intl.locale, t)} · {shadowMonitor.policy.queue_id ?? t('decisionLab.sourceUnmarked')}</p>
+              <p className="text-xs text-muted-foreground">{t('decisionLab.shadowWindow')}: {dateTime(shadowMonitor.policy.effective_from_utc, intl.locale, t)} – {dateTime(shadowMonitor.policy.effective_until_utc, intl.locale, t)}</p>
               <div className="grid gap-3 lg:grid-cols-2">
                 <ShadowAssessmentCard title={t('decisionLab.shadowAggregate')} assessment={shadowMonitor.aggregate} t={t} />
                 <ShadowAssessmentCard title={t('decisionLab.shadowSla')} assessment={shadowMonitor.sla} t={t} />
@@ -696,9 +698,9 @@ export function DecisionLabPage() {
               {pilotReview && <div className="space-y-1 rounded border p-3 text-sm" role="status">
                 <p><Badge variant={pilotReview.status === 'approved' ? 'secondary' : 'outline'}>{t(`decisionLab.reviewStatus.${pilotReview.status}`)}</Badge></p>
                 <p>{t('decisionLab.approvalId')}: <span className="break-all font-mono">{pilotReview.link.approval_id}</span></p>
-                <p>{t('decisionLab.reviewExpires')}: {dateTime(pilotReview.expires_at_utc, intl.locale)}</p>
+                <p>{t('decisionLab.reviewExpires')}: {dateTime(pilotReview.expires_at_utc, intl.locale, t)}</p>
                 {pilotReview.decided_by && <p>{t('decisionLab.reviewDecider')}: {pilotReview.decided_by}</p>}
-                {reviewCheckedAt && <p className="text-xs text-muted-foreground">{t('decisionLab.reviewCheckedAt')}: {dateTime(reviewCheckedAt, intl.locale)}</p>}
+                {reviewCheckedAt && <p className="text-xs text-muted-foreground">{t('decisionLab.reviewCheckedAt')}: {dateTime(reviewCheckedAt, intl.locale, t)}</p>}
                 <p className="text-xs text-muted-foreground">{t('decisionLab.reviewReceiptOnly')}</p>
               </div>}
             </CardContent></Card>}
@@ -825,7 +827,7 @@ function EngineeringValidationPanel({ busy, report, origin, locale, t, onRun }: 
       <Button disabled={busy} onClick={onRun}>{t('decisionLab.runEngineeringValidation')}</Button>
     </div>
     {report && <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2"><Badge variant="outline">{report.status}</Badge><span className="text-xs text-muted-foreground">{t('decisionLab.generatedAtUtcLabel')}: {dateTime(report.generated_at_utc, locale)}</span></div>
+      <div className="flex flex-wrap items-center gap-2"><Badge variant="outline">{report.status}</Badge><span className="text-xs text-muted-foreground">{t('decisionLab.generatedAtUtcLabel')}: {dateTime(report.generated_at_utc, locale, t)}</span></div>
       <div className="break-all rounded border p-2 text-xs"><p>{t('decisionLab.snapshot')}: <span className="font-mono">{report.snapshot_id}</span></p>
         <p>{t('decisionLab.model')}: <span className="font-mono">{report.model_version}</span></p>
         <p>{t('decisionLab.sourceArtifact')}: <span className="font-mono">{report.source_artifact_id}</span></p>
@@ -1433,7 +1435,7 @@ function EvidenceBriefReport({ brief, origin, locale, t }: {
         ? 'decisionLab.yes' : 'decisionLab.no')}</p>
       <p className="break-all font-mono text-xs">{t('decisionLab.forecastRecordId')}: {forecast.record_id} · {t('decisionLab.forecastRecordSha')}: {forecast.record_sha256}</p>
       <p className="break-all font-mono text-xs">{t('decisionLab.uploadSourceSha')}: {forecast.source_sha256} · {t('decisionLab.evidenceForecastEngineHash')}: {forecast.calibration_engine_sha256}</p>
-      <p className="text-xs text-muted-foreground">{t('decisionLab.evidenceForecastWindow')}: {dateTime(forecast.window_start_utc, locale)}</p>
+      <p className="text-xs text-muted-foreground">{t('decisionLab.evidenceForecastWindow')}: {dateTime(forecast.window_start_utc, locale, t)}</p>
     </div>}
     {screen && <p className="break-all text-sm">{t('decisionLab.evidenceScreenHash')}: {screen.screen_hash} · {t('decisionLab.empiricalScreenChoice')}: {t(`decisionLab.empiricalChoice.${screen.report.choice}`)}</p>}
     {effects.length > 0 && <div className="space-y-2">
@@ -1473,9 +1475,9 @@ function ObservationalEvidenceCard({ effect, dataCutoffUtc, locale, t }: {
     <p className="break-all">{t('decisionLab.evidenceVariables', {
       treatment: effect.treatment_variable_id, treatmentUnit: effect.treatment_unit,
       outcome: effect.outcome_variable_id, outcomeUnit: effect.outcome_unit })}</p>
-    <p>{t('decisionLab.evidenceEffectWindow', { start: dateTime(effect.window_start, locale),
-      end: dateTime(effect.window_end, locale) })}</p>
-    <p>{t('decisionLab.evidenceIngestedAt')}: {dateTime(effect.data_ingested_at, locale)}</p>
+    <p>{t('decisionLab.evidenceEffectWindow', { start: dateTime(effect.window_start, locale, t),
+      end: dateTime(effect.window_end, locale, t) })}</p>
+    <p>{t('decisionLab.evidenceIngestedAt')}: {dateTime(effect.data_ingested_at, locale, t)}</p>
     <p>{t('decisionLab.evidenceSampleSize', { units: effect.unit_count, strata: effect.strata_count })}</p>
     <p>{t('decisionLab.evidenceNegativeControl')}: {status(effect.negative_control?.imbalance_flag)}
       {' · '}{t('decisionLab.evidencePreTreatment')}: {status(effect.pre_treatment_placebo?.imbalance_flag)}</p>
@@ -1497,7 +1499,7 @@ function ObservationalEvidenceCard({ effect, dataCutoffUtc, locale, t }: {
       shift: effect.leave_one_unit_out.max_abs_effect_shift === null
         ? t('decisionLab.evidenceCheckUnavailable') : number(effect.leave_one_unit_out.max_abs_effect_shift) })}</p>
     {effect.temporal_holdout && <p>{t('decisionLab.evidenceTemporalDetail', {
-      cutoff: dateTime(effect.temporal_holdout.cutoff, locale),
+      cutoff: dateTime(effect.temporal_holdout.cutoff, locale, t),
       training: number(effect.temporal_holdout.training_estimate),
       heldout: number(effect.temporal_holdout.holdout_estimate),
       gap: number(effect.temporal_holdout.abs_gap),
@@ -1536,7 +1538,7 @@ function ArtifactRow({ artifact, locale, t }: { artifact: DecisionArtifact; loca
     .filter((value): value is string => Boolean(value));
   return <div className="space-y-1 py-3 first:pt-0 last:pb-0">
     <div className="flex flex-wrap items-center gap-2"><Badge variant="outline">{artifact.kind}</Badge><span className="break-all font-mono text-xs">{artifact.id}</span>{artifact.status && <Badge variant="secondary">{artifact.status}</Badge>}</div>
-    <p className="text-xs text-muted-foreground">{dateTime(artifact.created_at_unix, locale)} · {artifact.ticket_backed ? t('decisionLab.ticketBacked') : t('decisionLab.notTicketBacked')}</p>
+    <p className="text-xs text-muted-foreground">{dateTime(artifact.created_at_unix, locale, t)} · {artifact.ticket_backed ? t('decisionLab.ticketBacked') : t('decisionLab.notTicketBacked')}</p>
     {refs.length > 0 && <p className="break-words text-xs text-muted-foreground">{refs.join(' · ')}</p>}
     {artifact.replay_hash && <p className="break-all font-mono text-xs text-muted-foreground">{t('decisionLab.replayHash')}: {artifact.replay_hash}</p>}
   </div>;

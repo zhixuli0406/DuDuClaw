@@ -944,7 +944,7 @@ Non-Admin add/update scans the complete resulting name + task model prompt with 
 
 Employee cron uses UTC (also accepts zero-offset UTC/GMT aliases) or an IANA timezone whose UTC offset stays the same over the next two years, such as `Asia/Taipei`; with a constant offset, clock-time gaps equal elapsed time, so the 15-minute proof holds. A timezone with daylight saving or another offset change is refused on create, edit, resume or manual run, and the scheduler skips it, because DST can compress clock-time gaps. Such records remain readable and authorized users can pause/remove them; Admin manages other timezone schedules and must change a skipped one to UTC or a timezone without daylight saving.
 
-Human-origin MCP creation defaults to UTC and accepts an explicit timezone without daylight saving; unmarked Admin/background schedules keep local-timezone detection.
+New schedules without an explicit timezone use the company time zone; when it is unset or invalid they use UTC. Member-created routines use UTC with a notice if the company time zone observes daylight saving. Existing schedules are unchanged.
 
 ### Wiki path and policy checks
 

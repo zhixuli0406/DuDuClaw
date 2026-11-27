@@ -282,6 +282,12 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 ## 從說明搬出來的長版細節
 
+### `tasks_create` 排程
+
+cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未設定或無效時改用 UTC，並在確認訊息說明。公司時區有夏令時間時，成員建立的例行工作以 UTC 儲存並提示。一次性 `schedule` 時間必須包含 UTC 偏移，例如 `2026-11-28T09:00:00+08:00`。
+
+
+
 ### `tasks_create`／`tasks_update` — 目標費用上限
 
 `tasks_create` 搭配 `kind="goal"` 時接受 `cost_cap_cents`，單位是美分，須為正整數（最大 `9223372036854775807`）。省略時使用 `[goal_loop] default_cost_cap_cents`（`0` 代表沒有預設上限）。一般任務與排程請求帶這個參數會被拒絕。例如 `{"kind":"goal","title":"檢查報告","assigned_to":"agnes","cost_cap_cents":500}`，其他目標說明與驗收標準仍照常填寫。
