@@ -303,13 +303,27 @@ Admin only (`delegation.get` / `delegation.set`). Saved changes apply to the nex
 | Delegation mode → Department (default) / Reporting line / Open / No delegation (v1.82) | `config.toml [delegation] policy` = `department` / `hierarchy` / `open` / `none` | Next delegation |
 | Cross-department collaboration → pairs | `[delegation] allow = [["a", "b"], …]` | Next delegation |
 
-**No delegation (`none`, v1.82.0).** No AI employee may delegate to, message, spawn, create or assign work to another AI employee: `send_to_agent`, `spawn_agent`, `spawn_ephemeral`, `create_agent`, `tasks_create` / `create_task` naming another employee, task reassignment, scheduled work for another employee and the bus dispatch gate all refuse. The first four tools are hidden from employees' tool lists; `tasks_create` and `create_task` stay listed for the employee's own work. Cross-department pairs stay saved but do not apply (the page says so). People and schedules you configured (dashboard, cron, heartbeat, the goal loop) still give work to employees. Team mode (one employee's planner, executor and verifier roles exchanging task packets within one goal round) keeps working.
+**No delegation (`none`, v1.82.0).** Unless the v1.86.0 role exception below applies, no AI employee may delegate to, message, spawn, create or assign work to another AI employee: `send_to_agent`, `spawn_agent`, `spawn_ephemeral`, `create_agent`, `tasks_create` / `create_task` naming another employee, task reassignment, scheduled work for another employee and the bus dispatch gate all refuse. The first four tools are hidden from employees' tool lists; `tasks_create` and `create_task` stay listed for the employee's own work. Cross-department pairs stay saved but do not apply (the page says so). People and schedules you configured (dashboard, cron, heartbeat, the goal loop) still give work to employees. Team mode (one employee's planner, executor and verifier roles exchanging task packets within one goal round) keeps working.
+
+**Roles exempt from delegation scope (v1.86.0).** Check Admin or Manager; all are unchecked by default. A checked role's member may use their own AI avatar, assigned in member management by an administrator, to hand work to any AI employee and create tasks, schedules or reminders for anyone. This requires the member's own request in that conversation. The recipient gains no right to delegate back. Each decision rechecks the account's status and role. The exception applies only while the member personally asks in that conversation; schedules, reminders and other background work of that AI follow the ordinary delegation rules in every mode, including protected mode.
+
+Only Admin and Manager (`admin` / `manager`) are eligible. Employee is not offered because selecting it would exempt every ordinary member’s AI avatar; legacy `employee` entries in `unrestricted_roles` are ignored. Adding a role requires reading the risk notice and checking **I understand** before saving. The gateway requires `acknowledge_risk: true` for additions through both `delegation.set` and `config.raw.set`. The `delegation_config_changed` audit record includes `roles_added`, the enabling user ID (`acknowledged_by`) and a server-generated RFC3339 timestamp (`acknowledged_at`). Removing roles requires no acknowledgement and is still audited.
+
+The role exception also applies under **No delegation**, and the page shows a warning when roles are checked. Both two-way and one-way pairs stay inactive under that mode. Always-deny boundaries still apply: self-delegation, another owner's personal employee, the main-agent boundary for non-admin requests, machine employees and an employee with **Can Send Cross-Agent Messages** off. Human-principal enforcement still applies. Decisions check those boundaries, then the role exception, then pairs, then the mode. 
+
+**Cross-department pairs.** Choose Two-way or One-way A → B on each row; use the swap button to reverse it. Existing pairs remain two-way. One-way permits A → B without granting B → A; other applicable rules may still allow the reverse direction.
+
+**Saving and refusals.** Saving any delegation setting invalidates pending approval cards bound to that setting and pauses enabled workflows until their next run. A refused delegation gives the AI and the person a consistent explanation of the active rule, the reason for this pair and the next step.
+
+Schedules, tasks and skills that people create from the dashboard, plus webhooks, timers and automation rules, are operator actions and are not limited by AI-to-AI delegation rules.
 
 **Unrecognised values fail closed (behaviour change in v1.82.0).** A `policy` value that is not one of the four (a typo, a number), a `[delegation]` that is not a table, and a `config.toml` that exists but cannot be read or parsed are all enforced as `none`. Before v1.82.0 they fell back to the wider `department`. The gateway logs the problem once per process; the page lists it under warnings, `delegation.get` returns the raw value as `configured_policy`, and an unparsable file makes `delegation.get` and `delegation.set` return an error (nothing is written). Fix the value in the Advanced config editor.
 
 **Load failures cannot overwrite the setting (v1.82.0).** If the page cannot load the current setting, it shows the error and keeps every control and **Save** disabled until **Try again** succeeds; it never submits values it did not load.
 
 **Employee page → Overview → Delegation (v1.82.0).** A read-only card shows what applies to that employee: the effective mode, whether it comes from the company-wide setting or the employee's own **Can Send Cross-Agent Messages** switch (`[permissions] can_send_cross_agent = false` makes it `none` for that employee), whether it may create employees or temporary helpers, the pairs naming it (pairs that do not apply in the current mode are listed separately) and any configuration problem. Visible to Admins and to Managers with access to the employee (`delegation.effective {agent_id}`, read-only). When white-list entries were dropped as malformed, the card shows only how many ("N delegation setting warnings — an administrator can review them in Settings"); the warning texts quote the raw entries and are shown on this page (Admin) only. Change the setting on this page or on the employee edit page.
+
+The card also shows role-exception eligibility and one-way pairs as outgoing and incoming. Current account and work context are still checked on every request.
 
 ## Channels
 
@@ -1044,3 +1058,20 @@ recovery code. Expiry is mandatory (1–365 days); the UI offers 30/90/365 and d
 to 90. Each member can have five active keys. The secret is shown once. Password
 changes and MFA resets invalidate existing keys. Do not put keys in browser
 front-end code; call from your server. See the [member API contract](../api/member-contract.md#personal-member-api-keys-1850).
+
+## Company Google sign-in
+
+`[google_signin]` is administered through `google.signin.set`. Set these values from the dashboard's Google settings once available; its pages are not built yet. Personal edition does not offer this feature. Enabling sign-in, switching to direct creation, or enabling approval-based MFA enrollment requires explicit risk acknowledgement. A configured company Google OAuth client and valid `[dashboard] public_url` are also required for sign-in.
+
+| Key | Default / meaning |
+|---|---|
+| `enabled` | `false`. Requests Google sign-in; effective only with acknowledgement and a nonempty valid domain list. |
+| `enabled_ack` | Absent. `{ by, at }` records the administrator and time, both nonblank strings; written only by the settings method. |
+| `allowed_hd` | Empty. Settings accepts 1–50 ASCII domains, trims and lowercases them, and removes duplicates. Matches the verified ID-token `hd` in full; no subdomain matching. |
+| `approval` | `"admin"` for approval requests; `"direct"` creates accounts directly. |
+| `daily_new_accounts` | `20`, range 1–200. Rolling 24-hour new-account limit, including pending requests. |
+| `avatar_template` | Absent or `""` selects a blank avatar; `"company:<key>"` selects a non-premium, single-employee company template. |
+| `avatar_template_revision` | Positive integer required for a company template. A revision mismatch waits for an administrator. |
+| `approval_grants_mfa_enrollment` | `false`. Allows an administrator to grant first MFA enrollment explicitly when approving; one use within 72 hours. Enabling this key alone grants nothing. |
+
+Settings are reread at start, callback and completion. An unreadable or malformed config disables sign-in. Missing/wrong-type `enabled`, missing or blank acknowledgement fields, or an empty/invalid `allowed_hd` list disables it too; one malformed domain invalidates the entire list. Only exact `"direct"` selects direct creation; other approval values require admin approval. A missing cap uses 20; an invalid cap becomes zero and blocks new admissions. An invalid template blocks avatar creation without selecting a blank fallback. MFA preauthorization is enabled only by boolean `true`. The raw config editor can only disable sign-in, remove its acknowledgement or delete the section; it cannot enable or expand this feature.

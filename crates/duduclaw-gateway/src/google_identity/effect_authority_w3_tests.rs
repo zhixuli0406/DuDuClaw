@@ -110,6 +110,26 @@ fn count(wire: &D1Wire) -> usize {
     wire.hits.load(Ordering::SeqCst)
 }
 #[tokio::test]
+async fn assertion_drive_refusals_never_reach_wire() {
+    use crate::google_workspace::native_confirmation::{drive_refusal_cases, TEST_DRIVE_REQUEST};
+    for kind in ["sa", "delegate"] {
+        let wire = d1_wire(|_, _| D1Reply::json(json!({"files":[]}))).await;
+        let h = Harness::new(kind, &wire).await;
+        let value = h.call("drive_search", json!({"query":"q"})).await.unwrap();
+        assert_ne!(value["isError"], true);
+        assert_eq!(wire.hits.swap(0, Ordering::SeqCst), 1);
+        wire.requests.lock().unwrap().clear();
+        for (method, url) in drive_refusal_cases() {
+            let result = TEST_DRIVE_REQUEST.scope((method.clone(), url.clone()),
+                h.call("drive_search", json!({"query":"q"}))).await;
+            assert!(result.is_err(), "{kind}: {method} {url}");
+            assert_eq!(count(&wire), 0);
+            assert!(wire.requests.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn w3_home_sa_and_delegate_execute_all_eighteen_actual_native_recipes() {
     for kind in ["sa", "delegate"] {
         let wire = d1_wire(|_, _| D1Reply::ok()).await;

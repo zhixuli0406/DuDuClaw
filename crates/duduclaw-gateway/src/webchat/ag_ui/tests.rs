@@ -329,7 +329,7 @@ async fn resume_authorization_denies_dashboard_only_other_kinds_and_non_admin() 
         let mut input = f.input();
         input.resume = serde_json::from_value(json!([{"interruptId":id.as_str(), "status":"cancelled"}])).unwrap();
         let (connection, _rx) = f.connection(input);
-        assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record], &mut HashMap::new()).await, Err("approval_forbidden"));
+        assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record], &mut HashMap::new()).await, Err("approval_forbidden".into()));
         assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
     }
     let id = crate::approval::scope_turn("resume-session", "resume-turn",
@@ -352,7 +352,7 @@ async fn resumed_decision_cannot_change_after_atomic_success() {
     run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record.clone()], &mut accepted).await.unwrap();
     input.resume[0].payload = Some(json!({"approved":false}));
     let (changed, _rx) = f.connection(input);
-    assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &changed, &[record], &mut accepted).await, Err("resume_decision_changed"));
+    assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &changed, &[record], &mut accepted).await, Err("resume_decision_changed".into()));
 }
 
 #[tokio::test]
@@ -413,7 +413,7 @@ async fn self_approval_policy_blocks_approve_but_allows_deny() {
     let mut input = f.input();
     input.resume = serde_json::from_value(json!([{"interruptId":id.as_str(),"status":"resolved","payload":{"approved":true}}])).unwrap();
     let (connection, _rx) = f.connection(input.clone());
-    assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record.clone()], &mut HashMap::new()).await, Err("self_approval_forbidden"));
+    assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record.clone()], &mut HashMap::new()).await, Err("self_approval_forbidden".into()));
     input.resume[0].payload = Some(json!({"approved":false}));
     let (connection, _rx) = f.connection(input);
     run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn", &connection, &[record], &mut HashMap::new()).await.unwrap();
@@ -436,17 +436,17 @@ async fn external_confirmation_requires_matching_result_origin_and_live_access()
     input.resume = serde_json::from_value(json!([{"interruptId":id.as_str(), "status":"resolved", "payload":{"approved":true}}])).unwrap();
     let (connection, _rx) = f.connection(input.clone());
     assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn",
-        &connection, &[card.clone()], &mut HashMap::new()).await, Err("approval_forbidden"));
+        &connection, &[card.clone()], &mut HashMap::new()).await, Err("approval_forbidden".into()));
     broker.decide(&id, false, "dashboard:admin").await.unwrap();
     assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn",
-        &connection, &[card.clone()], &mut HashMap::new()).await, Err("resume_decision_changed"));
+        &connection, &[card.clone()], &mut HashMap::new()).await, Err("resume_decision_changed".into()));
     input.resume[0].payload = Some(json!({"approved":false}));
     let (connection, _rx) = f.connection(input);
     assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "other-session", "resume-turn",
-        &connection, &[card.clone()], &mut HashMap::new()).await, Err("stale_interrupt"));
+        &connection, &[card.clone()], &mut HashMap::new()).await, Err("stale_interrupt".into()));
     f.chat.user_db.set_user_status(&f.user, duduclaw_auth::UserStatus::Suspended).unwrap();
     assert_eq!(run::decide_resume(&state, &broker, &f.user, "worker", "resume-session", "resume-turn",
-        &connection, &[card], &mut HashMap::new()).await, Err("authorization_changed"));
+        &connection, &[card], &mut HashMap::new()).await, Err("authorization_changed".into()));
     assert_eq!(broker.get(&id).await.unwrap().unwrap().decided_by.as_deref(), Some("dashboard:admin"));
 }
 
@@ -532,4 +532,45 @@ async fn member_key_bearer_has_live_provenance_and_is_revocable() {
     assert!(authenticate(&f.chat, &headers).await.is_err());
     assert_eq!(f.chat.chat_credential_validity(Some(&identity), true).await,
         crate::handlers::live_context::SocketValidity::Revoked);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn entry_refusal_blocks_ag_ui_start_and_positive_resume_but_not_denial() {
+    for broken in [false, true] {
+        let f = Fixture::new(UserRole::Admin).await;
+        let state = f.state();
+        let broker = state.chat.approvals.clone().unwrap();
+        let sid = session_id(&f.user, "worker", "thread");
+        let id = crate::approval::scope_turn(&sid, "resume-turn",
+            broker.request("worker", "mcp_call", "test", json!({}), 120)).await.unwrap();
+        let record = broker.get(&id).await.unwrap().unwrap();
+        let path = f.home.path().join("agents/worker/agent.toml");
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["model"]["preferred"] = toml::Value::String("gpt-5.4".into());
+        doc.as_table_mut().unwrap().insert("runtime".into(), toml::Value::Table(toml::map::Map::from_iter([
+            ("provider".into(), toml::Value::String("grok".into()))])));
+        std::fs::write(path, if broken { "[model".into() } else { toml::to_string(&doc).unwrap() }).unwrap();
+        let before = crate::model_call_probe::calls();
+        let response = router(f.chat.clone()).oneshot(f.request(Some(&f.token), serde_json::to_value(f.input()).unwrap())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = to_bytes(response.into_body(), MAX_BODY).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let code = if broken { "agent_config_unreadable" } else { "model_provider_mismatch" };
+        assert!(value["message"].as_str().unwrap().contains(code));
+        let mut input = f.input();
+        input.resume = serde_json::from_value(json!([{"interruptId":id.as_str(),"status":"resolved","payload":{"approved":true}}])).unwrap();
+        let (connection, _rx) = f.connection(input.clone());
+        let mut accepted = HashMap::new();
+        let error = run::decide_resume(&state, &broker, &f.user, "worker", &sid, "resume-turn", &connection, &[record.clone()], &mut accepted).await.unwrap_err();
+        assert!(matches!(error, run::ResumeError::Entry(ref text) if text.contains(code)));
+        assert!(accepted.is_empty());
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        input.resume[0].payload = Some(json!({"approved":false}));
+        let (connection, _rx) = f.connection(input);
+        run::decide_resume(&state, &broker, &f.user, "worker", &sid, "resume-turn", &connection, &[record], &mut accepted).await.unwrap();
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert!(state.chat.ctx.session_manager.get_messages(&sid).await.unwrap().is_empty());
+        crate::channel_reply::entry_gate_test_helpers::assert_no_saved_attachments(f.home.path());
+    }
 }

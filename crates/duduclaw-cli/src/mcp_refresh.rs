@@ -362,7 +362,7 @@ mod tests {
         let (token, _) = issue_refresh_token(dir.path(), "dev", "client", &scopes, false).unwrap();
         let principal = authenticate_with_refresh_token(&token, dir.path()).unwrap();
         assert_eq!(principal.scopes,
-            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect());
+            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
     }
 
     #[test]

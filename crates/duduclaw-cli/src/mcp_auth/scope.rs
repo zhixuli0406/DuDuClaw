@@ -522,6 +522,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // lifecycle + dispatch) — enumerated explicitly instead of relying
         // on the Admin fall-through (2026-07 scope-table consistency).
         | "spawn_ephemeral"
+        | "admin_settings_read"
+        | "admin_settings_propose"
         | "agent_update"
         | "agent_update_soul"
         | "agent_remove"

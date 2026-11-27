@@ -554,6 +554,7 @@ mod instructions_slot_tests {
     async fn full_mode_injects_instructions_after_identity() {
         let (_tmp, agent) = agent_with("").await;
         let p = prompt_for(&agent);
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         let soul = p.find("SOUL-BODY").unwrap();
         let ident = p.find("IDENTITY-BODY").unwrap();
         let user = p.find("USER-BODY &lt;/user_profile&gt;").expect("user data is escaped");
@@ -570,6 +571,7 @@ mod instructions_slot_tests {
     async fn minimal_mode_injects_instructions_too() {
         let (_tmp, agent) = agent_with("\n[prompt]\nmode = \"minimal\"\n").await;
         let p = prompt_for(&agent);
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         assert!(p.contains("# Instructions\nINSTRUCTIONS-BODY"), "{p}");
         let labels = ["Your name is", "SOUL-BODY", "IDENTITY-BODY", "USER-BODY &lt;/user_profile&gt;", "# Instructions", "CONTRACT-BODY"];
         let positions: Vec<_> = labels.iter().map(|label| p.find(label).unwrap()).collect();

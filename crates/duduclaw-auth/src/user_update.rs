@@ -78,6 +78,13 @@ fn apply_update(
     load_user(tx, user_id)
         .map_err(other)?
         .ok_or(UserWriteError::Org(OrgError::UserNotFound))?;
+    // Check the stored credential before any field changes, including a
+    // password supplied in this same request. All role writers use this path.
+    if matches!(update.role, Some(UserRole::Admin | UserRole::Manager)) {
+        let has_password: bool = tx.query_row("SELECT password_hash <> '' FROM users WHERE id=?1",
+            [user_id], |r| r.get(0)).map_err(other)?;
+        if !has_password { return Err(other("role_requires_local_password")); }
+    }
     // An Employee cannot be anyone's manager (Q2).
     if update.role == Some(UserRole::Employee) && reports_count(tx, user_id).map_err(other)? > 0 {
         return Err(OrgError::HasReports.into());

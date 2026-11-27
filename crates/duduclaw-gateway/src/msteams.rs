@@ -858,9 +858,25 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         }
     }
 
+    let drop_files = if !file_attachments.is_empty() {
+        match crate::channel_reply::attachment_gate::check(
+            &state.ctx, &session_id, &session_id,
+            crate::ccr_runtime::reply_principal_for_sender(&sender_id), &text, None, None,
+        ).await {
+            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                drop(typing_guard);
+                deliver_reply(&state.creds, &target, &reply, None).await;
+                return;
+            }
+        }
+    } else { false };
+
     // WP1.3: download inbound file attachments to the resolved agent's dir.
     let mut attachment_lines: Vec<String> = Vec::new();
-    if !file_attachments.is_empty() {
+    if !drop_files && !file_attachments.is_empty() {
         let attach_base =
             crate::channel_reply::resolve_attachment_base(state.ctx.as_ref(), None).await;
         for (name, url) in &file_attachments {
@@ -889,7 +905,7 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
         }
     }
     // ── Quoted-reply context ──
-    let text = match teams_quoted_context(activity) {
+    let text = match teams_quoted_context(activity).filter(|_| !drop_files) {
         Some(quote_block) if text.is_empty() => quote_block,
         Some(quote_block) => format!("{quote_block}\n{text}"),
         None => text,

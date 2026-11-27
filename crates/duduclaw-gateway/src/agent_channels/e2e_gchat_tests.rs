@@ -26,37 +26,51 @@ struct TestKey {
 
 fn test_key() -> &'static TestKey {
     static K: OnceLock<TestKey> = OnceLock::new();
-    K.get_or_init(|| {
-        use aws_lc_rs::encoding::AsDer;
-        use aws_lc_rs::signature::KeyPair as _;
-        let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-        let der = AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).unwrap();
-        let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
-        let body: Vec<String> = b64
-            .as_bytes()
-            .chunks(64)
-            .map(|c| String::from_utf8(c.to_vec()).unwrap())
-            .collect();
-        let pem = format!(
-            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-            body.join("\n")
-        );
-        let public = kp.public_key();
-        TestKey {
-            pem,
-            n: B64URL.encode(public.modulus().big_endian_without_leading_zero()),
-            e: B64URL.encode(public.exponent().big_endian_without_leading_zero()),
-        }
-    })
+    K.get_or_init(generate_test_key)
+}
+
+fn generate_test_key() -> TestKey {
+    use aws_lc_rs::encoding::AsDer;
+    use aws_lc_rs::signature::KeyPair as _;
+    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+    let der = AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).unwrap();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(der.as_ref());
+    let body: Vec<String> = b64
+        .as_bytes()
+        .chunks(64)
+        .map(|c| String::from_utf8(c.to_vec()).unwrap())
+        .collect();
+    let pem = format!(
+        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+        body.join("\n")
+    );
+    let public = kp.public_key();
+    TestKey {
+        pem,
+        n: B64URL.encode(public.modulus().big_endian_without_leading_zero()),
+        e: B64URL.encode(public.exponent().big_endian_without_leading_zero()),
+    }
 }
 
 /// A request token as Google's Chat signer would mint it for `audience`.
 pub(crate) fn chat_jwt(audience: &str) -> String {
+    chat_jwt_with("chat@system.gserviceaccount.com", audience,
+        chrono::Utc::now().timestamp() + 600, true)
+}
+
+/// The untrusted signer uses the same kid but a different RSA key: this tests
+/// signature verification, not just the unknown-kid branch.
+pub(crate) fn chat_jwt_with(issuer: &str, audience: &str, expires: i64, trusted: bool) -> String {
     let now = chrono::Utc::now().timestamp();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
     header.kid = Some("test-kid".into());
-    let claims = json!({"iss": "chat@system.gserviceaccount.com", "aud": audience, "iat": now, "exp": now + 600});
-    let key = jsonwebtoken::EncodingKey::from_rsa_pem(test_key().pem.as_bytes()).unwrap();
+    let claims = json!({"iss":issuer, "aud":audience, "iat":now, "exp":expires});
+    let untrusted;
+    let signer = if trusted { test_key() } else {
+        untrusted = generate_test_key();
+        &untrusted
+    };
+    let key = jsonwebtoken::EncodingKey::from_rsa_pem(signer.pem.as_bytes()).unwrap();
     jsonwebtoken::encode(&header, &claims, &key).unwrap()
 }
 

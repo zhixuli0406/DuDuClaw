@@ -778,6 +778,13 @@ fn session_administration_requires_admin_scope() {
 }
 
 #[test]
+fn drive_write_tools_require_explicit_write_scope() {
+    for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        assert_eq!(tool_requires_scope(tool), Some(Scope::GoogleWrite), "{tool}");
+    }
+}
+
+#[test]
 fn person_tool_scopes_match_the_person_key_contract() {
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         assert_eq!(tool_requires_scope(tool.name).unwrap().to_string(), tool.scope);

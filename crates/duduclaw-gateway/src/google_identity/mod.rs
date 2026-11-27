@@ -27,11 +27,13 @@
 
 pub mod check;
 pub(crate) mod chat_send;
+pub(crate) mod member_card;
 pub(crate) mod personal_check;
 pub(crate) mod delegated_scopes;
 pub(crate) mod delegate_owner;
 pub(crate) mod credential_registry;
 pub(crate) mod effect_authority;
+pub(crate) mod drive_write;
 pub mod delegation_key;
 pub mod execute;
 pub mod isolation_bridge;
@@ -43,6 +45,7 @@ pub mod native_tools;
 pub mod requester_gate;
 pub mod resolve;
 pub mod route;
+pub(crate) mod write_scope_guard;
 pub(crate) mod tenant_source;
 
 #[cfg(test)]
@@ -89,6 +92,14 @@ impl Refusal {
 
 /// Every refusal code this module emits.
 pub const REFUSAL_CODES: &[&str] = &[
+    "drive_write_unsupported_identity",
+    "drive_write_needs_member_consent",
+    "drive_write_needs_home_consent",
+    "changed",
+    "public_visitor",
+    "requester_not_account_holder",
+    "approval_unavailable_unattended",
+    "drive_write_admin_scope_missing",
     "no_verified_caller",
     "external",
     "attestation_required",
@@ -103,7 +114,7 @@ pub const REFUSAL_CODES: &[&str] = &[
     "delegate_rejected",
     "google_unreachable",
     "gateway_unreachable",
-    "not_connected", "awaiting_consent", "consent_declined", "ambiguous_owner", "no_owner", "needs_reconnect", "scope_missing",
+    "not_connected", "awaiting_consent", "consent_declined", "ambiguous_owner", "no_owner", "needs_reconnect", "scope_missing", "write_scope_isolated", "scope_unverified", "write_tool_gateway_only",
 ];
 
 /// Message when the protected key is not ready (B2c design §11).

@@ -993,6 +993,25 @@ fn googlechat_button(label: &str, primary: bool, action: String) -> Value {
     })
 }
 
+/// Full cardsV2 array for chat-admin approvals. Content only; the sender must
+/// separately check that this Chat app receives authenticated HTTP clicks.
+pub(crate) fn googlechat_approval_card(card: &crate::approval::chat_admin::card::ChatCard) -> Value {
+    let (approve, deny) = card.button_labels();
+    json!([{
+        "cardId": "duduclaw-approval",
+        "card": {
+            "header": { "title": crate::goal_state::xml_escape(&card.title) },
+            "sections": [{ "widgets": [
+                { "textParagraph": { "text": crate::goal_state::xml_escape(&card.body).replace('\n', "<br>") } },
+                { "buttonList": { "buttons": [
+                    googlechat_button(approve, true, card.approve_data.clone()),
+                    googlechat_button(deny, false, card.deny_data.clone())
+                ] } }
+            ] }]
+        }
+    }])
+}
+
 /// Google Chat `cardsV2`: retry / done as filled buttons (primary), abort /
 /// take-over as outlined buttons in a second button list (secondary tier).
 /// Returned as the full `cardsV2` array of the message.

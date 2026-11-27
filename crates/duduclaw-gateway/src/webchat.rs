@@ -325,6 +325,8 @@ impl ChatMessage {
 pub(crate) mod ag_ui;
 mod liveness;
 mod turns;
+#[cfg(test)]
+pub(crate) use turns::entry_gate_all_helpers;
 
 pub(crate) use turns::configured_global_limit;
 
@@ -343,6 +345,7 @@ const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
 const NO_REPLY_CODE: &str = "no_reply";
 mod route;
+mod entry;
 mod uploads;
 pub(crate) mod access;
 
@@ -642,17 +645,18 @@ impl WebChatState {
         if let Err(e) = &lookup {
             warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        if !resolve_agent_acl(&lookup, agent_name) { return false; }
+        if is_widget_visitor(user_id) { return false; }
+        let Ok(snapshot) = &lookup else { return false; };
         if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
             return true;
         }
-        // This helper checks the named grant, not operational status (the
-        // execution/resume gate checks that separately). A binding never grants
-        // dashboard access to Main or the configured gateway default.
-        let sender = crate::trigger_route::SenderAccess::no_bindings(user_id)
-            .for_webchat(access::gateway_default_id(&self.ctx.home_dir).await);
+        // This helper checks named grants or effective main-list admission;
+        // execution/resume checks operational status separately.
+        let sender = crate::trigger_route::SenderAccess::from_effective(snapshot.access.clone())
+            .for_webchat_converse(&self.ctx.home_dir).await;
         self.ctx.registry.read().await.get(agent_name)
-            .is_some_and(|agent| sender.webchat_allows(agent))
+            .is_some_and(|agent| sender.webchat_allows(agent)
+                && (resolve_agent_acl(&lookup, agent_name) || sender.main_converse_allowed(agent)))
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -1632,13 +1636,25 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     turn_sink.identity_unavailable(validity, true).await;
                                     continue;
                                 }
-                                let attachments = match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
+                                let entry_result = entry::check(
+                                    &state, &auth_user, effective_agent.as_deref().unwrap_or(&agent_id),
+                                    sid, &user_id, &content, !attachments.is_empty(), &msg_id,
+                                ).await;
+                                // A refused file must not disable an emergency stop or
+                                // a repair command. Report and discard the refused files,
+                                // then let the runner execute the exempt command.
+                                let exempt_files = entry_result.is_err() && !attachments.is_empty() && entry::continues_without_files(&content);
+                                if let Err(text) = entry_result {
+                                    turn_sink.frame(ChatMessage::error(&text)).await;
+                                    if !exempt_files { continue; }
+                                }
+                                let attachments = if exempt_files { Vec::new() } else { match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
                                     Ok(files) => files,
                                     Err(error) => {
                                         turn_sink.frame(ChatMessage::error_coded(error, "attachment_upload_refused")).await;
                                         continue;
                                     }
-                                };
+                                }};
                                 let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
                                 // Only the final routed id can establish socket-local provenance.
                                 // An @ call may replace a new selected session with an old one.

@@ -191,7 +191,7 @@ pub(crate) fn assign_right_under(
     else {
         return AssignRight::Denied;
     };
-    if !access.webchat_allows(loaded) {
+    if !access.webchat_allows_work(loaded) && !access.main_assign_allowed(loaded) {
         return AssignRight::Denied;
     }
     if crate::machine_employee::requires_admin(loaded)
@@ -205,6 +205,9 @@ pub(crate) fn assign_right_under(
         } else {
             AssignRight::Denied
         };
+    }
+    if access.main_assign_allowed(loaded) {
+        return AssignRight::Allowed(GrantSource::Default);
     }
     match &access.sender {
         Sender::Admin { .. } => AssignRight::Allowed(GrantSource::Admin),
@@ -293,6 +296,12 @@ pub(crate) fn plan(reg: &AgentRegistry, lang: Lang, cmd: &AssignCommand, caller:
 }
 
 fn plan_text(reg: &AgentRegistry, lang: Lang, text: &str, caller: &AssignCaller<'_>) -> Plan {
+    // A listed person receives the actionable shell/isolation refusal for an exact target.
+    if let MentionScan::Hit(hit) = trigger_match::scan_mentions(text, &super::mention_targets(reg), &|_| true) {
+        if let Some(reason) = reg.get(&hit.id).and_then(|agent| caller.access.main_assign_refusal(agent)) {
+            return refused(caller, Some(&hit.id), "main_turn_unavailable", reason.into());
+        }
+    }
     let targets = assignment_mention_targets(reg, &caller.access, caller.channel, caller.fallback);
     let allowed =
         |id: &str| matches!(assign_right(reg, &caller.access, id, caller.fallback), AssignRight::Allowed(_));
@@ -353,6 +362,9 @@ fn spec_for(agent: String, agent_name: String, grant: GrantSource, task: &str, l
 /// The plan for the message an armed `/交辦 @name` was waiting for: the
 /// whole text is the task, and the right is checked again now.
 pub(crate) fn plan_pending(reg: &AgentRegistry, lang: Lang, agent: &str, text: &str, caller: &AssignCaller<'_>) -> Plan {
+    if let Some(reason) = reg.get(agent).and_then(|loaded| caller.access.main_assign_refusal(loaded)) {
+        return refused(caller, Some(agent), "main_turn_unavailable", reason.into());
+    }
     match assign_right(reg, &caller.access, agent, caller.fallback) {
         AssignRight::Allowed(grant) => {
             let name = super::display_name(reg, agent);
@@ -446,7 +458,8 @@ pub fn arm_on_admission(reg: &AgentRegistry, text: &str, caller: &AssignCaller<'
     let allowed =
         |id: &str| matches!(assign_right(reg, &caller.access, id, caller.fallback), AssignRight::Allowed(_));
     if let MentionScan::Hit(hit) = trigger_match::scan_mentions(&rest, &targets, &allowed) {
-        if trigger_match::task_text_without(&rest, &hit).is_empty() {
+        if trigger_match::task_text_without(&rest, &hit).is_empty()
+            && crate::entry_gate::resolve_and_check(caller.home, reg, &hit.id).is_ok() {
             let origin = caller.event.unwrap_or_default();
             pending::arm_kind(&pending_key(caller), &hit.id, PendingKind::Assign, origin, caller.seq);
         }
@@ -466,6 +479,8 @@ pub async fn run(
 ) -> AssignReply {
     let home = ctx.home_dir.as_path();
     let lang = texts::lang_for(home);
+    let prepared = AssignCaller { access: caller.access.clone().for_assign(home).await, ..caller.clone() };
+    let caller = &prepared;
     let decided = {
         let reg = ctx.registry.read().await;
         plan(&reg, lang, cmd, caller)
@@ -484,6 +499,8 @@ pub async fn run_pending(
 ) -> AssignReply {
     let home = ctx.home_dir.as_path();
     let lang = texts::lang_for(home);
+    let prepared = AssignCaller { access: caller.access.clone().for_assign(home).await, ..caller.clone() };
+    let caller = &prepared;
     let decided = {
         let reg = ctx.registry.read().await;
         plan_pending(&reg, lang, agent, text, caller)
@@ -493,6 +510,26 @@ pub async fn run_pending(
 
 /// Carry out a [`Plan`].
 pub(crate) async fn execute(home: &Path, lang: Lang, decided: Plan, caller: &AssignCaller<'_>) -> AssignReply {
+    let target = match &decided {
+        Plan::Arm { agent, .. } => Some(agent.as_str()),
+        Plan::Create(spec) | Plan::ScheduleCreate { spec, .. } => Some(spec.agent.as_str()),
+        _ => None,
+    };
+    if let Some(agent) = target {
+        let principal = principal_of(&caller.access);
+        let admitted = if matches!(&decided, Plan::ScheduleCreate { .. }) {
+            crate::on_behalf_of::access::check_main_target(home, principal.as_deref(), agent).await
+        } else {
+            Box::pin(crate::on_behalf_of::access::check_main_target_for(
+                home, principal.as_deref(), agent, crate::on_behalf_of::access::MainUse::Assign,
+            )).await
+        };
+        if let Err(reason) = admitted { return AssignReply::text(reason); }
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(home, agent) {
+            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, agent).await;
+            return AssignReply::text(refusal.user_text(caller.conversation, language.as_deref(), caller.event.unwrap_or("assign")));
+        }
+    }
     match decided {
         Plan::Reply(reply) => reply,
         Plan::Status => AssignReply::text(super::assign_create::status_text(home, lang, caller).await),

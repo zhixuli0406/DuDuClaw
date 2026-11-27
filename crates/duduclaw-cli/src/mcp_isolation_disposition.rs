@@ -1,7 +1,7 @@
 //! Isolation changes execution location, not employee permissions.
 //! Operator-only tools are refused by the existing gates, never this table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, PersonalKeyRequired }
+pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, DriveWriteUnavailable, PersonalKeyRequired }
 impl Refusal {
     pub fn message(self) -> &'static str {
         self.message_for_language(None)
@@ -11,6 +11,7 @@ impl Refusal {
             Self::HostAuthority => "隔離執行沒有主機桌面、裝置或系統服務的控制權。",
             Self::ForkNextRelease => duduclaw_mcp_boundary::fork_policy::message(language),
             Self::ProposalRequired => PROPOSAL_REQUIRED,
+            Self::DriveWriteUnavailable => "受保護模式尚不支援雲端硬碟寫入。",
             Self::PersonalKeyRequired => "This tool is only available to a personal key",
         }
     }
@@ -26,6 +27,7 @@ pub const PROPOSAL_REQUIRED: &str = "受保護模式下 AI 員工不能自行建
 /// Gateway-owned computer containers retain their original session handlers.
 pub fn intentional_refusal(name: &str) -> Option<Refusal> {
     use Refusal::*;
+    if duduclaw_core::google_identity::is_drive_write_tool(name) { return Some(DriveWriteUnavailable); }
     if duduclaw_core::mcp_person_tools::is_person_tool(name) { return Some(PersonalKeyRequired); }
     if duduclaw_mcp_boundary::fork_policy::deferred(name) { return Some(ForkNextRelease); }
     Some(match name {

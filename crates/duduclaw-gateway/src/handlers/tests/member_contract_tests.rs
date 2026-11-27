@@ -118,10 +118,11 @@ impl Fixture {
             "me.status_tokens.create" => json!({"name": "Contract fixture"}),
             "me.status_tokens.revoke" => json!({"id": uuid::Uuid::new_v4().to_string()}),
             "me.google.connect_start" => json!({"redirect_origin": "http://localhost:18889", "acknowledge_google_data": false}),
+            "me.google.write_connect_start" => json!({"redirect_origin": "http://localhost:18889", "acknowledge_google_data": false, "acknowledge_write": false}),
             "me.google.connect_finish" => json!({"state": "missing-fixture-state"}),
             "me.google.connect_paste" => json!({"url": "invalid-fixture-callback"}),
-            "me.google.disconnect" => json!({"confirm": false}),
-            "me.google.chat_confirm" => json!({"id":"missing", "approve":false}),
+            "me.google.disconnect" | "me.google.write_disconnect" => json!({"confirm": false}),
+            "me.google.chat_confirm" | "me.google.write_confirm" => json!({"id":"missing", "approve":false}),
             "me.google.consents.set" => json!({"agent_id": "sales", "allowed": false}),
             "agents.list" | "chat.sessions.list" | "tasks.list" | "activity.list"
             | "decisions.list" | "skills.list" | "skills.recent" | "memory.browse"
@@ -129,7 +130,7 @@ impl Fixture {
             "users.me" | "about.get" | "onboarding.get" | "agents.callable" | "agents.org_chart"
             | "cron.list" | "cron.templates" | "reminders.list" | "assign_schedules.list"
             | "skills.shared" | "skills.leaderboard" | "shared_wiki.pages" | "me.memory.list"
-            | "dashboard.layout.get" | "me.status_tokens.list" | "me.google.status" | "me.google.chat_confirmations" => json!({}),
+            | "dashboard.layout.get" | "me.status_tokens.list" | "me.google.status" | "me.google.chat_confirmations" | "me.google.write_confirmations" => json!({}),
             other => panic!("missing member contract fixture: {other}"),
         }
     }
@@ -203,5 +204,14 @@ fn member_contract_markdown_lists_exactly_the_contract_methods() {
     assert_eq!(names.len(), actual.len(), "duplicate method in Markdown");
     assert_eq!(MEMBER_CONTRACT_METHODS.len(), expected.len(), "duplicate contract method");
     assert_eq!(actual, expected);
-    assert!(MEMBER_CONTRACT_METHODS.iter().all(|m| m.since == "1.85.0" && !m.summary_en.is_empty()));
+    assert!(MEMBER_CONTRACT_METHODS.iter().all(|m| matches!(m.since, "1.85.0" | "1.86.0") && !m.summary_en.is_empty()));
+}
+
+#[test]
+fn drive_confirmation_contract_is_browser_only_since_1_86() {
+    for method in ["me.google.write_confirmations", "me.google.write_confirm"] {
+        let entry = MEMBER_CONTRACT_METHODS.iter().find(|entry| entry.name == method).unwrap();
+        assert_eq!(entry.since, "1.86.0");
+        assert!(super::super::member_contract::member_key_method(method).is_none());
+    }
 }

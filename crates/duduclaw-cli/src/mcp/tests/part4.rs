@@ -88,7 +88,7 @@ skill_security_scan = false
 }
 
 #[tokio::test]
-async fn agent_update_reports_to_operator_and_open_policy_but_never_self() {
+async fn agent_update_reports_to_operator_only_even_under_open() {
     let tmp = delegation_home();
     let home = tmp.path();
 
@@ -103,12 +103,11 @@ async fn agent_update_reports_to_operator_and_open_policy_but_never_self() {
         "[delegation]\npolicy = \"open\"\n",
     )
     .unwrap();
-    // Under `open` another team's agent may be re-parented...
+    // Open delegation does not grant authority to reparent another employee.
     let params = serde_json::json!({ "agent_id": "mkt-rep", "reports_to": "sales-lead" });
     let res = handle_agent_update(&params, home, "sales-lead").await;
-    assert_ne!(res["isError"], true, "{res}");
-    // ...but an employee still cannot re-parent itself: `reports_to` is an
-    // authority field and the self-edit guard is policy-independent.
+    assert_eq!(res["isError"], true, "{res}");
+    // The same authority rule applies to self-edits.
     let params = serde_json::json!({ "agent_id": "sales-rep", "reports_to": "ceo" });
     let res = handle_agent_update(&params, home, "sales-rep").await;
     assert_eq!(res["isError"], true, "{res}");
@@ -612,12 +611,12 @@ async fn agent_update_stop_with_background_edits_always_drains_admissions() {
         let mut writer = tokio::task::spawn_blocking(move || {
             started_tx.send(()).unwrap();
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            // Keep reparenting within the caller's subtree so the request
-            // reaches the lifecycle barrier instead of the placement refusal.
+            // A human operator can reparent, so this request reaches the
+            // lifecycle barrier rather than the AI authority refusal.
             runtime.block_on(handle_agent_update(&serde_json::json!({
                 "agent_id": "sales-rep", "status": "paused",
                 "heartbeat_enabled": true, "reports_to": "sales-rep2",
-            }), &worker_home, "sales-lead"))
+            }), &worker_home, "dashboard"))
         });
         started_rx.await.unwrap();
         let waiting = tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer).await;

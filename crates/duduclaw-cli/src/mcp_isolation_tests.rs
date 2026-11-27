@@ -211,6 +211,11 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     // actual ToolDefs, not a source-text count or a duplicated name fixture.
     for tool in crate::mcp::tools() {
         assert!(seen.insert(tool.name), "duplicate ToolDef: {}", tool.name);
+        if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
+            assert_eq!(boundary_route(tool.name), None, "admin AI is unavailable in protected mode");
+            assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some());
+            continue;
+        }
         assert!(boundary_route(tool.name).is_some(), "missing route: {}", tool.name);
         assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some(),
             "missing effect: {}", tool.name);
@@ -316,10 +321,11 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
     // 141K-P5: +two person tools, intentionally refused for all employees.
-    assert_eq!(tools.len(), 276, "review every new tool's isolation disposition");
+    // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
+    assert_eq!(tools.len(), 288, "review every new tool's isolation disposition");
     for tool in tools {
-        let route = boundary_route(tool.name).expect("exact route");
         if intentional_refusal(tool.name).is_some() { continue; }
+        let route = boundary_route(tool.name).expect("exact route");
         if route == BoundaryRoute::Resource {
             assert!(legacy_resource_handler(tool.name)
                 || duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name).is_some(),
@@ -335,7 +341,16 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
         if let Some(reason) = intentional_refusal(tool.name) {
             let mut record = context().record().clone();
             record.tools = List::new(vec![Text::new(tool.name.into()).unwrap()]).unwrap();
-            record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+            let mut resources = vec![ResourceGrant::Employee { id: record.employee }];
+            if duduclaw_core::google_identity::is_drive_write_tool(tool.name) {
+                assert_eq!(reason, crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable);
+                resources.push(ResourceGrant::Connector {
+                    account: Text::new("drive-account".into()).unwrap(),
+                    binding: record.employee_binding.clone(),
+                });
+                assert_eq!(boundary_route(tool.name), Some(BoundaryRoute::Resource));
+            }
+            record.resources = List::new(resources).unwrap();
             let call = Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), context: live_context(record),
                 agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
                 services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
@@ -354,7 +369,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 276);
+    assert_eq!(manifest.len(), 288);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
             ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));

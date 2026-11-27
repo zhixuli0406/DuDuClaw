@@ -6873,6 +6873,9 @@ fn agent_file_guard_decision(
                             duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, portability::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
                             // RM-137 H3: an employee may not run its own ACP server.
                             duduclaw_core::bash_operator_command_decision(command, &caller, acp::server::OPERATOR_COMMANDS)
                         })
@@ -10505,6 +10508,22 @@ fn refuse_org_write_in_agent_session(claimed: &str) -> String {
 /// automatic re-import on every boot would let anyone who can write an
 /// `agent.toml` promote their edit to authority just by waiting for a restart.
 /// Making the adoption a typed command keeps that decision with a human.
+/// Operator-only advisory output: never create/migrate the user store and
+/// never prevent sync when grant impact cannot be read. Use sync's actual
+/// before/after authority entries, including for dry runs.
+fn org_sync_reach_line(home: &std::path::Path, before: Option<&duduclaw_core::org_store::OrgEntry>,
+    after: &duduclaw_core::org_store::OrgEntry) -> Option<String> {
+    use duduclaw_auth::dept_grants::{reach_change, reach_sentence_zh};
+    let from = before.map(|entry| entry.department.as_str()).filter(|d| !d.is_empty());
+    let to = (!after.department.is_empty()).then_some(after.department.as_str());
+    if from == to { return None; }
+    match duduclaw_auth::UserDb::open_read_only(&home.join("users.db"))
+        .and_then(|db| reach_change(&db, from, to)) {
+        Ok(lines) => reach_sentence_zh(&lines),
+        Err(_) => Some("警告：授權影響無法計算，請到儀表板確認部門主管的管理範圍。".to_owned()),
+    }
+}
+
 fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
@@ -10551,6 +10570,9 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
                 org_entry_label(&c.after)
             ),
             None => println!("  • {}(新增): {}", c.agent_id, org_entry_label(&c.after)),
+        }
+        if let Some(sentence) = org_sync_reach_line(&home, c.before.as_ref(), &c.after) {
+            println!("    {sentence}");
         }
     }
 
@@ -12336,6 +12358,7 @@ async fn cmd_export_data(out: Option<PathBuf>) -> duduclaw_core::error::Result<(
 
 /// `duduclaw import <file>` — restore a personal-edition `.tar.gz` into `~/.duduclaw/`.
 async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Result<()> {
+    portability::refuse_import_in_ai_session()?;
     let home = duduclaw_home();
     println!("Importing personal-edition data...");
     println!("  Archive: {}", file.display());
@@ -15345,6 +15368,28 @@ mod removed_name_hook_tests {
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
     }
 
+    #[test]
+    fn import_bash_is_operator_only_through_agent_file_guard() {
+        let h = home_with_trash();
+        for binary in ["duduclaw", "duduclaw-pro", "duduclaw.exe", "duduclaw-pro.exe", "/opt/bin/duduclaw"] {
+            for suffix in ["import input.tar.gz --force", "--redact on import input.tar.gz", "im''port input.tar.gz"] {
+                let command = format!("{binary} {suffix}");
+                for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+                    let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &caller).unwrap();
+                    assert!(!decision.is_allowed(), "{command}: {decision:?}");
+                    if matches!(caller, HookCaller::Agent(_)) {
+                        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
+                    }
+                }
+                let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &HookCaller::Absent);
+                assert!(decision.is_none_or(|d| d.is_allowed()), "{command}");
+            }
+        }
+        let command = "bash -c 'env -u DUDUCLAW_AGENT_ID duduclaw import input.tar.gz --force'";
+        let decision = agent_file_guard_decision("Bash", &bash(command), h.path(), &agent("ceo")).unwrap();
+        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
+    }
+
     /// P2-A appendix D.1 (moved from core onto the shared operator-command
     /// matcher at the S9 rebase): `duduclaw responsibility …`, every
     /// subcommand, is refused for employees and unverified callers.
@@ -15791,3 +15836,6 @@ mod users_mfa_cmd;
 
 #[cfg(test)]
 mod third_party_mcp_tests;
+
+#[cfg(test)]
+mod org_sync_reach_tests;

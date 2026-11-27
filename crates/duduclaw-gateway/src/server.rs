@@ -74,7 +74,7 @@ static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (
 const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// The address the login limiter keys on for a peer `ip`.
-fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn login_throttle_ip(ip: IpAddr) -> IpAddr {
     if ip.is_loopback() {
         LOOPBACK_THROTTLE_IP
     } else {
@@ -102,7 +102,7 @@ pub(crate) fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
 
 /// Clear the failed-attempt counter for `(ip, email)` after a successful login
 /// so a legitimate user is never penalised for earlier typos (M2).
-fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+pub(crate) fn reset_login_rate_limit(ip: IpAddr, email: &str) {
     let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&(ip, email.to_string()));
@@ -178,23 +178,27 @@ pub struct GatewayConfig {
 }
 
 /// Internal shared state for the Axum application.
-struct AppState {
-    auth: AuthManager,
-    handler: Arc<MethodHandler>,
-    tx: broadcast::Sender<String>,
+pub(crate) struct AppState {
+    pub(crate) auth: AuthManager,
+    pub(crate) handler: Arc<MethodHandler>,
+    pub(crate) tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
-    event_tx: broadcast::Sender<String>,
-    prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
+    pub(crate) event_tx: broadcast::Sender<String>,
+    pub(crate) prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
     /// User database for multi-user authentication.
-    user_db: Arc<UserDb>,
+    pub(crate) user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
-    jwt_config: Arc<JwtConfig>,
+    pub(crate) jwt_config: Arc<JwtConfig>,
     /// Channel-DM delivery for passwordless login OTP codes (WP12). Injected so
     /// the pre-auth OTP handler never needs raw channel config / secret manager.
-    otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
+    pub(crate) otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
     /// DuDuClaw home directory (`~/.duduclaw`). Used by the voice endpoints to
     /// read `[voice]` STT/TTS config from `config.toml`.
-    home_dir: std::path::PathBuf,
+    pub(crate) home_dir: std::path::PathBuf,
+}
+
+impl AsRef<MethodHandler> for AppState {
+    fn as_ref(&self) -> &MethodHandler { &self.handler }
 }
 
 /// Identity policy and initial key creation are mandatory startup gates.
@@ -1328,6 +1332,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
     crate::skill_lifecycle::curator::restore_on_startup(&home_dir).await;
+    // Imported skill policy decisions belong only to the live lock holder.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !duduclaw_core::gateway_instance::held(&home) || !home.join("approvals.db").exists() {
+                    continue;
+                }
+                if let Ok(broker) = crate::approval::ApprovalBroker::open(&home) {
+                    crate::skill_trust::run_once(&home, &broker).await;
+                }
+            }
+        });
+    }
 
     // RM-136 (M5): deliver `users.mfa_reset` audit rows a previous process
     // committed but did not deliver (held rows included). Only the gateway
@@ -1791,6 +1812,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Some(silence_tx),
         Some(proactive_notice),
         Some(Arc::new(|home, dir, agent| Box::pin(async move {
+            crate::entry_gate::check_task_assignee(&home, &agent)
+                .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
             crate::budget::gate_before_spawn(&home, Some(&dir), &agent, "heartbeat_proactive")
                 .await.map_err(|e| e.to_string())
         }))),
@@ -2918,6 +2941,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
 
+    // Google provisioning maintenance belongs exclusively to the lock holder.
+    if crate::google_signin::onboarding::should_run(&home_dir) {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if crate::google_signin::onboarding::should_run(&bg_state.home_dir) {
+                    crate::google_signin::onboarding::run_once(
+                        &bg_state.handler, chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
+
     // M1/M60: open the shared audit index once and refresh it on a background
     // interval, so audit/reliability requests reuse one connection instead of
     // opening + full-syncing per request.
@@ -3013,6 +3052,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/login/methods", get(crate::google_signin::routes::methods))
+        .route("/api/login/google/start", post(crate::google_signin::routes::start).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/login/google/callback", get(crate::google_signin::routes::callback))
+        .route("/api/login/google/complete", post(crate::google_signin::routes::complete).layer(DefaultBodyLimit::max(4096)))
         .route("/api/invite/check", post(server_invites::check_invite))
         .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))
@@ -3402,6 +3445,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .route("/api/me/google/authorization-request", get(handle_google_authorization_preview)
             .post(handle_google_authorization_confirm).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/me/approvals/step-up", get(handle_approval_step_up_preview)
+            .post(handle_approval_step_up_confirm).layer(DefaultBodyLimit::max(4096)))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route(
             crate::google_personal::flow::CALLBACK_PATH,
@@ -3494,7 +3539,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/a2a", post(a2a_http::rpc))
         .route("/.well-known/agent-card.json", get(a2a_http::card))
         .route("/.well-known/agent.json", get(a2a_http::card))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(auth_router)
         .merge(webchat_router)
         .merge(ag_ui_router);
@@ -3568,6 +3613,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(_license_runtime.clone()),
         ),
     )));
+    app = app.merge(crate::admin_ai::route::router(Arc::new(crate::admin_ai::route::RouteState::with_executor(home_dir.clone(), state.clone()))));
     // RouteState synchronously restores durable sink fences (or records a
     // fail-closed store error) before the listener below can serve any request.
     app = app.merge(crate::egress_guard::router(Arc::new(
@@ -5727,6 +5773,9 @@ fn authorize_file_access(
         return Err(unauthorized());
     }
     if authenticated.member_key_id.is_some() && ctx.is_admin() { return Err(unauthorized()); }
+    ctx.origin = if authenticated.member_key_id.is_some() {
+        duduclaw_auth::acl::ContextOrigin::MemberKey
+    } else { authenticated.origin };
     ctx.member_key_id = authenticated.member_key_id;
     require_password_changed(&ctx)?;
 
@@ -16760,6 +16809,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "lockscreen".to_string(),
@@ -16871,7 +16921,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 }
                             } else if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
-                                    Ok(ctx) => {
+                                    Ok(mut ctx) => {
+                                        ctx.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
                                         access_expires = Some(0);
@@ -18083,6 +18134,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -18133,6 +18185,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -18187,6 +18240,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -19927,7 +19981,7 @@ mod live_events_socket_tests {
 }
 
 #[path = "server_mfa.rs"]
-mod server_mfa;
+pub(crate) mod server_mfa;
 
 #[cfg(test)]
 mod tts_limit_tests {
@@ -19993,13 +20047,20 @@ mod identity_key_startup_tests {
 // member keys, channel OTPs or the authorization ticket itself.
 fn google_authorization_caller(state: &AppState, headers: &axum::http::HeaderMap)
     -> Result<(String,String), axum::response::Response> {
+    dashboard_ticket_caller(state, headers).map(|(ctx, session)| (ctx.user_id, session))
+}
+fn dashboard_ticket_caller(state: &AppState, headers: &axum::http::HeaderMap)
+    -> Result<(UserContext,String), axum::response::Response> {
     let ctx = knowledge_caller(state, headers)?;
     let token = extract_bearer_token(headers).ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
     let claims = state.jwt_config.verify_access_token(token)
         .map_err(|_| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
     let session = claims.jti.filter(|s| uuid::Uuid::parse_str(s).is_ok())
         .ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
-    Ok((ctx.user_id,session))
+    if uuid::Uuid::parse_str(&ctx.user_id).is_err() {
+        return Err(axum::http::StatusCode::UNAUTHORIZED.into_response());
+    }
+    Ok((ctx,session))
 }
 async fn handle_google_authorization_preview(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap)
     -> axum::response::Response {
@@ -20052,3 +20113,57 @@ async fn handle_google_authorization_confirm(State(state): State<Arc<AppState>>,
     };
     routes::private_response(response)
 }
+
+// RM-143: same JWT-only authentication as RM-147, plus a live Active Admin.
+// No member-key dispatch, MCP surface, cookie or legacy system-token fallback.
+fn approval_step_up_caller(state: &AppState, headers: &axum::http::HeaderMap)
+    -> Result<(UserContext, String), crate::approval::chat_admin::step_up::Error> {
+    use crate::approval::chat_admin::step_up::Error;
+    let (ctx, session) = dashboard_ticket_caller(state, headers).map_err(|_| Error::unauthenticated())?;
+    let _ = crate::approval::chat_admin::step_up::active_admin(&state.user_db, &ctx, &session)?;
+    Ok((ctx, session))
+}
+
+async fn approval_step_up_env(state: &AppState)
+    -> Result<crate::approval::decision_service::DecisionEnv, crate::approval::chat_admin::step_up::Error> {
+    use crate::approval::chat_admin::step_up::Error;
+    let home = state.home_dir.clone();
+    let broker = tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&home))
+        .await.map_err(|_| Error::forbidden())?.map_err(|_| Error::forbidden())?;
+    Ok(crate::approval::decision_service::DecisionEnv { home:state.home_dir.clone(),
+        registry:Some(state.handler.registry().clone()), broker, users:Some(state.user_db.clone()) })
+}
+
+async fn handle_approval_step_up_preview(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap)
+    -> axum::response::Response {
+    use crate::approval::chat_admin::step_up::{self, routes};
+    let result = async {
+        let (ctx, session) = approval_step_up_caller(&state, &headers)?;
+        let ticket = headers.get("x-approval-ticket").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let env = approval_step_up_env(&state).await?;
+        routes::preview(&state.handler, &env, &ctx, &session, ticket).await
+    }.await;
+    step_up::response(match result { Ok(value) => Json(value).into_response(), Err(error) => error.into_response() })
+}
+
+async fn handle_approval_step_up_confirm(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap,
+    body: Result<Json<crate::approval::chat_admin::step_up::routes::Decision>, axum::extract::rejection::JsonRejection>)
+    -> axum::response::Response {
+    use crate::approval::chat_admin::step_up::{self, routes, Error};
+    let result = async {
+        let (ctx, session) = approval_step_up_caller(&state, &headers)?;
+        let origin = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !crate::google_authorization_requests::routes::valid_origin(origin, &allowed_origins_snapshot()) {
+            return Err(Error::forbidden());
+        }
+        let Json(input) = body.map_err(|_| Error::invalid())?;
+        let ticket = headers.get("x-approval-ticket").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let env = approval_step_up_env(&state).await?;
+        routes::confirm(&env, &ctx, &session, ticket, input).await
+    }.await;
+    step_up::response(match result { Ok(value) => Json(value).into_response(), Err(error) => error.into_response() })
+}
+
+#[cfg(test)]
+#[path = "server_approval_step_up_tests.rs"]
+mod approval_step_up_tests;

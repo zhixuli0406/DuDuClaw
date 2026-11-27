@@ -79,6 +79,20 @@ impl GoalLoopDriver {
             debug!(task = %task_id, "goal loop: durable round fenced by the dispatcher — slot released");
             return Ok(false);
         }
+        // Queue errors survive restarts and token expiry. Recheck the durable
+        // assignee instead of authenticating a persisted refusal token.
+        if let Some(task) = self.store.get_task(task_id).await? {
+            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                let code = refusal.code();
+                let error = crate::entry_gate::background_refusal(&refusal);
+                self.dispatch_failures.lock().await.remove(task_id);
+                self.escalate(inflight, &task, &error,
+                    crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+                self.post_activity("goal_loop.entry_refused", &task.assigned_to, Some(task_id),
+                    &format!("blocked_needs_decision: {code}")).await;
+                return Ok(true);
+            }
+        }
         // Admission may change after enqueue but before the runtime handoff.
         // These refusals are not infrastructure failures and must not enter
         // the failure counter/backoff ladder or spend another dispatch round.
@@ -174,4 +188,38 @@ impl GoalLoopDriver {
             );
         }
     }
+}
+
+/// Exercise the real failed-queue reconciliation without invoking the planner.
+#[cfg(test)]
+pub(crate) async fn assert_entry_refusal_tick(
+    home: &Path, store: Arc<crate::task_store::TaskStore>, error: &str,
+) {
+    let code = crate::entry_gate::background_refusal_code(error).unwrap();
+    let mut task = crate::task_store::TaskRow::new("entry-goal".into(), "Entry gate".into(),
+        "work".into(), "medium".into(), "worker".into(), "system".into());
+    task.goal_mode = true;
+    task.status = "todo".into();
+    store.insert_task(&task).await.unwrap();
+    let queue = Arc::new(MessageQueue::open(home).unwrap());
+    let message_id = super::enqueue::enqueue_goal_work(&queue, &store, &task, 1, "").await.unwrap();
+    queue.fail(&message_id, error).await.unwrap();
+    let driver = GoalLoopDriver::new(store.clone(), queue.clone(), GoalLoopConfig::default())
+        .with_home_dir(home.to_path_buf());
+    driver.inflight.lock().await.insert(task.id.clone(), InFlight {
+        iter: 1, enqueued_at: Utc::now(), awaiting_pickup: true, lease: None,
+        message_id: Some(message_id), progress_reported_round: None,
+    });
+    driver.tick_once().await.unwrap();
+    let task = store.get_task(&task.id).await.unwrap().unwrap();
+    assert_eq!(task.status, "needs_human");
+    assert_eq!(task.pause_reason.as_deref(), Some("blocked_needs_decision"));
+    assert!(store.list_activity_for_task(&task.id, 100).await.unwrap().iter().any(|row|
+        row.event_type == "goal_loop.entry_refused" && row.summary == format!("blocked_needs_decision: {code}")));
+    assert!(driver.inflight.lock().await.is_empty());
+    assert!(driver.dispatch_failures.lock().await.is_empty());
+    driver.tick_once().await.unwrap();
+    assert!(queue.pending_messages(10).await.unwrap().is_empty());
+    assert!(driver.dispatch_failures.lock().await.is_empty());
+    assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, "needs_human");
 }

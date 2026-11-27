@@ -1047,6 +1047,8 @@ async fn reminder_autonomy_check(home: &Path, registry: &Arc<RwLock<AgentRegistr
     } else {
         reminder.agent_id.clone()
     };
+    crate::entry_gate::check_task_assignee(home, &effective)
+        .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
     duduclaw_core::autonomy_gate::check(home, &effective, duduclaw_core::autonomy_gate::AutonomyPath::Background)
         .map_err(|pause| format!("{AUTONOMY_PAUSED}{pause}"))?;
     Ok(effective)
@@ -1439,7 +1441,13 @@ pub(crate) async fn cancel_pending_where(
 }
 
 /// Dashboard reads fail closed on corrupt or unreadable persistence.
-pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserContext, cancel: Option<&str>) -> Result<Vec<Reminder>, String> {
+// Return each row's control flag and the target of a successful grant-backed
+// cancellation so the async caller can audit only after persistence succeeds.
+pub(crate) async fn dashboard_reminders(
+    home: &Path, ctx: &duduclaw_auth::UserContext,
+    view: crate::dept_grants::DeptGrantView, cancel: Option<&str>,
+) -> Result<(Vec<(Reminder, bool)>, Option<String>), String> {
+    use crate::dept_grants::{GrantAction, GrantGroup, department_grant_allows};
     let home = home.to_path_buf();
     let ctx = ctx.clone();
     let cancel = cancel.map(str::to_string);
@@ -1456,16 +1464,28 @@ pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserCo
         // v1.81 P1g: another person's Personal employee's reminders are
         // neither listed nor cancelled through the Admin role or a stored
         // origin — owner only.
-        let allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
+        let original_allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
             && (ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
                 || ctx.has_agent_access(&r.agent_id, level));
+        let allowed = |r: &Reminder, level, action| original_allowed(r, level)
+            || department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, action);
+        let mut grant_cancelled_agent = None;
         if let Some(id) = cancel {
             let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
-                && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
+                && allowed(r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove)).ok_or("permission denied")?;
+            if !original_allowed(row, duduclaw_auth::AccessLevel::Operator) {
+                grant_cancelled_agent = Some(row.agent_id.clone());
+            }
             row.status = ReminderStatus::Cancelled;
             save_reminders_sync(&home, &rows)?;
         }
-        Ok(rows.into_iter().filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer)).collect())
+        let visible = rows.into_iter()
+            .filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer, GrantAction::Read))
+            .map(|r| {
+                let can_manage = allowed(&r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove);
+                (r, can_manage)
+            }).collect();
+        Ok((visible, grant_cancelled_agent))
     }).await.map_err(|e| e.to_string())?
 }
 
@@ -1486,6 +1506,28 @@ pub fn start_reminder_scheduler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn callback_reminder_surfaces_entry_refusal_without_model_or_delivery() {
+        let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(
+            duduclaw_core::types::RuntimeType::Codex).await;
+        let path = {
+            let reg = ctx.registry.read().await;
+            crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path
+        };
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["runtime"]["provider"] = toml::Value::String("claude".into());
+        std::fs::write(path, toml::to_string(&doc).unwrap()).unwrap();
+        let reminder = callback_reminder("worker", None);
+        let before = crate::model_call_probe::calls();
+        let error = deliver_reminder(home.path(), &reqwest::Client::new(), &ctx.registry,
+            &Arc::new(tokio::sync::Semaphore::new(1)), &reminder).await.unwrap_err();
+        let refusal = error.strip_prefix("Agent callback failed: ").unwrap_or(&error);
+        assert_eq!(crate::entry_gate::background_refusal_code(refusal), Some("model_provider_mismatch"));
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
 
     #[tokio::test]
     async fn partial_reminder_is_not_retried_and_notifies_once() {

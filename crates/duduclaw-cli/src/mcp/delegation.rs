@@ -72,6 +72,7 @@ pub(crate) async fn send_to_agent_with_ctx(
     let origin = ctx.origin.as_deref().unwrap_or(caller);
 
     let msg_id = uuid::Uuid::new_v4().to_string();
+    super::delegation_roles::record_initiator(home_dir, "message", caller, target, &msg_id).await;
 
     // v1.8.18: SQLite `message_queue.db` is the authoritative dispatch rail.
     // Writing to `bus_queue.jsonl` as well created a dual-rail race: the
@@ -534,12 +535,46 @@ pub(crate) async fn check_delegation_allowed(
     target: &str,
     path_kind: &str,
 ) -> std::result::Result<(), String> {
-    let rules = duduclaw_core::delegation_rules_from_home(home_dir);
+    check_delegation_for_work(home_dir, sender, target, path_kind, false).await
+}
+
+/// Only ordinary task creation/hand-over opts into the main person list.
+/// Scheduling, discovery and message delegation retain the legacy entry point.
+pub(crate) async fn check_assignment_delegation_allowed(
+    home_dir: &Path, sender: &str, target: &str, path_kind: &str,
+) -> std::result::Result<(), String> {
+    check_delegation_for_work(home_dir, sender, target, path_kind, true).await
+}
+
+async fn check_delegation_for_work(
+    home_dir: &Path, sender: &str, target: &str, path_kind: &str, assignment: bool,
+) -> std::result::Result<(), String> {
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home_dir);
+    let roles = super::delegation_roles::LoopbackOwnerRoles::load(home_dir, sender, &read).await;
+    let principal = host_on_behalf_of(home_dir, sender);
+    let mut boundaries = duduclaw_gateway::delegation_roles::sync_boundaries(home_dir, sender, target, principal.as_deref());
+    if assignment {
+        boundaries = Box::pin(duduclaw_gateway::delegation_roles::assignment_boundaries(
+            home_dir, sender, target, principal.as_deref(),
+        )).await?;
+    } else {
+        duduclaw_gateway::on_behalf_of::access::check_main_target(home_dir, principal.as_deref(), target).await?;
+    }
     let org = org_snapshot(home_dir, &[sender, target]).await;
-    match duduclaw_core::can_delegate_rules(&rules, &org, sender, target) {
+    match duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, sender, target,
+        &duduclaw_core::delegation_policy::DelegationContext {
+            overrides: &read.overrides, owner_roles: Some(&roles), boundaries, extra_system_senders: &[],
+        }) {
         // The employee tree allows it; the person the work is for must too
         // (`[delegation] human_principal = "enforce"`; record mode passes).
-        Ok(()) => check_human_principal(home_dir, sender, target, path_kind, rules.policy).await,
+        Ok(source) => {
+            // This Assign operation still uses the live human-authority bridge.
+            // Its main boundary was proved above; legacy on_behalf_of callers stay Admin-only.
+            let human_path = if assignment { "tasks_assign_admitted" } else { path_kind };
+            check_human_principal(home_dir, sender, target, human_path, read.rules.policy).await?;
+            super::delegation_roles::audit_allow(home_dir, sender, target, source, &roles, path_kind);
+            Ok(())
+        },
         Err(denied) => {
             duduclaw_security::audit::append_tool_call_with_extras(
                 home_dir,
@@ -612,9 +647,16 @@ pub(crate) fn check_delegation_allowed_blocking(
     target: &str,
     path_kind: &str,
 ) -> std::result::Result<(), String> {
-    let rules = duduclaw_core::delegation_rules_from_home(home_dir);
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home_dir);
+    let roles = super::delegation_roles::LoopbackOwnerRoles::load_blocking(home_dir, sender, &read);
+    let principal = host_on_behalf_of(home_dir, sender);
+    let boundaries = duduclaw_gateway::delegation_roles::sync_boundaries(home_dir, sender, target, principal.as_deref());
     let org = org_snapshot_blocking(home_dir, &[sender, target]);
-    duduclaw_core::can_delegate_rules(&rules, &org, sender, target).map_err(|denied| {
+    duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, sender, target,
+        &duduclaw_core::delegation_policy::DelegationContext {
+            overrides: &read.overrides, owner_roles: Some(&roles), boundaries, extra_system_senders: &[],
+        }).map(|source| super::delegation_roles::audit_allow(home_dir, sender, target, source, &roles, path_kind))
+        .map_err(|denied| {
         duduclaw_security::audit::append_tool_call_with_extras(
             home_dir,
             sender,
@@ -638,20 +680,18 @@ pub(crate) fn check_delegation_allowed_blocking(
 /// WP21 T6 (design doc §2.5) — may `caller` see `target` in `list_agents` /
 /// `agent_status`?
 ///
-/// "A can delegate to B" and "A can see B" deliberately share the same
-/// hierarchy/department test, plus the whitelist: the design doc's own
-/// rationale for folding whitelist partners into the visible set is that a
-/// caller who can delegate to someone but cannot see them is a
-/// self-contradicting UX. `Open` policy, system senders, and `caller ==
-/// target` are each call site's responsibility to short-circuit *before*
-/// reaching this — `list_agents` always lists the caller unconditionally, and
-/// neither call site pays for an org read when the policy is `open`.
+/// New role/pair visibility uses the same evaluator and boundaries as calls.
+/// `none` retains the existing reporting-line view (read-only); one-way pairs
+/// and unrestricted roles never widen the reverse direction. Self stays visible.
 pub(crate) fn org_visible(
-    rules: &duduclaw_core::DelegationRules,
+    home: &Path,
+    read: &duduclaw_core::delegation_policy::DelegationConfigRead,
+    roles: &super::delegation_roles::LoopbackOwnerRoles,
     org: &impl duduclaw_core::OrgView,
     caller: &str,
     target: &str,
 ) -> bool {
+    let rules = &read.rules;
     if caller == target {
         return true;
     }
@@ -671,7 +711,15 @@ pub(crate) fn org_visible(
     }
     // RM-137: under `none` the whitelist grants nothing, so it widens no
     // listing either (the reporting line stays visible, as under hierarchy).
-    rules.policy.honors_allow_pairs() && rules.allows_pair(caller, target)
+    if rules.policy.honors_allow_pairs() && rules.allows_pair(caller, target) { return true; }
+    if read.overrides.unrestricted_roles.is_empty() && read.overrides.allow_one_way.is_empty() { return false; }
+    let principal = host_on_behalf_of(home, caller);
+    let boundaries = duduclaw_gateway::delegation_roles::sync_boundaries(home, caller, target, principal.as_deref());
+    matches!(duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, org, caller, target,
+        &duduclaw_core::delegation_policy::DelegationContext {
+            overrides: &read.overrides, owner_roles: Some(roles), boundaries, extra_system_senders: &[],
+        }), Ok(duduclaw_core::delegation_policy::DelegationAllowSource::UnrestrictedRole
+            | duduclaw_core::delegation_policy::DelegationAllowSource::OneWayPair))
 }
 
 /// WP21 T6 — the single "not found or not visible" response for

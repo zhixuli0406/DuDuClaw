@@ -35,7 +35,7 @@ pub(crate) fn ensure_json_size<T: serde::Serialize + ?Sized>(value: &T) -> Resul
     ensure_json_budget(value, MAX_CONFIRMATION_BYTES)
 }
 
-fn ensure_approval_size(payload: &Value, summary: &str) -> Result<(), String> {
+pub(crate) fn ensure_approval_size(payload: &Value, summary: &str) -> Result<(), String> {
     let budget = MAX_CONFIRMATION_BYTES.checked_sub(summary.len()).ok_or_else(size_error)?;
     ensure_json_budget(payload, budget)
 }
@@ -162,22 +162,23 @@ impl HostContext {
     }
 }
 
+pub(crate) fn escaped(value: &Value) -> String {
+    // Escape controls in strings before JSON quoting, including nested
+    // attendee/attachment data. Reuse the shared core diagnostic boundary.
+    let safe = duduclaw_security::credential_protection::sanitize_output_value(value.clone());
+    let text = safe.to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut out = String::new();
+    for ch in text.chars() {
+        if matches!(ch, '*' | '_' | '`' | '[' | ']' | '#' | '!') { out.push('\\'); }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escape all untrusted card data, including Markdown and line controls.
 /// Each value is quoted JSON, so provider text cannot impersonate a card label.
 pub(crate) fn card(tool: &str, snapshot: &Value) -> Result<String, String> {
     validate_snapshot(snapshot, &[])?;
-    fn escaped(value: &Value) -> String {
-        // Escape controls in strings before JSON quoting, including nested
-        // attendee/attachment data. Reuse the shared core diagnostic boundary.
-        let safe = duduclaw_security::credential_protection::sanitize_output_value(value.clone());
-        let text = safe.to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-        let mut out = String::new();
-        for ch in text.chars() {
-            if matches!(ch, '*' | '_' | '`' | '[' | ']' | '#' | '!') { out.push('\\'); }
-            out.push(ch);
-        }
-        out
-    }
     let mut text = format!("確認這一次 Google 操作：{tool}\n（核准用過即失效；內容改變須重新確認）\n");
     if let Some(fields) = snapshot.as_object() {
         let ordered = ["account", "from", "to", "cc", "bcc", "subject", "calendar", "calendar_info", "title", "start", "end", "attendees",
@@ -208,9 +209,113 @@ pub(crate) fn calendar_endpoint(template: &NativeCallTemplate, url: &reqwest::Ur
     ].iter().any(|path| path == url.path())
 }
 
-/// New tools get exact paths; existing tools retain their existing allowlists.
+// Legacy helpers accept arbitrary URLs, so cover the two Google API aliases too.
+fn drive_host(url: &reqwest::Url) -> bool {
+    matches!(url.host_str(), Some("www.googleapis.com" | "content.googleapis.com" | "googleapis.com"))
+}
+
+// Decode exactly once, rejecting malformed escapes and ambiguous path syntax.
+// A remaining '%' could become a separator after a second decoding upstream.
+fn drive_segments(path: &str) -> Option<Vec<String>> {
+    if path == "/" { return Some(Vec::new()); }
+    path.strip_prefix('/')?.split('/').map(|segment| {
+        if segment.is_empty() { return None; }
+        let mut decoded = Vec::with_capacity(segment.len());
+        let mut bytes = segment.bytes();
+        while let Some(byte) = bytes.next() {
+            decoded.push(if byte == b'%' {
+                let high = char::from(bytes.next()?).to_digit(16)?;
+                let low = char::from(bytes.next()?).to_digit(16)?;
+                (high * 16 + low) as u8
+            } else { byte });
+        }
+        let value = String::from_utf8(decoded).ok()?;
+        if matches!(value.as_str(), "." | "..")
+            || value.chars().any(|ch| matches!(ch, '/' | '\\' | '%') || ch.is_control())
+        { return None; }
+        Some(value)
+    }).collect()
+}
+
+/// Method fence for existing transports. Raw input must also pass
+/// `drive_request_url`: Url parsing has already removed dot segments.
+pub(crate) fn drive_method_allowed(method: &reqwest::Method, url: &reqwest::Url) -> bool {
+    if !drive_host(url) { return true; }
+    let Some(parts) = drive_segments(url.path()) else { return false; };
+    let parts: Vec<_> = parts.iter().map(String::as_str).collect();
+    match parts.first().copied() {
+        Some("upload") => false,
+        Some("drive") => *method == reqwest::Method::GET
+            && !parts.iter().any(|part| matches!(*part, "permissions" | "revisions" | "comments"))
+            && !parts.windows(2).any(|pair| pair == ["files", "trash"]),
+        _ => true,
+    }
+}
+
+/// Exact read routes used by Drive tools and the account health probe.
+pub(crate) fn drive_read_path_allowed(url: &reqwest::Url) -> bool {
+    let Some(parts) = drive_segments(url.path()) else { return false; };
+    let parts: Vec<_> = parts.iter().map(String::as_str).collect();
+    match parts.as_slice() {
+        ["drive", "v3", "files"] | ["drive", "v3", "about"] => true,
+        ["drive", "v3", "files", id] | ["drive", "v3", "files", id, "export"] => {
+            !id.is_empty() && id.len() <= 256
+                && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+                && !matches!(*id, "trash" | "permissions" | "revisions" | "comments")
+        }
+        _ => false,
+    }
+}
+
+/// Validate the original spelling before URL normalization can erase traversal.
+/// Non-Drive services retain their own transport policy.
+pub(crate) fn drive_request_url(method: &reqwest::Method, original: &str) -> Option<reqwest::Url> {
+    let url = reqwest::Url::parse(original).ok()?;
+    if let Some(host) = url.host_str() {
+        let canonical = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        // Refuse aliases outright rather than treating them as another service.
+        if host.ends_with('.') || (host != canonical.as_str()
+            && matches!(canonical.as_str(), "www.googleapis.com" | "content.googleapis.com" | "googleapis.com"))
+        { return None; }
+    }
+    if drive_host(&url) {
+        if original.chars().any(|ch| ch == '\\' || ch.is_control()) { return None; }
+        let without_query = original.split(['?', '#']).next()?;
+        let (_, authority_and_path) = without_query.split_once("://")?;
+        let path = authority_and_path.split_once('/').map_or("/".to_owned(), |(_, path)| format!("/{path}"));
+        drive_segments(&path)?;
+        let parts = drive_segments(url.path())?;
+        if parts.first().is_some_and(|part| part == "drive") && !drive_read_path_allowed(&url) {
+            return None;
+        }
+    }
+    drive_method_allowed(method, &url).then_some(url)
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // Replace only the request recipe; all real transport gates still execute.
+    pub(crate) static TEST_DRIVE_REQUEST: (reqwest::Method, String);
+}
+
+#[cfg(test)]
+pub(crate) fn drive_refusal_cases() -> Vec<(reqwest::Method, String)> {
+    [
+        (reqwest::Method::DELETE, "/drive/v3/files/x1234567890"),
+        (reqwest::Method::POST, "/upload/drive/v3/files?uploadType=multipart"),
+        (reqwest::Method::PATCH, "/drive/v3/files/x1234567890"),
+        (reqwest::Method::GET, "/drive/v3/files/x1234567890/permissions"),
+    ].into_iter().map(|(method, path)| (method, format!("https://www.googleapis.com{path}"))).collect()
+}
+
+/// New tools and Drive get exact paths; other existing allowlists remain in force.
 pub(crate) fn endpoint_allowed(template: &NativeCallTemplate, url: &reqwest::Url) -> bool {
     use super::native_call::ParsedNativeArguments::*;
+    if drive_host(url) {
+        let Some(parts) = drive_segments(url.path()) else { return false; };
+        if parts.first().is_some_and(|part| part == "drive" || part == "upload")
+            && !drive_read_path_allowed(url) { return false; }
+    }
     match template.parsed() {
         GmailSend { draft } => url.query().is_none() && url.host_str() == Some("gmail.googleapis.com")
             && ["/gmail/v1/users/me/profile".to_owned(), "/gmail/v1/users/me/drafts/send".into(),
@@ -223,6 +328,96 @@ pub(crate) fn endpoint_allowed(template: &NativeCallTemplate, url: &reqwest::Url
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drive_method_fence_preserves_reads_and_other_services() {
+        for host in ["www.googleapis.com", "WWW.GOOGLEAPIS.COM", "content.googleapis.com", "googleapis.com"] {
+            for path in ["/drive/v3/files?pageSize=1", "/drive/v3/files/a-B_1?fields=id,name,mimeType",
+                "/drive/v3/files/a-B_1?alt=media", "/drive/v3/files/a-B_1/export?mimeType=text%2Fplain",
+                "/drive/v3/about?fields=user"] {
+                let url = format!("https://{host}{path}");
+                assert!(drive_method_allowed(&reqwest::Method::GET, &url.parse().unwrap()), "{url}");
+                assert!(drive_request_url(&reqwest::Method::GET, &url).is_some(), "{url}");
+                for method in [reqwest::Method::POST, reqwest::Method::PATCH, reqwest::Method::DELETE,
+                    reqwest::Method::HEAD, reqwest::Method::PUT, reqwest::Method::OPTIONS,
+                    reqwest::Method::from_bytes(b"get").unwrap()] {
+                    assert!(!drive_method_allowed(&method, &url.parse().unwrap()), "{method} {url}");
+                }
+            }
+        }
+        for url in ["https://www.googleapis.com/drivex/v3/files", "https://www.googleapis.com/drive-other/files",
+            "https://www.googleapis.com/calendar/v3/calendars/primary/events/e1",
+            "https://docs.googleapis.com/v1/documents/doc:batchUpdate",
+            "https://sheets.googleapis.com/v4/spreadsheets/s/values/A1",
+            "https://gmail.googleapis.com/drive/v3/files/x", "https://www.googleapis.com.evil.test/drive/v3/files/x"] {
+            assert!(drive_method_allowed(&reqwest::Method::DELETE, &url.parse().unwrap()), "{url}");
+        }
+    }
+
+    #[test]
+    fn drive_method_fence_rejects_uploads_and_decoded_forbidden_segments() {
+        for path in ["/upload/drive/v3/files", "/upload/anything", "/%75pload/drive/v3/files",
+            "/drive/v3/files/trash", "/drive/v3/files/%74rash",
+            "/drive/v3/files/x/permissions", "/drive/v3/files/x/%70ermissions",
+            "/drive/v3/files/x/revisions", "/drive/v3/files/x/%63omments",
+            "/drive/v3/files/x%2Fy", "/drive/v3/files/x%2fy", "/drive%2fv3/files/x",
+            "/drive/v3/files/x%5Cy", "/drive/v3/files/x%252Fy", "/drive/v3/files/x%00",
+            "//drive/v3/files/x", "/drive//v3/files/x", "//upload/drive/v3/files",
+            "/drive/v3/files/%FF", "/drive/v3/files/%", "/drive/v3/files/%2", "/drive/v3/files/%GG"] {
+            let url = format!("https://www.googleapis.com{path}");
+            assert!(!drive_method_allowed(&reqwest::Method::GET, &url.parse().unwrap()), "{url}");
+        }
+        // Reserved names are whole segments, never substring matches.
+        assert!(drive_method_allowed(&reqwest::Method::GET,
+            &"https://www.googleapis.com/drive/v3/files/my_permissions_backup".parse().unwrap()));
+    }
+
+    #[test]
+    fn drive_raw_url_fence_rejects_traversal_and_parse_errors() {
+        for url in ["not a URL", "https://[", "https://www.googleapis.com/drive/v3/files/../files/x",
+            "https://www.googleapis.com/drive/v3/files/./x", "https://www.googleapis.com/drive/v3/files/%2e/x",
+            "https://www.googleapis.com/drive/v3/files/%2E%2e/files/x",
+            "https://www.googleapis.com/drive/../../calendar/v3/calendars/primary/events",
+            "https://www.googleapis.com/drive/v3/fi\tles/x"] {
+            assert!(drive_request_url(&reqwest::Method::GET, url).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn drive_raw_url_fence_rejects_trailing_dot_hosts() {
+        for host in ["www.googleapis.com.", "content.googleapis.com.", "googleapis.com.",
+            "WWW.GOOGLEAPIS.COM.", "gmail.googleapis.com.", "other.example."] {
+            for (method, path) in [
+                (reqwest::Method::GET, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::DELETE, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::PATCH, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::POST, "/upload/drive/v3/files?uploadType=multipart"),
+            ] {
+                let url = format!("https://{host}{path}");
+                assert!(drive_request_url(&method, &url).is_none(), "{method} {url}");
+            }
+        }
+    }
+
+    #[test]
+    fn drive_endpoints_require_exact_read_routes_and_bounded_ids() {
+        let template = NativeCallTemplate::prepare("drive_search", &json!({"query":"q"})).unwrap();
+        for length in [1, 256] {
+            let url: reqwest::Url = format!("https://www.googleapis.com/drive/v3/files/{}", "x".repeat(length)).parse().unwrap();
+            assert!(drive_read_path_allowed(&url));
+            assert!(endpoint_allowed(&template, &url));
+        }
+        for path in ["/drive/v3/files/".to_owned(), "/drive/v3/filesx".into(), "/drive/v3/files/x/copy".into(),
+            "/drive/v3/files/x/export/extra".into(), "/drive/v3/files/x/export/".into(),
+            "/drive/v3/files/x/permissions".into(), "/drive/v3/files/trash".into(),
+            "/drive/v3/files/x.y".into(), "/drive/v3/files/中文".into(), "/drive/v3/drives".into(),
+            "/upload/drive/v3/files".into(), format!("/drive/v3/files/{}", "x".repeat(257))] {
+            let url: reqwest::Url = format!("https://www.googleapis.com{path}").parse().unwrap();
+            assert!(!drive_read_path_allowed(&url), "{path}");
+            assert!(!endpoint_allowed(&template, &url), "{path}");
+            assert!(drive_request_url(&reqwest::Method::GET, url.as_str()).is_none(), "{path}");
+        }
+    }
 
     fn fixture() -> tempfile::TempDir {
         let home = tempfile::tempdir().unwrap();

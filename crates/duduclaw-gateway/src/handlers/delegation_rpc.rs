@@ -123,7 +123,9 @@ impl MethodHandler {
                 );
             }
         };
-        let (policy, allow, warnings) = Self::parse_delegation_section(&table);
+        let (policy, allow, mut warnings) = Self::parse_delegation_section(&table);
+        let (overrides, extra_warnings) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
+        warnings.extend(extra_warnings);
         let configured_policy =
             duduclaw_core::delegation_policy::delegation_config_read_from_table(&table)
                 .configured_policy;
@@ -134,32 +136,30 @@ impl MethodHandler {
                 // The value as written, so the page can show what it was
                 // when it did not resolve (null when the key is absent).
                 "configured_policy": configured_policy,
+                "unrestricted_roles": overrides.unrestricted_roles,
+                "allow_one_way": overrides.allow_one_way,
                 "allow": allow.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>(),
                 "warnings": warnings,
             }),
         )
     }
 
-    /// `delegation.set` — validate and persist `{ policy?, allow? }`.
+    /// `delegation.set` — validate and persist optional policy, pair and role keys.
     ///
     /// Fail-closed: an unknown policy, a malformed pair, or a pair naming an
     /// agent that does not exist rejects the WHOLE payload (nothing is written)
-    /// — a half-applied permission boundary is worse than none. Self-pairs and
-    /// duplicates are cleaned rather than rejected, because they carry no
-    /// meaning either way.
+    /// — a half-applied permission boundary is worse than none. Legacy two-way
+    /// self-pairs are dropped; directional self-pairs and cross-list duplicates
+    /// reject the request. Omitted keys preserve their current values.
     pub(crate) async fn handle_delegation_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
         use duduclaw_core::delegation_policy::DelegationPolicy;
 
-        /// Guardrail on config size — a whitelist this long is a policy smell,
-        /// not a legitimate setup, and keeps the config file reviewable.
-        const MAX_ALLOW_PAIRS: usize = 200;
-
         let policy_param = params.get("policy");
         let allow_param = params.get("allow");
-        if policy_param.is_none() && allow_param.is_none() {
+        if policy_param.is_none() && allow_param.is_none() && params.get("allow_one_way").is_none() && params.get("unrestricted_roles").is_none() {
             return WsFrame::error_response(
                 "",
-                "沒有要更新的項目。請提供 policy 或 allow(跨部門協作配對)。",
+                "沒有要更新的項目。請提供委派模式、協作配對或角色設定。",
             );
         }
 
@@ -189,194 +189,192 @@ impl MethodHandler {
         };
 
         // ── allow ──
-        let new_allow: Option<Vec<(String, String)>> = match allow_param {
-            None => None,
-            Some(v) => {
-                let items = match v.as_array() {
-                    Some(a) => a,
-                    None => {
-                        return WsFrame::error_response("", "allow 必須是配對清單。");
-                    }
-                };
-                if items.len() > MAX_ALLOW_PAIRS {
-                    return WsFrame::error_response(
-                        "",
-                        &format!("跨部門協作配對最多 {MAX_ALLOW_PAIRS} 組。"),
-                    );
-                }
-                let mut raw_pairs: Vec<(String, String)> = Vec::new();
-                for (idx, item) in items.iter().enumerate() {
-                    let arr = match item.as_array() {
-                        Some(a) if a.len() == 2 => a,
-                        _ => {
-                            return WsFrame::error_response(
-                                "",
-                                &format!(
-                                    "第 {} 組配對格式有誤:每組必須剛好選兩位 AI 員工。",
-                                    idx + 1
-                                ),
-                            );
+        let mut pair_updates = Vec::new();
+        for key in ["allow", "allow_one_way"] {
+            let new_pairs: Option<Vec<(String, String)>> = match params.get(key) {
+                None => None,
+                Some(v) => {
+                    let items = match v.as_array() {
+                        Some(a) => a,
+                        None => {
+                            return WsFrame::error_response("", "協作配對必須是清單。");
                         }
                     };
-                    let a = arr[0].as_str().map(str::trim).unwrap_or("");
-                    let b = arr[1].as_str().map(str::trim).unwrap_or("");
-                    if a.is_empty() || b.is_empty() {
+                    if let Err(e) = validate_pair_count(items.len()) {
+                        return WsFrame::error_response("", e);
+                    }
+                    let mut raw_pairs: Vec<(String, String)> = Vec::new();
+                    for (idx, item) in items.iter().enumerate() {
+                        let arr = match item.as_array() {
+                            Some(a) if a.len() == 2 => a,
+                            _ => {
+                                return WsFrame::error_response(
+                                    "",
+                                    &format!(
+                                        "第 {} 組配對格式有誤:每組必須剛好選兩位 AI 員工。",
+                                        idx + 1
+                                    ),
+                                );
+                            }
+                        };
+                        let a = arr[0].as_str().map(str::trim).unwrap_or("");
+                        let b = arr[1].as_str().map(str::trim).unwrap_or("");
+                        if a.is_empty() || b.is_empty() {
+                            return WsFrame::error_response(
+                                "",
+                                &format!("第 {} 組配對還沒選滿兩位 AI 員工。", idx + 1),
+                            );
+                        }
+                        raw_pairs.push((a.to_string(), b.to_string()));
+                    }
+
+                    // WP21 欠帳③ — namespace unification: `gate_bus_dispatch` /
+                    // `DispatchOrgView` / mcp.rs `org_snapshot` all key agents by
+                    // their **directory name** (bus tasks carry `sender_agent` /
+                    // `target` as directory names), while the registry's `get()` /
+                    // `list()` index by `[agent] name`. Those two need not match.
+                    // Validating (and persisting) whatever the caller typed against
+                    // `config.agent.name` alone would accept a value that then
+                    // never matches at enforcement time — a whitelist entry that
+                    // passes save but silently grants nothing. So: resolve each id
+                    // against the directory-name namespace first; if that misses,
+                    // resolve via `name → directory name` and normalize to the
+                    // directory name before it is ever written to config.toml.
+                    //
+                    // WP22 T4 — `[agent] name` is supposed to be unique, but
+                    // nothing enforced that before this WP (create-time checks are
+                    // new; existing installs can already have two directories
+                    // sharing a name). Note this deliberately does NOT read
+                    // through `self.registry`: `AgentRegistry::scan` already
+                    // collapses same-name directories into a single last-wins
+                    // entry keyed by name (see `duduclaw_agent::registry`), so by
+                    // the time `reg.list()` is observable the duplicate-directory
+                    // information needed to DETECT the collision is already gone
+                    // — only one of the two directories would ever be visible.
+                    // Scanning `<home>/agents/` directly here preserves both, so
+                    // a name that maps to more than one directory can be flagged
+                    // and rejected outright instead of silently resolved to
+                    // whichever directory the registry happened to keep.
+                    let (known_dirs, name_to_dir, ambiguous_names): (
+                        std::collections::HashSet<String>,
+                        std::collections::HashMap<String, String>,
+                        std::collections::HashSet<String>,
+                    ) = {
+                        let mut dirs = std::collections::HashSet::new();
+                        let mut map: std::collections::HashMap<String, String> =
+                            std::collections::HashMap::new();
+                        let mut ambiguous = std::collections::HashSet::new();
+                        if let Ok(entries) = std::fs::read_dir(self.home_dir.join("agents")) {
+                            for entry in entries.flatten() {
+                                let path = entry.path();
+                                if !path.is_dir() {
+                                    continue;
+                                }
+                                let dir_name = match path.file_name().and_then(|n| n.to_str()) {
+                                    Some(n) => n.to_string(),
+                                    None => continue,
+                                };
+                                dirs.insert(dir_name.clone());
+                                // Shared typed parse point (R2 unification): an
+                                // absent file, malformed TOML, an absent
+                                // `[agent]` table and an absent/wrong-typed
+                                // `name` all still skip this directory.
+                                let Some(name) = duduclaw_core::agent_toml::load(&path)
+                                    .agent
+                                    .and_then(|a| a.name)
+                                else {
+                                    continue;
+                                };
+                                let name = name.as_str();
+                                if let Some(existing_dir) = map.get(name) {
+                                    if existing_dir != &dir_name {
+                                        ambiguous.insert(name.to_string());
+                                    }
+                                }
+                                map.insert(name.to_string(), dir_name);
+                            }
+                        }
+                        (dirs, map, ambiguous)
+                    };
+                    // Returns `(resolved directory name, is_ambiguous)`. Directory
+                    // names always take priority and are never ambiguous — the
+                    // caller can always disambiguate by typing the directory name
+                    // (design doc §5).
+                    let resolve_to_dir_name = |id: &str| -> (Option<String>, bool) {
+                        if known_dirs.contains(id) {
+                            (Some(id.to_string()), false)
+                        } else if ambiguous_names.contains(id) {
+                            (None, true)
+                        } else {
+                            (name_to_dir.get(id).cloned(), false)
+                        }
+                    };
+
+                    // Every named agent must resolve — a whitelist pointing at a
+                    // typo'd id silently grants nothing and looks like it works.
+                    // An ambiguous name is rejected before "missing": it did
+                    // resolve to *something*, just not unambiguously, which is a
+                    // sharper problem than a plain typo.
+                    let mut missing: Vec<String> = Vec::new();
+                    let mut ambiguous_hits: Vec<String> = Vec::new();
+                    let mut normalized_pairs: Vec<(String, String)> = Vec::new();
+                    for (a, b) in &raw_pairs {
+                        let (ra, ra_ambiguous) = resolve_to_dir_name(a);
+                        let (rb, rb_ambiguous) = resolve_to_dir_name(b);
+                        if ra_ambiguous {
+                            if !ambiguous_hits.contains(a) {
+                                ambiguous_hits.push(a.clone());
+                            }
+                        } else if ra.is_none() && !missing.contains(a) {
+                            missing.push(a.clone());
+                        }
+                        if rb_ambiguous {
+                            if !ambiguous_hits.contains(b) {
+                                ambiguous_hits.push(b.clone());
+                            }
+                        } else if rb.is_none() && !missing.contains(b) {
+                            missing.push(b.clone());
+                        }
+                        if let (Some(ra), Some(rb)) = (ra, rb) {
+                            normalized_pairs.push((ra, rb));
+                        }
+                    }
+                    if !ambiguous_hits.is_empty() {
                         return WsFrame::error_response(
                             "",
-                            &format!("第 {} 組配對還沒選滿兩位 AI 員工。", idx + 1),
+                            &format!(
+                                "名稱 {} 對應多個 AI 員工,請改用目錄名指定。",
+                                ambiguous_hits.join("、")
+                            ),
                         );
                     }
-                    raw_pairs.push((a.to_string(), b.to_string()));
-                }
+                    if !missing.is_empty() {
+                        return WsFrame::error_response(
+                            "",
+                            &format!(
+                                "找不到這些 AI 員工:{}。請確認名稱後再儲存。",
+                                missing.join("、")
+                            ),
+                        );
+                    }
 
-                // WP21 欠帳③ — namespace unification: `gate_bus_dispatch` /
-                // `DispatchOrgView` / mcp.rs `org_snapshot` all key agents by
-                // their **directory name** (bus tasks carry `sender_agent` /
-                // `target` as directory names), while the registry's `get()` /
-                // `list()` index by `[agent] name`. Those two need not match.
-                // Validating (and persisting) whatever the caller typed against
-                // `config.agent.name` alone would accept a value that then
-                // never matches at enforcement time — a whitelist entry that
-                // passes save but silently grants nothing. So: resolve each id
-                // against the directory-name namespace first; if that misses,
-                // resolve via `name → directory name` and normalize to the
-                // directory name before it is ever written to config.toml.
-                //
-                // WP22 T4 — `[agent] name` is supposed to be unique, but
-                // nothing enforced that before this WP (create-time checks are
-                // new; existing installs can already have two directories
-                // sharing a name). Note this deliberately does NOT read
-                // through `self.registry`: `AgentRegistry::scan` already
-                // collapses same-name directories into a single last-wins
-                // entry keyed by name (see `duduclaw_agent::registry`), so by
-                // the time `reg.list()` is observable the duplicate-directory
-                // information needed to DETECT the collision is already gone
-                // — only one of the two directories would ever be visible.
-                // Scanning `<home>/agents/` directly here preserves both, so
-                // a name that maps to more than one directory can be flagged
-                // and rejected outright instead of silently resolved to
-                // whichever directory the registry happened to keep.
-                let (known_dirs, name_to_dir, ambiguous_names): (
-                    std::collections::HashSet<String>,
-                    std::collections::HashMap<String, String>,
-                    std::collections::HashSet<String>,
-                ) = {
-                    let mut dirs = std::collections::HashSet::new();
-                    let mut map: std::collections::HashMap<String, String> =
-                        std::collections::HashMap::new();
-                    let mut ambiguous = std::collections::HashSet::new();
-                    if let Ok(entries) = std::fs::read_dir(self.home_dir.join("agents")) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if !path.is_dir() {
-                                continue;
-                            }
-                            let dir_name = match path.file_name().and_then(|n| n.to_str()) {
-                                Some(n) => n.to_string(),
-                                None => continue,
-                            };
-                            dirs.insert(dir_name.clone());
-                            // Shared typed parse point (R2 unification): an
-                            // absent file, malformed TOML, an absent
-                            // `[agent]` table and an absent/wrong-typed
-                            // `name` all still skip this directory.
-                            let Some(name) = duduclaw_core::agent_toml::load(&path)
-                                .agent
-                                .and_then(|a| a.name)
-                            else {
-                                continue;
-                            };
-                            let name = name.as_str();
-                            if let Some(existing_dir) = map.get(name) {
-                                if existing_dir != &dir_name {
-                                    ambiguous.insert(name.to_string());
-                                }
-                            }
-                            map.insert(name.to_string(), dir_name);
-                        }
-                    }
-                    (dirs, map, ambiguous)
-                };
-                // Returns `(resolved directory name, is_ambiguous)`. Directory
-                // names always take priority and are never ambiguous — the
-                // caller can always disambiguate by typing the directory name
-                // (design doc §5).
-                let resolve_to_dir_name = |id: &str| -> (Option<String>, bool) {
-                    if known_dirs.contains(id) {
-                        (Some(id.to_string()), false)
-                    } else if ambiguous_names.contains(id) {
-                        (None, true)
-                    } else {
-                        (name_to_dir.get(id).cloned(), false)
-                    }
-                };
+                    // Dedup uses normalized directory ids. Legacy two-way
+                    // self-pairs are dropped; directional self-pairs are rejected.
+                    let cleaned = match clean_delegation_pairs(normalized_pairs, key == "allow_one_way") {
+                        Ok(pairs) => pairs,
+                        Err(e) => return WsFrame::error_response("", e),
+                    };
+                    Some(cleaned)
+                }
+            };
 
-                // Every named agent must resolve — a whitelist pointing at a
-                // typo'd id silently grants nothing and looks like it works.
-                // An ambiguous name is rejected before "missing": it did
-                // resolve to *something*, just not unambiguously, which is a
-                // sharper problem than a plain typo.
-                let mut missing: Vec<String> = Vec::new();
-                let mut ambiguous_hits: Vec<String> = Vec::new();
-                let mut normalized_pairs: Vec<(String, String)> = Vec::new();
-                for (a, b) in &raw_pairs {
-                    let (ra, ra_ambiguous) = resolve_to_dir_name(a);
-                    let (rb, rb_ambiguous) = resolve_to_dir_name(b);
-                    if ra_ambiguous {
-                        if !ambiguous_hits.contains(a) {
-                            ambiguous_hits.push(a.clone());
-                        }
-                    } else if ra.is_none() && !missing.contains(a) {
-                        missing.push(a.clone());
-                    }
-                    if rb_ambiguous {
-                        if !ambiguous_hits.contains(b) {
-                            ambiguous_hits.push(b.clone());
-                        }
-                    } else if rb.is_none() && !missing.contains(b) {
-                        missing.push(b.clone());
-                    }
-                    if let (Some(ra), Some(rb)) = (ra, rb) {
-                        normalized_pairs.push((ra, rb));
-                    }
-                }
-                if !ambiguous_hits.is_empty() {
-                    return WsFrame::error_response(
-                        "",
-                        &format!(
-                            "名稱 {} 對應多個 AI 員工,請改用目錄名指定。",
-                            ambiguous_hits.join("、")
-                        ),
-                    );
-                }
-                if !missing.is_empty() {
-                    return WsFrame::error_response(
-                        "",
-                        &format!(
-                            "找不到這些 AI 員工:{}。請確認名稱後再儲存。",
-                            missing.join("、")
-                        ),
-                    );
-                }
-
-                // Self-pairs mean nothing (self-delegation is denied by the
-                // policy itself) — drop instead of rejecting the save. Dedup
-                // runs on the *normalized* (directory-name) ids, since a name
-                // and its own directory name could otherwise be entered as
-                // "two different" agents in the same pair.
-                let mut cleaned: Vec<(String, String)> = Vec::new();
-                let mut seen: std::collections::HashSet<(String, String)> =
-                    std::collections::HashSet::new();
-                for (a, b) in normalized_pairs {
-                    if a == b {
-                        continue;
-                    }
-                    if seen.insert(Self::delegation_pair_key(&a, &b)) {
-                        cleaned.push((a, b));
-                    }
-                }
-                Some(cleaned)
-            }
+            pair_updates.push(new_pairs);
+        }
+        let new_one_way = pair_updates.pop().unwrap();
+        let new_allow = pair_updates.pop().unwrap();
+        let new_roles = match validate_unrestricted_roles(params.get("unrestricted_roles")) {
+            Ok(roles) => roles,
+            Err(e) => return WsFrame::error_response("", e),
         };
 
         // ── persist ──
@@ -401,6 +399,12 @@ impl MethodHandler {
             }
         };
         let (before_policy, before_allow, _) = Self::parse_delegation_section(&table);
+        let (before_overrides, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
+        let after_one_way = new_one_way.clone().unwrap_or_else(|| before_overrides.allow_one_way.clone());
+        let after_allow_check = new_allow.as_ref().unwrap_or(&before_allow);
+        if pairs_overlap(&after_one_way, after_allow_check) {
+            return WsFrame::error_response("", "單向配對與雙向配對重複，請移除其中一組。");
+        }
 
         // An existing-but-non-table [delegation] is operator data we refuse to
         // silently destroy; report it instead of overwriting.
@@ -439,6 +443,18 @@ impl MethodHandler {
             );
         }
 
+        write_optional_delegation_keys(section, new_roles.as_ref(), new_one_way.as_ref());
+
+        // Check the final effective table, including a policy edit that re-enables
+        // previously ignored role entries.
+        let (after_overrides, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
+        let after_roles = after_overrides.unrestricted_roles;
+        let roles_added = match require_delegation_role_ack(&before_overrides.unrestricted_roles, &after_roles,
+            params.get("acknowledge_risk").and_then(Value::as_bool) == Some(true)) {
+            Ok(roles) => roles,
+            Err(e) => return WsFrame::error_response("", e),
+        };
+
         // Atomic write: temp + rename (same discipline as system.update_config).
         if let Err(e)=super::config_commit::commit_table_locked(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("",&format!("寫入設定失敗:{e}"));
@@ -459,13 +475,10 @@ impl MethodHandler {
                 "delegation_config_changed",
                 "dashboard",
                 duduclaw_security::audit::Severity::Warning,
-                json!({
-                    "actor_user_id": ctx.user_id,
-                    "actor_email": ctx.email,
-                    "actor_role": format!("{:?}", ctx.role).to_lowercase(),
-                    "before": { "policy": before_policy, "allow": pairs_json(&before_allow) },
-                    "after": { "policy": after_policy, "allow": pairs_json(&after_allow) },
-                }),
+                delegation_audit_details(ctx,
+                    json!({ "policy": before_policy, "allow": pairs_json(&before_allow), "unrestricted_roles": before_overrides.unrestricted_roles, "allow_one_way": before_overrides.allow_one_way }),
+                    json!({ "policy": after_policy, "allow": pairs_json(&after_allow), "unrestricted_roles": after_roles, "allow_one_way": after_one_way }),
+                    &roles_added),
             ),
         );
 
@@ -480,6 +493,8 @@ impl MethodHandler {
             "",
             json!({
                 "success": true,
+                "unrestricted_roles": after_roles,
+                "allow_one_way": after_one_way,
                 "policy": after_policy,
                 "allow": pairs_json(&after_allow),
                 // Enforcement re-reads config.toml per decision — no restart.
@@ -581,6 +596,16 @@ pub(crate) fn effective_delegation_json(
             // The gate refuses every permission-gated tool on this error.
             Err(e) => (false, false, Some(e)),
         };
+    use duduclaw_core::delegation_policy::OwnerRoleView;
+    let owner = if read.overrides.unrestricted_roles.is_empty() {
+        Ok(None)
+    } else {
+        crate::delegation_roles::GatewayOwnerRoles::new(home, crate::delegation_roles::Requester::background())
+            .avatar_owner_role(&dir_name)
+    };
+    let owner_error = owner.is_err();
+    let owner_role = owner.ok().flatten();
+    let unrestricted = owner_role.as_ref().is_some_and(|r| read.overrides.unrestricted_roles.contains(r));
     let global = read.rules.policy;
     let (policy, source) = if global == DelegationPolicy::Disabled {
         (DelegationPolicy::Disabled, "global")
@@ -613,6 +638,11 @@ pub(crate) fn effective_delegation_json(
             entry
         })
         .collect();
+    let one_way: Vec<Value> = read.overrides.allow_one_way.iter()
+        .filter(|(a, b)| names_this_agent(a) || names_this_agent(b))
+        .map(|(a, b)| json!({ "from": shown(a), "to": shown(b),
+            "direction": if names_this_agent(a) { "outgoing" } else { "incoming" } }))
+        .collect();
     let pairs_apply = policy.honors_allow_pairs();
     let (active_pairs, inactive_pairs) = if pairs_apply {
         (naming, Vec::new())
@@ -641,6 +671,11 @@ pub(crate) fn effective_delegation_json(
     };
     let mut payload = json!({
         "agent_id": agent_name,
+        "unrestricted": unrestricted,
+        "owner_role": owner_role,
+        "unrestricted_error": if owner_error { Some("users_unreadable") } else { None },
+        "allow_one_way": if pairs_apply { one_way.clone() } else { Vec::new() },
+        "inactive_allow_one_way": if pairs_apply { Vec::new() } else { one_way },
         // What applies to this employee: `none` when either the global
         // policy or its own switch stops it.
         "policy": policy.as_str(),
@@ -653,7 +688,7 @@ pub(crate) fn effective_delegation_json(
         "config_error": config_error,
         // How many `[delegation] allow` entries were dropped as malformed —
         // the only allow-warning information a non-Admin viewer receives.
-        "allow_warning_count": read.allow_warnings.len(),
+        "allow_warning_count": read.allow_warnings.len() + read.override_warnings.len(),
         "may_delegate": policy != DelegationPolicy::Disabled,
         // `create_agent` / `spawn_ephemeral`: the employee's own switch,
         // and never under a global `none`.
@@ -674,7 +709,7 @@ pub(crate) fn effective_delegation_json(
     });
     if viewer_is_admin {
         // The raw texts quote the dropped entries verbatim — Admin only.
-        payload["allow_warnings"] = json!(read.allow_warnings);
+        payload["allow_warnings"] = json!(read.allow_warnings.iter().chain(&read.override_warnings).collect::<Vec<_>>());
         // May quote raw config text (TOML parse excerpt) — Admin only.
         payload["config_error_detail"] = json!(config_error_detail);
     }
@@ -694,3 +729,224 @@ pub(crate) const CONFIG_ERROR_PERMISSIONS_UNREADABLE: &str = "permissions_unread
 /// … or a config error without a recorded category (not produced today;
 /// keeps the field non-null — fail closed toward "there is a problem").
 pub(crate) const CONFIG_ERROR_UNKNOWN: &str = "unknown";
+
+/// Compare effective roles, so ignored legacy entries cannot bypass acknowledgement.
+pub(super) fn require_delegation_role_ack(before: &[String], after: &[String], acknowledged: bool) -> Result<Vec<String>, &'static str> {
+    let added: Vec<_> = after.iter().filter(|role| !before.contains(role)).cloned().collect();
+    if !added.is_empty() && !acknowledged {
+        return Err("新增不受委派範圍限制的角色前，請先確認風險。");
+    }
+    Ok(added)
+}
+
+pub(super) fn delegation_audit_details(ctx: &UserContext, before: Value, after: Value, roles_added: &[String]) -> Value {
+    let mut details = json!({
+        "actor_user_id": ctx.user_id,
+        "actor_email": ctx.email,
+        "actor_role": format!("{:?}", ctx.role).to_lowercase(),
+        "before": before,
+        "after": after,
+    });
+    if !roles_added.is_empty() {
+        details["roles_added"] = json!(roles_added);
+        details["acknowledged_by"] = json!(ctx.user_id);
+        details["acknowledged_at"] = json!(chrono::Utc::now().to_rfc3339());
+    }
+    details
+}
+
+fn validate_unrestricted_roles(value: Option<&Value>) -> Result<Option<Vec<String>>, &'static str> {
+    let Some(value) = value else { return Ok(None); };
+    let items = value.as_array().ok_or("角色必須是清單。")?;
+    let mut roles = Vec::new();
+    for item in items {
+        let role = item.as_str().filter(|r| duduclaw_core::delegation_policy::UNRESTRICTABLE_ROLE_NAMES.contains(r))
+            .ok_or("不受委派範圍限制的角色只能是管理員或主管。");
+        let role = role?;
+        if !roles.iter().any(|r| r == role) { roles.push(role.to_string()); }
+    }
+    Ok(Some(roles))
+}
+
+fn write_optional_delegation_keys(section: &mut toml::Table, roles: Option<&Vec<String>>, pairs: Option<&Vec<(String, String)>>) {
+    if let Some(roles) = roles {
+        if roles.is_empty() { section.remove("unrestricted_roles"); }
+        else { section.insert("unrestricted_roles".into(), toml::Value::Array(roles.iter().cloned().map(toml::Value::String).collect())); }
+    }
+    if let Some(pairs) = pairs {
+        if pairs.is_empty() { section.remove("allow_one_way"); }
+        else { section.insert("allow_one_way".into(), toml::Value::Array(pairs.iter().map(|(a,b)| toml::Value::Array(vec![toml::Value::String(a.clone()), toml::Value::String(b.clone())])).collect())); }
+    }
+}
+
+fn validate_pair_count(count: usize) -> Result<(), &'static str> {
+    if count > duduclaw_core::delegation_policy::MAX_ONE_WAY_PAIRS { Err("跨部門協作配對最多 200 組。") } else { Ok(()) }
+}
+
+fn clean_delegation_pairs(pairs: Vec<(String, String)>, directional: bool) -> Result<Vec<(String, String)>, &'static str> {
+    let mut seen = std::collections::HashSet::new();
+    let mut cleaned = Vec::new();
+    for (a, b) in pairs {
+        if a == b {
+            if directional { return Err("單向配對必須是不同的 AI 員工。"); }
+            continue;
+        }
+        let key = if directional { (a.clone(), b.clone()) } else { MethodHandler::delegation_pair_key(&a, &b) };
+        if seen.insert(key) { cleaned.push((a, b)); }
+    }
+    Ok(cleaned)
+}
+
+fn pairs_overlap(one_way: &[(String, String)], two_way: &[(String, String)]) -> bool {
+    one_way.iter().any(|(a, b)| two_way.iter().any(|(x, y)| MethodHandler::delegation_pair_key(a, b) == MethodHandler::delegation_pair_key(x, y)))
+}
+
+#[cfg(test)]
+mod rm183_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delegation_role_additions_require_ack_and_record_server_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[delegation]\npolicy='none'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        for params in [json!({"unrestricted_roles": ["employee"], "acknowledge_risk": true}),
+            json!({"unrestricted_roles": ["admin"]}),
+            json!({"unrestricted_roles": ["admin"], "acknowledge_risk": "true"})] {
+            let response = handler.handle_delegation_set(params, &ctx).await;
+            assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[delegation]\npolicy='none'\n");
+        }
+        let response = handler.handle_delegation_set(json!({"unrestricted_roles": ["admin"],
+            "acknowledge_risk": true, "acknowledged_by": "forged", "acknowledged_at": "forged"}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let event: Value = rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["event_type"] == "delegation_config_changed").unwrap();
+        assert_eq!(event["details"]["roles_added"], json!(["admin"]));
+        assert_eq!(event["details"]["acknowledged_by"], ctx.user_id);
+        assert!(chrono::DateTime::parse_from_rfc3339(event["details"]["acknowledged_at"].as_str().unwrap()).is_ok());
+        let response = handler.handle_delegation_set(json!({"unrestricted_roles": []}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let event: Value = rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["event_type"] == "delegation_config_changed").last().unwrap();
+        assert!(event["details"].get("acknowledged_by").is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_valid_policy_requires_ack_for_legacy_roles() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[delegation]\npolicy='typo'\nunrestricted_roles=['admin']\n";
+        std::fs::write(&path, original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let response = handler.handle_delegation_set(json!({"policy": "none"}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let response = handler.handle_delegation_set(json!({"policy": "none", "acknowledge_risk": true}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+    }
+
+    fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
+        values.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+    }
+
+    #[test]
+    fn rejects_invalid_roles_and_deduplicates_exact_roles() {
+        for value in [json!(["root"]), json!(["Admin"]), json!([" admin "]), json!([1]), json!(null)] {
+            assert!(validate_unrestricted_roles(Some(&value)).is_err());
+        }
+        assert_eq!(validate_unrestricted_roles(Some(&json!(["admin", "admin", "manager"]))).unwrap(), Some(vec!["admin".to_string(), "manager".to_string()]));
+        assert!(validate_unrestricted_roles(Some(&json!(["employee"]))).is_err());
+        assert_eq!(validate_unrestricted_roles(None).unwrap(), None);
+        assert_eq!(validate_unrestricted_roles(Some(&json!(["root"]))).unwrap_err(), "不受委派範圍限制的角色只能是管理員或主管。");
+    }
+
+    #[test]
+    fn ordered_dedupe_preserves_reverse_pair_and_rejects_self_pair() {
+        assert_eq!(clean_delegation_pairs(pairs(&[("a", "b"), ("a", "b"), ("b", "a")]), true).unwrap(), pairs(&[("a", "b"), ("b", "a")]));
+        assert!(clean_delegation_pairs(pairs(&[("a", "a")]), true).is_err());
+        assert!(pairs_overlap(&pairs(&[("b", "a")]), &pairs(&[("a", "b")])));
+        assert!(!pairs_overlap(&pairs(&[("c", "a")]), &pairs(&[("a", "b")])));
+        assert!(validate_pair_count(200).is_ok());
+        assert!(validate_pair_count(201).is_err());
+    }
+
+    #[test]
+    fn omitted_keys_preserve_values_and_empty_arrays_remove_them() {
+        let mut section: toml::Table = "unrestricted_roles=['admin']\nallow_one_way=[['a','b']]".parse().unwrap();
+        let before = section.clone();
+        write_optional_delegation_keys(&mut section, None, None);
+        assert_eq!(section, before);
+        write_optional_delegation_keys(&mut section, Some(&vec![]), Some(&vec![]));
+        assert!(!section.contains_key("unrestricted_roles"));
+        assert!(!section.contains_key("allow_one_way"));
+    }
+
+    #[test]
+    fn effective_without_unrestricted_roles_does_not_require_users_db() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='a'\n[permissions]\ncan_send_cross_agent=true").unwrap();
+        for roles in ["", "\nunrestricted_roles=[]", "\nunrestricted_roles=['employee']"] {
+            std::fs::write(home.path().join("config.toml"), format!("[delegation]\npolicy='department'{roles}")).unwrap();
+            let value = effective_delegation_json(home.path(), &agent, "a", &|_| true, true);
+            assert_eq!(value["unrestricted"], false);
+            assert!(value["owner_role"].is_null());
+            assert!(value["unrestricted_error"].is_null());
+            assert!(value["config_error"].is_null());
+            assert!(value["config_error_detail"].is_null());
+            assert!(!home.path().join("users.db").exists());
+        }
+    }
+
+    #[test]
+    fn effective_masks_directional_peers_and_reports_unreadable_users() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='a'\n[permissions]\ncan_send_cross_agent=true").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='department'\nunrestricted_roles=['admin']\nallow_one_way=[['a','hidden'],['visible','a']]").unwrap();
+        let value = effective_delegation_json(home.path(), &agent, "a", &|p| p == "visible", false);
+        assert_eq!(value["allow_one_way"][0]["direction"], "outgoing");
+        assert_eq!(value["allow_one_way"][0]["to"], HIDDEN_PEER_PLACEHOLDER);
+        assert_eq!(value["allow_one_way"][1]["direction"], "incoming");
+        assert_eq!(value["allow_one_way"][1]["from"], "visible");
+        assert_eq!(value["unrestricted"], false);
+        assert_eq!(value["unrestricted_error"], "users_unreadable");
+        assert!(value["owner_role"].is_null());
+        assert!(value["config_error"].is_null());
+        assert!(value.get("config_error_detail").is_none());
+        assert!(!home.path().join("users.db").exists());
+    }
+}
+
+#[cfg(test)]
+mod rm183_owner_tests {
+    use super::*;
+
+    #[test]
+    fn effective_role_override_under_none_requires_unique_active_avatar_owner() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = home.path().join("agents/a");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("agent.toml"), "[agent]\nname='a'").unwrap();
+        std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='none'\nunrestricted_roles=['admin']\nallow_one_way=[['a','b']]").unwrap();
+        let db = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        db.execute_batch("CREATE TABLE users (role TEXT, status TEXT, avatar_agent_id TEXT); INSERT INTO users VALUES ('admin', 'active', 'a');").unwrap();
+        let value = effective_delegation_json(home.path(), &agent, "a", &|_| false, false);
+        assert_eq!(value["unrestricted"], true);
+        assert_eq!(value["owner_role"], "admin");
+        assert_eq!(value["allow_one_way"], json!([]));
+        assert_eq!(value["inactive_allow_one_way"][0]["to"], HIDDEN_PEER_PLACEHOLDER);
+        db.execute("UPDATE users SET status='disabled'", []).unwrap();
+        assert_eq!(effective_delegation_json(home.path(), &agent, "a", &|_| false, false)["unrestricted"], false);
+        db.execute_batch("UPDATE users SET status='active'; INSERT INTO users VALUES ('admin', 'active', 'a');").unwrap();
+        assert_eq!(effective_delegation_json(home.path(), &agent, "a", &|_| false, false)["unrestricted"], false);
+    }
+}

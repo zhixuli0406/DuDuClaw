@@ -188,7 +188,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search" | "wiki_stats"
         | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get" | "xlsx_read"
         | "calendar_list_events" | "discovery_catalog" | "discovery_list" | "discovery_tree"
-        | "discovery_artifact" | "meeting_transcribe_status" => Read,
+        | "discovery_artifact" | "meeting_transcribe_status" | "admin_settings_read" => Read,
 
         // ── draft ───────────────────────────────────────────────────────
         "gmail_create_draft" | "canvas_push" | "plan_start" | "skill_from_recording"
@@ -202,7 +202,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         // ── publish ─────────────────────────────────────────────────────
         // `knowledge_add_source` only files a proposal; a person decides in
         // the dashboard. Classified as publishing to a shared store.
-        "wiki_share" | "github_issue_comment" | "shared_skill_share" | "knowledge_add_source" => {
+        "wiki_share" | "github_issue_comment" | "shared_skill_share" | "knowledge_add_source" | "drive_create_file" | "drive_copy_file" | "drive_move_file" => {
             Publish
         }
 
@@ -211,7 +211,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 
         // ── delete ──────────────────────────────────────────────────────
         "agent_remove" | "delete_cron_task" | "cancel_reminder" | "shared_wiki_delete"
-        | "memory_invalidate_by_origin" | "calendar_delete_event" => Delete,
+        | "memory_invalidate_by_origin" | "calendar_delete_event" | "drive_trash_file" => Delete,
 
         // ── modify ──────────────────────────────────────────────────────
         "meeting_transcribe_cancel" | "activity_post" | "belief_settle" | "belief_submit" | "browser_record_start"
@@ -219,7 +219,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "computer_navigate" | "computer_scroll" | "computer_session_start"
         | "computer_session_stop" | "computer_type" | "computer_login" | "credential_declare" | "computer_workspace_write"
         | "create_task" | "decision_resolve" | "desktop_record_start" | "desktop_record_stop"
-        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
+        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_update_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
         | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" | "odoo_attachment_add"
@@ -233,7 +233,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "working_state_set" | "discovery_cancel" => Modify,
 
         // ── admin ───────────────────────────────────────────────────────
-        "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
+        "admin_settings_propose" | "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
         | "codrive_run" | "create_agent" | "evolution_toggle" | "execute_program"
         | "llamafile_start" | "llamafile_stop" | "model_download" | "model_load"
         | "model_unload" | "odoo_execute" | "os_apply_update" | "os_doctor_repair"
@@ -306,7 +306,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "computer_scroll" | "computer_session_stop" | "computer_type" | "computer_login"
         | "credential_declare" | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
         | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
-        | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
+        | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_create_file" | "drive_copy_file" | "drive_update_file" | "drive_move_file" | "drive_trash_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
         | "gmail_create_draft" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send" | "odoo_message_send"
         | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
@@ -349,6 +349,15 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "docs_replace_text",
     "sheets_create",
     "sheets_update",
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "drive_move_file",
+    "drive_trash_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
     "calendar_update_event",
     "calendar_delete_event",
     "gmail_send_draft",
@@ -1130,6 +1139,15 @@ mod tests {
             "docs_replace_text",
             "sheets_create",
             "sheets_update",
+            "drive_create_file",
+            "drive_copy_file",
+            "drive_update_file",
+            "drive_move_file",
+            "drive_trash_file",
+            "docs_insert_text",
+            "docs_format",
+            "sheets_add_sheet",
+            "sheets_add_note",
             "calendar_update_event",
             "calendar_delete_event",
             "gmail_send_draft",
@@ -1456,5 +1474,24 @@ mod google_write_effect_tests {
             }
         }
         assert_eq!(effect_of("gmail_create_draft"), ToolEffect::Draft);
+    }
+}
+
+#[cfg(test)]
+mod drive_write_effect_tests {
+    use super::*;
+    #[test]
+    fn drive_writes_have_effects_and_never_enter_explore() {
+        for tool in crate::google_identity::DRIVE_WRITE_TOOLS {
+            let expected = match *tool {
+                "drive_create_file" | "drive_copy_file" | "drive_move_file" => ToolEffect::Publish,
+                "drive_trash_file" => ToolEffect::Delete,
+                _ => ToolEffect::Modify,
+            };
+            assert_eq!(effect_of_builtin(tool), Some(expected), "{tool}");
+            assert_eq!(reads_private(tool), Some(false), "{tool}");
+            assert_eq!(egress_capable(tool), Some(true), "{tool}");
+            assert!(!ProcessLane::Explore.permits(expected), "{tool}");
+        }
     }
 }

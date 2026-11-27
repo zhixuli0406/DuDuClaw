@@ -52,7 +52,10 @@ pub(crate) fn authenticate(home: &Path, db: &UserDb, raw: &str) -> Result<UserCo
 fn refresh_id(home: &Path, db: &UserDb, id: &str, user: &str) -> Result<UserContext, String> {
     if !read_config(home)?.enabled { return Err("member keys disabled".into()); }
     db.member_key_context(id, user)
-        .map(|ctx| crate::machine_employee::without_restricted_access(home, ctx))
+        .map(|mut ctx| {
+            ctx.origin = duduclaw_auth::acl::ContextOrigin::MemberKey;
+            crate::machine_employee::without_restricted_access(home, ctx)
+        })
 }
 pub(crate) fn refresh(home: &Path, db: &UserDb, ctx: &UserContext) -> Result<UserContext, String> {
     refresh_authority(home, db, ctx).map(|live| live.context)
@@ -62,6 +65,7 @@ pub(crate) fn refresh_authority(home: &Path, db: &UserDb, ctx: &UserContext)
     let id = ctx.member_key_id.as_deref().ok_or("member key invalid")?;
     if !read_config(home)?.enabled { return Err("member keys disabled".into()); }
     let mut live = db.member_key_authority(id, &ctx.user_id)?;
+    live.context.origin = duduclaw_auth::acl::ContextOrigin::MemberKey;
     live.context = crate::machine_employee::without_restricted_access(home, live.context);
     if live.context.credential_epoch != ctx.credential_epoch { return Err("member key invalid".into()); }
     Ok(live)

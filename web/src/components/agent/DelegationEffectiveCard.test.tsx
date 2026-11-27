@@ -95,6 +95,18 @@ describe('DelegationEffectiveCard (RM-137)', () => {
     }
   });
 
+  it('shows an unknown owner role as one muted line without a config alert', async () => {
+    effectiveMock.mockResolvedValue({
+      ...BASE, unrestricted: false, owner_role: null, unrestricted_error: 'users_unreadable',
+    });
+    renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+    const note = await screen.findByText(en['agentDetail.delegation.unrestrictedUnknown']);
+    expect(note).toHaveClass('text-muted-foreground');
+    expect(screen.getAllByText(en['agentDetail.delegation.unrestrictedUnknown'])).toHaveLength(1);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.queryByText(/No delegation scope limits/)).not.toBeInTheDocument();
+  });
+
   it('never renders config text, even from an older gateway or in the Admin detail (RM-137 re-review)', async () => {
     signIn('admin');
     // An older gateway sent the raw parse error as `config_error`; an Admin
@@ -171,4 +183,17 @@ describe('DelegationEffectiveCard (RM-137)', () => {
       }
     }
   });
+});
+
+
+it('shows unrestricted ownership and directional peers without exposing hidden ids', async () => {
+  effectiveMock.mockResolvedValue({ ...BASE, unrestricted: true, owner_role: 'admin', allow_one_way: [
+    { from: 'sales-rep', to: '*hidden*', direction: 'outgoing' },
+    { from: 'mkt-lead', to: 'sales-rep', direction: 'incoming' },
+  ] });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText(/No delegation scope limits/)).toBeInTheDocument();
+  expect(screen.getByText(/Can delegate to:/)).toHaveTextContent(en['agentDetail.delegation.hiddenPeer']);
+  expect(screen.getByText(/Can accept work from:/)).toHaveTextContent('mkt-lead');
+  expect(screen.queryByText(/\*hidden\*/)).not.toBeInTheDocument();
 });

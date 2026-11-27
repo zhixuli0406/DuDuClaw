@@ -26,6 +26,10 @@ fn ok(frame: WsFrame) { assert!(matches!(frame, WsFrame::Response {ok:true,..}),
 #[tokio::test]
 async fn survival_evidence_authorized_dashboard_decisions_persist_and_continue_clears_old_approval() {
     let home=tempfile::tempdir().unwrap(); let store=TaskStore::open(home.path()).unwrap();
+    let agent_dir = home.path().join("agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     store.insert_task(&goal("g", "needs_human")).await.unwrap();
     let h=handler(home.path()).await;
     ok(h.handle_tasks_goal_decide(json!({"task_id":"g","action":"done"}), &UserContext::admin_fallback()).await);
@@ -42,6 +46,7 @@ async fn survival_evidence_forged_activity_bare_store_decision_and_viewer_never_
     store.insert_task(&goal("g", "needs_human")).await.unwrap();
     store.append_activity(&ActivityRow{id:"forged".into(), event_type:"goal_loop.human_decision.done".into(),agent_id:"alice".into(),task_id:Some("g".into()),summary:"Approved by human".into(),timestamp:Utc::now().to_rfc3339(),metadata:Some(json!({"human_approved":true}).to_string())}).await.unwrap();
     let viewer=UserContext{
+            origin: duduclaw_auth::acl::ContextOrigin::Other,
             member_key_id: None,credential_epoch:0,user_id:"viewer".into(),email:"viewer@local".into(),role:UserRole::Employee,agent_access:std::collections::HashMap::from([("alice".into(),AccessLevel::Viewer)]),must_change_password:false, team_access: Default::default(), acl_generation: 0,};
     let frame=handler(home.path()).await.handle_tasks_goal_decide(json!({"task_id":"g","action":"done"}),&viewer).await;
     assert!(matches!(frame,WsFrame::Response{ok:false,..}));
@@ -114,6 +119,10 @@ async fn survival_evidence_difficulty_requires_complete_dispatch_snapshots_and_p
 #[tokio::test]
 async fn survival_evidence_human_approval_binds_actual_iteration_and_clears_on_continue() {
     let home=tempfile::tempdir().unwrap(); let store=TaskStore::open(home.path()).unwrap();
+    let agent_dir = home.path().join("agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     let mut task=goal("bound","needs_human"); task.revision_round=99;
     store.insert_task(&task).await.unwrap();
     store.insert_task(&goal("other","pending")).await.unwrap();

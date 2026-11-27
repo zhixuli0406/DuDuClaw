@@ -89,6 +89,7 @@ mod permission_history_rpc_tests;
 mod agent_channels_rpc_tests;
 mod agent_files_rpc_tests;
 mod org_change_rpc_tests;
+mod org_change_reach_tests;
 mod agents_pause_binding_tests;
 mod agent_files_skill_tests;
 mod responsibilities_rpc_tests;
@@ -121,3 +122,7 @@ mod member_keys_rpc_tests;
 mod mcp_keys_rpc_tests;
 
 mod odoo_member_rpc_tests;
+mod dept_grant_matrix_tests;
+mod dept_grants_rpc_tests;
+mod main_access_rpc_tests;
+mod google_drive_write_rpc_tests;

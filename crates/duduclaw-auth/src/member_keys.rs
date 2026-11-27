@@ -766,6 +766,7 @@ impl UserDb {
         let mut ctx = crate::UserContext::from_live(&user, &access);
         if ctx.is_admin() || ctx.must_change_password { return Err("member key invalid".into()); }
         ctx.member_key_id = Some(id.to_owned());
+        ctx.origin = crate::acl::ContextOrigin::MemberKey;
         // The schema requires expiry; missing, malformed or negative timestamps
         // remain refusals, never an unbounded credential.
         let (expiry, include_conversations, scopes): (String, i64, String) = tx.query_row(
@@ -889,6 +890,15 @@ mod tests {
         let user = db.create_user("member@test.invalid", "Member", "test-password", UserRole::Employee).unwrap();
         (home, db, user)
     }
+    #[test]
+    fn context_origin_member_key() {
+        let (_home, db, user) = fixture();
+        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch, false, &[]).unwrap();
+        let ctx = db.member_key_context(&key.info.id, &user.id).unwrap();
+        assert_eq!(ctx.origin, crate::acl::ContextOrigin::MemberKey);
+        assert_eq!(ctx.member_key_id.as_deref(), Some(key.info.id.as_str()));
+    }
+
     #[test]
     fn secret_is_random_redacted_and_never_listed_or_audited() {
         let (_home, db, user) = fixture();

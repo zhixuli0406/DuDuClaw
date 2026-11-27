@@ -191,6 +191,11 @@ pub(crate) async fn create(
                 },
             )
         }
+        Err(CreateError::AssigneeUnavailable) => duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE.to_string(),
+        Err(CreateError::Entry(refusal)) => {
+            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, &spec.agent).await;
+            refusal.user_text(caller.conversation, language.as_deref(), caller.event.unwrap_or("schedule"))
+        }
         Err(CreateError::Spec(e)) => t::spec_error(lang, &e),
         Err(CreateError::TooMany { max }) => t::too_many(lang, max),
         Err(CreateError::Empty) => at::usage(lang).to_string(),

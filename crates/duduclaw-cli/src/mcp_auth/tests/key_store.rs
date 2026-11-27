@@ -297,7 +297,7 @@ fn hand_edited_stored_keys_drop_person_only_scopes_but_keep_odoo() {
         let principal = authenticate_with_key(&raw, home.path()).unwrap();
         assert_eq!(principal.is_external, external);
         assert_eq!(principal.scopes,
-            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect());
+            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
     }
 }
 
@@ -313,6 +313,6 @@ fn legacy_and_gateway_internal_authentication_drop_person_only_scopes() {
         }
         let principal = authenticate_with_key(&raw, home.path()).unwrap();
         assert_eq!(principal.scopes,
-            [Scope::Admin, Scope::OdooRead, Scope::OdooWrite].into_iter().collect());
+            [Scope::Admin, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
     }
 }

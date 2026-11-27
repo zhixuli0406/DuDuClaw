@@ -125,7 +125,12 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("drive_create_file", "folder", "boolean"),
+    ("docs_format", "operations", "array"),
     ("my_tasks_list", "limit", "integer"),
+    ("admin_settings_read", "agent_ids", "array"),
+    ("admin_settings_read", "sections", "array"),
+    ("admin_settings_propose", "items", "array"),
     ("docs_replace_text", "match_case", "boolean"),
     ("calendar_update_event", "notify_attendees", "boolean"),
     ("calendar_delete_event", "notify_attendees", "boolean"),
@@ -241,6 +246,8 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         properties.get_mut("name").unwrap()["maxLength"] = serde_json::json!(255);
         properties.get_mut("file").unwrap()["minLength"] = serde_json::json!(1);
     }
+    agents::admin_settings_properties(tool.name, &mut properties);
+
     if tool.name == "sheets_update" {
         properties.get_mut("values").unwrap()["items"] = serde_json::json!({
             "type":"array", "items":{"type":["string","number","boolean","null"]}
@@ -298,17 +305,18 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
         );
     }
+    let mut input_schema = serde_json::json!({"type":"object","properties":properties,"required":required});
+    google::drive_write_schema(tool.name, &mut input_schema);
     let mut schema = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required
-        },
+        "inputSchema": input_schema,
         "annotations": annotations::tool_annotations(tool.name)
     });
     if writeback { schema["inputSchema"]["additionalProperties"] = serde_json::json!(false); }
+    if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
+        schema["inputSchema"]["additionalProperties"] = serde_json::json!(false);
+    }
     schema
 }
 

@@ -52,7 +52,8 @@ async fn withdraw_approval(broker: &ApprovalBroker, approval_id: &str, task_id: 
 }
 
 #[derive(Debug, Clone)]
-pub struct TrustedCaller { principal: Principal, isolated: bool, creator: Option<IsolatedCreator> }
+pub struct TrustedCaller { principal: Principal, isolated: bool, creator: Option<IsolatedCreator>,
+    delegation_roles: Option<crate::delegation_roles::RoleFacts> }
 #[derive(Debug, Clone)]
 enum Principal { User(UserContext), Agent(String) }
 
@@ -82,7 +83,7 @@ impl TrustedCaller {
         if context.user_id.trim().is_empty() || context.requires_password_change() {
             return Err("permission denied".into());
         }
-        Ok(Self { principal: Principal::User(context.clone()), isolated: false, creator: None })
+        Ok(Self { principal: Principal::User(context.clone()), isolated: false, creator: None, delegation_roles: None })
     }
     pub fn from_signed_agent(home: &Path, id: &str, token: Option<&str>) -> Result<Self, String> {
         valid_id(id)?;
@@ -90,7 +91,7 @@ impl TrustedCaller {
             duduclaw_core::IdentityVerdict::Verified) {
             return Err("discovery requires a verified agent identity".into());
         }
-        Ok(Self { principal: Principal::Agent(id.into()), isolated: false, creator: None })
+        Ok(Self { principal: Principal::Agent(id.into()), isolated: false, creator: None, delegation_roles: None })
     }
     /// The connection-bound MCP dispatcher has already authenticated this
     /// request. Keep the employee role: a human principal behind the run does
@@ -111,13 +112,21 @@ impl TrustedCaller {
         let employee = call.employee();
         let incarnation = incarnation(home, id, employee).map_err(|_| ISOLATED_CALLER_REQUIRED.to_owned())?;
         Ok(Self { principal: Principal::Agent(id.into()), isolated: true,
-            creator: Some(IsolatedCreator { employee: employee.0, incarnation }) })
+            creator: Some(IsolatedCreator { employee: employee.0, incarnation }), delegation_roles: None })
     }
     /// Test seam: an isolated caller whose incarnation is given instead of read
     /// from the confirmed lifecycle (the gateway-scope check still applies).
     #[cfg(test)]
     pub(crate) fn from_isolated_agent_at(home: &Path, id: &str, incarnation: u32) -> Result<Self, String> {
         Self::from_isolated_agent_with(home, id, &move |_, _, _| Ok(incarnation))
+    }
+    /// Internal MCP bridge input: only the signed delegation-roles response,
+    /// never a tool argument. This service also runs inside the separate MCP process.
+    pub fn with_delegation_roles(mut self, facts: crate::delegation_roles::RoleFacts) -> Self {
+        if matches!(&self.principal, Principal::Agent(id) if *id == facts.agent) {
+            self.delegation_roles = Some(facts);
+        }
+        self
     }
     /// The protected creator identity, `None` for RPC/signed callers.
     pub fn isolated_creator(&self) -> Option<IsolatedCreator> { self.creator }
@@ -144,9 +153,18 @@ impl TrustedCaller {
             Principal::Agent(id) if id == agent => Ok(()),
             Principal::Agent(id) => {
                 let org = crate::delegation_gate::DispatchOrgView::new(home, None);
-                duduclaw_core::delegation_policy::can_delegate_rules(
-                    &duduclaw_core::delegation_policy::delegation_rules_from_home(home),
-                    &org, id, agent).map_err(|_| "delegation denied".into())
+                let read = duduclaw_core::delegation_policy::read_delegation_config(home);
+                let facts = self.delegation_roles.as_ref();
+                let principal = crate::on_behalf_of::current();
+                let boundaries = crate::delegation_roles::sync_boundaries(home, id, agent, principal.as_deref());
+                duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, id, agent,
+                    &duduclaw_core::delegation_policy::DelegationContext {
+                        overrides: &read.overrides,
+                        owner_roles: facts.map(|f| f as &dyn duduclaw_core::delegation_policy::OwnerRoleView),
+                        boundaries, extra_system_senders: &[],
+                    }).map(|source| crate::delegation_roles::audit_allow(home, id, agent, source,
+                        facts.as_ref().and_then(|f| f.requester_account_id.as_deref()), "discovery"))
+                    .map_err(|_| "delegation denied".into())
             }
         }
     }

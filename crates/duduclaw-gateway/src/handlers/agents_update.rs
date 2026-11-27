@@ -3,6 +3,75 @@
 #[allow(unused_imports)]
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(crate) enum UpdateOrigin {
+    Dashboard,
+    OsSettings,
+    AdminAi { approval_id: String, expected_snapshot: Option<crate::agent_files::writer::AdminAiSnapshot> },
+}
+
+impl UpdateOrigin {
+    fn source(&self) -> &'static str {
+        match self { Self::Dashboard => "agents.update", Self::OsSettings => "os.settings.update", Self::AdminAi { .. } => "admin_ai" }
+    }
+}
+
+/// Request-derived allowlist; the final table is checked separately under the writer lock.
+fn admin_ai_requested_fields(params: &Value) -> Result<Vec<duduclaw_core::admin_ai_settings::AdminAiField>, &'static str> {
+    use duduclaw_core::admin_ai_settings::{AdminAiField as F, DIFF_REFUSED};
+    let mut fields = Vec::new();
+    for (key, value) in params.as_object().ok_or(DIFF_REFUSED)? {
+        let field = match key.as_str() {
+            "agent_id" => continue,
+            "display_name" => F::DisplayName, "icon" => F::Icon, "trigger" => F::Trigger,
+            "status" => F::Status, "reply_language" => F::ReplyLanguage,
+            "preferred" => F::Model, "fallback" => F::FallbackModel,
+            "heartbeat_enabled" => F::HeartbeatEnabled, "heartbeat_interval" => F::HeartbeatInterval,
+            "heartbeat_cron" => F::HeartbeatCron, "heartbeat_cron_timezone" => F::HeartbeatCronTimezone,
+            "model.effort" => F::Effort,
+            "runtime.timeout_secs" => F::TimeoutSecs, "runtime.max_turns" => F::MaxTurns,
+            "runtime.idle_timeout_secs" => F::IdleTimeoutSecs,
+            "runtime" | "model" | "prompt" => {
+                for child in value.as_object().ok_or(DIFF_REFUSED)?.keys() {
+                    let path = format!("{key}.{child}");
+                    let f = F::ALL.iter().find(|f| f.toml_path() == path).ok_or(DIFF_REFUSED)?;
+                    fields.push(*f);
+                }
+                continue;
+            }
+            _ => return Err(DIFF_REFUSED),
+        };
+        fields.push(field);
+    }
+    Ok(fields)
+}
+
+/// Authority paths never appear twice in audit; secrets are omitted recursively.
+fn ordinary_settings_diff(before: &toml::Table, after: &toml::Table) -> Vec<Value> {
+    fn safe(value: Value) -> Value {
+        match value {
+            Value::String(s) => {
+                if super::config_raw_rpc::url_has_password(&s) || super::config_raw_rpc::url_has_secret_query(&s) {
+                    return json!("[redacted]");
+                }
+                let s = duduclaw_security::credential_protection::sanitize_output_text(&s);
+                json!(duduclaw_core::truncate_chars(&s, 200))
+            }
+            Value::Array(values) => Value::Array(values.into_iter().map(safe).collect()),
+            Value::Object(values) => Value::Object(values.into_iter()
+                .filter(|(k, _)| !super::config_raw_rpc::is_secret_key(k) && !["headers", "otlp_headers", "env"].contains(&k.as_str()))
+                .map(|(k, v)| (k, safe(v))).collect()),
+            other => other,
+        }
+    }
+    duduclaw_core::admin_ai_settings::changed_leaves(before, after).into_iter().filter(|(path, _, _)| {
+        let under = |prefix: &str| path == prefix || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'));
+        !super::agent_authority::AUTHORITY.iter().any(|key| under(key.toml_key))
+            && !["channels", "odoo", "google"].iter().any(|prefix| under(prefix))
+            && !path.split('.').any(|key| super::config_raw_rpc::is_secret_key(key) || ["headers", "otlp_headers", "env"].contains(&key))
+    }).map(|(path, before, after)| json!({"path": path, "before": safe(before), "after": safe(after)})).collect()
+}
+
 impl MethodHandler {
     /// Update one or more fields of an agent's `agent.toml`.
     ///
@@ -23,7 +92,7 @@ impl MethodHandler {
         params: Value,
         caller: Option<&UserContext>,
     ) -> WsFrame {
-        self.agents_update_inner(params, caller, None).await
+        self.agents_update_inner(params, caller, None, UpdateOrigin::Dashboard).await
     }
 
     /// `agents.update` from the dashboard: `live` is the caller re-read from
@@ -36,15 +105,31 @@ impl MethodHandler {
         live: &UserContext,
         session: &UserContext,
     ) -> WsFrame {
-        self.agents_update_inner(params, Some(live), Some(session)).await
+        self.agents_update_inner(params, Some(live), Some(session), UpdateOrigin::Dashboard).await
     }
 
-    async fn agents_update_inner(
+    pub(crate) async fn agents_update_inner(
         &self,
         params: Value,
         caller: Option<&UserContext>,
         session: Option<&UserContext>,
+        origin: UpdateOrigin,
     ) -> WsFrame {
+        let update_source = origin.source();
+        let expected_snapshot = match &origin {
+            UpdateOrigin::AdminAi { expected_snapshot: Some(hash), .. } => Some(hash.clone()),
+            UpdateOrigin::AdminAi { .. } => return WsFrame::error_response("", crate::admin_ai::proposal::STALE),
+            _ => None,
+        };
+        let requested_fields = if matches!(&origin, UpdateOrigin::AdminAi { .. }) {
+            if !caller.is_some_and(|ctx| ctx.has_role(UserRole::Admin)) {
+                return WsFrame::error_response("", "管理員 AI 設定需要管理員權限。");
+            }
+            match admin_ai_requested_fields(&params) {
+                Ok(fields) => Some(fields),
+                Err(e) => return WsFrame::error_response("", e),
+            }
+        } else { None };
         // Also protect direct callers, before registry, locks or channel side effects.
         if caller.is_some_and(|ctx| ctx.member_key_id.is_some())
             || session.is_some_and(|ctx| ctx.member_key_id.is_some()) {
@@ -182,7 +267,7 @@ impl MethodHandler {
                             "agent_id": agent_id,
                             "keys": ["agent.role"],
                             "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
-                            "source": "agents.update",
+                            "source": update_source,
                         }),
                     ),
                 );
@@ -337,6 +422,8 @@ impl MethodHandler {
             std::sync::Mutex<Vec<super::system_update_config_v168::ProtectedChange>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let authority_for_closure = authority_changes.clone();
+        let ordinary_changes = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let ordinary_for_closure = ordinary_changes.clone();
         let audit_agent_id = agent_id.clone();
         let audit_user_id = caller.map(|c| c.user_id.clone()).unwrap_or_else(|| "unknown".into());
 
@@ -465,7 +552,7 @@ impl MethodHandler {
             None
         };
 
-        let result = self.update_agent_toml_as_within(&agent_id, "agents.update", caller, session, lock_wait, move |table| {
+        let result = self.update_agent_toml_as_within(&agent_id, update_source, caller, session, lock_wait, expected_snapshot, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
             // an already-broken file can still be repaired through here).
@@ -1217,7 +1304,7 @@ impl MethodHandler {
                             "agent_authority_refused",
                             audit_agent_id.as_str(),
                             duduclaw_security::audit::Severity::Warning,
-                            json!({ "agent_id": audit_agent_id, "keys": keys, "user_id": audit_user_id, "source": "agents.update" }),
+                            json!({ "agent_id": audit_agent_id, "keys": keys, "user_id": audit_user_id, "source": update_source }),
                         ),
                     );
                     return Err(format!(
@@ -1234,7 +1321,7 @@ impl MethodHandler {
                             "agent_id": audit_agent_id,
                             "keys": keys,
                             "user_id": audit_user_id,
-                            "source": "agents.update",
+                            "source": update_source,
                         }),
                     ),
                 );
@@ -1258,11 +1345,35 @@ impl MethodHandler {
                 super::agents_update_v168::agent_config_check(table)?;
             }
 
+            if let Some(fields) = &requested_fields {
+                duduclaw_core::admin_ai_settings::validate_changed_leaves(&table_before, table, fields)
+                    .map_err(str::to_string)?;
+                if fields.iter().any(|f| matches!(f,
+                    duduclaw_core::admin_ai_settings::AdminAiField::Trigger
+                    | duduclaw_core::admin_ai_settings::AdminAiField::DisplayName)) {
+                    // The writer holds both the authority namespace lease and
+                    // this profile's lock through the eventual commit.
+                    crate::admin_ai::proposal::check_live_trigger(&home_for_update, &audit_agent_id, table)
+                        .map_err(|_| crate::admin_ai::proposal::STALE.to_string())?;
+                }
+            }
+            *ordinary_for_closure.lock().map_err(|_| "settings audit lock poisoned".to_string())? =
+                ordinary_settings_diff(&table_before, table);
             Ok(())
         }).await;
 
         match result {
             Ok(hot_reloaded) => {
+                let changed = ordinary_changes.lock().map(|g| g.clone()).unwrap_or_default();
+                let mut details = json!({"agent_id": agent_id,
+                    "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
+                    "source": origin.source(), "changed": changed});
+                if let UpdateOrigin::AdminAi { approval_id, .. } = &origin {
+                    details["approval_id"] = json!(approval_id);
+                }
+                crate::security_autopilot::audit_and_emit(&self.home_dir,
+                    &duduclaw_security::audit::AuditEvent::new("agent_settings_changed", agent_id.as_str(),
+                        duduclaw_security::audit::Severity::Info, details));
                 if let Some(admission) = &seat_admission {
                     if let Err(error) = admission.recount(0) {
                         return WsFrame::error_response("", &error);
@@ -1300,7 +1411,7 @@ impl MethodHandler {
                                     "agent_id": agent_id,
                                     "authority": committed.as_ref().map(|c| json!({ "reports_to": c.reports_to, "department": c.department })),
                                     "mirror": { "reports_to": mirror.reports_to, "department": mirror.department },
-                                    "source": "agents.update",
+                                    "source": update_source,
                                 }),
                             ),
                         );
@@ -1317,7 +1428,7 @@ impl MethodHandler {
                             json!({
                                 "agent_id": agent_id,
                                 "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
-                                "source": "agents.update",
+                                "source": update_source,
                                 "changes": super::agents_update_v168::audit_details(&authority),
                             }),
                         ),
@@ -1471,7 +1582,7 @@ impl MethodHandler {
                             json!({
                                 "agent_id": agent_id,
                                 "authority": { "reports_to": written.reports_to, "department": written.department },
-                                "source": "agents.update",
+                                "source": update_source,
                                 "error": duduclaw_core::truncate_chars(&format!("{e}; rollback: {re}"), 300),
                             }),
                         ),
@@ -1610,5 +1721,78 @@ mod memory_language_writer_tests {
         }
         apply_memory_language(&mut table, &json!(""), &mut changes).unwrap();
         assert!(!table.contains_key("language"));
+    }
+}
+
+#[cfg(test)]
+mod admin_ai_update_tests {
+    use super::*;
+
+    fn events(home: &Path) -> Vec<Value> {
+        std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default().lines()
+            .filter_map(|line| serde_json::from_str(line).ok()).collect()
+    }
+
+    #[test]
+    fn ordinary_diff_excludes_authority_and_secrets() {
+        let before: toml::Table = "[agent]\nicon='A'\n[runtime]\nprovider='claude'".parse().unwrap();
+        let after: toml::Table = "[agent]\nicon='B'\n[runtime]\nprovider='codex'\n[channels.test]\ntoken='canary'\n[google]\nsubject='private'\n[prompt]\nsecret='canary'".parse().unwrap();
+        assert_eq!(ordinary_settings_diff(&before, &after), vec![json!({"path":"agent.icon", "before":"A", "after":"B"})]);
+    }
+
+    #[tokio::test]
+    async fn ordinary_update_emits_one_event_with_before_after() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let h = MethodHandler::new(home.path().to_owned()).await;
+        let admin = UserContext::admin_fallback();
+        let frame = h.handle_agents_create_as(json!({"name":"audit-a"}), Some(&admin)).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
+        let path = home.path().join("agents/audit-a/agent.toml");
+        let before: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+        let frame = h.handle_agents_update_as(json!({"agent_id":"audit-a", "icon":"🦊", "can_schedule_tasks":true}), Some(&admin)).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
+        let rows = events(home.path());
+        let rows: Vec<_> = rows.iter().filter(|e| e["event_type"] == "agent_settings_changed").collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["details"]["source"], "agents.update");
+        assert!(rows[0]["details"]["changed"].as_array().unwrap().iter()
+            .all(|c| !c["path"].as_str().unwrap().starts_with("permissions.")));
+        assert!(rows[0]["details"]["changed"].as_array().unwrap().iter().any(|c|
+            c["path"] == "agent.icon" && c["before"] == before["agent"]["icon"].as_str().unwrap() && c["after"] == "🦊"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn admin_ai_refuses_extra_path_and_auto_aligned_engine_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let _db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let h = MethodHandler::new(home.path().to_owned()).await;
+        let admin = UserContext::admin_fallback();
+        let frame = h.handle_agents_create_as(json!({"name":"ai-a", "model_preferred":"claude-sonnet-4-6", "runtime":{"provider":"claude"}}), Some(&admin)).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
+        let path = home.path().join("agents/ai-a/agent.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let _availability = crate::runtime_config::testing::AvailabilityGuard::at("gpt-5.4", true);
+        for params in [json!({"agent_id":"ai-a", "icon":"B", "runtime":{"provider":"codex"}}),
+            json!({"agent_id":"ai-a", "preferred":"gpt-5.4"})] {
+            let frame = h.agents_update_inner(params, Some(&admin), Some(&admin),
+                UpdateOrigin::AdminAi {approval_id:"approved-1".into(), expected_snapshot:Some(crate::agent_files::writer::AdminAiSnapshot {
+                    effective_hash: crate::admin_ai::proposal::hash_text(&before),
+                    raw_hash: crate::admin_ai::proposal::hash_text(&before),
+                })}).await;
+            assert!(matches!(&frame, WsFrame::Response {ok:false,..}), "{frame:?}");
+            assert!(serde_json::to_string(&frame).unwrap().contains("admin_ai_diff_refused"), "{frame:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+        let frame = h.agents_update_inner(json!({"agent_id":"ai-a", "icon":"🦊"}), Some(&admin), Some(&admin),
+            UpdateOrigin::AdminAi {approval_id:"approved-2".into(), expected_snapshot:Some(crate::agent_files::writer::AdminAiSnapshot {
+                    effective_hash: crate::admin_ai::proposal::hash_text(&before),
+                    raw_hash: crate::admin_ai::proposal::hash_text(&before),
+                })}).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
+        let rows = events(home.path());
+        let row = rows.iter().find(|e| e["event_type"] == "agent_settings_changed").unwrap();
+        assert_eq!(row["details"]["source"], "admin_ai");
+        assert_eq!(row["details"]["approval_id"], "approved-2");
     }
 }
