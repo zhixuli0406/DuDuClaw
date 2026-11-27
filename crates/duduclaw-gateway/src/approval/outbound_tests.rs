@@ -5,6 +5,7 @@ use crate::protocol::WsFrame;
 use serde_json::{json, Value};
 
 const SECRET: &str = "private outbound content";
+const SECRET_SUMMARY: &str = "客戶輸入內容 https://private.example.invalid/customer";
 
 fn ok(frame: &WsFrame) -> bool { matches!(frame, WsFrame::Response { ok:true, .. }) }
 
@@ -34,9 +35,9 @@ async fn card(f: &Fixture, agent: &str, principal: Option<&str>, kind: &str, bou
                 expires_at:(chrono::Utc::now() + chrono::Duration::seconds(600)).to_rfc3339(),
                 resume_handler:"live_only_v1".into(), resume_version:1,
             };
-            broker.request_bound(RequestKind::Approval, agent, "Review", body, binding).await.unwrap()
+            broker.request_bound(RequestKind::Approval, agent, SECRET_SUMMARY, body, binding).await.unwrap()
         } else {
-            broker.request(agent, kind, "Review", body, 600).await.unwrap()
+            broker.request(agent, kind, SECRET_SUMMARY, body, 600).await.unwrap()
         }
     }).await;
     broker.get(&id).await.unwrap().unwrap()
@@ -64,7 +65,10 @@ async fn outbound_reviewer_other_department_redacted() {
         assert!(listed["approvals"][0]["digest"].is_null());
         assert!(listed["approvals"][0]["binding"].is_null());
         assert!(!listed.to_string().contains(SECRET));
+        assert_eq!(listed["approvals"][0]["summary"], NOTICE_SUMMARY);
+        assert!(!listed.to_string().contains(SECRET_SUMMARY));
         let full = get(&f, &sales, &f.mgr_a).await;
+        assert_eq!(full["approvals"][0]["summary"], SECRET_SUMMARY);
         assert_eq!(full["approvals"][0]["payload"], sales.payload);
         assert!(full["approvals"][0]["digest"].is_string());
         assert_eq!(get(&f, &other, &f.mgr_a).await["count"], 0);
@@ -146,14 +150,86 @@ async fn outbound_admin_and_audits() {
     let admin_card = card(&f, "b1", Some("user:admin"), "cli_egress", false).await;
     let listed = payload(f.h.handle_approvals_list(json!({"id":admin_card.id.as_str()}), &f.admin).await);
     assert_eq!(listed["approvals"][0]["payload"], json!({"redacted":true}));
+    assert_eq!(listed["approvals"][0]["summary"], NOTICE_SUMMARY);
     assert!(ok(&f.h.handle_approvals_decide(json!({"id":admin_card.id.as_str(), "approve":false}), &f.admin).await));
     let decisions = audits(&f, "outbound_decided");
     assert_eq!(decisions.len(), 2);
     assert_eq!(decisions[0]["details"]["reviewer_type"], "department_manager");
     assert_eq!(decisions[1]["details"]["reviewer_type"], "admin");
     let raw = std::fs::read_to_string(f.home.join("security_audit.jsonl")).unwrap();
-    for secret in [SECRET, "private-source", "someone@example.invalid", "account@example.invalid"] {
+    for secret in [SECRET, SECRET_SUMMARY, "private-source", "someone@example.invalid", "account@example.invalid"] {
         assert!(!raw.contains(secret));
+    }
+}
+
+#[tokio::test]
+async fn personal_owner_cannot_review_or_receive_outbound_cards_via_grants() {
+    let f = fixture().await;
+    let owner = crate::dept_grants::tests::make_personal(&f, "a1");
+    f.db.bind_channel_identity(&owner.user_id, "telegram", "22222", true).unwrap();
+    let broker = ApprovalBroker::open(&f.home).unwrap();
+    for bound in [false, true] {
+        let rec = card(&f, "a1", None, "mcp_call", bound).await;
+        assert_eq!(payload(f.h.handle_approvals_list(json!({"id":rec.id.as_str()}), &owner).await)["count"], 0);
+        assert_eq!(get(&f, &rec, &owner).await["count"], 0);
+        assert!(crate::approval_notify::dashboard_only_targets_for_test(&f.home, &rec).is_empty());
+        assert!(!DeptGrantView::notification_allows(&f.home, &owner.user_id, "a1"));
+        for approve in [false, true] {
+            assert!(!ok(&f.h.handle_approvals_decide(json!({"id":rec.id.as_str(), "approve":approve}), &owner).await));
+            let decision = if bound { broker.decide_bound_dashboard(&rec.id, &owner, approve).await }
+                else { broker.decide_egress_dashboard(&rec.id, &owner, approve).await };
+            assert!(decision.is_err());
+        }
+        assert_eq!(broker.get(&rec.id).await.unwrap().unwrap().status, ApprovalStatus::Pending);
+    }
+}
+
+#[tokio::test]
+async fn outbound_open_audit_failure_returns_only_redacted_card_and_error() {
+    let f = fixture().await;
+    for bound in [false, true] {
+        let rec = card(&f, "a1", None, "mcp_call", bound).await;
+        let path = f.home.join("security_audit.jsonl");
+        if path.exists() { std::fs::remove_file(&path).unwrap(); }
+        std::fs::create_dir(&path).unwrap();
+        let frame = f.h.handle_approvals_get(json!({"id":rec.id.as_str()}), &f.mgr_a).await;
+        assert!(!serde_json::to_string(&frame).unwrap().contains(SECRET));
+        assert!(!serde_json::to_string(&frame).unwrap().contains(SECRET_SUMMARY));
+        let WsFrame::Response { ok: false, payload: Some(redacted), error: Some(error), .. } = frame else {
+            panic!("audit failure must return a redacted error response");
+        };
+        assert!(error.is_string());
+        let row = &redacted["approvals"][0];
+        assert_eq!(redacted["count"], 1);
+        assert_eq!(row["summary"], NOTICE_SUMMARY);
+        assert_eq!(row["payload"], json!({"redacted":true}));
+        for field in ["digest", "binding", "answer", "simulation", "workflow_activation", "invalidated_reason"] {
+            assert!(row[field].is_null(), "{field}");
+        }
+        // Listing never needs an open audit; Admin's existing path is unchanged.
+        assert!(ok(&f.h.handle_approvals_list(json!({"id":rec.id.as_str()}), &f.mgr_a).await));
+        assert_eq!(get(&f, &rec, &f.admin).await["approvals"][0]["payload"], rec.payload);
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(get(&f, &rec, &f.mgr_a).await["approvals"][0]["payload"], rec.payload);
+        assert_eq!(audits(&f, "outbound_card_opened").len(), 1);
+    }
+}
+
+#[test]
+fn outbound_list_summary_is_fixed_for_every_card_marker() {
+    // Exercise the shared projection used by task timelines as well as lists.
+    let mut rec: ApprovalRecord = serde_json::from_value(json!({
+        "id":"summary", "agent_id":"a1", "action_kind":"cli_egress", "summary":SECRET_SUMMARY,
+        "payload":{}, "status":"pending", "created_at":"2026-11-27T00:00:00Z", "ttl_seconds":600
+    })).unwrap();
+    assert_eq!(list_summary(&rec), NOTICE_SUMMARY);
+    rec.action_kind = "goal_kickoff".into();
+    assert_eq!(list_summary(&rec), SECRET_SUMMARY);
+    for marker in [Value::Null, json!(false), json!({})] {
+        rec.payload["egress_guard"] = marker;
+        assert_eq!(list_summary(&rec), NOTICE_SUMMARY);
+        assert!(!crate::approval::pending_summary_for_channel(&rec).contains(SECRET_SUMMARY));
+        assert!(!crate::approval_notify::approval_body(&rec, false).contains(SECRET_SUMMARY));
     }
 }
 
@@ -222,9 +298,14 @@ async fn outbound_chat_manager_refused_even_with_review_grant() {
 async fn outbound_cli_kind_without_guard_is_still_protected() {
     let f = fixture().await;
     let broker = ApprovalBroker::open(&f.home).unwrap();
-    let id: ApprovalId = broker.request("a1", "cli_egress", "Review", json!({"arguments":{"text":SECRET}}), 600).await.unwrap();
+    let id: ApprovalId = broker.request("a1", "cli_egress", SECRET_SUMMARY, json!({"arguments":{"text":SECRET}}), 600).await.unwrap();
     let rec = broker.get(&id).await.unwrap().unwrap();
     assert!(is_outbound_data_card(&rec));
+    for ctx in [&f.admin, &f.mgr_a] {
+        let listed = payload(f.h.handle_approvals_list(json!({"id":id.as_str()}), ctx).await);
+        assert_eq!(listed["approvals"][0]["summary"], NOTICE_SUMMARY);
+        assert!(!listed.to_string().contains(SECRET_SUMMARY));
+    }
     assert_eq!(get(&f, &rec, &f.mgr_a).await["approvals"][0]["payload"], rec.payload);
     assert!(broker.decide(&id, true, "dashboard:admin").await.is_err());
     assert!(ok(&f.h.handle_approvals_decide(json!({"id":id.as_str(), "approve":false}), &f.mgr_a).await));

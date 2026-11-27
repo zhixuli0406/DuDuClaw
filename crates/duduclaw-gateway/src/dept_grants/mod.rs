@@ -213,6 +213,10 @@ fn grant_target_department(v: &DeptGrantView, agent: &str) -> Result<Option<Stri
     if !duduclaw_core::is_valid_agent_id(agent) || agent == v.default_id
         || v.main_agents.contains(agent) || !v.loaded_agents.contains_key(agent)
     { return Ok(None); }
+    // Personal employees never inherit department grants, including for their
+    // owner. Explicit Owner bindings remain the authority for owner operations.
+    let owners = crate::personal_visibility::personal_owners(&v.home).map_err(|_| ())?;
+    if owners.contains_key(agent) { return Ok(None); }
     // Registry roles can be stale; only exact loaded directory ids qualify.
     let raw = std::fs::read_to_string(v.home.join("agents").join(agent).join("agent.toml"))
         .map_err(|_| ())?;

@@ -69,6 +69,7 @@ impl MethodHandler {
                     Err(frame) => return frame,
                 };
                 let mut items: Vec<Value> = Vec::with_capacity(rows.len());
+                let mut open_audit_failed = false;
                 for r in rows
                     .iter()
                     .filter(|r| action_kind_filter.map_or(true, |k| r.action_kind == k))
@@ -93,9 +94,15 @@ impl MethodHandler {
                     let may_decide = (!outbound || reviewer)
                         && (r.binding.is_none()
                             || Box::pin(self.authorize_bound_decider(r, ctx)).await.is_ok());
-                    let full_outbound = outbound && detail && reviewer;
+                    let mut full_outbound = outbound && detail && reviewer;
                     if full_outbound && !fresh.is_admin() {
-                        crate::approval::outbound::audit(&self.home_dir, r, &fresh.user_id, false, None);
+                        let (home, record, user) = (self.home_dir.clone(), r.clone(), fresh.user_id.clone());
+                        if !matches!(tokio::task::spawn_blocking(move || {
+                            crate::approval::outbound::audit_opened(&home, &record, &user)
+                        }).await, Ok(Ok(()))) {
+                            full_outbound = false;
+                            open_audit_failed = true;
+                        }
                     }
                     let activation = super::approval_decider::is_activation_record(r);
                     let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
@@ -152,7 +159,7 @@ impl MethodHandler {
                             }
                             _ => None,
                         };
-                    let activation_facts = if activation && may_decide {
+                    let activation_facts = if activation && may_decide && (!outbound || full_outbound) {
                         super::approval_decider::activation_facts(&self.home_dir, r)
                     } else {
                         Value::Null
@@ -165,7 +172,7 @@ impl MethodHandler {
                         } else { viewer_digest(r, &activation_facts, fresh.is_admin(), may_decide) },
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
-                        "summary": r.summary,
+                        "summary": if full_outbound { &r.summary } else { crate::approval::outbound::list_summary(r) },
                         "payload": if outbound {
                             if full_outbound { r.payload.clone() } else { json!({"redacted": true}) }
                         } else if r.action_kind == crate::admin_ai::card::ACTION_KIND {
@@ -186,7 +193,7 @@ impl MethodHandler {
                         // A-H-1: what an Admin accepts — each effect and the
                         // one record it may change.
                         "workflow_activation": activation_facts,
-                        "invalidated_reason":r.invalidated_reason,
+                        "invalidated_reason": if outbound && !full_outbound { Value::Null } else { json!(r.invalidated_reason) },
                         "created_at": r.created_at,
                         "ttl_seconds": r.ttl_seconds,
                         // Epoch seconds the approval auto-denies at (TTL
@@ -208,7 +215,15 @@ impl MethodHandler {
                         "channel_link": channel_link,
                     }));
                 }
-                WsFrame::ok_response("", json!({ "approvals": items, "count": items.len() }))
+                let payload = json!({ "approvals": items, "count": items.len() });
+                if open_audit_failed {
+                    WsFrame::Response {
+                        id: String::new(), ok: false, payload: Some(payload),
+                        error: Some(json!("無法記錄審核卡開啟紀錄，內容暫不顯示，請稍後重試。")),
+                    }
+                } else {
+                    WsFrame::ok_response("", payload)
+                }
             }
             Err(e) => WsFrame::error_response("", &format!("list approvals: {e}")),
         }

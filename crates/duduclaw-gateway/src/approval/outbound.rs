@@ -6,6 +6,12 @@ use crate::dept_grants::{DeptGrantView, department_grant_allows, GrantGroup, Gra
 use super::{ApprovalBroker, ApprovalRecord};
 
 pub(crate) const REFUSAL: &str = "outgoing data approval requires an authorized dashboard reviewer";
+pub(crate) const NOTICE_SUMMARY: &str = "有一則對外操作等待審核。";
+
+/// Lists and notifications must not disclose content before an audited open.
+pub(crate) fn list_summary(rec: &ApprovalRecord) -> &str {
+    if is_outbound_data_card(rec) { NOTICE_SUMMARY } else { &rec.summary }
+}
 
 pub(crate) fn is_outbound_data_card(rec: &ApprovalRecord) -> bool {
     rec.payload.get("egress_guard").is_some() || rec.action_kind == super::cli_egress::KIND
@@ -48,6 +54,16 @@ impl ApprovalBroker {
         }
         authorize(&home, ctx, rec)
     }
+}
+
+/// The full card may be released only after this synchronous write succeeds.
+pub(crate) fn audit_opened(home: &Path, rec: &ApprovalRecord, user: &str) -> Result<(), String> {
+    duduclaw_security::audit::try_append_audit_event(home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "outbound_card_opened", &rec.agent_id, duduclaw_security::audit::Severity::Info,
+            serde_json::json!({"approval_id": rec.id.as_str(), "user_id": user,
+                "reviewer_type": "department_manager", "decision": null}),
+        ))
 }
 
 /// Same approvals security audit stream as workflow_activation_decided.

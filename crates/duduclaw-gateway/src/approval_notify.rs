@@ -278,7 +278,7 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
     if crate::approval::is_outbound_data_card(rec) {
-        let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
+        let head = if reminder { "有一則對外操作審核快到期了。" } else { crate::approval::outbound::NOTICE_SUMMARY };
         return format!("{head}\n請管理員或被授權的部門主管開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
             deadline_phrase(rec), rec.id.as_str());
     }
@@ -377,11 +377,25 @@ pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
     )
 }
 
-/// Destinations for a dashboard-only notice: the agent's own control
-/// channel, else the approvers' linked chats — never the originating
-/// conversation, which is excluded explicitly rather than by relying on the
-/// reply-channel task-local being absent.
-fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<(String, String)> {
+/// Keep the granting identity attached until the actual delivery check.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NoticeTarget {
+    destination: (String, String),
+    department_manager: Option<String>,
+}
+
+impl NoticeTarget {
+    fn unscoped(destination: (String, String)) -> Self {
+        Self { destination, department_manager: None }
+    }
+
+    fn allows_send(&self, home: &Path, rec: &ApprovalRecord) -> bool {
+        self.department_manager.as_ref().is_none_or(|user|
+            crate::dept_grants::DeptGrantView::notification_allows(home, user, &rec.agent_id))
+    }
+}
+
+fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<NoticeTarget> {
     let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return vec![]; };
     let Ok(users) = db.list_users() else { return vec![]; };
     let mut targets = std::collections::BTreeSet::new();
@@ -391,7 +405,11 @@ fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<(String, String)> 
             || (user.role == duduclaw_auth::UserRole::Manager
                 && crate::dept_grants::DeptGrantView::notification_allows(home, &user.id, &rec.agent_id));
         if allowed && let Ok(destinations) = db.verified_dm_destinations_for_user(&user.id) {
-            targets.extend(destinations.into_iter().map(|dest| (dest.channel, dest.channel_user_id)));
+            let department_manager = (user.role == duduclaw_auth::UserRole::Manager).then(|| user.id.clone());
+            targets.extend(destinations.into_iter().map(|dest| NoticeTarget {
+                destination: (dest.channel, dest.channel_user_id),
+                department_manager: department_manager.clone(),
+            }));
         }
     }
     targets.into_iter().collect()
@@ -401,7 +419,7 @@ fn dashboard_only_targets(
     home_dir: &Path,
     rec: &ApprovalRecord,
     reminder: bool,
-) -> Vec<(String, String)> {
+) -> Vec<NoticeTarget> {
     let origin = origin_target();
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let owners = if kb { crate::knowledge::add_source_chat::owner_targets(home_dir, rec) } else { vec![] };
@@ -415,7 +433,7 @@ fn dashboard_only_targets(
         targets.extend(approver_links(home_dir));
         let mut seen = std::collections::HashSet::new();
         targets.retain(|t| seen.insert(t.clone()));
-        targets
+        targets.into_iter().map(NoticeTarget::unscoped).collect()
     } else { match (
         reminder,
         rec.notify_channel.as_deref(),
@@ -429,7 +447,7 @@ fn dashboard_only_targets(
             crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id),
             approver_links(home_dir),
         ),
-    }
+    }.into_iter().map(NoticeTarget::unscoped).collect()
     };
     // R-L1: the origin recorded on the card at filing (captured before the
     // distillation was spawned) is the reliable one; the task-local is a
@@ -442,8 +460,8 @@ fn dashboard_only_targets(
         _ => None,
     };
     base.into_iter()
-        .filter(|t| (origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
-            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, t, &owners)))
+        .filter(|t| (origin.as_ref() != Some(&t.destination) && recorded.as_ref() != Some(&t.destination))
+            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, &t.destination, &owners)))
         .collect()
 }
 
@@ -453,7 +471,7 @@ pub(crate) fn dashboard_only_targets_for_test(
     home_dir: &Path,
     rec: &ApprovalRecord,
 ) -> Vec<(String, String)> {
-    dashboard_only_targets(home_dir, rec, false)
+    dashboard_only_targets(home_dir, rec, false).into_iter().map(|t| t.destination).collect()
 }
 
 /// Push the plain dashboard-only notice: no buttons, no card record (so no
@@ -464,6 +482,15 @@ async fn push_dashboard_only(
     reminder: bool,
 ) -> Option<(String, String)> {
     let targets = dashboard_only_targets(home_dir, rec, reminder);
+    push_dashboard_only_targets(home_dir, rec, reminder, targets).await
+}
+
+async fn push_dashboard_only_targets(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+    reminder: bool,
+    targets: Vec<NoticeTarget>,
+) -> Option<(String, String)> {
     if targets.is_empty() {
         return None;
     }
@@ -508,7 +535,10 @@ async fn push_dashboard_only(
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let mut delivered = None;
     let mut notified_users = std::collections::HashSet::new();
-    for (channel, chat_id) in targets {
+    let mut delivered_destinations = std::collections::HashSet::new();
+    for target in targets {
+        if delivered_destinations.contains(&target.destination) { continue; }
+        let (channel, chat_id) = target.destination.clone();
         // Re-read owner and destinations at delivery time. Never reuse a
         // queued content preview after an ACL or identity change.
         let uid = if kb {
@@ -524,12 +554,16 @@ async fn push_dashboard_only(
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return delivered; }
         let is_owner = kb && crate::knowledge::add_source_chat::owner_targets(home_dir, rec)
             .contains(&(channel.clone(), chat_id.clone()));
+        // Check after token resolution and immediately before either send. A
+        // destination queued before revocation is not authority for a reminder.
+        if !target.allows_send(home_dir, rec) { continue; }
         let sent = if is_owner {
             crate::knowledge::add_source_chat::push_owner_card(home_dir, &http, rec, &channel, &token, &chat_id).await
         } else {
             crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
         };
         if sent {
+            delivered_destinations.insert((channel.clone(), chat_id.clone()));
             if !kb && !crate::approval::is_outbound_data_card(rec) { return Some((channel, chat_id)); }
             if let Some(uid) = uid { notified_users.insert(uid); }
             if delivered.is_none() { delivered = Some((channel, chat_id)); }
@@ -1619,6 +1653,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbound_notice_rechecks_queued_manager_before_first_send_and_reminder() {
+        let f = crate::dept_grants::tests::fixture().await;
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let config = std::fs::read_to_string(f.home.join("config.toml")).unwrap();
+        std::fs::write(f.home.join("config.toml"), format!(
+            "{config}\n[channels]\ntelegram_bot_token='{}'\n", provider.token,
+        )).unwrap();
+        let _ = crate::dept_grants::DeptGrantView::load(&f.h, &f.mgr_a).await;
+        for (ctx, chat) in [(&f.admin, "11111"), (&f.mgr_a, "22222")] {
+            f.db.bind_channel_identity(&ctx.user_id, "telegram", chat, true).unwrap();
+        }
+        let mut record = rec("mcp_call");
+        record.agent_id = "a1".into();
+        record.summary = "secret customer https://private.example.invalid".into();
+        record.payload = json!({"egress_guard":{}, "arguments":{"text":"secret content"}});
+        record.notify_channel = Some("telegram".into());
+        record.notify_chat_id = Some("22222".into());
+        for reminder in [false, true] {
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
+                &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
+            let targets = dashboard_only_targets(&f.home, &record, reminder);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[1].department_manager.as_deref(), Some(f.mgr_a.user_id.as_str()));
+            let before = provider.requests().len();
+            // Legitimate control proves the transport/token path is reachable.
+            assert!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await.is_some());
+            assert_eq!(provider.requests().len(), before + 2);
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                Some(("telegram".into(), "11111".into())));
+            let requests = provider.requests();
+            assert_eq!(requests.len(), before + 3);
+            assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some("11111"));
+            for request in requests {
+                assert!(!request.body.to_string().contains("secret"));
+                assert!(!request.body.to_string().contains("private.example.invalid"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn dashboard_only_notice_never_targets_the_originating_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agents").join("sales-bot");
@@ -1647,7 +1722,7 @@ mod tests {
                 dashboard_only_targets(&home, &r, false)
             })
             .await;
-        assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
+        assert_eq!(got, vec![NoticeTarget::unscoped(("telegram".to_string(), "555".to_string()))]);
     }
 }
 
