@@ -1392,12 +1392,13 @@ async fn apply_bound_request(
         if answer.is_some() {
             return Err("這筆舊請求不是可回答的問題".into());
         }
-        return crate::approval_notify::apply_decision(
+        return crate::approval_notify::apply_decision_in_session(
             home,
             &context.channel,
             &context.principal_id,
             id,
             approve.unwrap_or(false),
+            Some(&context.conversation_id),
         )
         .await;
     }
@@ -1419,6 +1420,9 @@ async fn apply_bound_request(
     let auth = authorize_press(role, identity_active, true);
     if auth != PressAuth::Allow && !crate::approval::mail_requester::eligible(home, &rec) {
         return Err(refusal_text(auth, "核准"));
+    }
+    if context.channel == "webchat" {
+        crate::entry_gate::check_approval_start(home, &rec, approve == Some(true), &context.conversation_id).await?;
     }
     broker
         .decide_bound(&request, context, approve.ok_or("請使用確認或取消指令")?)

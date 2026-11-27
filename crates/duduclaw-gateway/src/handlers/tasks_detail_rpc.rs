@@ -400,6 +400,9 @@ impl MethodHandler {
             Ok(secs) => secs,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, agent_id) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+        }
         // Files handed over with the goal (交辦任務 page). All of them are
         // decoded and size-checked before anything is written; then they are
         // saved into the assigned employee's attachment area and their paths

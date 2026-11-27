@@ -668,6 +668,13 @@ pub(crate) async fn apply_decision(
     approval_id: &str,
     approve: bool,
 ) -> Result<String, String> {
+    apply_decision_in_session(home_dir, channel, channel_user_id, approval_id, approve, None).await
+}
+
+pub(crate) async fn apply_decision_in_session(
+    home_dir: &Path, channel: &str, channel_user_id: &str, approval_id: &str,
+    approve: bool, session: Option<&str>,
+) -> Result<String, String> {
     let broker = ApprovalBroker::open(home_dir).map_err(|e| format!("開啟審批資料庫失敗：{e}"))?;
     let id = ApprovalId::from(approval_id.to_string());
     let Some(rec) = broker.get(&id).await.map_err(|e| e.to_string())? else {
@@ -731,6 +738,13 @@ pub(crate) async fn apply_decision(
         approve,
     ) {
         return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
+    }
+
+    if channel == "webchat" {
+        // Only the adapter knows the conversation. A positive decision without
+        // it cannot safely select its refusal audience.
+        if approve && session.is_none() { return Err(crate::channel_decision_route::DECISION_REFUSED.into()); }
+        crate::entry_gate::check_approval_start(home_dir, &rec, approve, session.unwrap_or("")).await?;
     }
 
     // ── decide ──────────────────────────────────────────────

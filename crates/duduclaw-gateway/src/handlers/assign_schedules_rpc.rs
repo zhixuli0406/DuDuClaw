@@ -26,6 +26,8 @@ fn create_error(e: &CreateError) -> String {
                 e.code()
             )
         }
+        CreateError::AssigneeUnavailable => format!("{}: {}", e.code(), duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE),
+        CreateError::Entry(refusal) => refusal.user_text("dashboard:schedule", None, "schedule-create"),
         CreateError::Store(detail) => format!("{}: {detail}", e.code()),
         other => other.code().to_string(),
     }

@@ -2,6 +2,22 @@ use super::*;
 use crate::channel_reply::entry_gate_test_helpers::owned_channel;
 
 #[tokio::test(flavor = "current_thread")]
+async fn task_assignee_checks_directory_resolved_from_registry_name() {
+    let (home, _ctx, _runtime, _calls) = owned_channel(RuntimeType::Codex).await;
+    let directory = home.path().join("agents/w-dir");
+    std::fs::rename(home.path().join("agents/worker"), &directory).unwrap();
+    assert_eq!(check_task_assignee(home.path(), "worker"), Ok(()));
+    let path = directory.join("agent.toml");
+    let healthy = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, healthy.replace("provider='codex'", "provider='grok'")).unwrap();
+    let refusal = check_task_assignee(home.path(), "worker").unwrap_err();
+    assert_eq!(refusal.code(), "model_provider_mismatch");
+    assert_eq!(refusal, EntryRefusal::ModelProviderMismatch {
+        model: "gpt-5.4".into(), provider: RuntimeType::Grok,
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn strict_refusals_cover_every_config_failure_without_registry_rescan() {
     let (home, ctx, _runtime, _calls) = owned_channel(RuntimeType::Codex).await;
     let registry = ctx.registry.read().await;

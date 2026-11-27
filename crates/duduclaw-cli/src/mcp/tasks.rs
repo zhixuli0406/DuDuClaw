@@ -176,14 +176,17 @@ fn validate_created_task_assignee(
     assignee: &str,
     implicit_operator_task: bool,
 ) -> std::result::Result<(), &'static str> {
-    if implicit_operator_task
-        && matches!(duduclaw_core::agent_seats::resolve_agent_seat(home, assignee), Ok(None))
-        && matches!(std::fs::symlink_metadata(home.join("agents").join(assignee)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
+    if implicit_operator_assignee(home, assignee, implicit_operator_task) {
         return Ok(());
     }
     duduclaw_core::agent_seats::validate_task_assignee(home, Some(assignee))
+}
+
+fn implicit_operator_assignee(home: &Path, assignee: &str, implicit_operator_task: bool) -> bool {
+    implicit_operator_task
+        && matches!(duduclaw_core::agent_seats::resolve_agent_seat(home, assignee), Ok(None))
+        && matches!(std::fs::symlink_metadata(home.join("agents").join(assignee)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// T5/O4 — the one agent-facing entry point for "create work".
@@ -315,30 +318,6 @@ pub(crate) async fn handle_tasks_create(
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
     }
-    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
-        return tool_error(message);
-    }
-    // Giving a goal more time than its employee's own `[runtime]
-    // timeout_secs` is an Admin decision made on the dashboard; no MCP
-    // caller (employee or external key) may widen it, only narrow.
-    if let Err(e) = duduclaw_gateway::goal_create_core::check_timeout_widening(
-        home_dir,
-        &assigned_to,
-        timeout_secs,
-        false,
-    ) {
-        return tool_error(&e);
-    }
-    // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
-    // only ever written by the server itself — `goal_create_core` builds the
-    // `outcome:` tag from the `outcome` argument — never taken from a caller.
-    if let Some(tags) = args.get("tags").and_then(|v| v.as_str()) {
-        if let Err(refusal) =
-            check_no_reserved_tags(home_dir, actor, "tasks_create", &assigned_to, tags)
-        {
-            return refusal;
-        }
-    }
     // ── WP21 C3: department × hierarchy delegation gate ────────
     // Assigning to yourself never invokes the predicate (self-delegation is a
     // hard DENY under every policy in core) — this mirrors tasks_claim, which
@@ -362,6 +341,45 @@ pub(crate) async fn handle_tasks_create(
         // mode the person it is for must still be allowed to hand this
         // employee work (no laundering a hand-over through self-assignment).
         return tool_error(&reason);
+    }
+    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
+        if let Some(refusal) = duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, &assigned_to) {
+            return tool_error(&format!(
+                "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+                refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+            ));
+        }
+        return tool_error(message);
+    }
+    // Giving a goal more time than its employee's own `[runtime]
+    // timeout_secs` is an Admin decision made on the dashboard; no MCP
+    // caller (employee or external key) may widen it, only narrow.
+    if let Err(e) = duduclaw_gateway::goal_create_core::check_timeout_widening(
+        home_dir,
+        &assigned_to,
+        timeout_secs,
+        false,
+    ) {
+        return tool_error(&e);
+    }
+    // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
+    // only ever written by the server itself — `goal_create_core` builds the
+    // `outcome:` tag from the `outcome` argument — never taken from a caller.
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_str()) {
+        if let Err(refusal) =
+            check_no_reserved_tags(home_dir, actor, "tasks_create", &assigned_to, tags)
+        {
+            return refusal;
+        }
+    }
+    // All creation rails (goal, board task, cron and one-shot reminder) share
+    // the gateway's effective-artifact gate before writing any record.
+    if !implicit_operator_assignee(home_dir, &assigned_to, implicit_operator_task)
+        && let Err(refusal) = duduclaw_gateway::entry_gate::check_task_assignee(home_dir, &assigned_to) {
+        return tool_error(&format!(
+            "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+            refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+        ));
     }
     // The person the new task is for: the host env only, never an argument.
     let on_behalf_of = host_on_behalf_of(home_dir, default_agent);
@@ -1656,7 +1674,11 @@ mod live_assignee_tests {
             assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
         }
         std::fs::write(home.path().join("agents/dudu/agent.toml"), "[agent").unwrap();
-        assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
+        let malformed = handle_tasks_create(&params, home.path(), actor).await;
+        let text = malformed["content"][0]["text"].as_str().unwrap();
+        assert_eq!(malformed["isError"], true);
+        assert!(text.contains("agent_config_unreadable"));
+        assert!(!text.contains("agent.toml"));
         std::fs::remove_file(home.path().join("agents/dudu/agent.toml")).unwrap();
         assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
         assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
@@ -1723,5 +1745,51 @@ mod live_assignee_tests {
         let saved = store.get_task("old").await.unwrap().unwrap();
         assert_eq!(saved.assigned_to, "deleted");
         assert_eq!(saved.description, "仍可編輯");
+    }
+}
+
+#[cfg(test)]
+mod entry_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn goals_board_tasks_and_schedules_refuse_broken_target_settings() {
+        for broken in ["[model", "[agent]\nname='worker'\nstatus='active'\n[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='grok'\n"] {
+            let home = tempfile::tempdir().unwrap();
+            super::super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
+            std::fs::write(home.path().join("agents/worker/agent.toml"), broken).unwrap();
+            for args in [
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"goal", "plan_first":true}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task"}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task", "schedule":"0 9 * * 1"}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task", "schedule":"2099-01-01T09:00:00Z"}),
+            ] {
+                let reply = handle_tasks_create(&args, home.path(), RecordActor::Operator("worker")).await;
+                assert_eq!(reply["isError"], true, "{reply}");
+                let text = reply["content"][0]["text"].as_str().unwrap();
+                assert!(text.starts_with("Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n"), "{text}");
+                assert!(text.contains("agent_config_unreadable") || text.contains("model_provider_mismatch"), "{text}");
+                assert!(!text.contains("agent.toml"), "{text}");
+                assert!(!home.path().join("tasks.db").exists());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod implicit_entry_regression_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_implicit_operator_employee_is_gated() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
+        let path = home.path().join("agents/worker/agent.toml");
+        let healthy = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, healthy.replace("claude-sonnet-4-6", "gpt-5.4")).unwrap();
+        let reply = handle_tasks_create(&serde_json::json!({"title":"work"}), home.path(), RecordActor::Operator("worker")).await;
+        assert_eq!(reply["isError"], true);
+        assert!(reply["content"][0]["text"].as_str().unwrap().contains("model_provider_mismatch"));
+        assert!(!home.path().join("tasks.db").exists());
     }
 }

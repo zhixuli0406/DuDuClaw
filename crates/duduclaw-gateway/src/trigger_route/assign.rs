@@ -446,7 +446,8 @@ pub fn arm_on_admission(reg: &AgentRegistry, text: &str, caller: &AssignCaller<'
     let allowed =
         |id: &str| matches!(assign_right(reg, &caller.access, id, caller.fallback), AssignRight::Allowed(_));
     if let MentionScan::Hit(hit) = trigger_match::scan_mentions(&rest, &targets, &allowed) {
-        if trigger_match::task_text_without(&rest, &hit).is_empty() {
+        if trigger_match::task_text_without(&rest, &hit).is_empty()
+            && crate::entry_gate::resolve_and_check(caller.home, reg, &hit.id).is_ok() {
             let origin = caller.event.unwrap_or_default();
             pending::arm_kind(&pending_key(caller), &hit.id, PendingKind::Assign, origin, caller.seq);
         }
@@ -493,6 +494,17 @@ pub async fn run_pending(
 
 /// Carry out a [`Plan`].
 pub(crate) async fn execute(home: &Path, lang: Lang, decided: Plan, caller: &AssignCaller<'_>) -> AssignReply {
+    let target = match &decided {
+        Plan::Arm { agent, .. } => Some(agent.as_str()),
+        Plan::Create(spec) | Plan::ScheduleCreate { spec, .. } => Some(spec.agent.as_str()),
+        _ => None,
+    };
+    if let Some(agent) = target {
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(home, agent) {
+            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, agent).await;
+            return AssignReply::text(refusal.user_text(caller.conversation, language.as_deref(), caller.event.unwrap_or("assign")));
+        }
+    }
     match decided {
         Plan::Reply(reply) => reply,
         Plan::Status => AssignReply::text(super::assign_create::status_text(home, lang, caller).await),

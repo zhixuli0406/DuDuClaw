@@ -62,7 +62,7 @@ fn home() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("agents/sales")).unwrap();
     std::fs::write(dir.path().join("agents/sales/agent.toml"),
-        "[agent]\nname='sales'\nstatus='active'\n").unwrap();
+        "[agent]\nname='sales'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     let db = duduclaw_auth::UserDb::new(&dir.path().join("users.db")).unwrap();
     let user = db.create_user("origin@test.invalid", "Origin", "fixture-password",
         duduclaw_auth::UserRole::Employee).unwrap();

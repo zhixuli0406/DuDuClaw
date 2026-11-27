@@ -123,11 +123,98 @@ fn resolve_with_reader(
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) -> Result<ResolvedTurnConfig, EntryRefusal> {
     let agent = registry.get(agent_id).ok_or(EntryRefusal::AgentNotFound)?;
+    let artifact = check_artifact(home, &agent.dir, agent_id, read)?;
+    Ok(ResolvedTurnConfig {
+        registry_agent: agent.clone(), config_path: artifact.path,
+        preset_resolved: artifact.preset_resolved,
+        runtime_settings: artifact.settings, model: artifact.model,
+        local_model_id: artifact.local_model_id, sections: artifact.sections,
+        document: artifact.document,
+    })
+}
+
+/// Task producers also run in the MCP process, without a live registry.
+/// Check the effective artifact directly, without scanning the registry (a
+/// scan can rewrite preset artifacts). This uses the exact same strict gate.
+pub fn check_task_assignee(home: &Path, agent_id: &str) -> Result<(), EntryRefusal> {
+    if !duduclaw_core::is_valid_agent_id(agent_id) {
+        return Err(EntryRefusal::AgentNotFound);
+    }
+    let seat = duduclaw_core::agent_seats::resolve_agent_seat(home, agent_id)
+        .map_err(|_| EntryRefusal::AgentNotFound)?
+        .ok_or(EntryRefusal::AgentNotFound)?;
+    check_artifact(home, &home.join("agents").join(seat.id), agent_id,
+        |path| std::fs::read_to_string(path)).map(|_| ())
+}
+
+/// Classify an unavailable assignee's malformed profile without allowing it.
+/// Call only after authorization and a failed roster check. Missing/deleted/
+/// archived employees retain the roster error; malformed files get safe text.
+pub fn malformed_assignee_refusal(home: &Path, agent_id: &str) -> Option<EntryRefusal> {
+    let seat = duduclaw_core::agent_seats::resolve_agent_seat(home, agent_id).ok()??;
+    let text = std::fs::read_to_string(home.join("agents").join(seat.id).join("agent.toml")).ok()?;
+    text.parse::<toml::Table>().err()
+        .map(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))
+}
+
+/// Check the durable assignee, never a card's display label or chat selection.
+/// The caller must already have authorized access to this task.
+pub(crate) async fn check_task_start(
+    home: &Path, task_id: &str, session: &str, turn: &str,
+) -> Result<(), String> {
+    let unavailable = || {
+        if crate::channel_reply::assembly::public_session(session) {
+            crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.to_string()
+        } else {
+            "目前無法開始這項工作，請稍後再試。".to_string()
+        }
+    };
+    let store = crate::task_store::TaskStore::open(home).map_err(|_| unavailable())?;
+    let task = store.get_task(task_id).await.map_err(|_| unavailable())?.ok_or_else(unavailable)?;
+    if let Err(refusal) = check_task_assignee(home, &task.assigned_to) {
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, &task.assigned_to).await;
+        return Err(refusal.user_text(session, language.as_deref(), turn));
+    }
+    Ok(())
+}
+
+/// Denial never checks configuration. Approval is checked only when it releases
+/// employee work; management/configuration repair cards retain their behavior.
+pub(crate) async fn check_approval_start(
+    home: &Path, record: &crate::approval::ApprovalRecord, approve: bool, session: &str,
+) -> Result<(), String> {
+    if !approve { return Ok(()); }
+    let task_id = record.binding.as_ref().and_then(|binding| binding.task_id.clone())
+        .or_else(|| crate::handlers::approval_task_ref(&record.payload));
+    if let Some(task_id) = task_id {
+        return check_task_start(home, &task_id, session, record.id.as_str()).await;
+    }
+    // A kickoff without its durable task is never allowed to authorize work.
+    if record.action_kind == "goal_kickoff" {
+        return Err(EntryRefusal::AgentNotFound.user_text(session, None, record.id.as_str()));
+    }
+    Ok(())
+}
+
+struct CheckedArtifact {
+    path: PathBuf,
+    preset_resolved: bool,
+    settings: RuntimeSettings,
+    model: String,
+    local_model_id: Option<String>,
+    sections: AgentTomlSections,
+    document: toml::Value,
+}
+
+fn check_artifact(
+    home: &Path, agent_dir: &Path, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<CheckedArtifact, EntryRefusal> {
     // Use the same effective artifact selection as load_runtime_settings_strict.
-    let mut path = agent.dir.join("agent.toml");
+    let mut path = agent_dir.join("agent.toml");
     let mut preset_resolved = false;
-    if let Some(agent_home) = duduclaw_core::preset::agent_home_dir(&agent.dir) {
-        if let Some(id) = agent.dir.file_name().and_then(|id| id.to_str()) {
+    if let Some(agent_home) = duduclaw_core::preset::agent_home_dir(agent_dir) {
+        if let Some(id) = agent_dir.file_name().and_then(|id| id.to_str()) {
             let resolved = duduclaw_core::preset::agent_resolved_path(&agent_home, id);
             match std::fs::symlink_metadata(&resolved) {
                 Ok(_) => { path = resolved; preset_resolved = true; }
@@ -166,10 +253,7 @@ fn resolve_with_reader(
             crate::product_policy::require_substituted_catalog_model(policy, settings.provider, &model)
         ).map_err(|diagnostic| EntryRefusal::ProductPolicy { diagnostic })?;
     }
-    Ok(ResolvedTurnConfig {
-        registry_agent: agent.clone(), config_path: path, preset_resolved,
-        runtime_settings: settings, model, local_model_id, sections, document,
-    })
+    Ok(CheckedArtifact { path, preset_resolved, settings, model, local_model_id, sections, document })
 }
 
 /// Also used by the legacy second gate until W2 removes that re-read.

@@ -180,13 +180,40 @@ pub struct GoalCreated {
     pub plan_first: bool,
 }
 
+/// Preserve entry refusals until the transport can choose the real audience.
+#[derive(Debug)]
+pub(crate) enum GoalCreateError {
+    Entry(crate::entry_gate::EntryRefusal),
+    Other(String),
+}
+impl From<String> for GoalCreateError {
+    fn from(error: String) -> Self { Self::Other(error) }
+}
+impl From<&str> for GoalCreateError {
+    fn from(error: &str) -> Self { Self::Other(error.into()) }
+}
+impl GoalCreateError {
+    fn operator_text(self) -> String {
+        match self {
+            Self::Entry(refusal) => refusal.user_text("dashboard:task-create", None, "task-create"),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+pub(crate) async fn create_goal_task_for_chat(
+    home_dir: &Path, store: &TaskStore, req: GoalCreateRequest,
+) -> Result<GoalCreated, GoalCreateError> {
+    create_goal_task_inner(home_dir, store, req, None, None).await
+}
+
 /// Create one autonomous goal task. `Err` is a caller-facing message.
 pub async fn create_goal_task(
     home_dir: &Path,
     store: &TaskStore,
     req: GoalCreateRequest,
 ) -> Result<GoalCreated, String> {
-    create_goal_task_inner(home_dir, store, req, None, None).await
+    create_goal_task_inner(home_dir, store, req, None, None).await.map_err(GoalCreateError::operator_text)
 }
 
 /// Create a goal with a caller-owned admission future, polled only after planning.
@@ -197,7 +224,7 @@ pub async fn create_goal_task_with_admission(
     req: GoalCreateRequest,
     admission: duduclaw_core::autonomy_handoff::AdmissionFuture,
 ) -> Result<GoalCreated, String> {
-    create_goal_task_inner(home_dir, store, req, None, Some(admission)).await
+    create_goal_task_inner(home_dir, store, req, None, Some(admission)).await.map_err(GoalCreateError::operator_text)
 }
 
 /// The same goal contract, with an atomic scheduled-slot fence at insert.
@@ -207,7 +234,19 @@ pub(crate) async fn create_scheduled_goal_task(
     req: GoalCreateRequest,
     slot: &crate::task_store::AssignScheduleSlot<'_>,
 ) -> Result<GoalCreated, String> {
-    create_goal_task_inner(home_dir, store, req, Some(slot), None).await
+    create_goal_task_inner(home_dir, store, req, Some(slot), None).await.map_err(GoalCreateError::operator_text)
+}
+
+fn check_creation_assignee(home_dir: &Path, agent_id: &str) -> Result<(), GoalCreateError> {
+    if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(home_dir, Some(agent_id)) {
+        return Err(match crate::entry_gate::malformed_assignee_refusal(home_dir, agent_id) {
+            Some(refusal) => GoalCreateError::Entry(refusal),
+            None => GoalCreateError::Other(message.into()),
+        });
+    }
+    crate::entry_gate::check_task_assignee(home_dir, agent_id)
+        .map_err(GoalCreateError::Entry)?;
+    Ok(())
 }
 
 async fn create_goal_task_inner(
@@ -216,14 +255,15 @@ async fn create_goal_task_inner(
     req: GoalCreateRequest,
     slot: Option<&crate::task_store::AssignScheduleSlot<'_>>,
     admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
-) -> Result<GoalCreated, String> {
+) -> Result<GoalCreated, GoalCreateError> {
     crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
     crate::on_behalf_of::access::check_main_target(
         home_dir, req.on_behalf_of.as_deref(), &req.agent_id,
     ).await?;
+    check_creation_assignee(home_dir, &req.agent_id)?;
     let description = req.description.trim();
     if description.is_empty() {
-        return Err("description is required".to_string());
+        return Err("description is required".into());
     }
     let description = duduclaw_core::truncate_chars(description, 4000);
     let acceptance = req
@@ -235,7 +275,7 @@ async fn create_goal_task_inner(
     let priority = match req.priority.trim() {
         "" => "medium",
         p @ ("low" | "medium" | "high" | "urgent") => p,
-        other => return Err(format!("invalid priority: {other}")),
+        other => return Err(format!("invalid priority: {other}").into()),
     };
     // Structured outcome spec: fail-closed parse — a malformed spec refuses
     // the whole create rather than silently dropping the contract.
@@ -247,7 +287,7 @@ async fn create_goal_task_inner(
         .map(crate::outcome_spec::OutcomeSpec::parse)
     {
         Some(Ok(spec)) => spec.to_tag(),
-        Some(Err(e)) => return Err(format!("outcome 產出驗收格式錯誤：{e}")),
+        Some(Err(e)) => return Err(format!("outcome 產出驗收格式錯誤：{e}").into()),
         None => None,
     };
     if req
@@ -263,7 +303,7 @@ async fn create_goal_task_inner(
     let duration_hours = match req.duration_hours {
         None => None,
         Some(h) if (1.0..=720.0).contains(&h) => Some(h),
-        Some(_) => return Err("duration_hours must be between 1 and 720".to_string()),
+        Some(_) => return Err("duration_hours must be between 1 and 720".into()),
     };
     let risk_boundary = req
         .risk_boundary
@@ -381,6 +421,7 @@ async fn create_goal_task_inner(
         Some(admission) => admission.await?,
         None => None,
     };
+    check_creation_assignee(home_dir, &req.agent_id)?;
     if let Some((message_id, payload_sha256)) = &req.a2a_request {
         if slot.is_some() || req.plan_first {
             return Err("A2A does not support scheduled or planned creation".into());
@@ -471,7 +512,7 @@ mod tests {
         let dir = home.join("agents/a");
         std::fs::create_dir_all(&dir).unwrap();
         if !dir.join("agent.toml").exists() {
-            std::fs::write(dir.join("agent.toml"), "[agent]\nname = 'a'\nstatus = 'active'\n").unwrap();
+            std::fs::write(dir.join("agent.toml"), "[agent]\nname = 'a'\nstatus = 'active'\n[model]\npreferred = 'claude-sonnet-4-6'\n").unwrap();
         }
         TaskStore::open(home).expect("open task store")
     }
@@ -481,8 +522,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = store_in(home.path()).await;
         for (id, profile) in [
-            ("deleted", "[agent]\nstatus = 'deleted'"),
-            ("archived", "[agent]\nstatus = 'archived'"),
+            ("deleted", "[agent]\nstatus = 'deleted'\n[model]\npreferred = 'claude-sonnet-4-6'"),
+            ("archived", "[agent]\nstatus = 'archived'\n[model]\npreferred = 'claude-sonnet-4-6'"),
             ("malformed", "[agent"),
         ] {
             let dir = home.path().join("agents").join(id);
@@ -492,7 +533,7 @@ mod tests {
         for id in ["deleted", "archived", "malformed", "missing"] {
             let error = create_goal_task(home.path(), &store, req(id)).await.unwrap_err();
             if id == "malformed" {
-                assert_eq!(error, "agent.toml: invalid TOML");
+                assert!(error.contains("agent_config_unreadable"));
             } else {
                 assert_eq!(error, duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
             }
@@ -507,7 +548,7 @@ mod tests {
         let store = store_in(home.path()).await;
         let profile = home.path().join("agents/a/agent.toml");
         let admission = Box::pin(async move {
-            std::fs::write(profile, "[agent]\nname = 'a'\nstatus = 'archived'\n").unwrap();
+            std::fs::write(profile, "[agent]\nname = 'a'\nstatus = 'archived'\n[model]\npreferred = 'claude-sonnet-4-6'\n").unwrap();
             Ok(None)
         });
         let error = create_goal_task_with_admission(home.path(), &store, req("a"), admission)
@@ -554,7 +595,10 @@ mod tests {
                 let agent_dir = home.path().join("agents/a");
                 std::fs::create_dir_all(&agent_dir).unwrap();
                 let path = if global { home.path().join("config.toml") } else { agent_dir.join("agent.toml") };
-                std::fs::write(path, body).unwrap();
+                let profile = if global { body.to_string() } else {
+                    format!("[agent]\nname='a'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n{body}")
+                };
+                std::fs::write(path, profile).unwrap();
                 let store = store_in(home.path()).await;
                 let error = create_goal_task(home.path(), &store, req("a")).await.unwrap_err();
                 assert!(!error.contains(&home.path().display().to_string()));
@@ -770,3 +814,7 @@ mod configured_timeout_tests {
         assert!(check_timeout_widening(home.path(), "anna", Some(7200), true).unwrap_err().contains("3600 (one hour)"));
     }
 }
+
+#[cfg(test)]
+#[path = "goal_create_entry_tests.rs"]
+mod entry_tests;

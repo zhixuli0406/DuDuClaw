@@ -253,9 +253,6 @@ impl MethodHandler {
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("goal"));
         let raw_target = params.get(if is_goal { "agent_id" } else { "assigned_to" })
             .and_then(Value::as_str).unwrap_or("");
-        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(raw_target.trim())) {
-            return frame;
-        }
         if let Err(frame) = self.delegation_check(ctx, raw_target).await { return frame; }
         let target = raw_target.trim();
         if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
@@ -265,6 +262,12 @@ impl MethodHandler {
             ) {
                 return WsFrame::error_response("", &refusal);
             }
+        }
+        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(target)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, target) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
+            return frame;
         }
         match params.get("kind").and_then(Value::as_str).unwrap_or("task").trim().to_ascii_lowercase().as_str() {
             "discovery" => return self.handle_discovery_create(params, ctx).await,
@@ -363,7 +366,14 @@ impl MethodHandler {
         row.created_via = row.on_behalf_of.as_ref().map(|_| "dashboard".to_string());
 
         if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(&row.assigned_to)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, &row.assigned_to) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
             return frame;
+        }
+        if !row.assigned_to.is_empty()
+            && let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &row.assigned_to) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
         }
         if let Err(e) = store.insert_task(&row).await {
             return WsFrame::error_response("", &format!("create task: {e}"));
@@ -888,7 +898,7 @@ mod live_assignee_tests {
         let dir = home.join("agents").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"),
-            format!("[agent]\nname = '{id}'\nstatus = '{status}'\n")).unwrap();
+            format!("[agent]\nname = '{id}'\nstatus = '{status}'\n[model]\npreferred = 'claude-sonnet-4-6'\n")).unwrap();
     }
 
     fn assert_ok(frame: WsFrame) {

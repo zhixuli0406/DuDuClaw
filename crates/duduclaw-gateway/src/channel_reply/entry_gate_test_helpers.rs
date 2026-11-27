@@ -181,3 +181,13 @@ pub(crate) async fn misaligned_worker(extra: &str) -> (
     (home, ctx, registry, calls)
 }
 
+
+/// Inbound files must never land for a refused entry, on disk or in a ledger.
+pub(crate) fn assert_no_saved_attachments(home: &std::path::Path) {
+    for agent in ["main", "worker"] {
+        let path = home.join("agents").join(agent).join("attachments");
+        assert!(!path.exists() || std::fs::read_dir(path).unwrap().next().is_none());
+    }
+    // Admission is before the upload reservation too.
+    assert!(!home.join("webchat_upload_quota.db").exists());
+}

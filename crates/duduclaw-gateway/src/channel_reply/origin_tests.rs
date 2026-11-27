@@ -384,8 +384,12 @@ async fn missing_openai_compat_model_is_refused_with_a_specific_code_and_no_mode
     let broken = original.replace("preferred='gpt-5.4'\n", "");
     assert_ne!(broken, original, "fixture must remove the configured model");
     std::fs::write(&path, &broken).unwrap();
+    let refusal = {
+        let registry = ctx.registry.read().await;
+        crate::entry_gate::resolve_and_check(home.path(), &*registry, "worker").unwrap_err()
+    };
     assert_eq!(
-        crate::entry_gate::resolve_and_check(home.path(), &ctx.registry.read().await, "worker").unwrap_err(),
+        refusal,
         crate::entry_gate::EntryRefusal::Config(crate::runtime_config::RuntimeSettingsError::MissingModel),
     );
     let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
