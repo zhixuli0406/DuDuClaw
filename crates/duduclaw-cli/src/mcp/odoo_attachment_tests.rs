@@ -1,33 +1,8 @@
 use super::*;
 
-use lopdf::{dictionary, Document, Object};
-
-fn pdf_document() -> Document {
-    let mut doc = Document::with_version("1.7");
-    let pages = doc.new_object_id();
-    let page = doc.add_object(dictionary! {
-        "Type" => "Page", "Parent" => pages,
-        "MediaBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
-    });
-    doc.objects.insert(pages, dictionary! {
-        "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
-    }.into());
-    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
-    doc.trailer.set("Root", catalog);
-    let info = doc.add_object(dictionary! { "Title" => Object::string_literal("private attachment") });
-    doc.trailer.set("Info", info);
-    doc.trailer.set("ID", vec![Object::string_literal("attachment-test-id"),
-        Object::string_literal("attachment-test-id")]);
-    doc
+pub(in crate::mcp) fn clean_pdf() -> Vec<u8> {
+    raw_object_pdf(b"<< /Title (private attachment) >>")
 }
-
-fn save_pdf(mut doc: Document) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    doc.save_to(&mut bytes).unwrap();
-    bytes
-}
-
-pub(in crate::mcp) fn clean_pdf() -> Vec<u8> { save_pdf(pdf_document()) }
 
 pub(in crate::mcp) fn image_bytes(format: image::ImageFormat, width: u32, height: u32) -> Vec<u8> {
     let pixels = image::DynamicImage::new_rgb8(width, height);
@@ -38,9 +13,8 @@ pub(in crate::mcp) fn image_bytes(format: image::ImageFormat, width: u32, height
 
 fn valid_png() -> Vec<u8> { image_bytes(image::ImageFormat::Png, 2, 2) }
 
-// Build correct offsets around verbatim PDF names; serializing an escaped name
-// through lopdf would escape the '#' again and stop testing the attack.
-fn raw_object_pdf(object: &[u8]) -> Vec<u8> {
+// Build correct offsets around verbatim PDF names, including #xx escapes.
+pub(in crate::mcp) fn raw_object_pdf(object: &[u8]) -> Vec<u8> {
     use std::io::Write;
     let mut bytes = b"%PDF-1.7\n".to_vec();
     let mut offsets = vec![0];
@@ -253,72 +227,130 @@ fn image_dimensions_and_both_input_and_output_sizes_are_bounded() {
     assert!(prepare_file(&attachment("x.webp"), webp.clone(), webp.len() as u64).is_err());
 }
 
+fn deflate(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn stream_object(filter: &str, data: &[u8], length: usize) -> Vec<u8> {
+    let mut object = format!("<< /Type /ObjStm /N 1 /First 4 /Length {length} {filter} >>\nstream\n").into_bytes();
+    object.extend_from_slice(data);
+    object.extend_from_slice(b"\nendstream");
+    object
+}
+
+fn stream_pdf(filter: &str, data: &[u8]) -> Vec<u8> {
+    raw_object_pdf(&stream_object(filter, data, data.len()))
+}
+
 #[test]
-fn pdf_requires_real_parse_header_eof_and_no_active_names_anywhere() {
+fn pdf_requires_header_eof_and_no_active_names_in_original_bytes() {
     let pdf = clean_pdf();
     assert!(mimetype("x.pdf", &pdf).is_ok());
     assert!(mimetype("x.pdf", &[pdf.as_slice(), b" \r\n\t"].concat()).is_ok());
+    assert!(pdf_valid(&[b"%PDF-2.0\n".as_slice(), &pdf].concat()));
     for bad in [b"%PDF-1.7 no eof".to_vec(), [pdf.as_slice(), b"payload"].concat(),
         [pdf.as_slice(), &vec![b' '; 1024]].concat(), b"prefix%PDF-1.7\n%%EOF".to_vec(),
-        b"%PDF-1.7\nnot a document\n%%EOF".to_vec(), raw_object_pdf(b"<< /Broken [ >>")] {
+        b"%PDF-3.0\n<<>>\n%%EOF".to_vec(), b"%PDF-1.7\nnot a document\n%%EOF".to_vec(),
+        raw_object_pdf(b"<< /Broken [ >>")] {
         assert!(mimetype("x.pdf", &bad).is_err());
     }
     for token in ["JavaScript", "JS", "Launch", "EmbeddedFile", "EmbeddedFiles", "OpenAction", "AA",
-        "RichMedia", "XFA", "SubmitForm", "ImportData", "GoToR", "GoToE", "Sound", "Movie",
-        "Java#53cript", "Open#41ction", "javascript", "jS"] {
+        "RichMedia", "XFA", "SubmitForm", "ImportData", "GoToR", "GoToE", "Sound", "Movie", "Encrypt",
+        "Java#53cript", "Open#41ction", "javascript", "jS", "Bad#zz", "Bad#", "Bad#0"] {
         for object in [format!("<< /{token} null >>"), format!("[<< /Nested [/{token}] >>]"),
             format!("<< /Length 0 /Nested [/{token}] >>\nstream\n\nendstream")] {
-            let bytes = raw_object_pdf(object.as_bytes());
-            assert!(Document::load_mem(&bytes).unwrap().objects.contains_key(&(4, 0)), "{token}");
-            assert!(!pdf_valid(&bytes), "{token}");
+            assert!(!pdf_valid(&raw_object_pdf(object.as_bytes())), "{token}");
         }
     }
-    // Whole names only; text strings and longer names are not PDF actions.
-    assert!(pdf_valid(&raw_object_pdf(b"<< /JavaScriptNotes (/JavaScript) >>")));
+    // The conservative whole-buffer pass includes strings, comments and objects
+    // absent from the xref table, rather than relying on one parser's object map.
+    assert!(pdf_valid(&raw_object_pdf(b"<< /JavaScriptNotes (/SafeName) >>")));
+    assert!(!pdf_valid(&raw_object_pdf(b"<< /Label (/JavaScript) >>")));
+    assert!(!pdf_valid(&[pdf.as_slice(), b"\n% /OpenAction\n%%EOF"].concat()));
+    let incremental = [pdf.as_slice(),
+        b"\n99 0 obj\n<< /OpenAction 100 0 R >>\nendobj\ntrailer\n<< /Prev 9 >>\n%%EOF"].concat();
+    assert!(!pdf_valid(&incremental));
+    // Even an unindexed object in the original revision is scanned.
+    assert!(!pdf_valid(&raw_object_pdf(b"<<>>\nendobj\n99 0 obj\n<< /Open#41ction null >>")));
 }
 
 #[test]
-fn pdf_walks_compressed_object_streams_and_refuses_encryption() {
-    for active in [false, true] {
-        let mut doc = pdf_document();
-        doc.add_object(dictionary! { "Nested" => vec![Object::Name(
-            if active { b"JavaScript".to_vec() } else { b"SafeName".to_vec() })] });
-        let mut bytes = Vec::new();
-        doc.save_modern(&mut bytes).unwrap();
-        let loaded = Document::load_mem(&bytes).unwrap();
-        assert!(loaded.reference_table.entries.values().any(|e|
-            matches!(e, lopdf::xref::XrefEntry::Compressed { .. })));
-        assert!(!bytes.windows(b"/JavaScript".len()).any(|w| w == b"/JavaScript"));
-        assert_eq!(pdf_valid(&bytes), !active);
+fn pdf_scans_flate_object_streams_and_only_accepts_supported_filters() {
+    let plain = b"5 0 << /Label /SafeName >>";
+    let compressed = deflate(plain);
+    for filter in ["/Filter /FlateDecode", "/Filter [/FlateDecode]", "/Filter /Fl",
+        "/Filter [/Fl]", "/F#69lter /Flate#44ecode",
+        "/Filter /FlateDecode /DecodeParms << /Predictor 15 /Columns 1 >>"] {
+        assert!(pdf_valid(&stream_pdf(filter, &compressed)), "{filter}");
     }
-    for password in ["", "secret"] {
-        let mut doc = pdf_document();
-        let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V1 {
-            document: &doc, owner_password: "owner", user_password: password,
-            permissions: lopdf::Permissions::PRINTABLE,
-        }).unwrap();
-        doc.encrypt(&state).unwrap();
-        let bytes = save_pdf(doc);
-        assert!(!pdf_valid(&bytes));
+    let twice = deflate(&compressed);
+    assert!(pdf_valid(&stream_pdf("/Filter [/FlateDecode /Fl]", &twice)));
+    for payload in [b"5 0 << /JS (alert) >>".as_slice(), b"5 0 << /Java#53cript null >>",
+        b"5 0 << /Open#41ction null >>", b"5 0 << /Encrypt null >>", b"5 0 << /Bad#zz null >>"] {
+        let compressed = deflate(payload);
+        assert!(!compressed.windows(3).any(|w| w == b"/JS"));
+        assert!(!pdf_valid(&stream_pdf("/Filter /FlateDecode", &compressed)));
     }
+    for filter in ["/Filter /LZWDecode", "/Filter /ASCII85Decode", "/Filter /ASCIIHexDecode",
+        "/Filter /RunLengthDecode", "/Filter /Crypt", "/Filter /Unknown",
+        "/Filter [/FlateDecode /DCTDecode]", "/Filter [/DCTDecode /Fl]",
+        "/Filter [/DCTDecode /JPXDecode]", "/Filter 8 0 R", "/Filter []",
+        "/Filter /Fl /Filter /DCTDecode"] {
+        assert!(!pdf_valid(&stream_pdf(filter, &compressed)), "{filter}");
+    }
+    for filter in ["/Filter /DCTDecode", "/Filter [/JPXDecode]",
+        "/Filter /CCITTFaxDecode", "/Filter /JBIG2Decode"] {
+        assert!(pdf_valid(&stream_pdf(filter, b"\xff\xd8image\xff\xd9")), "{filter}");
+    }
+    assert!(pdf_valid(&stream_pdf("", plain)));
+    assert!(!pdf_valid(&stream_pdf("", b"/JS")));
+    assert!(!pdf_valid(&stream_pdf("/Filter /Fl", b"invalid zlib")));
+    let nested = stream_object("/Filter /FlateDecode", &compressed, compressed.len());
+    assert!(!pdf_valid(&stream_pdf("/Filter /Fl", &deflate(&nested))));
 }
 
 #[test]
-fn pdf_refuses_incomplete_object_streams_and_names_in_original_stream_dictionaries() {
-    let mut objects = lopdf::ObjectStream::builder().build();
-    objects.add_object((5, 0), dictionary! { "Label" => "SafeName" }.into()).unwrap();
-    let stream = objects.to_stream_object().unwrap();
-    let first = stream.dict.get(b"First").unwrap().as_i64().unwrap();
-    for (count, extra, valid) in [(1, "", true), (2, "", false),
-        (1, "/DecodeParms << /Java#53cript null >>", false)] {
-        let mut body = format!("<< /Type /ObjStm /N {count} /First {first} /Filter /FlateDecode /Length {} {extra} >>\nstream\n",
-            stream.content.len()).into_bytes();
-        body.extend_from_slice(&stream.content);
-        body.extend_from_slice(b"\nendstream");
-        assert_eq!(pdf_valid(&raw_object_pdf(&body)), valid, "{count}, {extra}");
+fn pdf_stream_bounds_ignore_inconsistent_lengths_and_refuse_bombs() {
+    let plain = b"5 0 << /Label /SafeName >>";
+    let compressed = deflate(plain);
+    for length in [0, 1, compressed.len(), compressed.len() + 20, usize::MAX] {
+        assert!(pdf_valid(&raw_object_pdf(&stream_object("/Filter /Fl", &compressed, length))));
     }
-    let malformed = raw_object_pdf(b"<< /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode /Length 4 >>\nstream\nnope\nendstream");
-    assert!(!pdf_valid(&malformed));
+    // A consistent length permits delimiter-looking bytes inside image data.
+    assert!(pdf_valid(&stream_pdf("/Filter /DCTDecode", b"image\nendstream\nmore image")));
+    assert!(!pdf_valid(&raw_object_pdf(b"<< /Filter /Fl >>\nstream\nno end marker")));
+    assert!(!pdf_valid(&raw_object_pdf(b"<< /Filter /Fl >> stream no EOL endstream")));
+    assert_eq!(pdf_inflate(&compressed, plain.len() + 1).unwrap(), plain);
+    assert!(pdf_inflate(&compressed, plain.len()).is_none());
+    let bomb = deflate(&vec![0; 1024 * 1024]);
+    let cap = bomb.len() * 10;
+    assert!(cap < 1024 * 1024);
+    // The decoder reads at most cap + 1 bytes; output reserves only cap bytes.
+    assert!(pdf_inflate(&bomb, cap).is_none());
+    assert!(!pdf_valid(&stream_pdf("/Filter /FlateDecode", &bomb)));
+    let mut trailing = compressed.clone();
+    trailing.extend_from_slice(b"hidden");
+    assert!(pdf_inflate(&trailing, 1024).is_none());
+}
+
+#[test]
+fn pdf_name_stream_and_depth_counts_are_bounded() {
+    let names = b"/Safe ".repeat(PDF_MAX_NAMES);
+    let mut count = 0;
+    assert!(pdf_names_valid(&names, &mut count));
+    assert!(!pdf_names_valid(b"/OneMore", &mut count));
+    // Inflated names share the original buffer's budget.
+    let mut count = PDF_MAX_NAMES;
+    let compressed = deflate(b"5 0 << /Safe null >>");
+    assert!(pdf_streams_valid(&stream_pdf("/Filter /Fl", &compressed), &mut count).is_none());
+    let object = b"<< /Length 0 >>\nstream\n\nendstream\n";
+    assert!(pdf_valid(&raw_object_pdf(&object.repeat(PDF_MAX_STREAMS))));
+    assert!(!pdf_valid(&raw_object_pdf(&object.repeat(PDF_MAX_STREAMS + 1))));
+    let deep = [b"[".repeat(PDF_MAX_DEPTH + 1), b"]".repeat(PDF_MAX_DEPTH + 1)].concat();
+    assert!(!pdf_valid(&raw_object_pdf(&deep)));
 }
 
 #[test]

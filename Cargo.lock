@@ -1802,7 +1802,6 @@ dependencies = [
  "image",
  "json5",
  "libc",
- "lopdf",
  "minisign-verify",
  "rand 0.8.6",
  "regex",

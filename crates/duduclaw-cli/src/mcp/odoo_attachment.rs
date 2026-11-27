@@ -18,6 +18,7 @@ pub(super) fn verified_employee(home: &Path, agent: &str) -> bool {
         && super::caller_token_verified(home, agent)
 }
 
+#[derive(Clone)]
 struct Attachment {
     model: String,
     res_id: i64,
@@ -210,100 +211,308 @@ fn reencode_image(bytes: &[u8], expected: image::ImageFormat, limit: u64)
     Ok(output.bytes)
 }
 
-fn forbidden_pdf_name(name: &[u8]) -> bool {
-    // lopdf has already decoded PDF #xx name escapes. Match whole names, also
-    // rejecting nonstandard case variants conservatively.
-    [b"JavaScript".as_slice(), b"JS", b"Launch", b"EmbeddedFile", b"EmbeddedFiles",
-        b"OpenAction", b"AA", b"RichMedia", b"XFA", b"SubmitForm", b"ImportData",
-        b"GoToR", b"GoToE", b"Sound", b"Movie"]
-        .iter().any(|blocked| name.eq_ignore_ascii_case(blocked))
+const PDF_MAX_NAMES: usize = 100_000;
+const PDF_MAX_STREAMS: usize = 10_000;
+const PDF_MAX_DEPTH: usize = 32;
+const PDF_MAX_INFLATED: usize = 50 * 1024 * 1024;
+
+fn pdf_space(byte: u8) -> bool { matches!(byte, 0 | 9 | 10 | 12 | 13 | 32) }
+
+fn pdf_delimiter(byte: u8) -> bool {
+    pdf_space(byte) || b"()<>[]{}/%".contains(&byte)
 }
 
-fn pdf_names_valid(object: &lopdf::Object, depth: usize) -> bool {
-    if depth > 128 { return false; }
-    let dict = match object {
-        lopdf::Object::Name(name) => return !forbidden_pdf_name(name),
-        lopdf::Object::Array(values) => return values.iter().all(|v| pdf_names_valid(v, depth + 1)),
-        lopdf::Object::Dictionary(dict) => dict,
-        lopdf::Object::Stream(stream) => &stream.dict,
-        _ => return true,
-    };
-    dict.iter().all(|(key, value)| !forbidden_pdf_name(key) && pdf_names_valid(value, depth + 1))
-}
-
-fn pdf_load_filter(id: lopdf::ObjectId, object: &mut lopdf::Object)
-    -> Option<(lopdf::ObjectId, lopdf::Object)> {
-    // Inspect original stream dictionaries before lopdf removes Filter and
-    // DecodeParms during object-stream expansion. Rejected entries leave the
-    // cross-reference map incomplete, which pdf_valid refuses below.
-    pdf_names_valid(object, 0).then(|| (id, object.clone()))
-}
-
-fn pdf_dictionary_valid(dict: &lopdf::Dictionary, doc: &lopdf::Document, depth: usize) -> bool {
-    depth <= 128 && dict.iter().all(|(key, value)|
-        !forbidden_pdf_name(key) && pdf_object_valid(value, doc, depth + 1))
-}
-
-fn pdf_object_valid(object: &lopdf::Object, doc: &lopdf::Document, depth: usize) -> bool {
-    if depth > 128 { return false; }
-    match object {
-        lopdf::Object::Name(name) => !forbidden_pdf_name(name),
-        lopdf::Object::Array(values) => values.iter().all(|v| pdf_object_valid(v, doc, depth + 1)),
-        lopdf::Object::Dictionary(dict) => pdf_dictionary_valid(dict, doc, depth + 1),
-        lopdf::Object::Stream(stream) => {
-            if !pdf_dictionary_valid(&stream.dict, doc, depth + 1) { return false; }
-            if !stream.dict.has_type(b"ObjStm") { return true; }
-            // The loader expands object streams, but can silently drop malformed
-            // entries. Reparse each container and require all declared entries;
-            // inspect even objects not selected by the final cross-reference map.
-            let mut stream = stream.clone();
-            if stream.dict.has(b"Filter") && stream.decompress().is_err() { return false; }
-            let Ok(count) = stream.dict.get(b"N").and_then(lopdf::Object::as_i64) else { return false };
-            let Ok(first) = stream.dict.get(b"First").and_then(lopdf::Object::as_i64) else { return false };
-            let Ok(first) = usize::try_from(first) else { return false };
-            let Some(header) = stream.content.get(..first) else { return false };
-            let Ok(header) = std::str::from_utf8(header) else { return false };
-            let numbers: Result<Vec<u32>, _> = header.split_ascii_whitespace().map(str::parse).collect();
-            let Ok(numbers) = numbers else { return false };
-            let Ok(count) = usize::try_from(count) else { return false };
-            if count.checked_mul(2) != Some(numbers.len()) { return false; }
-            let Ok(objects) = lopdf::ObjectStream::new(&mut stream) else { return false };
-            objects.objects.len() == count
-                && objects.objects.values().all(|v| pdf_object_valid(v, doc, depth + 1))
-        }
-        // All indirect objects are visited independently below; do not recurse
-        // through references (valid page trees contain cycles).
-        lopdf::Object::Reference(id) => doc.objects.contains_key(id),
-        _ => true,
+fn pdf_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
+}
+
+// Decode into a fixed-size prefix, but validate every escape even in long names.
+// All names of interest fit in this prefix; longer names cannot match them.
+fn pdf_name(raw: &[u8]) -> Option<([u8; 16], usize)> {
+    let mut name = [0; 16];
+    let mut length = 0;
+    let mut pos = 0;
+    while let Some(&byte) = raw.get(pos) {
+        let decoded = if byte == b'#' {
+            let high = pdf_hex(*raw.get(pos + 1)?)?;
+            let low = pdf_hex(*raw.get(pos + 2)?)?;
+            pos += 3;
+            high * 16 + low
+        } else {
+            pos += 1;
+            byte
+        };
+        if let Some(slot) = name.get_mut(length) { *slot = decoded; }
+        length += 1;
+    }
+    Some((name, length))
+}
+
+fn pdf_name_is(raw: &[u8], expected: &[u8]) -> bool {
+    pdf_name(raw).is_some_and(|(name, length)|
+        length == expected.len() && name.get(..length) == Some(expected))
+}
+
+fn pdf_names_valid(bytes: &[u8], names: &mut usize) -> bool {
+    let mut pos = 0;
+    while let Some(&byte) = bytes.get(pos) {
+        pos += 1;
+        if byte != b'/' { continue; }
+        *names += 1;
+        if *names > PDF_MAX_NAMES { return false; }
+        let start = pos;
+        while bytes.get(pos).is_some_and(|b| !pdf_delimiter(*b)) { pos += 1; }
+        let Some(raw) = bytes.get(start..pos) else { return false };
+        let Some((name, length)) = pdf_name(raw) else { return false };
+        if let Some(name) = name.get(..length) {
+            if [b"JavaScript".as_slice(), b"JS", b"Launch", b"EmbeddedFile", b"EmbeddedFiles",
+                b"OpenAction", b"AA", b"RichMedia", b"XFA", b"SubmitForm", b"ImportData",
+                b"GoToR", b"GoToE", b"Sound", b"Movie", b"Encrypt"]
+                .iter().any(|blocked| name.eq_ignore_ascii_case(blocked)) { return false; }
+        }
+    }
+    true
+}
+
+#[derive(Clone, Copy)]
+enum PdfToken<'a> {
+    Name(&'a [u8]),
+    Word(&'a [u8]),
+    Dictionary,
+    EndDictionary,
+    Array,
+    EndArray,
+    Other,
+}
+
+// A bounded lexical walk, not a reference-table parser. Strings/comments are
+// skipped only for stream structure; the separate name pass covers ALL bytes.
+fn pdf_token<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<Option<PdfToken<'a>>, ()> {
+    while let Some(&byte) = bytes.get(*pos) {
+        if pdf_space(byte) { *pos += 1; continue; }
+        if byte == b'%' {
+            while bytes.get(*pos).is_some_and(|b| !matches!(b, b'\r' | b'\n')) { *pos += 1; }
+            continue;
+        }
+        *pos += 1;
+        return Ok(Some(match byte {
+            b'<' if bytes.get(*pos) == Some(&b'<') => { *pos += 1; PdfToken::Dictionary }
+            b'>' if bytes.get(*pos) == Some(&b'>') => { *pos += 1; PdfToken::EndDictionary }
+            b'[' => PdfToken::Array,
+            b']' => PdfToken::EndArray,
+            b'(' => {
+                let mut depth = 1;
+                while depth > 0 {
+                    let byte = *bytes.get(*pos).ok_or(())?;
+                    *pos += 1;
+                    match byte {
+                        b'\\' => { bytes.get(*pos).ok_or(())?; *pos += 1; }
+                        b'(' => { depth += 1; if depth > PDF_MAX_DEPTH { return Err(()); } }
+                        b')' => depth -= 1,
+                        _ => (),
+                    }
+                }
+                PdfToken::Other
+            }
+            b'<' => {
+                loop {
+                    let byte = *bytes.get(*pos).ok_or(())?;
+                    *pos += 1;
+                    if byte == b'>' { break; }
+                    if !pdf_space(byte) && pdf_hex(byte).is_none() { return Err(()); }
+                }
+                PdfToken::Other
+            }
+            b')' | b'>' | b'{' | b'}' => return Err(()),
+            b'/' => {
+                let start = *pos;
+                while bytes.get(*pos).is_some_and(|b| !pdf_delimiter(*b)) { *pos += 1; }
+                PdfToken::Name(bytes.get(start..*pos).ok_or(())?)
+            }
+            _ => {
+                let start = *pos - 1;
+                while bytes.get(*pos).is_some_and(|b| !pdf_delimiter(*b)) { *pos += 1; }
+                PdfToken::Word(bytes.get(start..*pos).ok_or(())?)
+            }
+        }));
+    }
+    Ok(None)
+}
+
+#[derive(Default)]
+struct PdfDictionary {
+    // None = no filter; Some(0) = a sole image filter; Some(n) = n Flate stages.
+    filter: Option<usize>,
+    length: Option<usize>,
+}
+
+fn pdf_filter(bytes: &[u8], pos: &mut usize) -> Result<usize, ()> {
+    let first = pdf_token(bytes, pos)?.ok_or(())?;
+    let array = matches!(first, PdfToken::Array);
+    let mut token = if array { pdf_token(bytes, pos)?.ok_or(())? } else { first };
+    let mut count = 0;
+    let mut image = false;
+    loop {
+        let PdfToken::Name(name) = token else { return Err(()) };
+        count += 1;
+        if count > PDF_MAX_DEPTH { return Err(()); }
+        if pdf_name_is(name, b"FlateDecode") || pdf_name_is(name, b"Fl") {
+            if image { return Err(()); }
+        } else if count == 1 && [b"DCTDecode".as_slice(), b"JPXDecode", b"CCITTFaxDecode", b"JBIG2Decode"]
+            .iter().any(|allowed| pdf_name_is(name, allowed)) {
+            image = true;
+        } else { return Err(()); }
+        if !array { break; }
+        token = pdf_token(bytes, pos)?.ok_or(())?;
+        if matches!(token, PdfToken::EndArray) { break; }
+    }
+    Ok(if image { 0 } else { count })
+}
+
+fn pdf_keyword(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool {
+    let Some(end) = pos.checked_add(keyword.len()) else { return false };
+    bytes.get(pos..end) == Some(keyword)
+        && (pos == 0 || bytes.get(pos - 1).is_some_and(|b| pdf_delimiter(*b)))
+        && bytes.get(end).is_none_or(|b| pdf_delimiter(*b))
+}
+
+fn pdf_stream_start(bytes: &[u8], mut pos: usize) -> Option<usize> {
+    // PDF stream data starts after LF or CRLF (accept CR conservatively too).
+    while bytes.get(pos).is_some_and(|b| matches!(b, 0 | 9 | 12 | 32)) { pos += 1; }
+    match bytes.get(pos) {
+        Some(b'\r') => Some(pos + 1 + usize::from(bytes.get(pos + 1) == Some(&b'\n'))),
+        Some(b'\n') => Some(pos + 1),
+        _ => None,
+    }
+}
+
+fn pdf_stream_end(bytes: &[u8], start: usize, length: Option<usize>) -> Option<(usize, usize)> {
+    // Use Length only when it ends exactly at a delimited endstream keyword.
+    if let Some(end) = length.and_then(|n| start.checked_add(n)).filter(|end| *end <= bytes.len()) {
+        // Only an immediate EOL may separate a consistent length and marker;
+        // never rescan a distant whitespace suffix for each claimed Length.
+        let marker = match bytes.get(end) {
+            Some(b'\r') => end + 1 + usize::from(bytes.get(end + 1) == Some(&b'\n')),
+            Some(b'\n') => end + 1,
+            _ => end,
+        };
+        if pdf_keyword(bytes, marker, b"endstream") { return Some((end, marker + 9)); }
+    }
+    let rest = bytes.get(start..)?;
+    for (offset, window) in rest.windows(9).enumerate() {
+        let marker = start + offset;
+        if window == b"endstream" && pdf_keyword(bytes, marker, b"endstream") {
+            let mut end = marker;
+            if end > start && bytes.get(end - 1) == Some(&b'\n') { end -= 1; }
+            if end > start && bytes.get(end - 1) == Some(&b'\r') { end -= 1; }
+            return Some((end, marker + 9));
+        }
+    }
+    None
+}
+
+fn pdf_inflate(data: &[u8], cap: usize) -> Option<Vec<u8>> {
+    if cap == 0 { return None; }
+    let decoder = flate2::read::ZlibDecoder::new(data);
+    let mut limited = decoder.take((cap as u64) + 1);
+    // Reserve the exact bound up front; read_to_end may grow beyond the bound
+    // while probing EOF. The fixed scratch buffer never depends on PDF input.
+    let mut output = Vec::with_capacity(cap);
+    let mut chunk = [0; 8192];
+    loop {
+        let read = limited.read(&mut chunk).ok()?;
+        if read == 0 { break; }
+        if read >= cap.saturating_sub(output.len()) { return None; }
+        output.extend_from_slice(chunk.get(..read)?);
+    }
+    // Do not accept trailing compressed data hidden behind the first zlib member.
+    if limited.into_inner().total_in() != data.len() as u64 { return None; }
+    Some(output)
+}
+
+fn pdf_streams_valid(bytes: &[u8], names: &mut usize) -> Option<()> {
+    let file_cap = bytes.len().saturating_mul(10).min(PDF_MAX_INFLATED);
+    let mut inflated_total = 0usize;
+    let mut streams = 0;
+    let mut pos = 0;
+    // None is an array frame; Some is a dictionary frame. No recursive parsing.
+    let mut stack: Vec<Option<PdfDictionary>> = Vec::new();
+    let mut preceding_dictionary = None;
+    let mut saw_dictionary = false;
+    while let Some(token) = pdf_token(bytes, &mut pos).ok()? {
+        let previous = preceding_dictionary.take();
+        match token {
+            PdfToken::Dictionary => {
+                if stack.len() >= PDF_MAX_DEPTH { return None; }
+                stack.push(Some(PdfDictionary::default()));
+                saw_dictionary = true;
+            }
+            PdfToken::Array => {
+                if stack.len() >= PDF_MAX_DEPTH { return None; }
+                stack.push(None);
+            }
+            PdfToken::EndDictionary => { preceding_dictionary = Some(stack.pop()??); }
+            PdfToken::EndArray => { if stack.pop()?.is_some() { return None; } }
+            PdfToken::Name(name) if pdf_name_is(name, b"Filter") => {
+                let dictionary = stack.last_mut()?.as_mut()?;
+                if dictionary.filter.is_some() { return None; }
+                dictionary.filter = Some(pdf_filter(bytes, &mut pos).ok()?);
+            }
+            PdfToken::Name(name) if pdf_name_is(name, b"Length") => {
+                let dictionary = stack.last_mut()?.as_mut()?;
+                let mut next = pos;
+                if let Some(PdfToken::Word(number)) = pdf_token(bytes, &mut next).ok()? {
+                    // Indirect lengths are ignored unless the candidate is consistent.
+                    dictionary.length = number.iter().try_fold(0usize, |n, b|
+                        if b.is_ascii_digit() { n.checked_mul(10)?.checked_add(usize::from(b - b'0')) }
+                        else { None });
+                }
+            }
+            PdfToken::Word(b"stream") => {
+                if !stack.is_empty() { return None; }
+                let dictionary = previous?;
+                streams += 1;
+                if streams > PDF_MAX_STREAMS { return None; }
+                let start = pdf_stream_start(bytes, pos)?;
+                let (end, after) = pdf_stream_end(bytes, start, dictionary.length)?;
+                let data = bytes.get(start..end)?;
+                let stream_cap = data.len().saturating_mul(10).min(PDF_MAX_INFLATED);
+                let mut decoded = Vec::new();
+                for stage in 0..dictionary.filter.unwrap_or(0) {
+                    let input = if stage == 0 { data } else { decoded.as_slice() };
+                    let cap = stream_cap.min(file_cap.checked_sub(inflated_total)?);
+                    let output = pdf_inflate(input, cap)?;
+                    inflated_total = inflated_total.checked_add(output.len())?;
+                    if !pdf_names_valid(&output, names) { return None; }
+                    // Object streams cannot contain other streams. Refuse nested
+                    // stream syntax without any recursive decompression.
+                    if output.windows(6).enumerate().any(|(i, w)| w == b"stream"
+                        && pdf_keyword(&output, i, b"stream")
+                        && pdf_stream_start(&output, i + 6).is_some()) { return None; }
+                    decoded = output;
+                }
+                pos = after;
+            }
+            PdfToken::Word(b"endstream") => return None,
+            _ => (),
+        }
+    }
+    (saw_dictionary && stack.is_empty()).then_some(())
 }
 
 fn pdf_valid(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"%PDF-") { return false; }
-    let tail = &bytes[bytes.len().saturating_sub(1024)..];
+    if !bytes.starts_with(b"%PDF-1.") && !bytes.starts_with(b"%PDF-2.") { return false; }
+    let Some(tail) = bytes.get(bytes.len().saturating_sub(1024)..) else { return false };
     if !tail.windows(5).rposition(|w| w == b"%%EOF")
-        .is_some_and(|end| tail[end + 5..].iter().all(u8::is_ascii_whitespace)) { return false; }
-    let Ok(doc) = lopdf::Document::load_mem_with_options(bytes,
-        lopdf::LoadOptions { strict: true, filter: Some(pdf_load_filter), ..Default::default() }) else { return false };
-    // Empty-password encryption can be transparently decrypted on load.
-    if doc.trailer.has(b"Encrypt") || doc.is_encrypted() || doc.was_encrypted() { return false; }
-    // lopdf's loader may skip an object on a parse error. Never treat an
-    // incomplete loaded object map as a successfully screened document.
-    for (&id, entry) in &doc.reference_table.entries {
-        let generation = match entry {
-            lopdf::xref::XrefEntry::Normal { generation, .. } => *generation,
-            lopdf::xref::XrefEntry::Compressed { container, .. } => {
-                if !doc.objects.get(&(*container, 0)).is_some_and(|v|
-                    v.as_stream().is_ok_and(|s| s.dict.has_type(b"ObjStm"))) { return false; }
-                0
-            }
-            lopdf::xref::XrefEntry::Free | lopdf::xref::XrefEntry::UnusableFree => continue,
-        };
-        if !doc.objects.contains_key(&(id, generation)) { return false; }
-    }
-    doc.catalog().is_ok()
-        && pdf_dictionary_valid(&doc.trailer, &doc, 0)
-        && doc.objects.values().all(|object| pdf_object_valid(object, &doc, 0))
+        .and_then(|end| tail.get(end + 5..))
+        .is_some_and(|suffix| suffix.iter().all(|b| pdf_space(*b))) { return false; }
+    let mut names = 0;
+    pdf_names_valid(bytes, &mut names) && pdf_streams_valid(bytes, &mut names).is_some()
 }
 
 fn display_name_matches(name: &str, mime: &str) -> bool {
@@ -461,9 +670,15 @@ pub(super) async fn handle(
     };
     let result = async {
         policy.check_call(TOOL, params, decision.as_ref())?;
-        // Local file I/O finishes before the first await; no OS handles or ZIP
-        // readers cross an await. Upload precisely the bytes that passed checks.
-        let (bytes, mime, name) = read_file(home, agent, &call, policy.access.attachment_max_mb)?;
+        // File I/O and bounded content scans stay off the async runtime. Upload
+        // the original PDF bytes owned by this task after all checks pass.
+        let read_home = home.to_path_buf();
+        let read_agent = agent.to_owned();
+        let read_call = call.clone();
+        let max_mb = policy.access.attachment_max_mb;
+        let (bytes, mime, name) = tokio::task::spawn_blocking(move ||
+            read_file(&read_home, &read_agent, &read_call, max_mb)).await
+            .map_err(|_| "附件讀取或檢查失敗。".to_owned())??;
         let records = conn.search_read(&call.model, vec![json!(["id", "=", call.res_id])], &["id"], 1).await?;
         if !records.as_array().is_some_and(|rows| rows.len() == 1 && rows[0]["id"].as_i64() == Some(call.res_id)) {
             return Err("找不到目標記錄，或連線帳號無法讀取這筆資料。".into());

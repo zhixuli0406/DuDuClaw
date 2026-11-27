@@ -96,7 +96,7 @@ impl Stub {
                     "authenticate" => json!(if args[1] == "agent" { 17 } else if args[1] == "alice" { 37 } else { 7 }),
                     "version" => json!({"server_version":"18.0"}),
                     _ if method == "fields_get" => json!({"id":{"type":"integer"}}),
-                    _ if method == "search_read" && args[3] == "crm.lead" && found => json!([{"id":9}]),
+                    _ if method == "search_read" && (args[3] == "crm.lead" || args[3] == "sale.order") && found => json!([{"id":9}]),
                     _ if method == "activity_schedule" => json!([42]),
                     _ if method == "message_post" => json!(43),
                     _ if method == "create" && args[3] == "ir.attachment" => json!(44),
@@ -543,7 +543,7 @@ async fn attachment_images_upload_reencoded_bytes_and_webp_uses_png_name_and_mim
     let before = attachment_requests(&stub).len();
     for (file, bytes) in [
         ("bad.jpg", b"\xff\xd8\xff\xda\x00\x02data\xff\xd9".to_vec()),
-        ("bad.pdf", b"%PDF-1.7\nnot a PDF\n%%EOF".to_vec()),
+        ("bad.pdf", b"%PDF-1.7\n<< /Open#41ction null >>\n%%EOF".to_vec()),
         ("wide.png", image_bytes(ImageFormat::Png, 12_001, 1)),
     ] {
         std::fs::write(home.path().join("agents/bot/attachments").join(file), bytes).unwrap();
@@ -552,4 +552,48 @@ async fn attachment_images_upload_reencoded_bytes_and_webp_uses_png_name_and_mim
         assert_eq!(result["isError"], true, "{result}");
     }
     assert_eq!(attachment_requests(&stub).len(), before);
+}
+
+#[tokio::test]
+async fn attachment_pdf_scan_refuses_active_incremental_updates_before_upload() {
+    use super::super::odoo_attachment::tests::{clean_pdf, raw_object_pdf};
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "company", false, &["attach:crm.lead"]);
+    attachment_file(home.path());
+    let clean = clean_pdf();
+    for bytes in [
+        raw_object_pdf(b"<< /Java#53cript null >>"),
+        raw_object_pdf(b"<< /Encrypt 8 0 R >>"),
+        raw_object_pdf(b"<< /Bad#zz null >>"),
+        [clean.as_slice(), b"\n99 0 obj\n<< /OpenAction null >>\nendobj\n%%EOF"].concat(),
+        b"%PDF-1.7\n<<>>".to_vec(),
+    ] {
+        std::fs::write(home.path().join("agents/bot/attachments/x.pdf"), bytes).unwrap();
+        let result = attachment_call(home.path(), "company", false,
+            &json!({"model":"crm.lead","res_id":9,"file":"x.pdf"})).await;
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    assert!(attachment_requests(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn attachment_clean_pdf_uploads_original_bytes_to_sales_order() {
+    use base64::Engine;
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "company", false, &["attach:sale.order"]);
+    let agent = home.path().join("agents/bot/agent.toml");
+    let config = std::fs::read_to_string(&agent).unwrap();
+    std::fs::write(&agent, config.replace("allowed_models=['crm.lead']", "allowed_models=['sale.order']")).unwrap();
+    attachment_file(home.path());
+    let original = std::fs::read(home.path().join("agents/bot/attachments/x.pdf")).unwrap();
+    let result = attachment_call(home.path(), "company", false,
+        &json!({"model":"sale.order","res_id":9,"file":"x.pdf","name":"訂單.pdf"})).await;
+    assert_ne!(result["isError"], true, "{result}");
+    let writes = attachment_requests(&stub);
+    assert_eq!(writes.len(), 1);
+    let values = &writes[0][5][0];
+    assert_eq!(values["res_model"], "sale.order");
+    assert_eq!(values["mimetype"], "application/pdf");
+    let uploaded = base64::engine::general_purpose::STANDARD.decode(values["datas"].as_str().unwrap()).unwrap();
+    assert_eq!(uploaded, original);
 }
