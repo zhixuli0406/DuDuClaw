@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows};
 
 impl MethodHandler {
     pub(crate) async fn handle_approvals_decide(
@@ -587,7 +588,7 @@ impl MethodHandler {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(_) => return WsFrame::error_response("", "Budget incidents unavailable"),
         };
-        // Same direct-binding and Personal visibility rule as agents.list.
+        // Direct bindings or Cost grants admit rows; Personal hiding still applies.
         // Filter before both pagination and aggregation; hidden rows contribute
         // neither entries nor counts, including unattributed rows.
         let hidden = if ctx.is_admin() {
@@ -599,6 +600,7 @@ impl MethodHandler {
             }
         };
         let visible = ctx.visible_agents();
+        let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -606,7 +608,9 @@ impl MethodHandler {
             .filter(|event| match &visible {
                 None => true,
                 Some(ids) => event.get("agent_id").and_then(Value::as_str)
-                    .is_some_and(|id| !hidden.contains(id) && ids.iter().any(|visible_id| visible_id == id)),
+                    .is_some_and(|id| !hidden.contains(id)
+                        && (ids.iter().any(|visible_id| visible_id == id)
+                            || department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read))),
             })
             .collect();
         events.reverse(); // newest first

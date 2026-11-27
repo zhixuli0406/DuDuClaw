@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows, record_grant_use};
 
 impl MethodHandler {
     // ── Analytics ────────────────────────────────────────────
@@ -336,10 +337,17 @@ impl MethodHandler {
             return WsFrame::error_response("", "agent_id is required");
         }
 
-        if let Err(reason) = require_heartbeat_operation(ctx, agent_id) {
-            return WsFrame::error_response("", &reason);
-        }
+        let grant_only = if let Err(reason) = require_heartbeat_operation(ctx, agent_id) {
+            let view = DeptGrantView::load(self, ctx).await;
+            if !department_grant_allows(&view, agent_id, GrantGroup::Schedules, GrantAction::RunNow) {
+                return WsFrame::error_response("", &reason);
+            }
+            true
+        } else { false };
         if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
+        if grant_only {
+            record_grant_use(self, ctx, agent_id, GrantGroup::Schedules, GrantAction::RunNow, "heartbeat.trigger").await;
+        }
         let hb = self.heartbeat.read().await;
         match hb.as_ref() {
             Some(scheduler) => {

@@ -28,7 +28,7 @@ pub(crate) const METHOD_COVERAGE: &[(&str, GrantGroup, Coverage)] = &[
     ("assign_schedules.remove", Schedules, Scoped(Remove)),
     ("cron.run_now", Schedules, Scoped(RunNow)),
     ("cron.templates", Schedules, NotDelegated("no agent data")),
-    ("heartbeat.trigger", Schedules, NotDelegated("binding-scoped since MGR-1; grant alternative pending")),
+    ("heartbeat.trigger", Schedules, Scoped(RunNow)),
     ("heartbeat.status", Schedules, NotDelegated("company-wide summary, unchanged in v1.86")),
     // Rules are department-scoped; breakers and ticks remain AdminOnly.
     ("autopilot.list", Automation, Scoped(Read)),
@@ -74,7 +74,7 @@ pub(crate) const METHOD_COVERAGE: &[(&str, GrantGroup, Coverage)] = &[
     ("cost.agents", Cost, AdminOnly),
     ("cost.recent", Cost, AdminOnly),
     ("cost.by_role", Cost, AdminOnly),
-    ("budget.incidents", Cost, NotDelegated("binding-scoped since MGR-1; grant alternative pending")),
+    ("budget.incidents", Cost, Scoped(Read)),
     ("billing.usage", Cost, NotDelegated("company-wide summary, unchanged in v1.86")),
     ("billing.history", Cost, NotDelegated("company-wide summary, unchanged in v1.86")),
     ("analytics.summary", Cost, NotDelegated("company-wide summary, unchanged in v1.86")),
