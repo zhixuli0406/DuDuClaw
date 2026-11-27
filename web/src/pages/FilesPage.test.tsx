@@ -1,3 +1,4 @@
+import { resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -13,6 +14,7 @@ function jsonResponse(body: unknown) {
 }
 
 beforeEach(() => {
+  resetCompanyTimeZone();
   vi.spyOn(api.agents, 'callable').mockImplementation(async () => ({ agents: AGENTS.map(a => ({ ...a, via: 'binding', selectable: true })), default_agent: null }) as never);
   vi.clearAllMocks();
   // Scoped viewers need a direct binding; team visibility does not grant files.
@@ -30,6 +32,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  resetCompanyTimeZone();
   vi.unstubAllGlobals();
 });
 
@@ -58,14 +61,18 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     );
   });
 
-  it('sends since/until as inclusive epoch-millisecond bounds', async () => {
+  it.each([
+    ['Asia/Taipei', '2026-11-27', '2026-11-26T16:00:00Z', '2026-11-27T15:59:59.999Z'],
+    ['America/New_York', '2026-03-08', '2026-03-08T05:00:00Z', '2026-03-09T03:59:59.999Z'],
+  ])('sends inclusive company-zone bounds for %s on %s', async (zone, date, start, end) => {
+    useCompanyTimeStore.setState({ status: 'set', zone });
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ files: [] }));
     vi.stubGlobal('fetch', fetchMock);
     renderWithProviders(<FilesPage />);
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
     fetchMock.mockClear();
 
-    fireEvent.change(screen.getByLabelText('From date'), { target: { value: '2026-08-01' } });
+    fireEvent.change(screen.getByLabelText('From date'), { target: { value: date } });
 
     await waitFor(() => {
       const call = fetchMock.mock.calls.at(-1);
@@ -73,13 +80,15 @@ describe('<FilesPage> — I-4 search / task / date filters', () => {
     });
     const url = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'http://x');
     const since = Number(url.searchParams.get('since'));
-    // Compared against the LOCAL-time constructor (not ISO/UTC slicing) so
-    // this assertion holds regardless of the test runner's timezone — it must
-    // match exactly what the component itself computes from the same
-    // timezone-less date-time literal.
-    expect(since).toBe(new Date(2026, 7, 1, 0, 0, 0).getTime());
-    // Only `since` was set — no search/task param leaking in.
+    expect(since).toBe(Date.parse(start));
     expect(url.searchParams.get('until')).toBeNull();
+
+    fireEvent.change(screen.getByLabelText('To date'), { target: { value: date } });
+    await waitFor(() => {
+      const filtered = new URL(String(fetchMock.mock.calls.at(-1)?.[0]), 'http://x');
+      expect(Number(filtered.searchParams.get('until'))).toBe(Date.parse(end));
+      expect(Number(filtered.searchParams.get('since'))).toBe(Date.parse(start));
+    });
   });
 
   it('shows the honest "no files at all" empty state when nothing has ever landed', async () => {

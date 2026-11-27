@@ -24,7 +24,7 @@ fn configuration(home: &Path) -> Result<Available, &'static str> {
     Ok(Available { settings, client, base, secure })
 }
 
-fn personal_sub(home: &Path, user: &str) -> Result<Option<String>, &'static str> {
+pub(crate) fn personal_sub(home: &Path, user: &str) -> Result<Option<String>, &'static str> {
     crate::person_credentials::get(home, user)
         .map(|r| r.map(|r| r.metadata.google_sub)).map_err(|_| "signin_storage_unavailable")
 }

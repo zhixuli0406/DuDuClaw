@@ -528,7 +528,23 @@ pub(crate) enum ChatCredential {
     Jwt(duduclaw_auth::jwt::Claims),
     Member(duduclaw_auth::UserContext),
 }
+tokio::task_local! {
+    /// Host-set credential provenance; explicitly carried across turn tasks.
+    pub(crate) static MAIN_CREDENTIAL_ORIGIN: duduclaw_auth::acl::ContextOrigin;
+}
+
+pub(crate) fn main_credential_origin() -> duduclaw_auth::acl::ContextOrigin {
+    MAIN_CREDENTIAL_ORIGIN.try_with(|origin| *origin)
+        .unwrap_or(duduclaw_auth::acl::ContextOrigin::Other)
+}
+
 impl ChatCredential {
+    pub(crate) fn origin(&self) -> duduclaw_auth::acl::ContextOrigin {
+        match self {
+            Self::Jwt(_) => duduclaw_auth::acl::ContextOrigin::DashboardSession,
+            Self::Member(_) => duduclaw_auth::acl::ContextOrigin::MemberKey,
+        }
+    }
     fn user_id(&self) -> &str {
         match self { Self::Jwt(claims) => &claims.sub, Self::Member(ctx) => &ctx.user_id }
     }
@@ -647,12 +663,14 @@ impl WebChatState {
         }
         if is_widget_visitor(user_id) { return false; }
         let Ok(snapshot) = &lookup else { return false; };
-        if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
+        if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin)
+            && main_credential_origin() != duduclaw_auth::acl::ContextOrigin::MemberKey {
             return true;
         }
         // This helper checks named grants or effective main-list admission;
         // execution/resume checks operational status separately.
         let sender = crate::trigger_route::SenderAccess::from_effective(snapshot.access.clone())
+            .with_credential_origin(crate::webchat::main_credential_origin())
             .for_webchat_converse(&self.ctx.home_dir).await;
         self.ctx.registry.read().await.get(agent_name)
             .is_some_and(|agent| sender.webchat_allows(agent)
@@ -978,6 +996,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         }
     };
 
+    let origin = credential.as_ref().map(ChatCredential::origin)
+        .unwrap_or(duduclaw_auth::acl::ContextOrigin::Other);
+    MAIN_CREDENTIAL_ORIGIN.scope(origin, async {
     // Ownership anchor. The authenticated user is the only durable identity this
     // socket has; the per-connection random suffix is NOT one. Keying sessions by
     // the connection (the previous behaviour) meant every page reload minted a
@@ -1790,6 +1811,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     let _ = writer.await;
     state.release_connection(&rate_limit_id).await;
     info!("WebChat connection terminated: {user_id}");
+    }).await;
 }
 
 /// Build a `session_info` frame for `session_id` describing the agent that will

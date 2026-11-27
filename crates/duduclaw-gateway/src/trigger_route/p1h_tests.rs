@@ -73,7 +73,7 @@ async fn p1h_channel_mention_of_another_owners_personal_employee_is_refused() {
     assert!(line_alice.may_call_under(agent(PERSONAL), None, r));
 
     // The synthetic "everyone" sender (is the bot addressed?) is not a person.
-    let everyone = SenderAccess { sender: Sender::Admin { user_id: None }, webchat_scope: None };
+    let everyone = SenderAccess { sender: Sender::Admin { user_id: None }, credential_origin: duduclaw_auth::acl::ContextOrigin::Other, webchat_scope: None };
     assert!(everyone.may_call_under(agent(PERSONAL), None, r));
     // Unprotected installs are unchanged; unreadable ownership refuses all.
     let off = AclRestriction::with_flag(h.path(), false);

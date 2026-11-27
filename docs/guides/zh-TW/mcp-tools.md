@@ -282,6 +282,12 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 ## 從說明搬出來的長版細節
 
+### `tasks_create` 排程
+
+cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未設定或無效時改用 UTC，並在確認訊息說明。公司時區有夏令時間時，成員建立的例行工作以 UTC 儲存並提示。一次性 `schedule` 時間必須包含 UTC 偏移，例如 `2026-11-28T09:00:00+08:00`。
+
+
+
 ### `tasks_create`／`tasks_update` — 目標費用上限
 
 `tasks_create` 搭配 `kind="goal"` 時接受 `cost_cap_cents`，單位是美分，須為正整數（最大 `9223372036854775807`）。省略時使用 `[goal_loop] default_cost_cap_cents`（`0` 代表沒有預設上限）。一般任務與排程請求帶這個參數會被拒絕。例如 `{"kind":"goal","title":"檢查報告","assigned_to":"agnes","cost_cap_cents":500}`，其他目標說明與驗收標準仍照常填寫。
@@ -442,6 +448,8 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 每次最多保留 **400 個模型、每模型 500 個欄位**。中繼資料與欄位探索上限 **5 分鐘**，`fields_get` 同時最多四個；帳號權限探測另外設 30 秒整體上限。優先順序為內建工具模型、已安裝業務模組的模型（CRM、銷售、採購、庫存、會計、專案、人資、製造、客服及網站），其餘按名稱排序。逾時會標記不完整；身分、版本與模組未變時，下輪沿用已取得的完整欄位，接續處理未完成模型。模組／模型目錄各上限 5,000 筆；不完整的差異不代表資料已刪除。
 
+以下既有通用寫入與結構查詢的員工授權／敏感模型限制適用於引擎模式。依 Odoo 帳號模式改用本人 Odoo 權限，仍保留公司功能開關及共同拒絕規則。
+
 ### `odoo_create` / `odoo_write`：通用新增與修改（v1.81.0）
 
 - `odoo_create {model, values}` 新增一筆紀錄並回傳 ID；`odoo_write {model, ids, values}` 修改 1–100 筆紀錄（重複 ID 只算一次）並回傳 `ok`。兩者都需要 **`odoo:write`**，效果類別為 `modify`，`action_rules`、審批清單與探索通道的規則與 `odoo_crm_create_lead` 相同。
@@ -541,6 +549,14 @@ Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App �
 
 Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。
 
+## 管理員 AI 設定
+
+`admin_settings_read` 讀取管理員 AI 功能開放的日常設定；`admin_settings_propose` 只會建立待檢視的確認卡，不會直接套用變更。兩者只在符合資格的管理員本人親自參與、且使用其專屬 AI 分身的對話中提供。只有私訊或已登入的 WebChat 能提出變更。群組讀取不包含排程提示全文與技能說明。管理員必須先閱讀風險說明並確認後啟用功能。每份提案即使只有一項，也必須由提出者在十分鐘內到儀表板收件匣確認。
+
+此功能可修改一般資料、模型、執行上限、定時喚醒、純提示型排程及已安裝技能的啟用狀態。權限、通道與憑證、隔離、執行引擎、預算放寬、組織與委派權限、外部工具連線、人格與工作合約、刪除員工及安裝外部技能仍只能在儀表板處理。
+
+AI 呼叫者使用 `agent_update` 時只能調低預算；調高預算及其他受保護的安全設定會遭拒。新增資料庫來源會建立只能由管理員在儀表板決定的核准卡；移除來源仍可作為權限縮減。這些限制適用於所有委派政策，包括 `open`。
+
 ## 雲端硬碟寫入工具
 
 這九個原生工具需要 `google:write`。管理員分別決定是否開放建立、修改、搬移與移到垃圾桶，四項預設全關。開啟動作或放寬規則前，須明確確認了解風險，系統會記錄管理員與時間；這項設定變更不要求額外重新登入。儀表板控制項會隨本版設定頁交付，目前 Google 整合與個人寫入連線區塊尚未提供。
@@ -580,3 +596,41 @@ ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `pare
 既有 `docs_append`、`docs_create`、`docs_replace_text`、`sheets_append`、`sheets_create`、`sheets_update` 沿用原本的授權規則，不受這四項開關與資料夾規則控制。上表四個新增的 Docs／Sheets 工具歸入「修改」。Google 官方 Drive 遠端 MCP 永遠拿不到完整 Drive 權限的權杖；這九個寫入工具只在主 gateway 行程內執行。
 
 帳號需求見[連線設定](google-setup.md)與[個人寫入同意](google-personal-connections.md)。Google OAuth 隔離與撤銷、委派範圍、文件分頁、格式轉換、共用雲端硬碟角色及私訊確認送達仍待實際帳號驗收；本文不代表這些項目已通過驗證。
+
+## 人工具與 Odoo 權限（v1.86.0）
+
+本人金鑰只提供下列工具，並與金鑰範圍、管理員目前的 `allow_mcp_scopes` 取交集：
+
+| 範圍 | 工具 |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`：目前有權查看的任務，預設 50 筆、範圍 1～200；結果受限或省略時以 `truncated` 標示。 |
+| `agents:status` | `my_agents_status {}`：可見員工的 ID、名稱、狀態與 `can_call`。 |
+| `odoo:read` | `odoo_search`、`odoo_crm_leads`、`odoo_sale_orders`、`odoo_inventory_products`、`odoo_inventory_check`、`odoo_invoice_list`、`odoo_payment_status`、`odoo_partner_search`、`odoo_schema_overview`、`odoo_schema_fields`、`odoo_status`。 |
+| `odoo:write` | `odoo_create`、`odoo_write`、`odoo_activity_create`、`odoo_note_post`，須已確認啟用 `follow_odoo_account`。 |
+
+工具依持有人目前權限執行。Odoo 只用本人已連接的帳號，不借用員工或公司憑證。`odoo_execute`、`odoo_report`、`odoo_connect`、`odoo_message_send`、`odoo_attachment_add` 及 CRM／銷售專用修改工具不在本人金鑰子集中。兩個 `my_*` 工具只供本人金鑰，不是員工工具。
+
+### 四個 Odoo 專用寫入工具
+
+四者都需要 `odoo:write`，目標記錄必須存在且可讀。文字採純文字、HTML 跳脫，不接受提及或呼叫者指定的收件人清單。
+
+| 工具／參數 | 用途 |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | 建立活動，文字欄位各限 10,000 字元，期限格式 `YYYY-MM-DD`，預設類型 `mail.mail_activity_data_todo`。引擎模式指派給連線帳號，只有依 Odoo 帳號模式接受 `user_id`。 |
+| `odoo_note_post {model, res_id, body}` | 新增內部備註，本文限 10,000 字元。 |
+| `odoo_message_send {model, res_id, body}` | 通知記錄追蹤者，本文限 10,000 字元；每次都須綁定完整內容的人工核准，且須有員工身分。 |
+| `odoo_attachment_add {model, res_id, file, name?}` | 從呼叫員工自己的附件資料夾建立私人附件。不接受內嵌／base64、絕對路徑、路徑跳脫、符號連結或共用資料夾。接受經內容驗證且格式相符的 PDF、PNG、JPEG、WebP、UTF-8 TXT／CSV、OOXML XLSX／DOCX／PPTX。原檔及編碼後檔案都須符合 `attachment_max_mb`（預設 10 MiB、範圍 1～25）。須有員工身分。 |
+
+引擎模式須在 `allowed_models` 明列目標，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`，空清單不授權。依 Odoo 帳號模式以本人 Odoo 帳號權限取代員工模型／動作授權及引擎敏感模型封鎖清單；公司功能開關、`always_refuse`、固定拒絕、輸入檢查、核准與 Odoo ACL 仍適用。公司／AI 自有帳號仍用引擎模式。員工 `permission_override=engine` 保留引擎模式，`read_only` 移除寫入。全域 Follow 缺少有效管理員確認時退回引擎模式。
+
+`always_refuse` 預設：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。規則可用完整模型、`*` 或 `ir.*` 等點號子模型；`method:<name>` 精確比對方法。專用工具以目標模型與 `activity:`、`note:`、`message:`、`attach:` 動作比對。
+
+| 規則 | 固定拒絕的操作 |
+| --- | --- |
+| F1 | 修改、刪除 `ir.attachment`，或透過通用工具新增附件。新增附件請用 `odoo_attachment_add`，從檔案建立。 |
+| F2 | 修改 `ir.model`、所有 `ir.model.*` 子模型及 `ir.rule`。 |
+| F3 | 修改 `res.users.apikeys` 及其點號分隔的子模型。 |
+| F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
+| F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |
+
+所有會修改資料的 `odoo_execute` 與 `action_*`、`button_*`、`toggle_*` 方法，在所有模式都須人工核准；`odoo_message_send` 也一律須核准。Allow 規則不能略過核准或拒絕規則；核准只用一次，綁定工具與完整參數。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。

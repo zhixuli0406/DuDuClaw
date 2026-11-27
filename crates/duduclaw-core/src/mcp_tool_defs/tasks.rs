@@ -84,7 +84,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "schedule",
-                description: "Run on a schedule instead of now: a cron expression ('0 9 * * *') for recurring work, or an RFC3339 instant for a one-shot wake-up. Cannot be combined with kind='goal'.",
+                description: "Cron ('0 9 * * *') or a one-shot RFC3339 instant with an offset. Omitted cron zone uses the company time zone; see cron_timezone. Cannot combine with kind='goal'.",
                 required: false,
             },
             ParamDef {
@@ -104,7 +104,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "cron_timezone",
-                description: "IANA timezone for a cron. Member schedules: UTC if omitted; no-DST zones (e.g. 'Asia/Taipei') allowed, DST zones refused. Others: host timezone if omitted.",
+                description: "IANA zone name (e.g. 'Asia/Taipei'). Omitted: administrator's company time zone (UTC if unset); member-origin uses UTC if it has daylight saving. Explicit zones kept; member DST zones refused.",
                 required: false,
             },
             ParamDef {

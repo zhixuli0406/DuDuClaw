@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useState } from 'react';
 import { Badge, Button, Card, CardContent, Input } from '@/components/mds';
 import { decisionApi, type DecisionShadowSlaAssessment, type DecisionShadowSlaErrorSums,
@@ -168,8 +169,9 @@ function validReview(value: DecisionShadowSlaReview, screen: DecisionShadowSlaSc
 
 function dateTime(value: string | number, locale: string): string {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return !Number.isNaN(date.getTime()) ? new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short',
-    timeZone: 'UTC' }).format(date) : String(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const time = formatDateTime(date, { locale, zone: 'UTC', dateStyle: 'medium', timeStyle: 'short' });
+  return time;
 }
 
 function Limitations({ values, t }: { values: string[]; t: Translate }) {
@@ -253,6 +255,7 @@ function TicketSourceInput({ kind, value, onChange, onError, disabled, t }: {
 export function DecisionSlaShadowWorkflowPanel({ scope, blocked, onBusyChange, locale, t }: {
   scope: Scope; blocked: boolean; onBusyChange: (busy: boolean) => void; locale: string; t: Translate;
 }) {
+  useCompanyTimeZone();
   const [slaId, setSlaId] = useState('');
   const [forecastId, setForecastId] = useState('');
   const [modelVersion, setModelVersion] = useState('');

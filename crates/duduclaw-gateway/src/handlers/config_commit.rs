@@ -388,7 +388,7 @@ pub(super) async fn commit_drive_write_policy(
                 let mut table = current.parse::<toml::Table>().map_err(|_| "無法讀取設定。".to_string())?;
                 table_at_mut(&mut table, &["google"])?.insert("drive_write".into(), section);
                 render_preserving(current, &table)
-            }, true, Some(g), None, None, true)
+            }, true, Some(g), None, None, true, false)
         )).map_err(|e| e.to_string())?
     }).await.map_err(|_| "無法儲存設定，請稍後重試。".to_string())?
 }
@@ -408,10 +408,31 @@ fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)
     }
     commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None)
 }
-fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
-    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false)
+/// Dedicated writer; callers must perform Admin verification before entering.
+/// All normal CAS, policy, source, authority and atomic-write fences still apply.
+pub(super) fn commit_skill_trust_table(
+    home: &Path, expected_hash: &str, table: &toml::Table,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let path = home.join("config.toml");
+    crate::google_identity::home_source::with_source_guard(home, |source| Ok(
+        commit_rendered_inner_authorized(&path, expected_hash, |current| {
+            guard()?;
+            // This exception may change exactly one section.
+            let mut old = current.parse::<toml::Table>().map_err(|e| e.to_string())?;
+            let mut new = table.clone();
+            old.remove("skill_trust");
+            new.remove("skill_trust");
+            if old != new { return Err("只能變更自家技能來源。".into()); }
+            render_preserving(current, table)
+        }, true, Some(source), None, None, false, true)
+    )).map_err(|e| e.to_string())?
 }
-fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool)->Result<(),String> {
+
+fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
+    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false, false)
+}
+fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool,skill_trust_write:bool)->Result<(),String> {
     let authority_home = match path.file_name().and_then(|n| n.to_str()) {
         Some("config.toml") => path.parent(),
         Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
@@ -437,6 +458,16 @@ fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl Fn
         if !drive_write_consent && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
             if let Err(error) = refuse_drive_write_text_edit(&current, &new_content) {
                 return Ok(Err(error));
+            }
+        }
+        // Only the dedicated Admin RPC may change the auto-approval policy.
+        // Check final TOML values under the common lock, including generic
+        // whole-table, raw, observed and local-config adapters.
+        if !skill_trust_write && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            let unchanged = current.parse::<toml::Table>().and_then(|old|
+                new_content.parse::<toml::Table>().map(|new| old.get("skill_trust") == new.get("skill_trust")));
+            if !matches!(unchanged, Ok(true)) {
+                return Ok(Err("請到自家技能來源設定頁變更自動放行清單。".into()));
             }
         }
         if observer.is_some() && source.is_some() {

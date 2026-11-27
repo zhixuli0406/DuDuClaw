@@ -2,6 +2,7 @@
 //! selects an Odoo account; environment values only authenticate the employee.
 use std::{fmt, path::Path, time::Duration};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
@@ -24,6 +25,9 @@ pub(crate) struct OdooIdentity {
     pub odoo_uid: Option<i64>,
     pub login: Option<String>,
     pub rev: Option<i64>,
+    pub url: Option<String>,
+    pub db: Option<String>,
+    pub server_fp: Option<String>,
     pub secret: Option<Zeroizing<String>>,
 }
 
@@ -36,6 +40,29 @@ impl fmt::Debug for OdooIdentity {
 }
 
 impl OdooIdentity {
+    /// Validate the exact gateway snapshot again at the connection boundary.
+    pub fn personal_endpoint(&self) -> Result<(&str, &str, &str), String> {
+        let url = self.url.as_deref().ok_or(MALFORMED)?;
+        let db = self.db.as_deref().ok_or(MALFORMED)?;
+        let fp = self.server_fp.as_deref().ok_or(MALFORMED)?;
+        let parsed = reqwest::Url::parse(url).map_err(|_| MALFORMED)?;
+        if self.kind != IdentityKind::Personal || url.trim() != url || url.len() > 512
+            || url.chars().any(char::is_control)
+            || !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none()
+            || !parsed.username().is_empty() || parsed.password().is_some()
+            || parsed.query().is_some() || parsed.fragment().is_some()
+            || !duduclaw_odoo::url_guard::is_valid_odoo_db(db)
+            || fp != format!("{:x}", Sha256::digest(format!("{url}|{db}").as_bytes()))
+        { return Err(MALFORMED.into()); }
+        Ok((url, db, fp))
+    }
+
+    pub fn personal_profile(&self) -> Result<String, String> {
+        let (_, _, fp) = self.personal_endpoint()?;
+        Ok(format!("person:{}:{}:{fp}", self.user_id.as_deref().ok_or(MALFORMED)?,
+            self.rev.ok_or(MALFORMED)?))
+    }
+
     pub fn audit_value(&self) -> Value {
         json!({"kind": match self.kind {
             IdentityKind::Personal => "personal", IdentityKind::Agent => "agent", IdentityKind::Company => "company",
@@ -66,6 +93,9 @@ struct Response {
     odoo_uid: Option<i64>,
     login: Option<String>,
     rev: Option<i64>,
+    url: Option<String>,
+    db: Option<String>,
+    server_fp: Option<String>,
     #[serde(default, deserialize_with = "secret")]
     secret: Option<Zeroizing<String>>,
     code: Option<String>,
@@ -96,12 +126,14 @@ fn interpret(status: u16, body: &[u8], have_rev: Option<i64>) -> Result<OdooIden
         }
         IdentityKind::Agent | IdentityKind::Company => {
             if r.secret.is_some() || r.user_id.is_some() || r.odoo_uid.is_some()
-                || r.login.is_some() || r.rev.is_some()
+                || r.login.is_some() || r.rev.is_some() || r.url.is_some() || r.db.is_some() || r.server_fp.is_some()
             { return Err(refuse(MALFORMED)); }
         }
     }
-    Ok(OdooIdentity { kind, permission, user_id: r.user_id, odoo_uid: r.odoo_uid,
-        login: r.login, rev: r.rev, secret: r.secret })
+    let identity = OdooIdentity { kind, permission, user_id: r.user_id, odoo_uid: r.odoo_uid,
+        login: r.login, rev: r.rev, secret: r.secret, url: r.url, db: r.db, server_fp: r.server_fp };
+    if kind == IdentityKind::Personal { identity.personal_endpoint().map_err(|_| refuse(MALFORMED))?; }
+    Ok(identity)
 }
 
 fn env_trimmed(name: &str) -> Option<Zeroizing<String>> {
@@ -122,7 +154,7 @@ pub(crate) async fn request_identity(home: &Path, agent: &str, tool: &str, have_
 pub(crate) async fn request_identity_for_person_key(home: &Path, raw_member_key: &str,
     tool: &str, have_rev: Option<i64>) -> Result<OdooIdentity, IdentityRefusal> {
     let identity = post(home, None, Some(raw_member_key), json!({"tool":tool,"have_rev":have_rev}), have_rev).await?;
-    if identity.kind != IdentityKind::Personal { return Err(refuse(MALFORMED)); }
+    if identity.kind != IdentityKind::Personal || identity.permission == IdentityPermission::Engine { return Err(refuse(MALFORMED)); }
     Ok(identity)
 }
 
@@ -173,7 +205,7 @@ fn employee_auth(name: &str) -> Result<Zeroizing<String>, IdentityRefusal> {
 /// decision and connect, preventing an older response resurrecting a revoked rev.
 #[derive(Default)]
 pub(crate) struct IdentityCache {
-    pub entries: Vec<(String, String, i64, Zeroizing<String>)>,
+    pub entries: Vec<(String, String, i64, String, Zeroizing<String>)>,
 }
 
 // The call context holds only the audit stamp; connectors return the complete
@@ -183,11 +215,59 @@ pub(super) async fn with_call<F: std::future::Future>(future: F) -> F::Output {
     if CALL_IDENTITY.try_with(|_| ()).is_ok() { return future.await; }
     CALL_IDENTITY.scope(std::cell::RefCell::new(None), future).await
 }
+pub(super) async fn with_new_call<F: std::future::Future>(future: F) -> F::Output {
+    CALL_IDENTITY.scope(std::cell::RefCell::new(None), future).await
+}
 pub(super) fn record(identity: &OdooIdentity) {
     let _ = CALL_IDENTITY.try_with(|cell| *cell.borrow_mut() = Some(identity.audit_value()));
 }
+// Person calls emit one metadata-only row at their boundary, including early
+// refusals. Handler summaries/results can contain business text or credentials.
+tokio::task_local! { static PERSON_CALL: (); }
+pub(super) async fn with_person_call<F: std::future::Future>(future: F) -> F::Output {
+    PERSON_CALL.scope((), future).await
+}
+
+/// Explicit sensitive models plus exact dot/underscore-delimited credential
+/// segments. No result content (including upstream errors) is retained here.
+pub(super) fn sensitive_model(model: &str) -> bool {
+    matches!(model, "ir.config_parameter" | "ir.mail_server" | "fetchmail.server"
+        | "payment.provider" | "res.users" | "ir.attachment")
+        || model == "res.users.apikeys" || model.strip_prefix("res.users.apikeys.").is_some()
+        || model.split(['.', '_']).any(|segment| matches!(segment,
+            "token" | "tokens" | "secret" | "secrets" | "key" | "keys"
+            | "password" | "passwords" | "credential" | "credentials" | "apikey" | "apikeys"))
+}
+
+pub(super) fn audit_result(home: &Path, agent: &str, tool: &str, params: &Value,
+    success: bool, raw: &str, metadata_only: bool) {
+    if PERSON_CALL.try_with(|_| ()).is_ok() { return; }
+    let (_, model, method) = super::odoo_access::operation(tool, Some(params))
+        .unwrap_or((duduclaw_odoo::access_policy::ToolClass::Read, None, None));
+    if !metadata_only && !model.is_some_and(sensitive_model) {
+        audit_call(home, agent, tool, "Odoo call", success, Some(raw));
+        return;
+    }
+    let model = model.filter(|m| duduclaw_odoo::schema::valid_model_name(m));
+    let method = method.filter(|m| !m.is_empty() && m.len() <= 128
+        && m.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'));
+    let value = serde_json::from_str::<Value>(raw).ok().or_else(||
+        raw.rsplit_once('\n').and_then(|(body, _)| serde_json::from_str::<Value>(body).ok()));
+    let ids = params.get("ids").and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()).or_else(|| Some(v.clone())));
+    let stamp = CALL_IDENTITY.try_with(|cell| cell.borrow().clone()).ok().flatten().unwrap_or(Value::Null);
+    duduclaw_security::audit::append_tool_call_with_extras(home, agent, tool, "Odoo result metadata", success,
+        &[("odoo_identity", stamp), ("odoo_result", json!({
+            "model": model, "method": method,
+            "record_count": value.as_ref().and_then(|v| v.as_array().map(Vec::len)
+                .or_else(|| v.get("id").filter(|id| id.is_i64()).map(|_| 1))),
+            "ids_count": ids.as_ref().and_then(Value::as_array).map(Vec::len),
+            "byte_length": raw.len(),
+        }))]);
+}
+
 pub(super) fn audit_call(home: &Path, agent: &str, tool: &str, summary: &str,
     success: bool, result: Option<&str>) {
+    if PERSON_CALL.try_with(|_| ()).is_ok() { return; }
     let stamp = CALL_IDENTITY.try_with(|cell| cell.borrow().clone()).ok().flatten().unwrap_or(Value::Null);
     let mut extras = vec![("odoo_identity", stamp)];
     if let Some(raw) = result {

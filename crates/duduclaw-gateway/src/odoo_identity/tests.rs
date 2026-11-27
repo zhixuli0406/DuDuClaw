@@ -151,9 +151,14 @@ async fn five_rows_and_personal_precedence_and_revision_handoff() {
     assert_eq!(value["user_id"], f.a);
     assert_eq!(value["secret"], SECRET_A);
     assert_eq!(value["permission"], "engine");
+    let server = server::company_server(f.home.path()).unwrap().unwrap();
+    assert_eq!(value["url"], server.url);
+    assert_eq!(value["db"], server.db);
+    assert_eq!(value["server_fp"], server.fp);
     let rev = value["rev"].as_i64().unwrap();
     let (_, cached) = f.employee("alice", json!({"tool":"odoo_read","have_rev":rev})).await;
     assert_eq!(cached["rev"], rev);
+    for field in ["url", "db", "server_fp"] { assert_eq!(cached[field], value[field]); }
     assert_eq!(cached["odoo_uid"], 42);
     assert!(cached.get("secret").is_none());
     assert!(f.state.users.odoo_credential_status(&f.a).unwrap().unwrap().last_used_at.is_some());
@@ -174,7 +179,7 @@ async fn five_rows_and_personal_precedence_and_revision_handoff() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["identity"], identity);
         assert_eq!(value["permission"], "engine");
-        for key in ["secret", "user_id", "login", "rev"] { assert!(value.get(key).is_none()); }
+        for key in ["secret", "user_id", "login", "rev", "url", "db", "server_fp"] { assert!(value.get(key).is_none()); }
     }
     let (status, value) = f.employee("company-extra", read()).await;
     refused(status, &value, "odoo_not_connected");
@@ -363,7 +368,7 @@ async fn person_key_scopes_never_borrow_server_employee_or_company() {
     assert_eq!(value["user_id"], f.a);
     assert_eq!(value["secret"], SECRET_A);
     assert_eq!(value["permission"], "read_only");
-    let (_, cached) = f.person(&key, json!({"tool":"odoo_read","have_rev":value["rev"]})).await;
+    let (_, cached) = f.person(&key, json!({"tool":"odoo_search","have_rev":value["rev"]})).await;
     assert!(cached.get("secret").is_none());
     let (status, value) = f.person(&key, json!({"tool":"odoo_write"})).await;
     refused(status, &value, "odoo_follow_required");
@@ -371,7 +376,9 @@ async fn person_key_scopes_never_borrow_server_employee_or_company() {
         let mut body = read(); body[field] = json!("forged");
         assert_eq!(f.person(&key, body).await.0, StatusCode::BAD_REQUEST);
     }
-    for tool in ["odoo_execute", "odoo_message_send", "odoo_attachment_add", "odoo_search_extra"] {
+    for tool in ["odoo_execute", "odoo_message_send", "odoo_attachment_add", "odoo_search_extra",
+        "odoo_report", "odoo_read", "odoo_connect", "odoo_crm_create_lead", "odoo_crm_update_stage",
+        "odoo_sale_create_quotation", "odoo_sale_confirm"] {
         assert_eq!(f.person(&key, json!({"tool":tool})).await.0, StatusCode::BAD_REQUEST);
     }
     f.config("", "https://erp.example.com", &[]);
@@ -484,4 +491,24 @@ async fn password_epoch_change_stops_personal_handoff_even_with_new_person_key()
     let (status, value) = f.employee("alice", read()).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(value["secret"], SECRET_B);
+}
+
+#[tokio::test]
+async fn person_odoo_route_accepts_exact_shared_subset() {
+    use duduclaw_core::mcp_person_tools::{PERSON_TOOLS, PersonToolHost};
+    let f = Fixture::new();
+    f.config("permission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}",
+        "https://erp.example.com", &["odoo:read", "odoo:write"]);
+    f.credential(&f.a, SECRET_A);
+    let key = f.key(&f.a, &["odoo:read", "odoo:write"]);
+    let read_key = f.key(&f.a, &["odoo:read"]);
+    for tool in PERSON_TOOLS.iter().filter(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+        let (status, value) = f.person(&key, json!({"tool":tool.name})).await;
+        assert_eq!(status, StatusCode::OK, "{}: {value}", tool.name);
+        assert_eq!(value["identity"], "personal");
+        assert_eq!(value["user_id"], f.a);
+        let (status, value) = f.person(&read_key, json!({"tool":tool.name})).await;
+        if tool.scope == "odoo:write" { refused(status, &value, "person_key_scope"); }
+        else { assert_eq!(status, StatusCode::OK); }
+    }
 }

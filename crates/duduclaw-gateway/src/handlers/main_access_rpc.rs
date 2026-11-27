@@ -1,5 +1,5 @@
-//! Admin-only main-agent list management. P13 does not switch conversation or
-//! assignment admission: existing entry points still enforce Admin-only access.
+//! Admin-only main-agent list management. Listed members gain conversation
+//! and assignment access only when employee execution is isolated.
 
 use std::collections::BTreeSet;
 
@@ -11,7 +11,7 @@ const UNAVAILABLE: &str = "無法讀取主要 AI 員工開放名單，請稍後�
 const SAVE_FAILED: &str = "無法儲存主要 AI 員工開放名單，請稍後再試。";
 const INVALID_USERS: &str = "請提供成員編號陣列，每個編號都必須是非空白文字，最多 500 筆。";
 const MAX_USERS: usize = 500;
-const INEFFECTIVE_REASON: &str = "主要 AI 員工目前可以執行命令列指令，名單暫時不會生效。請先在「工具與權限」移除命令列工具，或啟用受保護模式。";
+const INEFFECTIVE_REASON: &str = "目前沒有啟用受保護模式，名單暫時不會生效；只有管理員能使用主要 AI 員工。啟用受保護模式後，名單內的成員才能和主要 AI 員工對話、交辦工作。";
 
 fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
     let ids = db.main_agent_users().map_err(|_| UNAVAILABLE)?;
@@ -26,23 +26,9 @@ fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
     Ok(json!({"users": users, "risk_notice": RISK_NOTICE}))
 }
 
-async fn with_effectiveness(home: &std::path::Path, mut payload: Value) -> Value {
-    use crate::on_behalf_of::access::{listed_access_effective, main_default_targets};
+fn with_effectiveness(mut payload: Value, isolated: bool) -> Value {
     let nonempty = payload["users"].as_array().is_some_and(|users| !users.is_empty());
-    let mut effective = true;
-    if nonempty {
-        match main_default_targets(home).await {
-            Ok(targets) => {
-                for target in targets {
-                    if !listed_access_effective(home, &target).await.unwrap_or(false) {
-                        effective = false;
-                        break;
-                    }
-                }
-            }
-            Err(_) => effective = false,
-        }
-    }
+    let effective = !nonempty || isolated;
     payload["effective"] = json!(effective);
     if nonempty && !effective { payload["ineffective_reason"] = json!(INEFFECTIVE_REASON); }
     payload
@@ -60,14 +46,26 @@ fn store_message(error: &str) -> &'static str {
 impl MethodHandler {
     // dispatch_org requires a live Admin; gates.rs requires Enterprise.
     pub(crate) async fn handle_main_access_get(&self) -> WsFrame {
+        self.handle_main_access_get_with_isolation(duduclaw_core::execution_gate::isolation_required()).await
+    }
+
+    // Host-only composition boundary for deterministic isolation tests.
+    pub(super) async fn handle_main_access_get_with_isolation(&self, isolated: bool) -> WsFrame {
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", UNAVAILABLE); };
         match tokio::task::spawn_blocking(move || list_payload(&db)).await {
-            Ok(Ok(payload)) => WsFrame::ok_response("", Box::pin(with_effectiveness(&self.home_dir, payload)).await),
+            Ok(Ok(payload)) => WsFrame::ok_response("", with_effectiveness(payload, isolated)),
             _ => WsFrame::error_response("", UNAVAILABLE),
         }
     }
 
     pub(crate) async fn handle_main_access_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        self.handle_main_access_set_with_isolation(params, ctx,
+            duduclaw_core::execution_gate::isolation_required()).await
+    }
+
+    pub(super) async fn handle_main_access_set_with_isolation(
+        &self, params: Value, ctx: &UserContext, isolated: bool,
+    ) -> WsFrame {
         let Some(raw_ids) = params.get("user_ids").and_then(Value::as_array) else {
             return WsFrame::error_response("", INVALID_USERS);
         };
@@ -90,7 +88,7 @@ impl MethodHandler {
             list_payload(&db)
         }).await;
         match result {
-            Ok(Ok(payload)) => WsFrame::ok_response("", Box::pin(with_effectiveness(&self.home_dir, payload)).await),
+            Ok(Ok(payload)) => WsFrame::ok_response("", with_effectiveness(payload, isolated)),
             Ok(Err(duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED)) => acknowledgement_required(),
             Ok(Err(message)) => WsFrame::error_response("", message),
             Err(_) => WsFrame::error_response("", SAVE_FAILED),

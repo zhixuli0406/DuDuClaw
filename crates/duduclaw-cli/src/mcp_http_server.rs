@@ -1314,6 +1314,7 @@ pub mod tests {
         let home = tempfile::tempdir().unwrap();
         let stub = Stub::start(home.path()).await;
         let state = hint_test_state(home.path()).http;
+        let odoo = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
         // Task-local permits keep this saturation test isolated from other tests.
         let slots = Arc::new(tokio::sync::Semaphore::new(4));
         let held = slots.clone().acquire_many_owned(4).await.unwrap();
@@ -1330,7 +1331,7 @@ pub mod tests {
             assert!(namespace.read_namespaces.is_empty() && namespace.write_namespace.is_empty());
             let principal = call.principal().clone();
             crate::mcp_auth::with_authenticated_call(call, async {
-                let result = crate::mcp::person_tools::call(home.path(), &principal, "my_tasks_list", &serde_json::json!({})).await;
+                let result = crate::mcp::person_tools::call(home.path(), &odoo, &principal, "my_tasks_list", &serde_json::json!({})).await;
                 assert_eq!(result["structuredContent"]["tasks"][0]["id"], "visible");
             }).await;
             let seen = stub.seen.lock().unwrap();

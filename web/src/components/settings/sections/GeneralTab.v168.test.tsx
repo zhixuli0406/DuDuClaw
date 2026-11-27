@@ -5,10 +5,12 @@ import { renderWithProviders } from '@/test/render';
 
 const configMock = vi.fn();
 const updateConfigMock = vi.fn();
+const companyTimezoneMock = vi.fn();
 vi.mock('@/lib/api', () => ({
   api: {
     system: {
       config: () => configMock(),
+      companyTimezone: () => companyTimezoneMock(),
       updateConfig: (f: Record<string, unknown>) => updateConfigMock(f),
       autostartStatus: () => Promise.resolve({ supported: false, enabled: false }),
     },
@@ -17,9 +19,12 @@ vi.mock('@/lib/api', () => ({
 
 import { GeneralTab } from './GeneralTab';
 import { useAuthStore } from '@/stores/auth-store';
+import { resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  resetCompanyTimeZone();
+  companyTimezoneMock.mockResolvedValue({ timezone: null, status: 'unset', source: null });
   useAuthStore.setState({ user: null } as never);
   updateConfigMock.mockResolvedValue({ success: true, changes: [], restart_required: [] });
 });
@@ -91,5 +96,73 @@ describe('<GeneralTab> memory language (RM-178)', () => {
     configMock.mockResolvedValue({ config: '' });
     renderWithProviders(<GeneralTab />);
     expect(await screen.findByRole('combobox', { name: 'Memory language' })).toBeDisabled();
+  });
+});
+
+
+describe('<GeneralTab> company time zone (RM-222)', () => {
+  beforeEach(() => {
+    useAuthStore.setState({ user: { id: 'admin', role: 'admin' } } as never);
+  });
+
+  it('loads the stored value and sends only the changed company zone', async () => {
+    configMock.mockResolvedValue({ config: '[general]\ncompany_timezone = "Asia/Taipei"\n' });
+    companyTimezoneMock.mockResolvedValue({ timezone: 'Asia/Tokyo', status: 'set', source: null });
+    renderWithProviders(<GeneralTab />);
+    const input = screen.getByRole('combobox', { name: 'Company time zone' });
+    await waitFor(() => expect(input).toHaveValue('Asia/Taipei'));
+    fireEvent.change(input, { target: { value: 'Asia/Tokyo' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ company_timezone: 'Asia/Tokyo' }));
+    await waitFor(() => expect(companyTimezoneMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(useCompanyTimeStore.getState().zone).toBe('Asia/Tokyo'));
+  });
+
+  it('clears the stored zone with an empty string', async () => {
+    configMock.mockResolvedValue({ config: '[general]\ncompany_timezone = "Asia/Taipei"\n' });
+    renderWithProviders(<GeneralTab />);
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Company time zone' })).toHaveValue('Asia/Taipei'));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ company_timezone: '' }));
+    await waitFor(() => expect(companyTimezoneMock).toHaveBeenCalledTimes(1));
+  });
+
+  it('confirms the automatically detected value even when unchanged', async () => {
+    configMock.mockResolvedValue({ config: '[general]\ncompany_timezone = "Asia/Taipei"\ncompany_timezone_source = "detected_at_upgrade"\n' });
+    companyTimezoneMock.mockResolvedValue({ timezone: 'Asia/Taipei', status: 'set', source: null });
+    renderWithProviders(<GeneralTab />);
+    expect(await screen.findByText('Filled in automatically from this host’s time zone. Please confirm.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalledWith({ company_timezone: 'Asia/Taipei' }));
+    await waitFor(() => expect(companyTimezoneMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument());
+  });
+
+  it('explains the fallback when the company zone is unset', async () => {
+    configMock.mockResolvedValue({ config: '' });
+    renderWithProviders(<GeneralTab />);
+    expect(await screen.findByText('Not set: new schedules use UTC. Times on screen follow each person’s computer time zone.')).toBeInTheDocument();
+  });
+
+  it('shows an invalid stored value and rejects an unknown selection', async () => {
+    configMock.mockResolvedValue({ config: '[general]\ncompany_timezone = "Not/AZone"\n' });
+    renderWithProviders(<GeneralTab />);
+    expect(await screen.findByText('The current setting is invalid. Please choose a time zone again.')).toBeInTheDocument();
+    fireEvent.change(screen.getByRole('combobox', { name: 'Company time zone' }), { target: { value: 'Still/Invalid' } });
+    expect(screen.queryByText('The current setting is invalid. Please choose a time zone again.')).not.toBeInTheDocument();
+    expect(screen.getByText('Choose a time zone from the list.')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(updateConfigMock).not.toHaveBeenCalled();
+  });
+
+  it('disables changes and confirmation for non-admins', async () => {
+    useAuthStore.setState({ user: null } as never);
+    configMock.mockResolvedValue({ config: '[general]\ncompany_timezone = "Asia/Taipei"\ncompany_timezone_source = "detected_at_upgrade"\n' });
+    renderWithProviders(<GeneralTab />);
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Company time zone' })).toHaveValue('Asia/Taipei'));
+    expect(screen.getByRole('combobox', { name: 'Company time zone' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Clear' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Confirm' })).not.toBeInTheDocument();
   });
 });

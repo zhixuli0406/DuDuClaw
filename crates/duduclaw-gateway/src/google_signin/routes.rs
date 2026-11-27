@@ -333,10 +333,9 @@ pub(crate) async fn callback(
                 daily_cap: available.settings.daily_new_accounts,
                 settings_version: available.settings.revision, ack_by, ack_at,
             };
-            let db = state.user_db.clone();
-            let decision = tokio::task::spawn_blocking(move || decide(&db, &identity, &policy, now)).await;
+            let decision = decide_login(state.user_db.clone(), state.home_dir.clone(), identity, policy, now).await;
             match decision {
-                Ok(Ok((result, notification))) => {
+                Ok((result, notification)) => {
                     if let Some((key, text)) = notification { notify_admins(&state.home_dir, key, text).await; }
                     result
                 }
@@ -354,11 +353,33 @@ pub(crate) async fn callback(
 }
 
 type Notification = Option<(String, &'static str)>;
-fn decide(db: &UserDb, identity: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64)
+async fn decide_login(db: Arc<UserDb>, home: PathBuf, identity: VerifiedGoogleIdentity,
+    policy: SigninPolicy, now: i64) -> Result<(LoginResult, Notification), String>
+{
+    let probe_db = db.clone();
+    let probe_id = identity.clone();
+    let candidate = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        if probe_db.google_signin_link_by_sub(&probe_id.sub)?.is_some() { return Ok(false); }
+        probe_db.signin_attestation_candidate_exists(&probe_id.email, now)
+    }).await.map_err(|_| "signin_storage_unavailable")??;
+    let lease = if candidate {
+        Some(crate::google_personal::grants::acquire(&home).await
+            .map_err(|_| "signin_storage_unavailable")?)
+    } else { None };
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        decide(&db, &identity, &policy, now, _lease.is_some(),
+            &|user| me::personal_sub(&home, user).map_err(str::to_owned))
+    }).await.map_err(|_| "signin_storage_unavailable")?
+}
+
+fn decide(db: &UserDb, identity: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+    grant_lease_held: bool,
+    personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>)
     -> Result<(LoginResult, Notification), String>
 {
     let previous_request = db.signin_request_by_sub(&identity.sub)?;
-    let outcome = db.resolve_google_signin(identity, policy, now)?;
+    let outcome = db.resolve_google_signin(grant_lease_held, identity, policy, now, personal_sub)?;
     let mut notification = None;
     let result = match outcome {
         SigninOutcome::Ok { user_id, credential_epoch, .. } => {

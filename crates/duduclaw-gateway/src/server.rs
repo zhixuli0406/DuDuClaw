@@ -1354,6 +1354,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // committed but did not deliver (held rows included). Only the gateway
     // lock holder drains.
     if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::company_timezone_init::run_once(&home_dir);
         crate::handlers::drain_reset_audit_outbox(&home_dir, &user_db, true);
     }
     let jwt_config = Arc::new(JwtConfig::load_or_generate(&home_dir).map_err(|e| {
@@ -2866,6 +2867,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
                 skills = ?report.seeded,
                 "WP19 built-in skills backfill applied"
             );
+        }
+    }
+
+    // Only the lock-owning gateway migrates, before serving Odoo tools.
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        if let Err(error) = crate::odoo_access_migration::run(&home_dir).await {
+            tracing::warn!(%error, "Odoo company account migration not applied");
         }
     }
 

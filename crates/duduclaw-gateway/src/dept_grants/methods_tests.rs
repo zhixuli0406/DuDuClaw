@@ -84,7 +84,8 @@ fn string_literals(source: &str) -> Vec<String> {
 fn is_method_name(name: &str) -> bool {
     // Exclude bare prefixes, wildcard patterns, paths and prose explicitly.
     PREFIXES.iter().any(|prefix| name.strip_prefix(*prefix).is_some_and(|tail| {
-        !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        tail.split('.').all(|segment| !segment.is_empty()
+            && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'))
     })) && name != "budget.daily_cap_cents" // Config field in member_contract.rs.
 }
 
@@ -122,4 +123,12 @@ fn routed_methods_have_explicit_coverage() {
             assert!(!reason.trim().is_empty(), "missing non-delegation reason: {method}");
         }
     }
+}
+
+#[test]
+fn method_scan_includes_nested_runs_but_not_prose_or_prefixes() {
+    assert!(is_method_name("autopilot.runs.list"));
+    assert!(is_method_name("autopilot.runs.cancel"));
+    assert!(!is_method_name("skills.recent."));
+    assert!(!is_method_name("autopilot."));
 }

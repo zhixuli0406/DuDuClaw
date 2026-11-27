@@ -18,6 +18,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
+iana-time-zone = "0.1"
 cron = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }

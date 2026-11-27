@@ -229,6 +229,28 @@ async fn write_finish_rechecks_policy_client_user_and_ordinary_connection() {
     }
 }
 
+
+#[tokio::test]
+async fn write_connection_refuses_signin_link_mismatch_without_replacing_credentials() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let start = start_write(&f, true, true).await.unwrap();
+    finish(&f, &start, "write-alice").await.unwrap();
+    // Model a legacy ordinary connection that differs from the sign-in link.
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
+        "INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at)
+         VALUES(?1,'214001','c.test','login@c.test','self_link',?1,1)",
+        [&f.alice.id],
+    ).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    let ordinary_before = std::fs::read(vault::path(&f.home)).unwrap();
+    let write_before = std::fs::read(write_store::path(&f.home)).unwrap();
+    assert_eq!(finish(&f, &start, "write-alice").await.unwrap_err(), "google_signin_account_mismatch");
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary_before);
+    assert_eq!(std::fs::read(write_store::path(&f.home)).unwrap(), write_before);
+}
+
 #[tokio::test]
 async fn authorization_request_drive_write_finishes_only_in_write_vault() {
     use crate::google_authorization_requests::{self as requests, store::Store};

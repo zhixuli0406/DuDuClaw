@@ -81,6 +81,8 @@ pub(crate) enum DashboardOnlyReader {
     Admin,
     /// Admin, or Editor/Owner on the collection ACL loaded for this frame.
     CollectionEditor,
+    /// Live EgressReview authority for this card only.
+    OutboundReviewer,
     /// Manager with Viewer on the card's stored `agent_id`.
     EmployeeViewer,
     /// Nobody through the generic approval surfaces (approvals.list/get and
@@ -97,11 +99,11 @@ pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyRea
         return DashboardOnlyReader::PersonalOwnerOnly;
     }
     // Payload-detected activation is Admin even when `action_kind` differs.
-    if crate::approval::is_activation_record(record)
-        || record.action_kind == crate::approval::cli_egress::KIND
-        || record.payload.get("egress_guard").is_some()
-    {
+    if crate::approval::is_activation_record(record) {
         return DashboardOnlyReader::Admin;
+    }
+    if crate::approval::is_outbound_data_card(record) {
+        return DashboardOnlyReader::OutboundReviewer;
     }
     if record.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
         return DashboardOnlyReader::CollectionEditor;
@@ -134,6 +136,7 @@ pub(crate) struct ApprovalVisibility {
     task: Option<TaskVisibility>,
     employee_requires_admin: Option<bool>,
     admin_ai_reader: Option<String>,
+    outbound_reader: Option<String>,
 }
 
 impl ApprovalVisibility {
@@ -154,11 +157,14 @@ impl ApprovalVisibility {
             .then(|| ActivationVisibility::load(home, &record.payload));
         let task = approval_task_ref(&record.payload).filter(|_| record.binding.is_none())
             .map(|id| TaskVisibility::load(home, &id));
-        Self { collection_acl, activation, task, employee_requires_admin: None, admin_ai_reader: None }
+        Self { collection_acl, activation, task, employee_requires_admin: None, admin_ai_reader: None, outbound_reader: None }
     }
 
     pub(crate) fn for_reader(mut self, home: &Path, record: &ApprovalRecord, fresh: &UserContext) -> Self {
         self.employee_requires_admin = None;
+        self.outbound_reader = (crate::approval::is_outbound_data_card(record)
+            && crate::approval::outbound::authorize(home, fresh, record).is_ok())
+            .then(|| fresh.user_id.clone());
         self.admin_ai_reader = (record.action_kind == crate::admin_ai::card::ACTION_KIND
             && crate::admin_ai::may_decide(home, record, &fresh.user_id)).then(|| fresh.user_id.clone());
         if !fresh.is_admin()
@@ -182,6 +188,7 @@ impl ApprovalVisibility {
         if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {
             DashboardOnlyReader::Admin => fresh.is_admin(),
+            DashboardOnlyReader::OutboundReviewer => self.outbound_reader.as_deref() == Some(fresh.user_id.as_str()),
             // Same predicate as `add_source_approval::may_decide`, on this
             // frame's ACL snapshot. Admin is allowed without a grant. Everyone
             // else needs a current Editor or Owner grant. A missing snapshot
@@ -203,14 +210,16 @@ impl ApprovalVisibility {
         if let Some(activation) = &self.activation {
             if !activation.as_ref().is_some_and(|a| a.may_read(fresh)) { return false; }
         }
-        self.task.as_ref().is_none_or(|task| task.may_read(fresh, false))
+        crate::approval::is_outbound_data_card(record)
+            || self.task.as_ref().is_none_or(|task| task.may_read(fresh, false))
     }
 }
 
 /// Refresh the identity and the department used by knowledge collection ACLs
 /// together, off the socket loop. Never retain this result across frames.
 pub(crate) fn fresh_reader(home: &Path, ctx: &UserContext) -> Option<(UserContext, Option<String>)> {
-    let fresh = live_reader_context(home, ctx).ok()?;
+    let mut fresh = live_reader_context(home, ctx).ok()?;
+    fresh.origin = ctx.origin;
     let department = if fresh.user_id == "system" { None } else {
         readonly_db(&home.join("users.db")).ok().and_then(|db| {
             db.query_row("SELECT department FROM users WHERE id=?1", [&fresh.user_id], |r| r.get::<_, Option<String>>(0))

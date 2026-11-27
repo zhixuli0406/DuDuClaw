@@ -15,7 +15,7 @@ pub(crate) async fn gateway_default_id(home: &std::path::Path) -> Result<String,
     parse_gateway_default(&raw)
 }
 
-fn parse_gateway_default(raw: &str) -> Result<String, String> {
+pub(crate) fn parse_gateway_default(raw: &str) -> Result<String, String> {
     let config: toml::Value = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let general = match config.get("general") {
         None => return Ok(String::new()),
@@ -51,8 +51,10 @@ impl WebChatState {
     pub(super) async fn resolve_new_agent(&self, user: &str) -> Result<Option<String>, &'static str> {
         if is_widget_visitor(user) { return Ok(None); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| "unavailable")?;
-        if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(None); }
+        if snapshot.role() == duduclaw_auth::UserRole::Admin
+            && super::main_credential_origin() != duduclaw_auth::acl::ContextOrigin::MemberKey { return Ok(None); }
         let sender = SenderAccess::from_effective(snapshot.access.clone())
+            .with_credential_origin(crate::webchat::main_credential_origin())
             .for_webchat_converse(&self.ctx.home_dir).await;
         if !sender.webchat_scope.as_ref().is_some_and(|s| s.available) { return Err("unavailable"); }
         let db = self.user_db.clone();
@@ -209,8 +211,10 @@ impl WebChatState {
                 return Err(denied("personal_employee"));
             }
         }
-        if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
+        if snapshot.role() == duduclaw_auth::UserRole::Admin
+            && super::main_credential_origin() != duduclaw_auth::acl::ContextOrigin::MemberKey { return Ok(()); }
         let sender = SenderAccess::from_effective(snapshot.access.clone())
+            .with_credential_origin(crate::webchat::main_credential_origin())
             .for_webchat_converse(&self.ctx.home_dir).await;
         let reg = self.ctx.registry.read().await;
         let loaded = reg.get(agent).ok_or_else(|| denied("unknown_agent"))?;
