@@ -217,6 +217,10 @@ mod memory_tools;
 mod messaging;
 mod notion_github;
 mod odoo;
+mod odoo_access;
+#[cfg(test)]
+mod odoo_access_tests;
+pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
 mod on_behalf_of;
 mod os_tools;
@@ -389,3 +393,6 @@ pub(crate) mod recipient_gate;
 mod tool_pruning_tests;
 
 pub(crate) mod google_owner_client;
+
+pub(crate) mod person_key_client;
+pub(crate) mod person_tools;

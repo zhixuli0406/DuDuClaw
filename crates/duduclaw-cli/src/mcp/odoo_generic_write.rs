@@ -1,6 +1,6 @@
-//! RM-120: permission-controlled generic `odoo_create` / `odoo_write`.
+//! RM-120 / RM-141: permission-controlled generic `odoo_create` / `odoo_write`.
 //!
-//! These two tools are allowed **only** when the employee's own
+//! In Engine mode these two tools are allowed **only** when the employee's own
 //! `agent.toml [odoo]` settings grant them twice over:
 //!
 //! * the regular grant — `allowed_models` names the model exactly and
@@ -37,6 +37,10 @@
 //!    command needs (0 ⇒ create, 1 ⇒ write, 4 on a one2many ⇒ write because
 //!    it moves the record, 4 on a many2many ⇒ link: no grant of its own, but
 //!    still steps 2 and 4), plus the account ACL of step 7 for create / write.
+//!
+//! Follow mode uses the gateway Personal decision, common feature/refusal
+//! gates and local argument validation, skipping Engine steps 2–4 and 7–9.
+//! ReadOnly refuses both tools. Mode is never derived from local settings.
 //!
 //! Steps 7–9 read the snapshot of this connection identity, and that
 //! identity (credential hash, uid) is only known after connecting, so they
@@ -215,15 +219,8 @@ pub(crate) fn generic_write_model_gate(
 /// same [`generic_write_model_gate`] (never-writable list, grant + opt-in,
 /// module switch, block list), quantified over `allowed_models`.
 pub(crate) fn generic_write_listed(home_dir: &Path, caller_agent: &str, tool: &str) -> bool {
-    let Some(verb) = generic_write_verb(tool) else { return true };
-    let Ok(Some(cfg)) = load_generic_write_override(home_dir, caller_agent) else { return false };
-    let Some(global) = load_global_odoo(home_dir) else { return false };
-    // Same rule as `OdooConnectorPool::unblock_models`: an absent per-agent
-    // list inherits the global one.
-    let unblock = cfg.unblock_models.clone().unwrap_or_else(|| global.unblock_models.clone());
-    cfg.allowed_models
-        .iter()
-        .any(|model| generic_write_model_gate(Some(&cfg), &global, &unblock, verb, model).is_ok())
+    super::odoo_access::ToolPolicy::load(home_dir, caller_agent)
+        .is_ok_and(|policy| policy.listed_for_context(tool))
 }
 
 /// Validated arguments of one generic write call.
@@ -598,7 +595,7 @@ fn audit_safe(text: &str) -> String {
 }
 
 pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str, verb: &str, reason: &str) {
-    duduclaw_security::audit::append_tool_call(
+    super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
         tool,
@@ -608,6 +605,7 @@ pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str,
             audit_safe(duduclaw_core::truncate_bytes(reason, 400))
         ),
         false,
+        None,
     );
 }
 
@@ -643,6 +641,10 @@ pub(crate) fn generic_write_local_gate(
         }
     };
     let model = model.as_str();
+    let policy = super::odoo_access::ToolPolicy::load(home_dir, caller_agent)
+        .map_err(|error| super::egress_gate::pre_dispatch_error(&error))?;
+    policy.check_call(tool, params, None)
+        .map_err(|error| super::egress_gate::pre_dispatch_error(&error))?;
     if never_generically_writable(model) {
         deny(home_dir, caller_agent, tool, model, verb, "never generically writable");
         return Err(super::egress_gate::pre_dispatch_error(&GenericWriteDenial::NeverWritable.message(tool, model)));
@@ -682,7 +684,7 @@ pub(crate) async fn handle_odoo_generic_write(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None).await
+    super::odoo_access::sanitize_result(super::odoo_identity_client::with_call(generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None)).await)
 }
 
 /// Protected mode: the same gate chain on the employee's own isolation
@@ -697,7 +699,7 @@ pub(crate) async fn handle_bound_odoo_generic_write(
     caller_agent: &str,
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
 ) -> Value {
-    generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, Some(connector)).await
+    super::odoo_access::sanitize_result(generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, Some(connector)).await)
 }
 
 async fn generic_write_with_connection(
@@ -722,41 +724,14 @@ async fn generic_write_with_connection(
     };
     let model = model_name.as_str();
 
-    // ── 2. never-generically-writable list (fixed, local) ───────────────
-    if never_generically_writable(model) {
-        let message = GenericWriteDenial::NeverWritable.message(tool, model);
-        deny(home_dir, caller_agent, tool, model, verb, "never generically writable");
-        return super::egress_gate::pre_dispatch_error(&message);
-    }
-
-    // ── 3. regular grant + opt-in (shared with tools/list) ──────────────
-    let cfg = match load_generic_write_override(home_dir, caller_agent) {
-        Ok(cfg) => cfg,
-        Err(error) => {
-            deny(home_dir, caller_agent, tool, model, verb, &error);
-            return super::egress_gate::pre_dispatch_error(&error);
-        }
+    let policy = match super::odoo_access::ToolPolicy::load(home_dir, caller_agent) {
+        Ok(policy) => policy, Err(error) => return mcp_error(&error),
     };
-    if let Err(reason) = generic_write_grant(cfg.as_ref(), verb, model) {
-        deny(home_dir, caller_agent, tool, model, verb, &reason);
-        return super::egress_gate::pre_dispatch_error(&GenericWriteDenial::Grant(reason).message(tool, model));
-    }
-    // Keep the pool's override in step with the file, as the other tools do.
-    if let Some(cfg) = &cfg {
-        odoo.register_agent(caller_agent, cfg.clone()).await;
-    }
-
-    // ── 4. module switch + security block list ───────────────────────────
-    if let Err(error) = odoo.load_global_for_gate(home_dir).await {
-        return super::egress_gate::pre_dispatch_error(&error);
-    }
+    let cfg = Some(policy.agent.clone());
+    odoo.register_agent(caller_agent, policy.agent.clone()).await;
+    if let Err(error) = odoo.load_global_for_gate(home_dir).await { return mcp_error(&error); }
     let global = odoo.global_config().await;
     let unblock_models = odoo.unblock_models(caller_agent).await;
-    if let Err(denial) = generic_write_model_gate(cfg.as_ref(), &global, &unblock_models, verb, model) {
-        let message = denial.message(tool, model);
-        deny(home_dir, caller_agent, tool, model, verb, &message);
-        return super::egress_gate::pre_dispatch_error(&message);
-    }
 
     // ── 5. values / ids shape, size, x2many codes, archiving (local) ────
     let args = match parse_generic_write_args(tool, params) {
@@ -770,85 +745,110 @@ async fn generic_write_with_connection(
     // ── 6. connection (first credential use) ─────────────────────────────
     // Protected mode: the isolation connector the provider bound to this
     // employee, used as-is (no pool lookup / account resolution).
-    let conn = if let Some(connector) = bound {
-        connector
+    let (conn, decision) = if let Some(connector) = bound {
+        (connector, None)
     } else {
-        if let Err(error) = odoo.connect_precheck(caller_agent).await {
-            return super::egress_gate::pre_dispatch_error(&format!(
-                "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"
-            ));
-        }
-        match connect_odoo_pool(home_dir, odoo, caller_agent).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                return mcp_error(&format!("Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"));
-            }
+        match super::odoo::connect_odoo_pool_checked(home_dir, odoo, caller_agent, tool, params).await {
+            Ok((conn, identity)) => (conn, Some(identity)),
+            Err(error) => return mcp_error(&error),
         }
     };
     if conn.verify_io().is_err() {
         return mcp_error("Odoo authority revoked");
     }
-    let profile = odoo.pool_key(caller_agent).await.1;
+    let profile = match &decision {
+        Some(identity) => match odoo.key_for_identity(caller_agent, identity).await {
+            Ok(key) => key.1, Err(error) => return mcp_error(&error),
+        },
+        None => odoo.pool_key(caller_agent).await.1,
+    };
 
-    // ── 7. account ACL from this identity's snapshot ─────────────────────
-    let scan_first = "Odoo 結構正在背景準備中，尚未能確認這張資料表的欄位與帳號權限；請等結構準備完成後再試。 / \
-                      The Odoo schema has not been scanned for this connection yet, so the fields and account rights \
-                      of this model cannot be checked; try again once the schema is ready.";
-    let snapshot = match duduclaw_odoo::schema::load_snapshot(home_dir, &conn.schema_profile(&profile)) {
-        Ok(Some(snapshot)) if snapshot.connection_identity == conn.connection_identity() => snapshot,
-        Ok(_) | Err(_) => {
-            deny(home_dir, caller_agent, tool, model, verb, "schema snapshot unavailable");
-            return mcp_error(&format!("Odoo {tool}: {scan_first}"));
+    let follow = super::odoo_access::follows(decision.as_ref());
+    if let Err(error) = policy.check_call(tool, params, decision.as_ref()) {
+        deny(home_dir, caller_agent, tool, model, verb, &error);
+        return super::egress_gate::pre_dispatch_error(&error);
+    }
+    if !follow {
+        if let Err(denial) = generic_write_model_gate(cfg.as_ref(), &global, &unblock_models, verb, model) {
+            let message = denial.message(tool, model);
+            deny(home_dir, caller_agent, tool, model, verb, &message);
+            return super::egress_gate::pre_dispatch_error(&message);
         }
-    };
-    let account_right = |target: &str, right: &str| {
-        let rights = snapshot.access_rights.get(target);
-        match right {
-            "create" => rights.and_then(|r| r.create),
-            _ => rights.and_then(|r| r.write),
+
+        // ── 7. account ACL from this identity's snapshot ─────────────────────
+        let scan_first = "Odoo 結構正在背景準備中，尚未能確認這張資料表的欄位與帳號權限；請等結構準備完成後再試。 / \
+                          The Odoo schema has not been scanned for this connection yet, so the fields and account rights \
+                          of this model cannot be checked; try again once the schema is ready.";
+        let snapshot = match duduclaw_odoo::schema::load_snapshot(home_dir, &conn.schema_profile(&profile)) {
+            Ok(Some(snapshot)) if snapshot.connection_identity == conn.connection_identity() => snapshot,
+            Ok(_) | Err(_) => {
+                deny(home_dir, caller_agent, tool, model, verb, "schema snapshot unavailable");
+                return mcp_error(&format!("Odoo {tool}: {scan_first}"));
+            }
+        };
+        let account_right = |target: &str, right: &str| {
+            let rights = snapshot.access_rights.get(target);
+            match right {
+                "create" => rights.and_then(|r| r.create),
+                _ => rights.and_then(|r| r.write),
+            }
+        };
+        match account_right(model, verb) {
+            Some(true) => {}
+            Some(false) => {
+                let reason = format!("the Odoo account this employee uses has no '{verb}' right on '{model}'");
+                deny(home_dir, caller_agent, tool, model, verb, &reason);
+                return mcp_error(&format!("Odoo account permission: {reason}. {UNAVAILABLE_SUFFIX}"));
+            }
+            None => {
+                let reason = format!("the '{verb}' right of the Odoo account on '{model}' is unknown (not yet checked)");
+                deny(home_dir, caller_agent, tool, model, verb, &reason);
+                return mcp_error(&format!(
+                    "Odoo account permission: {reason}; the call is refused until the schema scan has checked it. {scan_first}"
+                ));
+            }
         }
-    };
-    match account_right(model, verb) {
-        Some(true) => {}
-        Some(false) => {
-            let reason = format!("the Odoo account this employee uses has no '{verb}' right on '{model}'");
-            deny(home_dir, caller_agent, tool, model, verb, &reason);
-            return mcp_error(&format!("Odoo account permission: {reason}. {UNAVAILABLE_SUFFIX}"));
+
+        // ── 8./9. fields and x2many values against the snapshot; every related
+        // model a nested command reaches passes the same model gate (and, for
+        // create / update, the account ACL) before its values are looked at.
+        let Some(scanned) = snapshot.models.iter().find(|m| m.model == model) else {
+            deny(home_dir, caller_agent, tool, model, verb, "model not in schema snapshot");
+            return mcp_error(&format!("Odoo {tool}: model '{model}' is not in the scanned schema. {scan_first}"));
+        };
+        let mut authorize = |related: &str, use_verb: &'static str| -> std::result::Result<(), String> {
+            policy.common(related, if use_verb == LINK_USE { "write" } else { use_verb })
+                .map_err(|error| format!("related table '{related}': {error}"))?;
+            if let Err(denial) = generic_write_model_gate(cfg.as_ref(), &global, &unblock_models, use_verb, related) {
+                return Err(format!(
+                    "a nested command needs '{use_verb}' on related table '{related}', which is refused — {}",
+                    denial.message(tool, related)
+                ));
+            }
+            if use_verb != LINK_USE && account_right(related, use_verb) != Some(true) {
+                return Err(format!(
+                    "Odoo account permission: the '{use_verb}' right of the Odoo account on related table '{related}' is \
+                     not confirmed by the schema scan. {POLICY_SUFFIX}"
+                ));
+            }
+            Ok(())
+        };
+        if let Err(error) = check_values_against_schema(&snapshot, scanned, &args.values, &mut authorize) {
+            deny(home_dir, caller_agent, tool, model, verb, &error);
+            return mcp_error(&format!("Odoo {tool}: {error}"));
         }
-        None => {
-            let reason = format!("the '{verb}' right of the Odoo account on '{model}' is unknown (not yet checked)");
-            deny(home_dir, caller_agent, tool, model, verb, &reason);
-            return mcp_error(&format!(
-                "Odoo account permission: {reason}; the call is refused until the schema scan has checked it. {scan_first}"
-            ));
-        }
+
     }
 
-    // ── 8./9. fields and x2many values against the snapshot; every related
-    // model a nested command reaches passes the same model gate (and, for
-    // create / update, the account ACL) before its values are looked at.
-    let Some(scanned) = snapshot.models.iter().find(|m| m.model == model) else {
-        deny(home_dir, caller_agent, tool, model, verb, "model not in schema snapshot");
-        return mcp_error(&format!("Odoo {tool}: model '{model}' is not in the scanned schema. {scan_first}"));
-    };
-    let mut authorize = |related: &str, use_verb: &'static str| -> std::result::Result<(), String> {
-        if let Err(denial) = generic_write_model_gate(cfg.as_ref(), &global, &unblock_models, use_verb, related) {
-            return Err(format!(
-                "a nested command needs '{use_verb}' on related table '{related}', which is refused — {}",
-                denial.message(tool, related)
-            ));
+    // Follow still checks fixed/admin refusals on nested mutation targets.
+    // Live relation metadata is used only to identify the target, never as a
+    // snapshot ACL or an employee-table grant.
+    if follow {
+        if let Err(error) = duduclaw_odoo::rpc::with_personal_access_errors(true,
+            check_follow_relations(&policy, &conn, model, &args.values)).await {
+            deny(home_dir, caller_agent, tool, model, verb, error_class(&error));
+            return mcp_error(&super::odoo_access::error_text(&error, decision.as_ref()));
         }
-        if use_verb != LINK_USE && account_right(related, use_verb) != Some(true) {
-            return Err(format!(
-                "Odoo account permission: the '{use_verb}' right of the Odoo account on related table '{related}' is \
-                 not confirmed by the schema scan. {POLICY_SUFFIX}"
-            ));
-        }
-        Ok(())
-    };
-    if let Err(error) = check_values_against_schema(&snapshot, scanned, &args.values, &mut authorize) {
-        deny(home_dir, caller_agent, tool, model, verb, &error);
-        return mcp_error(&format!("Odoo {tool}: {error}"));
     }
 
     // ── RPC ──────────────────────────────────────────────────────────────
@@ -857,7 +857,7 @@ async fn generic_write_with_connection(
         return mcp_error("Odoo authority revoked");
     }
     let values = Value::Object(args.values.clone());
-    let result: std::result::Result<String, String> = match verb {
+    let result: std::result::Result<String, String> = duduclaw_odoo::rpc::with_personal_access_errors(follow, async { match verb {
         "create" => conn
             .create(model, values)
             .await
@@ -867,7 +867,8 @@ async fn generic_write_with_connection(
             Ok(false) => Err(format!("Odoo reported that the write on '{model}' did not apply")),
             Err(error) => Err(error),
         },
-    };
+    }}).await;
+    let result = result.map(|text| format!("{text}\n{}", super::odoo_access::identity_suffix(decision.as_ref(), verb)));
     let fields: Vec<&str> = args.values.keys().map(String::as_str).collect();
     let summary = format!(
         "profile={profile}; tool={tool}; model={model}; fields={}; ids={}; ok={}",
@@ -881,20 +882,55 @@ async fn generic_write_with_connection(
         Ok(text) => text.clone(),
         Err(error) => format!("error class={}; length={}", error_class(error), error.len()),
     };
-    duduclaw_security::audit::append_tool_call_with_input(
+    super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
         tool,
         &summary,
         result.is_ok(),
-        None,
         Some(result_text.as_str()),
     );
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
         Err(error) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Odoo error: {error}")}],
+            "content": [{"type": "text", "text": super::odoo_access::error_text(&error, decision.as_ref())}],
             "isError": true
         }),
     }
+}
+
+/// Follow mode does not consult snapshot field/ACL restrictions. For command
+/// arrays, fetch only current relation metadata to enforce the unconditional
+/// refusal policy on the actual target of each nested create/write/link.
+async fn check_follow_relations(
+    policy: &super::odoo_access::ToolPolicy,
+    conn: &duduclaw_odoo::OdooConnector,
+    model: &str,
+    values: &serde_json::Map<String, Value>,
+) -> std::result::Result<(), String> {
+    let mut pending = vec![(model.to_owned(), values.clone())];
+    while let Some((model, values)) = pending.pop() {
+        let commands: Vec<_> = values.iter().filter(|(_, value)|
+            value.as_array().is_some_and(|items| items.iter().any(Value::is_array))).collect();
+        if commands.is_empty() { continue; }
+        policy.common(&model, "fields_get")?;
+        let names: Vec<_> = commands.iter().map(|(name, _)| name.as_str()).collect();
+        let fields = conn.execute_kw(&model, "fields_get", vec![serde_json::json!(names)],
+            serde_json::json!({"attributes":["type","relation"]})).await?;
+        for (name, value) in commands {
+            let field = &fields[name];
+            let kind = field["type"].as_str().ok_or("Odoo 無法確認關聯欄位，這次操作尚未執行。")?;
+            if !matches!(kind, "one2many" | "many2many") { continue; }
+            let related = field["relation"].as_str().ok_or("Odoo 無法確認關聯資料表，這次操作尚未執行。")?;
+            for command in value.as_array().into_iter().flatten() {
+                let code = command.get(0).and_then(Value::as_i64);
+                let method = match code { Some(0) => "create", Some(1 | 4) => "write", _ => return Err("不允許這種關聯資料修改。".into()) };
+                policy.common(related, method)?;
+                if let Some(nested) = command.get(2).and_then(Value::as_object) {
+                    pending.push((related.to_owned(), nested.clone()));
+                }
+            }
+        }
+    }
+    Ok(())
 }

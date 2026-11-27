@@ -4,6 +4,23 @@ use super::task_privacy_tests::{fixture, admin, denied, ok, payload, Fixture};
 
 const TASK: &str = "a2a-private-task";
 
+#[tokio::test]
+async fn bounded_list_skips_newer_a2a_tasks_before_the_limit() {
+    let f = a2a_fixture().await;
+    let conn = rusqlite::Connection::open(f.home.join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET created_at = '2020-01-01T00:00:00Z'", []).unwrap();
+    conn.execute("UPDATE tasks SET created_at = '2099-01-01T00:00:00Z' WHERE id = ?1", [TASK]).unwrap();
+    for ctx in [&f.bob, &admin(&f)] {
+        let list = payload(f.handler.handle_tasks_list(json!({"agent_id":"sales", "limit":2}), ctx).await);
+        let rows = list["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "open-task");
+        assert_eq!(rows[1]["id"], "private-task");
+        assert!(!list.to_string().contains(TASK));
+        assert!(!list.to_string().contains("private A2A"));
+    }
+}
+
 async fn a2a_fixture() -> Fixture {
     let f = fixture().await;
     let mut row = TaskRow::new(TASK.into(), "private A2A title".into(),

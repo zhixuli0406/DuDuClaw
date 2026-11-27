@@ -74,6 +74,7 @@ use Ty::*;
 
 /// `(section path, key, type)` for every typed key a reader consumes.
 pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
+    ("odoo", "member_credentials", Bool),
     ("security", "mail_requester_approval", Bool),
     ("auth", "mfa_enforced", Bool),
     ("product", "profile", OneOf(&["standard", "restricted"])),
@@ -375,6 +376,13 @@ fn location(text: &str, section: &str, key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn odoo_member_credentials_is_boolean() {
+        check("[odoo]\nmember_credentials=true\n").unwrap();
+        check("[odoo]\nmember_credentials=false\n").unwrap();
+        assert!(check("[odoo]\nmember_credentials='true'\n").is_err());
+    }
 
     fn check(text: &str) -> Result<(), String> {
         check_config_types(text, &text.parse().unwrap())

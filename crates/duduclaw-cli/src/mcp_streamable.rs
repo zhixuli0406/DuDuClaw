@@ -163,6 +163,19 @@ pub(crate) async fn mcp_post_handler(
             .into_response();
     }
 
+    // Parse before authentication: neither blocking-worker saturation nor a
+    // member-key gateway outage may turn malformed JSON into a 503 or 401.
+    let msg: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(jsonrpc_error(&Value::Null, -32700, "Parse error")),
+            )
+                .into_response();
+        }
+    };
+
     // 3. Bearer auth — same key surface and scope enforcement as /mcp/v1/call
     //    (static mcp_keys AND OAuth-issued tokens). Spec MUST: a 401 from the
     //    MCP endpoint carries `WWW-Authenticate` pointing at the RFC 9728
@@ -182,17 +195,6 @@ pub(crate) async fn mcp_post_handler(
         };
     let principal = authenticated.principal().clone();
     crate::mcp_auth::with_authenticated_call(authenticated, async {
-        // 4. Body: exactly one JSON-RPC request or notification per POST.
-        let msg: Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(jsonrpc_error(&Value::Null, -32700, "Parse error")),
-                )
-                    .into_response();
-            }
-        };
         if msg.is_array() {
             // 2025-06-18 removed JSON-RPC batching; a stateless server rejects it.
             return (

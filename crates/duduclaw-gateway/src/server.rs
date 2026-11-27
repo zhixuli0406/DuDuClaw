@@ -180,7 +180,7 @@ pub struct GatewayConfig {
 /// Internal shared state for the Axum application.
 struct AppState {
     auth: AuthManager,
-    handler: MethodHandler,
+    handler: Arc<MethodHandler>,
     tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
     event_tx: broadcast::Sender<String>,
@@ -2898,7 +2898,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     });
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
             prepared_events: Default::default(),
@@ -2992,6 +2992,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let meeting_auth_state = state.clone();
     let extension_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
+    let person_key_state = Arc::new(crate::person_key_route::PersonKeyRouteState::new(
+        home_dir.clone(), state.user_db.clone(), state.handler.clone(),
+    ));
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
         state.jwt_config.clone(),
@@ -3574,6 +3577,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::knowledge::route::KnowledgeRouteState::new(
             home_dir.clone(),
             Some(knowledge_users.clone()),
+        ),
+    )));
+    // Personal MCP keys execute through the same live dashboard handler.
+    app = app.merge(crate::person_key_route::router(person_key_state));
+    app = app.merge(crate::odoo_identity::route::router(Arc::new(
+        crate::odoo_identity::route::OdooIdentityRouteState::new(
+            home_dir.clone(), knowledge_users.clone(),
         ),
     )));
     // ── Per-employee Google identity (internal, B2a) ──────────────
@@ -10071,7 +10081,7 @@ mod decision_shadow_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -10902,7 +10912,7 @@ mod decision_sla_shadow_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -11352,7 +11362,7 @@ mod decision_model_candidate_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -12227,7 +12237,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -12366,7 +12376,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13030,7 +13040,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13216,7 +13226,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13379,7 +13389,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -15244,7 +15254,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -18376,7 +18386,7 @@ mod owner_verify_tests {
         let (event_tx, _) = broadcast::channel(4);
         Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -19343,7 +19353,7 @@ mod live_events_socket_tests {
             let (tx, _) = broadcast::channel(4);
             let (event_tx, _) = broadcast::channel(4);
             let state = Arc::new(AppState {
-                auth: AuthManager::new(None), handler, tx, event_tx,
+                auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
                 prepared_events: Default::default(), user_db: db, jwt_config: jwt,
                 otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
                 home_dir: home.path().to_path_buf(),
@@ -19864,7 +19874,7 @@ mod live_events_socket_tests {
         let (event_tx, _) = broadcast::channel(1024);
         handler.set_event_tx(event_tx.clone()).await;
         let state = Arc::new(AppState {
-            auth: AuthManager::new(None), handler, tx, event_tx: event_tx.clone(),
+            auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx: event_tx.clone(),
             prepared_events: Default::default(),
             user_db: Arc::new(UserDb::new(&home.path().join("users.db")).unwrap()),
             jwt_config: Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!")),

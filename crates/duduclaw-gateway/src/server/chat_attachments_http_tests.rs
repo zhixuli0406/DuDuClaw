@@ -44,7 +44,7 @@ async fn chat_attachment_http_requires_header_jwt_and_rejects_query_tokens() {
     let (tx, _) = broadcast::channel(4);
     let (event_tx, _) = broadcast::channel(4);
     let state = Arc::new(AppState {
-        auth: AuthManager::new(None), handler, tx, event_tx,
+        auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
         prepared_events: Default::default(), user_db, jwt_config,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
         home_dir: home,
@@ -124,7 +124,7 @@ async fn files_download_and_inline_preview_bind_snapshot_and_enforce_caps() {
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
-            auth: AuthManager::new(None), handler, tx, event_tx,
+            auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
             prepared_events: Default::default(), user_db, jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
             home_dir: home.clone(),

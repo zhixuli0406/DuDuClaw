@@ -27,7 +27,8 @@
 //! 1. Add the `ToolDef` to the matching family file (create a new one and
 //!    register it in [`TOOL_GROUPS`] if no family fits).
 //! 2. Add the enforced scope arm in `mcp_auth::tool_requires_scope`.
-//! 3. Add the catalog row in `crate::tool_catalog` — the drift tests
+//! 3. Add the catalog row in `crate::tool_catalog` (person-only tools use
+//!    `crate::mcp_person_tools` instead and never enter employee pickers) — the drift tests
 //!    (`tool_catalog_covers_all_advertised_tools`,
 //!    `test_catalog_scopes_match_tool_requires_scope`) fail otherwise.
 //! 4. If the tool is gated by a per-agent capability, add it to the matching
@@ -126,6 +127,7 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("drive_create_file", "folder", "boolean"),
     ("docs_format", "operations", "array"),
+    ("my_tasks_list", "limit", "integer"),
     ("docs_replace_text", "match_case", "boolean"),
     ("calendar_update_event", "notify_attendees", "boolean"),
     ("calendar_delete_event", "notify_attendees", "boolean"),

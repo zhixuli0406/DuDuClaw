@@ -70,6 +70,8 @@ pub(crate) enum PrincipalKind {
     /// The gateway's own `gateway-internal` key, accepted through the
     /// fingerprint the gateway recorded (`Authority::Internal`).
     GatewayInternal,
+    /// A member identity authenticated live by the gateway.
+    PersonKey { key_id: String, user_id: String },
     /// A key in the hashed store; `agent_binding` is its immutable employee
     /// binding (`StoredKey::agent_binding`) and `key_created_at` its
     /// creation time, which the HTTP gate compares with the bound
@@ -82,6 +84,39 @@ pub(crate) enum PrincipalKind {
     Other,
 }
 
+impl PrincipalKind {
+    /// Only a gateway-authenticated member key represents a person.
+    pub(crate) fn is_person_key(&self) -> bool {
+        match self {
+            Self::PersonKey { .. } => true,
+            Self::GatewayInternal | Self::Stored { .. } | Self::Other => false,
+        }
+    }
+}
+
+/// Shared early listing/dispatch gate, before Admin and employee exemptions.
+/// Identity is taken only from the matching authentication decision.
+pub(crate) fn person_tool_refused(name: &str, principal: &Principal) -> bool {
+    let tool = duduclaw_core::mcp_person_tools::person_tool(name);
+    if is_person_principal(principal) {
+        return !tool.is_some_and(|tool| parse_scopes(tool.scope).ok()
+            .is_some_and(|scopes| scopes.is_subset(&principal.scopes)));
+    }
+    tool.is_some()
+}
+
+pub(crate) fn is_person_principal(principal: &Principal) -> bool {
+    current_call_matches(principal).is_some_and(|call| call.kind().is_person_key())
+}
+
+/// Only PersonKey retains these scopes. Existing credentials
+/// (including hand-edited stored rows) never carry them. Odoo stays unchanged.
+pub(crate) fn non_person_key_scopes(mut scopes: HashSet<Scope>) -> HashSet<Scope> {
+    scopes.remove(&Scope::TasksRead);
+    scopes.remove(&Scope::AgentsStatus);
+    scopes
+}
+
 /// The same successful authentication that produced this call's principal.
 /// OAuth and explicitly unauthenticated calls have no Google execution receipt.
 #[derive(Debug, Clone)]
@@ -92,9 +127,31 @@ pub(crate) struct AuthenticatedCall {
     /// The hashed-store row id (`mk_…`) when the store decided the key, for
     /// the security audit only (`mcp_auth_audit`, reason `key_unbound`).
     stored_key_id: Option<String>,
+    /// Never serialized or formatted; clones share this request-scoped secret.
+    person_key: Option<std::sync::Arc<PersonKeySecret>>,
+}
+
+struct PersonKeySecret(zeroize::Zeroizing<String>);
+impl std::fmt::Debug for PersonKeySecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 impl AuthenticatedCall {
+    pub(crate) fn with_person_key(mut self, raw: String) -> Self {
+        self.person_key = Some(std::sync::Arc::new(PersonKeySecret(zeroize::Zeroizing::new(raw))));
+        self
+    }
+    pub(crate) fn raw_person_key(&self) -> Option<&str> {
+        self.person_key.as_ref().map(|raw| raw.0.as_str())
+    }
+    pub(crate) fn namespace(&self) -> Option<crate::mcp_namespace::NamespaceContext> {
+        self.kind.is_person_key().then(|| crate::mcp_namespace::NamespaceContext {
+            write_namespace: String::new(), read_namespaces: Vec::new(),
+        })
+    }
+
     pub(crate) fn principal(&self) -> &Principal {
         &self.principal
     }
@@ -115,6 +172,7 @@ impl AuthenticatedCall {
             credential_ref: None,
             kind: PrincipalKind::Other,
             stored_key_id: None,
+            person_key: None,
         }
     }
     /// The same call with the authority's decision attached.
@@ -136,6 +194,7 @@ impl AuthenticatedCall {
             }),
             kind: PrincipalKind::Other,
             stored_key_id: None,
+            person_key: None,
         }
     }
 }
@@ -652,7 +711,7 @@ fn stored_principal(
     }
     // Same rule as the legacy registry: an unknown scope string (a newer
     // binary's row read by an older one) collapses to no scopes.
-    let scopes = parse_scopes(&key.scopes.join(",")).unwrap_or_default();
+    let scopes = non_person_key_scopes(parse_scopes(&key.scopes.join(",")).unwrap_or_default());
     // RM-134 fourth review (Medium 2): a key bound to an employee carries
     // only per-employee scopes, whatever its row says — `admin` (or any
     // other scope) on such a row never takes effect, so it can never stand
@@ -727,7 +786,7 @@ fn legacy_principal(entry: &KeyEntry) -> Result<Principal, AuthError> {
 
     Ok(Principal {
         client_id: entry.client_id.clone(),
-        scopes: entry.scopes.clone(),
+        scopes: non_person_key_scopes(entry.scopes.clone()),
         is_external: entry.is_external,
         created_at: entry.created_at,
     })
@@ -895,6 +954,11 @@ pub(crate) fn authenticate_from_env_cached_call_refusal(
             return Err(AuthError::MissingKey.into());
         }
     };
+
+    if duduclaw_auth::member_keys::is_member_key(&raw_key) {
+        return crate::mcp::person_key_client::authenticate_blocking(config_dir, &raw_key)
+            .map_err(Refusal::from);
+    }
 
     // Same prefix-based dispatch as `authenticate_from_env`.
     if raw_key.starts_with(crate::mcp_refresh::REFRESH_TOKEN_PREFIX) {

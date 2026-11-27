@@ -32,19 +32,25 @@ impl Config {
     }
 }
 pub(crate) fn config(home: &Path) -> Config {
-    std::fs::read_to_string(home.join("config.toml")).ok()
-        .and_then(|s| Config::parse(&s)).unwrap_or_default()
+    read_config(home).unwrap_or_default()
+}
+
+/// Preserve unavailable/invalid configuration separately from an explicit disable.
+pub(crate) fn read_config(home: &Path) -> Result<Config, String> {
+    let text = std::fs::read_to_string(home.join("config.toml"))
+        .map_err(|_| "member key configuration unavailable".to_owned())?;
+    Config::parse(&text).ok_or_else(|| "member key configuration unavailable".to_owned())
 }
 
 pub(crate) fn authenticate(home: &Path, db: &UserDb, raw: &str) -> Result<UserContext, String> {
-    if !config(home).enabled { return Err("member keys disabled".into()); }
+    if !read_config(home)?.enabled { return Err("member keys disabled".into()); }
     match db.member_key_lookup(raw)? {
         MemberKeyLookup::Valid { token_id, user_id } => refresh_id(home, db, &token_id, &user_id),
         _ => Err("member key invalid".into()),
     }
 }
 fn refresh_id(home: &Path, db: &UserDb, id: &str, user: &str) -> Result<UserContext, String> {
-    if !config(home).enabled { return Err("member keys disabled".into()); }
+    if !read_config(home)?.enabled { return Err("member keys disabled".into()); }
     db.member_key_context(id, user)
         .map(|mut ctx| {
             ctx.origin = duduclaw_auth::acl::ContextOrigin::MemberKey;
@@ -57,7 +63,7 @@ pub(crate) fn refresh(home: &Path, db: &UserDb, ctx: &UserContext) -> Result<Use
 pub(crate) fn refresh_authority(home: &Path, db: &UserDb, ctx: &UserContext)
     -> Result<duduclaw_auth::member_keys::MemberKeyAuthority, String> {
     let id = ctx.member_key_id.as_deref().ok_or("member key invalid")?;
-    if !config(home).enabled { return Err("member keys disabled".into()); }
+    if !read_config(home)?.enabled { return Err("member keys disabled".into()); }
     let mut live = db.member_key_authority(id, &ctx.user_id)?;
     live.context.origin = duduclaw_auth::acl::ContextOrigin::MemberKey;
     live.context = crate::machine_employee::without_restricted_access(home, live.context);
@@ -84,7 +90,7 @@ static LIMITER: LazyLock<Mutex<Limiter>> = LazyLock::new(|| Mutex::new(Limiter::
 pub(crate) fn record_call(home: &Path, db: &UserDb, ctx: &UserContext, method: &str, write: bool) -> Result<(), String> {
     let live = refresh(home, db, ctx)?;
     let id = live.member_key_id.as_deref().ok_or("member key invalid")?;
-    let settings = config(home);
+    let settings = read_config(home)?;
     if !settings.enabled { return Err("member keys disabled".into()); }
     let allowed = LIMITER.lock().map_err(|_| "member key limiter unavailable")?
         .allow(home, id, settings.rate_per_minute, Instant::now());

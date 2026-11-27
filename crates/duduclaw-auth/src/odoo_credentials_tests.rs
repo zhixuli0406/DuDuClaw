@@ -109,3 +109,78 @@ fn odoo_credential_init_is_idempotent_and_status_does_not_select_ciphertext() {
     db.conn().execute_batch("ALTER TABLE member_odoo_credentials DROP COLUMN secret_ct;").unwrap();
     assert!(db.odoo_credential_status(&user.id).unwrap().is_some());
 }
+
+
+struct NeverOpen;
+impl OdooSecretSealer for NeverOpen {
+    fn seal(&self, _: &[u8], _: &[u8]) -> Result<Vec<u8>, String> { panic!("must not seal") }
+    fn open(&self, _: &[u8], _: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> { panic!("must not unseal") }
+}
+
+#[test]
+fn odoo_credential_epoch_revokes_use_and_reverification_until_reentered() {
+    let (db, _home) = test_db();
+    let user = db.create_user("epoch@test.invalid", "Member", "password", UserRole::Employee).unwrap();
+    put(&db, &user.id);
+    db.conn().execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&user.id]).unwrap();
+    // Metadata reflects revocation even before the first attempted unseal.
+    assert_eq!(db.odoo_credential_status(&user.id).unwrap().unwrap().state, "needs_reverify");
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &NeverOpen).unwrap().is_none());
+    let stored: String = db.conn().query_row("SELECT state FROM member_odoo_credentials WHERE user_id=?1",
+        [&user.id], |r| r.get(0)).unwrap();
+    assert_eq!(stored, "needs_reverify");
+    assert!(db.odoo_credential_unseal_for_reverification(&user.id, 1, &NeverOpen).unwrap().is_none());
+    assert!(!db.odoo_credential_reverified(&user.id, 1, 7, "Member", "server-a").unwrap());
+    put(&db, &user.id);
+    let epoch: i64 = db.conn().query_row("SELECT credential_epoch FROM member_odoo_credentials WHERE user_id=?1",
+        [&user.id], |r| r.get(0)).unwrap();
+    assert_eq!(epoch, 1);
+    assert_eq!(db.odoo_credential_status(&user.id).unwrap().unwrap().state, "ok");
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &BoundSealer).unwrap().is_some());
+}
+
+#[test]
+fn odoo_credential_reverification_detects_epoch_without_prior_unseal() {
+    let (db, _home) = test_db();
+    let user = db.create_user("test@test.invalid", "Member", "password", UserRole::Employee).unwrap();
+    put(&db, &user.id);
+    db.conn().execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&user.id]).unwrap();
+    // An already-running remote verification must not restore this credential.
+    assert!(!db.odoo_credential_reverified(&user.id, 1, 7, "Member", "server-a").unwrap());
+    assert!(db.odoo_credential_unseal_for_reverification(&user.id, 1, &NeverOpen).unwrap().is_none());
+    let stored: String = db.conn().query_row("SELECT state FROM member_odoo_credentials WHERE user_id=?1",
+        [&user.id], |r| r.get(0)).unwrap();
+    assert_eq!(stored, "needs_reverify");
+}
+
+#[test]
+fn odoo_credential_epoch_migration_is_idempotent_and_legacy_rows_fail_closed() {
+    let (db, _home) = test_db();
+    let user = db.create_user("legacy@test.invalid", "Member", "password", UserRole::Employee).unwrap();
+    put(&db, &user.id);
+    db.conn().execute_batch("ALTER TABLE member_odoo_credentials DROP COLUMN credential_epoch;").unwrap();
+    migrate(&db.conn()).unwrap();
+    migrate(&db.conn()).unwrap();
+    let epoch: i64 = db.conn().query_row("SELECT credential_epoch FROM member_odoo_credentials WHERE user_id=?1",
+        [&user.id], |r| r.get(0)).unwrap();
+    assert_eq!(epoch, -1);
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &NeverOpen).unwrap().is_none());
+    assert!(db.odoo_credential_unseal_for_reverification(&user.id, 1, &NeverOpen).unwrap().is_none());
+    assert!(!db.odoo_credential_reverified(&user.id, 1, 7, "Member", "server-a").unwrap());
+    put(&db, &user.id);
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &BoundSealer).unwrap().is_some());
+}
+
+#[test]
+fn odoo_credential_suspended_and_deleted_accounts_never_unseal() {
+    let (db, _home) = test_db();
+    let user = db.create_user("inactive@test.invalid", "Member", "password", UserRole::Employee).unwrap();
+    put(&db, &user.id);
+    db.conn().execute("UPDATE users SET status='suspended' WHERE id=?1", [&user.id]).unwrap();
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &NeverOpen).unwrap().is_none());
+    assert!(db.odoo_credential_unseal_for_reverification(&user.id, 1, &NeverOpen).unwrap().is_none());
+    assert!(!db.odoo_credential_reverified(&user.id, 1, 7, "Member", "server-a").unwrap());
+    db.conn().execute("DELETE FROM users WHERE id=?1", [&user.id]).unwrap();
+    assert!(db.odoo_credential_unseal(&user.id, "server-a", &NeverOpen).unwrap().is_none());
+    assert!(db.odoo_credential_status(&user.id).unwrap().is_none());
+}

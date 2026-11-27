@@ -222,6 +222,7 @@ pub mod doctor_probes;
 pub mod extension;
 pub mod external_status;
 pub(crate) mod member_keys;
+pub mod person_key_route;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
@@ -542,6 +543,7 @@ pub mod run_identity;
 pub mod server;
 mod mfa;
 pub(crate) mod odoo_credentials;
+pub(crate) mod odoo_identity;
 mod mfa_email;
 /// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
 pub mod installation_identity;

@@ -299,7 +299,7 @@ mod route_tests {
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
-            auth: AuthManager::new(None), handler: MethodHandler::new(home.clone()).await,
+            auth: AuthManager::new(None), handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx, event_tx, prepared_events: Default::default(), user_db: db,
             jwt_config: Arc::new(JwtConfig::new(b"invitation-route-tests-at-least-32-bytes")),
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),

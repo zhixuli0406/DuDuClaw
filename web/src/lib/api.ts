@@ -2952,6 +2952,8 @@ export interface OdooPermissionOptions {
 }
 
 export interface OdooConfig {
+  /** Admin opt-in, default false; changed via odoo.member_credentials.set_enabled. */
+  member_credentials?: boolean;
   blocked_models?: string[];
   read_only_models?: string[];
   url: string;

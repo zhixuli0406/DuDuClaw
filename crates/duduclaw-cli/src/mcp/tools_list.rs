@@ -533,6 +533,12 @@ pub(crate) async fn handle_tools_list_for_transport(
     default_agent: &str,
     remote_bearer: bool,
 ) -> Value {
+    if crate::mcp_auth::is_person_principal(principal) {
+        let tools: Vec<Value> = tools()
+            .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, principal))
+            .map(build_tool_schema).collect();
+        return jsonrpc_response(id, serde_json::json!({"tools":tools}));
+    }
     let access = remote_bearer.then(|| remote_access(home_dir, principal, default_agent));
     let tools: Vec<&'static ToolDef> = match &access {
         Some(RemoteAccess::Unbound(_)) => Vec::new(),
@@ -666,6 +672,9 @@ pub(crate) async fn visible_tools_in_lane(
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
+    if crate::mcp_auth::is_person_principal(principal) {
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+    }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
     // not act for the process's agent. Discovery filter only.
@@ -785,16 +794,10 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
-    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant and
-    // the separate per-table opt-in in the employee's own Odoo settings, and
-    // the table must clear the never-writable list, the 功能模組 switch and
-    // the block list. The Odoo handler acts for `default_agent`, so the same
-    // agent and the same predicate (`generic_write_model_gate` over
-    // `allowed_models`) decide the listing.
-    let allow_odoo_create =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
-    let allow_odoo_write =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_write");
+    // RM-141: one policy adapter for listing and dispatch, with read-only
+    // identity metadata. A malformed artifact hides every Odoo tool.
+    let odoo_policy = (!member_invalid).then(||
+        super::odoo_access::ToolPolicy::load(home_dir, default_agent).ok()).flatten();
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -936,6 +939,7 @@ pub(crate) async fn visible_tools_in_lane(
 
     tools()
         .filter(|t| !duduclaw_core::google_identity::is_drive_write_tool(t.name))
+        .filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
         // applies, so it is not listed there either (discoverable ⇔ callable).
@@ -983,8 +987,8 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
-        .filter(|t| t.name != "odoo_create" || allow_odoo_create)
-        .filter(|t| t.name != "odoo_write" || allow_odoo_write)
+        .filter(|t| !t.name.starts_with("odoo_")
+            || odoo_policy.as_ref().is_some_and(|policy| policy.listed_for_context(t.name)))
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))

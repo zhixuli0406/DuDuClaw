@@ -9,6 +9,11 @@ use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
+        name: "my_agents_status",
+        description: "Show only AI employee statuses visible to the personal key's holder. Requires a personal key; never acts as the server's employee.",
+        params: &[],
+    },
+    ToolDef {
         name: "create_agent",
         description: "Create a persistent sub-agent with its own identity, skills, and configuration. The agent is registered and available for delegation immediately.",
         params: &[

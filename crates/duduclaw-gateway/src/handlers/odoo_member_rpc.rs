@@ -4,14 +4,15 @@ use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use crate::odoo_identity::server::{Server, company_server, member_credentials_enabled, MEMBER_CREDENTIALS_OFF};
 use zeroize::Zeroizing;
-use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
+use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event, try_append_audit_event};
 
 const STORE: &str = "目前無法處理 Odoo 連線，請稍後再試。";
 const LOGIN: &str = "請使用瀏覽器重新登入後管理自己的 Odoo 連線。";
 const CONFIG: &str = "公司還沒有設定 Odoo 連線，請找管理員。";
 const DENIED: &str = "Odoo 登入名稱和金鑰對不上，請確認後再試。";
+const REENTER: &str = "你的帳號登入資料已變更，請重新輸入 Odoo 登入名稱和金鑰。";
 const CHANGED: &str = "連線資料已變更，請重新整理頁面，確認伺服器位址和資料庫後再試。";
 const CONFIRM_SERVER: &str = "請先重新整理連線頁面，確認 Odoo 伺服器位址和資料庫後再連線或重新驗證。";
 
@@ -23,7 +24,7 @@ pub(super) fn owns(method: &str) -> bool {
 pub(super) fn minimum_role(method: &str) -> Option<UserRole> {
     match method {
         "me.odoo.status" | "me.odoo.connect" | "me.odoo.test" | "me.odoo.disconnect" => Some(UserRole::Employee),
-        "odoo.member_credentials.list" | "odoo.member_credentials.revoke" => Some(UserRole::Admin),
+        "odoo.member_credentials.list" | "odoo.member_credentials.revoke" | "odoo.member_credentials.set_enabled" => Some(UserRole::Admin),
         _ => None,
     }
 }
@@ -40,35 +41,19 @@ struct Revoke { user_id: String }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Empty {}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetEnabled {
+    enabled: bool,
+    #[serde(default)]
+    acknowledge_risk: bool,
+}
+fn require_enabled(home: &Path) -> Result<(), String> {
+    if member_credentials_enabled(home) { Ok(()) } else { Err(MEMBER_CREDENTIALS_OFF.into()) }
+}
 fn valid_input(value: &str, max: usize) -> bool {
     !value.is_empty() && value == value.trim() && value.chars().count() <= max
         && !value.chars().any(char::is_control)
-}
-#[derive(Deserialize)]
-struct ServerFields {
-    #[serde(default)] url: String,
-    #[serde(default)] db: String,
-    #[serde(default)] allow_private_network: bool,
-}
-struct Server { url: String, db: String, destination: String, fp: String, allow_private: bool }
-fn company_server(home: &Path) -> Result<Option<Server>, String> {
-    let text = std::fs::read_to_string(home.join("config.toml")).map_err(|_| CONFIG.to_owned())?;
-    let doc: toml::Value = toml::from_str(&text).map_err(|_| CONFIG.to_owned())?;
-    let Some(section) = doc.get("odoo") else { return Ok(None); };
-    let fields: ServerFields = section.clone().try_into().map_err(|_| CONFIG.to_owned())?;
-    if fields.url.is_empty() && fields.db.is_empty() { return Ok(None); }
-    if fields.url != fields.url.trim() || !duduclaw_odoo::url_guard::is_valid_odoo_db(&fields.db) {
-        return Err(CONFIG.into());
-    }
-    duduclaw_odoo::url_guard::check_url(&fields.url, fields.allow_private_network).map_err(|_| CONFIG.to_owned())?;
-    let parsed = url::Url::parse(&fields.url).map_err(|_| CONFIG.to_owned())?;
-    if parsed.query().is_some() || parsed.fragment().is_some() { return Err(CONFIG.into()); }
-    // check_url rejects userinfo; query/fragment are rejected above. Include
-    // the effective port and base path so same-host changes remain visible.
-    let destination = format!("{}://{}:{}{}", parsed.scheme(), parsed.host_str().ok_or(CONFIG)?,
-        parsed.port_or_known_default().ok_or(CONFIG)?, parsed.path());
-    let fp = format!("{:x}", Sha256::digest(format!("{}|{}", fields.url, fields.db).as_bytes()));
-    Ok(Some(Server { url: fields.url, db: fields.db, destination, fp, allow_private: fields.allow_private_network }))
 }
 
 #[derive(Default)]
@@ -119,7 +104,14 @@ fn fresh(db: &UserDb, ctx: &UserContext, session: &str, role: UserRole) -> Resul
     Ok(live)
 }
 fn status(db: &UserDb, home: &Path, user: &str, session: &str) -> Result<Value, String> {
-    let server = company_server(home)?;
+    let enabled = member_credentials_enabled(home);
+    // Status remains available even when config cannot be read. No destination
+    // acknowledgement is created from an invalid or missing configuration.
+    let server = match company_server(home) {
+        Ok(server) => server,
+        Err(error) if enabled => return Err(error),
+        Err(_) => None,
+    };
     let mut row = db.odoo_credential_status(user).map_err(|_| STORE.to_owned())?;
     if let Some(row) = row.as_mut() {
         if server.as_ref().is_none_or(|s| s.fp != row.server_fp) {
@@ -128,7 +120,7 @@ fn status(db: &UserDb, home: &Path, user: &str, session: &str) -> Result<Value, 
         }
     }
     if let Some(server) = &server { seen_server(home, user, session, &server.fp, true)?; }
-    Ok(json!({"connected":row.is_some(), "state":row.as_ref().map(|r| &r.state),
+    Ok(json!({"member_credentials_enabled":enabled, "connected":row.is_some(), "state":row.as_ref().map(|r| &r.state),
         "login":row.as_ref().map(|r| &r.login), "odoo_name":row.as_ref().map(|r| &r.odoo_name),
         "server":server.as_ref().map(|s| &s.destination), "database":server.as_ref().map(|s| &s.db),
         "verified_at":row.as_ref().map(|r| &r.verified_at),
@@ -211,7 +203,36 @@ impl MethodHandler {
                 "odoo.member_credentials.list" => {
                     serde_json::from_value::<Empty>(params).map_err(|_| STORE.to_owned())?;
                     let rows = db.odoo_credentials_admin_list(user).map_err(|_| STORE.to_owned())?;
-                    Ok(json!({"credentials":rows}))
+                    Ok(json!({"credentials":rows,"enabled":member_credentials_enabled(&home)}))
+                }
+                "odoo.member_credentials.set_enabled" => {
+                    let args: SetEnabled = serde_json::from_value(params)
+                        .map_err(|_| "請選擇是否開放同仁連接 Odoo。".to_owned())?;
+                    if args.enabled && !args.acknowledge_risk {
+                        return Err("開放同仁連接 Odoo 前，請先確認你已了解風險。".into());
+                    }
+                    let path = home.join("config.toml");
+                    let raw = super::config_commit::read_text_or_empty(&path).map_err(|_| STORE.to_owned())?;
+                    let mut table = raw.parse::<toml::Table>().map_err(|_| CONFIG.to_owned())?;
+                    super::config_commit::table_at_mut(&mut table, &["odoo"])
+                        .map_err(|_| CONFIG.to_owned())?
+                        .insert("member_credentials".into(), toml::Value::Boolean(args.enabled));
+                    let guard_db = db.clone();
+                    let guard_home = home.clone();
+                    let guard_ctx = ctx.clone();
+                    let guard_session = session.clone();
+                    runtime.block_on(super::config_commit::commit_table_locked_with_guard(
+                        &path, super::config_commit::content_hash(&raw), &table, move || {
+                            let actor = fresh(&guard_db, &guard_ctx, &guard_session, UserRole::Admin)?;
+                            // Write-ahead audit under the config lock, after CAS and
+                            // live authorization. Failure aborts publication; a later
+                            // commit failure may leave an explicitly labelled intent.
+                            let event = AuditEvent::new("odoo_member_credentials_toggled", "", Severity::Info,
+                                json!({"actor_user_id":actor.user_id,"enabled":args.enabled,"acknowledged":args.acknowledge_risk,"phase":"before_commit"}));
+                            try_append_audit_event(&guard_home, &event).map_err(|_| STORE.to_owned())
+                        },
+                    )).map_err(|_| STORE.to_owned())?;
+                    Ok(json!({"enabled":args.enabled}))
                 }
                 "odoo.member_credentials.revoke" => {
                     let args: Revoke = serde_json::from_value(params).map_err(|_| "請選擇要撤銷連線的同仁。".to_owned())?;
@@ -221,6 +242,7 @@ impl MethodHandler {
                     Ok(json!({"revoked":revoked}))
                 }
                 "me.odoo.connect" | "me.odoo.test" => {
+                    require_enabled(&home)?;
                     let is_connect = method == "me.odoo.connect";
                     // The limit is shared, including malformed/failed attempts.
                     let allowed = LIMITER.lock().map_err(|_| STORE.to_owned())?.allow(&home, user, Instant::now());
@@ -257,7 +279,7 @@ impl MethodHandler {
                         }
                         let sealer = crate::odoo_credentials::Sealer::load(&home)?;
                         let opened = db.odoo_credential_unseal_for_reverification(user, row.rev, &sealer)
-                            .map_err(|_| STORE.to_owned())?.ok_or(CHANGED)?;
+                            .map_err(|_| STORE.to_owned())?.ok_or(REENTER)?;
                         (opened.login, opened.secret, Some(opened.rev), row.server_fp != server.fp)
                     };
                     // Load the existing machine key before sending a newly entered secret.
@@ -266,6 +288,7 @@ impl MethodHandler {
                     } else { None };
                     let check = || -> Result<(), String> {
                         fresh(&db, &ctx, &session, role)?;
+                        require_enabled(&home)?;
                         let current = company_server(&home)?.ok_or(CONFIG)?;
                         if current.fp != server.fp { return Err(CHANGED.into()); }
                         if requires_confirmation && !seen_server(&home, user, &session, &current.fp, false)? {
