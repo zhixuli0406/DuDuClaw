@@ -261,7 +261,7 @@ pub(super) fn audit_result(home: &Path, agent: &str, tool: &str, params: &Value,
             "record_count": value.as_ref().and_then(|v| v.as_array().map(Vec::len)
                 .or_else(|| v.get("id").filter(|id| id.is_i64()).map(|_| 1))),
             "ids_count": ids.as_ref().and_then(Value::as_array).map(Vec::len),
-            "byte_length": raw.len(), "sha256": format!("{:x}", Sha256::digest(raw.as_bytes())),
+            "byte_length": raw.len(),
         }))]);
 }
 

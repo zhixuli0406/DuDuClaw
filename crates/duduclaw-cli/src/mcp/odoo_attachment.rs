@@ -160,76 +160,150 @@ fn open_file(_: &Path, _: &str, _: &str) -> AttachmentResult<OpenedAttachment> {
     Err("Safe attachment file access is unavailable on this platform".into())
 }
 
-// Structural screening only; this is not an antivirus scan or a full decoder.
-fn png_valid(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return false; }
-    let mut offset = 8usize;
-    let mut first = true;
-    let mut saw_data = false;
-    while let Some(header) = bytes.get(offset..).and_then(|b| b.get(..8)) {
-        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
-        let Some(end) = offset.checked_add(12).and_then(|n| n.checked_add(length)) else { return false };
-        let Some(chunk) = bytes.get(offset..end) else { return false };
-        let kind = &header[4..8];
-        if !kind.iter().all(u8::is_ascii_alphabetic) { return false; }
-        if first && (kind != b"IHDR" || length != 13) { return false; }
-        if !first && kind == b"IHDR" { return false; }
-        first = false;
-        // PNG uses the standard reflected CRC-32 over type and data.
-        let mut crc = !0u32;
-        for byte in &chunk[4..chunk.len() - 4] {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 { crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1))); }
+const IMAGE_MAX_DIMENSION: u32 = 12_000;
+const IMAGE_MAX_ALLOC: u64 = 256 * 1024 * 1024;
+const SIZE_REFUSED: &str = "附件超過 attachment_max_mb 大小限制。";
+
+// Bound encoded output while writing, rather than allocating an oversized file
+// and checking only after the encoder has finished.
+struct ImageOutput {
+    bytes: Vec<u8>,
+    limit: u64,
+}
+impl std::io::Write for ImageOutput {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() as u64 > self.limit.saturating_sub(self.bytes.len() as u64) {
+            return Err(std::io::Error::other(SIZE_REFUSED));
         }
-        if !crc != u32::from_be_bytes(chunk[chunk.len() - 4..].try_into().unwrap()) { return false; }
-        if kind == b"IDAT" { saw_data = true; }
-        if kind == b"IEND" { return length == 0 && saw_data && end == bytes.len(); }
-        offset = end;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
     }
-    false
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-fn jpeg_valid(bytes: &[u8]) -> bool {
-    if !bytes.starts_with(b"\xff\xd8") || !bytes.ends_with(b"\xff\xd9") { return false; }
-    let mut offset = 2usize;
-    let mut scan = false;
-    let mut saw_scan = false;
-    while offset < bytes.len() {
-        if bytes[offset] != 0xff {
-            if !scan { return false; }
-            offset += 1;
-            continue;
-        }
-        while bytes.get(offset) == Some(&0xff) { offset += 1; }
-        let Some(&marker) = bytes.get(offset) else { return false };
-        offset += 1;
-        match marker {
-            0x00 | 0xd0..=0xd7 if scan => continue,
-            0xd9 => return saw_scan && offset == bytes.len(),
-            0x00 | 0xd0..=0xd8 => return false,
-            0x01 => continue,
-            _ => (),
-        }
-        let Some(length) = bytes.get(offset..).and_then(|b| b.get(..2)) else { return false };
-        let length = u16::from_be_bytes(length.try_into().unwrap()) as usize;
-        if length < 2 { return false; }
-        let Some(end) = offset.checked_add(length).filter(|n| *n <= bytes.len()) else { return false };
-        offset = end;
-        scan = marker == 0xda;
-        saw_scan |= scan;
+fn reencode_image(bytes: &[u8], expected: image::ImageFormat, limit: u64)
+    -> AttachmentResult<Vec<u8>> {
+    let invalid = "圖片無法完整解碼或重新編碼，或超過圖片尺寸、記憶體或附件大小限制。";
+    if bytes.len() as u64 > limit { return Err(SIZE_REFUSED.into()); }
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format().map_err(|_| invalid)?;
+    if reader.format() != Some(expected) {
+        return Err("圖片內容與副檔名不一致。".into());
     }
-    false
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(IMAGE_MAX_DIMENSION);
+    limits.max_image_height = Some(IMAGE_MAX_DIMENSION);
+    limits.max_alloc = Some(IMAGE_MAX_ALLOC);
+    reader.limits(limits);
+    let decoded = reader.decode().map_err(|_| invalid)?;
+    let mut output = ImageOutput { bytes: Vec::new(), limit };
+    // Fresh encoders receive pixels only: no original metadata or trailing bytes.
+    // WebP is deliberately normalized to PNG (including its name and MIME type).
+    match expected {
+        image::ImageFormat::Jpeg => decoded.write_with_encoder(
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut output, 90)),
+        image::ImageFormat::Png | image::ImageFormat::WebP => decoded.write_with_encoder(
+            image::codecs::png::PngEncoder::new(&mut output)),
+        _ => return Err(invalid.into()),
+    }.map_err(|_| invalid)?;
+    if output.bytes.len() as u64 > limit { return Err(SIZE_REFUSED.into()); }
+    Ok(output.bytes)
+}
+
+fn forbidden_pdf_name(name: &[u8]) -> bool {
+    // lopdf has already decoded PDF #xx name escapes. Match whole names, also
+    // rejecting nonstandard case variants conservatively.
+    [b"JavaScript".as_slice(), b"JS", b"Launch", b"EmbeddedFile", b"EmbeddedFiles",
+        b"OpenAction", b"AA", b"RichMedia", b"XFA", b"SubmitForm", b"ImportData",
+        b"GoToR", b"GoToE", b"Sound", b"Movie"]
+        .iter().any(|blocked| name.eq_ignore_ascii_case(blocked))
+}
+
+fn pdf_names_valid(object: &lopdf::Object, depth: usize) -> bool {
+    if depth > 128 { return false; }
+    let dict = match object {
+        lopdf::Object::Name(name) => return !forbidden_pdf_name(name),
+        lopdf::Object::Array(values) => return values.iter().all(|v| pdf_names_valid(v, depth + 1)),
+        lopdf::Object::Dictionary(dict) => dict,
+        lopdf::Object::Stream(stream) => &stream.dict,
+        _ => return true,
+    };
+    dict.iter().all(|(key, value)| !forbidden_pdf_name(key) && pdf_names_valid(value, depth + 1))
+}
+
+fn pdf_load_filter(id: lopdf::ObjectId, object: &mut lopdf::Object)
+    -> Option<(lopdf::ObjectId, lopdf::Object)> {
+    // Inspect original stream dictionaries before lopdf removes Filter and
+    // DecodeParms during object-stream expansion. Rejected entries leave the
+    // cross-reference map incomplete, which pdf_valid refuses below.
+    pdf_names_valid(object, 0).then(|| (id, object.clone()))
+}
+
+fn pdf_dictionary_valid(dict: &lopdf::Dictionary, doc: &lopdf::Document, depth: usize) -> bool {
+    depth <= 128 && dict.iter().all(|(key, value)|
+        !forbidden_pdf_name(key) && pdf_object_valid(value, doc, depth + 1))
+}
+
+fn pdf_object_valid(object: &lopdf::Object, doc: &lopdf::Document, depth: usize) -> bool {
+    if depth > 128 { return false; }
+    match object {
+        lopdf::Object::Name(name) => !forbidden_pdf_name(name),
+        lopdf::Object::Array(values) => values.iter().all(|v| pdf_object_valid(v, doc, depth + 1)),
+        lopdf::Object::Dictionary(dict) => pdf_dictionary_valid(dict, doc, depth + 1),
+        lopdf::Object::Stream(stream) => {
+            if !pdf_dictionary_valid(&stream.dict, doc, depth + 1) { return false; }
+            if !stream.dict.has_type(b"ObjStm") { return true; }
+            // The loader expands object streams, but can silently drop malformed
+            // entries. Reparse each container and require all declared entries;
+            // inspect even objects not selected by the final cross-reference map.
+            let mut stream = stream.clone();
+            if stream.dict.has(b"Filter") && stream.decompress().is_err() { return false; }
+            let Ok(count) = stream.dict.get(b"N").and_then(lopdf::Object::as_i64) else { return false };
+            let Ok(first) = stream.dict.get(b"First").and_then(lopdf::Object::as_i64) else { return false };
+            let Ok(first) = usize::try_from(first) else { return false };
+            let Some(header) = stream.content.get(..first) else { return false };
+            let Ok(header) = std::str::from_utf8(header) else { return false };
+            let numbers: Result<Vec<u32>, _> = header.split_ascii_whitespace().map(str::parse).collect();
+            let Ok(numbers) = numbers else { return false };
+            let Ok(count) = usize::try_from(count) else { return false };
+            if count.checked_mul(2) != Some(numbers.len()) { return false; }
+            let Ok(objects) = lopdf::ObjectStream::new(&mut stream) else { return false };
+            objects.objects.len() == count
+                && objects.objects.values().all(|v| pdf_object_valid(v, doc, depth + 1))
+        }
+        // All indirect objects are visited independently below; do not recurse
+        // through references (valid page trees contain cycles).
+        lopdf::Object::Reference(id) => doc.objects.contains_key(id),
+        _ => true,
+    }
 }
 
 fn pdf_valid(bytes: &[u8]) -> bool {
     if !bytes.starts_with(b"%PDF-") { return false; }
-    for token in [b"/JavaScript".as_slice(), b"/JS", b"/Launch", b"/EmbeddedFile",
-        b"/OpenAction", b"/AA", b"/RichMedia", b"/XFA"] {
-        if bytes.windows(token.len()).any(|w| w == token) { return false; }
-    }
     let tail = &bytes[bytes.len().saturating_sub(1024)..];
-    tail.windows(5).rposition(|w| w == b"%%EOF")
-        .is_some_and(|end| tail[end + 5..].iter().all(u8::is_ascii_whitespace))
+    if !tail.windows(5).rposition(|w| w == b"%%EOF")
+        .is_some_and(|end| tail[end + 5..].iter().all(u8::is_ascii_whitespace)) { return false; }
+    let Ok(doc) = lopdf::Document::load_mem_with_options(bytes,
+        lopdf::LoadOptions { strict: true, filter: Some(pdf_load_filter), ..Default::default() }) else { return false };
+    // Empty-password encryption can be transparently decrypted on load.
+    if doc.trailer.has(b"Encrypt") || doc.is_encrypted() || doc.was_encrypted() { return false; }
+    // lopdf's loader may skip an object on a parse error. Never treat an
+    // incomplete loaded object map as a successfully screened document.
+    for (&id, entry) in &doc.reference_table.entries {
+        let generation = match entry {
+            lopdf::xref::XrefEntry::Normal { generation, .. } => *generation,
+            lopdf::xref::XrefEntry::Compressed { container, .. } => {
+                if !doc.objects.get(&(*container, 0)).is_some_and(|v|
+                    v.as_stream().is_ok_and(|s| s.dict.has_type(b"ObjStm"))) { return false; }
+                0
+            }
+            lopdf::xref::XrefEntry::Free | lopdf::xref::XrefEntry::UnusableFree => continue,
+        };
+        if !doc.objects.contains_key(&(id, generation)) { return false; }
+    }
+    doc.catalog().is_ok()
+        && pdf_dictionary_valid(&doc.trailer, &doc, 0)
+        && doc.objects.values().all(|object| pdf_object_valid(object, &doc, 0))
 }
 
 fn display_name_matches(name: &str, mime: &str) -> bool {
@@ -252,12 +326,12 @@ fn mimetype(file: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
     let extension = Path::new(file).extension().and_then(|s| s.to_str())
         .unwrap_or("").to_ascii_lowercase();
     let kind = match extension.as_str() {
-        "pdf" if pdf_valid(bytes) => "application/pdf",
-        "png" if png_valid(bytes) => "image/png",
-        "jpg" | "jpeg" if jpeg_valid(bytes) => "image/jpeg",
-        "webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
-            && bytes.get(4..8).is_some_and(|size| u32::from_le_bytes(size.try_into().unwrap()) as u64 + 8 == bytes.len() as u64)
-            && matches!(bytes.get(12..16), Some(b"VP8 " | b"VP8L" | b"VP8X")) => "image/webp",
+        "pdf" => {
+            if !pdf_valid(bytes) {
+                return Err("PDF 無法安全解析、已加密或含有不允許的主動內容，無法上傳。".into());
+            }
+            "application/pdf"
+        }
         "txt" | "csv" if !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok() => {
             if extension == "txt" { "text/plain" } else { "text/csv" }
         }
@@ -317,7 +391,7 @@ fn ooxml_type(extension: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
 }
 
 fn read_file(home: &Path, agent: &str, call: &Attachment, max_mb: u8)
-    -> AttachmentResult<(Vec<u8>, &'static str)> {
+    -> AttachmentResult<(Vec<u8>, &'static str, String)> {
     if !(1..=25).contains(&max_mb) { return Err("Invalid attachment_max_mb".into()); }
     let limit = u64::from(max_mb) * 1024 * 1024;
     let mut opened = open_file(home, agent, &call.file)?;
@@ -327,11 +401,38 @@ fn read_file(home: &Path, agent: &str, call: &Attachment, max_mb: u8)
     let mut bytes = Vec::new();
     (&mut opened.file).take(limit + 1).read_to_end(&mut bytes).map_err(|_| FILE_REFUSED)?;
     if bytes.len() as u64 > limit { return Err("附件超過 attachment_max_mb 大小限制。".into()); }
-    let mime = mimetype(&call.file, &bytes)?;
+    prepare_file(call, bytes, limit)
+}
+
+fn prepare_file(call: &Attachment, bytes: Vec<u8>, limit: u64)
+    -> AttachmentResult<(Vec<u8>, &'static str, String)> {
+    if bytes.len() as u64 > limit { return Err(SIZE_REFUSED.into()); }
+    let extension = Path::new(&call.file).extension().and_then(|s| s.to_str())
+        .unwrap_or("").to_ascii_lowercase();
+    let image = match extension.as_str() {
+        "png" => Some((image::ImageFormat::Png, "image/png")),
+        "jpg" | "jpeg" => Some((image::ImageFormat::Jpeg, "image/jpeg")),
+        "webp" => Some((image::ImageFormat::WebP, "image/webp")),
+        _ => None,
+    };
+    let mime = match image {
+        Some((_, mime)) => mime,
+        None => mimetype(&call.file, &bytes)?,
+    };
     if !display_name_matches(&call.name, mime) {
         return Err("附件顯示名稱的副檔名必須符合已驗證的檔案格式。".into());
     }
-    Ok((bytes, mime))
+    let mut name = call.name.clone();
+    let (bytes, mime) = if let Some((format, mime)) = image {
+        let bytes = reencode_image(&bytes, format, limit)?;
+        let mime = if format == image::ImageFormat::WebP {
+            name = Path::new(&name).with_extension("png").to_str().ok_or(FILE_REFUSED)?.to_owned();
+            "image/png"
+        } else { mime };
+        (bytes, mime)
+    } else { (bytes, mime) };
+    if bytes.len() as u64 > limit { return Err(SIZE_REFUSED.into()); }
+    Ok((bytes, mime, name))
 }
 
 pub(crate) fn odoo_attachment_precheck(home: &Path, agent: &str, params: &Value) -> AttachmentResult<()> {
@@ -362,14 +463,14 @@ pub(super) async fn handle(
         policy.check_call(TOOL, params, decision.as_ref())?;
         // Local file I/O finishes before the first await; no OS handles or ZIP
         // readers cross an await. Upload precisely the bytes that passed checks.
-        let (bytes, mime) = read_file(home, agent, &call, policy.access.attachment_max_mb)?;
+        let (bytes, mime, name) = read_file(home, agent, &call, policy.access.attachment_max_mb)?;
         let records = conn.search_read(&call.model, vec![json!(["id", "=", call.res_id])], &["id"], 1).await?;
         if !records.as_array().is_some_and(|rows| rows.len() == 1 && rows[0]["id"].as_i64() == Some(call.res_id)) {
             return Err("找不到目標記錄，或連線帳號無法讀取這筆資料。".into());
         }
         // An upstream traceback can include submitted values (including datas).
         // Do not reflect any upload error payload back to the model or audit.
-        conn.attachment_create(&call.model, call.res_id, &call.name, mime, &bytes).await
+        conn.attachment_create(&call.model, call.res_id, &name, mime, &bytes).await
             .map_err(|_| "Odoo 附件建立失敗，請檢查目標記錄與帳號權限；重試前先確認是否已建立附件。".to_owned())
     }.await;
     let suffix = identity_suffix(decision.as_ref(), "create");
@@ -382,4 +483,4 @@ pub(super) async fn handle(
 
 #[cfg(test)]
 #[path = "odoo_attachment_tests.rs"]
-mod tests;
+pub(super) mod tests;

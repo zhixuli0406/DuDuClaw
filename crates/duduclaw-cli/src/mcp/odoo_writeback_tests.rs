@@ -310,7 +310,8 @@ fn attachment_requests(stub: &Stub) -> Vec<Value> {
 
 fn attachment_file(home: &Path) {
     std::fs::create_dir_all(home.join("agents/bot/attachments")).unwrap();
-    std::fs::write(home.join("agents/bot/attachments/x.pdf"), b"%PDF-1.7\nprivate attachment\n%%EOF").unwrap();
+    std::fs::write(home.join("agents/bot/attachments/x.pdf"),
+        super::super::odoo_attachment::tests::clean_pdf()).unwrap();
 }
 
 async fn attachment_call(home: &Path, kind: &str, follow: bool, params: &Value) -> Value {
@@ -501,4 +502,54 @@ async fn generic_writes_to_mail_and_model_families_never_reach_odoo() {
         }
         assert!(stub.requests.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn attachment_images_upload_reencoded_bytes_and_webp_uses_png_name_and_mime() {
+    use base64::Engine;
+    use image::ImageFormat;
+    use super::super::odoo_attachment::tests::image_bytes;
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "company", false, &["attach:crm.lead"]);
+    attachment_file(home.path());
+    for (file, format, name, expected_name, mime) in [
+        ("x.png", ImageFormat::Png, "圖片.PNG", "圖片.PNG", "image/png"),
+        ("x.jpg", ImageFormat::Jpeg, "相片.jpeg", "相片.jpeg", "image/jpeg"),
+        ("x.webp", ImageFormat::WebP, "圖片.WEBP", "圖片.png", "image/png"),
+    ] {
+        let original = image_bytes(format, 2, 2);
+        let mut input = original.clone();
+        if format != ImageFormat::WebP { input.extend_from_slice(b"private-trailing-payload"); }
+        std::fs::write(home.path().join("agents/bot/attachments").join(file), &input).unwrap();
+        let result = attachment_call(home.path(), "company", false,
+            &json!({"model":"crm.lead","res_id":9,"file":file,"name":name})).await;
+        assert_ne!(result["isError"], true, "{result}");
+        let writes = attachment_requests(&stub);
+        let values = &writes.last().unwrap()[5][0];
+        assert_eq!(values["name"], expected_name);
+        assert_eq!(values["mimetype"], mime);
+        let uploaded = base64::engine::general_purpose::STANDARD.decode(values["datas"].as_str().unwrap()).unwrap();
+        let decoded = image::load_from_memory(&original).unwrap();
+        let mut expected = Vec::new();
+        if format == ImageFormat::Jpeg {
+            decoded.write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut expected, 90)).unwrap();
+        } else {
+            decoded.write_with_encoder(image::codecs::png::PngEncoder::new(&mut expected)).unwrap();
+        }
+        assert_eq!(uploaded, expected);
+        assert_ne!(uploaded, input);
+    }
+    assert_eq!(attachment_requests(&stub).len(), 3);
+    let before = attachment_requests(&stub).len();
+    for (file, bytes) in [
+        ("bad.jpg", b"\xff\xd8\xff\xda\x00\x02data\xff\xd9".to_vec()),
+        ("bad.pdf", b"%PDF-1.7\nnot a PDF\n%%EOF".to_vec()),
+        ("wide.png", image_bytes(ImageFormat::Png, 12_001, 1)),
+    ] {
+        std::fs::write(home.path().join("agents/bot/attachments").join(file), bytes).unwrap();
+        let result = attachment_call(home.path(), "company", false,
+            &json!({"model":"crm.lead","res_id":9,"file":file})).await;
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    assert_eq!(attachment_requests(&stub).len(), before);
 }

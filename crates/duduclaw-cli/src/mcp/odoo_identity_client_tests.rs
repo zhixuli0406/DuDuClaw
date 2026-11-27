@@ -575,7 +575,7 @@ async fn follow_sensitive_read_never_persists_values() {
         assert!(row.get("result_text").is_none());
         assert_eq!(row["odoo_result"]["model"], "ir.config_parameter");
         assert_eq!(row["odoo_result"]["record_count"], 1);
-        assert_eq!(row["odoo_result"]["sha256"].as_str().unwrap().len(), 64);
+        assert_metadata_fields_only(&row);
     }
 }
 
@@ -591,6 +591,9 @@ fn sensitive_models_are_metadata_only_even_without_follow() {
     for model in ["crm.lead", "secretary.notes", "keynote.slide", "tokenizer.result"] { assert!(!sensitive_model(model)); }
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("secret-never-log") && !audit.contains("result_text"));
+    for row in audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()) {
+        assert_metadata_fields_only(&row);
+    }
 }
 
 #[tokio::test]
@@ -642,4 +645,38 @@ async fn person_listing_and_dispatch_share_local_policy_and_follow_ack() {
         }).await;
     }
     assert!(odoo.calls.lock().unwrap().is_empty());
+}
+
+fn assert_metadata_fields_only(row: &Value) {
+    let metadata = row["odoo_result"].as_object().unwrap();
+    assert_eq!(metadata.len(), 5);
+    for key in ["model", "method", "record_count", "ids_count", "byte_length"] {
+        assert!(metadata.contains_key(key), "missing {key}: {metadata:?}");
+    }
+    assert!(row.get("result_text").is_none());
+    for key in row.as_object().unwrap().keys().chain(metadata.keys()) {
+        let key = key.to_ascii_lowercase();
+        assert!(!key.contains("hash") && !key.contains("digest") && !key.contains("sha256"));
+    }
+}
+
+#[test]
+fn follow_audit_keeps_counts_and_lengths_without_content_or_digest_even_on_error() {
+    let home = tempfile::tempdir().unwrap();
+    let raw = r#"[{"value":"low-entropy-pin-1234"}]"#;
+    for success in [true, false] {
+        audit_result(home.path(), "bot", "odoo_execute",
+            &json!({"model":"crm.lead","method":"read","ids":[1,2]}), success, raw, true);
+    }
+    let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+    assert!(!audit.contains("low-entropy-pin-1234"));
+    assert!(!audit.contains(&format!("{:x}", Sha256::digest(raw.as_bytes()))));
+    for row in audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()) {
+        assert_metadata_fields_only(&row);
+        assert_eq!(row["odoo_result"]["model"], "crm.lead");
+        assert_eq!(row["odoo_result"]["method"], "read");
+        assert_eq!(row["odoo_result"]["ids_count"], 2);
+        assert_eq!(row["odoo_result"]["record_count"], 1);
+        assert_eq!(row["odoo_result"]["byte_length"], raw.len());
+    }
 }
