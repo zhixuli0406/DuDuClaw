@@ -6,7 +6,7 @@
 //!   partial): `budget.daily_cap_cents`, `model.effort`, `fork.enabled`,
 //!   `team.{enabled,roles.<role>.{runtime,model,effort}}`, `guardrails.*`,
 //!   `memory.{decision_continuity,decision_ttl_days}`, `night_engine.enabled`,
-//!   `runtime.minimal_context` (the `capabilities.*_tools` lists live in
+//!   `goal_intent.enabled`, `runtime.minimal_context` (the `capabilities.*_tools` lists live in
 //!   `capabilities_apply`).
 //! * The typed advanced key/value editor (`advanced_kv`).
 //! * The authority guard: the org-guarded keys (`[agent] reports_to /
@@ -109,6 +109,7 @@ pub(crate) fn apply_agent_v168_keys(table: &mut toml::Table, params: &Value, is_
     for (path, section, key) in [
         ("fork.enabled", "fork", "enabled"),
         ("night_engine.enabled", "night_engine", "enabled"),
+        ("goal_intent.enabled", "goal_intent", "enabled"),
         ("team.enabled", "team", "enabled"),
         ("memory.decision_continuity", "memory", "decision_continuity"),
         ("runtime.minimal_context", "runtime", "minimal_context"),
@@ -355,6 +356,7 @@ pub(crate) fn agent_settings_json(raw: &toml::Table) -> Value {
         "guardrails": pick(raw, "guardrails", &["enabled", "block_secrets", "block_injection_echo", "redact_pii", "deny_phrases"]),
         "memory": pick(raw, "memory", &["language", "decision_continuity", "decision_ttl_days"]),
         "night_engine": pick(raw, "night_engine", &["enabled"]),
+        "goal_intent": pick(raw, "goal_intent", &["enabled"]),
         "channels": pick(raw, "channels", &["public_trigger"]),
         "evolution": evolution,
         "container": pick(
@@ -652,6 +654,27 @@ skill_security_scan = true
         let mut off = before.clone();
         apply_agent_v168_keys(&mut off, &json!({"channels": {"public_trigger": false}}), false).unwrap();
         assert!(authority_diff(&before, &off).is_empty());
+    }
+
+    #[test]
+    fn goal_intent_enabled_round_trips_for_non_admin_and_preserves_other_keys() {
+        let mut t = table();
+        let section = table_at_mut(&mut t, &["goal_intent"]).unwrap();
+        section.insert("t_goal".into(), toml::Value::Integer(80));
+        section.insert("mode".into(), toml::Value::String("reply_tag".into()));
+        assert!(agent_settings_json(&t)["goal_intent"].get("enabled").is_none());
+
+        for enabled in [false, true] {
+            apply_agent_v168_keys(&mut t, &json!({"goal_intent": {"enabled": enabled}}), false).unwrap();
+            assert_eq!(toml_at(&t, "goal_intent.enabled").unwrap().as_bool(), Some(enabled));
+            assert_eq!(toml_at(&t, "goal_intent.t_goal").unwrap().as_integer(), Some(80));
+            assert_eq!(toml_at(&t, "goal_intent.mode").unwrap().as_str(), Some("reply_tag"));
+            assert_eq!(agent_settings_json(&t)["goal_intent"], json!({"enabled": enabled}));
+        }
+
+        let before = t.clone();
+        assert!(apply_agent_v168_keys(&mut t, &json!({"goal_intent": {"enabled": "false"}}), false).is_err());
+        assert_eq!(t, before);
     }
 
     #[test]

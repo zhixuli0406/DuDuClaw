@@ -239,6 +239,15 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(buildUpdatePayload(s, new Set(['odoo.allowed_models']), CTX).payload).toEqual({ odoo: { allowed_models: [] } });
   });
 
+  it('sends goal intent only when its switch is edited', () => {
+    const s = state({ v: { ...DEFAULT_V168, goal_intent_enabled: false } });
+    expect(buildUpdatePayload(s, new Set(['v.goal_intent_enabled']), CTX).payload).toEqual({
+      goal_intent: { enabled: false },
+    });
+    expect(buildUpdatePayload(s, new Set(), CTX).payload).not.toHaveProperty('goal_intent');
+    expect(buildUpdatePayload(state(), new Set(), CTX).payload).not.toHaveProperty('goal_intent');
+  });
+
   it('maps the v1.68 controls onto their sections', () => {
     const v = {
       ...DEFAULT_V168,

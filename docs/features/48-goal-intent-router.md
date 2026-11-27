@@ -75,6 +75,8 @@ in every case.
 
 ## Configuration
 
+The per-employee `enabled` switch is also available on the employee’s edit page in the dashboard under Automation → Task suggestions.
+
 Per-agent in `agent.toml` (or global in `config.toml`) under `[goal_intent]`:
 
 | Key | Default | Meaning |
