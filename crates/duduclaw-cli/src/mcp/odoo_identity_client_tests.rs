@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // Request-local signing credentials, never process-global environment mutation.
-tokio::task_local! { pub(super) static AUTH: (); }
+// Shared by local-refusal fixtures so an accidental identity request is observable.
+tokio::task_local! { pub(crate) static AUTH: (); }
 
 pub(crate) fn company() -> OdooIdentity {
     interpret(200, br#"{"ok":true,"identity":"company","permission":"engine"}"#, None).unwrap()
