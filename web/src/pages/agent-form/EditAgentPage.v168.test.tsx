@@ -296,6 +296,30 @@ describe('new controls round-trip from inspect to payload', () => {
     expect(updateAgent).not.toHaveBeenCalled();
   });
 
+  it('defaults task suggestions to on without sending the untouched setting', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=automation');
+    const toggle = await screen.findByRole('switch', { name: 'Suggest creating tasks in chat' });
+    await waitFor(() => expect(toggle).toBeChecked());
+    expect(updateAgent).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('switch', { name: 'Turn on night-time tidy-up' }));
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ night_engine: { enabled: false } });
+  });
+
+  it.each([false, true])('prefills task suggestions as %s and lets a non-admin toggle them', async (enabled) => {
+    const user = userEvent.setup();
+    setRole('employee');
+    mockWsClient.call.mockResolvedValue({ ...FULL, goal_intent: { enabled } });
+    renderAt('/agents/my-bot/edit?tab=automation');
+    const toggle = await screen.findByRole('switch', { name: 'Suggest creating tasks in chat' });
+    await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', String(enabled)));
+    expect(toggle).not.toHaveAttribute('data-disabled');
+    await user.click(toggle);
+    await waitFor(() => expect(updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+    expect(lastPayload()).toEqual({ goal_intent: { enabled: !enabled } });
+  });
+
   it('prefills memory + night engine and sends the edited memory key only', async () => {
     const user = userEvent.setup();
     renderAt('/agents/my-bot/edit?tab=automation');

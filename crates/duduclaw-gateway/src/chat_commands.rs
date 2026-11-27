@@ -1228,14 +1228,39 @@ pub(crate) async fn handle_goal_create(
     risk_boundary: Option<&str>,
     plan_first: bool,
 ) -> String {
+    match create_goal(ctx, session_id, agent_id, description, acceptance_criteria,
+        outcome, duration_hours, risk_boundary, plan_first).await {
+        Ok(created) => created.command_reply,
+        Err(reply) => reply,
+    }
+}
+
+/// Creation facts shared with the channel suggestion path; command copy stays intact.
+pub(crate) struct GoalCreated {
+    pub command_reply: String,
+    pub dispatch_enabled: bool,
+    pub steps: usize,
+}
+
+pub(crate) async fn create_goal(
+    ctx: &ReplyContext,
+    session_id: &str,
+    agent_id: &str,
+    description: &str,
+    acceptance_criteria: Option<&str>,
+    outcome: Option<&str>,
+    duration_hours: Option<f64>,
+    risk_boundary: Option<&str>,
+    plan_first: bool,
+) -> Result<GoalCreated, String> {
     if let Err(refusal) = crate::machine_employee::check_chat_goal(ctx, agent_id, session_id).await {
-        return refusal;
+        return Err(refusal);
     }
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "goal: open task store failed");
-            return format!("⚠️ 無法建立目標任務：{e}");
+            return Err(format!("⚠️ 無法建立目標任務：{e}"));
         }
     };
     let (channel, chat_id) = source_from_session(session_id);
@@ -1249,7 +1274,7 @@ pub(crate) async fn handle_goal_create(
     // user fixes it rather than getting a silently text-only acceptance.
     let outcome_tag = match outcome.map(crate::outcome_spec::OutcomeSpec::parse) {
         Some(Ok(spec)) => spec.to_tag(), // None for `text` (nothing to persist)
-        Some(Err(e)) => return format!("⚠️ outcome 產出驗收格式錯誤：{e}"),
+        Some(Err(e)) => return Err(format!("⚠️ outcome 產出驗收格式錯誤：{e}")),
         None => None,
     };
 
@@ -1283,7 +1308,7 @@ pub(crate) async fn handle_goal_create(
         )
         .await
         {
-            return reply;
+            return Ok(reply);
         }
     }
 
@@ -1381,10 +1406,10 @@ pub(crate) async fn handle_goal_create(
 
         if let Err(e) = store.insert_task(&task).await {
             warn!(error = %e, "goal: insert plan-first task failed");
-            return format!("⚠️ 無法建立目標任務：{e}");
+            return Err(format!("⚠️ 無法建立目標任務：{e}"));
         }
         let review_hint = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
-        return match &task.plan_pending {
+        let command_reply = match &task.plan_pending {
             Some(plan) => format!(
                 "🧭 已建立目標任務 #{short}，並產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n{review_hint}請到 /goals 儀表板核准或修改。"
             ),
@@ -1392,11 +1417,16 @@ pub(crate) async fn handle_goal_create(
                 "⚠️ 已建立目標任務 #{short}，但計畫生成失敗，已標記為待你決定，請到 /goals 儀表板處理。"
             ),
         };
+        return Ok(GoalCreated {
+            command_reply,
+            dispatch_enabled: crate::dispatch_engine::dispatch_engine_enabled(&ctx.home_dir),
+            steps: 1,
+        });
     }
 
     if let Err(e) = store.insert_task(&task).await {
         warn!(error = %e, "goal: insert task failed");
-        return format!("⚠️ 無法建立目標任務：{e}");
+        return Err(format!("⚠️ 無法建立目標任務：{e}"));
     }
 
     let cap = crate::goal_loop::GoalLoopConfig::from_home(&ctx.home_dir).iteration_cap;
@@ -1436,10 +1466,10 @@ pub(crate) async fn handle_goal_create(
              請在 config.toml 設定 `[dispatch] enabled = true` 後重啟。",
         );
     }
-    msg
+    Ok(GoalCreated { command_reply: msg, dispatch_enabled: enabled, steps: 1 })
 }
 
-/// Attempt LLMCompiler-style decomposition (D4 item 1). Returns `Some(reply)`
+/// Attempt LLMCompiler-style decomposition (D4 item 1). Returns `Some(created)`
 /// when a valid multi-task DAG was inserted; `None` to fall back to the
 /// single-task path. Fail-safe at every step: a decomposer error, a trivial or
 /// cyclic plan, or an insert failure ⇒ `None` (never partially inserts a broken
@@ -1453,7 +1483,7 @@ async fn try_decompose_goal(
     criteria: &str,
     channel: &str,
     chat_id: &str,
-) -> Option<String> {
+) -> Option<GoalCreated> {
     use crate::goal_plan::{GoalDecomposer, plan_is_dag, plan_to_tasks};
 
     let decomposer =
@@ -1544,7 +1574,7 @@ async fn try_decompose_goal(
              請在 config.toml 設定 `[dispatch] enabled = true` 後重啟。",
         );
     }
-    Some(msg)
+    Some(GoalCreated { command_reply: msg, dispatch_enabled: enabled, steps: rows.len() })
 }
 
 /// List the current agent's in-progress goal tasks.
@@ -3064,6 +3094,8 @@ mod goal_contract_tests {
             false,
         )
         .await;
+        assert!(msg.contains("已建立自主目標任務"), "{msg}");
+        assert!(msg.contains("/goal status"), "{msg}");
         assert!(msg.contains("目標："), "{msg}");
         assert!(msg.contains("輸入："), "{msg}");
         assert!(msg.contains("輸出格式："), "{msg}");

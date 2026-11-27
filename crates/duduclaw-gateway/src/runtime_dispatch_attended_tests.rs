@@ -202,3 +202,26 @@ async fn dropping_pending_detailed_entry_revokes_context_without_ending_human_tu
         fixture.assert_revoked();
     }).await;
 }
+
+#[tokio::test]
+async fn human_dispatch_without_directory_only_admits_utility_purpose() {
+    let fixture = Fixture::new(None).await;
+    live_human_turn(async {
+        // A nested employee turn must not inherit the outer utility exemption.
+        super::UTILITY_CALL.scope((), async {
+            for purpose in [super::SpawnPurpose::Utility, super::SpawnPurpose::EmployeeTurn] {
+                let mut req = request(fixture.home.path(), RequestType::Dispatch, "purpose-check");
+                req.purpose = purpose;
+                let error = run_agent_prompt_detailed(req).await.unwrap_err();
+                if purpose == super::SpawnPurpose::Utility {
+                    assert_typed_refusal(&error);
+                } else {
+                    assert!(error.preflight.is_some());
+                    assert!(error.steps.is_empty(), "employee refusal must precede runtime execution");
+                }
+                fixture.assert_revoked();
+            }
+        }).await;
+        assert_eq!(fixture.observations().len(), 1);
+    }).await;
+}

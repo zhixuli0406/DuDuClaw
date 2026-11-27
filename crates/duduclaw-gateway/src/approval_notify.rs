@@ -1799,7 +1799,7 @@ mod tests {
                     "UPDATE users SET role='employee' WHERE id=?1",
                     "UPDATE users SET status='suspended' WHERE id=?1",
                     "UPDATE users SET must_change_password=1 WHERE id=?1",
-                    "UPDATE users SET id='removed-reviewer' WHERE id=?1",
+                    "UPDATE users SET status='offboarded' WHERE id=?1",
                 ] {
                     let targets = dashboard_only_targets(&f.home, &record, reminder);
                     assert_eq!(targets.len(), 2);
@@ -1813,8 +1813,8 @@ mod tests {
                     let requests = provider.requests();
                     assert_eq!(requests.len(), before + 1, "reminder={reminder}, user={user}, change={change}");
                     assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
-                    conn.execute("UPDATE users SET id=?1, role=?2, status='active', must_change_password=0
-                        WHERE id=?1 OR id='removed-reviewer'", rusqlite::params![user, role]).unwrap();
+                    conn.execute("UPDATE users SET role=?2, status='active', must_change_password=0
+                        WHERE id=?1", rusqlite::params![user, role]).unwrap();
                     // Role/status changes revoke grants transactionally. Restoring
                     // the account does not restore authority for the next case.
                     f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",

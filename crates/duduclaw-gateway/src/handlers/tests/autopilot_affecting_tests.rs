@@ -179,7 +179,8 @@ async fn affecting_me_protected_rules_are_owner_only_even_with_stale_nonowner_bi
     duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, "a2", &f.mgr_a.user_id).unwrap();
     duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, "a2", &f.mgr_a.user_id).unwrap();
     tx.commit().unwrap();
-    // Simulate legacy/corrupt non-owner bindings; do not install a global ACL.
+    // Simulate legacy/corrupt non-owner bindings in this test-owned database only.
+    conn.execute_batch("DROP TRIGGER isolation_personal_binding_insert").unwrap();
     for ctx in [&f.emp, &f.admin] {
         conn.execute("INSERT INTO user_agent_bindings (user_id, agent_name, access_level, bound_at) VALUES (?1, 'a2', 'viewer', '2026-11-27')",
             [&ctx.user_id]).unwrap();

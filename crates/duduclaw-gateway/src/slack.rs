@@ -1114,6 +1114,7 @@ async fn handle_event(
     // markdown block takes 12000)
     let reply_thread = thread_ts.as_deref().or(Some(ts));
     group_turn.delivery(ctx, guarded.answered_by.as_ref(), reply_thread).scope(send_markdown_message(
+        &ctx.home_dir,
         http,
         bot_token,
         channel,
@@ -1596,6 +1597,7 @@ async fn post_message_returning_ts(
 /// action buttons (handled by the `interactive` Socket-Mode envelope).
 #[allow(clippy::too_many_arguments)]
 async fn send_markdown_message(
+    home_dir: &Path,
     http: &reqwest::Client,
     token: &str,
     channel: &str,
@@ -1638,7 +1640,7 @@ async fn send_markdown_message(
                 // conversation-control buttons (unchanged from before P1).
                 let buttons = if crate::goal_intent::reply_has_confirmation_menu(markdown) {
                     crate::goal_intent::pending_button_nonce(sid)
-                        .map(|nonce| channel_format::slack_gintent_buttons(&nonce))
+                        .map(|nonce| channel_format::slack_gintent_buttons(&nonce, crate::trigger_route::texts::lang_for(home_dir)))
                         .unwrap_or_else(|| channel_format::slack_action_buttons(sid))
                 } else {
                     channel_format::slack_action_buttons(sid)

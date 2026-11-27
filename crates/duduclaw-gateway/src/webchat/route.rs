@@ -250,6 +250,8 @@ fn route_outcome(
             trigger_route::audit(home, "webchat", access, auth_user, &agent, "refused", None);
             Err(Box::new(if matches!(access.sender, trigger_route::Sender::Admin { .. }) {
                 ChatMessage::error_coded(trigger_route::FORBIDDEN_TEXT, AGENT_FORBIDDEN_CODE)
+            } else if let Some(reason) = reg.get(&agent).and_then(|loaded| access.main_converse_refusal(loaded)) {
+                ChatMessage::error_coded(reason, "agent_unavailable")
             } else {
                 super::access::agent_unavailable()
             }))
