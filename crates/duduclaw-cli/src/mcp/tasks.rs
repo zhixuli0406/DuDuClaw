@@ -1687,15 +1687,20 @@ mod live_assignee_tests {
     #[tokio::test]
     async fn mcp_create_accepts_live_and_rejects_unavailable_assignees() {
         let home = tempfile::tempdir().unwrap();
+        // Unavailable targets must fail the live gate before department policy
+        // can return delegation advice for a target with no department.
+        std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='department'").unwrap();
         employee(home.path(), "live", "active");
         employee(home.path(), "deleted", "deleted");
         employee(home.path(), "archived", "archived");
+        employee(home.path(), "unreadable", "active");
+        std::fs::write(home.path().join("agents/unreadable/agent.toml"), "[agent").unwrap();
         let actor = RecordActor::Operator("live");
         let result = handle_tasks_create(&serde_json::json!({
             "title": "工作", "assigned_to": "live"
         }), home.path(), actor).await;
         assert_ne!(result["isError"], true, "{result}");
-        for id in ["deleted", "archived", "unknown"] {
+        for id in ["deleted", "archived", "unknown", "unreadable"] {
             assert_unavailable(handle_tasks_create(&serde_json::json!({
                 "title": "工作", "assigned_to": id
             }), home.path(), actor).await);
