@@ -324,34 +324,45 @@ async fn skill_budget_unlimited_requires_admin_for_flat_and_advanced_updates() {
         "agent_id": "a1", "skill_budget_unlimited": false, "skill_token_budget": 1200,
     }), &owner).await);
     let stored: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(stored["evolution"]["skill_budget_unlimited"].as_bool(), Some(false));
     assert_eq!(stored["evolution"]["skill_token_budget"].as_integer(), Some(1200));
 
     for advanced in [false, true] {
-        for value in [true, false] {
-            let params = if advanced {
-                json!({ "agent_id": "a1", "advanced_kv": [{
-                    "section": "evolution", "key": "skill_budget_unlimited",
-                    "type": "boolean", "value": value,
-                }] })
-            } else {
-                json!({ "agent_id": "a1", "skill_budget_unlimited": value })
-            };
-            let before = std::fs::read(&path).unwrap();
-            let e = err(&handler.handle("agents.update", params.clone(), &owner).await);
-            assert!(e.contains("evolution.skill_budget_unlimited"), "{e}");
-            assert_eq!(std::fs::read(&path).unwrap(), before);
-            let refused = audit_rows(home.path(), "agent_authority_refused");
-            let row = refused.last().unwrap();
-            assert_eq!(row["details"]["keys"], json!(["evolution.skill_budget_unlimited"]));
-            assert_eq!(row["details"]["user_id"], "owner-7");
+        let params = |value: bool| if advanced {
+            json!({ "agent_id": "a1", "advanced_kv": [{
+                "section": "evolution", "key": "skill_budget_unlimited",
+                "type": "boolean", "value": value,
+            }] })
+        } else {
+            json!({ "agent_id": "a1", "skill_budget_unlimited": value })
+        };
+        let before = std::fs::read(&path).unwrap();
+        let refused_before = audit_rows(home.path(), "agent_authority_refused").len();
+        let e = err(&handler.handle("agents.update", params(true), &owner).await);
+        assert!(e.contains("administrator"), "{e}");
+        assert!(e.contains("evolution.skill_budget_unlimited"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let refused = audit_rows(home.path(), "agent_authority_refused");
+        assert_eq!(refused.len(), refused_before + 1);
+        let row = refused.last().unwrap();
+        assert_eq!(row["details"]["keys"], json!(["evolution.skill_budget_unlimited"]));
+        assert_eq!(row["details"]["user_id"], "owner-7");
 
-            ok(&handler.handle("agents.update", params, &admin()).await);
+        // Both owners and admins can narrow an enabled setting; only admins enable it.
+        let administrator = admin();
+        for actor in [&owner, &administrator] {
+            ok(&handler.handle("agents.update", params(true), &admin()).await);
             let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
-            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(value));
+            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(true));
+            ok(&handler.handle("agents.update", params(false), actor).await);
+            let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(false));
+            assert_eq!(written["evolution"]["skill_token_budget"].as_integer(), Some(1200));
         }
+        assert_eq!(audit_rows(home.path(), "agent_authority_refused").len(), refused_before + 1);
     }
     let inspect = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &owner).await);
-    assert!(inspect["admin_only_fields"].as_array().unwrap()
+    assert!(!inspect["admin_only_fields"].as_array().unwrap()
         .contains(&json!("form.skill_budget_unlimited")));
 }
 

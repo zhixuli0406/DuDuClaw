@@ -1013,7 +1013,7 @@ mod skill_budget_authority_tests {
     use super::*;
 
     #[test]
-    fn ai_skill_budget_unlimited_change_is_refused_and_audited() {
+    fn ai_skill_budget_unlimited_enabling_is_refused_and_audited() {
         let tmp = tempfile::tempdir().unwrap();
         let before = toml::Table::new();
         let after: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
@@ -1034,6 +1034,28 @@ mod skill_budget_authority_tests {
             assert_eq!(row["source"], "mcp.agent_update");
             assert_eq!(row["reason"], "authority_widening");
             assert_eq!(row["attempted_value_class"], "protected_value_change");
+        }
+    }
+
+    #[test]
+    fn ai_skill_budget_unlimited_disabling_is_allowed_without_refusal_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+        let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
+        let absent = toml::Table::new();
+        // Seed a refusal so successful narrowing must leave the audit unchanged.
+        assert!(check_ai_authority(
+            tmp.path(), RecordActor::Agent("rep"), "rep", &absent, &before, None,
+        ).is_err());
+        let audit_path = tmp.path().join("tool_calls.jsonl");
+        let audit_before = std::fs::read(&audit_path).unwrap();
+        for caller in ["rep", "lead"] {
+            for after in [&off, &absent] {
+                assert_eq!(check_ai_authority(
+                    tmp.path(), RecordActor::Agent(caller), "rep", &before, after, None,
+                ), Ok(()));
+                assert_eq!(std::fs::read(&audit_path).unwrap(), audit_before);
+            }
         }
     }
 }

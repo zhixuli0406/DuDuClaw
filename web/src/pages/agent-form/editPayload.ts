@@ -188,7 +188,6 @@ export const ADMIN_ONLY_FORM_PATHS_FALLBACK: ReadonlyArray<string> = [
   'form.can_send_cross_agent',
   'form.can_schedule_tasks',
   'form.can_modify_own_skills',
-  'form.skill_budget_unlimited',
   'v.guardrails_enabled',
   'v.guardrails_block_secrets',
   'v.public_trigger',

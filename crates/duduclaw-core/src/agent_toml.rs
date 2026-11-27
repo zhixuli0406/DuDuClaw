@@ -1594,8 +1594,9 @@ pub mod authority {
     pub enum AuthorityKind {
         /// Any change of the effective value.
         Change,
-        /// Only loosening: raising a budget cap (0 = no cap) or turning
-        /// `hard_stop` off. Tightening stays open to the Owner.
+        /// Only loosening: raising runtime limits or a budget cap (0 = no cap),
+        /// turning `hard_stop` off, or turning unlimited skill content on.
+        /// Tightening stays open to the Owner.
         Loosen,
         /// Becoming, or ceasing to be, `role = "main"`.
         RoleMain,
@@ -1653,7 +1654,7 @@ pub mod authority {
         key("permissions.can_modify_own_skills", &["form.can_modify_own_skills"], Change),
         // Which channels the employee may answer on.
         key("permissions.allowed_channels", &[], Change),
-        key("evolution.skill_budget_unlimited", &["form.skill_budget_unlimited"], Change),
+        key("evolution.skill_budget_unlimited", &["form.skill_budget_unlimited"], Loosen),
         key("guardrails.enabled", &["v.guardrails_enabled"], Change),
         key("guardrails.block_secrets", &["v.guardrails_block_secrets"], Change),
         // v1.76: opens the employee to `@` calls from unmapped channel senders.
@@ -1771,6 +1772,9 @@ pub mod authority {
             RoleMain => (before.as_str() == Some("main")) != (after.as_str() == Some("main")),
             Loosen if k.toml_key == "budget.when_unavailable" => {
                 before.as_str() == Some("deny") && after.as_str() == Some("allow")
+            }
+            Loosen if k.toml_key == "evolution.skill_budget_unlimited" => {
+                before.as_bool() != Some(true) && after.as_bool() == Some(true)
             }
             Loosen if k.toml_key == "budget.hard_stop" => {
                 before.as_bool() == Some(true) && after.as_bool() != Some(true)
@@ -1893,7 +1897,7 @@ pub mod authority {
         use super::*;
 
         #[test]
-        fn skill_budget_unlimited_changes_require_admin_in_both_directions() {
+        fn skill_budget_unlimited_only_enabling_requires_admin() {
             let absent = toml::Table::new();
             let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
             let on: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
@@ -1902,12 +1906,9 @@ pub mod authority {
                     key: "evolution.skill_budget_unlimited".into(),
                     before: json!(false), after: json!(true),
                 }]);
-                assert_eq!(authority_diff(&on, before), vec![ProtectedChange {
-                    key: "evolution.skill_budget_unlimited".into(),
-                    before: json!(true), after: json!(false),
-                }]);
+                assert!(authority_diff(&on, before).is_empty());
             }
-            assert!(admin_only_form_paths().contains(&"form.skill_budget_unlimited"));
+            assert!(!admin_only_form_paths().contains(&"form.skill_budget_unlimited"));
         }
 
         #[test]
