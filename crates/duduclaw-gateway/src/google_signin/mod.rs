@@ -1,6 +1,7 @@
 //! Company Google sign-in primitives. HTTP flows are registered separately.
 pub mod oidc;
 pub mod config;
+pub(crate) mod routes;
 
 #[cfg(test)]
 mod config_tests;

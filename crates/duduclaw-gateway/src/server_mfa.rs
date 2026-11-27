@@ -28,7 +28,7 @@ fn limited() -> axum::response::Response {
 }
 
 /// None preserves the exact legacy response, including all field names.
-pub(super) async fn after_first_factor(
+pub(crate) async fn after_first_factor(
     state: &AppState,
     user: &duduclaw_auth::User,
     first: FirstFactor,
@@ -40,7 +40,7 @@ pub(super) async fn after_first_factor(
 
 /// The issuance transaction refused a one-factor session. Do not consult the
 /// cached policy again: another connection may have enabled the durable policy.
-pub(super) async fn require_after_first_factor(
+pub(crate) async fn require_after_first_factor(
     state: &AppState, user: &duduclaw_auth::User, first: FirstFactor,
 ) -> axum::response::Response {
     first_factor_response(state, user, first, true).await.unwrap_or_else(denied)
@@ -77,9 +77,23 @@ async fn first_factor_response(
                 factors
             } else {serde_json::json!({"mfa_enrollment_required":true,"enrollment_token":challenge,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&challenge),
                 "setup_code_required":bootstrap})};
-            let reason=crate::mfa_email::unavailable_reason(&state.home_dir);
-            payload["email_available"]=serde_json::json!(reason.is_none());
-            payload["email_unavailable_reason"]=serde_json::json!(reason);
+            if matches!(first, FirstFactor::GoogleOidc) {
+                // Google cannot prove an independent second factor via email.
+                if let Some(factors) = payload.get_mut("factors").and_then(serde_json::Value::as_object_mut) {
+                    factors.remove("email");
+                }
+                if payload["last_used"].as_str() == Some("email") {
+                    payload["last_used"] = if payload["factors"]["totp"] == true { serde_json::json!("totp") }
+                        else if payload["factors"]["passkey"] == true { serde_json::json!("passkey") }
+                        else { serde_json::Value::Null };
+                }
+                payload["email_available"] = serde_json::json!(false);
+                payload["email_unavailable_reason"] = serde_json::json!("請使用其他兩步驟驗證方式。");
+            } else {
+                let reason=crate::mfa_email::unavailable_reason(&state.home_dir);
+                payload["email_available"]=serde_json::json!(reason.is_none());
+                payload["email_unavailable_reason"]=serde_json::json!(reason);
+            }
             Ok(Some(payload))
         }
         Ok(Ok(None)) => Ok(None),

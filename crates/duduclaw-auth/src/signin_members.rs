@@ -36,7 +36,7 @@ pub struct SigninPolicy {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SigninOutcome {
-    Ok { user_id: String, created: bool, linked_via: Option<&'static str> },
+    Ok { user_id: String, credential_epoch: u64, created: bool, linked_via: Option<&'static str> },
     AccountDisabled,
     ExistingAccount,
     Rejected,
@@ -122,29 +122,30 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
     let linked: Option<String> = tx.query_row("SELECT user_id FROM google_signin_links WHERE google_sub=?1",
         [&id.sub], |r| r.get(0)).optional().map_err(|_| STORAGE)?;
     if let Some(user_id) = linked {
-        let status: String = tx.query_row("SELECT status FROM users WHERE id=?1", [&user_id], |r| r.get(0)).map_err(|_| STORAGE)?;
+        let (status, credential_epoch): (String, u64) = tx.query_row("SELECT status,credential_epoch FROM users WHERE id=?1",
+            [&user_id], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|_| STORAGE)?;
         if status != "active" { return Ok(SigninOutcome::AccountDisabled); }
         tx.execute("UPDATE google_signin_links SET last_signin_at=?2 WHERE user_id=?1", params![user_id, now]).map_err(|_| STORAGE)?;
-        return Ok(SigninOutcome::Ok { user_id, created: false, linked_via: None });
+        return Ok(SigninOutcome::Ok { user_id, credential_epoch, created: false, linked_via: None });
     }
     // 2. Read provenance before the attestation helper consumes it, under the
     // same transaction. Never take an attestation from an already-linked user.
     let attestations = {
-        let mut stmt = tx.prepare("SELECT u.id,u.status,a.attested_by FROM users u
+        let mut stmt = tx.prepare("SELECT u.id,u.status,a.attested_by,u.credential_epoch FROM users u
             JOIN google_signin_attestations a ON a.user_id=u.id
             WHERE u.email=?1 COLLATE NOCASE
             AND NOT EXISTS(SELECT 1 FROM google_signin_links l WHERE l.user_id=u.id)").map_err(|_| STORAGE)?;
-        let rows = stmt.query_map([&id.email], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        let rows = stmt.query_map([&id.email], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, u64>(3)?)))
             .map_err(|_| STORAGE)?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| STORAGE)?
     };
-    for (user_id, status, attested_by) in attestations {
+    for (user_id, status, attested_by, credential_epoch) in attestations {
         if UserDb::take_valid_google_signin_attestation_tx(tx, &user_id, &id.email, now).map_err(|_| STORAGE)? {
             if status != "active" { return Ok(SigninOutcome::AccountDisabled); }
             insert_link(tx, &user_id, id, &attested_by, "admin_attest", now)?;
             audit(tx, SYSTEM_ACTOR, "user.google_signin_linked", &user_id,
                 &json!({"linked_via": "admin_attest", "hd": id.hd}), now)?;
-            return Ok(SigninOutcome::Ok { user_id, created: false, linked_via: Some("admin_attest") });
+            return Ok(SigninOutcome::Ok { user_id, credential_epoch, created: false, linked_via: Some("admin_attest") });
         }
     }
     // 3. Email is only a collision guard, never an identity proof.
@@ -173,7 +174,9 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
             let detail = json!({"linked_via": "jit_direct", "hd": id.hd, "settings_version": policy.settings_version,
                 "ack_by": policy.ack_by, "ack_at": policy.ack_at});
             let user_id = create_signin_account_tx(tx, id, SYSTEM_ACTOR, "jit_direct", &detail, now)?;
-            Ok(SigninOutcome::Ok { user_id, created: true, linked_via: Some("jit_direct") })
+            let credential_epoch = tx.query_row("SELECT credential_epoch FROM users WHERE id=?1",
+                [&user_id], |r| r.get::<_, u64>(0)).map_err(|_| STORAGE)?;
+            Ok(SigninOutcome::Ok { user_id, credential_epoch, created: true, linked_via: Some("jit_direct") })
         }
     }
 }
