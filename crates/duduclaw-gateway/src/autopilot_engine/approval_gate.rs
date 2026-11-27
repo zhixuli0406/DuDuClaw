@@ -73,13 +73,14 @@ impl AutopilotEngine {
     /// performs the action.
     pub(super) async fn gate_on_approval(
         &self,
+        origin: EventOrigin,
         rule: &AutopilotRuleRow,
         event_name: &str,
         action: &Value,
         fields: &serde_json::Map<String, Value>,
         screen_note: Option<String>,
     ) {
-        if !self.admit_department_rule(rule, fields, chrono::Utc::now()).await { return; }
+        if !self.admit_department_rule(origin, rule, fields, chrono::Utc::now()).await { return; }
         let note = |base: String| match &screen_note {
             Some(n) => format!("{n}｜{base}"),
             None => base,
@@ -251,7 +252,7 @@ impl AutopilotEngine {
             action.get("steps").and_then(Value::as_array).and_then(|steps| steps.get(index)))
             .ok_or(DEPARTMENT_CONTAINMENT_SKIP)?;
         if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
-            crate::autopilot_scope::check(&self.home_dir, rule, Some(step), fields)
+            crate::autopilot_scope::check(&self.home_dir, rule, Some(step), fields, run.event_origin())
         { return Err(DEPARTMENT_CONTAINMENT_SKIP.into()); }
         let broker = self.approval_broker.as_ref().ok_or("核准服務沒有接上")?;
         let dispatch = FrozenDispatch {
@@ -516,14 +517,14 @@ impl AutopilotEngine {
                     let step = usize::try_from(run.step_index).ok()
                         .and_then(|index| action.get("steps").and_then(Value::as_array).and_then(|steps| steps.get(index)));
                     match step {
-                        Some(step) => crate::autopilot_scope::check(&self.home_dir, rule, Some(step), &fields),
+                        Some(step) => crate::autopilot_scope::check(&self.home_dir, rule, Some(step), &fields, run.event_origin()),
                         None => crate::autopilot_scope::ScopeDecision::Deny { reason: "step missing".into() },
                     }
                 }
                 _ => crate::autopilot_scope::ScopeDecision::Deny { reason: "run fields or action unreadable".into() },
             }
         } else {
-            crate::autopilot_scope::check(&self.home_dir, rule, None, &serde_json::Map::new())
+            crate::autopilot_scope::check(&self.home_dir, rule, None, &serde_json::Map::new(), EventOrigin::external())
         };
         if let crate::autopilot_scope::ScopeDecision::Deny { .. } = scope {
             drop(fence);
@@ -555,7 +556,7 @@ impl AutopilotEngine {
         let who = rec.decided_by.as_deref().unwrap_or("unknown");
         let queue_id = row.run_id.as_deref().zip(row.step_index)
             .map(|(run_id, index)| super::runs::queue_id(run_id, index));
-        let outcome = self.perform_action_with_queue_id(&dispatch.action, queue_id.as_deref(), chrono::Utc::now()).await;
+        let outcome = self.perform_action_with_queue_id(&dispatch.action, queue_id.as_deref(), chrono::Utc::now(), Some(rule)).await;
         let (result, detail) = match &outcome {
             Ok(()) => (RESULT_SUCCESS, format!("已由 {who} 核准並執行（{}）", row.event_name)),
             Err(e) => (RESULT_FAILURE, format!("已由 {who} 核准，但執行失敗：{e}")),
@@ -839,8 +840,38 @@ impl AutopilotEngine {
     /// (then the best-effort live event), and its chat push. Each is marked
     /// done only after it succeeded; whatever is left stays owed and is
     /// re-driven by the next sweep.
+    async fn dispatch_notice_department(&self, row: &AutopilotDispatchRow) -> Result<Option<String>, String> {
+        if let Some(run_id) = &row.run_id {
+            let run = self.store.get_run(run_id).await.map_err(|_| "scope_denied")?
+                .ok_or("scope_denied")?;
+            if run.rule_id != row.rule_id || run.rule_hash != row.rule_hash {
+                return Err("scope_denied".into());
+            }
+            return Ok(run.owner_department);
+        }
+        // Department rules require steps. For legacy single actions the hash
+        // binds ownership too, so a changed/deleted rule cannot shed its scope.
+        let rule = self.store.get_rule(&row.rule_id).await.map_err(|_| "scope_denied")?
+            .ok_or("scope_denied")?;
+        if rule.owner_department.is_some() || gate::rule_revision_hash(&rule) != row.rule_hash {
+            return Err("scope_denied".into());
+        }
+        Ok(None)
+    }
+
     async fn announce_row(&self, row: &AutopilotDispatchRow) {
         if row.state != DISPATCH_SETTLED {
+            return;
+        }
+        let allowed = match self.dispatch_notice_department(row).await {
+            Ok(department) => crate::autopilot_scope::notice_targets(&self.home_dir, &self.store,
+                &row.rule_id, department.as_deref()).await.is_ok(),
+            Err(_) => false,
+        };
+        if !allowed {
+            if self.store.deny_dispatch_notice(&row.dispatch_id).await.is_err() {
+                warn!("autopilot: scope-denied approval notice could not be settled");
+            }
             return;
         }
         let outcome = row.outcome.as_deref().unwrap_or(RESULT_APPROVAL_ERROR);
@@ -893,6 +924,19 @@ impl AutopilotEngine {
     /// in flight twice. Limited outcomes are held to one push per rule per
     /// hour (decided before the first attempt).
     async fn drive_notice_push(&self, row: &AutopilotDispatchRow, outcome: &str, detail: &str) {
+        let department = match self.dispatch_notice_department(row).await {
+            Ok(department) => department,
+            Err(_) => {
+                let _ = self.store.deny_dispatch_notice(&row.dispatch_id).await;
+                return;
+            }
+        };
+        if crate::autopilot_scope::notice_targets(&self.home_dir, &self.store,
+            &row.rule_id, department.as_deref()).await.is_err()
+        {
+            let _ = self.store.deny_dispatch_notice(&row.dispatch_id).await;
+            return;
+        }
         let id = row.dispatch_id.as_str();
         if row.notice_push_attempts == 0
             && !gate::always_noticed(outcome)
@@ -947,7 +991,7 @@ impl AutopilotEngine {
         let rule_id = row.rule_id.clone();
         let dispatch_id = id.to_string();
         tokio::spawn(async move {
-            let result = gate::push_admin_notice(&home, &rule_id, &body).await;
+            let result = gate::push_scoped_notice(&home, &store, &rule_id, department.as_deref(), &body).await;
             record_notice_push(&store, &dispatch_id, attempt, result).await;
         });
     }
@@ -1016,6 +1060,7 @@ async fn record_notice_push(store: &AutopilotStore, dispatch_id: &str, attempt: 
     let recorded = match result {
         NoticePush::Sent => store.finish_dispatch_notice_push(dispatch_id, PUSH_SENT).await,
         NoticePush::Queued => store.finish_dispatch_notice_push(dispatch_id, PUSH_QUEUED).await,
+        NoticePush::ScopeDenied => store.finish_dispatch_notice_push(dispatch_id, "scope_denied").await,
         NoticePush::NoTarget => store.finish_dispatch_notice_push(dispatch_id, PUSH_NO_TARGET).await,
         NoticePush::Failed if attempt >= gate::MAX_NOTICE_PUSH_ATTEMPTS => {
             error!(dispatch_id, attempt,

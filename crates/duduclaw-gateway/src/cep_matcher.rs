@@ -556,6 +556,7 @@ mod tests {
 
     fn task_created(id: &str) -> AutopilotEvent {
         AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: serde_json::json!({ "id": id, "title": "t" }),
         }
     }

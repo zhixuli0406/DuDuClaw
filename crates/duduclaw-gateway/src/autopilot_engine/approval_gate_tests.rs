@@ -171,6 +171,7 @@ fn reproduced_action() -> Value {
 
 fn task_created(title: &str) -> AutopilotEvent {
     AutopilotEvent::TaskCreated {
+        origin: crate::autopilot_engine::EventOrigin::external(),
         task: json!({ "id": format!("task-{title}"), "title": title, "priority": "high" }),
     }
 }

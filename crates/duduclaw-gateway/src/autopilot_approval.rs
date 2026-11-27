@@ -566,6 +566,8 @@ pub fn notice_body(rule_name: &str, result: &str, detail: &str) -> String {
 /// What one chat push of an Admin notice achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticePush {
+    /// Authority changed before delivery; never retry or fall back to Admins.
+    ScopeDenied,
     /// Sent to at least one Admin's verified channel.
     Sent,
     /// Durably queued for after quiet hours.
@@ -582,7 +584,23 @@ pub enum NoticePush {
 /// it carries the existing 「暫停這條規則」 button for this rule. The
 /// dashboard copy (Activity Feed + live event) is written by the caller.
 pub(crate) async fn push_admin_notice(home: &Path, rule_id: &str, body: &str) -> NoticePush {
-    let targets = crate::macos_folder_access::admin_links(home);
+    push_notice_to(home, rule_id, body, crate::macos_folder_access::admin_links(home)).await
+}
+
+/// Re-check immediately inside the detached delivery task, then bind destinations.
+pub(crate) async fn push_scoped_notice(
+    home: &Path, store: &crate::autopilot_store::AutopilotStore,
+    rule_id: &str, department: Option<&str>, body: &str,
+) -> NoticePush {
+    let targets = match crate::autopilot_scope::notice_targets(home, store, rule_id, department).await {
+        Ok(Some(targets)) => targets,
+        Ok(None) => crate::macos_folder_access::admin_links(home),
+        Err(_) => return NoticePush::ScopeDenied,
+    };
+    push_notice_to(home, rule_id, body, targets).await
+}
+
+async fn push_notice_to(home: &Path, rule_id: &str, body: &str, targets: Vec<(String, String)>) -> NoticePush {
     if targets.is_empty() {
         tracing::info!(rule_id, "autopilot approval notice: no Admin with a verified channel; dashboard only");
         return NoticePush::NoTarget;
@@ -801,12 +819,14 @@ mod tests {
     #[test]
     fn event_ref_names_the_task_and_digests_the_fields() {
         let fields = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "x"}),
         }
         .to_fields();
         let r = event_ref("task_created", &fields);
         assert!(r.starts_with("task_created:task=t-42:sha256="), "{r}");
         let other = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "y"}),
         }
         .to_fields();
@@ -816,6 +836,7 @@ mod tests {
     #[test]
     fn dedupe_key_is_stable_per_event_rule_and_revision() {
         let fields = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "x"}),
         }
         .to_fields();
@@ -824,6 +845,7 @@ mod tests {
         assert_ne!(k, dedupe_key("r2", "h1", "task_created", &fields));
         assert_ne!(k, dedupe_key("r1", "h2", "task_created", &fields));
         let other = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "y"}),
         }
         .to_fields();

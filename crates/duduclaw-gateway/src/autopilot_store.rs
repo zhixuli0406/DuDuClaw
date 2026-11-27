@@ -397,6 +397,11 @@ impl AutopilotStore {
         }
         conn.execute_batch(RUNS_SCHEMA_SQL)
             .map_err(|e| format!("init autopilot runs schema: {e}"))?;
+        if let Err(e) = conn.execute("ALTER TABLE autopilot_runs ADD COLUMN gateway_origin INTEGER NOT NULL DEFAULT 0", []) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(format!("autopilot origin migration failed: {e}"));
+            }
+        }
         Ok(())
     }
 
@@ -853,6 +858,16 @@ impl AutopilotStore {
 
     /// The outcome's Activity Feed entry exists: clear the flag. `Ok(true)`
     /// only for the caller that cleared it.
+    /// A scope denial settles the durable notice, without an Activity or push.
+    pub async fn deny_dispatch_notice(&self, dispatch_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute("UPDATE autopilot_approval_dispatch SET notice_activity_pending=0,
+            notice_push_state='scope_denied', notice_push_next_at=NULL
+            WHERE dispatch_id=?1 AND state='settled'", params![dispatch_id])
+            .map_err(|_| "settle scope-denied approval notice".to_string())?;
+        Ok(())
+    }
+
     pub async fn mark_dispatch_activity_done(&self, dispatch_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let n = conn

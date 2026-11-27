@@ -18,7 +18,7 @@ pub(crate) async fn validate_department_rule(
         || view.is_some_and(|v| v.is_empty()
             || !v.departments_for(GrantGroup::Automation).iter().any(|d| d == department))
         || !matches!(row.trigger_event.as_str(), "task_created" | "task_updated"
-            | "task_status_changed" | "activity_new" | "channel_message" | "agent_idle" | "run_at_risk")
+            | "task_status_changed")
         || row.sequence.is_some() || row.metadata.is_some()
     { return Err(DENIED.into()); }
     let admin_targets;
@@ -82,8 +82,9 @@ pub(crate) async fn validate_department_rule(
 /// Fixed codes only: callers must never persist event data on a denial.
 pub(crate) fn dept_rule_contained(
     home: &std::path::Path, rule: &AutopilotRuleRow, step: Option<&Value>,
-    fields: &serde_json::Map<String, Value>,
+    fields: &serde_json::Map<String, Value>, origin: crate::autopilot_engine::EventOrigin,
 ) -> Result<(), String> {
+    if !origin.is_gateway() { return Err("origin_untrusted".into()); }
     let department = rule.owner_department.as_deref().ok_or("department_missing")?;
     if !duduclaw_core::is_valid_department(department) {
         return Err("department_invalid".into());
@@ -92,10 +93,8 @@ pub(crate) fn dept_rule_contained(
         return Err("trigger_unsupported".into());
     }
     let subject = match rule.trigger_event.as_str() {
-        "channel_message" | "agent_idle" | "run_at_risk" => fields.get("agent_id"),
         "task_created" | "task_updated" | "task_status_changed" =>
             fields.get("task").and_then(|v| v.get("assigned_to")),
-        "activity_new" => fields.get("activity").and_then(|v| v.get("agent_id")),
         _ => return Err("trigger_unsupported".into()),
     }.and_then(Value::as_str).ok_or("subject_missing")?;
     if !duduclaw_core::is_valid_agent_id(subject) {
@@ -119,7 +118,7 @@ pub(crate) fn dept_rule_contained(
     Ok(())
 }
 
-fn contained_step(
+pub(crate) fn contained_step(
     home: &std::path::Path, rule: &AutopilotRuleRow, department: &str, step: &Value,
 ) -> Result<(), String> {
     let kind = step.get("type").and_then(Value::as_str).ok_or("step_unsupported")?;
@@ -134,7 +133,8 @@ fn contained_step(
     let default_id = general.and_then(|v| v.get("default_agent"))
         .map(|v| v.as_str().ok_or("targets_unavailable")).transpose()?.unwrap_or("");
     let target_in_department = |agent: &str| -> Result<bool, String> {
-        if !duduclaw_core::is_valid_agent_id(agent) || agent == default_id || owners.contains_key(agent) {
+        if !duduclaw_core::is_valid_agent_id(agent) || matches!(agent, "main" | "default")
+            || agent == default_id || owners.contains_key(agent) {
             return Ok(false);
         }
         let raw = std::fs::read_to_string(home.join("agents").join(agent).join("agent.toml"))
@@ -187,6 +187,24 @@ fn contained_step(
 }
 
 
+/// Owner notices require current Automation authority, even if another employee
+/// happens to share the same notification destination.
+pub(crate) fn owner_notice_targets(
+    home: &std::path::Path, rule: &AutopilotRuleRow, department: &str,
+) -> Result<Vec<(String, String)>, String> {
+    let owner = rule.created_by_user_id.as_deref().ok_or("scope_denied")?;
+    let db = crate::decision_notify::open_user_db_read_only(home)
+        .map_err(|_| "scope_denied")?.ok_or("scope_denied")?;
+    let user = db.get_user(owner).map_err(|_| "scope_denied")?.ok_or("scope_denied")?;
+    let grants = db.dept_grants_for_user(owner).map_err(|_| "scope_denied")?;
+    if user.status != UserStatus::Active || !(user.role == UserRole::Admin
+        || (user.role == UserRole::Manager && grants.iter().any(|(dept, groups)|
+            dept == department && groups.contains(&GrantGroup::Automation))))
+    { return Err("scope_denied".into()); }
+    let targets = db.verified_dm_destinations_for_user(owner).map_err(|_| "scope_denied")?;
+    Ok(targets.into_iter().map(|d| (d.channel, d.channel_user_id)).collect())
+}
+
 #[cfg(test)]
 pub(crate) mod runtime_tests {
     use super::*;
@@ -222,11 +240,26 @@ pub(crate) mod runtime_tests {
     pub(crate) fn rule(step: Value) -> AutopilotRuleRow {
         serde_json::from_value(json!({
             "id":"dept", "name":"Department rule", "enabled":true,
-            "trigger_event":"channel_message", "conditions":"{}",
+            "trigger_event":"task_created", "conditions":"{}",
             "action":json!({"type":"steps", "steps":[step]}).to_string(),
             "created_at":"", "trigger_count":0, "owner_department":"sales",
             "created_by_user_id":"mgrA"
         })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn department_write_whitelist_requires_a_gateway_producer() {
+        let f = super::super::tests::fixture().await;
+        let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+        let mut row = rule(json!({"type":"delegate", "target_agent":"a2", "prompt":"work"}));
+        for trigger in ["task_created", "task_updated", "task_status_changed"] {
+            row.trigger_event = trigger.into();
+            assert!(validate_department_rule(&f.h, Some(&view), &row).await.is_ok());
+        }
+        for trigger in ["activity_new", "channel_message", "agent_idle", "run_at_risk"] {
+            row.trigger_event = trigger.into();
+            assert!(validate_department_rule(&f.h, Some(&view), &row).await.is_err());
+        }
     }
 
     #[test]
@@ -236,45 +269,46 @@ pub(crate) mod runtime_tests {
         employee(home, "a1", "sales");
         employee(home, "a2", "sales");
         employee(home, "b1", "mfg");
-        let fields = json!({"agent_id":"a1"}).as_object().unwrap().clone();
+        let fields = json!({"task":{"assigned_to":"a1"}}).as_object().unwrap().clone();
         let delegate = json!({"type":"delegate","target_agent":"a2","prompt":"test"});
         let mut row = rule(delegate.clone());
-        assert!(dept_rule_contained(home, &row, None, &fields).is_ok());
+        assert!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         for (event, fields) in [
-            ("channel_message", json!({"agent_id":"a1"})),
-            ("agent_idle", json!({"agent_id":"a1"})),
-            ("run_at_risk", json!({"agent_id":"a1"})),
+
+
+
             ("task_created", json!({"task":{"assigned_to":"a1"}})),
             ("task_updated", json!({"task":{"assigned_to":"a1"}})),
             ("task_status_changed", json!({"task":{"assigned_to":"a1"}})),
-            ("activity_new", json!({"activity":{"agent_id":"a1"}})),
+
         ] {
             row.trigger_event = event.into();
-            assert!(dept_rule_contained(home, &row, None, fields.as_object().unwrap()).is_ok());
-            assert!(dept_rule_contained(home, &row, None, &Default::default()).is_err());
+            assert!(dept_rule_contained(home, &row, None, fields.as_object().unwrap(), crate::autopilot_engine::EventOrigin::gateway()).is_ok());
+            assert!(dept_rule_contained(home, &row, None, &Default::default(), crate::autopilot_engine::EventOrigin::gateway()).is_err());
         }
-        for trigger in ["tick", "task_deleted", "security_event", "cep_trigger"] {
+        for trigger in ["tick", "task_deleted", "security_event", "cep_trigger",
+            "channel_message", "agent_idle", "run_at_risk", "activity_new"] {
             row.trigger_event = trigger.into();
-            assert_eq!(dept_rule_contained(home, &row, None, &fields), Err("trigger_unsupported".into()));
+            assert_eq!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()), Err("trigger_unsupported".into()));
         }
-        row.trigger_event = "channel_message".into();
+        row.trigger_event = "task_created".into();
         row.sequence = Some("{}".into());
-        assert_eq!(dept_rule_contained(home, &row, None, &fields), Err("trigger_unsupported".into()));
+        assert_eq!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()), Err("trigger_unsupported".into()));
         row.sequence = None;
         row.owner_department = Some("sale".into());
-        assert_eq!(dept_rule_contained(home, &row, None, &fields), Err("subject_outside_department".into()));
+        assert_eq!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()), Err("subject_outside_department".into()));
         row.owner_department = Some("sales".into());
-        assert_eq!(dept_rule_contained(home, &row, None, json!({"agent_id":"b1"}).as_object().unwrap()),
+        assert_eq!(dept_rule_contained(home, &row, None, json!({"task":{"assigned_to":"b1"}}).as_object().unwrap(), crate::autopilot_engine::EventOrigin::gateway()),
             Err("subject_outside_department".into()));
         for step in [json!({"type":"run_skill","target_agent":"b1"}),
             json!({"type":"delegate","target_agent":"main"}), json!({"type":"unknown"})] {
-            assert!(dept_rule_contained(home, &row, Some(&step), &fields).is_err());
+            assert!(dept_rule_contained(home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_err());
         }
         employee(home, "a2", "mfg");
-        assert_eq!(dept_rule_contained(home, &row, None, &fields), Err("target_outside_department".into()));
-        assert!(dept_rule_contained(home, &row, Some(&json!({"type":"wait"})), &fields).is_ok());
+        assert_eq!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()), Err("target_outside_department".into()));
+        assert!(dept_rule_contained(home, &row, Some(&json!({"type":"wait"})), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         std::fs::write(home.join("org.toml"), "[broken").unwrap();
-        assert_eq!(dept_rule_contained(home, &row, None, &fields), Err("subject_unavailable".into()));
+        assert_eq!(dept_rule_contained(home, &row, None, &fields, crate::autopilot_engine::EventOrigin::gateway()), Err("subject_unavailable".into()));
     }
 
     #[tokio::test]
@@ -283,7 +317,7 @@ pub(crate) mod runtime_tests {
         f.db.bind_channel_identity("mgrA", "line", "owner-dm", true).unwrap();
         let step = json!({"type":"notify", "channel":"line", "chat_id":"owner-dm", "text":"test"});
         let row = rule(step.clone());
-        let fields = json!({"agent_id":"a1"}).as_object().unwrap().clone();
+        let fields = json!({"task":{"assigned_to":"a1"}}).as_object().unwrap().clone();
         for name in ["_internal", "empty", "invalid name"] {
             std::fs::create_dir_all(f.home.join("agents").join(name)).unwrap();
         }
@@ -291,10 +325,10 @@ pub(crate) mod runtime_tests {
         for name in ["_internal", "invalid name"] {
             std::fs::write(f.home.join("agents").join(name).join("agent.toml"), "[broken").unwrap();
         }
-        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields).is_ok());
+        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         // A corrupt employee config must still fail closed after a destination match.
         std::fs::write(f.home.join("agents/empty/agent.toml"), "[broken").unwrap();
-        assert_eq!(dept_rule_contained(&f.home, &row, Some(&step), &fields),
+        assert_eq!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()),
             Err("targets_unavailable".into()));
     }
 
@@ -304,23 +338,23 @@ pub(crate) mod runtime_tests {
         f.db.bind_channel_identity("mgrA", "line", "owner-dm", true).unwrap();
         let step = json!({"type":"notify", "channel":"line", "chat_id":"owner-dm", "text":"test"});
         let row = rule(step.clone());
-        let fields = json!({"agent_id":"a1"}).as_object().unwrap().clone();
-        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields).is_ok());
+        let fields = json!({"task":{"assigned_to":"a1"}}).as_object().unwrap().clone();
+        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         f.db.set_dept_grants("admin", "mgrA", "sales", &[], true).unwrap();
-        assert_eq!(dept_rule_contained(&f.home, &row, Some(&step), &fields),
+        assert_eq!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()),
             Err("destination_outside_department".into()));
         let mut admin_row = row.clone();
         admin_row.created_by_user_id = Some("admin".into());
         f.db.bind_channel_identity("admin", "line", "admin-dm", true).unwrap();
         let admin_step = json!({"type":"notify", "channel":"line", "chat_id":"admin-dm", "text":"test"});
-        assert!(dept_rule_contained(&f.home, &admin_row, Some(&admin_step), &fields).is_ok());
+        assert!(dept_rule_contained(&f.home, &admin_row, Some(&admin_step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         f.db.set_user_status("admin", UserStatus::Suspended).unwrap();
-        assert!(dept_rule_contained(&f.home, &admin_row, Some(&admin_step), &fields).is_err());
+        assert!(dept_rule_contained(&f.home, &admin_row, Some(&admin_step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_err());
         let path = f.home.join("agents/a2/agent.toml");
         let raw = std::fs::read_to_string(&path).unwrap();
         std::fs::write(&path, format!("{raw}\n[proactive]\nnotify_channel = 'line'\nnotify_chat_id = 'owner-dm'\n")).unwrap();
-        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields).is_ok());
+        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_ok());
         employee(&f.home, "a2", "mfg");
-        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields).is_err());
+        assert!(dept_rule_contained(&f.home, &row, Some(&step), &fields, crate::autopilot_engine::EventOrigin::gateway()).is_err());
     }
 }

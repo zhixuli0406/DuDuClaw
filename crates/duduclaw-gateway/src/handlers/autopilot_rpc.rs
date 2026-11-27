@@ -665,6 +665,7 @@ mod tests {
     async fn insert_status_run(store: &AutopilotStore, id: &str, state: &str, now: chrono::DateTime<Utc>) {
         use crate::autopilot_store::{AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, run_ts};
         let run = AutopilotRunRow {
+            gateway_origin: false,
             run_id: id.into(), rule_id: "status-rule".into(), rule_name: "Status".into(),
             rule_hash: "private-hash".into(), event_name: "task_created".into(),
             event_ref: "private-event".into(), dedupe_key: format!("dedupe-{id}"),

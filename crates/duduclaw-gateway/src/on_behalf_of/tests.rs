@@ -400,6 +400,8 @@ fn labels_fall_back_without_exposing_platform_ids() {
 
 fn queue_msg(id: &str, on_behalf_of: Option<&str>) -> crate::message_queue::QueueMessage {
     crate::message_queue::QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.into(),
         sender: "sales".into(),
         target: "finance".into(),
