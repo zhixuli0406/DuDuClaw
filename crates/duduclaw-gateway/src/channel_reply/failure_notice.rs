@@ -148,32 +148,20 @@ pub(super) async fn model_alignment_gate(
 ) -> Result<(), String> {
     // v1.84.0: a bare Claude alias on a prefixed non-Claude engine runs with
     // that engine's default (the runtime layer substitutes it the same way).
-    let runnable = crate::runtime_config::runnable_model(agent, model, provider);
-    let result = crate::runtime_config::ensure_model_provider(&runnable, provider);
+    let result = crate::entry_gate::check_model(agent, model, provider);
     if result.is_err() {
         if generation.is_some() {
             persist_failure_notice(ctx, sid, agent, turn, TurnFailureReason::ModelProviderMismatch, generation).await;
         }
     }
     match result {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) => {
-            tracing::warn!(agent, %error, "model/provider alignment refused");
+            tracing::warn!(agent, ?error, "model/provider alignment refused");
             let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
-            let reason = TurnFailureReason::ModelProviderMismatch;
-            Err(format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn)))
+            Err(error.user_text(sid, language.as_deref(), turn))
         }
     }
-}
-
-/// The turn's refusal when the employee's provider/model pair could not be
-/// read strictly (`runtime_config::load_runtime_settings_strict`). Fixed
-/// sentence + specific code only; the path and parser text are already in the
-/// gateway log. Runs before any session row exists, so nothing is persisted.
-pub(super) async fn agent_config_refusal(ctx: &ReplyContext, agent: &str, turn: &str) -> String {
-    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
-    let reason = TurnFailureReason::AgentConfigUnreadable;
-    format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn))
 }
 
 pub(super) async fn active_provider_gate(

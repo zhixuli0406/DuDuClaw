@@ -260,8 +260,9 @@ async fn build_reply_with_session_inner_impl(
     // takeover commands or the typing-takeover gate: takeover there is
     // Odoo-native (an operator speaking in the chat, `crate::odoo_livechat`),
     // and the `/takeover` status text is written for operators.
-    let public_visitor = crate::odoo_livechat::is_public_visitor_session(session_id);
-    if let Some(tk) = crate::chat_commands::parse_takeover(text).filter(|_| !public_visitor) {
+    let public_visitor = super::assembly::public_session(session_id);
+    if let Some(tk) = crate::chat_commands::parse_takeover(text)
+        .filter(|command| !public_visitor && crate::entry_gate::takeover_is_exempt(command)) {
         return crate::chat_commands::handle_takeover(ctx, gate_session, user_id, &tk).await;
     }
 
@@ -513,23 +514,117 @@ async fn build_reply_with_session_inner_impl(
         return reply;
     }
 
-    // This turn's provider/model pair: BOTH from one strict read of the
-    // employee's settings (never the registry cache, which may be another
-    // snapshot, and never parse defaults for an unreadable file). A read
-    // failure is refused by the gate below, before anything else runs.
-    let initial_runtime_settings = agent
-        .map(|a| crate::runtime_config::load_runtime_settings_strict(&a.dir)
-            .and_then(|settings| settings.preferred_or_default().map(|model| (settings, model))));
-    let model = match initial_runtime_settings.as_ref() {
-        Some(Ok((_, model))) => model.clone(),
-        // Refused at the gate; this value is never used for a call.
-        Some(Err(_)) => String::new(),
-        None => duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string(),
-    };
-
     let agent_id = agent
         .map(|a| a.config.agent.name.clone())
         .unwrap_or_default();
+
+    // ── L0: Safety word check (highest priority, zero latency) ──
+    // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
+    let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
+    if crate::chat_commands::parse_safety_word_with_config(text, &ctx.killswitch.safety_words)
+        .as_ref().is_some_and(crate::entry_gate::command_is_exempt)
+    {
+        // Safety words are handled by chat_commands.rs, but if we reach here
+        // (e.g., direct call without command parsing), handle inline
+        match &safety_action {
+            duduclaw_security::safety_word::SafetyWordAction::Stop(scope) => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    match scope {
+                        duduclaw_security::safety_word::SafetyWordScope::CurrentScope => {
+                            failsafe.force_halt(session_id, "safety word").await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir,
+                                &agent_id,
+                                session_id,
+                                user_id,
+                                "stop",
+                            );
+                            // C1 producer 甲 companion — see `security_autopilot.rs`.
+                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
+                            return duduclaw_security::safety_word::format_response(
+                                &safety_action,
+                                session_id,
+                            );
+                        }
+                        duduclaw_security::safety_word::SafetyWordScope::Global => {
+                            // Global stop requires admin — this inline path has no
+                            // admin context, so only halt the current scope as a
+                            // safeguard. The full !STOP ALL is handled via
+                            // chat_commands::handle_command which enforces admin.
+                            warn!(
+                                session_id,
+                                user_id,
+                                "!STOP ALL via inline path — halting scope only (admin check unavailable)"
+                            );
+                            failsafe
+                                .force_halt(session_id, "safety word: STOP ALL (scope-only)")
+                                .await;
+                            duduclaw_security::audit::log_safety_word(
+                                &ctx.home_dir,
+                                &agent_id,
+                                session_id,
+                                user_id,
+                                "stop_all_downgraded",
+                            );
+                            // C1 producer 甲 companion — see `security_autopilot.rs`.
+                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
+                            return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
+                        }
+                    }
+                }
+                return duduclaw_security::safety_word::format_response(&safety_action, session_id);
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Resume => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    // Only resume the current scope — global halt requires
+                    // explicit !STOP ALL scope to be cleared separately (via
+                    // chat_commands handler which has user_id for admin check).
+                    failsafe.resume(session_id).await;
+                    duduclaw_security::audit::log_safety_word(
+                        &ctx.home_dir,
+                        &agent_id,
+                        session_id,
+                        user_id,
+                        "resume",
+                    );
+                    // C1 producer 甲 companion — see `security_autopilot.rs`.
+                    crate::security_autopilot::emit_safety_word_triggered(&agent_id);
+                    return duduclaw_security::safety_word::format_response(
+                        &safety_action,
+                        session_id,
+                    );
+                }
+                return "⚠️ Failsafe system not initialized.".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::Status => {
+                if let Some(ref failsafe) = ctx.failsafe {
+                    let state = failsafe.get_state(session_id).await;
+                    return duduclaw_security::failsafe::format_status(session_id, state.as_ref());
+                }
+                return "Failsafe: not initialized".to_string();
+            }
+            duduclaw_security::safety_word::SafetyWordAction::None => {}
+        }
+    }
+
+    // W1: one strict employee snapshot for the entry checks. W2 will carry
+    // it through spawn and remove the legacy downstream re-reads.
+    let resolved_turn = agent.map(|_| crate::entry_gate::resolve_and_check(
+        &ctx.home_dir, &reg, &agent_id,
+    ));
+    if let Some(Err(ref refusal)) = resolved_turn {
+        warn!(agent = %agent_id, code = refusal.code(), ?refusal, "employee entry refused");
+        super::health::receive(ctx, &agent_id, session_id).await;
+        super::health::mark(&agent_id, Some("other"));
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
+        let text = refusal.user_text(session_id, language.as_deref(), &turn_id);
+        return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
+    }
+    let model = match resolved_turn.as_ref() {
+        Some(Ok(turn)) => turn.model.clone(),
+        Some(Err(_)) => unreachable!("entry refusal returned above"),
+        None => duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string(),
+    };
 
     let internal_sender = sender_is_internal_for_reply(&ctx.home_dir, session_id, user_id, &agent_id);
     let on_progress = on_progress.map(|callback| -> ProgressCallback {
@@ -561,38 +656,6 @@ async fn build_reply_with_session_inner_impl(
         span.record(crate::otel::attrs::REQUEST_MODEL, model.as_str());
     }
     let agent_dir = agent.map(|a| a.dir.clone());
-
-    // ── Model/provider alignment gate ──
-    // The first thing once the pair is known: before the 「加入知識庫」 command,
-    // the system-operator/OS-intent route (utility model), pending goal
-    // confirmation (plan model, task creation), safety-word/failsafe/killswitch
-    // state, credential ledger, skill recorder/bank, recent skills, the
-    // session row and the WebChat `turn_accepted` frame. No session row exists
-    // yet, so nothing is persisted (generation `None`); the refusal text
-    // carries the specific reason code. The later gate before the main model
-    // call re-checks a re-read pair.
-    if let Some(dir) = agent_dir.as_deref() {
-        let refusal = match initial_runtime_settings.as_ref() {
-            Some(Ok((settings, _))) => super::model_alignment_gate(
-                ctx, session_id, &agent_id, &turn_id, &model, settings.provider, None,
-            ).await.err(),
-            Some(Err(error @ (crate::runtime_config::RuntimeSettingsError::Missing
-                | crate::runtime_config::RuntimeSettingsError::Unreadable
-                | crate::runtime_config::RuntimeSettingsError::Malformed
-                | crate::runtime_config::RuntimeSettingsError::UnknownProvider
-                | crate::runtime_config::RuntimeSettingsError::MissingModel))) => {
-                warn!(agent = %agent_id, kind = error.as_str(), dir = %dir.display(),
-                    "employee runtime settings unreadable — turn refused before any side effect");
-                Some(super::agent_config_refusal(ctx, &agent_id, &turn_id).await)
-            }
-            None => None,
-        };
-        if let Some(error) = refusal {
-            super::health::receive(ctx, &agent_id, session_id).await;
-            super::health::mark(&agent_id, Some("other"));
-            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { live_only_notice(format!("⚠️ {error}")) };
-        }
-    }
 
     // ── 「加入知識庫 <集合>」 (document knowledge base) ──
     // Proposes this message's attachments (or the sender's recent ones) for
@@ -810,102 +873,14 @@ async fn build_reply_with_session_inner_impl(
         Err(error) => {
             tracing::warn!(agent = %agent_id, %error, "Agent profile could not be loaded");
 
-            return "⚠️ 無法讀取這位員工的設定，已暫停本次執行。請管理者檢查設定後重試。".to_string();
+            let text = crate::entry_gate::EntryRefusal::SystemPromptUnreadable
+                .user_text(session_id, default_language.as_deref(), &turn_id);
+            return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
         }
     };
     drop(reg);
 
     let session_mgr = &ctx.session_manager;
-
-    // ── L0: Safety word check (highest priority, zero latency) ──
-    // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
-    let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
-    if !matches!(
-        safety_action,
-        duduclaw_security::safety_word::SafetyWordAction::None
-    ) {
-        // Safety words are handled by chat_commands.rs, but if we reach here
-        // (e.g., direct call without command parsing), handle inline
-        match &safety_action {
-            duduclaw_security::safety_word::SafetyWordAction::Stop(scope) => {
-                if let Some(ref failsafe) = ctx.failsafe {
-                    match scope {
-                        duduclaw_security::safety_word::SafetyWordScope::CurrentScope => {
-                            failsafe.force_halt(session_id, "safety word").await;
-                            duduclaw_security::audit::log_safety_word(
-                                &ctx.home_dir,
-                                &agent_id,
-                                session_id,
-                                user_id,
-                                "stop",
-                            );
-                            // C1 producer 甲 companion — see `security_autopilot.rs`.
-                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
-                            return duduclaw_security::safety_word::format_response(
-                                &safety_action,
-                                session_id,
-                            );
-                        }
-                        duduclaw_security::safety_word::SafetyWordScope::Global => {
-                            // Global stop requires admin — this inline path has no
-                            // admin context, so only halt the current scope as a
-                            // safeguard. The full !STOP ALL is handled via
-                            // chat_commands::handle_command which enforces admin.
-                            warn!(
-                                session_id,
-                                user_id,
-                                "!STOP ALL via inline path — halting scope only (admin check unavailable)"
-                            );
-                            failsafe
-                                .force_halt(session_id, "safety word: STOP ALL (scope-only)")
-                                .await;
-                            duduclaw_security::audit::log_safety_word(
-                                &ctx.home_dir,
-                                &agent_id,
-                                session_id,
-                                user_id,
-                                "stop_all_downgraded",
-                            );
-                            // C1 producer 甲 companion — see `security_autopilot.rs`.
-                            crate::security_autopilot::emit_safety_word_triggered(&agent_id);
-                            return "🛑 Agent stopped (scope). Global stop requires admin — use chat command.".to_string();
-                        }
-                    }
-                }
-                return duduclaw_security::safety_word::format_response(&safety_action, session_id);
-            }
-            duduclaw_security::safety_word::SafetyWordAction::Resume => {
-                if let Some(ref failsafe) = ctx.failsafe {
-                    // Only resume the current scope — global halt requires
-                    // explicit !STOP ALL scope to be cleared separately (via
-                    // chat_commands handler which has user_id for admin check).
-                    failsafe.resume(session_id).await;
-                    duduclaw_security::audit::log_safety_word(
-                        &ctx.home_dir,
-                        &agent_id,
-                        session_id,
-                        user_id,
-                        "resume",
-                    );
-                    // C1 producer 甲 companion — see `security_autopilot.rs`.
-                    crate::security_autopilot::emit_safety_word_triggered(&agent_id);
-                    return duduclaw_security::safety_word::format_response(
-                        &safety_action,
-                        session_id,
-                    );
-                }
-                return "⚠️ Failsafe system not initialized.".to_string();
-            }
-            duduclaw_security::safety_word::SafetyWordAction::Status => {
-                if let Some(ref failsafe) = ctx.failsafe {
-                    let state = failsafe.get_state(session_id).await;
-                    return duduclaw_security::failsafe::format_status(session_id, state.as_ref());
-                }
-                return "Failsafe: not initialized".to_string();
-            }
-            duduclaw_security::safety_word::SafetyWordAction::None => {}
-        }
-    }
 
     // ── L1: Failsafe state gate ──
     if let Some(ref failsafe) = ctx.failsafe {

@@ -71,7 +71,7 @@ fn wrong_config_type(path: &Path, field: &str) -> String {
 }
 
 /// Validate only runtime selectors before the deliberately lenient typed read.
-fn check_runtime_field_types(doc: &toml::Value, path: &Path) -> Result<(), String> {
+pub(crate) fn check_runtime_field_types(doc: &toml::Value, path: &Path) -> Result<(), String> {
     if let Some(runtime) = doc.get("runtime") {
         let runtime = runtime.as_table().ok_or_else(|| wrong_config_type(path, "[runtime]"))?;
         for field in ["provider", "fallback"] {
@@ -100,7 +100,7 @@ fn check_runtime_field_types(doc: &toml::Value, path: &Path) -> Result<(), Strin
     Ok(())
 }
 
-fn check_removed_agent_runtimes(doc: &toml::Value, path: &Path) -> Result<(), String> {
+pub(crate) fn check_removed_agent_runtimes(doc: &toml::Value, path: &Path) -> Result<(), String> {
     for field in ["provider", "fallback"] {
         if let Some(removed) = doc.get("runtime").and_then(|runtime| runtime.get(field))
             .and_then(toml::Value::as_str)
@@ -177,7 +177,16 @@ pub fn ensure_active_agent_provider(agent_dir: &Path) -> Result<(), String> {
         .map(|home| crate::team_composer::read_global_team_config(&home))
         .transpose()?
         .unwrap_or_default();
-    let team = duduclaw_core::types::TeamConfig::merge(&global_team, &sections.team);
+    ensure_active_team_providers(&global_team, &sections.team)
+}
+
+/// The active-provider gate's pure half, shared with the entry snapshot.
+/// The caller supplies the already parsed employee team; no employee re-read.
+pub(crate) fn ensure_active_team_providers(
+    global_team: &duduclaw_core::types::TeamConfig,
+    agent_team: &duduclaw_core::types::TeamConfig,
+) -> Result<(), String> {
+    let team = duduclaw_core::types::TeamConfig::merge(global_team, agent_team);
     for role in duduclaw_core::types::Role::ALL {
         if let Some(removed) = team.roles.get(*role).runtime.as_deref()
             .and_then(duduclaw_core::runtime_catalog::removed_runtime) {
@@ -644,7 +653,8 @@ pub enum RuntimeSettingsError {
     Malformed,
     /// `[runtime] provider` names no known runtime.
     UnknownProvider,
-    /// No non-blank preferred model and the runtime has no catalog default.
+    /// No usable preferred model. Legacy readers may use a catalog default;
+    /// the shared entry gate requires an explicitly configured model.
     MissingModel,
 }
 
