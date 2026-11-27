@@ -3727,6 +3727,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/handlers/chat_admin_settings_rpc.rs::MethodHandler::handle_chat_admin_settings_rpc",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Runs the cosmetic chat-card sweep as a Tokio task after the settings write; no process is created."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/handlers/experts_import_rpc.rs::MethodHandler::spawn_cli_group_detailed",
       "apis": {
         "backend_spawn": 1,

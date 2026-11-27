@@ -246,7 +246,9 @@ async fn all_t2_kinds_require_step_up_by_default_and_exemptions_are_exact() {
         let kind = if *key == "egress_guard" { "other_outgoing" } else { *key };
         let id = if kind == crate::admin_ai::card::ACTION_KIND {
             f.admin_ai().await
-        } else { f.simple(kind).await };
+        } else {
+            f.simple(kind).await
+        };
         let rec = f.env.broker.get(&id).await.unwrap().unwrap();
         let proof = f.proof(&id).await;
         f.config(true, "telegram", &[]);
@@ -712,6 +714,7 @@ skill_security_scan = true
         use crate::org_change_approval::{self as oc, Proposal};
         let before = duduclaw_core::org_store::load_for_write(&self.env.home).unwrap()
             .get("support").cloned().unwrap();
+        std::fs::create_dir_all(self.env.home.join("shared/wiki/departments/新部門")).unwrap();
         let proposal = Proposal {
             agent_id: "support".into(), before,
             after: duduclaw_core::org_store::OrgEntry::new("", "新部門"),
