@@ -27,7 +27,7 @@
 use super::*;
 use crate::dept_grants::reach;
 use crate::org_change_approval::{self as oc, journal, Proposal};
-use duduclaw_core::org_change;
+use duduclaw_core::org_change::{self, OrgChangeError};
 use duduclaw_core::org_store::{self, OrgEntry};
 
 use crate::approval::decision_service::{Decider, files_org::{

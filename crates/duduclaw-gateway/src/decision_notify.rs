@@ -1577,7 +1577,7 @@ pub(crate) async fn route_verified_bound_press(
         // A delivered RM-143 card stays receipt-bound after disabling or
         // retirement; it must never fall back to legacy decision authority.
         if press::owns(&ctx.home_dir, &row).await
-            || crate::approval::chat_admin::receipts::has_for_approval(&broker.store, &row.id).await.unwrap_or(true) {
+            || broker.has_chat_admin_receipt(&row.id).await.unwrap_or(true) {
             return Some(press::handle(ctx, context, &action, &row, origin, scope).await);
         }
         if (row.binding.is_some() || row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND) && !access_ok {

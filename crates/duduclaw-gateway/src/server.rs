@@ -3532,7 +3532,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/a2a", post(a2a_http::rpc))
         .route("/.well-known/agent-card.json", get(a2a_http::card))
         .route("/.well-known/agent.json", get(a2a_http::card))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(auth_router)
         .merge(webchat_router)
         .merge(ag_ui_router);

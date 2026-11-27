@@ -15,6 +15,18 @@ impl ApprovalBroker {
         )?)))
     }
 
+    /// Read receipt ownership without exposing the writable approval store.
+    pub(crate) async fn has_chat_admin_receipt(&self, id: &ApprovalId) -> Result<bool, String> {
+        chat_admin::receipts::has_for_approval(&self.store, id).await
+    }
+
+    /// Look up a receipt by exact delivery coordinates; callers still verify its proof.
+    pub(crate) async fn lookup_chat_admin_receipt(
+        &self, channel: &str, account: &str, dm: &str, message_id: &str,
+    ) -> Result<Option<chat_admin::receipts::Receipt>, String> {
+        chat_admin::receipts::lookup_message(&self.store, channel, account, dm, message_id).await
+    }
+
     /// Record a new pending approval. `payload` is the exact thing to
     /// re-dispatch once approved. A non-positive `ttl` falls back to
     /// [`DEFAULT_TTL_SECONDS`] (a zero/negative TTL would mean "expire

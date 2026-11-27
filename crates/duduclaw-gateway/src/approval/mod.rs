@@ -433,7 +433,7 @@ impl ApprovalRecord {
     /// The instant this approval expires (created_at + ttl). `None` if
     /// `created_at` is unparseable — treated as "already expired" by
     /// [`is_stale`] (fail-closed).
-    fn expires_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) fn expires_at(&self) -> Option<DateTime<Utc>> {
         let created = DateTime::parse_from_rfc3339(&self.created_at).ok()?;
         Some(created.with_timezone(&Utc) + chrono::Duration::seconds(self.ttl_seconds))
     }

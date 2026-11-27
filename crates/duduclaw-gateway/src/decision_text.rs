@@ -132,7 +132,7 @@ pub(crate) async fn route_verified_text_reply(
     scope: crate::decision_notify::DecisionAccessScope<'_>,
     text: &str,
 ) -> Option<Result<String, String>> {
-    use crate::approval::{ApprovalBroker, ApprovalId, chat_admin::{press, receipts}};
+    use crate::approval::{ApprovalBroker, ApprovalId, chat_admin::press};
     let act = parse_decision_verb(text)?;
     let message_id = origin.message_id.as_deref()?;
     let home = ctx.home_dir.clone();
@@ -140,7 +140,7 @@ pub(crate) async fn route_verified_text_reply(
         Ok(Ok(broker)) => broker,
         _ => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
     };
-    let receipt = match receipts::lookup_message(&broker.store, &context.channel,
+    let receipt = match broker.lookup_chat_admin_receipt(&context.channel,
         &origin.account, &origin.dm, message_id).await {
         Ok(receipt) => receipt,
         Err(_) => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
