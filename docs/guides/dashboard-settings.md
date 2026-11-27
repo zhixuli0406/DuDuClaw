@@ -1,5 +1,19 @@
 # Dashboard settings map (v1.80.0)
 
+## Department and main employee access settings (Enterprise, v1.86.0)
+
+| Location | Controls and current availability |
+|---|---|
+| Manage → Members → department grants | Admin chooses an active Manager, department and schedules, automation rules, skills or usage. Outbound-data review is also an option, to be documented separately. The gateway supports saving grants; the Members-page editor still needs dashboard integration. |
+| Main AI employee → Who may use | Admin maintains the initially empty list for conversation and ordinary work. The gateway supports saving the list and explains when it is inactive; the dashboard control still needs integration. It grants access only in protected mode with isolated employee execution. Otherwise only Admins can use these entry points. |
+| Routines | A Manager with schedules access can filter by department and manage eligible routines, reminders and scheduled assignments. Creation is limited to prompt-only routines. Employees needing an Admin org sync are counted in a notice. Department automation editing and member read-only rule screens still need integration. |
+| Skills | Granted Managers can switch skills on or off, remove, restore and choose **Request installation** for an employee. Installation still requires Admin approval. |
+| Budget / billing → Department usage | Granted Managers can choose a department and 7, 30 or 90 days, then read per-employee usage, totals and recent records. They cannot change budgets through this grant. |
+
+Adding or widening a grant, or adding people to the main list, requires reading the risk note and ticking **I understand**. Changes are audited. Department grants apply only to signed-in dashboard sessions, not personal API keys or chat apps. They end automatically when the person stops being an active Manager. The main list warns that listed people may ask about memories, including Admin conversations; personal API keys can never use the main employee. Scheduling the main employee, creating employees and changing their settings stay Admin-only.
+
+See [Department managers](../features/79-department-managers.md) for exact permissions, rule execution limits, revocation and existing work. Company-wide analytics and billing summaries remain visible to all Managers.
+
 ## Skill archive recovery
 
 Automatic skill staleness and archiving have been removed. `[skill_curator]`
@@ -124,9 +138,9 @@ Automations are checked on the server for each record: employees can read their 
 
 New conversations show up to five recently submitted skills for the signed-in account, with short descriptions. Select one or more chips to insert `/skill-name` into the draft, then add your instructions and send. Selecting a chip sends nothing. The server records accepted chat/task submissions and filters the history by current skill access; this is not a claim that the AI finished executing the skill. Assign task uses the same history when that page is enabled.
 
-Non-Admin cron uses UTC schedules (a schedule that already carries a timezone without daylight saving, such as Asia/Taipei, also runs and stays editable) and requires a host-running agent with task sandbox disabled. Limits are 20 enabled jobs per user, 50 per agent, 20 creations per rolling hour and a minimum 15-minute interval. Add/update messages pass the chat input protection; denied messages are audited. The organization chart shows directly bound agents and your own department; out-of-scope ancestors expose only name and role. Admin behavior remains unchanged.
+Non-Admin cron schedules without an explicit timezone use the company time zone when it has no daylight saving; when it has daylight saving, member-created routines use UTC with a notice. The existing restriction to a host-running agent with task sandbox disabled remains. Limits are 20 enabled jobs per user, 50 per agent, 20 creations per rolling hour and a minimum 15-minute interval. Add/update messages pass the chat input protection; denied messages are audited. The organization chart shows directly bound agents and your own department; out-of-scope ancestors expose only name and role. Admin behavior remains unchanged.
 
-These limits also apply to human-origin schedules created or edited through MCP. Such MCP schedules default to UTC and accept an explicit timezone without daylight saving; timezones with daylight saving are refused, and an older schedule that has one is skipped until an Admin changes it. Skipped schedules show “Skipped” with an explanation on the Automations page, and administrators receive a one-time notification. Unmarked Admin/background schedules keep local-timezone detection. Manual runs allow 3 accepted attempts per schedule and 10 per account per 10 minutes, with at most 2 outstanding per account and 4 globally. Busy requests are rejected immediately. The manual-run window resets when the gateway restarts. Employee cron expressions are limited to 256 bytes.
+These limits also apply to human-origin schedules created or edited through MCP. For member-origin MCP routines without an explicit timezone, the company time zone is used when it has no daylight saving; otherwise the routine is stored in UTC with a notice. Explicit member time zones with daylight saving remain refused, and an older schedule that has one is skipped until an Admin changes it. Skipped schedules show “Skipped” with an explanation on the Automations page, and administrators receive a one-time notification. New Admin/background schedules without an explicit timezone use the company time zone, or UTC when it is unset or invalid. Existing schedules keep their stored behavior. Manual runs allow 3 accepted attempts per schedule and 10 per account per 10 minutes, with at most 2 outstanding per account and 4 globally. Busy requests are rejected immediately. The manual-run window resets when the gateway restarts. Employee cron expressions are limited to 256 bytes.
 
 Task board (`/tasks`), Goals (`/goals`) and Assign task (`/assign`) entry points are hidden for every role, including Admin and Personal. The sidebar’s primary button and the mobile centre ＋ start a new conversation; existing prefilled text becomes an unsent draft. `/assign` redirects to `/chat`. Direct links to `/tasks`, `/tasks/:id` and `/goals` still work under their existing permissions, including notification and task-card links. Tasks, schedules and backend APIs are unchanged. Responsibilities (`/responsibilities`) and Foresight (`/foresight`) retain their existing visibility and permissions.
 
@@ -196,6 +210,14 @@ Conversation storage (v1.81.0, Enterprise edition, Manage → Advanced → Membe
 - A save edits the file in place: only the keys you changed are rewritten. Comments, blank lines, key order and the formatting of every untouched key stay exactly as you wrote them, and a changed value keeps the comment at the end of its line. A new key goes at the end of its section and a new section at the end of the file. This holds for every settings page that writes `config.toml` or `inference.toml`, not only the Advanced config editor.
 - Keys that only take effect after a restart come back in `restart_required`. The Settings and Channels pages show "These settings take effect after the gateway restarts" until the gateway has restarted (you can also dismiss it). The Inference page and the employee edit page do not show this banner.
 - Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`, `dashboard.public_url`.
+
+## Settings → General → Company time zone (v1.86.0)
+
+Admins can set **Company time zone** in System settings → General (`[general] company_timezone`) to an IANA name such as `Asia/Taipei`. It is the default for new routines, scheduled assignments and chat schedules. Dashboard times, reminder confirmations, channel notices, AI wake-up context and data export calendar dates also use it. If unset or invalid, new schedules use UTC and confirmations say so; dashboard times use each viewer’s browser time zone.
+
+On the first v1.86 gateway start, if `config.toml` exists and the setting is absent, DuDuClaw fills it once from the host time zone and marks it **Filled in automatically, please confirm**. If detection fails it remains unset. It never detects again, including after an Admin clears the setting. Member-created routines in a company time zone with daylight saving are stored in UTC with a notice; the existing member time zone restriction remains. Existing schedules do not move: routines without a zone remain UTC, and pre-v1.86 scheduled assignments without a zone remain on the host time zone.
+
+Heartbeat `cron_timezone`, digest `timezone`, and proactive notification quiet-hours `[proactive] timezone` are separate settings; an empty value does not mean the company time zone.
 
 ## Settings → General → Dashboard public URL
 
@@ -418,13 +440,13 @@ member_credentials = true # default: false
 
 A missing key, unreadable configuration or non-boolean value disables personal connections. While disabled, `me.odoo.connect` and `me.odoo.test` refuse before contacting Odoo or decrypting a key. Identity selection skips personal credentials; person-key requests return `odoo_member_credentials_off`. Saved credentials remain stored, and members can still disconnect. Administrators can still list and revoke connections.
 
-The browser-only Admin RPC `odoo.member_credentials.set_enabled {enabled: bool}` returns `{enabled}`. It uses the locked, hash-checked, format-preserving config commit path. Before publishing the setting, it writes `odoo_member_credentials_toggled` with the live actor's user ID, the requested value and a timestamp. Audit failure aborts the change. Records with `phase: "before_commit"` are write-ahead intents: a subsequent config write failure may leave an intent without a completed change.
+The browser-only Admin RPC `odoo.member_credentials.set_enabled {enabled: bool, acknowledge_risk?: bool}` returns `{enabled}`. Enabling requires `acknowledge_risk=true`. It uses the locked, hash-checked, format-preserving config commit path. Before publishing the setting, it writes `odoo_member_credentials_toggled` with the live actor's user ID, the requested value and a timestamp. Audit failure aborts the change. Records with `phase: "before_commit"` are write-ahead intents: a subsequent config write failure may leave an intent without a completed change.
 
 `me.odoo.status` always includes `member_credentials_enabled`; `odoo.member_credentials.list` returns `{credentials: [...], enabled}`. Neither response includes secrets. Credentials are bound to the member's account credential epoch. A password reset or sign-out-everywhere that changes this epoch makes status report `needs_reverify` and prevents both use and testing of the old key. The member must enter the key again through `me.odoo.connect`. Suspended or deleted accounts cannot use stored credentials. Legacy rows without an epoch binding also require re-entry; the existing offboarding cleanup remains in place.
 
 ## Integrations → Odoo → Employee permissions
 
-Open an employee's edit page to choose allowed tables and add action rules. No checked tables means no additional table restriction; no action rules means no additional action restriction. Odoo's own ACLs, feature switches and the built-in sensitive-table block list still apply. Each rule chooses a table (or **All tables**) and actions: **Search and read** saves both `read` and `search`; **Create**, **Update**, **Delete**, **Button actions** and **Other methods** save `create`, `write`, `unlink`, `action` and `execute`. For generic `odoo_execute` calls, button actions cover `action_*`, `button_*` and `toggle_*` methods, such as confirm, validate and archive. Grant `action` for all tables or `action:sale.order` for one table; `execute` remains the category for other methods. The stored format remains bare verbs for all tables and `verb:model` for one table, for example `read:hr.employee` and `search:hr.employee`.
+In Engine mode, open an employee's edit page to choose allowed tables and add action rules. No checked tables means no additional table restriction; no action rules means no additional action restriction. Odoo's own ACLs, feature switches and the built-in sensitive-table block list still apply. Each rule chooses a table (or **All tables**) and actions: **Search and read** saves both `read` and `search`; **Create**, **Update**, **Delete**, **Button actions** and **Other methods** save `create`, `write`, `unlink`, `action` and `execute`. For generic `odoo_execute` calls, button actions cover `action_*`, `button_*` and `toggle_*` methods, such as confirm, validate and archive. Grant `action` for all tables or `action:sale.order` for one table; `execute` remains the category for other methods. The stored format remains bare verbs for all tables and `verb:model` for one table, for example `read:hr.employee` and `search:hr.employee`.
 
 Tables marked **Sensitive**, including `hr.employee`, require confirmation because they contain sensitive data. Confirming a selection in either the table list or an action rule automatically records the employee's exception to the block list; removing the last use removes that exception. There is no separate employee unblock field. `ir.model`, `ir.model.fields` and `ir.attachment` remain read-only even after confirmation. The global Odoo page provides sensitive-table checkboxes with the same confirmation; these apply to the global connection, while an employee override replaces the global exception list.
 
@@ -635,7 +657,7 @@ The persona you give at creation (the optional Persona box on the blank create f
 
 | Control | Writes | Effect |
 |---|---|---|
-| Chat assignment or RPC: once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins); the dashboard creation form is hidden | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
+| Chat assignment or RPC: once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins); the dashboard creation form is hidden | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the company time zone; when unset, the form temporarily uses the browser time zone and says so) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
 | Open `/goals` directly → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
 | **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
 
@@ -1091,3 +1113,32 @@ front-end code; call from your server. See the [member API contract](../api/memb
 | `approval_grants_mfa_enrollment` | `false`. Allows an administrator to grant first MFA enrollment explicitly when approving; one use within 72 hours. Enabling this key alone grants nothing. |
 
 Settings are reread at start, callback and completion. An unreadable or malformed config disables sign-in. Missing/wrong-type `enabled`, missing or blank acknowledgement fields, or an empty/invalid `allowed_hd` list disables it too; one malformed domain invalidates the entire list. Only exact `"direct"` selects direct creation; other approval values require admin approval. A missing cap uses 20; an invalid cap becomes zero and blocks new admissions. An invalid template blocks avatar creation without selecting a blank fallback. MFA preauthorization is enabled only by boolean `true`. The raw config editor can only disable sign-in, remove its acknowledgement or delete the section; it cannot enable or expand this feature.
+
+## Member-key and Odoo access settings (v1.86.0)
+
+These additions are configured through settings/RPCs; dashboard controls arrive with the dashboard update.
+
+| Section / key | Default and behavior |
+| --- | --- |
+| `[member_api_keys] allow_conversation_content` | `false`; permits creation with `include_conversations=true`. Does not remove existing grants. Pre-upgrade keys retain conversation access, labelled migrated. |
+| `[member_api_keys] allow_mcp_scopes` | `[]`; allowed values are `tasks:read`, `agents:status`, `odoo:read`, `odoo:write`. The effective MCP grant is the intersection with each key's scopes, checked live. |
+| `[odoo] member_credentials` | `false`; allows members to connect their own Odoo account. Enabling through `odoo.member_credentials.set_enabled` requires `acknowledge_risk=true`. |
+| `[odoo_access] permission_mode` | Default `"engine"`; alternatively `"follow_odoo_account"`. Follow applies only to personal identities and requires a valid acknowledgement; AI/company accounts retain Engine. |
+| `[odoo_access] permission_mode_ack` | Absent by default. Admin RPC records `{by, at}` with the actor and RFC 3339 timestamp. Missing or invalid acknowledgement falls back to Engine. |
+| `[odoo_access] company_key_agents` | `[]`; explicit list of AI employee IDs permitted to use the company account. |
+| `[odoo_access] company_key_agents_migrated` | Empty before migration; system-maintained completion marker. |
+| `[odoo_access] upgrade_notice_pending` | `false` by default; set to `true` by upgrade backfill. Clear using `dismiss_upgrade_notice=true` in the access RPC. |
+| `[odoo_access] always_refuse` | Default list below; applies in every mode. Removing a rule requires risk acknowledgement. Fixed F1–F5 refusals remain. |
+| `[odoo_access] attachment_max_mb` | `10` MiB, range 1–25; controls both source and encoded attachment size. |
+| Employee `[odoo] permission_override` | `"inherit"` by default, or `"engine"` / `"read_only"`; can only narrow policy. Unknown values become read-only. |
+| Employee `[odoo] act_as_requester` | `false`; opts into the verified requester's personal Odoo identity. Does not let an avatar borrow another person's account. |
+
+Default `always_refuse`: `unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`.
+
+Admin browser RPCs `odoo.access_get {}` and `odoo.access_set` read/update access settings. Set accepts `permission_mode`, `company_key_agents`, `always_refuse`, `attachment_max_mb`, `dismiss_upgrade_notice`, and `acknowledge_risk`. Selecting Follow, adding company-account AIs or removing refusal rules requires `acknowledge_risk=true`. Changes are audited; a failed audit refuses the write. Malformed policy refuses Odoo operations. Engine grants for the new dedicated tools require the target model explicitly in `allowed_models` and the exact `activity:<model>`, `note:<model>`, `message:<model>` or `attach:<model>` token in `allowed_actions`; empty lists grant none of these operations.
+
+When upgrading an installation with a configured company Odoo URL/database, a one-time backfill adds every existing regular AI without its own Odoo account to `company_key_agents`. It records the marker and upgrade notice without changing permission mode. AIs with an incomplete own Odoo account are not added and must be assigned by the admin. New AIs are never added automatically. Review this list after upgrading.
+
+Members manage their connection through browser-only `me.odoo.status`, `me.odoo.connect {login, api_key}`, `me.odoo.test {}` and `me.odoo.disconnect {}`. Read status first to see the current server/database; after a server change read it again in the same browser session before re-verifying. Connect and test share a limit of five attempts per minute per member, including failed/malformed attempts. Password changes, sign-out-everywhere and suspension require re-entering the key. Admins can list/revoke with `odoo.member_credentials.list` and `.revoke {user_id}`; they cannot enter another person's secret.
+
+Before downgrading to v1.85.x, remove `allow_conversation_content` and `allow_mcp_scopes` from `[member_api_keys]`. Older versions reject unknown keys in this section and disable all personal keys. v1.85 ignores `[odoo_access]` and falls back to the global Odoo account; the new company-account list and refusal policy do not protect a downgraded installation.

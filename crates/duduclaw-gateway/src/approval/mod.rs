@@ -138,6 +138,8 @@ pub(crate) mod decision_service;
 mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
+pub(crate) mod outbound;
+pub(crate) use outbound::{is_outbound_data_card, outbound_reviewer};
 mod action_guard;
 mod binding;
 mod fixture_decision;

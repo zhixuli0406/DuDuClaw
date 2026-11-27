@@ -79,6 +79,19 @@ impl Harness {
         self.mq.pending_messages(100).await.unwrap()
     }
 
+    async fn assert_scope_denied_notice(&self, outcome: &str, queued: usize) -> AutopilotRunRow {
+        let run = self.run().await;
+        assert_eq!(run.state, RUN_SETTLED);
+        assert_eq!(run.outcome.as_deref(), Some(outcome));
+        assert_eq!(self.queued().await.len(), queued);
+        assert!(!run.notice_pending);
+        assert_eq!(run.notice_push_state.as_deref(), Some("scope_denied"));
+        let notice_id = format!("run:{}:outcome", run.run_id);
+        assert!(!self.store.list_history(Some("r"), 100).await.unwrap().iter().any(|h| h.id == notice_id));
+        assert!(!self.tasks.list_activity(None, None, 100, 0).await.unwrap().0.iter().any(|a| a.id == notice_id));
+        run
+    }
+
     async fn assert_outcome(&self, outcome: &str, queued: usize) -> AutopilotRunRow {
         let run = self.run().await;
         assert_eq!(run.state, RUN_SETTLED);
@@ -96,7 +109,7 @@ impl Harness {
 
     async fn waiting(&self, engine: &AutopilotEngine) -> AutopilotRunRow {
         let rule = self.rule(flow()).await;
-        engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+        engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
         let run = self.run().await;
         assert_eq!(run.state, RUN_WAITING);
         assert_eq!(run.step_index, 2);
@@ -135,6 +148,7 @@ async fn full_flow_delegate_wait_delegate() {
     engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
     engine.resume_runs_once(now() + ChronoDuration::seconds(62)).await.unwrap();
     h.assert_outcome("completed", 2).await;
+    assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 2);
     let b = h.mq.get_by_id(&runs::queue_id(&run.run_id, 2)).await.unwrap().unwrap();
     assert_eq!(b.target, "other");
     assert!(b.payload.contains("凍結標題"));
@@ -164,7 +178,7 @@ async fn restart_mid_step_no_duplicate_enqueue() {
             let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
             let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][2],
                 &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
-            engine.perform_action_with_queue_id(&prepared, Some(&id), started).await.unwrap();
+            engine.perform_action_with_queue_id(&prepared, Some(&id), started, None).await.unwrap();
         }
         drop(engine);
         // New engine + reopened connections, retaining only durable state.
@@ -193,7 +207,7 @@ async fn notify_crash_settles_uncertain() {
         let engine = h.engine();
         let rule = h.rule(json!({"type":"steps","steps":[step,
             {"type":"delegate","target_agent":"plain","prompt":"never"}]})).await;
-        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
         let run = h.run().await;
         h.acquire();
         assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
@@ -226,7 +240,8 @@ async fn edit_during_wait_settles_stale() {
             _ => unreachable!(),
         }
         engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
-        h.assert_outcome(outcome, 1).await;
+        if outcome == "rule_removed" { h.assert_scope_denied_notice(outcome, 1).await; }
+        else { h.assert_outcome(outcome, 1).await; }
     }
 }
 
@@ -247,7 +262,7 @@ async fn non_lock_holder_never_advances() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     engine.resume_runs_once(now() + ChronoDuration::minutes(1)).await.unwrap();
     assert_eq!(h.run().await.state, RUN_PENDING);
     assert!(h.queued().await.is_empty());
@@ -267,7 +282,7 @@ async fn run_limit_enforced() {
     for i in 0..21 {
         let mut fields = fields();
         fields.insert("event_id".into(), json!(i));
-        engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields, now()).await.unwrap();
     }
     assert_eq!(h.store.list_runs_for_rule("r", 100).await.unwrap().len(), 20);
     assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 20);
@@ -282,7 +297,7 @@ async fn duplicate_event_creates_one_run() {
     let engine = h.engine();
     let rule = h.rule(flow()).await;
     for _ in 0..2 {
-        engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+        engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     }
     assert_eq!(h.run().await.state, RUN_PENDING);
     assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
@@ -312,7 +327,7 @@ async fn later_step_rechecks_active_window() {
         active_window: Some(Some(json!({"days":[5],"start":"09:00","end":"09:01","timezone":"UTC"}).to_string())),
         run_policy: None, owner_department: None, updated_by_user_id: None, updated_at: run_ts(now()),
     }).await.unwrap().unwrap();
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     assert_eq!(h.run().await.state, RUN_WAITING);
     engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
     h.assert_outcome("outside_window", 1).await;
@@ -327,7 +342,7 @@ async fn missing_skill_param_fails_step() {
         "type":"run_skill","target_agent":"plain","skill_name":"test",
         "params":{"order":"{{task.deadline_at}}"}
     }]})).await;
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     let run = h.assert_outcome("step_failed", 0).await;
     assert_eq!(run.detail.as_deref(), Some("param_missing:order"));
     let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
@@ -344,7 +359,7 @@ async fn gated_step_without_approval_service_is_blocked() {
     let rule = h.rule(json!({"type":"steps","steps":[{
         "type":"delegate","target_agent":"plain","prompt":"never","require_approval":true
     }]})).await;
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     let run = h.assert_outcome("blocked_no_approval_service", 0).await;
     assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
     assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
@@ -353,7 +368,7 @@ async fn gated_step_without_approval_service_is_blocked() {
 }
 
 #[tokio::test]
-async fn dept_rule_denied_until_predicate_wired() {
+async fn department_run_without_subject_denied_at_admission() {
     let h = Harness::new();
     h.acquire();
     let engine = h.engine();
@@ -363,16 +378,16 @@ async fn dept_rule_denied_until_predicate_wired() {
         updated_by_user_id: None, updated_at: run_ts(now()),
     }).await.unwrap().unwrap();
     // Trigger admission denies without a fire-counter increment or a run.
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await;
     assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
     assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 0);
-    let history = h.store.list_history(Some("r"), 100).await.unwrap();
-    assert_eq!(history[0].result, "scope_denied");
-    assert_eq!(history[0].details.as_deref(), Some("department_scope_unavailable"));
-    // Direct admission represents a persisted run awaiting the executor check.
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
-    let run = h.assert_outcome("scope_denied", 0).await;
-    assert_eq!(run.detail.as_deref(), Some("department_scope_unavailable"));
+    assert!(h.store.list_history(Some("r"), 100).await.unwrap().is_empty());
+    // Direct admission is guarded too, before a run or history can be created.
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
+    assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+    assert!(h.store.list_history(Some("r"), 100).await.unwrap().is_empty());
+    assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert!(h.queued().await.is_empty());
 }
 
 #[tokio::test]
@@ -380,7 +395,7 @@ async fn unknown_persisted_run_state_settles_unsupported() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     h.corrupt_run(&run.run_id, "state", "future_state");
     h.acquire();
@@ -393,7 +408,7 @@ async fn unreadable_frozen_fields_fail_closed() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     h.corrupt_run(&h.run().await.run_id, "fields_json", "[]");
     h.acquire();
     engine.resume_runs_once(now()).await.unwrap();
@@ -405,11 +420,11 @@ async fn deterministic_queue_id_requires_exact_delivery() {
     let h = Harness::new();
     let engine = h.engine();
     let id = runs::queue_id("test", 0);
-    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
-    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
-    assert!(engine.enqueue_prompt_with_id("other", "two", None, Some(&id), now()).await.is_err());
-    assert!(engine.enqueue_prompt_with_id("plain", "two", None, Some(&id), now()).await.is_err());
-    assert!(engine.enqueue_prompt_with_id("plain", "one", Some("explore".into()), Some(&id), now()).await.is_err());
+    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now(), None).await.unwrap();
+    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now(), None).await.unwrap();
+    assert!(engine.enqueue_prompt_with_id("other", "two", None, Some(&id), now(), None).await.is_err());
+    assert!(engine.enqueue_prompt_with_id("plain", "two", None, Some(&id), now(), None).await.is_err());
+    assert!(engine.enqueue_prompt_with_id("plain", "one", Some("explore".into()), Some(&id), now(), None).await.is_err());
     assert_eq!(h.queued().await.len(), 1);
 }
 
@@ -422,7 +437,7 @@ async fn recovery_queue_target_mismatch_fails_closed() {
     let started = now() + ChronoDuration::seconds(61);
     assert!(h.store.claim_run(&run.run_id, "crashed", started).await.unwrap());
     assert!(h.store.mark_step_running(&run.run_id, 2, "crashed", started).await.unwrap());
-    engine.enqueue_prompt_with_id("plain", "wrong recipient", None, Some(&runs::queue_id(&run.run_id, 2)), started).await.unwrap();
+    engine.enqueue_prompt_with_id("plain", "wrong recipient", None, Some(&runs::queue_id(&run.run_id, 2)), started, None).await.unwrap();
     engine.resume_runs_once(started + ChronoDuration::seconds(61)).await.unwrap();
     h.assert_outcome("step_failed", 2).await;
     assert!(h.queued().await.iter().all(|m| m.target == "plain"));
@@ -437,7 +452,7 @@ async fn proactive_suppression_skips_step_and_continues() {
         {"type":"proactive_notify","channel":"test","chat_id":"admin","text":"suppressed"},
         {"type":"delegate","target_agent":"plain","prompt":"continue"}
     ]})).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.assert_outcome("completed", 1).await;
     let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
     assert_eq!(steps[0].state, "skipped");
@@ -453,7 +468,7 @@ async fn later_step_rechecks_global_target_and_event_autonomy() {
         let rule = h.rule(flow()).await;
         let mut fields = fields();
         fields.insert("agent_id".into(), json!("plain"));
-        engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields, now()).await.unwrap();
         assert_eq!(h.run().await.state, RUN_WAITING);
         duduclaw_core::autonomy_gate::set_pause(&h.home, paused, "test pause", "admin").unwrap();
         engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
@@ -469,7 +484,7 @@ async fn run_skill_recovery_reconciles_or_requeues_once() {
         let rule = h.rule(json!({"type":"steps","steps":[{
             "type":"run_skill","target_agent":"plain","skill_name":"test"
         }]})).await;
-        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
         let run = h.run().await;
         h.acquire();
         assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
@@ -480,7 +495,7 @@ async fn run_skill_recovery_reconciles_or_requeues_once() {
             let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
             let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
                 &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
-            engine.perform_action_with_queue_id(&prepared, Some(&id), now()).await.unwrap();
+            engine.perform_action_with_queue_id(&prepared, Some(&id), now(), None).await.unwrap();
         }
         let restarted = h.engine();
         restarted.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
@@ -497,7 +512,7 @@ async fn oversized_fields_do_not_create_or_count_run() {
     let rule = h.rule(flow()).await;
     let mut fields = fields();
     fields.insert("oversized".into(), json!("x".repeat(crate::autopilot_approval::MAX_FROZEN_PAYLOAD_BYTES)));
-    engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields, now()).await.unwrap();
     assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
     assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 0);
     let history = h.store.list_history(Some("r"), 100).await.unwrap();
@@ -519,7 +534,7 @@ async fn malformed_stored_steps_fail_closed() {
         h.acquire();
         let engine = h.engine();
         let rule = h.rule(action).await;
-        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
         assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
         assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap()[0].result, "invalid_action");
         assert!(h.queued().await.is_empty());
@@ -550,8 +565,10 @@ async fn rule_change_after_render_prevents_step_start() {
                 _ => unreachable!(),
             }
         }));
-        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
-        let run = h.assert_outcome(outcome, 0).await;
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
+        let run = if outcome == "rule_removed" {
+            h.assert_scope_denied_notice(outcome, 0).await
+        } else { h.assert_outcome(outcome, 0).await };
         let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
         assert_eq!(steps[0].state, "pending");
         assert!(steps[0].started_at.is_none());
@@ -568,7 +585,7 @@ async fn running_wait_recovery_restores_deadline_or_settles_late() {
             {"type":"wait","minutes":60},
             {"type":"delegate","target_agent":"plain","prompt":"after wait"}
         ]})).await;
-        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
         let run = h.run().await;
         assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
         assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
@@ -597,7 +614,7 @@ async fn settlement_outbox_survives_restart_and_duplicate_audit_writes() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
     // Crash after the settlement transaction, before any announcement.
@@ -631,7 +648,7 @@ async fn run_notice_failed_push_retries_until_gave_up() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_PENDING], "execution_uncertain", None, now()).await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -670,7 +687,7 @@ async fn run_notice_no_target_stops_retrying() {
     let h = Harness::new();
     let engine = h.engine();
     let rule = h.rule(flow()).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_PENDING], "missed_late", None, now()).await.unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -725,7 +742,7 @@ impl Harness {
         let rule = self.rule(json!({"type":"steps", "steps":[{
             "type":"delegate", "target_agent":"plain", "prompt":"A {{task.title}}", "require_approval":true
         }]})).await;
-        engine.start_run(&rule, "task_created", &fields(), at).await.unwrap();
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), at).await.unwrap();
         let run = self.run().await;
         self.acquire();
         assert!(self.store.claim_run(&run.run_id, owner, at).await.unwrap());
@@ -778,7 +795,7 @@ impl Harness {
 
     async fn pending_approval(&self, engine: &AutopilotEngine, skill: bool, tail: bool) -> (AutopilotRunRow, ApprovalId) {
         let rule = self.rule(gated_flow(skill, tail)).await;
-        engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+        engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), Utc::now()).await;
         let run = self.run().await;
         assert_eq!(run.state, RUN_AWAITING_APPROVAL);
         assert_eq!(run.step_index, 1);
@@ -932,7 +949,7 @@ async fn duplicate_step_filing_reuses_one_card() {
 }
 
 #[tokio::test]
-async fn department_gated_run_never_files_approval() {
+async fn department_gated_run_without_subject_never_files_approval() {
     let h = Harness::new();
     h.acquire();
     let engine = h.approval_engine();
@@ -941,10 +958,11 @@ async fn department_gated_run_never_files_approval() {
         owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
         updated_by_user_id: None, updated_at: run_ts(Utc::now()),
     }).await.unwrap().unwrap();
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), Utc::now()).await;
     assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
-    engine.start_run(&rule, "task_created", &fields(), Utc::now()).await.unwrap();
-    h.assert_outcome("scope_denied", 0).await;
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), Utc::now()).await.unwrap();
+    assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+    assert!(h.store.list_history(Some("r"), 100).await.unwrap().is_empty());
     assert!(h.cards().await.is_empty());
 }
 
@@ -952,15 +970,19 @@ async fn department_gated_run_never_files_approval() {
 async fn approved_run_step_scope_denied_under_fence() {
     let h = Harness::new();
     let engine = h.approval_engine();
-    h.rule(gated_flow(false, false)).await;
+    let company_rule = h.rule(gated_flow(false, false)).await;
+    let at = Utc::now();
+    engine.start_run(EventOrigin::gateway(), &company_rule, "task_created", &fields(), at).await.unwrap();
     let rule = h.store.set_rule_extensions("r", &RuleExtensionsPatch {
         owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
         updated_by_user_id: None, updated_at: run_ts(Utc::now()),
     }).await.unwrap().unwrap();
     // Construct a bound ledger directly: admission must not be the check that
     // prevents execution in this test.
-    let at = Utc::now();
-    engine.start_run(&rule, "task_created", &fields(), at).await.unwrap();
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+        "UPDATE autopilot_runs SET owner_department='sales', rule_hash=?1 WHERE rule_id='r'",
+        [gate::rule_revision_hash(&rule)],
+    ).unwrap();
     let run = h.run().await;
     h.acquire();
     assert!(h.store.claim_run(&run.run_id, "fixture", at).await.unwrap());
@@ -981,10 +1003,12 @@ async fn approved_run_step_scope_denied_under_fence() {
         0, "fixture", at, StepApprovalBindMode::Filing).await.unwrap());
     h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
     engine.resume_approvals_once().await;
-    h.assert_outcome("scope_denied", 0).await;
+    assert_eq!(h.run().await.state, RUN_AWAITING_APPROVAL);
+    assert!(h.queued().await.is_empty());
+    assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
     let settled = h.step_dispatch(&run).await;
     assert_eq!(settled.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
-    assert_eq!(settled.detail.as_deref(), Some("scope_denied"));
+    assert_eq!(settled.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
 }
 
 #[tokio::test]
@@ -1080,7 +1104,7 @@ async fn gated_step_payload_refusal_fails_without_filing() {
         let rule = h.rule(json!({"type":"steps", "steps":[{
             "type":"delegate", "target_agent":"plain", "prompt":prompt, "require_approval":true
         }]})).await;
-        engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+        engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), Utc::now()).await;
         let run = h.assert_outcome("approval_error", 0).await;
         assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
         assert!(h.cards().await.is_empty());
@@ -1098,7 +1122,7 @@ async fn gated_skill_render_failure_fails_step_without_filing() {
         "type":"run_skill", "target_agent":"plain", "skill_name":"test",
         "params":{"order":"{{task.deadline_at}}"}, "require_approval":true
     }]})).await;
-    engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+    engine.fire_matched_rule_at(EventOrigin::gateway(), &rule, "task_created", &fields(), Utc::now()).await;
     let run = h.assert_outcome("step_failed", 0).await;
     assert_eq!(run.detail.as_deref(), Some("param_missing:order"));
     assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
@@ -1244,7 +1268,7 @@ async fn exact_enqueue_reuses_only_identical_masked_delivery() {
     use crate::message_queue::EnqueueOutcome;
     let h = Harness::new();
     let prompt = format!("Process sk-{}", "x".repeat(40));
-    let msg = AutopilotEngine::prompt_queue_message("other", &prompt, None, Some("exact-id"), now());
+    let msg = AutopilotEngine::prompt_queue_message("other", &prompt, None, Some("exact-id"), now(), None);
     assert_eq!(h.mq.enqueue_or_verify_exact(&msg).await.unwrap(), EnqueueOutcome::Inserted);
     let stored = h.mq.get_by_id(&msg.id).await.unwrap().unwrap();
     assert_ne!(stored.payload, prompt);
@@ -1252,7 +1276,7 @@ async fn exact_enqueue_reuses_only_identical_masked_delivery() {
     // A completed row still proves the identical delivery, without a new row.
     h.mq.complete(&msg.id, "done").await.unwrap();
     assert_eq!(h.mq.enqueue_or_verify_exact(&msg).await.unwrap(), EnqueueOutcome::AlreadyPresent);
-    h.engine().enqueue_prompt_with_id("other", &prompt, None, Some(&msg.id), now()).await.unwrap();
+    h.engine().enqueue_prompt_with_id("other", &prompt, None, Some(&msg.id), now(), None).await.unwrap();
     for field in ["target", "payload", "lane", "sender", "origin_agent", "sender_agent", "delegation_depth"] {
         let mut different = msg.clone();
         change_delivery(&mut different, field);
@@ -1279,7 +1303,7 @@ async fn recovery_queue_delivery_mismatch_fails_step() {
         let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][2],
             &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
         let FrozenAction::Delegate { target_agent, prompt, lane } = prepared else { panic!("delegate expected") };
-        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&id), started);
+        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&id), started, None);
         change_delivery(&mut conflict, field);
         h.mq.enqueue(&conflict).await.unwrap();
         h.engine().resume_runs_once(started + ChronoDuration::seconds(61)).await.unwrap();
@@ -1299,7 +1323,7 @@ async fn approved_step_queue_delivery_mismatch_fails_dispatch() {
         let frozen: FrozenDispatch = serde_json::from_str(&row.frozen_json).unwrap();
         let FrozenAction::Delegate { target_agent, prompt, lane } = frozen.action else { panic!("delegate expected") };
         let queue_id = runs::queue_id(&run.run_id, run.step_index);
-        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&queue_id), Utc::now());
+        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&queue_id), Utc::now(), None);
         change_delivery(&mut conflict, field);
         h.mq.enqueue(&conflict).await.unwrap();
         h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
@@ -1318,7 +1342,7 @@ async fn recovery_render_failure_cannot_accept_existing_queue_row() {
     let rule = h.rule(json!({"type":"steps","steps":[{
         "type":"run_skill","target_agent":"plain","skill_name":"test"
     }]})).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     h.acquire();
     assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
@@ -1326,7 +1350,7 @@ async fn recovery_render_failure_cannot_accept_existing_queue_row() {
     let action: Value = serde_json::from_str(&rule.action).unwrap();
     let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
         &fields(), &fields(), None).await.unwrap().unwrap();
-    engine.perform_action_with_queue_id(&prepared, Some(&runs::queue_id(&run.run_id, 0)), now()).await.unwrap();
+    engine.perform_action_with_queue_id(&prepared, Some(&runs::queue_id(&run.run_id, 0)), now(), None).await.unwrap();
     std::fs::remove_file(h.home.join("agents/plain/SKILLS/test.md")).unwrap();
     engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
     h.assert_outcome("step_failed", 1).await;
@@ -1341,7 +1365,7 @@ async fn recovery_matches_masked_frozen_prompt() {
     let rule = h.rule(json!({"type":"steps","steps":[{
         "type":"delegate","target_agent":"plain","prompt":prompt
     }]})).await;
-    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
     let run = h.run().await;
     h.acquire();
     assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
@@ -1351,7 +1375,7 @@ async fn recovery_matches_masked_frozen_prompt() {
     let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
         &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
     let id = runs::queue_id(&run.run_id, 0);
-    engine.perform_action_with_queue_id(&prepared, Some(&id), now()).await.unwrap();
+    engine.perform_action_with_queue_id(&prepared, Some(&id), now(), None).await.unwrap();
     let FrozenAction::Delegate { prompt, .. } = prepared else { panic!("delegate expected") };
     let stored = h.mq.get_by_id(&id).await.unwrap().unwrap();
     assert_ne!(stored.payload, prompt);
@@ -1359,4 +1383,190 @@ async fn recovery_matches_masked_frozen_prompt() {
     h.engine().resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
     h.assert_outcome("completed", 1).await;
     assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_DONE);
+}
+
+#[tokio::test]
+async fn persisted_runs_with_changed_department_settle_stale() {
+    for frozen in [false, true] {
+        let h = Harness::new();
+        let engine = h.engine();
+        let rule = h.rule(flow()).await;
+        // No gateway lock: persist a pending run without executing its first step.
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &fields(), now()).await.unwrap();
+        let run = h.run().await;
+        if frozen {
+            rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+                "UPDATE autopilot_runs SET owner_department='sales' WHERE run_id=?1", [&run.run_id],
+            ).unwrap();
+        } else {
+            h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+                owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+                updated_by_user_id: None, updated_at: run_ts(now()),
+            }).await.unwrap();
+        }
+        let before = h.store.list_history(Some("r"), 100).await.unwrap().len();
+        h.acquire();
+        engine.resume_runs_once(now()).await.unwrap();
+        assert_eq!(h.run().await.state, RUN_SETTLED);
+        assert_eq!(h.run().await.outcome.as_deref(), Some("stale_rule_changed"));
+        assert!(h.queued().await.is_empty());
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap().len(), before);
+        h.assert_scope_denied_notice("stale_rule_changed", 0).await;
+    }
+}
+
+
+async fn department_flow(h: &Harness, action: Value) -> AutopilotRuleRow {
+    use crate::dept_grants::rules::runtime_tests::employee;
+    employee(&h.home, "a1", "sales");
+    employee(&h.home, "plain", "sales");
+    employee(&h.home, "other", "sales");
+    let db = duduclaw_auth::UserDb::new(&h.home.join("users.db")).unwrap();
+    let owner = db.create_user("owner@example.invalid", "owner", "isolated-test-password",
+        duduclaw_auth::UserRole::Admin).unwrap();
+    h.rule(action).await;
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+        "UPDATE autopilot_rules SET created_by_user_id=?1 WHERE id='r'", [&owner.id]).unwrap();
+    h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: run_ts(now()),
+    }).await.unwrap().unwrap()
+}
+
+fn department_fields() -> serde_json::Map<String, Value> {
+    let mut fields = fields();
+    fields.get_mut("task").unwrap()["assigned_to"] = json!("a1");
+    fields
+}
+
+#[tokio::test]
+async fn department_run_step_denied_after_target_moves_mid_run() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &department_fields(), now()).await.unwrap();
+    assert_eq!(h.run().await.state, RUN_WAITING);
+    assert_eq!(h.queued().await.len(), 1);
+    crate::dept_grants::rules::runtime_tests::employee(&h.home, "other", "mfg");
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    let run = h.assert_outcome("scope_denied", 1).await;
+    assert_eq!(run.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+    assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn department_approval_resume_rechecks_moved_target() {
+    for moved in [false, true] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let rule = department_flow(&h, gated_flow(false, false)).await;
+        engine.start_run(EventOrigin::gateway(), &rule, "task_created", &department_fields(), Utc::now()).await.unwrap();
+        let run = h.run().await;
+        assert_eq!(run.state, RUN_AWAITING_APPROVAL);
+        assert_eq!(h.queued().await.len(), 1);
+        if moved { crate::dept_grants::rules::runtime_tests::employee(&h.home, "other", "mfg"); }
+        let cards = h.cards().await;
+        assert_eq!(cards.len(), 1);
+        h.broker().decide(&cards[0].id, true, "dashboard:admin").await.unwrap();
+        engine.resume_approvals_once().await;
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        let dispatch = h.step_dispatch(&run).await;
+        if moved {
+            assert_eq!(dispatch.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+            assert_eq!(dispatch.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+            assert_eq!(h.run().await.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+            assert_eq!(h.queued().await.len(), 1);
+        } else {
+            assert_eq!(dispatch.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+            h.assert_outcome("completed", 2).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn department_step_fence_rechecks_after_preparation() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    let home = h.home.clone();
+    *engine.after_claim_hook.lock().unwrap() = Some(Box::new(move || {
+        crate::dept_grants::rules::runtime_tests::employee(&home, "plain", "mfg");
+    }));
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &department_fields(), now()).await.unwrap();
+    let run = h.assert_outcome("scope_denied", 0).await;
+    assert_eq!(run.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+}
+
+#[tokio::test]
+async fn department_outboxes_settle_without_activity_or_push_after_owner_grant_revoked() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    let owner = rule.created_by_user_id.as_deref().unwrap();
+    let db = duduclaw_auth::UserDb::new(&h.home.join("users.db")).unwrap();
+    let admin = db.create_user("admin@example.invalid", "admin", "isolated-test-password",
+        duduclaw_auth::UserRole::Admin).unwrap();
+    rusqlite::Connection::open(h.home.join("users.db")).unwrap().execute(
+        "UPDATE users SET role='manager' WHERE id=?1", [owner]).unwrap();
+    db.set_dept_grants(&admin.id, owner, "sales", &[duduclaw_auth::dept_grants::GrantGroup::Automation], true).unwrap();
+    db.bind_channel_identity(owner, "line", "owner-dm", true).unwrap();
+    assert_eq!(crate::autopilot_scope::notice_targets(&h.home, &h.store, &rule.id, Some("sales"))
+        .await.unwrap(), Some(vec![("line".into(), "owner-dm".into())]));
+    // No gateway lease yet: neither the run nor either notice can execute.
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &department_fields(), now()).await.unwrap();
+    let run = h.run().await;
+    assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_PENDING], "execution_uncertain",
+        Some("private detail must not be published"), now()).await.unwrap());
+    let frozen = FrozenDispatch {
+        dispatch_id: "dept-outbox".into(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+        rule_hash: gate::rule_revision_hash(&rule), event: "task_created".into(),
+        event_ref: "t1".into(), source_agent: Some("a1".into()),
+        action: gate::FrozenAction::Delegate { target_agent: "plain".into(), prompt: "private".into(), lane: None },
+    };
+    let mut dispatch = frozen.ledger_row(&run_ts(now()), "department-notice");
+    dispatch.run_id = Some(run.run_id.clone());
+    dispatch.step_index = Some(0);
+    assert!(h.store.insert_dispatch(&dispatch).await.unwrap());
+    assert!(h.store.settle_dispatch(&dispatch.dispatch_id, DISPATCH_REQUESTING,
+        gate::RESULT_UNCERTAIN, "private detail must not be published", true, false).await.unwrap());
+    let pushes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = pushes.clone();
+    *engine.notice_pusher.lock().unwrap() = Some(Arc::new(move |_, _| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        gate::NoticePush::Sent
+    }));
+    db.set_dept_grants(&admin.id, owner, "sales", &[], true).unwrap();
+    h.acquire();
+    engine.announce_run_notices_once(now()).await.unwrap();
+    engine.announce_pending_notices().await;
+    let run = h.run().await;
+    assert!(!run.notice_pending);
+    assert_eq!(run.notice_push_state.as_deref(), Some("scope_denied"));
+    let dispatch = h.store.get_dispatch(&dispatch.dispatch_id).await.unwrap().unwrap();
+    assert!(!dispatch.notice_activity_pending);
+    assert_eq!(dispatch.notice_push_state.as_deref(), Some("scope_denied"));
+    assert!(h.tasks.list_activity(None, None, 100, 0).await.unwrap().0.is_empty());
+    assert_eq!(pushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Both outboxes stay settled on another sweep.
+    engine.announce_run_notices_once(now() + ChronoDuration::hours(1)).await.unwrap();
+    assert_eq!(engine.announce_pending_notices().await, 0);
+    assert_eq!(pushes.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_department_run_without_gateway_provenance_cannot_resume() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    engine.start_run(EventOrigin::gateway(), &rule, "task_created", &department_fields(), now()).await.unwrap();
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+        "UPDATE autopilot_runs SET gateway_origin=0", []).unwrap();
+    h.acquire();
+    engine.resume_runs_once(now()).await.unwrap();
+    assert_eq!(h.run().await.outcome.as_deref(), Some("scope_denied"));
+    assert!(h.queued().await.is_empty());
 }

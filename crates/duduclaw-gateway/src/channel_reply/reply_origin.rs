@@ -91,6 +91,7 @@ impl ReplyFailure {
         }
     }
     pub(super) fn stop_fallbacks(&self) -> bool {
+        if self.summary == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return true; }
         if crate::work_outcome::is_work_result(&self.summary) { return true; }
         if self.spawn_gate_message().is_some() { return true; }
         if self.runtime.as_ref().is_some_and(|failure| failure.preflight.is_some()) { return true; }

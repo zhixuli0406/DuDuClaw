@@ -1010,6 +1010,7 @@ async fn handle_message(
     let route = crate::googlechat_shared::route(
         &state.ctx, state.agent.is_some(), conversation, &sender_id, &text,
     ).await;
+    let member_turn = matches!(&route, crate::googlechat_shared::Route::Avatar(_));
     let (routed_agent, own_turn, called_turn) = match route {
         crate::googlechat_shared::Route::Legacy => (state.agent.clone(), state.agent.is_some(), false),
         crate::googlechat_shared::Route::Avatar(agent) => (Some(agent), true, false),
@@ -1323,7 +1324,11 @@ async fn handle_message(
                 &input_text, &state.ctx, agent, &session_id,
                 crate::ccr_runtime::reply_principal_for_sender(&sender_id), Some(on_progress),
             );
-            if own_turn {
+            if member_turn {
+                thinking.scope(crate::shared_app_route::member_turn(
+                    crate::trigger_route::as_own_bot_turn(reply),
+                )).await
+            } else if own_turn {
                 thinking.scope(crate::trigger_route::as_own_bot_turn(reply)).await
             } else {
                 thinking.scope(crate::trigger_route::as_called_turn(called_turn, reply)).await

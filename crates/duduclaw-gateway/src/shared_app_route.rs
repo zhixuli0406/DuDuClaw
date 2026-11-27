@@ -5,6 +5,15 @@ use std::sync::Arc;
 use crate::channel_reply::ReplyContext;
 use crate::trigger_route::SenderAccess;
 
+/// Execute only after a shared-app member's primary/avatar route was admitted
+/// through the WebChat main rule. Keep its final spawn and fallback under that
+/// rule; ordinary channel defaults and employee-owned bots do not call this.
+pub(crate) async fn member_turn<F: std::future::Future>(turn: F) -> F::Output {
+    crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+        crate::on_behalf_of::access::MainUse::Converse, Box::pin(turn),
+    ).await
+}
+
 /// Only authenticated event resource names are accepted, never an email alias,
 /// display name, bare numeric id or Google-account-derived identity.
 pub(crate) fn manual_googlechat_sender(home: &std::path::Path, sender: &str) -> SenderAccess {

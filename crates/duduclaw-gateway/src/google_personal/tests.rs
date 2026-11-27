@@ -127,6 +127,8 @@ async fn token(
     let (account, scope) = match who {
         code if code.strip_prefix("write-for-").is_some() => (code.strip_prefix("write-for-").unwrap(), format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "write-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", oauth::DRIVE_WRITE_SCOPE)),
+        "write-no-refresh-alice" | "write-no-scopes-alice" =>
+            ("alice", format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "write-bob" => ("bob", format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "chat-send-alice" => ("alice", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
         "chat-send-bob" => ("bob", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
@@ -139,12 +141,10 @@ async fn token(
         "drive-bob" => ("bob", format!("openid email {}", oauth::DRIVE_TOOLS_SCOPE)),
         _ => (who, "openid email https://www.googleapis.com/auth/gmail.readonly".into()),
     };
-    (
-        StatusCode::OK,
-        Json(
-            json!({"access_token":format!("access-{account}"),"refresh_token":format!("refresh-{account}"),"token_type":"Bearer","expires_in":3600,"scope":scope}),
-        ),
-    )
+    let mut response = json!({"access_token":format!("access-{account}"),"refresh_token":format!("refresh-{account}"),"token_type":"Bearer","expires_in":3600,"scope":scope});
+    if who == "write-no-refresh-alice" { response.as_object_mut().unwrap().remove("refresh_token"); }
+    if who == "write-no-scopes-alice" { response.as_object_mut().unwrap().remove("scope"); }
+    (StatusCode::OK, Json(response))
 }
 
 // Test-only adjacent Home fixture. The Personal endpoint keeps its exact
@@ -172,11 +172,11 @@ async fn bound_home_token(
     (
         StatusCode::OK,
         Json(
-            json!({"access_token":"owned-home-access","refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")}),
+            json!({"access_token":if code == "home-alice" { "access-alice" } else { "owned-home-access" },"refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")}),
         ),
     )
 }
-async fn bound_home_before_personal_capture(
+pub(super) async fn bound_home_before_personal_capture(
     f: &Fixture,
 ) -> (
     String,
@@ -223,10 +223,15 @@ async fn info(headers: HeaderMap) -> (StatusCode, Json<Value>) {
             Json(json!({"error":"fixture"})),
         );
     }
+    let sub = if !who.is_empty() && who.bytes().all(|b| b.is_ascii_digit()) {
+        who.to_owned()
+    } else {
+        format!("sub-{who}")
+    };
     (
         StatusCode::OK,
         Json(
-            json!({"sub":format!("sub-{who}"),"email":format!("{who}@c.test"),"email_verified":true,"hd":"c.test"}),
+            json!({"sub":sub,"email":format!("{who}@c.test"),"email_verified":true,"hd":"c.test"}),
         ),
     )
 }
@@ -477,6 +482,46 @@ async fn unknown_external_requester_needs_explicit_anyone_and_personal_consent_b
             "requester_refused"
         );
     }
+}
+
+#[tokio::test]
+async fn token_refresh_does_not_hold_authority_while_waiting_for_grant() {
+    use crate::google_identity::route::{self, GoogleTokenRouteState};
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    f.connect().await;
+    f.db.set_google_consent(&f.alice.id, "bot", true, &f.alice.id).unwrap();
+    let key = crate::google_identity::protection_gate(&f.home).unwrap();
+    let old = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    let secret = vault::Secret {
+        access_token: "expired".into(), refresh_token: Some("refresh-alice".into()), expires_at: Some(0),
+    };
+    assert!(vault::finish_refresh(&f.home, &key, &old.metadata, &secret).unwrap());
+    access::pinned_test::install(&f.home);
+    let held = grants::acquire(&f.home).await.unwrap();
+    let state = GoogleTokenRouteState::new(f.home.clone(), Some(f.db.clone()));
+    let requester = RequesterIdentity::DashboardUser { user_id: f.alice.id.clone() };
+    let refresh = tokio::spawn(async move { route::serve(&state, "bot", "gmail_read", &requester).await });
+    // Observe the real refresh boundary, not an assumed scheduling delay.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !access::pinned_test::events(&f.home).contains(&"token_refresh_waiting_for_grant") {
+            assert!(!refresh.is_finished(), "request must reach the refresh grant wait");
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("refresh did not reach the grant wait");
+    let coordinator = AuthorityCoordinator::new(&f.home);
+    let writer = tokio::task::spawn_blocking(move || coordinator.write());
+    let exclusive = tokio::time::timeout(Duration::from_secs(1), writer).await
+        .expect("refresh must release shared authority while waiting for the grant")
+        .unwrap().unwrap();
+    assert!(!refresh.is_finished());
+    drop(exclusive);
+    drop(held);
+    let value = tokio::time::timeout(Duration::from_secs(2), refresh).await.unwrap().unwrap().unwrap();
+    assert_eq!(value["access_token"], "access-alice");
+    access::pinned_test::remove(&f.home);
 }
 
 #[tokio::test]
@@ -1347,3 +1392,71 @@ async fn rejected_write_consent_and_local_disconnect_never_revoke_google() {
 
 #[path = "write_scope_tests.rs"]
 mod write_scope_tests;
+
+
+fn signin_link(f: &Fixture, sub: &str) {
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
+        "INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at)
+         VALUES(?1,?2,'c.test','login@c.test','self_link',?1,1)",
+        rusqlite::params![f.alice.id, sub],
+    ).unwrap();
+}
+
+async fn finish_signin_connection(f: &Fixture, code: &str) -> Result<Value, String> {
+    let start = flow::start(&f.home, &f.db, &f.alice.id, "login-a",
+        "http://127.0.0.1:18889", &[], true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, code).unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "login-a", state).await
+}
+
+#[tokio::test]
+async fn connection_sub_must_equal_signin_link() {
+    let f = Fixture::new();
+    signin_link(&f, "214001");
+    let error = finish_signin_connection(&f, "214002").await.unwrap_err();
+    assert_eq!(error, "google_signin_account_mismatch");
+    assert_eq!(flow::error_message(&error), "請用你登入 DuDuClaw 時使用的同一個公司 Google 帳號連線。");
+    assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
+    assert!(!crate::person_credentials::write_store::path(&f.home).exists());
+
+    finish_signin_connection(&f, "214001").await.unwrap();
+    let start = flow::start(&f.home, &f.db, &f.alice.id, "login-a",
+        "http://127.0.0.1:18889", &[], true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, "214002").unwrap();
+    let before = std::fs::read(vault::path(&f.home)).unwrap();
+    assert_eq!(flow::finish(&f.home, &f.db, &f.alice.id, "login-a", state).await.unwrap_err(), error);
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), before);
+}
+
+#[tokio::test]
+async fn connection_same_sub_allowed() {
+    let f = Fixture::new();
+    signin_link(&f, "214001");
+    finish_signin_connection(&f, "214001").await.unwrap();
+    let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert_eq!(record.metadata.google_sub, "214001");
+    let key = crate::google_identity::protection_gate(&f.home).unwrap();
+    assert_eq!(vault::unseal(&key, &record).unwrap().access_token, "access-214001");
+}
+
+#[tokio::test]
+async fn no_link_unchanged() {
+    let f = Fixture::new();
+    f.connect().await;
+    finish_signin_connection(&f, "bob").await.unwrap();
+    assert_eq!(vault::get(&f.home, &f.alice.id).unwrap().unwrap().metadata.google_sub, "sub-bob");
+}
+
+#[tokio::test]
+async fn link_lookup_failure_refuses() {
+    let f = Fixture::new();
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute_batch("DROP TABLE google_signin_links").unwrap();
+    let error = finish_signin_connection(&f, "alice").await.unwrap_err();
+    assert_eq!(error, "google_signin_link_lookup_failed");
+    assert_eq!(flow::error_message(&error), "目前無法確認你的 Google 登入帳號，沒有保存這次連線，請稍後再試。");
+    assert!(vault::get(&f.home, &f.alice.id).unwrap().is_none());
+    assert!(!crate::person_credentials::write_store::path(&f.home).exists());
+}

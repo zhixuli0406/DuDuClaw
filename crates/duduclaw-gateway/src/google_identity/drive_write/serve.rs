@@ -98,7 +98,7 @@ fn arg_error(error: ArgError) -> Refusal { Refusal::hard(error.code(), error.use
 fn unconfirmed() -> Refusal {
     Refusal::hard("result_unconfirmed", "結果無法確認，請先到 Google 檢查，沒有重送。")
 }
-fn not_sent() -> Refusal { Refusal::hard("not_sent", "這次操作沒有送出。") }
+fn not_sent() -> Refusal { Refusal::hard("not_sent", "這次雲端硬碟操作沒有送出，若仍需執行，請重新提出操作並完成確認。") }
 fn mode_text(mode: ApprovalMode) -> &'static str {
     match mode { ApprovalMode::None => "none", ApprovalMode::Member => "member", ApprovalMode::MemberAndAdmin => "member_and_admin" }
 }
@@ -124,8 +124,8 @@ fn require_scope(verdict: &scope::ScopeVerdict) -> Result<(), Refusal> {
     match verdict {
         scope::ScopeVerdict::InScope { .. } => Ok(()),
         scope::ScopeVerdict::OutOfScope { reason } => Err(Refusal::hard(reason.code(), reason.user_text())),
-        scope::ScopeVerdict::LimitExceeded => Err(Refusal::hard("folder_check_limit", "無法在這次操作中確認完整的資料夾範圍，沒有執行。")),
-        scope::ScopeVerdict::Failed => Err(Refusal::hard("scope_unconfirmed", "無法確認檔案所在的資料夾，沒有執行。")),
+        scope::ScopeVerdict::LimitExceeded => Err(Refusal::hard("folder_check_limit", "無法確認這次操作涉及的所有資料夾是否允許使用，沒有執行，請管理員檢查資料夾位置與存取權限。")),
+        scope::ScopeVerdict::Failed => Err(Refusal::hard("scope_unconfirmed", "無法確認檔案所在的資料夾，沒有執行，請帳號本人檢查檔案位置與存取權限。")),
     }
 }
 
@@ -138,15 +138,20 @@ fn policy_check(policy: &policy::DriveWritePolicy, action: DriveWriteAction) -> 
     };
     if !enabled { return Err(Refusal::hard("action_off", format!("管理員還沒開放 AI 在雲端硬碟{verb}。"))); }
     if matches!(action, DriveWriteAction::Move | DriveWriteAction::Trash) && policy.folders.is_empty() {
-        return Err(Refusal::hard("folder_required", "需要先限定資料夾"));
+        return Err(Refusal::hard("folder_required", "這項操作需要先限定可使用的資料夾，請管理員設定。"));
     }
     Ok(())
 }
-fn readiness_check(home: &Path, route: &IdentityRoute) -> Result<(), Refusal> {
+fn readiness_check(home: &Path, route: &IdentityRoute, agent: &str, tool: &str,
+    who: &RequesterIdentity, turn: Option<&str>) -> Result<(), Refusal> {
     match credential::readiness(home, route) {
         Readiness::Ready => Ok(()),
-        // RM-147's closed purpose table does not support drive_write yet.
-        Readiness::NeedsMemberConsent { .. } => Err(Refusal::hard("drive_write_needs_member_consent", "請到「我的連線」連結雲端硬碟寫入")),
+        Readiness::NeedsMemberConsent { user_id } => {
+            let message=crate::google_authorization_requests::turn::drive_write_notice(
+                home,agent,turn,who,&user_id,tool)
+                .unwrap_or_else(|| "這次沒有執行，請帳號本人到「我的連線」連結雲端硬碟並同意寫入權限。".into());
+            Err(Refusal::hard("drive_write_needs_member_consent",message))
+        }
         Readiness::NeedsHomeConsent => Err(Refusal::hard("drive_write_needs_home_consent", "公司 Google 帳號需要重新連結雲端硬碟寫入，請聯絡管理員。")),
         Readiness::NeedsAdminScope => Err(crate::google_identity::resolve::drive_write_admin_scope_missing()),
         Readiness::Unsupported => Err(Refusal::hard("drive_write_unsupported_identity", "這種 Google 連線方式不支援雲端硬碟寫入。")),
@@ -162,13 +167,13 @@ impl Snapshot {
         let policy = policy::load(home);
         policy_check(&policy, action)?;
         let route = credential::resolve_route(home, agent)?;
-        readiness_check(home, &route)?;
         let mode = policy.approval_for(action);
         credential::requester_check(&route, who, mode != ApprovalMode::None)?;
         if turn.is_none() && run.is_none() { return Err(changed()); }
         for id in [turn.as_deref(), run.as_deref()].into_iter().flatten() {
             if crate::knowledge::turn_requesters::lookup(agent, id).as_ref() != Some(who) { return Err(changed()); }
         }
+        readiness_check(home, &route, agent, tool, who, turn.as_deref())?;
         let (kind, account, record) = match &route {
             IdentityRoute::Personal { owner_user_id, account_email } => ("personal", account_email.clone(),
                 Some(crate::person_credentials::write_store::get(home, "user", owner_user_id)
@@ -412,7 +417,7 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
                 record.approval.approval_ids = approval_ids; record.approval.decided_by = decided_by;
             }
             ConfirmOutcome::Denied | ConfirmOutcome::Expired => return Err(not_sent()),
-            ConfirmOutcome::Approved { .. } | ConfirmOutcome::Unavailable => return Err(Refusal::hard("approval_unavailable", "目前無法送出確認，沒有執行。")),
+            ConfirmOutcome::Approved { .. } | ConfirmOutcome::Unavailable => return Err(Refusal::hard("approval_unavailable", "目前無法請帳號本人確認這項操作，沒有執行，請稍後再提出操作。")),
         }
     }
     // Do not hold authority or a mutex while waiting for a person. Reacquire
@@ -549,8 +554,8 @@ fn content_text(args: &ToolArgs) -> Option<&str> {
 
 fn read_attachment(home: &Path, agent: &str, turn: Option<&str>, who: &RequesterIdentity, file_name: &str) -> Result<program::AttachmentContent, Refusal> {
     const LIMIT: u64 = 5 * 1024 * 1024;
-    let invalid = || Refusal::hard("invalid_attachment", "只能上傳這次對話的附件");
-    let too_large = || Refusal::hard("content_too_large", "這個檔案超過 5 MB，這一版不能上傳。");
+    let invalid = || Refusal::hard("invalid_attachment", "這次沒有上傳，請在這次對話中提供要上傳的附件。");
+    let too_large = || Refusal::hard("content_too_large", "這個檔案超過 5 MB，無法上傳，請提供較小的檔案。");
     args::attachment_name(file_name).map_err(|_| invalid())?;
     if !duduclaw_core::is_valid_agent_id(agent) { return Err(invalid()); }
     let dir = home.join("agents").join(agent).join("attachments");

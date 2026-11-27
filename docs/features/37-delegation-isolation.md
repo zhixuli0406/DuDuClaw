@@ -505,3 +505,5 @@ If another employee's settings must change (e.g. a lead adjusting a report's dep
 3. **Capabilities and permissions** — dashboard "AI employees → advanced settings" or the MCP `agent_update` tool (admin verification required)
 
 These channels all embody human decisions and cannot be bypassed by employee self-service.
+
+Administrator AI settings changes use the dashboard administration path after the proposing administrator confirms the card. They do not use AI-to-AI delegation, so delegation policy does not grant or restrict this write path. The separate `agent_update` limits still apply under every policy. See [Administrator AI settings](79-admin-ai-settings.md).

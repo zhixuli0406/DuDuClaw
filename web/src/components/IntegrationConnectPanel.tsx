@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
@@ -86,6 +87,7 @@ export function IntegrationConnectPanel({
   hideRedirect = false,
 }: IntegrationConnectPanelProps) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const t = useCallback((suffix: string) => intl.formatMessage({ id: `${prefix}.${suffix}` }), [intl, prefix]);
   const [state, setState] = useState<PanelState>({
     conn: 'loading',
@@ -538,7 +540,7 @@ export function IntegrationConnectPanel({
               <p className="text-xs text-muted-foreground">
                 {intl.formatMessage(
                   { id: `${prefix}.connected.expires` },
-                  { date: new Date(state.expiresAt).toLocaleString() },
+                  { date: formatDateTime(state.expiresAt, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) },
                 )}
               </p>
             )}

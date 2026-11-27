@@ -615,6 +615,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo:write",
         "odoo",
     ),
+    ("odoo_message_send", "Send a message on an Odoo record", "odoo:write", "odoo"),
+    ("odoo_attachment_add", "Attach a conversation file to an Odoo record", "odoo:write", "odoo"),
     // ── Odoo: execute (odoo:execute) ─────────────────────────────────────
     (
         "odoo_sale_confirm",

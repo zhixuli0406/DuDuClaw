@@ -371,6 +371,45 @@ select `third_party_mcp_tests::isolated_spawn_regression` in the
 process (including Rust stdio children); without a binary it prints an explicit
 SKIP. Its process helpers are registered in `scripts/ci/privileged_effects.json`.
 
+## Google Drive write: RM-131 P15
+
+With Node 22+, macOS `sandbox-exec`, `sqlite3`, and an already-built debug
+binary with `--features live-test-mocks`, run from the repository root:
+
+```bash
+node --check scripts/live-test/google-drive-write.mjs
+node scripts/live-test/google-drive-write.mjs /path/to/mock-debug-duduclaw
+```
+
+The sibling driver leaves the historical delegated identity probe unchanged.
+It uses `make-home.sh`, temporary `HOME` and `DUDUCLAW_HOME`, a disposable signed
+Enterprise entitlement, the legacy MFA upgrade fixture, and a production-shaped
+employee with the `mcp__duduclaw__*` allowlist. A local fake Claude launches real
+stdio MCP calls within authenticated WebChat turns, including an admitted
+current-turn attachment. No installed model CLI or real Google credential is
+used. Google issuer/REST traffic uses the existing mock-base environment seam,
+including the new write transport; a loopback-only process sandbox also denies
+any accidental external request. The remote Drive MCP control uses a local
+HTTP MCP server and a local fake model tool loop.
+
+Design §7 rows **3–8, 10, 11** assert tampered consent hiding/refusal, delegated
+multipart upload and confirmed audit, three folder refusals with GET-only
+traffic, exact trash PATCH, empty-folder move refusal, member approval/cancel/
+changed-filename invalidation, separate personal write OAuth consent and read
+scopes, and overgranted refresh refusal at the signed token broker and remote
+MCP mount. Row 8 decides real member cards using `me.google.write_confirm`;
+Telegram/LINE/Google Chat delivery and buttons are not exercised. Row 11 first
+executes the mounted read tool as a positive control, then checks that the
+rejected connection cannot even initialize/list/call the remote MCP.
+
+Every mock request records method, path, query and body. Global assertions
+require zero DELETE requests and no Google bearer in captured stdio/HTTP MCP
+messages. Artifacts (requests, MCP wire, scenario results, mock failures and
+gateway logs) remain in the printed temporary directory; issuer bodies contain
+only disposable fixture grants. This script was syntax-checked only during
+implementation: it has not been live-run. Other §7 rows and real Google,
+external bots, native Linux and Windows acceptance are outside this driver.
+
 ## Company Google sign-in (RM-214 P20)
 
 Requires Node 22+, `sqlite3`, and an already-built debug `live-test-mocks`

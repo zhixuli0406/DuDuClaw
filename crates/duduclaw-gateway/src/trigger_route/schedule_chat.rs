@@ -134,9 +134,13 @@ pub(crate) async fn create(
         return at::usage(lang).to_string();
     };
     let now = Utc::now();
-    // Chat times are read in the gateway host's zone (the confirmation
-    // shows the time it understood).
-    let zone = Zone::Local;
+    let choice = duduclaw_core::company_timezone::default_for_new_schedule(
+        &duduclaw_core::company_timezone::read(home), false, now,
+    );
+    let Some(tz) = duduclaw_core::parse_timezone(&choice.zone) else {
+        return at::failed(lang).to_string();
+    };
+    let zone = Zone::Named(tz);
     let Ok(schedule) = natural::parse_natural(when, now, zone) else {
         return t::when_usage(lang).to_string();
     };
@@ -170,7 +174,7 @@ pub(crate) async fn create(
         kind: AssignKind::Goal,
         payload,
         spec: schedule.clone(),
-        timezone: None,
+        timezone: Some(choice.zone.clone()),
         created_via: caller.channel.to_string(),
         source: Some(crate::chat_commands::source_from_session(
             caller.conversation,
@@ -185,6 +189,8 @@ pub(crate) async fn create(
                     agent_name: &spec.agent_name,
                     when: &t::describe(lang, &schedule, zone),
                     next: &next,
+                    zone: &choice.zone,
+                    zone_source: choice.source,
                     short_id: &duduclaw_core::truncate_chars(&row.id, 8),
                     description: &duduclaw_core::truncate_chars(&description, 200),
                     boundary_ignored,
@@ -272,8 +278,9 @@ fn list_text(home: &Path, lang: Lang, rows: &[AssignScheduleRow]) -> String {
             .map(|s| t::describe(lang, &s, zone))
             .unwrap_or_default();
         let next = next_text(r, zone);
+        let zone_name = t::zone_name(lang, r.timezone.as_deref());
         out.push_str(&format!(
-            "\n• #{} 【{}】{when}｜{}｜{}",
+            "\n• #{} 【{}】{when}（{zone_name}）｜{}｜{}",
             duduclaw_core::truncate_chars(&r.id, 8),
             agent_name(home, &r.agent_id),
             duduclaw_core::truncate_chars(&r.title, 40),

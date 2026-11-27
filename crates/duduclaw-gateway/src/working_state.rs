@@ -745,13 +745,10 @@ fn read_history_tail(state_dir: &Path, limit: usize) -> Vec<serde_json::Value> {
     rows
 }
 
-/// Local-time display ("MM-DD HH:MM") for injected lines.
-fn display_time(ts: &str) -> String {
+/// Company-zone display ("MM-DD HH:MM" with a zone label) for injected lines.
+fn display_time(company: &duduclaw_core::company_timezone::CompanyZone, ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt
-            .with_timezone(&chrono::Local)
-            .format("%m-%d %H:%M")
-            .to_string(),
+        Ok(dt) => duduclaw_core::company_timezone::format_local(company, dt.with_timezone(&chrono::Utc), "%m-%d %H:%M"),
         Err(_) => truncate_chars(ts, 16),
     }
 }
@@ -784,19 +781,20 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 
     // Byte budget: drop oldest-updated entries first, keep alphabetical
     // render order for the survivors (deterministic bytes).
+    let company = duduclaw_core::company_timezone::read(home_dir);
     let mut lines: Vec<(String, String)> = Vec::new(); // (updated_at, line)
     for (key, e) in live.drain(..) {
         let expiry = e
             .expires_at
             .as_deref()
-            .map(|x| format!("；有效至 {}", display_time(x)))
+            .map(|x| format!("；有效至 {}", display_time(&company, x)))
             .unwrap_or_default();
         lines.push((
             e.updated_at.clone(),
             format!(
                 "- {key} = {}（{} 設；理由：{}{expiry}）",
                 one_line(&e.value),
-                display_time(&e.updated_at),
+                display_time(&company, &e.updated_at),
                 one_line(&e.reason),
             ),
         ));
@@ -804,7 +802,7 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
     let handoff_line = handoff.map(|h| {
         let base = format!(
             "交接註記（{} 留）：{}",
-            display_time(&h.updated_at),
+            display_time(&company, &h.updated_at),
             one_line(&h.note)
         );
         // H8: when the handoff carries a structured Ralph-style report,
@@ -869,6 +867,16 @@ pub fn build_working_state_section(home_dir: &Path, agent_id: &str) -> Option<St
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn display_time_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let ts = "2026-11-27T01:30:00Z";
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 01:30 UTC");
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 09:30 CST");
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), "bad timestamp"), "bad timestamp");
+    }
     use super::*;
 
     #[tokio::test]

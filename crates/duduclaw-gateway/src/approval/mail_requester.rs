@@ -252,7 +252,7 @@ pub(crate) mod tests {
             assert!(!eligible(f.home.path(), &rec));
             assert!(crate::approval_notify::is_dashboard_only_record(Some(f.home.path()), &rec));
             for reminder in [false, true] {
-                let notice = crate::approval_notify::dashboard_only_notice_body(&rec, reminder);
+                let notice = crate::approval_notify::dashboard_only_notice_body(f.home.path(), &rec, reminder);
                 for secret in ["recipient@example.com", "A real subject", "Mail body"] { assert!(!notice.contains(secret)); }
             }
             assert!(f.broker.decide_bound(&id, &context, true).await.is_err());

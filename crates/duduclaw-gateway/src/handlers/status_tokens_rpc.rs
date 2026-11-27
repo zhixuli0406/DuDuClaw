@@ -207,7 +207,7 @@ impl MethodHandler {
             .ok_or_else(|| "task store not initialized".to_string())?;
         let principal = crate::trigger_route::assign::principal_for_user(&reader.user_id)
             .ok_or_else(|| "status reader has no principal".to_string())?;
-        let (today, window) = day_bounds(Utc::now());
+        let (today, window) = day_bounds(&self.home_dir, Utc::now());
         let rows = store
             .status_rows_for_principal(&ids, today, window, &principal)
             .await?;

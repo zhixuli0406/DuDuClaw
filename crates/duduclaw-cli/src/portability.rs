@@ -226,9 +226,6 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
     }
     let decision = validate_import_policy(&mut snapshot, home, personal)?;
     apply_import_snapshot(&mut snapshot, home, force, &decision, |_| Ok(()))?;
-    if decision.removed_drive_write {
-        println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
-    }
     Ok(())
 }
 
@@ -331,6 +328,9 @@ fn apply_import_snapshot_with_limits(
     // or identity data; per-entry checks still guard subsequent changes.
     if decision.publish_before_unpack {
         publish_import_config(home, &decision.prepared_config)?;
+        if decision.removed_drive_write {
+            println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
+        }
     }
     if has_agents {
         let backup = home.join("agents.pre-import");

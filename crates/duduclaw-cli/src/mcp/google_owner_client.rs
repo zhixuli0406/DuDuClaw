@@ -76,7 +76,7 @@ pub(crate) async fn execute(home: &Path, tool: &str, args: &Value) -> Value {
         ROUTE, request_timeout(tool, false), 512 * 1024).await {
         Ok(value) => value.get("result").cloned().unwrap_or_else(|| super::tool_error("Google 結果無法確認。")),
         // Transport failure after dispatch never asserts non-execution.
-        Err(error) => super::tool_error(&format!("Google 結果無法確認（result_unconfirmed）；請先檢查 Google，勿直接重試。{error}")),
+        Err(error) => super::tool_error(&format!("Google 結果無法確認，請先檢查 Google，勿直接重試。{error}")),
     }
 }
 

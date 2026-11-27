@@ -90,3 +90,24 @@ pub(crate) fn bind_generation(home:&Path,agent:&str,id:&str,generation:Option<St
         }
     }
 }
+
+/// Only host-registered ingress facts may create a write-consent request.
+/// A signed tool caller supplies neither the task text nor the destination.
+pub(crate) fn drive_write_notice(home:&Path,agent:&str,turn_id:Option<&str>,
+    requester:&RequesterIdentity,user:&str,tool:&str) -> Option<String> {
+    if !duduclaw_core::google_identity::is_drive_write_tool(tool) { return None; }
+    let turn=turns().lock().ok()?.get(&(home.into(),agent.into(),turn_id?.into()))?.clone();
+    if &turn.requester!=requester { return None; }
+    let member=match &turn.requester {
+        RequesterIdentity::DashboardUser {user_id} => user_id,
+        RequesterIdentity::ChannelUser {user_id:Some(id),..} => id,
+        _ => return None,
+    };
+    if member!=user { return None; }
+    let db=crate::decision_notify::open_user_db(home).ok()??;
+    let notice=super::issue_for_turn(home,&db,agent,tool,&turn.text,&turn.session,
+        &turn.requester,turn.source,turn.generation).ok()??;
+    if notice==super::DASHBOARD_HINT { return None; }
+    let link=super::render::ticket_url(&notice)?;
+    Some(format!("請本人開啟這個連結，連結雲端硬碟寫入：{link}"))
+}

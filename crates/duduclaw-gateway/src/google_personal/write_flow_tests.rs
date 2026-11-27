@@ -43,6 +43,53 @@ async fn write_start_requires_policy_acknowledgements_and_connected_ordinary_acc
 }
 
 #[tokio::test]
+async fn write_start_alone_persists_ever_granted_without_write_credential() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    assert!(!write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    let ordinary = std::fs::read(vault::path(&f.home)).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    assert!(start["authorization_url"].as_str().is_some());
+    assert!(write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn write_finish_account_mismatch_after_exchange_retains_ever_granted() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let ordinary = std::fs::read(vault::path(&f.home)).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    assert!(finish(&f, &start, "write-bob").await.unwrap_err().contains("原本連結"));
+    assert!(write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn ordinary_only_member_keeps_ever_granted_false() {
+    let f = Fixture::new();
+    enable_write(&f);
+    f.connect().await;
+    assert!(!write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(!write_store::path(&f.home).exists());
+}
+
+#[tokio::test]
+async fn write_start_fails_when_marker_cannot_be_persisted() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let file = write_store::path(&f.home);
+    std::fs::create_dir(&file).unwrap();
+    assert!(start_write(&f, true, true).await.is_err());
+    assert!(file.is_dir());
+}
+
+#[tokio::test]
 async fn write_url_requests_only_five_scopes_without_merging() {
     let f = Fixture::new();
     f.connect().await;
@@ -180,4 +227,60 @@ async fn write_finish_rechecks_policy_client_user_and_ordinary_connection() {
         assert_eq!(std::fs::read(write_store::path(&f.home)).unwrap(), before);
         assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
     }
+}
+
+
+#[tokio::test]
+async fn write_connection_refuses_signin_link_mismatch_without_replacing_credentials() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let start = start_write(&f, true, true).await.unwrap();
+    finish(&f, &start, "write-alice").await.unwrap();
+    // Model a legacy ordinary connection that differs from the sign-in link.
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
+        "INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at)
+         VALUES(?1,'214001','c.test','login@c.test','self_link',?1,1)",
+        [&f.alice.id],
+    ).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    let ordinary_before = std::fs::read(vault::path(&f.home)).unwrap();
+    let write_before = std::fs::read(write_store::path(&f.home)).unwrap();
+    assert_eq!(finish(&f, &start, "write-alice").await.unwrap_err(), "google_signin_account_mismatch");
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary_before);
+    assert_eq!(std::fs::read(write_store::path(&f.home)).unwrap(), write_before);
+}
+
+#[tokio::test]
+async fn authorization_request_drive_write_finishes_only_in_write_vault() {
+    use crate::google_authorization_requests::{self as requests, store::Store};
+    use duduclaw_knowledge::requester::RequesterIdentity;
+    let f=Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let ordinary=std::fs::read(vault::path(&f.home)).unwrap();
+    let who=RequesterIdentity::DashboardUser {user_id:f.alice.id.clone()};
+    let notice=requests::issue_for_turn(&f.home,&f.db,"bot","drive_create_file","Create a file",
+        "webchat:write-test",&who,None,None).unwrap().unwrap();
+    let ticket=notice.split_once("#ticket=").unwrap().1;
+    let preview=requests::routes::preview(&f.home,&f.db,&f.alice.id,ticket).unwrap();
+    assert_eq!(preview["purpose"],"drive_write");
+    assert!(preview["services"].as_array().unwrap().iter().any(|s| s==oauth::DRIVE_WRITE_SCOPE));
+    let session=uuid::Uuid::new_v4().to_string();
+    let start=requests::routes::confirm(&f.home,&f.db,&f.alice.id,&session,ticket,
+        "http://127.0.0.1:18889",true,true,true).await.unwrap();
+    let state=start["state"].as_str().unwrap();
+    let request=Store::open(&f.home).unwrap().oauth(state,&f.alice.id,&session).unwrap().unwrap();
+    let old=vault::get(&f.home,&f.alice.id).unwrap().unwrap().metadata;
+    assert!(requests::routes::complete(&f.home,&f.db,request,Some(&old)).is_err());
+    assert!(Store::open(&f.home).unwrap().ready_rows().unwrap().is_empty());
+    pending::receive_code(&f.home,state,"write-alice").unwrap();
+    flow::finish(&f.home,&f.db,&f.alice.id,&session,state).await.unwrap();
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(),ordinary);
+    let write=write_store::get(&f.home,"user",&f.alice.id).unwrap().unwrap().metadata;
+    assert_eq!(write.google_sub,"sub-alice");
+    let ready=Store::open(&f.home).unwrap().ready_rows().unwrap();
+    assert_eq!(ready.len(),1);
+    assert_eq!(ready[0].1["credential_id"],write.credential_id);
+    assert_eq!(ready[0].1["purpose"],"drive_write");
 }

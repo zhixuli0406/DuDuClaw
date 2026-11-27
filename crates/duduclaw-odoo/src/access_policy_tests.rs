@@ -144,7 +144,7 @@ fn fixed_refusals_and_exemptions() {
             assert_eq!(fixed_refusal(&op(Generic, model, "read", Verb::Read)), None);
         }
     }
-    for model in ["res.users.apikeysx", "res.users.apikeys_extra", "x.res.users.apikeys", "ir.modelx", "mail.mailx"] {
+    for model in ["res.users.apikeysx", "res.users.apikeys_extra", "x.res.users.apikeys", "ir.modelx", "mailing.mail"] {
         assert_eq!(fixed_refusal(&op(Generic, model, "write", Verb::Write)), None);
     }
     for method in ["message_post", "message_notify", "message_subscribe", "send_mail", "action_send_mail"] {
@@ -373,4 +373,33 @@ fn user_messages_are_plain_and_stable() {
     assert_eq!(list_refusal_message("刪除資料"), "公司設定的『一律不允許』清單不允許 AI 做這件事（刪除資料）。");
     assert_eq!(not_connected_message(true), "你還沒有連接自己的 Odoo 帳號，請到『我的連線』連接。");
     assert_eq!(not_connected_message(false), "這位 AI 員工沒有連接 Odoo，請管理員到 Odoo 設定指定帳號。");
+}
+
+#[test]
+fn fixed_model_families_are_segment_aware_in_every_mode() {
+    for access in [OdooAccessConfig::default(), follow_config()] {
+        for model in ["ir.model", "ir.model.data", "ir.model.constraint", "ir.model.fields.selection",
+            "ir.rule", "mail.template", "mail.message", "mail.any.future_model"] {
+            for method in ["create", "write", "unlink", "action_send_customer_email", "unknown_method"] {
+                let operation = op(ToolKind::Generic, model, method, method_verb(method));
+                assert!(fixed_refusal(&operation).is_some(), "{model}.{method} {:?}", access.permission_mode);
+            }
+            assert_eq!(fixed_refusal(&op(ToolKind::Generic, model, "read", Verb::Read)), None);
+        }
+    }
+    for model in ["ir.models", "ir.modeling.data", "mailing.message", "mailbox.template"] {
+        assert_eq!(fixed_refusal(&op(ToolKind::Generic, model, "write", Verb::Write)), None);
+    }
+    for kind in [ToolKind::Activity, ToolKind::Note, ToolKind::Message] {
+        assert_eq!(fixed_refusal(&op(kind, "crm.lead", "message_post", Verb::Message)), None);
+    }
+}
+
+#[test]
+fn upgrade_notice_flag_is_strict_and_defaults_off() {
+    assert!(!OdooAccessConfig::parse_config_toml("").unwrap().upgrade_notice_pending);
+    let config = OdooAccessConfig::parse_config_toml("[odoo_access]\nupgrade_notice_pending=true\n").unwrap();
+    assert!(config.upgrade_notice_pending);
+    assert_eq!(config.permission_mode, PermissionMode::Engine);
+    assert!(OdooAccessConfig::parse_config_toml("[odoo_access]\nupgrade_notice_pending='yes'\n").is_err());
 }

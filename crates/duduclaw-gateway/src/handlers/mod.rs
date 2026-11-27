@@ -137,7 +137,9 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod skill_trust_rpc;
 mod odoo_member_rpc;
+mod odoo_access_rpc;
 mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
@@ -228,6 +230,8 @@ mod approvals_decide;
 pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
+mod autopilot_department_rpc;
+mod autopilot_affecting_rpc;
 mod ticks_rpc;
 mod os_rpc;
 mod redaction_status_rpc;
@@ -784,6 +788,10 @@ impl MethodHandler {
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route
         // before extension dispatch so no plugin sees a freshly issued one.
+        // Pin parameters contain fresh credentials; never pass them to extensions.
+        if method.split('.').next() == Some("skill_trust") {
+            return boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await;
+        }
         if member_keys_rpc::owns(method) {
             return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx, conn)).await;
         }

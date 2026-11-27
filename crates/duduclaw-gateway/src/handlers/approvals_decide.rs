@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows};
 
 impl MethodHandler {
     pub(crate) async fn handle_approvals_decide(
@@ -150,14 +151,17 @@ impl MethodHandler {
                     return frame;
                 }
             }
-            if let Err(error) = self.authorize_egress_decider(r, ctx) {
+            if let Err(error) = self.authorize_egress_decider(r, ctx).await {
                 return WsFrame::error_response("", &error);
             }
             // Reject hidden-payload guesses before any digest-dependent outcome,
             // including expired cards and specialized decision paths.
             if params.get("expected_digest").is_some() {
+                // Outbound reviewers can obtain the full card/digest through get.
+                let full_outbound = crate::approval::is_outbound_data_card(r)
+                    && self.authorize_egress_decider(r, ctx).await.is_ok();
                 let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx);
-                if fresh.as_ref().map_or(true, |fresh| {
+                if !full_outbound && fresh.as_ref().map_or(true, |fresh| {
                     super::approvals_topology_rpc::digest_hidden_by_redaction(r, fresh.is_admin())
                 }) {
                     return WsFrame::error_response("", "expected_digest is not accepted for this approval");
@@ -173,7 +177,7 @@ impl MethodHandler {
             // A card built from a task is decided only by someone who may
             // read that task (live identity + audience), as in the list.
             // Bound cards are judged by `authorize_bound_decider` below.
-            if let Some(task_id) = approval_task_ref(&r.payload).filter(|_| r.binding.is_none()) {
+            if let Some(task_id) = approval_task_ref(&r.payload).filter(|_| r.binding.is_none() && !crate::approval::is_outbound_data_card(r)) {
                 let visible = live_reader_context(&self.home_dir, ctx).is_ok_and(|live| {
                     task_owner_readonly(&self.home_dir, &task_id).is_some_and(|owner| {
                         task_content_visible(&self.home_dir, &live, &task_id, &owner)
@@ -331,7 +335,7 @@ impl MethodHandler {
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
-        let decision = if record.as_ref().is_some_and(|r| r.payload.get("egress_guard").is_some()) {
+        let decision = if record.as_ref().is_some_and(crate::approval::is_outbound_data_card) {
             broker.decide_egress_dashboard(&approval_id, ctx, approve).await
         } else {
             broker.decide(&approval_id, approve, &decided_by).await
@@ -584,7 +588,7 @@ impl MethodHandler {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(_) => return WsFrame::error_response("", "Budget incidents unavailable"),
         };
-        // Same direct-binding and Personal visibility rule as agents.list.
+        // Direct bindings or Cost grants admit rows; Personal hiding still applies.
         // Filter before both pagination and aggregation; hidden rows contribute
         // neither entries nor counts, including unattributed rows.
         let hidden = if ctx.is_admin() {
@@ -596,6 +600,8 @@ impl MethodHandler {
             }
         };
         let visible = ctx.visible_agents();
+        let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
+        let mut grant_allowed = std::collections::HashMap::<String, bool>::new();
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -603,7 +609,10 @@ impl MethodHandler {
             .filter(|event| match &visible {
                 None => true,
                 Some(ids) => event.get("agent_id").and_then(Value::as_str)
-                    .is_some_and(|id| !hidden.contains(id) && ids.iter().any(|visible_id| visible_id == id)),
+                    .is_some_and(|id| !hidden.contains(id)
+                        && (ids.iter().any(|visible_id| visible_id == id)
+                            || *grant_allowed.entry(id.to_owned()).or_insert_with(||
+                                department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read)))),
             })
             .collect();
         events.reverse(); // newest first

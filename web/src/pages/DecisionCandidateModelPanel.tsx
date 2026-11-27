@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useState } from 'react';
 import { Badge, Button, Card, CardContent, Input } from '@/components/mds';
 import { decisionApi, type DecisionCandidateModel, type DecisionCandidateRun,
@@ -94,17 +95,18 @@ function exactCount(value: string | null | undefined, locale: string, unavailabl
   return value == null ? unavailable : new Intl.NumberFormat(locale).format(BigInt(value));
 }
 
-function dateTime(value: string | number, locale: string): string {
+function dateTime(value: string | number, locale: string, t: Translate): string {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat(locale, {
-    dateStyle: 'medium', timeStyle: 'short', timeZone: 'UTC',
-  }).format(date);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const time = formatDateTime(date, { locale, zone: 'UTC', dateStyle: 'medium', timeStyle: 'short' });
+  return t('decisionLab.utcTime', { time });
 }
 
 export function DecisionCandidateModelPanel({ scope, blocked, onBusyChange, locale, t, screenPrefill = '' }: {
   scope: Scope; blocked: boolean; onBusyChange: (busy: boolean) => void; locale: string; t: Translate;
   screenPrefill?: string;
 }) {
+  useCompanyTimeZone();
   const [candidateId, setCandidateId] = useState('');
   const [screenHash, setScreenHash] = useState(screenPrefill);
   const [candidate, setCandidate] = useState<DecisionCandidateModel | null>(null);
@@ -242,7 +244,7 @@ export function DecisionCandidateModelPanel({ scope, blocked, onBusyChange, loca
         <Badge variant="secondary">{t('decisionLab.candidateSimulationOnly')}</Badge>
         <p>{candidate.queue_id} · {candidate.parent_model_version} → {candidate.model.version}</p>
         <p>{t('decisionLab.candidateCapacity')}: {formatted(candidate.model.service_capacity_per_agent_day, locale)} · {t('decisionLab.candidateSlaDays')}: {formatted(candidate.model.sla_days, locale)} · {t('decisionLab.candidateCost')}: {formatted(candidate.model.staff_cost_cents_per_agent_day, locale)}</p>
-        <p>{t('decisionLab.candidateObservedThrough')}: {dateTime(candidate.observed_through_utc, locale)}</p>
+        <p>{t('decisionLab.candidateObservedThrough')}: {dateTime(candidate.observed_through_utc, locale, t)}</p>
         <p className="break-all font-mono text-xs">{t('decisionLab.candidateRecordSha')}: {candidate.record_sha256} · {t('decisionLab.candidateFit')}: {candidate.fit_id} · {t('decisionLab.candidateTrainingOutcome')}: {candidate.outcome_id}</p>
         <details className="text-xs"><summary>{t('decisionLab.candidateProvenance')}</summary>
           <p className="break-all">{t('decisionLab.candidateScreenHash')}: {candidate.screen_replay_hash}</p>
@@ -313,8 +315,8 @@ export function DecisionCandidateModelPanel({ scope, blocked, onBusyChange, loca
       {score && <div className="space-y-2 text-sm" aria-label={t('decisionLab.candidateScoreLoaded')}>
         <p className="break-all font-mono text-xs">{t('decisionLab.candidateScoreHash')}: {score.replay_hash} · {t('decisionLab.candidateRecordSha')}: {score.record_sha256}</p>
         <p className="break-all text-xs font-medium">{t('decisionLab.candidateScoreIdentity')}: {run?.candidate_id} · {score.comparison_run_hash} · {score.outcome_id}</p>
-        <p>{t('decisionLab.candidateScoreWindow')}: {dateTime(score.observed_window_start_utc, locale)} · {formatted(score.parent.days, locale)} {t('decisionLab.candidateDays')}</p>
-        <p>{t('decisionLab.candidateLocalTiming')}: {dateTime(score.candidate_created_at_unix, locale)} → {dateTime(score.comparison_created_at_unix, locale)}</p>
+        <p>{t('decisionLab.candidateScoreWindow')}: {dateTime(score.observed_window_start_utc, locale, t)} · {formatted(score.parent.days, locale)} {t('decisionLab.candidateDays')}</p>
+        <p>{t('decisionLab.candidateLocalTiming')}: {dateTime(score.candidate_created_at_unix, locale, t)} → {dateTime(score.comparison_created_at_unix, locale, t)}</p>
         <details className="text-xs"><summary>{t('decisionLab.candidateProvenance')}</summary>
           <p className="break-all">{t('decisionLab.candidateRunHash')}: {score.comparison_run_hash} · {t('decisionLab.candidateComparisonSha')}: {score.comparison_run_sha256}</p>
           <p className="break-all">{t('decisionLab.candidateOutcome')}: {score.outcome_id} · {t('decisionLab.candidateOutcomeSha')}: {score.outcome_record_sha256}</p>
@@ -338,7 +340,7 @@ export function DecisionCandidateModelPanel({ scope, blocked, onBusyChange, loca
         <Badge variant="outline">{t(score.ticket_source_sha256 ? 'decisionLab.candidateTicketBacked' : 'decisionLab.candidateAggregateLabels')}</Badge>
         {score.ticket_source_sha256 && <p className="break-all font-mono text-xs">{t('decisionLab.uploadSourceSha')}: {score.ticket_source_sha256}</p>}
         {score.ticket_label_engine_sha256 && <p className="break-all font-mono text-xs">{t('decisionLab.candidateTicketLabelEngineSha')}: {score.ticket_label_engine_sha256}</p>}
-        {score.ticket_source_retention_until_utc && <p className="text-xs">{t('decisionLab.candidateTicketRetention')}: {dateTime(score.ticket_source_retention_until_utc, locale)}</p>}
+        {score.ticket_source_retention_until_utc && <p className="text-xs">{t('decisionLab.candidateTicketRetention')}: {dateTime(score.ticket_source_retention_until_utc, locale, t)}</p>}
         <Limitations values={score.limitations} t={t} />
       </div>}
     </section>

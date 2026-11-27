@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
@@ -292,6 +293,7 @@ function SourceSettingRow({
 
 export function RedactionTab() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [config, setConfig] = useState<RedactionConfigWithGuard | null>(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -432,7 +434,7 @@ export function RedactionTab() {
                 <p className="font-mono text-xs text-muted-foreground">
                   {intl.formatMessage(
                     { id: 'redaction.poison.since' },
-                    { time: new Date(config.poisoned.since).toLocaleString(intl.locale) },
+                    { time: formatDateTime(config.poisoned.since, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) },
                   )}
                 </p>
               </div>
@@ -737,6 +739,7 @@ function auditEventTone(event: string): 'success' | 'warning' | 'danger' | 'neut
 
 function RedactionAuditSection() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [stats, setStats] = useState<RedactionStats | null>(null);
   const [policy, setPolicy] = useState<RedactionPolicyStatus | null>(null);
   const [audit, setAudit] = useState<RedactionAuditEntry[] | null>(null);
@@ -885,7 +888,7 @@ function RedactionAuditSection() {
                       {entry.agent_id && <span className="text-muted-foreground">{entry.agent_id}</span>}
                       {entry.ts && (
                         <span className="ml-auto font-mono text-muted-foreground">
-                          {new Date(entry.ts).toLocaleString('zh-TW', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {formatDateTime(entry.ts, { locale: 'zh-TW', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                         </span>
                       )}
                     </li>

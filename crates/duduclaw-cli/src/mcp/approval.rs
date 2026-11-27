@@ -65,6 +65,17 @@ pub(crate) fn install_approval_required(
 /// (or `block`, which the dispatch gate refuses earlier). Rules only ever add
 /// to `always`, so an `allow` rule cannot remove an approval a name list
 /// imposes (take-the-stricter).
+pub(crate) fn odoo_requires_approval(tool: &str, payload: &Value) -> bool {
+    let args = payload.get("arguments").unwrap_or(&Value::Null);
+    let Some((_, _, method)) = super::odoo_access::operation(tool, Some(args)) else { return false };
+    // The runtime permission decision arrives later. Conservatively require
+    // exact-call approval in every mode for arbitrary mutations and buttons.
+    tool == "odoo_message_send"
+        || (tool == "odoo_execute" && method.is_none_or(|m|
+            duduclaw_odoo::access_policy::method_verb(m) != duduclaw_odoo::access_policy::Verb::Read))
+        || method.is_some_and(|m| ["action_", "button_", "toggle_"].iter().any(|prefix| m.starts_with(prefix)))
+}
+
 pub(crate) fn static_gate_flags(
     agent_dir: &Path,
     tool_name: &str,
@@ -74,7 +85,11 @@ pub(crate) fn static_gate_flags(
         tool_name,
         payload.get("arguments").unwrap_or(&Value::Null),
     );
-    let always = payload.get("egress_guard").is_some()
+    // RM-141: notifying Odoo followers always needs a human, even when an
+    // action rule allows the tool. Send classification binds/consumes its
+    // exact arguments through ActionGrant below.
+    let always = odoo_requires_approval(tool_name, payload)
+        || payload.get("egress_guard").is_some()
         || install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
         || crate::mcp_dispatch::action_rule_verdict_for_call(
@@ -712,7 +727,8 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 payload["reason"] = serde_json::json!("action_rule");
             }
             let grant =
-                duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask)
+                (odoo_requires_approval(tool_name, &payload)
+                    || duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask))
                     .then(|| {
                         duduclaw_gateway::approval::action_grant::ActionGrant::build(
                             agent_id, tool_name, &payload,

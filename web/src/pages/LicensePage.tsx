@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useAuthStore } from '@/stores/auth-store';
 import { LicenseValidationWarning } from '@/components/LicenseValidationWarning';
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
@@ -178,6 +179,7 @@ function PhoneHomeIndicator({
 
 export function LicensePage() {
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
+  useCompanyTimeZone();
   const intl = useIntl();
   const contact = useCommercialContact();
   const connectionState = useConnectionStore((s) => s.state);
@@ -366,7 +368,7 @@ export function LicensePage() {
                   : intl.formatMessage({ id: 'license.expiry.unknown' })
               }
               sub={
-                snapshot.expires_at ? new Date(snapshot.expires_at).toLocaleString() : '—'
+                snapshot.expires_at ? formatDateTime(snapshot.expires_at, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) : '—'
               }
             />
             <StatTile
@@ -374,7 +376,7 @@ export function LicensePage() {
               value={<PhoneHomeIndicator daysSincePhoneHome={snapshot.days_since_phone_home} />}
               sub={
                 snapshot.last_phone_home
-                  ? new Date(snapshot.last_phone_home).toLocaleString()
+                  ? formatDateTime(snapshot.last_phone_home, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })
                   : '—'
               }
             />
@@ -395,12 +397,12 @@ export function LicensePage() {
             </SettingsRow>
             <SettingsRow label={intl.formatMessage({ id: 'license.expiresAt' })}>
               <span className="font-mono text-xs">
-                {snapshot.expires_at ? new Date(snapshot.expires_at).toLocaleString() : '—'}
+                {snapshot.expires_at ? formatDateTime(snapshot.expires_at, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) : '—'}
               </span>
             </SettingsRow>
             <SettingsRow label={intl.formatMessage({ id: 'license.lastPhoneHome' })}>
               <span className="font-mono text-xs">
-                {snapshot.last_phone_home ? new Date(snapshot.last_phone_home).toLocaleString() : '—'}
+                {snapshot.last_phone_home ? formatDateTime(snapshot.last_phone_home, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) : '—'}
               </span>
             </SettingsRow>
             {seatLimit && (

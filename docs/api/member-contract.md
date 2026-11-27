@@ -346,9 +346,10 @@ out-of-range values return HTTP 400. It queries at most 50 visible employees
 in employee-id order and stops collecting at `5 * limit` rows (at most 1000).
 The collected rows are sorted newest-first before applying the result limit.
 The result includes `truncated: true` when employees or rows were omitted.
-The member contract exposes `tasks.list` without pagination; `tasks.list_page`
-is not available to member keys, so each queried employee's RPC still returns
-its full task list. Member stdio sessions do not poll for tool-list changes;
+The bridge passes a bounded `limit` to each employee's `tasks.list` query;
+SQL ownership checks and a scan cap bound collection before enrichment.
+`more_may_exist` contributes to `truncated`. `tasks.list_page` is not exposed
+to member keys. Member stdio sessions do not poll for tool-list changes;
 the next real request observes current scopes.
 
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
@@ -395,14 +396,14 @@ Drive write confirmations are browser-session operations. `me.google.write_confi
 and returns `{ "decided": true }`. Only the authenticated requesting member may decide;
 managerial roles and chat-admin authority cannot substitute for that member.
 
-### Internal person-key MCP bridge (v1.86, 141K-P6a)
+### Internal person-key MCP bridge (v1.86)
 
 `POST /api/internal/person-key` accepts only a loopback peer and exactly one
 `Authorization: Bearer ddc_member_…` header, with a 64 KiB request-body limit.
 The gateway derives the holder from that key on every request. JWTs, MCP keys
 and status credentials cannot authenticate this route. This is the gateway
 contract for the separate MCP process; MCP transport support is a separate
-delivery (141K-P6b).
+delivery on the MCP side.
 
 `{"op":"authenticate"}` returns HTTP 200
 `{"ok":true,"key_id":"…","user_id":"…","scopes":[…]}`. Scopes are sorted,
@@ -457,3 +458,52 @@ effect on the next call; composite operations also recheck scope between RPCs
 and before releasing a result. The route tests were added without execution
 in the P6a implementation session; gateway compilation and tests remain to
 be run by the integration/review session.
+
+## Personal-key scopes and own Odoo connections (v1.86.0)
+
+`me.member_keys.create` additionally accepts `include_conversations` (boolean, default `false`) and `mcp_scopes` (array of strings, default `[]`). Existing password/MFA re-verification is unchanged. Scopes are sorted/deduplicated and must be a subset of `tasks:read`, `agents:status`, `odoo:read`, `odoo:write` and the administrator's `[member_api_keys] allow_mcp_scopes`. Conversation opt-in requires `[member_api_keys] allow_conversation_content=true` at creation only. Key/list metadata includes `include_conversations`, `mcp_scopes`, and `conversations_migrated`. Pre-upgrade keys migrate with conversations enabled and `conversations_migrated=true`; they still obey the own-web-conversation boundary.
+
+A member key sees only its holder's own web conversations. Owner access to an AI employee never opens other members' conversations or external-channel conversations. New keys default to `include_conversations=false`; without it they cannot read conversation methods, resume or subscribe to existing WebChat conversations, or download conversation attachments or conversation-derived files. `activity.list` exposes conversation text only for the holder's own conversations with this option enabled. Memory reads are restricted to the holder's assigned avatar or their own personal employee under active isolation; ownership of a shared employee is insufficient.
+
+`[member_api_keys] allow_conversation_content` (default `false`) governs creation only. Turning it off does not strip existing grants. Keys created before the upgrade retain conversation access and carry `conversations_migrated=true`, within the same own-web-conversation boundary. Browser-only `me.member_keys.narrow` and Admin `member_keys.admin_narrow` can remove conversation access or MCP scopes, never add them. Creation still requires the existing password/MFA re-verification.
+
+| RPC | Parameters / result |
+| --- | --- |
+| `me.member_keys.narrow` | `{id, include_conversations?, mcp_scopes?}` → `{narrowed:true}`; browser-only owner operation. |
+| `member_keys.admin_narrow` | Same parameters/result; live browser Admin may narrow any member key. |
+
+Omitted fields stay unchanged. These operations can turn conversations off or remove scopes; they cannot enable conversations or add a scope, even if the administrator currently permits it. Changes are audited and take effect at live authority checks. Create a new key with fresh re-verification to obtain wider grants.
+
+| Error code | Meaning |
+| --- | --- |
+| `member_key_conversation_scope` | Key lacks the conversation option for a conversation method. |
+| `member_key_memory_scope` | Requested employee is neither the holder's assigned avatar nor their personal employee under active isolation. |
+| `member_key_conversation_not_allowed` | Creation requested conversations while the administrator disallows it. |
+| `member_key_scope_not_allowed` | Creation requested MCP scopes outside the administrator allowlist. |
+| `member_key_invalid_scopes` | Scopes are not an array of supported strings. |
+| `member_key_invalid_conversations` | Conversation option is not a boolean. |
+| `member_key_cannot_widen` | Narrowing would add authority. |
+
+The conversation option gates `chat.sessions.list`, `chat.sessions.history`, `chat.sessions.restore`, `knowledge.citations.for_session`, `memory.search`, `memory.browse`, `memory.key_facts`, `memory.history`, and `me.memory.list`. It does not gate `me.memory.forget`, which deletes the holder's own memory rather than reading it.
+
+### MCP credentials
+
+Use `Authorization: Bearer <member-key>` on MCP HTTP or `DUDUCLAW_MCP_API_KEY` for stdio. Never use URL query credentials. Effective scopes are the stored grant intersected with current `allow_mcp_scopes`. Only `my_tasks_list`, `my_agents_status` and the documented personal Odoo subset are available; see [MCP tools](../guides/mcp-tools.md#person-tools-and-odoo-access-v1860). Personal Odoo calls always use the key holder's own connected account and have no employee/company fallback. Personal writes require acknowledged `follow_odoo_account`; otherwise only reads are available. OAuth consent refuses personal keys in this release. `/api/internal/person-key` is a loopback-only internal bridge, not a client API.
+
+### Browser-only personal Odoo RPCs
+
+These methods require a live authenticated browser session and cannot be called with a member key. `[odoo] member_credentials` defaults to `false`.
+
+| RPC | Parameters / result |
+| --- | --- |
+| `me.odoo.status` | `{}` → `member_credentials_enabled`, `connected`, `state`, `login`, `odoo_name`, `server`, `database`, `verified_at`, `last_used_at`; no secret. |
+| `me.odoo.connect` | `{login, api_key}`; verifies the Odoo identity against the company's configured URL/database and stores an owner/epoch-bound sealed credential. |
+| `me.odoo.test` | `{}`; tests the stored credential. After a server change, read status in the same browser session before testing against the new destination. |
+| `me.odoo.disconnect` | `{}` → `{disconnected:true}`; removes the saved credential, including while the feature is off. |
+| `odoo.member_credentials.list` | Admin, `{}` → `{credentials:[...], enabled}`; metadata only. |
+| `odoo.member_credentials.revoke` | Admin, `{user_id}` → `{revoked:boolean}`. |
+| `odoo.member_credentials.set_enabled` | Admin, `{enabled, acknowledge_risk?}` → `{enabled}`; enabling requires `acknowledge_risk=true` and is audited. |
+
+Read status first to see the current server/database; the same session must have read the matching destination within ten minutes before connect or a server-change test. A server fingerprint mismatch marks `needs_reverify`. An epoch change (password change, sign-out-everywhere, suspension) requires key re-entry with connect; test cannot revive that credential. Connect/test share five attempts per minute per member, including malformed and failed attempts. Offboarding removes the credential. Admins cannot set another member's key.
+
+Admin browser RPCs `odoo.access_get {}` and `odoo.access_set {permission_mode?, company_key_agents?, always_refuse?, attachment_max_mb?, dismiss_upgrade_notice?, acknowledge_risk?}` manage the audited policy. Selecting Follow, adding company-account AIs or removing refusal rules requires risk acknowledgement. See [settings](../guides/dashboard-settings.md#member-key-and-odoo-access-settings-v1860) for defaults and downgrade behavior.

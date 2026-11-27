@@ -1,5 +1,19 @@
 # 儀表板設定對照（v1.80.0）
 
+## 部門與主要 AI 員工權限設定（企業版，v1.86.0）
+
+| 位置 | 操作與目前狀態 |
+|---|---|
+| 管理 → 成員 → 部門主管授權 | 管理員選擇使用中的主管、部門，以及排程、自動化規則、技能或用量。另有對外傳送審核選項，將另行說明。閘道已支援儲存授權，成員頁編輯介面仍待整合。 |
+| 主要 AI 員工 → 誰可以使用 | 管理員維護預設為空的對話與一般工作開放名單。閘道已支援儲存並說明未生效原因，儀表板控制項仍待整合。只在受保護模式且員工工作已隔離執行時生效；其他情況下，這些入口仍只限管理員。 |
+| 例行工作 | 有排程授權的主管可依部門篩選，管理符合條件的例行工作、提醒與排程交辦。只可建立純提示例行工作。需要管理員同步組織資料的員工會計入提醒。部門自動化編輯與成員唯讀規則畫面仍待整合。 |
+| 技能 | 有授權的主管可啟用、停用、移除、還原技能，並替員工「提出安裝申請」。安裝仍須管理員核准。 |
+| 預算／帳務 → 部門用量 | 有授權的主管可選擇部門與七天、三十天或九十天，查看逐員工用量、合計與近期紀錄。這項授權不能修改預算。 |
+
+新增或擴大授權、將成員加入主要 AI 員工名單前，都須閱讀風險說明並勾選「我了解」。變更有稽核紀錄。部門授權只適用於儀表板登入，本人 API 金鑰與聊天軟體不適用；對方不再是使用中的主管時自動撤銷。主要 AI 員工名單會提醒，被加入的人可能問到包含管理員對話的記憶；本人 API 金鑰一律不能使用主要 AI 員工。替主要 AI 員工排程、建立員工與修改員工設定仍只限管理員。
+
+完整權限、規則執行限制、撤銷與既有工作的處理方式，請見[部門主管](../../features/zh-TW/79-department-managers.md)。全公司分析與帳務彙總仍對所有主管可見。
+
 ## 技能封存還原
 
 技能不再因閒置而被標成過時或自動封存。`[skill_curator]` 設定仍可讀取，但所有值都無作用，每個程序會警告一次。Gateway 啟動時會將有紀錄的封存技能搬回原位並恢復使用，不覆蓋既有技能；衝突檔留在 `skills-archive`，由管理員處理。Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，並拒絕符號連結路徑；其他平台保留封存檔，供管理員手動還原。
@@ -119,9 +133,9 @@ no_success_hours = 6    # 1..168
 
 自動化由伺服器逐筆檢查：員工可讀取本人建立的紀錄與直接綁定 AI 員工的紀錄；Viewer 綁定只能查看，Operator、Owner 綁定可管理。建立時仍須能操作目標 AI 員工，解除綁定會在下一次請求生效。組織圖只提供組織結構欄位，不提供模型、預算、憑證、聯絡資料或編輯控制。
 
-非 Admin 的 cron 使用 UTC 排程（已帶有沒有夏令時間的時區的排程，例如 Asia/Taipei，也能執行與編輯），僅能用未啟用任務沙箱、在主機執行的 AI 員工；每人最多 20 筆啟用排程、每位 AI 員工 50 筆，每帳號滾動一小時最多建立 20 筆，最短間隔 15 分鐘。新增／更新訊息會經過對話輸入防護，拒絕時留下稽核。組織圖只顯示直接綁定與本人部門，範圍外上級只提供名稱與角色。Admin 既有行為不變。
+成員建立的 cron 例行工作未指定時區時，使用沒有夏令時間的公司時區；若公司時區有夏令時間，則以 UTC 儲存並提示。仍僅能使用未啟用任務沙箱、在主機執行的 AI 員工；每人最多 20 筆啟用排程、每位 AI 員工 50 筆，每帳號滾動一小時最多建立 20 筆，最短間隔 15 分鐘。新增／更新訊息會經過對話輸入防護，拒絕時留下稽核。組織圖只顯示直接綁定與本人部門，範圍外上級只提供名稱與角色。Admin 既有行為不變。
 
-這些限制也適用於經 MCP 新增或修改、帶人類來源的排程；這類 MCP 排程預設 UTC，也可明確指定沒有夏令時間的時區；有夏令時間的時區會被拒絕，帶有這類時區的舊排程會被略過，直到 Admin 修改。被略過的排程會在「自動化」頁標示「已略過」並說明原因，管理員會收到一次通知。未帶來源標記的 Admin／背景排程保留本地時區偵測。手動執行每 10 分鐘最多受理每排程 3 次、每帳號 10 次，每帳號最多 2 件、全域最多 4 件未完成工作；忙碌時立即拒絕。手動執行的窗口在 gateway 重啟後重置。員工 cron 表達式上限為 256 bytes。
+這些限制也適用於經 MCP 新增或修改、帶人類來源的排程；成員來源的 MCP 例行工作未指定時區時，使用沒有夏令時間的公司時區；若公司時區有夏令時間，則以 UTC 儲存並提示。明確指定有夏令時間的時區仍會被拒絕，帶有這類時區的舊排程會被略過，直到 Admin 修改。被略過的排程會在「自動化」頁標示「已略過」並說明原因，管理員會收到一次通知。新的 Admin／背景排程未指定時區時使用公司時區，未設定或無效時使用 UTC；既有排程維持原有行為。手動執行每 10 分鐘最多受理每排程 3 次、每帳號 10 次，每帳號最多 2 件、全域最多 4 件未完成工作；忙碌時立即拒絕。手動執行的窗口在 gateway 重啟後重置。員工 cron 表達式上限為 256 bytes。
 
 新對話列出目前帳號最近送出使用、且仍可使用的最多五個技能及簡短說明。可連續點選多個標籤，把 `/技能名稱` 帶入草稿，再補充需求並送出；點選本身不會執行。紀錄由伺服器在對話或任務受理後保存，讀取時重新檢查技能權限，不代表 AI 已成功執行技能。交辦任務頁在啟用時也使用同一份紀錄。
 
@@ -189,6 +203,14 @@ npm 未安裝或安裝失敗時，提示會提供完整的手動指令與複製�
 - 存檔是原地修改檔案，只改你動到的鍵。你寫的註解、空行、鍵的順序和沒動到的鍵的排版都原樣保留，改了值的那一行行尾註解也還在。新增的鍵放在所屬區段的最後，新增的區段放在檔案最後。所有會寫 `config.toml` 或 `inference.toml` 的設定頁都是這樣，不只設定檔進階編輯。
 - 需要重啟才生效的鍵會出現在回應的 `restart_required`。系統設定頁與通道管理頁上方會顯示「以下設定要重啟 gateway 才生效」，gateway 重啟後自動消失，也可以手動關閉。推理頁與 AI 員工編輯頁不顯示這條提示。
 - 下列鍵每次改動都會另寫一筆稽核事件 `config_protected_key_changed`（含改動前後的值）：`acp.trusted`、`tick.allow_command_sources`、`container.sandbox.when_unavailable`、`container.sandbox.script_when_unavailable`、`memory.supersession_trust_guard`、`dashboard.public_url`。
+
+## 系統設定 → 一般 → 公司時區（v1.86.0）
+
+管理員可在「系統設定 → 一般」設定「公司時區」（`[general] company_timezone`），值為 `Asia/Taipei` 這類 IANA 名稱。新建例行工作、交辦排程與聊天排程以此為預設；儀表板時間、提醒確認、頻道通知、AI 喚醒資訊及資料匯出日期也依此顯示或計算。未設定或無效時，新排程使用 UTC 並在確認訊息說明；儀表板時間則依各自瀏覽器時區顯示。
+
+v1.86 gateway 第一次啟動時，若 `config.toml` 存在且尚未設定此鍵，會從主機時區自動帶入一次，並標示「自動帶入，請確認」。偵測失敗時維持未設定。之後不會再次偵測，管理員清空也不會重新帶入。成員在有夏令時間的公司時區建立例行工作時，會以 UTC 儲存並收到提示；成員明確指定時區的限制維持不變。既有排程不會移動：未帶時區的例行工作仍以 UTC 執行，v1.86 以前建立且未帶時區的交辦排程仍使用主機時區。
+
+Heartbeat 的 `cron_timezone`、摘要的 `timezone`、主動通知勿擾時段的 `[proactive] timezone` 各自維持原意；留空不代表公司時區。
 
 ## 系統設定 → 一般 → 控制台公開網址
 
@@ -1013,3 +1035,32 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 | `approval_grants_mfa_enrollment` | `false`。允許管理員核准時明確授權首次 MFA 註冊，72 小時內限用一次。單獨開啟此鍵不會核發授權。 |
 
 開始登入、回呼及完成登入時都會重讀設定。設定檔無法讀取或解析時關閉登入。`enabled` 缺漏或型別錯誤、確認紀錄缺漏或欄位空白、`allowed_hd` 為空或無效時也關閉；任何一個網域格式錯誤會使整份清單無效。只有完整的 `"direct"` 值會直接建立帳號，其他核准模式值皆要求管理員核准。上限未設定時採 20，無效值轉為 0 並阻擋新增申請或帳號。無效範本會阻擋分身建立，不會自動改用空白分身。MFA 預先授權僅在值為布林 `true` 時開啟。原始設定編輯器只能關閉登入、移除風險確認紀錄或刪除整段，無法啟用或擴大此功能。
+
+## 本人金鑰與 Odoo 權限設定（v1.86.0）
+
+以下新增項目目前透過設定／RPC 操作，儀表板控制項會隨儀表板更新提供。
+
+| 區段／鍵 | 預設與用途 |
+| --- | --- |
+| `[member_api_keys] allow_conversation_content` | `false`；允許建立 `include_conversations=true` 的金鑰，只管建立時授權，不會移除既有權限。升級前的金鑰保留對話權限並標示已遷移。 |
+| `[member_api_keys] allow_mcp_scopes` | `[]`；只接受 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`。每次使用時與金鑰範圍取交集。 |
+| `[odoo] member_credentials` | `false`；是否允許同仁連接本人 Odoo 帳號。透過 `odoo.member_credentials.set_enabled` 啟用時須帶 `acknowledge_risk=true`。 |
+| `[odoo_access] permission_mode` | 預設 `"engine"`，也可設為 `"follow_odoo_account"`；後者只對本人身分生效且須有有效確認紀錄，員工／公司帳號仍用引擎模式。 |
+| `[odoo_access] permission_mode_ack` | 預設無。管理員 RPC 記錄 `{by, at}`，包含操作人與 RFC 3339 時間。缺少或無效時退回引擎模式。 |
+| `[odoo_access] company_key_agents` | `[]`；允許使用公司帳號的 AI 員工 ID。 |
+| `[odoo_access] company_key_agents_migrated` | 遷移前為空，由系統維護的完成標記。 |
+| `[odoo_access] upgrade_notice_pending` | 預設 `false`，升級補入清單時設為 `true`；權限 RPC 的 `dismiss_upgrade_notice=true` 可清除。 |
+| `[odoo_access] always_refuse` | 預設清單如下，所有模式均適用。移除規則須確認風險，F1～F5 固定拒絕仍保留。 |
+| `[odoo_access] attachment_max_mb` | `10` MiB，範圍 1～25；原始檔與重新編碼後的附件都須符合。 |
+| 員工 `[odoo] permission_override` | 預設 `"inherit"`，也可選 `"engine"`、`"read_only"`，只能收窄。未知值視為唯讀。 |
+| 員工 `[odoo] act_as_requester` | `false`；允許使用經驗證請求者的本人 Odoo 身分，分身不能借用別人的帳號。 |
+
+`always_refuse` 預設清單：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
+
+管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
+
+已有公司 Odoo URL／資料庫的安裝在升級時會一次將所有沒有自己 Odoo 帳號的既有正式 AI 補入 `company_key_agents`，記錄完成標記與升級提示，不更改權限模式。自身 Odoo 帳號設定不完整的 AI 不會加入，必須由管理員明確指派。 新 AI 不會自動加入，升級後請檢查清單。
+
+同仁透過瀏覽器限定的 `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` 管理連線。先讀 status 查看伺服器／資料庫；位址變更後，須在同一瀏覽器工作階段重新讀取再驗證。Connect 與 test 共用每位同仁每分鐘五次限制，包含失敗與格式錯誤。改密碼、登出所有裝置或停權後須重新輸入金鑰。管理員可用 `odoo.member_credentials.list`、`.revoke {user_id}` 列出／撤銷，但不能代填別人的秘密。
+
+降回 v1.85.x 前，請移除 `[member_api_keys]` 的 `allow_conversation_content`、`allow_mcp_scopes`。舊版會將未知鍵視為整段無效，停用所有本人金鑰。v1.85 忽略 `[odoo_access]` 並退回全域 Odoo 帳號，新版公司帳號清單與拒絕政策不會保護降版後的安裝。

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useAuthStore } from '@/stores/auth-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useState } from 'react';
@@ -72,6 +73,7 @@ const INCIDENT_FILTERS = ['all', 'over'] as const;
 // ── Budget console (WP14-T14.6) — open-events per AI staff + recent incidents ──
 
 function BudgetConsole() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [incidents, setIncidents] = useState<BudgetIncident[]>([]);
   const [byAgent, setByAgent] = useState<BudgetByAgent[]>([]);
@@ -199,7 +201,7 @@ function BudgetConsole() {
                             <span className="text-muted-foreground"> / {fmtCents(inc.cap_cents)}</span>
                           </TableCell>
                           <TableCell className="font-mono text-xs text-muted-foreground">
-                            {new Date(inc.ts).toLocaleString('zh-TW', {
+                            {formatDateTime(inc.ts, { locale: 'zh-TW',
                               month: 'short',
                               day: 'numeric',
                               hour: '2-digit',
@@ -222,6 +224,7 @@ function BudgetConsole() {
 
 /** Read-only departmental usage, using only departments granted by users.me. */
 function DepartmentUsage({ departments }: { departments: string[] }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const connection = useConnectionStore(s => s.state);
@@ -290,7 +293,7 @@ function DepartmentUsage({ departments }: { departments: string[] }) {
               <span>{data.summary?.agents?.find(a => a.agent_id === r.agent_id)?.display_name || r.agent_id}</span>
               <span className="text-muted-foreground">{r.model}</span>
               <span className="tabular-nums">{money(r.cost_millicents)}</span>
-              <time className="text-xs text-muted-foreground" dateTime={r.created_at}>{intl.formatDate(r.created_at, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>
+              <time className="text-xs text-muted-foreground" dateTime={r.created_at}>{formatDateTime(r.created_at, { locale: intl.locale, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>
             </li>)}
           </ul>}
       </>}

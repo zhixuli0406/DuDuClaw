@@ -284,7 +284,7 @@ fn requester_matrix_rejects_visitors_nonholders_and_unattended_approval() {
             for public in ["widget", "odoolivechat"] {
                 for user in [None, Some("holder")] {
                     let result = requester_check(route, &channel(public, user), approval);
-                    assert_eq!(result.as_ref().unwrap_err().message_zh, "這個對話無法執行這項操作。");
+                    assert_eq!(result.as_ref().unwrap_err().message_zh, "這個對話無法執行雲端硬碟寫入，請帳號本人登入後提出操作。");
                     refusal(result, "public_visitor");
                 }
             }
@@ -313,4 +313,18 @@ async fn unattended_notice_targets_primary_owner_once_per_hour_without_fallback(
     assert_eq!(notices[0].0, f.user);
     notify_unattended(f.home.path(), "missing").await;
     assert!(crate::notify_push::person_notice_test::take(f.home.path()).is_empty());
+}
+
+#[tokio::test]
+async fn home_oauth_readiness_becomes_ready_after_admin_consent() {
+    let f = crate::google_personal::home_write_tests::Fixture::new().await;
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::NeedsHomeConsent);
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::Ready);
+    let token = write_token(f.home(), &IdentityRoute::HomeOAuth).await.unwrap();
+    assert_eq!(token.meta.identity_kind, "home_oauth");
+    assert_eq!(token.meta.account_email, "alice@c.test");
+    store::disconnect(f.home(), "home", "home").unwrap();
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::NeedsHomeConsent);
 }

@@ -6,6 +6,9 @@ pub mod authority;
 pub mod flow;
 pub mod grants;
 pub mod history;
+pub(crate) mod home_write;
+#[cfg(test)]
+pub(crate) mod home_write_tests;
 pub mod lifecycle;
 pub(crate) mod meeting_access;
 #[cfg(test)]

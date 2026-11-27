@@ -1,5 +1,7 @@
 # MCP HTTP/SSE Transport
 
+The query-string examples below apply only to supported MCP API keys. Personal member keys must use `Authorization: Bearer` on every HTTP request, including SSE; native `EventSource` cannot supply that header. Use a client with header support.
+
 > A second front door to the MCP toolbox — Bearer-authenticated REST for single calls, Server-Sent Events for long-lived streams, so remote clients can reach the same tools the stdio transport serves.
 
 ---
@@ -227,3 +229,11 @@ The `?api_key=` fallback on `/mcp/v1/stream` exists precisely because `EventSour
 ## The Takeaway
 
 stdio is the private line: one process, one caller, no network. The HTTP/SSE transport is the switchboard and the radio broadcast — `POST /mcp/v1/call` for a single dial-and-answer, `GET /mcp/v1/stream` to tune in, `POST /mcp/v1/stream/call` to fire a request and hear the result come back over the air. Same toolbox, Bearer-authenticated, rate-limited at 60 req/min, fail-closed by default — now reachable by any external HTTP client, not just the local CLI.
+
+## Personal member keys for MCP (v1.86.0)
+
+A personal `ddc_member_` key requires a running gateway and an enabled member-key feature. It is separate from a standalone MCP key. Send it as `Authorization: Bearer <member-key>` on the MCP HTTP transport, or set `DUDUCLAW_MCP_API_KEY` in the stdio server's environment. Never put a personal key in a URL query; use an HTTP/SSE client that can send the authorization header.
+
+Effective scopes are the key's `mcp_scopes` intersected with the current administrator setting `[member_api_keys] allow_mcp_scopes` (default `[]`). Only `tasks:read`, `agents:status`, `odoo:read`, and `odoo:write` are available. Tools act as the key holder, with live permission checks, rather than borrowing an AI employee's identity. Odoo requires the holder's own connected Odoo account; company and employee accounts are never substituted. See [MCP tools](../guides/mcp-tools.md) for the exact person-tool subset.
+
+OAuth consent refuses personal member keys in this release. Configure the header or stdio environment directly; a personal key cannot be exchanged through the OAuth consent page.

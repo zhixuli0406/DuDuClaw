@@ -3078,15 +3078,12 @@ async fn shared_route_reply(
             (guard.text.clone(), Some(guard), Some(agent))
         }
         SharedRoute::Primary(agent) => {
-            let guard = crate::trigger_route::as_own_bot_turn(build_guarded_reply_for_agent(
-                text,
-                ctx,
-                &agent,
-                session_id,
-                user_id,
-                on_progress,
-            ))
-            .await;
+            let reply = build_guarded_reply_for_agent(
+                text, ctx, &agent, session_id, user_id, on_progress,
+            );
+            let guard = crate::shared_app_route::member_turn(
+                crate::trigger_route::as_own_bot_turn(reply),
+            ).await;
             (guard.text.clone(), Some(guard), Some(agent))
         }
         SharedRoute::Unbound => {

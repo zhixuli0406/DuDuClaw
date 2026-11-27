@@ -54,6 +54,7 @@ pub struct OdooAccessConfig {
     pub permission_mode_ack: Option<PermissionModeAck>,
     pub company_key_agents: Vec<String>,
     pub company_key_agents_migrated: String,
+    pub upgrade_notice_pending: bool,
     pub always_refuse: Vec<String>,
     pub attachment_max_mb: u8,
 }
@@ -65,6 +66,7 @@ impl Default for OdooAccessConfig {
             permission_mode_ack: None,
             company_key_agents: Vec::new(),
             company_key_agents_migrated: String::new(),
+            upgrade_notice_pending: false,
             always_refuse: DEFAULT_ALWAYS_REFUSE.iter().map(|s| (*s).to_owned()).collect(),
             attachment_max_mb: 10,
         }
@@ -80,6 +82,7 @@ struct RawAccessConfig {
     permission_mode_ack: Option<toml::Value>,
     company_key_agents: Vec<String>,
     company_key_agents_migrated: String,
+    upgrade_notice_pending: bool,
     always_refuse: Vec<String>,
     attachment_max_mb: u8,
 }
@@ -92,6 +95,7 @@ impl Default for RawAccessConfig {
             permission_mode_ack: None,
             company_key_agents: defaults.company_key_agents,
             company_key_agents_migrated: defaults.company_key_agents_migrated,
+            upgrade_notice_pending: defaults.upgrade_notice_pending,
             always_refuse: defaults.always_refuse,
             attachment_max_mb: defaults.attachment_max_mb,
         }
@@ -135,6 +139,7 @@ impl OdooAccessConfig {
             permission_mode_ack: ack,
             company_key_agents: raw.company_key_agents,
             company_key_agents_migrated: raw.company_key_agents_migrated,
+            upgrade_notice_pending: raw.upgrade_notice_pending,
             always_refuse: raw.always_refuse,
             attachment_max_mb: raw.attachment_max_mb,
         };
@@ -359,13 +364,13 @@ pub fn fixed_refusal(op: &OdooOp<'_>) -> Option<FixedRefusal> {
     {
         return Some(FixedRefusal::F1);
     }
-    if modifies && matches!(op.model, "ir.model" | "ir.model.fields" | "ir.model.access" | "ir.rule") {
+    if modifies && (op.model == "ir.model" || descendant(op.model, "ir.model") || op.model == "ir.rule") {
         return Some(FixedRefusal::F2);
     }
     if modifies && (op.model == "res.users.apikeys" || descendant(op.model, "res.users.apikeys")) {
         return Some(FixedRefusal::F3);
     }
-    if (modifies && matches!(op.model, "mail.mail" | "mail.compose.message" | "mail.followers" | "mail.template"))
+    if (modifies && (op.model == "mail" || descendant(op.model, "mail")))
         || (op.tool == ToolKind::Generic
             && matches!(op.method, "message_post" | "message_notify" | "message_subscribe" | "send_mail" | "action_send_mail"))
     {
