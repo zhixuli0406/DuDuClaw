@@ -118,3 +118,5 @@ mod dashboard_scope_tests;
 mod status_tokens_rpc_tests;
 mod member_keys_rpc_tests;
 mod mcp_keys_rpc_tests;
+
+mod dept_grant_matrix_tests;

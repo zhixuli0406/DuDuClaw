@@ -11,6 +11,8 @@ use crate::handlers::MethodHandler;
 
 pub(crate) use duduclaw_auth::dept_grants::GrantGroup;
 
+pub(crate) mod methods;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantAction {
     Read, Create, Edit, Toggle, Remove, Restore, RunNow, RequestInstall, Decide,
