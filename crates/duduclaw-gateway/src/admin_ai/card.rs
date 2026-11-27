@@ -71,7 +71,9 @@ fn channel_body(rec: &ApprovalRecord, code: &str) -> String {
     if body.chars().count() <= 1800 { body } else { NOTICE.into() }
 }
 
-pub(super) async fn create(home: &Path, turn: &AdminTurn, prepared: Prepared) -> Result<Value> {
+pub(super) async fn create(home: &Path, turn: &AdminTurn, mut prepared: Prepared, executor: Option<super::execute::Executor>) -> Result<Value> {
+    #[cfg(not(test))]
+    if executor.is_none() { return Err(refused("admin_ai_execution_unavailable")); }
     if turn.audience != ConversationAudience::Private { return Err(refused("admin_ai_private_audience_required")); }
     let context = turn.decision_context.clone().ok_or_else(|| refused("admin_ai_invalid_context"))?;
     let target = if turn.channel == "webchat" { None } else {
@@ -80,6 +82,9 @@ pub(super) async fn create(home: &Path, turn: &AdminTurn, prepared: Prepared) ->
             .ok_or_else(|| refused("admin_ai_invalid_context"))?;
         Some(target)
     };
+    // Show the exact execution order: one atomic field update per employee,
+    // followed by schedule/skill operations. Never execute a later displayed item early.
+    super::execute::order_items(&mut prepared.items);
     let id = ApprovalId::new();
     let code: String = OsRng.sample_iter(&Alphanumeric).take(4).map(char::from).collect();
     let count = prepared.items.len();
@@ -122,6 +127,11 @@ pub(super) async fn create(home: &Path, turn: &AdminTurn, prepared: Prepared) ->
             "agent": audit_text(&turn.agent), "session_id": audit_text(&turn.session_id),
             "turn_id": audit_text(&turn.turn_id), "channel": audit_text(&turn.channel),
             "audience": turn.audience, "item_count": count, "employee_count": prepared.employee_count})));
+    if let Some(executor) = executor {
+        let webchat = crate::turn_context::webchat_origin_for(&turn.agent, &turn.turn_id)
+            .and_then(|origin| crate::scheduled_webchat::bind_origin(home, Some(&origin), &turn.agent));
+        super::execute::spawn(home.to_owned(), executor, rec.clone(), target.clone(), webchat);
+    }
     if let Some(target) = target {
         // Failure leaves the already-persisted inbox card available. Never fan out.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(15),

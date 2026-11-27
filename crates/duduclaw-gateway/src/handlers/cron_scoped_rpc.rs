@@ -61,6 +61,16 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_scoped_cron(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        self.handle_scoped_cron_inner(method, params, ctx, false).await
+    }
+
+    /// Internal Admin-AI path. The creator cannot be supplied by RPC callers.
+    pub(crate) async fn handle_admin_ai_cron(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        if !ctx.is_admin() { return WsFrame::error_response("", PERMISSION_DENIED); }
+        self.handle_scoped_cron_inner(method, params, ctx, true).await
+    }
+
+    async fn handle_scoped_cron_inner(&self, method: &str, params: Value, ctx: &UserContext, record_creator: bool) -> WsFrame {
         if ctx.is_admin() {
             // v1.81 P1g: a cron routine makes its employee run work, so on
             // another person's Personal employee it is owner-only — the
@@ -72,7 +82,7 @@ impl MethodHandler {
             }
             return match method {
                 "cron.list" => self.handle_cron_list().await,
-                "cron.add" => self.handle_cron_add(params).await,
+                "cron.add" => self.handle_cron_add_with_creator(params, record_creator.then_some(ctx)).await,
                 "cron.update" => self.handle_cron_update(params).await,
                 "cron.pause" => self.handle_cron_set_enabled(params, false).await,
                 "cron.resume" => self.handle_cron_set_enabled(params, true).await,

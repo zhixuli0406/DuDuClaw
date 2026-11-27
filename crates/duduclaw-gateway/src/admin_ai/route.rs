@@ -19,15 +19,21 @@ const READ_LIMIT: usize = 64 * 1024;
 
 pub struct RouteState {
     home: PathBuf,
+    executor: Option<super::execute::Executor>,
     replay: ReplayGuard,
     proof_rate: RateLimiter,
     read_rate: RateLimiter,
 }
 impl RouteState {
-    pub fn new(home: PathBuf) -> Self {
-        Self { home, replay: ReplayGuard::default(), proof_rate: RateLimiter::default(),
+    fn empty(home: PathBuf) -> Self {
+        Self { home, executor: None, replay: ReplayGuard::default(), proof_rate: RateLimiter::default(),
             read_rate: RateLimiter::default() }
     }
+    pub(crate) fn with_executor(home: PathBuf, executor: super::execute::Executor) -> Self {
+        Self { executor: Some(executor), ..Self::empty(home) }
+    }
+    #[cfg(test)]
+    pub fn new(home: PathBuf) -> Self { Self::empty(home) }
 }
 
 #[derive(Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -100,7 +106,7 @@ async fn handle(
                 Ok(proposal) => proposal,
                 Err(_) => return denied(&state.home, &caller.agent_id, "admin_ai_invalid_proposal"),
             };
-            let result = super::proposal::propose(&state.home, &turn, &context, proposal).await;
+            let result = super::proposal::propose(&state.home, &turn, &context, proposal, state.executor.clone()).await;
             match result {
                 Ok(value) => Json(value).into_response(),
                 Err(error) => {

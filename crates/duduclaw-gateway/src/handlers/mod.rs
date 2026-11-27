@@ -71,7 +71,7 @@ mod templates_library;
 mod agents_ops;
 mod main_agent_access;
 mod autonomy_rpc;
-mod agents_update;
+pub(crate) mod agents_update;
 mod contract_rpc;
 mod redaction_rpc;
 mod identity_rpc;

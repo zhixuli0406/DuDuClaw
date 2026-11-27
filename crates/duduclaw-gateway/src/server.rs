@@ -197,6 +197,10 @@ struct AppState {
     home_dir: std::path::PathBuf,
 }
 
+impl AsRef<MethodHandler> for AppState {
+    fn as_ref(&self) -> &MethodHandler { &self.handler }
+}
+
 /// Identity policy and initial key creation are mandatory startup gates.
 fn prepare_identity_key(home: &std::path::Path) -> std::io::Result<()> {
     let strict = duduclaw_core::require_identity_token_from_home(home)?;
@@ -3558,7 +3562,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(_license_runtime.clone()),
         ),
     )));
-    app = app.merge(crate::admin_ai::route::router(Arc::new(crate::admin_ai::route::RouteState::new(home_dir.clone()))));
+    app = app.merge(crate::admin_ai::route::router(Arc::new(crate::admin_ai::route::RouteState::with_executor(home_dir.clone(), state.clone()))));
     // RouteState synchronously restores durable sink fences (or records a
     // fail-closed store error) before the listener below can serve any request.
     app = app.merge(crate::egress_guard::router(Arc::new(

@@ -318,7 +318,7 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
         reason: proposal.reason, admin_name, avatar_name })
 }
 
-pub(super) async fn propose(home: &Path, turn: &AdminTurn, context: &str, proposal: Proposal) -> Result<Value> {
+pub(super) async fn propose(home: &Path, turn: &AdminTurn, context: &str, proposal: Proposal, executor: Option<super::execute::Executor>) -> Result<Value> {
     let prepared = prepare(home, turn, proposal).await?;
     let fresh = admin_turn(home, &turn.agent, context, AdminTurnLevel::Write).map_err(|e| refused(e.code()))?;
     if fresh.user_id != turn.user_id || fresh.turn_id != turn.turn_id || fresh.session_id != turn.session_id
@@ -326,5 +326,5 @@ pub(super) async fn propose(home: &Path, turn: &AdminTurn, context: &str, propos
         return Err(refused("admin_ai_state_changed"));
     }
     if prepared.items.is_empty() { return Ok(json!({"message": "沒有需要變更的內容", "item_count": 0})); }
-    super::card::create(home, &fresh, prepared).await
+    super::card::create(home, &fresh, prepared, executor).await
 }
