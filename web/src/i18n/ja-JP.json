@@ -11746,5 +11746,13 @@
   "myConnections.chatSend.egress": "全文を確認してください。確認すると、個人情報を含む可能性がある内容が上記スペースへ送信されます。Google にアプリ名も表示されます。",
   "myConnections.chatSend.expires": "確認期限：{time}",
   "myConnections.chatSend.confirm": "確認して送信",
-  "myConnections.chatSend.cancel": "キャンセル"
+  "myConnections.chatSend.cancel": "キャンセル",
+  "settings.general.companyTimezone.label": "会社のタイムゾーン",
+  "settings.general.companyTimezone.placeholder": "例：Asia/Taipei",
+  "settings.general.companyTimezone.clear": "クリア",
+  "settings.general.companyTimezone.unset": "未設定：新しいスケジュールは UTC で動作し、画面の時刻は各自のパソコンのタイムゾーンで表示されます。",
+  "settings.general.companyTimezone.invalidStored": "現在の設定値は無効です。選び直してください。",
+  "settings.general.companyTimezone.invalidInput": "一覧からタイムゾーンを選択してください。",
+  "settings.general.companyTimezone.detected": "このホストのタイムゾーンから自動入力しました。確認してください。",
+  "settings.general.companyTimezone.confirm": "確認"
 }

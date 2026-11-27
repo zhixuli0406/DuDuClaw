@@ -11746,5 +11746,13 @@
   "myConnections.chatSend.egress": "Read the full text. Confirming sends this content, which may include private data, to the space above. Google includes the app name.",
   "myConnections.chatSend.expires": "Confirm before {time}",
   "myConnections.chatSend.confirm": "Confirm send",
-  "myConnections.chatSend.cancel": "Cancel"
+  "myConnections.chatSend.cancel": "Cancel",
+  "settings.general.companyTimezone.label": "Company time zone",
+  "settings.general.companyTimezone.placeholder": "For example, Asia/Taipei",
+  "settings.general.companyTimezone.clear": "Clear",
+  "settings.general.companyTimezone.unset": "Not set: new schedules use UTC. Times on screen follow each person’s computer time zone.",
+  "settings.general.companyTimezone.invalidStored": "The current setting is invalid. Please choose a time zone again.",
+  "settings.general.companyTimezone.invalidInput": "Choose a time zone from the list.",
+  "settings.general.companyTimezone.detected": "Filled in automatically from this host’s time zone. Please confirm.",
+  "settings.general.companyTimezone.confirm": "Confirm"
 }

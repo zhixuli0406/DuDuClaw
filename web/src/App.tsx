@@ -1,8 +1,9 @@
 import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
-import { useEffect, lazy, Suspense } from 'react';
+import { useEffect, useRef, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router';
 import { onPetOpenStudio } from './lib/pet';
 import { client } from './lib/ws-client';
+import { resetCompanyTimeZone, useCompanyTimeStore } from './lib/company-time';
 import { handleDashboardNavigate } from './lib/dashboard-navigate';
 import { toast } from './lib/toast';
 import { MainLayout } from './components/layout/MainLayout';
@@ -164,6 +165,19 @@ export function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const initialized = useAuthStore((s) => s.initialized);
   const navigate = useNavigate();
+  const connectionState = useConnectionStore((s) => s.state);
+  const companyTimeLoaded = useRef(false);
+
+  useEffect(() => {
+    if (!initialized) return;
+    if (!isAuthenticated) {
+      companyTimeLoaded.current = false;
+      resetCompanyTimeZone();
+    } else if (connectionState === 'authenticated' && !companyTimeLoaded.current) {
+      companyTimeLoaded.current = true;
+      void useCompanyTimeStore.getState().load();
+    }
+  }, [initialized, isAuthenticated, connectionState]);
 
   // The desktop pet's right-click "open studio" item fires a Tauri event on the
   // main window; navigate there when it arrives (no-op outside Tauri).

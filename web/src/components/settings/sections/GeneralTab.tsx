@@ -8,6 +8,7 @@ import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import {
   Button,
+  Input,
   ErrorState,
   SettingsSection,
   SettingsCard,
@@ -19,6 +20,7 @@ import { RowSelect, RowSwitch, RowText } from '@/pages/agent-form/form-rows';
 import { SettingRow } from './shared';
 import { changedPayload, parseTomlSubset, tomlStr, type FlatValues } from '@/lib/config-toml';
 import { isValidPublicUrl } from '@/lib/dashboard-base';
+import { supportedTimeZones, useCompanyTimeStore } from '@/lib/company-time';
 import { useRestartRequiredStore } from '@/stores/restart-required-store';
 
 export function GeneralTab() {
@@ -27,6 +29,23 @@ export function GeneralTab() {
   const startTour = useTourStore((s) => s.start);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
   const [defaultLanguage, setDefaultLanguage] = useState('');
+  const [companyTimezone, setCompanyTimezone] = useState('');
+  const [storedCompanyTimezone, setStoredCompanyTimezone] = useState('');
+  const [companyTimezoneSource, setCompanyTimezoneSource] = useState('');
+  const [timeZones] = useState(supportedTimeZones);
+  const companyTimezoneValue = companyTimezone.trim();
+  const companyTimezoneValid = !companyTimezoneValue
+    || typeof Intl.supportedValuesOf !== 'function' || timeZones.includes(companyTimezoneValue);
+  let storedTimezoneInvalid = false;
+  if (storedCompanyTimezone) {
+    try { new Intl.DateTimeFormat('en', { timeZone: storedCompanyTimezone }); }
+    catch { storedTimezoneInvalid = true; }
+  }
+  let editedTimezoneInvalid = false;
+  if (companyTimezoneValue) {
+    try { new Intl.DateTimeFormat('en', { timeZone: companyTimezoneValue }); }
+    catch { editedTimezoneInvalid = true; }
+  }
   const [memoryLanguage, setMemoryLanguage] = useState('auto');
   // RM-129: `[dashboard] public_url` — the externally reachable dashboard
   // address (sub-path included) used for OAuth callbacks and return links.
@@ -59,12 +78,16 @@ export function GeneralTab() {
         // regexes could pick up `level` / `strategy` from another table).
         const tables = parseTomlSubset(raw);
         const language = tomlStr(tables, 'general', 'default_language', '');
+        const timezone = tomlStr(tables, 'general', 'company_timezone', '');
+        setCompanyTimezone(timezone);
+        setStoredCompanyTimezone(timezone);
+        setCompanyTimezoneSource(tomlStr(tables, 'general', 'company_timezone_source', ''));
         const publicUrlValue = tomlStr(tables, 'dashboard', 'public_url', '');
         const memoryLanguageValue = tomlStr(tables, 'memory', 'language', 'auto');
         setMemoryLanguage(memoryLanguageValue);
         setDefaultLanguage(language);
         setPublicUrl(publicUrlValue);
-        initialRef.current = { 'memory.language': memoryLanguageValue, default_language: language, 'dashboard.public_url': publicUrlValue };
+        initialRef.current = { company_timezone: timezone, 'memory.language': memoryLanguageValue, default_language: language, 'dashboard.public_url': publicUrlValue };
       }
     }).catch((e) => {
       console.warn("[api]", e);
@@ -99,17 +122,22 @@ export function GeneralTab() {
     }
   };
 
-  const handleSave = async () => {
+  const handleSave = async (confirmTimezone = false) => {
     const current: FlatValues = {
       default_language: defaultLanguage,
       'memory.language': memoryLanguage,
-      ...(isAdmin ? { 'dashboard.public_url': publicUrl.trim() } : {}),
+      ...(isAdmin ? { 'dashboard.public_url': publicUrl.trim(), company_timezone: companyTimezoneValue } : {}),
     };
     if (isAdmin && !publicUrlValid) {
       toast.error(intl.formatMessage({ id: 'settings.general.publicUrl.invalid' }));
       return;
     }
     const payload = changedPayload(initialRef.current, current);
+    if (isAdmin && confirmTimezone) payload.company_timezone = companyTimezoneValue;
+    if ('company_timezone' in payload && !companyTimezoneValid) {
+      toast.error(intl.formatMessage({ id: 'settings.general.companyTimezone.invalidInput' }));
+      return;
+    }
     if (Object.keys(payload).length === 0) {
       toast.info(intl.formatMessage({ id: 'settings.noChanges' }));
       return;
@@ -119,7 +147,13 @@ export function GeneralTab() {
     setSaveError(null);
     try {
       const res = await api.system.updateConfig(payload);
-      initialRef.current = current;
+      initialRef.current = { ...initialRef.current, ...current };
+      if ('company_timezone' in payload) {
+        setCompanyTimezone(companyTimezoneValue);
+        setStoredCompanyTimezone(companyTimezoneValue);
+        setCompanyTimezoneSource('');
+        await useCompanyTimeStore.getState().load();
+      }
       const restart = res?.restart_required ?? [];
       if (restart.length > 0) useRestartRequiredStore.getState().add(restart);
       setSaved(true);
@@ -178,6 +212,53 @@ export function GeneralTab() {
             onChange={setDefaultLanguage}
             options={languageOptions}
           />
+          <SettingsRow
+            label={<label htmlFor="company-timezone">{intl.formatMessage({ id: 'settings.general.companyTimezone.label' })}</label>}
+            tier="text"
+            description={
+              <div id="company-timezone-notice" className="space-y-1">
+                {!companyTimezoneValue && (
+                  <span className="block">{intl.formatMessage({ id: 'settings.general.companyTimezone.unset' })}</span>
+                )}
+                {storedTimezoneInvalid && companyTimezoneValue === storedCompanyTimezone && (
+                  <span className="block" role="alert">{intl.formatMessage({ id: 'settings.general.companyTimezone.invalidStored' })}</span>
+                )}
+                {!(storedTimezoneInvalid && companyTimezoneValue === storedCompanyTimezone) && (!companyTimezoneValid || editedTimezoneInvalid) && (
+                  <span className="block" role="alert">{intl.formatMessage({ id: 'settings.general.companyTimezone.invalidInput' })}</span>
+                )}
+                {companyTimezoneSource === 'detected_at_upgrade' && (
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span>{intl.formatMessage({ id: 'settings.general.companyTimezone.detected' })}</span>
+                    {isAdmin && (
+                      <Button variant="outline" size="sm" disabled={saving} onClick={() => void handleSave(true)}>
+                        {intl.formatMessage({ id: 'settings.general.companyTimezone.confirm' })}
+                      </Button>
+                    )}
+                  </div>
+                )}
+              </div>
+            }
+          >
+            <div className="flex items-center gap-2">
+              <Input
+                id="company-timezone"
+                list="company-timezones"
+                aria-describedby="company-timezone-notice"
+                aria-invalid={!companyTimezoneValid || storedTimezoneInvalid}
+                value={companyTimezone}
+                onChange={(e) => setCompanyTimezone(e.target.value)}
+                placeholder={intl.formatMessage({ id: 'settings.general.companyTimezone.placeholder' })}
+                disabled={!isAdmin || saving}
+                autoComplete="off"
+              />
+              <datalist id="company-timezones">
+                {timeZones.map((zone) => <option key={zone} value={zone} />)}
+              </datalist>
+              <Button variant="outline" size="sm" disabled={!isAdmin || saving || !companyTimezone} onClick={() => setCompanyTimezone('')}>
+                {intl.formatMessage({ id: 'settings.general.companyTimezone.clear' })}
+              </Button>
+            </div>
+          </SettingsRow>
           <RowSelect
             disabled={!isAdmin}
             label={intl.formatMessage({ id: 'settings.general.memoryLanguage' })}
@@ -256,7 +337,7 @@ export function GeneralTab() {
           savingLabel={intl.formatMessage({ id: 'common.saving' })}
           savedLabel={intl.formatMessage({ id: 'settings.general.saved' })}
         />
-        <Button variant="brand" size="sm" onClick={handleSave} disabled={saving}>
+        <Button variant="brand" size="sm" onClick={() => void handleSave()} disabled={saving}>
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>

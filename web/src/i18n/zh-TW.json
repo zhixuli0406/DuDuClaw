@@ -11746,5 +11746,13 @@
   "myConnections.chatSend.egress": "請閱讀完整文字。確認後，這些內容（可能包含私人資料）會傳到上述空間；Google 會附上應用程式名稱。",
   "myConnections.chatSend.expires": "確認期限：{time}",
   "myConnections.chatSend.confirm": "確認傳送",
-  "myConnections.chatSend.cancel": "取消"
+  "myConnections.chatSend.cancel": "取消",
+  "settings.general.companyTimezone.label": "公司所在時區",
+  "settings.general.companyTimezone.placeholder": "例如 Asia/Taipei",
+  "settings.general.companyTimezone.clear": "清除",
+  "settings.general.companyTimezone.unset": "尚未設定：新的排程以 UTC 計時，畫面依各自電腦的時區顯示。",
+  "settings.general.companyTimezone.invalidStored": "目前的設定值無效，請重新選擇。",
+  "settings.general.companyTimezone.invalidInput": "請從清單選擇時區。",
+  "settings.general.companyTimezone.detected": "已依這台主機的時區自動帶入，請確認。",
+  "settings.general.companyTimezone.confirm": "確認"
 }

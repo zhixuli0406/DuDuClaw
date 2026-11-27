@@ -17,6 +17,7 @@ import { setTimeAgoNowLabel } from './lib/format';
 import { installExternalLinkInterceptor } from './lib/external-link';
 import './index.css';
 import { dashboardBase } from './lib/dashboard-base';
+import { useCompanyTimeZone } from './lib/company-time';
 
 // Apply the persisted theme before first render. The embedded production
 // server sends a strict `script-src 'self'` CSP that blocks inline scripts,
@@ -31,6 +32,8 @@ void loadPublicBrand();
 void loadPublicCompany();
 
 function Root() {
+  const { zone, status } = useCompanyTimeZone();
+  const companyZone = status === 'set' ? zone ?? undefined : undefined;
   const locale = useLocaleStore((s) => s.locale);
   const brand = useBrandStore((state) => state.brand);
   const dark = useDarkAppearance();
@@ -42,7 +45,7 @@ function Root() {
     // IntlProvider must wrap ToastProvider: ToastItem calls useIntl(), so the
     // toast viewport has to live inside the intl context or it throws
     // "Could not find required `intl` object" the first time a toast renders.
-    <IntlProvider locale={locale} messages={messages} defaultLocale="zh-TW">
+    <IntlProvider timeZone={companyZone} locale={locale} messages={messages} defaultLocale="zh-TW">
       {/* Root safety net: a crash in the layout chrome shows a reload
           message instead of a blank tab (RouteErrorBoundary covers pages). */}
       <AppErrorBoundary>
