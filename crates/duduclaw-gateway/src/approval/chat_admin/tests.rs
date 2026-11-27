@@ -414,8 +414,9 @@ async fn assert_dashboard_sync(f: &PressFixture, status: ApprovalStatus) {
     let listed = payload(h.handle_approvals_list(json!({"id":f.row.id.as_str()}), &ctx).await);
     assert_eq!(listed["approvals"].as_array().unwrap().len(), 1);
     assert_eq!(listed["approvals"][0]["status"], status.as_str());
-    assert_eq!(listed["approvals"][0]["decided_by"],
-        f.service.env.broker.get(&f.row.id).await.unwrap().unwrap().decided_by.unwrap());
+    assert_eq!(listed["approvals"][0]["decided_by_display"], "Ada（Telegram，直接核准）");
+    assert!(listed["approvals"][0].get("decided_by").is_none());
+    assert!(!listed["approvals"][0]["decided_by_display"].as_str().unwrap().contains(&f.service.user));
 }
 
 #[tokio::test]
