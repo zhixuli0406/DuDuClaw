@@ -938,3 +938,21 @@ Creation, revocation and write calls are audited; repeated use is aggregated.
 **Do not put this key in browser front-end code; call from your server.** See the
 [member API authentication reference](../api/member-contract.md#personal-member-api-keys-1850)
 for transport examples and the precise method restrictions.
+
+## Company Google sign-in
+
+The server supports Google sign-in alongside passwords and channel one-time codes. It is off by default and unavailable in the personal edition. Availability requires an administrator's risk acknowledgement, allowed company domains, a configured company Google OAuth client ID and secret, and a valid `[dashboard] public_url` (HTTPS, or HTTP on localhost/loopback). Dashboard pages for this feature are not available yet.
+
+Only Google Workspace / Cloud Identity accounts with `email_verified=true` and an allowed `hd` in the verified ID token are accepted. Personal Gmail accounts are refused. Domain values are lowercased and matched in full, without subdomain matching; the email suffix never supplies the domain. Google does not document which `hd` it returns for secondary domains or aliases. List each accepted domain explicitly and confirm the returned value.
+
+Identity uses Google's stable `sub`. A matching email never merges accounts automatically. Existing members sign in with their existing method and link Google after a password re-check; the email addresses must match, ignoring ASCII case. Alternatively, an administrator can confirm up to 100 existing active, unlinked accounts per batch. Confirmation lasts 14 days and is invalidated by email or credential changes.
+
+By default, a new colleague's first sign-in creates an approval request. Requests expire after 14 days; at most 50 may be pending. Rejected applicants wait seven days. An administrator can select direct creation after acknowledging the risk. The new-account cap defaults to 20 (range 1–200) over a rolling 24 hours and counts pending requests too. New accounts have the Employee role and no local password. Accounts without a local password cannot be promoted to Admin or Manager.
+
+Company two-step verification still applies; Google's own two-step verification does not satisfy it. After Google sign-in, Email codes cannot be the second factor because they use the same Google mailbox. Use an authenticator app (TOTP) or a passkey. Under enforced policy, a new colleague needs an administrator enrollment code unless the administrator explicitly allows first two-step enrollment when approving. That option requires `approval_grants_mfa_enrollment`, off by default, and grants one use within 72 hours of approval. Passwordless members manage their factors after fresh Google reauthentication. Google must return a recent `auth_time`; otherwise an administrator must reset two-step verification.
+
+New colleagues receive an AI avatar automatically, using a blank avatar or a non-premium, single-employee company template pinned to its revision. A changed or invalid template, full seats, or protected native Linux isolation waits for an administrator. Creation failures retry after one and ten minutes; the third failure waits for an administrator.
+
+Admin or self-service unlinking invalidates all of that member's sessions. Self-service unlinking requires a local password and a password re-check. For offboarding, suspend the DuDuClaw account or unlink Google sign-in. Disabling the Google Workspace account alone does not terminate existing DuDuClaw sessions. Google-only accounts without a local password cannot sign in after downgrading to v1.85.0 or older.
+
+See [settings](../guides/dashboard-settings.md#company-google-sign-in) and [OAuth setup](../guides/google-setup.md#company-google-sign-in).
