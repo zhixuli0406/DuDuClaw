@@ -15,6 +15,14 @@ struct Fixture {
     member: String,
 }
 
+impl Fixture {
+    fn conn(&self) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(self.home.path().join("users.db")).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn
+    }
+}
+
 async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
@@ -88,7 +96,7 @@ fn assert_absent(f: &Fixture, name: &str) {
     assert_eq!(f.db.avatar_agent(&f.member).unwrap(), None);
     assert!(f.db.get_agent_users(name).unwrap().is_empty());
     assert!(duduclaw_core::org_store::load(f.home.path()).get(name).is_none());
-    let pending: String = f.db.conn().query_row("SELECT avatar FROM user_onboarding WHERE user_id=?1",
+    let pending: String = f.conn().query_row("SELECT avatar FROM user_onboarding WHERE user_id=?1",
         [&f.member], |r| r.get(0)).unwrap();
     assert_eq!(pending, "pending");
 }
@@ -101,7 +109,7 @@ fn assert_created(f: &Fixture, name: &str, actor: &str) {
     assert_eq!(table["agent"]["department"].as_str(), Some(""));
     assert_eq!(f.db.avatar_agent(&f.member).unwrap().as_deref(), Some(name));
     assert_eq!(f.db.check_agent_access(&f.member, name).unwrap(), Some(AccessLevel::Owner));
-    let conn = f.db.conn();
+    let conn = f.conn();
     let audit: (String, String, String) = conn.query_row(
         "SELECT user_id,target,detail FROM auth_audit_log WHERE action='user.create_avatar'",
         [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
@@ -152,7 +160,7 @@ async fn signin_avatar_blank_created() {
 #[tokio::test]
 async fn signin_avatar_requires_google_member() {
     let f = fixture().await;
-    f.db.conn().execute("DELETE FROM google_signin_links WHERE user_id=?1", [&f.member]).unwrap();
+    f.conn().execute("DELETE FROM google_signin_links WHERE user_id=?1", [&f.member]).unwrap();
     let result = f.handler.create_signin_avatar(request(&f, "no-link", AvatarTemplate::Blank)).await;
     assert_eq!(result, Err(Error::NotEligible));
     assert_absent(&f, "no-link");
@@ -247,7 +255,7 @@ async fn admin_avatar_path_unchanged() {
     let admin = f.db.create_user("admin@company.test", "Admin", "password123", UserRole::Admin).unwrap();
     let caller: UserContext = f.db.live_user_context(&admin.id).unwrap().unwrap();
     // Admin avatars do not require Google link or onboarding policy.
-    f.db.conn().execute("DELETE FROM google_signin_links WHERE user_id=?1", [&f.member]).unwrap();
+    f.conn().execute("DELETE FROM google_signin_links WHERE user_id=?1", [&f.member]).unwrap();
     let response = f.handler.create_agent_files(json!({"name":"admin-avatar", "avatar_for_user":f.member}), Some(&caller)).await;
     assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
     assert_created(&f, "admin-avatar", &admin.id);
@@ -263,7 +271,7 @@ async fn signin_avatar_failure_after_publish_restores_directory_and_org() {
         // Force failure AFTER publication, owner binding and avatar assignment.
         // The users transaction and the outer filesystem compensation must
         // both roll back; no std Mutex guard crosses the await below.
-        f.db.conn().execute_batch("CREATE TRIGGER reject_avatar_audit BEFORE INSERT ON auth_audit_log
+        f.conn().execute_batch("CREATE TRIGGER reject_avatar_audit BEFORE INSERT ON auth_audit_log
             WHEN NEW.action='user.create_avatar' BEGIN SELECT RAISE(ABORT,'fixture publish failure'); END;").unwrap();
         assert_eq!(f.handler.create_signin_avatar(request(&f, "rollback-avatar", selected)).await, Err(Error::Failed));
         assert_absent(&f, "rollback-avatar");
