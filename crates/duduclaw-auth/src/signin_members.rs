@@ -60,7 +60,7 @@ fn timestamp(now: i64) -> Result<String, &'static str> {
     chrono::DateTime::from_timestamp(now, 0).map(|t| t.to_rfc3339()).ok_or("signin_invalid_timestamp")
 }
 
-fn live_admin(tx: &Transaction<'_>, admin_id: &str, admin_epoch: u64) -> Result<(), &'static str> {
+pub(crate) fn live_admin(tx: &Transaction<'_>, admin_id: &str, admin_epoch: u64) -> Result<(), &'static str> {
     let authorized: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='admin' AND status='active'
          AND must_change_password=0 AND credential_epoch=?2)",
@@ -83,7 +83,7 @@ fn insert_link(tx: &Transaction<'_>, user_id: &str, id: &VerifiedGoogleIdentity,
     }).map_err(|_| STORAGE)
 }
 
-fn audit(tx: &Transaction<'_>, actor: &str, action: &str, target: &str, detail: &Value, now: i64) -> Result<(), &'static str> {
+pub(crate) fn audit(tx: &Transaction<'_>, actor: &str, action: &str, target: &str, detail: &Value, now: i64) -> Result<(), &'static str> {
     tx.execute("INSERT INTO auth_audit_log(user_id,action,target,detail,timestamp) VALUES(?1,?2,?3,?4,?5)",
         params![actor, action, target, detail.to_string(), timestamp(now)?]).map_err(|_| STORAGE)?;
     Ok(())

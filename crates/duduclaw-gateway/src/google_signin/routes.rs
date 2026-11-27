@@ -100,7 +100,7 @@ struct Available {
     secure: bool,
 }
 
-fn public_base(home: &Path) -> Option<(String, bool)> {
+pub(crate) fn public_base(home: &Path) -> Option<(String, bool)> {
     let root = std::fs::read_to_string(home.join("config.toml")).ok()?.parse::<toml::Table>().ok()?;
     let raw = root.get("dashboard")?.get("public_url")?.as_str()?;
     let (_, base) = crate::deep_link::valid_oauth_public_base(raw)?;
@@ -108,12 +108,21 @@ fn public_base(home: &Path) -> Option<(String, bool)> {
     Some((base, secure))
 }
 
+/// Shared by the public flow and the admin settings checks. Never serialize
+/// the returned client configuration into dashboard responses or audit rows.
+pub(crate) fn configured_client(home: &Path) -> Option<crate::mcp_oauth::McpOAuthClientConfig> {
+    let client = crate::mcp_oauth::get_client_config(home, "google")?;
+    if client.client_id.trim().is_empty() || client.client_secret.trim().is_empty() { return None; }
+    Some(client)
+}
+
+pub(crate) fn redirect_uri(base: &str) -> String { format!("{base}{CALLBACK_PATH}") }
+
 async fn availability(state: &AppState) -> Result<Available, &'static str> {
     if state.handler.resolve_edition_profile().await.is_personal() { return Err("off"); }
     let settings = config::read_strict(&state.home_dir);
     if !settings.enabled { return Err("off"); }
-    let client = crate::mcp_oauth::get_client_config(&state.home_dir, "google").ok_or("off")?;
-    if client.client_id.trim().is_empty() || client.client_secret.trim().is_empty() { return Err("off"); }
+    let client = configured_client(&state.home_dir).ok_or("off")?;
     let (base, secure) = public_base(&state.home_dir).ok_or("needs_public_url")?;
     Ok(Available { settings, client, base, secure })
 }
@@ -188,7 +197,7 @@ pub(crate) async fn start(
     let (Ok(state_value), Ok(nonce), Ok(verifier), Ok(cookie_value)) =
         (oidc::random_state(), oidc::random_nonce(), oidc::random_pkce_verifier(), oidc::random_state())
         else { return error(StatusCode::SERVICE_UNAVAILABLE); };
-    let redirect_uri = format!("{}{CALLBACK_PATH}", available.base);
+    let redirect_uri = redirect_uri(&available.base);
     let authorization_url = oidc::authorization_url(&available.client.client_id, &redirect_uri,
         &state_value, &nonce, &oidc::pkce_challenge_s256(&verifier), &available.settings.allowed_hd,
         oidc::SigninPurpose::Login, None);
@@ -268,7 +277,7 @@ pub(crate) async fn callback(
     let Ok(available) = availability(&state).await else { return expired(&state.home_dir); };
     if available.settings.revision != pending.settings_revision
         || available.client.client_id != pending.client_id
-        || format!("{}{CALLBACK_PATH}", available.base) != pending.redirect_uri
+        || redirect_uri(&available.base) != pending.redirect_uri
     { return expired(&state.home_dir); }
     let Ok(id_token) = oauth::exchange_for_id_token(&pending.client_id, &available.client.client_secret,
         &code, &pending.verifier, &pending.redirect_uri).await else { return expired(&state.home_dir); };

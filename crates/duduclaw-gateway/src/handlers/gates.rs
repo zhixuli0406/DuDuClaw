@@ -462,3 +462,22 @@ pub(crate) fn power_local_result_frame(result: crate::device_ops::OpResult) -> W
         other => device_op_result_frame(other),
     }
 }
+
+/// RM-214 authentication administration stays in core dispatch. Unknown
+/// operations within these exact namespaces are Admin-only and then denied.
+pub(super) fn google_signin_minimum_role(method: &str) -> Option<UserRole> {
+    match method {
+        "google.signin.get" | "google.signin.set"
+        | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+        | "users.google_signin.attest" | "users.google_signin.unlink"
+        | "users.signin_onboarding.retry_avatar" => Some(UserRole::Admin),
+        _ => {
+            let mut parts = method.split('.');
+            match (parts.next(), parts.next()) {
+                (Some("google"), Some("signin"))
+                | (Some("users"), Some("signin_requests" | "google_signin" | "signin_onboarding")) => Some(UserRole::Admin),
+                _ => None,
+            }
+        }
+    }
+}

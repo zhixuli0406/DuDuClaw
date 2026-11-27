@@ -401,3 +401,22 @@ fn signin_attested_disabled_user_never_links() {
     assert_eq!(count(&db, "google_signin_links"), 0);
     assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, UserStatus::Suspended);
 }
+
+#[test]
+fn user_update_google_only_account_cannot_be_admin() {
+    let (db, _path) = test_db();
+    let id = direct(&db, &identity("123"));
+    for role in [UserRole::Admin, UserRole::Manager] {
+        let update = crate::UserUpdate { role: Some(role), display_name: Some("Changed"), password: Some("new-password"), ..Default::default() };
+        assert_eq!(db.apply_user_update(&id, &update).unwrap_err().to_string(), "role_requires_local_password");
+        assert_eq!(db.update_user(&id, None, Some(role), None).unwrap_err(), "role_requires_local_password");
+        assert_eq!(db.get_user(&id).unwrap().unwrap().display_name, "新同仁");
+        assert_passwordless_employee(&db, &id);
+    }
+    db.update_user(&id, None, Some(UserRole::Employee), None).unwrap();
+    let password = password_user(&db, "password@company.test", UserRole::Employee);
+    for role in [UserRole::Manager, UserRole::Admin, UserRole::Employee] {
+        db.update_user(&password.id, None, Some(role), None).unwrap();
+        assert_eq!(db.get_user(&password.id).unwrap().unwrap().role, role);
+    }
+}

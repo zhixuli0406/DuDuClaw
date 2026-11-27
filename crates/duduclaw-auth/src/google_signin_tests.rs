@@ -188,3 +188,64 @@ fn google_signin_legacy_onboarding_migration_is_idempotent() {
     let reopened = UserDb::new(path.path()).unwrap();
     assert_eq!(reopened.onboarding_progress(&a, 0).unwrap().steps.channel, crate::onboarding::StepStatus::Skipped);
 }
+
+#[test]
+fn signin_attest_batch_is_atomic_and_checks_live_admin() {
+    let (db, _path) = test_db();
+    let admin = db.create_user("admin@test.invalid", "Admin", "password123", UserRole::Admin).unwrap();
+    let a = user(&db, "a");
+    let b = user(&db, "b");
+    for ids in [vec![a.clone(), "missing".into()], vec![a.clone(), a.clone()], vec![a.clone(); 101]] {
+        assert_eq!(db.attest_google_signin_users(&admin.id, admin.credential_epoch, &ids, 100), Err("signin_attest_invalid_target"));
+        assert_eq!(attestation_count(&db), 0);
+        assert!(db.query_audit_log(None, Some("google_signin.attested"), 100).unwrap().is_empty());
+    }
+    db.set_user_status(&b, crate::UserStatus::Suspended).unwrap();
+    assert_eq!(db.attest_google_signin_users(&admin.id, admin.credential_epoch, &[a.clone(), b.clone()], 100), Err("signin_attest_invalid_target"));
+    db.set_user_status(&b, crate::UserStatus::Active).unwrap();
+    insert(&db, &link(&b, "123", "self_link", 10)).unwrap();
+    assert_eq!(db.attest_google_signin_users(&admin.id, admin.credential_epoch, &[a.clone(), b], 100), Err("signin_attest_invalid_target"));
+    assert_eq!(db.attest_google_signin_users(&a, 0, &[a.clone()], 100), Err("signin_admin_required"));
+    assert_eq!(db.attest_google_signin_users(&admin.id, admin.credential_epoch + 1, &[a.clone()], 100), Err("signin_admin_required"));
+    assert_eq!(attestation_count(&db), 0);
+    assert_eq!(db.attest_google_signin_users(&admin.id, admin.credential_epoch, &[a.clone(), admin.id.clone()], 100), Ok(2));
+    assert_eq!(attestation_count(&db), 2);
+    assert_eq!(db.query_audit_log(Some(&admin.id), Some("google_signin.attested"), 100).unwrap().len(), 2);
+    assert!(take(&db, &a, "a@test.invalid", 101));
+}
+
+#[test]
+fn google_signin_unlink_revokes_sessions() {
+    let (db, _path) = test_db();
+    let admin = db.create_user("admin@test.invalid", "Admin", "password123", UserRole::Admin).unwrap();
+    let a = user(&db, "a");
+    insert(&db, &link(&a, "123", "self_link", 10)).unwrap();
+    db.upsert_google_signin_attestation(&a, &admin.id, 100).unwrap();
+    let user = db.get_user(&a).unwrap().unwrap();
+    let jwt = crate::JwtConfig::new(b"test-secret-at-least-32-bytes-long!!");
+    let (_, token) = jwt.issue_session_tokens(&user, &[]).unwrap();
+    let claims = jwt.verify_refresh_token(&token).unwrap();
+    let refresh = || db.mfa_refresh_and_issue(&a, claims.credential_epoch, claims.jti.as_deref(), false, |_, _| Ok(()));
+    assert!(refresh().is_ok());
+    let generation = db.acl_generation().unwrap();
+    assert_eq!(db.unlink_google_signin(&a, user.credential_epoch, &a, 101), Err("signin_admin_required"));
+    assert_eq!(db.unlink_google_signin(&admin.id, admin.credential_epoch + 1, &a, 101), Err("signin_admin_required"));
+    db.unlink_google_signin(&admin.id, admin.credential_epoch, &a, 101).unwrap();
+    assert_eq!(db.get_user(&a).unwrap().unwrap().credential_epoch, user.credential_epoch + 1);
+    assert!(db.acl_generation().unwrap() > generation);
+    assert!(refresh().is_err());
+    assert!(db.google_signin_link_for_user(&a).unwrap().is_none());
+    assert_eq!(attestation_count(&db), 0);
+    assert_eq!(db.query_audit_log(Some(&admin.id), Some("google_signin.unlinked"), 100).unwrap().len(), 1);
+    assert_eq!(db.unlink_google_signin(&admin.id, admin.credential_epoch, &a, 102), Err("signin_not_linked"));
+}
+
+#[test]
+fn google_signin_storage_errors_do_not_expose_sqlite_details() {
+    let (db, _path) = test_db();
+    let a = user(&db, "a");
+    insert(&db, &link(&a, "123", "self_link", 10)).unwrap();
+    assert_eq!(insert(&db, &link(&a, "456", "self_link", 10)), Err("signin_storage_unavailable".into()));
+    db.conn().execute("DROP TABLE google_signin_requests", []).unwrap();
+    assert_eq!(db.list_pending_signin_requests().unwrap_err(), "signin_storage_unavailable");
+}
