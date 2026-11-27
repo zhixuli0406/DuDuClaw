@@ -568,6 +568,12 @@ build the model's tool list from name, description and input schema only.
 
 ## Long-form details moved out of descriptions
 
+### `tasks_create` schedules
+
+For a cron `schedule`, `cron_timezone` defaults to the company time zone. If it is unset or invalid, the schedule uses UTC and the confirmation says so. Member-created routines use UTC with a notice when the company time zone observes daylight saving. One-shot `schedule` times must include a UTC offset, for example `2026-11-28T09:00:00+08:00`.
+
+
+
 ### `tasks_create` / `tasks_update` — goal cost cap
 
 `tasks_create` accepts `cost_cap_cents` with `kind="goal"`: a positive integer in US cents (up to `9223372036854775807`). Omit it to use `[goal_loop] default_cost_cap_cents` (`0` means no default cap). Non-goal and scheduled requests reject the argument. Example: `{"kind":"goal","title":"Review the report","assigned_to":"agnes","cost_cap_cents":500}`. Keep the usual description and acceptance criteria for your goal.
