@@ -38,7 +38,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::requester_gate::people_for;
-use super::resolve::{Resolved, resolve_person_for_tool};
+use super::resolve::{Resolved, resolve_token_route};
 use super::{Refusal, audit_issue};
 use crate::computer_use_sessions::auth::{RateLimiter, ReplayGuard, authenticate, check_peer};
 
@@ -191,8 +191,13 @@ pub(crate) async fn serve(
         );
         return outcome;
     }
-    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
-        .shared().await.map_err(|_| super::owner_snapshot::changed())?;
+    if crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS.contains(&tool) {
+        let outcome = Err(Refusal::hard("write_tool_gateway_only", "此連線不支援雲端硬碟寫入，請管理員檢查 Google 連線設定。"));
+        audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
+        return outcome.map(|_| Value::Null);
+    }
+    let mut authority = Some(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
+        .shared().await.map_err(|_| super::owner_snapshot::changed())?);
     refuse_owner_token(&state.home, agent)?;
     if tool == "google_chat_send" || !crate::google_personal::scopes::token_tool(tool) {
         let outcome = Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
@@ -216,7 +221,25 @@ pub(crate) async fn serve(
     }
     let people = people_for(&state.home, state.users.as_ref());
     let outcome =
-        resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
+        resolve_token_route(&state.home, agent, requester, people.as_ref(), tool, Some(&mut authority)).await
+            .and_then(|resolved| {
+                match &resolved {
+                    Resolved::Delegated { token, .. } => {
+                        super::write_scope_guard::check_requested(super::delegated_scopes::for_tool(&state.home, tool)?)?;
+                        if let Some(scopes) = &token.granted_scopes {
+                            super::write_scope_guard::check_actual(scopes)?;
+                        }
+                    }
+                    // Personal access checked the exact cached/refresh scopes
+                    // before producing this token, including reconnect/notice.
+                    Resolved::Personal { token, .. } => {
+                        super::write_scope_guard::check_actual(token.granted_scopes.as_deref()
+                            .ok_or_else(super::write_scope_guard::write_scope_isolated)?)?;
+                    }
+                    Resolved::UseHome { .. } => {},
+                }
+                Ok(resolved)
+            });
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
     refuse_owner_token(&state.home, agent)?;
     match outcome? {

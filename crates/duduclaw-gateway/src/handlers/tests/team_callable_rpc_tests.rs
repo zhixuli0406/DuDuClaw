@@ -120,6 +120,7 @@ pub(super) async fn fixture() -> Fixture {
 /// replaces it per RPC).
 pub(super) fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: user_id.to_string(),

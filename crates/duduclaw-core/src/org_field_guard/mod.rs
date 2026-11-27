@@ -10,7 +10,7 @@
 //!   both directions), `[agent] department` (same-department lateral rule) and
 //!   `[agent] name` (the registry id the whitelist resolves against).
 //! - `<home>/config.toml` → `[delegation] policy` / `allow` whitelist and
-//!   `[acp] trusted` (which widens the trusted-sender list).
+//!   `[acp] trusted` (which widens the trusted-sender list), and `[admin_ai]`.
 //!
 //! …and on two things that decide *who the caller is* and *whether this guard
 //! runs at all*:

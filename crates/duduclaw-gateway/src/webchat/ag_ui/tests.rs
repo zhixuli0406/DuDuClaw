@@ -522,7 +522,7 @@ async fn member_key_bearer_has_live_provenance_and_is_revocable() {
     let f = Fixture::new(UserRole::Employee).await;
     std::fs::write(f.home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
     let epoch = f.chat.user_db.get_user(&f.user).unwrap().unwrap().credential_epoch;
-    let key = f.chat.user_db.member_key_create(&f.user, "ag-ui", 1, epoch).unwrap();
+    let key = f.chat.user_db.member_key_create(&f.user, "ag-ui", 1, epoch, false, &[]).unwrap();
     let mut headers = HeaderMap::new();
     headers.insert("authorization", format!("Bearer {}", key.secret).parse().unwrap());
     let identity = authenticate(&f.chat, &headers).await.unwrap();

@@ -370,3 +370,90 @@ select `third_party_mcp_tests::isolated_spawn_regression` in the
 `duduclaw-cli` library tests. It runs the full regression in a separate test
 process (including Rust stdio children); without a binary it prints an explicit
 SKIP. Its process helpers are registered in `scripts/ci/privileged_effects.json`.
+
+## Google Drive write: RM-131 P15
+
+With Node 22+, macOS `sandbox-exec`, `sqlite3`, and an already-built debug
+binary with `--features live-test-mocks`, run from the repository root:
+
+```bash
+node --check scripts/live-test/google-drive-write.mjs
+node scripts/live-test/google-drive-write.mjs /path/to/mock-debug-duduclaw
+```
+
+The sibling driver leaves the historical delegated identity probe unchanged.
+It uses `make-home.sh`, temporary `HOME` and `DUDUCLAW_HOME`, a disposable signed
+Enterprise entitlement, the legacy MFA upgrade fixture, and a production-shaped
+employee with the `mcp__duduclaw__*` allowlist. A local fake Claude launches real
+stdio MCP calls within authenticated WebChat turns, including an admitted
+current-turn attachment. No installed model CLI or real Google credential is
+used. Google issuer/REST traffic uses the existing mock-base environment seam,
+including the new write transport; a loopback-only process sandbox also denies
+any accidental external request. The remote Drive MCP control uses a local
+HTTP MCP server and a local fake model tool loop.
+
+Design §7 rows **3–8, 10, 11** assert tampered consent hiding/refusal, delegated
+multipart upload and confirmed audit, three folder refusals with GET-only
+traffic, exact trash PATCH, empty-folder move refusal, member approval/cancel/
+changed-filename invalidation, separate personal write OAuth consent and read
+scopes, and overgranted refresh refusal at the signed token broker and remote
+MCP mount. Row 8 decides real member cards using `me.google.write_confirm`;
+Telegram/LINE/Google Chat delivery and buttons are not exercised. Row 11 first
+executes the mounted read tool as a positive control, then checks that the
+rejected connection cannot even initialize/list/call the remote MCP.
+
+Every mock request records method, path, query and body. Global assertions
+require zero DELETE requests and no Google bearer in captured stdio/HTTP MCP
+messages. Artifacts (requests, MCP wire, scenario results, mock failures and
+gateway logs) remain in the printed temporary directory; issuer bodies contain
+only disposable fixture grants. This script was syntax-checked only during
+implementation: it has not been live-run. Other §7 rows and real Google,
+external bots, native Linux and Windows acceptance are outside this driver.
+
+## Company Google sign-in (RM-214 P20)
+
+Requires Node 22+, `sqlite3`, and an already-built debug `live-test-mocks`
+executable. Pass an **OS sandbox wrapper**, as with
+`google-personal-identity.mjs`: it must deny real credentials/keychains and
+all non-loopback network access for the binary and its children.
+
+```bash
+node scripts/live-test/google-signin.mjs /path/to/guarded-binary-wrapper
+node --test scripts/live-test/google-signin.test.mjs
+```
+
+The bench creates isolated `HOME` (empty `os-home`) and `DUDUCLAW_HOME`, a
+`make-home.sh` production-shaped employee, and
+`[dashboard] public_url = "http://localhost:<port>"`. It sets
+`DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE` to its loopback mock, serves RSA JWKS and
+RS256 ID tokens, and verifies PKCE S256 plus the exact redirect URI on every
+code exchange. It never visits Google's authorization page or uses real Google
+credentials. The wrapper is an operator prerequisite; the argument alone does
+not enforce OS isolation.
+
+Named scenarios cover design §7 scenarios 1–11 and 13–14; Odoo (12) is excluded.
+Daily-cap checks run before other JIT accounts so the third new account can be
+checked against a cap of two. The Enterprise fixture uses the existing
+pre-MFA upgrade schema with MFA off and a disposable signed OEM license;
+it does not validate fresh-install Enterprise MFA defaults. The direct-MFA
+scenario enables policy through the real admin RPC at the end. A separate
+Personal process confirms its resolved edition before checking public routes.
+
+The script prints PASS/FAIL/SKIP with observed HTTP status and result code
+(`n/a` for RPC-only or unavailable observations), exits nonzero only for FAIL,
+and never prints tokens, authorization codes, cookies, nonces or client secrets.
+It retains private fixture homes, gateway logs and sanitized
+`google-signin-results.json` (including every token-endpoint hit's validation
+booleans), and stops its owned gateways. Inspect private logs locally; do not
+publish the fixture home as a production acceptance artifact.
+
+UI button rendering, admin notification delivery, completed blank-avatar creation,
+self-service linking, changed-email attestation, unlink/refresh, and full MFA
+code/TOTP/preauthorization ceremonies are explicitly SKIP. Scenario 11 selects
+a deliberately stale company-template revision, then only reads the member's
+`onboarding.get`; it SKIPs if real maintenance has not exposed
+`waiting_admin/template_changed` within 20 seconds. It does not inject avatar
+state or drive retry. Personal startup or edition-identification limitations
+also produce SKIP. Real Google, native keychain and platform acceptance remain
+separate. The self-tests import pure helpers without a binary, subprocess,
+listener, or npm dependencies.

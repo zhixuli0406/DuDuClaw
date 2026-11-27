@@ -8,11 +8,28 @@ impl ApprovalBroker {
         Self { store }
     }
 
+    #[cfg(test)]
+    pub(crate) fn store_for_tests(&self) -> &ApprovalStore {
+        &self.store
+    }
+
     /// Open the on-disk store and wrap it in a broker.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         Ok(Self::new(std::sync::Arc::new(ApprovalStore::open(
             home_dir,
         )?)))
+    }
+
+    /// Read receipt ownership without exposing the writable approval store.
+    pub(crate) async fn has_chat_admin_receipt(&self, id: &ApprovalId) -> Result<bool, String> {
+        chat_admin::receipts::has_for_approval(&self.store, id).await
+    }
+
+    /// Look up a receipt by exact delivery coordinates; callers still verify its proof.
+    pub(crate) async fn lookup_chat_admin_receipt(
+        &self, channel: &str, account: &str, dm: &str, message_id: &str,
+    ) -> Result<Option<chat_admin::receipts::Receipt>, String> {
+        chat_admin::receipts::lookup_message(&self.store, channel, account, dm, message_id).await
     }
 
     /// Record a new pending approval. `payload` is the exact thing to
@@ -66,7 +83,13 @@ impl ApprovalBroker {
         // Push it to the humans who can decide it, on the channel they are
         // actually on. Best-effort and time-boxed — a channel outage must never
         // stop the approval from being filed.
-        self.push_new_request(&rec).await;
+        // Scheduling hint only. The gateway verifies the quarantined artifact
+        // before either approving this SAME row or pushing its manual card.
+        if !(action_kind == crate::expert_skills::SKILLS_ACTION_KIND
+            && rec.payload.get("auto_approval_candidate").and_then(Value::as_bool) == Some(true))
+        {
+            self.push_new_request(&rec).await;
+        }
         Ok(id)
     }
 
@@ -151,7 +174,7 @@ impl ApprovalBroker {
         }
     }
 
-    pub(super) fn home_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn home_dir(&self) -> Option<PathBuf> {
         self.store
             .db_path
             .as_ref()
@@ -162,6 +185,11 @@ impl ApprovalBroker {
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
     pub(crate) async fn push_new_request(&self, rec: &ApprovalRecord) {
+        #[cfg(test)]
+        if let Some(delivered) = crate::skill_trust::tests::capture_card(self.home_dir().as_deref(), rec) {
+            if delivered { self.store.set_notify_target(&rec.id, "test", "admin").await.unwrap(); }
+            return;
+        }
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
@@ -312,22 +340,77 @@ impl ApprovalBroker {
         self.decide_unbound(id, approve, decided_by, false).await
     }
 
-    /// Egress approvals require live Admin authority even without a binding.
+    /// Gateway-only policy decision; no additional approval row or grant.
+    pub(crate) async fn decide_by_skill_trust_policy(
+        &self, id: &ApprovalId, decided_by: &str,
+    ) -> Result<(), String> {
+        let rec = self.store.get(id).await?.ok_or("找不到技能核准單")?;
+        if rec.status != ApprovalStatus::Pending
+            || rec.action_kind != crate::expert_skills::SKILLS_ACTION_KIND
+            || !decided_by.starts_with("policy:skill_trust:")
+        {
+            return Err("這張核准單不能依自家技能來源設定核准".into());
+        }
+        // Keep the existing binding, expiry, lease and pending CAS checks.
+        self.decide_unbound(id, true, decided_by, false).await
+    }
+
+    /// Outbound authority is re-read inside the decision path, never supplied as a boolean.
     pub async fn decide_egress_dashboard(
         &self, id: &ApprovalId, ctx: &duduclaw_auth::UserContext, approve: bool,
     ) -> Result<(), String> {
-        self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
-        self.decide_unbound(id, approve, &format!("dashboard:{}", ctx.user_id), true).await
+        self.decide_unbound_inner(id, approve, &format!("dashboard:{}", ctx.user_id), false, None, Some(ctx)).await
+    }
+
+    /// Persist a decision from caller-verified identity. The future decision
+    /// service MUST verify a live Active Admin and matching chat proof before
+    /// using ChatAdmin, including for egress_guard records. This method does
+    /// not establish identity from the approval payload or tool arguments.
+    /// Dashboard outbound decisions use decide_egress_dashboard, which
+    /// re-loads the signed-in user's current department review authority.
+    pub(crate) async fn decide_as(
+        &self,
+        id: &ApprovalId,
+        approve: bool,
+        by: &chat_admin::DecisionActor,
+    ) -> Result<(), String> {
+        match by {
+            chat_admin::DecisionActor::Dashboard { user_id } => {
+                self.decide_unbound(id, approve, &format!("dashboard:{user_id}"), false).await
+            }
+            chat_admin::DecisionActor::ChatAdmin(entry) => {
+                self.decide_unbound_inner(
+                    id, approve, &entry.decided_by().to_string(), true, Some(entry), None,
+                ).await
+            }
+        }
     }
 
     async fn decide_unbound(&self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool) -> Result<(), String> {
+        self.decide_unbound_inner(id, approve, decided_by, egress_admin, None, None).await
+    }
+
+    async fn decide_unbound_inner(
+        &self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool,
+        ledger: Option<&chat_admin::LedgerEntry>,
+        dashboard: Option<&duduclaw_auth::UserContext>,
+    ) -> Result<(), String> {
         let rec = self
             .store
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
-        if rec.payload.get("egress_guard").is_some() && !egress_admin {
-            return Err("outgoing data approval requires an authenticated Admin".into());
+        if rec.action_kind == "db_source_grant" {
+            let ctx = dashboard.ok_or("database grants require an authenticated dashboard Admin")?;
+            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+        }
+        if !super::is_outbound_data_card(&rec) && let Some(ctx) = dashboard {
+            // Preserve the old Admin gate for callers using this entry for
+            // non-outbound cards (notably database source grants).
+            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+        }
+        if super::is_outbound_data_card(&rec) && dashboard.is_none() && (!egress_admin || ledger.is_none()) {
+            return Err(super::outbound::REFUSAL.into());
         }
         if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
             return Err("bound requests require authenticated decision context".into());
@@ -354,13 +437,29 @@ impl ApprovalBroker {
         } else {
             ApprovalStatus::Denied
         };
-        let n = self
-            .store
-            .decide_if_pending(id, new_status, decided_by, &Utc::now().to_rfc3339())
-            .await?;
+        let decided_at = Utc::now().to_rfc3339();
+        // Re-load immediately before the store CAS. A prior list/preflight is
+        // never authority, and generic dashboard decided_by strings grant nothing.
+        let reviewer = if super::is_outbound_data_card(&rec) {
+            match dashboard {
+                Some(ctx) => Some(self.require_outbound_reviewer(ctx, &rec)?),
+                None => None,
+            }
+        } else { None };
+        let n = match ledger {
+            Some(entry) => self.store.decide_if_pending_with_ledger(id, approve, entry, &decided_at).await?,
+            None => self.store.decide_if_pending(id, new_status, decided_by, &decided_at).await?,
+        };
         if n == 0 {
             // Lost the race to another decider between get() and update.
             return Err(format!("approval {id} was decided concurrently"));
+        }
+        if super::is_outbound_data_card(&rec) && let Some(home) = self.home_dir() {
+            if let Some(ctx) = reviewer {
+                super::outbound::audit(&home, &rec, &ctx.user_id, ctx.is_admin(), Some(approve));
+            } else if let Some(entry) = ledger {
+                super::outbound::audit(&home, &rec, &entry.user_id.to_string(), true, Some(approve));
+            }
         }
         info!(approval_id = %id, decision = new_status.as_str(), decided_by, "approval decided");
         Ok(())
@@ -519,6 +618,30 @@ impl ApprovalBroker {
         Ok(())
     }
 
+    /// Actor-aware equivalent of decide_as while an org-change decision
+    /// lease owns the row. Preserve the lease/TTL contract and atomically
+    /// consume the receipt with the ledger and decision; never release the
+    /// lease just to use an ordinary unleased write.
+    pub(crate) async fn decide_as_with_lease(
+        &self, id: &ApprovalId, lease: &DecisionLease, approve: bool,
+        actor: &chat_admin::DecisionActor,
+    ) -> Result<(), String> {
+        match actor {
+            chat_admin::DecisionActor::Dashboard { user_id } =>
+                self.decide_with_lease(id, lease, approve, &format!("dashboard:{user_id}")).await,
+            chat_admin::DecisionActor::ChatAdmin(entry) => {
+                let n = self.store.decide_leased_with_ledger(
+                    id, &lease.token, approve, entry, &Utc::now().to_rfc3339(),
+                ).await?;
+                if n == 0 {
+                    return Err(format!("approval {id}: the decision lease lapsed or the row is no longer pending"));
+                }
+                info!(approval_id = %id, decided_by = %entry.decided_by(), "approval decided (leased chat-admin)");
+                Ok(())
+            }
+        }
+    }
+
     /// Test-only seam: stamp the delivered notification destination without
     /// going through a real channel send, so `approval_notify`'s inbound tests
     /// can exercise the destination-match authorization path.
@@ -567,6 +690,12 @@ impl ApprovalBroker {
                 &Utc::now().to_rfc3339(),
             )
             .await?;
+        if n > 0 && let Some(home) = self.home_dir() {
+            match self.get(id).await {
+                Ok(Some(rec)) => chat_admin::sync::spawn_expire(home, rec),
+                _ => warn!("chat-admin withdrawn card snapshot unavailable"),
+            }
+        }
         Ok(n > 0)
     }
 

@@ -18,7 +18,7 @@ use crate::autopilot_approval::{
 use crate::autopilot_store::{
     AutopilotDispatchRow, DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_REQUESTING,
     DISPATCH_SETTLED, PUSH_GAVE_UP, PUSH_NO_TARGET, PUSH_PENDING, PUSH_QUEUED, PUSH_SENT,
-    PUSH_SUPPRESSED,
+    PUSH_SUPPRESSED, StepApprovalBindMode,
 };
 
 /// Test replacement of the outcome chat push: `(rule_id, body) -> result`.
@@ -73,12 +73,14 @@ impl AutopilotEngine {
     /// performs the action.
     pub(super) async fn gate_on_approval(
         &self,
+        origin: EventOrigin,
         rule: &AutopilotRuleRow,
         event_name: &str,
         action: &Value,
         fields: &serde_json::Map<String, Value>,
         screen_note: Option<String>,
     ) {
+        if !self.admit_department_rule(origin, rule, fields, chrono::Utc::now()).await { return; }
         let note = |base: String| match &screen_note {
             Some(n) => format!("{n}｜{base}"),
             None => base,
@@ -151,19 +153,7 @@ impl AutopilotEngine {
         let ttl = crate::approval::DEFAULT_TTL_SECONDS;
         let latest = gate::latest_execution_at(now_utc, ttl);
         let payload = dispatch.approval_payload(&latest);
-        if !gate::credential_free(&payload) {
-            let detail = "動作內容含有金鑰或憑證，不能送審；動作沒有執行".to_string();
-            self.record_fire(rule, RESULT_APPROVAL_ERROR, note(detail.clone())).await;
-            self.approval_notice(&rule.id, &rule.name, RESULT_APPROVAL_ERROR, &detail).await;
-            return;
-        }
-        // H1: the dashboard shows the complete frozen action; a payload too
-        // large to review reliably is never filed.
-        if !gate::payload_within_limit(&payload) {
-            let detail = format!(
-                "動作內容超過 {} KiB，無法完整送審；動作沒有執行",
-                gate::MAX_FROZEN_PAYLOAD_BYTES / 1024
-            );
+        if let Some(detail) = approval_payload_refusal(&payload) {
             self.record_fire(rule, RESULT_APPROVAL_ERROR, note(detail.clone())).await;
             self.approval_notice(&rule.id, &rule.name, RESULT_APPROVAL_ERROR, &detail).await;
             return;
@@ -247,6 +237,94 @@ impl AutopilotEngine {
             json_meta(&rule.id, &dispatch.dispatch_id, Some(approval_id.as_str())),
         )
         .await;
+    }
+
+    /// File a previously rendered, fenced running step. A run already counted
+    /// its fire; every failure here settles without incrementing that counter.
+    pub(super) async fn gate_step_on_approval(
+        &self, rule: &AutopilotRuleRow, run: &crate::autopilot_store::AutopilotRunRow,
+        frozen: gate::FrozenAction, fields: &serde_json::Map<String, Value>,
+        lease_owner: &str, now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        let action: Value = serde_json::from_str(&rule.action)
+            .map_err(|_| DEPARTMENT_CONTAINMENT_SKIP.to_string())?;
+        let step = usize::try_from(run.step_index).ok().and_then(|index|
+            action.get("steps").and_then(Value::as_array).and_then(|steps| steps.get(index)))
+            .ok_or(DEPARTMENT_CONTAINMENT_SKIP)?;
+        if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
+            crate::autopilot_scope::check(&self.home_dir, rule, Some(step), fields, run.event_origin())
+        { return Err(DEPARTMENT_CONTAINMENT_SKIP.into()); }
+        let broker = self.approval_broker.as_ref().ok_or("核准服務沒有接上")?;
+        let dispatch = FrozenDispatch {
+            dispatch_id: uuid::Uuid::new_v4().to_string(),
+            rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(),
+            rule_hash: run.rule_hash.clone(), event: run.event_name.clone(),
+            event_ref: run.event_ref.clone(),
+            source_agent: fields.get("agent_id").and_then(Value::as_str).map(str::to_owned),
+            action: frozen,
+        };
+        let ttl = crate::approval::DEFAULT_TTL_SECONDS;
+        let latest = gate::latest_execution_at(chrono::Utc::now(), ttl);
+        let payload = dispatch.approval_payload(&latest);
+        if let Some(detail) = approval_payload_refusal(&payload) { return Err(detail); }
+        let dedupe = gate::step_dispatch_dedupe_key(&run.rule_id, &run.rule_hash, &run.run_id, run.step_index);
+        let mut ledger = dispatch.ledger_row(&now.to_rfc3339(), &dedupe);
+        ledger.run_id = Some(run.run_id.clone());
+        ledger.step_index = Some(run.step_index);
+        match self.store.insert_dispatch(&ledger).await {
+            Ok(true) => {}
+            other => {
+                // Both the recent-event dedupe and the permanent run/step
+                // UNIQUE constraint land here. Never request another card.
+                if let Some(existing) = self.store.get_step_dispatch(&run.run_id, run.step_index).await? {
+                    if existing.state == DISPATCH_AWAITING && existing.rule_id == run.rule_id
+                        && existing.rule_hash == run.rule_hash && existing.approval_id.is_some()
+                    {
+                        // A duplicate may reuse only an already atomic binding.
+                        // Never repair an unbound awaiting row after the fact.
+                        let (fence, _) = self.store.fence_rule(&run.rule_id).await?;
+                        let bound = fence.approval_run(&run.run_id, run.step_index, &existing.dispatch_id)?;
+                        fence.release()?;
+                        if bound.is_some() { return Ok(()); }
+                    }
+                    if matches!(existing.state.as_str(), DISPATCH_REQUESTING | DISPATCH_AWAITING) {
+                        self.settle_with(&existing, &existing.state, RESULT_APPROVAL_ERROR,
+                            "這個步驟已有核准紀錄，但狀態不允許繼續送審", true, false).await;
+                    }
+                }
+                return Err(match other {
+                    Err(error) => format!("無法寫入核准紀錄：{error}"),
+                    _ => "這個步驟已有核准紀錄，但狀態不允許繼續送審".into(),
+                });
+            }
+        }
+        let filed: Result<(), String> = async {
+            let summary = format!("（第 {} 步）{}", run.step_index + 1, dispatch.summary(&latest));
+            let approval_id = broker.request(gate::REQUESTER, gate::ACTION_KIND, &summary, payload, ttl)
+                .await.map_err(|e| format!("無法建立核准單：{e}"))?;
+            ledger.approval_id = Some(approval_id.to_string());
+            match self.store.bind_step_dispatch_awaiting(&ledger.dispatch_id, approval_id.as_str(),
+                &run.run_id, run.step_index, lease_owner, chrono::Utc::now(), StepApprovalBindMode::Filing).await
+            {
+                Ok(true) => ledger.state = DISPATCH_AWAITING.into(),
+                other => {
+                    let _ = broker.withdraw(&approval_id, "system:autopilot_ledger_error").await;
+                    return Err(format!("核准單已撤回：無法更新核准紀錄（{other:?}）"));
+                }
+            }
+            Ok(())
+        }.await;
+        if let Err(detail) = &filed {
+            if let Some(id) = &ledger.approval_id {
+                let _ = broker.withdraw(&ApprovalId::from(id.clone()), "system:autopilot_ledger_error").await;
+            }
+            self.settle_with(&ledger, &ledger.state, RESULT_APPROVAL_ERROR, detail, true, false).await;
+        } else {
+            self.activity(gate::ACTIVITY_AWAITING,
+                format!("自動化規則「{}」第 {} 步等待管理員核准", rule.name, run.step_index + 1),
+                json_meta(&rule.id, &ledger.dispatch_id, ledger.approval_id.as_deref())).await;
+        }
+        filed
     }
 
     // ── Resumer ─────────────────────────────────────────────
@@ -412,6 +490,47 @@ impl AutopilotEngine {
             self.retire(broker, rec, row, "autonomy_paused").await;
             return self.settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, &pause, false).await;
         }
+        // 3e. Run cancellation and department scope narrow an approval too.
+        // All run facts come from the fence connection, never the store mutex.
+        let rule = rule.as_ref().expect("unchanged rule checked above");
+        let scope = if let Some(run_id) = &row.run_id {
+            let run = row.step_index.and_then(|index| {
+                match fence.approval_run(run_id, index, &row.dispatch_id) {
+                    Ok(run) => run,
+                    Err(error) => {
+                        warn!(dispatch_id = %row.dispatch_id, %error, "autopilot: fenced run read failed closed");
+                        None
+                    }
+                }
+            });
+            let Some(run) = run.filter(|run| run.rule_id == row.rule_id && run.rule_hash == row.rule_hash
+                && run.owner_department == rule.owner_department) else {
+                drop(fence);
+                self.retire(broker, rec, row, "stale_run").await;
+                return self.settle(row, DISPATCH_EXECUTING, RESULT_STALE,
+                    "流程已取消或已變更，已核准的步驟沒有執行", true).await;
+            };
+            let fields = serde_json::from_str::<serde_json::Map<String, Value>>(&run.fields_json);
+            let action = serde_json::from_str::<Value>(&rule.action);
+            match (fields, action) {
+                (Ok(fields), Ok(action)) => {
+                    let step = usize::try_from(run.step_index).ok()
+                        .and_then(|index| action.get("steps").and_then(Value::as_array).and_then(|steps| steps.get(index)));
+                    match step {
+                        Some(step) => crate::autopilot_scope::check(&self.home_dir, rule, Some(step), &fields, run.event_origin()),
+                        None => crate::autopilot_scope::ScopeDecision::Deny { reason: "step missing".into() },
+                    }
+                }
+                _ => crate::autopilot_scope::ScopeDecision::Deny { reason: "run fields or action unreadable".into() },
+            }
+        } else {
+            crate::autopilot_scope::check(&self.home_dir, rule, None, &serde_json::Map::new(), EventOrigin::external())
+        };
+        if let crate::autopilot_scope::ScopeDecision::Deny { .. } = scope {
+            drop(fence);
+            self.retire(broker, rec, row, "scope_denied").await;
+            return self.settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, DEPARTMENT_CONTAINMENT_SKIP, false).await;
+        }
         // 4. Consume the approval (approved → invalidated) — the point of no
         //    return — still under the fence.
         let reason = format!("{}{}", gate::CONSUMED_PREFIX, row.dispatch_id);
@@ -435,7 +554,9 @@ impl AutopilotEngine {
         }
         // 5. Perform exactly the frozen action, once.
         let who = rec.decided_by.as_deref().unwrap_or("unknown");
-        let outcome = self.perform_action(&dispatch.action).await;
+        let queue_id = row.run_id.as_deref().zip(row.step_index)
+            .map(|(run_id, index)| super::runs::queue_id(run_id, index));
+        let outcome = self.perform_action_with_queue_id(&dispatch.action, queue_id.as_deref(), chrono::Utc::now(), Some(rule)).await;
         let (result, detail) = match &outcome {
             Ok(()) => (RESULT_SUCCESS, format!("已由 {who} 核准並執行（{}）", row.event_name)),
             Err(e) => (RESULT_FAILURE, format!("已由 {who} 核准，但執行失敗：{e}")),
@@ -531,7 +652,14 @@ impl AutopilotEngine {
             .filter(|rec| rec.agent_id == gate::REQUESTER && gate::verify_card_payload(row, &rec.payload).is_ok())
             .collect();
         if let [only] = matching.as_slice() {
-            if let Ok(true) = self.store.mark_dispatch_awaiting(&row.dispatch_id, only.id.as_str()).await {
+            let bound = match (row.run_id.as_deref(), row.step_index) {
+                (Some(run_id), Some(index)) => self.store.bind_step_dispatch_awaiting(
+                    &row.dispatch_id, only.id.as_str(), run_id, index, super::runs::lease_owner(),
+                    chrono::Utc::now(), StepApprovalBindMode::Recovery).await,
+                (None, None) => self.store.mark_dispatch_awaiting(&row.dispatch_id, only.id.as_str()).await,
+                _ => Ok(false),
+            };
+            if let Ok(true) = bound {
                 info!(dispatch_id = %row.dispatch_id, "autopilot: recovered an approval filed before a restart");
                 return;
             }
@@ -566,10 +694,16 @@ impl AutopilotEngine {
             // Back to awaiting; the resumer re-checks everything (including
             // the execution window).
             Some(rec) if rec.status == ApprovalStatus::Approved => {
-                let _ = self
+                let restored = self
                     .store
                     .transition_dispatch(&row.dispatch_id, DISPATCH_EXECUTING, DISPATCH_AWAITING)
                     .await;
+                if !matches!(restored, Ok(true)) {
+                    self.retire(broker, &rec, row, "recovery").await;
+                    self.settle(row, DISPATCH_EXECUTING, RESULT_APPROVAL_ERROR,
+                        "無法恢復核准紀錄與流程的連結，動作沒有執行", true).await;
+                    return;
+                }
                 info!(dispatch_id = %row.dispatch_id, "autopilot: approved action had not started before the restart; it is re-checked and may run once");
             }
             // Consumed by this dispatch: the action may have run. Never again.
@@ -629,7 +763,7 @@ impl AutopilotEngine {
         let push = notice || gate::always_noticed(outcome);
         match self
             .store
-            .settle_dispatch(&row.dispatch_id, from, outcome, detail, push, count_fire)
+            .settle_dispatch(&row.dispatch_id, from, outcome, detail, push, count_fire && row.run_id.is_none())
             .await
         {
             Ok(true) => {}
@@ -643,6 +777,11 @@ impl AutopilotEngine {
         {
             if self.crash_after_settle.load(std::sync::atomic::Ordering::SeqCst) {
                 return true;
+            }
+        }
+        if row.run_id.is_some() {
+            if let Err(error) = self.reconcile_approval_runs_once(chrono::Utc::now()).await {
+                warn!(dispatch_id = %row.dispatch_id, %error, "autopilot: approval run reconciliation deferred to next tick");
             }
         }
         self.announce_dispatch(&row.dispatch_id).await;
@@ -701,8 +840,38 @@ impl AutopilotEngine {
     /// (then the best-effort live event), and its chat push. Each is marked
     /// done only after it succeeded; whatever is left stays owed and is
     /// re-driven by the next sweep.
+    async fn dispatch_notice_department(&self, row: &AutopilotDispatchRow) -> Result<Option<String>, String> {
+        if let Some(run_id) = &row.run_id {
+            let run = self.store.get_run(run_id).await.map_err(|_| "scope_denied")?
+                .ok_or("scope_denied")?;
+            if run.rule_id != row.rule_id || run.rule_hash != row.rule_hash {
+                return Err("scope_denied".into());
+            }
+            return Ok(run.owner_department);
+        }
+        // Department rules require steps. For legacy single actions the hash
+        // binds ownership too, so a changed/deleted rule cannot shed its scope.
+        let rule = self.store.get_rule(&row.rule_id).await.map_err(|_| "scope_denied")?
+            .ok_or("scope_denied")?;
+        if rule.owner_department.is_some() || gate::rule_revision_hash(&rule) != row.rule_hash {
+            return Err("scope_denied".into());
+        }
+        Ok(None)
+    }
+
     async fn announce_row(&self, row: &AutopilotDispatchRow) {
         if row.state != DISPATCH_SETTLED {
+            return;
+        }
+        let allowed = match self.dispatch_notice_department(row).await {
+            Ok(department) => crate::autopilot_scope::notice_targets(&self.home_dir, &self.store,
+                &row.rule_id, department.as_deref()).await.is_ok(),
+            Err(_) => false,
+        };
+        if !allowed {
+            if self.store.deny_dispatch_notice(&row.dispatch_id).await.is_err() {
+                warn!("autopilot: scope-denied approval notice could not be settled");
+            }
             return;
         }
         let outcome = row.outcome.as_deref().unwrap_or(RESULT_APPROVAL_ERROR);
@@ -755,6 +924,19 @@ impl AutopilotEngine {
     /// in flight twice. Limited outcomes are held to one push per rule per
     /// hour (decided before the first attempt).
     async fn drive_notice_push(&self, row: &AutopilotDispatchRow, outcome: &str, detail: &str) {
+        let department = match self.dispatch_notice_department(row).await {
+            Ok(department) => department,
+            Err(_) => {
+                let _ = self.store.deny_dispatch_notice(&row.dispatch_id).await;
+                return;
+            }
+        };
+        if crate::autopilot_scope::notice_targets(&self.home_dir, &self.store,
+            &row.rule_id, department.as_deref()).await.is_err()
+        {
+            let _ = self.store.deny_dispatch_notice(&row.dispatch_id).await;
+            return;
+        }
         let id = row.dispatch_id.as_str();
         if row.notice_push_attempts == 0
             && !gate::always_noticed(outcome)
@@ -809,7 +991,7 @@ impl AutopilotEngine {
         let rule_id = row.rule_id.clone();
         let dispatch_id = id.to_string();
         tokio::spawn(async move {
-            let result = gate::push_admin_notice(&home, &rule_id, &body).await;
+            let result = gate::push_scoped_notice(&home, &store, &rule_id, department.as_deref(), &body).await;
             record_notice_push(&store, &dispatch_id, attempt, result).await;
         });
     }
@@ -878,6 +1060,7 @@ async fn record_notice_push(store: &AutopilotStore, dispatch_id: &str, attempt: 
     let recorded = match result {
         NoticePush::Sent => store.finish_dispatch_notice_push(dispatch_id, PUSH_SENT).await,
         NoticePush::Queued => store.finish_dispatch_notice_push(dispatch_id, PUSH_QUEUED).await,
+        NoticePush::ScopeDenied => store.finish_dispatch_notice_push(dispatch_id, "scope_denied").await,
         NoticePush::NoTarget => store.finish_dispatch_notice_push(dispatch_id, PUSH_NO_TARGET).await,
         NoticePush::Failed if attempt >= gate::MAX_NOTICE_PUSH_ATTEMPTS => {
             error!(dispatch_id, attempt,
@@ -929,4 +1112,15 @@ pub(super) fn decision_window_check(
         return Err("核准後超過 15 分鐘才處理，已核准的動作沒有執行");
     }
     Ok(())
+}
+
+/// Both filing paths enforce the same credential and review-size boundaries.
+fn approval_payload_refusal(payload: &Value) -> Option<String> {
+    if !gate::credential_free(payload) {
+        Some("動作內容含有金鑰或憑證，不能送審；動作沒有執行".into())
+    } else if !gate::payload_within_limit(payload) {
+        Some(format!("動作內容超過 {} KiB，無法完整送審；動作沒有執行", gate::MAX_FROZEN_PAYLOAD_BYTES / 1024))
+    } else {
+        None
+    }
 }

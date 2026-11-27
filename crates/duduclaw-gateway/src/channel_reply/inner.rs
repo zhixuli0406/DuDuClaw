@@ -304,7 +304,7 @@ async fn build_reply_with_session_inner_impl(
     );
 
     // Determine which agent to use
-    let reg = ctx.registry.read().await;
+    let mut reg = ctx.registry.read().await;
     let mut via_trigger = false;
     let agent = if let Some(name) = agent_override {
         // Explicit agent name (per-agent bot, WebChat selection, LINE route
@@ -422,29 +422,44 @@ async fn build_reply_with_session_inner_impl(
         let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
         return no_responder_public_text(language.as_deref()).into();
     }
-    if let Some(a) = agent {
-        // Revalidate the actual LoadedAgent, not the earlier selected name.
-        // The authenticated account is host-owned task-local state; a model
-        // or a client-supplied message cannot replace it. This runs before
-        // any model seam/runtime and while the registry read lock is held.
-        if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
-            // "system" is the already-authenticated legacy token Admin.
-            if user != "system" && !crate::webchat::is_widget_visitor(&user) {
-                let wire = format!("user:{user}");
-                if let Some(refusal) = crate::machine_employee::refusal_for_known_target(
-                    &ctx.home_dir, &user, &a.config.agent.name,
-                ) {
-                    return refusal.into();
-                }
-                if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
-                    &ctx.home_dir, Some(&wire), a,
-                ).await {
-                    tracing::warn!(user, agent = %a.config.agent.name, reason,
-                        "WebChat final reply target unavailable");
-                    return crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into();
-                }
+    // Only dashboard accounts opt into the new conversation gate. Channels,
+    // token Admin and widgets keep their existing route and lock lifetime.
+    let main_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone)
+        .ok().filter(|user| user != "system" && !crate::webchat::is_widget_visitor(user));
+    let selected_agent = agent.cloned().map(Box::new);
+    let agent = selected_agent.as_deref();
+    if let Some(user) = main_user {
+        // The asynchronous tool proof loads employees; release the live lock.
+        drop(reg);
+        if let Some(a) = agent {
+            let wire = format!("user:{user}");
+            if let Some(refusal) = crate::machine_employee::refusal_for_known_target(
+                &ctx.home_dir, &user, &a.config.agent.name,
+            ) {
+                return refusal.into();
+            }
+            if let Err(reason) = Box::pin(crate::on_behalf_of::access::check_loaded_main_target_for(
+                &ctx.home_dir, Some(&wire), a, crate::on_behalf_of::access::MainUse::Converse,
+            )).await {
+                tracing::warn!(user, agent = %a.config.agent.name, reason,
+                    "WebChat final reply target unavailable");
+                return if reason == crate::on_behalf_of::access::MAIN_TURN_REFUSAL {
+                    reason
+                } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into() };
             }
         }
+        reg = ctx.registry.read().await;
+        // Reject a reload during the proof instead of executing a replacement.
+        if let Some(selected) = agent {
+            let unchanged = reg.get(&selected.config.agent.name).is_some_and(|current| {
+                current.dir == selected.dir
+                    && matches!((serde_json::to_value(&current.config), serde_json::to_value(&selected.config)),
+                        (Ok(current), Ok(selected)) if current == selected)
+            });
+            if !unchanged { return crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into(); }
+        }
+    }
+    if let Some(a) = agent {
         let principal = crate::on_behalf_of::current();
         // A failed requester lookup must not look like unattended work.
         let unknown = matches!(
@@ -632,8 +647,7 @@ async fn build_reply_with_session_inner_impl(
             warn!(agent = %agent_id, code = refusal.code(), ?refusal, "employee entry refused");
             super::health::receive(ctx, &agent_id, session_id).await;
             super::health::mark(&agent_id, Some("other"));
-            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
-            let text = refusal.user_text(session_id, language.as_deref(), &turn_id);
+            let text = super::failure_notice::entry_refusal_text(ctx, session_id, &agent_id, &turn_id, &refusal).await;
             return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
         }
     };
@@ -2347,7 +2361,7 @@ async fn build_reply_with_session_inner_impl(
     // for OAuth-only setups to avoid the misleading "未設定任何 API 帳號" error.
     let allow_direct_api = direct_api_allowed(non_claude,duduclaw_llm::is_moa_model_id(&model),mcp_gate_refused);
     let fallback_api_key = if reply.is_none() && allow_direct_api {
-        #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,true);
+        #[cfg(test)] super::reply_origin::testing::before_direct_api_credentials(&ctx.home_dir);
         get_api_key(&ctx.home_dir).await
     } else { None };
     let reply = match reply {
@@ -2356,6 +2370,7 @@ async fn build_reply_with_session_inner_impl(
         // A `moa:` id is not an Anthropic model — the MoA branch above was
         // this request's API path; don't re-send the ensemble id upstream.
         None if allow_direct_api && fallback_api_key.is_some() => {
+            #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir, true);
             let key = fallback_api_key.as_deref().unwrap_or_default();
             // P34 #4: a `system_operator`-capable agent gets one attempt at
             // the real MCP tool loop before falling through to the plain
@@ -4331,6 +4346,9 @@ async fn build_reply_with_session_inner_impl(
     drop(reg);
 
     let failure = last_cli_error.unwrap_or_else(||ReplyFailure::simple(ReplyOrigin::Unknown,"No error info".into()));
+    if failure.to_string() == crate::on_behalf_of::access::MAIN_TURN_REFUSAL {
+        return crate::on_behalf_of::access::MAIN_TURN_REFUSAL.into();
+    }
     let reason = failure.reason();
     super::health::mark(&agent_id, Some(if mcp_gate_refused && !crate::work_outcome::is_work_result(&failure) { "gate_refused" } else { super::health::reason(reason) }));
     let diagnostic = failure.audit();

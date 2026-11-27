@@ -343,11 +343,11 @@ fn sr5r3_import_accepts_v181_approvals_and_never_reads_incarnation() {
 
 #[test]
 fn sr5r3_import_refuses_approvals_with_an_extra_column() {
-    for schema in [APPROVALS_V180, APPROVALS_V181] {
+    for schema in [APPROVALS_V180, APPROVALS_V181, APPROVALS_V186] {
         let file = store(schema, "ALTER TABLE approvals ADD COLUMN planted_column TEXT;");
         assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
         let message = take_schema_refusal().expect("refusal report").to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.86)"), "{message}");
         assert!(message.contains("changed table approvals"), "{message}");
     }
     // Half-upgraded: v1.80.x plus the incarnation column with a different type.
@@ -437,4 +437,61 @@ fn googlechat_recovery_catalogs_match_initializer_and_refuse_unknown_objects() {
     let legacy = catalog_connection(GOOGLECHAT_INBOX_V183_V1, None).unwrap();
     legacy.execute_batch(include_str!("googlechat-placeholder-state-v183.sql")).unwrap();
     assert_eq!(detect(&legacy, Store::GoogleChatInbox, None).unwrap().version, SchemaVersion::V181);
+}
+
+#[test]
+fn rm143_import_v186_approvals_discards_chat_admin_evidence() {
+    assert_eq!(detected(APPROVALS_V186, Store::Approvals, None).version, SchemaVersion::V180);
+    let rows = "INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,decided_by)
+        VALUES ('SECRET-APPROVAL','sales','expert_skills_enable','old','approved','now',
+            'chat-admin:3f2afc12-4f13-4a28-8b7f-df31eadbb013:telegram:totp');
+        INSERT INTO chat_admin_cards VALUES ('SECRET-CARD','SECRET-APPROVAL','rm143','SECRET-USER',
+            'telegram','SECRET-BOT','SECRET-PRINCIPAL','SECRET-DM','42','SECRET-DIGEST','T2','later','consumed','now');
+        INSERT INTO chat_admin_decisions VALUES ('SECRET-APPROVAL','SECRET-CARD','SECRET-USER',
+            'telegram','totp',1,'SECRET-DIGEST',1,'now');";
+    let file = store(APPROVALS_V186, rows);
+    let proposals = extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].category, C::LegacyApproval);
+    assert_eq!(proposals[0].fields.len(), 1);
+    assert_eq!(proposals[0].fields[0].name, "reference");
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SECRET", "chat-admin:", "chat_admin_cards", "chat_admin_decisions"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    // Unknown additions to the evidence tables still reject the entire source.
+    for extra in ["ALTER TABLE chat_admin_cards ADD COLUMN planted TEXT;",
+        "CREATE TRIGGER planted AFTER INSERT ON chat_admin_decisions BEGIN SELECT 1; END;"] {
+        let file = store(APPROVALS_V186, extra);
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+    }
+}
+
+#[test]
+fn rm143_import_users_requires_reentry_and_refuses_unpinned_proofs() {
+    let rows = "INSERT INTO users(id,email,display_name,password_hash,role,created_at,updated_at)
+        VALUES ('u','admin@example.com','Admin','SECRET-PASSWORD','admin','now','now');
+        INSERT INTO channel_identities(user_id,channel,channel_user_id,verified,created_at)
+        VALUES ('u','telegram','SECRET-PRINCIPAL',1,'now');";
+    let file = store(include_str!("users-v1793.sql"), rows);
+    let proposals = extract(&request(SourceKind::AuthorityUsersSqlite, "users.db"), source(&file), None).unwrap();
+    let binding = proposals.iter().find(|p| p.category == C::ChannelBinding).unwrap();
+    assert_eq!(value(binding, "requires_reentry"), "true");
+    assert_eq!(value(binding, "binding"), r#"{"owner":"admin@example.com","requires_new_login":true}"#);
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SECRET", "proof_method", "proof_user_id", "proven_at", "proof_account", "proof_dm", "chat_link_"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    // Users is intentionally still an exact v1.79.3-only reader. Even one
+    // RM-143 column or table refuses the whole source, never a partial copy.
+    let chat_link = include_str!("../../duduclaw-auth/src/chat_link.rs");
+    let ddl = chat_link.split("conn.execute_batch(\"").nth(1).unwrap().split("\")").next().unwrap();
+    for extra in ["ALTER TABLE channel_identities ADD COLUMN proof_method TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_user_id TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proven_at INTEGER;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_account TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_dm TEXT;", ddl] {
+        let file = store(include_str!("users-v1793.sql"), &format!("{rows} {extra}"));
+        assert_eq!(extract(&request(SourceKind::AuthorityUsersSqlite, "users.db"), source(&file), None).err(), Some(Error::Schema));
+    }
 }

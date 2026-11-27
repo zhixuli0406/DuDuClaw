@@ -608,3 +608,12 @@ fn tool_pruning_is_frozen_with_the_capabilities_section() {
         other => panic!("expected frozen capability, got {other:?}"),
     }
 }
+
+#[test]
+fn guard_blocks_admin_ai_section() {
+    let enabled = format!("{CONFIG}\n[admin_ai]\nenabled = true\n");
+    for (before, after) in [(CONFIG, enabled.as_str()), (enabled.as_str(), CONFIG)] {
+        assert!(matches!(check_protected_toml_write(&home().join("config.toml"), &home(), Some(before), after),
+            GuardDecision::BlockedProtectedSection { .. }));
+    }
+}

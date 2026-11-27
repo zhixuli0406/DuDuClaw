@@ -2,6 +2,7 @@ use super::*;
 
 fn admin() -> UserContext {
     UserContext {
+            origin: duduclaw_auth::acl::ContextOrigin::Other,
             member_key_id: None,
         user_id: "system".into(), email: "admin@localhost".into(), role: UserRole::Admin,
         credential_epoch: 0, agent_access: Default::default(), must_change_password: false,

@@ -553,6 +553,14 @@ impl CronStore {
     /// Employee edits compare the whole authorized snapshot in one write transaction.
     /// This also refuses a concurrent workflow binding or owner reassignment.
     pub(crate) async fn edit_scoped(&self, expected: &CronTaskRow, changed: Option<&CronTaskRow>) -> Result<bool, String> {
+        self.edit_scoped_inner(expected, changed, None).await
+    }
+
+    pub(crate) async fn edit_admin_ai(&self, expected: &CronTaskRow, changed: Option<&CronTaskRow>, expected_hash: &str) -> Result<bool, String> {
+        self.edit_scoped_inner(expected, changed, Some(expected_hash)).await
+    }
+
+    async fn edit_scoped_inner(&self, expected: &CronTaskRow, changed: Option<&CronTaskRow>, expected_hash: Option<&str>) -> Result<bool, String> {
         let mut conn = self.conn.lock().await;
         let tx = begin_write(&mut conn)?;
         let current = tx.query_row(
@@ -562,6 +570,11 @@ impl CronStore {
             params![expected.id], row_to_cron_task,
         ).optional().map_err(|e| e.to_string())?;
         let Some(current) = current else { return Ok(false) };
+        if let Some(expected_hash) = expected_hash {
+            let actual = crate::admin_ai::proposal::hash_schedule(&current)
+                .map_err(|_| crate::admin_ai::proposal::STALE.to_string())?;
+            if actual != expected_hash { return Ok(false); }
+        }
         if serde_json::to_value(&current).map_err(|e| e.to_string())?
             != serde_json::to_value(expected).map_err(|e| e.to_string())? { return Ok(false); }
         let bound: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM cron_workflow_bindings WHERE cron_id=?1)",
@@ -573,10 +586,15 @@ impl CronStore {
             }
             // F6h writer gate: a tombstoned label's schedule stays as paused.
             crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
-            scoped::check_transition(&tx, &current, row)?;
-            tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
-                params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
-                .map_err(|e| e.to_string())?;
+            if expected_hash.is_some() {
+                // Includes timezone in the same transaction as the approved edit.
+                Self::persist_edit(&tx, &current, row)?;
+            } else {
+                scoped::check_transition(&tx, &current, row)?;
+                tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
+                    params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
+                    .map_err(|e| e.to_string())?;
+            }
             if !scoped::requires_admission(row) || scoped::validate_scoped_schedule(row).is_ok() { Self::clear_scoped_schedule_skip_in_transaction(&tx, &row.id)?; }
         } else {
             tx.execute("DELETE FROM cron_tasks WHERE id=?1", params![expected.id]).map_err(|e| e.to_string())?;

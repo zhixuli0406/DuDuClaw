@@ -91,6 +91,7 @@ fn admin_ctx() -> UserContext {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),
@@ -525,6 +526,7 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
 
 fn employee_ctx() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         role: UserRole::Employee,
         user_id: "e1".to_string(),
         email: "e1@test.local".to_string(),

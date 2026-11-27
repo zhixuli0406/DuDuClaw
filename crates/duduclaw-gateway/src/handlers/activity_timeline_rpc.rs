@@ -32,6 +32,10 @@ impl MethodHandler {
             }
             return match store.list_activity_for_task(task_id, limit.max(1)).await {
                 Ok(rows) => {
+                    let rows = match self.member_key_activity_rows(ctx, rows).await {
+                        Ok(rows) => rows,
+                        Err(frame) => return frame,
+                    };
                     let total = rows.len() as i64;
                     let events: Vec<Value> = rows.iter().map(activity_row_to_json).collect();
                     WsFrame::ok_response("", json!({ "events": events, "total": total }))
@@ -50,6 +54,10 @@ impl MethodHandler {
             .await
         {
             Ok((rows, total)) => {
+                let rows = match self.member_key_activity_rows(ctx, rows).await {
+                    Ok(rows) => rows,
+                    Err(frame) => return frame,
+                };
                 let owners = activity_task_owners(&store, &rows).await;
                 // v1.81 P1b: another person's Personal employee is hidden,
                 // by the row's employee and by its task's employee.

@@ -377,6 +377,9 @@ pub(crate) async fn run_claude_runtime_fallback(
 async fn run_agent_prompt_scoped(
     req: AgentPrompt<'_>, primary_error: Option<&str>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    // Direct dispatch callers also need the marker; Chat preserves the
+    // WebChat/shared-member scope (or the absence of one for ordinary channels).
+    let dispatch = req.request_type == RequestType::Dispatch;
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -385,7 +388,7 @@ async fn run_agent_prompt_scoped(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    crate::process_group::with_class(crate::process_group::request_class(req.request_type),
+    let run = Box::pin(crate::process_group::with_class(crate::process_group::request_class(req.request_type),
     crate::autonomous_runtime::request_scope(
         req.home_dir,
         &owner,
@@ -400,7 +403,14 @@ async fn run_agent_prompt_scoped(
                 crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req, primary_error)),
             ),
         ),
-    )).await
+    )));
+    if dispatch {
+        crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+            crate::on_behalf_of::access::MainUse::Assign, run,
+        ).await
+    } else {
+        run.await
+    }
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.
@@ -1823,7 +1833,8 @@ pub(crate) mod testing {
         let bin = home.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         crate::test_exec::write_executable(&bin.join("claude"),
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+             if [ \"$#\" -eq 2 ] && [ \"$1\" = auth ] && [ \"$2\" = status ]; then echo '{\"loggedIn\":false}'; exit 1; fi\n\
              printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
              /bin/cat \"$HOME/stream.jsonl\"\nexit 1\n", 0o755);
         let name = full_name.split_once("::").unwrap().1;

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useSearchParams } from 'react-router';
@@ -8,6 +9,7 @@ import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 import { DRIVE_FILE_SCOPE, MEET_READ_SCOPE } from '@/lib/meeting/drive';
 
 export function MyConnectionsPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const t = (id: string, values?: Record<string,string|number>) => intl.formatMessage({id},values);
   const [query, setQuery] = useSearchParams();
@@ -63,7 +65,7 @@ export function MyConnectionsPage() {
   return <div className="mx-auto max-w-4xl space-y-6 p-6">
     <div><h1 className="text-2xl font-semibold">{t('myConnections.title')}</h1><p className="mt-2 text-sm text-muted-foreground">{t('myConnections.intro')}</p></div>
     {(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
-      {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: new Date(notice.timestamp).toLocaleString(intl.locale) })}
+      {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: formatDateTime(notice.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) })}
     </p>)}
     {!!status.authorization_requests?.length && <Card><CardHeader><CardTitle>{t('googleAuthorization.requests')}</CardTitle></CardHeader><CardContent>
       <ul className="space-y-3 text-sm">{status.authorization_requests.map(request => <li key={request.id}>
@@ -74,7 +76,7 @@ export function MyConnectionsPage() {
       {status.connection && <><p className="font-medium">{status.connection.account_email}</p><p className="text-sm">{t(`myConnections.status.${status.connection.status}`)}</p>
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>
         {status.connection.account_email.toLowerCase() !== status.login_email.toLowerCase() && <p className="text-sm text-warning">{t('myConnections.different',{email:status.login_email})}</p>}
-        <p className="text-sm">{t('myConnections.connectedAt',{time:new Date(status.connection.connected_at).toLocaleString(intl.locale)})}</p>
+        <p className="text-sm">{t('myConnections.connectedAt',{time:formatDateTime(status.connection.connected_at, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })})}</p>
         <p className="text-sm">{t('myConnections.services')}: {['gmail','calendar','drive','spreadsheets','documents','presentations','forms','tasks','chat'].filter(service=>status.connection!.local_purposes?.includes(service === 'drive' ? 'drive_tools' : service === 'chat' ? 'chat_read' : 'base') && status.connection!.granted_scopes.some(scope=>service === 'drive' ? ['https://www.googleapis.com/auth/drive.readonly','https://www.googleapis.com/auth/drive'].includes(scope) : scope.includes(service))).map(service=>t(`myConnections.service.${service}`)).join('、') || t('myConnections.noServices')}</p>
       </>}
       {!status.client_configured && <p>{t('myConnections.noClient')}</p>}
@@ -116,7 +118,7 @@ export function MyConnectionsPage() {
     {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">
       <p>{request.employee} · {request.account}</p><p className="break-all">{request.space} {request.thread ?? ''}</p>
       <pre className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 font-sans text-sm">{request.text_display}</pre>
-      <p className="text-sm">{t('myConnections.chatSend.egress')}</p><p>{t('myConnections.chatSend.expires', {time:new Date(request.expires_at).toLocaleString(intl.locale)})}</p>
+      <p className="text-sm">{t('myConnections.chatSend.egress')}</p><p>{t('myConnections.chatSend.expires', {time:formatDateTime(request.expires_at, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })})}</p>
       <div className="flex gap-2"><Button disabled={busy||Date.parse(request.expires_at)<=Date.now()} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,true);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.confirm')}</Button>
       <Button variant="outline" disabled={busy} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,false);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.cancel')}</Button></div>
     </CardContent></Card>)}
@@ -132,6 +134,6 @@ export function MyConnectionsPage() {
       </div>)}
     </CardContent></Card>
     <Card><CardHeader><CardTitle>{t('myConnections.delegated')}</CardTitle></CardHeader><CardContent><p className="text-sm text-muted-foreground">{t('myConnections.adminManaged')}</p>{status.delegated.map(row=><p key={row.agent_id}>{row.agent_id} — {row.email}</p>)}</CardContent></Card>
-    <Card><CardHeader><CardTitle>{t('myConnections.history')}</CardTitle></CardHeader><CardContent><p className="text-xs text-muted-foreground">{t('myConnections.historyHint')}</p>{status.recent_usage.map((row,index)=><div className="mt-2 flex flex-wrap gap-3 text-sm" key={`${row.timestamp}-${index}`}><time>{new Date(row.timestamp).toLocaleString(intl.locale)}</time><span>{row.agent_id}</span><span>{row.tool_name}</span><span>{t(row.success?'myConnections.success':'myConnections.failure')}</span></div>)}</CardContent></Card>
+    <Card><CardHeader><CardTitle>{t('myConnections.history')}</CardTitle></CardHeader><CardContent><p className="text-xs text-muted-foreground">{t('myConnections.historyHint')}</p>{status.recent_usage.map((row,index)=><div className="mt-2 flex flex-wrap gap-3 text-sm" key={`${row.timestamp}-${index}`}><time>{formatDateTime(row.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time><span>{row.agent_id}</span><span>{row.tool_name}</span><span>{t(row.success?'myConnections.success':'myConnections.failure')}</span></div>)}</CardContent></Card>
   </div>;
 }

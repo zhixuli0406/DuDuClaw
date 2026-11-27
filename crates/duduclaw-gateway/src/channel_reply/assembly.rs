@@ -77,6 +77,9 @@ impl<'a> Assembly<'a> {
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
+        if !origin.is_claude_cli() {
+            crate::on_behalf_of::access::check_final_main_spawn(self.home, self.agent_dir, None).await?;
+        }
         self.run(|| {
             let work = call();
             async move {

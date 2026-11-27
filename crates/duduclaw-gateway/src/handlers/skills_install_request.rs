@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{department_grant_allows, record_grant_use, DeptGrantView, GrantAction, GrantGroup};
 
 impl MethodHandler {
     // ── Install approval requests (non-admin Skill / MCP install) ───
@@ -131,9 +132,14 @@ impl MethodHandler {
         // signer; an employee/manager may only *request* into an agent they can
         // reach. (The admin who signs can still see the requested scope.)
         // Validate agent scope binding for non-global scopes.
+        let mut grant_backed = false;
         if scope != "global" && !scope.starts_with("department:") {
+            let view = DeptGrantView::load(self, ctx).await;
             if let Err(e) = acl::require_agent_access(ctx, &scope, AccessLevel::Operator) {
-                return WsFrame::error_response("", &e);
+                if !department_grant_allows(&view, &scope, GrantGroup::Skills, GrantAction::RequestInstall) {
+                    return WsFrame::error_response("", &e);
+                }
+                grant_backed = true;
             }
         }
 
@@ -176,11 +182,15 @@ impl MethodHandler {
                 &format!("{:?}", scan.risk_level),
                 &scan_json,
                 &payload,
-                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+                crate::skill_ttl::skill_approval_ttl_secs(&self.home_dir),
             )
             .await
         {
             Ok(id) => {
+                if grant_backed {
+                    record_grant_use(self, ctx, &scope, GrantGroup::Skills,
+                        GrantAction::RequestInstall, "skills.install_request").await;
+                }
                 let stage = if ctx.role == UserRole::Employee {
                     "awaiting_manager"
                 } else {
@@ -290,7 +300,7 @@ impl MethodHandler {
                 &format!("{:?}", scan.risk_level),
                 &scan_json,
                 &payload,
-                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+                crate::skill_ttl::skill_approval_ttl_secs(&self.home_dir),
             )
             .await
         {

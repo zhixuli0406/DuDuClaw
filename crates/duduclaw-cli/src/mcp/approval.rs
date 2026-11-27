@@ -65,6 +65,17 @@ pub(crate) fn install_approval_required(
 /// (or `block`, which the dispatch gate refuses earlier). Rules only ever add
 /// to `always`, so an `allow` rule cannot remove an approval a name list
 /// imposes (take-the-stricter).
+pub(crate) fn odoo_requires_approval(tool: &str, payload: &Value) -> bool {
+    let args = payload.get("arguments").unwrap_or(&Value::Null);
+    let Some((_, _, method)) = super::odoo_access::operation(tool, Some(args)) else { return false };
+    // The runtime permission decision arrives later. Conservatively require
+    // exact-call approval in every mode for arbitrary mutations and buttons.
+    tool == "odoo_message_send"
+        || (tool == "odoo_execute" && method.is_none_or(|m|
+            duduclaw_odoo::access_policy::method_verb(m) != duduclaw_odoo::access_policy::Verb::Read))
+        || method.is_some_and(|m| ["action_", "button_", "toggle_"].iter().any(|prefix| m.starts_with(prefix)))
+}
+
 pub(crate) fn static_gate_flags(
     agent_dir: &Path,
     tool_name: &str,
@@ -74,7 +85,11 @@ pub(crate) fn static_gate_flags(
         tool_name,
         payload.get("arguments").unwrap_or(&Value::Null),
     );
-    let always = payload.get("egress_guard").is_some()
+    // RM-141: notifying Odoo followers always needs a human, even when an
+    // action rule allows the tool. Send classification binds/consumes its
+    // exact arguments through ActionGrant below.
+    let always = odoo_requires_approval(tool_name, payload)
+        || payload.get("egress_guard").is_some()
         || install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
         || crate::mcp_dispatch::action_rule_verdict_for_call(
@@ -249,7 +264,7 @@ pub(crate) async fn run_approval_bound(
     let private_account = crate::mcp_auth::current_google_account_approval();
     let account_json = payload.get(duduclaw_core::google_identity::GOOGLE_ACCOUNT_APPROVAL_KEY);
     let summary = if let Some(account) = private_account {
-        if !matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+        if !matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some() && !duduclaw_core::google_identity::is_drive_write_tool(tool))
             || !account.is_well_formed()
             || account_json != serde_json::to_value(&account).ok().as_ref()
         {
@@ -262,7 +277,7 @@ pub(crate) async fn run_approval_bound(
         format!("{summary}\n\n{card}")
     } else {
         if account_json.is_some()
-            && matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+            && matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some() && !duduclaw_core::google_identity::is_drive_write_tool(tool))
         {
             return InstallApprovalOutcome::Denied(
                 "Google 帳號核准資料不能由工具參數提供。".into(),
@@ -712,7 +727,8 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 payload["reason"] = serde_json::json!("action_rule");
             }
             let grant =
-                duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask)
+                (odoo_requires_approval(tool_name, &payload)
+                    || duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask))
                     .then(|| {
                         duduclaw_gateway::approval::action_grant::ActionGrant::build(
                             agent_id, tool_name, &payload,
@@ -1187,4 +1203,37 @@ fn home_account_card_never_invents_a_google_subject_or_personal_owner() {
     assert!(card.contains("公司共用"));
     assert!(!card.contains("連線擁有者"));
     assert!(!card.contains("選用個人"));
+}
+
+/// Mandatory RM-194 approval, independent of action_rules and delegation policy.
+/// Only canonical source names enter this payload; never connection details.
+pub(crate) async fn approve_db_source_grant(
+    home: &Path, caller: &str, target: &str, sources: &[String],
+) -> std::result::Result<(String, String), String> {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus, action_grant::{ActionGrant, verify_and_consume}};
+    const REFUSED: &str = "管理員未核准，資料庫授權沒有變更。";
+    let broker = ApprovalBroker::open(home).map_err(|_| REFUSED.to_string())?;
+    let mut payload = serde_json::json!({
+        "name":"agent_update", "arguments":{"agent_id":target, "db_sources":sources},
+        "pending_message":"新增資料庫授權需要管理員在儀表板核准；已送出核准單。"
+    });
+    let grant = ActionGrant::build(caller, "agent_update", &payload);
+    payload["action_grant"] = grant.to_json();
+    let summary = format!("AI 員工要求授權資料庫來源\n目標員工：{target}\n提出要求的員工：{caller}\n來源：{}", sources.join("、"));
+    let id = broker.request(caller, "db_source_grant", &summary, payload, INSTALL_APPROVAL_TTL_SECONDS)
+        .await.map_err(|_| REFUSED.to_string())?;
+    broker.record_tool_pending_state(caller, "agent_update", &id, "pending");
+    tracing::info!(approval_id = %id, "新增資料庫授權需要管理員在儀表板核准；已送出核准單。");
+    let decision = broker.await_decision(&id, INSTALL_APPROVAL_POLL).await;
+    if !matches!(decision, Ok(ApprovalStatus::Approved)) {
+        broker.record_tool_pending_state(caller, "agent_update", &id, "cancelled");
+        return Err(REFUSED.into());
+    }
+    let rec = broker.get(&id).await.map_err(|_| REFUSED.to_string())?
+        .ok_or_else(|| REFUSED.to_string())?;
+    let user = rec.decided_by.as_deref().and_then(|by| by.strip_prefix("dashboard:"))
+        .filter(|user| !user.is_empty()).ok_or_else(|| REFUSED.to_string())?.to_string();
+    verify_and_consume(&broker, &id, &grant).await.map_err(|_| REFUSED.to_string())?;
+    broker.record_tool_pending_state(caller, "agent_update", &id, "completed");
+    Ok((id.to_string(), user))
 }

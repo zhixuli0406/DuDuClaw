@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
@@ -44,6 +45,7 @@ const RISK_BADGE: Record<string, RiskBadge> = {
  */
 export function InstallRequestsSection() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const connectionState = useConnectionStore((s) => s.state);
   const [items, setItems] = useState<InstallRequestInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -178,7 +180,7 @@ export function InstallRequestsSection() {
 
                       <div className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
                         <Clock className="h-3 w-3" />
-                        {new Date(item.created_at).toLocaleString('zh-TW', {
+                        {formatDateTime(item.created_at, { locale: 'zh-TW',
                           month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
                         })}
                         {item.manager_by && (

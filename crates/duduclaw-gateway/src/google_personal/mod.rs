@@ -6,6 +6,9 @@ pub mod authority;
 pub mod flow;
 pub mod grants;
 pub mod history;
+pub(crate) mod home_write;
+#[cfg(test)]
+pub(crate) mod home_write_tests;
 pub mod lifecycle;
 pub(crate) mod meeting_access;
 #[cfg(test)]
@@ -18,6 +21,8 @@ pub mod pending;
 pub mod scopes;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_flow_tests;
 /// v1.81 E3: refresh / consent-revoke recheck on the legacy Personal path.
 #[cfg(test)]
 mod e3_tests;

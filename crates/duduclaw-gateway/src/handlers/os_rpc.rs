@@ -146,7 +146,7 @@ impl MethodHandler {
             mapped.insert("os_watch".into(), Value::Object(ow));
         }
 
-        self.handle_agents_update_as(Value::Object(mapped), caller).await
+        self.agents_update_inner(Value::Object(mapped), caller, None, super::agents_update::UpdateOrigin::OsSettings).await
     }
 
     /// `os.gate.recent` — tail of `proactive_gate.jsonl` (default 50, max 200)

@@ -156,7 +156,16 @@ pub fn load_keyfile_public(home_dir: &Path) -> Option<[u8; 32]> {
 
 fn load_keyfile(home_dir: &Path) -> Option<[u8; 32]> {
     let keyfile = home_dir.join(".keyfile");
-    let bytes = std::fs::read(&keyfile).ok()?;
+    let meta = std::fs::symlink_metadata(&keyfile).ok()?;
+    if !meta.is_file() { return None; }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != nix::unistd::Uid::effective().as_raw() || meta.mode() & 0o077 != 0 {
+            tracing::warn!("Machine keyfile is not owned by the current user or is group/world-accessible");
+        }
+    }
+    let bytes = zeroize::Zeroizing::new(std::fs::read(&keyfile).ok()?);
     if bytes.len() == 32 {
         let mut key = [0u8; 32];
         key.copy_from_slice(&bytes);

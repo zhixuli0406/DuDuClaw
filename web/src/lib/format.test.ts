@@ -1,4 +1,5 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
+import { resetCompanyTimeZone, useCompanyTimeStore } from './company-time';
 import {
   formatCents,
   formatTokens,
@@ -81,5 +82,21 @@ describe('format helpers (dashboard-redesign §8)', () => {
     expect(formatDurationSaved(2880)).toBe('2d');
     expect(formatDurationSaved(-10)).toBe('0m');
     expect(formatDurationSaved(null)).toBe('0m');
+  });
+});
+
+
+describe('timeAgo calendar-date fallback', () => {
+  afterEach(() => { resetCompanyTimeZone(); });
+
+  it('uses the company calendar date while keeping relative units unchanged', () => {
+    const date = '2024-11-26T17:30:00Z';
+    const now = Date.parse('2026-11-27T00:00:00Z');
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
+    expect(timeAgo(date, now)).toBe('2024-11-27');
+    expect(timeAgo(now - 5 * 60_000, now)).toBe('5m');
+    useCompanyTimeStore.setState({ status: 'set', zone: 'UTC' });
+    expect(timeAgo(date, now)).toBe('2024-11-26');
+    expect(timeAgo(now - 5 * 60_000, now)).toBe('5m');
   });
 });

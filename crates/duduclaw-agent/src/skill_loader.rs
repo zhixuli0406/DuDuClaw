@@ -671,30 +671,40 @@ pub async fn install_skill_department(
 /// Department prompt access requires an authoritative entry and a matching
 /// display mirror. An unavailable authority never falls back to self-assertion.
 pub fn authoritative_department(home: &Path, agent: &str) -> Option<String> {
+    try_authoritative_department(home, agent).ok().flatten()
+}
+
+/// Preserve unavailable/corrupt authority as an error for display-only callers.
+/// Authorization callers use `authoritative_department`, which denies both cases.
+pub fn try_authoritative_department(home: &Path, agent: &str) -> Result<Option<String>, ()> {
     use std::io::Read;
-    if !duduclaw_core::is_valid_agent_id(agent) { return None; }
-    let read = |path: &Path| -> Option<toml::Value> {
-        let dir = safe_dir::SafeDir::open(path.parent()?).ok()?;
-        let file = dir.read_file(path.file_name()?.to_str()?).ok()?;
-        if file.metadata().ok()?.len() > 1024 * 1024 { return None; }
+    if !duduclaw_core::is_valid_agent_id(agent) { return Ok(None); }
+    let read = |path: &Path| -> Result<toml::Value, ()> {
+        let dir = safe_dir::SafeDir::open(path.parent().ok_or(())?).map_err(|_| ())?;
+        let file = dir.read_file(path.file_name().and_then(|name| name.to_str()).ok_or(())?)
+            .map_err(|_| ())?;
+        if file.metadata().map_err(|_| ())?.len() > 1024 * 1024 { return Err(()); }
         let mut content = String::new();
-        file.take(1024 * 1024 + 1).read_to_string(&mut content).ok()?;
-        if content.len() > 1024 * 1024 { return None; }
-        content.parse().ok()
+        file.take(1024 * 1024 + 1).read_to_string(&mut content).map_err(|_| ())?;
+        if content.len() > 1024 * 1024 { return Err(()); }
+        content.parse().map_err(|_| ())
     };
     let authority = read(&home.join("org.toml"))?;
     if let Some(schema) = authority.get("schema") {
-        if schema.as_integer()? != 1 { return None; }
+        if schema.as_integer() != Some(1) { return Err(()); }
     }
-    let dept = authority.get("agents")?.get(agent)?.get("department")?.as_str()?.trim();
-    if dept.is_empty() || !duduclaw_core::is_valid_department(dept) { return None; }
-    let agent_dir = home.join("agents").join(agent);
-    let mirror = read(&agent_dir.join("agent.toml"))?;
-    if mirror.get("agent")?.get("department")?.as_str()?.trim() != dept {
+    let Some(value) = authority.get("agents").and_then(|agents| agents.get(agent))
+        .and_then(|entry| entry.get("department")) else { return Ok(None); };
+    let dept = value.as_str().ok_or(())?.trim();
+    if dept.is_empty() || !duduclaw_core::is_valid_department(dept) { return Ok(None); }
+    let mirror = read(&home.join("agents").join(agent).join("agent.toml"))?;
+    let mirrored = mirror.get("agent").and_then(|info| info.get("department"))
+        .and_then(|value| value.as_str()).map(str::trim);
+    if mirrored != Some(dept) {
         tracing::warn!(agent, "department skill layer refused: org.toml mirror drift");
-        return None;
+        return Ok(None);
     }
-    Some(dept.to_string())
+    Ok(Some(dept.to_string()))
 }
 
 /// Path to a department's shared skill directory. `department` MUST already be

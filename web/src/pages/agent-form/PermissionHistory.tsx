@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Lock } from 'lucide-react';
@@ -54,6 +55,7 @@ interface PermissionHistoryProps {
 }
 
 export function PermissionHistory({ agentId, isAdmin, refreshKey = 0 }: PermissionHistoryProps) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
 
@@ -148,7 +150,7 @@ export function PermissionHistory({ agentId, isAdmin, refreshKey = 0 }: Permissi
         {events.map((ev) => (
           <li key={`${ev.timestamp}-${ev.actor}`} className="space-y-1.5 px-3 py-2.5">
             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              <time dateTime={ev.timestamp}>{new Date(ev.timestamp).toLocaleString(intl.locale)}</time>
+              <time dateTime={ev.timestamp}>{formatDateTime(ev.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time>
               <span className="font-medium text-foreground">{ev.actor_name ?? ev.actor}</span>
             </div>
             <ul className="space-y-0.5 text-xs">

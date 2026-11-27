@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { ComplianceReportButton } from '@/components/ComplianceReportButton';
 import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useRef, useMemo, useState } from 'react';
@@ -332,11 +333,12 @@ function AuditRow({
   readonly expanded: boolean;
   readonly onToggle: () => void;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const agentName = useAgentsStore((s) => s.agents.find((a) => a.name === event.agent_id)?.display_name || event.agent_id);
   const time = (() => {
     try {
-      return new Date(event.timestamp).toLocaleString('zh-TW', {
+      return formatDateTime(event.timestamp, { locale: 'zh-TW',
         hour12: false,
         year: 'numeric',
         month: '2-digit',
@@ -405,6 +407,7 @@ function AuditRow({
 type LevelFilter = 'all' | 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 function RealtimeTab() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const {
     entries,
@@ -563,7 +566,7 @@ function RealtimeTab() {
 function formatTimestamp(ts: string): string {
   try {
     const date = new Date(ts);
-    return date.toLocaleTimeString('zh-TW', {
+    return formatDateTime(date, { locale: 'zh-TW',
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',

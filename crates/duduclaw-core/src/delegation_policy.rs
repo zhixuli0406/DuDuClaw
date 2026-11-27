@@ -370,7 +370,7 @@ pub const MAX_ONE_WAY_PAIRS: usize = 200;
 
 /// Coupled to `duduclaw_auth::models::UserRole`. Auth depends on core, so core
 /// must keep a local closed list rather than introduce a dependency cycle.
-pub const DELEGATION_ROLE_NAMES: [&str; 3] = ["admin", "manager", "employee"];
+pub const UNRESTRICTABLE_ROLE_NAMES: [&str; 2] = ["admin", "manager"];
 
 /// Same validation and trimming as `allow`, with ordered deduplication.
 /// Entries beyond the first 200 are ignored with one limit warning.
@@ -415,7 +415,7 @@ pub struct OwnerRoleLookupError;
 /// Owner bindings, and verify the current requester or persisted job initiator.
 /// Return `Ok(None)` for unknown identity/provenance, `Err` for read failures.
 /// Role strings are matched exactly against the closed list and config.
-pub trait OwnerRoleView {
+pub trait OwnerRoleView: Send + Sync {
     fn avatar_owner_role(&self, agent_id: &str) -> Result<Option<String>, OwnerRoleLookupError>;
     fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError>;
 }
@@ -462,7 +462,7 @@ impl DelegationAllowSource {
 }
 
 fn unrestricted_sender(view: &dyn OwnerRoleView, overrides: &DelegationOverrides, sender: &str) -> bool {
-    let configured = |role: &str| DELEGATION_ROLE_NAMES.contains(&role)
+    let configured = |role: &str| UNRESTRICTABLE_ROLE_NAMES.contains(&role)
         && overrides.unrestricted_roles.iter().any(|r| r == role);
     let Ok(Some(owner_role)) = view.avatar_owner_role(sender) else { return false };
     if !configured(&owner_role) { return false; }
@@ -692,73 +692,78 @@ fn short_id(id: &str) -> String {
     crate::truncate_chars(id.trim(), 64)
 }
 
+/// The recipient of a delegation refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialAudience {
+    Ai,
+    User,
+}
+
 impl DelegationDenied {
-    /// Operator-facing zh-TW explanation: who was refused, what relation is
-    /// missing, and the concrete ways to fix it.
-    pub fn message_zh(&self) -> String {
+    /// Plain zh-TW rule and reason, with actionable next steps for AI callers.
+    /// This value does not prove that messaging is allowed, so it never suggests
+    /// contacting the target as a workaround.
+    pub fn explain(&self, audience: DenialAudience) -> String {
         let s = short_id(&self.sender);
         let t = short_id(&self.target);
-        match self.reason {
+        let rule = match self.policy {
+            DelegationPolicy::Department => "目前是「部門模式」，依上下級、同部門與跨部門配對判定委派範圍。",
+            DelegationPolicy::Hierarchy => "目前是「階層模式」，依上下級與跨部門配對判定委派範圍。",
+            // Use the dashboard's help text: the mode name is deliberately
+            // omitted to avoid presenting it as a suggested remedy.
+            DelegationPolicy::Open => "目前的委派範圍不設限制，任何 AI 員工都能指派工作給任何人，但仍須通過個別權限檢查。",
+            DelegationPolicy::Disabled => "目前是「不允許委派」，只有符合條件的「不受委派範圍限制的角色」例外可通過。",
+        };
+        let reason = match self.reason {
             DenyReason::ReversePairOnly => format!(
-                "委派遭拒:配對只允許「{t}」委派給「{s}」,不允許反向,目前委派模式也未放行。"
+                "單向配對只允許「{t}」委派給「{s}」，不允許「{s}」反向交辦給「{t}」，目前模式也未允許這個方向。"
             ),
             DenyReason::PersonalTargetNotPermitted => format!(
-                "委派遭拒:「{s}」不能把工作交給「{t}」,個人員工的擁有者邊界未通過驗證。"
+                "「{s}」不能把工作交給「{t}」，因為「{t}」是另一位成員的個人員工，或無法確認是否有權使用。"
             ),
             DenyReason::MainTargetNotPermitted => format!(
-                "委派遭拒:「{s}」不能把工作交給「{t}」,主代理使用權限未通過驗證。"
+                "「{s}」不能把工作交給「{t}」，因為主代理的使用權限未通過確認。"
             ),
             DenyReason::CrossAgentSendDisabled => format!(
-                "委派遭拒:「{s}」的跨員工傳送權限未開啟或無法確認。"
+                "「{s}」不能把工作交給「{t}」，因為「允許跨 AI 員工通訊」開關已關閉，或無法確認是否啟用。"
             ),
-            DenyReason::DelegationDisabled => format!(
-                "委派遭拒:「{s}」不能把工作交給「{t}」— 委派政策是 {},AI 員工之間不能互相委派、\
-                 傳訊、建立或指派工作(跨部門協作配對在這個政策下不生效)。設定值無法辨識或 config.toml \
-                 無法讀取時也一律視為這個政策。可行處理:請管理員在 dashboard「委派權限」改成其他模式,\
-                 或修正 config.toml 的 [delegation] policy。",
-                self.policy.label_zh()
-            ),
-            DenyReason::HumanPrincipalNotPermitted => format!(
-                "委派遭拒:發出這個指令的人沒有權限把工作交給「{t}」(「{s}」本身可以委派,\
-                 但 [delegation] human_principal = \"enforce\" 也要求真人有權限)。\
-                 可行處理:① 請管理員在 dashboard 把「{t}」綁定給這個人(交辦需要操作權限);\
-                 ② 改由有權限的人直接交辦;③ 需要時把 human_principal 改回 \"record\"。"
-            ),
-            DenyReason::SelfDelegation => format!(
-                "委派遭拒:「{s}」不可委派給自己。自我委派會形成回音迴圈,所有委派政策皆禁止。"
-            ),
-            DenyReason::InvalidAgentId => {
-                "委派遭拒:發送者或目標的 agent 名稱為空,無法判定從屬關係,依 fail-closed 原則拒絕。"
-                    .to_string()
-            }
-            DenyReason::ChainTooDeep => format!(
-                "委派遭拒:「{s}」對「{t}」的從屬關係無法確認 — reports_to 從屬鏈超過 \
-                 {MAX_ANCESTOR_HOPS} 層或形成循環,已中止追溯並依 fail-closed 原則拒絕。\
-                 請檢查組織樹是否過深或成環(reports_to 互指)。"
-            ),
+            DenyReason::SelfDelegation => format!("「{s}」不可委派給自己，所有委派模式都禁止自我委派。"),
+            DenyReason::InvalidAgentId => "發送者或委派對象的資訊不完整，無法確認雙方的委派範圍。".to_string(),
             DenyReason::NoHierarchyRelation => format!(
-                "委派遭拒:「{s}」無權指派「{t}」(委派政策:{})。兩者不在同一條 reports_to \
-                 從屬鏈上(任一方為另一方的上級皆可)。可行處理:① 建立從屬關係 — 把「{t}」的 \
-                 reports_to 指向「{s}」或其上級;② 若只是同事橫向協作,把 config.toml 的 \
-                 [delegation] policy 設為 \"department\" 並讓兩者屬於同一部門;\
-                 ③ 需要完全開放時設為 \"open\"。",
-                self.policy.label_zh()
+                "「{s}」與「{t}」沒有上下級關係，也沒有適用的跨部門配對。"
             ),
             DenyReason::DifferentDepartment => format!(
-                "委派遭拒:「{s}」無權指派「{t}」(委派政策:{})。兩者既不在同一條 reports_to \
-                 從屬鏈上,也不屬於同一個部門。可行處理:① 建立從屬關係(把其中一方的 reports_to \
-                 指向另一方);② 把兩者的 [agent] department 設為同一部門;\
-                 ③ 在 config.toml 將 [delegation] policy 設為 \"open\" 解除限制。",
-                self.policy.label_zh()
+                "「{s}」與「{t}」沒有上下級關係、分屬不同部門，也沒有適用的跨部門配對。"
             ),
             DenyReason::MissingDepartment => format!(
-                "委派遭拒:「{s}」無權指派「{t}」(委派政策:{})。兩者沒有 reports_to 從屬關係,\
-                 且至少一方未設定部門 — 空白部門不視為同部門。可行處理:① 為雙方的 [agent] \
-                 department 填上同一個部門;② 建立從屬關係;\
-                 ③ 在 config.toml 將 [delegation] policy 設為 \"open\" 解除限制。",
-                self.policy.label_zh()
+                "「{s}」與「{t}」沒有上下級關係，至少一方未設定部門，也沒有適用的跨部門配對。"
             ),
+            DenyReason::ChainTooDeep => format!(
+                "「{s}」與「{t}」的上下級關係超過 {MAX_ANCESTOR_HOPS} 層或形成循環，無法確認委派範圍。"
+            ),
+            DenyReason::HumanPrincipalNotPermitted => format!(
+                "雖然「{s}」可以委派，但發出這個指令的人沒有權限把工作交給「{t}」，或無法確認其權限。"
+            ),
+            DenyReason::DelegationDisabled => {
+                let parties = if s.is_empty() || t.is_empty() {
+                    "這項跨員工操作".to_string()
+                } else {
+                    format!("「{s}」對「{t}」的這項操作")
+                };
+                format!("{parties}不符合角色例外，不能互相指派工作、傳訊或建立員工，跨部門配對在此模式下也不生效。")
+            }
+        };
+        match audience {
+            DenialAudience::Ai => format!(
+                "委派遭拒：{rule}{reason}請向你正在協助的人說明，這件事需要另請有權限的人處理；也可請管理員查看「設定 › 委派權限」或員工的「委派範圍」卡片。"
+            ),
+            DenialAudience::User => format!("⛔ 這項委派未執行：{rule}{reason}"),
         }
+    }
+
+    /// Compatibility alias for AI-facing tool errors and audit messages.
+    pub fn message_zh(&self) -> String {
+        self.explain(DenialAudience::Ai)
     }
 }
 
@@ -1172,7 +1177,7 @@ impl DelegationConfig {
         let mut unrestricted_roles = Vec::new();
         let mut unknown = false;
         for role in &self.unrestricted_roles {
-            if DELEGATION_ROLE_NAMES.contains(&role.as_str()) {
+            if UNRESTRICTABLE_ROLE_NAMES.contains(&role.as_str()) {
                 if !unrestricted_roles.contains(role) {
                     unrestricted_roles.push(role.clone());
                 }
@@ -1181,7 +1186,7 @@ impl DelegationConfig {
             }
         }
         if unknown {
-            warnings.push("config.toml [delegation] unrestricted_roles 含無法辨識的角色,已忽略;僅接受 admin / manager / employee。".into());
+            warnings.push("config.toml [delegation] unrestricted_roles 含無法辨識的角色,已忽略;僅接受 admin / manager。".into());
         }
         if self.resolve().1.is_some() {
             return (DelegationOverrides::default(), warnings);
@@ -1445,6 +1450,48 @@ pub fn delegation_rules_from_home(home_dir: &Path) -> DelegationRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delegation_explanations_cover_every_reason_and_audience() {
+        let cases = [
+            (DenyReason::ReversePairOnly, "單向配對只允許「乙」委派給「甲」"),
+            (DenyReason::PersonalTargetNotPermitted, "另一位成員的個人員工"),
+            (DenyReason::MainTargetNotPermitted, "主代理的使用權限"),
+            (DenyReason::CrossAgentSendDisabled, "允許跨 AI 員工通訊"),
+            (DenyReason::SelfDelegation, "不可委派給自己"),
+            (DenyReason::InvalidAgentId, "資訊不完整"),
+            (DenyReason::NoHierarchyRelation, "沒有上下級關係"),
+            (DenyReason::DifferentDepartment, "分屬不同部門"),
+            (DenyReason::MissingDepartment, "至少一方未設定部門"),
+            (DenyReason::ChainTooDeep, "層或形成循環"),
+            (DenyReason::HumanPrincipalNotPermitted, "發出這個指令的人沒有權限"),
+            (DenyReason::DelegationDisabled, "不符合角色例外"),
+        ];
+        for policy in DelegationPolicy::ALL {
+            for (reason, expected) in cases {
+                let denied = DelegationDenied {
+                    sender: "甲".into(), target: "乙".into(), policy, reason,
+                };
+                for audience in [DenialAudience::Ai, DenialAudience::User] {
+                    let text = denied.explain(audience);
+                    assert!(!text.is_empty());
+                    assert!(text.contains(expected), "{reason:?}: {text}");
+                    for forbidden in ["開放", "open", "config.toml", "[delegation]", "policy", "reports_to", "agent.toml", "send_to_agent"] {
+                        assert!(!text.contains(forbidden), "{reason:?}: {text}");
+                    }
+                    if policy == DelegationPolicy::Disabled {
+                        assert!(text.contains("不允許委派"), "{text}");
+                    }
+                }
+                let ai = denied.explain(DenialAudience::Ai);
+                let user = denied.explain(DenialAudience::User);
+                assert_eq!(denied.message_zh(), ai);
+                assert!(ai.contains("請向你正在協助的人說明"));
+                assert!(ai.contains("設定 › 委派權限") && ai.contains("委派範圍"));
+                assert!(!user.contains("請向") && user.len() < ai.len());
+            }
+        }
+    }
 
     /// ceo ─ sales_lead ─ sales_rep      (department 業務)
     ///     └ mkt_lead   ─ mkt_rep        (department 行銷)
@@ -1904,7 +1951,7 @@ mod tests {
         let d = denial(DelegationPolicy::Disabled, "sales_rep", "mkt_rep");
         let msg = d.message_zh();
         assert!(msg.contains("sales_rep") && msg.contains("mkt_rep"), "{msg}");
-        assert!(msg.contains("none") && msg.contains("委派權限"), "{msg}");
+        assert!(msg.contains("不允許委派") && msg.contains("委派權限"), "{msg}");
         assert!(!msg.contains("agent.toml") && !msg.contains('/'), "{msg}");
     }
 
@@ -2050,8 +2097,8 @@ mod tests {
         let d = denial(DelegationPolicy::Department, "sales_rep", "mkt_rep");
         let msg = d.message_zh();
         assert!(msg.contains("sales_rep") && msg.contains("mkt_rep"));
-        assert!(msg.contains("reports_to") && msg.contains("department"));
-        assert!(msg.contains("open"));
+        assert!(msg.contains("部門模式") && msg.contains("不同部門"));
+        assert!(msg.contains("設定 › 委派權限") && msg.contains("委派範圍"));
         // No internal paths leak into operator-facing text.
         assert!(!msg.contains("agent.toml") && !msg.contains('/'));
         assert_eq!(d.to_string(), msg);
@@ -2520,14 +2567,15 @@ allow = [["sales-lead", "warehouse-lead"], ["a"], ["x", "x"]]
     }
 
     #[test]
-    fn delegation_role_closed_list_tracks_auth_user_role() {
+    fn delegation_unrestrictable_roles_are_privileged_account_roles() {
         // Auth depends on core: compare its source declaration without building
         // auth or creating a circular dev-dependency. New roles require review.
         let source = include_str!("../../duduclaw-auth/src/models.rs");
         let body = source.split("pub enum UserRole {").nth(1).unwrap().split('}').next().unwrap();
         let roles: Vec<_> = body.lines().map(str::trim).filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches(',').to_ascii_lowercase()).collect();
-        assert_eq!(roles, DELEGATION_ROLE_NAMES);
+        assert_eq!(UNRESTRICTABLE_ROLE_NAMES, ["admin", "manager"]);
+        assert!(UNRESTRICTABLE_ROLE_NAMES.iter().all(|role| roles.iter().any(|r| r == role)));
         assert!(source.contains("#[serde(rename_all = \"lowercase\")]"));
     }
 
@@ -2543,8 +2591,13 @@ unrestricted_roles = ["admin", "manager", "employee", "admin", "Admin", " admin 
         let read = delegation_config_read_from_table(&table);
         assert_eq!(read.rules.allow_pairs, vec![("a".into(), "b".into())]);
         assert_eq!(read.overrides.allow_one_way, vec![("a".into(), "b".into()), ("b".into(), "a".into())]);
-        assert_eq!(read.overrides.unrestricted_roles, DELEGATION_ROLE_NAMES);
+        assert_eq!(read.overrides.unrestricted_roles, UNRESTRICTABLE_ROLE_NAMES);
         assert_eq!(read.override_warnings.len(), 4); // 3 invalid pairs + 1 role warning.
+        assert!(read.override_warnings.iter().any(|w| w.contains("僅接受 admin / manager。")));
+        let employee: toml::Table = "[delegation]\nunrestricted_roles=['employee']".parse().unwrap();
+        let employee_read = delegation_config_read_from_table(&employee);
+        assert!(employee_read.overrides.unrestricted_roles.is_empty());
+        assert_eq!(employee_read.override_warnings.len(), 1);
         for value in ["false", "42", "'not-a-list'"] {
             let table = toml::from_str(&format!(
                 "[delegation]\npolicy = 'hierarchy'\nallow = [['a', 'b']]\nallow_one_way = {value}\nunrestricted_roles = {value}"

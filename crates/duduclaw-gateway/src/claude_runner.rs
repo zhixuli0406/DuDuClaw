@@ -92,6 +92,12 @@ fn build_system_prompt(
         parts.push(section.content);
     }
 
+    audit.push(crate::prompt_audit::PromptSection::new(
+        "delegation_guidance",
+        crate::prompt_identity::DELEGATION_GUIDANCE,
+    ));
+    parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
     // Sort skills by name for deterministic ordering (cache-friendly).
     // Apply the employee's budget (with a 10 KB floor) or explicit unlimited
     // setting, and report any omitted skills in the truncation footer.
@@ -478,6 +484,11 @@ where
     F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
+    // Every runner invocation is execution/assignment, including calls whose
+    // telemetry type is Chat. Scope the full run so retries and failover retain it.
+    let fut = crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+        crate::on_behalf_of::access::MainUse::Assign, fut,
+    );
     let fut = crate::process_group::with_class(crate::process_group::request_class(request_type), fut);
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
     let snapshot_after_run = connector_snapshot.clone();
@@ -875,9 +886,9 @@ async fn call_claude_for_agent_resolved(
     let prompt = credential_prompt.as_deref().unwrap_or(prompt);
     let agent = &snapshot.registry_agent;
 
-    crate::on_behalf_of::access::check_loaded_main_target(
+    Box::pin(crate::on_behalf_of::access::check_loaded_main_target_for_execution(
         home_dir, crate::on_behalf_of::current().as_deref(), agent,
-    ).await?;
+    )).await?;
 
     // Sub-agents inherit a turn id from the dispatch chain via tokio
     // task_local — set by `channel_reply` before invoking the dispatcher.
@@ -1122,6 +1133,7 @@ async fn call_claude_for_agent_resolved(
     // dispatch is single-shot by design, so history is empty (same as the
     // non-Claude branch below).
     if duduclaw_llm::is_moa_model_id(&claude_model) {
+        crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(&agent_dir), None).await?;
         info!(
             agent = %agent_id,
             model = %claude_model,
@@ -1620,6 +1632,7 @@ pub(crate) fn resolve_background_model(
 
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
+    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return true; }
     crate::entry_gate::background_refusal_code(error).is_some()
         || crate::work_outcome::is_work_result(error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
         || crate::budget::budget_refusal_message(error).is_some()
@@ -2753,6 +2766,7 @@ async fn try_direct_api(
     rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(agent_dir), None).await?;
     crate::budget::gate_before_spawn(home_dir, Some(agent_dir), agent_id, "direct_api_attempt")
         .await.map_err(|e| e.legacy_message())?;
     crate::product_policy::require_model(crate::product_policy::load(home_dir)?, model)?;
@@ -2978,6 +2992,7 @@ async fn try_direct_api_chain(
     request_type: crate::cost_telemetry::RequestType,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(agent_dir), None).await?;
     let policy = crate::product_policy::load(home_dir)?;
     crate::product_policy::require_model(policy, preferred_model)?;
     // Rotator is best-effort: if it can't be built we still resolve keys via env.
@@ -3390,6 +3405,8 @@ async fn call_local_inference_raw(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    let final_dir = agent_id.map(|id| home_dir.join("agents").join(id));
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, final_dir.as_deref(), None).await?;
     // Provider transports admit each request, including local tool-loop rounds.
     crate::autonomous_runtime::check_current().await?;
     let engine = get_inference_engine(home_dir)
@@ -4057,6 +4074,18 @@ async fn call_claude_streaming(
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    let final_dir = protected_input.map(|(dir, _, _, _)| dir.to_path_buf())
+        .or_else(|| mcp_observer.map(|(home, agent)| home.join("agents").join(agent)))
+        .or_else(|| cmd.as_std().get_current_dir().map(Path::to_path_buf));
+    let final_home = mcp_observer.map(|(home, _)| home.to_path_buf())
+        .or_else(|| final_dir.as_deref().and_then(duduclaw_core::preset::agent_home_dir))
+        .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+    if protected_input.is_some() {
+        crate::on_behalf_of::access::check_final_main_spawn(
+            &final_home, final_dir.as_deref(), Some(cmd),
+        ).await?;
+    }
+
     // This is the final signed config attached to this command. A protected
     // runtime does not receive this employee stdio config, so observes no names.
     let mcp_names = {
@@ -4087,6 +4116,9 @@ async fn call_claude_streaming(
         }
     } else {
         let admission = crate::autonomous_runtime::admit_current().await?;
+        crate::on_behalf_of::access::check_final_main_spawn(
+            &final_home, final_dir.as_deref(), Some(cmd),
+        ).await?;
         let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
         crate::process_group::BackendChild::spawn_class_bound(cmd, crate::process_group::execution_class(
@@ -6609,6 +6641,7 @@ mod instructions_slot_tests {
             .await
             .unwrap();
         let p = super::build_system_prompt(&agent, None, None).unwrap();
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         let pinned_system = super::build_system_prompt(&agent, None, Some("en")).unwrap();
         for message in ["First dispatch", "Next cron turn"] {
             let user = crate::prompt_identity::with_reply_language_reminder(message.into(), Some("en"));
@@ -6986,5 +7019,55 @@ mod background_entry_tests {
         assert_eq!(calls[0].model, snapshot.model);
         assert_ne!(calls[0].model, "opus");
         assert_eq!(calls[0].effort, Some(duduclaw_core::effort::Effort::High));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod main_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn listed_main_execution_reaches_owned_cli_and_revocation_stops_it() {
+        crate::runtime_dispatch::testing::isolated_claude_test(
+            concat!(module_path!(), "::listed_main_execution_reaches_owned_cli_and_revocation_stops_it"), |cli_home| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                crate::test_exec::write_executable(&cli_home.join("bin/claude"),
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+                     printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
+                     /bin/cat \"$HOME/stream.jsonl\"\nexit 0\n", 0o755);
+                std::fs::write(cli_home.join("stream.jsonl"),
+                    "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"MAIN_ASSIGNED\"}\n").unwrap();
+                let home = tempfile::tempdir().unwrap();
+                crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+                    "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+                let profile = home.path().join("agents/main/agent.toml");
+                let raw = std::fs::read_to_string(&profile).unwrap();
+                std::fs::write(&profile, raw.replace("account_pool = [\"main\"]", "account_pool = []")).unwrap();
+                std::fs::write(home.path().join("config.toml"),
+                    "[general]\ndefault_agent = 'main'\ninference_mode = 'claude'\n").unwrap();
+                let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+                let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+                let employee = db.create_user("employee@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+                crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+                db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+                let mut reg = duduclaw_agent::registry::AgentRegistry::new(home.path().join("agents"));
+                reg.scan().await.unwrap();
+                let registry = Arc::new(tokio::sync::RwLock::new(reg));
+                let wire = format!("user:{}", employee.id);
+                let result = crate::on_behalf_of::scope_first(Some(wire.clone()), call_claude_for_agent_impl(
+                    home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
+                    None, DispatchOverrides::default(),
+                )).await;
+                assert_eq!(result.unwrap(), "MAIN_ASSIGNED");
+                let before = std::fs::read(cli_home.join("claude-argv")).unwrap();
+                db.set_main_agent_users(&admin.id, &[], true).unwrap();
+                let denied = crate::on_behalf_of::scope_first(Some(wire), call_claude_for_agent_impl(
+                    home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
+                    None, DispatchOverrides::default(),
+                )).await;
+                assert_eq!(denied.unwrap_err(), "主代理僅管理員可以使用。");
+                assert_eq!(std::fs::read(cli_home.join("claude-argv")).unwrap(), before);
+            });
+        });
     }
 }

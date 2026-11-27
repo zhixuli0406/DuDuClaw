@@ -173,6 +173,7 @@ pub(crate) struct TeamMemberSection {
 
 // ── Submodules (P10a: mcp.rs was split by tool family) ──────
 mod action_guard;
+pub(crate) mod admin_ai_client;
 mod agent_admin;
 mod agent_update;
 mod agents;
@@ -190,6 +191,7 @@ mod cost;
 mod cron_tasks;
 mod decision_tools;
 mod delegation;
+pub(crate) mod delegation_roles;
 mod discovery;
 mod group_history;
 
@@ -216,8 +218,18 @@ mod memory_tools;
 mod messaging;
 mod notion_github;
 mod odoo;
+mod odoo_access;
+mod odoo_actor;
+#[cfg(test)]
+mod odoo_access_tests;
+pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
+mod odoo_attachment;
+pub(crate) use odoo_attachment::odoo_attachment_precheck;
+mod odoo_writeback;
+pub(crate) use odoo_writeback::odoo_writeback_precheck;
 mod on_behalf_of;
+pub(crate) mod main_principal_gate;
 mod os_tools;
 mod personal_target;
 mod personal_wildcard;
@@ -388,3 +400,6 @@ pub(crate) mod recipient_gate;
 mod tool_pruning_tests;
 
 pub(crate) mod google_owner_client;
+
+pub(crate) mod person_key_client;
+pub(crate) mod person_tools;

@@ -655,3 +655,151 @@ async fn rm159_all_calendar_updates_use_the_existing_send_approval_policy() {
         assert!(result["error"]["message"].as_str().unwrap().contains("action_rules"), "{result}");
     }
 }
+
+#[tokio::test]
+async fn drive_writes_are_refused_by_dispatch_and_hidden_from_listing() {
+    let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+    let config = home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&config).unwrap().replace(
+        "scopes=['google:read']", "scopes=['google:read','google:write']");
+    std::fs::write(config, raw).unwrap();
+    let dispatcher = dispatcher(home.path()).await;
+    for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let principal = call.principal().clone();
+        let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
+            &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(1),
+        )).await;
+        assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
+        assert_eq!(result["error"]["message"], "此連線不支援雲端硬碟寫入。", "{tool}");
+    }
+    for external in [false, true] {
+        let mut principal = crate::mcp::test_principal(external);
+        principal.scopes = vec![crate::mcp_auth::Scope::Admin, crate::mcp_auth::Scope::GoogleRead,
+            crate::mcp_auth::Scope::GoogleWrite].into_iter().collect();
+        let response = crate::mcp::handle_tools_list_for_agent(
+            &json!(2), &principal, home.path(), "employee-a",
+        ).await;
+        let listed = crate::mcp::advertised_tool_names(&response);
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert!(!listed.iter().any(|name| name.as_str() == *tool), "{tool}");
+        }
+    }
+}
+
+fn drive_write_fixture(create: bool, move_: bool, backend: &str, capabilities: &str) -> tempfile::TempDir {
+    use duduclaw_gateway::google_workspace::drive_write_policy as policy;
+    let home = fixture(capabilities);
+    let mut config: toml::Value = std::fs::read_to_string(home.path().join("config.toml"))
+        .unwrap().parse().unwrap();
+    config["integrations"]["google_credential_path"] = toml::Value::String(backend.into());
+    if backend == "apps_script" {
+        config["integrations"]["google_apps_script"] = toml::Value::Table(Default::default());
+    }
+    let mut settings = policy::DriveWritePolicy::all_off();
+    settings.create = create;
+    settings.move_ = move_;
+    let ack = policy::sign(&settings, "admin", "admin@example.test", chrono::Utc::now());
+    config.as_table_mut().unwrap().insert("google".into(), toml::Value::Table(
+        [("drive_write".into(), policy::render_section(&settings, &ack))].into_iter().collect(),
+    ));
+    std::fs::write(home.path().join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    home
+}
+fn drive_principal() -> Principal {
+    let mut p = crate::mcp::test_principal(false);
+    p.client_id = "employee-a".into();
+    p.scopes = [crate::mcp_auth::Scope::Admin, crate::mcp_auth::Scope::GoogleRead,
+        crate::mcp_auth::Scope::GoogleWrite].into_iter().collect();
+    p
+}
+
+#[tokio::test]
+async fn drive_write_listing_admission_and_snapshot_follow_policy() {
+    use duduclaw_core::{ProcessLane, google_identity::DRIVE_WRITE_TOOLS};
+    for (create, move_, backend, capabilities) in [
+        (false, false, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']"),
+        (true, false, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']"),
+        (true, true, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']"),
+        (true, false, "apps_script", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']"),
+        (true, false, "oauth", "[capabilities]\ndenied_tools=['drive_*']"),
+        (true, false, "oauth", "[capabilities]\nallowed_tools=['drive_read']"),
+        (true, false, "oauth", "[[capabilities.action_rules]]\neffect='publish'\nverdict='block'"),
+    ] {
+        let home = drive_write_fixture(create, move_, backend, capabilities);
+        let principal = drive_principal();
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captured = requests.clone();
+        let _transport = crate::mcp::google_execute_test_transport::install(home.path(), Arc::new(move |_| {
+            captured.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err("gateway unavailable".into())
+        }));
+        let dispatcher = dispatcher(home.path()).await;
+        for lane in [ProcessLane::Normal, ProcessLane::Explore] {
+            let listed = crate::mcp::visible_tools_in_lane(&principal, home.path(), "employee-a", true, &lane).await;
+            for tool in DRIVE_WRITE_TOOLS {
+                let refusal = crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane);
+                assert_eq!(listed.iter().any(|t| t.name == *tool), refusal.is_none(), "{backend} {tool}: {refusal:?}");
+                if lane == ProcessLane::Normal && refusal.is_some() {
+                    let result = dispatcher.dispatch_tool_call(&principal, &namespace(),
+                        &json!({"name":tool,"arguments":{}}), &json!(131)).await;
+                    assert_eq!(result["error"]["message"], refusal.unwrap(), "{result}");
+                }
+                if move_ && *tool == "drive_move_file" && lane == ProcessLane::Normal {
+                    assert_eq!(crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane).as_deref(), Some("這項操作需要先限定可使用的資料夾，請管理員設定。"));
+                }
+            }
+        }
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+    let home = drive_write_fixture(false, false, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+    let principal = drive_principal();
+    let before = crate::mcp::visible_tool_snapshot(&principal, home.path(), "employee-a").await;
+    let enabled = drive_write_fixture(true, false, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+    std::fs::copy(enabled.path().join("config.toml"), home.path().join("config.toml")).unwrap();
+    let after = crate::mcp::visible_tool_snapshot(&principal, home.path(), "employee-a").await;
+    assert_ne!(before, after, "the existing listChanged watcher must see the change");
+    for tool in ["drive_create_file", "drive_copy_file"] {
+        assert!(!before.iter().any(|n| n == tool));
+        assert!(after.iter().any(|n| n == tool));
+    }
+}
+
+#[tokio::test]
+async fn enabled_drive_dispatch_prepares_at_gateway_and_refuses_gateway_failure() {
+    let home = drive_write_fixture(true, false, "oauth", "[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let _transport = crate::mcp::google_execute_test_transport::install(home.path(), Arc::new(move |wire| {
+        captured.lock().unwrap().push(wire.clone());
+        Err("gateway down; no fallback".into())
+    }));
+    let principal = drive_principal();
+    let result = dispatcher(home.path()).await.dispatch_tool_call(&principal, &namespace(),
+        &json!({"name":"drive_create_file","arguments":{"name":"test.txt","text":"test"}}), &json!(131)).await;
+    assert_eq!(result["error"]["message"], "gateway down; no fallback", "{result}");
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["route"], "/api/internal/google-execute");
+    assert_eq!(requests[0]["body"]["kind"], "employee_prepare");
+}
+
+#[tokio::test]
+async fn drive_write_approval_failure_after_prepare_never_executes() {
+    let home = drive_write_fixture(true, false, "oauth",
+        "[capabilities]\nallowed_tools=['mcp__duduclaw__*']\napproval_required_tools=['drive_create_file']");
+    // An unavailable approval store must fail closed after preparation.
+    std::fs::create_dir(home.path().join("approvals.db")).unwrap();
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = requests.clone();
+    let _transport = crate::mcp::google_execute_test_transport::install(home.path(), Arc::new(move |wire| {
+        captured.lock().unwrap().push(wire.clone());
+        assert_eq!(wire["body"]["kind"], "employee_prepare", "execute must not run before CLI approval");
+        Ok(json!({"ok":true,"result":{"approval_binding_digest":"a".repeat(64)}}))
+    }));
+    let principal = drive_principal();
+    let result = dispatcher(home.path()).await.dispatch_tool_call(&principal, &namespace(),
+        &json!({"name":"drive_create_file","arguments":{"name":"test.txt","text":"test"}}), &json!(131)).await;
+    assert_eq!(result["error"]["code"], -32003, "{result}");
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}

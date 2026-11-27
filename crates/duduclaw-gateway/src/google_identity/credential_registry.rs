@@ -14,6 +14,7 @@ pub(crate) fn authorize(
     agent: &str,
     tool: &str,
 ) -> Result<(), &'static str> {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Err("此連線不支援雲端硬碟寫入，請管理員檢查 Google 連線設定。"); }
     let required = native_google_scope(tool).ok_or(REFUSED)?.grant();
     if !reference.is_well_formed()
         || !duduclaw_core::is_valid_agent_id(agent)

@@ -1441,7 +1441,13 @@ pub(crate) async fn cancel_pending_where(
 }
 
 /// Dashboard reads fail closed on corrupt or unreadable persistence.
-pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserContext, cancel: Option<&str>) -> Result<Vec<Reminder>, String> {
+// Return each row's control flag and the target of a successful grant-backed
+// cancellation so the async caller can audit only after persistence succeeds.
+pub(crate) async fn dashboard_reminders(
+    home: &Path, ctx: &duduclaw_auth::UserContext,
+    view: crate::dept_grants::DeptGrantView, cancel: Option<&str>,
+) -> Result<(Vec<(Reminder, bool)>, Option<String>), String> {
+    use crate::dept_grants::{GrantAction, GrantGroup, department_grant_allows};
     let home = home.to_path_buf();
     let ctx = ctx.clone();
     let cancel = cancel.map(str::to_string);
@@ -1458,16 +1464,28 @@ pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserCo
         // v1.81 P1g: another person's Personal employee's reminders are
         // neither listed nor cancelled through the Admin role or a stored
         // origin — owner only.
-        let allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
+        let original_allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
             && (ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
                 || ctx.has_agent_access(&r.agent_id, level));
+        let allowed = |r: &Reminder, level, action| original_allowed(r, level)
+            || department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, action);
+        let mut grant_cancelled_agent = None;
         if let Some(id) = cancel {
             let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
-                && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
+                && allowed(r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove)).ok_or("permission denied")?;
+            if !original_allowed(row, duduclaw_auth::AccessLevel::Operator) {
+                grant_cancelled_agent = Some(row.agent_id.clone());
+            }
             row.status = ReminderStatus::Cancelled;
             save_reminders_sync(&home, &rows)?;
         }
-        Ok(rows.into_iter().filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer)).collect())
+        let visible = rows.into_iter()
+            .filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer, GrantAction::Read))
+            .map(|r| {
+                let can_manage = allowed(&r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove);
+                (r, can_manage)
+            }).collect();
+        Ok((visible, grant_cancelled_agent))
     }).await.map_err(|e| e.to_string())?
 }
 

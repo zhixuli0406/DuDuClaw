@@ -364,3 +364,24 @@ fn group_context_canonical_includes_names_and_text_across_rows() {
         assert!(format_context(&[late, early], 6000).is_empty(), "{name1}/{text1}/{name2}/{text2}");
     }
 }
+
+#[test]
+fn group_context_hides_handshake_codes_in_existing_history() {
+    for code in ["DUDU-0000-0000", "  dudu-oooo-llll\n"] {
+        let block = format_context(&[message(1, code)], 6000);
+        assert!(block.contains("[連結代碼已隱藏]"));
+        assert!(!block.contains(code.trim()));
+    }
+}
+
+#[tokio::test]
+async fn group_context_capture_hides_handshake_codes_before_storage() {
+    let home = home();
+    let ctx = context(home.path());
+    set(home.path(), &config()).unwrap();
+    capture(&ctx, "telegram", "global", "-100", None, "m1", "u1", "name",
+        "DUDU-0000-0000", "inbound").await;
+    let rows = read(home.path(), "telegram", "-100", None, 50, None).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].text, "[連結代碼已隱藏]");
+}

@@ -90,6 +90,10 @@ pub struct ToolPolicy {
 }
 
 pub const POLICIES: &[ToolPolicy] = &[
+    // Inventory only: the CLI's isolation disposition explicitly refuses
+    // person tools for every employee, even with a signed tool grant.
+    ToolPolicy { name: "my_tasks_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "my_agents_status", route: Route::Service, required: &[ResourceKind::Employee] },
     // google
     ToolPolicy { name: "google_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
@@ -122,6 +126,16 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "calendar_delete_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "calendar_update_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "slides_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // RM-131: exact routes remain declared even while protected execution refuses them.
+    ToolPolicy { name: "drive_create_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_copy_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_update_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_move_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_trash_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_insert_text", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_format", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_add_sheet", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_add_note", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // os
     ToolPolicy { name: "os_notify", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Recipient] },
     ToolPolicy { name: "os_watch_status", route: Route::Execution, required: &[ResourceKind::Employee] },
@@ -149,6 +163,8 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "os_audio_get", route: Route::Execution, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "os_audio_set", route: Route::Execution, required: &[ResourceKind::Employee] },
     // agents
+    ToolPolicy { name: "admin_settings_read", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "admin_settings_propose", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
     // H8: a TaskSpec plan is host-queue work under the run's own live task
@@ -189,6 +205,11 @@ pub const POLICIES: &[ToolPolicy] = &[
     // explicit-grant gate chain runs in the bound handler (owner decision C).
     ToolPolicy { name: "odoo_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_write", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_attachment_add", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_activity_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_note_post", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_message_send", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+
     // exec
     // H12a: own skill tools read host-owned skill files of the record's own
     // employee and publish only into its own wiki/SKILLS; no workspace input.

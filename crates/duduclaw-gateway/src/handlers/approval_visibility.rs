@@ -81,6 +81,8 @@ pub(crate) enum DashboardOnlyReader {
     Admin,
     /// Admin, or Editor/Owner on the collection ACL loaded for this frame.
     CollectionEditor,
+    /// Live EgressReview authority for this card only.
+    OutboundReviewer,
     /// Manager with Viewer on the card's stored `agent_id`.
     EmployeeViewer,
     /// Nobody through the generic approval surfaces (approvals.list/get and
@@ -97,11 +99,11 @@ pub(crate) fn dashboard_only_reader(record: &ApprovalRecord) -> DashboardOnlyRea
         return DashboardOnlyReader::PersonalOwnerOnly;
     }
     // Payload-detected activation is Admin even when `action_kind` differs.
-    if crate::approval::is_activation_record(record)
-        || record.action_kind == crate::approval::cli_egress::KIND
-        || record.payload.get("egress_guard").is_some()
-    {
+    if crate::approval::is_activation_record(record) {
         return DashboardOnlyReader::Admin;
+    }
+    if crate::approval::is_outbound_data_card(record) {
+        return DashboardOnlyReader::OutboundReviewer;
     }
     if record.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
         return DashboardOnlyReader::CollectionEditor;
@@ -133,6 +135,8 @@ pub(crate) struct ApprovalVisibility {
     activation: Option<Option<ActivationVisibility>>,
     task: Option<TaskVisibility>,
     employee_requires_admin: Option<bool>,
+    admin_ai_reader: Option<String>,
+    outbound_reader: Option<String>,
 }
 
 impl ApprovalVisibility {
@@ -153,11 +157,16 @@ impl ApprovalVisibility {
             .then(|| ActivationVisibility::load(home, &record.payload));
         let task = approval_task_ref(&record.payload).filter(|_| record.binding.is_none())
             .map(|id| TaskVisibility::load(home, &id));
-        Self { collection_acl, activation, task, employee_requires_admin: None }
+        Self { collection_acl, activation, task, employee_requires_admin: None, admin_ai_reader: None, outbound_reader: None }
     }
 
     pub(crate) fn for_reader(mut self, home: &Path, record: &ApprovalRecord, fresh: &UserContext) -> Self {
         self.employee_requires_admin = None;
+        self.outbound_reader = (crate::approval::is_outbound_data_card(record)
+            && crate::approval::outbound::authorize(home, fresh, record).is_ok())
+            .then(|| fresh.user_id.clone());
+        self.admin_ai_reader = (record.action_kind == crate::admin_ai::card::ACTION_KIND
+            && crate::admin_ai::may_decide(home, record, &fresh.user_id)).then(|| fresh.user_id.clone());
         if !fresh.is_admin()
         {
             self.employee_requires_admin = Some(crate::machine_employee::requires_admin_for_id(home, &record.agent_id));
@@ -169,11 +178,17 @@ impl ApprovalVisibility {
     /// Bound cards may be listed with their binding redacted; permission to
     /// decide is a separate gate and does not hide their metadata here.
     pub(crate) fn may_read(&self, record: &ApprovalRecord, fresh: &UserContext, department: Option<&str>) -> bool {
-        if crate::google_identity::chat_send::is_member_card(record) { return false; }
+        if record.action_kind == crate::admin_ai::card::ACTION_KIND {
+            return fresh.is_admin() && !fresh.requires_password_change()
+                && self.admin_ai_reader.as_deref() == Some(fresh.user_id.as_str())
+                && record.payload["admin_user_id"].as_str() == Some(fresh.user_id.as_str());
+        }
+        if crate::google_identity::member_card::is_member_card(record) { return false; }
         if !fresh.has_role(UserRole::Manager) || fresh.requires_password_change() { return false; }
         if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {
             DashboardOnlyReader::Admin => fresh.is_admin(),
+            DashboardOnlyReader::OutboundReviewer => self.outbound_reader.as_deref() == Some(fresh.user_id.as_str()),
             // Same predicate as `add_source_approval::may_decide`, on this
             // frame's ACL snapshot. Admin is allowed without a grant. Everyone
             // else needs a current Editor or Owner grant. A missing snapshot
@@ -195,14 +210,16 @@ impl ApprovalVisibility {
         if let Some(activation) = &self.activation {
             if !activation.as_ref().is_some_and(|a| a.may_read(fresh)) { return false; }
         }
-        self.task.as_ref().is_none_or(|task| task.may_read(fresh, false))
+        crate::approval::is_outbound_data_card(record)
+            || self.task.as_ref().is_none_or(|task| task.may_read(fresh, false))
     }
 }
 
 /// Refresh the identity and the department used by knowledge collection ACLs
 /// together, off the socket loop. Never retain this result across frames.
 pub(crate) fn fresh_reader(home: &Path, ctx: &UserContext) -> Option<(UserContext, Option<String>)> {
-    let fresh = live_reader_context(home, ctx).ok()?;
+    let mut fresh = live_reader_context(home, ctx).ok()?;
+    fresh.origin = ctx.origin;
     let department = if fresh.user_id == "system" { None } else {
         readonly_db(&home.join("users.db")).ok().and_then(|db| {
             db.query_row("SELECT department FROM users WHERE id=?1", [&fresh.user_id], |r| r.get::<_, Option<String>>(0))
@@ -476,5 +493,65 @@ mod tests {
             let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, ctx, false);
             assert_eq!(gate.filter_live(&line, &f.handler).await.is_some(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod admin_ai_tests {
+    use super::*;
+    use crate::handlers::task_privacy_tests::{fixture, admin, payload};
+    use crate::approval::{ApprovalBroker, ApprovalId, ExecutionBinding, DecisionContext, ConversationAudience};
+
+    #[tokio::test]
+    async fn admin_ai_other_admin_inbox_hidden_and_proposer_gets_display_only() {
+        let f = fixture().await;
+        let other_admin = admin(&f);
+        f.db.update_user(&f.alice.user_id, None, Some(UserRole::Admin), None).unwrap();
+        rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
+            "UPDATE users SET avatar_agent_id='sales', must_change_password=0 WHERE id=?1", [&f.alice.user_id]).unwrap();
+        let proposer = f.db.live_user_context(&f.alice.user_id).unwrap().unwrap();
+        let broker = ApprovalBroker::open(&f.home).unwrap();
+        let id = ApprovalId::new();
+        let arguments = json!({"admin_user_id":proposer.user_id, "private_args":"raw-only-value"});
+        let body = json!({"admin_user_id":proposer.user_id, "arguments":arguments,
+            "name":"admin_settings_propose", "items":[], "admin_name":"Alice", "reason":"確認設定"});
+        let binding = ExecutionBinding {
+            schema_version:1, run_id:"admin-ai-visibility".into(), run_origin_kind:"ingress".into(),
+            actor_principal:"sales".into(), conversation_audience:ConversationAudience::Private,
+            decision_context:DecisionContext { channel:"webchat".into(), account_id:"dashboard".into(),
+                conversation_id:"webchat:visibility".into(), principal_id:proposer.user_id.clone() },
+            task_id:None, task_revision:None, task_snapshot_hash:None,
+            payload_hash:crate::approval::payload_hash(&body),
+            policy_revision:crate::approval::policy_revision(&f.home, "sales").unwrap(),
+            cwd:None, environment_hash:"fixture".into(), file_hashes:Default::default(),
+            expires_at:(chrono::Utc::now() + chrono::Duration::seconds(600)).to_rfc3339(),
+            resume_handler:"live_only_v1".into(), resume_version:1,
+        };
+        let principal = duduclaw_core::HumanPrincipal::user(&proposer.user_id).unwrap().to_string();
+        let id = crate::on_behalf_of::ON_BEHALF_OF.scope(Some(principal),
+            broker.request_admin_ai(id, "sales", body, binding)).await.unwrap();
+        let rec = broker.get(&id).await.unwrap().unwrap();
+        let line = serde_json::to_string(&WsFrame::event("approval.created", json!({"id":id.as_str()}))).unwrap();
+        let prepared = std::sync::Arc::new(crate::handlers::push_filter::PreparedPush::prepare(f.home.clone(), line).await.unwrap());
+        for (ctx, allowed) in [(&proposer, true), (&other_admin, false), (&f.bob, false)] {
+            let list = payload(f.handler.handle_approvals_list(json!({"id":id.as_str()}), ctx).await);
+            assert_eq!(list["count"], if allowed {1} else {0});
+            let all = payload(f.handler.handle_approvals_list(json!({}), ctx).await);
+            assert_eq!(all.to_string().contains(id.as_str()), allowed);
+            let mut gate = crate::handlers::push_filter::PushGate::new(&f.home, ctx, false);
+            assert_eq!(gate.filter_prepared(prepared.clone()).await.is_some(), allowed);
+            if allowed {
+                assert_eq!(list["approvals"][0]["payload"], crate::admin_ai::card::confirmation_display(&rec));
+                assert!(list["approvals"][0]["binding"].is_null());
+                assert!(!list.to_string().contains("raw-only-value"));
+            } else {
+                let frame = f.handler.handle_approvals_decide(json!({"id":id.as_str(), "approve":false}), ctx).await;
+                assert!(matches!(frame, WsFrame::Response { ok:false, .. }));
+            }
+        }
+        let frame = f.handler.handle_approvals_decide(json!({"id":id.as_str(), "approve":false,
+            "expected_digest":crate::approval::decision_digest_at(&f.home, &rec)}), &proposer).await;
+        assert!(matches!(frame, WsFrame::Response { ok:true, .. }));
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
     }
 }

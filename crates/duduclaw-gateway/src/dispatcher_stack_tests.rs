@@ -133,6 +133,8 @@ async fn run_queued_wakes() {
         task.updated_at = (Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
         store.insert_task(&task).await.unwrap();
         let msg = QueueMessage {
+            autopilot_department: None,
+            autopilot_rule_id: None,
             id: marker.into(), sender: crate::responsibility::HEARTBEAT_SENDER.into(),
             target: "prod-shaped".into(), payload: format!("[{marker} task_id={marker}] continue"),
             status: MessageStatus::Pending, retry_count: 0, delegation_depth: 0,

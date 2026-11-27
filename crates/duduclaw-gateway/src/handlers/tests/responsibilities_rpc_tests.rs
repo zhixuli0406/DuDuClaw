@@ -18,6 +18,7 @@ fn user_ctx(r: &Rig, agent: &str, level: AccessLevel, role: UserRole) -> UserCon
     let mut agent_access = std::collections::HashMap::new();
     agent_access.insert(agent.to_string(), level);
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: u.id,

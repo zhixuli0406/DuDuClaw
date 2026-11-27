@@ -34,6 +34,17 @@ struct DispatchFailureDelivery {
     reason: crate::channel_reply::TurnFailureReason,
 }
 
+const AUTOPILOT_SCOPE_DENIED: &str = "部門範圍不符，已略過";
+
+async fn refuse_department_message(
+    home: &Path, queue: &crate::message_queue::MessageQueue,
+    message: &crate::message_queue::QueueMessage,
+) -> Result<bool, String> {
+    if crate::autopilot_scope::queued_work_allowed(home, message).await { return Ok(false); }
+    queue.fail(&message.id, AUTOPILOT_SCOPE_DENIED).await?;
+    Ok(true)
+}
+
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BusMessage {
@@ -474,6 +485,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     );
 
     for msg in messages {
+        // Check tags before sender-specific routing or readiness can bypass them.
+        if refuse_department_message(home_dir, queue, &msg).await? { continue; }
         // R-M1: workflow messages belong to the gateway holding this home's
         // instance lock; a second gateway leaves them untouched (not acked).
         if crate::workflow::queue_task::is_workflow_message(&msg)
@@ -809,6 +822,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         if fence_cancelled_turn(home_dir, queue, &msg).await? {
             continue;
         }
+        // Last check before the runtime future is polled (and can spawn).
+        if refuse_department_message(home_dir, queue, &msg).await? { continue; }
         let dispatch_fut = cancellable_dispatch(downstream.as_ref(), dispatch_fut);
         let class = if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
             duduclaw_core::execution_gate::ExecutionClass::Heartbeat
@@ -1985,20 +2000,23 @@ async fn dispatch_to_agent_outcome(
     let run = crate::autonomous_runtime::round_scope(home_dir, round_message_id,
     crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
         {
-            let reg = registry.read().await;
-            if let Some(agent) = reg.get(agent_id) {
+            let loaded = {
+                let reg = registry.read().await;
+                reg.get(agent_id).cloned().map(Box::new)
+            };
+            if let Some(agent) = loaded.as_deref() {
                 if delegation.credential_source.starts_with("message_queue:")
                     || delegation.credential_source.starts_with("bus:")
                 {
                     let sender = crate::delegation_gate::resolve_sender(
                         Some(&delegation.sender), Some(&delegation.origin),
                     ).unwrap_or_default();
-                    crate::on_behalf_of::access::check_loaded_queue_main_target(
+                    crate::on_behalf_of::access::check_loaded_queue_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                         crate::delegation_gate::is_background_system_sender(sender),
                     ).await.map_err(DispatchError::Other)?;
                 } else {
-                    crate::on_behalf_of::access::check_loaded_main_target(
+                    crate::on_behalf_of::access::check_loaded_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                     ).await.map_err(DispatchError::Other)?;
                 }
@@ -2295,7 +2313,7 @@ async fn dispatch_taskspec_inner(
         );
 
         // Check self-target steps too, including a role/default change since creation.
-        if let Err(reason) = crate::on_behalf_of::access::check_main_target(
+        if let Err(reason) = crate::on_behalf_of::access::check_main_target_for_execution(
             home_dir, crate::on_behalf_of::current().as_deref(), &target_agent,
         ).await {
             spec.steps[step_index].status = StepStatus::Failed;

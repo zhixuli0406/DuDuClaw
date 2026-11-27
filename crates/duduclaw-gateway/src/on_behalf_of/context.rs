@@ -14,10 +14,13 @@ struct Entry {
     home: PathBuf,
     agent: String,
     principal: super::PrincipalState,
+    requester: crate::delegation_roles::Requester,
     created: Instant,
     attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
     task: Option<String>,
     run: Option<String>,
+    turn: Option<String>,
+    session: Option<String>,
 }
 fn entries() -> &'static Mutex<HashMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -58,19 +61,28 @@ fn register_value(home: &Path, agent: &str, principal: Option<String>) -> Option
 /// Connection-bound MCP calls must not capture an unrelated gateway task's
 /// attendance, principal or round. The verified capability is the sole source.
 pub(crate) fn register_isolated(home: &Path, agent: &str,
-    context: &duduclaw_mcp_boundary::RequestContext) -> Option<ContextGuard> {
+    context: &duduclaw_mcp_boundary::RequestContext,
+    metadata: Option<&crate::isolation_egress::RunMetadata>) -> Option<ContextGuard> {
     let principal = match &context.record().principal {
         duduclaw_isolation::capability::Principal::Human { user_id, .. } =>
             Some(duduclaw_core::HumanPrincipal::user(user_id.as_str())?.to_string()),
         duduclaw_isolation::capability::Principal::Background { .. } => None,
     };
-    register_details(home, agent, principal, None,
-        context.record().task.as_ref().map(|task| task.as_str().to_string()), None)
+    register_details_with_requester(home, agent, principal, None,
+        context.record().task.as_ref().map(|task| task.as_str().to_string()), None,
+        crate::delegation_roles::Requester::isolated(context, metadata))
 }
 
 fn register_details(home: &Path, agent: &str, principal: Option<String>,
     attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
     task: Option<String>, run: Option<String>) -> Option<ContextGuard> {
+    register_details_with_requester(home, agent, principal, attendance, task, run,
+        crate::delegation_roles::Requester::current(home, agent))
+}
+
+fn register_details_with_requester(home: &Path, agent: &str, principal: Option<String>,
+    attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
+    task: Option<String>, run: Option<String>, requester: crate::delegation_roles::Requester) -> Option<ContextGuard> {
     if !duduclaw_core::is_valid_agent_id(agent) {
         return None;
     }
@@ -100,6 +112,9 @@ fn register_details(home: &Path, agent: &str, principal: Option<String>,
             home,
             agent: agent.into(),
             principal,
+            requester,
+            turn: duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten(),
+            session: duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten(),
             created: now,
             attendance,
             task,
@@ -344,3 +359,52 @@ mod tests {
         ).await;
     }
 }
+
+/// Only an authenticated, live runtime reference can retrieve this evidence.
+pub(crate) fn delegation_requester(home: &Path, agent: &str, reference: &str)
+    -> Option<crate::delegation_roles::Requester> {
+    lookup(home, agent, reference)?;
+    entries().lock().ok()?.get(reference).map(|entry| entry.requester.clone())
+}
+
+/// Refresh only from the connection-bound capability after isolation_egress
+/// has matched its home, employee, principal, task and run to this context.
+pub(crate) fn refresh_isolated_requester(home: &Path, agent: &str, reference: &str,
+    context: &duduclaw_mcp_boundary::RequestContext,
+    metadata: Option<&crate::isolation_egress::RunMetadata>) -> bool {
+    if lookup(home, agent, reference).is_none() { return false; }
+    let Ok(mut entries) = entries().lock() else { return false; };
+    let Some(entry) = entries.get_mut(reference) else { return false; };
+    entry.requester = crate::delegation_roles::Requester::isolated(context, metadata);
+    true
+}
+
+/// Owned read-only snapshot: the registry lock never leaves this function.
+/// Host turn/session are captured independently of attendance at registration.
+pub(crate) struct AdminTurnContext {
+    pub requester: crate::delegation_roles::Requester,
+    pub attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
+    pub task: Option<String>,
+    pub run: Option<String>,
+    pub turn: Option<String>,
+    pub session: Option<String>,
+}
+
+pub(crate) fn admin_turn_context(home: &Path, agent: &str, reference: &str) -> Option<AdminTurnContext> {
+    lookup(home, agent, reference)?;
+    let home = home.canonicalize().ok()?;
+    let entries = entries().lock().ok()?;
+    let entry = entries.get(reference)?;
+    if entry.home != home || entry.agent != agent || entry.created.elapsed() >= MAX_AGE {
+        return None;
+    }
+    Some(AdminTurnContext {
+        requester: entry.requester.clone(), attendance: entry.attendance.clone(),
+        task: entry.task.clone(), run: entry.run.clone(),
+        turn: entry.turn.clone(), session: entry.session.clone(),
+    })
+}
+
+#[cfg(test)]
+#[path = "admin_turn_tests.rs"]
+mod admin_turn_tests;

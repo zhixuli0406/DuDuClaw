@@ -21,6 +21,9 @@
 //!   (array items whose employee field names one, object keys equal to one,
 //!   bare names in arrays) — hidden, not redacted. The allowlisted metadata
 //!   surfaces are exempt (they show label / owner / status by design).
+//!   `autopilot.affecting_me` is NOT exempt: its handler checks live direct
+//!   bindings and explicitly hides rules targeting non-owned Personal
+//!   employees before projection; the generic hidden-row filter still applies.
 //! - **Explicit allowlist** (each audited by its handler): `agents.status`,
 //!   `presets.status`, `agents.avatar` (best-effort metadata audit),
 //!   `agents.pause` / `agents.resume` / `autonomy.pause` / `autonomy.resume`
@@ -156,6 +159,14 @@ pub(crate) fn metadata_allowlisted(method: &str) -> bool {
         "agents.status" | "presets.status" | "agents.avatar" | "agents.pause" | "agents.resume"
             | "autonomy.pause" | "autonomy.resume" | "autonomy.status" | "agents.list"
             | "users.list" | "users.me" | "approvals.list" | "approvals.get"
+            // Department authority is metadata, not employee content. mine
+            // checks owner-only access itself, including its drift metadata.
+            // Do not strip department/group strings that happen to equal an agent id.
+            | "users.dept_grants.list" | "users.dept_grants.set"
+            | "users.dept_grants.options" | "users.dept_grants.mine"
+            | "users.dept_grants.reach_preview"
+            // Admin-only person-list metadata, never employee content.
+            | "agents.main_access.get" | "agents.main_access.set"
     ) || LIFECYCLE_ALLOWLIST.iter().any(|(listed, _)| *listed == method)
 }
 

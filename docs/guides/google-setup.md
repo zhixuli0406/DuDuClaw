@@ -31,6 +31,17 @@ Use this guide with the setup wizard to connect your Google account.
 8. Save the client. Copy the client ID and download the client secret immediately. Google shows the secret only once and later displays its last four characters. Keep it in a password manager.
 9. Return to the wizard, enter the client ID and secret, confirm the data disclosure and select **Connect Google**. If Google shows “Google hasn't verified this app”, confirm it is your own project, select Advanced, then Go to (project name). Tick every permission on the consent screen and continue. Wait for the dashboard result.
 
+
+### Company Google sign-in
+
+Company sign-in uses the configured company Google OAuth client ID and secret. Service-account delegation and Apps Script do not supply this login. It is off by default, requires an administrator's risk acknowledgement and allowed `hd` domains, and is unavailable in the personal edition. Its dashboard pages are not built yet; configure sign-in from the dashboard's Google settings once available.
+
+Set `[dashboard] public_url` to the externally reachable dashboard base URL, including any path prefix. Use HTTPS; HTTP is accepted only for localhost or loopback addresses. Register `<public_url>/api/login/google/callback` exactly in the Google Cloud Web OAuth client's **Authorized redirect URIs**. For `public_url = "https://company.example/agents"`, register `https://company.example/agents/api/login/google/callback`. The base has no trailing slash. Keep any callbacks needed by personal connections or remote MCP separately.
+
+For a company rollout, choose **Internal** only when every user belongs to the Google Cloud project's own Workspace / Cloud Identity organization. An allowed domain in DuDuClaw cannot extend that Google audience. Users from other organizations need **External**, published for production with any required Google verification. Do not deploy company sign-in with a Testing-status consent screen. Testing normally limits access to 100 listed test users and expires authorization and refresh tokens after seven days. Google exempts requests limited to basic identity scopes; this sign-in requests only `openid email profile` with online access. Personal Google connections request additional service scopes and do not share that exception. See [Google's audience rules](https://support.google.com/cloud/answer/15549945?hl=en).
+
+The sign-in link and the member's personal Google connection must use the same Google account (`sub`). Linking sign-in refuses a different existing personal Google account. Sign-in alone does not connect Gmail, Drive or other personal services. See [sign-in security](../features/05-security-defense.md#company-google-sign-in) and [settings](dashboard-settings.md#company-google-sign-in).
+
 ### Remote host or Docker
 
 localhost refers to the computer running your browser. A local Docker install needs no SSH tunnel. Only forward a port when DuDuClaw runs on a remote machine. This example assumes the screen shows 18889:
@@ -104,3 +115,23 @@ https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/g
 ```
 
 Tool behavior and the security model: [Google Workspace reference](google-workspace.md). Enterprise account-holder consent: [personal connections](google-personal-connections.md). Google Chat channel credentials are separate: [Chat setup](channels-googlechat-teams.md).
+
+## Prepare cloud-drive write access
+
+Create, modify, move and trash are separate administrator choices, all off by default. Enabling an action or widening access requires an explicit risk acknowledgement, logged with the administrator and time, without additional re-authentication. Each action defaults to the member's confirmation; administrators may turn it off per action or add administrator approval. An empty folder list allows create and modify anywhere the account can write, and disables move and trash. The dashboard controls arrive with the settings page in this release; the write-settings and personal write-connection blocks are not built yet.
+
+For domain-wide delegation, the Workspace super administrator must add all three scopes to the service account's authorized scope list in **Google Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation**. Keep the existing scopes required by other services:
+
+```text
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/spreadsheets
+```
+
+These scopes cover writing; the ordinary `drive.readonly` scope does not. Colleagues using delegation do not each need a personal write consent. Actual token issuance after the Google Admin change still needs Workspace acceptance.
+
+For a shared company account connected by OAuth, an administrator must complete a one-time additional Google write consent for that company account. It is stored separately from the ordinary connection. People whose employees use their own Google connection instead need their own second write consent; see [personal connections](google-personal-connections.md).
+
+For a shared company service account, protect the key file carefully. Once full Drive scope is authorized, a key readable by the CLI could be used to mint write tokens independently of DuDuClaw's write switches. Prefer the gateway-sealed delegation key. Product checks do not isolate a process with unrestricted access to the key.
+
+Apps Script company connections and protected mode do not support Drive write: these tools are hidden and calls are refused. Existing Docs/Sheets write tools retain their own rules; see the [write-tool reference](google-mcp.md#cloud-drive-write-tools).

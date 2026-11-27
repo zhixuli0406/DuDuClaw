@@ -315,10 +315,14 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     let tools: Vec<_> = crate::mcp::tools().collect();
     // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
-    assert_eq!(tools.len(), 271, "review every new tool's isolation disposition");
+    // 141K-P5: +two person tools, intentionally refused for all employees.
+    // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
+    // RM-194: both admin settings tools are refused and hidden in protected mode.
+    // RM-141: includes four Odoo write-back tools with connector routes.
+    assert_eq!(tools.len(), 288, "review every new tool's isolation disposition");
     for tool in tools {
-        let route = boundary_route(tool.name).expect("exact route");
         if intentional_refusal(tool.name).is_some() { continue; }
+        let route = boundary_route(tool.name).expect("exact route");
         if route == BoundaryRoute::Resource {
             assert!(legacy_resource_handler(tool.name)
                 || duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name).is_some(),
@@ -334,7 +338,16 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
         if let Some(reason) = intentional_refusal(tool.name) {
             let mut record = context().record().clone();
             record.tools = List::new(vec![Text::new(tool.name.into()).unwrap()]).unwrap();
-            record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+            let mut resources = vec![ResourceGrant::Employee { id: record.employee }];
+            if duduclaw_core::google_identity::is_drive_write_tool(tool.name) {
+                assert_eq!(reason, crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable);
+                resources.push(ResourceGrant::Connector {
+                    account: Text::new("drive-account".into()).unwrap(),
+                    binding: record.employee_binding.clone(),
+                });
+                assert_eq!(boundary_route(tool.name), Some(BoundaryRoute::Resource));
+            }
+            record.resources = List::new(resources).unwrap();
             let call = Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), context: live_context(record),
                 agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
                 services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
@@ -353,13 +366,54 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 271);
+    assert_eq!(manifest.len(), 288);
+    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+        assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
+            ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));
+    }
     assert_eq!(manifest.iter().find(|(name, _)| *name == "file_read").unwrap().1, ServiceState::Ready);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "execute_program").unwrap().1, ServiceState::MissingFactory);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "transcribe_audio").unwrap().1, ServiceState::MissingFactory);
     assert!(matches!(manifest.iter().find(|(name, _)| *name == "os_power").unwrap().1,
         ServiceState::IntentionalRefusal(_)));
     assert!(dispatcher.require_complete_services().is_err());
+}
+
+#[tokio::test]
+async fn isolated_admin_settings_are_refused_and_not_listed_even_with_admin_grants() {
+    use crate::mcp_isolation_disposition::{Refusal, intentional_refusal};
+    use duduclaw_core::tool_effect::{ToolEffect, effect_of_builtin};
+    let home = tempfile::tempdir().unwrap();
+    let manifest = adapter(home.path()).service_manifest();
+    let mut admin = principal();
+    admin.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
+    for binding in [EmployeeBinding::Personal(Text::new("owner".into()).unwrap()),
+        EmployeeBinding::Shared(Text::new("tenant".into()).unwrap())] {
+        for (name, effect) in [("admin_settings_read", ToolEffect::Read),
+            ("admin_settings_propose", ToolEffect::Admin)] {
+            assert_eq!(boundary_route(name), Some(BoundaryRoute::Resource));
+            assert_eq!(effect_of_builtin(name), Some(effect));
+            assert_eq!(intentional_refusal(name), Some(Refusal::AdminSettingsUnavailable));
+            assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1,
+                ServiceState::IntentionalRefusal(Refusal::AdminSettingsUnavailable));
+            let mut record = context().record().clone();
+            record.lane = Lane::Standard;
+            record.employee_binding = binding.clone();
+            record.tools = List::new(vec![Text::new(name.into()).unwrap()]).unwrap();
+            record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+            let call = Arc::new(IsolatedCall { forks: None, home: home.path().into(), context: live_context(record),
+                agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
+                services: Some(Arc::new(RecordProbe)), execution: None, worker: None,
+                record_resolver: Some(Arc::new(RecordProbe)) });
+            ISOLATED_CALL.scope(call, async {
+                // The shared tools/list predicate must refuse even an installed service.
+                assert!(!tool_allowed(name, &admin), "{name}");
+                let result = dispatch_resource_tool(home.path(), name, &json!({})).await.unwrap();
+                assert_eq!(result["isError"], true, "{name}: {result}");
+                assert_eq!(result["content"][0]["text"], Refusal::AdminSettingsUnavailable.message());
+            }).await;
+        }
+    }
 }
 
 #[tokio::test]

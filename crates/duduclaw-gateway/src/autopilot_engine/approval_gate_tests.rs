@@ -71,6 +71,12 @@ impl Harness {
     async fn insert_rule(&self, id: &str, action: Value) {
         self.store
             .insert_rule(&AutopilotRuleRow {
+                active_window: None,
+                run_policy: None,
+                owner_department: None,
+                created_by_user_id: None,
+                updated_by_user_id: None,
+                updated_at: None,
                 id: id.into(),
                 name: format!("rule {id}"),
                 enabled: true,
@@ -165,6 +171,7 @@ fn reproduced_action() -> Value {
 
 fn task_created(title: &str) -> AutopilotEvent {
     AutopilotEvent::TaskCreated {
+        origin: crate::autopilot_engine::EventOrigin::external(),
         task: json!({ "id": format!("task-{title}"), "title": title, "priority": "high" }),
     }
 }
@@ -175,6 +182,63 @@ async fn file_one(h: &Harness, engine: &AutopilotEngine) -> ApprovalId {
     let cards = h.cards().await;
     assert_eq!(cards.len(), 1, "exactly one approval per fire");
     cards[0].id.clone()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn department_containment_blocks_approval_resume_before_perform_action() {
+    // Seed a legacy pending approval directly, bypassing the new trigger guard.
+    // The hash includes department ownership, so a stale-revision rejection
+    // cannot mask a missing containment check in the resumer.
+    for department in [Some("sales"), None] {
+        let h = Harness::new();
+        h.insert_rule("r1", reproduced_action()).await;
+        // Inject the legacy shape: typed writes now require a steps envelope.
+        rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+            "UPDATE autopilot_rules SET owner_department=?1 WHERE id='r1'", [department],
+        ).unwrap();
+        let rule = h.store.get_rule("r1").await.unwrap().unwrap();
+        let engine = h.engine(true);
+        let at = chrono::Utc::now();
+        let frozen = gate::FrozenDispatch {
+            dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+            rule_hash: gate::rule_revision_hash(&rule), event: "task_created".into(), event_ref: "legacy fixture".into(),
+            source_agent: None,
+            action: gate::FrozenAction::Delegate { target_agent: "plain".into(), prompt: "report".into(), lane: None },
+        };
+        let ledger = frozen.ledger_row(&at.to_rfc3339(), "department-fixture");
+        assert!(h.store.insert_dispatch(&ledger).await.unwrap());
+        let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
+        let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+            frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+        assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
+        let cards = h.cards().await;
+        assert_eq!(cards.len(), 1);
+        let id = &cards[0].id;
+        let pending = h.only_dispatch().await;
+        assert_eq!(pending.rule_hash, gate::rule_revision_hash(&rule));
+        h.broker().decide(id, true, "dashboard:admin").await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 1);
+
+        let row = h.only_dispatch().await;
+        assert_eq!(row.state, DISPATCH_SETTLED);
+        if department.is_some() {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 0);
+            assert!(h.queued().await.is_empty());
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+            let history = h.store.list_history(Some("r1"), 10).await.unwrap();
+            let skipped: Vec<_> = history.iter().filter(|r| r.result == "skipped").collect();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].details.as_deref(), Some("部門範圍不符，已略過"));
+            let card = h.broker().get(id).await.unwrap().unwrap();
+            assert_eq!(card.status, ApprovalStatus::Invalidated);
+            assert!(card.invalidated_reason.unwrap().starts_with(gate::RETIRED_PREFIX));
+        } else {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 1);
+            assert_eq!(h.queued().await.len(), 1);
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+        }
+        assert_eq!(engine.resume_approvals_once().await, 0);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -204,7 +268,7 @@ async fn reproduced_scenario_waits_for_approval_then_dispatches_the_frozen_promp
     assert!(frozen["event_ref"].as_str().unwrap().starts_with("task_created:task=task-季報:"));
     assert_eq!(frozen["action"]["type"], "delegate");
     assert_eq!(frozen["action"]["target_agent"], "plain");
-    assert_eq!(frozen["action"]["prompt"], "請處理新任務：季報（）");
+    assert_eq!(frozen["action"]["prompt"], format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
     // H1: the summary names the action but carries no content excerpt (the
     // dashboard view renders the complete frozen action from the payload),
     // and states the latest execution time.
@@ -224,7 +288,7 @@ async fn reproduced_scenario_waits_for_approval_then_dispatches_the_frozen_promp
     let queued = h.queued().await;
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].target, "plain");
-    assert_eq!(queued[0].payload, "請處理新任務：季報（）");
+    assert_eq!(queued[0].payload, format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
     assert_eq!(queued[0].sender, "autopilot");
 
     // Single use: the card is consumed and the ledger settled.
@@ -454,7 +518,7 @@ async fn an_approval_granted_while_the_gateway_was_down_runs_after_restart() {
     assert_eq!(second.resume_approvals_once().await, 1);
     let queued = h.queued().await;
     assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].payload, "請處理新任務：季報（）");
+    assert_eq!(queued[0].payload, format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
 }
 
 /// Move a decided card's `decided_at` by `offset` from now.
@@ -526,7 +590,9 @@ async fn the_card_carries_the_complete_prompt_with_its_long_suffix() {
     let card = h.broker().get(&id).await.unwrap().unwrap();
     let prompt = card.payload[gate::PAYLOAD_KEY]["action"]["prompt"].as_str().unwrap();
     assert!(prompt.chars().count() > 3000);
-    assert!(prompt.starts_with(&prefix) && prompt.ends_with(suffix), "the whole prompt is frozen");
+    let original = format!("{prefix}季報{suffix}");
+    assert_eq!(prompt, format!("{EVENT_DATA_BANNER}\n\n{original}"), "the whole prompt is frozen");
+    assert!(serde_json::to_vec(&card.payload).unwrap().len() <= gate::MAX_FROZEN_PAYLOAD_BYTES);
     assert!(!card.summary.contains(suffix), "no excerpt in the summary");
     // The view renders exactly this payload; its digest is what an approval must name.
     assert_eq!(card.payload[gate::DIGEST_KEY], json!(h.only_dispatch().await.frozen_digest));
@@ -1088,6 +1154,12 @@ async fn a_forged_security_event_row_is_ignored() {
     let h = Harness::new();
     h.store
         .insert_rule(&AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "sec".into(),
             name: "on security".into(),
             enabled: true,
@@ -1178,4 +1250,73 @@ fn approved_actions_expire_after_the_execution_window() {
     assert!(!approval_gate::decided_within_window(&rec, now), "unparseable fails closed");
     rec.decided_at = None;
     assert!(!approval_gate::decided_within_window(&rec, now));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn outside_window_skips_before_other_gates_without_counting() {
+    use chrono::Datelike;
+    use crate::autopilot_store::RuleExtensionsPatch;
+
+    let h = Harness::new();
+    h.insert_rule("windowed", json!({
+        "type": "steps",
+        "steps": [{"type": "notify", "message": "must not run"}]
+    })).await;
+    let today = chrono::Utc::now().weekday().number_from_monday() as u8;
+    // Exclude today and tomorrow so even a midnight rollover cannot admit it.
+    let excluded_tomorrow = today % 7 + 1;
+    let day = (1u8..=7).find(|d| *d != today && *d != excluded_tomorrow).unwrap();
+    let rule = h.store.set_rule_extensions("windowed", &RuleExtensionsPatch {
+        active_window: Some(Some(json!({
+            "days": [day], "start": "00:00", "end": "23:59", "timezone": "UTC"
+        }).to_string())),
+        run_policy: None,
+        owner_department: None,
+        updated_by_user_id: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }).await.unwrap().unwrap();
+    let engine = h.engine(true);
+    engine.process_event(&task_created("window test")).await.unwrap();
+    let history = h.store.list_history(Some("windowed"), 100).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].result, "outside_window");
+    assert!(history[0].details.as_deref().unwrap().contains("本次不執行"));
+    let saved = h.store.get_rule("windowed").await.unwrap().unwrap();
+    assert_eq!(saved.trigger_count, rule.trigger_count);
+    assert_eq!(saved.last_triggered_at, rule.last_triggered_at);
+    assert!(h.queued().await.is_empty());
+    assert!(h.cards().await.is_empty());
+    assert!(engine.circuit.lock().await.is_empty());
+    assert!(h.store.list_runs_for_rule("windowed", 100).await.unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn approved_single_action_scope_denied_under_fence() {
+    let h = Harness::new();
+    h.insert_rule("r1", reproduced_action()).await;
+    let at = chrono::Utc::now();
+    // Public writes require a steps envelope for departments. Inject the
+    // legacy-shaped row directly to exercise the no-run execution seam.
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+        "UPDATE autopilot_rules SET owner_department='sales' WHERE id='r1'", []).unwrap();
+    let rule = h.store.get_rule("r1").await.unwrap().unwrap();
+    let frozen = gate::FrozenDispatch {
+        dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+        rule_hash: gate::rule_revision_hash(&rule), event: "task_created".into(), event_ref: "direct fixture".into(),
+        source_agent: None,
+        action: gate::FrozenAction::Delegate { target_agent: "plain".into(), prompt: "never".into(), lane: None },
+    };
+    let ledger = frozen.ledger_row(&at.to_rfc3339(), "scope-fixture");
+    assert!(h.store.insert_dispatch(&ledger).await.unwrap());
+    let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
+    let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+        frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+    assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    assert_eq!(h.engine(true).resume_approvals_once().await, 1);
+    let row = h.only_dispatch().await;
+    assert_eq!(row.state, DISPATCH_SETTLED);
+    assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+    assert_eq!(row.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+    assert!(h.queued().await.is_empty());
 }

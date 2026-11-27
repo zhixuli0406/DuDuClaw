@@ -6,7 +6,7 @@ import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { AgentSkillsPanel } from './AgentSkillsPanel';
 
-function setup(canManage: boolean) {
+function setup(canManage: boolean, canRestore = canManage) {
   mockWsClient.call.mockImplementation((method: string) => {
     if (method === 'skills.list')
       return Promise.resolve({
@@ -21,7 +21,7 @@ function setup(canManage: boolean) {
     if (method === 'skills.archived')
       return Promise.resolve({
         agent_id: 'agnes',
-        can_restore: canManage,
+        can_restore: canRestore,
         archived: [{ archive_id: '20261023T000000000Z-abcd1234', skill_name: 'old-quote', archived_at: '2026-10-22T00:00:00Z', archived_by: 'u1' }],
       });
     return Promise.resolve({ results: [{ agent_id: 'agnes', skill_name: 'quote', ok: true }] });
@@ -82,4 +82,23 @@ describe('AgentSkillsPanel', () => {
     expect(await screen.findByRole('switch', { name: 'Agnes uses “quote”' })).toHaveAttribute('data-disabled');
     expect(screen.getByRole('button', { name: 'Restore' })).toBeDisabled();
   });
+});
+
+
+it('allows manager controls from server flags without a callable binding', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  setup(true);
+  renderWithProviders(<AgentSkillsPanel agentId="agnes" agentName="Agnes" />);
+  expect(await screen.findByRole('switch', { name: 'Agnes uses “quote”' })).not.toHaveAttribute('data-disabled');
+  expect(screen.getByRole('button', { name: 'Restore' })).toBeEnabled();
+});
+
+
+it.each([true, false])('honours restore separately from management (%s)', async canRestore => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  setup(!canRestore, canRestore);
+  renderWithProviders(<AgentSkillsPanel agentId="agnes" agentName="Agnes" />);
+  const restore = await screen.findByRole('button', { name: 'Restore' });
+  if (canRestore) expect(restore).toBeEnabled();
+  else expect(restore).toBeDisabled();
 });

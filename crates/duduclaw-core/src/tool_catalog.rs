@@ -615,6 +615,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo:write",
         "odoo",
     ),
+    ("odoo_message_send", "Send a message on an Odoo record", "odoo:write", "odoo"),
+    ("odoo_attachment_add", "Attach a conversation file to an Odoo record", "odoo:write", "odoo"),
     // ── Odoo: execute (odoo:execute) ─────────────────────────────────────
     (
         "odoo_sale_confirm",
@@ -717,6 +719,15 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "google:read",
         "google",
     ),
+    ("drive_create_file", "Create a Drive file from text or a conversation attachment, or create a folder.", "google:write", "google"),
+    ("drive_copy_file", "Copy a Drive file to a folder.", "google:write", "google"),
+    ("drive_update_file", "Rename a Drive file, change its description, or replace non-Google text file contents.", "google:write", "google"),
+    ("drive_move_file", "Move a Drive file to a destination folder.", "google:write", "google"),
+    ("drive_trash_file", "Move a Drive file to the trash; does not permanently delete it.", "google:write", "google"),
+    ("docs_insert_text", "Insert text at the start, end, or after unique text in a Google Doc.", "google:write", "google"),
+    ("docs_format", "Apply supported styles, a header, or a tab operation to a Google Doc.", "google:write", "google"),
+    ("sheets_add_sheet", "Add a spreadsheet sheet, optionally copying an existing sheet.", "google:write", "google"),
+    ("sheets_add_note", "Set a note on up to 1000 spreadsheet cells; an empty note clears it.", "google:write", "google"),
     // ── Google Workspace: write (google:write) ───────────────────────────
     (
         "gmail_create_draft",

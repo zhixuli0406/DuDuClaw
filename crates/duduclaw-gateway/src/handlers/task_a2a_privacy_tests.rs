@@ -4,6 +4,48 @@ use super::task_privacy_tests::{fixture, admin, denied, ok, payload, Fixture};
 
 const TASK: &str = "a2a-private-task";
 
+#[tokio::test]
+async fn bounded_list_skips_newer_a2a_tasks_before_the_limit() {
+    let f = a2a_fixture().await;
+    let conn = rusqlite::Connection::open(f.home.join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET created_at = '2020-01-01T00:00:00Z'", []).unwrap();
+    conn.execute("UPDATE tasks SET created_at = '2099-01-01T00:00:00Z' WHERE id = ?1", [TASK]).unwrap();
+    for ctx in [&f.bob, &admin(&f)] {
+        let list = payload(f.handler.handle_tasks_list(json!({"agent_id":"sales", "limit":2}), ctx).await);
+        let rows = list["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["id"], "open-task");
+        assert_eq!(rows[1]["id"], "private-task");
+        assert!(!list.to_string().contains(TASK));
+        assert!(!list.to_string().contains("private A2A"));
+        assert!(list.get("more_may_exist").is_none());
+    }
+    let owner = payload(f.handler.handle_tasks_list(json!({"agent_id":"sales", "limit":1}), &f.alice).await);
+    assert_eq!(owner["tasks"][0]["id"], TASK);
+    assert!(owner.get("more_may_exist").is_none());
+}
+
+#[tokio::test]
+async fn bounded_list_reports_hidden_a2a_scan_cap_but_unbounded_shape_is_unchanged() {
+    let f = a2a_fixture().await;
+    let store = f.handler.task_store().await.unwrap();
+    for index in 0..2000 {
+        let id = format!("hidden-a2a-{index:04}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "normal".into(), "sales".into(), "system".into());
+        row.a2a_owner = Some(format!("user:{}", f.alice.user_id));
+        row.created_at = "2099-01-01T00:00:00Z".into();
+        store.insert_task(&row).await.unwrap();
+    }
+    let bounded = payload(f.handler.handle_tasks_list(json!({"agent_id":"sales", "limit":2}), &f.bob).await);
+    assert_eq!(bounded["tasks"], json!([]));
+    assert_eq!(bounded["more_may_exist"], true);
+    assert!(!bounded.to_string().contains("hidden-a2a-"));
+    let unlimited = payload(f.handler.handle_tasks_list(json!({"agent_id":"sales"}), &f.bob).await);
+    assert_eq!(unlimited["tasks"].as_array().unwrap().len(), 2);
+    assert!(unlimited.get("more_may_exist").is_none());
+    assert!(!unlimited.to_string().contains("hidden-a2a-"));
+}
+
 async fn a2a_fixture() -> Fixture {
     let f = fixture().await;
     let mut row = TaskRow::new(TASK.into(), "private A2A title".into(),

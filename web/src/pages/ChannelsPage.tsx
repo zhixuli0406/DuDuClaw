@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { effectiveName } from '@/lib/product-identity';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
@@ -435,6 +436,7 @@ function ChannelRow({
   onRemove: () => void;
   onDetail: () => void;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const style = getChannelStyle(channel.name);
   const transitional = channel.error === 'connecting' || channel.error === 'reconnecting';
@@ -466,7 +468,7 @@ function ChannelRow({
             </div>
             {channel.last_connected && (
               <p className="mt-0.5 font-mono text-xs text-muted-foreground">
-                {new Date(channel.last_connected).toLocaleString('zh-TW')}
+                {formatDateTime(channel.last_connected, { locale: 'zh-TW', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}
               </p>
             )}
           </div>

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -183,6 +184,8 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
 }
 
 function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; expiresAt: number | null; t: (id: string) => string }) {
+  const intl = useIntl();
+  useCompanyTimeZone();
   const destinations = Object.entries(grant.fullArgs ?? {}).filter(([key]) =>
     ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id', 'notify_channel', 'notify_chat_id', 'notify_thread_id', 'attendees'].includes(key),
   );
@@ -239,7 +242,7 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
             </div>
           )}
           {expiresAt != null && Number.isFinite(expiresAt) && (
-            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={new Date(expiresAt * 1000).toISOString()}>{new Date(expiresAt * 1000).toLocaleString()}</time></p>
+            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={formatDateTime(expiresAt * 1000).toISOString()}>{new Date(expiresAt * 1000, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time></p>
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
@@ -864,10 +867,10 @@ function Escaped({ value, mono }: { value: string; mono?: boolean }) {
   );
 }
 
-function localTime(value: string | number | null | undefined): string | null {
+function localTime(value: string | number | null | undefined, locale: string): string | null {
   if (value == null || value === '') return null;
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? null : formatDateTime(date, { locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 }
 
 /**
@@ -892,6 +895,7 @@ function AutopilotActionApprovalView({
   decideError?: unknown;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const card: AutopilotActionCard | null = useMemo(() => parseAutopilotAction(approval.payload), [approval.payload]);
   const tooLarge = useMemo(
@@ -922,8 +926,8 @@ function AutopilotActionApprovalView({
       ? 'approval.autopilot.content.notify'
       : `approval.autopilot.content.${card.actionType}`
     : null;
-  const decideBy = localTime(approval.expires_at ?? null);
-  const latest = localTime(card?.latestExecutionAt ?? null);
+  const decideBy = localTime(approval.expires_at ?? null, intl.locale);
+  const latest = localTime(card?.latestExecutionAt ?? null, intl.locale);
   const windowMinutes = Math.round((card?.executionWindowSecs ?? 900) / 60);
 
   return (

@@ -218,3 +218,79 @@ async fn accessible_schedules_filter_bindings_and_enforce_viewer_read_only() {
     ok_payload(&f.handler.handle("assign_schedules.resume", json!({"id":id}), &operator).await);
     ok_payload(&f.handler.handle("assign_schedules.remove", json!({"id":id}), &operator).await);
 }
+
+fn company_config(home: &std::path::Path, zone: Option<&str>) {
+    let general = zone.map(|z| format!("[general]\ncompany_timezone = '{z}'\n")).unwrap_or_default();
+    std::fs::write(home.join("config.toml"), general).unwrap();
+}
+
+#[tokio::test]
+async fn assign_default_uses_company_zone() {
+    let f = fixture().await;
+    company_config(f._home.path(), Some("Asia/Taipei"));
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    for blank in [false, true] {
+        let mut params = weekly("sales");
+        params.as_object_mut().unwrap().remove("schedule_timezone");
+        if blank { params["schedule_timezone"] = json!("  "); }
+        let created = ok_payload(&f.handler.handle("tasks.goal_create", params, &mgr).await);
+        assert_eq!(created["schedule"]["timezone"], "Asia/Taipei");
+        assert!(created["zone_note"].is_null());
+        let store = TaskStore::open(f._home.path()).unwrap();
+        let row = store.get_assign_schedule(created["schedule"]["id"].as_str().unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.timezone.as_deref(), Some("Asia/Taipei"));
+    }
+}
+
+#[tokio::test]
+async fn assign_default_unset_is_utc_with_note() {
+    let f = fixture().await;
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    for (zone, note) in [
+        (None, "公司時區尚未設定，這個排程以 UTC 計時。"),
+        (Some("Bad/Zone"), "公司時區設定無效，這個排程以 UTC 計時。"),
+    ] {
+        company_config(f._home.path(), zone);
+        let created = ok_payload(&f.handler.handle("tasks.create", json!({
+            "assigned_to": "sales", "title": "Daily report", "schedule": "每天 9:00",
+        }), &mgr).await);
+        assert_eq!(created["schedule"]["timezone"], "UTC");
+        assert_eq!(created["zone_note"], note);
+        let store = TaskStore::open(f._home.path()).unwrap();
+        let row = store.get_assign_schedule(created["schedule"]["id"].as_str().unwrap()).await.unwrap().unwrap();
+        assert_eq!(row.timezone.as_deref(), Some("UTC"));
+    }
+}
+
+#[tokio::test]
+async fn company_zone_change_does_not_move_assign_rows_created_earlier() {
+    let f = fixture().await;
+    company_config(f._home.path(), Some("Asia/Taipei"));
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let mut params = weekly("sales");
+    params.as_object_mut().unwrap().remove("schedule_timezone");
+    let created = ok_payload(&f.handler.handle("tasks.goal_create", params, &mgr).await);
+    let id = created["schedule"]["id"].as_str().unwrap();
+    let store = TaskStore::open(f._home.path()).unwrap();
+    let before = store.get_assign_schedule(id).await.unwrap().unwrap();
+    company_config(f._home.path(), Some("America/New_York"));
+    let after = store.get_assign_schedule(id).await.unwrap().unwrap();
+    assert_eq!(after.timezone.as_deref(), Some("Asia/Taipei"));
+    assert_eq!(after.next_fire_at, before.next_fire_at);
+    // Resume recomputes the next time from the stored zone, not company settings.
+    ok_payload(&f.handler.handle("assign_schedules.pause", json!({"id": id}), &mgr).await);
+    let resumed = ok_payload(&f.handler.handle("assign_schedules.resume", json!({"id": id}), &mgr).await);
+    let next = crate::assign_schedule::spec::parse_utc(resumed["schedule"]["next_fire_at"].as_str().unwrap()).unwrap();
+    let local = next.with_timezone(&chrono_tz::Asia::Taipei);
+    assert_eq!(local.format("%H:%M").to_string(), "09:00");
+}
+
+#[tokio::test]
+async fn explicit_assign_schedule_timezone_is_kept() {
+    let f = fixture().await;
+    company_config(f._home.path(), Some("America/New_York"));
+    let mgr = jwt_ctx(&f.mgr, UserRole::Manager);
+    let created = ok_payload(&f.handler.handle("tasks.goal_create", weekly("sales"), &mgr).await);
+    assert_eq!(created["schedule"]["timezone"], "Asia/Taipei");
+    assert!(created["zone_note"].is_null());
+}

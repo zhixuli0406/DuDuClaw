@@ -85,6 +85,12 @@ pub struct SeedReport {
 
 fn critical_notify_rule(now: &str) -> AutopilotRuleRow {
     AutopilotRuleRow {
+        active_window: None,
+        run_policy: None,
+        owner_department: None,
+        created_by_user_id: None,
+        updated_by_user_id: None,
+        updated_at: None,
         id: RULE_ID_CRITICAL.to_string(),
         name: "🔴 安全：Critical 事件通知（需設定通知管道後啟用）".to_string(),
         enabled: false,
@@ -119,6 +125,12 @@ fn critical_notify_rule(now: &str) -> AutopilotRuleRow {
 
 fn warn_injection_breaker_rule(now: &str) -> AutopilotRuleRow {
     AutopilotRuleRow {
+        active_window: None,
+        run_policy: None,
+        owner_department: None,
+        created_by_user_id: None,
+        updated_by_user_id: None,
+        updated_at: None,
         id: RULE_ID_WARN_INJECTION_BREAKER.to_string(),
         name: "⚠️ 安全：注入／斷路器警示（需設定通知管道後啟用）".to_string(),
         enabled: false,

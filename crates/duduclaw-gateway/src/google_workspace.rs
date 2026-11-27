@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use crate::google_apps_script;
 pub mod chat_read;
+pub mod drive_write_policy;
 pub mod chat_send;
 pub(crate) mod native_call;
 pub(crate) mod native_confirmation;
@@ -807,10 +808,11 @@ pub use crate::google_identity::home_source::{get_valid_google_token, get_valid_
 /// every Google REST call to a local mock named by
 /// `DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE` (`https://gmail.googleapis.com/x` →
 /// `<base>/gmail.googleapis.com/x`).
-fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(test)]
     {
-        if let Some(base) = test_api_base::get()
+        if let Some(base) = test_api_base::SCOPED.try_with(Clone::clone).ok()
+            .or_else(|| test_api_base::get().map(str::to_owned))
             && let Some(rest) = url.strip_prefix("https://")
         {
             return std::borrow::Cow::Owned(format!("{base}/{rest}"));
@@ -832,6 +834,7 @@ fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
 pub(crate) mod test_api_base {
     use std::sync::OnceLock;
     static BASE: OnceLock<String> = OnceLock::new();
+    tokio::task_local! { pub(crate) static SCOPED: String; }
     pub(crate) fn set(base: String) {
         let _ = BASE.set(base);
     }
@@ -849,7 +852,8 @@ pub async fn api_get(token: &str, url: &str) -> Result<Value, GoogleApiError> {
 fn http_client() -> Result<reqwest::Client, GoogleApiError> {
     crate::isolation_connector_clients::client_builder()
         .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .redirect(crate::isolation_connector_clients::redirects())
+        // Redirects must not bypass the method/path fence on a second request.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| GoogleApiError::Http(format!("client build failed: {e}")))
 }
@@ -883,6 +887,9 @@ async fn google_request(
     query: &[(&str, String)],
     body: Option<&Value>,
 ) -> Result<Value, GoogleApiError> {
+    native_confirmation::drive_request_url(&method, url)
+        .filter(|url| !url.host_str().is_some_and(|host| host.ends_with(".googleapis.com.")))
+        .ok_or_else(|| GoogleApiError::Http("這個 Google 請求不被允許。".into()))?;
     let client = http_client()?;
     let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
 
@@ -948,6 +955,9 @@ async fn google_request_text(
     url: &str,
     query: &[(&str, String)],
 ) -> Result<String, GoogleApiError> {
+    native_confirmation::drive_request_url(&method, url)
+        .filter(|url| !url.host_str().is_some_and(|host| host.ends_with(".googleapis.com.")))
+        .ok_or_else(|| GoogleApiError::Http("這個 Google 請求不被允許。".into()))?;
     let client = http_client()?;
     let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
 
@@ -1613,6 +1623,69 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_drive_refusals_never_reach_json_or_text_wire() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(json!({})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        test_api_base::SCOPED.scope(base, async {
+            google_request("fixture-token", reqwest::Method::GET,
+                "https://www.googleapis.com/drive/v3/files", &[], None).await.unwrap();
+            assert_eq!(count.swap(0, Ordering::SeqCst), 1);
+            for (method, url) in native_confirmation::drive_refusal_cases() {
+                for host in ["www.googleapis.com", "content.googleapis.com", "googleapis.com",
+                    "www.googleapis.com.", "content.googleapis.com.", "googleapis.com.",
+                    "gmail.googleapis.com."] {
+                    let url = url.replace("www.googleapis.com", host);
+                    for text in [false, true] {
+                        let result = if text {
+                            google_request_text("fixture-token", method.clone(), &url, &[]).await.map(|_| ())
+                        } else {
+                            google_request("fixture-token", method.clone(), &url, &[], None).await.map(|_| ())
+                        };
+                        assert!(matches!(result, Err(GoogleApiError::Http(ref message)) if message == "這個 Google 請求不被允許。"), "{method} {url}");
+                        assert_eq!(count.load(Ordering::SeqCst), 0);
+                    }
+                }
+            }
+        }).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn legacy_redirects_cannot_bypass_drive_fence() {
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { (axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, "/drive/v3/files/x1234567890")], "") }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/calendar", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        for text in [false, true] {
+            let result = if text {
+                google_request_text("fixture-token", reqwest::Method::DELETE, &url, &[]).await.map(|_| ())
+            } else {
+                google_request("fixture-token", reqwest::Method::DELETE, &url, &[], None).await.map(|_| ())
+            };
+            assert!(matches!(result, Err(GoogleApiError::Api { status: 307, .. })));
+            assert_eq!(count.swap(0, Ordering::SeqCst), 1);
+        }
+        server.abort();
+        let _ = server.await;
+    }
 
     #[tokio::test]
     async fn dedicated_write_policy_preserves_read_and_legacy_status_retries() {

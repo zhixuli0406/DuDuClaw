@@ -118,8 +118,20 @@ async fn token_endpoint(
         )
             .into_response();
     }
+    if local == "p8-missing-scope" {
+        return axum::Json(json!({"access_token":"fixture-secret", "expires_in":3600,
+            "scope":"https://www.googleapis.com/auth/drive.readonly"})).into_response();
+    }
+    if local == "p8-explicit-scope" {
+        return axum::Json(json!({"access_token":"fixture-secret", "expires_in":3600,
+            "scope": c["scope"]})).into_response();
+    }
+    if local == "write-scope" {
+        return axum::Json(json!({"access_token":"isolated-delegate-secret", "expires_in":3600,
+            "token_type":"Bearer", "scope":format!("{} {}", c["scope"].as_str().unwrap_or(""), crate::google_personal::oauth::DRIVE_WRITE_SCOPE)})).into_response();
+    }
     axum::Json(
-        json!({"access_token":if headers.get("x-duduclaw-w3-owned-issuer").is_some(){closed_fixture_token(&sub)}else{format!("tok:{sub}")}, "expires_in": 3600, "token_type": "Bearer"}),
+        json!({"access_token":if headers.get("x-duduclaw-w3-owned-issuer").is_some() || local.starts_with("p8-"){closed_fixture_token(&sub)}else{format!("tok:{sub}")}, "expires_in": 3600, "token_type": "Bearer"}),
     )
     .into_response()
 }
@@ -206,6 +218,10 @@ async fn service_endpoint(
         .lock()
         .unwrap()
         .push((account.clone(), uri.to_string()));
+    if account == "p8-probe-denied@c.test" {
+        return (axum::http::StatusCode::FORBIDDEN,
+            axum::Json(json!({"error":{"message":"fixture-provider-detail"}}))).into_response();
+    }
     for code in [429u16, 503] {
         if uri
             .path()
@@ -1139,3 +1155,21 @@ async fn owner_diagnostic_records_audit_and_durable_notice_before_mint_without_d
     assert!(resolve::resolve_person_for_tool(home.p(), "bot", &requester, people.as_ref(), "gmail_read").await.is_err());
     assert_eq!(seen_for(email).len(), before + 2);
 }
+
+#[tokio::test]
+async fn delegated_token_actual_write_scope_refuses_even_on_cache_hit_and_home_fallback() {
+    let home = Home::new();
+    home.ready("write-scope-bot", "write-scope@c.test", "requesters='anyone'\nfallback='home'\n");
+    let state = route::GoogleTokenRouteState::new(home.p().to_path_buf(), None);
+    for _ in 0..2 {
+        let error = route::serve(&state, "write-scope-bot", "gmail_read", &RequesterIdentity::Unknown).await.unwrap_err();
+        assert_eq!(error.code, "write_scope_isolated");
+        assert!(!error.fallback_eligible);
+    }
+    let audit = std::fs::read_to_string(home.p().join("tool_calls.jsonl")).unwrap();
+    assert!(!audit.contains("isolated-delegate-secret"));
+    assert!(audit.contains("write_scope_isolated"));
+}
+
+#[path = "drive_write_check_tests.rs"]
+mod drive_write_check_tests;

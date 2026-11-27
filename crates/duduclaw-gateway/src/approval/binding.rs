@@ -28,9 +28,19 @@ impl RequestKind {
 }
 
 /// `action_kind` of a workflow activation card. Accepting a workflow version
-/// grants a standing authority, so only a current Admin decides it, in the
-/// dashboard only (see `approval_notify::is_dashboard_only_kind`).
+/// grants a standing authority, so only a current Admin decides it, through
+/// the dashboard or the verified chat-admin decision service.
 pub const WORKFLOW_ACTIVATION_KIND: &str = "workflow_activation";
+
+/// ChatAdmin entries come only from the decision service after live Active
+/// Admin, handshake, configuration and receipt preflight checks. Transport
+/// context alone never confers this authority (including for egress cards).
+#[derive(Clone, Copy)]
+pub(crate) enum BoundAuthority<'a> {
+    Channel,
+    Dashboard(&'a duduclaw_auth::UserContext),
+    ChatAdmin(&'a super::chat_admin::LedgerEntry),
+}
 
 fn is_activation_payload(payload: &Value) -> bool {
     payload.get("kind").and_then(Value::as_str) == Some(WORKFLOW_ACTIVATION_KIND)
@@ -328,7 +338,7 @@ impl ApprovalBroker {
                 ApprovalStatus::Denied
             },
             None,
-            None,
+            BoundAuthority::Channel,
         )
         .await
     }
@@ -357,7 +367,7 @@ impl ApprovalBroker {
             RequestKind::Question,
             ApprovalStatus::Answered,
             Some(answer),
-            None,
+            BoundAuthority::Channel,
         )
         .await
     }
@@ -368,27 +378,49 @@ impl ApprovalBroker {
         kind: RequestKind,
         status: ApprovalStatus,
         answer: Option<Value>,
-        dashboard: Option<&duduclaw_auth::UserContext>,
+        authority: BoundAuthority<'_>,
     ) -> Result<(), String> {
         context.validate()?;
         if let Some(value) = &answer {
             require_credential_free_payload(value)?;
         }
         let rec = self.get(id).await?.ok_or("request not found")?;
-        if crate::google_identity::chat_send::is_member_card(&rec) {
+        if let BoundAuthority::ChatAdmin(entry) = authority {
+            self.store.validate_bound_chat_decision(&rec, entry)?;
+        }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+            let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+            let user = match authority {
+                BoundAuthority::Dashboard(ctx) => ctx.user_id.clone(),
+                BoundAuthority::ChatAdmin(entry) => entry.user_id.to_string(),
+                BoundAuthority::Channel => return Err(crate::admin_ai::REFUSAL.into()),
+            };
+            if !crate::admin_ai::may_decide(&home, &rec, &user) { return Err(crate::admin_ai::REFUSAL.into()); }
+        }
+        if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
-            if !crate::google_identity::chat_send::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
-            if let Some(ctx) = dashboard {
-                if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+            if !crate::google_identity::member_card::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
+            if matches!(authority, BoundAuthority::ChatAdmin(_)) {
+                return Err("Only the requesting member may confirm".into());
+            }
+            if let BoundAuthority::Dashboard(ctx) = authority {
+                if !crate::google_identity::member_card::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
             } else if rec.binding.as_ref().is_none_or(|b| b.conversation_audience != super::ConversationAudience::Private) {
                 return Err("Confirm privately in My Connections".into());
             }
         }
-        if rec.payload.get("egress_guard").is_some() {
-            if let Some(ctx) = dashboard {
-                self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
-            } else if !self.home_dir().is_some_and(|home| super::mail_requester::eligible(&home, &rec)) {
-                return Err("outgoing data approval requires a dashboard Admin".into());
+        if super::is_outbound_data_card(&rec) {
+            match authority {
+                BoundAuthority::Dashboard(ctx) => {
+                    self.require_outbound_reviewer(ctx, &rec)?;
+                }
+                // The service, not channel metadata, verified the live Admin.
+                BoundAuthority::ChatAdmin(_) => (),
+                BoundAuthority::Channel => {
+                    if !self.home_dir().is_some_and(|home| super::mail_requester::eligible(&home, &rec)) {
+                        return Err("outgoing data approval requires a dashboard Admin".into());
+                    }
+                }
             }
         }
         let binding = rec
@@ -396,14 +428,14 @@ impl ApprovalBroker {
             .as_ref()
             .ok_or("legacy request has no authorization binding")?;
         binding.validate(&rec.payload)?;
-        if rec.request_kind != kind || (dashboard.is_none() && &binding.decision_context != context)
+        if rec.request_kind != kind || (matches!(authority, BoundAuthority::Channel) && &binding.decision_context != context)
         {
             return Err("request kind or decision identity mismatch".into());
         }
-        // An activation is decided by a current Admin in the dashboard, never
+        // An activation is decided by a current, authenticated Admin, never
         // by a channel press, whatever the press's context says.
         if (rec.action_kind == WORKFLOW_ACTIVATION_KIND || is_activation_payload(&rec.payload))
-            && dashboard.is_none()
+            && matches!(authority, BoundAuthority::Channel)
         {
             return Err("workflow activation is decided by an Admin in the dashboard".into());
         }
@@ -412,7 +444,7 @@ impl ApprovalBroker {
                 return Err("policy changed; request a new approval".into());
             }
         }
-        if rec.payload["name"] == "mail_send" && rec.payload.get("egress_guard").is_some()
+        if rec.payload["name"] == "mail_send" && super::is_outbound_data_card(&rec)
             && binding.run_origin_kind == "ingress" && binding.resume_handler == "live_only_v1" {
             let home = self.home_dir().ok_or("mail policy home unavailable")?;
             if super::mail_requester::environment_hash(&home, &rec.agent_id, &binding.run_id)? != binding.environment_hash {
@@ -421,6 +453,7 @@ impl ApprovalBroker {
         }
         binding.validate_host_files()?;
         self.validate_task_snapshot(binding).await?;
+        let mut outbound_reviewer = None;
         {
             let mut conn = self.store.conn.lock().await;
             self.attach_tasks(&conn, binding)?;
@@ -431,7 +464,40 @@ impl ApprovalBroker {
             if current.status != ApprovalStatus::Pending || current.is_stale(Utc::now()) {
                 return Err("request expired or decided concurrently".into());
             }
+            if super::is_outbound_data_card(&current) {
+                if let BoundAuthority::Dashboard(ctx) = authority {
+                    outbound_reviewer = Some(self.require_outbound_reviewer(ctx, &current)?);
+                }
+            }
             check_expected_digest(&current)?;
+            if current.action_kind == crate::admin_ai::card::ACTION_KIND {
+                let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+                let user = match authority {
+                    BoundAuthority::Dashboard(ctx) => ctx.user_id.clone(),
+                    BoundAuthority::ChatAdmin(entry) => entry.user_id.to_string(),
+                    BoundAuthority::Channel => return Err(crate::admin_ai::REFUSAL.into()),
+                };
+                if !crate::admin_ai::may_decide(&home, &current, &user) {
+                    return Err(crate::admin_ai::REFUSAL.into());
+                }
+            }
+            if let BoundAuthority::ChatAdmin(entry) = authority {
+                // Re-read classification, requester exceptions and the receipt
+                // digest under the write transaction; this helper never locks.
+                self.store.validate_bound_chat_decision(&current, entry)?;
+                if current.action_kind == crate::admin_ai::card::ACTION_KIND
+                    && !crate::admin_ai::receipt_matches(&tx, &current, entry) {
+                    return Err(crate::admin_ai::REFUSAL.into());
+                }
+            }
+            let decided_at = Utc::now().to_rfc3339();
+            let decided_by = match authority {
+                BoundAuthority::Dashboard(ctx) => format!("dashboard:{}", ctx.user_id),
+                BoundAuthority::ChatAdmin(entry) => entry.decided_by().to_string(),
+                BoundAuthority::Channel if super::is_outbound_data_card(&rec) =>
+                    format!("requester:{}:{}", context.channel, context.principal_id),
+                BoundAuthority::Channel => format!("{}:{}", context.channel, context.principal_id),
+            };
             let n = tx
                 .execute(
                     &format!("UPDATE approvals SET status=?1, decided_at=?2, decided_by=?3, answer_json=?4
@@ -442,12 +508,8 @@ impl ApprovalBroker {
                         live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                     params![
                         status.as_str(),
-                        Utc::now().to_rfc3339(),
-                        dashboard
-                            .map(|c| format!("dashboard:{}", c.user_id))
-                            .unwrap_or_else(|| if rec.payload.get("egress_guard").is_some() {
-                                format!("requester:{}:{}", context.channel, context.principal_id)
-                            } else { format!("{}:{}", context.channel, context.principal_id) }),
+                        decided_at,
+                        decided_by,
                         answer.map(|v| v.to_string()),
                         id.as_str(),
                         kind.as_str(),
@@ -458,12 +520,24 @@ impl ApprovalBroker {
             if n != 1 {
                 return Err("request expired or decided concurrently".into());
             }
+            if let BoundAuthority::ChatAdmin(entry) = authority {
+                super::chat_admin::ledger::insert_and_consume(
+                    &tx, id, status == ApprovalStatus::Approved, entry, &decided_at,
+                )?;
+            }
             // A decision on a workflow step wakes the same run in the same
             // transaction; the runner still re-checks every gate on resume.
             if resume_workflow {
                 Self::write_workflow_resume(&tx, binding, id)?;
             }
             commit_live_write(tx)?;
+        }
+        if super::is_outbound_data_card(&rec) && let Some(home) = self.home_dir() {
+            if let Some(ctx) = outbound_reviewer {
+                super::outbound::audit(&home, &rec, &ctx.user_id, ctx.is_admin(), Some(status == ApprovalStatus::Approved));
+            } else if let BoundAuthority::ChatAdmin(entry) = authority {
+                super::outbound::audit(&home, &rec, &entry.user_id.to_string(), true, Some(status == ApprovalStatus::Approved));
+            }
         }
         self.store.emit_lifecycle("approval.decided", &rec, status).await;
         Ok(())
@@ -489,23 +563,28 @@ impl ApprovalBroker {
         approve: bool,
     ) -> Result<(), String> {
         let rec = self.get(id).await?.ok_or("request missing")?;
-        if crate::google_identity::chat_send::is_member_card(&rec) {
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+            let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+            if !crate::admin_ai::may_decide(&home, &rec, &ctx.user_id) { return Err(crate::admin_ai::REFUSAL.into()); }
+        }
+        if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
-            if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+            if !crate::google_identity::member_card::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
             let context = rec.binding.as_ref().ok_or("binding missing")?.decision_context.clone();
             return self.resolve_bound(id, &context, RequestKind::Approval,
-                if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied }, None, Some(ctx)).await;
+                if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied }, None, BoundAuthority::Dashboard(ctx)).await;
         }
         let activation =
             rec.action_kind == WORKFLOW_ACTIVATION_KIND || is_activation_payload(&rec.payload);
         self.require_current_dashboard_role(
             ctx,
-            if activation || rec.payload.get("egress_guard").is_some() {
+            if activation {
                 duduclaw_auth::UserRole::Admin
             } else {
                 duduclaw_auth::UserRole::Manager
             },
         )?;
+        if super::is_outbound_data_card(&rec) { self.require_outbound_reviewer(ctx, &rec)?; }
         let context = rec
             .binding
             .as_ref()
@@ -522,9 +601,26 @@ impl ApprovalBroker {
                 ApprovalStatus::Denied
             },
             None,
-            Some(ctx),
+            BoundAuthority::Dashboard(ctx),
         )
         .await
+    }
+
+    /// Only the decision service may supply this entry after verifying a live
+    /// Active Admin and the exact proof/receipt. Never infer it from a binding.
+    pub(crate) async fn decide_bound_chat_admin(
+        &self,
+        id: &ApprovalId,
+        entry: &super::chat_admin::LedgerEntry,
+        approve: bool,
+    ) -> Result<(), String> {
+        let rec = self.get(id).await?.ok_or("request missing")?;
+        let context = rec.binding.as_ref().ok_or("binding missing")?.decision_context.clone();
+        self.resolve_bound(
+            id, &context, RequestKind::Approval,
+            if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied },
+            None, BoundAuthority::ChatAdmin(entry),
+        ).await
     }
 
     pub async fn invalidate_request(&self, id: &ApprovalId, reason: &str) -> Result<(), String> {

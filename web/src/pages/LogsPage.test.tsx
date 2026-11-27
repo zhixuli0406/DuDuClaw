@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route, useSearchParams } from 'react-router';
@@ -11,7 +12,10 @@ import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useLogsStore } from '@/stores/logs-store';
 
+afterEach(() => resetCompanyTimeZone());
+
 beforeEach(() => {
+  resetCompanyTimeZone();
   vi.clearAllMocks();
   useConnectionStore.setState({ state: 'authenticated' as never, error: null });
   useAgentsStore.setState({ agents: [], loaded: false });
@@ -23,6 +27,23 @@ beforeEach(() => {
 });
 
 describe('LogsPage', () => {
+  it('updates audit timestamps when the company zone loads', async () => {
+    useCompanyTimeStore.setState({ status: 'set', zone: 'UTC' });
+    mockWsClient.call.mockImplementation(async (method: string) => method === 'agents.list'
+      ? { agents: [] }
+      : { events: [{
+        timestamp: '2026-11-27T01:30:00Z', source: 'security',
+        event_type: 'company-zone-test', agent_id: 'worker', severity: 'info',
+        summary: '', details: {},
+      }] });
+    renderWithProviders(<LogsPage />);
+    expect(await screen.findByText(/01:30:00/)).toBeInTheDocument();
+
+    act(() => useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' }));
+    expect(await screen.findByText(/09:30:00/)).toBeInTheDocument();
+    expect(screen.queryByText(/01:30:00/)).not.toBeInTheDocument();
+  });
+
   it('renders the audit logs heading', () => {
     // Default tab is history — no realtime WS subscribe on load.
     renderWithProviders(<LogsPage />);

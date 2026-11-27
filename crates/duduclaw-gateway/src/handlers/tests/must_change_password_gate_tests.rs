@@ -109,6 +109,7 @@ async fn handler_with_flagged_admin() -> (tempfile::TempDir, MethodHandler, User
     handler.set_user_db(db.clone(), jwt).await;
 
     let ctx = UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: admin.id.clone(),

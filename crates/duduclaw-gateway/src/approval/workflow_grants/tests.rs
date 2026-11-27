@@ -3,6 +3,37 @@ use crate::workflow::*;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+async fn chat_admin_acceptance(evidence: super::super::chat_admin::ledger::consumer_test_support::Evidence) -> Result<(), String> {
+    let (_home, broker, _store, accepted, _run) = fixture().await;
+    {
+        let conn = broker.store.conn.lock().await;
+        super::super::chat_admin::ledger::consumer_test_support::install(&conn, &accepted.acceptance_id, evidence);
+    }
+    let grant = broker.prepare_revision_grant(&accepted).await?;
+    broker.activate_revision_grant(&grant).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn decided_by_without_ledger_refused() {
+    use super::super::chat_admin::ledger::consumer_test_support::Evidence;
+    assert_eq!(chat_admin_acceptance(Evidence::Missing).await.unwrap_err(),
+        "activation must be accepted by an Admin in the dashboard");
+}
+
+#[tokio::test]
+async fn chat_admin_acceptance_requires_matching_ledger_and_step() {
+    use super::super::chat_admin::ledger::consumer_test_support::CASES;
+    for &(evidence, accepted) in CASES {
+        let result = chat_admin_acceptance(evidence).await;
+        if accepted {
+            assert!(result.is_ok(), "{evidence:?}: {result:?}");
+        } else {
+            assert_eq!(result.unwrap_err(), "activation must be accepted by an Admin in the dashboard", "{evidence:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn legacy_purchase_delete_workflow_grants_cannot_authorize_calls() {
     let (_home, broker, store, accepted, run) = fixture().await;
@@ -278,15 +309,22 @@ async fn fixture() -> (
     WorkflowRun,
 ) {
     let home = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
+    let (broker, store, accepted, run) = fixture_at(home.path(), true).await;
+    (home, broker, store, accepted, run)
+}
+
+pub(crate) async fn fixture_at(home: &Path, decide: bool) -> (
+    ApprovalBroker, WorkflowStore, AcceptedRevisionGrant, WorkflowRun,
+) {
+    std::fs::create_dir_all(home.join("agents/alice")).unwrap();
     std::fs::write(
-        home.path().join("agents/alice/agent.toml"),
+        home.join("agents/alice/agent.toml"),
         "[capabilities]\nallowed_tools=['tasks_update']\n",
     )
     .unwrap();
-    let broker = ApprovalBroker::open(home.path()).unwrap();
-    let store = WorkflowStore::open(home.path()).unwrap();
-    let policy = policy_revision(home.path(), "alice").unwrap();
+    let broker = ApprovalBroker::open(home).unwrap();
+    let store = WorkflowStore::open(home).unwrap();
+    let policy = policy_revision(home, "alice").unwrap();
     let context = DecisionContext {
         channel: "line".into(),
         account_id: "bot".into(),
@@ -400,10 +438,12 @@ async fn fixture() -> (
         .await
         .unwrap();
     // U3 (F1b): activations are accepted by an Admin in the dashboard.
+    if decide {
     broker
         .decide_bound_dashboard(&id, &duduclaw_auth::UserContext::admin_fallback(), true)
         .await
         .unwrap();
+    }
     let revision = ApprovedWorkflowRevision {
         definition,
         revision_hash: spec.revision_hash.clone(),
@@ -470,7 +510,7 @@ async fn fixture() -> (
         failure_class: None,
         cancelled_by: None,
     };
-    (home, broker, store, accepted, run)
+    (broker, store, accepted, run)
 }
 async fn operation(
     broker: &ApprovalBroker,

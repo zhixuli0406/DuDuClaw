@@ -31,6 +31,17 @@ Gmail の検索と読取では、AI 従業員に渡す前にログインリン�
 8. 保存直後に Client ID と Client secret を保管します。シークレットの表示・ダウンロードは一度だけで、その後は末尾四文字しか表示されません。パスワード管理ツールに保存してください。
 9. ウィザードに ID とシークレットを入力し、データ利用の説明を確認して **Google を接続** を選びます。「Google hasn't verified this app」が出たら、自分のプロジェクトであることを確認し、Advanced、Go to（プロジェクト名）の順に選びます。同意画面の権限をすべて選択して続行し、ダッシュボードの結果を待ちます。
 
+
+### 会社の Google ログイン
+
+会社ログインは設定済みの会社 Google OAuth クライアント ID とシークレットを使用します。サービスアカウントの委任や Apps Script ではログインできません。既定は無効で、管理者のリスク確認と許可する `hd` ドメインが必要です。個人版では利用できません。ダッシュボード画面は未実装です。Google 設定が提供されたら、そこからログインを設定してください。
+
+`[dashboard] public_url` に外部から接続できるダッシュボードのベース URL を設定し、パスのプレフィックスも含めます。HTTPS を使ってください。HTTP は localhost またはループバックだけ利用できます。Google Cloud の Web OAuth クライアントの **Authorized redirect URIs** に `<public_url>/api/login/google/callback` を完全一致で登録します。`public_url = "https://company.example/agents"` なら `https://company.example/agents/api/login/google/callback` です。ベース URL の末尾にはスラッシュを付けません。個人接続やリモート MCP のコールバックは別途残してください。
+
+会社の本番利用で Internal を選べるのは、全員が Google Cloud プロジェクト自身の Workspace／Cloud Identity 組織に所属する場合だけです。DuDuClaw の許可ドメインは Google の対象ユーザーを拡大しません。他組織のユーザーには External が必要で、本番公開と必要な Google 検証を行います。会社ログインの本番運用で同意画面を Testing のままにしないでください。通常 Testing は登録済みテストユーザー 100 人までで、認可と更新トークンは 7 日で失効します。Google は基本的な本人情報のスコープだけを要求する場合を例外としています。このログインは online アクセスで `openid email profile` のみ要求します。個人 Google 接続はサービス用スコープも要求するため、その例外に該当しません。[Google の対象ユーザールール](https://support.google.com/cloud/answer/15549945?hl=en)を参照してください。
+
+ログイン連携と本人の個人 Google 接続は同じ Google アカウント（`sub`）を使う必要があります。既存の個人接続が別アカウントならログイン連携を拒否します。ログインだけでは Gmail、Drive などの個人サービスを接続しません。[ログインの安全性](../../features/ja-JP/05-security-defense.md#会社の-google-ログイン)と[設定](dashboard-settings.md#会社の-google-ログイン)も参照してください。
+
 ### リモートホストと Docker
 
 localhost はブラウザーを実行する端末です。ローカル Docker では SSH トンネルは不要です。DuDuClaw がリモート端末で動く場合だけポートを転送します。以下は画面に 18889 が表示される場合の例です。
@@ -104,3 +115,23 @@ https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/g
 ```
 
 ツールと安全モデルは [Workspace リファレンス](google-workspace.md)、Enterprise 本人同意は[個人接続](google-personal-connections.md)を参照してください。Google Chat の認証情報は別です。[Chat 設定](channels-googlechat-teams.md)を参照してください。
+
+## ドライブへの書き込み認可を準備する
+
+作成、変更、移動、ゴミ箱への移動は管理者が個別に許可し、既定はすべてオフです。有効化や制限の緩和にはリスクへの明示的な同意が必要で、管理者と時刻を記録します。追加の再認証は要求しません。各操作は既定でメンバー本人の確認が必要です。管理者は操作ごとに確認を無効にするか、管理者の追加承認を要求できます。フォルダリストが空なら、作成と変更はアカウントが書き込めるすべての場所で可能ですが、移動とゴミ箱への移動は使えません。ダッシュボード操作機能は本リリースの設定ページとともに提供予定で、書き込み設定と個人の書き込み接続のブロックはまだ実装されていません。
+
+ドメイン全体の委任では、Workspace の特権管理者が **Google 管理コンソール → セキュリティ → アクセスとデータ管理 → API の制御 → ドメイン全体の委任を管理** で、サービスアカウントの認可リストに次の三つを追加します。他のサービスに必要な既存スコープも保持してください。
+
+```text
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/spreadsheets
+```
+
+これらは書き込み用です。通常の `drive.readonly` では書き込めません。委任を使う同僚が個別に書き込み同意を行う必要はありません。Google 管理コンソールの変更後に実際にトークンを取得できるかは、Workspace での受け入れ確認が必要です。
+
+OAuth による会社共用接続では、管理者が会社アカウントについて追加の Google 書き込み同意を一度行います。資格情報は通常の接続とは別に保存します。社員が同僚自身の Google 接続を使う場合は、各本人が二回目の書き込み同意を行ってください。[個人接続](google-personal-connections.md)を参照してください。
+
+会社共用接続でサービスアカウントを使う場合、鍵ファイルを厳重に管理してください。完全な Drive スコープを認可した後は、CLI が読める鍵で DuDuClaw の書き込みスイッチとは独立して書き込みトークンを発行できる可能性があります。gateway に封印保存する委任鍵を優先してください。鍵に無制限にアクセスできるプロセスは製品内の確認では隔離できません。
+
+Apps Script の会社接続と保護モードは Drive 書き込みに対応しません。ツールは非表示になり、呼び出しも拒否します。既存の Docs／Sheets 書き込みツールは従来の規則を維持します。[書き込みツールのリファレンス](google-mcp.md#クラウドドライブへの書き込みツール)を参照してください。

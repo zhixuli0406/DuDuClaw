@@ -27,6 +27,15 @@ impl MethodHandler {
 
     /// Live security system status — replaces static placeholder panels.
     pub(crate) async fn handle_security_status(&self) -> WsFrame {
+        let names = self.registry.read().await.list().iter()
+            .map(|a| a.config.agent.name.clone()).collect::<Vec<_>>();
+        let home = self.home_dir.clone();
+        let db = self.user_db.read().await.clone();
+        let chat_admin = tokio::task::spawn_blocking(move || {
+            super::chat_admin_settings_rpc::status(&home, db.as_deref(), &names)
+        }).await.unwrap_or_else(|_| json!({"enabled": false, "readable": false,
+            "proven_admins": null, "web_link_available": false,
+            "message": "目前無法確認聊天核准狀態，請稍後再試。"}));
         let reg = self.registry.read().await;
         let agents = reg.list();
 
@@ -125,6 +134,7 @@ impl MethodHandler {
                 // spawn-env allowlist deliberately scrubs out of agent spawns
                 // — and "rules" was the first agent's container mount list
                 // rendered as if it were a global policy.
+                "chat_admin": chat_admin,
                 "rbac": rbac_entries,
                 "egress_bash_exposure": egress_bash_exposure,
                 "rate_limiter": rate_limit,

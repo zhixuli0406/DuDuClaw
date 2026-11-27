@@ -206,6 +206,9 @@ pub(crate) fn validate_home_oauth_material(
     with_metadata(home, |g, source| {
         require_receipt(g, source, receipt)?;
         let actual = home_store::observe_home_oauth(g, source)?;
+        if crate::google_identity::write_scope_guard::carries_write_scope(&actual.scopes) {
+            return Err(Error::WriteScopeIsolated);
+        }
         if actual != proof.row
             || scopes.iter().any(|s| !actual.scopes.contains(s))
             || home_store::home_oauth_expired(actual.expires_at, home_store::host_time_now(g))
@@ -318,6 +321,9 @@ async fn resolve_home_oauth_pinned_core(
     let capture = with_metadata(&canonical, |g, source| {
         require_receipt(g, source, receipt)?;
         let mut capture = home_store::capture_home_oauth(g, source)?;
+        if crate::google_identity::write_scope_guard::carries_write_scope(&capture.row.scopes) {
+            return Err(Error::WriteScopeIsolated);
+        }
         if home_store::home_oauth_expired(capture.row.expires_at, home_store::host_time_now(g)) {
             capture.client = Some(source.take_raw_client()?);
         }
@@ -430,6 +436,8 @@ pub async fn get_valid_google_token_for_tool(home_dir: &Path, tool: &str) -> std
 pub async fn get_valid_google_token_for_endpoint(home_dir: &Path, endpoint: &str) -> std::result::Result<String, GoogleAuthError> {
     let scopes = crate::google_identity::delegated_scopes::for_endpoint(home_dir, endpoint)
         .map_err(|r| GoogleAuthError::ServiceAccount(r.message_zh))?;
+    crate::google_identity::write_scope_guard::check_requested(scopes)
+        .map_err(|r| GoogleAuthError::RefreshFailed(r.code.into()))?;
     get_valid_google_token_with_scopes(home_dir, scopes).await
 }
 
@@ -439,9 +447,17 @@ async fn get_valid_google_token_with_scopes(home_dir: &Path, scopes: &[&str]) ->
     }
     match service_account_config(home_dir) {
         Ok(Some(cfg)) => {
-            return google_service_account::get_token(&cfg, scopes)
-                .await
-                .map_err(|e| GoogleAuthError::ServiceAccount(e.to_string()));
+            crate::google_identity::write_scope_guard::check_requested(scopes)
+                .map_err(|r| GoogleAuthError::RefreshFailed(r.code.into()))?;
+            let key = google_service_account::load_key(&cfg.key_file)
+                .map_err(|e| GoogleAuthError::ServiceAccount(e.to_string()))?;
+            let token = google_service_account::mint_for_subject(&key, &cfg.subject, scopes, google_service_account::CacheMode::Use)
+                .await.map_err(|e| GoogleAuthError::ServiceAccount(e.to_string()))?;
+            if let Some(actual) = &token.granted_scopes {
+                crate::google_identity::write_scope_guard::check_actual(actual)
+                    .map_err(|r| GoogleAuthError::RefreshFailed(r.code.into()))?;
+            }
+            return Ok(token.access_token);
         }
         Ok(None) => {}
         Err(e) => return Err(GoogleAuthError::ServiceAccount(e.to_string())),
@@ -743,4 +759,69 @@ impl HomeOAuthResolved {
             .expect("expected captured W3 token expiry")
             .mono = std::time::Instant::now();
     }
+}
+
+/// Company OAuth does not persist a Google subject/email: RefreshIdentity is
+/// a local credential identity. Bind verified userinfo to that exact material
+/// at consent start, then compare the provider's stable sub at completion.
+/// No email supplied by an RPC caller can become an account identity.
+pub(crate) struct HomeWriteIdentity {
+    pub(crate) sub: String,
+    pub(crate) email: String,
+    receipt: HomeSourceReceipt,
+    row: OAuthMaterialMetadata,
+}
+
+pub(crate) fn validate_home_write_identity(home: &Path, expected: &HomeWriteIdentity) -> Result<()> {
+    barrier(home)?;
+    if crate::google_workspace::selected_path(home).ok().as_deref() != Some("oauth") {
+        return Err(Error::NotReady);
+    }
+    with_metadata(home, |g, source| {
+        require_receipt(g, source, &expected.receipt)?;
+        if home_store::observe_home_oauth(g, source)? != expected.row {
+            return Err(Error::Stale);
+        }
+        Ok(())
+    })
+}
+
+/// Read-only account probe. Even an expired access token is refreshed only in
+/// RAM; neither success nor refusal publishes/revokes ordinary Home material.
+/// The caller holds the shared Google grant lease for this operation.
+pub(crate) async fn home_write_identity(home: &Path) -> Result<HomeWriteIdentity> {
+    barrier(home)?;
+    if crate::google_workspace::selected_path(home).ok().as_deref() != Some("oauth") {
+        return Err(Error::NotReady);
+    }
+    let (receipt, capture) = with_metadata(home, |g, source| {
+        let receipt = selection(g, source, &[], false)?;
+        let mut capture = home_store::capture_home_oauth(g, source)?;
+        capture.client = Some(source.take_raw_client()?);
+        Ok((receipt, capture))
+    })?;
+    let access = if home_store::home_oauth_expired(capture.row.expires_at, home_store::wall_time_now(home)) {
+        let raw = &capture.client.as_ref().ok_or(Error::Invalid)?._raw;
+        validate_google_client_raw(raw)?;
+        let client = raw["client_id"].as_str().ok_or(Error::Invalid)?;
+        let secret = open_captured(home, &receipt, &capture,
+            raw["client_secret"].as_str().ok_or(Error::Invalid)?, true)?;
+        let refresh = open_captured(home, &receipt, &capture,
+            capture.refresh.as_deref().map(String::as_str).ok_or(Error::Invalid)?, false)?;
+        let mut tokens = crate::google_personal::oauth::refresh(client, &secret, &refresh)
+            .await.map_err(|_| Error::Io)?;
+        validate_capture(home, &receipt, &capture)?;
+        Zeroizing::new(std::mem::take(&mut tokens.secret.access_token))
+    } else {
+        open_captured(home, &receipt, &capture, &capture.access, false)?
+    };
+    // This bearer is used only for userinfo inside the credential owner. It is
+    // never returned to a CLI, including when Google has merged grant scopes.
+    if !refresh_io::bearer(&access) { return Err(Error::Invalid); }
+    validate_capture(home, &receipt, &capture)?;
+    let info = crate::google_personal::oauth::userinfo(&access).await.map_err(|_| Error::Io)?;
+    validate_capture(home, &receipt, &capture)?;
+    let identity = HomeWriteIdentity { sub: info.sub, email: info.email, receipt, row: capture.row.clone() };
+    validate_home_write_identity(home, &identity)?;
+    Ok(identity)
 }

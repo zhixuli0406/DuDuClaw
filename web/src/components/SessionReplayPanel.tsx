@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect } from 'react';
 import { useIntl } from 'react-intl';
 
@@ -14,6 +15,7 @@ import { Play, Square, ExternalLink, Clock, DollarSign, MonitorPlay } from 'luci
 
 export function SessionReplayPanel() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const {
     browserbaseSessions,
     browserbaseCost,
@@ -109,7 +111,7 @@ export function SessionReplayPanel() {
 
               {/* Timestamp */}
               <span className="text-xs text-muted-foreground">
-                {new Date(s.created_at).toLocaleTimeString()}
+                {formatDateTime(s.created_at, { locale: intl.locale, hour: 'numeric', minute: 'numeric', second: 'numeric' })}
               </span>
 
               {/* Actions */}
