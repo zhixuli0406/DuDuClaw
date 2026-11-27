@@ -69,6 +69,14 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_remove(params)).await
             }
+            "autopilot.runs.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_list(params)).await
+            }
+            "autopilot.runs.cancel" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_cancel(params, ctx)).await
+            }
             "autopilot.history" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_history(params)).await

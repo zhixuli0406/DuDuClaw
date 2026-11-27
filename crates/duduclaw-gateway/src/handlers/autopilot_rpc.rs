@@ -192,6 +192,120 @@ impl MethodHandler {
         }
     }
 
+    pub(crate) async fn handle_autopilot_runs_list(&self, params: Value) -> WsFrame {
+        let Some(rule_id) = params.get("rule_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "rule_id is required and must be a non-empty string");
+        };
+        let limit = match params.get("limit") {
+            None => 20,
+            Some(value) => match value.as_i64() {
+                Some(limit) if (1..=100).contains(&limit) => limit,
+                _ => return WsFrame::error_response("", "limit must be an integer between 1 and 100"),
+            },
+        };
+        let store = match self.ap_store().await {
+            Ok(store) => store,
+            Err(frame) => return frame,
+        };
+        let runs = match store.list_runs_for_rule(rule_id, limit).await {
+            Ok(runs) => runs,
+            Err(error) => return WsFrame::error_response("", &format!("list autopilot runs: {error}")),
+        };
+        let mut result = Vec::with_capacity(runs.len());
+        for run in runs {
+            let steps = match store.list_run_steps(&run.run_id).await {
+                Ok(steps) => steps,
+                Err(error) => return WsFrame::error_response("", &format!("list autopilot run steps: {error}")),
+            };
+            // Explicit status projection: never serialize the durable rows, which
+            // carry customer event data and internal execution identifiers.
+            let steps: Vec<Value> = steps.iter().map(|step| json!({
+                "step_index": step.step_index,
+                "step_type": step.step_type,
+                "state": step.state,
+                "started_at": step.started_at,
+                "finished_at": step.finished_at,
+                "detail": step.detail,
+            })).collect();
+            result.push(json!({
+                "run_id": run.run_id,
+                "state": run.state,
+                "step_index": run.step_index,
+                "step_count": run.step_count,
+                "next_at": run.next_at,
+                "outcome": run.outcome,
+                "detail": run.detail,
+                "event_name": run.event_name,
+                "created_at": run.created_at,
+                "updated_at": run.updated_at,
+                "steps": steps,
+            }));
+        }
+        WsFrame::ok_response("", json!({"runs": result}))
+    }
+
+    pub(crate) async fn handle_autopilot_runs_cancel(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        use crate::autopilot_store::{RUN_PENDING, RUN_WAITING, RUN_AWAITING_APPROVAL};
+        let Some(run_id) = params.get("run_id").and_then(Value::as_str).filter(|s| !s.is_empty()) else {
+            return WsFrame::error_response("", "run_id is required and must be a non-empty string");
+        };
+        let store = match self.ap_store().await {
+            Ok(store) => store,
+            Err(frame) => return frame,
+        };
+        let run = match store.get_run(run_id).await {
+            Ok(Some(run)) => run,
+            Ok(None) => return WsFrame::error_response("", &format!("Run not found: {run_id}")),
+            Err(error) => return WsFrame::error_response("", &format!("get autopilot run: {error}")),
+        };
+        if !matches!(run.state.as_str(), RUN_PENDING | RUN_WAITING | RUN_AWAITING_APPROVAL) {
+            return autopilot_run_cancel_refused(&run.state);
+        }
+        let detail = format!("由 {} 取消", ctx.user_id);
+        // Match exactly the state observed above so the audit and approval cleanup
+        // describe the state that was actually cancelled, even during a resume tick.
+        match store.settle_unclaimed_run(run_id, &[run.state.as_str()], "cancelled_by_admin", Some(&detail), Utc::now()).await {
+            Ok(true) => {}
+            Ok(false) => return match store.get_run(run_id).await {
+                Ok(Some(current)) => autopilot_run_cancel_refused(&current.state),
+                Ok(None) => WsFrame::error_response("", &format!("Run not found: {run_id}")),
+                Err(error) => WsFrame::error_response("", &format!("get autopilot run: {error}")),
+            },
+            Err(error) => return WsFrame::error_response("", &format!("cancel autopilot run: {error}")),
+        }
+        duduclaw_security::audit::append_audit_event(
+            &self.home_dir,
+            &duduclaw_security::audit::AuditEvent::new(
+                "autopilot_run_cancelled", "autopilot", duduclaw_security::audit::Severity::Info,
+                json!({"actor": ctx.user_id, "rule_id": run.rule_id, "run_id": run_id, "previous_state": run.state}),
+            ),
+        );
+        if run.state == RUN_AWAITING_APPROVAL {
+            // The executor's fenced run-state check is the execution guarantee.
+            // Card withdrawal is best-effort and cannot undo the settled run.
+            let cleanup = async {
+                let steps = store.list_run_steps(run_id).await?;
+                let dispatch_id = steps.iter().find(|step| step.step_index == run.step_index)
+                    .and_then(|step| step.dispatch_id.as_deref())
+                    .ok_or_else(|| "approval step has no dispatch binding".to_string())?;
+                let dispatch = store.get_dispatch(dispatch_id).await?
+                    .ok_or_else(|| "approval dispatch not found".to_string())?;
+                let approval_id = dispatch.approval_id
+                    .ok_or_else(|| "approval dispatch has no approval id".to_string())?;
+                let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
+                let withdrawn = broker.withdraw(&crate::approval::ApprovalId::from(approval_id), "system:autopilot_run_cancelled").await?;
+                if !withdrawn {
+                    return Err("approval card was not pending or could not be withdrawn".to_string());
+                }
+                Ok::<(), String>(())
+            }.await;
+            if let Err(error) = cleanup {
+                tracing::warn!(%run_id, %error, "autopilot: cancelled run approval card withdrawal failed");
+            }
+        }
+        WsFrame::ok_response("", json!({"cancelled": true, "run_id": run_id}))
+    }
+
     pub(crate) async fn handle_autopilot_history(&self, params: Value) -> WsFrame {
         let store = match self.ap_store().await {
             Ok(s) => s,
@@ -219,6 +333,16 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
         }
     }
+}
+
+fn autopilot_run_cancel_refused(state: &str) -> WsFrame {
+    use crate::autopilot_store::{RUN_RUNNING, RUN_SETTLED};
+    let message = match state {
+        RUN_RUNNING => "目前正在執行步驟，請稍後再試",
+        RUN_SETTLED => "這次執行已結束，無法取消",
+        _ => "執行狀態已變更或無法取消，請重新整理後再試",
+    };
+    WsFrame::error_response("", message)
 }
 
 /// Absent and explicit null both mean no extension on create; update calls
@@ -526,6 +650,201 @@ mod tests {
         assert!(error.contains("placeholder"), "{error}");
         let after = store.get_rule(id).await.unwrap().unwrap();
         assert_eq!(serde_json::to_value(before).unwrap(), serde_json::to_value(after).unwrap());
+    }
+
+    async fn insert_status_run(store: &AutopilotStore, id: &str, state: &str, now: chrono::DateTime<Utc>) {
+        use crate::autopilot_store::{AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, run_ts};
+        let run = AutopilotRunRow {
+            run_id: id.into(), rule_id: "status-rule".into(), rule_name: "Status".into(),
+            rule_hash: "private-hash".into(), event_name: "task_created".into(),
+            event_ref: "private-event".into(), dedupe_key: format!("dedupe-{id}"),
+            fields_json: r#"{"text":"customer secret"}"#.into(), state: state.into(),
+            step_index: 1, step_count: 3, next_at: Some(run_ts(now)),
+            lease_owner: Some("private-owner".into()), lease_until: Some(run_ts(now)),
+            owner_department: None, outcome: None, detail: Some("status detail".into()),
+            notice_pending: false, notice_push_state: None, notice_push_attempts: 0,
+            notice_push_next_at: None, created_at: run_ts(now), updated_at: run_ts(now),
+        };
+        let steps: Vec<_> = (0..3).map(|index| AutopilotRunStepRow {
+            run_id: id.into(), step_index: index,
+            step_type: if index == 1 { "wait" } else { "delegate" }.into(),
+            state: if index == 1 && matches!(state, "running" | "awaiting_approval") { "running" }
+                else if index < 2 { "done" } else { "pending" }.into(),
+            idempotency_key: format!("key-{id}-{index}"),
+            dispatch_id: if matches!(state, "settled" | "awaiting_approval") { Some(format!("dispatch-{id}-{index}")) } else { None },
+            queue_message_id: if state == "settled" { Some(format!("queue-{id}-{index}")) } else { None },
+            started_at: None, finished_at: None, detail: None,
+        }).collect();
+        assert_eq!(store.insert_run(&run, &steps, now).await.unwrap(), RunInsertOutcome::Inserted);
+    }
+
+    fn assert_status_has_no_private_keys(value: &Value) {
+        match value {
+            Value::Object(object) => {
+                for key in ["fields_json", "dedupe_key", "lease_owner", "idempotency_key", "dispatch_id", "queue_message_id"] {
+                    assert!(!object.contains_key(key), "private key: {key}");
+                }
+                for value in object.values() { assert_status_has_no_private_keys(value); }
+            }
+            Value::Array(values) => for value in values { assert_status_has_no_private_keys(value); },
+            _ => {}
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_list_returns_newest_status_with_steps_and_no_private_fields() {
+        let (f, store, root) = automation_fixture().await;
+        let now = Utc::now();
+        for i in 0..21 {
+            insert_status_run(&store, &format!("run-{i}"), "settled", now + chrono::Duration::seconds(i)).await;
+        }
+        let payload = response_payload(f.handler.handle("autopilot.runs.list", json!({"rule_id":"status-rule"}), &root).await);
+        let runs = payload["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 20);
+        assert_eq!(runs[0]["run_id"], "run-20");
+        assert_eq!(runs[19]["run_id"], "run-1");
+        let newest = store.get_run("run-20").await.unwrap().unwrap();
+        assert_eq!(runs[0], json!({
+            "run_id":"run-20", "state":"settled", "step_index":1, "step_count":3,
+            "next_at":newest.next_at, "outcome":null, "detail":"status detail",
+            "event_name":"task_created", "created_at":newest.created_at, "updated_at":newest.updated_at,
+            "steps":[
+                {"step_index":0,"step_type":"delegate","state":"done","started_at":null,"finished_at":null,"detail":null},
+                {"step_index":1,"step_type":"wait","state":"done","started_at":null,"finished_at":null,"detail":null},
+                {"step_index":2,"step_type":"delegate","state":"pending","started_at":null,"finished_at":null,"detail":null}
+            ]
+        }));
+        assert_status_has_no_private_keys(&payload);
+        assert!(!payload.to_string().contains("customer secret"));
+        for (limit, count) in [(1, 1), (100, 21)] {
+            let payload = response_payload(f.handler.handle("autopilot.runs.list", json!({"rule_id":"status-rule","limit":limit}), &root).await);
+            assert_eq!(payload["runs"].as_array().unwrap().len(), count);
+        }
+        let payload = response_payload(f.handler.handle("autopilot.runs.list", json!({"rule_id":"other"}), &root).await);
+        assert_eq!(payload, json!({"runs":[]}));
+    }
+
+    #[tokio::test]
+    async fn runs_list_validates_required_rule_and_limit_bounds() {
+        let (f, _, root) = automation_fixture().await;
+        for params in [json!({}), json!({"rule_id":null}), json!({"rule_id":1}), json!({"rule_id":""})] {
+            assert!(response_error(f.handler.handle("autopilot.runs.list", params, &root).await).contains("rule_id"));
+        }
+        for limit in [json!(0), json!(101), json!(-1), json!(1.5), json!("20"), Value::Null] {
+            assert!(response_error(f.handler.handle("autopilot.runs.list", json!({"rule_id":"status-rule","limit":limit}), &root).await).contains("limit"));
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_cancel_waiting_settles_and_resume_leaves_remaining_steps_pending() {
+        use crate::autopilot_store::{RUN_SETTLED, STEP_PENDING};
+        let (f, store, root) = automation_fixture().await;
+        let now = Utc::now();
+        insert_status_run(&store, "waiting", "waiting", now).await;
+        let payload = response_payload(f.handler.handle("autopilot.runs.cancel", json!({"run_id":"waiting"}), &root).await);
+        assert_eq!(payload, json!({"cancelled":true,"run_id":"waiting"}));
+        let run = store.get_run("waiting").await.unwrap().unwrap();
+        assert_eq!(run.state, RUN_SETTLED);
+        assert_eq!(run.outcome.as_deref(), Some("cancelled_by_admin"));
+        assert_eq!(run.detail, Some(format!("由 {} 取消", root.user_id)));
+        assert!(run.notice_pending);
+        let events = duduclaw_security::audit::read_recent_events(&f.home, 100);
+        let events: Vec<_> = events.iter().filter(|e| e.event_type == "autopilot_run_cancelled").collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].details, json!({"actor":root.user_id,"rule_id":"status-rule","run_id":"waiting","previous_state":"waiting"}));
+        duduclaw_core::gateway_instance::acquire(&f.home).unwrap();
+        let mq = Arc::new(crate::message_queue::MessageQueue::open(&f.home).unwrap());
+        let tasks = Arc::new(TaskStore::open(&f.home).unwrap());
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let engine = crate::autopilot_engine::AutopilotEngine::new(f.home.clone(), store.clone(), tasks, Some(mq.clone()), rx);
+        engine.resume_runs_once(now + chrono::Duration::minutes(1)).await.unwrap();
+        assert!(!store.claim_run("waiting", "later-executor", now + chrono::Duration::minutes(1)).await.unwrap());
+        assert_eq!(store.get_run("waiting").await.unwrap().unwrap().state, RUN_SETTLED);
+        assert_eq!(store.list_run_steps("waiting").await.unwrap()[2].state, STEP_PENDING);
+        assert!(mq.pending_messages(100).await.unwrap().is_empty());
+        response_error(f.handler.handle("autopilot.runs.cancel", json!({"run_id":"waiting"}), &root).await);
+        let events = duduclaw_security::audit::read_recent_events(&f.home, 100);
+        assert_eq!(events.iter().filter(|e| e.event_type == "autopilot_run_cancelled").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn runs_cancel_accepts_pending_and_awaiting_approval() {
+        let (f, store, root) = automation_fixture().await;
+        for state in ["pending", "awaiting_approval"] {
+            insert_status_run(&store, state, state, Utc::now()).await;
+            // No ledger row: failed best-effort card cleanup must not undo cancellation.
+            response_payload(f.handler.handle("autopilot.runs.cancel", json!({"run_id":state}), &root).await);
+            let run = store.get_run(state).await.unwrap().unwrap();
+            assert_eq!(run.state, "settled");
+            assert_eq!(run.outcome.as_deref(), Some("cancelled_by_admin"));
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_cancel_awaiting_approval_withdraws_bound_card() {
+        use crate::approval::{ApprovalBroker, ApprovalStatus};
+        use crate::autopilot_store::{AutopilotDispatchRow, StepApprovalBindMode, run_ts};
+        let (f, store, root) = automation_fixture().await;
+        let now = Utc::now();
+        insert_status_run(&store, "gated", "running", now).await;
+        let broker = ApprovalBroker::open(&f.home).unwrap();
+        let approval_id = broker.request("autopilot", crate::autopilot_approval::ACTION_KIND,
+            "Gated step", json!({}), 3600).await.unwrap();
+        let row = AutopilotDispatchRow {
+            dispatch_id: "gated-dispatch".into(), approval_id: None,
+            rule_id: "status-rule".into(), rule_name: "Status".into(), rule_hash: "private-hash".into(),
+            event_name: "task_created".into(), event_ref: "private-event".into(),
+            dedupe_key: "gated-dispatch-dedupe".into(), frozen_json: "{}".into(), frozen_digest: "digest".into(),
+            state: "requesting".into(), outcome: None, detail: None,
+            notice_activity_pending: false, notice_push_state: None, notice_push_attempts: 0,
+            notice_push_next_at: None, notice_pushed_at: None, created_at: run_ts(now), updated_at: run_ts(now),
+            run_id: Some("gated".into()), step_index: Some(1),
+        };
+        assert!(store.insert_dispatch(&row).await.unwrap());
+        assert!(store.bind_step_dispatch_awaiting("gated-dispatch", approval_id.as_str(), "gated", 1,
+            "private-owner", now, StepApprovalBindMode::Filing).await.unwrap());
+        response_payload(f.handler.handle("autopilot.runs.cancel", json!({"run_id":"gated"}), &root).await);
+        let approval = broker.get(&approval_id).await.unwrap().unwrap();
+        assert_eq!(approval.status, ApprovalStatus::Denied);
+        assert_eq!(approval.decided_by.as_deref(), Some("system:autopilot_run_cancelled"));
+        let run = store.get_run("gated").await.unwrap().unwrap();
+        assert_eq!(run.state, "settled");
+        assert_eq!(run.outcome.as_deref(), Some("cancelled_by_admin"));
+        let steps = store.list_run_steps("gated").await.unwrap();
+        assert_eq!(steps[1].state, "failed");
+        assert_eq!(steps[2].state, "pending");
+    }
+
+    #[tokio::test]
+    async fn runs_cancel_refuses_running_settled_unknown_and_invalid_ids() {
+        let (f, store, root) = automation_fixture().await;
+        for (state, message) in [("running", "正在執行步驟"), ("settled", "已結束")] {
+            insert_status_run(&store, state, state, Utc::now()).await;
+            let error = response_error(f.handler.handle("autopilot.runs.cancel", json!({"run_id":state}), &root).await);
+            assert!(error.contains(message), "{error}");
+            assert_eq!(store.get_run(state).await.unwrap().unwrap().state, state);
+        }
+        assert!(response_error(f.handler.handle("autopilot.runs.cancel", json!({"run_id":"unknown"}), &root).await).contains("not found"));
+        for params in [json!({}), json!({"run_id":1}), json!({"run_id":""}), json!({"run_id":null})] {
+            assert!(response_error(f.handler.handle("autopilot.runs.cancel", params, &root).await).contains("run_id"));
+        }
+        assert!(duduclaw_security::audit::read_recent_events(&f.home, 100).iter().all(|e| e.event_type != "autopilot_run_cancelled"));
+    }
+
+    #[tokio::test]
+    async fn runs_routes_require_admin() {
+        let (f, store, _) = automation_fixture().await;
+        insert_status_run(&store, "waiting", "waiting", Utc::now()).await;
+        for role in [UserRole::Employee, UserRole::Manager] {
+            f.db.update_user(&f.bob.user_id, None, Some(role), None).unwrap();
+            for (method, params) in [
+                ("autopilot.runs.list", json!({"rule_id":"status-rule"})),
+                ("autopilot.runs.cancel", json!({"run_id":"waiting"}))
+            ] {
+                assert!(response_error(f.handler.handle(method, params, &f.bob).await).contains("permission denied"));
+            }
+        }
+        assert_eq!(store.get_run("waiting").await.unwrap().unwrap().state, "waiting");
     }
 
     #[tokio::test]
