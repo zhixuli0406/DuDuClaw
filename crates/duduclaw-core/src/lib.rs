@@ -125,7 +125,7 @@ pub use delegation_policy::{
     is_reserved_queue_sender, is_system_sender,
     policy_from_home as delegation_policy_from_home, read_delegation_config,
     require_identity_token_from_home, resolve_allow_pairs, DelegationConfig, DelegationConfigRead,
-    DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
+    DenialAudience, DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
     MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
     STANDALONE_CLIENT_PREFIX, SYSTEM_SENDERS,
 };

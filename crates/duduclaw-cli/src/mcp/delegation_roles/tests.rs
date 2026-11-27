@@ -212,7 +212,7 @@ async fn pass_holder_agent_update_keeps_none_listing_and_dispatch_behavior() {
         assert!(crate::mcp_dispatch::delegation_none_refuses_for(h.path(), "agent_update", &args, "avatar", || false));
         let result = dispatch(h.path(), "agent_update", args).await;
         assert_eq!(result["error"]["code"], -32003, "{result}");
-        assert!(result["error"]["message"].as_str().unwrap().contains("none"), "{result}");
+        assert!(result["error"]["message"].as_str().unwrap().contains("不允許委派"), "{result}");
         let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("delegation_disabled"));
     }).await;

@@ -443,11 +443,13 @@ pub(crate) fn delegation_none_refuses_for(
 
 /// zh-TW refusal for [`delegation_none_refuses`].
 pub(crate) fn delegation_none_message(tool_name: &str) -> String {
-    format!(
-        "目前的委派政策是「不允許委派(none)」:AI 員工之間不能互相委派、傳訊、建立員工或指派工作,\
-         工具「{tool_name}」已拒絕(跨部門協作配對在這個政策下也不生效)。請把需要別位員工處理的事回報給管理員,\
-         或請管理員在儀表板「委派權限」改成其他模式。"
-    )
+    let denied = duduclaw_core::DelegationDenied {
+        sender: String::new(),
+        target: String::new(),
+        policy: duduclaw_core::DelegationPolicy::Disabled,
+        reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
+    };
+    format!("工具「{tool_name}」已拒絕。{}", denied.explain(duduclaw_core::DenialAudience::Ai))
 }
 
 /// `true` only when the flag is written as `false` (the role-resolved
@@ -6066,7 +6068,7 @@ effect = "forbid"
             && result["error"]["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("不允許委派(none)")
+                .contains("不允許委派")
     }
 
     /// Every employee-to-employee entry point is refused under `none` (allow
