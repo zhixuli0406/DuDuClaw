@@ -63,7 +63,30 @@ async fn authorize_indexed(
     if let Some(task)=provenance.as_ref().and_then(|p|p.task_id.as_ref()) {
         bindings.push((task.clone(),Vec::new()));
     }
-    let fresh = super::audience::fresh_dashboard_context(home, ctx)?;
+    // Member keys reach both Files HTTP and history attachment projections. Read
+    // their live grant before task bindings can provide any alternate authority.
+    let (fresh, include_conversations) = if ctx.member_key_id.is_some() {
+        let home = home.to_path_buf();
+        let ctx = ctx.clone();
+        let live = tokio::task::spawn_blocking(move || {
+            let db = duduclaw_auth::UserDb::open_read_only(&home.join("users.db"))?;
+            crate::member_keys::refresh_authority(&home, &db, &ctx)
+        }).await.map_err(|_| "permission denied")??;
+        (live.context, live.include_conversations)
+    } else {
+        (super::audience::fresh_dashboard_context(home, ctx)?, false)
+    };
+    if fresh.member_key_id.is_some() {
+        if let Some(p) = provenance.as_ref() {
+            if (p.channel.is_some() || p.owner_user_id.is_some())
+                && (!include_conversations || p.channel.as_deref() != Some("webchat")
+                    || p.owner_user_id.as_deref() != Some(fresh.user_id.as_str())) {
+                return Err("permission denied".into());
+            }
+        } else if !explicit_binding {
+            return Err("permission denied".into());
+        }
+    }
     if fresh.requires_password_change() {return Err("permission denied".into());}
     if let Some(agent)=agent {
         if crate::history_privacy::mode(home,&fresh,agent)?==crate::history_privacy::Mode::Filtered {

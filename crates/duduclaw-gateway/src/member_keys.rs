@@ -13,9 +13,11 @@ use serde::Deserialize;
 pub(crate) struct Config {
     pub enabled: bool,
     pub rate_per_minute: u32,
+    pub allow_conversation_content: bool,
+    pub allow_mcp_scopes: Vec<String>,
 }
 impl Default for Config {
-    fn default() -> Self { Self { enabled: false, rate_per_minute: 120 } }
+    fn default() -> Self { Self { enabled: false, rate_per_minute: 120, allow_conversation_content: false, allow_mcp_scopes: Vec::new() } }
 }
 impl Config {
     fn parse(text: &str) -> Option<Self> {
@@ -24,7 +26,9 @@ impl Config {
             None => Self::default(),
             Some(section) => section.clone().try_into().ok()?,
         };
-        (config.rate_per_minute > 0 && config.rate_per_minute <= 60_000).then_some(config)
+        (config.rate_per_minute > 0 && config.rate_per_minute <= 60_000
+            && config.allow_mcp_scopes.iter().all(|scope|
+                duduclaw_core::mcp_scopes::PERSON_KEY_MCP_SCOPE_STRINGS.contains(&scope.as_str()))).then_some(config)
     }
 }
 pub(crate) fn config(home: &Path) -> Config {
@@ -96,6 +100,18 @@ mod tests {
         }
         assert!(Config::parse("[member_api_keys]\nenabled=true").unwrap().enabled);
         assert_eq!(Config::default().rate_per_minute, 120);
+    }
+    #[test]
+    fn conversation_and_mcp_config_parse_fail_closed() {
+        let defaults = Config::parse("[member_api_keys]\nenabled=true").unwrap();
+        assert!(!defaults.allow_conversation_content && defaults.allow_mcp_scopes.is_empty());
+        let enabled = Config::parse("[member_api_keys]\nenabled=true\nallow_conversation_content=true\nallow_mcp_scopes=['tasks:read','agents:status','odoo:read','odoo:write']").unwrap();
+        assert!(enabled.enabled && enabled.allow_conversation_content);
+        assert_eq!(enabled.allow_mcp_scopes.len(), 4);
+        for field in ["allow_conversation_content='true'", "allow_mcp_scopes=['tasks:read','admin']",
+            "allow_mcp_scopes=['unknown']", "allow_mcp_scopes='tasks:read'", "unknown=true"] {
+            assert!(!Config::parse(&format!("[member_api_keys]\nenabled=true\n{field}")).unwrap_or_default().enabled);
+        }
     }
     #[test]
     fn per_key_rate_and_map_are_bounded() {

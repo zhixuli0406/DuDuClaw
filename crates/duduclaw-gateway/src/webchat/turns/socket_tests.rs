@@ -1522,7 +1522,7 @@ async fn member_key_chat_socket_closes_after_revoke_expiry_epoch_or_admin() {
         std::fs::write(fixture._home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
         let (user, _) = fixture.employee("member-key", &["dudu"], Some("dudu")).await;
         let epoch = fixture.state.user_db.get_user(&user).unwrap().unwrap().credential_epoch;
-        let key = fixture.state.user_db.member_key_create(&user, "test", 1, epoch).unwrap();
+        let key = fixture.state.user_db.member_key_create(&user, "test", 1, epoch, false, &[]).unwrap();
         let ctx = crate::member_keys::authenticate(fixture._home.path(), &fixture.state.user_db, &key.secret).unwrap();
         let mut socket = fixture.open().await.unwrap();
         send(&mut socket, json!({"type":"auth","member_key":key.secret})).await;
@@ -1560,7 +1560,7 @@ async fn member_key_chat_prefixes_cannot_fall_back_to_jwt_or_widget() {
     let fixture = Fixture::start(true).await.unwrap();
     std::fs::write(fixture._home.path().join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
     let (user, jwt) = fixture.employee("prefix", &["dudu"], Some("dudu")).await;
-    let key = fixture.state.user_db.member_key_create(&user, "x", 1, 0).unwrap();
+    let key = fixture.state.user_db.member_key_create(&user, "x", 1, 0, false, &[]).unwrap();
     let status = fixture.state.user_db.status_token_create(&user, "x").unwrap();
     for raw in [status.secret.as_str(), jwt.as_str(), "ddc_prod_0123456789abcdef0123456789abcdef"] {
         let mut socket = fixture.open().await.unwrap();
@@ -1571,3 +1571,6 @@ async fn member_key_chat_prefixes_cannot_fall_back_to_jwt_or_widget() {
         assert!(authenticate_with(&fixture.state.jwt_config, &fixture.state.user_db, raw).is_err());
     }
 }
+
+#[path = "member_key_resume_tests.rs"]
+mod member_key_resume_tests;

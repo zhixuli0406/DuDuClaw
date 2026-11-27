@@ -192,14 +192,10 @@ fn read_store(home: &Path) -> Result<DiskStore, String> {
     Ok(store)
 }
 
-fn read_engine(home: &Path) -> Option<CryptoEngine> {
+pub(crate) fn read_engine(home: &Path) -> Option<CryptoEngine> {
     duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
-    let file = home.join(".keyfile");
-    let meta = std::fs::symlink_metadata(&file).ok()?;
-    if !meta.is_file() || meta.len() != 32 { return None; }
-    duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
-    let bytes = Zeroizing::new(std::fs::read(file).ok()?);
-    CryptoEngine::new(bytes.as_slice().try_into().ok()?).ok()
+    let key = Zeroizing::new(crate::config_crypto::load_keyfile_public(home)?);
+    CryptoEngine::new(&key).ok()
 }
 
 fn write_engine(home: &Path, store: &DiskStore) -> Result<CryptoEngine, String> {

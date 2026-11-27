@@ -105,13 +105,35 @@ pub fn list_in(
     limit: usize,
     archived: bool,
 ) -> Result<Vec<Metadata>, String> {
+    list_in_scoped(c, user, agent, limit, archived, false)
+}
+
+/// Apply the credential scope before the row cap and caller's list limit.
+pub fn list_in_for_reader(
+    c: &Connection,
+    ctx: &duduclaw_auth::UserContext,
+    agent: &str,
+    limit: usize,
+    archived: bool,
+) -> Result<Vec<Metadata>, String> {
+    list_in_scoped(c, &ctx.user_id, agent, limit, archived, ctx.member_key_id.is_some())
+}
+
+fn list_in_scoped(
+    c: &Connection,
+    user: &str,
+    agent: &str,
+    limit: usize,
+    archived: bool,
+    own_only: bool,
+) -> Result<Vec<Metadata>, String> {
     if !(1..=MAX_SESSIONS).contains(&limit) {
         return Err("invalid limit".into());
     }
-    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND (archived_at IS NOT NULL)=?4{NOT_SOMEONE_ELSES_CLEAR} AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) ORDER BY last_active DESC,id DESC LIMIT ?3");
+    let sql = format!("SELECT id,agent_id,origin_kind,owner_user_id,CASE WHEN origin_kind='webchat_user' AND owner_user_id=?2 THEN title ELSE NULL END,last_active FROM sessions WHERE agent_id=?1 AND (archived_at IS NOT NULL)=?4{NOT_SOMEONE_ELSES_CLEAR} AND ((origin_kind='webchat_user' AND owner_user_id=?2) OR origin_kind IN ('channel','webchat_visitor','public_visitor')) AND (?5=0 OR (origin_kind='webchat_user' AND owner_user_id=?2)) ORDER BY last_active DESC,id DESC LIMIT ?3");
     let mut s=c.prepare(&sql).map_err(|_|"history unavailable")?;
     let entries = s
-        .query_map(params![agent, user, (MAX_SESSIONS + 1) as i64, archived], |r| {
+        .query_map(params![agent, user, (MAX_SESSIONS + 1) as i64, archived, own_only], |r| {
             meta(r, user)
         })
         .map_err(|_| "history unavailable")?;

@@ -3,6 +3,7 @@
 //! Provides a WebSocket endpoint `/ws/chat` for real-time conversation
 //! directly from the web browser, without requiring any external messaging app.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,9 @@ const MAX_CONNECTIONS_PER_USER: usize = 3;
 
 /// Global limit on concurrent WebChat connections (prevents API quota exhaustion).
 const MAX_TOTAL_WEBCHAT_CONNECTIONS: usize = 10;
+
+/// Bound the member-key new-conversation exemptions retained by one socket.
+const MAX_SOCKET_NEW_SESSIONS: usize = 256;
 
 static WEBCHAT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_TOTAL_WEBCHAT_CONNECTIONS));
@@ -578,6 +582,18 @@ impl WebChatState {
         authenticate_with(&self.jwt_config, &self.user_db, token)
     }
 
+    // Existing conversations require a live opt-in; new turns do not use this gate.
+    async fn member_conversation_allowed(&self, credential: Option<&ChatCredential>) -> bool {
+        let Some(ChatCredential::Member(ctx)) = credential else { return true; };
+        let home = self.ctx.home_dir.clone();
+        let db = self.user_db.clone();
+        let ctx = ctx.clone();
+        matches!(tokio::task::spawn_blocking(move || {
+            crate::member_keys::refresh_authority(&home, &db, &ctx)
+                .map(|live| live.include_conversations)
+        }).await, Ok(Ok(true)))
+    }
+
     async fn chat_credential_validity(&self, credential: Option<&ChatCredential>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
         use crate::handlers::live_context::SocketValidity;
         match credential {
@@ -1010,6 +1026,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // name/icon/model without touching the client's session state.
     let mut announced_sid = session_id.clone();
     let mut announced_agent: Option<String> = None;
+    // Only a successful first-turn lookup of an absent session grants this exemption.
+    // Never learn ids from resume or subscribe frames, and never share across sockets.
+    let mut new_sessions: HashSet<String> = HashSet::new();
     let mut cfg_rx = crate::channel_reply::agent_config_events().subscribe();
 
     // Heartbeat: send ping every 30s, close if no pong in 60s
@@ -1337,7 +1356,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     // Authenticated users retain a stable ownership tag across
                                     // sockets. Widget identities rotate per connection; their
                                     // previous visit and every other user's sessions stay denied.
-                                    let owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    let mut owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    if owns_session {
+                                        if let Some(ChatCredential::Member(ctx)) = credential.as_ref() {
+                                            // A matching id is not stored-origin authority. Missing,
+                                            // unknown or external origins never admit a key resume.
+                                            owns_session = (new_sessions.contains(&want)
+                                                || state.member_conversation_allowed(credential.as_ref()).await)
+                                                && match state.ctx.session_manager.session_origin(&want).await {
+                                                Ok(origin) => crate::history_privacy::key_class_allowed(ctx,
+                                                    &crate::history_privacy::classify(&want, origin.as_ref(), &ctx.user_id)),
+                                                Err(_) => false,
+                                            };
+                                        }
+                                    }
                                     if !owns_session {
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"
@@ -1499,6 +1531,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 }
 
                                 if subscribe_only {
+                                    // Subscriptions do not route or establish new-session provenance.
+                                    if !new_sessions.contains(sid)
+                                        && !state.member_conversation_allowed(credential.as_ref()).await
+                                    {
+                                        let _ = sink.send(subscription_unavailable(sid, conv_nonce.as_deref())).await;
+                                        continue;
+                                    }
                                     subscription.subscribe(sid, conv_nonce.clone());
                                     let _ = sink.send(Message::Text(serde_json::json!({"type":"subscribed", "session_id":sid, "conv":conv_nonce}).to_string().into())).await;
                                     continue;
@@ -1616,6 +1655,29 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     }
                                 }};
                                 let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
+                                // Only the final routed id can establish socket-local provenance.
+                                // An @ call may replace a new selected session with an old one.
+                                let existing_conversation = if matches!(credential.as_ref(), Some(ChatCredential::Member(_))) {
+                                    match state.ctx.session_manager.session_agent(sid).await {
+                                        Ok(Some(_)) => !new_sessions.contains(sid),
+                                        Ok(None) => {
+                                            if new_sessions.len() < MAX_SOCKET_NEW_SESSIONS {
+                                                new_sessions.insert(sid.to_owned());
+                                            }
+                                            // At capacity, retain the strict lookup on future turns.
+                                            false
+                                        }
+                                        Err(_) => {
+                                            turn_sink.frame(ChatMessage::error("conversation not found")).await;
+                                            continue;
+                                        }
+                                    }
+                                } else { false };
+
+                                if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
+                                    turn_sink.frame(ChatMessage::error("conversation not found")).await;
+                                    continue;
+                                }
                                 match Box::pin(state.turns.admit_persistent(
                                     state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
                                     turns::configured_limit(&state.ctx.home_dir),
@@ -1627,6 +1689,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         recovery.observe(validity, false);
                                         if !turns::credential_allows_turn(validity, &turn_sink).await {
                                             if recovery.closed() { break; }
+                                            continue;
+                                        }
+                                        if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
+                                            turn_sink.frame(ChatMessage::error("conversation not found")).await;
                                             continue;
                                         }
                                         // Commands can arm an assignment at admission. From this

@@ -373,6 +373,7 @@ impl UserDb {
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
         crate::chat_link::migrate(&conn)?;
+        crate::odoo_credentials::migrate(&conn)?;
 
         // RM-143: old bindings retain their existing uses, without self-proof.
         for (column, kind) in [

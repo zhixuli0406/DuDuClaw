@@ -50,3 +50,5 @@ pub mod member_keys;
 
 /// RM-134 (v1.82): hashed store for dashboard-issued MCP API keys.
 pub mod mcp_keys;
+
+pub mod odoo_credentials;
