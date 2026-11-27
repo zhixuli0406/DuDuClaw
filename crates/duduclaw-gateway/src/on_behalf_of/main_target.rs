@@ -8,7 +8,7 @@ use duduclaw_auth::{models::UserStatus, UserRole};
 use duduclaw_core::{types::{AgentRole, RuntimeType}, HumanPrincipal};
 
 const REFUSAL: &str = "主代理僅管理員可以使用。";
-pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理工作，請聯絡管理員。";
+pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前只開放管理員使用（尚未啟用受保護模式），請聯絡管理員。";
 
 #[path = "main_tools.rs"]
 mod main_tools;
@@ -212,6 +212,9 @@ pub(crate) async fn check_final_main_spawn(
 async fn check_final_main_spawn_with_isolation(
     home: &Path, dir: Option<&Path>, _command: Option<&tokio::process::Command>, isolated: bool,
 ) -> Result<(), String> {
+    // A utility without an employee identity is outside this main-only gate.
+    // Employee calls with a missing directory must still fail closed.
+    if dir.is_none() && crate::runtime_dispatch::is_agentless_utility_call() { return Ok(()); }
     let web_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
         .filter(|id| id.as_str() != "system" && !crate::webchat::is_widget_visitor(id));
     let origin = crate::webchat::main_credential_origin();
