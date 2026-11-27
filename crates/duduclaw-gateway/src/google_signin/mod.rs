@@ -8,3 +8,8 @@ mod config_tests;
 
 #[cfg(test)]
 mod oidc_tests;
+
+pub(crate) mod avatar;
+
+#[cfg(test)]
+mod avatar_tests;
