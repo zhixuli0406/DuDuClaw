@@ -626,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_entry_refusal_still_falls_back_and_counts_provider_failure() {
-        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 500 internal server error";
+        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 503 service unavailable";
         assert_eq!(crate::entry_gate::background_refusal_code(error), None);
         assert_eq!(FailoverManager::model_fallback_for(
             "claude-sonnet-4-6", "claude-haiku-4-5", error), Some("claude-haiku-4-5"));
