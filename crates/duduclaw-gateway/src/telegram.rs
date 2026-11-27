@@ -2964,6 +2964,11 @@ fn strip_bot_mention(text: &str, bot_username: &str) -> String {
 /// knows *something* was quoted. Returns `None` only for service messages
 /// with no representable content.
 fn quoted_message_excerpt(quoted: &TgMessage) -> Option<String> {
+    // Check both fields before selecting or shortening the quoted content.
+    if [quoted.text.as_deref(), quoted.caption.as_deref()].into_iter().flatten()
+        .any(|text| duduclaw_auth::chat_link::parse_code(text).is_some()) {
+        return Some("[連結代碼已隱藏]".to_string());
+    }
     let body = quoted
         .text
         .as_deref()
@@ -3030,7 +3035,7 @@ fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
     if let Some(origin) = &msg.forward_origin {
         lines.push(format!(
             "〔以下訊息由使用者轉發，原始來源：{}〕",
-            forward_origin_label(origin)
+            crate::chat_link_intercept::context_text(&forward_origin_label(origin))
         ));
     }
 
@@ -3052,7 +3057,7 @@ fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
                 .and_then(|u| u.first_name.clone().or_else(|| u.username.clone()))
                 .unwrap_or_else(|| "對方".to_string())
         };
-        lines.push(channel_format::format_quoted_context(&who, &excerpt));
+        lines.push(channel_format::format_quoted_context(crate::chat_link_intercept::context_text(&who), &excerpt));
     }
 
     if lines.is_empty() {
@@ -3755,6 +3760,46 @@ mod reply_context_tests {
             "〔以下訊息由使用者轉發，原始來源：Alice〕");
         // Forwarded body stays in msg.text; the helper returns the origin label only.
         assert_eq!(msg.text.as_deref(), Some("Third party forwarded instructions."));
+    }
+
+    #[test]
+    fn quoted_handshake_in_secondary_caption_and_provenance_are_hidden() {
+        let code = "DUDU-0000-0000";
+        let msg: TgMessage = serde_json::from_value(json!({
+            "chat": {"id": 42}, "text": "hello",
+            "forward_origin": {"type": "hidden_user", "sender_user_name": code},
+            "reply_to_message": {
+                "chat": {"id": 42}, "text": "ordinary text", "caption": code,
+                "from": {"id": 7, "first_name": code}
+            }
+        })).unwrap();
+        let block = build_quoted_context(&msg, "fixture_bot").unwrap();
+        assert!(!block.contains(code));
+        assert!(block.contains("[連結代碼已隱藏]"));
+    }
+
+    #[test]
+    fn quoted_handshake_text_and_caption_are_hidden() {
+        for code in ["DUDU-0000-0000", "  dudu-oooo-llll\n"] {
+            for field in ["text", "caption"] {
+                let mut value = json!({
+                    "chat": {"id": 42, "type": "private"}, "text": "這是什麼？",
+                    "reply_to_message": {
+                        "chat": {"id": 42, "type": "private"},
+                        "from": {"id": 7, "first_name": "Alice"},
+                        "forward_origin": {"type": "hidden_user", "sender_user_name": "Bob"}
+                    }
+                });
+                value["reply_to_message"][field] = json!(code);
+                let msg: TgMessage = serde_json::from_value(value).unwrap();
+                let block = build_quoted_context(&msg, "fixture_bot").unwrap();
+                let input = format!("{block}\n\n{}", msg.text.as_deref().unwrap());
+                assert!(!input.contains(code.trim()));
+                assert!(input.contains("[連結代碼已隱藏]"));
+                assert!(input.contains("Alice"));
+                assert!(input.ends_with("這是什麼？"));
+            }
+        }
     }
 
     #[test]

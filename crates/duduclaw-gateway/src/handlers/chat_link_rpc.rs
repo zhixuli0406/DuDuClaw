@@ -96,7 +96,8 @@ fn status_value(handshake: chat_link::Handshake) -> Value {
         "handshake_id": handshake.handshake_id, "status": handshake.status,
         "channel": handshake.channel, "expires_at": handshake.expires_at,
         // Untrusted display text stays data. The dashboard must escape it.
-        "display_name": handshake.matched_display, "masked_target": handshake.masked_target,
+        "display_name": handshake.matched_display.as_deref().map(|name| duduclaw_core::plain_line(name, 200)),
+        "masked_target": handshake.masked_target,
     })
 }
 

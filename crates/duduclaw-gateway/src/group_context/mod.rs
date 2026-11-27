@@ -284,6 +284,7 @@ pub async fn capture(ctx: &ReplyContext, channel: &str, scope: &str, group_id: &
     // Bound input before cloning it into the blocking task. Truncation happens
     // after masking, so cutting a secret cannot defeat detection.
     if text.len() > 128 * 1024 || sender_name.len() > 4096 { return; }
+    let text = crate::chat_link_intercept::context_text(text);
     let home = ctx.home_dir.clone();
     let fallback_manager = ctx.redaction_manager.clone();
     let scope = scope.to_owned();

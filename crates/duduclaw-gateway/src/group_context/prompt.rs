@@ -14,7 +14,7 @@ pub fn format_context(messages: &[BufferedMessage], budget: usize) -> String {
     for row in messages {
         if row.direction == "bot_reply" { break; }
         let name = one_line(&row.sender_name);
-        let text = one_line(&row.text);
+        let text = one_line(crate::chat_link_intercept::context_text(&row.text));
         let time = chrono::DateTime::from_timestamp(row.timestamp,0)
             .map(|at| at.format("%H:%M").to_string()).unwrap_or_else(|| "--:--".into());
         let line = format!("[{time}] {name}: {text}");

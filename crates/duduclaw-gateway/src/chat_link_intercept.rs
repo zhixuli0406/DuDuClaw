@@ -61,6 +61,11 @@ impl InterceptReply {
     }
 }
 
+/// Hide whole-message handshake codes before quoting or persisting context.
+pub(crate) fn context_text(text: &str) -> &str {
+    if chat_link::parse_code(text).is_some() { "[連結代碼已隱藏]" } else { text }
+}
+
 /// Blocking core: None alone permits normal conversation processing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle(
@@ -70,7 +75,7 @@ pub(crate) fn handle(
     let code = chat_link::parse_code(text)?;
     let reply = match chat_link::match_code(
         db, channel, &code, principal, account, dm,
-        &duduclaw_core::truncate_chars(display_name, 200), is_private,
+        &duduclaw_core::truncate_chars(&duduclaw_core::plain_line(display_name, 200), 200), is_private,
     ) {
         Ok(MatchOutcome::Matched) => InterceptReply::Matched,
         Ok(MatchOutcome::MustUsePrivateChat) => InterceptReply::MustUsePrivateChat,
@@ -128,6 +133,17 @@ mod tests {
 
     fn receive(db: &UserDb, code: &str, private: bool) -> Option<InterceptReply> {
         handle(db, "telegram", &account_label("telegram", None), "123", "123", "王小明", private, code)
+    }
+
+    #[test]
+    fn matched_display_is_normalized_before_storage() {
+        let (_home, db, user) = fixture();
+        let started = chat_link::start(&db, &user, "telegram", "session").unwrap();
+        let name = format!("王\n\r\t\u{1b}\u{202E}\u{200B}{}", "明".repeat(250));
+        assert_eq!(handle(&db, "telegram", "telegram", "123", "123", &name, true,
+            &started.code), Some(InterceptReply::Matched));
+        let state = chat_link::status(&db, &user, &started.handshake_id).unwrap().unwrap();
+        assert_eq!(state.matched_display.unwrap(), format!("王{}", "明".repeat(199)));
     }
 
     #[test]

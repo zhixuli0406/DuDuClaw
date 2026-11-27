@@ -262,3 +262,17 @@ fn chat_link_targets_only_list_configured_http_apps_and_cached_names() {
     assert!(targets(home.path(), "googlechat", &agents).is_err());
     crate::agent_channels::identity::clear(&label);
 }
+
+#[test]
+fn status_projection_normalizes_existing_display_names() {
+    let home = tempfile::tempdir().unwrap();
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db.create_user("admin@example.test", "Admin", "password-test", UserRole::Admin).unwrap();
+    let started = chat_link::start(&db, &user.id, "telegram", "session").unwrap();
+    let state = chat_link::status(&db, &user.id, &started.handshake_id).unwrap().unwrap();
+    assert!(status_value(state)["display_name"].is_null());
+    let name = format!("王\n\r\t\u{1b}\u{202E}\u{200B}{}", "明".repeat(250));
+    let mut state = chat_link::status(&db, &user.id, &started.handshake_id).unwrap().unwrap();
+    state.matched_display = Some(name);
+    assert_eq!(status_value(state)["display_name"], json!(format!("王{}", "明".repeat(199))));
+}
