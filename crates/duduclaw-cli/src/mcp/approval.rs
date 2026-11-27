@@ -249,7 +249,7 @@ pub(crate) async fn run_approval_bound(
     let private_account = crate::mcp_auth::current_google_account_approval();
     let account_json = payload.get(duduclaw_core::google_identity::GOOGLE_ACCOUNT_APPROVAL_KEY);
     let summary = if let Some(account) = private_account {
-        if !matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+        if !matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some() && !duduclaw_core::google_identity::is_drive_write_tool(tool))
             || !account.is_well_formed()
             || account_json != serde_json::to_value(&account).ok().as_ref()
         {
@@ -262,7 +262,7 @@ pub(crate) async fn run_approval_bound(
         format!("{summary}\n\n{card}")
     } else {
         if account_json.is_some()
-            && matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some())
+            && matches!(subject,ApprovalSubject::ToolCall(tool) if duduclaw_core::google_identity::native_google_scope(tool).is_some() && !duduclaw_core::google_identity::is_drive_write_tool(tool))
         {
             return InstallApprovalOutcome::Denied(
                 "Google 帳號核准資料不能由工具參數提供。".into(),

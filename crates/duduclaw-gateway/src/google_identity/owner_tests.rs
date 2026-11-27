@@ -318,6 +318,10 @@ fn all_25_effect_tools_have_a_closed_native_template() {
     use crate::google_workspace::native_call::NativeCallTemplate;
     let mut count = 0;
     for tool in duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS {
+        if duduclaw_core::google_identity::is_drive_write_tool(tool) {
+            assert!(NativeCallTemplate::prepare(tool, &json!({})).is_err(), "{tool}");
+            continue;
+        }
         let args = match *tool {
             "google_status" => continue,
             "gmail_search" | "drive_search" => json!({"query":"test"}),
@@ -380,7 +384,7 @@ async fn google_token_refuses_all_drive_write_tools_before_resolution_and_audits
     let audit = std::fs::read_to_string(f.home.path().join("tool_calls.jsonl")).unwrap();
     let rows: Vec<serde_json::Value> = audit.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
     for tool in crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS {
-        assert!(rows.iter().any(|row| row["google_tool"] == tool
+        assert!(rows.iter().any(|row| row["google_tool"] == *tool
             && row["reason"] == "write_tool_gateway_only" && row["success"] == false));
     }
 }

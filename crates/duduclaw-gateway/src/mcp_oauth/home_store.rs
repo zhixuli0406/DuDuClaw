@@ -104,7 +104,7 @@ pub(crate) fn normalized_scopes(mut scopes: Vec<String>) -> Result<Vec<String>> 
 /// Keep the first sufficient singleton for existing any-of policies.
 fn native_scope_subset(tool: &str, actual: Vec<String>) -> Result<Vec<String>> {
     if tool == "google_status"
-        || duduclaw_core::google_identity::native_google_scope(tool).is_none()
+        || duduclaw_core::google_identity::native_google_scope(tool).is_none() || duduclaw_core::google_identity::is_drive_write_tool(tool)
     {
         return Err(Error::Invalid);
     }

@@ -1,3 +1,14 @@
+const UNSUPPORTED_DRIVE_WRITES: &[&str] = &[
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "drive_move_file",
+    "drive_trash_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
+];
 use super::*;
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
 use serde_json::json;
@@ -53,10 +64,18 @@ fn policy_covers_exactly_the_declared_catalog() {
                 .trim_start().strip_prefix('"').expect("quoted tool name");
             let name = field.split('"').next().unwrap();
             assert!(names.insert(name), "duplicate schema {name}");
-            assert!(policy(name).is_some(), "unclassified schema {name}");
+            if UNSUPPORTED_DRIVE_WRITES.contains(&name) {
+                assert!(policy(name).is_none(), "{name}");
+                let ctx = context(name, vec![employee()]);
+                assert!(!eligible(&ctx, name), "{name}");
+                assert!(authorize(&ctx, name, &json!({}), &Fixed(vec![employee()])).is_err());
+            } else {
+                assert!(policy(name).is_some(), "unclassified schema {name}");
+            }
         }
     }
-    assert_eq!(names.len(), POLICIES.len());
+    assert_eq!(names.len(), POLICIES.len() + UNSUPPORTED_DRIVE_WRITES.len());
+    for name in UNSUPPORTED_DRIVE_WRITES { assert!(names.contains(name)); }
     for entry in POLICIES {
         assert!(names.contains(entry.name));
         assert!(!entry.required.is_empty());

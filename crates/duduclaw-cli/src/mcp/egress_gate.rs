@@ -22,6 +22,7 @@ pub(crate) fn model_visible_payload(response: &Value) -> bool {
 /// Never infer completion from arbitrary content or a generic success shape:
 /// search aggregators and background launchers can hide unfinished effects.
 pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
     let terminal_contract = matches!(tool,
         "send_message" | "send_photo" | "send_sticker" | "web_search"
         | "web_fetch_cached" | "web_extract"

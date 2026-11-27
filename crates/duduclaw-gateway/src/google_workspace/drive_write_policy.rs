@@ -36,17 +36,7 @@ impl DriveWriteAction {
     }
 }
 
-pub const DRIVE_WRITE_TOOLS: [&str; 9] = [
-    "drive_create_file",
-    "drive_copy_file",
-    "drive_update_file",
-    "docs_insert_text",
-    "docs_format",
-    "sheets_add_sheet",
-    "sheets_add_note",
-    "drive_move_file",
-    "drive_trash_file",
-];
+pub const DRIVE_WRITE_TOOLS: &[&str] = duduclaw_core::google_identity::DRIVE_WRITE_TOOLS;
 
 pub fn action_for_tool(tool: &str) -> Option<DriveWriteAction> {
     match tool {

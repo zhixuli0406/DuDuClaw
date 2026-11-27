@@ -655,3 +655,34 @@ async fn rm159_all_calendar_updates_use_the_existing_send_approval_policy() {
         assert!(result["error"]["message"].as_str().unwrap().contains("action_rules"), "{result}");
     }
 }
+
+#[tokio::test]
+async fn drive_writes_are_refused_by_dispatch_and_hidden_from_listing() {
+    let home = fixture("[capabilities]\nallowed_tools=['mcp__duduclaw__*']");
+    let config = home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&config).unwrap().replace(
+        "scopes=['google:read']", "scopes=['google:read','google:write']");
+    std::fs::write(config, raw).unwrap();
+    let dispatcher = dispatcher(home.path()).await;
+    for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        let call = authenticate_with_key_call(KEY, home.path()).unwrap();
+        let principal = call.principal().clone();
+        let result = with_authenticated_call(call, dispatcher.dispatch_tool_call(
+            &principal, &namespace(), &json!({"name":tool,"arguments":{}}), &json!(1),
+        )).await;
+        assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
+        assert_eq!(result["error"]["message"], "雲端硬碟寫入只能由主程式執行。", "{tool}");
+    }
+    for external in [false, true] {
+        let mut principal = crate::mcp::test_principal(external);
+        principal.scopes = vec![crate::mcp_auth::Scope::Admin, crate::mcp_auth::Scope::GoogleRead,
+            crate::mcp_auth::Scope::GoogleWrite].into_iter().collect();
+        let response = crate::mcp::handle_tools_list_for_agent(
+            &json!(2), &principal, home.path(), "employee-a",
+        ).await;
+        let listed = crate::mcp::advertised_tool_names(&response);
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert!(!listed.iter().any(|name| name.as_str() == *tool), "{tool}");
+        }
+    }
+}

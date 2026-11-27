@@ -124,6 +124,8 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("drive_create_file", "folder", "boolean"),
+    ("docs_format", "operations", "array"),
     ("docs_replace_text", "match_case", "boolean"),
     ("calendar_update_event", "notify_attendees", "boolean"),
     ("calendar_delete_event", "notify_attendees", "boolean"),
@@ -274,14 +276,12 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
         );
     }
+    let mut input_schema = serde_json::json!({"type":"object","properties":properties,"required":required});
+    google::drive_write_schema(tool.name, &mut input_schema);
     serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required
-        },
+        "inputSchema": input_schema,
         "annotations": annotations::tool_annotations(tool.name)
     })
 }
