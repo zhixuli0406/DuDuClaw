@@ -1,3 +1,4 @@
+pub mod access_policy;
 pub mod agent_config;
 pub mod config;
 pub mod connector;
