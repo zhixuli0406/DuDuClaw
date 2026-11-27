@@ -1119,6 +1119,11 @@ async fn process_telegram_message(
                 crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
                 crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
                 crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
+                    if crate::channel_decision_route::is_strict_decision(&command) {
+                        telegram_decision_fastlane(&msg, &client, &api_base, &ctx,
+                            &verified_account_id, &bot_username).await;
+                        return;
+                    }
                     // The handler owns access/admin checks; no media reference
                     // or quoted text may change the parsed exempt command.
                     handle_command(&command, &client, &api_base, chat_id, thread_id,
@@ -1848,7 +1853,7 @@ async fn telegram_decision_fastlane(
     account: &str,
     bot_username: &str,
 ) -> bool {
-    let Some(raw) = msg.text.as_deref() else {
+    let Some(raw) = msg.text.as_deref().or(msg.caption.as_deref()) else {
         return false;
     };
     let text = crate::channel_decision_route::strip_leading_mention(raw, bot_username);

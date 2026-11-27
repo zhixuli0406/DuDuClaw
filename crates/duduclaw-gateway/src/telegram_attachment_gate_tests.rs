@@ -59,3 +59,45 @@ async fn blocked_sender_skips_document_and_voice_without_a_reply_or_saved_file()
         }
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn broken_bot_employee_decline_with_document_reaches_decision_fastlane() {
+    use crate::channel_decision_route::test_support::status_of;
+    use crate::decision_notify::native_loop_fixture::{NativeCuFixture, pending_native_request};
+
+    // Exercise both the attachment-preflight continuation and the receiver's
+    // caption fast lane, which must run before the conversation FIFO.
+    for (caption, receiver) in [(false, false), (true, false), (true, true)] {
+        let provider = TestChannelProvider::start().await;
+        let fixture = NativeCuFixture::new(&provider.token).await;
+        let id = pending_native_request(&fixture, crate::approval::DecisionContext {
+            channel: "telegram".into(), account_id: "7".into(),
+            conversation_id: "42".into(), principal_id: "42".into(),
+        }).await;
+        std::fs::write(fixture.home.path().join("agents/alice/agent.toml"), "[model").unwrap();
+        let mut message = serde_json::json!({
+            "message_id":1, "chat":{"id":42,"type":"private"},
+            "from":{"id":42,"first_name":"Sender","is_bot":false},
+            "document":{"file_id":"decision-file","file_name":"report.pdf"},
+            "reply_to_message":{"message_id":2,"chat":{"id":42,"type":"private"},
+                "text":"Quoted context must not alter the decision"}
+        });
+        message[if caption { "caption" } else { "text" }] =
+            serde_json::json!(format!("@fixturebot deny {}", id.as_str()));
+        let message: TgMessage = serde_json::from_value(message).unwrap();
+        let api_base = telegram_poll_api_base(&provider.token);
+        if receiver {
+            assert!(telegram_decision_fastlane(&message, &reqwest::Client::new(), &api_base,
+                &fixture.ctx, "7", "fixturebot").await);
+        } else {
+            process_telegram_message(message, reqwest::Client::new(), api_base,
+                provider.token.clone(), fixture.ctx.clone(), "telegram".into(),
+                Some("alice".into()), "7".into(), "fixturebot".into()).await;
+        }
+        assert_eq!(status_of(fixture.home.path(), &id).await, crate::approval::ApprovalStatus::Denied);
+        assert!(!provider.requests().iter().any(|r| r.path.ends_with("/getFile") || r.method == "GET"));
+        assert_no_saved_attachments(fixture.home.path());
+        assert!(!fixture.home.path().join("agents/alice/attachments").exists());
+        assert_eq!(fixture.executed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+}

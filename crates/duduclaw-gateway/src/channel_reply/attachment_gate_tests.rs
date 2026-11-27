@@ -49,13 +49,35 @@ async fn only_parsed_exempt_commands_drop_files_and_keep_the_command() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn strict_decisions_drop_files_before_resolving_the_answering_employee() {
+    let (home, ctx, _runtime, calls) = misaligned_worker("").await;
+    let before = crate::model_call_probe::calls();
+    for malformed in [false, true] {
+        if malformed {
+            std::fs::write(home.path().join("agents/worker/agent.toml"), "[model").unwrap();
+        }
+        for session in SESSIONS {
+            for verb in ["deny", "approve", "answer"] {
+                let text = format!("{verb} 12345678-1234-1234-1234-123456789abc");
+                for selected in [Some("worker"), Some("missing"), None] {
+                    assert_eq!(check(&ctx, session, session, "42", &text, selected, None).await,
+                        AttachmentEntry::DropFilesAndContinue(text.clone()), "{session}: {text}");
+                }
+            }
+            assert_refused_before_any_side_effect(&ctx, session, &calls, before).await;
+        }
+    }
+    assert_no_saved_attachments(home.path());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn blocked_or_unpaired_senders_keep_the_original_access_flow() {
     let (home, ctx, _runtime, _calls) = misaligned_worker("").await;
     for session in SESSIONS {
         let channel = session.split(':').next().unwrap();
         ctx.channel_settings.set(channel, "global", crate::channel_settings::keys::BLOCKED_USERS,
             r#"["42"]"#).await.unwrap();
-        for text in ["附件", "/help"] {
+        for text in ["附件", "/help", "deny 12345678-1234-1234-1234-123456789abc"] {
             assert_eq!(check(&ctx, session, session, "42", text, Some("worker"), None).await,
                 AttachmentEntry::SkipFiles);
         }

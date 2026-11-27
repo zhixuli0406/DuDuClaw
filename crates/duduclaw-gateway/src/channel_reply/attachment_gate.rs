@@ -36,6 +36,11 @@ pub(crate) async fn check(
     if denied.is_some() {
         return AttachmentEntry::SkipFiles;
     }
+    // Decisions validate the task's assignee in their own lane. Never let
+    // an unrelated answering employee or an attachment block a decline.
+    if crate::channel_decision_route::is_strict_decision(text) {
+        return AttachmentEntry::DropFilesAndContinue(text.to_string());
+    }
     let (target, session) = {
         let registry = ctx.registry.read().await;
         match selected.filter(|id| !id.is_empty()) {
