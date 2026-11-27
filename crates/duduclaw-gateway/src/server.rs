@@ -1332,6 +1332,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
     crate::skill_lifecycle::curator::restore_on_startup(&home_dir).await;
+    // Imported skill policy decisions belong only to the live lock holder.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !duduclaw_core::gateway_instance::held(&home) || !home.join("approvals.db").exists() {
+                    continue;
+                }
+                if let Ok(broker) = crate::approval::ApprovalBroker::open(&home) {
+                    crate::skill_trust::run_once(&home, &broker).await;
+                }
+            }
+        });
+    }
 
     // RM-136 (M5): deliver `users.mfa_reset` audit rows a previous process
     // committed but did not deliver (held rows included). Only the gateway

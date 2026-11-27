@@ -77,6 +77,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("odoo", "member_credentials", Bool),
     ("security", "mail_requester_approval", Bool),
     ("auth", "mfa_enforced", Bool),
+    ("approval", "skill_ttl_days", UInt),
     ("product", "profile", OneOf(&["standard", "restricted"])),
     ("general", "log_level", Str),
     ("general", "default_agent", Str),
@@ -330,6 +331,7 @@ pub(crate) fn check_config_types_with_stored(
         }
     }
     for (section, key, min, max) in [
+        ("approval", "skill_ttl_days", 1, 30),
         ("runtime", "default_timeout_secs", 30, 14400),
         ("runtime", "max_timeout_secs", 60, 14400),
         ("runtime", "default_max_turns", 1, 10000),
@@ -390,6 +392,16 @@ mod tests {
 
     fn check(text: &str) -> Result<(), String> {
         check_config_types(text, &text.parse().unwrap())
+    }
+
+    #[test]
+    fn skill_ttl_schema_requires_integer_in_range() {
+        for value in ["1", "30"] {
+            check(&format!("[approval]\nskill_ttl_days = {value}\n")).unwrap();
+        }
+        for value in ["0", "31", "1.5", "\"7\"", "true"] {
+            assert!(check(&format!("[approval]\nskill_ttl_days = {value}\n")).is_err());
+        }
     }
 
     #[test]

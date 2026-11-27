@@ -105,6 +105,27 @@ pub struct QueueMessage {
     pub on_behalf_of: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Inserted,
+    AlreadyPresent,
+}
+
+impl QueueMessage {
+    /// Compare immutable delivery identity, using the payload actually stored.
+    /// Status, retries and timestamps can change after a successful enqueue.
+    pub(crate) fn matches_enqueue(&self, expected: &QueueMessage) -> bool {
+        self.id == expected.id
+            && self.sender == expected.sender
+            && self.target == expected.target
+            && self.payload == duduclaw_security::credential_detect::mask(&expected.payload)
+            && self.lane == expected.lane
+            && self.origin_agent == expected.origin_agent
+            && self.sender_agent == expected.sender_agent
+            && self.delegation_depth == expected.delegation_depth
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Store
 // ---------------------------------------------------------------------------
@@ -273,6 +294,44 @@ impl MessageQueue {
         )
         .map_err(|e| format!("enqueue: {e}"))?;
         Ok(())
+    }
+
+    /// An id collision is success only for the exact same delivery. Keep the
+    /// insert and comparison in one write transaction, including across processes.
+    pub async fn enqueue_or_verify_exact(&self, msg: &QueueMessage) -> Result<EnqueueOutcome, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin exact enqueue: {e}"))?;
+        let inserted = tx.execute(
+            "INSERT INTO message_queue
+             (id, sender, target, payload, status, retry_count, delegation_depth,
+              origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id,
+              upstream_unknown, lane, on_behalf_of)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+             ON CONFLICT(id) DO NOTHING",
+            params![msg.id, msg.sender, msg.target,
+                duduclaw_security::credential_detect::mask(&msg.payload),
+                msg.status.as_str(), msg.retry_count, msg.delegation_depth,
+                msg.origin_agent, msg.sender_agent, msg.created_at, msg.reply_channel,
+                msg.turn_id, msg.session_id, msg.upstream_unknown, msg.lane, msg.on_behalf_of],
+        ).map_err(|e| format!("exact enqueue: {e}"))?;
+        let outcome = if inserted == 1 {
+            EnqueueOutcome::Inserted
+        } else {
+            let existing = tx.query_row(
+                "SELECT id, sender, target, payload, status, retry_count, delegation_depth,
+                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at,
+                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of
+                 FROM message_queue WHERE id=?1",
+                params![msg.id], Self::row_to_message,
+            ).map_err(|e| format!("verify exact enqueue: {e}"))?;
+            if !existing.matches_enqueue(msg) {
+                return Err("queue id delivery mismatch".into());
+            }
+            EnqueueOutcome::AlreadyPresent
+        };
+        tx.commit().map_err(|e| format!("commit exact enqueue: {e}"))?;
+        Ok(outcome)
     }
 
     /// Cancel only delegations not yet handed to the dispatcher. The existing

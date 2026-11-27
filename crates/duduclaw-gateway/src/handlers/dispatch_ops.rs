@@ -55,15 +55,27 @@ impl MethodHandler {
         match method {
             "autopilot.create" => {
                 require_admin!();
-                boxed_frame(|| self.handle_autopilot_create(params)).await
+                boxed_frame(|| self.handle_autopilot_create(params, ctx)).await
             }
             "autopilot.update" => {
                 require_admin!();
-                boxed_frame(|| self.handle_autopilot_update(params)).await
+                boxed_frame(|| self.handle_autopilot_update(params, ctx)).await
+            }
+            "autopilot.template_fields" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_template_fields(params)).await
             }
             "autopilot.remove" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_remove(params)).await
+            }
+            "autopilot.runs.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_list(params)).await
+            }
+            "autopilot.runs.cancel" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_cancel(params, ctx)).await
             }
             "autopilot.history" => {
                 require_admin!();

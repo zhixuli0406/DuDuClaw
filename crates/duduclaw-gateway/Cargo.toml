@@ -70,6 +70,7 @@ tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = "0.9"
 toml = { workspace = true }
 # Comment-preserving TOML edits for premium team-template staging (already the
 # engine underneath `toml` 0.8, so no new transitive deps).

@@ -44,6 +44,8 @@ pub struct PreparedSkill {
     pub label: Option<String>,
     /// The normalised copy, ready to move into place.
     pub staged_dir: PathBuf,
+    /// Original folder relative to the pack root, with `/` separators; unknown without a root.
+    pub source_rel: Option<String>,
     pub scripts: Vec<String>,
     pub needs: Vec<Need>,
     pub verdict: Verdict,
@@ -169,6 +171,7 @@ pub fn prepare(
         name: name.clone(),
         label: label.clone(),
         staged_dir: staged_dir.clone(),
+        source_rel: None,
         scripts: Vec::new(),
         needs: Vec::new(),
         verdict: Verdict::Enable,
