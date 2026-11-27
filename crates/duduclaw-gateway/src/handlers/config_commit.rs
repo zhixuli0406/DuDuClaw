@@ -682,6 +682,50 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 
 // ── Format-preserving render ────────────────────────────────────────────────
 
+/// Remove portable Drive write consent without re-serializing unrelated settings.
+/// Empty implicit parents disappear with the section; explicit `[google]` stays.
+pub fn strip_drive_write_preserving(text: &str) -> Result<(String, bool), String> {
+    let mut doc: toml_edit::DocumentMut = text.parse()
+        .map_err(|e| format!("config file is not valid TOML: {e}"))?;
+    let Some(google) = doc.get_mut("google") else {
+        return Ok((text.to_owned(), false));
+    };
+    let implicit = google.as_table().is_some_and(|table| table.is_implicit());
+    let Some(table) = google.as_table_like_mut() else {
+        return Err("設定中的 google 區段格式不正確，沒有匯入或還原。".into());
+    };
+    if table.remove("drive_write").is_none() {
+        return Ok((text.to_owned(), false));
+    }
+    let remove_google = implicit && table.is_empty();
+    if remove_google {
+        doc.as_table_mut().remove("google");
+    }
+    let mut rendered = doc.to_string();
+    // Opening comments may belong to the removed first item.
+    let header = leading_comment_header(text);
+    if !header.is_empty() && !rendered.starts_with(header) {
+        rendered.insert_str(0, header);
+    }
+    if text.ends_with('\n') && !rendered.ends_with('\n') {
+        rendered.push('\n');
+    }
+    // Refuse a divergent edit rather than falling back to a lossy serializer.
+    let mut expected: toml::Table = text.parse()
+        .map_err(|e| format!("config file is not valid TOML: {e}"))?;
+    expected.get_mut("google").and_then(toml::Value::as_table_mut)
+        .ok_or("google is not a table")?.remove("drive_write");
+    if remove_google {
+        expected.remove("google");
+    }
+    let actual: toml::Table = rendered.parse()
+        .map_err(|e| format!("stripped config is not valid TOML: {e}"))?;
+    if actual != expected {
+        return Err("Drive write consent removal changed unrelated settings".into());
+    }
+    Ok((rendered, true))
+}
+
 /// Render `new_table` as an edit of `original_text`: every key whose value is
 /// unchanged keeps its exact bytes (comments above it, trailing comment,
 /// blank lines, position, inline-table / array formatting); a changed scalar
@@ -1211,6 +1255,119 @@ name = "oa1"
             );
         });
         assert_eq!(tweaked, FIXTURE.replace("https://example.com", "https://example.org"));
+    }
+
+    #[test]
+    fn strip_drive_write_preserves_header_comments_order_and_trailing_newline() {
+        let kept = "# preserve this header\n[integrations]\ngoogle_workspace = true # keep this comment\n\n";
+        let original = format!("{kept}[google.drive_write]\ncreate = true\n[google.drive_write.approval]\ncreate = 'none'\n[google.drive_write.ack]\nsignature = 'signed'\n[[google.drive_write.folders]]\nid = 'folder'\n");
+        let (out, removed) = strip_drive_write_preserving(&original).unwrap();
+        assert!(removed);
+        assert_eq!(out.trim_end(), kept.trim_end());
+        assert!(out.ends_with('\n'));
+        let table: toml::Table = out.parse().unwrap();
+        assert!(!table.contains_key("google"));
+    }
+
+    #[test]
+    fn strip_drive_write_keeps_other_google_keys() {
+        let kept = "# header\n[google]\nclient_id = 'keep' # untouched\nclient_secret = 'also keep'\n";
+        let original = format!("{kept}[google.drive_write]\ncreate = true\n");
+        let (out, removed) = strip_drive_write_preserving(&original).unwrap();
+        assert!(removed);
+        assert_eq!(out, kept);
+    }
+
+    #[test]
+    fn strip_drive_write_removes_only_implicit_empty_google() {
+        for section in ["[google.drive_write]\ncreate = true\n",
+            "[google.drive_write.approval]\ncreate = 'none'\n"] {
+            let (out, removed) = strip_drive_write_preserving(section).unwrap();
+            assert!(removed);
+            assert!(!out.parse::<toml::Table>().unwrap().contains_key("google"));
+            let explicit = format!("# header\n[google]\n{section}");
+            let (out, removed) = strip_drive_write_preserving(&explicit).unwrap();
+            assert!(removed);
+            assert_eq!(out, "# header\n[google]\n");
+            assert!(out.parse::<toml::Table>().unwrap()["google"].as_table().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn strip_drive_write_handles_dotted_keys() {
+        for original in [
+            "# header\ngoogle.drive_write.create = true\n",
+            "# header\ngoogle.drive_write.approval.create = 'none'\n",
+        ] {
+            let (out, removed) = strip_drive_write_preserving(original).unwrap();
+            assert!(removed);
+            assert_eq!(out, "# header\n");
+            assert!(out.parse::<toml::Table>().unwrap().is_empty());
+        }
+        let original = "# header\ngoogle.client_id = 'keep' # untouched\ngoogle.drive_write.create = true\n";
+        let (out, removed) = strip_drive_write_preserving(original).unwrap();
+        assert!(removed);
+        assert_eq!(out, "# header\ngoogle.client_id = 'keep' # untouched\n");
+    }
+
+    #[test]
+    fn strip_drive_write_handles_inline_google() {
+        let original = "# header\ngoogle = { client_id = 'keep', drive_write = { create = true } }\n";
+        let (out, removed) = strip_drive_write_preserving(original).unwrap();
+        assert!(removed);
+        assert!(out.starts_with("# header\n"));
+        assert!(out.ends_with('\n'));
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(table["google"]["client_id"].as_str(), Some("keep"));
+        assert!(table["google"].get("drive_write").is_none());
+    }
+
+    #[test]
+    fn strip_drive_write_without_section_is_byte_identical() {
+        for original in ["", "# header\n", "# header\n[google]\nclient_id = 'keep' # comment\n\n",
+            "# header\n[integrations]\ngoogle_workspace = true"] {
+            assert_eq!(strip_drive_write_preserving(original).unwrap(), (original.to_owned(), false));
+        }
+        assert!(strip_drive_write_preserving("[broken").is_err());
+    }
+
+    #[test]
+    fn strip_drive_write_refuses_non_table_google() {
+        for original in [
+            "[[google]]\ndrive_write = { create = true }\n",
+            "google = [{ drive_write = { create = true } }]\n",
+            "google = 'unrelated'\n",
+            "google = []\n",
+        ] {
+            let error = strip_drive_write_preserving(original).unwrap_err();
+            assert!(error.contains("google 區段格式不正確"), "{original}: {error}");
+        }
+    }
+
+    #[test]
+    fn drive_write_text_edit_refuses_changed_non_table_google() {
+        for after in [
+            "[[google]]\ndrive_write = { create = true }\n",
+            "google = [{ drive_write = { create = true } }]\n",
+            "google = 'invalid'\n",
+            "google = []\n",
+        ] {
+            for before in ["", "[google]\nclient_id = 'keep'\n", "google = false\n"] {
+                assert!(refuse_drive_write_text_edit(before, after).is_err(), "{before} -> {after}");
+            }
+            assert!(refuse_drive_write_text_edit(after, after).is_ok());
+            assert!(refuse_drive_write_text_edit(after, "").is_ok());
+        }
+    }
+
+    #[test]
+    fn drive_write_text_edit_keeps_table_rules() {
+        let consent = "[google.drive_write]\ncreate = true\n";
+        assert!(refuse_drive_write_text_edit("", consent).is_err());
+        assert!(refuse_drive_write_text_edit(consent, consent).is_ok());
+        assert!(refuse_drive_write_text_edit(consent, "[google]\nclient_id = 'keep'\n").is_ok());
+        assert!(refuse_drive_write_text_edit("", "google = { client_id = 'keep' }\n").is_ok());
+        assert!(refuse_drive_write_text_edit("", "").is_ok());
     }
 
     #[test]
