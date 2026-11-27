@@ -259,6 +259,27 @@ impl ApprovalBroker {
             params![session_id, turn_id, Utc::now().to_rfc3339()],
         ).map_err(|e| format!("withdraw turn approvals: {e}"))?;
         tx.commit().map_err(|e| format!("commit approval cancellation: {e}"))?;
+        if withdrawn > 0 && let Some(home) = self.home_dir() {
+            // Cosmetic snapshots are read only AFTER the withdrawal commits.
+            // Failure must never turn a durable cancellation into an error.
+            let snapshots = (|| -> Result<Vec<ApprovalRecord>, String> {
+                super::verify_live_io()?;
+                let mut stmt = conn.prepare(
+                    "SELECT a.id FROM approvals a JOIN approval_turn_origins o ON a.id=o.approval_id
+                     WHERE o.session_id=?1 AND o.turn_id=?2 AND a.status='denied'
+                     AND a.decided_by='system:cancel:webchat_turn'",
+                ).map_err(|e| e.to_string())?;
+                let ids = stmt.query_map(params![session_id, turn_id], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+                ids.into_iter().filter_map(|id| {
+                    super::store::record_in_connection(&conn, &ApprovalId::from(id)).transpose()
+                }).collect()
+            })();
+            match snapshots {
+                Ok(records) => for rec in records { chat_admin::sync::spawn_expire(home.clone(), rec); },
+                Err(_) => warn!("chat-admin cancelled turn card snapshots unavailable"),
+            }
+        }
         // Existing withdraw() emits no lifecycle notifications: observers poll
         // the committed rows. Keep that behavior without replaying its CAS.
         Ok(TurnWithdrawal { withdrawn, approved_before_cancel })

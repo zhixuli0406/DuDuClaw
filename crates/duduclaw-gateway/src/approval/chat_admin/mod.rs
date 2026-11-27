@@ -5,6 +5,7 @@ pub(crate) mod ledger;
 pub(crate) mod receipts;
 pub(crate) mod press;
 pub(crate) mod step_up;
+pub(crate) mod sync;
 pub(crate) mod tier;
 
 pub(crate) use ledger::LedgerEntry;

@@ -623,6 +623,12 @@ impl ApprovalBroker {
                 &Utc::now().to_rfc3339(),
             )
             .await?;
+        if n > 0 && let Some(home) = self.home_dir() {
+            match self.get(id).await {
+                Ok(Some(rec)) => chat_admin::sync::spawn_expire(home, rec),
+                _ => warn!("chat-admin withdrawn card snapshot unavailable"),
+            }
+        }
         Ok(n > 0)
     }
 

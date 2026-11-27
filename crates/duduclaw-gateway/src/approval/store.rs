@@ -837,6 +837,16 @@ impl ApprovalStore {
         )
         .map_err(|e| format!("scrub approval: {e}"))?;
         commit_live_write(conn)?;
+        drop(connection);
+        if result > 0 && let Some(home) = self.db_path.as_deref().and_then(Path::parent) {
+            match self.get(id).await {
+                Ok(Some(rec)) if rec.status == ApprovalStatus::Invalidated => {
+                    chat_admin::sync::spawn_expire(home.to_path_buf(), rec);
+                }
+                Ok(_) => (),
+                Err(_) => warn!("chat-admin scrubbed card snapshot unavailable"),
+            }
+        }
         Ok(result)
     }
 

@@ -57,13 +57,17 @@ struct Recording<'a> {
     no_message_channel: Option<&'static str>,
     no_google_clicks: bool,
     mutate_on_send: bool,
+    edits: Mutex<Vec<(String, Option<String>, String)>>,
+    edit_destinations: Mutex<Vec<(String, String)>>,
+    fail_edit: bool,
 }
 
 impl<'a> Recording<'a> {
     fn new(store: &'a ApprovalStore) -> Self {
         Self { store, sent: Mutex::new(Vec::new()), replaced: Mutex::new(Vec::new()),
             reminders: Mutex::new(Vec::new()), fail_send:false, fail_channel:None, no_message_channel:None,
-            no_google_clicks:false, mutate_on_send:false }
+            no_google_clicks:false, mutate_on_send:false, edits:Mutex::new(Vec::new()),
+            edit_destinations:Mutex::new(Vec::new()), fail_edit:false }
     }
 }
 
@@ -90,6 +94,11 @@ impl Sender for Recording<'_> {
     }
     async fn remind(&self, target: &Target, message: Option<&str>, _: &str) -> bool {
         self.reminders.lock().unwrap().push((target.user_id.clone(), message.map(str::to_owned))); true
+    }
+    async fn edit(&self, target: &Target, message: &PushedMessage, text: &str) -> bool {
+        self.edits.lock().unwrap().push((target.proof.proof_account.clone(), target.agent.clone(), text.into()));
+        self.edit_destinations.lock().unwrap().push((message.edit_chat_id.clone(), message.message_id.clone()));
+        !self.fail_edit
     }
 }
 
@@ -321,4 +330,229 @@ async fn resend_plan_only_delivers_to_requested_live_admin() {
     drop(sent);
     f.db.update_user(&f.admin, None, Some(UserRole::Manager), None).unwrap();
     assert!(prepare_for_user(f.home.path(), &rec, &f.admin).unwrap().recipients.is_empty());
+}
+
+// P17 exercises the same recording transport as delivery, without HTTP.
+async fn receipt_status(store: &ApprovalStore, card_id: &str) -> String {
+    store.conn.lock().await.query_row("SELECT status FROM chat_admin_cards WHERE card_id=?1",
+        [card_id], |r| r.get(0)).unwrap()
+}
+
+#[tokio::test]
+async fn chat_decision_rewrites_other_admins_but_never_consumed_card() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    f.prove(&f.ack, "telegram", "456", "456", "telegram");
+    let rec = f.record();
+    let store = std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap());
+    store.insert(&rec).await.unwrap();
+    let sender = Recording::new(&store);
+    run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+    let live = receipts::list_live(&store, &rec.id).await.unwrap();
+    let pressed = live.iter().find(|r| r.user_id == f.admin).unwrap();
+    let entry = super::super::LedgerEntry { user_id:f.admin.parse().unwrap(),
+        channel:config::ChatChannel::Telegram, step:super::super::ledger::Step::Tap,
+        step_required:false, card_id:pressed.card_id.clone(), digest:pressed.digest.clone() };
+    ApprovalBroker::new(store.clone()).decide_as(&rec.id, true,
+        &super::super::DecisionActor::ChatAdmin(entry)).await.unwrap();
+    let rec = store.get(&rec.id).await.unwrap().unwrap();
+    sync::collapse_with_sender(&store, &rec, true, Some("Admin".into()), "Telegram",
+        crate::trigger_route::texts::Lang::ZhTw, &sender).await;
+    let edits = sender.edits.lock().unwrap();
+    assert_eq!(edits.len(), 1);
+    assert!(edits[0].2.contains("已核准"));
+    assert!(edits[0].2.contains("Admin"));
+    assert!(edits[0].2.contains("Telegram"));
+    let lang = crate::trigger_route::texts::Lang::ZhTw;
+    let decided_at = chrono::DateTime::parse_from_rfc3339(rec.decided_at.as_deref().unwrap()).unwrap().with_timezone(&Utc);
+    assert_eq!(edits[0].2, card::result_text(card::kind_label(&rec, lang), true, "Admin", decided_at, "Telegram", lang));
+    assert_eq!(sender.edit_destinations.lock().unwrap()[0].0, "456");
+    drop(edits);
+    for receipt in live {
+        assert_eq!(receipt_status(&store, &receipt.card_id).await,
+            if receipt.user_id == f.admin { "consumed" } else { "retired" });
+    }
+}
+
+#[tokio::test]
+async fn dashboard_decision_rewrites_all_cards_with_localized_dashboard_label() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    f.prove(&f.ack, "telegram", "456", "456", "telegram");
+    let rec = f.record();
+    let store = std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap());
+    store.insert(&rec).await.unwrap();
+    let sender = Recording::new(&store);
+    run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+    let live = receipts::list_live(&store, &rec.id).await.unwrap();
+    ApprovalBroker::new(store.clone()).decide_as(&rec.id, false,
+        &super::super::DecisionActor::Dashboard { user_id:f.admin.clone() }).await.unwrap();
+    let rec = store.get(&rec.id).await.unwrap().unwrap();
+    let lang = crate::trigger_route::texts::Lang::ZhTw;
+    sync::collapse_with_sender(&store, &rec, false, Some("Admin".into()),
+        &sync::decision_channel_label(&rec, lang), lang, &sender).await;
+    assert_eq!(sender.edits.lock().unwrap().len(), 2);
+    assert!(sender.edits.lock().unwrap().iter().all(|(_, _, text)| text.contains("已拒絕") && text.contains("儀表板")));
+    for receipt in live { assert_eq!(receipt_status(&store, &receipt.card_id).await, "retired"); }
+}
+
+#[tokio::test]
+async fn feature_off_sweeps_live_cards_across_approvals() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    let mut cards = Vec::new();
+    for _ in 0..2 {
+        let rec = f.record();
+        run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+        cards.extend(receipts::list_live(&store, &rec.id).await.unwrap());
+    }
+    f.config("['telegram']", "", false, false);
+    sync::sweep_feature_off_with_sender(f.home.path(), &store, &sender).await;
+    assert_eq!(sender.edits.lock().unwrap().len(), 2);
+    assert!(sender.edits.lock().unwrap().iter().all(|(_, _, text)| text == card::feature_off_text(crate::trigger_route::texts::Lang::ZhTw)));
+    for receipt in cards { assert_eq!(receipt_status(&store, &receipt.card_id).await, "retired"); }
+    sync::sweep_feature_off_with_sender(f.home.path(), &store, &sender).await;
+    assert_eq!(sender.edits.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn approval_expiry_rewrites_live_cards_and_marks_expired() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let rec = f.record();
+    let store = std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap());
+    store.insert(&rec).await.unwrap();
+    let sender = Recording::new(&store);
+    run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+    let receipt = receipts::list_live(&store, &rec.id).await.unwrap().pop().unwrap();
+    store.conn.lock().await.execute("UPDATE approvals SET created_at='2000-01-01T00:00:00Z' WHERE id=?1", [rec.id.as_str()]).unwrap();
+    assert_eq!(ApprovalBroker::new(store.clone()).expire_stale().await.unwrap(), 1);
+    let rec = store.get(&rec.id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ApprovalStatus::Expired);
+    sync::expire_with_sender(&store, &rec, crate::trigger_route::texts::Lang::ZhTw, &sender).await;
+    assert_eq!(receipt_status(&store, &receipt.card_id).await, "expired");
+    assert_eq!(sender.edits.lock().unwrap()[0].2, card::expired_text(card::kind_label(&rec, crate::trigger_route::texts::Lang::ZhTw), crate::trigger_route::texts::Lang::ZhTw));
+}
+
+#[tokio::test]
+async fn edit_failure_still_retires_and_line_needs_no_edit() {
+    use super::super::sync;
+    for line in [false, true] {
+        let f = Fixture::new();
+        if line {
+            f.config("['line']", "", true, false);
+            let dm = format!("U{}", "1".repeat(32));
+            f.prove(&f.admin, "line", &dm, &dm, "line");
+        } else { f.prove(&f.admin, "telegram", "123", "123", "telegram"); }
+        let mut rec = f.record();
+        let store = ApprovalStore::open_in_memory().unwrap();
+        let mut sender = Recording::new(&store);
+        sender.fail_edit = true;
+        run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+        let receipt = receipts::list_live(&store, &rec.id).await.unwrap().pop().unwrap();
+        rec.status = ApprovalStatus::Denied;
+        rec.decided_at = Some(Utc::now().to_rfc3339());
+        sync::collapse_with_sender(&store, &rec, false, None, "儀表板", crate::trigger_route::texts::Lang::ZhTw, &sender).await;
+        assert_eq!(receipt_status(&store, &receipt.card_id).await, "retired");
+        assert_eq!(sender.edits.lock().unwrap().len(), usize::from(!line));
+    }
+}
+
+#[tokio::test]
+async fn maintenance_expires_invalid_or_elapsed_card_deadlines_without_deciding() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    let mut cards = Vec::new();
+    for deadline in ["invalid", "2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z"] {
+        let rec = f.record();
+        store.insert(&rec).await.unwrap();
+        run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+        let receipt = receipts::list_live(&store, &rec.id).await.unwrap().pop().unwrap();
+        store.conn.lock().await.execute("UPDATE chat_admin_cards SET valid_until=?1 WHERE card_id=?2",
+            rusqlite::params![deadline, receipt.card_id]).unwrap();
+        cards.push(receipt);
+    }
+    sync::maintain_live(f.home.path(), &store, receipts::list_all_live(&store).await.unwrap(), &sender).await;
+    assert_eq!(sender.edits.lock().unwrap().len(), 2);
+    for (i, receipt) in cards.iter().enumerate() {
+        assert_eq!(receipt_status(&store, &receipt.card_id).await, if i == 2 { "live" } else { "expired" });
+        assert_eq!(store.get(&crate::approval::ApprovalId::from(receipt.approval_id.clone())).await.unwrap().unwrap().status, ApprovalStatus::Pending);
+    }
+}
+
+#[tokio::test]
+async fn sync_uses_each_receipts_own_bot_or_app_and_ignores_other_purposes() {
+    use super::super::sync;
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let mut rec = f.record();
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+    let base = receipts::list_live(&store, &rec.id).await.unwrap().pop().unwrap();
+    for channel in ["telegram", "googlechat", "slack", "discord"] {
+        let mut receipt = base.clone();
+        receipt.card_id = uuid::Uuid::new_v4().to_string();
+        receipt.channel = channel.into();
+        receipt.account = format!("{channel}:anna");
+        receipt.dm = format!("{channel}-dm");
+        receipt.message_id = Some(format!("{channel}-message"));
+        receipts::insert(&store, &receipt).await.unwrap();
+    }
+    // A future infrastructure consumer's receipt is not RM-143's to retire.
+    store.conn.lock().await.execute("UPDATE chat_admin_cards SET purpose='other' WHERE card_id=?1", [&base.card_id]).unwrap();
+    rec.status = ApprovalStatus::Approved;
+    rec.decided_at = Some(Utc::now().to_rfc3339());
+    sync::collapse_with_sender(&store, &rec, true, None, "Telegram", crate::trigger_route::texts::Lang::ZhTw, &sender).await;
+    let edits = sender.edits.lock().unwrap();
+    assert_eq!(edits.len(), 4);
+    for channel in ["telegram", "googlechat", "slack", "discord"] {
+        assert!(edits.iter().any(|(account, agent, _)| account == &format!("{channel}:anna") && agent.as_deref() == Some("anna")));
+        assert!(sender.edit_destinations.lock().unwrap().contains(&(format!("{channel}-dm"), format!("{channel}-message"))));
+    }
+    drop(edits);
+    assert_eq!(receipt_status(&store, &base.card_id).await, "live");
+}
+
+#[tokio::test]
+async fn feature_off_sweep_keeps_cards_live_when_effective_config_is_enabled() {
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let rec = f.record();
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+    super::super::sync::sweep_feature_off_with_sender(f.home.path(), &store, &sender).await;
+    assert_eq!(receipts::list_live(&store, &rec.id).await.unwrap().len(), 1);
+    assert!(sender.edits.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn maintenance_reconciles_invalidated_and_withdrawn_cards() {
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    let mut cards = Vec::new();
+    for (status, actor) in [("invalidated", "system:invalidate"), ("denied", "system:withdraw")] {
+        let rec = f.record();
+        store.insert(&rec).await.unwrap();
+        run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
+        cards.extend(receipts::list_live(&store, &rec.id).await.unwrap());
+        store.conn.lock().await.execute("UPDATE approvals SET status=?1, decided_by=?2 WHERE id=?3",
+            rusqlite::params![status, actor, rec.id.as_str()]).unwrap();
+    }
+    super::super::sync::maintain_live(f.home.path(), &store, receipts::list_all_live(&store).await.unwrap(), &sender).await;
+    assert_eq!(sender.edits.lock().unwrap().len(), 2);
+    assert!(sender.edits.lock().unwrap().iter().all(|(_, _, text)| text.starts_with("已失效")));
+    for receipt in cards { assert_eq!(receipt_status(&store, &receipt.card_id).await, "expired"); }
 }

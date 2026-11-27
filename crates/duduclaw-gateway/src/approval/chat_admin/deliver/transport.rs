@@ -4,13 +4,13 @@ use std::path::Path;
 use serde_json::{json, Value};
 use crate::{decision_card::PushedMessage, isolation_http::LiveRequest};
 
-pub(super) struct Network<'a> {
+pub(in crate::approval::chat_admin) struct Network<'a> {
     home: &'a Path,
     http: reqwest::Client,
 }
 
 impl<'a> Network<'a> {
-    pub(super) fn new(home: &'a Path) -> Self { Self { home, http: reqwest::Client::new() } }
+    pub(in crate::approval::chat_admin) fn new(home: &'a Path) -> Self { Self { home, http: reqwest::Client::new() } }
 
     async fn token(&self, target: &Target) -> Option<String> {
         let channel = target.proof.channel.as_str();
@@ -99,22 +99,31 @@ impl Sender for Network<'_> {
     async fn replace(&self, target: &Target, message: Option<&PushedMessage>) -> bool {
         const TEXT: &str = "請到儀表板處理";
         let channel = target.proof.channel.as_str();
-        if channel == "googlechat" {
+        if channel != "line" {
             let Some(message) = message else { return false; };
-            return crate::googlechat::replace_approval_card_as(self.home, target.agent.as_deref(), &message.message_id, TEXT).await.is_ok();
-        }
-        let Some(token) = self.token(target).await else { return false; };
-        if channel == "telegram" {
-            let Some(mid) = message.and_then(|m| m.message_id.parse::<i64>().ok()) else { return false; };
-            return self.telegram(&token, "editMessageText", json!({"chat_id":target.proof.proof_dm,
-                "message_id":mid, "text":TEXT, "reply_markup":{"inline_keyboard":[]}})).await.is_ok();
-        }
-        if let Some(message) = message.filter(|_| channel != "line") {
-            return crate::decision_card::edit_channel_message(&self.http, channel, &token, &message.edit_chat_id, &message.message_id, TEXT).await.is_ok();
+            return self.edit(target, message, TEXT).await;
         }
         // LINE cannot edit a pushed message. Replace it with a plain follow-up;
         // the old buttons have no receipt and therefore no decision authority.
+        let Some(token) = self.token(target).await else { return false; };
         crate::channel_sender::send_plain_text(self.home, &self.http, channel, &token, &target.proof.proof_dm, TEXT).await
+    }
+
+    async fn edit(&self, target: &Target, message: &PushedMessage, text: &str) -> bool {
+        if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return false; }
+        let channel = target.proof.channel.as_str();
+        if channel == "googlechat" {
+            return crate::googlechat::replace_approval_card_as(self.home, target.agent.as_deref(), &message.message_id, text).await.is_ok();
+        }
+        if !matches!(channel, "telegram" | "slack" | "discord") { return false; }
+        let Some(token) = self.token(target).await else { return false; };
+        if channel == "telegram" {
+            let Some(mid) = message.message_id.parse::<i64>().ok().filter(|id| *id > 0) else { return false; };
+            return self.telegram(&token, "editMessageText", json!({"chat_id":target.proof.proof_dm,
+                "message_id":mid, "text":text, "reply_markup":{"inline_keyboard":[]}})).await.is_ok();
+        }
+        crate::decision_card::edit_channel_message(&self.http, channel, &token,
+            &message.edit_chat_id, &message.message_id, text).await.is_ok()
     }
 
     async fn remind(&self, target: &Target, message: Option<&str>, text: &str) -> bool {

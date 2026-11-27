@@ -8,7 +8,7 @@ use serde_json::json;
 use crate::approval::{ApprovalBroker, ApprovalRecord, ApprovalStatus, ApprovalStore};
 use super::{card, config, receipts, chat_tier, Tier};
 
-mod transport;
+pub(super) mod transport;
 #[cfg(test)]
 mod tests;
 
@@ -28,10 +28,10 @@ impl DeliveryResult {
 }
 
 #[derive(Clone)]
-struct Target {
-    user_id: String,
-    proof: ChatApprovalProof,
-    agent: Option<String>,
+pub(super) struct Target {
+    pub(super) user_id: String,
+    pub(super) proof: ChatApprovalProof,
+    pub(super) agent: Option<String>,
 }
 
 struct Plan {
@@ -162,11 +162,12 @@ fn prepare_for_user(home: &Path, rec: &ApprovalRecord, user_id: &str) -> Option<
 }
 
 #[async_trait::async_trait]
-trait Sender: Sync {
+pub(super) trait Sender: Sync {
     async fn supports(&self, target: &Target) -> bool;
     async fn send(&self, target: &Target, card: &card::ChatCard, approval_id: &str) -> Result<Option<crate::decision_card::PushedMessage>, ()>;
     async fn replace(&self, target: &Target, message: Option<&crate::decision_card::PushedMessage>) -> bool;
     async fn remind(&self, target: &Target, message: Option<&str>, text: &str) -> bool;
+    async fn edit(&self, target: &Target, message: &crate::decision_card::PushedMessage, text: &str) -> bool;
 }
 
 async fn run(home: &Path, store: &ApprovalStore, rec: &ApprovalRecord, plan: Plan, sender: &impl Sender) -> DeliveryResult {

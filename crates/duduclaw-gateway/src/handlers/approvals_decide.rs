@@ -232,6 +232,10 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             self.audit_activation_decision(rec, &decider, approve);
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            crate::approval_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(), rec.clone(), approve, decider_name,
+            );
             return WsFrame::ok_response(
                 "",
                 json!({

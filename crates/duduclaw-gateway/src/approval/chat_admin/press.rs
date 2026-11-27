@@ -160,7 +160,15 @@ where F: FnOnce(PathBuf, ApprovalBroker, ApprovalRecord, String) -> Fut,
     };
     let settled = current.status != ApprovalStatus::Pending;
     if receipt.status != "live" && !(receipt.status == "consumed" && settled) {
-        return refuse(home, context, &id, origin, "receipt_not_live", lang).await;
+        let mut outcome = refuse(home, context, &id, origin, "receipt_not_live", lang).await;
+        let (owned_home, users) = (home.clone(), env.users.clone());
+        let enabled = tokio::task::spawn_blocking(move || config::effective(&owned_home, users.as_deref()).is_some())
+            .await.unwrap_or(false);
+        if !enabled {
+            outcome.reply = card::feature_off_text(lang).into();
+            outcome.card_text = Some(outcome.reply.clone());
+        }
+        return outcome;
     }
     // 4. Invalid expiry is expired too; terminal transitions cannot revive it.
     if !settled && !chrono::DateTime::parse_from_rfc3339(&receipt.valid_until).is_ok_and(|t| t > Utc::now()) {
@@ -239,7 +247,7 @@ fn receipt_mismatch(r: &receipts::Receipt, context: &DecisionContext,
 
 fn admin_label(lang: Lang) -> String { words(lang, "管理員", "Administrator", "管理者") }
 
-fn channel_label(channel: config::ChatChannel) -> &'static str {
+pub(super) fn channel_label(channel: config::ChatChannel) -> &'static str {
     match channel {
         config::ChatChannel::Telegram => "Telegram", config::ChatChannel::Googlechat => "Google Chat",
         config::ChatChannel::Line => "LINE", config::ChatChannel::Slack => "Slack", config::ChatChannel::Discord => "Discord",

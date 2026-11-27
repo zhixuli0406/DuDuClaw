@@ -275,7 +275,7 @@ async fn reply_to_receipted_message_uses_receipt_id() {
 }
 
 #[tokio::test]
-async fn feature_off_keeps_old_refusal_path() {
+async fn feature_off_refuses_without_legacy_fallback() {
     let f = Fixture::new().await;
     f.service.config(false, "telegram", &[]);
     assert!(!owns(&f.ctx.home_dir, &f.row).await);
@@ -283,9 +283,27 @@ async fn feature_off_keeps_old_refusal_path() {
     let old = crate::decision_notify::route_bound_press(&f.ctx.home_dir, &f.context, &data).await;
     assert!(matches!(old, Some(Err(_))));
     let result = crate::decision_notify::route_verified_bound_press(&f.ctx, &f.context, &data, PRIVATE, &f.origin).await;
-    assert_eq!(result.map(PressOutcome::into_reply), old);
+    let result = result.unwrap();
+    assert_eq!(result.refused_reason, Some("feature_off"));
+    assert_eq!(result.reply, card::feature_off_text(Lang::ZhTw));
     let outcome = f.refused("feature_off").await;
     assert_eq!(outcome.card_text, Some(card::feature_off_text(Lang::ZhTw).into()));
+}
+
+#[tokio::test]
+async fn closing_feature_refuses_old_cards() {
+    let f = Fixture::new().await;
+    f.service.config(false, "telegram", &[]);
+    super::super::sync::sweep_feature_off(&f.ctx.home_dir).await;
+    assert_eq!(f.saved_receipt().await.status, "retired");
+    let data = crate::decision_action::encode(DecisionSource::Approval, DecisionAct::Approve, f.row.id.as_str());
+    let outcome = crate::decision_notify::route_verified_bound_press(&f.ctx, &f.context, &data, PRIVATE, &f.origin).await.unwrap();
+    assert_eq!(outcome.refused_reason, Some("receipt_not_live"));
+    assert_eq!(outcome.reply, card::feature_off_text(Lang::ZhTw));
+    f.pending().await;
+    // Re-enabling cannot revive the old card's authority either.
+    f.service.config(true, "telegram", &[]);
+    f.refused("receipt_not_live").await;
 }
 
 #[tokio::test]
@@ -306,11 +324,12 @@ async fn shared_entry_preserves_card_text_and_never_falls_through() {
 }
 
 #[tokio::test]
-async fn already_decided_uses_recorded_dashboard_admin() {
+async fn dashboard_decision_retires_old_chat_card() {
     let f = Fixture::new().await;
     let user = f.service.db().live_user_context(&f.service.user).unwrap().unwrap();
     decision_service::decide(&f.service.env, &f.row.id, true, "", &Decider::Dashboard(user)).await.unwrap();
+    super::super::sync::collapse_after_decision(&f.ctx.home_dir, &f.row, true, None, "儀表板").await;
+    assert_eq!(f.saved_receipt().await.status, "retired");
     let reply = f.press().await;
-    assert_eq!(reply.refused_reason, Some("already_decided"));
-    assert_eq!(reply.reply, card::already_decided_text("Ada", "儀表板", true, Lang::ZhTw));
+    assert_eq!(reply.refused_reason, Some("receipt_not_live"));
 }

@@ -115,6 +115,27 @@ pub(crate) async fn list_live(store: &ApprovalStore, approval_id: &ApprovalId) -
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("read live chat-admin receipts: {e}"))
 }
 
+/// A delivered card stays in the receipt-bound route even after retirement.
+pub(crate) async fn has_for_approval(store: &ApprovalStore, approval_id: &ApprovalId) -> Result<bool, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM chat_admin_cards WHERE approval_id=?1 AND purpose='rm143')",
+        [approval_id.as_str()], |r| r.get(0))
+        .map_err(|e| format!("read chat-admin receipt ownership: {e}"))
+}
+
+/// Only RM-143 owns these maintenance edits; never sweep another purpose.
+pub(crate) async fn list_all_live(store: &ApprovalStore) -> Result<Vec<Receipt>, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM chat_admin_cards
+        WHERE purpose = 'rm143' AND status = 'live' ORDER BY sent_at, card_id"))
+        .map_err(|e| format!("prepare live chat-admin card sweep: {e}"))?;
+    let rows = stmt.query_map([], from_row)
+        .map_err(|e| format!("list live chat-admin card sweep: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("read live chat-admin card sweep: {e}"))
+}
+
 /// Terminal transitions never revive a receipt. Successful approval decisions
 /// use ledger::insert_and_consume instead, in the approval write transaction.
 pub(crate) async fn mark(
