@@ -345,14 +345,14 @@ impl MethodHandler {
             true
         } else { false };
         if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
-        if grant_only {
-            record_grant_use(self, ctx, agent_id, GrantGroup::Schedules, GrantAction::RunNow, "heartbeat.trigger").await;
-        }
         let hb = self.heartbeat.read().await;
         match hb.as_ref() {
             Some(scheduler) => {
                 let triggered = scheduler.trigger(agent_id).await;
                 if triggered {
+                    if grant_only {
+                        record_grant_use(self, ctx, agent_id, GrantGroup::Schedules, GrantAction::RunNow, "heartbeat.trigger").await;
+                    }
                     WsFrame::ok_response(
                         "",
                         json!({

@@ -601,6 +601,7 @@ impl MethodHandler {
         };
         let visible = ctx.visible_agents();
         let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
+        let mut grant_allowed = std::collections::HashMap::<String, bool>::new();
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
@@ -610,7 +611,8 @@ impl MethodHandler {
                 Some(ids) => event.get("agent_id").and_then(Value::as_str)
                     .is_some_and(|id| !hidden.contains(id)
                         && (ids.iter().any(|visible_id| visible_id == id)
-                            || department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read))),
+                            || *grant_allowed.entry(id.to_owned()).or_insert_with(||
+                                department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read)))),
             })
             .collect();
         events.reverse(); // newest first

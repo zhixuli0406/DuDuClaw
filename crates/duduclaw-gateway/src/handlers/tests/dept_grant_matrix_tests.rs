@@ -195,13 +195,11 @@ async fn schedules_heartbeat_scoped_matrix() {
 }
 
 #[tokio::test]
-async fn schedules_heartbeat_audits_only_grant_backed_admission() {
+async fn schedules_heartbeat_does_not_audit_failed_trigger() {
     let f = fixture().await;
     assert_heartbeat_scheduler_unavailable("heartbeat.trigger",
         Box::pin(f.h.handle("heartbeat.trigger", json!({"agent_id": "a1"}), &f.mgr_a)).await);
-    let expected = vec![(f.mgr_a.user_id.clone(), "a1".into(),
-        json!({"group": "schedules", "action": "run_now", "method": "heartbeat.trigger"}))];
-    assert_eq!(schedule_grant_audits(&f), expected);
+    assert!(schedule_grant_audits(&f).is_empty());
     // A live Operator binding takes precedence even while the grant exists.
     f.db.bind_agent(&f.mgr_a.user_id, "a1", AccessLevel::Operator).unwrap();
     for ctx in [&f.mgr_a, &f.admin] {
@@ -210,7 +208,7 @@ async fn schedules_heartbeat_audits_only_grant_backed_admission() {
     }
     assert_permission_denied("heartbeat.trigger",
         Box::pin(f.h.handle("heartbeat.trigger", json!({"agent_id": "b1"}), &f.mgr_a)).await);
-    assert_eq!(schedule_grant_audits(&f), expected);
+    assert!(schedule_grant_audits(&f).is_empty());
 }
 
 fn seed_matrix_reminder<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
