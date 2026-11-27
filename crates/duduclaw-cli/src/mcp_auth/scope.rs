@@ -370,7 +370,7 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "odoo_sale_create_quotation"
         | "odoo_create"
         | "odoo_write" | "odoo_activity_create" | "odoo_note_post"
-        | "odoo_message_send" => Some(Scope::OdooWrite),
+        | "odoo_message_send" | "odoo_attachment_add" => Some(Scope::OdooWrite),
         // Execute class: workflow buttons + generic execute_kw + report
         // generation. These can fire arbitrary Odoo-side actions.
         "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),

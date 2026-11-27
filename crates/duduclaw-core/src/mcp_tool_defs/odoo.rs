@@ -356,4 +356,14 @@ pub(super) const TOOLS: &[ToolDef] = &[
             ParamDef { name: "body", description: "Plain-text body, at most 10,000 characters; no mentions", required: true },
         ],
     },
+    ToolDef {
+        name: "odoo_attachment_add",
+        description: "Attach an existing file from your own employee attachments folder to a readable Odoo record. Only PDF, PNG, JPEG, WebP, UTF-8 TXT/CSV and OOXML XLSX/DOCX/PPTX are accepted; extension and content must agree. Size follows attachment_max_mb (default 10 MiB, maximum 25). No symlinks, absolute paths, parent traversal, shared folders or inline/base64 content. Engine mode requires attach:model permission. Attachment is private.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
+            ParamDef { name: "res_id", description: "Positive target record ID", required: true },
+            ParamDef { name: "file", description: "Relative path within agents/<verified calling employee>/attachments/", required: true },
+            ParamDef { name: "name", description: "Optional plain-text display name, at most 255 characters, without path separators or control characters; defaults to the file name", required: false },
+        ],
+    },
 ];

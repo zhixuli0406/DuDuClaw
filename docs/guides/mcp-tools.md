@@ -912,6 +912,16 @@ coverage. Vectors only ever rank passages inside the collections the call may re
 
 Each scan retains at most **400 models and 500 fields per model**. Metadata and field discovery have a **five-minute budget**, with four concurrent `fields_get` calls; account ACL probing has a separate 30-second overall limit. Built-in models come first, followed by models from installed business modules (CRM, sales, purchase, stock, accounting, project, HR, manufacturing, helpdesk and website), then remaining models alphabetically. A timed-out scan is marked truncated and reuses completed fields next cycle when identity, server version and modules are unchanged. Module/model catalogs cap at 5,000 entries. A partial diff never proves removal.
 
+### `odoo_attachment_add` — employee file attachment (v1.86.0)
+
+`odoo_attachment_add {model, res_id, file, name?}` creates a private attachment on an existing, readable Odoo record and returns its ID and the account used. It requires `odoo:write`, has effect `modify`, reads private data and is classified as outbound data transfer. The caller must have a verified employee identity; person API keys cannot use this tool.
+
+- `file` is relative to `<home>/agents/<verified employee>/attachments/`. Shared attachments, other employee folders, absolute paths, parent traversal, symlinks and Windows reparse points are refused. The tool reads the validated open file with a size bound; inline content and base64 arguments are refused.
+- `[odoo_access] attachment_max_mb` defaults to 10 MiB and must be an integer from 1 through 25. Invalid configuration refuses the operation. Optional `name` defaults to the file name and must contain 1–255 plain-text characters without control characters or path separators.
+- Allowed extensions and content must agree: PDF, PNG, JPG/JPEG, WebP, UTF-8 TXT/CSV without NUL, and XLSX/DOCX/PPTX. Office files require ZIP structure, `[Content_Types].xml` and the corresponding document part; VBA and ActiveX parts are refused. HTML, HTM, SVG, XML, executables, scripts and all other extensions are refused. These format checks are not an antivirus scan.
+- Engine mode requires the target in `allowed_models` and an exact `attach:<model>` token in `allowed_actions`. Follow-account mode uses the selected personal Odoo account. Both modes retain fixed refusals and `always_refuse` rules such as `attach:*`; read-only mode refuses attachment creation.
+- The connector writes only `name`, file-derived `datas`, `res_model`, `res_id`, validated `mimetype` and `public=false`. It never sets `access_token`; generic tools cannot create, write or unlink `ir.attachment`.
+
 ### `odoo_create` / `odoo_write` — generic create and update (v1.81.0)
 
 - `odoo_create {model, values}` creates one record and returns its id; `odoo_write {model, ids, values}` updates 1–100 records (duplicate ids are dropped) and returns `ok`. Both require **`odoo:write`** and are effect class `modify`, so `action_rules`, approval lists and the explore lane apply as to `odoo_crm_create_lead`.

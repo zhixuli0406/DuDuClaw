@@ -13,6 +13,7 @@ pub const ODOO_EXECUTOR_TOOLS: &[&str] = &[
     "odoo_report", "odoo_partner_search", "odoo_schema_overview", "odoo_schema_fields",
     // RM-120: every gate of `odoo_generic_write` runs on the bound connector.
     "odoo_create", "odoo_write",
+    "odoo_attachment_add",
     "odoo_activity_create", "odoo_note_post", "odoo_message_send",
 ];
 
@@ -48,6 +49,13 @@ impl BoundConnectorExecutor for OdooBoundExecutor {
             if matches!(call.name(), "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
                 if let Err(error) = crate::mcp::odoo_writeback_precheck(
                     self.provider.home(), self.provider.agent(), call.name(), call.arguments())
+                {
+                    return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]}));
+                }
+            }
+            if call.name() == "odoo_attachment_add" {
+                if let Err(error) = crate::mcp::odoo_attachment_precheck(
+                    self.provider.home(), self.provider.agent(), call.arguments())
                 {
                     return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]}));
                 }

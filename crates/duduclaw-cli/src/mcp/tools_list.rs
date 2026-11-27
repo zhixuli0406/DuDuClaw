@@ -986,6 +986,8 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "odoo_attachment_add"
+            || super::odoo_attachment::verified_employee(home_dir, effective_agent))
         .filter(|t| !t.name.starts_with("odoo_")
             || odoo_policy.as_ref().is_some_and(|policy| policy.listed_for_context(t.name)))
         // O7: PORTICO scoped tools without an active grant.

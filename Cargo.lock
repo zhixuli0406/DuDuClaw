@@ -2363,6 +2363,7 @@ dependencies = [
 name = "duduclaw-odoo"
 version = "1.85.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "duduclaw-core",
  "duduclaw-security",

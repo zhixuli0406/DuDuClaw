@@ -53,7 +53,7 @@ fn listing_and_dispatch_share_possible_identity_matrix() {
                     p.access.company_key_agents = if company { vec!["bot".into()] } else { vec![] };
                     p.agent.permission_override = readonly.then(|| "read_only".into());
                     for tool in ["odoo_search", "odoo_create", "odoo_write", "odoo_execute",
-                        "odoo_activity_create", "odoo_note_post", "odoo_message_send"] {
+                        "odoo_activity_create", "odoo_note_post", "odoo_message_send", "odoo_attachment_add"] {
                         let params = json!({"model":"res.partner", "method":"write"});
                         assert_eq!(p.listed(tool, Some(&params)), p.precheck(tool, &params).is_ok(),
                             "{tool}: personal={personal}, own={own}, company={company}, readonly={readonly}");
@@ -69,7 +69,7 @@ fn listing_and_dispatch_share_possible_identity_matrix() {
 #[test]
 fn writeback_policy_uses_semantic_verbs_and_exact_dedicated_tokens() {
     let params = json!({"model":"crm.lead", "res_id":1, "summary":"test", "body":"test"});
-    for (tool, verb) in [("odoo_activity_create", "activity"), ("odoo_note_post", "note"), ("odoo_message_send", "message")] {
+    for (tool, verb) in [("odoo_activity_create", "activity"), ("odoo_note_post", "note"), ("odoo_message_send", "message"), ("odoo_attachment_add", "attach")] {
         let mut p = policy();
         assert!(p.listed(tool, None));
         assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::Follow))).is_ok());

@@ -61,6 +61,7 @@ fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Op
         "odoo_activity_create" => (ToolClass::Activity, model, Some("activity_schedule")),
         "odoo_note_post" => (ToolClass::Note, model, Some("message_post")),
         "odoo_message_send" => (ToolClass::Message, model, Some("message_post")),
+        "odoo_attachment_add" => (ToolClass::Attach, model, Some("create")),
         "odoo_execute" => (ToolClass::Execute, model, params.and_then(|p| p.get("method")).and_then(Value::as_str)),
         "odoo_crm_leads" => (ToolClass::Read, Some("crm.lead"), Some("search_read")),
         "odoo_crm_create_lead" => (ToolClass::Execute, Some("crm.lead"), Some("create")),
@@ -159,12 +160,13 @@ impl ToolPolicy {
             "odoo_activity_create" => (ToolKind::Activity, Verb::Activity),
             "odoo_note_post" => (ToolKind::Note, Verb::Note),
             "odoo_message_send" => (ToolKind::Message, Verb::Message),
+            "odoo_attachment_add" => (ToolKind::Attachment, Verb::Attach),
             _ => (ToolKind::Generic, method_verb(method)),
         };
         self.common_operation(kind, verb, model, method)?;
         // The dedicated tools read the target before writing. This read is
         // intrinsic to the dedicated grant, but still obeys fixed/company gates.
-        if matches!(kind, ToolKind::Activity | ToolKind::Note | ToolKind::Message) {
+        if matches!(kind, ToolKind::Activity | ToolKind::Note | ToolKind::Message | ToolKind::Attachment) {
             self.common(model, "search_read")?;
             self.common(model, "fields_get")?;
         }
@@ -190,7 +192,7 @@ impl ToolPolicy {
             return super::odoo_generic_write::generic_write_model_gate(Some(&self.agent), &self.global, unblock, verb, model).is_ok();
         }
         if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview"
-            | "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
+            | "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add") {
             let kind = if method_verb(method) == Verb::Read { duduclaw_odoo::AccessKind::Read } else { duduclaw_odoo::AccessKind::Mutate };
             if duduclaw_odoo::check_blocklist(model, kind, unblock).is_err() { return false; }
         }

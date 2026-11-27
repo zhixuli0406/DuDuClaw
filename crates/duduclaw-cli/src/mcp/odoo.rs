@@ -111,6 +111,10 @@ async fn handle_odoo_tool_with_connector(
         return result;
     }
 
+    if tool == "odoo_attachment_add" {
+        return super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound).await;
+    }
+
     if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
         return super::odoo_writeback::handle(tool, params, home_dir, odoo, caller_agent, bound).await;
     }
@@ -702,11 +706,12 @@ async fn handle_odoo_tool_with_connector(
 /// need no model permission).
 pub(crate) fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, String)> {
     match tool {
-        "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" => {
+        "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add" => {
             let model = params.get("model").and_then(Value::as_str)?;
             let verb = match tool {
                 "odoo_activity_create" => "activity",
                 "odoo_note_post" => "note",
+                "odoo_attachment_add" => "attach",
                 _ => "message",
             };
             Some((verb, model.to_owned()))

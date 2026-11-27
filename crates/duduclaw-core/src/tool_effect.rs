@@ -222,7 +222,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
-        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post"
+        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" | "odoo_attachment_add"
         | "office_script" | "os_audio_set" | "os_backup_create" | "os_display_set" | "os_open"
         | "pause_cron_task" | "plan_update_step" | "responsibility_followup" | "run_cron_task"
         | "sheets_append" | "skill_bank_feedback" | "skill_extract"
@@ -298,7 +298,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "web_fetch" | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph"
         | "wiki_lint" | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search"
         | "wiki_stats" | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get"
-        | "xlsx_read" => Some(true),
+        | "xlsx_read" | "odoo_attachment_add" => Some(true),
         "activity_post" | "agent_remove" | "agent_update" | "agent_update_soul"
         | "belief_submit" | "browser_record_start" | "browser_record_stop"
         | "google_chat_send" | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
@@ -376,6 +376,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "notion_page_append",
     "notion_page_read",
     "notion_search",
+    "odoo_attachment_add",
     "odoo_activity_create",
     "odoo_note_post",
     "odoo_message_send",

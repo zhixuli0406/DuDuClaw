@@ -99,6 +99,7 @@ impl Stub {
                     _ if method == "search_read" && args[3] == "crm.lead" && found => json!([{"id":9}]),
                     _ if method == "activity_schedule" => json!([42]),
                     _ if method == "message_post" => json!(43),
+                    _ if method == "create" && args[3] == "ir.attachment" => json!(44),
                     _ => json!([]),
                 };
                 let body = json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string();
@@ -295,4 +296,144 @@ async fn message_approval_is_fixed_content_bound_and_single_use() {
     assert_eq!(writes[0][6]["message_type"], "comment");
     assert_eq!(writes[0][6]["body"], "&lt;hello&gt; @alice");
     assert!(writes[0][6].get("partner_ids").is_none());
+}
+
+fn attachment_requests(stub: &Stub) -> Vec<Value> {
+    stub.requests.lock().unwrap().iter().filter(|v|
+        v["params"]["args"][3] == "ir.attachment" && v["params"]["args"][4] == "create")
+        .map(|v| v["params"]["args"].clone()).collect()
+}
+
+fn attachment_file(home: &Path) {
+    std::fs::create_dir_all(home.join("agents/bot/attachments")).unwrap();
+    std::fs::write(home.join("agents/bot/attachments/x.pdf"), b"%PDF-1.7\nprivate attachment\n%%EOF").unwrap();
+}
+
+async fn attachment_call(home: &Path, kind: &str, follow: bool, params: &Value) -> Value {
+    super::super::with_token_verified_caller("bot", call(home, kind, follow, "odoo_attachment_add", params)).await
+}
+
+#[tokio::test]
+async fn attachment_upload_is_private_identity_bound_and_content_is_not_echoed() {
+    use base64::Engine;
+    assert_eq!(crate::mcp_auth::tool_requires_scope("odoo_attachment_add"), Some(crate::mcp_auth::Scope::OdooWrite));
+    for (kind, follow, uid) in [("company", false, 7), ("agent", false, 17), ("personal", true, 37)] {
+        let stub = Stub::start(true).await;
+        let home = home(&stub, kind, follow, &["attach:crm.lead"]);
+        attachment_file(home.path());
+        let args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf","name":"客戶文件.pdf"});
+        let result = attachment_call(home.path(), kind, follow, &args).await;
+        assert_ne!(result["isError"], true, "{result}");
+        assert!(result.to_string().contains("44"));
+        assert!(result.to_string().contains(match kind { "personal" => "alice", "company" => "公司帳號", _ => "AI 員工帳號" }));
+        let writes = attachment_requests(&stub);
+        assert_eq!(writes.len(), 1);
+        assert_eq!(writes[0][1], uid);
+        assert_eq!(writes[0][6], json!({}));
+        let values = &writes[0][5][0];
+        assert_eq!(values.as_object().unwrap().len(), 6);
+        assert_eq!(values["public"], false);
+        assert!(values.get("access_token").is_none());
+        assert_eq!(values["name"], "客戶文件.pdf");
+        assert_eq!(values["res_model"], "crm.lead");
+        assert_eq!(values["res_id"], 9);
+        assert_eq!(values["mimetype"], "application/pdf");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(values["datas"].as_str().unwrap()).unwrap();
+        assert_eq!(bytes, std::fs::read(home.path().join("agents/bot/attachments/x.pdf")).unwrap());
+        assert!(!result.to_string().contains("private attachment"));
+        assert!(!result.to_string().contains(values["datas"].as_str().unwrap()));
+    }
+}
+
+#[tokio::test]
+async fn attachment_missing_target_and_unknown_content_never_create() {
+    for found in [false, true] {
+        let stub = Stub::start(found).await;
+        let home = home(&stub, "personal", true, &[]);
+        attachment_file(home.path());
+        let mut args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
+        if found { args["content"] = json!("JVBERi0="); }
+        let result = attachment_call(home.path(), "personal", true, &args).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert!(attachment_requests(&stub).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn attachment_dispatch_refuses_bad_paths_types_symlinks_and_configured_size() {
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", true, &[]);
+    attachment_file(home.path());
+    let root = home.path().join("agents/bot/attachments");
+    for (file, bytes) in [("x.svg", b"<svg/>".as_slice()), ("x.html", b"<html/>".as_slice()),
+        ("fake.pdf", b"\x89PNG\r\n\x1a\n".as_slice())] {
+        std::fs::write(root.join(file), bytes).unwrap();
+    }
+    std::fs::create_dir_all(home.path().join("attachments")).unwrap();
+    std::fs::create_dir_all(home.path().join("agents/other/attachments")).unwrap();
+    std::fs::copy(root.join("x.pdf"), home.path().join("attachments/x.pdf")).unwrap();
+    std::fs::copy(root.join("x.pdf"), home.path().join("agents/other/attachments/x.pdf")).unwrap();
+    let config = home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, format!("{raw}\nattachment_max_mb=1\n")).unwrap();
+    std::fs::write(root.join("large.pdf"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    let mut paths = vec!["x.svg".to_owned(), "x.html".into(), "fake.pdf".into(), "large.pdf".into(),
+        "../../other/attachments/x.pdf".into(), "../../../attachments/x.pdf".into(),
+        home.path().join("attachments/x.pdf").to_string_lossy().into_owned(),
+        root.join("x.pdf").to_string_lossy().into_owned()];
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(home.path().join("attachments/x.pdf"), root.join("link.pdf")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("agents/other/attachments"), root.join("link-dir")).unwrap();
+        paths.extend(["link.pdf".into(), "link-dir/x.pdf".into()]);
+    }
+    for file in paths {
+        let result = attachment_call(home.path(), "personal", true,
+            &json!({"model":"crm.lead","res_id":9,"file":file})).await;
+        assert_eq!(result["isError"], true, "{file}: {result}");
+    }
+    for value in ["0", "26", "'broken'"] {
+        std::fs::write(&config, format!("{raw}\nattachment_max_mb={value}\n")).unwrap();
+        assert_eq!(attachment_call(home.path(), "personal", true,
+            &json!({"model":"crm.lead","res_id":9,"file":"x.pdf"})).await["isError"], true);
+    }
+    assert!(attachment_requests(&stub).is_empty());
+}
+
+#[tokio::test]
+async fn attachment_listing_and_dispatch_share_identity_and_policy_gates() {
+    use super::super::tools_list::{visible_tools_in_lane, test_principal};
+    for (follow, token, refuse, readonly, verified, allowed) in [
+        (false, false, false, false, true, false),
+        (false, true, false, false, true, true),
+        (true, false, false, false, true, true),
+        (true, false, true, false, true, false),
+        (true, false, false, true, true, false),
+        (true, false, false, false, false, false),
+    ] {
+        let stub = Stub::start(true).await;
+        let home = home(&stub, "personal", follow, if token { &["attach:crm.lead"] } else { &[] });
+        attachment_file(home.path());
+        if refuse {
+            let config = home.path().join("config.toml");
+            let raw = std::fs::read_to_string(&config).unwrap().replace("always_refuse=[]", "always_refuse=['attach:*']");
+            std::fs::write(config, raw).unwrap();
+        }
+        if readonly {
+            let config = home.path().join("agents/bot/agent.toml");
+            let raw = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(config, format!("{raw}\npermission_override='read_only'\n")).unwrap();
+        }
+        let args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
+        let principal = test_principal(false);
+        let outcome = super::super::with_token_verified_caller(if verified { "bot" } else { "other" }, async {
+            let tools = visible_tools_in_lane(&principal, home.path(), "bot", true, &duduclaw_core::ProcessLane::Normal).await;
+            let listed = tools.iter().any(|tool| tool.name == "odoo_attachment_add");
+            let result = call(home.path(), "personal", follow, "odoo_attachment_add", &args).await;
+            (listed, result)
+        }).await;
+        assert_eq!(outcome.0, allowed, "follow={follow}, token={token}, refuse={refuse}, readonly={readonly}, verified={verified}");
+        assert_eq!(outcome.1["isError"] != true, allowed, "{}", outcome.1);
+        assert_eq!(attachment_requests(&stub).len(), usize::from(allowed));
+    }
 }

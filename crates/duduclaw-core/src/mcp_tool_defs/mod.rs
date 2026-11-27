@@ -151,6 +151,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("odoo_activity_create", "res_id", "integer"),
     ("odoo_activity_create", "user_id", "integer"),
     ("odoo_note_post", "res_id", "integer"),
+    ("odoo_attachment_add", "res_id", "integer"),
     ("odoo_message_send", "res_id", "integer"),
     ("odoo_create", "values", "object"),
     ("odoo_write", "ids", "array"),
@@ -223,7 +224,7 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
-    let writeback = matches!(tool.name, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send");
+    let writeback = matches!(tool.name, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add");
     if writeback {
         for name in ["res_id", "user_id"] {
             if let Some(prop) = properties.get_mut(name) { prop["minimum"] = serde_json::json!(1); }
@@ -235,6 +236,10 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             prop["pattern"] = serde_json::json!("^[0-9]{4}-[0-9]{2}-[0-9]{2}$");
             prop["format"] = serde_json::json!("date");
         }
+    }
+    if tool.name == "odoo_attachment_add" {
+        properties.get_mut("name").unwrap()["maxLength"] = serde_json::json!(255);
+        properties.get_mut("file").unwrap()["minLength"] = serde_json::json!(1);
     }
     if tool.name == "sheets_update" {
         properties.get_mut("values").unwrap()["items"] = serde_json::json!({
@@ -310,6 +315,26 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
 #[cfg(test)]
 mod registration_tests {
     use super::{build_tool_schema, tools, EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS};
+
+    #[test]
+    fn mcp_odoo_attachment_schema_and_effects() {
+        let tool = tools().find(|t| t.name == "odoo_attachment_add").unwrap();
+        let schema = build_tool_schema(tool);
+        let input = &schema["inputSchema"];
+        assert_eq!(input["additionalProperties"], false);
+        assert_eq!(input["required"], serde_json::json!(["model", "res_id", "file"]));
+        assert_eq!(input["properties"].as_object().unwrap().len(), 4);
+        assert_eq!(input["properties"]["res_id"]["type"], "integer");
+        assert_eq!(input["properties"]["res_id"]["minimum"], 1);
+        assert_eq!(input["properties"]["file"]["type"], "string");
+        assert_eq!(input["properties"]["file"]["minLength"], 1);
+        assert_eq!(input["properties"]["name"]["maxLength"], 255);
+        assert!(input["properties"].get("content").is_none());
+        assert_eq!(crate::effect_of(tool.name), crate::ToolEffect::Modify);
+        assert_eq!(crate::tool_effect::reads_private(tool.name), Some(true));
+        assert_eq!(crate::tool_effect::egress_capable(tool.name), Some(true));
+        assert!(!EXTERNAL_TOOLS_WHITELIST.contains(&tool.name));
+    }
 
     #[test]
     fn mcp_odoo_writeback_schemas_and_effects() {
