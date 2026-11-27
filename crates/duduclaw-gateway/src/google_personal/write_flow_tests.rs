@@ -43,6 +43,53 @@ async fn write_start_requires_policy_acknowledgements_and_connected_ordinary_acc
 }
 
 #[tokio::test]
+async fn write_start_alone_persists_ever_granted_without_write_credential() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    assert!(!write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    let ordinary = std::fs::read(vault::path(&f.home)).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    assert!(start["authorization_url"].as_str().is_some());
+    assert!(write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn write_finish_account_mismatch_after_exchange_retains_ever_granted() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let ordinary = std::fs::read(vault::path(&f.home)).unwrap();
+    let start = start_write(&f, true, true).await.unwrap();
+    assert!(finish(&f, &start, "write-bob").await.unwrap_err().contains("原本連結"));
+    assert!(write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn ordinary_only_member_keeps_ever_granted_false() {
+    let f = Fixture::new();
+    enable_write(&f);
+    f.connect().await;
+    assert!(!write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    assert!(!write_store::path(&f.home).exists());
+}
+
+#[tokio::test]
+async fn write_start_fails_when_marker_cannot_be_persisted() {
+    let f = Fixture::new();
+    f.connect().await;
+    enable_write(&f);
+    let file = write_store::path(&f.home);
+    std::fs::create_dir(&file).unwrap();
+    assert!(start_write(&f, true, true).await.is_err());
+    assert!(file.is_dir());
+}
+
+#[tokio::test]
 async fn write_url_requests_only_five_scopes_without_merging() {
     let f = Fixture::new();
     f.connect().await;

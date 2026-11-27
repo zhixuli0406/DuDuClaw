@@ -265,8 +265,15 @@ fn next_epoch(store: &mut Store, kind: &str, id: &str) -> Result<u64, String> {
     Ok(epoch)
 }
 
+/// Persist the ever-granted marker with the epoch before returning a write
+/// authorization URL. Google may merge the grant even if finish never succeeds;
+/// connect also retains the marker when publishing the credential.
 pub fn begin_connection(home: &Path, owner_kind: &str, owner_id: &str) -> Result<u64, String> {
-    modify(home, |store| next_epoch(store, owner_kind, owner_id))
+    modify(home, |store| {
+        let epoch = next_epoch(store, owner_kind, owner_id)?;
+        store.ever_granted.insert(format!("{owner_kind}:{owner_id}"));
+        Ok(epoch)
+    })
 }
 
 pub fn connect(

@@ -230,6 +230,30 @@ fn missing_write_store_is_empty_without_creating_a_file() {
 }
 
 #[test]
+fn begin_connection_persists_ever_granted_without_connect_for_each_owner_namespace() {
+    for (kind, id) in [("user", "user-a"), ("home", "home")] {
+        let home = tempfile::tempdir().unwrap();
+        assert!(!ever_granted(home.path(), kind, id).unwrap());
+        let epoch = begin_connection(home.path(), kind, id).unwrap();
+        let stored = read(home.path()).unwrap();
+        assert_eq!(stored.epochs.get(&owner_key(kind, id).unwrap()), Some(&epoch));
+        assert!(stored.ever_granted.contains(&format!("{kind}:{id}")));
+        assert!(ever_granted(home.path(), kind, id).unwrap());
+        assert!(get(home.path(), kind, id).unwrap().is_none());
+        disconnect(home.path(), kind, id).unwrap();
+        assert!(ever_granted(home.path(), kind, id).unwrap());
+    }
+}
+
+#[test]
+fn ordinary_only_connection_does_not_set_ever_granted() {
+    let (home, key) = fixture();
+    connect_personal(home.path(), &key);
+    assert!(!ever_granted(home.path(), "user", "user-a").unwrap());
+    assert!(!path(home.path()).exists());
+}
+
+#[test]
 fn ever_granted_survives_disconnect_suspension_and_ordinary_disconnect() {
     let (home, key) = fixture();
     connect_personal(home.path(), &key);
