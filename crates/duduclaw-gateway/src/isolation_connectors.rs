@@ -568,6 +568,8 @@ fn verify_private_files(home: &Path) -> Result<(), CatalogError> {
 }
 
 pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
+    // A boundary route is classification, not support for protected execution.
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return None; }
     Some(match tool {
         "google_status" | "gmail_search" | "gmail_read" | "gmail_create_draft" |
         "google_chat_spaces" | "google_chat_messages" | "google_chat_send" |

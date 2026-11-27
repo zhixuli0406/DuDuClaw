@@ -64,21 +64,28 @@ fn policy_covers_exactly_the_declared_catalog() {
                 .trim_start().strip_prefix('"').expect("quoted tool name");
             let name = field.split('"').next().unwrap();
             assert!(names.insert(name), "duplicate schema {name}");
-            if UNSUPPORTED_DRIVE_WRITES.contains(&name) {
-                assert!(policy(name).is_none(), "{name}");
-                let ctx = context(name, vec![employee()]);
-                assert!(!eligible(&ctx, name), "{name}");
-                assert!(authorize(&ctx, name, &json!({}), &Fixed(vec![employee()])).is_err());
-            } else {
-                assert!(policy(name).is_some(), "unclassified schema {name}");
-            }
+            assert!(policy(name).is_some(), "unclassified schema {name}");
         }
     }
-    assert_eq!(names.len(), POLICIES.len() + UNSUPPORTED_DRIVE_WRITES.len());
+    assert_eq!(names.len(), POLICIES.len());
     for name in UNSUPPORTED_DRIVE_WRITES { assert!(names.contains(name)); }
     for entry in POLICIES {
         assert!(names.contains(entry.name));
         assert!(!entry.required.is_empty());
+    }
+}
+
+#[test]
+fn protected_drive_writes_have_exact_connector_policies() {
+    // The CLI disposition and gateway executor enforce intentional refusal;
+    // this dependency-neutral registry still classifies every ToolDef.
+    for name in UNSUPPORTED_DRIVE_WRITES {
+        let entry = policy(name).expect("Drive write policy");
+        assert_eq!(entry.route, Route::Connector, "{name}");
+        assert_eq!(entry.required, &[ResourceKind::Employee, ResourceKind::Connector], "{name}");
+        let ctx = context(name, vec![employee()]);
+        assert!(!eligible(&ctx, name), "{name}");
+        assert!(authorize(&ctx, name, &json!({}), &Fixed(vec![employee()])).is_err(), "{name}");
     }
 }
 

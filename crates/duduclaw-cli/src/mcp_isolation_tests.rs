@@ -315,6 +315,7 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     let tools: Vec<_> = crate::mcp::tools().collect();
     // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
+    // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
     assert_eq!(tools.len(), 280, "review every new tool's isolation disposition");
     for tool in tools {
         if intentional_refusal(tool.name).is_some() { continue; }
@@ -334,7 +335,16 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
         if let Some(reason) = intentional_refusal(tool.name) {
             let mut record = context().record().clone();
             record.tools = List::new(vec![Text::new(tool.name.into()).unwrap()]).unwrap();
-            record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+            let mut resources = vec![ResourceGrant::Employee { id: record.employee }];
+            if duduclaw_core::google_identity::is_drive_write_tool(tool.name) {
+                assert_eq!(reason, crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable);
+                resources.push(ResourceGrant::Connector {
+                    account: Text::new("drive-account".into()).unwrap(),
+                    binding: record.employee_binding.clone(),
+                });
+                assert_eq!(boundary_route(tool.name), Some(BoundaryRoute::Resource));
+            }
+            record.resources = List::new(resources).unwrap();
             let call = Arc::new(IsolatedCall { forks: None, home: PathBuf::new(), context: live_context(record),
                 agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
                 services: None, execution: None, worker: None, record_resolver: Some(Arc::new(RecordProbe)) });
