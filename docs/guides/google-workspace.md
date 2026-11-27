@@ -1,10 +1,10 @@
 # Google Workspace tools and security
 
-For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and twenty-nine tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
+For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and thirty-eight tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get
 
-Twenty-nine agent-facing MCP tools, gated by two scopes (`google:read` /
+Thirty-eight agent-facing MCP tools, gated by two scopes (`google:read` /
 `google:write`):
 
 | Tool | Class | What it does |
@@ -56,17 +56,15 @@ Write results report only what Google returned. `calendar_create_event` lists ho
 `formsmcp`/`tasksmcp` endpoints 404 and neither appears in Google's MCP docs),
 which is why they are served natively here.
 
+The table above lists the existing tools. The nine new cloud-drive write tools, their parameters, action switches and effect classes are listed in the [Drive write reference](google-mcp.md#cloud-drive-write-tools). They require native REST and `google:write`; the six existing Docs/Sheets write tools keep their existing gates.
+
 ### Safety design
 
 - **Sending requires confirmation.** `gmail_create_draft` saves without sending. `gmail_send_draft` sends only after a new card is confirmed for that call.
 - **Read stays read.** The read-class tools cannot modify anything in Gmail or
   Calendar.
-- **Forms, Drive and Slides are read-only.** No tool creates or edits a form,
-  writes to Drive, or modifies a presentation. Only Gmail (draft and confirmed send), Google Chat (confirmed
-  send as the member), Calendar, Sheets, Docs and Tasks have write tools.
-- **Least privilege.** Drive is requested `drive.readonly` (never `drive` or
-  `drive.file` — Docs and Sheets creation uses their own service scopes) and Slides
-  `presentations.readonly`. Docs uses the existing full `documents` scope for its write tools.
+- **Forms and Slides are read-only.** Drive writing uses nine separately gated tools; see [write tools and folder rules](google-mcp.md#cloud-drive-write-tools). All four action switches default off.
+- **Separate write permission.** Ordinary Drive reads use `drive.readonly`. The separate write connection requests `drive`, `documents` and `spreadsheets`; its credential stays in the gateway. Recording import separately uses `drive.file`. Slides uses `presentations.readonly`.
 - **Optional approval gate.** For extra caution, list the write tools under an
   agent's `agent.toml [capabilities] approval_required_tools` so each draft,
   event, or spreadsheet write waits for HITL approval:

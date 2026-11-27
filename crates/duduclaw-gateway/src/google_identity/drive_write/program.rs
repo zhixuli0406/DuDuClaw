@@ -156,8 +156,8 @@ impl OutcomeError {
     }
     pub(crate) fn user_text(self) -> &'static str {
         match self {
-            Self::InsufficientPermissions => "目前的 Google 授權不足，請重新連結帳號並同意所需權限。",
-            Self::Google(_) => "Google 無法完成這次操作。",
+            Self::InsufficientPermissions => "目前的 Google 帳號沒有足夠權限，這次操作無法完成，請帳號本人重新連結並同意所需權限。",
+            Self::Google(_) => "Google 無法完成這次操作，請帳號本人檢查檔案狀態與存取權限。",
             Self::Unconfirmed => "無法確認這次操作的結果，請先到雲端硬碟查看，不要重複執行。",
         }
     }

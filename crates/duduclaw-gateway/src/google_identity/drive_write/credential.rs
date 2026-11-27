@@ -54,7 +54,7 @@ pub(in crate::google_identity) fn resolve_route(home: &Path, agent: &str) -> Res
                 .map_err(|_| changed())?.ok_or_else(changed)?;
             let user = crate::google_personal::access::select_user(&db, agent, &selector).map_err(hard)?;
             if user.status != duduclaw_auth::UserStatus::Active {
-                return Err(Refusal::hard("person_inactive", "帳號本人目前無法使用 Google 連線。"));
+                return Err(Refusal::hard("person_inactive", "帳號本人目前無法使用 Google 連線，這次沒有執行，請管理員檢查帳號狀態。"));
             }
             // The login address and the linked Google account may differ.
             let account_email = vault::get(home, &user.id).map_err(|_| changed())?
@@ -192,13 +192,13 @@ async fn oauth_token(home: &Path, route: &IdentityRoute) -> Result<WriteToken, R
         );
         let mut updated = request.await.map_err(|_| consent(route))?;
         let scopes = updated.granted_scopes.as_deref().ok_or_else(||
-            Refusal::hard("scope_unverified", "無法確認 Google 寫入授權範圍，這次沒有執行。"))?;
+            Refusal::hard("scope_unverified", "無法確認這個 Google 帳號是否已同意雲端硬碟寫入，這次沒有執行，請帳號本人重新連結。"))?;
         if !scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE) {
             if !write_store::mark_needs_reconnect(home, &metadata).map_err(|_| changed())? {
                 return Err(changed());
             }
             return Err(Refusal::hard("drive_write_needs_member_consent",
-                "這個 Google 帳號需要重新連結雲端硬碟寫入，沒有執行。"));
+                "這次沒有執行，請帳號本人到「我的連線」重新連結雲端硬碟並同意寫入權限。"));
         }
         if updated.secret.refresh_token.is_none() {
             updated.secret.refresh_token = secret.refresh_token.take();
@@ -249,7 +249,7 @@ impl RequesterOutcome {
 pub(in crate::google_identity) fn requester_check(route: &IdentityRoute, who: &RequesterIdentity, approval_required: bool) -> Result<RequesterOutcome, Refusal> {
     if let RequesterIdentity::ChannelUser { channel, .. } = who {
         if is_public_visitor_channel(channel) {
-            return Err(Refusal::hard("public_visitor", "這個對話無法執行這項操作。"));
+            return Err(Refusal::hard("public_visitor", "這個對話無法執行雲端硬碟寫入，請帳號本人登入後提出操作。"));
         }
     }
     if matches!(route, IdentityRoute::Unsupported) { return Err(unsupported()); }
@@ -261,13 +261,13 @@ pub(in crate::google_identity) fn requester_check(route: &IdentityRoute, who: &R
         RequesterIdentity::DashboardUser { user_id } | RequesterIdentity::ChannelUser { user_id: Some(user_id), .. }
             if !user_id.is_empty() => (Some(user_id.as_str()), false),
         RequesterIdentity::System { on_behalf_of, .. } => (on_behalf_of.as_deref(), true),
-        _ => return Err(Refusal::hard("requester_refused", "無法確認這次請求的身分，沒有執行。")),
+        _ => return Err(Refusal::hard("requester_refused", "無法確認是誰提出這項操作，這次沒有執行，請帳號本人登入後重新提出。")),
     };
     if unattended && approval_required {
-        return Err(Refusal::hard("approval_unavailable_unattended", "這項寫入需要本人確認，背景工作無法等待確認，沒有執行。"));
+        return Err(Refusal::hard("approval_unavailable_unattended", "這項寫入需要帳號本人確認，背景工作無法等待確認，這次沒有執行，請帳號本人在對話中提出操作並確認。"));
     }
     if holder.is_some_and(|id| id.is_empty() || user != Some(id)) {
-        return Err(Refusal::hard("requester_not_account_holder", "這項寫入只能由帳號本人提出，沒有執行。"));
+        return Err(Refusal::hard("requester_not_account_holder", "這項寫入只能由帳號本人提出，這次沒有執行，請帳號本人提出操作。"));
     }
     Ok(if unattended { RequesterOutcome::Unattended } else { RequesterOutcome::LiveMember })
 }
