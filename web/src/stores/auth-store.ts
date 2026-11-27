@@ -47,7 +47,47 @@ interface AuthMe extends MeGrantFields {
 
 const EMPTY_DEPT_GROUPS: ReadonlySet<GrantGroup> = new Set();
 
+function isMinimalMeUser(v: unknown): v is Pick<AuthUser, 'id' | 'email' | 'role'> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const user = v as Record<string, unknown>;
+  return typeof user.id === 'string'
+    && typeof user.email === 'string'
+    && (user.role === 'admin' || user.role === 'manager' || user.role === 'employee');
+}
+
+function isAuthUser(v: unknown): v is AuthUser {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const user = v as Record<string, unknown>;
+  return typeof user.id === 'string'
+    && typeof user.email === 'string'
+    && typeof user.display_name === 'string'
+    && typeof user.status === 'string'
+    && (user.role === 'admin' || user.role === 'manager' || user.role === 'employee')
+    && [user.avatar_agent_id, user.primary_agent_id, user.department]
+      .every((value) => value === undefined || value === null || typeof value === 'string');
+}
+
+function isAgentBinding(v: unknown): v is AgentBinding {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const binding = v as Record<string, unknown>;
+  return typeof binding.user_id === 'string'
+    && typeof binding.agent_name === 'string'
+    && typeof binding.bound_at === 'string'
+    && (binding.access_level === 'owner' || binding.access_level === 'operator' || binding.access_level === 'viewer');
+}
+
+function isDepartmentGrant(v: unknown): v is { department: string; groups: string[] } {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const grant = v as Record<string, unknown>;
+  return typeof grant.department === 'string' && grant.department.length > 0
+    && Array.isArray(grant.groups) && grant.groups.every((group) => typeof group === 'string');
+}
+
 function grantState(me: MeGrantFields = {}) {
+  if ('dept_grants' in me
+    && (!Array.isArray(me.dept_grants) || !me.dept_grants.every(isDepartmentGrant))) {
+    return { deptGrants: [], deptGroups: EMPTY_DEPT_GROUPS, mainAgentAccess: false };
+  }
   const deptGrants: DepartmentGrant[] = (Array.isArray(me.dept_grants) ? me.dept_grants : []).map((grant) => ({
     department: grant.department,
     groups: grant.groups.filter(isGrantGroup),
@@ -587,14 +627,19 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     const stillCurrent = () => get().authAttempt === authAttempt && get().jwt === jwt
       && get().user?.id === user.id && get().isAuthenticated;
     try {
-      const me = await client.call('users.me') as AuthMe;
+      const me = await client.call('users.me') as MeGrantFields & { user: unknown; bindings: unknown };
       if (!stillCurrent()) return;
-      if (!me || !me.user || typeof me.user !== 'object' || Array.isArray(me.user)
-        || me.user.id !== user.id || !Array.isArray(me.bindings)) {
+      if (!me || !Array.isArray(me.bindings) || !me.bindings.every(isAgentBinding)) {
         set(grantState());
         return;
       }
-      set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      if (isAuthUser(me.user) && me.user.id === user.id) {
+        set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      } else if (isMinimalMeUser(me.user) && me.user.id === user.id) {
+        set({ user: { ...get().user!, role: me.user.role }, bindings: me.bindings, ...grantState(me) });
+      } else {
+        set(grantState());
+      }
     } catch {
       if (stillCurrent()) set(grantState());
     }
