@@ -2,6 +2,7 @@
 //! never approval-payload identity. Dashboard callers retain their RPC gates.
 //! `expected_digest` is inherited from EXPECTED_DECISION_DIGEST for dashboard
 //! calls; chat always scopes its receipt digest, including denials.
+pub(crate) mod files_org;
 mod identity;
 mod knowledge;
 mod locks;
@@ -70,11 +71,14 @@ pub(crate) enum DecisionRefusal {
     FeatureOff,
     StepUpRequired,
     Internal(String),
+    /// Preserve the existing structured org RPC error (code/message/effect).
+    Kind(Value),
 }
 
 impl DecisionRefusal {
     pub(crate) fn dashboard_text(&self) -> String {
         match self {
+            Self::Kind(error) => error.get("message").and_then(Value::as_str).unwrap_or("決定失敗").into(),
             Self::NotFound => "找不到這筆審核".into(),
             Self::Expired(text) | Self::Forbidden(text) | Self::Internal(text) => text.clone(),
             Self::AlreadyDecided { id, status, .. } => format!("approval {id} already {}", status.as_str()),
@@ -97,15 +101,25 @@ impl DecisionRefusal {
             Self::NotSupportedInChat => ["請到儀表板處理", "Please use the dashboard.", "ダッシュボードで処理してください。"],
             Self::FeatureOff => ["聊天核准已關閉，請到儀表板處理", "Chat approvals are disabled. Please use the dashboard.", "チャットでの承認は無効です。ダッシュボードで処理してください。"],
             Self::StepUpRequired => ["需要再確認一次", "One more confirmation is needed.", "追加の確認が必要です。"],
-            Self::Internal(_) => ["目前無法完成，請到儀表板確認結果後再試。", "Unable to complete this now. Check the dashboard before trying again.", "処理を完了できません。ダッシュボードで結果を確認してから再試行してください。"],
+            Self::Internal(_) | Self::Kind(_) => ["目前無法完成，請到儀表板確認結果後再試。", "Unable to complete this now. Check the dashboard before trying again.", "処理を完了できません。ダッシュボードで結果を確認してから再試行してください。"],
         };
         words[match lang { Lang::ZhTw => 0, Lang::En => 1, Lang::Ja => 2 }].into()
+    }
+
+    pub(crate) fn dashboard_frame(&self) -> crate::protocol::WsFrame {
+        match self {
+            Self::Kind(error) => crate::protocol::WsFrame::Response {
+                id: String::new(), ok: false, payload: None, error: Some(error.clone()),
+            },
+            _ => crate::protocol::WsFrame::error_response("", &self.dashboard_text()),
+        }
     }
 
     fn from_kind_error(error: String) -> Self {
         match error.as_str() {
             "approval digest mismatch; refetch the approval before deciding" => Self::DigestMismatch,
             crate::on_behalf_of::self_approval::REFUSAL
+                | files_org::SELF_APPROVAL_REFUSAL
                 | crate::knowledge::add_source_approval::NOT_EDITOR => Self::Forbidden(error),
             _ => Self::Internal(error),
         }
@@ -117,7 +131,7 @@ impl DecisionRefusal {
             Self::AlreadyDecided { .. } => "already_decided", Self::Forbidden(_) => "forbidden",
             Self::DigestMismatch => "digest_mismatch", Self::NotSupportedInChat => "not_supported",
             Self::FeatureOff => "feature_off", Self::StepUpRequired => "step_up_required",
-            Self::Internal(_) => "internal",
+            Self::Internal(_) | Self::Kind(_) => "internal",
         }
     }
 }
@@ -128,8 +142,7 @@ impl Decider {
     }
 }
 
-/// Specialized legacy side effects remain with their existing handlers.
-/// P6/P7 replace the explicit unsupported arms below, not this predicate.
+/// Unbound kinds whose side effects are owned by this service.
 pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
     if rec.binding.is_some() { return false; }
     match rec.action_kind.as_str() {
@@ -137,9 +150,9 @@ pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
         | crate::knowledge::add_source_approval::ACTION_KIND
         | crate::expert_skills::SKILLS_ACTION_KIND
         | crate::autopilot_approval::ACTION_KIND
-        | super::cli_egress::KIND => true,
-        crate::agent_files::approval::ACTION_KIND | crate::org_change_approval::ACTION_KIND
-        | super::WORKFLOW_ACTIVATION_KIND | "discovery"
+        | super::cli_egress::KIND
+        | crate::agent_files::approval::ACTION_KIND | crate::org_change_approval::ACTION_KIND => true,
+        super::WORKFLOW_ACTIVATION_KIND | "discovery"
         | crate::custom_skills::ACTION_KIND_SKILL_CREATE
         | crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE => false,
         _ => rec.payload.get("egress_guard").is_some()
@@ -167,7 +180,7 @@ pub(crate) async fn decide(
 }
 
 async fn decide_locked(
-    env: &DecisionEnv, id: &ApprovalId, approve: bool, _reason: &str, by: &Decider,
+    env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
 ) -> Result<DecisionOutcome, DecisionRefusal> {
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
@@ -175,10 +188,8 @@ async fn decide_locked(
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
         Decider::ChatAdmin(proof) => {
-            // These are deliberately separate extension points for P6 and P7.
+            // Workflow/bound decisions remain the P7 extension point.
             match rec.action_kind.as_str() {
-                crate::agent_files::approval::ACTION_KIND => return Err(DecisionRefusal::NotSupportedInChat),
-                crate::org_change_approval::ACTION_KIND => return Err(DecisionRefusal::NotSupportedInChat),
                 super::WORKFLOW_ACTIVATION_KIND => return Err(DecisionRefusal::NotSupportedInChat),
                 _ if rec.binding.is_some() || rec.request_kind != super::RequestKind::Approval => return Err(DecisionRefusal::NotSupportedInChat),
                 _ => (),
@@ -224,6 +235,25 @@ async fn decide_locked(
             crate::knowledge::add_source_approval::decide_as_locked(env, id, approve, by, &user, &actor)
                 .await.map_err(DecisionRefusal::from_kind_error)?
         }
+        crate::agent_files::approval::ACTION_KIND if rec.binding.is_none() => {
+            if matches!(by, Decider::ChatAdmin(_)) {
+                check_digest(&rec)?;
+                chat_preflight(env, &rec, approve, by).await?;
+            }
+            files_org::agent_file_change(env, id, approve, by, &actor).await?
+        }
+        crate::org_change_approval::ACTION_KIND if rec.binding.is_none() => {
+            if matches!(by, Decider::ChatAdmin(_)) {
+                check_digest(&rec)?;
+                if let Err(error) = chat_preflight(env, &rec, approve, by).await {
+                    files_org::audit_recovery_refusal(env, &rec, &error);
+                    return Err(error);
+                }
+            }
+            // The kind owns state/expiry ordering: an applied journal must
+            // be recovered before treating its original base as stale.
+            files_org::org_change(env, id, approve, reason, by, &actor).await?
+        }
         _ if handles(&rec) => {
             check_state(env, &rec, false).await?;
             check_digest(&rec)?;
@@ -265,6 +295,21 @@ async fn decide_locked(
         }
     };
     let value = value_result?;
+    // An org journal may finish a different Admin's earlier decision. Return
+    // the durable identity, not the identity of the person who retried it.
+    if rec.action_kind == crate::org_change_approval::ACTION_KIND {
+        let saved = env.broker.get(id).await.map_err(DecisionRefusal::Internal)?
+            .ok_or(DecisionRefusal::NotFound)?;
+        let decided_by = saved.decided_by.ok_or_else(|| DecisionRefusal::Internal("missing recorded decider".into()))?;
+        let (user_id, channel) = if let Ok(chat) = decided_by.parse::<chat_admin::ledger::DecidedBy>() {
+            (chat.user_id().to_owned(), Some(chat.channel()))
+        } else if let Some(user) = decided_by.strip_prefix("dashboard:") {
+            // The broker/journal constructs this exact dashboard format.
+            (user.to_owned(), None)
+        } else { return Err(DecisionRefusal::Internal("invalid recorded decider".into())); };
+        let display_name = identity::display_name(env, &user_id).await;
+        return Ok(DecisionOutcome { value, status: saved.status, decided_by, display_name, channel });
+    }
     Ok(DecisionOutcome { value, status, decided_by, display_name, channel })
 }
 
@@ -341,6 +386,8 @@ async fn general(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, by: &De
 fn is_general(rec: &ApprovalRecord) -> bool {
     rec.action_kind != crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         && rec.action_kind != crate::knowledge::add_source_approval::ACTION_KIND
+        && rec.action_kind != crate::agent_files::approval::ACTION_KIND
+        && rec.action_kind != crate::org_change_approval::ACTION_KIND
 }
 
 async fn recorded_chat_decision(

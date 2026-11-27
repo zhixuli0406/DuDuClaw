@@ -256,8 +256,7 @@ async fn step_up_kind_with_tap_requires_step_but_denial_does_not() {
 #[tokio::test]
 async fn t3_and_future_package_kinds_refused_in_chat() {
     for kind in [crate::approval::operator_cli_gate::OPERATOR_CLI_KINDS[0].kind,
-        crate::isolation_background::PERSONAL_DELEGATION_KIND, crate::agent_files::approval::ACTION_KIND,
-        crate::org_change_approval::ACTION_KIND, crate::approval::WORKFLOW_ACTIVATION_KIND] {
+        crate::isolation_background::PERSONAL_DELEGATION_KIND, crate::approval::WORKFLOW_ACTIVATION_KIND] {
         let f = Fixture::new();
         let id = f.simple(kind).await;
         let proof = f.proof(&id).await;
@@ -423,4 +422,375 @@ async fn password_change_required_refused() {
             "UPDATE users SET must_change_password=1 WHERE id=?1", [&f.user],
         ).unwrap();
     }).await;
+}
+
+// P6 fixtures use the same profile writer/sidecar and org Proposal/journal
+// shapes as handlers/tests/{agent_files_rpc,org_change_rpc}_tests.rs, with
+// UUID Admins and the verified transport evidence from the P5 fixture.
+const FILE_BEFORE: &str = "我是客服，協助回答產品問題。\n";
+const FILE_AFTER: &str = "我是客服，先確認問題，再說明處理方式。\n";
+
+impl Fixture {
+    async fn files_org() -> Self {
+        let mut f = Self::new();
+        // Registry scans require all non-default AgentConfig sections.
+        crate::knowledge::test_fixtures::agent(&f.env.home, "support", r#"
+[agent]
+name = "support"
+display_name = "Support"
+role = "specialist"
+status = "active"
+trigger = "@support"
+reports_to = ""
+icon = "x"
+department = "原部門"
+[model]
+preferred = "claude-sonnet-4-6"
+fallback = "claude-haiku-4-5"
+account_pool = ["main"]
+[container]
+timeout_ms = 60000
+max_concurrent = 1
+readonly_project = true
+[heartbeat]
+enabled = false
+interval_seconds = 3600
+max_concurrent_runs = 1
+cron = ""
+[budget]
+monthly_limit_cents = 500
+warn_threshold_percent = 80
+hard_stop = false
+[permissions]
+can_create_agents = false
+can_send_cross_agent = true
+can_modify_own_skills = false
+can_modify_own_soul = false
+can_schedule_tasks = false
+allowed_channels = []
+[evolution]
+skill_auto_activate = false
+skill_security_scan = true
+"#);
+        std::fs::write(f.env.home.join("agents/support/SOUL.md"), FILE_BEFORE).unwrap();
+        {
+            let guard = duduclaw_core::org_store::lock_org_mutations(&f.env.home).unwrap();
+            guard.upsert("support", duduclaw_core::org_store::OrgEntry::new("", "原部門")).unwrap();
+        }
+        let mut registry = AgentRegistry::new(f.env.home.join("agents"));
+        registry.scan().await.unwrap();
+        assert!(registry.get("support").is_some(), "fixture employee must load");
+        f.env.registry = Some(Arc::new(RwLock::new(registry)));
+        f
+    }
+
+    async fn file_change(&self) -> ApprovalId {
+        use crate::agent_files::{FileKey, approval, verdict::{Analysis, Verdict}};
+        let analysis = Analysis {
+            user_id: self.ack.clone(), agent_id: "support".into(), file: FileKey::Soul,
+            base_hash: crate::agent_files::hash_of(FILE_BEFORE),
+            content_sha256: crate::agent_files::hash_of(FILE_AFTER),
+            verdict: Verdict::Warn, basis: "review", summary: String::new(),
+            reasons: vec![], source: "dashboard",
+        };
+        ApprovalId::from(approval::file_request(&self.env.home, &analysis, FILE_AFTER,
+            "proposer@example.test", "調整說明方式").await.unwrap())
+    }
+
+    async fn org_change(&self, proposer: &str) -> ApprovalId {
+        use crate::org_change_approval::{self as oc, Proposal};
+        let before = duduclaw_core::org_store::load_for_write(&self.env.home).unwrap()
+            .get("support").cloned().unwrap();
+        let proposal = Proposal {
+            agent_id: "support".into(), before,
+            after: duduclaw_core::org_store::OrgEntry::new("", "新部門"),
+            base: duduclaw_core::org_change::entry_hash(&self.env.home, "support"),
+            proposer: proposer.into(), proposer_email: "proposer@example.test".into(),
+            reason: "調整負責部門".into(),
+        };
+        self.env.broker.request("support", oc::ACTION_KIND, "review", proposal.to_payload(), oc::TTL_SECS).await.unwrap()
+    }
+
+    async fn files_org_card(&self, org: bool) -> ApprovalId {
+        if org { self.org_change(&self.ack).await } else { self.file_change().await }
+    }
+
+    fn files_org_effect(&self, org: bool) -> Value {
+        if org {
+            let authority = duduclaw_core::org_store::load_for_write(&self.env.home).unwrap();
+            let mirror = duduclaw_core::org_store::read_mirror(&self.env.home.join("agents/support/agent.toml")).unwrap();
+            json!({"authority":crate::org_change_approval::entry_json(authority.get("support").unwrap()),
+                "mirror":crate::org_change_approval::entry_json(&mirror)})
+        } else {
+            json!(std::fs::read_to_string(self.env.home.join("agents/support/SOUL.md")).unwrap())
+        }
+    }
+
+    async fn assert_ledger(&self, id: &ApprovalId, chat: bool) {
+        let rec = self.env.broker.get(id).await.unwrap().unwrap();
+        let conn = self.env.broker.store.conn.lock().await;
+        let count: i64 = conn.query_row("SELECT count(*) FROM chat_admin_decisions WHERE approval_id=?1",
+            [id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(count, i64::from(chat));
+        assert_eq!(chat_admin::ledger::accepts(&conn, &rec), chat);
+    }
+
+    fn org_journal_path(&self, id: &ApprovalId) -> std::path::PathBuf {
+        self.env.home.join("org_change_journal").join(format!("{id}.json"))
+    }
+
+    fn decision_failure_audits(&self) -> usize {
+        std::fs::read_to_string(self.env.home.join("security_audit.jsonl")).unwrap()
+            .lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|event| event["event_type"] == "org_change_decision_unrecorded").count()
+    }
+}
+
+#[tokio::test]
+async fn files_org_chat_and_dashboard_have_identical_effects_and_actor_evidence() {
+    for org in [false, true] {
+        for approve in [false, true] {
+            let mut effects = Vec::new();
+            for chat in [false, true] {
+                let f = Fixture::files_org().await;
+                let id = f.files_org_card(org).await;
+                let by = if chat { Decider::ChatAdmin(f.proof(&id).await) } else { f.dashboard() };
+                let outcome = Box::pin(decide(&f.env, &id, approve, "fixture decision", &by)).await.unwrap();
+                let expected_by = if chat { format!("chat-admin:{}:telegram:tap", f.user) }
+                    else { format!("dashboard:{}", f.user) };
+                let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+                assert_eq!(rec.status, if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied });
+                assert_eq!(outcome.status, rec.status);
+                assert_eq!(rec.decided_by.as_deref(), Some(expected_by.as_str()));
+                assert_eq!(outcome.decided_by, expected_by);
+                assert_eq!(outcome.channel, chat.then_some(ChatChannel::Telegram));
+                f.assert_ledger(&id, chat).await;
+                let effect = f.files_org_effect(org);
+                if org {
+                    let department = if approve { "新部門" } else { "原部門" };
+                    assert_eq!(effect["authority"]["department"], department);
+                    assert_eq!(effect["mirror"], effect["authority"]);
+                } else {
+                    assert_eq!(effect, json!(if approve { FILE_AFTER } else { FILE_BEFORE }));
+                }
+                effects.push(effect);
+            }
+            assert_eq!(effects[0], effects[1], "org={org} approve={approve}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn files_org_side_effect_failures_leave_both_entry_points_pending() {
+    for org in [false, true] {
+        for chat in [false, true] {
+            let f = Fixture::files_org().await;
+            let id = f.files_org_card(org).await;
+            let by = if chat { Decider::ChatAdmin(f.proof(&id).await) } else { f.dashboard() };
+            if org {
+                // A corrupt authority is an IO/config failure, not a stale
+                // proposal: do not turn it into a terminal denial.
+                std::fs::write(f.env.home.join("org.toml"), "[broken").unwrap();
+            } else {
+                crate::agent_files::approval::remove_sidecar(&f.env.home, id.as_str());
+            }
+            assert!(Box::pin(decide(&f.env, &id, true, "", &by)).await.is_err());
+            assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+            f.assert_ledger(&id, false).await;
+            if org {
+                assert_eq!(duduclaw_core::org_store::read_mirror(&f.env.home.join("agents/support/agent.toml")).unwrap().department, "原部門");
+            } else {
+                assert_eq!(f.files_org_effect(false), json!(FILE_BEFORE));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn file_change_missing_registry_fails_closed_for_chat_and_dashboard() {
+    for chat in [false, true] {
+        let mut f = Fixture::files_org().await;
+        let id = f.file_change().await;
+        let by = if chat { Decider::ChatAdmin(f.proof(&id).await) } else { f.dashboard() };
+        f.env.registry = None;
+        assert!(matches!(Box::pin(decide(&f.env, &id, true, "", &by)).await, Err(DecisionRefusal::Internal(_))));
+        assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+        assert_eq!(f.files_org_effect(false), json!(FILE_BEFORE));
+        f.assert_ledger(&id, false).await;
+    }
+}
+
+#[tokio::test]
+async fn org_change_chat_proposer_cannot_self_approve_but_can_deny() {
+    let f = Fixture::files_org().await;
+    let path = f.env.home.join("config.toml");
+    let config = std::fs::read_to_string(&path).unwrap() + "\n[approval]\nforbid_self_approval=true\n";
+    std::fs::write(path, config).unwrap();
+    // No on_behalf_of: this specifically exercises the payload proposer gate.
+    let id = f.org_change(&f.user).await;
+    let by = Decider::ChatAdmin(f.proof(&id).await);
+    let result = Box::pin(decide(&f.env, &id, true, "", &by)).await;
+    assert!(matches!(result, Err(DecisionRefusal::Forbidden(_))));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert_eq!(f.files_org_effect(true)["authority"]["department"], "原部門");
+    Box::pin(decide(&f.env, &id, false, "", &by)).await.unwrap();
+    assert_eq!(f.status(&id).await, ApprovalStatus::Denied);
+    f.assert_ledger(&id, true).await;
+}
+
+#[tokio::test]
+async fn file_change_step_up_tap_refused_and_web_succeeds() {
+    let f = Fixture::files_org().await;
+    f.config(true, "telegram", &[crate::agent_files::approval::ACTION_KIND]);
+    let id = f.file_change().await;
+    let mut proof = f.proof(&id).await;
+    assert!(matches!(Box::pin(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof.clone()))).await,
+        Err(DecisionRefusal::StepUpRequired)));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert_eq!(f.files_org_effect(false), json!(FILE_BEFORE));
+    f.assert_ledger(&id, false).await;
+    proof.step = Step::Web;
+    let outcome = Box::pin(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof))).await.unwrap();
+    assert_eq!(outcome.decided_by, format!("chat-admin:{}:telegram:web", f.user));
+    assert_eq!(f.files_org_effect(false), json!(FILE_AFTER));
+    f.assert_ledger(&id, true).await;
+    let conn = f.env.broker.store.conn.lock().await;
+    let required: bool = conn.query_row("SELECT step_required FROM chat_admin_decisions WHERE approval_id=?1",
+        [id.as_str()], |row| row.get(0)).unwrap();
+    assert!(required);
+}
+
+async fn applied_chat_journal(f: &Fixture) -> (ApprovalId, ChatAdminProof) {
+    let id = f.org_change(&f.ack).await;
+    let proof = f.proof(&id).await;
+    files_org::decide_failpoint::arm(id.as_str());
+    let result = Box::pin(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof.clone()))).await;
+    files_org::decide_failpoint::disarm(id.as_str());
+    assert!(matches!(result, Err(DecisionRefusal::Kind(ref error)) if error["code"] == "decision_unrecorded"));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert_eq!(f.files_org_effect(true)["authority"]["department"], "新部門");
+    f.assert_ledger(&id, false).await;
+    (id, proof)
+}
+
+#[tokio::test]
+async fn org_change_recovery_preserves_chat_actor_and_atomically_replays_ledger() {
+    for chat_retry in [false, true] {
+        let mut f = Fixture::files_org().await;
+        let (id, proof) = applied_chat_journal(&f).await;
+        let journal: Value = serde_json::from_str(&std::fs::read_to_string(f.org_journal_path(&id)).unwrap()).unwrap();
+        let expected_by = format!("chat-admin:{}:telegram:tap", f.user);
+        assert_eq!(journal["decided_by"], expected_by);
+        assert_eq!(journal["chat_admin"]["card_id"], proof.card_id);
+        assert_eq!(journal["chat_admin"]["digest"], proof.digest);
+        assert_eq!(journal["chat_admin"]["channel"], "telegram");
+        assert_eq!(journal["chat_admin"]["step"], "tap");
+        assert_eq!(journal["chat_admin"]["step_required"], false);
+        let effect = f.files_org_effect(true);
+        // Drop/reopen the broker to ensure replay reads durable state.
+        f.env.broker = ApprovalBroker::open(&f.env.home).unwrap();
+        let by = if chat_retry { Decider::ChatAdmin(proof) } else {
+            Decider::Dashboard(f.db().live_user_context(&f.ack).unwrap().unwrap())
+        };
+        let outcome = Box::pin(decide(&f.env, &id, true, "retry", &by)).await.unwrap();
+        assert_eq!(outcome.decided_by, expected_by);
+        assert_eq!(outcome.channel, Some(ChatChannel::Telegram));
+        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.decided_by.as_deref(), Some(expected_by.as_str()));
+        assert_eq!(rec.status, ApprovalStatus::Approved);
+        assert_eq!(f.files_org_effect(true), effect);
+        f.assert_ledger(&id, true).await;
+        assert!(!f.org_journal_path(&id).exists());
+        let conn = f.env.broker.store.conn.lock().await;
+        let status: String = conn.query_row("SELECT status FROM chat_admin_cards WHERE approval_id=?1",
+            [id.as_str()], |row| row.get(0)).unwrap();
+        assert_eq!(status, "consumed");
+    }
+}
+
+#[tokio::test]
+async fn org_change_recovery_expired_chat_receipt_never_falls_back_to_dashboard() {
+    for chat_retry in [false, true] {
+        let f = Fixture::files_org().await;
+        let (id, proof) = applied_chat_journal(&f).await;
+        {
+            let conn = f.env.broker.store.conn.lock().await;
+            conn.execute("UPDATE chat_admin_cards SET valid_until='2000-01-01T00:00:00Z' WHERE card_id=?1",
+                [&proof.card_id]).unwrap();
+        }
+        let audits_before = f.decision_failure_audits();
+        let by = if chat_retry { Decider::ChatAdmin(proof) } else { f.dashboard() };
+        assert!(Box::pin(decide(&f.env, &id, true, "retry", &by)).await.is_err());
+        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.status, ApprovalStatus::Pending);
+        assert_eq!(rec.decided_by, None);
+        f.assert_ledger(&id, false).await;
+        assert!(f.org_journal_path(&id).exists());
+        assert_eq!(f.decision_failure_audits(), audits_before + 1);
+        assert_eq!(f.files_org_effect(true)["authority"]["department"], "新部門");
+    }
+}
+
+#[tokio::test]
+async fn org_change_old_format_journal_replays_original_dashboard_user() {
+    let mut f = Fixture::files_org().await;
+    let id = f.org_change(&f.ack).await;
+    files_org::decide_failpoint::arm(id.as_str());
+    let result = Box::pin(decide(&f.env, &id, true, "", &f.dashboard())).await;
+    files_org::decide_failpoint::disarm(id.as_str());
+    assert!(result.is_err());
+    let path = f.org_journal_path(&id);
+    let mut journal: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    journal.as_object_mut().unwrap().remove("decided_by");
+    journal.as_object_mut().unwrap().remove("chat_admin");
+    std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+    f.env.broker = ApprovalBroker::open(&f.env.home).unwrap();
+    let by = Decider::Dashboard(f.db().live_user_context(&f.ack).unwrap().unwrap());
+    let outcome = Box::pin(decide(&f.env, &id, true, "retry", &by)).await.unwrap();
+    let expected_by = format!("dashboard:{}", f.user);
+    assert_eq!(outcome.decided_by, expected_by);
+    assert_eq!(outcome.channel, None);
+    let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.decided_by.as_deref(), Some(expected_by.as_str()));
+    assert_eq!(rec.status, ApprovalStatus::Approved);
+    f.assert_ledger(&id, false).await;
+    assert!(!f.org_journal_path(&id).exists());
+}
+
+#[tokio::test]
+async fn files_org_chat_receipt_and_digest_checked_before_any_effect() {
+    for org in [false, true] {
+        for missing in [false, true] {
+            let f = Fixture::files_org().await;
+            let id = f.files_org_card(org).await;
+            let before = f.files_org_effect(org);
+            let mut proof = f.proof(&id).await;
+            if missing { proof.card_id = uuid::Uuid::new_v4().to_string(); }
+            else { proof.digest = "0".repeat(64); }
+            assert!(Box::pin(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof))).await.is_err());
+            assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+            assert_eq!(f.files_org_effect(org), before);
+            f.assert_ledger(&id, false).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn org_change_malformed_new_journal_identity_never_uses_legacy_fallback() {
+    for field in ["decided_by", "chat_admin"] {
+        let f = Fixture::files_org().await;
+        let (id, _) = applied_chat_journal(&f).await;
+        let path = f.org_journal_path(&id);
+        let mut journal: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Removing only one new field must not turn a chat journal into an
+        // old-format dashboard journal. Only absence of both is legacy.
+        journal.as_object_mut().unwrap().remove(field);
+        std::fs::write(path, serde_json::to_vec(&journal).unwrap()).unwrap();
+        assert!(Box::pin(decide(&f.env, &id, true, "retry", &f.dashboard())).await.is_err());
+        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+        assert_eq!(rec.status, ApprovalStatus::Pending);
+        assert_eq!(rec.decided_by, None);
+        f.assert_ledger(&id, false).await;
+        assert!(f.org_journal_path(&id).exists());
+    }
 }

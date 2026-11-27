@@ -244,24 +244,8 @@ impl MethodHandler {
                 &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
             )).await {
                 Ok(outcome) => WsFrame::ok_response("", outcome.value),
-                Err(error) => WsFrame::error_response("", &error.dashboard_text()),
+                Err(error) => error.dashboard_frame(),
             };
-        }
-        // R-M5: a knowledge review applies its side effect FIRST and records
-        // the decision only after it succeeded — a failed side effect leaves
-        // the approval pending (retryable) instead of terminal with the claim
-        // stranded.
-        // A profile file change applies first and records the decision only
-        // after the write succeeded (same order as a knowledge review).
-        if let Some(rec) = &record {
-            if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
-                return Box::pin(self.decide_agent_file_change(&broker, &approval_id, approve, ctx)).await;
-            }
-            // RM-027: an org chart change applies first (re-validated, base
-            // re-checked) and records the decision only after the write.
-            if rec.action_kind == crate::org_change_approval::ACTION_KIND {
-                return Box::pin(self.decide_org_change(&broker, &approval_id, approve, &reason, ctx)).await;
-            }
         }
         // L1: a knowledge review past its deadline is a denial (TTL = DENY),
         // even before the expiry sweep has flipped its status — approving it

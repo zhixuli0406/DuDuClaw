@@ -551,6 +551,30 @@ impl ApprovalBroker {
         Ok(())
     }
 
+    /// Actor-aware equivalent of decide_as while an org-change decision
+    /// lease owns the row. Preserve the lease/TTL contract and atomically
+    /// consume the receipt with the ledger and decision; never release the
+    /// lease just to use an ordinary unleased write.
+    pub(crate) async fn decide_as_with_lease(
+        &self, id: &ApprovalId, lease: &DecisionLease, approve: bool,
+        actor: &chat_admin::DecisionActor,
+    ) -> Result<(), String> {
+        match actor {
+            chat_admin::DecisionActor::Dashboard { user_id } =>
+                self.decide_with_lease(id, lease, approve, &format!("dashboard:{user_id}")).await,
+            chat_admin::DecisionActor::ChatAdmin(entry) => {
+                let n = self.store.decide_leased_with_ledger(
+                    id, &lease.token, approve, entry, &Utc::now().to_rfc3339(),
+                ).await?;
+                if n == 0 {
+                    return Err(format!("approval {id}: the decision lease lapsed or the row is no longer pending"));
+                }
+                info!(approval_id = %id, decided_by = %entry.decided_by(), "approval decided (leased chat-admin)");
+                Ok(())
+            }
+        }
+    }
+
     /// Test-only seam: stamp the delivered notification destination without
     /// going through a real channel send, so `approval_notify`'s inbound tests
     /// can exercise the destination-match authorization path.

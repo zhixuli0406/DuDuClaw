@@ -540,6 +540,29 @@ impl ApprovalStore {
         ).await
     }
 
+    /// Shared by ordinary and leased writes, inside the status transaction.
+    fn validate_chat_decision(&self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry) -> Result<(), String> {
+        // Re-read classification and binding under the write lock.
+        // Live Admin/proof checks belong to the decision service.
+        if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
+            return Err("bound requests require authenticated decision context".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
+            Some(home) => decision_digest_at(home, rec),
+            None => decision_digest(rec),
+        };
+        if entry.digest != digest {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
     async fn decide_if_pending_inner(
         &self,
         id: &ApprovalId,
@@ -565,24 +588,7 @@ impl ApprovalStore {
                     check_expected_digest(rec)?;
                 }
                 if let Some(entry) = ledger {
-                    // Re-read classification and binding under the write lock.
-                    // Live Admin/proof checks belong to the decision service.
-                    if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
-                        return Err("chat-admin decisions refuse T3 approvals".into());
-                    }
-                    if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
-                        return Err("bound requests require authenticated decision context".into());
-                    }
-                    if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
-                        return Err("chat-admin decision requires step-up".into());
-                    }
-                    let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
-                        Some(home) => decision_digest_at(home, rec),
-                        None => decision_digest(rec),
-                    };
-                    if entry.digest != digest {
-                        return Err("approval digest mismatch; refetch the approval before deciding".into());
-                    }
+                    self.validate_chat_decision(rec, entry)?;
                 }
             }
             let n = tx.execute(
@@ -698,13 +704,30 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
+        self.decide_leased_inner(id, token, status, decided_by, decided_at, None).await
+    }
+
+    pub(super) async fn decide_leased_with_ledger(
+        &self, id: &ApprovalId, token: &str, approve: bool,
+        entry: &chat_admin::LedgerEntry, decided_at: &str,
+    ) -> Result<usize, String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        self.decide_leased_inner(id, token, status, &entry.decided_by().to_string(), decided_at, Some(entry)).await
+    }
+
+    async fn decide_leased_inner(
+        &self, id: &ApprovalId, token: &str, status: ApprovalStatus,
+        decided_by: &str, decided_at: &str, ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| format!("begin leased approval decision: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
             let rec = record_in_connection(&tx, id)?;
             match &rec {
-                Some(r) if r.status == ApprovalStatus::Pending => check_expected_digest(r)?,
+                Some(r) if r.status == ApprovalStatus::Pending => {
+                    check_expected_digest(r)?;
+                    if let Some(entry) = ledger { self.validate_chat_decision(r, entry)?; }
+                }
                 _ => return Ok(0),
             }
             let n = tx.execute(
@@ -716,7 +739,10 @@ impl ApprovalStore {
                     live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                 params![status.as_str(), decided_by, decided_at, id.as_str(), token],
             ).map_err(|e| format!("decide leased approval: {e}"))?;
-            tx.commit().map_err(|e| format!("commit leased approval decision: {e}"))?;
+            if n > 0 && let Some(entry) = ledger {
+                chat_admin::ledger::insert_and_consume(&tx, id, status.is_granted(), entry, decided_at)?;
+            }
+            commit_live_write(tx)?;
             (n, rec)
         };
         if n > 0 && let Some(rec) = rec {
