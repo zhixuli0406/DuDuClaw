@@ -188,6 +188,24 @@ fn target(receipt: &Receipt) -> Option<Target> {
             proof_account: receipt.account.clone(), proof_dm: receipt.dm.clone(), proven_at: 0 } })
 }
 
+/// A web decision consumes its receipt before any provider edit. Re-read the
+/// committed result and edit that exact original delivery, never another bot.
+pub(crate) async fn collapse_step_up_card(home: &Path, store: &ApprovalStore, receipt: &Receipt) {
+    let Ok(Some(current)) = store.get(&ApprovalId::from(receipt.approval_id.clone())).await else { return; };
+    if !matches!(current.status, ApprovalStatus::Approved | ApprovalStatus::Denied) { return; }
+    let Some(at) = current.decided_at.as_deref().and_then(|v| DateTime::parse_from_rfc3339(v).ok()) else { return; };
+    let (Some(target), Some(mid)) = (target(receipt), &receipt.message_id) else { return; };
+    let lang = press::language(home).await;
+    let name = recorded_name(home, &current).await.unwrap_or_else(|| press::words(lang, "管理員", "Administrator", "管理者"));
+    let text = card::result_text(card::kind_label(&current, lang), current.status == ApprovalStatus::Approved,
+        &name, at.with_timezone(&Utc), &decision_channel_label(&current, lang), lang);
+    let message = PushedMessage { edit_chat_id: receipt.dm.clone(), message_id: mid.clone() };
+    let sender = Network::new(home);
+    if !tokio::time::timeout(Duration::from_secs(15), sender.edit(&target, &message, &text)).await.unwrap_or(false) {
+        tracing::warn!("chat-admin web result card edit failed");
+    }
+}
+
 async fn rewrite(store: &ApprovalStore, live: Vec<Receipt>, text: &str, status: TerminalStatus, sender: &impl Sender) {
     for receipt in live.into_iter().filter(|r| r.purpose == "rm143" && r.status == "live") {
         // Claim the terminal transition before network I/O. A competing press

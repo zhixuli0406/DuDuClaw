@@ -8,6 +8,8 @@
 //! `UserDb::migration_step_up`) and that proof's CSRF token. The step-up
 //! method here is the same proof, so a session verified on either page is
 //! valid on both. No request field can claim Admin, MFA or step-up state.
+//! `isolation.connector_step_up` also returns `step_up_csrf` (32 JSON bytes),
+//! allowing RM-143 confirmation without requiring an isolation catalog read.
 //!
 //! F5 UI-RPC: `isolation.connector_list` rows also carry the employees that
 //! may use each route (`employees`, plus `employee_id`/`employee_label`/
@@ -156,9 +158,9 @@ fn serve(home: &Path, db: &UserDb, user: &str, session: &str, epoch: u64, method
     if now < 0 { return Err("無法確認目前時間。"); }
     if method == STEP_UP {
         let input: StepUpRequest = serde_json::from_value(params).map_err(|_| "請輸入密碼與驗證碼。")?;
-        db.migration_step_up(user, session, epoch, &input.password, &input.code, &crate::mfa::Cipher(home), now)
+        let proof = db.migration_step_up(user, session, epoch, &input.password, &input.code, &crate::mfa::Cipher(home), now)
             .map_err(|_| "驗證失敗，請確認密碼與新的驗證碼後重試。")?;
-        return Ok(json!({ "verified": true }));
+        return Ok(json!({ "verified": true, "step_up_csrf": proof.csrf }));
     }
     let proof = db.migration_confirmation_session(user, session, epoch, now)
         .map_err(|_| "登入憑證已失效，請重新登入。")?;

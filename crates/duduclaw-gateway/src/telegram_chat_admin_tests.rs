@@ -121,7 +121,7 @@ async fn toast_is_character_bounded_and_only_card_text_requests_an_edit() {
     let api = telegram_poll_api_base(&provider.token);
     let client = reqwest::Client::new();
     let text = "界🦀".repeat(150);
-    let outcome = PressOutcome { reply:text.clone(), card_text:Some(text.clone()), refused_reason:None };
+    let outcome = PressOutcome { reply:text.clone(), card_text:Some(text.clone()), card_link:None, refused_reason:None };
     reply_to_decision_press(&cb, &client, &api, &outcome).await;
     let calls = provider.requests();
     assert_eq!(calls.len(), 2);
@@ -140,4 +140,20 @@ async fn toast_is_character_bounded_and_only_card_text_requests_an_edit() {
     assert_eq!(calls.iter().filter(|call| call.path.ends_with("/editMessageText")).count(), 1);
     assert_eq!(calls[3].body["text"], "legacy success");
     assert_eq!(calls[4].body["text"], "⚠️ legacy refusal");
+}
+
+#[tokio::test]
+async fn step_up_replaces_buttons_with_url_without_ticket_in_toast() {
+    let provider = TestChannelProvider::start().await;
+    let cb = callback("12345678-1234-4234-8234-123456789abc");
+    let url = format!("https://dashboard.example.test/approvals/confirm#ticket={}", "a".repeat(64));
+    let outcome = PressOutcome { reply:"需要再確認一次".into(), card_text:Some("需要再確認一次".into()),
+        card_link:Some(crate::approval::chat_admin::press::CardLink { label:"前往確認".into(), url:url.clone() }),
+        refused_reason:Some("step_up_required") };
+    reply_to_decision_press(&cb, &reqwest::Client::new(), &telegram_poll_api_base(&provider.token), &outcome).await;
+    let calls = provider.requests();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].body["text"], "需要再確認一次");
+    assert_eq!(calls[1].body["reply_markup"]["inline_keyboard"], json!([[{"text":"前往確認","url":url}]]));
+    assert_eq!(calls[1].body["link_preview_options"]["is_disabled"], true);
 }

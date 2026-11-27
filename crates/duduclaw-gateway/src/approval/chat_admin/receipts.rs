@@ -44,6 +44,13 @@ impl TerminalStatus {
 const COLUMNS: &str = "card_id, approval_id, purpose, user_id, channel, account, principal,
     dm, message_id, digest, tier, valid_until, status, sent_at";
 
+pub(crate) async fn by_card_id(store: &ApprovalStore, card_id: &str) -> Result<Option<Receipt>, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    conn.query_row(&format!("SELECT {COLUMNS} FROM chat_admin_cards WHERE card_id=?1"),
+        [card_id], from_row).optional().map_err(|e| format!("read chat-admin receipt: {e}"))
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Receipt> {
     Ok(Receipt {
         card_id: row.get(0)?, approval_id: row.get(1)?, purpose: row.get(2)?,

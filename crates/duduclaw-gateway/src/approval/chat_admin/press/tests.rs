@@ -253,7 +253,7 @@ async fn double_press_executes_once() {
 }
 
 #[tokio::test]
-async fn step_up_approve_is_stub_but_deny_decides() {
+async fn step_up_without_web_prerequisites_falls_back_but_deny_decides() {
     let mut f = Fixture::new().await;
     f.service.config(true, "telegram", &[]);
     let outcome = f.refused("step_up_required").await;

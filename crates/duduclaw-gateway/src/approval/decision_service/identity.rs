@@ -31,6 +31,9 @@ pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: 
         }
         let cfg = chat_admin::config::effective(&home, users.as_deref()).ok_or(DecisionRefusal::FeatureOff)?;
         if !cfg.channels.contains(&proof.channel) { return Err(DecisionRefusal::FeatureOff); }
+        if approve && proof.step == Step::Web && !cfg.step_up_methods.contains(&chat_admin::StepMethod::Web) {
+            return Err(DecisionRefusal::StepUpRequired);
+        }
         let user_id = uuid::Uuid::parse_str(&proof.user_id).map_err(|_| forbidden())?;
         // Ledger UUID serialization must not silently alter the identity key.
         if user_id.to_string() != proof.user_id { return Err(forbidden()); }

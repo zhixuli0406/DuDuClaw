@@ -3392,6 +3392,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         )
         .route("/api/me/google/authorization-request", get(handle_google_authorization_preview)
             .post(handle_google_authorization_confirm).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/me/approvals/step-up", get(handle_approval_step_up_preview)
+            .post(handle_approval_step_up_confirm).layer(DefaultBodyLimit::max(4096)))
         .route("/api/mcp/oauth/callback", get(handle_mcp_oauth_callback))
         .route(
             crate::google_personal::flow::CALLBACK_PATH,
@@ -19958,13 +19960,20 @@ mod identity_key_startup_tests {
 // member keys, channel OTPs or the authorization ticket itself.
 fn google_authorization_caller(state: &AppState, headers: &axum::http::HeaderMap)
     -> Result<(String,String), axum::response::Response> {
+    dashboard_ticket_caller(state, headers).map(|(ctx, session)| (ctx.user_id, session))
+}
+fn dashboard_ticket_caller(state: &AppState, headers: &axum::http::HeaderMap)
+    -> Result<(UserContext,String), axum::response::Response> {
     let ctx = knowledge_caller(state, headers)?;
     let token = extract_bearer_token(headers).ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
     let claims = state.jwt_config.verify_access_token(token)
         .map_err(|_| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
     let session = claims.jti.filter(|s| uuid::Uuid::parse_str(s).is_ok())
         .ok_or_else(|| axum::http::StatusCode::UNAUTHORIZED.into_response())?;
-    Ok((ctx.user_id,session))
+    if uuid::Uuid::parse_str(&ctx.user_id).is_err() {
+        return Err(axum::http::StatusCode::UNAUTHORIZED.into_response());
+    }
+    Ok((ctx,session))
 }
 async fn handle_google_authorization_preview(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap)
     -> axum::response::Response {
@@ -20017,3 +20026,57 @@ async fn handle_google_authorization_confirm(State(state): State<Arc<AppState>>,
     };
     routes::private_response(response)
 }
+
+// RM-143: same JWT-only authentication as RM-147, plus a live Active Admin.
+// No member-key dispatch, MCP surface, cookie or legacy system-token fallback.
+fn approval_step_up_caller(state: &AppState, headers: &axum::http::HeaderMap)
+    -> Result<(UserContext, String), crate::approval::chat_admin::step_up::Error> {
+    use crate::approval::chat_admin::step_up::Error;
+    let (ctx, session) = dashboard_ticket_caller(state, headers).map_err(|_| Error::unauthenticated())?;
+    let _ = crate::approval::chat_admin::step_up::active_admin(&state.user_db, &ctx, &session)?;
+    Ok((ctx, session))
+}
+
+async fn approval_step_up_env(state: &AppState)
+    -> Result<crate::approval::decision_service::DecisionEnv, crate::approval::chat_admin::step_up::Error> {
+    use crate::approval::chat_admin::step_up::Error;
+    let home = state.home_dir.clone();
+    let broker = tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&home))
+        .await.map_err(|_| Error::forbidden())?.map_err(|_| Error::forbidden())?;
+    Ok(crate::approval::decision_service::DecisionEnv { home:state.home_dir.clone(),
+        registry:Some(state.handler.registry().clone()), broker, users:Some(state.user_db.clone()) })
+}
+
+async fn handle_approval_step_up_preview(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap)
+    -> axum::response::Response {
+    use crate::approval::chat_admin::step_up::{self, routes};
+    let result = async {
+        let (ctx, session) = approval_step_up_caller(&state, &headers)?;
+        let ticket = headers.get("x-approval-ticket").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let env = approval_step_up_env(&state).await?;
+        routes::preview(&state.handler, &env, &ctx, &session, ticket).await
+    }.await;
+    step_up::response(match result { Ok(value) => Json(value).into_response(), Err(error) => error.into_response() })
+}
+
+async fn handle_approval_step_up_confirm(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap,
+    body: Result<Json<crate::approval::chat_admin::step_up::routes::Decision>, axum::extract::rejection::JsonRejection>)
+    -> axum::response::Response {
+    use crate::approval::chat_admin::step_up::{self, routes, Error};
+    let result = async {
+        let (ctx, session) = approval_step_up_caller(&state, &headers)?;
+        let origin = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+        if !crate::google_authorization_requests::routes::valid_origin(origin, &allowed_origins_snapshot()) {
+            return Err(Error::forbidden());
+        }
+        let Json(input) = body.map_err(|_| Error::invalid())?;
+        let ticket = headers.get("x-approval-ticket").and_then(|v| v.to_str().ok()).unwrap_or("");
+        let env = approval_step_up_env(&state).await?;
+        routes::confirm(&env, &ctx, &session, ticket, input).await
+    }.await;
+    step_up::response(match result { Ok(value) => Json(value).into_response(), Err(error) => error.into_response() })
+}
+
+#[cfg(test)]
+#[path = "server_approval_step_up_tests.rs"]
+mod approval_step_up_tests;

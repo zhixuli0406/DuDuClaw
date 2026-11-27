@@ -2133,11 +2133,14 @@ async fn reply_to_decision_press(
     answer_callback_query(client, api_base, &cb.id, &reply).await;
     if let (Some(text), Some(message)) = (&outcome.card_text, &cb.message) {
         if let Some(message_id) = message.message_id {
+            let keyboard = outcome.card_link.as_ref().map(|link|
+                json!([[{"text":link.label,"url":link.url}]])).unwrap_or_else(|| json!([]));
             // Use the receiving bot's API base, never resolve a different bot.
             // card.rs already sanitizes the text; send it without parse_mode.
             let response = client.post(format!("{api_base}/editMessageText"))
                 .json(&json!({"chat_id":message.chat.id, "message_id":message_id,
-                    "text":text, "reply_markup":{"inline_keyboard":[]}}))
+                    "text":text, "link_preview_options":{"is_disabled":true},
+                    "reply_markup":{"inline_keyboard":keyboard}}))
                 .send().await;
             let ok = match response {
                 Ok(response) if response.status().is_success() => response.json::<serde_json::Value>()

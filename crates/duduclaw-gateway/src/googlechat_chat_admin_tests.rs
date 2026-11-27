@@ -159,7 +159,7 @@ async fn non_bot_message_cannot_decide_or_request_an_update() {
 #[test]
 fn response_uses_card_text_verbatim_or_space_reply() {
     let press = parse_card_press(&click("12345678-1234-4234-8234-123456789abc")).unwrap();
-    let outcome = PressOutcome { reply:"toast".into(), card_text:Some("✓ 已核准：技能（Ada）".into()), refused_reason:None };
+    let outcome = PressOutcome { reply:"toast".into(), card_text:Some("✓ 已核准：技能（Ada）".into()), card_link:None, refused_reason:None };
     assert_eq!(card_press_response(&press, &outcome), json!({
         "actionResponse":{"type":"UPDATE_MESSAGE"}, "text":outcome.card_text.unwrap(), "cardsV2":[]
     }));
@@ -236,4 +236,18 @@ async fn pubsub_never_handshakes_or_decides() {
     let status = chat_link::status(f.db(), &admin.id, &handshake.handshake_id).unwrap().unwrap();
     assert_eq!(status.status, chat_link::HandshakeStatus::Waiting);
     assert!(f.db().channel_identities_for_user(&admin.id).unwrap().is_empty());
+}
+
+#[test]
+fn step_up_response_has_open_link_not_callback_authority() {
+    let press = parse_card_press(&click("12345678-1234-4234-8234-123456789abc")).unwrap();
+    let url = format!("https://dashboard.example.test/approvals/confirm#ticket={}", "a".repeat(64));
+    let outcome = PressOutcome { reply:"需要再確認一次".into(), card_text:Some("需要再確認一次".into()),
+        card_link:Some(crate::approval::chat_admin::press::CardLink { label:"前往確認".into(), url:url.clone() }),
+        refused_reason:Some("step_up_required") };
+    let value = card_press_response(&press, &outcome);
+    assert_eq!(value["actionResponse"]["type"], "UPDATE_MESSAGE");
+    assert_eq!(value["text"], "需要再確認一次");
+    let button = &value["cardsV2"][0]["card"]["sections"][0]["widgets"][0]["buttonList"]["buttons"][0];
+    assert_eq!(button["onClick"], json!({"openLink":{"url":url}}));
 }

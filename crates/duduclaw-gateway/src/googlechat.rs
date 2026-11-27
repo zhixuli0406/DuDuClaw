@@ -788,7 +788,12 @@ fn card_press_response(
         // https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#ResponseType
         // The receipt binds that exact message to the receiving app. An empty
         // cardsV2 removes its buttons; never copy event text/cards into the reply.
-        serde_json::json!({"actionResponse":{"type":"UPDATE_MESSAGE"}, "text":text, "cardsV2":[]})
+        let cards = outcome.card_link.as_ref().map(|link| serde_json::json!([{
+            "cardId":"approval-step-up", "card":{"sections":[{"widgets":[{"buttonList":{
+                "buttons":[{"text":link.label,"onClick":{"openLink":{"url":link.url}}}]
+            }}]}]}
+        }])).unwrap_or_else(|| serde_json::json!([]));
+        serde_json::json!({"actionResponse":{"type":"UPDATE_MESSAGE"}, "text":text, "cardsV2":cards})
     } else {
         let reply = if outcome.refused_reason == Some("legacy_refused") {
             format!("⚠️ {}", outcome.reply)

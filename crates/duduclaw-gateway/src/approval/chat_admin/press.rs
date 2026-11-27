@@ -22,14 +22,25 @@ pub(crate) struct PressOrigin {
 pub(crate) struct PressOutcome {
     pub reply: String,
     pub card_text: Option<String>,
+    pub card_link: Option<CardLink>,
     pub refused_reason: Option<&'static str>,
+}
+
+// Do not derive Debug: the URL can carry a single-use ticket.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CardLink { pub label: String, pub url: String }
+
+impl std::fmt::Debug for CardLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CardLink([redacted])")
+    }
 }
 
 impl PressOutcome {
     pub(crate) fn from_result(result: Result<String, String>) -> Self {
         match result {
-            Ok(reply) => Self { reply, card_text: None, refused_reason: None },
-            Err(reply) => Self { reply, card_text: None, refused_reason: Some("legacy_refused") },
+            Ok(reply) => Self { reply, card_text: None, card_link: None, refused_reason: None },
+            Err(reply) => Self { reply, card_text: None, card_link: None, refused_reason: Some("legacy_refused") },
         }
     }
 
@@ -39,7 +50,7 @@ impl PressOutcome {
     }
 
     pub(crate) fn refused(reply: String, reason: &'static str, rewrite: bool) -> Self {
-        Self { card_text: rewrite.then(|| reply.clone()), reply, refused_reason: Some(reason) }
+        Self { card_text: rewrite.then(|| reply.clone()), card_link: None, reply, refused_reason: Some(reason) }
     }
 }
 
@@ -224,9 +235,9 @@ where F: FnOnce(PathBuf, ApprovalBroker, ApprovalRecord, String) -> Fut,
             let text = card::result_text(card::kind_label(&current, lang),
                 result.status == ApprovalStatus::Approved, &name, Utc::now(),
                 channel_label(result.channel.unwrap_or(channel)), lang);
-            PressOutcome { reply: text.clone(), card_text: Some(text), refused_reason: None }
+            PressOutcome { reply: text.clone(), card_text: Some(text), card_link: None, refused_reason: None }
         }
-        Err(DecisionRefusal::StepUpRequired) => super::step_up::begin(home, &current, lang).await,
+        Err(DecisionRefusal::StepUpRequired) => super::step_up::begin(&env, &current, &receipt, lang).await,
         // 9. Use the recorded decider, never the presser's display name.
         Err(DecisionRefusal::AlreadyDecided { by, status, .. }) => already_decided(&env, by.as_deref(), status, lang).await,
         Err(DecisionRefusal::FeatureOff) => PressOutcome::refused(card::feature_off_text(lang).into(), "feature_off", true),
