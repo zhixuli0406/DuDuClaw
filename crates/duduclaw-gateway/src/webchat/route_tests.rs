@@ -622,6 +622,16 @@ async fn listed_main_fixture(shell: bool) -> Fixture {
 async fn listed_shell_free_main_conversation_needs_no_binding() {
     crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
     let f = listed_main_fixture(false).await;
+    assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
+    let refused = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
+    assert!(matches!(refused, ChatMessage::Error { message, .. }
+        if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    for text in ["你好", "@嘟嘟總機 你好"] {
+        let refused = route(&f, text, Some("dudu")).await.unwrap_err();
+        assert!(matches!(*refused, ChatMessage::Error { message, .. }
+            if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    }
+    crate::isolation_io_test_support::with_isolation(async {
     assert!(f.state.agent_access_allowed(&f.emp, "dudu").await);
     assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_ok());
     assert_eq!(route(&f, "你好", Some("dudu")).await.unwrap().agent.as_deref(), Some("dudu"));
@@ -651,6 +661,7 @@ async fn listed_shell_free_main_conversation_needs_no_binding() {
         )
     }).await.expect("listed shell-free conversation must reach the model seam");
     assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{reply}");
+    }).await;
     }).await;
 }
 

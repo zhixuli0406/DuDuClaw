@@ -473,6 +473,7 @@ WebChat 與儀表板 RPC 連線原本就由伺服器每 30 秒送出 WebSocket p
 | 腦袋與引擎 → 輔助模型 | `[model] utility`：Codex 與 OpenAI 相容 API 留白時沿用主要模型；Claude 預設 `claude-haiku-4-5`；Grok 與通用 CLI 改用全域背景設定 |
 | 腦袋與引擎 → 一員工四角色 | `[team] enabled`、`[team.roles.<角色>]` |
 | 自動化 → 夜間整理 | `[night_engine] enabled` |
+| 自動化 → 任務建議 → 在對話中主動建議建立任務 | `[goal_intent] enabled`：預設開啟，關閉後只停止這位員工的任務建議。開關顯示納入全域設定後這位員工目前是否啟用建議；儲存時寫入員工自己的值。`agent.toml` 中員工自己的值優先於 `config.toml` 的全域值；員工未設定時沿用全域值，兩者都未設定時為開啟。 |
 | 整合 → 專屬通道（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`，經 `agents.channels.*` 設定（管理員設定，負責人看得到狀態；見[專屬通道](per-employee-channels.md)） |
 | 通道與整合 → 讓外部聯絡人用 @ 呼叫（v1.76） | `[channels] public_trigger`（只限管理員；見[用 @ 呼叫 AI 員工](../../features/zh-TW/62-calling-ai-staff.md)） |
 | 自動化 → 記憶 → 決策延續、決定保留天數 | `[memory] decision_continuity`、`decision_ttl_days`（1 到 3650） |

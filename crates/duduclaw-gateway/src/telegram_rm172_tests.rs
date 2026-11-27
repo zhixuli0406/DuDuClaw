@@ -111,13 +111,16 @@ async fn rm142_listed_member_primary_requires_effective_converse_admission() {
     f.db.set_primary_agent(&f.user_id, Some("dudu")).unwrap();
     assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None);
     f.db.set_main_agent_users(&admin.id, &[f.user_id.clone()], true).unwrap();
-    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "shell blocks the list");
+    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "unprotected main blocks the list");
     write_agent(&f._dir.path().join("agents"), "dudu", "嘟嘟總機", "@嘟嘟總機", "main",
         "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
     f.ctx.registry.write().await.scan().await.unwrap();
+    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "unprotected main stays refused");
+    crate::isolation_io_test_support::with_isolation(async {
     assert_eq!(primary_agent_route(&f.ctx, TG_USER).await.as_deref(), Some("dudu"));
     crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
     assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None);
+    }).await;
     // Generic channel routing was never subject to WebChat's main gate.
     let sender = crate::trigger_route::access::for_channel_sender(f._dir.path(), "telegram", TG_USER);
     let reg = f.ctx.registry.read().await;

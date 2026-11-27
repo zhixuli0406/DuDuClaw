@@ -276,8 +276,43 @@ async fn sender_refuses_shell_free_main_but_keeps_listed_refusal() {
         assert!(!assign.main_assign_allowed(&loaded));
         if origin == ContextOrigin::DashboardSession {
             assert_eq!(assign.main_assign_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+            assert_eq!(converse.main_converse_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+        } else {
+            assert_eq!(assign.main_assign_refusal(&loaded), None);
+            assert_eq!(converse.main_converse_refusal(&loaded), None);
         }
     }
+    // An unreadable membership source cannot establish either text or admission.
+    rusqlite::Connection::open(f.dir.path().join("users.db")).unwrap()
+        .execute_batch("DROP TABLE main_agent_users").unwrap();
+    let sender = crate::trigger_route::SenderAccess::no_bindings(&f.emp)
+        .with_credential_origin(ContextOrigin::DashboardSession);
+    let converse = sender.clone().for_webchat_converse(f.dir.path()).await;
+    let assign = sender.for_assign(f.dir.path()).await;
+    assert!(!converse.main_converse_allowed(&loaded));
+    assert!(!assign.main_assign_allowed(&loaded));
+    assert_eq!(converse.main_converse_refusal(&loaded), None);
+    assert_eq!(assign.main_assign_refusal(&loaded), None);
+}
+
+#[tokio::test]
+async fn final_main_spawn_only_exempts_agentless_utility_calls() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let dir = f.dir.path().join("agents/main");
+    MAIN_TURN_USE.scope(MainUse::Assign,
+        crate::on_behalf_of::scope_first(Some(format!("user:{}", f.emp)), async {
+            assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), None, None, false).await,
+                Err(MAIN_TURN_REFUSAL.into()));
+            crate::runtime_dispatch::UTILITY_CALL.scope((), async {
+                assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), None, None, false).await, Ok(()));
+                assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), Some(&dir), None, false).await,
+                    Err(MAIN_TURN_REFUSAL.into()));
+            }).await;
+        }),
+    ).await;
 }
 
 fn frozen_command(home: &Path, tools: &str, servers: serde_json::Value) -> tokio::process::Command {

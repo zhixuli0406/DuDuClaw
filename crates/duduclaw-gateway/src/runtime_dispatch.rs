@@ -348,6 +348,14 @@ tokio::task_local! {
     /// Applies only to the new Claude continuation; older primary paths keep
     /// their existing environment behavior.
     pub(crate) static CLAUDE_FALLBACK_SPAWN: ();
+
+    /// Host-declared purpose of this exact call; nested employee calls replace it.
+    static CURRENT_SPAWN_PURPOSE: SpawnPurpose;
+}
+
+pub(crate) fn is_agentless_utility_call() -> bool {
+    CURRENT_SPAWN_PURPOSE.try_with(|purpose| *purpose == SpawnPurpose::Utility)
+        .unwrap_or_else(|_| in_utility_call())
 }
 
 pub(crate) fn in_claude_runtime_fallback() -> bool {
@@ -393,6 +401,7 @@ async fn run_agent_prompt_scoped(
     // Direct dispatch callers also need the marker; Chat preserves the
     // WebChat/shared-member scope (or the absence of one for ordinary channels).
     let dispatch = req.request_type == RequestType::Dispatch;
+    let purpose = req.purpose;
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -417,6 +426,7 @@ async fn run_agent_prompt_scoped(
             ),
         ),
     )));
+    let run = CURRENT_SPAWN_PURPOSE.scope(purpose, run);
     if dispatch {
         crate::on_behalf_of::access::MAIN_TURN_USE.scope(
             crate::on_behalf_of::access::MainUse::Assign, run,

@@ -441,6 +441,7 @@ export function buildUpdatePayload(
   if (has(dirty, 'v.effort')) put('model', { effort: s.v.effort as AgentEffort });
   if (has(dirty, 'v.fork_enabled')) put('fork', { enabled: s.v.fork_enabled });
   if (has(dirty, 'v.night_engine_enabled')) put('night_engine', { enabled: s.v.night_engine_enabled });
+  if (has(dirty, 'v.goal_intent_enabled')) put('goal_intent', { enabled: s.v.goal_intent_enabled });
   if (has(dirty, 'v.public_trigger')) put('channels', { public_trigger: s.v.public_trigger });
 
   const mem: Record<string, unknown> = {};

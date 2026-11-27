@@ -557,7 +557,15 @@ async fn ag_ui(f: &Fixture, case: Case) -> EntryResult {
         assert_eq!(f.calls.load(Ordering::SeqCst), 1, "healthy AG-UI reaches its configured runtime");
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("RUN_STARTED"), "{text}");
-        assert!(text.contains("RUN_FINISHED"), "{text}");
+        for gate_error in ["employee_entry_refused", "agent_config_unreadable", "model_provider_mismatch", "runtime_unavailable"] {
+            assert!(!text.contains(gate_error), "unexpected entry-gate refusal {gate_error}: {text}");
+        }
+        // The fixture runtime counts the call and then always fails.
+        assert!(
+            text.contains("RUN_FINISHED")
+                || (text.contains("RUN_ERROR") && text.contains("\"code\":\"runtime_failed\"")),
+            "{text}"
+        );
         EntryResult::result(Ok(()))
     } else {
         assert_eq!(status, StatusCode::CONFLICT);

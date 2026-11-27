@@ -2266,7 +2266,7 @@ async fn handle_message_create(
     // embedded in `reply` still works fine on its own.
     let buttons = if crate::goal_intent::reply_has_confirmation_menu(&reply) {
         crate::goal_intent::pending_button_nonce(&session_id)
-            .map(|nonce| channel_format::discord_gintent_buttons(&nonce))
+            .map(|nonce| channel_format::discord_gintent_buttons(&nonce, crate::trigger_route::texts::lang_for(&ctx.home_dir)))
             .unwrap_or_else(|| channel_format::discord_conversation_buttons(&session_id))
     } else {
         channel_format::discord_conversation_buttons(&session_id)
