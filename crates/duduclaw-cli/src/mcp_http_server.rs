@@ -529,8 +529,7 @@ pub(crate) fn authenticate_bearer_call(
     // RM-064: a `ddc_status_` credential belongs to the gateway's status
     // endpoint only. Refuse the type outright — it must never reach the
     // `[mcp_keys]` / OAuth lookups or any scope table.
-    if duduclaw_auth::status_tokens::is_status_token(raw_key)
-            || duduclaw_auth::member_keys::is_member_key(raw_key) {
+    if duduclaw_auth::status_tokens::is_status_token(raw_key) {
         return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
     }
 
@@ -538,7 +537,10 @@ pub(crate) fn authenticate_bearer_call(
     // in their own store (hashed at rest); everything else stays the static
     // mcp_keys path. Both produce a Principal that flows through the SAME
     // scope/namespace enforcement below.
-    let auth_result = if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
+    let auth_result = if duduclaw_auth::member_keys::is_member_key(raw_key) {
+        crate::mcp::person_key_client::authenticate_blocking(home_dir, raw_key)
+            .map_err(crate::mcp_auth::Refusal::from)
+    } else if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
         crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir, resource)
             .map(crate::mcp_auth::AuthenticatedCall::without_reference)
             .map_err(crate::mcp_auth::Refusal::from)
@@ -560,6 +562,9 @@ pub(crate) fn authenticate_bearer_call(
         )
     })?;
 
+    if let Some(namespace) = authenticated.namespace() {
+        return Ok((authenticated, namespace));
+    }
     let principal = authenticated.principal();
     let ns_ctx = resolve_for_caller(
         principal,
@@ -1344,20 +1349,37 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn member_credentials_are_refused_on_every_mcp_surface() {
+    async fn member_query_credential_is_refused_without_contacting_gateway() {
         let home = tempfile::tempdir().unwrap();
-        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
-        let user = db
-            .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Employee)
-            .unwrap();
-        let raw = db.member_key_create(&user.id, "odoo", 90, user.credential_epoch, false, &[]).unwrap().secret;
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        let response = authenticate_bearer_or_query(
+            &HeaderMap::new(), Some(crate::mcp::person_key_client::tests::RAW),
+            home.path(), "http://127.0.0.1:8765/mcp",
+        ).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.extensions().get::<crate::mcp_auth_audit::AuthFailureTag>().unwrap().reason,
+            crate::mcp_auth_audit::FailureReason::WrongCredentialType);
+        assert!(stub.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn member_credentials_without_gateway_are_refused_on_every_mcp_surface() {
+        let home = tempfile::tempdir().unwrap();
+        let raw = crate::mcp::person_key_client::tests::RAW.to_owned();
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
         let resource = "http://127.0.0.1:8765/mcp";
-        for response in [
-            authenticate_bearer(&headers, home.path(), resource).unwrap_err(),
-            authenticate_bearer_or_query(&HeaderMap::new(), Some(&raw), home.path(), resource).unwrap_err(),
-        ] {
+        // A rejecting stub keeps this test isolated from any real gateway.
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        stub.status.store(401, std::sync::atomic::Ordering::SeqCst);
+        let auth_home = home.path().to_path_buf();
+        let auth_raw = raw.clone();
+        let responses = tokio::task::spawn_blocking(move || [
+
+            authenticate_bearer(&headers, &auth_home, resource).unwrap_err(),
+            authenticate_bearer_or_query(&HeaderMap::new(), Some(&auth_raw), &auth_home, resource).unwrap_err(),
+        ]).await.unwrap();
+        for response in responses {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
@@ -1370,7 +1392,7 @@ pub mod tests {
         let status = router.oneshot(request).await.unwrap().status();
         assert!(
             status == StatusCode::UNAUTHORIZED || status == StatusCode::TOO_MANY_REQUESTS,
-            "a member credential must never be served by /mcp: {status}"
+            "a member credential rejected by the gateway must not be served by /mcp: {status}"
         );
     }
 

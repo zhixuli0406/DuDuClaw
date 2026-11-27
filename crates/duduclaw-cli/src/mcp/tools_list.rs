@@ -533,6 +533,12 @@ pub(crate) async fn handle_tools_list_for_transport(
     default_agent: &str,
     remote_bearer: bool,
 ) -> Value {
+    if crate::mcp_auth::is_person_principal(principal) {
+        let tools: Vec<Value> = tools()
+            .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, principal))
+            .map(build_tool_schema).collect();
+        return jsonrpc_response(id, serde_json::json!({"tools":tools}));
+    }
     let access = remote_bearer.then(|| remote_access(home_dir, principal, default_agent));
     let tools: Vec<&'static ToolDef> = match &access {
         Some(RemoteAccess::Unbound(_)) => Vec::new(),
@@ -666,6 +672,9 @@ pub(crate) async fn visible_tools_in_lane(
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
+    if crate::mcp_auth::is_person_principal(principal) {
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+    }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
     // not act for the process's agent. Discovery filter only.

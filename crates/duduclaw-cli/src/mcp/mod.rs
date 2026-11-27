@@ -388,3 +388,6 @@ pub(crate) mod recipient_gate;
 mod tool_pruning_tests;
 
 pub(crate) mod google_owner_client;
+
+pub(crate) mod person_key_client;
+pub(crate) mod person_tools;

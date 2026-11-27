@@ -729,6 +729,11 @@ impl McpDispatcher {
         if crate::mcp_auth::person_tool_refused(tool_name, principal) {
             return jsonrpc_error(id, -32003, "This tool is only available to a personal key");
         }
+        if crate::mcp_auth::is_person_principal(principal) {
+            let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let result = crate::mcp::person_tools::call(&self.home_dir, principal, tool_name, &args).await;
+            return jsonrpc_response(id, result);
+        }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────
         // On the HTTP MCP server every non-external principal other than the
         // verified gateway-internal key is classified from its authenticated
@@ -2423,6 +2428,39 @@ mod tests {
             RateLimiter::new(),
             DailyQuota::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn person_principals_list_exact_scopes_and_refuse_employee_tools() {
+        use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        for scopes in ["", "tasks:read", "agents:status", "tasks:read,agents:status"] {
+            let principal = Principal {
+                client_id: "person:holder".into(), scopes: crate::mcp_auth::parse_scopes(scopes).unwrap(),
+                is_external: true, created_at: chrono::Utc::now(),
+            };
+            let call = AuthenticatedCall::without_reference(principal.clone()).with_kind(
+                PrincipalKind::PersonKey { key_id: "key".into(), user_id: "holder".into() });
+            let ns = call.namespace().unwrap();
+            with_authenticated_call(call, async {
+                for remote in [false, true] {
+                    let listed = crate::mcp::handle_tools_list_for_transport(&json!(1), &principal, tmp.path(), "dudu", remote).await;
+                    let names: Vec<_> = listed["result"]["tools"].as_array().unwrap().iter()
+                        .map(|tool| tool["name"].as_str().unwrap()).collect();
+                    let expected: Vec<_> = duduclaw_core::mcp_person_tools::PERSON_TOOLS.iter()
+                        .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, &principal)).map(|tool| tool.name).collect();
+                    assert_eq!(names.len(), expected.len());
+                    assert!(expected.iter().all(|name| names.contains(name)));
+                }
+                for name in ["tasks_list", "memory_search", "odoo_search", "list_agents", "agent_status", "wiki_read", "unknown"] {
+                    let result = dispatcher.dispatch_tool_call(&principal, &ns, &json!({"name":name,"arguments":{}}), &json!(2)).await;
+                    assert_eq!(result["error"]["code"], -32003, "{name}: {result}");
+                }
+            }).await;
+        }
+        assert!(!tmp.path().join("agents/person:holder").exists());
+        assert!(!tmp.path().join("external").exists());
     }
 
     #[tokio::test]

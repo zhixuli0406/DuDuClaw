@@ -244,3 +244,30 @@ async fn call_audit_contains_identity_tool_and_outcome_without_credentials() {
     assert_eq!(events[0]["details"]["outcome"], "ok");
     assert_eq!(events[1]["details"]["outcome"], "person_key_scope");
 }
+
+#[tokio::test]
+async fn id_operations_with_gateway_internal_bearer_are_refused_without_execution() {
+    let f = fixture(&["tasks:read", "agents:status"]).await;
+    let proof = "ddc_prod_11111111111111111111111111111111";
+    let config_path = f.home.path().join("config.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str(&format!("\n[mcp_keys.{proof}]\nclient_id='gateway-internal'\nis_external=false\nscopes=['admin']\ncreated_at='{}'\n",
+        chrono::Utc::now().to_rfc3339()));
+    std::fs::write(config_path, config).unwrap();
+    duduclaw_auth::mcp_keys::McpKeyStore::open(f.home.path()).unwrap()
+        .record_internal_key(proof, chrono::Utc::now()).unwrap();
+    assert!(crate::mcp_internal_key::verify_internal_key(f.home.path(), proof));
+    let audit_path = f.home.path().join("security_audit.jsonl");
+    let audit_before = std::fs::read(&audit_path).ok();
+    for body in [
+        json!({"op":"authenticate_id", "key_id":f.key_id, "user_id":f.user}),
+        json!({"op":"call_id", "key_id":f.key_id, "user_id":f.user,
+            "tool":"my_tasks_list", "args":{}}),
+    ] {
+        assert_refusal(request(&f, "127.0.0.1:1", Some(proof), body.to_string()).await,
+            StatusCode::BAD_REQUEST, "person_key_bad_request");
+    }
+    // No authentication charge, member RPC or tool-call audit was reached.
+    assert!(f.state.user_db.member_api_keys_for_user(&f.user).unwrap()[0].last_used_at.is_none());
+    assert_eq!(std::fs::read(audit_path).ok(), audit_before);
+}
