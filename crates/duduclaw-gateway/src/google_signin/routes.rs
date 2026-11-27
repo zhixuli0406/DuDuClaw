@@ -334,7 +334,15 @@ pub(crate) async fn callback(
                 settings_version: available.settings.revision, ack_by, ack_at,
             };
             let db = state.user_db.clone();
-            let decision = tokio::task::spawn_blocking(move || decide(&db, &identity, &policy, now)).await;
+            let home = state.home_dir.clone();
+            let decision = match crate::google_personal::grants::acquire(&home).await {
+                Ok(lease) => tokio::task::spawn_blocking(move || {
+                    let _lease = lease;
+                    decide(&db, &identity, &policy, now,
+                        &|user| me::personal_sub(&home, user).map_err(str::to_owned))
+                }).await,
+                Err(_) => Ok(Err("signin_storage_unavailable".into())),
+            };
             match decision {
                 Ok(Ok((result, notification))) => {
                     if let Some((key, text)) = notification { notify_admins(&state.home_dir, key, text).await; }
@@ -354,11 +362,12 @@ pub(crate) async fn callback(
 }
 
 type Notification = Option<(String, &'static str)>;
-fn decide(db: &UserDb, identity: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64)
+fn decide(db: &UserDb, identity: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+    personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>)
     -> Result<(LoginResult, Notification), String>
 {
     let previous_request = db.signin_request_by_sub(&identity.sub)?;
-    let outcome = db.resolve_google_signin(identity, policy, now)?;
+    let outcome = db.resolve_google_signin(identity, policy, now, personal_sub)?;
     let mut notification = None;
     let result = match outcome {
         SigninOutcome::Ok { user_id, credential_epoch, .. } => {

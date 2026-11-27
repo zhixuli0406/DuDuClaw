@@ -54,7 +54,7 @@ async fn fixture() -> Fixture {
     }, &SigninPolicy {
         approval: SigninApproval::Direct, daily_cap: 20, settings_version: "fixture".into(),
         ack_by: "fixture-owner".into(), ack_at: "2026-11-27T00:00:00Z".into(),
-    }, NOW).unwrap() {
+    }, NOW, &|_| Ok(None)).unwrap() {
         SigninOutcome::Ok { user_id, created: true, .. } => user_id,
         other => panic!("unexpected provisioning outcome: {other:?}"),
     };

@@ -117,7 +117,8 @@ fn pending(tx: &Transaction<'_>, identity: &VerifiedGoogleIdentity, request_id: 
     }
 }
 
-fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64) -> Result<SigninOutcome, String> {
+fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+    personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>) -> Result<SigninOutcome, String> {
     // 1. An immutable subject link always wins, even if the token email changed.
     let linked: Option<String> = tx.query_row("SELECT user_id FROM google_signin_links WHERE google_sub=?1",
         [&id.sub], |r| r.get(0)).optional().map_err(|_| STORAGE)?;
@@ -140,6 +141,9 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| STORAGE)?
     };
     for (user_id, status, attested_by, credential_epoch) in attestations {
+        if personal_sub(&user_id)?.is_some_and(|sub| sub != id.sub) {
+            return Ok(SigninOutcome::ExistingAccount);
+        }
         if UserDb::take_valid_google_signin_attestation_tx(tx, &user_id, &id.email, now).map_err(|_| STORAGE)? {
             if status != "active" { return Ok(SigninOutcome::AccountDisabled); }
             insert_link(tx, &user_id, id, &attested_by, "admin_attest", now)?;
@@ -182,7 +186,9 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
 }
 
 impl UserDb {
-    pub fn resolve_google_signin(&self, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64) -> Result<SigninOutcome, String> {
+    /// The caller holds the personal grant lease; the lookup must not access users.db.
+    pub fn resolve_google_signin(&self, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+        personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>) -> Result<SigninOutcome, String> {
         let identity = validated_identity(id)?;
         timestamp(now)?;
         // These writes create neither bindings nor avatars: no seat admission
@@ -190,7 +196,7 @@ impl UserDb {
         let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
-        let outcome = resolve_tx(&tx, &identity, policy, now)?;
+        let outcome = resolve_tx(&tx, &identity, policy, now, personal_sub)?;
         tx.commit().map_err(|_| STORAGE)?;
         Ok(outcome)
     }

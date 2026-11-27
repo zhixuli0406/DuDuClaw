@@ -15,7 +15,7 @@ fn approved(preauthorize: bool) -> (tempfile::TempDir, UserDb, String, String, S
         approval: SigninApproval::Admin, daily_cap: 100,
         settings_version: "test".into(), ack_by: admin.clone(), ack_at: "test".into(),
     };
-    let request = match db.resolve_google_signin(&identity,&policy,NOW).unwrap() {
+    let request = match db.resolve_google_signin(&identity,&policy,NOW, &|_| Ok(None)).unwrap() {
         SigninOutcome::PendingApproval { request_id } => request_id,
         other => panic!("unexpected outcome: {other:?}"),
     };

@@ -252,6 +252,8 @@ pub async fn finish(
     let info = oauth::userinfo(&tokens.secret.access_token)
         .await
         .map_err(|_| "無法確認 Google 帳號或信箱尚未驗證，沒有保存連線。")?;
+    // The held grant lease serializes this check with every sign-in link writer
+    // (self-link completion and login attestation).
     require_signin_account(db, user, &info.sub)?;
     if let Some(request) = &authorization_request {
         crate::google_authorization_requests::validate(home, db, request)?;
@@ -358,6 +360,8 @@ pub async fn finish(
             return Err("Google 尚未授予原任務所需的用途與範圍，沒有保存這次連線。".into());
         }
     }
+    // The held grant lease serializes this check with every sign-in link writer
+    // (self-link completion and login attestation).
     require_signin_account(db, user, &metadata.google_sub)?;
     // v1.81 C4: the isolated connector catalog is fenced around publication
     // (same account: new generation / relink; another account: revoke).
@@ -408,6 +412,8 @@ async fn finish_drive_write(
     if info.sub != expected.google_sub {
         return Err("請使用原本連結的 Google 帳號開放雲端硬碟寫入，這次沒有保存。".into());
     }
+    // The held grant lease serializes this check with every sign-in link writer
+    // (self-link completion and login attestation).
     require_signin_account(db, user, &info.sub)?;
     let scopes = tokens.granted_scopes
         .ok_or("Google 沒有回傳實際授權範圍，請重新連結。")?;
@@ -457,6 +463,8 @@ async fn finish_drive_write(
         oauth_client_id: pending.client_id.clone(),
         google_data_consent: Some(pending.google_data_consent.clone()),
     };
+    // The held grant lease serializes this check with every sign-in link writer
+    // (self-link completion and login attestation).
     require_signin_account(db, user, &metadata.google_sub)?;
     write_store::connect(home, &key, metadata.clone(), &tokens.secret, pending.epoch)?;
     let detail = json!({"google_email": metadata.account_email,

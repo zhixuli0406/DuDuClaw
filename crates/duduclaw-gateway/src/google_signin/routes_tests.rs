@@ -361,6 +361,44 @@ async fn existing_account_code() {
     assert!(f.state.user_db.google_signin_link_for_user(&user.id).unwrap().is_none());
 }
 #[tokio::test]
+async fn login_attestation_refused_when_personal_connection_differs() {
+    use crate::person_credentials::{self as vault, Metadata, Secret, Status};
+
+    let f = Fixture::ready().await;
+    let db = &f.state.user_db;
+    let home = &f.state.home_dir;
+    let user = db.create_user(EMAIL, "Existing", "test-password-long", UserRole::Employee).unwrap();
+    let admin = db.create_user("admin@example.com", "Admin", "test-password-long", UserRole::Admin).unwrap();
+    db.attest_google_signin_users(&admin.id, admin.credential_epoch, std::slice::from_ref(&user.id),
+        chrono::Utc::now().timestamp()).unwrap();
+    duduclaw_core::gateway_instance::acquire(home).unwrap();
+    crate::handlers::credential_protection_rpc::protection_for(home).enable(false).unwrap();
+    let key = crate::google_identity::protection_gate(home).unwrap();
+    let epoch = vault::begin_connection(home, &user.id).unwrap();
+    vault::connect(home, &key, Metadata {
+        owner_kind: "user".into(), owner_id: user.id.clone(), provider: "google".into(),
+        credential_id: uuid::Uuid::new_v4().to_string(), revision: 1,
+        account_email: EMAIL.into(), google_sub: "987654321".into(),
+        hosted_domain: Some("example.com".into()), granted_scopes: vec!["openid".into(), "email".into()],
+        local_purposes: vec!["base".into()], status: Status::Connected, status_before_suspension: None,
+        connected_at: chrono::Utc::now().to_rfc3339(), last_refresh_at: None, oauth_client_id: CLIENT.into(),
+        google_data_consent: Some(crate::google_data_consent::Evidence::issue(&user.id).unwrap()),
+    }, &Secret {
+        access_token: "fixture-access-token".into(), refresh_token: Some("fixture-refresh-token".into()),
+        expires_at: Some(4_000_000_000),
+    }, epoch).unwrap();
+    let provider = Provider::new().await;
+    let (flow, ticket) = successful_callback(&f, &provider).await;
+    assert_eq!(f.complete(&ticket, &flow.cookie).await, json!({"result":"existing_account"}));
+    assert!(db.google_signin_link_for_user(&user.id).unwrap().is_none());
+    assert_eq!(me::personal_sub(home, &user.id).unwrap().as_deref(), Some("987654321"));
+    let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+    let attestations: i64 = conn.query_row("SELECT COUNT(*) FROM google_signin_attestations WHERE user_id=?1",
+        [&user.id], |row| row.get(0)).unwrap();
+    assert_eq!(attestations, 1);
+}
+
+#[tokio::test]
 async fn suspended_user_ticket_expired() {
     let f = Fixture::ready().await;
     let provider = Provider::new().await;
