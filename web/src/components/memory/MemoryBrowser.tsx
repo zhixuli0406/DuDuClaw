@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useIntl } from 'react-intl';
@@ -727,11 +728,12 @@ function MemoryDetail({
   prediction: PredictionMemory | null;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const layerId = memoryLayerMessageId(entry.layer);
   const sourceId = memorySourceMessageId(entry.source_event, entry.tags);
   const recorded = Number.isNaN(Date.parse(entry.timestamp))
     ? entry.timestamp
-    : new Date(entry.timestamp).toLocaleString();
+    : formatDateTime(entry.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 
   return (
     <Card data-size="sm">
@@ -853,6 +855,7 @@ function PredictionDetail({ data }: { data: PredictionMemory }) {
  */
 function MemoryHistory({ agentId, memoryId }: { agentId: string; memoryId: string }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [failed, setFailed] = useState(false);
@@ -963,14 +966,14 @@ function MemoryHistory({ agentId, memoryId }: { agentId: string; memoryId: strin
                           <ClockIcon className="size-3" />
                           {intl.formatMessage({ id: 'memory.history.validFrom' })}{' '}
                           <span className="font-mono">
-                            {c.valid_from ? new Date(c.valid_from).toLocaleString() : '—'}
+                            {c.valid_from ? formatDateTime(c.valid_from, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) : '—'}
                           </span>
                         </span>
                         <span>
                           {intl.formatMessage({ id: 'memory.history.validUntil' })}{' '}
                           <span className="font-mono">
                             {c.valid_until
-                              ? new Date(c.valid_until).toLocaleString()
+                              ? formatDateTime(c.valid_until, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })
                               : intl.formatMessage({ id: 'memory.history.now' })}
                           </span>
                         </span>
@@ -1011,7 +1014,7 @@ function MemoryHistory({ agentId, memoryId }: { agentId: string; memoryId: strin
                           {intl.formatMessage({ id: 'memory.history.validFrom' })}{' '}
                           <span className="font-mono">
                             {atResult.record.valid_from
-                              ? new Date(atResult.record.valid_from).toLocaleString()
+                              ? formatDateTime(atResult.record.valid_from, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })
                               : '—'}
                           </span>
                         </p>

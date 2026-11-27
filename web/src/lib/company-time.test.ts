@@ -94,6 +94,7 @@ describe('company time store', () => {
     let resolve!: (result: { timezone: string; status: 'set'; source: null }) => void;
     companyTimezoneMock.mockImplementationOnce(() => new Promise((done) => { resolve = done; }));
     const pending = useCompanyTimeStore.getState().load();
+    await vi.waitFor(() => expect(resolve).toBeTypeOf('function'));
     resetCompanyTimeZone();
     resolve({ timezone: 'Asia/Taipei', status: 'set', source: null });
     await pending;

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useId, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { CircleDot, Flag, UserRound, CalendarPlus, CalendarClock, CheckCircle2 } from 'lucide-react';
@@ -156,12 +157,13 @@ export function TaskProperties({
   onAssign: (agentName: string) => void;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const statusLabel = useStatusLabel();
   const statusKey = toStatusKey(task.status);
 
   const fmt = (d?: string) =>
     d
-      ? new Date(d).toLocaleString(intl.locale, {
+      ? formatDateTime(d, { locale: intl.locale,
           year: 'numeric',
           month: 'short',
           day: 'numeric',

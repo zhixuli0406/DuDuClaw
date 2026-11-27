@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import { api } from './api';
 
 interface CompanyTimeState {
   zone: string | null;
@@ -16,6 +15,7 @@ export const useCompanyTimeStore = create<CompanyTimeState>((set) => ({
   load: async () => {
     const epoch = ++requestEpoch;
     try {
+      const { api } = await import('./api');
       const result = await api.system.companyTimezone();
       if (epoch === requestEpoch) {
         set({ zone: result.timezone, status: result.status, source: result.source });
