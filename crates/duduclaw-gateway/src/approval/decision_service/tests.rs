@@ -283,6 +283,72 @@ async fn double_press_executes_once() { race(true).await; }
 async fn dashboard_and_chat_race_one_winner() { race(false).await; }
 
 #[tokio::test]
+async fn dashboard_and_chat_race_one_winner_bound() {
+    let f = Fixture::new();
+    let handler = crate::handlers::MethodHandler::new(f.env.home.clone()).await;
+    let ctx = f.db().live_user_context(&f.user).unwrap().unwrap();
+    let id = f.bound(json!({"egress_guard":{}}), &f.ack).await;
+    let by = Decider::ChatAdmin(f.proof(&id).await);
+    let lock = decision_lock(id.as_str());
+    let guard = lock.lock().await;
+    let dashboard = handler.handle_approvals_decide(json!({"id":id.as_str(), "approve":true}), &ctx);
+    tokio::pin!(dashboard);
+    // Exercise the real dashboard branch, not Decider::Dashboard (which the
+    // service does not handle for bound cards). It must wait on the same lock.
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), dashboard.as_mut()).await.is_err());
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    drop(guard);
+    let (dashboard, chat) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(dashboard.as_mut(), decide(&f.env, &id, true, "", &by))
+    }).await.expect("bound decisions must finish after releasing the lock");
+    let dashboard_ok = match &dashboard {
+        crate::protocol::WsFrame::Response { ok, error, .. } => {
+            assert_eq!(error.is_some(), !*ok, "{dashboard:?}");
+            *ok
+        }
+        other => panic!("expected dashboard response, got {other:?}"),
+    };
+    assert_eq!(usize::from(dashboard_ok) + usize::from(chat.is_ok()), 1);
+    let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.status, ApprovalStatus::Approved);
+    let expected_by = if dashboard_ok { format!("dashboard:{}", f.user) }
+        else { format!("chat-admin:{}:telegram:tap", f.user) };
+    assert_eq!(rec.decided_by.as_deref(), Some(expected_by.as_str()));
+    assert!(rec.decided_at.is_some());
+    // Exactly one ledger row for a chat winner, none for a dashboard winner.
+    f.assert_ledger(&id, chat.is_ok()).await;
+}
+
+#[tokio::test]
+async fn bound_dashboard_rereads_record_after_waiting_for_decision_lock() {
+    let f = Fixture::new();
+    let handler = crate::handlers::MethodHandler::new(f.env.home.clone()).await;
+    let ctx = f.db().live_user_context(&f.user).unwrap().unwrap();
+    let id = f.bound(json!({"egress_guard":{}}), &f.ack).await;
+    let proof = f.proof(&id).await;
+    let lock = decision_lock(id.as_str());
+    let guard = lock.lock().await;
+    let dashboard = handler.handle_approvals_decide(json!({"id":id.as_str(), "approve":true}), &ctx);
+    tokio::pin!(dashboard);
+    assert!(tokio::time::timeout(std::time::Duration::from_millis(50), dashboard.as_mut()).await.is_err());
+    // Simulate the service's winning transaction while owning its lock.
+    let entry = chat_admin::LedgerEntry {
+        user_id: f.user.parse().unwrap(), channel: proof.channel, step: proof.step,
+        step_required: false, card_id: proof.card_id, digest: proof.digest,
+    };
+    f.env.broker.decide_bound_chat_admin(&id, &entry, false).await.unwrap();
+    drop(guard);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), dashboard.as_mut())
+        .await.expect("dashboard must finish after releasing the lock");
+    let expected = crate::protocol::WsFrame::error_response("", &format!("approval {id} already denied"));
+    assert_eq!(serde_json::to_value(response).unwrap(), serde_json::to_value(expected).unwrap());
+    let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+    assert_eq!(rec.decided_by, Some(format!("chat-admin:{}:telegram:tap", f.user)));
+    assert_eq!(rec.status, ApprovalStatus::Denied);
+    f.assert_ledger(&id, true).await;
+}
+
+#[tokio::test]
 async fn side_effect_failure_leaves_pending() {
     for chat in [false, true] {
         let f = Fixture::new();

@@ -205,6 +205,14 @@ impl MethodHandler {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            let lock = decision_lock(approval_id.as_str());
+            let _guard = lock.lock().await;
+            // Chat-admin decisions share this lock; discard the pre-lock snapshot.
+            let fresh = match Self::required_approval_for_decision(broker.get(&approval_id).await) {
+                Ok(rec) => rec,
+                Err(response) => return response,
+            };
+            let rec = &fresh;
             if rec.is_stale(chrono::Utc::now()) {
                 let _ = broker.poll(&approval_id).await;
                 let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
