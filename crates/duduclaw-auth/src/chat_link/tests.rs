@@ -4,6 +4,32 @@ use crate::{otp::ChannelProofStatus, test_support::{test_db, TestDbPath}, UserRo
 const SESSION: &str = "authenticated-session-hash";
 const PRINCIPAL: &str = "12344821";
 
+#[test]
+fn chat_link_dashboard_lists_are_owner_scoped() {
+    let (db, _home, owner) = fixture();
+    let other = admin(&db, "other@example.com");
+    let waiting = begin(&db, &owner);
+    let matched = begin(&db, &owner);
+    receive(&db, &matched.code, PRINCIPAL, true);
+    let foreign = begin(&db, &other);
+    db.bind_channel_identity(&owner, "telegram", "pending-1", false).unwrap();
+    db.bind_channel_identity(&owner, "googlechat", "users/1", true).unwrap();
+    db.bind_channel_identity(&other, "telegram", "other-1", true).unwrap();
+    let rows = db.channel_identities_for_user(&owner).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r.user_id == owner));
+    assert!(rows.iter().any(|r| !r.verified));
+    let pending = pending_ids(&db, &owner).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.contains(&waiting.handshake_id));
+    assert!(pending.contains(&matched.handshake_id));
+    assert!(!pending.contains(&foreign.handshake_id));
+    cancel(&db, &owner, &waiting.handshake_id).unwrap();
+    db.conn().execute("UPDATE chat_link_handshakes SET expires_at=0 WHERE id=?1",
+        [&matched.handshake_id]).unwrap();
+    assert!(pending_ids(&db, &owner).unwrap().is_empty());
+}
+
 fn admin(db: &UserDb, email: &str) -> String {
     db.create_user(email, "Admin", "pw-unused-123456", UserRole::Admin).unwrap().id
 }

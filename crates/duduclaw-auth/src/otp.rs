@@ -164,6 +164,21 @@ pub(crate) fn generate_numeric_code() -> String {
 }
 
 impl UserDb {
+    /// All of the caller's bindings, including unverified admin-prefilled rows.
+    /// The gateway supplies the authenticated owner, never a request parameter.
+    pub fn channel_identities_for_user(&self, user_id: &str) -> Result<Vec<ChannelIdentity>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, channel, channel_user_id, verified, created_at
+             FROM channel_identities WHERE user_id = ?1 ORDER BY channel, channel_user_id"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([user_id], |r| Ok(ChannelIdentity {
+            user_id: r.get(0)?, channel: r.get(1)?, channel_user_id: r.get(2)?,
+            verified: r.get::<_, i64>(3)? != 0, created_at: r.get(4)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
     /// Read self-proof only; deliberately does NOT check role, Active status,
     /// or current bot configuration. The gateway must check those at use time.
     /// Multiple identities on a channel are ordered by most recent proof.

@@ -300,6 +300,18 @@ pub fn status(db: &UserDb, user_id: &str, handshake_id: &str) -> Result<Option<H
     Ok(result)
 }
 
+/// Owner-scoped pending handshake IDs for the dashboard. Status reads still
+/// perform expiry and expose only the public projection chosen by the gateway.
+pub fn pending_ids(db: &UserDb, user_id: &str) -> Result<Vec<String>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare("SELECT id FROM chat_link_handshakes
+        WHERE user_id=?1 AND status IN ('waiting','matched') AND expires_at > ?2
+        ORDER BY created_at,id").map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params![user_id, Utc::now().timestamp()], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    rows.collect::<std::result::Result<Vec<_>, _>>().map_err(|e| e.to_string())
+}
+
 /// Confirm using the same authenticated user/session as start. Rechecks live
 /// Admin/MFA eligibility and identity ownership inside the binding transaction.
 /// The gateway must audit successful confirmation (`channel_identity_proven`).
