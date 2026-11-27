@@ -57,7 +57,7 @@ pub(in crate::google_identity) fn live_key(
     reference: &CredentialRef,
     tool: &str,
 ) -> Result<(), Refusal> {
-    if gi::native_google_scope(tool).is_none() || !reference.is_well_formed() {
+    if gi::native_google_scope(tool).is_none() || duduclaw_core::google_identity::is_drive_write_tool(tool) || !reference.is_well_formed() {
         return Err(refused());
     }
     if !crate::google_workspace::integration_enabled(home) {

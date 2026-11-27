@@ -43,6 +43,7 @@ pub mod native_tools;
 pub mod requester_gate;
 pub mod resolve;
 pub mod route;
+pub(crate) mod write_scope_guard;
 pub(crate) mod tenant_source;
 
 #[cfg(test)]
@@ -103,7 +104,7 @@ pub const REFUSAL_CODES: &[&str] = &[
     "delegate_rejected",
     "google_unreachable",
     "gateway_unreachable",
-    "not_connected", "awaiting_consent", "consent_declined", "ambiguous_owner", "no_owner", "needs_reconnect", "scope_missing",
+    "not_connected", "awaiting_consent", "consent_declined", "ambiguous_owner", "no_owner", "needs_reconnect", "scope_missing", "write_scope_isolated", "scope_unverified", "write_tool_gateway_only",
 ];
 
 /// Message when the protected key is not ready (B2c design §11).

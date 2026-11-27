@@ -53,6 +53,7 @@ impl GoogleMountGuard {
         if dir.parent() != Some(agents.as_path()) || !dir.join("agent.toml").is_file() {
             return Err(unavailable());
         }
+        super::write_scope_guard::check_requested(super::delegated_scopes::for_endpoint(&home, endpoint)?)?;
         let effective = super::delegate_owner::effective_for(&home, Some(&agent));
         let who = requester(&agent);
         let resolved = match &effective.effective {
@@ -70,16 +71,23 @@ impl GoogleMountGuard {
             other => return Err(resolve::refusal_for(other).unwrap_or_else(unavailable)),
         };
         let (token, fallback, notice) = match resolved {
-            resolve::Resolved::Delegated { token, email } => (
-                token.access_token,
-                false,
-                Some(format!("目前代表 {email} 使用 Google。")),
-            ),
+            resolve::Resolved::Delegated { token, email } => {
+                if let Some(scopes) = &token.granted_scopes {
+                    super::write_scope_guard::check_actual(scopes)?;
+                }
+                (token.access_token, false, Some(format!("目前代表 {email} 使用 Google。")))
+            },
             resolve::Resolved::Personal { .. } => return Err(unavailable()),
             resolve::Resolved::UseHome { fallback, notice } => (
                 crate::google_workspace::get_valid_google_token_for_endpoint(&home, endpoint)
                     .await
-                    .map_err(|_| {
+                    .map_err(|error| {
+                        if matches!(&error, crate::google_workspace::GoogleAuthError::RefreshFailed(code) if code == "write_scope_isolated") {
+                            return super::write_scope_guard::write_scope_isolated();
+                        }
+                        if matches!(&error, crate::google_workspace::GoogleAuthError::RefreshFailed(code) if code == "scope_unverified") {
+                            return super::write_scope_guard::scope_unverified();
+                        }
                         Refusal::hard("account_unavailable", "公司共用 Google 帳號暫時無法使用。")
                     })?,
                 fallback,
@@ -128,7 +136,7 @@ impl GoogleMountGuard {
         match &now.effective {
             Effective::Home => Ok(()),
             Effective::Delegate { email } => {
-                super::delegated_scopes::for_endpoint(&self.home, &self.endpoint)?;
+                super::write_scope_guard::check_requested(super::delegated_scopes::for_endpoint(&self.home, &self.endpoint)?)?;
                 if !crate::google_workspace::integration_enabled(&self.home) {
                     return Err(Refusal::hard("disabled", "Google 整合尚未開啟。"));
                 }

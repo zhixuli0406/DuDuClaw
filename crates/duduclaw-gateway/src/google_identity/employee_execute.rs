@@ -77,6 +77,10 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         Request::Execute { tool, arguments, turn_id, run_id, call_id, approval_binding_digest } =>
             (tool, arguments, turn_id, run_id, call_id, Some(approval_binding_digest)),
     };
+    // Package 131-P9a will route these tools to the gateway executor.
+    if duduclaw_core::google_identity::is_drive_write_tool(&tool) {
+        return Err(Refusal::hard("drive_write_unavailable", "雲端硬碟寫入只能由主程式執行。"));
+    }
     if gi::native_google_scope(&tool).is_none() || !args.is_object() || !valid_id(&call) {
         return Err(changed());
     }

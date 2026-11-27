@@ -782,6 +782,9 @@ impl McpDispatcher {
         }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if duduclaw_core::google_identity::is_drive_write_tool(tool_name) {
+            return jsonrpc_error(id, -32003, "雲端硬碟寫入只能由主程式執行。");
+        }
         if let Err(message) = duduclaw_gateway::google_workspace::validate_native_tool_inputs(
             tool_name, params.get("arguments").unwrap_or(&Value::Null),
         ) {
@@ -5261,6 +5264,15 @@ effect = "forbid"
         "docs_replace_text",
         "sheets_create",
         "sheets_update",
+        "drive_create_file",
+        "drive_copy_file",
+        "drive_update_file",
+        "drive_move_file",
+        "drive_trash_file",
+        "docs_insert_text",
+        "docs_format",
+        "sheets_add_sheet",
+        "sheets_add_note",
         "calendar_update_event",
         "gmail_send_draft",
         "calendar_delete_event",
@@ -5485,7 +5497,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            271,
+            280,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

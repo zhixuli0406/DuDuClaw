@@ -15,6 +15,9 @@ pub(crate) async fn handle_tools_call(
 ) -> Value {
     let caller_client_id = principal.client_id.as_str();
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if duduclaw_core::google_identity::is_drive_write_tool(tool_name) {
+        return jsonrpc_error(id, -32003, "雲端硬碟寫入只能由主程式執行。");
+    }
     let arguments = params
         .get("arguments")
         .cloned()

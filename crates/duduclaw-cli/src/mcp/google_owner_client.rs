@@ -18,6 +18,7 @@ fn env(name: &str) -> Option<String> {
         !s.is_empty() && s.len() <= 128 && !s.chars().any(char::is_control))
 }
 pub(crate) async fn prepare(home: &Path, agent: &str, tool: &str, params: &mut Value) -> Result<Option<OwnerCall>, String> {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Err("雲端硬碟寫入只能由主程式執行。".into()); }
     if gi::native_google_scope(tool).is_none()
         || (tool != "google_chat_send" && gi::effective_for(home, Some(agent)).effective != gi::Effective::DelegateOwner) {
         return Ok(None);
@@ -74,7 +75,7 @@ mod tests {
     use super::*;
     #[test]
     fn all_26_native_tools_are_in_owner_lane() {
-        assert_eq!(gi::NATIVE_GOOGLE_TOOLS.len(), 29);
+        assert_eq!(gi::NATIVE_GOOGLE_TOOLS.len(), 38);
         for tool in gi::NATIVE_GOOGLE_TOOLS { assert!(gi::native_google_scope(tool).is_some()); }
     }
     #[tokio::test]

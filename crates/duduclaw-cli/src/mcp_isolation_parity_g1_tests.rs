@@ -33,7 +33,7 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 271;
+const CATALOG_TOOLS: usize = 280;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -382,6 +382,16 @@ github = true
     println!("G1\ttool\tpolicy_route\tboundary\trequired\tshared\tpersonal");
     for name in &tools {
         let name = *name;
+        if duduclaw_core::google_identity::is_drive_write_tool(name) {
+            assert!(policy_table::policy(name).is_none(), "{name}");
+            assert!(boundary_route(name).is_none(), "{name}");
+            for (index, employee) in employees.iter().enumerate() {
+                assert!(!policy_table::eligible(&employee.context, name), "{name}");
+                assert!(matches!(manifests[index].get(name),
+                    Some(ServiceState::IntentionalRefusal(_))), "{name}");
+            }
+            continue;
+        }
         let policy = policy_table::policy(name).unwrap_or_else(|| panic!("{name}: catalog tool without a tool_policy entry"));
         let boundary = boundary_route(name).unwrap_or_else(|| panic!("{name}: catalog tool without an exact boundary route"));
         // Required grants: never empty; the own Employee grant first, except
