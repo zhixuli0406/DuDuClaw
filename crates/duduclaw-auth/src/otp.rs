@@ -80,6 +80,23 @@ pub struct ChannelIdentity {
     pub created_at: String,
 }
 
+/// Self-confirmed chat identity and delivery destination. Times are Unix seconds.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatApprovalProof {
+    pub channel: String,
+    pub channel_user_id: String,
+    pub proof_account: String,
+    pub proof_dm: String,
+    pub proven_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelProofStatus {
+    SelfConfirmed,
+    AdminPrefilled,
+}
+
 /// The result of requesting an OTP — carries the plaintext code for the caller
 /// (RPC) to deliver over the channel, and a masked target for the UI. The code
 /// is NEVER stored in plaintext; only its hash lives in the DB.
@@ -147,6 +164,49 @@ pub(crate) fn generate_numeric_code() -> String {
 }
 
 impl UserDb {
+    /// Read self-proof only; deliberately does NOT check role, Active status,
+    /// or current bot configuration. The gateway must check those at use time.
+    /// Multiple identities on a channel are ordered by most recent proof.
+    pub fn approval_proof(&self, user_id: &str, channel: &str) -> Result<Option<ChatApprovalProof>, String> {
+        Ok(self.approval_proofs(user_id)?.into_iter().find(|p| p.channel == channel))
+    }
+
+    /// All self-proven identities, including multiple accounts per channel.
+    /// Like `approval_proof`, this is evidence, not live gateway authorization.
+    pub fn approval_proofs(&self, user_id: &str) -> Result<Vec<ChatApprovalProof>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT channel, channel_user_id, proof_account, proof_dm, proven_at
+             FROM channel_identities WHERE user_id = ?1 AND verified = 1
+                AND proof_method = 'chat_handshake' AND proof_user_id = user_id
+                AND proof_account IS NOT NULL AND proof_account != ''
+                AND proof_dm IS NOT NULL AND proof_dm != '' AND proven_at IS NOT NULL
+             ORDER BY proven_at DESC, channel, channel_user_id"
+        ).map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([user_id], |r| Ok(ChatApprovalProof {
+            channel: r.get(0)?, channel_user_id: r.get(1)?, proof_account: r.get(2)?,
+            proof_dm: r.get(3)?, proven_at: r.get(4)?,
+        })).map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    }
+
+    /// Dashboard label for one exact row; missing rows return None. Unknown or
+    /// incomplete proof never counts as self-confirmed. No role/bot checks.
+    pub fn channel_identity_proof_status(
+        &self, user_id: &str, channel: &str, channel_user_id: &str,
+    ) -> Result<Option<ChannelProofStatus>, String> {
+        self.conn().query_row(
+            "SELECT CASE WHEN verified = 1 AND proof_method = 'chat_handshake'
+                AND proof_user_id = user_id AND proof_account IS NOT NULL AND proof_account != ''
+                AND proof_dm IS NOT NULL AND proof_dm != '' AND proven_at IS NOT NULL
+                THEN 1 ELSE 0 END FROM channel_identities
+             WHERE user_id = ?1 AND channel = ?2 AND channel_user_id = ?3",
+            params![user_id, channel, channel_user_id],
+            |r| Ok(if r.get::<_, bool>(0)? { ChannelProofStatus::SelfConfirmed }
+                else { ChannelProofStatus::AdminPrefilled }),
+        ).optional().map_err(|e| e.to_string())
+    }
+
     // ── Channel identity binding ─────────────────────────────────
 
     /// Bind (or re-bind) a channel DM identity to a user. `verified` should be
@@ -218,7 +278,12 @@ impl UserDb {
             "INSERT INTO channel_identities (user_id, channel, channel_user_id, verified, created_at, verified_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(channel, channel_user_id)
-             DO UPDATE SET user_id = ?1, verified = ?4, verified_at = ?6",
+             DO UPDATE SET user_id = ?1, verified = ?4, verified_at = ?6,
+                proof_method = CASE WHEN channel_identities.user_id = ?1 THEN proof_method ELSE NULL END,
+                proof_user_id = CASE WHEN channel_identities.user_id = ?1 THEN proof_user_id ELSE NULL END,
+                proven_at = CASE WHEN channel_identities.user_id = ?1 THEN proven_at ELSE NULL END,
+                proof_account = CASE WHEN channel_identities.user_id = ?1 THEN proof_account ELSE NULL END,
+                proof_dm = CASE WHEN channel_identities.user_id = ?1 THEN proof_dm ELSE NULL END",
             params![user_id, channel, channel_user_id, verified as i64, now, verified.then(|| Utc::now().timestamp_micros())],
         )
         .map_err(|e| format!("bind channel identity failed: {e}"))?;
