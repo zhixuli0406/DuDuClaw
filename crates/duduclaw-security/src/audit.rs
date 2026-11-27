@@ -151,8 +151,7 @@ pub fn audit_log_position(home_dir: &Path) -> Result<u64, String> {
 /// appended at or after byte `since` already satisfies `present` (an earlier
 /// delivery whose acknowledgement was lost), nothing is written and
 /// `Ok(false)` is returned. The check and the append run under one lock;
-/// only the records after `since` are checked for duplicates. If the log is
-/// shorter than `since` (e.g. after rotation), append without a duplicate scan.
+/// only the records after `since` are read.
 pub fn try_append_audit_event_once(
     home_dir: &Path,
     event: &AuditEvent,
