@@ -137,6 +137,36 @@ impl MethodHandler {
     pub(crate) async fn handle_google_drive_write_rpc(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         if !ctx.is_admin() { return WsFrame::error_response("", "只有管理員可以調整雲端硬碟寫入權限。"); }
         if method == "google.drive_write.get" { return self.drive_write_get(); }
+        if matches!(method, "google.drive_write.consent_home_start" | "google.drive_write.consent_home_disconnect"
+            | "google.drive_write.consent_home_finish" | "google.drive_write.consent_home_paste") {
+            let result: Result<Value, String> = async {
+                use crate::google_personal::{self, flow, home_write, pending};
+                let session = google_personal::session_for(&ctx.user_id)?;
+                let db = self.user_db.read().await.clone().ok_or("人員資料尚未就緒。")?;
+                home_write::require_admin(&db, &ctx.user_id)?;
+                match method {
+                    "google.drive_write.consent_home_start" => {
+                        let origin = params.get("redirect_origin").and_then(Value::as_str)
+                            .ok_or("請提供目前控制台的網址。")?;
+                        home_write::start(&self.home_dir, &db, &ctx.user_id, &session, origin,
+                            &crate::server::allowed_origins_snapshot(),
+                            params.get("acknowledge_google_data").and_then(Value::as_bool) == Some(true),
+                            params.get("acknowledge_write").and_then(Value::as_bool) == Some(true)).await
+                    }
+                    "google.drive_write.consent_home_disconnect" =>
+                        home_write::disconnect(&self.home_dir, &db, &ctx.user_id),
+                    _ => {
+                        let state = if method == "google.drive_write.consent_home_paste" {
+                            pending::receive_pasted(&self.home_dir, &ctx.user_id, &session,
+                                params.get("url").and_then(Value::as_str).unwrap_or(""))?
+                        } else { params.get("state").and_then(Value::as_str).unwrap_or("").to_string() };
+                        flow::finish_home(&self.home_dir, &db, &ctx.user_id, &session, &state).await
+                    }
+                }
+            }.await;
+            return match result { Ok(value) => WsFrame::ok_response("", value), Err(e) => WsFrame::error_response("", &e) };
+        }
+        if method != "google.drive_write.set" { return WsFrame::error_response("", "未知的雲端硬碟寫入方法。"); }
         let lookup = GatewayFolderLookup { home: &self.home_dir, db: self.user_db.read().await.clone(), user: &ctx.user_id };
         self.drive_write_set(params, ctx, &lookup).await
     }
@@ -162,7 +192,18 @@ impl MethodHandler {
                 && r.status == crate::person_credentials::Status::Connected).count()}), false),
             Err(_) => (Value::Null, true),
         };
+        let route_oauth = crate::google_workspace::selected_path(&self.home_dir).ok().as_deref() == Some("oauth");
+        let home_write = match crate::person_credentials::write_store::get(&self.home_dir, "home", "home") {
+            Ok(Some(record)) => json!({"route_oauth": route_oauth,
+                "connected": record.metadata.status == crate::person_credentials::Status::Connected,
+                "status": record.metadata.status, "account_email": record.metadata.account_email}),
+            Ok(None) => json!({"route_oauth": route_oauth, "connected": false,
+                "status": "disconnected", "account_email": null}),
+            Err(_) => json!({"route_oauth": route_oauth, "connected": false,
+                "status": "unreadable", "account_email": null}),
+        };
         WsFrame::ok_response("", json!({
+            "home_write":home_write,
             "configured":configured, "effective":active, "approval":stored.approval,
             "folders":stored.folders.iter().map(|f| json!({"id":f.id,"name":f.name,"kind":f.kind})).collect::<Vec<_>>(),
             "ack":stored.ack.as_ref().map(|a| json!({"by_email":a.by_email,"by_role":a.by_role,"at":a.at})),

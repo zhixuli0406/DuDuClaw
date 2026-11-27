@@ -29,6 +29,7 @@ pub struct Pending {
     pub drive_write: bool,
     pub chat_read: bool,
     pub chat_send: bool,
+    pub(crate) expected_home_write: Option<crate::google_identity::home_source::HomeWriteIdentity>,
     pub expected_connection: Option<crate::person_credentials::Metadata>,
     pub google_data_consent: crate::google_data_consent::Evidence,
     pub created: Instant,

@@ -18052,6 +18052,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -18103,6 +18104,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -18158,6 +18160,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });

@@ -314,3 +314,17 @@ async fn unattended_notice_targets_primary_owner_once_per_hour_without_fallback(
     notify_unattended(f.home.path(), "missing").await;
     assert!(crate::notify_push::person_notice_test::take(f.home.path()).is_empty());
 }
+
+#[tokio::test]
+async fn home_oauth_readiness_becomes_ready_after_admin_consent() {
+    let f = crate::google_personal::home_write_tests::Fixture::new().await;
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::NeedsHomeConsent);
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::Ready);
+    let token = write_token(f.home(), &IdentityRoute::HomeOAuth).await.unwrap();
+    assert_eq!(token.meta.identity_kind, "home_oauth");
+    assert_eq!(token.meta.account_email, "alice@c.test");
+    store::disconnect(f.home(), "home", "home").unwrap();
+    assert_eq!(readiness(f.home(), &IdentityRoute::HomeOAuth), Readiness::NeedsHomeConsent);
+}

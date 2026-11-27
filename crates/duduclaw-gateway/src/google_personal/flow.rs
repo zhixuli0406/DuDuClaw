@@ -40,7 +40,7 @@ pub async fn start_with_meetings(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, false, false, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, false, false, None, false).await
 }
 
 pub async fn start_drive_tools(
@@ -52,7 +52,7 @@ pub async fn start_drive_tools(
     allowed: &[String],
     acknowledge_google_data: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, false, false, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, false, false, None, false).await
 }
 
 pub(crate) async fn start_authorization_request(
@@ -65,11 +65,11 @@ pub(crate) async fn start_authorization_request(
         return Err(crate::google_authorization_requests::store::REFUSED.into());
     }
     start_consent(home,db,user,session,origin,allowed,true,false,
-        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,request.purpose == "drive_write",Some(request)).await
+        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,request.purpose == "drive_write",Some(request), false).await
 }
 
 pub async fn start_chat_send(home: &Path, db: &UserDb, user: &str, session: &str, origin: &str, allowed: &[String], acknowledge: bool) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge, false, false, true, false, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge, false, false, true, false, None, false).await
 }
 
 pub async fn start_drive_write(
@@ -82,10 +82,10 @@ pub async fn start_drive_write(
     if !acknowledge_write {
         return Err("請先確認要開放 AI 在雲端硬碟寫入。".into());
     }
-    start_consent(home, db, user, session, origin, allowed, true, false, false, false, true, None).await
+    start_consent(home, db, user, session, origin, allowed, true, false, false, false, true, None, false).await
 }
 
-fn require_write_policy(home: &Path) -> Result<(), String> {
+pub(super) fn require_write_policy(home: &Path) -> Result<(), String> {
     if !crate::google_workspace::drive_write_policy::load(home).any_enabled() {
         return Err("管理員還沒開放 AI 在雲端硬碟寫入。".into());
     }
@@ -98,7 +98,7 @@ fn ordinary_for_write(home: &Path, user: &str) -> Result<Metadata, String> {
         .ok_or_else(|| "請先重新連結自己的 Google 帳號，再開放雲端硬碟寫入。".into())
 }
 
-async fn start_consent(
+pub(super) async fn start_consent(
     home: &Path,
     db: &UserDb,
     user: &str,
@@ -111,7 +111,14 @@ async fn start_consent(
     chat_send: bool,
     drive_write: bool,
     authorization_request: Option<&crate::google_authorization_requests::store::Request>,
+    home_write: bool,
 ) -> Result<Value, String> {
+    if home_write {
+        super::home_write::require_admin(db, user)?;
+        if !drive_write || authorization_request.is_some() {
+            return Err("這次授權不是公司 Google 寫入連線。".into());
+        }
+    }
     if drive_write { require_write_policy(home)?; }
     if chat_send && !crate::google_workspace::chat_send_enabled(home) { return Err(crate::google_workspace::chat_send::GUIDANCE.into()); }
     if [meeting_recordings, drive_tools, chat_send, drive_write].iter().filter(|v| **v).count() > 1 {
@@ -139,7 +146,14 @@ async fn start_consent(
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     // Incremental consent extends this person's existing Google account;
     // choosing another account cannot silently replace it.
-    let expected_connection = if drive_write {
+    let expected_home_write = if home_write {
+        Some(crate::google_identity::home_source::home_write_identity(home).await
+            .map_err(|_| "無法確認公司 OAuth 帳號，請先重新連結公司 Google 帳號。")?)
+    } else { None };
+    let home_email = expected_home_write.as_ref().map(|binding| binding.email.clone());
+    let expected_connection = if home_write {
+        None
+    } else if drive_write {
         Some(ordinary_for_write(home, user)?)
     } else if chat_send {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放 Chat 傳送。")?.metadata)
@@ -168,7 +182,9 @@ async fn start_consent(
         }
         oauth::scopes_for_purposes(&purposes, chat_read)
     };
-    let epoch = if drive_write { write_store::begin_connection(home, "user", user)? }
+    if home_write { super::home_write::require_admin(db, user)?; require_write_policy(home)?; }
+    let epoch = if home_write { write_store::begin_connection(home, "home", "home")? }
+        else if drive_write { write_store::begin_connection(home, "user", user)? }
         else { vault::begin_connection(home, user)? };
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
@@ -189,6 +205,7 @@ async fn start_consent(
         chat_read,
         chat_send,
         expected_connection,
+        expected_home_write,
         google_data_consent,
         created: Instant::now(),
         code: None,
@@ -196,9 +213,9 @@ async fn start_consent(
     let mut authorization_url = oauth::authorization_url_for_scopes(
         &client.client_id, &redirect_uri, &state, &challenge, &requested,
     )?;
-    if let Some(request) = authorization_request {
+    if let Some(email) = home_email.as_deref().or_else(|| authorization_request.map(|r| r.email.as_str())) {
         let mut url = url::Url::parse(&authorization_url).map_err(|_| "Google 授權網址無效。")?;
-        url.query_pairs_mut().append_pair("login_hint", &request.email);
+        url.query_pairs_mut().append_pair("login_hint", email);
         authorization_url = url.to_string();
     }
     Ok(
@@ -213,6 +230,19 @@ pub async fn finish(
     session: &str,
     state: &str,
 ) -> Result<Value, String> {
+    finish_consent(home, db, user, session, state, false).await
+}
+
+pub(crate) async fn finish_home(
+    home: &Path, db: &UserDb, user: &str, session: &str, state: &str,
+) -> Result<Value, String> {
+    super::home_write::require_admin(db, user)?;
+    finish_consent(home, db, user, session, state, true).await
+}
+
+async fn finish_consent(
+    home: &Path, db: &UserDb, user: &str, session: &str, state: &str, home_only: bool,
+) -> Result<Value, String> {
     active_user(db, user)?;
     let authorization_request = crate::google_authorization_requests::store::Store::open(home)?
         .oauth(state, user, session)?;
@@ -220,7 +250,16 @@ pub async fn finish(
         crate::google_authorization_requests::validate(home, db, request)?;
     }
     let pending = pending::take(home, state, user, session)?;
+    if home_only && pending.expected_home_write.is_none() {
+        return Err("這次授權不是公司 Google 寫入連線。".into());
+    }
     crate::google_data_consent::require_current(Some(&pending.google_data_consent))?;
+    if pending.expected_home_write.is_some() {
+        if !pending.drive_write || authorization_request.is_some() {
+            return Err("這次 Google 連結已失效，請重新開始。".into());
+        }
+        return super::home_write::finish(home, db, user, &pending).await;
+    }
     if pending.drive_write {
         if authorization_request.as_ref().is_some_and(|r| r.purpose != "drive_write") {
             return Err("這次 Google 連結已失效，請重新開始。".into());

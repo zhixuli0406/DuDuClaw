@@ -51,7 +51,9 @@ async fn rpc(h: &MethodHandler, method: &str, params: Value, ctx: &UserContext) 
 async fn non_admin_get_and_set_are_refused() {
     let (dir, h) = fixture().await;
     let mut member = admin(); member.role = UserRole::Employee;
-    for method in ["google.drive_write.get", "google.drive_write.set"] {
+    for method in ["google.drive_write.get", "google.drive_write.set",
+        "google.drive_write.consent_home_start", "google.drive_write.consent_home_disconnect",
+        "google.drive_write.consent_home_finish", "google.drive_write.consent_home_paste"] {
         refused(rpc(&h, method, input(), &member).await);
     }
     assert_eq!(std::fs::read_to_string(dir.path().join("config.toml")).unwrap(), ORIGINAL);
@@ -292,4 +294,27 @@ async fn http_error_folder_metadata_is_unavailable_and_stored_unverified() {
     let response = axum::http::Response::builder().status(200)
         .body(metadata.to_string()).unwrap();
     assert_eq!(folder_response_value(reqwest::Response::from(response)).await, Some(metadata));
+}
+
+#[tokio::test]
+async fn home_write_status_is_safe_and_unreadable_store_fails_closed() {
+    let (dir, h) = fixture().await;
+    let status = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    assert_eq!(status["home_write"]["connected"], false);
+    assert_eq!(status["home_write"]["status"], "disconnected");
+    assert!(status["home_write"]["account_email"].is_null());
+    std::fs::write(crate::person_credentials::write_store::path(dir.path()), "broken").unwrap();
+    let status = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    assert_eq!(status["home_write"]["connected"], false);
+    assert_eq!(status["home_write"]["status"], "unreadable");
+}
+
+#[tokio::test]
+async fn home_write_rpcs_require_authenticated_dashboard_session() {
+    let (_dir, h) = fixture().await;
+    for method in ["google.drive_write.consent_home_start", "google.drive_write.consent_home_disconnect",
+        "google.drive_write.consent_home_finish", "google.drive_write.consent_home_paste"] {
+        refused(rpc(&h, method, json!({"acknowledge_google_data":true,"acknowledge_write":true,
+            "redirect_origin":"http://127.0.0.1:18889","user_id":"admin-test"}), &admin()).await);
+    }
 }

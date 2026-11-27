@@ -102,7 +102,9 @@ impl MethodHandler {
         }
 
         match method {
-            "google.drive_write.get" | "google.drive_write.set" => {
+            "google.drive_write.get" | "google.drive_write.set"
+            | "google.drive_write.consent_home_start" | "google.drive_write.consent_home_disconnect"
+            | "google.drive_write.consent_home_finish" | "google.drive_write.consent_home_paste" => {
                 require_admin!();
                 boxed_frame(|| self.handle_google_drive_write_rpc(method, params, ctx)).await
             }
