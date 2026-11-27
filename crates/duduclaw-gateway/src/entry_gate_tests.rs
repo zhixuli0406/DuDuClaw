@@ -2,6 +2,50 @@ use super::*;
 use crate::channel_reply::entry_gate_test_helpers::owned_channel;
 
 #[tokio::test(flavor = "current_thread")]
+async fn heartbeat_assignee_gate_checks_effective_artifact_before_host_spawn() {
+    let (home, _ctx, _runtime, calls) = owned_channel(RuntimeType::Codex).await;
+    let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    let before = crate::model_call_probe::calls();
+    // Keep the raw profile healthy: refusal must come from the effective file.
+    for (text, expected) in [
+        ("[runtime]\nprovider='codex'\n[model]\npreferred='gpt-5.4'", None),
+        ("[runtime]\nprovider='claude'\n[model]\npreferred='claude-sonnet-4-6'", None),
+        ("[runtime]\nprovider='typo'\n[model]\npreferred='gpt-5.4'", Some("agent_config_unreadable")),
+        ("[runtime]\nprovider='claude'\n[model]\npreferred='gpt-5.4'", Some("model_provider_mismatch")),
+        ("[broken", Some("agent_config_unreadable")),
+    ] {
+        std::fs::write(&resolved, text).unwrap();
+        let result = check_task_assignee(home.path(), "worker")
+            .map_err(|refusal| background_refusal(&refusal));
+        match expected {
+            Some(code) => assert_eq!(background_refusal_code(&result.unwrap_err()), Some(code)),
+            None => assert_eq!(result, Ok(())),
+        }
+    }
+    std::fs::write(&resolved, [0xff, 0xfe]).unwrap();
+    assert_eq!(check_task_assignee(home.path(), "worker").unwrap_err().code(), "agent_config_unreadable");
+    assert_eq!(crate::model_call_probe::calls(), before);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn background_fallback_note_keeps_anchored_code_and_only_describes_mismatches() {
+    for refusal in refusals() {
+        for fallback in [None, Some(RuntimeType::Codex)] {
+            let error = background_refusal_with_fallback(&refusal, fallback);
+            assert_eq!(background_refusal_code(&error), Some(refusal.code()));
+            let expected = if matches!(refusal, EntryRefusal::ModelProviderMismatch { .. }) {
+                runtime_config::alignment_refusal_with_fallback(background_refusal(&refusal), fallback)
+            } else { background_refusal(&refusal) };
+            assert_eq!(error, expected);
+            assert_eq!(error.contains("A fallback runtime is configured, but it was not used because the model setting itself is incorrect."),
+                fallback.is_some() && refusal.code() == "model_provider_mismatch");
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn task_assignee_checks_directory_resolved_from_registry_name() {
     let (home, _ctx, _runtime, _calls) = owned_channel(RuntimeType::Codex).await;
     let directory = home.path().join("agents/w-dir");

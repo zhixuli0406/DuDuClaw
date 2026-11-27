@@ -92,6 +92,32 @@ impl EntryRefusal {
     }
 }
 
+/// Anchored operator-only marker shared by background producers and failover.
+pub(crate) const ENTRY_REFUSAL_PREFIX: &str = "ENTRY_REFUSED:";
+
+pub(crate) fn background_refusal(refusal: &EntryRefusal) -> String {
+    format!("{ENTRY_REFUSAL_PREFIX}{}: employee configuration refused", refusal.code())
+}
+
+pub(crate) fn background_refusal_with_fallback(
+    refusal: &EntryRefusal, fallback: Option<RuntimeType>,
+) -> String {
+    let error = background_refusal(refusal);
+    if matches!(refusal, EntryRefusal::ModelProviderMismatch { .. }) {
+        runtime_config::alignment_refusal_with_fallback(error, fallback)
+    } else { error }
+}
+
+/// Never infer admission from provider prose or substring matches.
+pub(crate) fn background_refusal_code(error: &str) -> Option<&str> {
+    let (code, _) = error.strip_prefix(ENTRY_REFUSAL_PREFIX)?.split_once(':')?;
+    match code {
+        "agent_not_found" | "agent_config_unreadable" | "runtime_unavailable"
+        | "model_provider_mismatch" | "runtime_policy_refused" => Some(code),
+        _ => None,
+    }
+}
+
 /// Owned so a caller can release the registry lock before running commands or
 /// spawning. `registry_agent` retains cached prompt assets/metadata explicitly;
 /// `document` and `sections` are the fresh effective configuration for this turn.
@@ -123,7 +149,41 @@ fn resolve_with_reader(
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) -> Result<ResolvedTurnConfig, EntryRefusal> {
     let agent = registry.get(agent_id).ok_or(EntryRefusal::AgentNotFound)?;
-    let artifact = check_artifact(home, &agent.dir, agent_id, read)?;
+    resolve_loaded_with_reader(home, agent, agent_id, read)
+}
+
+/// Ephemeral/team members have an authoritative scaffold outside the registry.
+/// Check that artifact once, just as for a registered employee.
+pub(crate) fn resolve_loaded_and_check(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    resolve_loaded_with_reader(home, agent, agent_id, |path| std::fs::read_to_string(path))
+}
+
+fn resolve_loaded_with_reader(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    resolve_loaded_with_settings(home, agent, agent_id, read, |_| {})
+}
+
+/// Preserve fallback diagnostics from the same strict read, even when model
+/// alignment refuses admission before a complete turn snapshot can be returned.
+pub(crate) fn resolve_loaded_for_background(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+) -> Result<ResolvedTurnConfig, (EntryRefusal, Option<RuntimeType>)> {
+    let mut fallback = None;
+    resolve_loaded_with_settings(home, agent, agent_id,
+        |path| std::fs::read_to_string(path), |settings| fallback = settings.fallback)
+        .map_err(|refusal| (refusal, fallback))
+}
+
+fn resolve_loaded_with_settings(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+    on_settings: impl FnOnce(&RuntimeSettings),
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    let artifact = check_artifact_with_settings(home, &agent.dir, agent_id, read, on_settings)?;
     Ok(ResolvedTurnConfig {
         registry_agent: agent.clone(), config_path: artifact.path,
         preset_resolved: artifact.preset_resolved,
@@ -210,6 +270,14 @@ fn check_artifact(
     home: &Path, agent_dir: &Path, agent_id: &str,
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) -> Result<CheckedArtifact, EntryRefusal> {
+    check_artifact_with_settings(home, agent_dir, agent_id, read, |_| {})
+}
+
+fn check_artifact_with_settings(
+    home: &Path, agent_dir: &Path, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+    on_settings: impl FnOnce(&RuntimeSettings),
+) -> Result<CheckedArtifact, EntryRefusal> {
     // Use the same effective artifact selection as load_runtime_settings_strict.
     let mut path = agent_dir.join("agent.toml");
     let mut preset_resolved = false;
@@ -231,6 +299,7 @@ fn check_artifact(
     ))?;
     let document: toml::Value = text.parse().map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
     let (sections, settings, local_model_id) = strict_settings(&document, &path)?;
+    on_settings(&settings);
     let global_team = crate::team_composer::read_global_team_config(home)
         .map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
     runtime_config::ensure_active_team_providers(&global_team, &sections.team)

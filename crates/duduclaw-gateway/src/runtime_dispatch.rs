@@ -19,7 +19,7 @@ use crate::runtime::{ConversationTurn, RuntimeContext, RuntimeRegistry, RuntimeR
 use crate::runtime_config::RuntimeSettings;
 
 tokio::task_local! {
-    // Owned employee snapshot, scoped only over the foreground chat execution.
+    // Owned employee snapshot, scoped over one chat or background execution.
     // It survives registry unlock, rotation and runtime fallback, not spawn().
     static CHAT_TURN_CONFIG: std::sync::Arc<crate::entry_gate::ResolvedTurnConfig>;
 }
@@ -30,7 +30,7 @@ pub(crate) async fn with_chat_turn_config<F: std::future::Future>(
     CHAT_TURN_CONFIG.scope(snapshot, future).await
 }
 
-/// None means this is a different employee or a legacy/background caller.
+/// None means this is a different employee or a caller without a snapshot.
 /// Once Some is returned, absent fields are authoritative: never reread disk.
 pub(crate) fn chat_turn_config(
     agent_dir: Option<&Path>,
@@ -433,18 +433,6 @@ async fn run_agent_prompt_inner(
     crate::isolation_readiness::check_execution().map_err(|error|
         RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config, error))?;
     let snapshot = chat_turn_config(req.agent_dir);
-    // A chat snapshot has already passed the strict active-runtime/team gate.
-    // Background callers retain their existing disk gate until W6.
-    if let Some(dir) = req.agent_dir.filter(|_| snapshot.is_none()) {
-        crate::runtime_config::ensure_active_agent_provider(dir).map_err(|error| {
-            RuntimeDispatchFailure::preflight(
-                req.provider_override,
-                req.model,
-                RuntimePreflightKind::Config,
-                error,
-            )
-        })?;
-    }
     // Knowledge-base tool calls made during this call learn who the turn is
     // for from the gateway's own record (every runtime, not just Claude).
     // Nothing is registered outside a channel turn; dropped on return.
@@ -461,14 +449,25 @@ async fn run_agent_prompt_inner(
         None => match snapshot.as_ref().map(|turn| &turn.runtime_settings) {
             Some(s) => s,
             None => {
-                owned_settings = req
-                    .agent_dir
-                    .map(crate::runtime_config::load_runtime_settings)
-                    .unwrap_or_default();
+                owned_settings = match req.agent_dir {
+                    Some(dir) => crate::runtime_config::load_runtime_settings_strict(dir)
+                        .map_err(|error| RuntimeDispatchFailure::preflight(
+                            req.provider_override, req.model, RuntimePreflightKind::Config,
+                            crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::Config(error)),
+                        ))?,
+                    None => RuntimeSettings::default(),
+                };
                 &owned_settings
             }
         },
     };
+    // Snapshots already passed this gate. Legacy direct callers still check
+    // removed runtime/team selectors, but never recover from an invalid read.
+    if let Some(dir) = req.agent_dir.filter(|_| snapshot.is_none()) {
+        crate::runtime_config::ensure_active_agent_provider(dir).map_err(|diagnostic|
+            RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config,
+                crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::InactiveRuntime { diagnostic })))?;
+    }
     let provider = req.provider_override.unwrap_or(settings.provider);
     // v1.84.0: a bare Claude alias saved on a prefixed non-Claude engine runs
     // with that engine's catalog default (warned once per agent) instead of
@@ -477,7 +476,11 @@ async fn run_agent_prompt_inner(
     let model: &str = &runnable_model;
     crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|
         RuntimeDispatchFailure::preflight(Some(provider), model, RuntimePreflightKind::Config,
-            crate::runtime_config::alignment_refusal_with_fallback(error, settings.fallback)))?;
+            if req.agent_dir.is_some() {
+                crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::ModelProviderMismatch {
+                    model: model.to_owned(), provider,
+                })
+            } else { crate::runtime_config::alignment_refusal_with_fallback(error, settings.fallback) }))?;
     crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
     // F5: only a catalog default DuDuClaw substituted is attributed to its
     // runtime's vendor; every other model keeps the v1.83.0 selector rule
@@ -2500,6 +2503,34 @@ mod chat_snapshot_tests {
             std::fs::write(&path, raw.replace("provider='codex'", &format!("provider='codex'\nfallback='{fallback}'"))).unwrap();
             let registry = ctx.registry.read().await;
             assert!(crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_strict_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_snapshot_employee_calls_fail_closed_before_runtime_execution() {
+        for contents in [b"[runtime]\nprovider='typo'\n".as_slice(), b"[runtime", b"\xff\xfe"] {
+            let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+            let turn = {
+                let reg = ctx.registry.read().await;
+                crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap()
+            };
+            std::fs::write(&turn.config_path, contents).unwrap();
+            let before = crate::model_call_probe::calls();
+            let error = run_agent_prompt(AgentPrompt {
+                agent_dir: Some(&turn.registry_agent.dir), home_dir: home.path(), agent_id: "worker",
+                prompt: "work", system_prompt: "", model: "gpt-5.4", max_tokens: 128,
+                provider_override: None, conversation_history: &[], request_type: RequestType::Dispatch,
+                runtime_settings: None, effort: None, allow_cross_family_failover: true,
+                purpose: SpawnPurpose::EmployeeTurn,
+            }).await.unwrap_err();
+            assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("agent_config_unreadable"));
+            assert_eq!(crate::model_call_probe::calls(), before);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         }
     }

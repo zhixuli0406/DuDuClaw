@@ -90,6 +90,9 @@ impl GoalLoopDriver {
             //    Free the slot NOW — before the candidate check below, because
             //    such a task is still `todo` and therefore a candidate — so the
             //    Personal-edition cap is not held by a round that never ran. ──
+            // The anchored entry-refusal code parks this round immediately in
+            // on_dispatch_failed; escalated_this_tick prevents a stale candidate
+            // from being enqueued again in this same pass.
             if let Some(failed_error) = self.dispatch_failure_for(&inflight, &id).await {
                 if self
                     .on_dispatch_failed(&mut inflight, &id, &failed_error)
@@ -277,6 +280,7 @@ impl GoalLoopDriver {
         };
 
         for task in &candidates {
+            if escalated_this_tick.contains(&task.id) { continue; }
             // Preserve the employee origin before kickoff/planning can call a model.
             if let Some(caller) = crate::autonomous_runtime::task_caller(&self.home_dir, task) {
                 if duduclaw_core::autonomy_gate::check(&self.home_dir, &caller,
@@ -289,6 +293,12 @@ impl GoalLoopDriver {
                 duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
             ) {
                 if pause.is_agent_config_refusal() {
+                    if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                        let error = crate::entry_gate::background_refusal(&refusal);
+                        self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
+                        active = inflight.len();
+                        continue;
+                    }
                     if let Err(detail) = crate::team_composer::check_team_dispatchable_for_task(
                         &self.home_dir, &task.assigned_to, &task.id,
                     ) {
@@ -1092,6 +1102,17 @@ impl GoalLoopDriver {
             let (team_dispatch, gate_inputs_json) = match team_result {
                 Ok(dispatch) => dispatch,
                 Err(enqueue::TeamDispatchError::ConfigRefused(detail)) => {
+                    let entry_error = if crate::entry_gate::background_refusal_code(&detail).is_some() {
+                        Some(detail.clone())
+                    } else {
+                        crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to).err()
+                            .map(|refusal| crate::entry_gate::background_refusal(&refusal))
+                    };
+                    if let Some(error) = entry_error {
+                        self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
+                        active = inflight.len();
+                        continue;
+                    }
                     self.escalate(
                         &mut inflight,
                         task,

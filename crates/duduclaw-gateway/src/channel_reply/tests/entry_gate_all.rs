@@ -1,8 +1,8 @@
 //! W8: one entry table crossed with every effective configuration state.
 //!
-//! Not gated yet (later packages): background/dispatch (cron, reminder,
-//! heartbeat, goal-loop tick, claude_runner, runtime_dispatch without a chat
-//! snapshot). MCP tasks_create/tasks_update
+//! Background rows exercise the shared runner with the producers' RequestType;
+//! goal tick additionally reconciles its actual refusal through a failed queue row.
+//! MCP tasks_create/tasks_update
 //! live in the CLI crate and retain their own tests in mcp/tasks.rs.
 //!
 //! Contract exceptions deliberately not disguised as shared-code rows:
@@ -175,8 +175,14 @@ enum Entry {
     Channel, Arrival, Turn(bool), Pending, AgUi, Command(&'static str), Attachment,
     Goal, Admission, ChatGoal, Schedule, Rpc(&'static str), Retry, Kickoff, Bound,
     TriggerPending, TriggerMention, TriggerReply, AssignArm(bool),
+    Background(crate::cost_telemetry::RequestType), GoalTick,
 }
 const ROWS: &[Row] = &[
+    row!("dispatch", false, Entry::Background(crate::cost_telemetry::RequestType::Dispatch)),
+    row!("cron", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("heartbeat (Cron request)", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("reminder (Cron request)", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("goal tick refused run", false, Entry::GoalTick),
     row!("channel pipeline", true, Entry::Channel),
     row!("channel trigger pending pipeline", false, Entry::TriggerPending),
     row!("channel trigger bare mention pipeline", false, Entry::TriggerMention),
@@ -223,6 +229,27 @@ async fn command_in_session(f: &Fixture, session: &str, text: &str) -> String {
 }
 async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
     match entry {
+        Entry::Background(_) | Entry::GoalTick => {
+            let request_type = match entry {
+                Entry::Background(kind) => kind,
+                _ => crate::cost_telemetry::RequestType::Dispatch,
+            };
+            let result = crate::claude_runner::call_claude_for_agent_with_type(
+                f.home(), &f.ctx.registry, "worker", "work", request_type).await;
+            if case.healthy() {
+                // The fixture runtime intentionally returns an auth failure.
+                assert!(f.calls.load(Ordering::SeqCst) > 0, "{result:?}");
+                return EntryResult::result(Ok(()));
+            }
+            let error = result.unwrap_err();
+            assert_eq!(crate::entry_gate::background_refusal_code(&error), f.expected_code);
+            let mut outcome = EntryResult::result(Err(error.clone()));
+            if matches!(entry, Entry::GoalTick) {
+                crate::goal_loop::assert_entry_refusal_tick(f.home(), f.store.clone(), &error).await;
+                outcome.seed_tasks = 1;
+            }
+            outcome
+        }
         Entry::Channel => {
             let spy = crate::channel_reply::reply_origin::testing::NoImplicitCloud::at(f.home());
             let text = build_reply_for_agent("整理報表", &f.ctx, "worker", case.session, "42", None).await;

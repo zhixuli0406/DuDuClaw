@@ -2081,6 +2081,9 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
             // One failed replica does not fail the round while another
             // produced something; a round where *every* executor failed is an
             // infrastructure failure, reported as one below.
+            Err(e) if crate::entry_gate::background_refusal_code(&e).is_some() => {
+                return TeamRoundOutcome::Failed { error: e };
+            }
             Err(e) => warn!(task = %task.id, round = ctx.round, "executor member failed: {e}"),
         }
     }
@@ -2150,6 +2153,9 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
     let passed = match &verdict {
         Ok(v) => v.passed,
         Err(e) => {
+            if crate::entry_gate::background_refusal_code(e).is_some() {
+                return TeamRoundOutcome::Failed { error: e.clone() };
+            }
             // A verifier that could not be reached must never auto-pass and
             // must never fail the work: the round submits and the existing
             // settle path (which has its own fail-closed judge) decides.
@@ -2223,6 +2229,9 @@ async fn run_team_round_inner(ctx: TeamRoundContext<'_>) -> TeamRoundOutcome {
         )
         .await
         {
+            if crate::entry_gate::background_refusal_code(&e).is_some() {
+                return TeamRoundOutcome::Failed { error: e };
+            }
             warn!(task = %task.id, round = ctx.round, "repair pass failed: {e}");
         }
         // Re-read: the repair pass writes its own packet, which becomes the

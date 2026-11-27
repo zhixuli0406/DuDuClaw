@@ -2423,6 +2423,8 @@ impl AutopilotEngine {
         prompt: &str,
         lane: Option<String>,
     ) -> Result<(), String> {
+        crate::entry_gate::check_task_assignee(&self.home_dir, target)
+            .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
         duduclaw_core::autonomy_gate::check(&self.home_dir, target, duduclaw_core::autonomy_gate::AutonomyPath::Autopilot)
             .map_err(|pause| format!("autonomy paused: {pause}"))?;
         let mq = match &self.message_queue {
