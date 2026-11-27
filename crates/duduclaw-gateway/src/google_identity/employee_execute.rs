@@ -51,12 +51,13 @@ impl Binding {
 
 pub(super) async fn serve(state: &ExecuteState, agent: &str, request: Request) -> Result<Value, Refusal> {
     let execute = matches!(&request, Request::Execute { .. });
-    let chat = match &request {
-        Request::Prepare { tool, .. } | Request::Execute { tool, .. } => tool == super::chat_send::TOOL,
+    let (chat, drive) = match &request {
+        Request::Prepare { tool, .. } | Request::Execute { tool, .. } =>
+            (tool == super::chat_send::TOOL, gi::is_drive_write_tool(tool)),
     };
     let progress = AtomicUsize::new(0);
     let mut binding = None;
-    let result = match tokio::time::timeout(Duration::from_secs(if chat { 420 } else { 120 }),
+    let result = match tokio::time::timeout(Duration::from_secs(if drive { 660 } else if chat { 420 } else { 120 }),
         serve_inner(state, agent, request, &progress, &mut binding)).await {
         Ok(result) => result,
         Err(_) => Err(Refusal::hard(if !chat && progress.load(Ordering::SeqCst) == 0 { "not_sent" } else { "result_unconfirmed" },
@@ -77,10 +78,6 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         Request::Execute { tool, arguments, turn_id, run_id, call_id, approval_binding_digest } =>
             (tool, arguments, turn_id, run_id, call_id, Some(approval_binding_digest)),
     };
-    // Package 131-P9a will route these tools to the gateway executor.
-    if duduclaw_core::google_identity::is_drive_write_tool(&tool) {
-        return Err(Refusal::hard("drive_write_unavailable", "雲端硬碟寫入只能由主程式執行。"));
-    }
     if gi::native_google_scope(&tool).is_none() || !args.is_object() || !valid_id(&call) {
         return Err(changed());
     }
@@ -90,6 +87,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
     }
     let who = requester(agent, turn.as_deref(), run.as_deref())?;
+    if gi::is_drive_write_tool(&tool) {
+        return super::drive_write::serve::serve(state, agent, &tool, &args, who, turn, run, call, approved, progress).await;
+    }
     if tool == super::chat_send::TOOL {
         return super::chat_send::serve(state, agent, &args, who, turn, call, approved).await;
     }

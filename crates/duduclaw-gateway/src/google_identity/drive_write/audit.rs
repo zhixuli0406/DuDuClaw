@@ -21,7 +21,7 @@ pub(in crate::google_identity) struct Reason(&'static str);
 impl Reason {
     pub(in crate::google_identity) fn from_code(code: &str) -> Option<Self> {
         const EXECUTION_CODES: &[&str] = &[
-            "action_off", "folder_required", "folder_out_of_scope", "parent_not_visible",
+            "not_sent", "approval_unavailable", "action_off", "folder_required", "folder_out_of_scope", "parent_not_visible",
             "trashed", "shortcut_not_allowed", "capability_denied", "cross_drive_move",
             "listed_folder_protected", "folder_check_limit", "failed", "result_unconfirmed",
             "insufficient_permissions", "google_error", "approval_denied", "post_check_violation",

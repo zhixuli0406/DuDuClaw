@@ -313,6 +313,11 @@ fn boundary_occurs(boundary: &str, bytes: &[u8]) -> bool {
 /// Debug: even a response or a user-controlled body may reflect the bearer.
 pub(crate) struct BuiltRequest(reqwest::Request);
 
+#[cfg(test)]
+impl BuiltRequest {
+    pub(super) fn into_test_request(self) -> reqwest::Request { self.0 }
+}
+
 impl fmt::Debug for BuiltRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("BuiltRequest([redacted])")
@@ -406,7 +411,7 @@ impl WriteTransport {
     }
 
     #[cfg(test)]
-    fn with_http(bearer: Zeroizing<String>, http: Box<dyn WriteHttp>) -> Self {
+    pub(super) fn with_http(bearer: Zeroizing<String>, http: Box<dyn WriteHttp>) -> Self {
         Self { bearer, requests: 0, http, test_api_base: None, test_target: None }
     }
 

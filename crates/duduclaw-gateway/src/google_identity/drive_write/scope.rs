@@ -97,7 +97,7 @@ struct WireMeta {
 #[serde(rename_all = "camelCase")]
 struct WireShortcut { target_id: String }
 
-fn metadata_result(result: WriteResult, expected: &GoogleId) -> Result<FileMeta, MetaError> {
+pub(super) fn metadata_result(result: WriteResult, expected: &GoogleId) -> Result<FileMeta, MetaError> {
     let body = match result {
         WriteResult::Ok((403 | 404, _)) => return Err(MetaError::NotVisible),
         WriteResult::Ok((200..=299, body)) => body,
