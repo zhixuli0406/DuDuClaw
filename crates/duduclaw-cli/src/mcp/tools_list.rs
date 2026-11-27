@@ -666,6 +666,21 @@ pub(crate) async fn visible_tools_in_lane(
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
+    let agent = acting_agent_id(&principal.client_id, default_agent);
+    let human = super::host_on_behalf_of(home_dir, agent);
+    visible_tools_for_principal(principal, home_dir, default_agent, employee_process, lane, human.as_deref()).await
+}
+
+/// Host principal injected separately from tool arguments and process env.
+/// Both tools/list and the listChanged snapshot use this same filter pipeline.
+pub(crate) async fn visible_tools_for_principal(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    human: Option<&str>,
+) -> Vec<&'static ToolDef> {
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
     // not act for the process's agent. Discovery filter only.
@@ -707,6 +722,8 @@ pub(crate) async fn visible_tools_in_lane(
     // clients are filtered separately by `external_tool_allowed` and carry no
     // per-agent capability config.
     let effective_agent = acting_agent_id(&principal.client_id, default_agent);
+    let main_restricted = (!principal.is_external || dedicated_google)
+        && super::main_principal_gate::restricted(home_dir, effective_agent, human);
     let is_member =
         !principal.is_external && duduclaw_gateway::ephemeral::is_ephemeral_id(effective_agent);
     let member_caps = is_member
@@ -935,6 +952,7 @@ pub(crate) async fn visible_tools_in_lane(
     .is_some();
 
     tools()
+        .filter(|t| super::main_principal_gate::refusal(main_restricted, t.name).is_none())
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
         // applies, so it is not listed there either (discoverable ⇔ callable).

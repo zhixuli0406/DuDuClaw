@@ -218,6 +218,7 @@ mod notion_github;
 mod odoo;
 mod odoo_generic_write;
 mod on_behalf_of;
+pub(crate) mod main_principal_gate;
 mod os_tools;
 mod personal_target;
 mod personal_wildcard;

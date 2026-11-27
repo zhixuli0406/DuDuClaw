@@ -765,6 +765,22 @@ impl McpDispatcher {
         id: &Value,
         remote: Option<&crate::mcp::RemoteAccess>,
     ) -> Value {
+        let agent = acting_gate_agent(principal, &self.default_agent);
+        let human = crate::mcp::host_on_behalf_of(&self.home_dir, agent);
+        self.dispatch_admitted_for_principal(principal, ns_ctx, params, id, remote, human.as_deref()).await
+    }
+
+    // The production caller above supplies only the host principal. Keeping it
+    // explicit lets tests exercise the real denial/audit path without env races.
+    async fn dispatch_admitted_for_principal(
+        &self,
+        principal: &Principal,
+        ns_ctx: &NamespaceContext,
+        params: &Value,
+        id: &Value,
+        remote: Option<&crate::mcp::RemoteAccess>,
+        human: Option<&str>,
+    ) -> Value {
         let workflow_params = params;
         let mut clean_params = params.clone();
         // Host account metadata can never be supplied by an MCP caller.
@@ -951,6 +967,9 @@ impl McpDispatcher {
         } else {
             load_agent_gate_config(&self.home_dir, gate_agent).await
         };
+        let main_restricted = employee_policy_applies
+            && crate::mcp::main_principal_gate::restricted(&self.home_dir, gate_agent, human);
+
         // RM-103 S3 (v1.81): a team role member's intrinsic tool
         // (`team_handoff`) is exempt from the approval layers the scaffold
         // inherits from the employee — `action_rules` (§3.455 and the approval
@@ -1086,6 +1105,14 @@ impl McpDispatcher {
                 return Some((jsonrpc_error(id, -32003, &msg), "external_shared_wiki_write", msg, None));
             }
 
+            // RM-142 P16: main may not lend administrative powers to a
+            // non-Admin person. No approval, action rule or explicit permission
+            // can override this; unknown/removed names still classify as admin.
+            if let Some(message) = crate::mcp::main_principal_gate::refusal(main_restricted, tool_name) {
+                duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
+                return Some((jsonrpc_error(id, -32003, message), "main_principal_restricted", message.into(), None));
+            }
+
             if removed_reply.is_some() {
                 return None;
             }
@@ -1219,25 +1246,32 @@ impl McpDispatcher {
                 );
                 if !needed.is_empty() {
                     let refusal = match load_agent_permissions(&self.home_dir, gate_agent).await {
-                        Ok(perms) => needed
-                            .iter()
-                            .find(|p| permission_explicitly_denied(&perms, p))
-                            .map(|p| {
-                                // v1.81 (S2): `can_create_agents` is the
-                                // effective value — an unwritten key on a
-                                // non-main employee refuses too.
-                                let why = if *p == "can_create_agents" {
-                                    "未開啟（未設定時只有 main 角色預設開啟）"
-                                } else {
-                                    "= false"
-                                };
-                                (
-                                    p.to_string(),
-                                    format!(
-                                        "此 AI 員工的 [permissions] {p} {why}，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
-                                    ),
-                                )
-                            }),
+                        Ok(mut perms) => {
+                            // P16: the turn ceiling also overrides an explicit
+                            // Admin-authored true, not just the main default.
+                            if main_restricted {
+                                perms.can_create_agents = Some(false);
+                            }
+                            needed
+                                .iter()
+                                .find(|p| permission_explicitly_denied(&perms, p))
+                                .map(|p| {
+                                    // v1.81 (S2): `can_create_agents` is the
+                                    // effective value — an unwritten key on a
+                                    // non-main employee refuses too.
+                                    let why = if *p == "can_create_agents" {
+                                        "未開啟（未設定時只有 main 角色預設開啟）"
+                                    } else {
+                                        "= false"
+                                    };
+                                    (
+                                        p.to_string(),
+                                        format!(
+                                            "此 AI 員工的 [permissions] {p} {why}，不能使用工具「{tool_name}」。請在儀表板「工具與權限」開啟後再試。"
+                                        ),
+                                    )
+                                })
+                        },
                         Err(e) => Some((
                             needed[0].to_string(),
                             format!(
@@ -4693,6 +4727,146 @@ effect = "forbid"
             format!("[agent]\nname = \"dudu\"\nstatus = \"active\"\n{body}")
         };
         std::fs::write(dir.join("agent.toml"), body).unwrap();
+    }
+
+    fn main_principal_fixture() -> (tempfile::TempDir, String, String) {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            "[general]\ndefault_agent = 'dudu'\n[delegation]\npolicy = 'open'\n").unwrap();
+        write_acting_agent_toml(&home,
+            "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\ncan_create_agents = true\n");
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        let user = db.create_user("person@example.invalid", "Person", "isolated-test-password",
+            duduclaw_auth::UserRole::Employee).unwrap();
+        db.set_main_agent_users(&admin.id, &[user.id.clone()]).unwrap();
+        (home, format!("user:{}", admin.id), format!("user:{}", user.id))
+    }
+
+    #[tokio::test]
+    async fn listed_user_main_turn_cannot_create_agent() {
+        use crate::mcp::main_principal_gate::{refusal, restricted, REFUSAL};
+        let (home, _, human) = main_principal_fixture();
+        let dispatcher = make_dispatcher(&home).await;
+        // Explicit true and the unwritten main-role default are both narrowed.
+        for permission in ["can_create_agents = true", ""] {
+            write_acting_agent_toml(&home, &format!(
+                "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\n{permission}\n"));
+            let turn = restricted(home.path(), "dudu", Some(&human));
+            assert!(turn);
+            assert_eq!(refusal(turn, "memory_search"), None);
+            for tool in ["create_agent", "agent_create", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
+                let result = dispatcher.dispatch_admitted_for_principal(
+                    &internal_principal(), &make_ns_ctx(false),
+                    &make_params(tool, serde_json::json!({"on_behalf_of":"user:forged-admin"})),
+                    &serde_json::json!(14216), None, Some(&human),
+                ).await;
+                assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
+                assert_eq!(result["error"]["message"], REFUSAL, "{tool}: {result}");
+            }
+        }
+        let read = dispatcher.dispatch_admitted_for_principal(
+            &internal_principal(), &make_ns_ctx(false),
+            &make_params("memory_search", serde_json::json!({"query":"missing"})),
+            &serde_json::json!(14217), None, Some(&human),
+        ).await;
+        assert_ne!(read["error"]["message"], REFUSAL, "read is permitted by this gate: {read}");
+        let rows = read_tool_call_rows(&home);
+        for tool in ["create_agent", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
+            assert!(rows.iter().any(|row| row["tool_name"] == tool
+                && row["error_class"] == "main_principal_restricted"), "{tool}: {rows:?}");
+        }
+    }
+
+    #[test]
+    fn main_principal_admin_background_and_unmapped_are_unchanged() {
+        use crate::mcp::main_principal_gate::{refusal, restricted};
+        let (home, admin, _) = main_principal_fixture();
+        for human in [Some(admin.as_str()), None, Some("unmapped:line:0123456789abcdef")] {
+            assert!(!restricted(home.path(), "dudu", human));
+            assert_eq!(refusal(restricted(home.path(), "dudu", human), "create_agent"), None);
+        }
+        // Broken main detection does not restrict established exempt principals.
+        std::fs::remove_file(home.path().join("config.toml")).unwrap();
+        for human in [Some(admin.as_str()), None, Some("unmapped:line:0123456789abcdef")] {
+            assert!(!restricted(home.path(), "dudu", human));
+        }
+    }
+
+    #[test]
+    fn main_principal_identity_uses_role_or_default_and_excludes_ephemerals() {
+        use crate::mcp::main_principal_gate::restricted;
+        let (home, _, human) = main_principal_fixture();
+        write_acting_agent_toml(&home, "[agent]\nname = 'dudu'\nrole = 'worker'\n");
+        assert!(restricted(home.path(), "dudu", Some(&human)), "configured default");
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'other'\n").unwrap();
+        assert!(!restricted(home.path(), "dudu", Some(&human)), "ordinary employee");
+        write_acting_agent_toml(&home, "[agent]\nname = 'dudu'\nrole = 'main'\n");
+        assert!(restricted(home.path(), "dudu", Some(&human)), "main role");
+        assert!(!restricted(home.path(), "eph-abc123", Some(&human)));
+        // The permission loader's effective preset artifact also supplies role.
+        write_acting_agent_toml(&home, "[agent]\nrole = 'worker'\n");
+        std::fs::create_dir(home.path().join("agent_resolved")).unwrap();
+        std::fs::write(home.path().join("agent_resolved/dudu.toml"), "[agent]\nrole = 'main'\n").unwrap();
+        assert!(restricted(home.path(), "dudu", Some(&human)), "resolved role");
+    }
+
+    #[test]
+    fn main_principal_unreadable_config_and_unknown_human_fail_closed() {
+        use crate::mcp::main_principal_gate::restricted;
+        let (home, _, human) = main_principal_fixture();
+        let config = home.path().join("config.toml");
+        let agent = home.path().join("agents/dudu/agent.toml");
+        for path in [&config, &agent] {
+            std::fs::write(&config, "[general]\ndefault_agent = 'other'\n").unwrap();
+            std::fs::write(&agent, "[agent]\nrole = 'worker'\n").unwrap();
+            assert!(!restricted(home.path(), "dudu", Some(&human)));
+            for bad in ["[broken", "agent = 12\ngeneral = 12", "[agent]\nrole = 12\n[general]\ndefault_agent = 12"] {
+                std::fs::write(path, bad).unwrap();
+                assert!(restricted(home.path(), "dudu", Some(&human)), "{path:?}: {bad}");
+            }
+            std::fs::remove_file(path).unwrap();
+            assert!(restricted(home.path(), "dudu", Some(&human)), "missing {path:?}");
+            std::fs::create_dir(path).unwrap();
+            assert!(restricted(home.path(), "dudu", Some(&human)), "unreadable {path:?}");
+            std::fs::remove_dir(path).unwrap();
+        }
+        for principal in ["user:missing", "unknown:rejected-principal"] {
+            assert!(restricted(home.path(), "dudu", Some(principal)));
+        }
+        std::fs::remove_file(home.path().join("users.db")).unwrap();
+        assert!(restricted(home.path(), "dudu", Some(&human)));
+    }
+
+    #[tokio::test]
+    async fn main_principal_tools_list_omits_exactly_refused_tools() {
+        use crate::mcp::main_principal_gate::{refusal, REFUSAL};
+        use std::collections::BTreeSet;
+        let (home, admin, human) = main_principal_fixture();
+        let principal = internal_principal();
+        let baseline = crate::mcp::visible_tools_for_principal(&principal, home.path(), "dudu", true,
+            &duduclaw_core::ProcessLane::Normal, Some(&admin)).await;
+        let restricted = crate::mcp::visible_tools_for_principal(&principal, home.path(), "dudu", true,
+            &duduclaw_core::ProcessLane::Normal, Some(&human)).await;
+        let expected: BTreeSet<_> = baseline.iter().filter(|t| refusal(true, t.name).is_none())
+            .map(|t| t.name).collect();
+        let actual: BTreeSet<_> = restricted.iter().map(|t| t.name).collect();
+        assert!(actual.contains("memory_search"));
+        assert!(baseline.iter().any(|t| refusal(true, t.name).is_some()), "non-vacuous filtering");
+        assert_eq!(actual, expected);
+        // Pin the design's real names and every class independently of the filter.
+        let names: BTreeSet<_> = duduclaw_core::mcp_tool_defs::tools().map(|t| t.name).collect();
+        let named = ["create_agent", "agent_remove", "agent_update", "agent_update_soul",
+            "shared_wiki_delete", "channel_config", "capability_request"];
+        for name in named { assert!(names.contains(name), "{name}"); }
+        assert!(!names.contains("agent_create"), "design spelling is an inert alias");
+        for name in names {
+            let denied = duduclaw_core::effect_of(name) == duduclaw_core::ToolEffect::Admin
+                || named.contains(&name) || name == "spawn_ephemeral";
+            assert_eq!(refusal(true, name), denied.then_some(REFUSAL), "{name}");
+            assert_eq!(refusal(false, name), None, "unrestricted: {name}");
+        }
     }
 
     /// Dispatch `tool` as the internal key, wait for the call to be HELD on a
