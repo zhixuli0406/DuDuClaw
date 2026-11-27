@@ -23,28 +23,31 @@ fn hooks() -> &'static Mutex<BTreeMap<PathBuf, Pushes>> {
     HOOKS.get_or_init(Default::default)
 }
 pub(crate) fn capture_card(home: Option<&Path>, rec: &ApprovalRecord) -> Option<bool> {
-    let home = home?;
+    let home = std::fs::canonicalize(home?).ok()?;
     let mut hooks = hooks().lock().unwrap();
-    let pushes = hooks.get_mut(home)?;
+    let pushes = hooks.get_mut(&home)?;
     pushes.cards.push(rec.clone());
     let success = pushes.card_failures == 0;
     pushes.card_failures = pushes.card_failures.saturating_sub(1);
     Some(success)
 }
 pub(super) fn capture_notice(home: &Path) -> Option<delivery::NoticeState> {
+    let home = std::fs::canonicalize(home).ok()?;
     let mut hooks = hooks().lock().unwrap();
-    let pushes = hooks.get_mut(home)?;
+    let pushes = hooks.get_mut(&home)?;
     pushes.notices += 1;
     let result = if pushes.notice_failures == 0 { delivery::NoticeState::Sent } else { delivery::NoticeState::Pending };
     pushes.notice_failures = pushes.notice_failures.saturating_sub(1);
     Some(result)
 }
 pub(super) fn fail_outbox_write(home: &Path, state: &State) -> bool {
-    !state.outbox.is_empty() && hooks().lock().unwrap().get(home).is_some_and(|p|
+    let Ok(home) = std::fs::canonicalize(home) else { return false; };
+    !state.outbox.is_empty() && hooks().lock().unwrap().get(&home).is_some_and(|p|
         p.fail_outbox_write || (p.fail_audit_ack && state.outbox.iter().any(|entry| entry.audit_done)))
 }
 pub(super) async fn before_cas(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord) {
-    let human = hooks().lock().unwrap().get(home).is_some_and(|p| p.human_before_cas);
+    let Ok(home) = std::fs::canonicalize(home) else { return; };
+    let human = hooks().lock().unwrap().get(&home).is_some_and(|p| p.human_before_cas);
     if human { broker.decide(&rec.id, true, "admin").await.unwrap(); }
 }
 
@@ -63,14 +66,15 @@ fn rendered_skill(version: &str) -> String {
     format!("---\n{yaml}---\n\n# Helper\nHelp with daily notes.\n")
 }
 
-struct Fixture { home: tempfile::TempDir, broker: ApprovalBroker, id: ApprovalId }
+struct Fixture { _home: tempfile::TempDir, canonical_home: PathBuf, broker: ApprovalBroker, id: ApprovalId }
 impl Drop for Fixture {
-    fn drop(&mut self) { hooks().lock().unwrap().remove(self.home.path()); }
+    fn drop(&mut self) { hooks().lock().unwrap().remove(self.path()); }
 }
 impl Fixture {
     async fn new(manifest: &str, signature: &str, script: &str, held: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let h = home.path();
+        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+        let h = canonical_home.as_path();
         hooks().lock().unwrap().insert(h.to_owned(), Pushes::default());
         if held { duduclaw_core::gateway_instance::acquire(h).unwrap(); }
         let root = h.join("experts/imported/provenance");
@@ -99,10 +103,10 @@ impl Fixture {
         let id = expert_skills::request_enable_with(h, "imported", vec![skill],
             expert_skills::EnableRequestOptions { auto_approval_candidate: true }).await.unwrap();
         let broker = ApprovalBroker::open(h).unwrap();
-        Self { home, broker, id: id.into() }
+        Self { _home: home, canonical_home, broker, id: id.into() }
     }
     async fn standard() -> Self { Self::new(V120_MANIFEST, V120_SIGNATURE, V120_SCRIPT_B64, true).await }
-    fn path(&self) -> &Path { self.home.path() }
+    fn path(&self) -> &Path { &self.canonical_home }
     fn quarantine(&self) -> PathBuf { expert_skills::quarantined_skill_dir(self.path(), "imported", "alice", "helper") }
     fn pushes(&self) -> Pushes { hooks().lock().unwrap().get(self.path()).unwrap().clone() }
     async fn record(&self) -> ApprovalRecord { self.broker.get(&self.id).await.unwrap().unwrap() }
@@ -172,6 +176,22 @@ async fn auto_approval_uses_same_record_and_cas() {
     f.run().await;
     assert_eq!(f.pushes().notices, 1);
     assert!(load_state(f.path()).unwrap().evaluated.is_empty(), "terminal ids are pruned");
+}
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_home_still_auto_approves() {
+    let f = Fixture::standard().await;
+    let links = tempfile::tempdir().unwrap();
+    let home = links.path().join("home");
+    std::os::unix::fs::symlink(f.path(), &home).unwrap();
+    let broker = ApprovalBroker::open(&home).unwrap();
+    assert_ne!(home, broker.home_dir().unwrap());
+    run_once(&home, &broker).await;
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+    assert!(home.join("agents/alice/SKILLS/helper/run.sh").is_file());
+    assert_eq!(f.pushes().notices, 1);
+    assert!(f.pushes().cards.is_empty());
+    assert!(load_state(&home).unwrap().outbox.is_empty());
 }
 #[tokio::test]
 async fn wrong_key_same_publisher_goes_manual() {
@@ -543,11 +563,10 @@ async fn broker_policy_honors_reviewed_digest() {
 #[cfg(unix)]
 #[tokio::test]
 async fn special_file_in_quarantine_goes_manual() {
-    use std::os::unix::net::UnixListener;
     let f = Fixture::standard().await;
     let script = f.quarantine().join("run.sh");
     std::fs::remove_file(&script).unwrap();
-    let _socket = UnixListener::bind(script).unwrap();
+    nix::unistd::mkfifo(&script, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
     f.manual(FILES).await;
 }
 #[tokio::test]
