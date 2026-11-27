@@ -364,3 +364,23 @@ fn email_restore_and_suspension_resume_retire_previous_authority() {
     f.attest();
     assert!(second.validate(f.home.path(), AGENT).is_err());
 }
+
+#[tokio::test]
+async fn google_token_refuses_all_drive_write_tools_before_resolution_and_audits() {
+    let f = Fixture::new();
+    let probe = route_test_probe::Guard::install(f.home.path());
+    for tool in crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS {
+        let body = serde_json::to_vec(&json!({"tool":tool, "turn_id":f.turn})).unwrap();
+        let (status, value) = f.post(route::ROUTE, body.clone(), f.signed(&body)).await;
+        assert_eq!(status, 403, "{tool}");
+        assert_eq!(value["code"], "write_tool_gateway_only", "{tool}");
+        assert!(value.get("access_token").is_none());
+    }
+    assert_eq!(probe.counts(), [0, 0]);
+    let audit = std::fs::read_to_string(f.home.path().join("tool_calls.jsonl")).unwrap();
+    let rows: Vec<serde_json::Value> = audit.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+    for tool in crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS {
+        assert!(rows.iter().any(|row| row["google_tool"] == tool
+            && row["reason"] == "write_tool_gateway_only" && row["success"] == false));
+    }
+}

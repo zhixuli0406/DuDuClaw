@@ -84,6 +84,14 @@ fn provider() {
 async fn token(
     Form(form): Form<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<Value>) {
+    if let Some(mode) = form.get("refresh_token").and_then(|v| v.strip_prefix("scope-isolation-")) {
+        let mut response = json!({"access_token":"isolation-fresh-secret", "expires_in":3600, "token_type":"Bearer"});
+        if mode != "missing" {
+            let scope = if mode == "drive" { oauth::DRIVE_WRITE_SCOPE } else { oauth::DRIVE_TOOLS_SCOPE };
+            response["scope"] = json!(format!("openid email https://www.googleapis.com/auth/gmail.readonly {scope}"));
+        }
+        return (StatusCode::OK, Json(response));
+    }
     if form.get("refresh_token").is_some_and(|v| v == "invalid") {
         return (
             StatusCode::BAD_REQUEST,
@@ -1334,3 +1342,6 @@ async fn rejected_write_consent_and_local_disconnect_never_revoke_google() {
     assert!(crate::person_credentials::write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
     delays().lock().unwrap().remove(&account);
 }
+
+#[path = "write_scope_tests.rs"]
+mod write_scope_tests;

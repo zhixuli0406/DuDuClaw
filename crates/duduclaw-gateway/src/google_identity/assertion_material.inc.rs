@@ -196,6 +196,8 @@ async fn mint(
     let scope = permit
         .assertion_scope()
         .map_err(crate::google_identity::effect_authority::CredentialResolveFailure::Authority)?;
+    crate::google_identity::write_scope_guard::check_requested(&scope.split_ascii_whitespace().collect::<Vec<_>>())
+        .map_err(crate::google_identity::effect_authority::CredentialResolveFailure::Authority)?;
     let claims = Claims {
         iss: &key.client_email,
         sub: subject,
@@ -321,10 +323,16 @@ async fn mint(
     }
     #[derive(serde::Deserialize)]
     struct Token {
+        #[serde(default)]
+        scope: Option<String>,
         access_token: String,
         expires_in: u64,
     }
     let token: Token = serde_json::from_slice(&bytes).map_err(|_| unavailable())?;
+    if let Some(scope) = &token.scope {
+        crate::google_identity::write_scope_guard::check_requested(&scope.split_ascii_whitespace().collect::<Vec<_>>())
+            .map_err(crate::google_identity::effect_authority::CredentialResolveFailure::Authority)?;
+    }
     if token.access_token.is_empty()
         || token.access_token.len() > 64 * 1024
         || !token

@@ -35,6 +35,8 @@ pub(crate) fn ensure_publication_unblocked(g: &SourceGuard) -> Result<()> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Error {
+    WriteScopeIsolated,
+    ScopeUnverified,
     Invalid,
     Stale,
     NotReady,
@@ -49,6 +51,8 @@ pub(crate) type Result<T> = std::result::Result<T, Error>;
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::WriteScopeIsolated => "write_scope_isolated",
+            Self::ScopeUnverified => "scope_unverified",
             Self::Invalid => "Google Home metadata is invalid.",
             Self::Stale => "Google Home authority changed.",
             Self::NotReady => "Google Home source is not ready.",
