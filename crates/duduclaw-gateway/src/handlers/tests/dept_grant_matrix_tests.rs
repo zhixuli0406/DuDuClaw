@@ -31,7 +31,7 @@ fn admin_only_params(method: &str) -> Value {
         "autopilot.update" | "autopilot.remove" | "autopilot.history" => {
             json!({"rule_id": "matrix-rule", "enabled": false, "agent_id": "a1"})
         }
-        "skills.install" => json!({"agent_id": "a1", "source": "matrix-skill", "name": "matrix-skill"}),
+        "skills.install" => json!({"scope": "a1", "content": MATRIX_SKILL}),
         _ => json!({"agent_id": "a1", "days": 7, "limit": 10}),
     }
 }
@@ -114,11 +114,11 @@ fn assert_scoped_rpc_outcome(label: &str, frame: WsFrame, allowed: bool) {
 }
 
 #[tokio::test]
-#[ignore = "skills and cost rows remain pending their grant wiring"]
+#[ignore = "only cost rows remain pending their grant wiring"]
 async fn scoped_method_matrix_rows_pending_wiring() {
-    // Add skills and cost rows using assert_scoped with record setup
+    // Add cost rows using assert_scoped with record setup
     // hooks and, for filtered list methods, a payload visibility assertion.
-    panic!("skills and cost matrix rows remain pending their wiring packages");
+    panic!("only cost matrix rows remain pending their wiring package");
 }
 
 fn scoped_payload(label: &str, frame: WsFrame) -> Value {
@@ -298,4 +298,235 @@ async fn schedules_reminder_and_assign_mutations_audit_the_checked_target() {
             json!({"group": "schedules", "action": action, "method": method}))));
     }
     assert_eq!(schedule_grant_audits(&f).len(), 4);
+}
+
+
+const MATRIX_SKILL: &str = "---\nname: matrix-skill\ndescription: matrix-skill fixture notes\n---\nWrite a short summary.\n";
+
+fn skill_items(agent: &str) -> Value {
+    json!({"items": [{"agent_id": agent, "skill_name": "matrix-skill"}], "enabled": false})
+}
+
+fn seed_matrix_skill<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        // The registry and archive use uppercase SKILLS on case-sensitive hosts.
+        let dir = f.home.join("agents").join(agent).join("SKILLS/matrix-skill");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), MATRIX_SKILL).unwrap();
+        f.h.registry().write().await.scan().await.unwrap();
+    })
+}
+
+fn seed_matrix_archive<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        seed_matrix_skill(f, agent).await;
+        let dir = f.home.join("agents").join(agent).join("SKILLS");
+        let mut manifest = duduclaw_agent::skill_archive::archive(
+            &f.home, agent, &dir, "matrix-skill", &f.admin.user_id,
+        ).unwrap();
+        // Give params_for_agent a deterministic, valid archive id.
+        let root = duduclaw_agent::skill_archive::agent_archive_dir(&f.home, agent).unwrap();
+        std::fs::rename(root.join(&manifest.archive_id), root.join("matrix-archive")).unwrap();
+        manifest.archive_id = "matrix-archive".into();
+        std::fs::write(root.join("matrix-archive/manifest.json"), serde_json::to_vec(&manifest).unwrap()).unwrap();
+    })
+}
+
+#[tokio::test]
+async fn skills_read_scoped_matrix() {
+    assert_scoped("skills.list", |_| json!({}), seed_matrix_skill,
+        |label, frame, allowed| {
+            let payload = scoped_payload(label, frame);
+            let rows = payload["agents"].as_array().unwrap();
+            assert_eq!(rows.iter().any(|r| r["agent_id"] == "a1"), allowed, "{label}: {payload}");
+            assert!(!rows.iter().any(|r| r["agent_id"] == "b1"), "{label}: {payload}");
+            if !allowed { assert!(rows.is_empty(), "{label}: {payload}"); }
+        }).await;
+    // Exercise the single-employee list refusal as well as aggregate visibility.
+    assert_scoped("skills.list", |a| json!({"agent_id": a}), seed_matrix_skill,
+        assert_scoped_rpc_outcome).await;
+    assert_scoped("skills.search", |_| json!({"query": "matrix-skill"}),
+        |f, agent| Box::pin(async move {
+            seed_matrix_skill(f, agent).await;
+            // A fresh unrelated market entry makes this RPC deterministic/offline.
+            let config = f.home.join("config.toml");
+            let raw = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(config, format!("{raw}\n[skill_hubs]\nenabled = ['anthropic-skills']\n")).unwrap();
+            let cache = f.home.join("skill_hub_cache");
+            std::fs::create_dir_all(&cache).unwrap();
+            let index = json!({"updated_at": chrono::Utc::now().to_rfc3339(),
+                "source": "anthropic-skills", "skills": [{"name": "unrelated-market-entry"}]});
+            std::fs::write(cache.join("anthropic-skills.json"), index.to_string()).unwrap();
+        }),
+        |label, frame, allowed| {
+            let payload = scoped_payload(label, frame);
+            let rows = payload["skills"].as_array().unwrap();
+            assert_eq!(rows.len(), usize::from(allowed), "{label}: {payload}");
+            if allowed { assert_eq!(rows[0]["author"], "a1", "{label}"); }
+        }).await;
+    assert_scoped("skills.content", |a| json!({"agent_id": a, "skill_name": "matrix-skill"}),
+        seed_matrix_skill, |label, frame, allowed| {
+            if allowed {
+                assert_eq!(scoped_payload(label, frame)["content"], MATRIX_SKILL, "{label}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+    assert_scoped("skills.archived", |a| json!({"agent_id": a}), seed_matrix_archive,
+        |label, frame, allowed| {
+            if allowed {
+                let payload = scoped_payload(label, frame);
+                assert_eq!(payload["archived"][0]["skill_name"], "matrix-skill", "{label}");
+                assert_eq!(payload["can_restore"], true, "{label}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+}
+
+#[tokio::test]
+async fn skills_recent_scoped_matrix_preserves_callable_and_account_filters() {
+    assert_scoped("skills.recent", |a| json!({"agent_id": a}),
+        |f, agent| Box::pin(async move {
+            seed_matrix_skill(f, agent).await;
+            for ctx in [&f.mgr_a, &f.mgr_b, &f.emp] {
+                crate::recent_skills::record(&f.home, &ctx.user_id, agent, &["matrix-skill".into()]).unwrap();
+            }
+        }),
+        |label, frame, allowed| {
+            if allowed {
+                // The grant admits the agent visibility check. Personal history
+                // still requires can_call_agent; a grant alone cannot run skills.
+                assert_eq!(scoped_payload(label, frame)["skills"], json!([]), "{label}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+    let f = fixture().await;
+    seed_matrix_skill(&f, "a1").await;
+    crate::recent_skills::record(&f.home, &f.mgr_a.user_id, "a1", &["matrix-skill".into()]).unwrap();
+    f.db.bind_agent(&f.mgr_a.user_id, "a1", AccessLevel::Viewer).unwrap();
+    let p = scoped_payload("skills.recent",
+        Box::pin(f.h.handle("skills.recent", json!({"agent_id": "a1"}), &f.mgr_a)).await);
+    assert_eq!(p["skills"][0]["name"], "matrix-skill");
+    for (params, ctx) in [(json!({"assigning": true}), &f.mgr_a),
+        (json!({"user_id": f.mgr_a.user_id}), &f.emp)] {
+        assert_eq!(scoped_payload("skills.recent",
+            Box::pin(f.h.handle("skills.recent", params, ctx)).await)["skills"], json!([]));
+    }
+}
+
+#[tokio::test]
+async fn skills_write_scoped_matrix() {
+    for method in ["skills.set_enabled", "skills.remove"] {
+        assert_scoped(method, skill_items, seed_matrix_skill, |label, frame, allowed| {
+            if allowed {
+                let payload = scoped_payload(label, frame);
+                assert_eq!(payload["results"][0]["ok"], true, "{label}: {payload}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+    }
+    assert_scoped("skills.restore", |a| json!({"agent_id": a, "archive_id": "matrix-archive"}),
+        seed_matrix_archive, |label, frame, allowed| {
+            if allowed {
+                assert_eq!(scoped_payload(label, frame)["restored"], true, "{label}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+    assert_scoped("skills.install_request", |a| json!({"scope": a, "content": MATRIX_SKILL}),
+        seed_matrix_skill, |label, frame, allowed| {
+            if allowed {
+                let payload = scoped_payload(label, frame);
+                assert_eq!(payload["status"], "pending", "{label}");
+                assert_eq!(payload["stage"], "awaiting_admin", "{label}");
+            } else { assert_permission_denied(label, frame); }
+        }).await;
+}
+
+#[tokio::test]
+async fn skills_mixed_targets_refuse_before_any_change() {
+    let f = fixture().await;
+    for agent in ["a1", "b1"] { seed_matrix_skill(&f, agent).await; }
+    let before = std::fs::read(f.home.join("agents/a1/SKILLS/matrix-skill/SKILL.md")).unwrap();
+    assert_permission_denied("skills.set_enabled", Box::pin(f.h.handle("skills.set_enabled",
+        json!({"items": [
+            {"agent_id": "a1", "skill_name": "matrix-skill"},
+            {"agent_id": "b1", "skill_name": "matrix-skill"}], "enabled": false}), &f.mgr_a)).await);
+    assert!(!duduclaw_agent::skill_state::read_disabled(&f.home, "a1").is_disabled("matrix-skill"));
+    assert_eq!(std::fs::read(f.home.join("agents/a1/SKILLS/matrix-skill/SKILL.md")).unwrap(), before);
+    assert!(schedule_grant_audits(&f).is_empty());
+    // A binding on b1 may coexist with the grant on a1; every target now passes.
+    f.db.bind_agent(&f.mgr_a.user_id, "b1", AccessLevel::Owner).unwrap();
+    let p = scoped_payload("skills.set_enabled", Box::pin(f.h.handle("skills.set_enabled",
+        json!({"items": [
+            {"agent_id": "a1", "skill_name": "matrix-skill"},
+            {"agent_id": "b1", "skill_name": "matrix-skill"}], "enabled": false}), &f.mgr_a)).await);
+    assert!(p["results"].as_array().unwrap().iter().all(|r| r["ok"] == true));
+    for agent in ["a1", "b1"] {
+        assert!(duduclaw_agent::skill_state::read_disabled(&f.home, agent).is_disabled("matrix-skill"));
+    }
+    assert_eq!(schedule_grant_audits(&f), vec![(f.mgr_a.user_id.clone(), "a1".into(),
+        json!({"group": "skills", "action": "toggle", "method": "skills.set_enabled"}))]);
+}
+
+#[tokio::test]
+async fn skills_adopt_stays_owner_only_despite_department_grant() {
+    let f = fixture().await;
+    assert_permission_denied("skills.adopt", Box::pin(f.h.handle("skills.adopt",
+        json!({"target_agent_id": "a1", "skill_name": "matrix-skill"}), &f.mgr_a)).await);
+}
+
+#[tokio::test]
+async fn skills_remove_audits_grant_once_per_employee_but_not_live_owner() {
+    let f = fixture().await;
+    seed_matrix_skill(&f, "a1").await;
+    let extra = f.home.join("agents/a1/SKILLS/matrix-extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(extra.join("SKILL.md"), MATRIX_SKILL.replace("matrix-skill", "matrix-extra")).unwrap();
+    let p = scoped_payload("skills.remove", Box::pin(f.h.handle("skills.remove", json!({"items": [
+        {"agent_id": "a1", "skill_name": "matrix-skill"},
+        {"agent_id": "a1", "skill_name": "matrix-extra"}]}), &f.mgr_a)).await);
+    assert!(p["results"].as_array().unwrap().iter().all(|r| r["ok"] == true));
+    assert_eq!(schedule_grant_audits(&f), vec![(f.mgr_a.user_id.clone(), "a1".into(),
+        json!({"group": "skills", "action": "remove", "method": "skills.remove"}))]);
+    seed_matrix_skill(&f, "a1").await;
+    f.db.bind_agent(&f.mgr_a.user_id, "a1", AccessLevel::Owner).unwrap();
+    let p = scoped_payload("skills.remove",
+        Box::pin(f.h.handle("skills.remove", skill_items("a1"), &f.mgr_a)).await);
+    assert_eq!(p["results"][0]["ok"], true);
+    assert_eq!(schedule_grant_audits(&f).len(), 1);
+}
+
+#[tokio::test]
+async fn skills_list_flags_follow_grants_or_owner_not_viewer() {
+    let f = fixture().await;
+    seed_matrix_skill(&f, "a1").await;
+    seed_matrix_skill(&f, "b1").await;
+    f.db.bind_agent(&f.emp.user_id, "a1", AccessLevel::Viewer).unwrap();
+    for (ctx, expected) in [(&f.mgr_a, true), (&f.emp, false)] {
+        let p = scoped_payload("skills.list", Box::pin(f.h.handle("skills.list", json!({}), ctx)).await);
+        let rows = p["agents"].as_array().unwrap();
+        assert!(!rows.iter().any(|r| r["agent_id"] == "b1"));
+        let a1 = rows.iter().find(|r| r["agent_id"] == "a1").unwrap();
+        for flag in ["can_manage", "can_restore"] {
+            assert_eq!(a1[flag], expected);
+            let skill = a1["skills"].as_array().unwrap().iter().find(|r| r["name"] == "matrix-skill").unwrap();
+            assert_eq!(skill[flag], expected);
+        }
+        let p = scoped_payload("skills.list",
+            Box::pin(f.h.handle("skills.list", json!({"agent_id": "a1"}), ctx)).await);
+        assert_eq!(p["can_manage"], expected);
+        assert_eq!(p["can_restore"], expected);
+    }
+}
+
+#[tokio::test]
+async fn skills_install_request_audits_grant_and_routes_only_to_admin() {
+    let f = fixture().await;
+    let p = scoped_payload("skills.install_request", Box::pin(f.h.handle("skills.install_request",
+        json!({"scope": "a1", "content": MATRIX_SKILL}), &f.mgr_a)).await);
+    let store = crate::install_requests::InstallRequestStore::open(&f.home).unwrap();
+    let request = store.get(p["request_id"].as_str().unwrap()).await.unwrap().unwrap();
+    assert!(!request.needs_manager());
+    assert_eq!(request.stage(), "awaiting_admin");
+    let users = [&f.admin, &f.mgr_a, &f.mgr_b].into_iter()
+        .map(|ctx| f.db.get_user(&ctx.user_id).unwrap().unwrap()).collect::<Vec<_>>();
+    let approvers = crate::install_notify::approvers_for(&users, &request);
+    assert_eq!(approvers.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec![f.admin.user_id.as_str()]);
+    assert!(store.decide(&request.id, &f.mgr_b.user_id, "manager", None, true, "").await.is_err());
+    assert_eq!(schedule_grant_audits(&f), vec![(f.mgr_a.user_id.clone(), "a1".into(),
+        json!({"group": "skills", "action": "request_install", "method": "skills.install_request"}))]);
 }

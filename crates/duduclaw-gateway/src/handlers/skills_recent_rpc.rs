@@ -1,4 +1,5 @@
 use super::*;
+use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
 
 impl MethodHandler {
     pub(crate) async fn handle_skills_recent(&self, params: Value, ctx: &UserContext) -> WsFrame {
@@ -6,9 +7,12 @@ impl MethodHandler {
             Ok(f) => f,
             Err(_) => return WsFrame::error_response("", "permission denied"),
         };
+        let view = DeptGrantView::load(self, ctx).await;
         let agent = params.get("agent_id").and_then(Value::as_str);
         let assigning = params.get("assigning").and_then(Value::as_bool).unwrap_or(false);
-        if agent.is_some_and(|id| !fresh.has_agent_access(id, AccessLevel::Viewer)) {
+        if agent.is_some_and(|id| !fresh.has_agent_access(id, AccessLevel::Viewer)
+            && !department_grant_allows(&view, id, GrantGroup::Skills, GrantAction::Read))
+        {
             return WsFrame::error_response("", "permission denied");
         }
         let history = match crate::recent_skills::list(&self.home_dir, &fresh.user_id) {
@@ -19,7 +23,7 @@ impl MethodHandler {
         let mut seen = std::collections::HashSet::new();
         for (_, name) in history {
             if !seen.insert(name.clone()) { continue; }
-            let (holdings, _) = self.skill_holdings(&fresh, &name).await;
+            let (holdings, _) = self.skill_holdings_with_grants(&fresh, &name, &view).await;
             let mut eligible = None;
             for holding in holdings {
                 if !holding.enabled || holding.security_failed

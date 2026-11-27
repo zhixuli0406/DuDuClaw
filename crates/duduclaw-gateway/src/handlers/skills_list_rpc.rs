@@ -15,9 +15,18 @@
 #[allow(unused_imports)]
 use super::*;
 
+use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
 use crate::evolution_events::skill_usage::SkillUsageMap;
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent, SkillFile};
 use duduclaw_agent::skill_state::{self, DisabledSkills};
+
+/// One UI flag covers both switching and removal; restore has its own flag.
+pub(super) fn skill_management_flags(ctx: &UserContext, view: &DeptGrantView, agent: &str) -> (bool, bool) {
+    let owner = ctx.has_agent_access(agent, AccessLevel::Owner);
+    let allows = |action| department_grant_allows(view, agent, GrantGroup::Skills, action);
+    (owner || (allows(GrantAction::Toggle) && allows(GrantAction::Remove)),
+        owner || allows(GrantAction::Restore))
+}
 
 /// Verdict-map key for a skill in one layer: `global/<name>`,
 /// `department:<dept>/<name>` or `agent:<id>/<name>`.
@@ -164,6 +173,7 @@ impl MethodHandler {
             Ok(f) => f,
             Err(_) => return WsFrame::error_response("", "permission denied"),
         };
+        let view = DeptGrantView::load(self, ctx).await;
         let global_dir = self.home_dir.join("skills");
         let global_skills = AgentRegistry::load_skills(&global_dir).await;
         let global_diag = Self::skill_layer_diag("global", &global_dir, global_skills.len());
@@ -175,13 +185,20 @@ impl MethodHandler {
         let reg = self.registry.read().await;
 
         if let Some(id) = params.get("agent_id").and_then(|v| v.as_str()) {
-            if !fresh.has_agent_access(id, AccessLevel::Viewer) {
+            if !fresh.has_agent_access(id, AccessLevel::Viewer)
+                && !department_grant_allows(&view, id, GrantGroup::Skills, GrantAction::Read)
+            {
                 return WsFrame::error_response("", "permission denied");
             }
             let Some(agent) = reg.get(id) else {
                 return WsFrame::error_response("", &format!("Agent not found: {id}"));
             };
-            let (skills, mut scanned, state) = self.read_agent_skill_layers(agent, &global_skills, &lc).await;
+            let (mut skills, mut scanned, state) = self.read_agent_skill_layers(agent, &global_skills, &lc).await;
+            let (can_manage, can_restore) = skill_management_flags(&fresh, &view, id);
+            for skill in &mut skills {
+                skill["can_manage"] = json!(can_manage);
+                skill["can_restore"] = json!(can_restore);
+            }
             scanned.push(global_diag);
             return WsFrame::ok_response(
                 "",
@@ -190,19 +207,26 @@ impl MethodHandler {
                     "skills": skills,
                     "scanned": scanned,
                     "skill_state": state_json(&state),
-                    "can_manage": fresh.has_agent_access(id, AccessLevel::Owner),
+                    "can_manage": can_manage,
+                    "can_restore": can_restore,
                     "usage_error": usage_error,
                     "usage_truncated": usage_truncated,
                 }),
             );
         }
 
-        let visible = |name: &str| fresh.has_agent_access(name, AccessLevel::Viewer);
+        let visible = |name: &str| fresh.has_agent_access(name, AccessLevel::Viewer)
+            || department_grant_allows(&view, name, GrantGroup::Skills, GrantAction::Read);
         let mut holders: HashMap<String, Vec<Value>> = HashMap::new();
         let mut all_agents = Vec::new();
         let mut scanned = vec![global_diag];
         for agent in reg.list().into_iter().filter(|a| visible(&a.config.agent.name)) {
-            let (skills, diag, state) = self.read_agent_skill_layers(agent, &global_skills, &lc).await;
+            let (mut skills, diag, state) = self.read_agent_skill_layers(agent, &global_skills, &lc).await;
+            let (can_manage, can_restore) = skill_management_flags(&fresh, &view, &agent.config.agent.name);
+            for skill in &mut skills {
+                skill["can_manage"] = json!(can_manage);
+                skill["can_restore"] = json!(can_restore);
+            }
             scanned.extend(diag);
             let (global_rows, own): (Vec<Value>, Vec<Value>) =
                 skills.into_iter().partition(|s| s["scope"] == "global");
@@ -214,6 +238,8 @@ impl MethodHandler {
                     "enabled": g["enabled"],
                     "use_count": g["use_count"],
                     "last_used_at": g["last_used_at"],
+                    "can_manage": can_manage,
+                    "can_restore": can_restore,
                 }));
             }
             all_agents.push(json!({
@@ -221,7 +247,8 @@ impl MethodHandler {
                 "display_name": agent.config.agent.display_name,
                 "skills": own,
                 "skill_state": state_json(&state),
-                "can_manage": fresh.has_agent_access(&agent.config.agent.name, AccessLevel::Owner),
+                "can_manage": can_manage,
+                "can_restore": can_restore,
             }));
         }
         let global: Vec<Value> = global_skills
@@ -267,6 +294,12 @@ impl MethodHandler {
         fresh: &UserContext,
         skill_name: &str,
     ) -> (Vec<SkillHolding>, Option<String>) {
+        self.skill_holdings_with_grants(fresh, skill_name, &DeptGrantView::empty()).await
+    }
+
+    pub(crate) async fn skill_holdings_with_grants(
+        &self, fresh: &UserContext, skill_name: &str, view: &DeptGrantView,
+    ) -> (Vec<SkillHolding>, Option<String>) {
         let global_skills = AgentRegistry::load_skills(&self.home_dir.join("skills")).await;
         let verdicts = self.load_skill_scan_verdicts();
         let (summary, usage_error) = self.skill_usage_map().await;
@@ -281,7 +314,8 @@ impl MethodHandler {
         for agent in reg
             .list()
             .into_iter()
-            .filter(|a| fresh.has_agent_access(&a.config.agent.name, AccessLevel::Viewer))
+            .filter(|a| fresh.has_agent_access(&a.config.agent.name, AccessLevel::Viewer)
+                || department_grant_allows(view, &a.config.agent.name, GrantGroup::Skills, GrantAction::Read))
         {
             let (skills, _, _) = self
                 .read_agent_skill_layers(agent, &global_skills, &lc)
