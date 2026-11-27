@@ -10,6 +10,7 @@ pub mod jwt;
 pub mod google_delegate_attestation;
 pub mod google_identity;
 pub mod google_signin;
+pub mod signin_members;
 pub mod models;
 pub mod org;
 pub mod org_write;

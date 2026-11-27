@@ -74,6 +74,8 @@ pub struct SigninRequest {
 }
 const LINK_COLUMNS: &str = "user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at,last_signin_at";
 const REQUEST_COLUMNS: &str = "id,google_sub,email,hd,display_name,status,requested_at,expires_at,decided_by,decided_at,user_id,mfa_preauthorized";
+const COUNT_JIT_SINCE_SQL: &str = "SELECT (SELECT COUNT(*) FROM google_signin_links WHERE linked_via IN ('jit_direct','jit_approved') AND linked_at>=?1)
+    + (SELECT COUNT(*) FROM google_signin_requests WHERE status='pending' AND requested_at>=?1)";
 fn link_row(r: &Row<'_>) -> rusqlite::Result<GoogleSigninLink> {
     Ok(GoogleSigninLink { user_id: r.get(0)?, google_sub: r.get(1)?, hd: r.get(2)?, email_at_link: r.get(3)?,
         linked_via: r.get(4)?, linked_by: r.get(5)?, linked_at: r.get(6)?, last_signin_at: r.get(7)? })
@@ -127,6 +129,12 @@ impl UserDb {
     pub fn signin_request_by_id(&self, id: &str) -> Result<Option<SigninRequest>, String> {
         self.conn().query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE id=?1"), [id], request_row).optional().map_err(error)
     }
+    pub(crate) fn signin_request_by_id_tx(tx: &Transaction<'_>, id: &str) -> Result<Option<SigninRequest>, String> {
+        tx.query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE id=?1"), [id], request_row).optional().map_err(error)
+    }
+    pub(crate) fn signin_request_by_sub_tx(tx: &Transaction<'_>, sub: &str) -> Result<Option<SigninRequest>, String> {
+        tx.query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE google_sub=?1"), [sub], request_row).optional().map_err(error)
+    }
     pub fn signin_request_by_sub(&self, sub: &str) -> Result<Option<SigninRequest>, String> {
         self.conn().query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE google_sub=?1"), [sub], request_row).optional().map_err(error)
     }
@@ -147,8 +155,10 @@ impl UserDb {
         self.conn().execute("UPDATE google_signin_requests SET status='expired' WHERE status='pending' AND expires_at<=?1", [now]).map_err(error)
     }
     pub fn count_signin_jit_since(&self, since: i64) -> Result<u32, String> {
-        self.conn().query_row("SELECT (SELECT COUNT(*) FROM google_signin_links WHERE linked_via IN ('jit_direct','jit_approved') AND linked_at>=?1)
-            + (SELECT COUNT(*) FROM google_signin_requests WHERE status='pending' AND requested_at>=?1)", [since], |r| r.get(0)).map_err(error)
+        self.conn().query_row(COUNT_JIT_SINCE_SQL, [since], |r| r.get(0)).map_err(error)
+    }
+    pub fn count_signin_jit_since_tx(tx: &Transaction<'_>, since: i64) -> Result<u32, String> {
+        tx.query_row(COUNT_JIT_SINCE_SQL, [since], |r| r.get(0)).map_err(error)
     }
     pub fn upsert_google_signin_attestation(&self, user_id: &str, attested_by: &str, now: i64) -> Result<(), String> {
         let expires = now.checked_add(SIGNIN_ATTESTATION_TTL_SECS).ok_or("signin_timestamp_overflow")?;
