@@ -870,9 +870,9 @@ pub(crate) async fn visible_tools_in_lane(
     // — mirror of dispatch §3.458, same predicate with no arguments, so only
     // tools every call to which is refused are hidden. External callers are
     // outside that gate in dispatch, so they are outside it here too.
-    let delegation_none = !principal.is_external
-        && duduclaw_core::delegation_policy_from_home(home_dir)
-            == duduclaw_core::DelegationPolicy::Disabled;
+    let delegation_none = if principal.is_external { None } else {
+        Some(super::delegation_roles::none_policy(home_dir, effective_agent).await)
+    };
     // RM-137 (soft identity mode): the handler and the `none` exemption also
     // require a token-verified identity (`caller_token_verified`); a soft-mode
     // `Unverified` process declaring an `eph-*` id gets neither. Only a role
@@ -1007,7 +1007,7 @@ pub(crate) async fn visible_tools_in_lane(
         })
         // RM-137: delegation policy `none` (mirror of dispatch §3.458).
         .filter(|t| {
-            !delegation_none
+            !delegation_none.as_ref().is_some_and(|policy| policy.blocks(t.name))
                 || !crate::mcp_dispatch::delegation_none_refuses_for(
                     home_dir,
                     t.name,

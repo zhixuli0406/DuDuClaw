@@ -1092,9 +1092,12 @@ where
     let principal = crate::on_behalf_of::from_stored(
         home_dir, reminder.on_behalf_of.as_deref(), &reminder.agent_id, "reminder",
     );
-    authority.scope(crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
+    let requester = crate::delegation_roles::initiators::lookup(home_dir, "reminder", &reminder.id,
+        None, &reminder.agent_id, principal.as_deref());
+    authority.scope(crate::delegation_roles::initiators::scope(&reminder.agent_id, requester,
+        crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
         home_dir, http, registry, sem, reminder, invoke,
-    ))).await
+    )))).await
 }
 
 async fn deliver_reminder_scoped<F, Fut>(

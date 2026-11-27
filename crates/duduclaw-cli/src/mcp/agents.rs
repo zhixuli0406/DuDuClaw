@@ -578,10 +578,10 @@ pub(crate) async fn list_agents_filtered(params: &Value, home_dir: &Path, caller
         }
     };
 
-    // WP21 T6 (design doc §2.5): `open` policy and system senders (dashboard /
-    // heartbeat / ...) keep the pre-WP21 unrestricted listing.
-    let rules = duduclaw_core::delegation_rules_from_home(home_dir);
-    let unrestricted = rules.policy == duduclaw_core::DelegationPolicy::Open
+    // Preserve the open/system listing; load role evidence once for overrides.
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home_dir);
+    let roles = super::delegation_roles::LoopbackOwnerRoles::load(home_dir, caller, &read).await;
+    let unrestricted = read.rules.policy == duduclaw_core::DelegationPolicy::Open
         || duduclaw_core::is_system_sender(caller);
 
     let mut candidates: Vec<(String, Value)> = Vec::new();
@@ -656,7 +656,7 @@ pub(crate) async fn list_agents_filtered(params: &Value, home_dir: &Path, caller
     // keyed by directory name, which is the agent id `org_visible` expects.
     let agents: Vec<Value> = candidates
         .into_iter()
-        .filter(|(name, _)| !hidden.contains(name) && (unrestricted || org_visible(&rules, &org, caller, name)))
+        .filter(|(name, _)| !hidden.contains(name) && (unrestricted || org_visible(home_dir, &read, &roles, &org, caller, name)))
         .map(|(_, v)| v)
         .collect();
 
@@ -730,15 +730,13 @@ pub(crate) async fn handle_agent_status(params: &Value, home_dir: &Path, caller:
     // WP21 T6 (design doc §2.5): read-side visibility gate. Same response
     // shape as "not found" (`agent_not_visible_error`) so the tool cannot be
     // used to probe which agent ids exist versus which are merely hidden.
-    // `open` policy, system senders, and the caller looking up itself all
-    // skip the org read entirely.
-    let rules = duduclaw_core::delegation_rules_from_home(home_dir);
-    if rules.policy != duduclaw_core::DelegationPolicy::Open
-        && !duduclaw_core::is_system_sender(caller)
-        && caller != agent_id
-    {
+    // Open policy, system senders and self skip the org read.
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home_dir);
+    if read.rules.policy != duduclaw_core::DelegationPolicy::Open
+        && !duduclaw_core::is_system_sender(caller) && caller != agent_id {
+        let roles = super::delegation_roles::LoopbackOwnerRoles::load(home_dir, caller, &read).await;
         let org = org_snapshot(home_dir, &[caller, agent_id]).await;
-        if !org_visible(&rules, &org, caller, agent_id) {
+        if !org_visible(home_dir, &read, &roles, &org, caller, agent_id) {
             return agent_not_visible_error(agent_id);
         }
     }

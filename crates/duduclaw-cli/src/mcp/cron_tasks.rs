@@ -188,6 +188,8 @@ pub(crate) async fn handle_schedule_task_for_actor(
     };
     match store.insert(&row).await {
         Ok(()) => {
+            super::delegation_roles::record_initiator(home_dir, "cron", caller, &scheduled_target, &task_id).await;
+
             // WP6.4 — channel receipt. The old result text was an English
             // developer string ("Task 'x' scheduled (id: …)"), which the agent
             // paraphrased however it liked, so the user often got no
@@ -772,6 +774,7 @@ pub(crate) async fn handle_update_cron_task(
     ).await;
     match updated {
         Ok(true) => {
+            super::delegation_roles::record_initiator(home_dir, "cron", actor.id(), &existing.agent_id, &existing.id).await;
             if let Ok(Some(row)) = store.get(&existing.id).await {
                 if row.name == new_name
                     && row.cron == new_cron

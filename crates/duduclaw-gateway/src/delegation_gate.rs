@@ -9,7 +9,7 @@
 //! line to `bus_queue.jsonl`. Before this module, none of those were checked.
 //!
 //! The decision itself lives in `duduclaw_core::delegation_policy`
-//! ([`can_delegate_ext`]); this module only supplies the two things the
+//! ([`evaluate_delegation`]); this module only supplies the two things the
 //! predicate needs from the gateway — an [`OrgView`] over the agent registry
 //! and the effective policy — plus the DENY consequences: fail the task, write
 //! the reason back, record an audit event, never spawn.
@@ -41,9 +41,10 @@ use tokio::sync::RwLock;
 use tracing::warn;
 
 use duduclaw_agent::registry::AgentRegistry;
-use duduclaw_core::delegation_policy::delegation_rules_from_table;
+use duduclaw_core::delegation_policy::{delegation_config_read_from_table, DelegationConfigRead,
+    evaluate_delegation, DelegationContext, DelegationBoundaries, DelegationAllowSource};
 use duduclaw_core::{
-    DelegationDenied, OrgNode, OrgView, can_delegate_rules_ext, is_valid_agent_id, truncate_chars,
+    DelegationDenied, OrgNode, OrgView, is_valid_agent_id, truncate_chars,
 };
 use duduclaw_security::audit::{AuditEvent, Severity};
 
@@ -55,7 +56,7 @@ use duduclaw_security::audit::{AuditEvent, Severity};
 /// agent's *own* deferred GVU retry to itself (see `poll_deferred_gvu`), a
 /// synthetic id that never crosses an org boundary. It is listed here — not in
 /// core — because it is a gateway implementation detail, and passing it through
-/// [`can_delegate_ext`] keeps the core predicate unchanged (design doc §2.3
+/// [`evaluate_delegation`] keeps the system-sender list explicit (design doc §2.3
 /// leaves the constant set closed).
 const GATEWAY_INTERNAL_SENDERS: [&str; 1] = ["__deferred_gvu__"];
 
@@ -82,14 +83,14 @@ pub(crate) fn is_background_system_sender(sender: &str) -> bool {
 /// back to `department`), `trusted = false`, human_principal enforce.
 fn read_config_table(
     home_dir: &Path,
-) -> (duduclaw_core::DelegationRules, toml::Table, duduclaw_core::HumanPrincipalMode) {
+) -> (DelegationConfigRead, toml::Table, duduclaw_core::HumanPrincipalMode) {
     let path = home_dir.join("config.toml");
     let table = match std::fs::read_to_string(&path) {
         Ok(content) => content.parse::<toml::Table>().ok(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let table = toml::Table::new();
             return (
-                delegation_rules_from_table(&table),
+                delegation_config_read_from_table(&table),
                 table,
                 duduclaw_core::HumanPrincipalMode::Record,
             );
@@ -101,17 +102,17 @@ fn read_config_table(
         duduclaw_core::delegation_policy::warn_policy_once(
             "config.toml 無法讀取或不是有效的 TOML;在修正前 AI 員工之間一律不能委派(視為 [delegation] policy = \"none\")。",
         );
-        let rules = duduclaw_core::DelegationRules {
-            policy: duduclaw_core::DelegationPolicy::Disabled,
-            allow_pairs: Vec::new(),
-        };
-        return (rules, toml::Table::new(), duduclaw_core::HumanPrincipalMode::Enforce);
+        let mut denied_table = toml::Table::new();
+        let mut section = toml::Table::new();
+        section.insert("policy".into(), toml::Value::String("none".into()));
+        denied_table.insert("delegation".into(), toml::Value::Table(section));
+        return (delegation_config_read_from_table(&denied_table), toml::Table::new(), duduclaw_core::HumanPrincipalMode::Enforce);
     };
     let (mode, warning) = duduclaw_core::HumanPrincipalMode::from_table(&table);
     if let Some(warning) = warning {
         warn!("{warning}");
     }
-    (delegation_rules_from_table(&table), table, mode)
+    (delegation_config_read_from_table(&table), table, mode)
 }
 
 /// `config.toml [acp] trusted` — WP21 T7, design doc §2.6.
@@ -121,7 +122,7 @@ fn read_config_table(
 /// deliberately absent from [`duduclaw_core::SYSTEM_SENDERS`] — so by default
 /// this gate denies every A2A-originated delegation (fail-closed, per the
 /// module docs). Setting `trusted = true` adds `ACP_CLIENT_SENDER` to the
-/// extra-system-senders list passed to `can_delegate_rules_ext`, which grants
+/// extra-system-senders list passed to `evaluate_delegation`, which grants
 /// it the *same reach as a system sender*: dispatch to any agent in this
 /// home, bypassing the org-tree hierarchy/department checks entirely.
 ///
@@ -365,7 +366,8 @@ pub(crate) async fn gate_bus_dispatch(
     // WP21 欠帳⑤: one read + one parse of config.toml serves both extractors
     // below — previously `delegation_rules_from_home` and
     // `acp_trusted_from_home` each re-read and re-parsed the whole file.
-    let (rules, config_table, human_mode) = read_config_table(home_dir);
+    let (read, config_table, human_mode) = read_config_table(home_dir);
+    let rules = &read.rules;
     // WP21 T7: `[acp] trusted = true` widens the extra-system-senders list for
     // this decision only — see `acp_trusted_from_table` for the risk this opts
     // into. Default (false) leaves `GATEWAY_INTERNAL_SENDERS` untouched, which
@@ -397,6 +399,18 @@ pub(crate) async fn gate_bus_dispatch(
     let acp_cross_target_under_none = rules.policy == duduclaw_core::DelegationPolicy::Disabled
         && sender_id == duduclaw_core::ACP_CLIENT_SENDER
         && guard.main_agent().map(|m| m.config.agent.name.trim()) != Some(target_id.trim());
+    let requester = crate::delegation_roles::initiators::lookup(home_dir, "message", task_id, Some(&sender_id), &target_id, on_behalf_of)
+        .unwrap_or_else(|| crate::delegation_roles::Requester::background());
+    let roles = crate::delegation_roles::GatewayOwnerRoles::new(home_dir, requester);
+    let facts = roles.snapshot(&sender_id).ok();
+    let boundaries = DelegationBoundaries {
+        personal_target_allowed: crate::personal_visibility::fire_time_refusal(home_dir,
+            crate::runtime_readiness::isolation_active(), &[on_behalf_of], Some(&sender_id), &target_id).is_none(),
+        // The live registry/main and machine checks above already succeeded.
+        main_target_allowed: true,
+        // The MCP permission gate checks can_send_cross_agent before enqueue.
+        can_send_cross_agent: true,
+    };
     let decision = (if acp_cross_target_under_none {
             Err(DelegationDenied {
                 sender: sender_id.clone(),
@@ -411,9 +425,12 @@ pub(crate) async fn gate_bus_dispatch(
                 policy: rules.policy,
                 reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
             })
-        } else if ephemeral_release { Ok(()) }
-        else { can_delegate_rules_ext(&rules, &view, &sender_id, &target_id, &extra_senders) })
-        .and_then(|()| {
+        } else if ephemeral_release { Ok(DelegationAllowSource::Mode) }
+        else { evaluate_delegation(rules, &view, &sender_id, &target_id, &DelegationContext {
+            overrides: &read.overrides, owner_roles: Some(&roles), boundaries,
+            extra_system_senders: &extra_senders,
+        }) })
+        .and_then(|source| {
             // The employee tree allowed it; in enforce mode the person the
             // work is for must be allowed too. System and gateway-internal
             // senders (goal rounds, heartbeat wake-ups, cron) are not an
@@ -422,7 +439,7 @@ pub(crate) async fn gate_bus_dispatch(
             if duduclaw_core::is_system_sender(&sender_id)
                 || extra_senders.iter().any(|s| s.trim() == sender_id)
             {
-                return Ok(());
+                return Ok(source);
             }
             let principal = on_behalf_of
                 .map(str::trim)
@@ -439,12 +456,16 @@ pub(crate) async fn gate_bus_dispatch(
                 &target_id,
                 path_kind,
                 rules.policy,
-            )
+            ).map(|()| source)
         });
     drop(guard);
 
     match decision {
-        Ok(()) => GateOutcome::Allow,
+        Ok(source) => {
+            crate::delegation_roles::audit_allow(home_dir, &sender_id, &target_id, source,
+                facts.as_ref().and_then(|f| f.requester_account_id.as_deref()), path_kind);
+            GateOutcome::Allow
+        },
         Err(denied) => {
             warn!(
                 task_id = %truncate_chars(task_id, 64),
@@ -566,7 +587,8 @@ mod tests {
         let path = root.join(name).join("agent.toml");
         let raw = std::fs::read_to_string(&path).unwrap();
         std::fs::write(path, raw.replace("reports_to = \"\"",
-            &format!("reports_to = \"{reports_to}\"\ndepartment = \"{department}\""))).unwrap();
+            &format!("reports_to = \"{reports_to}\"\ndepartment = \"{department}\""))
+            .replace("can_send_cross_agent = false", "can_send_cross_agent = true")).unwrap();
     }
 
     fn registry_for(home: &Path) -> Arc<RwLock<AgentRegistry>> {
@@ -1102,4 +1124,127 @@ mod tests {
         assert_eq!(resolve_sender(Some(" "), None), None);
         assert_eq!(resolve_sender(None, None), None);
     }
+    #[tokio::test]
+    async fn rm183_roles_none_and_one_way_pairs_at_queue_gate() {
+        let tmp = seed_home();
+        let home = tmp.path();
+        let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "test-password", duduclaw_auth::UserRole::Admin).unwrap().id;
+        let employee = db.create_user("employee@test.invalid", "Employee", "test-password", duduclaw_auth::UserRole::Employee).unwrap().id;
+        let conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        conn.execute("UPDATE users SET avatar_agent_id='sales_rep' WHERE id=?1", [&admin]).unwrap();
+        let reg = registry_for(home);
+        let principal = format!("user:{admin}");
+        duduclaw_core::ensure_identity_key(home).unwrap();
+        std::fs::write(home.join("config.toml"), "[delegation]\npolicy='none'\nunrestricted_roles=['admin']").unwrap();
+        for (id, sender, target, principal) in [
+            ("rm183", "sales_rep", "mkt_rep", principal.clone()),
+            ("rm183-reverse", "mkt_rep", "sales_rep", principal.clone()),
+            ("ordinary", "sales_rep", "mkt_rep", format!("user:{employee}")),
+            ("disabled", "sales_rep", "mkt_rep", principal.clone()),
+        ] {
+            crate::delegation_roles::initiators::record(home, "message", sender, target, id,
+                &crate::delegation_roles::Requester::attended(
+                    duduclaw_core::HumanPrincipal::parse(&principal).unwrap().user_id().unwrap())).unwrap();
+        }
+        for policy in ["hierarchy", "none"] {
+            std::fs::write(home.join("config.toml"), format!("[delegation]\npolicy='{policy}'\nunrestricted_roles=['admin']")).unwrap();
+            let outcome = gate_bus_dispatch(home, &reg, Some("sales_rep"), None, "mkt_rep",
+                "rm183", "bus_dispatch", Some(&principal)).await;
+            assert!(allows_dispatch(&outcome));
+            assert!(!allows_dispatch(&gate_bus_dispatch(home, &reg, Some("sales_rep"), None, "mkt_rep",
+                "forged-unrecorded", "bus_dispatch", Some(&principal)).await));
+            let reverse = gate_bus_dispatch(home, &reg, Some("mkt_rep"), None, "sales_rep",
+                "rm183-reverse", "bus_dispatch", Some(&principal)).await;
+            assert!(!allows_dispatch(&reverse));
+            let ordinary = format!("user:{employee}");
+            assert!(!allows_dispatch(&gate_bus_dispatch(home, &reg, Some("sales_rep"), None, "mkt_rep",
+                "ordinary", "bus_dispatch", Some(&ordinary)).await));
+        }
+        let audit = std::fs::read_to_string(home.join("security_audit.jsonl")).unwrap();
+        assert!(audit.contains("unrestricted_role") && audit.contains(&admin));
+        conn.execute("UPDATE users SET status='disabled' WHERE id=?1", [&admin]).unwrap();
+        assert!(!allows_dispatch(&gate_bus_dispatch(home, &reg, Some("sales_rep"), None, "mkt_rep",
+            "disabled", "bus_dispatch", Some(&principal)).await));
+        std::fs::write(home.join("config.toml"), "[delegation]\npolicy='hierarchy'\nallow_one_way=[['sales_rep','mkt_rep']]").unwrap();
+        assert!(allows_dispatch(&gate(home, Some("sales_rep"), "mkt_rep").await));
+        let reverse = gate(home, Some("mkt_rep"), "sales_rep").await;
+        assert!(matches!(reverse, GateOutcome::Deny(DelegationDenied { reason: DelegationDenyReason::ReversePairOnly, .. })));
+        let path = home.join("agents/sales_rep/agent.toml");
+        let mut table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        table.entry("permissions".to_string()).or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut().unwrap().insert("can_send_cross_agent".into(), toml::Value::Boolean(false));
+        std::fs::write(path, toml::to_string(&table).unwrap()).unwrap();
+        // C1 preserves v1.85: permissions are checked at the MCP front door.
+        assert!(allows_dispatch(&gate(home, Some("sales_rep"), "mkt_rep").await));
+    }
+
+    #[tokio::test]
+    async fn rm183_manager_pass_never_bypasses_main_boundary() {
+        let tmp = seed_home();
+        let home = tmp.path();
+        let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let manager = db.create_user("manager@test.invalid", "Manager", "test-password", duduclaw_auth::UserRole::Manager).unwrap().id;
+        rusqlite::Connection::open(home.join("users.db")).unwrap()
+            .execute("UPDATE users SET avatar_agent_id='sales_rep' WHERE id=?1", [&manager]).unwrap();
+        let path = home.join("agents/ceo/agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, raw.replace("role = \"worker\"", "role = \"main\"")).unwrap();
+        std::fs::write(home.join("config.toml"), "[delegation]\npolicy='none'\nunrestricted_roles=['manager']").unwrap();
+        duduclaw_core::ensure_identity_key(home).unwrap();
+        let principal = format!("user:{manager}");
+        crate::delegation_roles::initiators::record(home, "message", "sales_rep", "ceo", "main-test",
+            &crate::delegation_roles::Requester::attended(
+                    duduclaw_core::HumanPrincipal::parse(&principal).unwrap().user_id().unwrap())).unwrap();
+        let outcome = gate_bus_dispatch(home, &registry_for(home), Some("sales_rep"), None, "ceo",
+            "main-test", "bus_dispatch", Some(&principal)).await;
+        assert!(matches!(outcome, GateOutcome::Deny(DelegationDenied {
+            reason: DelegationDenyReason::HumanPrincipalNotPermitted, .. })));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rm183_admin_pass_never_bypasses_personal_queue_boundary() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = seed_home();
+        let home = tmp.path();
+        let db = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.invalid", "Admin", "test-password", duduclaw_auth::UserRole::Admin).unwrap().id;
+        let owner = db.create_user("owner@test.invalid", "Owner", "test-password", duduclaw_auth::UserRole::Employee).unwrap().id;
+        let mut conn = rusqlite::Connection::open(home.join("users.db")).unwrap();
+        conn.execute("UPDATE users SET avatar_agent_id='sales_rep' WHERE id=?1", [&admin]).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(duduclaw_auth::db::insert_personal_agent_in_transaction(&tx, "mkt_rep", &owner).unwrap());
+        assert!(duduclaw_auth::db::bind_personal_owner_in_transaction(&tx, "mkt_rep", &owner).unwrap());
+        tx.commit().unwrap();
+        drop(conn);
+        drop(db);
+        for name in ["users.db", "users.db-wal", "users.db-shm", "users.db-journal"] {
+            let file = home.join(name);
+            if file.exists() { std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600)).unwrap(); }
+        }
+        std::fs::write(home.join("config.toml"), "[delegation]\npolicy='none'\nunrestricted_roles=['admin']").unwrap();
+        duduclaw_core::ensure_identity_key(home).unwrap();
+        let principal = format!("user:{admin}");
+        crate::delegation_roles::initiators::record(home, "message", "sales_rep", "mkt_rep", "personal-test",
+            &crate::delegation_roles::Requester::attended(
+                    duduclaw_core::HumanPrincipal::parse(&principal).unwrap().user_id().unwrap())).unwrap();
+        let isolation = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(isolation.path().join("opt/duduclaw-isolated")).unwrap();
+        std::os::unix::fs::symlink("generations/missing", isolation.path().join("opt/duduclaw-isolated/current")).unwrap();
+        let marker = isolation.path().join("protected-mode");
+        std::fs::write(&marker, "native-systemd\n").unwrap();
+        let sources = duduclaw_core::protected_mode::Sources { env: None, marker,
+            service_home: isolation.path().join("no-service-home") };
+        duduclaw_core::protected_mode::with_thread_sources(sources, || {
+            duduclaw_core::isolation_install::with_thread_root(isolation.path().to_path_buf(), || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                let outcome = rt.block_on(gate_bus_dispatch(home, &registry_for(home), Some("sales_rep"), None,
+                    "mkt_rep", "personal-test", "bus_dispatch", Some(&principal)));
+                assert!(matches!(outcome, GateOutcome::Deny(DelegationDenied {
+                    reason: DelegationDenyReason::PersonalTargetNotPermitted, .. })));
+            });
+        });
+    }
+
 }

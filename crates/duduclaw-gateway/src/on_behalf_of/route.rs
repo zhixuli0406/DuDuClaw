@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 pub const ROUTE: &str = "/api/internal/human-principal";
+pub const DELEGATION_ROLES_ROUTE: &str = "/api/internal/delegation-roles";
 
 pub struct RouteState {
     home: PathBuf,
@@ -77,6 +78,7 @@ struct Request {
 pub fn router(state: Arc<RouteState>) -> Router {
     Router::new()
         .route(ROUTE, post(handle))
+        .route(DELEGATION_ROLES_ROUTE, post(delegation_roles))
         .layer(DefaultBodyLimit::max(4096))
         .with_state(state)
 }
@@ -156,3 +158,49 @@ async fn handle(
 #[cfg(test)]
 #[path = "route_tests.rs"]
 mod tests;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoleRequest { context: String, record: Option<InitiatorRecord> }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitiatorRecord { kind: String, id: String, target: String }
+
+async fn delegation_roles(
+    State(state): State<Arc<RouteState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Response {
+    if check_peer(peer).is_err() { return refusal(StatusCode::UNAUTHORIZED); }
+    let Ok(body) = body else { return refusal(StatusCode::PAYLOAD_TOO_LARGE); };
+    let timestamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let Ok(caller) = authenticate(&state.home, peer, &headers, &body, timestamp) else {
+        return refusal(StatusCode::UNAUTHORIZED);
+    };
+    if duduclaw_core::is_reserved_agent_id(&caller.agent_id) {
+        return refusal(StatusCode::FORBIDDEN);
+    }
+    let now = Instant::now();
+    if !state.rate.allow(&caller.agent_id, now) { return refusal(StatusCode::TOO_MANY_REQUESTS); }
+    if !state.replay.record(&caller.nonce, now) { return refusal(StatusCode::UNAUTHORIZED); }
+    let Ok(request) = serde_json::from_slice::<RoleRequest>(&body) else {
+        return refusal(StatusCode::BAD_REQUEST);
+    };
+    let Some(requester) = super::context::delegation_requester(&state.home, &caller.agent_id, &request.context) else {
+        return refusal(StatusCode::FORBIDDEN);
+    };
+    let roles = crate::delegation_roles::GatewayOwnerRoles::new(&state.home, requester.clone());
+    let Ok(facts) = roles.snapshot(&caller.agent_id) else { return refusal(StatusCode::FORBIDDEN); };
+    if super::context::lookup(&state.home, &caller.agent_id, &request.context).is_none() {
+        return refusal(StatusCode::FORBIDDEN);
+    }
+    if let Some(record) = request.record {
+        if crate::delegation_roles::initiators::record(&state.home, &record.kind, &caller.agent_id,
+            &record.target, &record.id, &requester).is_err() {
+            return refusal(StatusCode::FORBIDDEN);
+        }
+    }
+    (StatusCode::OK, Json(json!({"ok":true,"facts":facts}))).into_response()
+}
