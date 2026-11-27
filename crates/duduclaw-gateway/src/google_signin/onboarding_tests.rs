@@ -48,13 +48,13 @@ impl Fixture {
 async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
-    let member = match db.resolve_google_signin(&VerifiedGoogleIdentity {
+    let member = match db.resolve_google_signin(true, &VerifiedGoogleIdentity {
         sub: "123456789".into(), email: "member@company.test".into(),
         hd: "company.test".into(), display_name: "新同仁".into(),
     }, &SigninPolicy {
         approval: SigninApproval::Direct, daily_cap: 20, settings_version: "fixture".into(),
         ack_by: "fixture-owner".into(), ack_at: "2026-11-27T00:00:00Z".into(),
-    }, NOW).unwrap() {
+    }, NOW, &|_| Ok(None)).unwrap() {
         SigninOutcome::Ok { user_id, created: true, .. } => user_id,
         other => panic!("unexpected provisioning outcome: {other:?}"),
     };
