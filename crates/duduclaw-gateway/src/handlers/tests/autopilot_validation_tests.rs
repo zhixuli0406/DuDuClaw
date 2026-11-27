@@ -299,15 +299,16 @@ fn action_require_approval_accepts_only_a_boolean() {
 
 #[tokio::test]
 async fn autopilot_create_and_update_refuse_a_non_bool_require_approval() {
-    use crate::handlers::task_privacy_tests::fixture;
+    use crate::handlers::task_privacy_tests::{admin, fixture};
     let f = fixture().await;
+    let root = admin(&f);
     let store = Arc::new(AutopilotStore::open(&f.home).unwrap());
     f.handler.set_autopilot_store(store.clone()).await;
     let refused = f
         .handler
         .handle_autopilot_create(json!({"name": "gate", "action": {
             "type": "delegate", "target_agent": "plain", "prompt": "{task.title}", "require_approval": "yes"
-        }}))
+        }}), &root)
         .await;
     assert!(
         matches!(refused, WsFrame::Response { ok: false, error: Some(ref e), .. }
@@ -320,7 +321,7 @@ async fn autopilot_create_and_update_refuse_a_non_bool_require_approval() {
         .handler
         .handle_autopilot_create(json!({"name": "gate", "action": {
             "type": "delegate", "target_agent": "plain", "prompt": "{task.title}", "require_approval": true
-        }}))
+        }}), &root)
         .await;
     let rule_id = match created {
         WsFrame::Response { ok: true, payload: Some(p), .. } => p["rule"]["id"].as_str().unwrap().to_string(),
@@ -330,7 +331,7 @@ async fn autopilot_create_and_update_refuse_a_non_bool_require_approval() {
         .handler
         .handle_autopilot_update(json!({"rule_id": rule_id, "action": {
             "type": "delegate", "target_agent": "plain", "prompt": "p", "require_approval": 0
-        }}))
+        }}), &root)
         .await;
     assert!(matches!(refused, WsFrame::Response { ok: false, .. }), "{refused:?}");
     let stored = store.get_rule(&rule_id).await.unwrap().unwrap();
@@ -415,4 +416,78 @@ fn update_accepts_cron_tick_only_when_unchanged() {
     assert!(validate_autopilot_trigger_event_for_update("task_created", "cron_tick").is_ok());
     assert!(validate_autopilot_trigger_event_for_update("tick", "task_created").is_ok());
     assert!(validate_autopilot_trigger_event_for_update("nope", "nope").is_err());
+}
+
+fn notification_step() -> Value {
+    json!({"type":"notify", "channel":"webchat", "chat_id":"test", "text":"hello"})
+}
+
+macro_rules! rejects_steps {
+    ($name:ident, $action:expr) => {
+        #[test]
+        fn $name() {
+            let action = $action;
+            assert!(validate_autopilot_action(&action).is_err(), "{action}");
+        }
+    };
+}
+
+rejects_steps!(steps_reject_zero, json!({"type":"steps", "steps":[]}));
+rejects_steps!(steps_reject_six, json!({"type":"steps", "steps":vec![notification_step(); 6]}));
+rejects_steps!(steps_reject_wait_zero, json!({"type":"steps", "steps":[{"type":"wait", "minutes":0}, notification_step()]}));
+rejects_steps!(steps_reject_wait_1441, json!({"type":"steps", "steps":[{"type":"wait", "minutes":1441}, notification_step()]}));
+rejects_steps!(steps_reject_wait_fraction, json!({"type":"steps", "steps":[{"type":"wait", "minutes":1.5}, notification_step()]}));
+rejects_steps!(steps_reject_wait_string, json!({"type":"steps", "steps":[{"type":"wait", "minutes":"5"}, notification_step()]}));
+rejects_steps!(steps_reject_wait_sum_1441, json!({"type":"steps", "steps":[{"type":"wait", "minutes":720}, notification_step(), {"type":"wait", "minutes":721}, notification_step()]}));
+rejects_steps!(steps_reject_consecutive_waits, json!({"type":"steps", "steps":[{"type":"wait", "minutes":1}, {"type":"wait", "minutes":1}, notification_step()]}));
+rejects_steps!(steps_reject_trailing_wait, json!({"type":"steps", "steps":[notification_step(), {"type":"wait", "minutes":1}]}));
+rejects_steps!(steps_reject_only_waits, json!({"type":"steps", "steps":[{"type":"wait", "minutes":1}]}));
+rejects_steps!(steps_reject_nested_steps, json!({"type":"steps", "steps":[{"type":"steps", "steps":[notification_step()]}]}));
+rejects_steps!(steps_reject_step_screen, json!({"type":"steps", "steps":[{"type":"run_skill", "target_agent":"sales", "skill_name":"test", "screen":null}]}));
+rejects_steps!(steps_reject_envelope_approval, json!({"type":"steps", "steps":[notification_step()], "require_approval":false}));
+rejects_steps!(steps_reject_unknown_envelope_key, json!({"type":"steps", "steps":[notification_step()], "extra":true}));
+rejects_steps!(steps_reject_wait_extra_key, json!({"type":"steps", "steps":[{"type":"wait", "minutes":1, "require_approval":true}, notification_step()]}));
+rejects_steps!(steps_reject_non_array, json!({"type":"steps", "steps":{}}));
+rejects_steps!(steps_reject_non_bool_approval, json!({"type":"steps", "steps":[{"type":"run_skill", "target_agent":"sales", "skill_name":"test", "require_approval":"yes"}]}));
+rejects_steps!(steps_reject_invalid_screen, json!({"type":"steps", "steps":[notification_step()], "screen":{"mode":"cloud", "prompt":"p"}}));
+rejects_steps!(steps_reject_non_object_params, json!({"type":"steps", "steps":[{"type":"run_skill", "target_agent":"sales", "skill_name":"test", "params":[]}]}));
+rejects_steps!(steps_reject_params_on_delegate, json!({"type":"steps", "steps":[{"type":"delegate", "target_agent":"sales", "prompt":"test", "params":{}}]}));
+rejects_steps!(legacy_action_rejects_params, json!({"type":"run_skill", "target_agent":"sales", "skill_name":"test", "params":{}}));
+
+#[test]
+fn steps_accept_three_actions_and_wait_boundaries() {
+    let action = json!({"type":"steps", "screen":{"mode":"local", "prompt":"p"}, "steps":[
+        notification_step(), {"type":"wait", "minutes":1440},
+        {"type":"run_skill", "target_agent":"sales", "skill_name":"test", "require_approval":true, "params":{"note":"hello"}}
+    ]});
+    assert!(validate_autopilot_action(&action).is_ok());
+    let five = json!({"type":"steps", "steps":[notification_step(), {"type":"wait", "minutes":720},
+        {"type":"delegate", "target_agent":"sales", "prompt":"p"}, {"type":"wait", "minutes":720},
+        {"type":"proactive_notify", "channel":"webchat", "chat_id":"test", "text":"hello"}]});
+    assert!(validate_autopilot_action(&five).is_ok());
+}
+
+#[test]
+fn steps_params_entry_limit() {
+    let mut params = serde_json::Map::new();
+    for n in 0..10 {
+        params.insert(format!("p{n}"), json!("text"));
+    }
+    let mut step = json!({"type":"run_skill", "target_agent":"sales", "skill_name":"test", "params":params});
+    assert!(validate_autopilot_action(&wrap_in_steps_envelope(step.clone())).is_ok());
+    step["params"]["extra"] = json!("text");
+    assert!(validate_autopilot_action(&wrap_in_steps_envelope(step)).is_err());
+}
+
+#[test]
+fn wrap_moves_screen_and_preserves_step_approval() {
+    let action = json!({"type":"run_skill", "target_agent":"sales", "skill_name":"test",
+        "screen":{"mode":"local", "prompt":"p"}, "require_approval":true, "params":{"note":"hello"}});
+    let wrapped = wrap_in_steps_envelope(action.clone());
+    assert_eq!(wrapped["screen"], action["screen"]);
+    assert!(wrapped["steps"][0].get("screen").is_none());
+    assert_eq!(wrapped["steps"][0]["require_approval"], true);
+    assert!(wrapped.get("require_approval").is_none());
+    assert!(validate_autopilot_action(&wrapped).is_ok());
+    assert_eq!(wrap_in_steps_envelope(wrapped.clone()), wrapped);
 }

@@ -63,7 +63,7 @@ pub struct AutopilotRuleRow {
     /// Last modifying account; NULL for system updates.
     #[serde(default)]
     pub updated_by_user_id: Option<String>,
-    /// Timestamp of the last extension update.
+    /// Timestamp of the last definition or extension update.
     #[serde(default)]
     pub updated_at: Option<String>,
 }
@@ -550,6 +550,36 @@ impl AutopilotStore {
             }
             let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
                 .optional().map_err(|e| format!("read updated rule: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
+        })
+    }
+
+    /// Atomically persist a validated definition and its editor. Identity,
+    /// ownership, metadata and execution counters remain database-owned.
+    pub async fn replace_rule_definition(
+        &self,
+        id: &str,
+        definition: &AutopilotRuleRow,
+        updated_by: Option<&str>,
+        updated_at: &str,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "replace rule definition", |conn| {
+            let n = conn.execute(
+                "UPDATE autopilot_rules SET name = ?1, enabled = ?2,
+                 trigger_event = ?3, conditions = ?4, action = ?5, sequence = ?6,
+                 active_window = ?7, run_policy = ?8, updated_by_user_id = ?9,
+                 updated_at = ?10 WHERE id = ?11",
+                params![definition.name, definition.enabled, definition.trigger_event,
+                    definition.conditions, definition.action, definition.sequence,
+                    definition.active_window, definition.run_policy, updated_by, updated_at, id],
+            ).map_err(|e| format!("replace rule definition: {e}"))?;
+            if n == 0 { return Ok(None); }
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read replaced rule: {e}"))?;
             if let Some(row) = &row {
                 extensions_require_steps_envelope(row)?;
             }
