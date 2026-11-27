@@ -336,6 +336,9 @@ impl MethodHandler {
             return WsFrame::error_response("", "agent_id is required");
         }
 
+        if let Err(reason) = require_heartbeat_operation(ctx, agent_id) {
+            return WsFrame::error_response("", &reason);
+        }
         if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
         let hb = self.heartbeat.read().await;
         match hb.as_ref() {
@@ -394,4 +397,11 @@ impl MethodHandler {
             }),
         )
     }
+}
+
+/// Operation scope is deliberately separate from visibility and team calling.
+/// The dispatch chokepoint supplies a live context; lookup failures deny there.
+fn require_heartbeat_operation(ctx: &UserContext, agent_id: &str) -> Result<(), String> {
+    if ctx.is_admin() { return Ok(()); }
+    duduclaw_auth::acl::require_agent_access(ctx, agent_id, AccessLevel::Operator)
 }
