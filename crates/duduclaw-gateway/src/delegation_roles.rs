@@ -33,6 +33,14 @@ pub(crate) struct Requester {
     background: bool,
 }
 impl Requester {
+    pub(crate) fn identity(&self) -> &RequesterIdentity { &self.who }
+
+    /// Reuse the RM-183 live channel binding check without inferring an account role.
+    pub(crate) fn verified_account_id(&self, home: &Path) -> Result<Option<String>, OwnerRoleLookupError> {
+        GatewayOwnerRoles::new(home, self.clone()).requester_id()
+            .map(|requester| requester.map(|(id, _)| id))
+    }
+
     #[cfg(test)]
     pub(crate) fn attended(user_id: &str) -> Self {
         Self { who: RequesterIdentity::DashboardUser { user_id: user_id.into() },
