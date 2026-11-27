@@ -27,6 +27,9 @@ impl MethodHandler {
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
     pub(crate) async fn handle_system_update_config(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
+        if params.as_object().is_some_and(|fields| fields.keys().any(|key| key.split('.').next() == Some("skill_trust"))) {
+            return WsFrame::error_response("", "請到自家技能來源設定頁變更自動放行清單。");
+        }
         if super::transcription_credentials_rpc::reject_generic_credentials(&mut params) {
             return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
         }
