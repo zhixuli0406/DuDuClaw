@@ -939,3 +939,21 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 管理員或本人解除 Google 登入綁定，都會使該同仁所有工作階段失效。自行解除需要本機密碼並重新驗證密碼。離職時請停用 DuDuClaw 帳號或解除 Google 登入綁定；只在 Google Workspace 停用帳號，不會結束既有的 DuDuClaw 工作階段。只有 Google 登入、沒有本機密碼的帳號，降版至 v1.85.0 或更舊版本後無法登入。
 
 請參閱[設定對照](../../guides/zh-TW/dashboard-settings.md#公司-google-登入)及 [OAuth 設定](../../guides/zh-TW/google-setup.md#公司-google-登入)。
+
+## 本人金鑰與 Odoo 帳號邊界（v1.86.0）
+
+本人金鑰只看持有人自己的網頁對話；即使持有人是 AI 員工的 Owner，也不能看其他同仁或外部通道的對話。新金鑰的 `include_conversations` 預設為 `false`；未開啟時不能讀取對話方法、恢復或訂閱既有 WebChat 對話，也不能下載對話附件或由對話產生的檔案。`activity.list` 只有開啟選項時才顯示本人對話的文字。記憶讀取只限自己的指定分身，或隔離功能啟用下屬於自己的個人員工；共用員工的 Owner 權限不夠。
+
+`[member_api_keys] allow_conversation_content` 預設 `false`，只管建立金鑰時能否授予對話權限；關閉不會移除既有授權。升級前建立的金鑰保留對話權限，標記 `conversations_migrated=true`，但仍只限本人的網頁對話。瀏覽器限定的 `me.member_keys.narrow` 與管理員 `member_keys.admin_narrow` 可移除對話權限或 MCP 範圍，不能擴大。建立金鑰仍須原有的密碼／MFA 重新驗證。
+
+Odoo 依序選擇身分：分身持有人的本人憑證；開啟 `act_as_requester` 時，經驗證請求者的本人憑證；AI 員工自己的帳號；只有列入 `company_key_agents` 的 AI 才能使用公司帳號；最後為未連接。分身不能借用另一位請求者的憑證。本人 API 金鑰只使用持有人的本人 Odoo 憑證，不會改用員工或公司帳號。
+
+本人 Odoo 憑證以 gateway 的機器加密金鑰封存，封裝內容綁定持有人，僅由 gateway 解封。使用時必須符合有效帳號、帳號憑證世代（credential epoch）與已驗證的伺服器指紋（URL、資料庫）。伺服器變更後，須先在同一瀏覽器工作階段透過 `me.odoo.status` 查看新位址與資料庫，才能重新測試。改密碼、登出所有裝置或停權後，舊憑證不能使用；帳號恢復可用時須重新輸入金鑰。離職會刪除憑證，管理員也可撤銷，不會看到秘密。gateway 交給獲授權 MCP 行程的是身分決策、驗證過的端點、帳號資訊與憑證版本；快取版本不同時才附上選定的秘密，絕不交出封存用的機器金鑰。這是應用程式的權限邊界，不是對同一作業系統使用者下無限制行程的隔離。
+
+| 規則 | 固定拒絕的操作 |
+| --- | --- |
+| F1 | 修改、刪除 `ir.attachment`，或透過通用工具新增附件。新增附件請用 `odoo_attachment_add`，從檔案建立。 |
+| F2 | 修改 `ir.model`、所有 `ir.model.*` 子模型及 `ir.rule`。 |
+| F3 | 修改 `res.users.apikeys` 及其點號分隔的子模型。 |
+| F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
+| F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |

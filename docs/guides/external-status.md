@@ -132,3 +132,9 @@ Turning the feature off from the dashboard applies to the next request; a hand e
 - The existing DuDuClaw Connector module uses its "Gateway URL" for `/ingest/transcript` (the MCP server) with an MCP API key. Employee status needs the **dashboard gateway URL** and the person's own `ddc_status_` credential; the two are not interchangeable.
 - Give each person's card that person's own credential so it shows only their bound employees; do not share one credential across the company.
 - The Odoo host must be able to reach the dashboard gateway. The card itself (an Odoo module update) is not part of this release.
+
+## Personal API key options (v1.86.0)
+
+The status-only credential above still never returns conversations. A separate personal API key can request **Include my conversation content** with `me.member_keys.create` parameter `include_conversations=true`, only when `[member_api_keys] allow_conversation_content` permits creation. Default is off. It opens only your own web conversations, even if you own a shared AI employee; old keys retain this option and are labelled migrated. Creation still requires password/MFA re-verification.
+
+Optional `mcp_scopes` are `tasks:read`, `agents:status`, `odoo:read`, `odoo:write`, limited by `[member_api_keys] allow_mcp_scopes` (default empty). These options are currently available at the RPC/settings level; dashboard controls arrive with the dashboard update. See the [member API contract](../api/member-contract.md#personal-member-api-keys-1850).

@@ -1003,3 +1003,32 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 | `approval_grants_mfa_enrollment` | `false`。管理者が承認時に初回 MFA 登録を明示的に許可できます。72 時間以内に 1 回限り。このキーだけでは許可を発行しません。 |
 
 開始、コールバック、完了時に設定を読み直します。ファイルを読めない、または解析できない場合はログインを無効にします。`enabled` の欠落・型不正、確認記録の欠落・空白、空または無効な `allowed_hd` も無効になります。ドメインが一つでも不正ならリスト全体が無効です。`"direct"` の完全一致だけが直接作成を選び、他の値は管理者承認になります。上限の省略時は 20、不正な値は 0 となり、新規受付を拒否します。不正なテンプレートは分身作成を止め、空白へ切り替えません。MFA 事前許可は boolean の `true` のみ有効です。生の設定エディターはログインの無効化、確認記録の削除、セクションの削除だけを許可し、有効化や範囲拡大はできません。
+
+## 個人キーと Odoo 権限の設定（v1.86.0）
+
+追加項目は現在、設定／RPC で操作します。ダッシュボードの操作項目はダッシュボード更新時に提供します。
+
+| セクション／キー | 既定値と動作 |
+| --- | --- |
+| `[member_api_keys] allow_conversation_content` | `false`。`include_conversations=true` での作成を許可します。既存の付与は削除しません。旧キーは会話権限を保持し、移行済みと表示します。 |
+| `[member_api_keys] allow_mcp_scopes` | `[]`。`tasks:read`、`agents:status`、`odoo:read`、`odoo:write` のみ。キーのスコープとの共通部分を毎回適用します。 |
+| `[odoo] member_credentials` | `false`。メンバー本人の Odoo 接続を許可します。`odoo.member_credentials.set_enabled` で有効にするには `acknowledge_risk=true` が必要です。 |
+| `[odoo_access] permission_mode` | 既定 `"engine"`。`"follow_odoo_account"` も選べます。後者は確認記録のある個人認証主体にのみ適用し、AI／会社アカウントは Engine のままです。 |
+| `[odoo_access] permission_mode_ack` | 既定はなし。管理者 RPC が操作人と RFC 3339 時刻の `{by, at}` を記録します。欠落・無効時は Engine に戻ります。 |
+| `[odoo_access] company_key_agents` | `[]`。会社アカウントを使用できる AI 社員 ID の一覧です。 |
+| `[odoo_access] company_key_agents_migrated` | 移行前は空。システム管理の完了マーカーです。 |
+| `[odoo_access] upgrade_notice_pending` | 既定 `false`。移行時に `true`。権限 RPC の `dismiss_upgrade_notice=true` で解除します。 |
+| `[odoo_access] always_refuse` | 既定リストは下記。全モードに適用し、削除にはリスク確認が必要です。固定拒否 F1–F5 は残ります。 |
+| `[odoo_access] attachment_max_mb` | `10` MiB、範囲 1–25。元ファイルと再エンコード後の両方に適用します。 |
+| 社員 `[odoo] permission_override` | 既定 `"inherit"`。`"engine"`、`"read_only"` で制限を強められます。未知の値は読み取り専用です。 |
+| 社員 `[odoo] act_as_requester` | `false`。確認済み依頼者の個人 Odoo 認証を使用します。アバターが別の人のアカウントを借用することはできません。 |
+
+`always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
+
+管理者のブラウザー RPC `odoo.access_get {}` と `odoo.access_set` で読み取り・更新します。Set は `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk` を受け付けます。Follow の選択、会社アカウント AI の追加、拒否ルールの削除には `acknowledge_risk=true` が必要です。変更は監査し、監査失敗時は書き込みません。不正な権限設定では Odoo 操作を拒否します。Engine の新ツールは `allowed_models` の明示的な対象モデルと、`allowed_actions` の正確な `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` が必要です。空リストでは許可しません。
+
+会社 Odoo URL／データベースが設定済みの場合、アップグレード時に自分の Odoo アカウントを持たない既存の通常 AI を一度だけ `company_key_agents` に追加し、完了マーカーと通知を記録します。権限モードは変更しません。新規 AI は自動追加しません。移行後にリストを確認してください。
+
+本人の接続はブラウザー限定の `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` で管理します。先に status でサーバー／データベースを確認し、変更後は同じブラウザーセッションで読み直して再検証します。Connect と test は失敗・不正入力を含め、メンバーごとに毎分 5 回を共有します。パスワード変更、全端末サインアウト、利用停止後はキーの再入力が必要です。管理者は `odoo.member_credentials.list`、`.revoke {user_id}` で一覧・取り消しができますが、他人の秘密は設定できません。
+
+v1.85.x に戻す前に `[member_api_keys]` の `allow_conversation_content`、`allow_mcp_scopes` を削除してください。旧版は未知のキーを含むセクションを無効と判断し、全個人キーを停止します。v1.85 は `[odoo_access]` を無視してグローバル Odoo アカウントに戻るため、新しい会社アカウント一覧や拒否ポリシーは適用されません。

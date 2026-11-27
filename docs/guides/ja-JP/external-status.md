@@ -133,3 +133,9 @@ curl -s "https://ai.example.com/api/v1/status/employees?agent_id=sales" \
 - 既存の DuDuClaw Connector モジュールは「Gateway URL」を `/ingest/transcript`（MCP サーバー）に使い、MCP API キーで認証します。社員の状況照会に必要なのは **ダッシュボード gateway の URL** と本人の `ddc_status_` 資格情報で、互いに代用できません。
 - 各自のカードには本人の資格情報を使い、本人に紐付いた社員だけが見えるようにしてください。全社で 1 つを共有しないでください。
 - Odoo ホストからダッシュボード gateway に到達できる必要があります。カード本体（Odoo 側モジュールの更新）は今回の範囲外です。
+
+## 個人 API キーのオプション（v1.86.0）
+
+上記の状況照会専用認証情報は引き続き会話を返しません。別の個人 API キーでは `me.member_keys.create` に `include_conversations=true` を指定して「自分の会話内容を含める」を選べます。管理者の `[member_api_keys] allow_conversation_content` による作成許可が必要です。既定は無効で、共有 AI 社員の Owner でも本人の Web 会話だけを参照できます。旧キーはこのオプションを保持し、移行済みと表示します。作成にはパスワード／MFA の再確認が必要です。
+
+`mcp_scopes` は `tasks:read`、`agents:status`、`odoo:read`、`odoo:write` から選び、`[member_api_keys] allow_mcp_scopes`（既定は空）で制限します。現在は RPC／設定で利用し、ダッシュボードの操作項目はダッシュボード更新時に提供します。[メンバー API 契約](../../api/member-contract.md#personal-member-api-keys-1850)を参照してください。
