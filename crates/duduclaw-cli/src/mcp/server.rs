@@ -515,11 +515,16 @@ async fn authenticate_stdio(
     })
 }
 
-/// The synchronous registry and live member gateway client run off Tokio's
-/// async workers; no authority survives beyond the dispatched request.
+/// Only the synchronous registry uses a blocking worker. Member gateway I/O
+/// is async and bounded to five seconds; authority is request-scoped.
 async fn stdio_auth_call(
     home: &Path, cache: &std::sync::Arc<crate::mcp_auth::KeyRegistryCache>,
 ) -> std::result::Result<crate::mcp_auth::AuthenticatedCall, crate::mcp_auth::Refusal> {
+    if let Ok(raw) = std::env::var("DUDUCLAW_MCP_API_KEY")
+        && duduclaw_auth::member_keys::is_member_key(&raw) {
+        return super::person_key_client::authenticate(home, &raw).await
+            .map_err(crate::mcp_auth::Refusal::from);
+    }
     let home = home.to_path_buf();
     let cache = cache.clone();
     tokio::task::spawn_blocking(move || crate::mcp_auth::authenticate_from_env_cached_call_refusal(&home, &cache))

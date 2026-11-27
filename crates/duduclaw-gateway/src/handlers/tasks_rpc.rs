@@ -224,7 +224,10 @@ impl MethodHandler {
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
         let result = match limit {
-            Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit).await,
+            Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
+                |id, assignee| !reader.hides(assignee)
+                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+            ).await,
             None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
         };
         match result {

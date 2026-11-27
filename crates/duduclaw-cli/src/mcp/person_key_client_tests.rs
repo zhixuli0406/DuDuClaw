@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::{Arc, Mutex, atomic::{AtomicU16, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU16, AtomicU64, Ordering}};
 use axum::{Json, Router, extract::State, http::{HeaderMap, StatusCode}, routing::post};
 
 pub(crate) const RAW: &str = "ddc_member_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
@@ -8,12 +8,14 @@ pub(crate) struct Stub {
     pub(crate) status: Arc<AtomicU16>,
     pub(crate) scopes: Arc<Mutex<Vec<String>>>,
     pub(crate) seen: Arc<Mutex<Vec<(String, Value)>>>,
+    pub(crate) delay_ms: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
 struct StubState {
     status: Arc<AtomicU16>, scopes: Arc<Mutex<Vec<String>>>, seen: Arc<Mutex<Vec<(String, Value)>>>,
+    delay_ms: Arc<AtomicU64>,
 }
 
 impl Stub {
@@ -24,10 +26,11 @@ impl Stub {
         let status = Arc::new(AtomicU16::new(200));
         let scopes = Arc::new(Mutex::new(vec!["tasks:read".into(), "agents:status".into()]));
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let state = StubState { status: status.clone(), scopes: scopes.clone(), seen: seen.clone() };
+        let delay_ms = Arc::new(AtomicU64::new(0));
+        let state = StubState { status: status.clone(), scopes: scopes.clone(), seen: seen.clone(), delay_ms: delay_ms.clone() };
         let app = Router::new().route("/api/internal/person-key", post(reply)).with_state(state);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-        Self { status, scopes, seen, task }
+        Self { status, scopes, seen, delay_ms, task }
     }
 }
 impl Drop for Stub { fn drop(&mut self) { self.task.abort(); } }
@@ -36,6 +39,7 @@ async fn reply(State(state): State<StubState>, headers: HeaderMap, Json(body): J
     let bearer = headers.get("authorization").unwrap().to_str().unwrap().to_owned();
     state.seen.lock().unwrap().push((bearer.clone(), body.clone()));
     assert_eq!(bearer, format!("Bearer {RAW}"));
+    tokio::time::sleep(Duration::from_millis(state.delay_ms.load(Ordering::SeqCst))).await;
     let status = StatusCode::from_u16(state.status.load(Ordering::SeqCst)).unwrap();
     if status != StatusCode::OK {
         return (status, Json(json!({"ok":false, "code":"refused", "message":"scope removed"})));
@@ -45,6 +49,16 @@ async fn reply(State(state): State<StubState>, headers: HeaderMap, Json(body): J
     } else {
         (status, Json(json!({"ok":true,"result":{"tasks":[{"id":"visible"}]}})))
     }
+}
+
+#[tokio::test]
+async fn unreachable_gateway_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::fs::write(home.path().join("config.toml"), format!("[gateway]\nport={port}\n")).unwrap();
+    drop(listener);
+    assert!(matches!(authenticate(home.path(), RAW).await, Err(AuthError::UnknownKey)));
 }
 
 #[tokio::test]

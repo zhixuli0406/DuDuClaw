@@ -9,6 +9,7 @@ use crate::mcp_auth::{AuthError, AuthenticatedCall, Principal, PrincipalKind};
 const UNAVAILABLE: &str = "本人金鑰驗證服務無法使用，請稍後再試。";
 const MALFORMED: &str = "本人金鑰驗證服務的回應格式不正確。";
 const MAX_RESPONSE: usize = 4 * 1024 * 1024;
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct Identity {
@@ -35,12 +36,14 @@ fn identity(value: Value) -> Result<AuthenticatedCall, AuthError> {
 }
 
 pub(crate) async fn authenticate(home: &Path, raw: &str) -> Result<AuthenticatedCall, AuthError> {
-    let result = post(home, raw, &json!({"op":"authenticate"})).await
+    let body = json!({"op":"authenticate"});
+    let result = tokio::time::timeout(AUTH_TIMEOUT, post_with_timeout(home, raw, &body, AUTH_TIMEOUT))
+        .await.map_err(|_| AuthError::UnknownKey)?
         .map_err(|_| AuthError::UnknownKey)?;
     Ok(identity(result)?.with_person_key(raw.to_owned()))
 }
 
-/// Called only on blocking workers (HTTP and stdio authentication).
+/// Compatibility for synchronous callers. Async transports call `authenticate` directly.
 /// Keep reqwest async: the workspace does not enable its blocking client.
 pub(crate) fn authenticate_blocking(home: &Path, raw: &str) -> Result<AuthenticatedCall, AuthError> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()
@@ -48,10 +51,16 @@ pub(crate) fn authenticate_blocking(home: &Path, raw: &str) -> Result<Authentica
 }
 
 pub(crate) async fn post(home: &Path, bearer: &str, body: &Value) -> Result<Value, String> {
+    post_with_timeout(home, bearer, body, Duration::from_secs(30)).await
+}
+
+async fn post_with_timeout(home: &Path, bearer: &str, body: &Value, timeout: Duration) -> Result<Value, String> {
     let (port, _) = duduclaw_core::gateway_port_for_home(home);
     let client = reqwest::Client::builder().no_proxy()
         .redirect(reqwest::redirect::Policy::none()).retry(reqwest::retry::never())
-        .timeout(Duration::from_secs(30)).build().map_err(|_| UNAVAILABLE)?;
+        // The total deadline includes connecting and reading the response body.
+        .connect_timeout(Duration::from_secs(2)).timeout(timeout)
+        .build().map_err(|_| UNAVAILABLE)?;
     let bytes = serde_json::to_vec(body).map_err(|_| MALFORMED)?;
     if bytes.len() > 64 * 1024 { return Err("人工具請求過大。".into()); }
     let mut response = client.post(format!("http://127.0.0.1:{port}/api/internal/person-key"))
