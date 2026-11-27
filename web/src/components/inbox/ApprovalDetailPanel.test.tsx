@@ -5,6 +5,9 @@ import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { useAuthStore } from '@/stores/auth-store';
+import { resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
+
+afterEach(() => resetCompanyTimeZone());
 
 // The panel imports decideApproval → api-custom-skills → ws-client. Stub the
 // socket so the module graph loads without a live connection.
@@ -854,6 +857,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
   });
 
   it.each(['read', 'draft'])('shows the matching rule and expiry for %s approvals without full arguments', (effect) => {
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
     const approval = genericApproval({
       expires_at: 1793210400,
       payload: {
@@ -869,6 +873,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"tool": "memory_search"');
     expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"verdict": "ask"');
     expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+    expect(box.querySelector('time')).toHaveTextContent('10/29/2026, 2:00:00 AM');
     expect(screen.queryByTestId('approval-full-content')).not.toBeInTheDocument();
   });
 
@@ -950,6 +955,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(box).toHaveTextContent('An action rule requires approval');
   });
   it.each(['send', 'publish', 'purchase', 'read'])('expands complete %s arguments, sources, destination and expiry', (effect) => {
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
     const content = 'Confidential customer note '.repeat(100) + 'END OF FULL CONTENT';
     const approval = genericApproval({
       expires_at: 1793210400,
@@ -967,6 +973,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(box).toHaveTextContent('mail_read');
     expect(box).toHaveTextContent('Private data was read during this turn');
     expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+    expect(box.querySelector('time')).toHaveTextContent('10/29/2026, 2:00:00 AM');
   });
 });
 

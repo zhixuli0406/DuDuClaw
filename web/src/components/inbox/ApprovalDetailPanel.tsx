@@ -242,7 +242,7 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
             </div>
           )}
           {expiresAt != null && Number.isFinite(expiresAt) && (
-            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={formatDateTime(expiresAt * 1000).toISOString()}>{new Date(expiresAt * 1000, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time></p>
+            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={new Date(expiresAt * 1000).toISOString()}>{formatDateTime(expiresAt * 1000, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time></p>
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
