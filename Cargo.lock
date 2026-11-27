@@ -1748,6 +1748,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]

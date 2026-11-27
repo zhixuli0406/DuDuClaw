@@ -39,6 +39,8 @@ pub struct MemberKeyAuthority {
     pub context: crate::UserContext,
     /// Unix seconds, rounded down so a grant never outlives the key.
     pub expires_at: u64,
+    pub include_conversations: bool,
+    pub mcp_scopes: Vec<String>,
 }
 
 /// Idempotent `member_api_keys` migration, invoked by `UserDb::init_tables`.
@@ -47,6 +49,11 @@ pub struct MemberKeyAuthority {
 /// a *suspended* account's credentials are refused at request time instead,
 /// so a reinstated account does not have to re-pair every external system.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let conn = &tx;
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS auth_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
+        INSERT OR IGNORE INTO auth_meta(key,value) VALUES('acl_generation',1);")
+        .map_err(|e| e.to_string())?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS member_key_audit_agg (
             token_id TEXT NOT NULL,
@@ -85,7 +92,10 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
             expires_at TEXT NOT NULL,
             credential_epoch INTEGER NOT NULL,
             last_used_at TEXT,
-            revoked_at TEXT
+            revoked_at TEXT,
+            include_conversations INTEGER NOT NULL DEFAULT 0,
+            mcp_scopes TEXT NOT NULL DEFAULT '',
+            conversations_migrated INTEGER NOT NULL DEFAULT 0
          );
          CREATE TRIGGER IF NOT EXISTS member_keys_acl_update
          AFTER UPDATE OF revoked_at, expires_at, credential_epoch ON member_api_keys
@@ -112,7 +122,26 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
                  WHERE user_id = NEW.id AND revoked_at IS NULL;
          END;",
     )
-    .map_err(|e| format!("member_api_keys migration failed: {e}"))
+    .map_err(|e| format!("member_api_keys migration failed: {e}"))?;
+    for (column, definition) in [
+        ("include_conversations", "INTEGER NOT NULL DEFAULT 0"),
+        ("mcp_scopes", "TEXT NOT NULL DEFAULT ''"),
+        ("conversations_migrated", "INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !crate::user_row::has_column(conn, "member_api_keys", column)? {
+            conn.execute(&format!("ALTER TABLE member_api_keys ADD COLUMN {column} {definition}"), [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    conn.execute_batch("DROP TRIGGER IF EXISTS member_keys_acl_update;
+        CREATE TRIGGER member_keys_acl_update
+        AFTER UPDATE OF revoked_at, expires_at, credential_epoch, include_conversations, mcp_scopes ON member_api_keys
+        BEGIN UPDATE auth_meta SET value=value+1 WHERE key='acl_generation'; END;
+        UPDATE member_api_keys SET include_conversations=1, conversations_migrated=1
+        WHERE NOT EXISTS(SELECT 1 FROM auth_meta WHERE key='member_keys_v186_backfill');
+        INSERT OR IGNORE INTO auth_meta(key,value) VALUES('member_keys_v186_backfill',1);")
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())
 }
 
 /// Does `raw` claim to be a member key? Prefix only, on purpose: every
@@ -161,6 +190,9 @@ pub struct MemberKeyInfo {
     pub last_used_at: Option<String>,
     pub revoked_at: Option<String>,
     pub active: bool,
+    pub include_conversations: bool,
+    pub mcp_scopes: Vec<String>,
+    pub conversations_migrated: bool,
 }
 
 /// One credential as listed to an Admin, with its owner.
@@ -192,6 +224,8 @@ impl std::fmt::Debug for CreatedMemberKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberKeyError {
     InvalidName,
+    InvalidScopes,
+    CannotWiden,
     InvalidExpiry,
     AdminForbidden,
     LimitReached,
@@ -207,6 +241,8 @@ impl MemberKeyError {
     /// Stable machine-readable code for the RPC error frame.
     pub fn code(self) -> &'static str {
         match self {
+            Self::InvalidScopes => "member_key_invalid_scopes",
+            Self::CannotWiden => "member_key_cannot_widen",
             Self::InvalidExpiry => "member_key_invalid_expiry",
             Self::AdminForbidden => "member_key_admin_forbidden",
             Self::InvalidName => "member_key_invalid_name",
@@ -252,13 +288,32 @@ fn info_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemberKeyInfo> {
         expires_at: row.get(5)?,
         active: revoked_at.is_none() && row.get::<_, bool>(6)?,
         revoked_at,
+        include_conversations: row.get::<_, i64>(7)? == 1,
+        mcp_scopes: stored_scopes(&row.get::<_, String>(8)?),
+        conversations_migrated: row.get::<_, i64>(9)? == 1,
     })
 }
 
 const INFO_COLUMNS: &str = "t.id, t.name, t.created_at, t.last_used_at, t.revoked_at, t.expires_at,
     (julianday(t.expires_at) > julianday('now') AND EXISTS(SELECT 1 FROM users u
      WHERE u.id=t.user_id AND u.status='active' AND u.role IN ('employee','manager')
-     AND u.must_change_password=0 AND u.credential_epoch=t.credential_epoch))";
+     AND u.must_change_password=0 AND u.credential_epoch=t.credential_epoch)),
+    t.include_conversations, t.mcp_scopes, t.conversations_migrated";
+
+/// Canonical wire representation; unknown entries invalidate the entire set.
+fn canonical_scopes(scopes: &[String]) -> Result<Vec<String>, MemberKeyError> {
+    if scopes.iter().any(|scope| !duduclaw_core::mcp_scopes::PERSON_KEY_MCP_SCOPE_STRINGS.contains(&scope.as_str())) {
+        return Err(MemberKeyError::InvalidScopes);
+    }
+    let mut result = scopes.to_vec();
+    result.sort();
+    result.dedup();
+    Ok(result)
+}
+fn stored_scopes(raw: &str) -> Vec<String> {
+    if raw.is_empty() { return Vec::new(); }
+    canonical_scopes(&raw.split(',').map(str::to_owned).collect::<Vec<_>>()).unwrap_or_default()
+}
 
 fn audit(
     conn: &Connection,
@@ -371,6 +426,7 @@ impl UserDb {
     /// Consume before creation (including failed creation); a proof cannot be replayed.
     pub fn member_key_create_authenticated(
         &self, user: &str, name: &str, days: u64, epoch: u64, session: &str, proof: &str,
+        include_conversations: bool, mcp_scopes: &[String],
     ) -> Result<CreatedMemberKey, MemberKeyError> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
@@ -388,7 +444,7 @@ impl UserDb {
         drop(conn);
         // The password snapshot also closes the legacy epoch-zero first-key race.
         let snapshot = snapshot.filter(|_| valid).ok_or(MemberKeyError::ReauthenticationRequired)?;
-        self.member_key_create_in_session(user, name, days, epoch, Some((session, &snapshot)))
+        self.member_key_create_in_session(user, name, days, epoch, Some((session, &snapshot)), include_conversations, mcp_scopes)
     }
 
     /// Issue a credential for `user_id` (who must be an active account not
@@ -401,15 +457,19 @@ impl UserDb {
         name: &str,
         expires_in_days: u64,
         verified_epoch: u64,
+        include_conversations: bool,
+        mcp_scopes: &[String],
     ) -> Result<CreatedMemberKey, MemberKeyError> {
-        self.member_key_create_in_session(user_id, name, expires_in_days, verified_epoch, None)
+        self.member_key_create_in_session(user_id, name, expires_in_days, verified_epoch, None, include_conversations, mcp_scopes)
     }
 
     fn member_key_create_in_session(
         &self, user_id: &str, name: &str, expires_in_days: u64, verified_epoch: u64, proof_binding: Option<(&str, &str)>,
+        include_conversations: bool, mcp_scopes: &[String],
     ) -> Result<CreatedMemberKey, MemberKeyError> {
         if !(1..=365).contains(&expires_in_days) { return Err(MemberKeyError::InvalidExpiry); }
         let name = clean_name(name)?;
+        let mcp_scopes = canonical_scopes(mcp_scopes)?;
         let mut bytes = [0u8; SECRET_BYTES];
         OsRng.try_fill_bytes(&mut bytes)
             .map_err(|_| MemberKeyError::Store)?;
@@ -460,9 +520,9 @@ impl UserDb {
             return Err(if total >= MAX_MEMBER_KEY_ROWS { MemberKeyError::HistoryLimitReached } else { MemberKeyError::LimitReached });
         }
         tx.execute(
-            "INSERT INTO member_api_keys(id, user_id, name, token_hash, created_at, expires_at, credential_epoch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, user_id, name, hash, now, expires_at, verified_epoch],
+            "INSERT INTO member_api_keys(id, user_id, name, token_hash, created_at, expires_at, credential_epoch, include_conversations, mcp_scopes)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![id, user_id, name, hash, now, expires_at, verified_epoch, include_conversations, mcp_scopes.join(",")],
         )
         .map_err(store_error)?;
         audit(
@@ -483,6 +543,9 @@ impl UserDb {
                 last_used_at: None,
                 revoked_at: None,
                 active: true,
+                include_conversations,
+                mcp_scopes,
+                conversations_migrated: false,
             },
             secret,
         })
@@ -527,8 +590,8 @@ impl UserDb {
              ORDER BY t.created_at DESC, t.id LIMIT ?3"
         )).map_err(store_error)?;
         let mut keys = stmt.query_map(params![cursor.as_ref().map(|c| &c.created_at), cursor.as_ref().map(|c| &c.id), limit + 1], |row| {
-            Ok(MemberKeyAdminEntry { token: info_from_row(row)?, user_id: row.get(7)?,
-                user_email: row.get(8)?, user_display_name: row.get(9)? })
+            Ok(MemberKeyAdminEntry { token: info_from_row(row)?, user_id: row.get(10)?,
+                user_email: row.get(11)?, user_display_name: row.get(12)? })
         }).map_err(store_error)?.collect::<Result<Vec<_>, _>>().map_err(store_error)?;
         let more = keys.len() > limit as usize;
         keys.truncate(limit as usize);
@@ -598,6 +661,46 @@ impl UserDb {
         tx.commit().map_err(store_error)
     }
 
+    /// Narrow an owned key. Widening requires revocation and a new credential.
+    pub fn member_key_narrow_own(
+        &self, user_id: &str, key_id: &str, include_conversations: Option<bool>, mcp_scopes: Option<&[String]>,
+    ) -> Result<(), MemberKeyError> {
+        self.narrow_member_key(user_id, key_id, Some(user_id), include_conversations, mcp_scopes)
+    }
+
+    /// The actor is required so Admin authority and audit attribution stay live.
+    pub fn member_key_narrow_admin(
+        &self, admin_id: &str, key_id: &str, include_conversations: Option<bool>, mcp_scopes: Option<&[String]>,
+    ) -> Result<(), MemberKeyError> {
+        self.narrow_member_key(admin_id, key_id, None, include_conversations, mcp_scopes)
+    }
+
+    fn narrow_member_key(
+        &self, actor: &str, key_id: &str, owner: Option<&str>,
+        include_conversations: Option<bool>, mcp_scopes: Option<&[String]>,
+    ) -> Result<(), MemberKeyError> {
+        let requested = mcp_scopes.map(canonical_scopes).transpose()?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        if owner.is_none() { require_admin(&tx, actor)?; }
+        let before = tx.query_row(&format!("SELECT {INFO_COLUMNS} FROM member_api_keys t
+            WHERE t.id=?1 AND (?2 IS NULL OR t.user_id=?2)"), params![key_id, owner], info_from_row)
+            .optional().map_err(store_error)?.filter(|key| key.active).ok_or(MemberKeyError::NotFound)?;
+        let include = include_conversations.unwrap_or(before.include_conversations);
+        let scopes = requested.as_ref().unwrap_or(&before.mcp_scopes);
+        if (include && !before.include_conversations) || scopes.iter().any(|scope| !before.mcp_scopes.contains(scope)) {
+            return Err(MemberKeyError::CannotWiden);
+        }
+        tx.execute("UPDATE member_api_keys SET include_conversations=?2, mcp_scopes=?3 WHERE id=?1",
+            params![key_id, include, scopes.join(",")]).map_err(store_error)?;
+        audit(&tx, actor, "member_key_narrowed", key_id, serde_json::json!({
+            "by_admin": owner.is_none(),
+            "before": {"include_conversations": before.include_conversations, "mcp_scopes": before.mcp_scopes},
+            "after": {"include_conversations": include, "mcp_scopes": scopes},
+        })).map_err(store_error)?;
+        tx.commit().map_err(store_error)
+    }
+
     /// Resolve a presented credential. Read-only: the caller decides (after
     /// its rate limit) whether to [`Self::member_key_touch`] it. A database
     /// error is an `Err`, which the caller must treat as a refusal.
@@ -663,14 +766,16 @@ impl UserDb {
         let mut ctx = crate::UserContext::from_live(&user, &access);
         if ctx.is_admin() || ctx.must_change_password { return Err("member key invalid".into()); }
         ctx.member_key_id = Some(id.to_owned());
+        ctx.origin = crate::acl::ContextOrigin::MemberKey;
         // The schema requires expiry; missing, malformed or negative timestamps
         // remain refusals, never an unbounded credential.
-        let expiry: String = tx.query_row("SELECT expires_at FROM member_api_keys WHERE id=?1",
-            [id], |r| r.get(0)).map_err(|_| "authentication service unavailable")?;
+        let (expiry, include_conversations, scopes): (String, i64, String) = tx.query_row(
+            "SELECT expires_at, include_conversations, mcp_scopes FROM member_api_keys WHERE id=?1",
+            [id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(|_| "authentication service unavailable")?;
         let expires_at = DateTime::parse_from_rfc3339(&expiry)
             .map_err(|_| "member key invalid")?.timestamp();
         let expires_at = u64::try_from(expires_at).map_err(|_| "member key invalid")?;
-        Ok(MemberKeyAuthority { context: ctx, expires_at })
+        Ok(MemberKeyAuthority { context: ctx, expires_at, include_conversations: include_conversations == 1, mcp_scopes: stored_scopes(&scopes) })
     }
 
     /// Write attempts carry only the key id and method, never params or secrets.
@@ -786,10 +891,19 @@ mod tests {
         (home, db, user)
     }
     #[test]
+    fn context_origin_member_key() {
+        let (_home, db, user) = fixture();
+        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch, false, &[]).unwrap();
+        let ctx = db.member_key_context(&key.info.id, &user.id).unwrap();
+        assert_eq!(ctx.origin, crate::acl::ContextOrigin::MemberKey);
+        assert_eq!(ctx.member_key_id.as_deref(), Some(key.info.id.as_str()));
+    }
+
+    #[test]
     fn secret_is_random_redacted_and_never_listed_or_audited() {
         let (_home, db, user) = fixture();
-        let a = db.member_key_create(&user.id, "服務", 90, user.credential_epoch).unwrap();
-        let b = db.member_key_create(&user.id, "服務二", 90, user.credential_epoch).unwrap();
+        let a = db.member_key_create(&user.id, "服務", 90, user.credential_epoch, false, &[]).unwrap();
+        let b = db.member_key_create(&user.id, "服務二", 90, user.credential_epoch, false, &[]).unwrap();
         assert_ne!(a.secret, b.secret);
         assert_eq!(URL_SAFE_NO_PAD.decode(a.secret.strip_prefix(MEMBER_KEY_PREFIX).unwrap()).unwrap().len(), 32);
         assert!(!format!("{a:?}").contains(&a.secret));
@@ -804,28 +918,28 @@ mod tests {
     fn expiry_cap_admin_and_owner_gates() {
         let (_home, db, user) = fixture();
         for days in [0, 366, u64::MAX] {
-            assert_eq!(db.member_key_create(&user.id, "x", days, 0).unwrap_err(), MemberKeyError::InvalidExpiry);
+            assert_eq!(db.member_key_create(&user.id, "x", days, 0, false, &[]).unwrap_err(), MemberKeyError::InvalidExpiry);
         }
         for name in ["", "\n", "bad\nname"] {
-            assert_eq!(db.member_key_create(&user.id, name, 1, 0).unwrap_err(), MemberKeyError::InvalidName);
+            assert_eq!(db.member_key_create(&user.id, name, 1, 0, false, &[]).unwrap_err(), MemberKeyError::InvalidName);
         }
         let admin = db.create_user("admin@test.invalid", "Admin", "test-password", UserRole::Admin).unwrap();
-        assert_eq!(db.member_key_create(&admin.id, "x", 1, 0).unwrap_err(), MemberKeyError::AdminForbidden);
-        let first = db.member_key_create(&user.id, "first", 1, 0).unwrap();
-        for _ in 1..5 { db.member_key_create(&user.id, "x", 365, 0).unwrap(); }
-        assert_eq!(db.member_key_create(&user.id, "six", 90, 0).unwrap_err(), MemberKeyError::LimitReached);
+        assert_eq!(db.member_key_create(&admin.id, "x", 1, 0, false, &[]).unwrap_err(), MemberKeyError::AdminForbidden);
+        let first = db.member_key_create(&user.id, "first", 1, 0, false, &[]).unwrap();
+        for _ in 1..5 { db.member_key_create(&user.id, "x", 365, 0, false, &[]).unwrap(); }
+        assert_eq!(db.member_key_create(&user.id, "six", 90, 0, false, &[]).unwrap_err(), MemberKeyError::LimitReached);
         assert!(db.member_api_keys_all(&user.id).is_err());
         assert!(db.member_key_admin_revoke(&user.id, &first.info.id).is_err());
         assert!(db.member_key_revoke_own(&admin.id, &first.info.id).is_err());
         assert_eq!(db.member_api_keys_all(&admin.id).unwrap().len(), 5);
         db.member_key_admin_revoke(&admin.id, &first.info.id).unwrap();
-        db.member_key_create(&user.id, "replacement", 1, 0).unwrap();
+        db.member_key_create(&user.id, "replacement", 1, 0, false, &[]).unwrap();
     }
     #[test]
     fn new_and_open_credentials_refuse_all_revocation_causes() {
         for cause in ["revoke", "expire", "epoch", "password", "admin", "offboard", "suspend", "delete"] {
             let (_home, db, user) = fixture();
-            let created = db.member_key_create(&user.id, "x", 1, 0).unwrap();
+            let created = db.member_key_create(&user.id, "x", 1, 0, false, &[]).unwrap();
             let before = db.member_key_context(&created.info.id, &user.id).unwrap();
             assert_eq!(before.member_key_id.as_deref(), Some(created.info.id.as_str()));
             match cause {
@@ -850,7 +964,7 @@ mod tests {
     #[test]
     fn token_types_do_not_cross_authenticate() {
         let (_home, db, user) = fixture();
-        let member = db.member_key_create(&user.id, "x", 1, 0).unwrap();
+        let member = db.member_key_create(&user.id, "x", 1, 0, false, &[]).unwrap();
         let status = db.status_token_create(&user.id, "x").unwrap();
         let jwt = crate::JwtConfig::new(b"member-key-tests-secret-at-least-32-bytes").issue_access_token(&user, &[]).unwrap();
         for raw in [status.secret.as_str(), jwt.as_str(), "ddc_prod_0123456789abcdef0123456789abcdef", "ddc_member_", "ddc_member_字"] {
@@ -861,7 +975,7 @@ mod tests {
     #[test]
     fn use_is_aggregated_but_each_write_is_audited() {
         let (_home, db, user) = fixture();
-        let key = db.member_key_create(&user.id, "x", 1, 0).unwrap();
+        let key = db.member_key_create(&user.id, "x", 1, 0, false, &[]).unwrap();
         let now = Utc::now();
         for _ in 0..120 {
             db.member_key_record_call(&key.info.id, &user.id, "ok", 0, None, now).unwrap();
@@ -892,33 +1006,33 @@ mod tests {
         }
         let proof = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now).unwrap();
         for (owner, jti, epoch) in [("someone-else", session.as_str(), 0), (user.id.as_str(), other_session.as_str(), 0), (user.id.as_str(), session.as_str(), 1)] {
-            assert!(db.member_key_create_authenticated(owner, "x", 1, epoch, jti, &proof).is_err());
+            assert!(db.member_key_create_authenticated(owner, "x", 1, epoch, jti, &proof, false, &[]).is_err());
         }
         db.conn().execute("UPDATE member_key_create_proofs SET method='users.change_password'", []).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof).is_err());
+        assert!(db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof, false, &[]).is_err());
         db.conn().execute("UPDATE member_key_create_proofs SET method=?1", [CREATE_METHOD]).unwrap();
-        db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof).unwrap();
-        assert_eq!(db.member_key_create_authenticated(&user.id, "replay", 1, 0, &session, &proof).unwrap_err(), MemberKeyError::ReauthenticationRequired);
+        db.member_key_create_authenticated(&user.id, "x", 1, 0, &session, &proof, false, &[]).unwrap();
+        assert_eq!(db.member_key_create_authenticated(&user.id, "replay", 1, 0, &session, &proof, false, &[]).unwrap_err(), MemberKeyError::ReauthenticationRequired);
         let expired = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now - 300).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "expired", 1, 0, &session, &expired).is_err());
+        assert!(db.member_key_create_authenticated(&user.id, "expired", 1, 0, &session, &expired, false, &[]).is_err());
         let future = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now + 300).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "future", 1, 0, &session, &future).is_err());
+        assert!(db.member_key_create_authenticated(&user.id, "future", 1, 0, &session, &future, false, &[]).is_err());
         let stale = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, now).unwrap();
         db.mfa_operator_reset(&user.email).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "stale", 1, 0, &session, &stale).is_err());
+        assert!(db.member_key_create_authenticated(&user.id, "stale", 1, 0, &session, &stale, false, &[]).is_err());
         assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 1);
     }
 
     #[test]
     fn cleanup_revokes_expired_and_old_epochs_and_preserves_retention_at_total_cap() {
         let (_home, db, user) = fixture();
-        let expired = db.member_key_create(&user.id, "expired", 1, 0).unwrap();
-        let old_epoch = db.member_key_create(&user.id, "old epoch", 1, 0).unwrap();
-        let old_revoked = db.member_key_create(&user.id, "old revoked", 1, 0).unwrap();
+        let expired = db.member_key_create(&user.id, "expired", 1, 0, false, &[]).unwrap();
+        let old_epoch = db.member_key_create(&user.id, "old epoch", 1, 0, false, &[]).unwrap();
+        let old_revoked = db.member_key_create(&user.id, "old revoked", 1, 0, false, &[]).unwrap();
         db.conn().execute("UPDATE member_api_keys SET expires_at='2000-01-01T00:00:00Z' WHERE id=?1", [&expired.info.id]).unwrap();
         db.conn().execute("UPDATE member_api_keys SET credential_epoch=99 WHERE id=?1", [&old_epoch.info.id]).unwrap();
         db.conn().execute("UPDATE member_api_keys SET revoked_at='2000-01-01T00:00:00Z' WHERE id=?1", [&old_revoked.info.id]).unwrap();
-        let current = db.member_key_create(&user.id, "current", 1, 0).unwrap();
+        let current = db.member_key_create(&user.id, "current", 1, 0, false, &[]).unwrap();
         let listed = db.member_api_keys_for_user(&user.id).unwrap();
         assert!(!listed.iter().any(|key| key.id == old_revoked.info.id));
         for id in [&expired.info.id, &old_epoch.info.id] {
@@ -926,13 +1040,13 @@ mod tests {
         }
         db.member_key_revoke_own(&user.id, &current.info.id).unwrap();
         for _ in listed.len()..MAX_MEMBER_KEY_ROWS as usize {
-            let key = db.member_key_create(&user.id, "history", 1, 0).unwrap();
+            let key = db.member_key_create(&user.id, "history", 1, 0, false, &[]).unwrap();
             db.member_key_revoke_own(&user.id, &key.info.id).unwrap();
         }
-        assert_eq!(db.member_key_create(&user.id, "over cap", 1, 0).unwrap_err(), MemberKeyError::HistoryLimitReached);
+        assert_eq!(db.member_key_create(&user.id, "over cap", 1, 0, false, &[]).unwrap_err(), MemberKeyError::HistoryLimitReached);
         assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 50);
         db.conn().execute("UPDATE member_api_keys SET revoked_at='2000-01-01T00:00:00Z' WHERE id=?1", [&current.info.id]).unwrap();
-        db.member_key_create(&user.id, "after retention", 1, 0).unwrap();
+        db.member_key_create(&user.id, "after retention", 1, 0, false, &[]).unwrap();
         assert_eq!(db.member_api_keys_for_user(&user.id).unwrap().len(), 50);
     }
 
@@ -942,7 +1056,7 @@ mod tests {
         let other = db.create_user("other@test.invalid", "Other", "test-password", UserRole::Employee).unwrap();
         let admin = db.create_user("admin@test.invalid", "Admin", "test-password", UserRole::Admin).unwrap();
         for owner in [&user.id, &other.id] {
-            for _ in 0..3 { db.member_key_create(owner, "x", 1, 0).unwrap(); }
+            for _ in 0..3 { db.member_key_create(owner, "x", 1, 0, false, &[]).unwrap(); }
         }
         db.conn().execute("UPDATE member_api_keys SET created_at='2026-01-01T00:00:00Z'", []).unwrap();
         let first = db.member_api_keys_for_user_page(&user.id, 2, None).unwrap();
@@ -978,8 +1092,8 @@ mod tests {
         assert_eq!(db.member_key_reauthenticate(&user.id, &session, epoch, "test-password", "", &Cipher, now).unwrap_err(), MemberKeyError::ReauthenticationRequired);
         let code = crate::mfa::test_totp_code(&secret, now / 30);
         let proof = db.member_key_reauthenticate(&user.id, &session, epoch, "", &code, &Cipher, now).unwrap();
-        db.member_key_create_authenticated(&user.id, "mfa", 1, epoch, &session, &proof).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "replay", 1, epoch, &session, &proof).is_err());
+        db.member_key_create_authenticated(&user.id, "mfa", 1, epoch, &session, &proof, false, &[]).unwrap();
+        assert!(db.member_key_create_authenticated(&user.id, "replay", 1, epoch, &session, &proof, false, &[]).is_err());
         assert!(db.member_key_reauthenticate(&user.id, &session, epoch, "", &code, &Cipher, now).is_err());
     }
 
@@ -990,10 +1104,14 @@ mod tests {
         let proof = db.member_key_reauthenticate(&user.id, &session, 0, "test-password", "", &Cipher, Utc::now().timestamp()).unwrap();
         // There are no key rows yet, so the legacy password trigger may leave epoch zero.
         db.conn().execute("UPDATE users SET password_hash='changed-test-hash' WHERE id=?1", [&user.id]).unwrap();
-        assert!(db.member_key_create_authenticated(&user.id, "stale password", 1, 0, &session, &proof).is_err());
+        assert!(db.member_key_create_authenticated(&user.id, "stale password", 1, 0, &session, &proof, false, &[]).is_err());
         assert!(db.member_api_keys_for_user(&user.id).unwrap().is_empty());
         let remaining: i64 = db.conn().query_row("SELECT COUNT(*) FROM member_key_create_proofs", [], |r| r.get(0)).unwrap();
         assert_eq!(remaining, 0);
     }
 
 }
+
+#[cfg(test)]
+#[path = "member_key_scope_tests.rs"]
+mod scope_tests;

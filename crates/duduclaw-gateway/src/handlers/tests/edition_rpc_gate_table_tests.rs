@@ -136,6 +136,8 @@ fn personal_surfaces_are_untouched() {
         "status_tokens.admin_list",
         "status_tokens.admin_revoke",
         // 委派權限 — 跨 agent 不是跨人 (§1.6)
+        "admin_ai.get",
+        "admin_ai.set",
         "delegation.get",
         "delegation.set",
         "delegation.effective",

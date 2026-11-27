@@ -183,13 +183,13 @@ pub(crate) fn expires_at(rec: &ApprovalRecord) -> Value {
 }
 
 /// zh-TW one-line summary for the approval card.
-pub(crate) fn summary(p: &Proposal) -> String {
+pub(crate) fn summary(p: &Proposal, sentence: Option<&str>) -> String {
     let label = |e: &OrgEntry| {
         let boss = if e.reports_to.is_empty() { "最上層".to_string() } else { format!("向「{}」回報", e.reports_to) };
         let dept = if e.department.is_empty() { "無部門".to_string() } else { format!("部門「{}」", e.department) };
         format!("{boss}、{dept}")
     };
-    format!(
+    let mut text = format!(
         "{who} 提議調整 AI 員工「{agent}」的組織位置：{before} → {after}。",
         who = duduclaw_core::truncate_chars(
             if p.proposer_email.is_empty() { p.proposer.as_str() } else { p.proposer_email.as_str() },
@@ -198,7 +198,12 @@ pub(crate) fn summary(p: &Proposal) -> String {
         agent = p.agent_id,
         before = label(&p.before),
         after = label(&p.after),
-    )
+    );
+    if let Some(sentence) = sentence {
+        text.push('\n');
+        text.push_str(sentence);
+    }
+    text
 }
 
 /// The `org_change` approval journal, keyed by approval id
@@ -272,6 +277,10 @@ pub(crate) mod journal {
         pub after: OrgEntry,
         /// User id of the Admin whose approval was applied.
         pub approved_by: String,
+        /// Full original identity. None only for journals written before RM-143.
+        pub decided_by: Option<String>,
+        /// Evidence needed for the atomic ledger/receipt replay.
+        pub chat_admin: Option<JournalChatAdmin>,
         pub prepared_at: String,
         /// Empty while [`State::Prepared`].
         pub applied_at: String,
@@ -282,6 +291,16 @@ pub(crate) mod journal {
         /// "mirror pending" record the recovery finishes, and nothing about
         /// the decision is redone.
         pub decision_recorded: bool,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(crate) struct JournalChatAdmin {
+        card_id: String,
+        channel: String,
+        step: String,
+        step_required: bool,
+        digest: String,
     }
 
     /// Digest of an approval's payload, as journaled.
@@ -306,11 +325,69 @@ pub(crate) mod journal {
                 before: before.clone(),
                 after: after.clone(),
                 approved_by: approved_by.to_string(),
+                decided_by: None,
+                chat_admin: None,
                 prepared_at: chrono::Utc::now().to_rfc3339(),
                 applied_at: String::new(),
                 registry_reloaded: false,
                 mirror_synced: false,
                 decision_recorded: false,
+            }
+        }
+
+        /// Called only with the decision service's caller-verified actor.
+        pub(crate) fn with_actor(mut self, actor: &crate::approval::chat_admin::DecisionActor) -> Self {
+            use crate::approval::chat_admin::DecisionActor;
+            match actor {
+                DecisionActor::Dashboard { user_id } => {
+                    self.approved_by = user_id.clone();
+                    self.decided_by = Some(format!("dashboard:{user_id}"));
+                    self.chat_admin = None;
+                }
+                DecisionActor::ChatAdmin(entry) => {
+                    self.approved_by = entry.user_id.to_string();
+                    self.decided_by = Some(entry.decided_by().to_string());
+                    self.chat_admin = Some(JournalChatAdmin {
+                        card_id: entry.card_id.clone(), channel: entry.channel.as_str().into(),
+                        step: entry.step.as_str().into(), step_required: entry.step_required,
+                        digest: entry.digest.clone(),
+                    });
+                }
+            }
+            self
+        }
+
+        /// Reconstruct only the original actor; malformed new data never
+        /// falls back to dashboard authority. The broker revalidates and
+        /// consumes the live receipt when it writes the ledger.
+        pub(crate) fn decision_actor(&self) -> Result<crate::approval::chat_admin::DecisionActor, String> {
+            use crate::approval::chat_admin::{ChatChannel, DecisionActor, LedgerEntry, ledger::Step};
+            let invalid = || "invalid org-change journal decision identity".to_string();
+            match (&self.decided_by, &self.chat_admin) {
+                (None, None) => Ok(DecisionActor::Dashboard { user_id: self.approved_by.clone() }),
+                (Some(saved), None) if *saved == format!("dashboard:{}", self.approved_by) =>
+                    Ok(DecisionActor::Dashboard { user_id: self.approved_by.clone() }),
+                (Some(saved), Some(chat)) => {
+                    let user_id = uuid::Uuid::parse_str(&self.approved_by).map_err(|_| invalid())?;
+                    if user_id.to_string() != self.approved_by { return Err(invalid()); }
+                    let channel = match chat.channel.as_str() {
+                        "telegram" => ChatChannel::Telegram, "googlechat" => ChatChannel::Googlechat,
+                        "line" => ChatChannel::Line, "slack" => ChatChannel::Slack,
+                        "discord" => ChatChannel::Discord, _ => return Err(invalid()),
+                    };
+                    let step = match chat.step.as_str() {
+                        "tap" => Step::Tap, "web" => Step::Web, "totp" => Step::Totp,
+                        _ => return Err(invalid()),
+                    };
+                    let entry = LedgerEntry { user_id, channel, step, step_required: chat.step_required,
+                        card_id: chat.card_id.clone(), digest: chat.digest.clone() };
+                    if entry.decided_by().to_string() != *saved || entry.card_id.is_empty()
+                        || entry.digest.is_empty() || (entry.step_required && entry.step == Step::Tap) {
+                        return Err(invalid());
+                    }
+                    Ok(DecisionActor::ChatAdmin(entry))
+                }
+                _ => Err(invalid()),
             }
         }
 
@@ -336,7 +413,7 @@ pub(crate) mod journal {
         }
 
         fn to_json(&self) -> Value {
-            json!({
+            let mut value = json!({
                 "approval_id": self.approval_id,
                 "payload_digest": self.payload_digest,
                 "state": self.state.as_str(),
@@ -349,7 +426,10 @@ pub(crate) mod journal {
                 "registry_reloaded": self.registry_reloaded,
                 "mirror_synced": self.mirror_synced,
                 "decision_recorded": self.decision_recorded,
-            })
+            });
+            if let Some(decided_by) = &self.decided_by { value["decided_by"] = json!(decided_by); }
+            if let Some(chat) = &self.chat_admin { value["chat_admin"] = json!(chat); }
+            value
         }
 
         fn from_json(v: &Value) -> Option<Self> {
@@ -362,6 +442,12 @@ pub(crate) mod journal {
                 before: entry_from(v.get("before"))?,
                 after: entry_from(v.get("after"))?,
                 approved_by: s("approved_by")?,
+                decided_by: match v.get("decided_by") {
+                    None => None, Some(value) => Some(value.as_str()?.to_string()),
+                },
+                chat_admin: match v.get("chat_admin") {
+                    None => None, Some(value) => Some(serde_json::from_value(value.clone()).ok()?),
+                },
                 prepared_at: s("prepared_at").unwrap_or_default(),
                 applied_at: s("applied_at").unwrap_or_default(),
                 registry_reloaded: v.get("registry_reloaded").and_then(Value::as_bool).unwrap_or(false),
@@ -459,10 +545,13 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
     } else {
         "📥 有一則組織調整等待審核"
     };
+    let reach_line = rec.payload.get("sentence").and_then(Value::as_str)
+        .map(|sentence| format!("{}\n", crate::goal_state::xml_escape(sentence)))
+        .unwrap_or_default();
     format!(
         "{head}\n\
          AI 員工：{agent}\n\
-         這類調整只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
+         {reach_line}這類調整只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
@@ -513,7 +602,7 @@ mod tests {
         assert_eq!((back.before, back.after), (p.before.clone(), p.after.clone()));
         assert!(Proposal::from_record(&rec(p.to_payload(), "someone-else")).is_none());
         assert!(Proposal::from_record(&rec(json!({"agent_id": "rep"}), "rep")).is_none());
-        assert!(summary(&p).contains("rep"));
+        assert!(summary(&p, None).contains("rep"));
         assert!(expires_at(&rec(p.to_payload(), "rep")).is_string());
     }
 

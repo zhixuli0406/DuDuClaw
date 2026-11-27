@@ -1,3 +1,4 @@
+import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
@@ -680,6 +681,8 @@ export interface GoalCreateResult {
 }
 
 export interface SkillInfo {
+  can_manage?: boolean;
+  can_restore?: boolean;
   name: string;
   agent_id?: string | null;
   content: string;
@@ -706,6 +709,8 @@ export interface SkillInfo {
 
 /** B8: one employee holding a company-wide skill. */
 export interface SkillHolder {
+  can_manage?: boolean;
+  can_restore?: boolean;
   agent_id: string;
   display_name?: string;
   enabled: boolean;
@@ -952,7 +957,12 @@ export interface CredentialInventoryReport {
  *  unrecognised value or an unreadable config is enforced as `none` too. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 
+export type DelegationRole = 'admin' | 'manager';
+export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
+
 export interface DelegationSettings {
+  unrestricted_roles?: DelegationRole[];
+  allow_one_way?: Array<[string, string]>;
   /** The policy the gateway enforces (an unrecognised value reads `none`). */
   policy: DelegationPolicy;
   /** The value as written in config.toml, when present (v1.82+). */
@@ -968,6 +978,12 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 
 /** `delegation.effective` (v1.82, RM-137) — what applies to one employee. */
 export interface DelegationEffective {
+  unrestricted?: boolean;
+  owner_role?: DelegationRole | 'employee' | null;
+  /** Owner role lookup failed; role exceptions cannot be confirmed. */
+  unrestricted_error?: 'users_unreadable' | null;
+  allow_one_way?: DelegationOneWayPair[];
+  inactive_allow_one_way?: DelegationOneWayPair[];
   agent_id: string;
   /** Effective for this employee: `none` when the global policy or its own switch stops it. */
   policy: DelegationPolicy;
@@ -2952,6 +2968,8 @@ export interface OdooPermissionOptions {
 }
 
 export interface OdooConfig {
+  /** Admin opt-in, default false; changed via odoo.member_credentials.set_enabled. */
+  member_credentials?: boolean;
   blocked_models?: string[];
   read_only_models?: string[];
   url: string;
@@ -5814,6 +5832,23 @@ export interface CostRecentRow {
   created_at: string;
 }
 
+export interface DepartmentCostTotals {
+  total_requests: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_millicents: number;
+  total_cache_savings_millicents: number;
+  avg_cache_efficiency: number;
+}
+
+export interface DepartmentCostSummary {
+  available: boolean;
+  department: string;
+  days: number;
+  agents: (DepartmentCostTotals & { agent_id: string; display_name: string })[];
+  totals: DepartmentCostTotals;
+}
+
 export interface CostRecentResult {
   available: boolean;
   records: CostRecentRow[];
@@ -8246,12 +8281,14 @@ export const api = {
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]> }) =>
+    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;
         allow: Array<[string, string]>;
         applied: boolean;
+        unrestricted_roles: DelegationRole[];
+        allow_one_way: Array<[string, string]>;
       }>,
     /** Read-only effective delegation for one employee (Manager+ with view access). */
     effective: (agentId: string) =>
@@ -8666,6 +8703,10 @@ export const api = {
   // Cache-efficiency telemetry (CostTelemetry). `available:false` on every
   // response when telemetry isn't initialized.
   cost: {
+    departmentSummary: (department: string, days: 7 | 30 | 90 = 30) =>
+      client.call('cost.department_summary', { department, days }) as Promise<DepartmentCostSummary>,
+    departmentRecent: (department: string, limit = 50) =>
+      client.call('cost.department_recent', { department, limit }) as Promise<CostRecentResult & { department: string }>,
     summary: (hours = 24) =>
       client.call('cost.summary', { hours }) as Promise<CostSummary>,
     agents: (hours = 24) =>
@@ -9928,12 +9969,16 @@ export const api = {
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
-      client.call('users.me') as Promise<{
+      client.call('users.me') as Promise<MeGrantFields & {
         user: UserInfo;
         bindings: UserAgentBinding[];
         /** Absent on gateways older than v1.73. */
         email_setup?: EmailSetup;
       }>,
+    deptGrants: {
+      mine: (group?: GrantGroup) =>
+        client.call('users.dept_grants.mine', group ? { group } : {}) as Promise<DeptGrantsMineResult>,
+    },
     /** Self-service: the logged-in user changes their OWN login email. */
     changeEmail: (email: string, currentPassword?: string) =>
       client.call('users.change_email', {

@@ -8,7 +8,7 @@
 //! conversation's default employee and `[channels] public_trigger`
 //! employees are open to every sender on top of that.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -38,7 +38,8 @@ pub enum Sender {
 ///
 /// Outside WebChat, every sender may call the conversation's default
 /// employee and employees opened with `[channels] public_trigger`. WebChat
-/// restricts main-role and gateway-default employees to Admin on every edition.
+/// restricts main-role and gateway-default employees to Admin or a precomputed
+/// effective Enterprise person-list admission for conversations.
 /// Calling anyone else needs a direct binding, a team grant (a Manager calling
 /// a report's employee), a public trigger, or Admin.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,10 @@ pub struct SenderAccess {
 pub struct WebChatScope {
     pub default_agent: String,
     pub available: bool,
+    /// Directory identities admitted for this sender's conversation only.
+    main_converse: BTreeSet<String>,
+    main_assign: BTreeSet<String>,
+    main_assign_listed: bool,
 }
 
 impl SenderAccess {
@@ -92,22 +97,112 @@ impl SenderAccess {
     }
 
     pub(crate) fn for_webchat(mut self, default_agent: Result<String, String>) -> Self {
+        let old = self.webchat_scope.take();
+        let main_converse = old.as_ref().map(|s| s.main_converse.clone()).unwrap_or_default();
+        let main_assign = old.as_ref().map(|s| s.main_assign.clone()).unwrap_or_default();
+        let main_assign_listed = old.is_some_and(|s| s.main_assign_listed);
         self.webchat_scope = Some(WebChatScope {
             available: default_agent.is_ok(),
             default_agent: default_agent.unwrap_or_default(),
+            main_converse,
+            main_assign,
+            main_assign_listed,
         });
         self
+    }
+
+    /// Call before acquiring the registry lock. The list is never inferred from
+    /// a message, a binding, a public trigger or an anonymous widget identity.
+    pub(crate) async fn for_webchat_converse(self, home: &Path) -> Self {
+        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
+        let scope = sender.webchat_scope.as_mut().expect("WebChat scope was set");
+        scope.main_converse.clear();
+        if !scope.available { return sender; }
+        if let Sender::Account { user_id, .. } = &sender.sender {
+            if !crate::webchat::is_widget_visitor(user_id)
+                && main_access_allowed(home, user_id, MainUse::Converse).unwrap_or(false)
+            {
+                if let Ok(targets) = Box::pin(main_default_targets(home)).await {
+                    for target in targets {
+                        if Box::pin(main_turn_allowed(home, user_id, &target, MainUse::Converse))
+                            .await.unwrap_or(false)
+                        {
+                            scope.main_converse.insert(target);
+                        }
+                    }
+                }
+            }
+        }
+        sender
+    }
+
+    /// Assignment admission is precomputed separately, before the registry lock.
+    pub(crate) async fn for_assign(self, home: &Path) -> Self {
+        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
+        let scope = sender.webchat_scope.as_mut().expect("assignment scope was set");
+        scope.main_assign.clear();
+        scope.main_assign_listed = false;
+        if !scope.available { return sender; }
+        if let Sender::Account { user_id, .. } = &sender.sender {
+            if !crate::webchat::is_widget_visitor(user_id)
+                && main_access_allowed(home, user_id, MainUse::Assign).unwrap_or(false)
+            {
+                scope.main_assign_listed = true;
+                if let Ok(targets) = Box::pin(main_default_targets(home)).await {
+                    for target in targets {
+                        if Box::pin(main_turn_allowed(home, user_id, &target, MainUse::Assign))
+                            .await.unwrap_or(false)
+                        {
+                            scope.main_assign.insert(target);
+                        }
+                    }
+                }
+            }
+        }
+        sender
+    }
+
+    pub(crate) fn main_assign_allowed(&self, agent: &LoadedAgent) -> bool {
+        matches!(self.sender, Sender::Account { .. })
+            && self.webchat_scope.as_ref().is_some_and(|scope| {
+                scope.available && is_main_target(scope, agent)
+                    && agent.dir.file_name().and_then(|id| id.to_str())
+                        .is_some_and(|id| scope.main_assign.contains(id))
+                    && crate::on_behalf_of::access::loaded_access_effective(agent).unwrap_or(false)
+            })
+    }
+
+    pub(crate) fn main_assign_refusal(&self, agent: &LoadedAgent) -> Option<&'static str> {
+        (self.webchat_scope.as_ref().is_some_and(|scope|
+            scope.main_assign_listed && is_main_target(scope, agent))
+            && !self.main_assign_allowed(agent))
+            .then_some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL)
+    }
+
+    pub(crate) fn main_converse_allowed(&self, agent: &LoadedAgent) -> bool {
+        matches!(self.sender, Sender::Account { .. })
+            && self.webchat_scope.as_ref().is_some_and(|scope| {
+                scope.available && is_main_target(scope, agent)
+                    && agent.dir.file_name().and_then(|id| id.to_str())
+                        .is_some_and(|id| scope.main_converse.contains(id))
+                    && crate::on_behalf_of::access::loaded_access_effective(agent).unwrap_or(false)
+            })
+    }
+
+    /// Management keeps the legacy Admin-only main gate.
+    pub(crate) fn webchat_allows_work(&self, agent: &LoadedAgent) -> bool {
+        matches!(self.sender, Sender::Admin { .. })
+            || self.webchat_scope.as_ref().is_none_or(|scope|
+                scope.available && !is_main_target(scope, agent))
     }
 
     pub(crate) fn webchat_allows(&self, agent: &LoadedAgent) -> bool {
         if matches!(self.sender, Sender::Admin { .. }) {
             return true;
         }
-        self.webchat_scope.as_ref().is_none_or(|scope| {
-            scope.available
-                && agent.config.agent.role != duduclaw_core::types::AgentRole::Main
-                && agent.config.agent.name != scope.default_agent
-        })
+        self.webchat_allows_work(agent) || self.main_converse_allowed(agent)
     }
 
     /// v1.81 P1h (N1): the person this sender is, for the Personal check — a
@@ -178,6 +273,9 @@ impl SenderAccess {
             return None;
         }
         let id = agent.config.agent.name.as_str();
+        if self.main_converse_allowed(agent) {
+            return Some(GrantSource::Default);
+        }
         let open_here = || {
             if fallback == Some(id) {
                 Some(GrantSource::Default)
@@ -227,6 +325,12 @@ impl SenderAccess {
             ),
         }
     }
+}
+
+fn is_main_target(scope: &WebChatScope, agent: &LoadedAgent) -> bool {
+    agent.config.agent.role == duduclaw_core::types::AgentRole::Main
+        || agent.config.agent.name == scope.default_agent
+        || agent.dir.file_name().and_then(|name| name.to_str()) == Some(scope.default_agent.as_str())
 }
 
 /// No bindings, no team, never Admin.

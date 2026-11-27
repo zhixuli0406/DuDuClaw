@@ -245,9 +245,9 @@ pub async fn verify_and_consume(
     if !grant.matches_stored(stored) {
         return Err(GrantRefusal::Mismatch);
     }
-    if crate::google_identity::chat_send::is_member_card(&rec) {
+    if crate::google_identity::member_card::is_member_card(&rec) {
         let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
-        if !crate::google_identity::chat_send::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
+        if !crate::google_identity::member_card::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
     }
     // Bound mail decisions retain the execution snapshot through the actual
     // single-use claim, including current requester authority after approval.
@@ -263,10 +263,6 @@ pub async fn verify_and_consume(
                     .map_err(GrantRefusal::Store)? != binding.environment_hash {
                 return Err(GrantRefusal::Store("policy changed; request a new approval".into()));
             }
-            if !rec.decided_by.as_deref().is_some_and(|who| who.strip_prefix("dashboard:").is_some())
-                && !super::mail_requester::eligible(&home, &rec) {
-                return Err(GrantRefusal::Store("mail requester authority changed".into()));
-            }
         }
     }
     let reason = format!("{CONSUMED_PREFIX}{}", uuid::Uuid::new_v4());
@@ -279,8 +275,39 @@ pub async fn verify_and_consume(
     }
     // Live-I/O authority is re-verified around the IMMEDIATE transaction.
     let tx = super::begin_live_write(&mut conn).map_err(GrantRefusal::Store)?;
+    if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::admin_ai::decided_by_admin(&home, &rec, &tx) { return Err(GrantRefusal::Mismatch); }
+    }
+    if rec.payload["drive_write_admin_confirmation"] == true {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        let by = rec.decided_by.as_deref().ok_or(GrantRefusal::Mismatch)?;
+        let chat = by.parse::<super::chat_admin::ledger::DecidedBy>().ok();
+        let uid = if let Some(uid) = by.strip_prefix("dashboard:") { uid }
+            else if let Some(chat) = &chat {
+                if !super::chat_admin::ledger::accepts(&tx, &rec) { return Err(GrantRefusal::Mismatch); }
+                chat.user_id()
+            } else { return Err(GrantRefusal::Mismatch); };
+        let db = crate::decision_notify::open_user_db_read_only(&home)
+            .map_err(GrantRefusal::Store)?.ok_or(GrantRefusal::Mismatch)?;
+        let user = db.get_user(uid).map_err(GrantRefusal::Store)?.ok_or(GrantRefusal::Mismatch)?;
+        let principal = duduclaw_core::HumanPrincipal::user(uid).ok_or(GrantRefusal::Mismatch)?.to_string();
+        if rec.action_kind != "mcp_call" || rec.payload.get("egress_guard").is_none()
+            || user.status != duduclaw_auth::UserStatus::Active || user.role != duduclaw_auth::UserRole::Admin
+            || crate::on_behalf_of::self_approval::refuses(&home, rec.on_behalf_of.as_deref(), Some(&principal), true)
+            || !ActionGrant::build(&rec.agent_id, &grant.tool, &rec.payload).matches_stored(stored) {
+            return Err(GrantRefusal::Mismatch);
+        }
+    }
     if let Some(binding) = mail_binding {
         ApprovalBroker::check_task(&tx, binding).map_err(GrantRefusal::Store)?;
+        let home = broker.home_dir().ok_or_else(|| GrantRefusal::Store("missing policy home".into()))?;
+        if !rec.decided_by.as_deref().is_some_and(|who| who.strip_prefix("dashboard:").is_some())
+            && !super::chat_admin::ledger::accepts(&tx, &rec)
+            && !super::mail_requester::eligible(&home, &rec)
+        {
+            return Err(GrantRefusal::Store("mail requester authority changed".into()));
+        }
     }
     if !rec.expires_at().is_some_and(|expiry| chrono::Utc::now() < expiry) {
         return Err(GrantRefusal::NotApproved);
@@ -309,12 +336,13 @@ pub async fn verify_and_consume(
         &format!("UPDATE approvals SET status='invalidated', invalidated_reason=?1
          WHERE id=?2 AND status='approved' AND agent_id=?3
            AND payload=?4 AND created_at=?5 AND ttl_seconds=?6
-           AND binding_json IS ?7 AND {live_origin}
+           AND binding_json IS ?7 AND decided_by IS ?8 AND {live_origin}
            AND (binding_json IS NULL OR julianday(json_extract(binding_json,'$.expires_at')) > julianday('now'))
            AND julianday(created_at) + ttl_seconds / 86400.0 > julianday('now')",
             live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
         rusqlite::params![reason, id.as_str(), rec.agent_id, rec.payload.to_string(), rec.created_at, rec.ttl_seconds,
-            rec.binding.as_ref().map(|binding| serde_json::to_string(binding).expect("serializable binding"))],
+            rec.binding.as_ref().map(|binding| serde_json::to_string(binding).expect("serializable binding")),
+            rec.decided_by],
     ).map_err(|e| GrantRefusal::Store(e.to_string()))?;
     match consumed {
         1 => super::commit_live_write(tx).map_err(GrantRefusal::Store),
@@ -444,6 +472,10 @@ mod action_grant_tests {
         assert_eq!(rec.status, ApprovalStatus::Invalidated);
     }
 }
+
+#[cfg(test)]
+#[path = "action_grant_chat_admin_tests.rs"]
+mod chat_admin_tests;
 
 #[cfg(test)]
 #[tokio::test]

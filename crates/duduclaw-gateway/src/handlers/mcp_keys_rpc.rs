@@ -314,7 +314,11 @@ impl MethodHandler {
             }
         }
         // RM-157: name the first scope this key may not carry.
-        if let Some(scope) = first_ungrantable(binding, &scopes) {
+        // Person-only scopes can never be issued by an admin, including
+        // internal per-employee keys. Do not reject the shared Odoo scopes.
+        let person_scope = scopes.iter().map(|s| s.trim())
+            .find(|s| matches!(*s, "tasks:read" | "agents:status"));
+        if let Some(scope) = person_scope.map(str::to_owned).or_else(|| first_ungrantable(binding, &scopes)) {
             let known = duduclaw_core::mcp_scopes::MCP_SCOPE_STRINGS.contains(&scope.as_str());
             let error = if known { McpKeyError::ScopeNotGrantable } else { McpKeyError::InvalidScopes };
             return WsFrame::Response {

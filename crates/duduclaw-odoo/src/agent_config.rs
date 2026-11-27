@@ -18,8 +18,17 @@
 //! allowed_actions = ["read", "search", "write:crm.lead"]
 //! # RM-120 opt-in for the generic odoo_create / odoo_write tools (default off):
 //! # allowed_actions += ["generic_create:crm.lead", "generic_write:crm.lead"]
+//! # RM-141 engine-mode opt-ins for dedicated tools (always model-qualified):
+//! # allowed_actions += ["activity:crm.lead", "note:crm.lead", "message:crm.lead", "attach:crm.lead"]
+//! permission_override = "inherit"  # inherit | engine | read_only; unknown => read_only
+//! act_as_requester = false         # use the verified requester's personal identity
 //! company_ids     = [1, 2]
 //! ```
+//!
+//! The four dedicated tokens grant only their named model, never a wildcard.
+//! An empty action list grants none of them. `activity` schedules an activity,
+//! `note` posts an internal note, `message` notifies followers, and `attach`
+//! adds a file through the dedicated attachment tool.
 //!
 //! Without an `[odoo]` block in `agent.toml`, the agent falls back to the
 //! global `config.toml [odoo]` exactly as before — no regression.
@@ -74,6 +83,12 @@ pub struct AgentOdooConfig {
     /// `"generic_create:<model>"` / `"generic_write:<model>"` (always
     /// qualified); see [`Self::generic_opt_in`].
     pub allowed_actions: Vec<String>,
+    /// RM-141 mode narrowing only. Unknown strings become read-only when
+    /// interpreted by [`Self::permission_override_mode`].
+    pub permission_override: Option<String>,
+    /// Use a verified human requester's personal Odoo identity when available.
+    /// This does not itself grant any action or enable account-following mode.
+    pub act_as_requester: bool,
     /// Multi-company scope. When non-empty, queries are narrowed to these
     /// `res.company` ids. Empty ⇒ inherit Odoo user's default companies.
     pub company_ids: Vec<i32>,
@@ -127,6 +142,8 @@ impl AgentOdooConfig {
             && self.password_enc.is_none()
             && self.allowed_models.is_empty()
             && self.allowed_actions.is_empty()
+            && self.permission_override.is_none()
+            && !self.act_as_requester
             && self.company_ids.is_empty()
             && self.unblock_models.is_none()
     }
@@ -299,6 +316,23 @@ impl AgentOdooConfig {
                 .allowed_actions
                 .iter()
                 .any(|tok| tok.split_once(':').is_some_and(|(v, m)| v == token && m == model))
+    }
+
+    /// RM-141 explicit opt-in for a dedicated tool on exactly one model.
+    /// Bare tokens, wildcards, unknown actions and empty lists grant nothing.
+    /// The caller must also enforce [`Self::permits_model`].
+    pub fn dedicated_opt_in(&self, action: &str, model: &str) -> bool {
+        matches!(action, "activity" | "note" | "message" | "attach")
+            && crate::access_policy::valid_policy_model(model)
+            && self.allowed_actions.iter().any(|token| {
+                token.split_once(':').is_some_and(|(verb, target)| verb == action && target == model)
+            })
+    }
+
+    /// Interpret the optional override without allowing an unknown value to
+    /// widen the company policy.
+    pub fn permission_override_mode(&self) -> crate::access_policy::PermissionOverride {
+        crate::access_policy::PermissionOverride::from_config(self.permission_override.as_deref())
     }
 }
 

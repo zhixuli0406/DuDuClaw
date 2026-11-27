@@ -453,6 +453,11 @@ impl TaskStore {
             [],
         )
         .map_err(|e| format!("create idx_tasks_archived: {e}"))?;
+        // Bounded employee reads can stop in creation order without sorting a board.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_employee_created ON tasks(assigned_to, created_at DESC, id ASC) WHERE archived = 0",
+            [],
+        ).map_err(|e| format!("create idx_tasks_employee_created: {e}"))?;
         // "Tasks I assigned" (`/交辦 狀態`, `tasks.list_page on_behalf_of`):
         // a partial index, so the many rows without a principal cost nothing.
         conn.execute(

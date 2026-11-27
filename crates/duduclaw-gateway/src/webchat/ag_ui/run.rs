@@ -57,16 +57,33 @@ async fn pending(broker: &ApprovalBroker, sid: &str, turn: &str, accepted: &Hash
     Ok(records.into_iter().filter(|r| r.status == ApprovalStatus::Pending && !accepted.contains_key(r.id.as_str())).collect())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ResumeError {
+    Protocol(&'static str),
+    Entry(String),
+}
+impl From<&'static str> for ResumeError {
+    fn from(code: &'static str) -> Self { Self::Protocol(code) }
+}
+impl ResumeError {
+    fn frame(&self) -> Value {
+        match self {
+            Self::Protocol(code) => failure(code),
+            Self::Entry(text) => json!({"type":"RUN_ERROR", "code":"employee_entry_refused", "message":text}),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn decide_resume(
     state: &AgUiState, broker: &ApprovalBroker, user: &str, agent: &str,
     sid: &str, turn: &str, connection: &Connection, cards: &[ApprovalRecord],
     accepted: &mut HashMap<String, ResumeEntry>,
-) -> Result<(), &'static str> {
-    if !authorized(state, user, agent, connection).await { return Err("authorization_changed"); }
+) -> Result<(), ResumeError> {
+    if !authorized(state, user, agent, connection).await { return Err("authorization_changed".into()); }
     let entries = &connection.input.resume;
     if entries.len() != cards.len() || cards.iter().any(|r| !entries.iter().any(|e| e.interrupt_id == r.id.as_str())) {
-        return Err("incomplete_interrupt_coverage");
+        return Err("incomplete_interrupt_coverage".into());
     }
     let records = broker.records_for_turn(sid, turn).await.map_err(|_| "approval_unavailable")?;
     let admin = webchat_command_admin(&state.chat.user_db, user);
@@ -75,13 +92,13 @@ pub(super) async fn decide_resume(
     for card in cards {
         let current = records.iter().find(|r| r.id == card.id).ok_or("stale_interrupt")?;
         if current.agent_id != agent || !crate::approval::same_ag_ui_request(card, current) {
-            return Err("stale_interrupt");
+            return Err("stale_interrupt".into());
         }
         let entry = entries.iter().find(|e| e.interrupt_id == current.id.as_str()).ok_or("unknown_interrupt")?;
         let approve = entry.approved()?;
         if let Some(previous) = accepted.get(current.id.as_str()) {
             if previous.status != entry.status || previous.payload != entry.payload {
-                return Err("resume_decision_changed");
+                return Err("resume_decision_changed".into());
             }
         }
         match current.status {
@@ -89,25 +106,33 @@ pub(super) async fn decide_resume(
                 // Confirm the original card's external decision without acting
                 // as its decider. Employee access still gates continuation.
                 if approve != (current.status == ApprovalStatus::Approved) {
-                    return Err("resume_decision_changed");
+                    return Err("resume_decision_changed".into());
                 }
             }
             ApprovalStatus::Pending => {
-                if !may_decide(current, admin) { return Err("approval_forbidden"); }
-                if current.is_stale(chrono::Utc::now()) { return Err("expired_interrupt"); }
+                if !may_decide(current, admin) { return Err("approval_forbidden".into()); }
+                if current.is_stale(chrono::Utc::now()) { return Err("expired_interrupt".into()); }
                 if crate::on_behalf_of::self_approval::refuses(&state.chat.ctx.home_dir,
                     current.on_behalf_of.as_deref(), principal.as_deref(), approve) {
-                    return Err("self_approval_forbidden");
+                    return Err("self_approval_forbidden".into());
                 }
             }
-            _ => return Err("stale_interrupt"),
+            _ => return Err("stale_interrupt".into()),
         }
         decisions.push((current.clone(), approve));
     }
     if !authorized(state, user, agent, connection).await
         || (decisions.iter().any(|(r, _)| r.status == ApprovalStatus::Pending)
             && !webchat_command_admin(&state.chat.user_db, user)) {
-        return Err("authorization_changed");
+        return Err("authorization_changed".into());
+    }
+    for (record, approve) in &decisions {
+        if *approve {
+            crate::entry_gate::check_approval_start(&state.chat.ctx.home_dir, record, true, sid)
+                .await.map_err(ResumeError::Entry)?;
+            crate::webchat::entry::check(&state.chat, user, agent, sid, user, "resume-work", false, turn)
+                .await.map_err(ResumeError::Entry)?;
+        }
     }
     broker.decide_ag_ui_batch(sid, turn, &decisions, &format!("ag-ui:{user}")).await
         .map_err(|_| "decision_conflict")?;
@@ -155,6 +180,10 @@ pub(super) async fn execute(
 ) -> bool {
     if send(&connection, started(&connection.input)).await.is_err() { return false; }
     if !authorized(state, user, agent, &connection).await { let _ = send(&connection, failure("authorization_changed")).await; return false; }
+    if let Err(text) = crate::webchat::entry::check(&state.chat, user, agent, sid, user, text, false, turn).await {
+        let _ = send(&connection, ResumeError::Entry(text).frame()).await;
+        return false;
+    }
     let (progress_tx, mut progress_rx) = mpsc::channel(64);
     let overflow = Arc::new(AtomicBool::new(false));
     let overflow_callback = overflow.clone();
@@ -272,8 +301,8 @@ pub(super) async fn execute(
                 }
                 match decide_resume(state, broker, user, agent, sid, turn, &next, &cards, &mut accepted).await {
                     Ok(()) => { receipt = next.input.resume.clone(); connection = next; break; }
-                    Err(code) => {
-                        let _ = send(&next, failure(code)).await;
+                    Err(error) => {
+                        let _ = send(&next, error.frame()).await;
                         waiting.store(true, Ordering::Release);
                     }
                 }

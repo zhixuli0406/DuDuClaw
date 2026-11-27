@@ -435,6 +435,7 @@ async fn remove_account_rechecks_admin_role_on_an_open_connection() {
         )
         .unwrap();
     let cached = UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: user.id.clone(),

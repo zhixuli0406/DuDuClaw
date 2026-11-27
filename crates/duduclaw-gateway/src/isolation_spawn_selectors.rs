@@ -67,9 +67,23 @@ impl GatewayResourceResolver {
             || target == duduclaw_core::UNTRUSTED_AGENT_ID || crate::ephemeral::is_ephemeral_id(target) {
             return Err(VerificationError::Invalid);
         }
-        let rules = duduclaw_core::delegation_rules_from_home(&self.home);
+        let read = duduclaw_core::delegation_policy::read_delegation_config(&self.home);
+        let roles = crate::delegation_roles::GatewayOwnerRoles::new(&self.home,
+            crate::delegation_roles::Requester::isolated(context, crate::isolation_egress::run_metadata().as_ref()));
+        let facts = roles.snapshot(&self.agent).ok();
+        let principal = match &context.record().principal {
+            duduclaw_isolation::capability::Principal::Human { user_id, .. } =>
+                duduclaw_core::HumanPrincipal::user(user_id.as_str()).map(|p| p.to_string()),
+            duduclaw_isolation::capability::Principal::Background { .. } => None,
+        };
+        let boundaries = crate::delegation_roles::sync_boundaries(&self.home, &self.agent, target, principal.as_deref());
         let org = crate::delegation_gate::DispatchOrgView::new(&self.home, None);
-        duduclaw_core::can_delegate_rules(&rules, &org, &self.agent, target).map_err(|_| VerificationError::Invalid)?;
+        let source = duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, &self.agent, target,
+            &duduclaw_core::delegation_policy::DelegationContext {
+                overrides: &read.overrides, owner_roles: Some(&roles), boundaries, extra_system_senders: &[],
+            }).map_err(|_| VerificationError::Invalid)?;
+        crate::delegation_roles::audit_allow(&self.home, &self.agent, target, source,
+            facts.as_ref().and_then(|f| f.requester_account_id.as_deref()), "isolation_spawn");
         let receipt = crate::isolation_lifecycle::confirmed_receipt(&self.home, target).map_err(|error| match error {
             crate::isolation_lifecycle::LifecycleError::Unavailable => VerificationError::Unavailable,
             _ => VerificationError::Revoked,

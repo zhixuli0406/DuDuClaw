@@ -195,3 +195,50 @@ fn bound_own_projection_preserves_whole_text_and_attachment_lines_without_ner() 
     assert_eq!(plain_parts(&transcript.messages[0].parts),original);
     assert!(!transcript.ner);
 }
+
+
+#[test]
+fn member_key_mode_is_filtered_before_owner_admin_and_legacy_toggle() {
+    let home = tempfile::tempdir().unwrap();
+    for enabled in [true, false] {
+        std::fs::write(home.path().join("config.toml"),
+            format!("[people]\nbound_history_privacy={enabled}\n")).unwrap();
+        for level in [AccessLevel::Viewer, AccessLevel::Operator, AccessLevel::Owner] {
+            let browser = employee(level);
+            let mut key = browser.clone();
+            key.member_key_id = Some("key-id".into());
+            assert_eq!(mode(home.path(), &key, "sales").unwrap(), Mode::Filtered);
+            let expected = if level == AccessLevel::Owner || !enabled { Mode::Full } else { Mode::Filtered };
+            assert_eq!(mode(home.path(), &browser, "sales").unwrap(), expected);
+        }
+        // Authentication forbids Admin member keys; the privacy gate still narrows them.
+        let mut admin = UserContext::admin_fallback();
+        assert_eq!(mode(home.path(), &admin, "sales").unwrap(), Mode::Full);
+        admin.member_key_id = Some("impossible-admin-key".into());
+        assert_eq!(mode(home.path(), &admin, "sales").unwrap(), Mode::Filtered);
+    }
+}
+
+#[test]
+fn member_key_mode_preserves_permission_denial() {
+    let home = tempfile::tempdir().unwrap();
+    let mut key = employee(AccessLevel::Owner);
+    key.member_key_id = Some("key-id".into());
+    key.must_change_password = true;
+    assert_eq!(mode(home.path(), &key, "sales").unwrap_err(), "permission denied");
+    key.must_change_password = false;
+    key.agent_access.clear();
+    assert_eq!(mode(home.path(), &key, "sales").unwrap_err(), "permission denied");
+}
+
+#[test]
+fn member_key_class_allowed_matrix_preserves_browser_policy() {
+    let browser = employee(AccessLevel::Owner);
+    let mut key = browser.clone();
+    key.member_key_id = Some("key-id".into());
+    for class in [Class::Own, Class::External { channel: "line".into() }, Class::Hidden] {
+        assert_eq!(key_class_allowed(&key, &class), class == Class::Own);
+        // This predicate only adds a key restriction; existing browser gates still apply.
+        assert!(key_class_allowed(&browser, &class));
+    }
+}

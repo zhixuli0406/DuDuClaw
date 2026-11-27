@@ -90,6 +90,10 @@ pub struct ToolPolicy {
 }
 
 pub const POLICIES: &[ToolPolicy] = &[
+    // Inventory only: the CLI's isolation disposition explicitly refuses
+    // person tools for every employee, even with a signed tool grant.
+    ToolPolicy { name: "my_tasks_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "my_agents_status", route: Route::Service, required: &[ResourceKind::Employee] },
     // google
     ToolPolicy { name: "google_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },
@@ -122,6 +126,16 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "calendar_delete_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "calendar_update_event", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "slides_read", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    // RM-131: exact routes remain declared even while protected execution refuses them.
+    ToolPolicy { name: "drive_create_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_copy_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_update_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_move_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "drive_trash_file", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_insert_text", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "docs_format", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_add_sheet", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "sheets_add_note", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     // os
     ToolPolicy { name: "os_notify", route: Route::Execution, required: &[ResourceKind::Employee, ResourceKind::Recipient] },
     ToolPolicy { name: "os_watch_status", route: Route::Execution, required: &[ResourceKind::Employee] },

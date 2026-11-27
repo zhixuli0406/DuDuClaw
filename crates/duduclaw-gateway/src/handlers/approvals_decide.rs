@@ -205,6 +205,27 @@ impl MethodHandler {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                let env = crate::approval::decision_service::DecisionEnv {
+                    home: self.home_dir.clone(), registry: Some(self.registry.clone()),
+                    broker: broker.clone(), users: self.user_db.read().await.clone(),
+                };
+                return match Box::pin(crate::approval::decision_service::decide(
+                    &env, &approval_id, approve, &reason,
+                    &crate::approval::decision_service::Decider::Dashboard(decider),
+                )).await {
+                    Ok(outcome) => WsFrame::ok_response("", outcome.value),
+                    Err(error) => error.dashboard_frame(),
+                };
+            }
+            let lock = decision_lock(approval_id.as_str());
+            let _guard = lock.lock().await;
+            // Chat-admin decisions share this lock; discard the pre-lock snapshot.
+            let fresh = match Self::required_approval_for_decision(broker.get(&approval_id).await) {
+                Ok(rec) => rec,
+                Err(response) => return response,
+            };
+            let rec = &fresh;
             if rec.is_stale(chrono::Utc::now()) {
                 let _ = broker.poll(&approval_id).await;
                 let error = if crate::approval_notify::is_dashboard_only_kind(&rec.action_kind) {
@@ -218,12 +239,20 @@ impl MethodHandler {
             if let Err(error) = crate::approval::check_expected_digest(rec) {
                 return WsFrame::error_response("", &error);
             }
+            let session = "dashboard:approval";
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, session).await {
+                return WsFrame::error_response("", &text);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
                 return WsFrame::error_response("", &e);
             }
             self.audit_activation_decision(rec, &decider, approve);
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            crate::approval_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(), rec.clone(), approve, decider_name,
+            );
             return WsFrame::ok_response(
                 "",
                 json!({
@@ -234,54 +263,19 @@ impl MethodHandler {
                 }),
             );
         }
-        // A proposal to add a source to a knowledge collection: decided only
-        // by an Admin or the collection's editor / owner (re-read now), side
-        // effect (hash check + ingest) first, decision after.
-        if let Some(rec) = &record {
-            if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
-                let Ok(fresh) =
-                    crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
-                else {
-                    return WsFrame::error_response("", PERMISSION_DENIED);
-                };
-                let users = self.user_db.read().await.clone();
-                let user = crate::knowledge::dashboard_user(&fresh, users.as_ref());
-                return match crate::knowledge::add_source_approval::decide(
-                    &self.home_dir,
-                    &broker,
-                    &approval_id,
-                    approve,
-                    &user,
-                )
-                .await
-                {
-                    Ok(v) => WsFrame::ok_response("", v),
-                    Err(e) => WsFrame::error_response("", &e),
-                };
-            }
-        }
-        // R-M5: a knowledge review applies its side effect FIRST and records
-        // the decision only after it succeeded — a failed side effect leaves
-        // the approval pending (retryable) instead of terminal with the claim
-        // stranded.
-        // A profile file change applies first and records the decision only
-        // after the write succeeded (same order as a knowledge review).
-        if let Some(rec) = &record {
-            if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
-                return Box::pin(self.decide_agent_file_change(&broker, &approval_id, approve, ctx)).await;
-            }
-            // RM-027: an org chart change applies first (re-validated, base
-            // re-checked) and records the decision only after the write.
-            if rec.action_kind == crate::org_change_approval::ACTION_KIND {
-                return Box::pin(self.decide_org_change(&broker, &approval_id, approve, &reason, ctx)).await;
-            }
-        }
-        if let Some(rec) = &record {
-            if rec.action_kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE {
-                return self
-                    .decide_knowledge_quarantine(&broker, &approval_id, rec, approve, ctx)
-                    .await;
-            }
+        if record.as_ref().is_some_and(crate::approval::decision_service::handles) {
+            let env = crate::approval::decision_service::DecisionEnv {
+                home: self.home_dir.clone(), registry: Some(self.registry.clone()),
+                broker: broker.clone(), users: self.user_db.read().await.clone(),
+            };
+            return match Box::pin(crate::approval::decision_service::decide_with_reach(
+                &env, &approval_id, approve, &reason,
+                &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+                params["reach_digest"].as_str(),
+            )).await {
+                Ok(outcome) => WsFrame::ok_response("", outcome.value),
+                Err(error) => error.dashboard_frame(),
+            };
         }
         // L1: a knowledge review past its deadline is a denial (TTL = DENY),
         // even before the expiry sweep has flipped its status — approving it
@@ -329,6 +323,11 @@ impl MethodHandler {
             .await
             {
                 return WsFrame::error_response("", &error);
+            }
+        }
+        if let Some(rec) = &record {
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, "dashboard:approval").await {
+                return WsFrame::error_response("", &text);
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
@@ -507,191 +506,6 @@ impl MethodHandler {
         )
     }
 
-    /// `approvals.decide` for `knowledge_quarantine` (dashboard-only kind).
-    ///
-    /// Order: the card must be pending and not past its deadline; the side
-    /// effect runs; only then is the decision recorded. If the side effect
-    /// fails, the approval stays pending and the caller gets the error — a
-    /// retry is idempotent (applied rows are skipped; rows a failed release
-    /// already converted to held claims are re-reported and get their card).
-    /// Concurrent decisions on one card are serialized by a per-id lock and
-    /// the card is re-read inside it, so the second one finds the card no
-    /// longer pending and gets an error frame without applying anything. If
-    /// the side effect applied but `decide` then fails (expiry, store error),
-    /// the response is an error frame naming what was applied, plus the audit
-    /// row `knowledge_review_decision_unrecorded` — never an OK frame.
-    async fn decide_knowledge_quarantine(
-        &self,
-        broker: &crate::approval::ApprovalBroker,
-        approval_id: &crate::approval::ApprovalId,
-        rec: &crate::approval::ApprovalRecord,
-        approve: bool,
-        ctx: &UserContext,
-    ) -> WsFrame {
-        // Serialize side effect + decision per approval id (the gateway is
-        // the only writer of decisions for this dashboard-only kind), then
-        // re-read the card inside the lock: a concurrent approve/deny or an
-        // expiry that happened while waiting is seen here, before anything
-        // is applied.
-        let lock = decision_lock(approval_id.as_str());
-        let _guard = lock.lock().await;
-        let fresh = match broker.get(approval_id).await {
-            Ok(Some(r)) => r,
-            Ok(None) => return WsFrame::error_response("", "找不到這筆審核"),
-            Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
-        };
-        let rec = &fresh;
-        if rec.status != crate::approval::ApprovalStatus::Pending {
-            return WsFrame::error_response(
-                "",
-                &format!("approval {} already {}", rec.id, rec.status.as_str()),
-            );
-        }
-        if rec.is_stale(chrono::Utc::now()) {
-            let _ = broker.poll(approval_id).await;
-            return WsFrame::error_response("", "這則知識審核已逾期，已自動捨棄，無法再核准。");
-        }
-        if let Err(error) = crate::approval::check_expected_digest(rec) {
-            return WsFrame::error_response("", &error);
-        }
-        let memory_db = rec
-            .payload
-            .get("memory_db")
-            .and_then(|v| v.as_str())
-            .map(std::path::PathBuf::from);
-        let q_agent = rec
-            .payload
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(rec.agent_id.as_str())
-            .to_string();
-        let ids: Vec<String> = rec
-            .payload
-            .get("quarantined_ids")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Trust-held claims are promoted with the approver's authority,
-        // bound to the digest of the row the card showed (R-H1).
-        let promote = rec
-            .payload
-            .get("promote_on_approve")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let claim_digest = rec
-            .payload
-            .get("claim_digest")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let origin = match (
-            rec.payload.get("origin_channel").and_then(|v| v.as_str()),
-            rec.payload.get("origin_chat_id").and_then(|v| v.as_str()),
-        ) {
-            (Some(ch), Some(chat)) => Some((ch.to_string(), chat.to_string())),
-            _ => None,
-        };
-
-        let mut side_effect = Value::Null;
-        match memory_db {
-            Some(db) if !ids.is_empty() => {
-                match crate::wiki_ingest::apply_quarantine_decision(
-                    self.home_dir.clone(),
-                    db.clone(),
-                    q_agent.clone(),
-                    ids,
-                    approve,
-                    promote,
-                    claim_digest,
-                )
-                .await
-                {
-                    Ok(report) => {
-                        side_effect = report.side_effect(approve, promote);
-                        if !report.held.is_empty() {
-                            crate::wiki_ingest::dispatch_quarantine_side_effects(
-                                &q_agent,
-                                &self.home_dir,
-                                &db,
-                                &report.held,
-                                origin.as_ref(),
-                            )
-                            .await;
-                        }
-                    }
-                    Err(e) => {
-                        return WsFrame::error_response(
-                            "",
-                            &format!("沒有套用，這筆審核仍待決定，可以再試一次：{e}"),
-                        );
-                    }
-                }
-            }
-            _ => warn!("knowledge_quarantine approval missing memory_db/ids in payload"),
-        }
-
-        let decided_by = format!("dashboard:{}", ctx.user_id);
-        let decided = {
-            #[cfg(test)]
-            let forced = take_forced_decide_failure(approval_id.as_str());
-            #[cfg(not(test))]
-            let forced: Option<String> = None;
-            match forced {
-                Some(e) => Err(e),
-                None => broker.decide(approval_id, approve, &decided_by).await,
-            }
-        };
-        if let Err(e) = decided {
-            // The side effect is applied but the decision is not recorded
-            // (the card expired in between, or a real store error): never
-            // report success. Say exactly what was applied, and leave an
-            // audit row so the mismatch can be traced.
-            let action = if approve { "approve" } else { "deny" };
-            warn!(approval_id = %approval_id, "knowledge review decision unrecorded: {e}");
-            duduclaw_security::audit::append_audit_event(
-                &self.home_dir,
-                &duduclaw_security::audit::AuditEvent::new(
-                    AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED,
-                    &q_agent,
-                    duduclaw_security::audit::Severity::Warning,
-                    json!({
-                        "approval_id": rec.id.as_str(),
-                        "action": action,
-                        "side_effect": side_effect,
-                        "error": duduclaw_core::truncate_chars(&e, 300),
-                    }),
-                ),
-            );
-            return WsFrame::error_response(
-                "",
-                &format!(
-                    "已套用（{action}：{side_effect}），但這筆審核的決定沒有記錄成功（{err}）。\
-                     資料以已套用的結果為準，已寫入稽核紀錄 {AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED}。",
-                    err = duduclaw_core::truncate_chars(&e, 300),
-                ),
-            );
-        }
-        let decider_name = self.user_display_name(&ctx.user_id).await;
-        crate::approval_notify::spawn_dashboard_collapse(
-            self.home_dir.clone(),
-            rec.clone(),
-            approve,
-            decider_name,
-        );
-        WsFrame::ok_response(
-            "",
-            json!({
-                "id": rec.id.as_str(),
-                "decided": if approve { "approved" } else { "denied" },
-                "side_effect": side_effect,
-                "capability_handle": Value::Null,
-            }),
-        )
-    }
-
     pub(crate) async fn handle_approval_operations(
         &self,
         params: Value,
@@ -762,14 +576,35 @@ impl MethodHandler {
 
     /// WP14-T14.6: recent budget-breaker incidents from `budget_events.jsonl`,
     /// newest first, plus a per-agent open-count. `limit` default 50.
-    pub(crate) async fn handle_budget_incidents(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_budget_incidents(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let path = self.home_dir.join("budget_events.jsonl");
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return WsFrame::error_response("", "Budget incidents unavailable"),
+        };
+        // Same direct-binding and Personal visibility rule as agents.list.
+        // Filter before both pagination and aggregation; hidden rows contribute
+        // neither entries nor counts, including unattributed rows.
+        let hidden = if ctx.is_admin() {
+            Default::default()
+        } else {
+            match self.personal_hidden_agents(ctx).await {
+                Ok(hidden) => hidden,
+                Err(reason) => return WsFrame::error_response("", reason),
+            }
+        };
+        let visible = ctx.visible_agents();
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|event| match &visible {
+                None => true,
+                Some(ids) => event.get("agent_id").and_then(Value::as_str)
+                    .is_some_and(|id| !hidden.contains(id) && ids.iter().any(|visible_id| visible_id == id)),
+            })
             .collect();
         events.reverse(); // newest first
         let mut per_agent: std::collections::HashMap<String, u64> =
@@ -864,47 +699,11 @@ impl MethodHandler {
 
 /// Audit event: a knowledge-review side effect was applied but its decision
 /// could not be recorded.
-pub(crate) const AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED: &str =
-    "knowledge_review_decision_unrecorded";
+pub(crate) use crate::approval::decision_service::AUDIT_KNOWLEDGE_REVIEW_DECISION_UNRECORDED;
 
-/// Per-approval-id lock serializing side effect + decision for knowledge
-/// reviews. Entries are tiny and keyed by approval id; they are dropped when
-/// no request holds them.
-pub(super) fn decision_lock(id: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
-    static LOCKS: std::sync::OnceLock<
-        std::sync::Mutex<
-            std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
-        >,
-    > = std::sync::OnceLock::new();
-    let map = LOCKS.get_or_init(Default::default);
-    let mut m = map.lock().unwrap_or_else(|p| p.into_inner());
-    m.retain(|_, w| w.strong_count() > 0);
-    if let Some(l) = m.get(id).and_then(std::sync::Weak::upgrade) {
-        return l;
-    }
-    let l = std::sync::Arc::new(tokio::sync::Mutex::new(()));
-    m.insert(id.to_string(), std::sync::Arc::downgrade(&l));
-    l
-}
-
+pub(super) use crate::approval::decision_service::decision_lock;
 #[cfg(test)]
-static FORCED_DECIDE_FAILURE: std::sync::Mutex<Option<(String, String)>> =
-    std::sync::Mutex::new(None);
-
-/// Test seam: make the next `decide` for `id` fail with `err`.
-#[cfg(test)]
-pub(crate) fn force_decide_failure(id: &str, err: &str) {
-    *FORCED_DECIDE_FAILURE.lock().unwrap() = Some((id.to_string(), err.to_string()));
-}
-
-#[cfg(test)]
-fn take_forced_decide_failure(id: &str) -> Option<String> {
-    let mut g = FORCED_DECIDE_FAILURE.lock().unwrap();
-    match g.as_ref() {
-        Some((i, _)) if i == id => g.take().map(|(_, e)| e),
-        _ => None,
-    }
-}
+pub(crate) use crate::approval::decision_service::force_decide_failure;
 
 #[cfg(test)]
 mod tests {

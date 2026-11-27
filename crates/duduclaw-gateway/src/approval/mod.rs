@@ -133,6 +133,8 @@ fn masked_approval_value(value: &Value) -> Value {
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+pub(crate) mod chat_admin;
+pub(crate) mod decision_service;
 mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
@@ -144,6 +146,7 @@ pub mod policy_snapshot;
 mod delivery;
 pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+mod admin_ai;
 mod ag_ui;
 pub(crate) use ag_ui::same_ag_ui_request;
 mod turn_origin;
@@ -430,7 +433,7 @@ impl ApprovalRecord {
     /// The instant this approval expires (created_at + ttl). `None` if
     /// `created_at` is unparseable — treated as "already expired" by
     /// [`is_stale`] (fail-closed).
-    fn expires_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) fn expires_at(&self) -> Option<DateTime<Utc>> {
         let created = DateTime::parse_from_rfc3339(&self.created_at).ok()?;
         Some(created.with_timezone(&Utc) + chrono::Duration::seconds(self.ttl_seconds))
     }

@@ -359,15 +359,21 @@ async fn a_peer_cannot_be_given_the_right_by_a_schedule_and_an_unknown_employee_
     .unwrap();
     let mut ghost = weekly_goal("y");
     ghost.agent_id = "ghost".into();
+    assert!(matches!(create(
+        dir.path(), &store, &Creator::new(&o.admin, true).unwrap(), ghost, now(),
+    ).await, Err(crate::assign_schedule::manage::CreateError::AssigneeUnavailable)));
+    // The employee exists at creation and becomes unavailable before fire.
     let ghost_row = create(
         dir.path(),
         &store,
         &Creator::new(&o.admin, true).unwrap(),
-        ghost,
+        weekly_goal("y"),
         now(),
     )
     .await
     .unwrap();
+    std::fs::write(dir.path().join("agents").join(&ghost_row.agent_id).join("agent.toml"),
+        "[model").unwrap();
     tick(dir.path(), &reg, at("2026-10-26T01:00:20Z"))
         .await
         .unwrap();

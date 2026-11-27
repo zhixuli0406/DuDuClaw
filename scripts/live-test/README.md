@@ -101,6 +101,115 @@ The old evidence did not retain the close code or distinguish transport errors
 from JSON errors; the transport diagnosis follows the shutdown path and the
 existing socket contract, and the rerun must capture those details.
 
+## Runtime fallback reproduction
+
+`runtime-fallback-repro.mjs` observes runtime fallback using any supplied release
+or development executable, with no special build features or npm dependencies.
+Requires Node 20+ and macOS `sandbox-exec`/`lsof` for enforced loopback-only
+network access. Run outside the implementation sandbox:
+
+```bash
+node scripts/live-test/runtime-fallback-repro.mjs --bin /path/to/v1.85.0/duduclaw
+node scripts/live-test/runtime-fallback-repro.mjs --bin /path/to/new/duduclaw --scenario C-fallback-model --keep --verbose
+```
+
+Each scenario gets fresh `HOME`/`DUDUCLAW_HOME`, fake vendor CLIs, no inherited
+credentials, and a random loopback port. The script sends one ordinary WebChat
+turn; C first calls the real `agents.update` RPC with `fallback` set to
+`grok-4.7-build-fast`. Claude missing-model output is a synthetic stream with
+system/init, assistant text and an error result (no captured vendor transcript).
+`A-chat-exec-error` instead emits stderr and exits non-zero without a stream.
+A-dispatch is explicitly skipped:
+the existing acceptance harness does not drive dispatch, and `tasks.create`
+alone only inserts a task-board row; scheduler/judge execution is unverified.
+
+Stdout is JSON Lines: one observation per scenario followed by a summary of
+observed fallback attempts, with no version-specific verdict. RUN counts exclude
+Claude utility calls and calls before the chat turn. Probe counts include startup:
+help/version flags, auth/login/status commands, and other non-run commands
+(including Codex sandbox preflight) are probes. RUN forms are Claude `-p`/`--print`,
+Codex `exec`, and Grok `-p`/`--single`. Retained `invocations.jsonl` contains every
+shim invocation, its kind, arguments, model environment, inherited/effective homes,
+working directory and timestamp. Scrubbed subprocesses may omit `DUDUCLAW_HOME`;
+the shim validates HOME and restores only its baked-in isolated home. Successful
+fake version probes register Codex/Grok; no real or fake login files are needed.
+`fallback_model_arg` is the last observed fallback RUN model (null if absent).
+`primary_models_tried` and `fallback_models_tried` list model arguments in
+invocation order, including repeated attempts. Models come from `--model`/`-m`
+or Codex `-c model=...`; missing values appear in `model_extraction_errors`,
+never as invented model names or null array entries.
+Primary CLI fixtures fail for every requested model, including the singular
+model fallback. Claude scenarios use `claude-does-not-exist-9` as preferred;
+Codex scenarios use `gpt-5.3-codex`. Both keep `claude-haiku-4-5` as the initial
+singular model fallback, matching the `agents.create` scaffold.
+`agent_toml_model_section` preserves the actual model section, including singular
+or plural fallback keys; C also records `agent_toml_model_section_before` before
+`agents.update`. C also reports `agents_update_fallback_requested`,
+`model_fallback_written`, `model_fallbacks_written` (null if absent), and
+`grok_run_models_received` as plain observations. `diagnostics` contains every
+runtime-unavailable diagnostic JSON; parse failures remain visible separately.
+`explicit_fallback_logged`/`explicit_fallback_lines` retain fallback log evidence.
+`fallback_attempted` requires a fallback RUN; `fallback_step_recorded` instead
+checks for an `explicit_fallback` diagnostic step (successful fallback can have
+no failure diagnostic). A missing fixture agent error includes the last matching
+gateway parse/load log lines. Control requires a Grok RUN after the failing Codex
+RUN; otherwise it reports `harness_invalid` with diagnostics and exits 2. A/C
+have no fallback expectation. Other harness errors/timeouts also exit 2;
+exit 0 means turns completed and any selected control was valid. Gateways are always stopped;
+temporary homes/logs are removed unless `--keep` is supplied. `--verbose` prints
+log paths to stderr, and repeatable `--scenario <name>` selects scenarios.
+These commands have not been live-run during implementation.
+
+## Authorization scope reproduction (K / M / U)
+
+`authz-scope-repro.mjs` observes member-key history reads (K1–K3), Manager
+budget/heartbeat access (M1–M3), and employee MCP `agent_update` authority
+(U1–U4). Requires Node 20+, macOS `sandbox-exec`, `sqlite3`, `lsof`, and an
+already-built executable; other operating systems fail closed before boot.
+
+```sh
+node scripts/live-test/authz-scope-repro.mjs --bin /absolute/path/to/duduclaw
+node scripts/live-test/authz-scope-repro.mjs --bin /absolute/path/to/duduclaw --scenario K1 --scenario U3 --keep --verbose
+```
+
+Each run creates fresh OS/product homes, production wildcard employee
+allowlists, a locally signed disposable OEM entitlement and a pre-MFA upgrade
+store, following `v185-acceptance.mjs`. Scenario accounts and bindings use
+Admin RPCs. PATH contains only local CLI shims plus `/usr/bin:/bin`; shims use
+the running Node executable. No inherited provider credentials are passed.
+Only generated internal MCP credentials and employee identity are forwarded
+from each employee's registration. An inherited OS sandbox blocks external
+network, real CLI fallback paths and access to the operator's product/Claude
+homes and keychains. Gateway, MCP and fake CLI processes use isolated HOME and
+DUDUCLAW_HOME. All owned process groups stop on completion or SIGINT/SIGTERM;
+the temporary home is deleted unless `--keep` is supplied (its path is in the
+summary). Retained homes contain disposable credentials; keep them private.
+
+Stdout is JSON Lines: one record per executed scenario, then a summary.
+`http_status` reports the WebSocket upgrade (normally 101), not the RPC
+outcome; `rpc_error` and per-call success fields record that separately.
+Stdio MCP has no HTTP status. No vulnerability verdict is assumed, and a
+refusal is a completed observation. Summary `null` means not observed;
+`false` means a completed observation did not find the named behavior.
+Consult `scenario_status` and the per-call evidence. Shared setup/helper
+failures emit one top-level `status: "harness_error"` record with a
+`harness_error` message and exit 2; scenarios that never ran emit no records.
+Exit 1 indicates scenario/cleanup errors, not an authorization verdict.
+Verbose, redacted logs go to stderr. Fake CLI records distinguish `probe`
+(`--help`, `--version`, `auth status`) from `run`; invocation evidence counts
+only matching runs.
+
+M2 runs before budget seeding. B has its automatic heartbeat disabled, with a
+local proactive check enabled to make an explicit trigger observable. M1
+seeds synthetic spend into the isolated telemetry database, as the budget
+unit tests do, then calls Admin `heartbeat.trigger`. Only a budget event
+written by the actual gateway gate qualifies; otherwise M1 is skipped with
+the reason. M3's heartbeat runs after seeding, so budget denial can prevent a
+CLI invocation even if its RPC was accepted. U4 is skipped if the tested
+binary does not advertise the database grant parameter. Nothing connects to
+a real model or database service. Implementation verification was limited to
+`node --check`; this harness has not been live-run in the restricted sandbox.
+
 ## Why `prod-shaped` exists
 
 v1.68.1 fixed a regression present since v1.67.0: an employee whose
@@ -261,3 +370,51 @@ select `third_party_mcp_tests::isolated_spawn_regression` in the
 `duduclaw-cli` library tests. It runs the full regression in a separate test
 process (including Rust stdio children); without a binary it prints an explicit
 SKIP. Its process helpers are registered in `scripts/ci/privileged_effects.json`.
+
+## Company Google sign-in (RM-214 P20)
+
+Requires Node 22+, `sqlite3`, and an already-built debug `live-test-mocks`
+executable. Pass an **OS sandbox wrapper**, as with
+`google-personal-identity.mjs`: it must deny real credentials/keychains and
+all non-loopback network access for the binary and its children.
+
+```bash
+node scripts/live-test/google-signin.mjs /path/to/guarded-binary-wrapper
+node --test scripts/live-test/google-signin.test.mjs
+```
+
+The bench creates isolated `HOME` (empty `os-home`) and `DUDUCLAW_HOME`, a
+`make-home.sh` production-shaped employee, and
+`[dashboard] public_url = "http://localhost:<port>"`. It sets
+`DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE` to its loopback mock, serves RSA JWKS and
+RS256 ID tokens, and verifies PKCE S256 plus the exact redirect URI on every
+code exchange. It never visits Google's authorization page or uses real Google
+credentials. The wrapper is an operator prerequisite; the argument alone does
+not enforce OS isolation.
+
+Named scenarios cover design §7 scenarios 1–11 and 13–14; Odoo (12) is excluded.
+Daily-cap checks run before other JIT accounts so the third new account can be
+checked against a cap of two. The Enterprise fixture uses the existing
+pre-MFA upgrade schema with MFA off and a disposable signed OEM license;
+it does not validate fresh-install Enterprise MFA defaults. The direct-MFA
+scenario enables policy through the real admin RPC at the end. A separate
+Personal process confirms its resolved edition before checking public routes.
+
+The script prints PASS/FAIL/SKIP with observed HTTP status and result code
+(`n/a` for RPC-only or unavailable observations), exits nonzero only for FAIL,
+and never prints tokens, authorization codes, cookies, nonces or client secrets.
+It retains private fixture homes, gateway logs and sanitized
+`google-signin-results.json` (including every token-endpoint hit's validation
+booleans), and stops its owned gateways. Inspect private logs locally; do not
+publish the fixture home as a production acceptance artifact.
+
+UI button rendering, admin notification delivery, completed blank-avatar creation,
+self-service linking, changed-email attestation, unlink/refresh, and full MFA
+code/TOTP/preauthorization ceremonies are explicitly SKIP. Scenario 11 selects
+a deliberately stale company-template revision, then only reads the member's
+`onboarding.get`; it SKIPs if real maintenance has not exposed
+`waiting_admin/template_changed` within 20 seconds. It does not inject avatar
+state or drive retry. Personal startup or edition-identification limitations
+also produce SKIP. Real Google, native keychain and platform acceptance remain
+separate. The self-tests import pure helpers without a binary, subprocess,
+listener, or npm dependencies.

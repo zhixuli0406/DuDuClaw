@@ -16,6 +16,7 @@ use duduclaw_core::google_identity::{
 use duduclaw_knowledge::requester::RequesterIdentity;
 
 use super::{oauth, scopes};
+use crate::google_identity::write_scope_guard;
 use crate::google_identity::resolve::Resolved;
 use crate::google_identity::{
     Refusal,
@@ -149,6 +150,7 @@ fn check_record(home: &Path, record: &vault::Record, tool: &str) -> Result<(), R
     check_metadata(home, &record.metadata, tool)
 }
 pub(super) fn check_metadata(home: &Path, metadata: &Metadata, tool: &str) -> Result<(), Refusal> {
+    write_scope_guard::check_personal(home, metadata, &metadata.granted_scopes)?;
     if metadata.status != Status::Connected {
         return Err(Refusal::soft(
             "needs_reconnect",
@@ -318,6 +320,13 @@ pub async fn resolve(
                 if tokens.secret.refresh_token.is_none() {
                     tokens.secret.refresh_token = secret.refresh_token.take();
                 }
+                tokens.granted_scopes = Some(write_scope_guard::check_personal_refresh(
+                    home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+                ).await?);
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+                    zeroize::Zeroize::zeroize(&mut tokens.secret.access_token);
+                    return Err(refresh_route_changed());
+                }
                 let current_scopes = tokens.granted_scopes.as_deref();
                 if !vault::finish_refresh_with_scopes(
                     home,
@@ -408,6 +417,7 @@ pub async fn resolve(
         email: record.metadata.account_email,
         authority,
         token: crate::google_service_account::MintedToken {
+            granted_scopes: Some(record.metadata.granted_scopes.clone()),
             access_token: secret.access_token.clone(),
             expires_in,
         },
@@ -700,6 +710,12 @@ async fn resolve_pinned_core(
         #[cfg(test)]
         pinned_test::run_before_publish(home);
         read_mode.check()?;
+        tokens.granted_scopes = Some(read_mode.wait(write_scope_guard::check_personal_refresh(
+            home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+        )).await??);
+        read_mode.check()?;
+        validate_pinned_selection(home, agent, requester, people, selected, purpose_key)?;
+        before.validate(home, agent, requester, people, purpose_key)?;
         if !vault::finish_refresh_with_scopes(
             home,
             &key,

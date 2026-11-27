@@ -1,7 +1,7 @@
 //! Signed internal MCP callers use the same create/query service as RPC.
 use super::*;
 use duduclaw_gateway::discovery::service::{self, TrustedCaller};
-fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String> {
+fn caller_identity(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String> {
     if let Some(call) = crate::mcp_isolation::current() {
         if call.home != home || call.agent != agent {
             return Err("discovery caller does not match the verified request".into());
@@ -13,6 +13,12 @@ fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller,String>
     let token=crate::mcp_isolation_identity::var(duduclaw_core::ENV_AGENT_TOKEN).ok();
     TrustedCaller::from_signed_agent(home,&claim,token.as_deref())
 }
+async fn caller(home: &Path, agent: &str) -> std::result::Result<TrustedCaller, String> {
+    let caller = caller_identity(home, agent)?;
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home);
+    let roles = super::delegation_roles::LoopbackOwnerRoles::load(home, agent, &read).await;
+    Ok(match roles.facts() { Some(facts) => caller.with_delegation_roles(facts), None => caller })
+}
 pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &str) -> Value {
     // Preserve the existing signed-agent/operator admission and approval flow.
     // Only the protected execution target is newly restricted here.
@@ -23,7 +29,7 @@ pub(crate) async fn handle_discovery_create(args: &Value, home: &Path, agent: &s
     ).await {
         return tool_error(&reason);
     }
-    let caller=match caller(home,agent) {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
+    let caller=match caller(home,agent).await {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
     let store=match duduclaw_gateway::task_store::TaskStore::open(home) {Ok(store)=>store,Err(error)=>return tool_error(&error)};
     let broker=match duduclaw_gateway::approval::ApprovalBroker::open(home) {Ok(broker)=>broker,Err(error)=>return tool_error(&error)};
     let mut request=args.clone();
@@ -51,7 +57,7 @@ fn protected_refusal(name: &str, args: &Value) -> Option<Value> {
 }
 pub(crate) async fn handle_discovery_query(name: &str,args: &Value,home: &Path,agent: &str) -> Value {
     if let Some(refused) = protected_refusal(name, args) { return refused; }
-    let caller=match caller(home,agent) {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
+    let caller=match caller(home,agent).await {Ok(caller)=>caller,Err(error)=>return tool_error(&error)};
     let run=args.get("run_id").and_then(Value::as_str).unwrap_or("");
     let result=match name {
         "discovery_catalog"=>service::catalog(home,&caller,args.get("agent_id").and_then(Value::as_str).unwrap_or(agent)),

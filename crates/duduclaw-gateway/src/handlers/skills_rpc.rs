@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
 
 impl MethodHandler {
     // ── Skills ──────────────────────────────────────────────
@@ -13,14 +14,22 @@ impl MethodHandler {
 
     /// Installed skills matching `query` (name or content), only on the
     /// employees `viewer` may view.
+    #[cfg(test)]
     pub(crate) async fn local_skill_hits(&self, viewer: &UserContext, query: &str) -> Vec<Value> {
+        self.local_skill_hits_with_grants(viewer, query, &DeptGrantView::empty()).await
+    }
+
+    async fn local_skill_hits_with_grants(
+        &self, viewer: &UserContext, query: &str, view: &DeptGrantView,
+    ) -> Vec<Value> {
         let lower = query.to_lowercase();
         let reg = self.registry.read().await;
         let mut results = Vec::new();
         for agent in reg
             .list()
             .into_iter()
-            .filter(|a| viewer.has_agent_access(&a.config.agent.name, AccessLevel::Viewer))
+            .filter(|a| viewer.has_agent_access(&a.config.agent.name, AccessLevel::Viewer)
+                || department_grant_allows(view, &a.config.agent.name, GrantGroup::Skills, GrantAction::Read))
         {
             for skill in &agent.skills {
                 let name_match = skill.name.to_lowercase().contains(&lower);
@@ -52,7 +61,8 @@ impl MethodHandler {
             Err(_) => return WsFrame::error_response("", "permission denied"),
         };
 
-        let mut results = self.local_skill_hits(&fresh, query).await;
+        let view = DeptGrantView::load(self, ctx).await;
+        let mut results = self.local_skill_hits_with_grants(&fresh, query, &view).await;
 
         // Search the skill market via the multi-hub aggregator — the same
         // HubRegistry the MCP `skill_search` tool uses, so the dashboard and

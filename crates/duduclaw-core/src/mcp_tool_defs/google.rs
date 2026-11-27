@@ -9,6 +9,91 @@ use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
+        name: "drive_create_file",
+        description: "Create a Drive file from text or a conversation attachment, or create a folder.",
+        params: &[
+            ParamDef { name: "name", description: "File or folder name", required: true },
+            ParamDef { name: "parent_folder_id", description: "Folder ID or Drive folder link; omitted means My Drive root when permitted", required: false },
+            ParamDef { name: "text", description: "Text content, max 100000 characters; choose exactly one of text, attachment, folder", required: false },
+            ParamDef { name: "attachment", description: "File name of an attachment from this conversation", required: false },
+            ParamDef { name: "folder", description: "Set true to create a folder", required: false },
+            ParamDef { name: "convert_to", description: "Convert content to document or spreadsheet", required: false },
+            ParamDef { name: "mime_type", description: "Text MIME type", required: false },
+        ],
+    },
+    ToolDef {
+        name: "drive_copy_file",
+        description: "Copy a Drive file to a folder.",
+        params: &[
+            ParamDef { name: "file_id", description: "File ID or URL", required: true },
+            ParamDef { name: "parent_folder_id", description: "Destination folder ID or Drive folder link", required: true },
+            ParamDef { name: "name", description: "New file name", required: false },
+        ],
+    },
+    ToolDef {
+        name: "drive_update_file",
+        description: "Rename a Drive file, change its description, or replace non-Google text file contents.",
+        params: &[
+            ParamDef { name: "file_id", description: "File ID or URL", required: true },
+            ParamDef { name: "name", description: "New file name", required: false },
+            ParamDef { name: "description", description: "New file description", required: false },
+            ParamDef { name: "text", description: "Replacement content; only non-Google-format text files", required: false },
+        ],
+    },
+    ToolDef {
+        name: "drive_move_file",
+        description: "Move a Drive file to a destination folder.",
+        params: &[
+            ParamDef { name: "file_id", description: "File ID or URL", required: true },
+            ParamDef { name: "destination_folder_id", description: "Destination folder ID or Drive folder link", required: true },
+        ],
+    },
+    ToolDef {
+        name: "drive_trash_file",
+        description: "Move a Drive file to the trash; does not permanently delete it.",
+        params: &[
+            ParamDef { name: "file_id", description: "File ID or URL", required: true },
+        ],
+    },
+    ToolDef {
+        name: "docs_insert_text",
+        description: "Insert text at the start, end, or after unique text in a Google Doc.",
+        params: &[
+            ParamDef { name: "document_id", description: "Document ID or URL", required: true },
+            ParamDef { name: "text", description: "Text to insert, max 20000 characters", required: true },
+            ParamDef { name: "at", description: "Insert at start or end; choose at or after_text", required: false },
+            ParamDef { name: "after_text", description: "Anchor text that must occur exactly once in the document", required: false },
+            ParamDef { name: "tab_id", description: "Document tab ID", required: false },
+        ],
+    },
+    ToolDef {
+        name: "docs_format",
+        description: "Apply supported styles, a header, or a tab operation to a Google Doc.",
+        params: &[
+            ParamDef { name: "document_id", description: "Document ID or URL", required: true },
+            ParamDef { name: "operations", description: "Up to 50 supported operations using unique text anchors", required: true },
+        ],
+    },
+    ToolDef {
+        name: "sheets_add_sheet",
+        description: "Add a spreadsheet sheet, optionally copying an existing sheet.",
+        params: &[
+            ParamDef { name: "spreadsheet_id", description: "Spreadsheet ID or URL", required: true },
+            ParamDef { name: "title", description: "New sheet title", required: true },
+            ParamDef { name: "copy_from_sheet", description: "Existing sheet name to copy", required: false },
+        ],
+    },
+    ToolDef {
+        name: "sheets_add_note",
+        description: "Set a note on up to 1000 spreadsheet cells; an empty note clears it.",
+        params: &[
+            ParamDef { name: "spreadsheet_id", description: "Spreadsheet ID or URL", required: true },
+            ParamDef { name: "range", description: "A1 range, at most 1000 cells", required: true },
+            ParamDef { name: "note", description: "Note text, max 5000 characters; empty clears the note", required: true },
+        ],
+    },
+
+    ToolDef {
         name: "gmail_send_draft",
         description: "Send a Gmail draft after per-call human confirmation of a Google-owned content snapshot. Native REST only; never retry an unconfirmed result.",
         params: &[ParamDef { name: "draft_id", description: "Existing Gmail draft ID", required: true }],
@@ -406,3 +491,117 @@ pub(super) const TOOLS: &[ToolDef] = &[
         }],
     },
 ];
+
+/// Schema constraints for the gateway-only write vocabulary.
+pub(super) fn drive_write_schema(tool: &str, schema: &mut serde_json::Value) {
+    use serde_json::json;
+    if !crate::google_identity::is_drive_write_tool(tool) { return; }
+    schema["additionalProperties"] = json!(false);
+    match tool {
+        "drive_create_file" => {
+            schema["properties"]["text"]["maxLength"] = json!(100000);
+            schema["properties"]["folder"]["const"] = json!(true);
+            schema["properties"]["convert_to"]["enum"] = json!(["document", "spreadsheet"]);
+            schema["properties"]["mime_type"]["enum"] = json!(["text/plain", "text/csv", "text/markdown"]);
+            schema["oneOf"] = json!([
+                {"required":["text"]}, {"required":["attachment"]}, {"required":["folder"]}
+            ]);
+        }
+        "docs_insert_text" => {
+            schema["properties"]["text"]["maxLength"] = json!(20000);
+            schema["properties"]["text"]["minLength"] = json!(1);
+            schema["properties"]["at"]["enum"] = json!(["start", "end"]);
+            schema["properties"]["after_text"]["minLength"] = json!(1);
+            schema["properties"]["after_text"]["maxLength"] = json!(1000);
+            schema["properties"]["tab_id"]["pattern"] = json!("^[A-Za-z0-9._-]{1,128}$");
+            schema["oneOf"] = json!([{"required":["at"]}, {"required":["after_text"]}]);
+        }
+        "docs_format" => {
+            schema["properties"]["operations"] = json!({
+                "type":"array", "minItems":1, "maxItems":50,
+                "items":{"oneOf":[
+                    {"type":"object","additionalProperties":false,"required":["type","text","named_style"],
+                     "properties":{
+                        "type":{"const":"paragraph_style"},
+                        "text":{"type":"string","minLength":1},
+                        "named_style":{"type":"string","enum":["NORMAL_TEXT","TITLE","SUBTITLE","HEADING_1","HEADING_2","HEADING_3","HEADING_4","HEADING_5","HEADING_6"]},
+                        "alignment":{"type":"string","enum":["START","CENTER","END","JUSTIFIED"]}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","text"],
+                     "anyOf":[{"required":["bold"]},{"required":["italic"]},{"required":["underline"]},{"required":["font_size_pt"]}],
+                     "properties":{
+                        "type":{"const":"text_style"},
+                        "text":{"type":"string","minLength":1},
+                        "bold":{"type":"boolean"},"italic":{"type":"boolean"},"underline":{"type":"boolean"},
+                        "font_size_pt":{"type":"number","minimum":6,"maximum":96}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","table_index","row","column","background_hex"],
+                     "properties":{
+                        "type":{"const":"table_cell_style"},
+                        "table_index":{"type":"integer","minimum":0,"maximum":99},
+                        "row":{"type":"integer","minimum":0,"maximum":499},
+                        "column":{"type":"integer","minimum":0,"maximum":49},
+                        "background_hex":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","text"],
+                     "properties":{"type":{"const":"header"},"text":{"type":"string","maxLength":1000}}},
+                    {"type":"object","additionalProperties":false,"required":["type","title"],
+                     "properties":{"type":{"const":"add_tab"},"title":{"type":"string","minLength":1,"maxLength":100}}}
+                ]}
+            });
+        }
+        "sheets_add_sheet" => {
+            for key in ["title", "copy_from_sheet"] {
+                schema["properties"][key]["minLength"] = json!(1);
+                schema["properties"][key]["maxLength"] = json!(100);
+            }
+        }
+        "sheets_add_note" => { schema["properties"]["note"]["maxLength"] = json!(5000); }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn drive_write_schemas_are_closed_and_bounded() {
+        let schema = |name| {
+            super::super::build_tool_schema(TOOLS.iter().find(|t| t.name == name).unwrap())["inputSchema"].clone()
+        };
+        for tool in crate::google_identity::DRIVE_WRITE_TOOLS {
+            assert_eq!(schema(*tool)["additionalProperties"], false, "{tool}");
+        }
+        let create = schema("drive_create_file");
+        assert_eq!(create["required"], json!(["name"]));
+        assert_eq!(create["oneOf"], json!([
+            {"required":["text"]}, {"required":["attachment"]}, {"required":["folder"]}
+        ]));
+        assert_eq!(create["properties"]["folder"]["type"], "boolean");
+        assert_eq!(create["properties"]["folder"]["const"], true);
+        assert_eq!(create["properties"]["text"]["maxLength"], 100000);
+        assert_eq!(create["properties"]["convert_to"]["enum"], json!(["document","spreadsheet"]));
+        assert_eq!(create["properties"]["mime_type"]["enum"], json!(["text/plain","text/csv","text/markdown"]));
+        let insert = schema("docs_insert_text");
+        assert_eq!(insert["properties"]["text"]["maxLength"], 20000);
+        assert_eq!(insert["oneOf"], json!([{"required":["at"]},{"required":["after_text"]}]));
+        assert_eq!(insert["properties"]["at"]["enum"], json!(["start","end"]));
+        let format = schema("docs_format");
+        assert_eq!(format["properties"]["operations"]["maxItems"], 50);
+        let operations = format["properties"]["operations"]["items"]["oneOf"].as_array().unwrap();
+        for (op, name) in operations.iter().zip(["paragraph_style","text_style","table_cell_style","header","add_tab"]) {
+            assert_eq!(op["additionalProperties"], false);
+            assert_eq!(op["properties"]["type"]["const"], name);
+        }
+        assert_eq!(operations[1]["properties"]["font_size_pt"]["maximum"], 96);
+        assert!(operations[1]["properties"].get("font_size").is_none());
+        assert_eq!(operations[2]["properties"]["row"]["maximum"], 499);
+        assert_eq!(schema("sheets_add_note")["properties"]["note"]["maxLength"], 5000);
+        assert_eq!(schema("drive_move_file")["required"], json!(["file_id","destination_folder_id"]));
+        assert!(schema("drive_move_file")["properties"].get("removeParents").is_none());
+        assert_eq!(schema("drive_copy_file")["required"], json!(["file_id","parent_folder_id"]));
+        assert_eq!(schema("sheets_add_sheet")["required"], json!(["spreadsheet_id","title"]));
+    }
+}
