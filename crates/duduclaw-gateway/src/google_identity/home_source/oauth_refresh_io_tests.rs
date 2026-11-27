@@ -98,6 +98,7 @@ async fn home_refresh_without_scope_and_no_write_credential_retains_captured_sco
     use crate::google_identity::write_scope_guard::testing::TokeninfoWire;
     use crate::google_personal::oauth::TEST_TOKENINFO_URL;
     let home = tempfile::tempdir().unwrap();
+    assert!(!crate::person_credentials::write_store::ever_granted(home.path(), "home", "home").unwrap());
     let mut body = good();
     body.as_object_mut().unwrap().remove("scope");
     let mut parsed = parse_tokens(body, &["captured-scope".into()], 1_800_000_000).unwrap();
@@ -106,6 +107,34 @@ async fn home_refresh_without_scope_and_no_write_credential_retains_captured_sco
         .await.unwrap();
     assert_eq!(parsed.scopes, vec!["captured-scope"]);
     assert_eq!(wire.calls(), 0);
+}
+
+#[tokio::test]
+async fn home_refresh_without_scope_after_write_disconnect_verifies_tokeninfo() {
+    use crate::google_identity::write_scope_guard::testing::{install_write_credential, TokeninfoWire};
+    use crate::google_personal::oauth;
+    use crate::person_credentials::write_store;
+    for scopes in [Some(oauth::DRIVE_WRITE_SCOPE), Some(oauth::DRIVE_TOOLS_SCOPE), None] {
+        let home = tempfile::tempdir().unwrap();
+        duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
+        crate::handlers::credential_protection_rpc::protection_for(home.path()).enable(false).unwrap();
+        let key = crate::google_identity::protection_gate(home.path()).unwrap();
+        install_write_credential(home.path(), &key, "home", "home", "home-client");
+        write_store::disconnect(home.path(), "home", "home").unwrap();
+        assert!(write_store::get(home.path(), "home", "home").unwrap().is_none());
+        let mut body = good();
+        body.as_object_mut().unwrap().remove("scope");
+        let mut parsed = parse_tokens(body, &["captured-scope".into()], 1_800_000_000).unwrap();
+        let wire = TokeninfoWire::new("owned-access", "home-client", scopes).await;
+        let result = oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(),
+            verify_refresh_scopes(home.path(), "home-client", &mut parsed)).await;
+        match scopes {
+            Some(oauth::DRIVE_WRITE_SCOPE) => assert!(matches!(result, Err(Error::WriteScopeIsolated))),
+            Some(scope) => { result.unwrap(); assert_eq!(parsed.scopes, vec![scope]); }
+            None => assert!(matches!(result, Err(Error::ScopeUnverified))),
+        }
+        assert_eq!(wire.calls(), 1);
+    }
 }
 
 #[tokio::test]

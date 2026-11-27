@@ -225,7 +225,56 @@ fn missing_write_store_is_empty_without_creating_a_file() {
     assert!(all_metadata(home.path()).unwrap().is_empty());
     assert!(get(home.path(), "user", "user-a").unwrap().is_none());
     assert!(snapshot(home.path(), "home", "home").unwrap().is_none());
+    assert!(!ever_granted(home.path(), "user", "user-a").unwrap());
     assert!(!path(home.path()).exists());
+}
+
+#[test]
+fn ever_granted_survives_disconnect_suspension_and_ordinary_disconnect() {
+    let (home, key) = fixture();
+    connect_personal(home.path(), &key);
+    connected(home.path(), &key, "user", "user-a");
+    assert!(read(home.path()).unwrap().ever_granted.contains("user:user-a"));
+    assert!(!ever_granted(home.path(), "user", "user-b").unwrap());
+    assert!(!ever_granted(home.path(), "home", "home").unwrap());
+    crate::person_credentials::sync_user_status(home.path(), "user-a", false).unwrap();
+    assert!(ever_granted(home.path(), "user", "user-a").unwrap());
+    disconnect(home.path(), "user", "user-a").unwrap();
+    assert!(get(home.path(), "user", "user-a").unwrap().is_none());
+    assert!(ever_granted(home.path(), "user", "user-a").unwrap());
+    crate::person_credentials::disconnect(home.path(), "user-a").unwrap();
+    assert!(crate::person_credentials::get(home.path(), "user-a").unwrap().is_none());
+    assert!(ever_granted(home.path(), "user", "user-a").unwrap());
+}
+
+#[test]
+fn legacy_write_store_without_ever_granted_parses_and_disconnect_retains_grant() {
+    let (home, key) = fixture();
+    connected(home.path(), &key, "user", "user-a");
+    let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(path(home.path())).unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("ever_granted");
+    std::fs::write(path(home.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(read(home.path()).unwrap().ever_granted.is_empty());
+    assert!(ever_granted(home.path(), "user", "user-a").unwrap());
+    disconnect(home.path(), "user", "user-a").unwrap();
+    assert!(get(home.path(), "user", "user-a").unwrap().is_none());
+    assert!(ever_granted(home.path(), "user", "user-a").unwrap());
+
+    legacy["records"] = serde_json::json!([]);
+    std::fs::write(path(home.path()), serde_json::to_vec(&legacy).unwrap()).unwrap();
+    assert!(!ever_granted(home.path(), "user", "user-a").unwrap());
+}
+
+#[test]
+fn ever_granted_rejects_unreadable_store_and_invalid_markers() {
+    let home = tempfile::tempdir().unwrap();
+    begin_connection(home.path(), "user", "user-a").unwrap();
+    for contents in ["invalid-json".to_owned(),
+        serde_json::json!({"version": super::super::VERSION, "records": [], "ever_granted": ["home:other"]}).to_string(),
+    ] {
+        std::fs::write(path(home.path()), contents).unwrap();
+        assert!(ever_granted(home.path(), "user", "user-a").is_err());
+    }
 }
 
 #[test]

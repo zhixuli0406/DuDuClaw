@@ -45,7 +45,8 @@ pub(in crate::google_identity) struct Approval {
 /// Explicit fields only: no argument/content bags or token-bearing structs.
 pub(in crate::google_identity) struct DriveWriteAudit {
     pub call_id: String,
-    pub google_turn_id: Option<String>,
+    pub google_turn_id: String,
+    pub id_source: &'static str,
     pub run_id: Option<String>,
     pub agent_id: String,
     pub identity_kind: String,
@@ -74,6 +75,7 @@ pub(in crate::google_identity) fn append(home: &Path, record: &DriveWriteAudit) 
         record.outcome == Outcome::Confirmed && record.post_check == PostCheck::Ok,
         &[
             ("call_id", json!(record.call_id)), ("google_turn_id", json!(record.google_turn_id)),
+            ("id_source", json!(record.id_source)),
             ("run_id", json!(record.run_id)), ("identity_kind", json!(record.identity_kind)),
             ("account_email", json!(record.account_email)), ("requester", json!(record.requester)),
             ("action", json!(record.action)), ("tool", json!(record.tool)),

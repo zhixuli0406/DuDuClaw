@@ -427,13 +427,13 @@ async fn push_plain_notice_inner(
     receipt
 }
 
-/// Exact host-attested account/chat/thread, with explicit full-UUID commands.
-/// No token cascade or alternative destination may receive private mail details.
 #[cfg(test)]
 tokio::task_local! {
     pub(crate) static TEST_EXACT_CONFIRMATIONS: std::sync::Arc<std::sync::Mutex<Vec<(crate::approval::DecisionContext, String)>>>;
 }
 
+/// Exact host-attested account/chat/thread, with explicit full-UUID commands.
+/// No token cascade or alternative destination may receive private mail details.
 pub(crate) async fn push_exact_confirmation(
     target: &crate::approval::TrustedReplyTarget, body: &str,
 ) -> Option<(String, String)> {
