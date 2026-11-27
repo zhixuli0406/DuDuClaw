@@ -1,3 +1,4 @@
+pub(crate) mod card;
 pub(crate) mod config;
 pub(crate) mod ledger;
 pub(crate) mod receipts;

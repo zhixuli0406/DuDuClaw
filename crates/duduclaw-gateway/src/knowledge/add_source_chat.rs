@@ -108,13 +108,22 @@ pub(crate) async fn decide(home: &Path, rec: &ApprovalRecord, context: &Decision
     Ok(if approve { "已核准並加入知識庫。" } else { "已拒絕加入知識庫。" }.into())
 }
 
+/// Shared content fields and limits for owner and chat-admin cards.
+/// Keep missing fields absent; callers supply their own localized labels.
+pub(crate) fn card_fields(rec: &ApprovalRecord) -> [(&'static str, usize); 3] {
+    [("title", 120),
+        if rec.payload["url"].is_string() { ("url", 2048) } else { ("original_name", 200) },
+        ("preview", 300)]
+}
+
 /// Each untrusted field is a bounded, inert single line; notices never call this.
 pub(crate) fn card_body(rec: &ApprovalRecord, channel: &str) -> String {
     let field = |key: &str, max: usize| crate::markdown_render::untrusted_preview(
         channel, rec.payload[key].as_str().unwrap_or(""), max);
+    let fields = card_fields(rec);
     format!("加入知識庫的請求\n標題：{}\n檔案／網址：{}\n預覽：{}\n僅限集合目前的擁有者在此私訊決定。\n確認 {}\n取消 {}",
-        field("title", 120), if rec.payload["url"].is_string() { field("url", 2048) } else { field("original_name", 200) },
-        field("preview", 300), rec.id.as_str(), rec.id.as_str())
+        field(fields[0].0, fields[0].1), field(fields[1].0, fields[1].1),
+        field(fields[2].0, fields[2].1), rec.id.as_str(), rec.id.as_str())
 }
 
 /// Each collection decider's verified DMs first. Departments expand to active
