@@ -220,3 +220,106 @@ fn unknown_proof_kind_denied_even_with_factor() {
         [&user]).unwrap();
     assert!(db.mfa_require_independent_proof(&token,NOW).is_err());
 }
+
+fn assert_email_refused(db: &UserDb, user: &str, token: &str, enrollment: bool) {
+    assert_eq!(db.mfa_email_http_capability(token,enrollment,None,NOW).unwrap_err(),DENIED);
+    assert_eq!(db.mfa_email_send(token,enrollment,NOW).unwrap_err(),DENIED);
+    let count: i64 = db.conn().query_row("SELECT COUNT(*) FROM mfa_email_codes WHERE token_hash=?1",
+        [token_hash(token)], |r|r.get(0)).unwrap();
+    assert_eq!(count,0);
+    // Seed a valid code so verification must reject the first factor, not
+    // merely fail because sending was refused or the code was incorrect.
+    let code = "123456";
+    db.conn().execute("INSERT INTO mfa_email_codes(token_hash,user_id,email,code_hash,expires_at)
+        SELECT ?1,id,email,?3,?4 FROM users WHERE id=?2",
+        params![token_hash(token),user,token_hash(&format!("email:{token}:{code}")),NOW+email::EMAIL_TTL]).unwrap();
+    let mut issued = false;
+    let result = db.mfa_email_verify_and_issue(token,code,enrollment,NOW,|_,_,_| {
+        issued = true;
+        Ok(())
+    });
+    assert_eq!(result.unwrap_err(),DENIED);
+    assert!(!issued);
+    let state: (i64,bool) = db.conn().query_row("SELECT attempts,consumed FROM mfa_challenges WHERE token_hash=?1",
+        [token_hash(token)], |r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(state,(0,false));
+}
+
+fn email_factor_count(db: &UserDb, user: &str) -> i64 {
+    db.conn().query_row("SELECT COUNT(*) FROM mfa_email_credentials WHERE user_id=?1",
+        [user], |r|r.get(0)).unwrap()
+}
+
+#[test]
+fn google_oidc_email_enrollment_refused() {
+    let (_dir, db, _admin, user, _request) = approved(false);
+    let token = prepare(&db,&user,FirstFactor::GoogleOidc,NOW);
+    assert_eq!(proof(&db,&token),("admin".into(),false));
+    assert_email_refused(&db,&user,&token,true);
+    assert_eq!(email_factor_count(&db,&user),0);
+    assert!(!db.mfa_active(&user).unwrap());
+}
+
+#[test]
+fn google_oidc_email_refused_even_with_preauth() {
+    let (_dir, db, _admin, user, _request) = approved(true);
+    let token = prepare(&db,&user,FirstFactor::GoogleOidc,NOW);
+    assert_eq!(proof(&db,&token),("signin_approval".into(),true));
+    assert_email_refused(&db,&user,&token,true);
+    assert_eq!(email_factor_count(&db,&user),0);
+    let secret = db.mfa_begin(&user,Some(&token),&Cipher,NOW).unwrap();
+    let code = test_totp_code(&secret,NOW/30);
+    let codes = db.mfa_confirm_and_issue(&user,Some(&token),&code,&Cipher,NOW,|account,_,codes| {
+        assert_eq!(account.credential_epoch,1);
+        Ok(codes)
+    }).unwrap();
+    assert_eq!(codes.len(),10);
+    assert_eq!(db.mfa_factors(&user).unwrap()["factors"]["totp"],true);
+}
+
+#[test]
+fn google_oidc_email_login_refused() {
+    let (_dir, db, _admin, user, _request) = approved(false);
+    db.conn().execute("INSERT INTO mfa_email_credentials(user_id,email,verified_at)
+        SELECT id,email,?2 FROM users WHERE id=?1",params![user,NOW]).unwrap();
+    let token = db.mfa_challenge(&user,FirstFactor::GoogleOidc,false,NOW).unwrap();
+    assert_email_refused(&db,&user,&token,false);
+    assert_eq!(email_factor_count(&db,&user),1);
+}
+
+#[test]
+fn password_email_unchanged() {
+    let (_dir, db, admin, _user, _request) = approved(false);
+    let token = prepare(&db,&admin,FirstFactor::Password,NOW);
+    assert_eq!(proof(&db,&token),("admin".into(),false));
+    db.mfa_email_http_capability(&token,true,None,NOW).unwrap();
+    let (address,code) = db.mfa_email_send(&token,true,NOW).unwrap();
+    assert_eq!(address,db.get_user(&admin).unwrap().unwrap().email);
+    let mut issued = false;
+    let codes = db.mfa_email_verify_and_issue(&token,&code,true,NOW,|account,_,codes| {
+        issued = true;
+        assert_eq!(account.id,admin);
+        Ok(codes)
+    }).unwrap();
+    assert!(issued);
+    assert_eq!(codes.len(),10);
+    assert_eq!(email_factor_count(&db,&admin),1);
+    assert_eq!(db.mfa_factors(&admin).unwrap()["factors"]["email"],true);
+}
+
+#[test]
+fn unknown_first_factor_email_refused() {
+    for enrollment in [true,false] {
+        let (_dir, db, _admin, user, _request) = approved(false);
+        if !enrollment {
+            db.conn().execute("INSERT INTO mfa_email_credentials(user_id,email,verified_at)
+                SELECT id,email,?2 FROM users WHERE id=?1",params![user,NOW]).unwrap();
+        }
+        let token = db.mfa_challenge(&user,FirstFactor::GoogleOidc,enrollment,NOW).unwrap();
+        if enrollment { db.mfa_prepare_enrollment(&token,true,NOW).unwrap(); }
+        db.conn().execute("UPDATE mfa_challenges SET first_factor='bogus' WHERE token_hash=?1",
+            [token_hash(&token)]).unwrap();
+        assert_email_refused(&db,&user,&token,enrollment);
+        assert_eq!(email_factor_count(&db,&user),if enrollment {0} else {1});
+    }
+}

@@ -46,6 +46,17 @@ fn email_hash(token: &str, code: &str) -> String {
     token_hash(&format!("email:{token}:{code}"))
 }
 
+fn require_email_first_factor(conn: &Connection, token: &str) -> Result<()> {
+    let first: String = conn.query_row("SELECT first_factor FROM mfa_challenges WHERE token_hash=?1",
+        [token_hash(token)], |r|r.get(0)).map_err(|_|DENIED)?;
+    // The Google mailbox is not independent of Google sign-in. Unknown
+    // first factors must be explicitly evaluated before allowing email.
+    match first.as_str() {
+        "password" | "channel_otp" => Ok(()),
+        _ => Err(DENIED.into()),
+    }
+}
+
 impl UserDb {
     /// Password-capability reset. Test fixture only (eligibility-log writer
     /// tests): it has no Administrator-target rules. Production resets go
@@ -113,6 +124,7 @@ impl UserDb {
         if enrollment { self.mfa_http_enrollment(token, password, now)?; }
         let conn = self.conn();
         let user = challenge_user(&conn, token, if enrollment {"enroll"} else {"login"}, now)?;
+        require_email_first_factor(&conn, token)?;
         active_user(&conn, &user)?;
         if !enrollment {
             let verified: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials e JOIN users u ON u.id=e.user_id WHERE e.user_id=?1 AND e.email=u.email)",
@@ -127,6 +139,7 @@ impl UserDb {
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let user=challenge_user(&tx,token,if enrollment {"enroll"} else {"login"},now)?;
+        require_email_first_factor(&tx,token)?;
         active_user(&tx,&user)?;
         let email:String=tx.query_row("SELECT email FROM users WHERE id=?1",[&user],|r|r.get(0)).map_err(|_|DENIED)?;
         if !enrollment {
@@ -162,6 +175,7 @@ impl UserDb {
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since=crate::credential_changes::high_water(&tx)?;
         let user=challenge_user(&tx,token,if enrollment {"enroll"} else {"login"},now)?;
+        require_email_first_factor(&tx,token)?;
         active_user(&tx,&user)?;
         tx.execute("UPDATE mfa_challenges SET attempts=attempts+1 WHERE token_hash=?1",[token_hash(token)]).map_err(|e|e.to_string())?;
         let record:Option<(String,String)>=tx.query_row("SELECT c.email,c.code_hash FROM mfa_email_codes c JOIN users u ON u.id=c.user_id
