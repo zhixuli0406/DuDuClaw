@@ -20,6 +20,7 @@ use files::{Directory, safe_relative, segment};
 const STATE_FILE: &str = "skill_trust_state.json";
 const MAX_STATE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATED: usize = 4096;
+const MAX_OUTBOX_PER_TICK: usize = 16;
 const INTERNAL: &str = "自動放行檢查暫時無法完成，請人工確認";
 const EVIDENCE: &str = "來源證據缺漏、無法讀取或含不安全的檔案";
 const CONFIG: &str = "無法讀取自家技能來源設定";
@@ -417,9 +418,15 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
     static RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _running = RUN.lock().await;
     if !duduclaw_core::gateway_instance::held(home) { return; }
+    let mut outbox_budget = MAX_OUTBOX_PER_TICK;
     // Recover committed side effects even when there are no pending approvals.
     if let Ok(state) = load_state(home) {
-        for entry in state.outbox {
+        let now = chrono::Utc::now().timestamp();
+        for entry in state.outbox.into_iter().filter(|entry|
+            !entry.audit_done || !entry.activity_done || entry.next_at <= now
+                || entry.notice_state != delivery::NoticeState::Pending).take(outbox_budget)
+        {
+            outbox_budget -= 1;
             if let Err(error) = process_outbox(home, broker, entry).await {
                 tracing::warn!(%error, "skill trust outbox remains pending");
             }
@@ -449,11 +456,17 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
             retry_card(home, broker, &rec).await;
             continue;
         }
-        let evaluated = evaluate(home, &rec).await;
+        // New approvals share the recovery budget; leave excess candidates
+        // pending until a later tick rather than creating unbounded work.
+        if outbox_budget == 0 { break; }
+        let evaluated = evaluate(home, &rec).await.and_then(|approved| {
+            let entry = Outbox::new(home, &rec, &approved)?;
+            Ok((approved, entry))
+        });
         let reserved = update_state(home, |state| {
             if state.evaluated.contains(rec.id.as_str()) { return Ok(false); }
             if state.evaluated.len() >= MAX_EVALUATED { return Err(INTERNAL.into()); }
-            if let Ok(approved) = &evaluated {
+            if let Ok((approved, entry)) = &evaluated {
                 check_version(state, approved)?;
                 // An unresolved outbox reserves its version/digest without
                 // changing the high-water mark. Identical replays still pass.
@@ -469,7 +482,7 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
                     || (state.highest_versions.len() >= 4096 && !state.highest_versions.iter().any(|v|
                         v.publisher == approved.publisher && v.pack == approved.pack))
                 { return Err(INTERNAL.into()); }
-                state.outbox.push(Outbox::new(&rec, approved));
+                state.outbox.push(entry.clone());
             } else if let Err(reason) = &evaluated {
                 state.cards.insert(rec.id.to_string(), CardRetry::new(reason));
             }
@@ -493,12 +506,11 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
             }
             Ok(true) => {}
         }
-        let approved = match evaluated {
-            Ok(approved) => approved,
+        let entry = match evaluated {
+            Ok((_, entry)) => entry,
             Err(reason) => { refuse_with_retry(home, broker, &rec, &reason).await; continue; }
         };
         if !duduclaw_core::gateway_instance::held(home) { return; }
-        let entry = Outbox::new(&rec, &approved);
         #[cfg(test)]
         tests::before_cas(home, broker, &rec).await;
         // Reuse the store's in-transaction digest guard and status CAS.
@@ -507,6 +519,7 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
             Some((rec.id.to_string(), crate::approval::decision_digest(&rec))),
             broker.decide_by_skill_trust_policy(&rec.id, &policy),
         ).await;
+        outbox_budget -= 1;
         if let Err(error) = process_outbox(home, broker, entry).await {
             tracing::warn!(%error, "skill trust outbox remains pending");
         }

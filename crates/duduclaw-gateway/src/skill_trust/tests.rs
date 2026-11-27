@@ -16,7 +16,7 @@ use fixtures::*;
 struct Pushes {
     cards: Vec<ApprovalRecord>, notices: usize,
     card_failures: usize, notice_failures: usize,
-    human_before_cas: bool, fail_outbox_write: bool,
+    human_before_cas: bool, fail_outbox_write: bool, fail_audit_ack: bool,
 }
 fn hooks() -> &'static Mutex<BTreeMap<PathBuf, Pushes>> {
     static HOOKS: OnceLock<Mutex<BTreeMap<PathBuf, Pushes>>> = OnceLock::new();
@@ -40,7 +40,8 @@ pub(super) fn capture_notice(home: &Path) -> Option<delivery::NoticeState> {
     Some(result)
 }
 pub(super) fn fail_outbox_write(home: &Path, state: &State) -> bool {
-    !state.outbox.is_empty() && hooks().lock().unwrap().get(home).is_some_and(|p| p.fail_outbox_write)
+    !state.outbox.is_empty() && hooks().lock().unwrap().get(home).is_some_and(|p|
+        p.fail_outbox_write || (p.fail_audit_ack && state.outbox.iter().any(|entry| entry.audit_done)))
 }
 pub(super) async fn before_cas(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord) {
     let human = hooks().lock().unwrap().get(home).is_some_and(|p| p.human_before_cas);
@@ -526,6 +527,156 @@ async fn same_version_same_manifest_is_allowed() {
     update_state(f.path(), |state| { state.highest_versions.push(HighestVersion::from(&approved)); Ok(()) }).unwrap();
     f.run().await;
     assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn large_audit_log_retries_from_pre_cas_position_after_lost_ack() {
+    let f = Fixture::standard().await;
+    let path = f.path().join("security_audit.jsonl");
+    let filler = format!("{{\"filler\":\"{}\"}}\n", "x".repeat(1024)).repeat(4096);
+    std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap()
+        .write_all(filler.as_bytes()).unwrap();
+    // A matching record before the captured position must not suppress this delivery.
+    let event = AuditEvent::new("skills_auto_approved", "imported", Severity::Info,
+        serde_json::json!({"approval_id": f.id.as_str()}));
+    duduclaw_security::audit::try_append_audit_event(f.path(), &event).unwrap();
+    let since = duduclaw_security::audit::audit_log_position(f.path()).unwrap();
+    assert!(since > 4 * 1024 * 1024);
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = true;
+    f.run().await;
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+    let state = load_state(f.path()).unwrap();
+    assert_eq!(state.outbox.len(), 1);
+    assert_eq!(state.outbox[0].audit_since, since);
+    assert!(!state.outbox[0].audit_done, "append succeeded but its acknowledgement was lost");
+    assert_eq!(f.pushes().notices, 0);
+    let matches = || duduclaw_security::audit::read_recent_events(f.path(), 100).iter()
+        .filter(|e| e.event_type == "skills_auto_approved" && e.details["approval_id"] == f.id.as_str()).count();
+    assert_eq!(matches(), 2, "the earlier matching record is outside the deduplication window");
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = false;
+    f.run().await;
+    f.run().await;
+    assert_eq!(matches(), 2, "the matching record after audit_since prevents a duplicate");
+    assert!(load_state(f.path()).unwrap().outbox.is_empty());
+    assert_eq!(f.pushes().notices, 1);
+}
+
+#[tokio::test]
+async fn audit_position_failure_never_approves_and_pushes_manual_card() {
+    let f = Fixture::standard().await;
+    let path = f.path().join("security_audit.jsonl");
+    if path.exists() { std::fs::remove_file(&path).unwrap(); }
+    std::fs::create_dir(&path).unwrap();
+    assert!(duduclaw_security::audit::audit_log_position(f.path()).is_err());
+    f.run().await;
+    let record = f.record().await;
+    assert_eq!(record.status, ApprovalStatus::Pending);
+    assert!(record.decided_by.is_none());
+    let state = load_state(f.path()).unwrap();
+    assert!(state.outbox.is_empty() && state.highest_versions.is_empty());
+    assert!(state.evaluated.contains(f.id.as_str()));
+    assert_eq!(state.cards[f.id.as_str()].reason, INTERNAL);
+    assert_eq!(f.pushes().cards.len(), 1);
+    assert!(f.pushes().cards[0].summary.contains(INTERNAL));
+    assert_eq!(f.pushes().notices, 0);
+    assert!(!f.path().join("agents/alice/SKILLS/helper").exists());
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_outbox_persists_current_audit_position_before_append() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = true;
+    f.run().await;
+    let path = f.path().join(STATE_FILE);
+    let mut legacy: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    legacy["outbox"][0].as_object_mut().unwrap().remove("audit_since");
+    std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let since = duduclaw_security::audit::audit_log_position(f.path()).unwrap();
+    assert!(since > 0);
+
+    // A failed migration save must not append an event with an unpersisted position.
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_outbox_write = true;
+    f.run().await;
+    assert_eq!(duduclaw_security::audit::audit_log_position(f.path()).unwrap(), since);
+    assert_eq!(load_state(f.path()).unwrap().outbox[0].audit_since, u64::MAX);
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_outbox_write = false;
+    f.run().await;
+    let migrated = load_state(f.path()).unwrap();
+    assert_eq!(migrated.outbox[0].audit_since, since);
+    assert!(!migrated.outbox[0].audit_done);
+    let after_append = duduclaw_security::audit::audit_log_position(f.path()).unwrap();
+    assert!(after_append > since);
+    // Another lost acknowledgement must not recapture the now-larger position.
+    f.run().await;
+    assert_eq!(load_state(f.path()).unwrap().outbox[0].audit_since, since);
+    assert_eq!(duduclaw_security::audit::audit_log_position(f.path()).unwrap(), after_append);
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = false;
+    f.run().await;
+    assert!(load_state(f.path()).unwrap().outbox.is_empty());
+}
+
+#[tokio::test]
+async fn empty_log_position_is_not_mistaken_for_a_legacy_entry_on_retry() {
+    let f = Fixture::standard().await;
+    std::fs::write(f.path().join("security_audit.jsonl"), b"").unwrap();
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = true;
+    f.run().await;
+    assert_eq!(load_state(f.path()).unwrap().outbox[0].audit_since, 0);
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_audit_ack = false;
+    f.run().await;
+    let audit = duduclaw_security::audit::read_recent_events(f.path(), 100);
+    assert_eq!(audit.iter().filter(|e| e.event_type == "skills_auto_approved").count(), 1);
+}
+
+#[tokio::test]
+async fn outbox_recovery_processes_at_most_sixteen_entries_per_tick() {
+    let f = Fixture::standard().await;
+    let rec = f.record().await;
+    let approved = evaluate(f.path(), &rec).await.unwrap();
+    let template = Outbox::new(f.path(), &rec, &approved).unwrap();
+    update_state(f.path(), |state| {
+        for index in 0..=MAX_OUTBOX_PER_TICK {
+            let mut entry = template.clone();
+            entry.approval_id = format!("missing-{index}");
+            state.outbox.push(entry);
+        }
+        Ok(())
+    }).unwrap();
+    f.run().await;
+    let state = load_state(f.path()).unwrap();
+    assert_eq!(state.outbox.len(), 1, "each missing approval consumes one recovery slot");
+    assert_eq!(state.outbox[0].approval_id, format!("missing-{}", MAX_OUTBOX_PER_TICK));
+    assert_eq!(f.record().await.status, ApprovalStatus::Pending, "new work waits for a free slot");
+    f.run().await;
+    assert!(load_state(f.path()).unwrap().outbox.is_empty());
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn new_outbox_deliveries_share_the_recovery_budget() {
+    let f = Fixture::standard().await;
+    let rec = f.record().await;
+    let approved = evaluate(f.path(), &rec).await.unwrap();
+    let template = Outbox::new(f.path(), &rec, &approved).unwrap();
+    let other = f.broker.request("imported", expert_skills::SKILLS_ACTION_KIND,
+        &rec.summary, rec.payload.clone(), 60).await.unwrap();
+    update_state(f.path(), |state| {
+        for index in 0..MAX_OUTBOX_PER_TICK - 1 {
+            let mut entry = template.clone();
+            entry.approval_id = format!("missing-{index}");
+            state.outbox.push(entry);
+        }
+        Ok(())
+    }).unwrap();
+    f.run().await;
+    let statuses = [f.record().await.status, f.broker.get(&other).await.unwrap().unwrap().status];
+    assert_eq!(statuses.iter().filter(|s| **s == ApprovalStatus::Approved).count(), 1);
+    assert_eq!(statuses.iter().filter(|s| **s == ApprovalStatus::Pending).count(), 1);
+    assert_eq!(f.pushes().notices, 1);
+    assert!(f.pushes().cards.is_empty(), "the excess candidate was deferred, not evaluated and refused");
+    assert!(!load_state(f.path()).unwrap().evaluated.contains(other.as_str()));
 }
 
 #[tokio::test]

@@ -3,6 +3,9 @@ use super::*;
 
 const MAX_NOTICE_ATTEMPTS: u32 = 6;
 
+// Zero is a valid captured position for an empty log, not a legacy marker.
+fn missing_audit_since() -> u64 { u64::MAX }
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct CardRetry {
@@ -33,20 +36,23 @@ pub(super) struct Outbox {
     pub skills: Vec<(String, String, String)>,
     pub attempts: u32,
     pub next_at: i64,
+    #[serde(default = "missing_audit_since")]
+    pub audit_since: u64,
     pub audit_done: bool,
     pub activity_done: bool,
     pub notice_state: NoticeState,
 }
 impl Outbox {
-    pub(super) fn new(rec: &ApprovalRecord, approved: &AutoApproval) -> Self {
-        Self {
+    pub(super) fn new(home: &Path, rec: &ApprovalRecord, approved: &AutoApproval) -> Result<Self, String> {
+        let audit_since = duduclaw_security::audit::audit_log_position(home).map_err(|_| INTERNAL)?;
+        Ok(Self {
             approval_id: rec.id.to_string(), slug: rec.agent_id.clone(),
             publisher: approved.publisher.clone(), key_id: approved.key_id.clone(),
             pack: approved.pack.clone(), version: approved.pack_version.clone(),
             manifest_sha256: approved.manifest_sha256.clone(), skills: approved.skills.clone(),
-            attempts: 0, next_at: 0, audit_done: false, activity_done: false,
+            attempts: 0, next_at: 0, audit_since, audit_done: false, activity_done: false,
             notice_state: NoticeState::Pending,
-        }
+        })
     }
     fn approved(&self) -> AutoApproval {
         AutoApproval {
@@ -124,6 +130,12 @@ pub(super) async fn process_outbox(home: &Path, broker: &ApprovalBroker, mut ent
         })?;
         return Ok(None);
     }
+    if entry.audit_since == missing_audit_since() {
+        // Persist the legacy entry's first observed position before any append.
+        // Replays must keep this position even if the acknowledgement is lost.
+        entry.audit_since = duduclaw_security::audit::audit_log_position(home)?;
+        entry.save(home)?;
+    }
     if !entry.audit_done {
         let event = AuditEvent::new("skills_auto_approved", &entry.slug, Severity::Info,
             serde_json::json!({"approval_id": entry.approval_id, "publisher": entry.publisher,
@@ -132,9 +144,9 @@ pub(super) async fn process_outbox(home: &Path, broker: &ApprovalBroker, mut ent
                 "skills": entry.skills.iter().map(|(agent, name, digest)| serde_json::json!({
                     "agent": agent, "skill": name, "digest": digest,
                 })).collect::<Vec<_>>() }));
-        // The audit writer checks + appends under its own lock. Starting at 0
-        // also covers a crash between the append and saving audit_done.
-        duduclaw_security::audit::try_append_audit_event_once(home, &event, 0, &|value|
+        // Only check records since the durable pre-CAS position, including an
+        // append whose audit_done acknowledgement was lost in a crash.
+        duduclaw_security::audit::try_append_audit_event_once(home, &event, entry.audit_since, &|value|
             value["event_type"] == "skills_auto_approved" && value["details"]["approval_id"] == entry.approval_id)?;
         entry.audit_done = true;
         entry.save(home)?;

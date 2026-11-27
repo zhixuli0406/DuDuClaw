@@ -249,8 +249,8 @@ pub type LineMatch<'a> = &'a dyn Fn(&serde_json::Value) -> bool;
 ///
 /// For a caller that durably stored `since` (from [`chained_len`]) before
 /// its first append attempt: only the lines appended after that point are
-/// read, never the whole log. A log shorter than `since` was replaced, and
-/// is then checked from its start.
+/// checked for duplicates, never the whole log. A log shorter than `since`
+/// is treated as replaced: append without scanning it from the start.
 pub fn append_chained_line_strict_once(
     path: &Path,
     record: serde_json::Map<String, serde_json::Value>,
@@ -283,7 +283,8 @@ fn present_since(path: &Path, since: u64, present: LineMatch<'_>) -> io::Result<
         Err(e) => return Err(e),
     };
     let len = file.metadata()?.len();
-    file.seek(io::SeekFrom::Start(if len < since { 0 } else { since }))?;
+    if len < since { return Ok(false); }
+    file.seek(io::SeekFrom::Start(since))?;
     for line in BufReader::new(file).split(b'\n') {
         let line = line?;
         if serde_json::from_slice::<serde_json::Value>(&line).is_ok_and(|value| present(&value)) {
@@ -539,11 +540,56 @@ mod tests {
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().filter(|l| l.contains("\"a\"")).count(), 2);
         assert!(verify_chain(&path).unwrap().is_intact());
-        // An offset past the end (replaced log) checks the whole file.
-        assert!(!append_chained_line_strict_once(&path, obj(&[("id", "old")]), u64::MAX, &is("old")).unwrap());
+        // An offset past the end (replaced log) appends without a duplicate scan.
+        assert!(append_chained_line_strict_once(&path, obj(&[("id", "old")]), u64::MAX,
+            &|_| panic!("a replaced log must not be scanned from zero")).unwrap());
         // A directory in place of the log has no position.
         assert!(chained_len(&home).is_err());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn strict_once_skips_large_prefix_and_deduplicates_only_after_offset() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        let filler = format!("{{\"filler\":\"{}\"}}\n", "x".repeat(1024)).repeat(4096);
+        fs::write(&path, filler).unwrap();
+        append_chained_line_strict(&path, obj(&[("id", "a")])).unwrap();
+        let since = chained_len(&path).unwrap();
+        assert!(since > 4 * 1024 * 1024);
+        let checked = std::cell::Cell::new(0);
+        let present = |line: &serde_json::Value| {
+            assert!(line.get("filler").is_none(), "must not check the large prefix");
+            checked.set(checked.get() + 1);
+            line["id"] == "a"
+        };
+        assert!(append_chained_line_strict_once(&path, obj(&[("id", "a")]), since, &present).unwrap());
+        assert_eq!(checked.get(), 0, "a match before since is ignored");
+        let after_append = chained_len(&path).unwrap();
+        assert!(!append_chained_line_strict_once(&path, obj(&[("id", "a")]), since, &present).unwrap());
+        assert_eq!(checked.get(), 1, "only the appended record is checked on retry");
+        assert_eq!(chained_len(&path).unwrap(), after_append);
+        assert!(verify_chain(&path).unwrap().is_intact());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn strict_once_appends_after_rotation_without_scanning_large_replacement() {
+        let home = fresh_home();
+        let path = home.join("test.jsonl");
+        let filler = format!("{{\"filler\":\"{}\"}}\n", "x".repeat(1024));
+        fs::write(&path, filler.repeat(4096)).unwrap();
+        let since = chained_len(&path).unwrap();
+        fs::rename(&path, home.join("test.jsonl.old")).unwrap();
+        fs::write(&path, filler.repeat(2048)).unwrap();
+        append_chained_line_strict(&path, obj(&[("id", "a")])).unwrap();
+        let before_append = chained_len(&path).unwrap();
+        assert!(before_append > 2 * 1024 * 1024 && before_append < since);
+        assert!(append_chained_line_strict_once(&path, obj(&[("id", "a")]), since,
+            &|_| panic!("rotation must not trigger a duplicate scan from zero")).unwrap());
+        assert!(chained_len(&path).unwrap() > before_append);
+        assert!(verify_chain(&path).unwrap().is_intact());
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
