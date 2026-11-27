@@ -70,6 +70,13 @@ export function AuthGuard() {
   const connectWithAuth = useConnectionStore((s) => s.connectWithAuth);
   const mustChangePassword = useConnectionStore((s) => s.mustChangePassword);
   const location = useLocation();
+  const jwt = useAuthStore((s) => s.jwt);
+  const refreshMe = useAuthStore((s) => s.refreshMe);
+
+  // HTTP /api/me may omit grants; use the authenticated RPC.
+  useEffect(() => {
+    if (isAuthenticated && wsState === 'authenticated') void refreshMe();
+  }, [isAuthenticated, wsState, jwt, refreshMe]);
 
   useEffect(() => {
     if (!initialized) {

@@ -272,6 +272,9 @@ impl MethodHandler {
             }
             "system.update_config" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_system_update_config(params, ctx)).await
             }
             // ── v1.68: raw config editor (admin; masked read, validated +
@@ -288,6 +291,14 @@ impl MethodHandler {
             // Who may hand work to whom, org-wide. Admin-gated like every
             // other config-writing RPC; the write takes effect on the next
             // delegation decision (enforcement re-reads config.toml).
+            "admin_ai.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_get(ctx)).await
+            }
+            "admin_ai.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_set(params, ctx)).await
+            }
             "delegation.get" => {
                 require_admin!();
                 boxed_frame(|| self.handle_delegation_get()).await
@@ -572,7 +583,7 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_playbook_retire(params)).await
             }
 
-            // ── Cost / cache-efficiency telemetry (admin only) ──
+            // ── Cost / cache-efficiency telemetry ──
             "cost.summary" => {
                 require_admin!();
                 boxed_frame(|| self.handle_cost_summary(params)).await
@@ -585,10 +596,20 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_cost_recent(params)).await
             }
-            // WP-A2: per-model rollup. Same admin gate as its `cost.*`
-            // siblings — it exposes the same spend data, sliced by model.
+            "cost.department_summary" => {
+                boxed_frame(|| self.handle_cost_department_summary(params, ctx)).await
+            }
+            "cost.department_recent" => {
+                boxed_frame(|| self.handle_cost_department_recent(params, ctx)).await
+            }
             "cost.by_model" => {
-                require_admin!();
+                if !ctx.is_admin() {
+                    use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
+                    let view = DeptGrantView::load(self, ctx).await;
+                    let allowed = params.get("agent_id").and_then(Value::as_str)
+                        .is_some_and(|id| department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read));
+                    if !allowed { return WsFrame::error_response("", "permission denied"); }
+                }
                 boxed_frame(|| self.handle_cost_by_model(params)).await
             }
             "cost.by_role" => {

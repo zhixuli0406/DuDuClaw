@@ -224,13 +224,9 @@ pub(crate) async fn handle_create_reminder(
         Err(reason) => return tool_error(&reason),
     };
     // Atomic count-check + append, with the lease owned by the blocking writer.
-    let result = append_reminder_checked_admitted(
+    match append_reminder_checked_admitted(
         home_dir, &reminder, MAX_REMINDERS_PER_AGENT, admission,
-    ).await;
-    if matches!(&result, Ok(AppendResult::Ok)) {
-        super::delegation_roles::record_initiator(home_dir, "reminder", actor.id(), &reminder.agent_id, &id).await;
-    }
-    match result {
+    ).await {
         Ok(AppendResult::Ok) => created_reminder_receipt(
             home_dir, &id, trigger_at, channel, webchat_origin,
             supplied_channel.is_empty() && supplied_chat.is_empty(),

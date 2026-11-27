@@ -222,6 +222,14 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // Absence preserves the board API; every supplied value must narrow it.
+        let limit = match params.get("limit") {
+            None => None,
+            Some(value) => match value.as_u64().filter(|n| (1..=1000).contains(n)) {
+                Some(n) => Some(n as usize),
+                None => return WsFrame::error_response("", "limit must be an integer between 1 and 1000"),
+            },
+        };
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -236,10 +244,14 @@ impl MethodHandler {
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
-        match store
-            .list_tasks_filtered(status, agent_id, priority, goal_mode)
-            .await
-        {
+        let result = match limit {
+            Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
+                |id, assignee| !reader.hides(assignee)
+                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+            ).await,
+            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
+        };
+        match result {
             Ok(rows) => {
                 let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
                     && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
@@ -276,7 +288,14 @@ impl MethodHandler {
             .and_then(Value::as_str).unwrap_or("");
         if let Err(frame) = self.delegation_check(ctx, raw_target).await { return frame; }
         let target = raw_target.trim();
-        if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
+        let scheduled = params.get("schedule").is_some_and(|value| !value.is_null());
+        let main_gate = if scheduled || (!is_goal && params.get("kind").and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("discovery"))) {
+            self.deny_main_for_non_admin(ctx, target).await
+        } else {
+            self.deny_main_unless_admitted(ctx, target, crate::on_behalf_of::access::MainUse::Assign).await
+        };
+        if let Err(frame) = main_gate { return frame; }
         if !ctx.is_admin() {
             if let Err(refusal) = crate::machine_employee::check_target(
                 &self.home_dir, target, Some(&format!("user:{}", ctx.user_id)),
@@ -493,16 +512,18 @@ impl MethodHandler {
             // v1.81 P1d: canonical destination; owner-only for a Personal one
             // (also reached in-process from `tasks.assign`).
             if let Err(frame) = self.delegation_check(ctx, dest).await { return frame; }
-            if !dest.is_empty() && !ctx.can_assign_to(dest) {
+            if !dest.is_empty() {
+                if let Err(frame) = self.deny_main_unless_admitted(ctx, dest,
+                    crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
+            }
+            if !dest.is_empty() && !ctx.can_assign_to(dest)
+                && !self.main_assignment_admitted(ctx, dest).await {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
         }
-        // Both the existing executor and a new destination must be non-main.
+        // Both the existing executor and the destination require assignment admission.
         if let Some(agent) = owner_agent.as_deref() {
-            if let Err(frame) = self.deny_main_for_non_admin(ctx, agent).await { return frame; }
-        }
-        if let Some(dest) = params.get("assigned_to").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            if let Err(frame) = self.deny_main_for_non_admin(ctx, dest).await { return frame; }
+            if let Err(frame) = self.deny_main_unless_admitted(ctx, agent, crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
         }
         // HIGH-1 parity with the MCP layer: a depends_on rewire must reference
         // existing tasks only (fail-closed — the store validates shape+cycle,
@@ -1081,5 +1102,58 @@ mod live_assignee_tests {
         let saved = store.get_task("old").await.unwrap().unwrap();
         assert_eq!(saved.assigned_to, "deleted");
         assert_eq!(saved.description, "仍可編輯");
+    }
+}
+
+#[cfg(test)]
+mod main_assignment_tests {
+    use super::*;
+
+    fn error(frame: WsFrame) -> String {
+        match frame {
+            WsFrame::Response { ok: false, error: Some(error), .. } => error["message"].as_str().unwrap().into(),
+            other => panic!("expected refusal: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_employee_can_create_main_work_but_cannot_schedule_it() {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("emp@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+        let ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+        handler.registry.write().await.scan().await.unwrap();
+        let store = Arc::new(TaskStore::open(home.path()).unwrap());
+        handler.set_task_store(store.clone()).await;
+        let params = json!({"title":"work", "assigned_to":"main"});
+        assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
+        db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+        assert!(handler.main_assignment_admitted(&ctx, "main").await);
+        assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+        for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
+            let mut scheduled = params.clone();
+            scheduled["schedule"] = json!(schedule);
+            assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
+            assert_eq!(error(handler.handle_tasks_goal_create(json!({
+                "agent_id":"main", "description":"work", "schedule":schedule
+            }), &ctx).await), "主代理僅管理員可以使用。");
+        }
+        let rows = store.list_tasks(None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+        handler.registry.write().await.scan().await.unwrap();
+        assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
+        assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
+            WsFrame::Response { ok: true, .. }));
+        db.set_main_agent_users(&admin.id, &[], true).unwrap();
+        assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
     }
 }

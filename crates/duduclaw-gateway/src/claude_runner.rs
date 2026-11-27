@@ -92,6 +92,12 @@ fn build_system_prompt(
         parts.push(section.content);
     }
 
+    audit.push(crate::prompt_audit::PromptSection::new(
+        "delegation_guidance",
+        crate::prompt_identity::DELEGATION_GUIDANCE,
+    ));
+    parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
     // Sort skills by name for deterministic ordering (cache-friendly).
     // Apply the employee's budget (with a 10 KB floor) or explicit unlimited
     // setting, and report any omitted skills in the truncation footer.
@@ -875,9 +881,9 @@ async fn call_claude_for_agent_resolved(
     let prompt = credential_prompt.as_deref().unwrap_or(prompt);
     let agent = &snapshot.registry_agent;
 
-    crate::on_behalf_of::access::check_loaded_main_target(
+    Box::pin(crate::on_behalf_of::access::check_loaded_main_target_for_execution(
         home_dir, crate::on_behalf_of::current().as_deref(), agent,
-    ).await?;
+    )).await?;
 
     // Sub-agents inherit a turn id from the dispatch chain via tokio
     // task_local — set by `channel_reply` before invoking the dispatcher.
@@ -6609,6 +6615,7 @@ mod instructions_slot_tests {
             .await
             .unwrap();
         let p = super::build_system_prompt(&agent, None, None).unwrap();
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         let pinned_system = super::build_system_prompt(&agent, None, Some("en")).unwrap();
         for message in ["First dispatch", "Next cron turn"] {
             let user = crate::prompt_identity::with_reply_language_reminder(message.into(), Some("en"));
@@ -6986,5 +6993,55 @@ mod background_entry_tests {
         assert_eq!(calls[0].model, snapshot.model);
         assert_ne!(calls[0].model, "opus");
         assert_eq!(calls[0].effort, Some(duduclaw_core::effort::Effort::High));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod main_assignment_tests {
+    use super::*;
+
+    #[test]
+    fn listed_main_execution_reaches_owned_cli_and_revocation_stops_it() {
+        crate::runtime_dispatch::testing::isolated_claude_test(
+            concat!(module_path!(), "::listed_main_execution_reaches_owned_cli_and_revocation_stops_it"), |cli_home| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                crate::test_exec::write_executable(&cli_home.join("bin/claude"),
+                    "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+                     printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
+                     /bin/cat \"$HOME/stream.jsonl\"\nexit 0\n", 0o755);
+                std::fs::write(cli_home.join("stream.jsonl"),
+                    "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"MAIN_ASSIGNED\"}\n").unwrap();
+                let home = tempfile::tempdir().unwrap();
+                crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+                    "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+                let profile = home.path().join("agents/main/agent.toml");
+                let raw = std::fs::read_to_string(&profile).unwrap();
+                std::fs::write(&profile, raw.replace("account_pool = [\"main\"]", "account_pool = []")).unwrap();
+                std::fs::write(home.path().join("config.toml"),
+                    "[general]\ndefault_agent = 'main'\ninference_mode = 'claude'\n").unwrap();
+                let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+                let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+                let employee = db.create_user("employee@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+                crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+                db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+                let mut reg = duduclaw_agent::registry::AgentRegistry::new(home.path().join("agents"));
+                reg.scan().await.unwrap();
+                let registry = Arc::new(tokio::sync::RwLock::new(reg));
+                let wire = format!("user:{}", employee.id);
+                let result = crate::on_behalf_of::scope_first(Some(wire.clone()), call_claude_for_agent_impl(
+                    home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
+                    None, DispatchOverrides::default(),
+                )).await;
+                assert_eq!(result.unwrap(), "MAIN_ASSIGNED");
+                let before = std::fs::read(cli_home.join("claude-argv")).unwrap();
+                db.set_main_agent_users(&admin.id, &[], true).unwrap();
+                let denied = crate::on_behalf_of::scope_first(Some(wire), call_claude_for_agent_impl(
+                    home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
+                    None, DispatchOverrides::default(),
+                )).await;
+                assert_eq!(denied.unwrap_err(), "主代理僅管理員可以使用。");
+                assert_eq!(std::fs::read(cli_home.join("claude-argv")).unwrap(), before);
+            });
+        });
     }
 }

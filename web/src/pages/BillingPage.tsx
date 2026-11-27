@@ -1,10 +1,11 @@
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
+import { useAuthStore } from '@/stores/auth-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import { useConnectionStore } from '@/stores/connection-store';
-import { api, type BillingUsage, type BudgetIncident, type BudgetByAgent } from '@/lib/api';
+import { api, type BillingUsage, type BudgetIncident, type BudgetByAgent, type DepartmentCostSummary, type DepartmentCostTotals, type CostRecentResult } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import { toast, formatError } from '@/lib/toast';
 import { useUrlState } from '@/lib/use-url-state';
@@ -221,6 +222,84 @@ function BudgetConsole() {
   );
 }
 
+/** Read-only departmental usage, using only departments granted by users.me. */
+function DepartmentUsage({ departments }: { departments: string[] }) {
+  useCompanyTimeZone();
+  const intl = useIntl();
+  const t = (id: string) => intl.formatMessage({ id });
+  const connection = useConnectionStore(s => s.state);
+  const [chosen, setChosen] = useState(departments[0]);
+  const department = departments.includes(chosen) ? chosen : departments[0];
+  const [days, setDays] = useState<7 | 30 | 90>(30);
+  const [result, setResult] = useState<{ key: string; summary: DepartmentCostSummary; recent: CostRecentResult }>();
+  const [error, setError] = useState<{ key: string; value: unknown }>();
+  const [retry, setRetry] = useState(0);
+  const key = JSON.stringify([department, days, connection, retry]);
+  useEffect(() => {
+    if (connection !== 'authenticated' || !department) return;
+    let current = true;
+    Promise.all([api.cost.departmentSummary(department, days), api.cost.departmentRecent(department)])
+      .then(([summary, recent]) => { if (current) setResult({ key, summary, recent }); })
+      .catch(value => { if (current) setError({ key, value }); });
+    return () => { current = false; };
+  }, [department, days, connection, key]);
+  const data = result?.key === key ? result : undefined;
+  const money = (millicents: number) => fmtCents(millicents / 1000);
+  const columns = ['billing.department.requests', 'billing.department.input', 'billing.department.output',
+    'billing.department.cost', 'billing.department.savings', 'billing.department.efficiency'];
+  const cells = (row: DepartmentCostTotals) => <>
+    <TableCell>{intl.formatNumber(row.total_requests)}</TableCell>
+    <TableCell>{intl.formatNumber(row.total_input_tokens)}</TableCell>
+    <TableCell>{intl.formatNumber(row.total_output_tokens)}</TableCell>
+    <TableCell>{money(row.total_cost_millicents)}</TableCell>
+    <TableCell>{money(row.total_cache_savings_millicents)}</TableCell>
+    <TableCell>{intl.formatNumber(row.avg_cache_efficiency, { style: 'percent', maximumFractionDigits: 1 })}</TableCell>
+  </>;
+  return <section className="space-y-4" aria-label={t('billing.department.title')}>
+    <h2 className="text-base font-medium">{t('billing.department.title')}</h2>
+    <div className="flex flex-wrap gap-4">
+      <label className="space-y-1 text-sm">
+        <span className="block">{t('department.filter')}</span>
+        <select className="rounded-lg border border-input bg-surface px-3 py-2 focus-visible:outline-2 focus-visible:outline-ring" value={department} onChange={e => setChosen(e.target.value)}>
+          {departments.map(d => <option key={d} value={d}>{d}</option>)}
+        </select>
+      </label>
+      <label className="space-y-1 text-sm">
+        <span className="block">{t('billing.department.period')}</span>
+        <select className="rounded-lg border border-input bg-surface px-3 py-2 focus-visible:outline-2 focus-visible:outline-ring" value={days} onChange={e => setDays(Number(e.target.value) as 7 | 30 | 90)}>
+          {([7, 30, 90] as const).map(d => <option key={d} value={d}>{intl.formatMessage({ id: 'billing.department.days' }, { days: d })}</option>)}
+        </select>
+      </label>
+    </div>
+    {error?.key === key ? <ErrorState error={error.value} title={t('errorState.manage.loadFailed')} onRetry={() => setRetry(n => n + 1)} />
+      : !data ? <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p>
+      : <>
+        {!data.summary?.available ? <p className="text-sm text-muted-foreground">{t('billing.department.unavailable')}</p>
+          : data.summary.agents.length === 0 ? <p className="text-sm text-muted-foreground">{t('billing.department.empty')}</p>
+          : <div className="overflow-x-auto rounded-xl border border-surface-border">
+            <Table>
+              <TableHeader><TableRow><TableHead>{t('billing.col.agent')}</TableHead>{columns.map(c => <TableHead key={c}>{t(c)}</TableHead>)}</TableRow></TableHeader>
+              <TableBody>
+                {data.summary.agents.map(a => <TableRow key={a.agent_id}><TableCell>{a.display_name || a.agent_id}</TableCell>{cells(a)}</TableRow>)}
+                <TableRow className="font-medium"><TableCell>{t('billing.department.total')}</TableCell>{cells(data.summary.totals)}</TableRow>
+              </TableBody>
+            </Table>
+          </div>}
+        <h3 className="text-sm font-medium">{t('billing.department.recent')}</h3>
+        {!data.recent?.available ? <p className="text-sm text-muted-foreground">{t('billing.department.unavailable')}</p>
+          : data.recent.records.length === 0 ? <p className="text-sm text-muted-foreground">{t('billing.department.noRecent')}</p>
+          : <ul className="divide-y divide-surface-border rounded-xl border border-surface-border">
+            {data.recent.records.map((r, i) => <li key={`${r.agent_id}-${r.created_at}-${i}`} className="flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-3 text-sm">
+              <span>{data.summary?.agents?.find(a => a.agent_id === r.agent_id)?.display_name || r.agent_id}</span>
+              <span className="text-muted-foreground">{r.model}</span>
+              <span className="tabular-nums">{money(r.cost_millicents)}</span>
+              <time className="text-xs text-muted-foreground" dateTime={r.created_at}>{formatDateTime(r.created_at, { locale: intl.locale, month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</time>
+            </li>)}
+          </ul>}
+      </>}
+  </section>;
+}
+
 // ── Spend-cap mechanisms overview (WP-D §2-4) ──────────────────────
 //
 // UX audit §2-4 — five independent "how much can this cost" mechanisms
@@ -272,6 +351,9 @@ function SpendCapsOverview() {
 
 export function BillingPage() {
   const intl = useIntl();
+  const { user, deptGrants } = useAuthStore();
+  const costDepartments = [...new Set(deptGrants.filter(g => g.groups.includes('cost')).map(g => g.department))];
+  const showDepartment = !!user && user.role !== 'admin' && costDepartments.length > 0;
   const connectionState = useConnectionStore((s) => s.state);
   const [usage, setUsage] = useState<BillingUsage | null>(null);
   // P05: every usage tile falls back to `?? 0`, so a failed fetch renders a
@@ -305,6 +387,8 @@ export function BillingPage() {
           <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'billing.subtitle' })}</p>
         </div>
       </div>
+
+      {showDepartment && <DepartmentUsage key={JSON.stringify([user?.id, costDepartments])} departments={costDepartments} />}
 
       <DataExportButton dataset="usage" />
 

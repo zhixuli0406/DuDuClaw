@@ -1,5 +1,3 @@
-import { canSelectAgent, useSelectableCallableAgents } from '@/stores/callable-agents-store';
-import { useAuthStore } from '@/stores/auth-store';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
@@ -53,11 +51,9 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
     void load();
   }, [load]);
 
-  const grants = useSelectableCallableAgents();
-  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
-  const canMutate = useCallback((target: string) => useAuthStore.getState().user?.role === 'admin' || canSelectAgent(target), [isAdmin]);
-  const grantsReady = isAdmin || (!grants.loading && grants.agents !== null && canMutate(agentId));
-  useEffect(() => { if (!grantsReady) setRemoveTargets(null); }, [grantsReady]);
+  const canMutate = useCallback((target: string, skillName: string) => target === agentId &&
+    skills.some(s => s.name === skillName && (s.can_manage ?? canManage)), [agentId, skills, canManage]);
+  useEffect(() => { if (!canManage) setRemoveTargets(null); }, [canManage]);
   const actions = useSkillActions(() => void load(), canMutate);
   const sorted = useMemo(
     () => sortSkills(skills, 'name', intl.locale, (s) => sortFieldsOf(s)),
@@ -67,7 +63,7 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
   const restore = useCallback(
     async (a: ArchivedSkill) => {
       try {
-        if (!canMutate(agentId)) return;
+        if (!canRestore) return;
         await skillsManageApi.restore(agentId, a.archive_id);
         toast.success(intl.formatMessage({ id: 'skills.manage.restoredDone' }, { name: a.skill_name }));
       } catch (e) {
@@ -76,7 +72,7 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
         void load();
       }
     },
-    [agentId, intl, load, canMutate],
+    [agentId, intl, load, canRestore],
   );
 
   if (error) {
@@ -116,7 +112,7 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
                 <Button
                   variant="ghost"
                   size="icon-sm"
-                  disabled={!canManage || actions.busy || !grantsReady}
+                  disabled={!(s.can_manage ?? canManage) || actions.busy}
                   onClick={() => setRemoveTargets([{ agent_id: agentId, skill_name: s.name }])}
                   aria-label={intl.formatMessage({ id: 'skills.manage.removeOne' }, { name: s.name })}
                 >
@@ -125,7 +121,7 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
               )}
               <Switch
                 checked={s.enabled !== false}
-                disabled={!canManage || actions.busy || !grantsReady}
+                disabled={!(s.can_manage ?? canManage) || actions.busy}
                 onCheckedChange={(on) => void actions.setEnabled([{ agent_id: agentId, skill_name: s.name }], on)}
                 aria-label={intl.formatMessage({ id: 'skills.manage.switchFor' }, { agent: agentName, name: s.name })}
               />
@@ -142,7 +138,7 @@ export function AgentSkillsPanel({ agentId, agentName }: { agentId: string; agen
                 <span className="truncate text-foreground">{a.skill_name}</span>
                 <span className="flex items-center gap-2">
                   <span className="text-xs text-muted-foreground">{lastUsed(a.archived_at)}</span>
-                  <Button variant="outline" size="sm" disabled={!canRestore || !grantsReady} onClick={() => void restore(a)}>
+                  <Button variant="outline" size="sm" disabled={!canRestore} onClick={() => void restore(a)}>
                     <RotateCcw />
                     {intl.formatMessage({ id: 'skills.manage.restore' })}
                   </Button>

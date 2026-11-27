@@ -2,6 +2,75 @@
 
 use super::*;
 
+#[tokio::test]
+async fn bounded_list_filters_metadata_and_stops_at_n_visible_rows() {
+    let (store, dir) = temp_store();
+    for index in 0..6 {
+        let id = format!("candidate-{index}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "medium".into(),
+            if index < 2 { "hidden".into() } else { "bot".into() }, "system".into());
+        row.created_at = format!("2026-01-0{}T00:00:00Z", 6 - index);
+        store.insert_task(&row).await.unwrap();
+    }
+    // SQL filters also apply before the visible-row cut.
+    for (id, field, value) in [("excluded-status", "status", serde_json::json!("done")),
+        ("excluded-priority", "priority", serde_json::json!("high")),
+        ("excluded-goal", "goal_mode", serde_json::json!(true)),
+        ("excluded-archive", "archived", serde_json::json!(true))] {
+        let mut row = TaskRow::new(id.into(), id.into(), String::new(), "medium".into(), "bot".into(), "system".into());
+        row.created_at = "2099-01-01T00:00:00Z".into();
+        match field {
+            "status" => row.status = value.as_str().unwrap().into(),
+            "priority" => row.priority = value.as_str().unwrap().into(),
+            "goal_mode" => row.goal_mode = true,
+            "archived" => row.archived = true,
+            _ => unreachable!(),
+        }
+        store.insert_task(&row).await.unwrap();
+    }
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    // Hidden full rows must never deserialize. Even metadata past the cut
+    // is invalid, so an extra SQLite row read would fail this test.
+    conn.execute("UPDATE tasks SET title = X'FF' WHERE assigned_to = 'hidden'", []).unwrap();
+    conn.execute("UPDATE tasks SET assigned_to = X'FF' WHERE id = 'candidate-4'", []).unwrap();
+    let mut visited = Vec::new();
+    let rows = store.list_tasks_filtered_bounded(Some("todo"), None, Some("medium"), Some(false), 2,
+        |id, assignee| {
+            visited.push(id.to_owned());
+            assignee != "hidden"
+        }).await.unwrap();
+    assert_eq!(visited, ["candidate-0", "candidate-1", "candidate-2", "candidate-3"]);
+    assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["candidate-2", "candidate-3"]);
+}
+
+#[tokio::test]
+async fn bounded_list_limits_sql_materialization_and_orders_newest_first() {
+    let (store, dir) = temp_store();
+    for index in 0..6 {
+        let id = format!("bounded-{index}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "medium".into(), "bot".into(), "system".into());
+        // The two newest rows tie; ID ascending must break the tie.
+        row.created_at = format!("2026-01-0{}T00:00:00Z", index.min(4) + 1);
+        row.updated_at = format!("2026-02-0{}T00:00:00Z", 6 - index);
+        row.pinned = index == 0;
+        store.insert_task(&row).await.unwrap();
+    }
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    // This old row cannot deserialize as TaskRow. A load-all-then-truncate
+    // implementation would fail even when the caller only asks for one row.
+    conn.execute("UPDATE tasks SET title = X'FF' WHERE id = 'bounded-0'", []).unwrap();
+    for (limit, expected) in [(1, vec!["bounded-4"]), (2, vec!["bounded-4", "bounded-5"])] {
+        let rows = store.list_tasks_filtered_bounded(Some("todo"), Some("bot"), Some("medium"), Some(false), limit, |_, _| true).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), expected);
+    }
+    assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, 6, |_, _| true).await.is_err());
+    assert!(store.list_tasks_filtered(None, Some("bot"), None, None).await.is_err());
+    for invalid in [0, 1001, usize::MAX] {
+        assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, invalid, |_, _| true).await.is_err());
+    }
+    assert!(store.list_tasks_filtered_bounded(None, Some("other"), None, None, 1, |_, _| true).await.unwrap().is_empty());
+}
+
 // ── W2-7: source_discord_guild_id column round trip ──────
 
 #[tokio::test]

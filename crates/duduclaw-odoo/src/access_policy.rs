@@ -113,6 +113,9 @@ impl OdooAccessConfig {
         let Some(section) = table.get("odoo_access") else {
             return Ok(Self::default());
         };
+        if !section.is_table() {
+            return Err(CONFIG_UNREADABLE.to_owned());
+        }
         let raw: RawAccessConfig = section.clone().try_into()
             .map_err(|_| CONFIG_UNREADABLE.to_owned())?;
         let ack = match raw.permission_mode_ack {

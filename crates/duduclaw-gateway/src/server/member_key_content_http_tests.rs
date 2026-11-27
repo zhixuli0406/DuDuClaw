@@ -102,7 +102,7 @@ async fn member_key_http_content_scope_and_task_bindings_are_live() {
     ))).await;
     let (tx, _) = broadcast::channel(4);
     let (event_tx, _) = broadcast::channel(4);
-    let state = Arc::new(AppState { auth: AuthManager::new(None), handler, tx, event_tx,
+    let state = Arc::new(AppState { auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
         prepared_events: Default::default(), user_db: db.clone(), jwt_config,
         otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
         home_dir: home.clone() });

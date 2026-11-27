@@ -125,6 +125,10 @@ pub(crate) struct LiveContextCache {
 }
 
 impl LiveContextCache {
+    pub(super) fn invalidate_user(&self, user_id: &str) {
+        self.lock().remove(user_id);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext, std::time::Instant)>> {
         // A panicked holder leaves plain data behind; keep serving.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())

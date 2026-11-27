@@ -47,7 +47,7 @@ pub(crate) async fn fixture() -> Fixture {
     let mgr_a = add("mgrA", UserRole::Manager);
     let mgr_b = add("mgrB", UserRole::Manager);
     let emp = add("emp", UserRole::Employee);
-    db.set_dept_grants(&admin.user_id, &mgr_a.user_id, "sales", &GrantGroup::ALL).unwrap();
+    db.set_dept_grants(&admin.user_id, &mgr_a.user_id, "sales", &GrantGroup::ALL, true).unwrap();
     let h = MethodHandler::new(home.clone()).await;
     h.set_test_edition(Some(EditionProfile::Enterprise)).await;
     h.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
@@ -168,7 +168,7 @@ async fn agent_department_mirror_mismatch_denies() {
 async fn revoked_grant_denies_next_rpc() {
     let f = fixture().await;
     assert!(allows_create(&DeptGrantView::load(&f.h, &f.mgr_a).await, "a1"));
-    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[]).unwrap();
+    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
     assert!(!allows_create(&DeptGrantView::load(&f.h, &f.mgr_a).await, "a1"));
 }
 
@@ -242,8 +242,8 @@ async fn credential_epoch_change_denies_stale_session() {
 #[tokio::test]
 async fn department_names_match_exact_case() {
     let f = fixture().await;
-    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[]).unwrap();
-    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "Sales", &GrantGroup::ALL).unwrap();
+    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
+    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "Sales", &GrantGroup::ALL, true).unwrap();
     let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
     assert_eq!(view.departments_for(GrantGroup::Schedules), vec!["Sales".to_string()]);
     assert!(!allows_create(&view, "a1"));
@@ -327,4 +327,47 @@ fn action_allowed_full_table() {
     for (action, name) in actions.into_iter().zip([
         "read", "create", "edit", "toggle", "remove", "restore", "run_now", "request_install", "decide",
     ]) { assert_eq!(action.as_str(), name); }
+}
+
+#[tokio::test]
+async fn display_creator_access_lost_checks_accounts_bindings_and_exact_grant_targets() {
+    let f = fixture().await;
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(None, "a1"), Some(false));
+    assert_eq!(display.display_creator_access_lost(Some("missing"), "a1"), Some(true));
+    assert_eq!(display.display_creator_access_lost(Some("admin"), "a1"), Some(false));
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), "a1"), Some(false));
+    for agent in ["b1", "main", "../a1", "A1", "missing"] {
+        assert_eq!(display.display_creator_access_lost(Some("mgrA"), agent), Some(true), "{agent}");
+    }
+    // A cache is request-local; the next request reads fresh account/binding facts.
+    let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+    conn.execute("INSERT INTO user_agent_bindings(user_id, agent_name, access_level, bound_at) VALUES ('emp','a1','operator','2026-11-27T00:00:00Z')", []).unwrap();
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("emp"), "a1"), Some(false));
+    assert_eq!(display.display_creator_access_lost(Some("emp"), "a2"), Some(true));
+    conn.execute("UPDATE users SET status='suspended' WHERE id='emp'", []).unwrap();
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("emp"), "a1"), Some(true));
+    assert_eq!(display.creators.len(), 1);
+}
+
+#[tokio::test]
+async fn display_creator_access_lost_preserves_unknown_reads_and_mirror_drift() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, raw.replace("department = 'sales'", "department = 'mfg'")).unwrap();
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), "a1"), Some(true));
+    std::fs::write(&path, &raw).unwrap();
+    std::fs::write(f.home.join("org.toml"), "invalid TOML !").unwrap();
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), "a1"), None);
+    assert_eq!(display.display_creator_access_lost(Some("admin"), "a1"), Some(false));
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DROP TABLE department_manager_grants", []).unwrap();
+    let mut display = DisplayCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), "a1"), None);
+    assert_eq!(display.display_creator_access_lost(None, "a1"), Some(false));
 }

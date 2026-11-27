@@ -61,47 +61,154 @@ impl MethodHandler {
     pub(crate) async fn handle_onboarding(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         let Some(db) = self.user_db.read().await.clone() else { return error("onboarding_unavailable"); };
         let locale = match locale(&params) { Ok(locale) => locale.to_owned(), Err(frame) => return frame };
-        // Check the current person before reading their connection metadata.
-        let mut progress = match db.onboarding_progress(&ctx.user_id, ctx.credential_epoch) {
-            Ok(progress) => progress,
-            Err(_) => return error("permission_denied"),
-        };
-        if method == "onboarding.update" {
-            let mut change = params.clone();
-            if let Some(object) = change.as_object_mut() { object.remove("locale"); }
-            let update = match serde_json::from_value::<duduclaw_auth::onboarding::ProgressUpdate>(change) {
-                Ok(update) => update,
-                Err(_) => return error("invalid_onboarding_update"),
+        let (home, ctx, method) = (self.home_dir.clone(), ctx.clone(), method.to_owned());
+        let result = tokio::task::spawn_blocking(move || -> Result<Value, WsFrame> {
+            // Check the live caller before reading connection metadata.
+            let mut progress = db.onboarding_progress(&ctx.user_id, ctx.credential_epoch)
+                .map_err(|_| error("permission_denied"))?;
+            if method == "onboarding.update" {
+                let mut change = params;
+                if let Some(object) = change.as_object_mut() { object.remove("locale"); }
+                let update = serde_json::from_value::<duduclaw_auth::onboarding::ProgressUpdate>(change)
+                    .map_err(|_| error("invalid_onboarding_update"))?;
+                progress = db.update_onboarding(&ctx.user_id, ctx.credential_epoch, &update)
+                    .map_err(|code| error(&code))?;
+            } else if method != "onboarding.get" { return Err(error("unknown_method")); }
+            // Sign-in steps always use live authorities, even for a dismissed card.
+            if let Some(signin) = &progress.signin {
+                let steps = signin_steps(&home, &db, &ctx.user_id, signin)?;
+                let mut payload = json!(progress);
+                payload["steps_remaining"] = json!(steps.remaining());
+                payload["signin_steps"] = json!(steps);
+                payload["examples"] = json!([]);
+                return Ok(payload);
+            }
+            // Hidden legacy cards need no connection-vault reads or invitation copy.
+            if !progress.enabled || progress.dismissed {
+                let mut payload = json!(progress);
+                payload["examples"] = json!([]);
+                return Ok(payload);
+            }
+            let google = match crate::person_credentials::get(&home, &ctx.user_id) {
+                Ok(Some(record)) => record.metadata.status == crate::person_credentials::Status::Connected,
+                Ok(None) => false,
+                Err(_) => return Err(error("onboarding_unavailable")),
             };
-            progress = match db.update_onboarding(&ctx.user_id, ctx.credential_epoch, &update) {
-                Ok(progress) => progress,
-                Err(code) => return error(&code),
-            };
-        } else if method != "onboarding.get" { return error("unknown_method"); }
-        // Hidden cards need no connection-vault reads or invitation copy.
-        if !progress.enabled || progress.dismissed {
+            db.observe_onboarding_connections(&ctx.user_id, ctx.credential_epoch, google)
+                .map_err(|_| error("onboarding_unavailable"))?;
+            let progress = db.onboarding_progress(&ctx.user_id, ctx.credential_epoch)
+                .map_err(|_| error("onboarding_unavailable"))?;
+            let content = db.invitation_content(&locale).map_err(|_| error("onboarding_unavailable"))?;
             let mut payload = json!(progress);
-            payload["examples"] = json!([]);
-            return WsFrame::ok_response("", payload);
+            payload["examples"] = json!(content.examples);
+            Ok(payload)
+        }).await;
+        match result {
+            Ok(Ok(payload)) => WsFrame::ok_response("", payload),
+            Ok(Err(frame)) => frame,
+            Err(_) => error("onboarding_unavailable"),
         }
-        let google = match crate::person_credentials::get(&self.home_dir, &ctx.user_id) {
-            Ok(Some(record)) => record.metadata.status == crate::person_credentials::Status::Connected,
-            Ok(None) => false,
-            Err(_) => return error("onboarding_unavailable"),
-        };
-        if db.observe_onboarding_connections(&ctx.user_id, ctx.credential_epoch, google).is_err() { return error("onboarding_unavailable"); }
-        let progress = match db.onboarding_progress(&ctx.user_id, ctx.credential_epoch) { Ok(progress) => progress, Err(_) => return error("onboarding_unavailable") };
-        let content = match db.invitation_content(&locale) { Ok(content) => content, Err(_) => return error("onboarding_unavailable") };
-        let mut payload = json!(progress);
-        payload["examples"] = json!(content.examples);
-        WsFrame::ok_response("", payload)
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SigninStatus {
+    Done, Recommended, Required, Unknown, WaitingAdmin, Preparing, BlockedDomain,
+    Pending, AdminBinds, NotApplicable, NeedsReverify, Invalid,
+}
+#[derive(Debug, serde::Serialize)]
+struct SigninStep {
+    status: SigninStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+impl SigninStep {
+    fn new(status: SigninStatus) -> Self { Self { status, reason: None } }
+}
+#[derive(Debug, serde::Serialize)]
+struct LiveSigninSteps {
+    mfa: SigninStep, avatar: SigninStep, google: SigninStep,
+    google_chat: SigninStep, odoo: SigninStep,
+}
+impl LiveSigninSteps {
+    fn remaining(&self) -> usize {
+        [&self.mfa, &self.avatar, &self.google, &self.google_chat, &self.odoo].into_iter()
+            .filter(|step| !matches!(step.status, SigninStatus::Done | SigninStatus::NotApplicable | SigninStatus::Recommended)).count()
+    }
+}
+
+fn odoo_step(home: &Path, db: &UserDb, user_id: &str) -> SigninStep {
+    // Interface from the RM-141 Odoo keys line (odoo_credentials.rs, odoo_identity/server.rs).
+    if !crate::odoo_identity::server::member_credentials_enabled(home) {
+        return SigninStep::new(SigninStatus::NotApplicable);
+    }
+    let status = match db.odoo_credential_status(user_id) {
+        Ok(Some(row)) => match row.state.as_str() {
+            "ok" => SigninStatus::Done,
+            "needs_reverify" => SigninStatus::NeedsReverify,
+            "invalid" => SigninStatus::Invalid,
+            _ => SigninStatus::Unknown,
+        },
+        Ok(None) => SigninStatus::Pending,
+        Err(_) => SigninStatus::Unknown,
+    };
+    SigninStep::new(status)
+}
+
+fn google_step(home: &Path, user_id: &str) -> Result<SigninStep, WsFrame> {
+    // Same metadata status and current-consent check as me.google.status;
+    // authority_state never unseals or returns bearer credentials.
+    let own = crate::person_credentials::authority_state(home, user_id)
+        .map_err(|_| error("onboarding_unavailable"))?.metadata;
+    if own.is_some_and(|metadata| metadata.status == crate::person_credentials::Status::Connected
+        && crate::google_data_consent::require_current(metadata.google_data_consent.as_ref()).is_ok()) {
+        return Ok(SigninStep::new(SigninStatus::Done));
+    }
+    if let Ok(policy) = duduclaw_core::google_identity::read_home_config(home) {
+        let domains = crate::google_signin::config::read_strict(home).allowed_hd;
+        if !policy.allowed_domains.is_empty() && !domains.is_empty()
+            && domains.iter().all(|domain| !policy.allowed_domains.contains(domain)) {
+            return Ok(SigninStep::new(SigninStatus::BlockedDomain));
+        }
+    }
+    // Delegation selectors are per employee; no installation-wide member mode
+    // is inferred from a tenant credential or a domain allowlist.
+    Ok(SigninStep::new(SigninStatus::Pending))
+}
+
+fn signin_steps(home: &Path, db: &UserDb, user_id: &str, stored: &duduclaw_auth::onboarding::SigninSteps) -> Result<LiveSigninSteps, WsFrame> {
+    let user = db.get_user(user_id).map_err(|_| error("onboarding_unavailable"))?
+        .ok_or_else(|| error("permission_denied"))?;
+    let mfa = match db.mfa_active(user_id) {
+        Ok(true) => SigninStatus::Done,
+        Ok(false) => match crate::mfa::enforced(home, false) {
+            Ok(true) => SigninStatus::Required, Ok(false) => SigninStatus::Recommended,
+            Err(_) => SigninStatus::Unknown,
+        },
+        Err(_) => SigninStatus::Unknown,
+    };
+    let avatar = if user.avatar_agent_id.is_some() { SigninStep::new(SigninStatus::Done) }
+        else if stored.avatar.as_deref() == Some("waiting_admin") {
+            SigninStep { status: SigninStatus::WaitingAdmin, reason: stored.avatar_error.clone() }
+        } else { SigninStep::new(SigninStatus::Preparing) };
+    let chat = db.verified_channels_for_user(user_id).map_err(|_| error("onboarding_unavailable"))?
+        .iter().any(|identity| identity.channel == "googlechat" && identity.verified);
+    Ok(LiveSigninSteps {
+        mfa: SigninStep::new(mfa), avatar, google: google_step(home, user_id)?,
+        google_chat: SigninStep::new(if chat { SigninStatus::Done } else { SigninStatus::AdminBinds }),
+        odoo: odoo_step(home, db, user_id),
+    })
+}
+
+#[cfg(test)]
+#[path = "onboarding_rpc_signin_tests.rs"]
+mod signin_tests;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    async fn fixture() -> (tempfile::TempDir, MethodHandler, Arc<UserDb>, UserContext) {
+    pub(super) async fn fixture() -> (tempfile::TempDir, MethodHandler, Arc<UserDb>, UserContext) {
         let home = tempfile::tempdir().unwrap();
         let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
         let admin = db.create_user("admin@test.invalid", "Admin", "password123", UserRole::Admin).unwrap();
@@ -115,7 +222,7 @@ mod tests {
         (home, handler, db, ctx)
     }
     fn refused(frame: WsFrame) -> bool { matches!(frame, WsFrame::Response { ok: false, .. }) }
-    fn payload(frame: WsFrame) -> Value {
+    pub(super) fn payload(frame: WsFrame) -> Value {
         match frame { WsFrame::Response { ok: true, payload: Some(v), .. } => v, _ => panic!("expected success") }
     }
     #[test]

@@ -128,7 +128,7 @@ async fn department_set_deduplicates_audits_and_updates_users_me() {
 #[tokio::test]
 async fn department_set_revokes_stale_grants_and_accepts_system_admin_actor() {
     let f = fixture().await;
-    f.db.set_dept_grants("admin", "mgrA", "gone", &[GrantGroup::Cost]).unwrap();
+    f.db.set_dept_grants("admin", "mgrA", "gone", &[GrantGroup::Cost], true).unwrap();
     let admin = UserContext::admin_fallback();
     payload(rpc(&f, METHODS[1], json!({
         "user_id": "mgrA", "department": "gone", "groups": [],
@@ -213,4 +213,27 @@ async fn users_me_grant_read_failure_returns_empty_authority() {
     assert_eq!(error(rpc(&f, METHODS[1], json!({
         "user_id": "mgrA", "department": "sales", "groups": ["cost"],
     }), &f.admin).await), "無法儲存部門管理授權，請稍後再試。");
+}
+
+#[tokio::test]
+async fn widening_requires_strict_boolean_acknowledgement_but_revocation_does_not() {
+    let f = fixture().await;
+    let base = json!({"user_id": "mgrB", "department": "sales", "groups": ["schedules"]});
+    for ack in [None, Some(json!(false)), Some(json!("true")), Some(json!(1)), Some(Value::Null)] {
+        let mut params = base.clone();
+        if let Some(ack) = ack { params["acknowledged"] = ack; }
+        let refused = error(rpc(&f, METHODS[1], params, &f.admin).await);
+        assert_eq!(refused, json!({
+            "code": "acknowledgement_required",
+            "message": "請先閱讀風險說明並勾選「我了解」後再授權。",
+        }));
+        assert!(f.db.dept_grants_for_user("mgrB").unwrap().is_empty());
+    }
+    let mut params = base.clone();
+    params["acknowledged"] = json!(true);
+    payload(rpc(&f, METHODS[1], params, &f.admin).await);
+    // Identical sets and revocations do not require confirmation.
+    payload(rpc(&f, METHODS[1], base, &f.admin).await);
+    payload(rpc(&f, METHODS[1], json!({"user_id": "mgrB", "department": "sales", "groups": []}), &f.admin).await);
+    assert!(f.db.dept_grants_for_user("mgrB").unwrap().is_empty());
 }

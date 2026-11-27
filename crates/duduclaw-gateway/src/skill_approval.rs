@@ -25,7 +25,7 @@ pub const ACTION_KIND_SKILL_ACTIVATION: &str = "skill_activation";
 
 /// Default TTL for a skill-activation approval: 7 days. A skill sitting in the
 /// inbox unactioned for a week reverts to "draft" (deny-on-expiry, fail-closed).
-pub const SKILL_ACTIVATION_TTL_SECONDS: i64 = 7 * 24 * 3600;
+pub const SKILL_ACTIVATION_TTL_SECONDS: i64 = crate::skill_ttl::DEFAULT_SKILL_APPROVAL_TTL_SECS;
 
 /// Inputs for a skill-activation approval request.
 #[derive(Debug, Clone)]
@@ -77,7 +77,9 @@ pub async fn request_skill_activation(
             ACTION_KIND_SKILL_ACTIVATION,
             &build_summary(req),
             build_payload(req),
-            SKILL_ACTIVATION_TTL_SECONDS,
+            broker.home_dir().as_deref()
+                .map(crate::skill_ttl::skill_approval_ttl_secs)
+                .unwrap_or(SKILL_ACTIVATION_TTL_SECONDS),
         )
         .await
 }
@@ -111,6 +113,16 @@ mod tests {
     fn summary_handles_missing_estimate() {
         assert!(build_summary(&sample(None)).contains("未提供"));
         assert!(build_summary(&sample(Some(30))).contains("30 分鐘"));
+    }
+
+    #[tokio::test]
+    async fn activation_request_uses_configured_ttl() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[approval]\nskill_ttl_days = 1\n").unwrap();
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let id = request_skill_activation(&broker, "agnes", &sample(Some(20)))
+            .await.unwrap();
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().ttl_seconds, 86_400);
     }
 
     #[tokio::test]

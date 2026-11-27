@@ -360,6 +360,9 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({"status": "updated"}))
             }
             Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) if e == "role_requires_local_password" => {
+                super::google_signin_rpc::signin_error(&e)
+            }
             Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => {
                 WsFrame::error_response("", &format!("failed to update user: {e}"))
             }
@@ -738,6 +741,15 @@ impl MethodHandler {
     pub(crate) async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
         let view = crate::dept_grants::DeptGrantView::load(self, ctx).await;
         let dept_grants = super::dept_grants_rpc::effective_grants(&view);
+        // Informational in P13: conversation/assignment entry points still use
+        // the existing Admin-only gate until their later integration packages.
+        let main_agent_access = if ctx.origin == duduclaw_auth::acl::ContextOrigin::DashboardSession
+            && ctx.member_key_id.is_none() && ctx.user_id != "system"
+        {
+            Box::pin(crate::on_behalf_of::access::main_entry_available(
+                &self.home_dir, &ctx.user_id,
+            )).await.unwrap_or(false)
+        } else { false };
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => {
@@ -754,6 +766,7 @@ impl MethodHandler {
                         },
                         "bindings": [],
                         "dept_grants": dept_grants,
+                        "main_agent_access": main_agent_access,
                     }),
                 );
             }
@@ -775,6 +788,7 @@ impl MethodHandler {
                         "user": user,
                         "bindings": bindings,
                         "dept_grants": dept_grants,
+                        "main_agent_access": main_agent_access,
                         "email_setup": {
                             "placeholder": setup.placeholder,
                             "password_required": setup.password_required,
@@ -794,6 +808,7 @@ impl MethodHandler {
                     },
                     "bindings": [],
                     "dept_grants": dept_grants,
+                    "main_agent_access": main_agent_access,
                 }),
             ),
         }

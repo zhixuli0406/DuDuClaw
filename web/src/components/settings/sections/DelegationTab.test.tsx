@@ -69,7 +69,7 @@ describe('<DelegationTab>', () => {
     await waitFor(() => {
       const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
       expect(selects[0].value).toBe('sales-lead');
-      expect(selects[1].value).toBe('warehouse-lead');
+      expect(selects[2].value).toBe('warehouse-lead');
     });
     expect(screen.getByText('Sales')).toBeInTheDocument();
     expect(screen.getByText('Warehouse')).toBeInTheDocument();
@@ -100,6 +100,7 @@ describe('<DelegationTab>', () => {
     await waitFor(() => expect(setMock).toHaveBeenCalled());
     expect(setMock.mock.calls[0][0]).toEqual({
       policy: 'hierarchy',
+      unrestricted_roles: [], allow_one_way: [],
       allow: [['sales-lead', 'warehouse-lead']],
     });
   });
@@ -125,7 +126,7 @@ describe('<DelegationTab>', () => {
     fireEvent.click(saveButton());
 
     await waitFor(() => expect(setMock).toHaveBeenCalled());
-    expect(setMock.mock.calls[0][0]).toEqual({ policy: 'department', allow: [] });
+    expect(setMock.mock.calls[0][0]).toEqual({ policy: 'department', allow: [], unrestricted_roles: [], allow_one_way: [] });
   });
 
   it('surfaces gateway config warnings', async () => {
@@ -177,7 +178,7 @@ describe('<DelegationTab>', () => {
     fireEvent.click(saveButton());
     await waitFor(() => expect(setMock).toHaveBeenCalled());
     // Exactly what was loaded — not `department` + no pairs.
-    expect(setMock.mock.calls[0][0]).toEqual({ policy: 'hierarchy', allow: [] });
+    expect(setMock.mock.calls[0][0]).toEqual({ policy: 'hierarchy', allow: [], unrestricted_roles: [], allow_one_way: [] });
   });
 
   it('offers "none" with a plain description and saves it', async () => {
@@ -196,6 +197,7 @@ describe('<DelegationTab>', () => {
     await waitFor(() => expect(setMock).toHaveBeenCalled());
     expect(setMock.mock.calls[0][0]).toEqual({
       policy: 'none',
+      unrestricted_roles: [], allow_one_way: [],
       allow: [['sales-lead', 'warehouse-lead']],
     });
   });
@@ -222,5 +224,67 @@ describe('<DelegationTab>', () => {
         expect(catalogue[key], key).toBeTruthy();
       }
     }
+  });
+});
+
+
+describe('delegation role and direction settings', () => {
+  it('loads checked roles, adds a role and saves both lists', async () => {
+    getMock.mockResolvedValue({ policy: 'none', allow: [], unrestricted_roles: ['manager'], allow_one_way: [], warnings: [] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+    expect(screen.getByRole('checkbox', { name: 'Manager' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Administrator' })).not.toBeChecked();
+    setMock.mockImplementationOnce(async (params) => {
+      getMock.mockResolvedValue({ ...params, warnings: [] });
+      return { success: true, ...params, applied: true };
+    });
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Administrator' }));
+    expect(screen.getByRole('alert')).toHaveTextContent(en['settings.delegation.roles.noneWarning']);
+    expect(screen.getByText(en['settings.delegation.roles.risk'])).toBeInTheDocument();
+    expect(saveButton()).toBeDisabled();
+    fireEvent.click(saveButton());
+    expect(setMock).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'I understand' }));
+    expect(saveButton()).not.toBeDisabled();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'none', allow: [], unrestricted_roles: ['manager', 'admin'], allow_one_way: [], acknowledge_risk: true }));
+    await waitLoaded();
+    expect(screen.getByRole('checkbox', { name: 'Manager' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Administrator' })).toBeChecked();
+  });
+
+  it('removes a saved role without acknowledgement', async () => {
+    getMock.mockResolvedValue({ policy: 'none', allow: [], unrestricted_roles: ['manager'], allow_one_way: [], warnings: [] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Manager' }));
+    expect(screen.queryByText(en['settings.delegation.roles.risk'])).not.toBeInTheDocument();
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+    expect(saveButton()).not.toBeDisabled();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'none', allow: [], unrestricted_roles: [], allow_one_way: [] }));
+  });
+
+  it('clears acknowledgement when the selected roles change', async () => {
+    getMock.mockResolvedValue({ policy: 'department', allow: [], unrestricted_roles: [], allow_one_way: [], warnings: [] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Administrator' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'I understand' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Manager' }));
+    expect(screen.getByRole('checkbox', { name: 'I understand' })).not.toBeChecked();
+    expect(saveButton()).toBeDisabled();
+  });
+
+  it('saves a changed direction and swaps an existing one-way row', async () => {
+    getMock.mockResolvedValue({ policy: 'department', allow: [['sales-lead', 'warehouse-lead']], unrestricted_roles: [], allow_one_way: [['intern', 'sales-lead']], warnings: [] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    fireEvent.change(screen.getAllByRole('combobox')[1], { target: { value: 'one_way' } });
+    fireEvent.click(screen.getAllByRole('button', { name: 'Swap direction' })[1]);
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'department', allow: [], unrestricted_roles: [], allow_one_way: [['sales-lead', 'warehouse-lead'], ['sales-lead', 'intern']] }));
   });
 });

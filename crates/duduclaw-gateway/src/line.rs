@@ -632,8 +632,13 @@ async fn process_line_decision(event: LineEvent, state: &LineState, token: &str)
                         .and_then(|p| p.data.as_deref())
                         .unwrap_or(""),
                     scope,
+                    &crate::approval::chat_admin::press::PressOrigin {
+                        message_id: None, private: false,
+                        account: crate::chat_link_intercept::account_label("line", None),
+                        dm: context.conversation_id.clone(),
+                    },
                 )
-                .await
+                .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
             } else {
                 crate::decision_notify::route_trusted_decision_fastlane_with_scope(
                     &state.ctx, &context, &command, scope,
@@ -742,12 +747,20 @@ async fn process_line_events(
                         } else {
                             sender_for_decision
                         };
-                        if let Some(outcome) = crate::decision_text::route_text_reply(
-                            &state.home_dir,
-                            "line",
-                            sender_for_decision,
-                            card_chat,
-                            qid,
+                        if let Some(outcome) = crate::decision_text::route_verified_text_reply(
+                            &state.ctx,
+                            &crate::approval::CURRENT_DECISION_CONTEXT.try_with(Clone::clone).ok().flatten()
+                                .unwrap_or(crate::approval::DecisionContext {
+                                    channel: "line".into(), account_id: String::new(),
+                                    conversation_id: card_chat.into(), principal_id: sender_for_decision.into(),
+                                }),
+                            &crate::approval::chat_admin::press::PressOrigin {
+                                message_id: Some(qid.into()), private: false,
+                                account: crate::chat_link_intercept::account_label("line", None), dm: card_chat.into(),
+                            },
+                            crate::decision_notify::DecisionAccessScope {
+                                channel_id: is_group.then_some(card_chat), guild_id: None, session_id: None,
+                            },
                             text,
                         )
                         .await

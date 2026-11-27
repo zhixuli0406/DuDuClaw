@@ -35,12 +35,38 @@ pub(crate) fn check_personal(home: &Path, metadata: &Metadata, scopes: &[String]
     Err(write_scope_isolated())
 }
 
-pub(crate) fn check_personal_refresh(home: &Path, metadata: &Metadata, scopes: Option<&[String]>) -> Result<(), Refusal> {
-    match scopes {
-        Some(scopes) => check_personal(home, metadata, scopes),
-        // A refresh without scope evidence cannot prove bearer isolation.
-        None => Err(scope_unverified()),
+/// Omitted scopes retain the credential's grant unless a past or present write grant
+/// makes a merged grant plausible. Store and tokeninfo failures never fall back.
+pub(crate) async fn refresh_scopes(
+    home: &Path,
+    owner_kind: &str,
+    owner_id: &str,
+    stored_scopes: &[String],
+    scopes: Option<&[String]>,
+    access_token: &str,
+    client_id: &str,
+) -> Result<Vec<String>, Refusal> {
+    if let Some(scopes) = scopes {
+        return Ok(scopes.to_vec());
     }
+    match vault::write_store::ever_granted(home, owner_kind, owner_id) {
+        Ok(false) => Ok(stored_scopes.to_vec()),
+        Ok(true) => crate::google_personal::oauth::tokeninfo(access_token, client_id)
+            .await.map_err(|_| scope_unverified()),
+        Err(_) => Err(scope_unverified()),
+    }
+}
+
+pub(crate) async fn check_personal_refresh(
+    home: &Path,
+    metadata: &Metadata,
+    scopes: Option<&[String]>,
+    access_token: &str,
+) -> Result<Vec<String>, Refusal> {
+    let scopes = refresh_scopes(home, "user", &metadata.owner_id,
+        &metadata.granted_scopes, scopes, access_token, &metadata.oauth_client_id).await?;
+    check_personal(home, metadata, &scopes)?;
+    Ok(scopes)
 }
 
 fn isolate_personal(home: &Path, metadata: &Metadata) {
@@ -58,6 +84,10 @@ fn isolate_personal(home: &Path, metadata: &Metadata) {
         Err(_) => tracing::warn!("Could not mark isolated Google credential for reconnect"),
     }
 }
+
+#[cfg(test)]
+#[path = "write_scope_test_support.rs"]
+pub(crate) mod testing;
 
 #[cfg(test)]
 mod tests {

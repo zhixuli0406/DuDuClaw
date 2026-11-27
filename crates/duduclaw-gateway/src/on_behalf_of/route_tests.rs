@@ -332,6 +332,12 @@ async fn delegation_roles_route_resolves_only_host_evidence_and_live_roles() {
         "record":{"kind":"message","id":"new-job","target":"other"}})).await.0, 200);
     assert!(crate::delegation_roles::initiators::lookup(h.path(), "message", "new-job", Some("avatar"), "other",
         Some(&format!("user:{admin}"))).is_some());
+    for kind in ["cron", "reminder", "task", "task_spec"] {
+        assert_eq!(role_request(state.clone(), "avatar", json!({"context":guard.reference(),
+            "record":{"kind":kind,"id":"background-job","target":"other"}})).await.0, 403);
+    }
+    assert_eq!(role_request(state.clone(), "avatar", json!({"context":guard.reference(),
+        "record":{"kind":"message","id":"forged","target":"other","created_at":1}})).await.0, 400);
     assert_eq!(role_request(state.clone(), "other", request.clone()).await.0, 403);
     assert_eq!(role_request(state.clone(), "dashboard", request.clone()).await.0, 403);
     let mut injected = request.clone();

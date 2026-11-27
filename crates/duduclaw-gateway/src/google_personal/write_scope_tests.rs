@@ -1,5 +1,6 @@
 //! Real signed route plus the owned OAuth fixture; no live Google traffic.
 use super::*;
+use crate::google_identity::write_scope_guard::testing::{install_write_credential, TokeninfoWire};
 
 async fn ready() -> Fixture {
     let f = Fixture::new();
@@ -80,11 +81,74 @@ async fn google_token_refresh_drive_isolated_marks_reconnect_and_notifies() {
 }
 
 #[tokio::test]
-async fn google_token_refresh_without_scope_evidence_fails_closed() {
+async fn google_token_refresh_without_scope_and_no_write_credential_retains_stored_scopes() {
+    let f = ready().await;
+    assert!(!vault::write_store::ever_granted(&f.home, "user", &f.alice.id).unwrap());
+    let before = expire(&f, "missing").await;
+    // Any accidental tokeninfo call would fail instead of supplying scopes.
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id, None).await;
+    let (status, response) = oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), request(&f)).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["access_token"], "isolation-fresh-secret");
+    let current = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert_eq!(current.metadata.granted_scopes, before.metadata.granted_scopes);
+    assert_eq!(current.metadata.status, Status::Connected);
+    assert_eq!(current.metadata.revision, before.metadata.revision + 1);
+    assert_eq!(wire.calls(), 0);
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_after_write_disconnect_checks_tokeninfo_drive() {
     let f = ready().await;
     let before = expire(&f, "missing").await;
+    let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
+    vault::write_store::disconnect(&f.home, "user", &f.alice.id).unwrap();
+    assert!(vault::write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id,
+        Some(oauth::DRIVE_WRITE_SCOPE)).await;
+    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_isolated(&f, &before)).await;
+    assert_eq!(wire.calls(), 1);
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_after_write_disconnect_tokeninfo_failure_fails_closed() {
+    let f = ready().await;
+    let before = expire(&f, "missing").await;
+    let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
+    vault::write_store::disconnect(&f.home, "user", &f.alice.id).unwrap();
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id, None).await;
+    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_unverified(&f, &before)).await;
+    assert_eq!(wire.calls(), 1);
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_with_write_credential_checks_tokeninfo_drive() {
+    let f = ready().await;
+    let before = expire(&f, "missing").await;
+    let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id,
+        Some(oauth::DRIVE_WRITE_SCOPE)).await;
+    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_isolated(&f, &before)).await;
+    assert_eq!(wire.calls(), 1);
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_with_write_credential_and_tokeninfo_failure_fails_closed() {
+    let f = ready().await;
+    let before = expire(&f, "missing").await;
+    let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id, None).await;
+    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_unverified(&f, &before)).await;
+    assert_eq!(wire.calls(), 1);
+}
+
+async fn assert_unverified(f: &Fixture, before: &vault::Record) {
     crate::notify_push::person_notice_test::take(&f.home);
-    let (status, response) = request(&f).await;
+    let (status, response) = request(f).await;
     assert_eq!(status, 403);
     assert_eq!(response["code"], "scope_unverified");
     assert!(response.get("access_token").is_none());
@@ -92,7 +156,7 @@ async fn google_token_refresh_without_scope_evidence_fails_closed() {
     assert_eq!(current.metadata.status, before.metadata.status);
     assert_eq!(current.metadata.revision, before.metadata.revision);
     let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
-    let old_secret = vault::unseal(&key, &before).unwrap();
+    let old_secret = vault::unseal(&key, before).unwrap();
     let secret = vault::unseal(&key, &current).unwrap();
     assert_eq!(secret.access_token, old_secret.access_token);
     assert_eq!(secret.refresh_token, old_secret.refresh_token);
@@ -103,6 +167,35 @@ async fn google_token_refresh_without_scope_evidence_fails_closed() {
     assert!(audit.lines().filter_map(|s| serde_json::from_str::<Value>(s).ok())
         .any(|row| row["reason"] == "scope_unverified" && row["success"] == false));
     assert!(!audit.contains("isolation-fresh-secret"));
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_with_write_credential_uses_tokeninfo_scopes() {
+    let f = ready().await;
+    let before = expire(&f, "missing").await;
+    let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
+    let mut scopes = before.metadata.granted_scopes.clone();
+    scopes.push(oauth::DRIVE_TOOLS_SCOPE.into());
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id,
+        Some(&scopes.join(" "))).await;
+    let (status, response) = oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), request(&f)).await;
+    assert_eq!(status, 200);
+    assert_eq!(response["access_token"], "isolation-fresh-secret");
+    let current = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert_eq!(current.metadata.granted_scopes, scopes);
+    assert_eq!(current.metadata.status, Status::Connected);
+    assert_eq!(wire.calls(), 1);
+}
+
+#[tokio::test]
+async fn google_token_refresh_without_scope_and_unreadable_write_store_fails_closed() {
+    let f = ready().await;
+    let before = expire(&f, "missing").await;
+    std::fs::write(vault::write_store::path(&f.home), "invalid-json").unwrap();
+    let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id, None).await;
+    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_unverified(&f, &before)).await;
+    assert_eq!(wire.calls(), 0);
 }
 
 #[tokio::test]

@@ -96,8 +96,8 @@ pub(crate) async fn handle_check_responses(params: &Value, home_dir: &Path) -> V
 /// up on its next poll cycle and executes steps sequentially with retry/replan.
 pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: &str) -> Value {
     let principal = host_on_behalf_of(home_dir, caller);
-    if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
-        home_dir, principal.as_deref(), caller,
+    if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target_for(
+        home_dir, principal.as_deref(), caller, duduclaw_gateway::on_behalf_of::access::MainUse::Assign,
     ).await {
         return mcp_error(&reason);
     }
@@ -163,7 +163,7 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
                 return mcp_error(&format!("step {i} has an invalid 'agent' id"));
             }
             if let Err(reason) =
-                check_delegation_allowed(home_dir, caller, &agent, "create_task").await
+                super::delegation::check_assignment_delegation_allowed(home_dir, caller, &agent, "create_task").await
             {
                 return mcp_error(&format!("step {i}: {reason}"));
             }
@@ -175,8 +175,8 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
         }
 
         let target = if agent.is_empty() { caller } else { &agent };
-        if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target(
-            home_dir, principal.as_deref(), target,
+        if let Err(reason) = duduclaw_gateway::on_behalf_of::access::check_main_target_for(
+            home_dir, principal.as_deref(), target, duduclaw_gateway::on_behalf_of::access::MainUse::Assign,
         ).await {
             return mcp_error(&format!("step {i}: {reason}"));
         }
@@ -252,8 +252,6 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
     if let Err(e) = spec.save(&agent_dir) {
         return mcp_error(&format!("failed to save task: {e}"));
     }
-
-    super::delegation_roles::record_initiator(home_dir, "task_spec", caller, caller, &task_id).await;
 
     // Write a signal to bus_queue.jsonl so the dispatcher picks up the new task.
     let signal = serde_json::json!({

@@ -270,7 +270,6 @@ fn attach_cron(home: &Path, job: &Job, proof: &str) -> Result<bool, String> {
     .map_err(|e| e.to_string())?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-    crate::delegation_roles::initiators::revoke_before_write(home, "cron", &job.id);
     let changed = tx
         .execute(
             "UPDATE cron_tasks SET notify_origin_proof = ?2

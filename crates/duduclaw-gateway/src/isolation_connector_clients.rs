@@ -340,11 +340,16 @@ impl NativeConnectorExecutor {
 }
 impl BoundConnectorExecutor for NativeConnectorExecutor {
     fn supports(&self, tool: &str) -> bool {
+        if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
         matches!(provider_for_tool(tool), Some("google" | "notion" | "github"))
     }
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
+            // Refuse before selection rechecks, credentials or any Google I/O.
+            if duduclaw_core::google_identity::is_drive_write_tool(call.name()) {
+                return Err(VerificationError::Unavailable);
+            }
             selected.verify_call(&call)?;
             if !self.supports(call.name()) || selected.context().record() != call.context().record()
                 || provider_for_tool(call.name()) != Some(selected.provider())

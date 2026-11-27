@@ -199,3 +199,65 @@ async fn append_step_history_is_retryable_without_bumping_trigger_count() {
     assert_eq!(fired.trigger_count, 1);
     assert_eq!(fired.last_triggered_at, Some(history.triggered_at));
 }
+
+#[tokio::test]
+async fn replace_definition_preserves_database_owned_fields() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    let mut original = rule();
+    original.action = json!({"type":"steps", "steps":[{"type":"notify"}]}).to_string();
+    original.owner_department = Some("sales".into());
+    original.metadata = Some(json!({"induced":true}).to_string());
+    original.trigger_count = 7;
+    original.last_triggered_at = Some("last-fire".into());
+    store.insert_rule(&original).await.unwrap();
+    let mut definition = original.clone();
+    definition.id = "ignored".into();
+    definition.name = "Edited".into();
+    definition.enabled = false;
+    definition.trigger_event = "channel_message".into();
+    definition.conditions = json!({"field":"text", "value":"hello"}).to_string();
+    definition.sequence = Some(json!({"first":{"event":"task_created"}, "then":{"event":"channel_message"}, "within_secs":60}).to_string());
+    definition.active_window = Some(json!({"days":[1], "start":"09:00", "end":"18:00", "timezone":"Asia/Taipei"}).to_string());
+    definition.run_policy = Some(json!({"outside_window":"skip"}).to_string());
+    definition.owner_department = Some("other".into());
+    definition.created_by_user_id = Some("spoofed".into());
+    definition.created_at = "spoofed".into();
+    definition.metadata = None;
+    definition.trigger_count = 0;
+    definition.last_triggered_at = None;
+    definition.updated_by_user_id = Some("spoofed".into());
+    definition.updated_at = Some("spoofed".into());
+    let updated = store.replace_rule_definition("r", &definition, Some("editor"), "now").await.unwrap().unwrap();
+    let mut expected = definition;
+    expected.id = original.id;
+    expected.owner_department = original.owner_department;
+    expected.created_by_user_id = original.created_by_user_id;
+    expected.created_at = original.created_at;
+    expected.metadata = original.metadata;
+    expected.trigger_count = original.trigger_count;
+    expected.last_triggered_at = original.last_triggered_at;
+    expected.updated_by_user_id = Some("editor".into());
+    expected.updated_at = Some("now".into());
+    assert_eq!(serde_json::to_value(&updated).unwrap(), serde_json::to_value(&expected).unwrap());
+    assert!(store.replace_rule_definition("missing", &expected, None, "later").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn replace_definition_rolls_back_when_stored_extensions_require_envelope() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    let mut original = rule();
+    original.action = json!({"type":"steps", "steps":[{"type":"notify"}]}).to_string();
+    original.owner_department = Some("sales".into());
+    store.insert_rule(&original).await.unwrap();
+    let mut definition = original.clone();
+    definition.name = "must roll back".into();
+    definition.action = json!({"type":"notify"}).to_string();
+    // A stale caller cannot clear ownership through this API: validate the
+    // actual database row, including ownership, before committing the write.
+    definition.owner_department = None;
+    assert!(store.replace_rule_definition("r", &definition, Some("editor"), "now").await.is_err());
+    let stored = store.get_rule("r").await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(stored).unwrap(), serde_json::to_value(original).unwrap());
+}

@@ -12,6 +12,7 @@ use crate::handlers::MethodHandler;
 pub(crate) use duduclaw_auth::dept_grants::GrantGroup;
 
 pub(crate) mod methods;
+pub(crate) mod reach;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantAction {
@@ -78,11 +79,17 @@ impl DeptGrantView {
         };
         if grants.is_empty() { return Self::empty(); }
 
-        let home = h.home_dir().to_path_buf();
-        let default_id = match crate::webchat::access::gateway_default_id(&home).await {
-            Ok(id) => id,
-            Err(_) => return Self::denied("gateway default unavailable"),
+        let Some(mut view) = Self::load_targets(h).await else {
+            return Self::denied("agent targets unavailable");
         };
+        view.grants = grants;
+        view.ctx = Some(ctx.clone());
+        view
+    }
+
+    async fn load_targets(h: &MethodHandler) -> Option<Self> {
+        let home = h.home_dir().to_path_buf();
+        let default_id = crate::webchat::access::gateway_default_id(&home).await.ok()?;
         let mut main_agents = BTreeSet::new();
         let mut loaded_agents = BTreeMap::new();
         {
@@ -94,7 +101,7 @@ impl DeptGrantView {
                     || dir_id == Some(default_id.as_str())
                 {
                     let Some(dir_id) = dir_id else {
-                        return Self::denied("main agent directory unavailable");
+                        return None;
                     };
                     main_agents.insert(agent.config.agent.name.clone());
                     main_agents.insert(dir_id.to_owned());
@@ -104,7 +111,7 @@ impl DeptGrantView {
                 }
             }
         }
-        Self { grants, home, ctx: Some(ctx.clone()), default_id, main_agents, loaded_agents }
+        Some(Self { home, default_id, main_agents, loaded_agents, ..Self::default() })
     }
 
     // Only fixed, non-sensitive reasons reach logs; never include database errors.
@@ -128,37 +135,101 @@ impl DeptGrantView {
 pub(crate) fn department_grant_allows(
     v: &DeptGrantView, agent: &str, g: GrantGroup, a: GrantAction,
 ) -> bool {
-    if v.is_empty() || !duduclaw_core::is_valid_agent_id(agent)
-        || agent == v.default_id || v.main_agents.contains(agent)
-    {
-        return false;
-    }
+    if v.is_empty() { return false; }
     let Some(ctx) = v.ctx.as_ref() else { return false; };
     if ctx.owner_only_denied(agent) { return false; }
-    // Only successfully loaded directory ids qualify; config names are not aliases.
-    if !v.loaded_agents.contains_key(agent) { return false; }
-    // The registry may be stale. Deserialize the fresh role with the same
-    // AgentRole serde implementation used by the registry's AgentConfig.
-    let path = v.home.join("agents").join(agent).join("agent.toml");
-    let Ok(raw) = std::fs::read_to_string(path) else { return false; };
-    let Ok(config) = toml::from_str::<toml::Value>(&raw) else { return false; };
-    let role: Option<AgentRole> = config.get("agent").and_then(|info| info.get("role"))
-        .and_then(|role| role.clone().try_into().ok());
-    match role {
-        Some(AgentRole::Main) | None => return false,
-        Some(_) => {},
-    }
+    let Ok(Some(department)) = grant_target_department(v, agent) else { return false; };
     // A present user principal never parses as Background. load admits only
     // live Managers in non-Personal editions, not the machine Admin shortcut.
     let principal = format!("user:{}", ctx.user_id);
     if crate::machine_employee::check_target(&v.home, agent, Some(&principal)).is_err() {
         return false;
     }
-    let Some(department) = duduclaw_agent::skill_loader::authoritative_department(&v.home, agent) else {
-        return false;
-    };
     v.grants.iter().any(|(name, groups)| name == &department && groups.contains(&g))
         && action_allowed(g, a)
+}
+
+/// Shared target checks for authorization and display. Errors stay unknown for
+/// display callers; authorization always denies them.
+fn grant_target_department(v: &DeptGrantView, agent: &str) -> Result<Option<String>, ()> {
+    if !duduclaw_core::is_valid_agent_id(agent) || agent == v.default_id
+        || v.main_agents.contains(agent) || !v.loaded_agents.contains_key(agent)
+    { return Ok(None); }
+    // Registry roles can be stale; only exact loaded directory ids qualify.
+    let raw = std::fs::read_to_string(v.home.join("agents").join(agent).join("agent.toml"))
+        .map_err(|_| ())?;
+    let config: toml::Value = toml::from_str(&raw).map_err(|_| ())?;
+    let role: AgentRole = config.get("agent").and_then(|info| info.get("role"))
+        .ok_or(())?.clone().try_into().map_err(|_| ())?;
+    if role == AgentRole::Main { return Ok(None); }
+    duduclaw_agent::skill_loader::try_authoritative_department(&v.home, agent)
+}
+
+/// DISPLAY ONLY: never use this cache or its results to authorize any operation.
+/// One fresh users.db snapshot per distinct creator per list request; target
+/// metadata and the registry/default/main snapshot are shared by all rows.
+/// No session/origin requirement: this describes an account, not a login.
+pub(crate) struct DisplayCreatorAccessCache {
+    db: Option<std::sync::Arc<duduclaw_auth::UserDb>>,
+    targets: Option<DeptGrantView>,
+    grants_enabled: bool,
+    creators: BTreeMap<String, Result<Option<duduclaw_auth::dept_grants::DisplayCreatorAccess>, String>>,
+    departments: BTreeMap<String, Result<Option<String>, ()>>,
+    machine_restricted: BTreeMap<String, Option<bool>>,
+}
+
+impl DisplayCreatorAccessCache {
+    pub(crate) async fn load(h: &MethodHandler) -> Self {
+        Self {
+            db: h.user_db().await,
+            targets: DeptGrantView::load_targets(h).await,
+            grants_enabled: !h.resolve_edition_profile().await.is_personal(),
+            creators: BTreeMap::new(), departments: BTreeMap::new(),
+            machine_restricted: BTreeMap::new(),
+        }
+    }
+
+    /// DISPLAY ONLY. None means unknown (serialize as null), never permission.
+    pub(crate) fn display_creator_access_lost(&mut self, user_id: Option<&str>, agent: &str) -> Option<bool> {
+        let Some(user_id) = user_id.filter(|id| !id.is_empty()) else { return Some(false); };
+        let db = self.db.as_ref()?;
+        let record = self.creators.entry(user_id.to_owned())
+            .or_insert_with(|| db.display_creator_access(user_id));
+        let record = record.as_ref().ok()?;
+        let Some(record) = record else { return Some(true); };
+        if record.user.status != UserStatus::Active { return Some(true); }
+        if record.user.role == UserRole::Admin { return Some(false); }
+        if record.bindings.get(agent).is_some_and(|level| level.at_least(duduclaw_auth::AccessLevel::Operator)) {
+            return Some(false);
+        }
+        if !self.grants_enabled || record.user.role != UserRole::Manager
+            || !record.grants.iter().any(|(_, groups)| groups.contains(&GrantGroup::Schedules))
+            || !action_allowed(GrantGroup::Schedules, GrantAction::Toggle)
+        { return Some(true); }
+        let targets = self.targets.as_ref()?;
+        let department = self.departments.entry(agent.to_owned())
+            .or_insert_with(|| grant_target_department(targets, agent)).as_ref().ok()?;
+        let Some(department) = department else { return Some(true); };
+        if !record.grants.iter().any(|(name, groups)| name == department && groups.contains(&GrantGroup::Schedules)) {
+            return Some(true);
+        }
+        if duduclaw_auth::acl::personal_restriction()
+            .is_some_and(|r| r.denies_delegation(user_id, agent))
+        {
+            // This API conflates ownership denial with unreadable ownership.
+            // Do not present that ambiguous result as a confirmed revocation.
+            return None;
+        }
+        // Preserve unknown preset reads; do not re-read the creator via check_target.
+        let restricted = *self.machine_restricted.entry(agent.to_owned())
+            .or_insert_with(|| crate::machine_employee::restriction_known(&targets.home, agent));
+        restricted
+    }
+
+    pub(crate) fn display_creator_name(&self, user_id: &str) -> Option<&str> {
+        let name = self.creators.get(user_id)?.as_ref().ok()?.as_ref()?.user.display_name.trim();
+        (!name.is_empty()).then_some(name)
+    }
 }
 
 /// Exhaustive on both axes: every new group or action requires an explicit decision.

@@ -71,7 +71,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
         description: "Apply supported styles, a header, or a tab operation to a Google Doc.",
         params: &[
             ParamDef { name: "document_id", description: "Document ID or URL", required: true },
-            ParamDef { name: "operations", description: "Up to 50 supported operations using after_text or text anchors", required: true },
+            ParamDef { name: "operations", description: "Up to 50 supported operations using unique text anchors", required: true },
         ],
     },
     ToolDef {
@@ -509,30 +509,52 @@ pub(super) fn drive_write_schema(tool: &str, schema: &mut serde_json::Value) {
         }
         "docs_insert_text" => {
             schema["properties"]["text"]["maxLength"] = json!(20000);
+            schema["properties"]["text"]["minLength"] = json!(1);
             schema["properties"]["at"]["enum"] = json!(["start", "end"]);
             schema["properties"]["after_text"]["minLength"] = json!(1);
+            schema["properties"]["after_text"]["maxLength"] = json!(1000);
+            schema["properties"]["tab_id"]["pattern"] = json!("^[A-Za-z0-9._-]{1,128}$");
             schema["oneOf"] = json!([{"required":["at"]}, {"required":["after_text"]}]);
         }
         "docs_format" => {
             schema["properties"]["operations"] = json!({
                 "type":"array", "minItems":1, "maxItems":50,
-                "items":{
-                    "type":"object", "additionalProperties":false, "required":["type"],
-                    "properties":{
-                        "type":{"type":"string","enum":["paragraph_style","text_style","table_cell_style","header","add_tab"]},
-                        "after_text":{"type":"string","minLength":1},
-                        "text":{"type":"string"},
-                        "bold":{"type":"boolean"},
-                        "italic":{"type":"boolean"},
-                        "underline":{"type":"boolean"},
-                        "font_size":{"type":"number","exclusiveMinimum":0},
-                        "alignment":{"type":"string","enum":["START","CENTER","END","JUSTIFIED"]},
-                        "named_style_type":{"type":"string","enum":["NORMAL_TEXT","TITLE","SUBTITLE","HEADING_1","HEADING_2","HEADING_3","HEADING_4","HEADING_5","HEADING_6"]},
-                        "background_color":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"},
-                        "title":{"type":"string"}
-                    }
-                }
+                "items":{"oneOf":[
+                    {"type":"object","additionalProperties":false,"required":["type","text","named_style"],
+                     "properties":{
+                        "type":{"const":"paragraph_style"},
+                        "text":{"type":"string","minLength":1},
+                        "named_style":{"type":"string","enum":["NORMAL_TEXT","TITLE","SUBTITLE","HEADING_1","HEADING_2","HEADING_3","HEADING_4","HEADING_5","HEADING_6"]},
+                        "alignment":{"type":"string","enum":["START","CENTER","END","JUSTIFIED"]}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","text"],
+                     "anyOf":[{"required":["bold"]},{"required":["italic"]},{"required":["underline"]},{"required":["font_size_pt"]}],
+                     "properties":{
+                        "type":{"const":"text_style"},
+                        "text":{"type":"string","minLength":1},
+                        "bold":{"type":"boolean"},"italic":{"type":"boolean"},"underline":{"type":"boolean"},
+                        "font_size_pt":{"type":"number","minimum":6,"maximum":96}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","table_index","row","column","background_hex"],
+                     "properties":{
+                        "type":{"const":"table_cell_style"},
+                        "table_index":{"type":"integer","minimum":0,"maximum":99},
+                        "row":{"type":"integer","minimum":0,"maximum":499},
+                        "column":{"type":"integer","minimum":0,"maximum":49},
+                        "background_hex":{"type":"string","pattern":"^#[0-9A-Fa-f]{6}$"}
+                     }},
+                    {"type":"object","additionalProperties":false,"required":["type","text"],
+                     "properties":{"type":{"const":"header"},"text":{"type":"string","maxLength":1000}}},
+                    {"type":"object","additionalProperties":false,"required":["type","title"],
+                     "properties":{"type":{"const":"add_tab"},"title":{"type":"string","minLength":1,"maxLength":100}}}
+                ]}
             });
+        }
+        "sheets_add_sheet" => {
+            for key in ["title", "copy_from_sheet"] {
+                schema["properties"][key]["minLength"] = json!(1);
+                schema["properties"][key]["maxLength"] = json!(100);
+            }
         }
         "sheets_add_note" => { schema["properties"]["note"]["maxLength"] = json!(5000); }
         _ => {}
@@ -568,9 +590,14 @@ mod tests {
         assert_eq!(insert["properties"]["at"]["enum"], json!(["start","end"]));
         let format = schema("docs_format");
         assert_eq!(format["properties"]["operations"]["maxItems"], 50);
-        assert_eq!(format["properties"]["operations"]["items"]["additionalProperties"], false);
-        assert_eq!(format["properties"]["operations"]["items"]["properties"]["type"]["enum"],
-            json!(["paragraph_style","text_style","table_cell_style","header","add_tab"]));
+        let operations = format["properties"]["operations"]["items"]["oneOf"].as_array().unwrap();
+        for (op, name) in operations.iter().zip(["paragraph_style","text_style","table_cell_style","header","add_tab"]) {
+            assert_eq!(op["additionalProperties"], false);
+            assert_eq!(op["properties"]["type"]["const"], name);
+        }
+        assert_eq!(operations[1]["properties"]["font_size_pt"]["maximum"], 96);
+        assert!(operations[1]["properties"].get("font_size").is_none());
+        assert_eq!(operations[2]["properties"]["row"]["maximum"], 499);
         assert_eq!(schema("sheets_add_note")["properties"]["note"]["maxLength"], 5000);
         assert_eq!(schema("drive_move_file")["required"], json!(["file_id","destination_folder_id"]));
         assert!(schema("drive_move_file")["properties"].get("removeParents").is_none());

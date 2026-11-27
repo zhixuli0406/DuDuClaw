@@ -795,6 +795,28 @@ pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Tab
     Ok(())
 }
 
+/// Drive write consent is issued only by the dedicated Admin dialog.
+/// Removing the complete section is the only permitted raw edit.
+pub(crate) fn refuse_drive_write_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    let new = super::config_commit::toml_at(after, "google.drive_write");
+    if new.is_some() && new != super::config_commit::toml_at(before, "google.drive_write") {
+        return Err("請到 Google 整合設定頁調整雲端硬碟寫入權限。".into());
+    }
+    Ok(())
+}
+
+/// Generic settings RPCs must not silently accept a misplaced consent edit.
+pub(crate) fn refuse_drive_write_params(params: &Value) -> Result<(), String> {
+    let forbidden = params.as_object().is_some_and(|object| object.keys().any(|key| {
+        let parts: Vec<_> = key.split('.').collect();
+        matches!(parts.as_slice(), ["google", "drive_write", ..] | ["drive_write", ..])
+    })) || params.get("google").and_then(Value::as_object).is_some_and(|object| {
+        object.keys().any(|key| key.split('.').next() == Some("drive_write"))
+    });
+    if forbidden { return Err("請到 Google 整合設定頁調整雲端硬碟寫入權限。".into()); }
+    Ok(())
+}
+
 /// RM-027 round 3: a raw `agent.toml` save that changes the org pair must
 /// not carry along a field the admin left alone while that field differs
 /// from the authority (the mirror drifted — possibly tampered by the
@@ -963,7 +985,19 @@ impl MethodHandler {
         }
         // Every validation message is scrubbed of restored secrets.
         let before: toml::Table = stored.parse().unwrap_or_default();
-        let after = validate_raw_with_stored(&kind, &new_text, Some(&before)).map_err(|e| rctx.scrub(&e))?;
+        let mut after = validate_raw_with_stored(&kind, &new_text, Some(&before)).map_err(|e| rctx.scrub(&e))?;
+        let delegation_roles_added = if matches!(kind, RawFile::Config) {
+            let (before_roles, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&before).resolve_overrides();
+            let (after_roles, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&after).resolve_overrides();
+            super::delegation_rpc::require_delegation_role_ack(&before_roles.unrestricted_roles, &after_roles.unrestricted_roles,
+                params.get("acknowledge_risk").and_then(Value::as_bool) == Some(true))?
+        } else { Vec::new() };
+        let admin_ai_changed = if matches!(kind, RawFile::Config) {
+            let changed = super::admin_ai_rpc::prepare_admin_ai_change(&before, &mut after,
+                params.get("acknowledge_risk").and_then(Value::as_bool) == Some(true), &ctx.user_id)?;
+            if changed { new_text = super::config_commit::render_preserving(&new_text, &after)?; }
+            changed
+        } else { false };
         if matches!(kind, RawFile::Agent(_)) {
             if let Some(value) = super::config_commit::toml_at(&after, "runtime.timeout_secs") {
                 let max = crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs;
@@ -986,6 +1020,7 @@ impl MethodHandler {
         if matches!(kind, RawFile::Config) {
             refuse_disclosure_ack_edit(&before, &after)?;
             crate::google_signin::config::refuse_google_signin_widening(&before, &after)?;
+            refuse_drive_write_edit(&before, &after)?;
         }
         // B11 L3: the raw editor follows the same one-bot / one-app rule as
         // the dashboard bind, under the same lock.
@@ -1168,6 +1203,16 @@ impl MethodHandler {
                 .map_err(|e| format!("write task failed: {e}"))??;
         }
 
+        if matches!(kind, RawFile::Config) && before.get("delegation") != after.get("delegation") {
+            crate::security_autopilot::audit_and_emit(&self.home_dir,
+                &duduclaw_security::audit::AuditEvent::new("delegation_config_changed", "dashboard",
+                    duduclaw_security::audit::Severity::Warning,
+                    super::delegation_rpc::delegation_audit_details(ctx,
+                        json!(before.get("delegation")), json!(after.get("delegation")), &delegation_roles_added)));
+        }
+        if admin_ai_changed {
+            super::admin_ai_rpc::audit_admin_ai_toggle(&self.home_dir, &ctx.user_id, &before, &after);
+        }
         // Committed (authority first, then mirror): release the org lock.
         drop(org_lock);
         let backup_name = backup
@@ -1341,6 +1386,24 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_delegation_role_addition_requires_acknowledgement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[delegation]\npolicy='none'\nunrestricted_roles=['employee']\n";
+        std::fs::write(&path, original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let params = json!({"file": "config", "base_hash": content_hash(original),
+            "content": "[delegation]\npolicy='none'\nunrestricted_roles=['admin','employee']\n"});
+        let response = handler.handle_config_raw_set(params, &UserContext::admin_fallback()).await;
+        assert!(matches!(&response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        assert!(serde_json::to_string(&response).unwrap().contains("新增不受委派範圍限制的角色前，請先確認風險。"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
+        assert!(!rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .any(|v| v["event_type"] == "delegation_config_changed"));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn config_raw_lifecycle_timeout_leaves_backups_and_profile_unchanged() {

@@ -348,6 +348,51 @@ pub(crate) fn commit_rendered_locked(
 ) -> Result<(), String> {
     commit_rendered_policy(path,expected_hash,render,true,None)
 }
+/// Used by backup restore and CLI import, including final publication validation.
+pub fn refuse_drive_write_text_edit(before: &str, after: &str) -> Result<(), String> {
+    let parse = |text: &str| text.parse::<toml::Table>()
+        .map_err(|_| "無法讀取設定，這次沒有變更寫入權限。".to_string());
+    super::config_raw_rpc::refuse_drive_write_edit(&parse(before)?, &parse(after)?)
+}
+
+/// The only consent-producing adapter. Its input is a validated policy, never
+/// an arbitrary caller-supplied config table; all other writers use the guard.
+pub(super) async fn commit_drive_write_policy(
+    home: &Path, expected_hash: String,
+    policy: crate::google_workspace::drive_write_policy::DriveWritePolicy,
+    actor: UserContext, db: Option<Arc<UserDb>>,
+) -> Result<(), String> {
+    acl::require_role(&actor, UserRole::Admin)?;
+    let home = home.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let section = crate::google_workspace::drive_write_policy::render_section(
+            &policy, &crate::google_workspace::drive_write_policy::sign(
+                &policy, &actor.user_id, &actor.email, chrono::Utc::now()));
+        // Verify the exact section we are about to publish, including actor fields.
+        if crate::google_workspace::drive_write_policy::parse_section(Some(&section), true).ack.is_none() {
+            return Err("無法確認管理員身分，這次沒有變更寫入權限。".into());
+        }
+        crate::google_identity::home_source::with_source_guard(&home, |g| Ok(
+            commit_rendered_inner_authorized(&home.join("config.toml"), &expected_hash, |current| {
+                // Folder lookups may await the network. Recheck the authenticated
+                // person immediately before publication, under the config lock.
+                if let Some(db) = &db {
+                    let live = db.live_user_context(&actor.user_id)
+                        .map_err(|_| "無法確認管理員身分。".to_string())?
+                        .ok_or_else(|| "無法確認管理員身分。".to_string())?;
+                    if !live.is_admin() || live.credential_epoch != actor.credential_epoch
+                        || live.email != actor.email || live.must_change_password {
+                        return Err("管理員身分已變更，請重新登入。".into());
+                    }
+                }
+                let mut table = current.parse::<toml::Table>().map_err(|_| "無法讀取設定。".to_string())?;
+                table_at_mut(&mut table, &["google"])?.insert("drive_write".into(), section);
+                render_preserving(current, &table)
+            }, true, Some(g), None, None, true)
+        )).map_err(|e| e.to_string())?
+    }).await.map_err(|_| "無法儲存設定，請稍後重試。".to_string())?
+}
+
 /// Existing local CLI policy remains at its caller. This narrow final-write
 /// adapter changes locking/durability, not operator role/product policy.
 pub(crate) fn commit_local_config_rendered(
@@ -364,6 +409,9 @@ fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)
     commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None)
 }
 fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
+    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false)
+}
+fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool)->Result<(),String> {
     let authority_home = match path.file_name().and_then(|n| n.to_str()) {
         Some("config.toml") => path.parent(),
         Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
@@ -386,6 +434,11 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        if !drive_write_consent && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            if let Err(error) = refuse_drive_write_text_edit(&current, &new_content) {
+                return Ok(Err(error));
+            }
+        }
         if observer.is_some() && source.is_some() {
             if let Err(error)=crate::google_identity::home_source::require_unrelated_config(&current,&new_content) {
                 return Ok(Err(error.to_string()));
@@ -513,6 +566,7 @@ pub(crate) fn commit_boot_config<T>(
             };
             let (result, rendered) = render(&current, missing).map_err(std::io::Error::other)?;
             if let Some(rendered) = rendered {
+                refuse_drive_write_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
                 use std::io::Write;
                 let tmp = home.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
                 let mut opts = std::fs::OpenOptions::new();
@@ -610,7 +664,7 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 /// `toml::to_string_pretty`, as before. If the edited document would not
 /// read back as exactly `new_table` (a bug here), the full re-serialisation
 /// is used instead, which is always correct, only not format-preserving.
-pub(crate) fn render_preserving(original_text: &str, new_table: &toml::Table) -> Result<String, String> {
+pub fn render_preserving(original_text: &str, new_table: &toml::Table) -> Result<String, String> {
     let pretty = || toml::to_string_pretty(new_table).map_err(|e| format!("failed to serialize config: {e}"));
     if original_text.trim().is_empty() {
         return pretty();

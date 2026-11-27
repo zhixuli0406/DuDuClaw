@@ -104,7 +104,11 @@ pub async fn install(
         let Some(id) = id_map.get(&draft.ref_id) else { continue };
         let parent = draft.reports_to.as_ref().and_then(|r| id_map.get(r))
             .cloned().or_else(|| ctx.attach_under.clone()).unwrap_or_default();
-        plans.push(plan_agent(draft, id, &parent, bundle.format_code, &slug, stage.path(), &mut book, report)?);
+        let mut plan = plan_agent(draft, id, &parent, bundle.format_code, &slug, stage.path(), &mut book, report)?;
+        for ((prepared, _), source) in plan.skills.iter_mut().zip(&draft.skills) {
+            prepared.source_rel = super::provenance::source_rel(root, &source.dir);
+        }
+        plans.push(plan);
     }
     if plans.is_empty() {
         return Err(import_err("import.nothing_imported", json!({"agents": report.agent_problems()}),
@@ -183,7 +187,14 @@ pub async fn install(
         report.ignored("archive", &u.rel, u.reason.clone());
         report.tag("archive.unmapped", json!({ "file": u.rel }));
     }
-    placement::file_quarantine(ctx, &slug, quarantined, report).await;
+    let provenance = plans.iter().flat_map(|plan| {
+        plan.skills.iter().filter(|(skill, _)| matches!(skill.verdict, super::skills::Verdict::Quarantine(_)))
+            .map(move |(skill, files)| super::provenance::SkillProvenance {
+                agent: plan.draft.id_hint.clone(), name: skill.name.clone(),
+                source_dir: skill.source_rel.clone(), files: files.keys().cloned().collect(),
+            })
+    }).collect::<Vec<_>>();
+    placement::file_quarantine(ctx, root, &slug, quarantined, &provenance, report).await;
     Ok(record)
 }
 

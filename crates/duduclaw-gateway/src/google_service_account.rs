@@ -699,6 +699,16 @@ subject = "boss@customer.com"
     }
 
     #[test]
+    fn cache_key_separates_drive_write_from_ordinary_scopes() {
+        let write = ["https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/spreadsheets"];
+        let ordinary = ["https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/spreadsheets"];
+        assert_ne!(cache_key("sa", "person@c.test", &write), cache_key("sa", "person@c.test", &ordinary));
+        assert_ne!(cache_key("sa", "person@c.test", &write), cache_key("sa", "person@c.test", &write[1..]));
+    }
+
+    #[test]
     fn cache_key_separates_scopes_and_subjects() {
         assert_eq!(cache_key("sa", "a@c.com", &["y", "x", "x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "a@c.com", &["x", "y"]));

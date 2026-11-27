@@ -457,9 +457,12 @@ pub(crate) fn merge_data_file_guard_hook(root: &mut Value, duduclaw_bin: &Path) 
 
 pub(crate) fn merge_egress_guard_hook(root: &mut Value, bin: &Path, agent: &str, home: Option<&Path>) -> bool {
     let command = build_named_hook_command(bin, EGRESS_HOOK_ID, agent, home);
+    let matcher: String = ["WebFetch", "WebSearch", "Fetch", "web_fetch", "web_search"]
+        .into_iter().chain(duduclaw_core::types::SHELL_TOOLS.iter().copied())
+        .collect::<Vec<_>>().join("|");
     let desired = json!({
         HOOK_TAG: EGRESS_HOOK_ID,
-        "matcher": "WebFetch|WebSearch|Bash|Fetch|Shell|web_fetch|web_search|run_terminal_command",
+        "matcher": matcher,
         "hooks": [{"type": "command", "command": command}]
     });
     let Some(entries) = pre_tool_use_array(root) else { return false; };

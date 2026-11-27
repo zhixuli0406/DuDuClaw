@@ -208,10 +208,13 @@ fn audit_ai_authority_refusal(home: &Path, caller: &str, target: &str, field: &s
 
 fn check_ai_authority(
     home: &Path, actor: RecordActor<'_>, target: &str,
-    before: &toml::Table, after: &toml::Table,
+    before: &toml::Table, after: &toml::Table, approved_db: Option<&[String]>,
 ) -> std::result::Result<(), String> {
     let Some(caller) = actor.agent() else { return Ok(()); };
-    let changes = duduclaw_core::agent_toml::authority::authority_diff(before, after);
+    let changes: Vec<_> = duduclaw_core::agent_toml::authority::authority_diff(before, after)
+        .into_iter().filter(|change| !(change.key == "capabilities.db_sources"
+            && approved_db.is_some_and(|ids| change.after == serde_json::json!(ids))))
+        .collect();
     for change in &changes {
         let class = match change.key.as_str() {
             "budget.monthly_limit_cents" | "budget.daily_cap_cents" => {
@@ -468,7 +471,7 @@ pub(crate) async fn handle_agent_update(
         if let Some(agent) = after.get_mut("agent").and_then(toml::Value::as_table_mut) {
             agent.insert("reports_to".into(), toml::Value::String(v.into()));
         }
-        if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before, &after) {
+        if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before, &after, None) {
             return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true});
         }
         // Validate reports_to references an existing agent and won't create a cycle
@@ -589,8 +592,8 @@ pub(crate) async fn handle_agent_update(
 
     // -- Capability fields: read-only database source grants (WP-B) --
     //
-    // The shared authority comparator permits AI revocation only. Human
-    // operators retain grants; source validation still applies to their edits.
+    // AI expansions for another employee require a bound Admin approval.
+    // Self-expansions remain refused; revocations apply directly.
     //
     // Fail-closed on the granting side: every id named by `db_sources` /
     // `db_sources_add` is validated against the configured
@@ -772,6 +775,20 @@ pub(crate) async fn handle_agent_update(
             return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
+    // Refuse unrelated authority changes before filing a card. Only this
+    // other-employee database expansion is eligible for the Admin exception.
+    let needs_db_approval = actor.agent().is_some_and(|me| me != agent_id)
+        && !db_sources_added.is_empty();
+    let approved_sources = if needs_db_approval { db_sources_after.as_deref() } else { None };
+    if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before_t, &after_t, approved_sources) {
+        return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true});
+    }
+    let db_approval = if let Some(sources) = approved_sources {
+        match super::approval::approve_db_source_grant(home_dir, caller, agent_id, sources).await {
+            Ok(proof) => Some(proof),
+            Err(reason) => return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true}),
+        }
+    } else { None };
     // RM-027 review: a re-parenting holds the global org mutation lock
     // (shared with the dashboard `org.*` RPCs, `agents.update` and
     // `duduclaw org sync`), taken BEFORE the agent.toml lock — the order every
@@ -821,7 +838,24 @@ pub(crate) async fn handle_agent_update(
         // Compare the artifact read under the cross-process lock with the
         // final artifact. A concurrent admin tightening cannot be overwritten
         // using an older, more permissive baseline.
-        check_ai_authority(home_dir, actor, agent_id, &authority_before, raw)?;
+        if let Some(sources) = approved_sources {
+            // A concurrent revocation must not be undone by an old approval.
+            let current = authority_before.get("capabilities").and_then(|v| v.get("db_sources"));
+            let held: Option<Vec<&str>> = match current {
+                None => Some(Vec::new()),
+                Some(toml::Value::Array(ids)) => ids.iter().map(toml::Value::as_str).collect(),
+                _ => None,
+            };
+            let baseline: Vec<&str> = config_before.capabilities.db_sources.iter().map(String::as_str).collect();
+            if held.as_ref() != Some(&baseline) { return Err("資料庫授權已變更，請重新提出核准。".into()); }
+            let final_list = raw.get("capabilities").and_then(|v| v.get("db_sources"))
+                .and_then(toml::Value::as_array).ok_or("核准清單不符。")?;
+            let exact: Option<Vec<&str>> = final_list.iter().map(toml::Value::as_str).collect();
+            if exact.as_deref() != Some(sources.iter().map(String::as_str).collect::<Vec<_>>().as_slice()) {
+                return Err("核准清單不符。".into());
+            }
+        }
+        check_ai_authority(home_dir, actor, agent_id, &authority_before, raw, approved_sources)?;
         Ok(())
     }, || {
         // RM-137 H4: the policy / org tree may have changed since the front
@@ -880,6 +914,14 @@ pub(crate) async fn handle_agent_update(
         });
     }
     drop(org_lock);
+
+    if let Some((approval_id, user_id)) = &db_approval {
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home_dir, caller, "db_source_grant_applied", "Admin approved database source grant applied", true,
+            &[("target", serde_json::json!(agent_id)), ("added", serde_json::json!(db_sources_added)),
+              ("approval_id", serde_json::json!(approval_id)), ("decider_user_id", serde_json::json!(user_id))],
+        );
+    }
 
     if config_before.agent.status != config.agent.status {
         duduclaw_gateway::dashboard_feedback::emit(home_dir, "agent.status_changed",
@@ -964,4 +1006,18 @@ pub(crate) async fn handle_agent_update(
             changes.iter().map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")
         )}]
     })
+}
+
+#[cfg(test)]
+mod db_source_grant_binding_tests {
+    use super::*;
+
+    #[test]
+    fn approved_list_cannot_exempt_a_different_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before: toml::Table = toml::from_str("[capabilities]\ndb_sources=[]\n").unwrap();
+        let after: toml::Table = toml::from_str("[capabilities]\ndb_sources=['crm','hr']\n").unwrap();
+        assert!(check_ai_authority(tmp.path(), RecordActor::Agent("lead"), "rep", &before, &after, Some(&["crm".into()])).is_err());
+        assert!(check_ai_authority(tmp.path(), RecordActor::Agent("lead"), "rep", &before, &after, Some(&["crm".into(), "hr".into()])).is_ok());
+    }
 }

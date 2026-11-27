@@ -105,6 +105,8 @@ impl MethodHandler {
             edition_fixture_runtime: RwLock::new(None),
             #[cfg(test)]
             agent_cap_fixture: RwLock::new(None),
+            #[cfg(test)]
+            cost_telemetry_fixture: std::sync::OnceLock::new(),
             cli_auth_sessions: RwLock::new(std::collections::HashMap::new()),
             setup_token_session: RwLock::new(None),
             cron_store: RwLock::new(None),
@@ -732,6 +734,11 @@ impl MethodHandler {
 
     /// Clone the configured store without carrying its guard into blocking work.
     pub(crate) async fn user_db(&self) -> Option<Arc<UserDb>> {
+        self.user_db.read().await.clone()
+    }
+
+    /// Clone the shared database before moving synchronous work off the async runtime.
+    pub(crate) async fn signin_onboarding_db(&self) -> Option<Arc<UserDb>> {
         self.user_db.read().await.clone()
     }
 

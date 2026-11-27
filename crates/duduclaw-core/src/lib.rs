@@ -1,4 +1,5 @@
 pub mod module_lease;
+pub mod admin_ai_settings;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
@@ -49,6 +50,7 @@ pub mod llm_contract;
 pub mod macos_bundle;
 pub mod match_utils;
 pub mod net_addr;
+pub mod mcp_person_tools;
 pub mod mcp_scopes;
 pub mod org;
 pub mod org_change;
@@ -121,12 +123,12 @@ pub use delegation_policy::{
     can_delegate, can_delegate_ext, can_delegate_rules, can_delegate_rules_ext, evaluate_delegation,
     DelegationAllowSource, DelegationBoundaries, DelegationContext, DelegationOverrides,
     DelegationRequesterRole, OwnerRoleLookupError, OwnerRoleView, resolve_allow_one_way,
-    DELEGATION_ROLE_NAMES, MAX_ONE_WAY_PAIRS,
+    UNRESTRICTABLE_ROLE_NAMES, MAX_ONE_WAY_PAIRS,
     delegation_rules_from_home, is_ancestor as is_org_ancestor, is_reserved_agent_id,
     is_reserved_queue_sender, is_system_sender,
     policy_from_home as delegation_policy_from_home, read_delegation_config,
     require_identity_token_from_home, resolve_allow_pairs, DelegationConfig, DelegationConfigRead,
-    DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
+    DenialAudience, DelegationDenied, DelegationPolicy, DelegationRules, DenyReason as DelegationDenyReason,
     MapOrgView, OrgNode, OrgView, ACP_CLIENT_SENDER, MAX_ANCESTOR_HOPS, RESERVED_QUEUE_SENDERS,
     STANDALONE_CLIENT_PREFIX, SYSTEM_SENDERS,
 };

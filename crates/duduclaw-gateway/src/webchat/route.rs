@@ -1,5 +1,5 @@
-//! WebChat routing: dashboard accounts may call their authorized non-main
-//! employees; admins keep the default path. Anonymous widgets keep their
+//! WebChat routing: dashboard accounts may call their authorized employees,
+//! including main under an effective person-list grant. Anonymous widgets keep their
 //! server-selected conversation partner and cannot choose an employee.
 
 use crate::trigger_route::{self, SenderAccess, TriggerRoute};
@@ -79,7 +79,7 @@ impl WebChatState {
         }
         match self.acl_snapshot(auth_user).await {
             Ok(s) => SenderAccess::from_effective(s.access)
-                .for_webchat(super::access::gateway_default_id(&self.ctx.home_dir).await),
+                .for_webchat_converse(&self.ctx.home_dir).await,
             Err(e) => {
                 tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — denying calls: {e}");
                 SenderAccess::no_bindings(auth_user).for_webchat(Err(e))
@@ -94,7 +94,7 @@ impl WebChatState {
     /// `agents.callable` use, with the session's own default employee, so a
     /// conversation started by `@` with a public or default employee resumes
     /// like one with a bound or team employee. An unreadable account or a
-    /// non-admin main-agent target is refused before considering public grants.
+    /// main target without effective admission is refused before public grants.
     pub(super) async fn may_resume_into(
         &self,
         auth_user: &str,

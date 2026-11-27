@@ -220,3 +220,87 @@ mod tests {
         }
     }
 }
+
+pub(crate) const NO_CONFIGURED_ACCOUNTS: &str = "目前沒有可連結的機器人或聊天應用程式，請先完成設定；Google Chat 需使用 HTTP 連線。";
+
+const CONFIG_UNAVAILABLE: &str = "目前無法處理聊天連結，請重新整理後再試。";
+
+fn configured_string(table: &toml::Table, key: &str) -> bool {
+    table.get(key).and_then(toml::Value::as_str).is_some_and(|s| !s.trim().is_empty())
+}
+
+fn configured_secret(table: &toml::Table, key: &str) -> bool {
+    configured_string(table, key) || configured_string(table, &format!("{key}_enc"))
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ConfiguredAccount {
+    pub(crate) channel: String,
+    pub(crate) account: String,
+    pub(crate) agent_id: Option<String>,
+    pub(crate) display_name: String,
+    pub(crate) project_number: Option<String>,
+}
+
+fn target(channel: &str, agent: Option<&str>, name: &str, project: Option<&str>) -> ConfiguredAccount {
+    ConfiguredAccount { channel: channel.into(), account: account_label(channel, agent),
+        agent_id: agent.map(str::to_owned), display_name: name.into(),
+        project_number: project.map(str::to_owned) }
+}
+
+/// Local configuration only: never resolve SecretRefs or call getMe. Like the
+/// existing channel status RPC, encrypted credentials count as configured.
+pub(crate) fn configured_accounts(home: &Path, channel: &str, agents: &[String]) -> Result<Vec<ConfiguredAccount>, &'static str> {
+    if !chat_link::CHANNELS.contains(&channel) {
+        return Err(CONFIG_UNAVAILABLE);
+    }
+    let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| CONFIG_UNAVAILABLE)?;
+    let config: toml::Table = raw.parse().map_err(|_| CONFIG_UNAVAILABLE)?;
+    let mut result = Vec::new();
+    if let Some(value) = config.get("channels") {
+        let ch = value.as_table().ok_or(CONFIG_UNAVAILABLE)?;
+        if channel == "telegram" && configured_secret(ch, "telegram_bot_token") {
+            result.push(target(channel, None, "共用 Telegram 機器人", None));
+        } else if channel == "googlechat" {
+            let allowed = ["project_number", "service_account_json", "service_account_json_enc",
+                "connection", "pubsub_subscription"];
+            let valid_fields = ch.keys().filter_map(|k| k.strip_prefix("googlechat_"))
+                .all(|k| allowed.contains(&k));
+            // Same fail-closed transport rules as shared_http_enabled and
+            // sending_app_takes_http_clicks: default HTTP, empty subscription.
+            let http = ch.get("googlechat_connection").map_or(true, |v| v.as_str() == Some("http"))
+                && ch.get("googlechat_pubsub_subscription").map_or(true, |v| v.as_str() == Some(""));
+            if valid_fields && http && configured_secret(ch, "googlechat_service_account_json") {
+                if let Some(project) = ch.get("googlechat_project_number").and_then(toml::Value::as_str)
+                    .filter(|p| crate::agent_channels::googlechat_config::validate_project_number(p).is_ok()) {
+                    result.push(target(channel, None, "共用 Google Chat 應用程式", Some(project)));
+                }
+            }
+        }
+    }
+    for id in agents {
+        if !duduclaw_core::is_valid_agent_id(id) { return Err(CONFIG_UNAVAILABLE); }
+        let raw = std::fs::read_to_string(home.join("agents").join(id).join("agent.toml"))
+            .map_err(|_| CONFIG_UNAVAILABLE)?;
+        let config: toml::Table = raw.parse().map_err(|_| CONFIG_UNAVAILABLE)?;
+        let Some(channels) = config.get("channels") else { continue; };
+        let Some(value) = channels.as_table().ok_or(CONFIG_UNAVAILABLE)?.get(channel) else { continue; };
+        let section = value.as_table().ok_or(CONFIG_UNAVAILABLE)?;
+        if channel == "telegram" && configured_secret(section, "bot_token") {
+            result.push(target(channel, Some(id), id, None));
+        } else if channel == "googlechat" {
+            let cfg: duduclaw_core::types::GoogleChatChannelConfig = value.clone().try_into()
+                .map_err(|_| CONFIG_UNAVAILABLE)?;
+            if cfg.connection == "http" && cfg.pubsub_subscription.trim().is_empty()
+                && crate::agent_channels::store::googlechat_configured(Some(&cfg))
+                && crate::agent_channels::googlechat_config::validate_project_number(&cfg.project_number).is_ok() {
+                result.push(target(channel, Some(id), id, Some(&cfg.project_number)));
+            }
+        }
+    }
+    if result.is_empty() {
+        return Err(NO_CONFIGURED_ACCOUNTS);
+    }
+    Ok(result)
+}
+

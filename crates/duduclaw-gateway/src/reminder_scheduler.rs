@@ -524,16 +524,6 @@ async fn load_reminders(home_dir: &Path) -> Vec<Reminder> {
 /// to acquire it internally.
 fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), String> {
     let path = home_dir.join("reminders.jsonl");
-    // Every writer holds the lock, including cancellation, GC and backfill.
-    // Compare persisted material before publishing to prevent edit-back revival.
-    for before in load_reminders_sync(home_dir) {
-        let after = reminders.iter().find(|row| row.id == before.id);
-        if after.is_none_or(|row| row.status != ReminderStatus::Pending
-            || crate::isolation_background::material::reminder(row)
-                != crate::isolation_background::material::reminder(&before)) {
-            crate::delegation_roles::initiators::revoke_before_write(home_dir, "reminder", &before.id);
-        }
-    }
 
     let mut content = String::new();
     for r in reminders {
@@ -1104,12 +1094,9 @@ where
     let principal = crate::on_behalf_of::from_stored(
         home_dir, reminder.on_behalf_of.as_deref(), &reminder.agent_id, "reminder",
     );
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "reminder", &reminder.id,
-        None, &reminder.agent_id, principal.as_deref());
-    authority.scope(crate::delegation_roles::initiators::scope(&reminder.agent_id, requester,
-        crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
+    authority.scope(crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
         home_dir, http, registry, sem, reminder, invoke,
-    )))).await
+    ))).await
 }
 
 async fn deliver_reminder_scoped<F, Fut>(
@@ -1454,7 +1441,13 @@ pub(crate) async fn cancel_pending_where(
 }
 
 /// Dashboard reads fail closed on corrupt or unreadable persistence.
-pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserContext, cancel: Option<&str>) -> Result<Vec<Reminder>, String> {
+// Return each row's control flag and the target of a successful grant-backed
+// cancellation so the async caller can audit only after persistence succeeds.
+pub(crate) async fn dashboard_reminders(
+    home: &Path, ctx: &duduclaw_auth::UserContext,
+    view: crate::dept_grants::DeptGrantView, cancel: Option<&str>,
+) -> Result<(Vec<(Reminder, bool)>, Option<String>), String> {
+    use crate::dept_grants::{GrantAction, GrantGroup, department_grant_allows};
     let home = home.to_path_buf();
     let ctx = ctx.clone();
     let cancel = cancel.map(str::to_string);
@@ -1471,16 +1464,28 @@ pub(crate) async fn dashboard_reminders(home: &Path, ctx: &duduclaw_auth::UserCo
         // v1.81 P1g: another person's Personal employee's reminders are
         // neither listed nor cancelled through the Admin role or a stored
         // origin — owner only.
-        let allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
+        let original_allowed = |r: &Reminder, level| !ctx.owner_only_denied(&r.agent_id)
             && (ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
                 || ctx.has_agent_access(&r.agent_id, level));
+        let allowed = |r: &Reminder, level, action| original_allowed(r, level)
+            || department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, action);
+        let mut grant_cancelled_agent = None;
         if let Some(id) = cancel {
             let row = rows.iter_mut().find(|r| r.id == id && r.status == ReminderStatus::Pending
-                && allowed(r, duduclaw_auth::AccessLevel::Operator)).ok_or("permission denied")?;
+                && allowed(r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove)).ok_or("permission denied")?;
+            if !original_allowed(row, duduclaw_auth::AccessLevel::Operator) {
+                grant_cancelled_agent = Some(row.agent_id.clone());
+            }
             row.status = ReminderStatus::Cancelled;
             save_reminders_sync(&home, &rows)?;
         }
-        Ok(rows.into_iter().filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer)).collect())
+        let visible = rows.into_iter()
+            .filter(|r| allowed(r, duduclaw_auth::AccessLevel::Viewer, GrantAction::Read))
+            .map(|r| {
+                let can_manage = allowed(&r, duduclaw_auth::AccessLevel::Operator, GrantAction::Remove);
+                (r, can_manage)
+            }).collect();
+        Ok((visible, grant_cancelled_agent))
     }).await.map_err(|e| e.to_string())?
 }
 

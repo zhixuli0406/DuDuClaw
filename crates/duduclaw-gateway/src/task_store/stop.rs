@@ -95,7 +95,6 @@ impl TaskStore {
         let mut tree = tree;
         let truncated = tree.len() > STOP_TREE_LIMIT;
         tree.truncate(STOP_TREE_LIMIT);
-        for id in &tree { self.revoke_initiator(id); }
         let ids_json = serde_json::to_string(&tree).map_err(|e| e.to_string())?;
         tx.execute(
             "UPDATE tasks SET status='cancelled', judge_feedback='stopped by operator',
@@ -349,7 +348,6 @@ impl TaskStore {
                 .map_err(|e| format!("stop batch: {e}"))?
         };
         let batch: Vec<&String> = open.iter().take(STOP_TREE_LIMIT).collect();
-        for id in &batch { self.revoke_initiator(id); }
         let batch_json = serde_json::to_string(&batch).map_err(|e| e.to_string())?;
         let n = conn
             .execute(
