@@ -1083,9 +1083,14 @@ pub(crate) async fn handle_pause_cron_task(
         Err(reason) => return tool_error(&reason),
     };
     match store.set_enabled_with_principal(&row.id, enabled, principal.as_deref()).await {
-        Ok(true) => serde_json::json!({
-            "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
-        }),
+        Ok(true) => {
+            if enabled {
+                super::delegation_roles::record_initiator(home_dir, "cron", actor.id(), &row.agent_id, &row.id).await;
+            }
+            serde_json::json!({
+                "content": [{"type": "text", "text": format!("Cron task '{key}' {action}.")}]
+            })
+        },
         Ok(false) => tool_error(&format!("Cron task not found: {key}")),
         Err(e) => tool_error(&format!("{action} cron task: {e}")),
     }

@@ -25,7 +25,7 @@ fn signature(home: &Path) -> Result<Hmac<Sha256>, OwnerRoleLookupError> {
     mac.update(b"duduclaw/delegation-initiator/v1\n");
     Ok(mac)
 }
-fn database(home: &Path, write: bool) -> Result<Connection, OwnerRoleLookupError> {
+fn database(home: &Path, write: bool) -> Result<crate::fs_safe::sqlite::Connection, OwnerRoleLookupError> {
     #[cfg(unix)]
     let db = if write {
         crate::fs_safe::sqlite::open(home, "delegation-initiators.db")
@@ -33,9 +33,10 @@ fn database(home: &Path, write: bool) -> Result<Connection, OwnerRoleLookupError
         crate::fs_safe::sqlite::open_existing(home, "delegation-initiators.db", crate::fs_safe::sqlite::Access::ReadOnly)
     }.map_err(|_| OwnerRoleLookupError)?;
     #[cfg(not(unix))]
-    let db = Connection::open_with_flags(home.join("delegation-initiators.db"),
-        if write { OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE }
-        else { OpenFlags::SQLITE_OPEN_READ_ONLY }).map_err(|_| OwnerRoleLookupError)?;
+    // Windows pins the protected secure-db directory and returns a guarded
+    // connection. The secure opener refuses every other non-Unix platform.
+    let db = crate::fs_safe::sqlite::open(home, "delegation-initiators.db")
+        .map_err(|_| OwnerRoleLookupError)?;
     db.busy_timeout(std::time::Duration::from_secs(5)).map_err(|_| OwnerRoleLookupError)?;
     if write {
         db.execute_batch("CREATE TABLE IF NOT EXISTS initiators (
@@ -44,6 +45,31 @@ fn database(home: &Path, write: bool) -> Result<Connection, OwnerRoleLookupError
             .map_err(|_| OwnerRoleLookupError)?;
     }
     Ok(db)
+}
+
+/// Remove every version and target before durable work loses its authority.
+pub(crate) fn revoke(home: &Path, kind: &str, id: &str) -> Result<(), OwnerRoleLookupError> {
+    let path = crate::fs_safe::sqlite::database_path(home, "delegation-initiators.db");
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(OwnerRoleLookupError),
+        Ok(_) => {},
+    }
+    let db = database(home, true)?;
+    db.execute("DELETE FROM initiators WHERE kind=?1 AND id=?2", rusqlite::params![kind, id])
+        .map_err(|_| OwnerRoleLookupError)?;
+    Ok(())
+}
+
+/// A receipt-store failure must never prevent stopping the actual work.
+pub(crate) fn revoke_before_write(home: &Path, kind: &str, id: &str) {
+    if revoke(home, kind, id).is_err() {
+        tracing::error!(kind, id, "delegation initiator revocation failed");
+        crate::security_autopilot::audit_and_emit(home, &duduclaw_security::audit::AuditEvent::new(
+            "delegation_initiator_revoke_failed", "system", duduclaw_security::audit::Severity::Critical,
+            serde_json::json!({"kind": kind, "id": id}),
+        ));
+    }
 }
 
 fn material_digest(home: &Path, kind: &str, id: &str, target: &str, sender: Option<&str>)

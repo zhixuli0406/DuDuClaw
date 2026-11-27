@@ -1000,8 +1000,10 @@ pub(crate) async fn handle_tasks_update(
             }));
         }
     }
-    if duduclaw_gateway::isolation_background::material::task(&current)
-        != duduclaw_gateway::isolation_background::material::task(&updated) {
+    if !updated.archived && !matches!(updated.status.as_str(), "cancelled" | "failed" | "done")
+        && (current.status != updated.status || current.archived != updated.archived
+            || duduclaw_gateway::isolation_background::material::task(&current)
+                != duduclaw_gateway::isolation_background::material::task(&updated)) {
         super::delegation_roles::record_initiator(home_dir, "task", caller, &updated.assigned_to, &updated.id).await;
     }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;

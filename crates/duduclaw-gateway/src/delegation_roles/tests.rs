@@ -91,7 +91,7 @@ fn signed_initiator_is_bound_to_record_sender_target_and_live_account() {
     users.execute("UPDATE users SET role='employee' WHERE id=?1", [&admin]).unwrap();
     let recovered = load("job", Some("avatar"), "other", Some(&principal)).unwrap();
     assert!(decision(&GatewayOwnerRoles::new(home.path(), recovered)).is_err());
-    let receipts = Connection::open(home.path().join("delegation-initiators.db")).unwrap();
+    let receipts = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
     receipts.execute("UPDATE initiators SET body=?1 WHERE id='job'", [b"{}".as_slice()]).unwrap();
     assert!(load("job", Some("avatar"), "other", Some(&principal)).is_none());
 }
@@ -139,7 +139,7 @@ async fn cron_receipt_requires_current_persisted_content_and_target() {
         DenyReason::DelegationDisabled);
     initiators::record(home.path(), "cron", "avatar", "avatar", "cron", &requester).unwrap();
     assert_eq!(decision(&GatewayOwnerRoles::new(home.path(), load().unwrap())), Ok(DelegationAllowSource::UnrestrictedRole));
-    let count: i64 = Connection::open(home.path().join("delegation-initiators.db")).unwrap()
+    let count: i64 = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap()
         .query_row("SELECT COUNT(*) FROM initiators WHERE kind='cron' AND id='cron'", [], |r| r.get(0)).unwrap();
     assert_eq!(count, 2);
 }
@@ -206,4 +206,111 @@ fn initiator_database_is_private_and_refuses_symlinks() {
     symlink(&moved, &path).unwrap();
     assert!(initiators::lookup(home.path(), "message", "job", None, "other", Some(&format!("user:{admin}"))).is_none());
     assert_eq!(initiators::record(home.path(), "message", "avatar", "other", "new", &Requester::attended(&admin)), Err(OwnerRoleLookupError));
+}
+
+
+fn assert_receipt_access(home: &Path, kind: &str, id: &str, admin: &str, allowed: bool) {
+    let requester = initiators::lookup(home, kind, id, None, "avatar", Some(&format!("user:{admin}")));
+    assert_eq!(requester.is_some(), allowed);
+    assert_eq!(decision(&GatewayOwnerRoles::new(home,
+        requester.unwrap_or_else(Requester::background))).is_ok(), allowed);
+}
+
+#[tokio::test]
+async fn cron_pause_resume_requires_a_new_qualifying_initiator() {
+    let (home, admin, employee) = seed();
+    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
+    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
+        "0 9 * * *".into(), "work".into());
+    store.insert(&row).await.unwrap();
+    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
+    assert!(store.set_enabled(&row.id, false).await.unwrap());
+    assert!(store.set_enabled(&row.id, true).await.unwrap());
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
+    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&employee)).unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
+    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
+}
+
+#[tokio::test]
+async fn cron_delete_removes_all_receipt_versions() {
+    let (home, admin, _) = seed();
+    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
+    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
+        "0 9 * * *".into(), "work".into());
+    store.insert(&row).await.unwrap();
+    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
+    // Seed another target/version to prove revocation is not digest-scoped.
+    {
+        let db = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
+        db.execute("INSERT INTO initiators SELECT kind,id,'other','old',body,mac FROM initiators", []).unwrap();
+    }
+    assert!(store.delete(&row.id).await.unwrap());
+    let db = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
+    let count: i64 = db.query_row("SELECT COUNT(*) FROM initiators WHERE kind='cron' AND id='cron'", [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+    drop(db);
+    store.insert(&row).await.unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
+}
+
+#[tokio::test]
+async fn task_cancel_reopen_and_reassign_revoke_initiator() {
+    let (home, admin, _) = seed();
+    let store = crate::task_store::TaskStore::open(home.path()).unwrap();
+    let row = crate::task_store::TaskRow::new("task".into(), "Task".into(), "work".into(),
+        "medium".into(), "avatar".into(), "avatar".into());
+    store.insert_task(&row).await.unwrap();
+    for fields in [serde_json::json!({"status":"cancelled"}), serde_json::json!({"assigned_to":"other"})] {
+        initiators::record(home.path(), "task", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+        assert_receipt_access(home.path(), "task", &row.id, &admin, true);
+        store.update_task(&row.id, &fields).await.unwrap().unwrap();
+        assert_receipt_access(home.path(), "task", &row.id, &admin, false);
+        store.update_task(&row.id, &serde_json::json!({"status":"todo","assigned_to":"avatar"})).await.unwrap().unwrap();
+        assert_receipt_access(home.path(), "task", &row.id, &admin, false);
+    }
+}
+
+#[tokio::test]
+async fn reminder_cancel_revokes_initiator() {
+    let (home, admin, _) = seed();
+    let row: crate::reminder_scheduler::Reminder = serde_json::from_value(serde_json::json!({
+        "id":"reminder", "agent_id":"avatar", "trigger_at":"2099-01-01T00:00:00Z",
+        "channel":"test", "chat_id":"test", "prompt":"work", "mode":"agent_callback",
+        "sender_agent":"avatar"
+    })).unwrap();
+    crate::reminder_scheduler::append_reminder(home.path(), &row).await.unwrap();
+    initiators::record(home.path(), "reminder", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+    assert_receipt_access(home.path(), "reminder", &row.id, &admin, true);
+    assert!(crate::reminder_scheduler::cancel_reminder(home.path(), &row.id, Some("avatar")).await.unwrap());
+    assert_receipt_access(home.path(), "reminder", &row.id, &admin, false);
+    // Restore identical pending material without re-recording to detect resurrection.
+    std::fs::write(home.path().join("reminders.jsonl"), format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+    assert_receipt_access(home.path(), "reminder", &row.id, &admin, false);
+}
+
+#[tokio::test]
+async fn receipt_revoke_failure_does_not_block_cron_pause() {
+    let (home, admin, _) = seed();
+    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
+    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
+        "0 9 * * *".into(), "work".into());
+    store.insert(&row).await.unwrap();
+    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
+    let path = crate::fs_safe::sqlite::database_path(home.path(), "delegation-initiators.db");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(store.set_enabled(&row.id, false).await.unwrap());
+    assert!(!store.get(&row.id).await.unwrap().unwrap().enabled);
+    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
+    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+    assert!(audit.lines().any(|line| {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        line.contains("delegation_initiator_revoke_failed")
+            && event["details"]["kind"] == "cron" && event["details"]["id"] == "cron"
+    }));
 }

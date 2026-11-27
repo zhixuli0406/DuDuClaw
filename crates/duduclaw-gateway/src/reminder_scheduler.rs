@@ -524,6 +524,16 @@ async fn load_reminders(home_dir: &Path) -> Vec<Reminder> {
 /// to acquire it internally.
 fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), String> {
     let path = home_dir.join("reminders.jsonl");
+    // Every writer holds the lock, including cancellation, GC and backfill.
+    // Compare persisted material before publishing to prevent edit-back revival.
+    for before in load_reminders_sync(home_dir) {
+        let after = reminders.iter().find(|row| row.id == before.id);
+        if after.is_none_or(|row| row.status != ReminderStatus::Pending
+            || crate::isolation_background::material::reminder(row)
+                != crate::isolation_background::material::reminder(&before)) {
+            crate::delegation_roles::initiators::revoke_before_write(home_dir, "reminder", &before.id);
+        }
+    }
 
     let mut content = String::new();
     for r in reminders {
