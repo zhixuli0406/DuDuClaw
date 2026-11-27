@@ -135,7 +135,7 @@ fn audit(home: &std::path::Path, binding: &Binding, steps: usize, success: bool,
     let outcome = if steps == 0 { "not_sent" } else if success { "confirmed" } else { "may_have_sent" };
     duduclaw_security::audit::append_tool_call_with_extras(home, &binding.agent, "google_execute", &binding.tool,
         success, &[("call_id", json!(binding.call_id)), ("run_id", json!(binding.run_id)),
-        ("turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
+        ("google_turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
         ("authority_epoch", json!(binding.snapshot.epoch)), ("args_digest", json!(binding.args_digest)),
         ("step_count", json!(steps)), ("outcome", json!(outcome)), ("reason", json!(reason))]);
 }
@@ -188,6 +188,27 @@ pub(super) async fn verify_policy_approval(home: &std::path::Path, agent: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn d12_audit_preserves_google_turn_id() {
+        let home = tempfile::tempdir().unwrap();
+        let binding = Binding {
+            agent: "bot".into(), tool: "gmail_read".into(), args_digest: "digest".into(),
+            turn_id: Some("registered-d12-turn".into()), run_id: None, call_id: "call".into(),
+            approval_nonce: "nonce".into(),
+            snapshot: OwnerSnapshot {
+                owner_id: "holder".into(), email: "holder@c.test".into(), employee_nonce: "nonce".into(),
+                employee_id: "employee".into(), incarnation: 1, owner_generation: 1,
+                attestation_revision: "revision".into(), epoch: "epoch".into(), policy_digest: "policy".into(),
+                user_epoch: "user-epoch".into(), credential_epoch: 1, policy_epoch: "policy-epoch".into(),
+            },
+        };
+        audit(home.path(), &binding, 1, true, None);
+        let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["tool_name"], "google_execute");
+        assert_eq!(row["google_turn_id"], "registered-d12-turn");
+    }
+
     #[test]
     fn no_wire_subject_or_forged_run() {
         for field in ["subject", "email", "owner_id", "credential_ref"] {
