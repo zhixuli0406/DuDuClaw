@@ -1307,7 +1307,7 @@ mod tests {
         for nested in [false, true] {
             for current in ["", "[google.drive_write]\ncreate = true\n"] {
                 let tmp = tempfile::tempdir().unwrap();
-                let home = tmp.path().join("home");
+                let home = tmp.path().join("duduclaw");
                 std::fs::create_dir(&home).unwrap();
                 std::fs::write(home.join("config.toml"), current).unwrap();
                 let backup = "# backup header\n[google]\nclient_id = 'keep' # untouched\n\n[google.drive_write]\ncreate = false\nmodify = true\n[google.drive_write.approval]\ncreate = 'none'\n[[google.drive_write.folders]]\nid = 'Folder_0123456789'\n\n[general]\nlog_level = 'debug' # keep spelling\n";
