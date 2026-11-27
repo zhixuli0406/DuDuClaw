@@ -19,7 +19,7 @@
 //! [`crate::autopilot_approval`] and the `approval_gate` child module).
 //! `security_event` is gateway-only ([`GATEWAY_ONLY_EVENTS`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -41,6 +41,17 @@ mod approval_gate;
 mod approval_gate_tests;
 
 const DEPARTMENT_CONTAINMENT_SKIP: &str = "部門範圍檢查尚未啟用，已略過";
+
+/// Process-wide deduplication, including across engine instances. If the lock
+/// is poisoned, suppress diagnostics; the containment guard still denies.
+fn first_department_skip(rule_id: &str) -> bool {
+    static LOGGED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    LOGGED
+        .get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+        .lock()
+        .map(|mut logged| logged.insert(rule_id.to_owned()))
+        .unwrap_or(false)
+}
 
 // ─── Event types ────────────────────────────────────────────
 
@@ -1344,7 +1355,7 @@ impl AutopilotEngine {
             if !rule.enabled {
                 return Ok(());
             }
-            if self.skip_department_rule(&rule).await {
+            if self.skip_department_rule(&rule) {
                 return Ok(());
             }
             let fields_map = fields.as_object().cloned().unwrap_or_default();
@@ -1374,7 +1385,7 @@ impl AutopilotEngine {
                 // this event's name (it's an unused placeholder for such rules).
                 && r.sequence.is_none()
         }) {
-            if self.skip_department_rule(rule).await {
+            if self.skip_department_rule(rule) {
                 continue;
             }
             let conditions: Value = serde_json::from_str(&rule.conditions).unwrap_or(Value::Null);
@@ -1388,21 +1399,14 @@ impl AutopilotEngine {
 
     /// Temporary fail-closed guard: replace this with the department containment
     /// check when wired, keeping it before conditions, screening and approval.
-    async fn skip_department_rule(&self, rule: &AutopilotRuleRow) -> bool {
+    fn skip_department_rule(&self, rule: &AutopilotRuleRow) -> bool {
         if rule.owner_department.is_none() {
             return false;
         }
-        // Record only rule metadata and a fixed reason, never event content.
-        // A rejected candidate is not a fire: do not bump trigger bookkeeping.
-        if let Err(error) = self.store.append_step_history(&AutopilotHistoryRow {
-            id: uuid::Uuid::new_v4().to_string(),
-            rule_id: rule.id.clone(),
-            rule_name: rule.name.clone(),
-            triggered_at: chrono::Utc::now().to_rfc3339(),
-            result: crate::autopilot_approval::RESULT_SKIPPED.into(),
-            details: Some(DEPARTMENT_CONTAINMENT_SKIP.into()),
-        }).await {
-            warn!(rule_id = %rule.id, %error, "autopilot: department skip history write failed");
+        // Per-event history would disclose company-wide event timing/counts
+        // and amplify SQLite writes. Log only the id, once per process.
+        if first_department_skip(&rule.id) {
+            warn!(rule_id = %rule.id, "autopilot: department containment unavailable; rule skipped");
         }
         true
     }
@@ -4871,10 +4875,7 @@ json_fields = { secret = "/secret" }
             assert!(mq.pending_messages(10).await.unwrap().is_empty());
             assert!(broker.list_by_kind(crate::autopilot_approval::ACTION_KIND).await.unwrap().is_empty());
             let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
-            assert_eq!(history.len(), 1);
-            assert_eq!(history[0].result, "skipped");
-            assert_eq!(history[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
-            assert!(!serde_json::to_string(&history[0]).unwrap().contains(text));
+            assert!(history.is_empty(), "skips must not disclose event timing or counts");
             let stored = engine.store.get_rule(&rule.id).await.unwrap().unwrap();
             assert_eq!(stored.trigger_count, 0);
             assert!(stored.last_triggered_at.is_none());
@@ -4883,6 +4884,64 @@ json_fields = { secret = "/secret" }
             drop(mq);
             let _ = std::fs::remove_dir_all(&tmp);
         }
+    }
+
+    #[tokio::test]
+    async fn department_skips_leave_no_history_and_company_wide_rule_still_fires() {
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        for i in 0..128 {
+            let mut rule = department_screened_steps_rule(Some("sales"));
+            rule.id = format!("department-{i}");
+            engine.store.insert_rule(&rule).await.unwrap();
+        }
+        let mut company_rule = screened_rule(None);
+        company_rule.trigger_event = "channel_message".into();
+        company_rule.action = serde_json::json!({
+            "type": "delegate", "target_agent": "trader", "prompt": "company rule fired"
+        }).to_string();
+        engine.store.insert_rule(&company_rule).await.unwrap();
+        assert!(engine.store.list_history(None, 1000).await.unwrap().is_empty());
+
+        engine.process_event(&AutopilotEvent::ChannelMessage {
+            channel: "finance".into(), agent_id: "worker".into(),
+            text: "finance confidential event".into(),
+        }).await.unwrap();
+
+        let history = engine.store.list_history(None, 1000).await.unwrap();
+        assert_eq!(history.len(), 1, "only the company-wide fire may write history");
+        assert_eq!(history[0].rule_id, company_rule.id);
+        assert_eq!(history[0].result, "success");
+        assert_eq!(mq.pending_messages(10).await.unwrap().len(), 1);
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(screener.calls().is_empty());
+        for rule in engine.store.list_rules().await.unwrap() {
+            if rule.owner_department.is_some() {
+                assert_eq!(rule.trigger_count, 0);
+                assert!(rule.last_triggered_at.is_none());
+            }
+        }
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn department_skip_log_gate_allows_only_one_call_per_rule_across_threads() {
+        let rule_id = uuid::Uuid::new_v4().to_string();
+        let first_calls = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..16)
+                .map(|_| scope.spawn(|| first_department_skip(&rule_id)))
+                .collect();
+            handles.into_iter()
+                .map(|h| usize::from(h.join().unwrap())).sum::<usize>()
+        });
+        assert_eq!(first_calls, 1);
+        assert!(!first_department_skip(&rule_id));
+        let other_id = uuid::Uuid::new_v4().to_string();
+        assert!(first_department_skip(&other_id));
+        assert!(!first_department_skip(&other_id));
     }
 
     #[tokio::test]
@@ -4929,9 +4988,7 @@ json_fields = { secret = "/secret" }
         assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert!(mq.pending_messages(10).await.unwrap().is_empty());
         let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].result, "skipped");
-        assert_eq!(history[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
+        assert!(history.is_empty(), "synthetic triggers must not create skip history either");
         drop(engine);
         drop(mq);
         let _ = std::fs::remove_dir_all(&tmp);
