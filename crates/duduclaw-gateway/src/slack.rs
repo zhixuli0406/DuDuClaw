@@ -746,6 +746,20 @@ async fn handle_event(
 
     info!("📩 Slack [{user}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
 
+    let drop_files = if has_files {
+        let session = if is_dm { format!("slack:{user}") } else { format!("slack:group:{channel}") };
+        match crate::channel_reply::attachment_gate::check(
+            ctx, &session, &session, user, text, agent_name, None,
+        ).await {
+            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
+            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
+                return;
+            }
+        }
+    } else { false };
+
     // Add thinking emoji reaction
     let _ = http
         .post(slack_inbound_url(bot_token, "reactions.add"))
@@ -923,7 +937,7 @@ async fn handle_event(
     // WP1.3: download Slack file attachments (url_private + Bearer bot token)
     // to the resolved agent's dir, then append markdown refs to the prompt.
     let mut attachment_lines: Vec<String> = Vec::new();
-    if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
+    if !drop_files && let Some(files) = event.get("files").and_then(|v| v.as_array()) {
         let attach_base =
             crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name).await;
         for f in files {
@@ -962,7 +976,7 @@ async fn handle_event(
         }
     }
     // ── Quoted/shared-message context ──
-    let base_text = match slack_quoted_context(event, bot_user_id) {
+    let base_text = match slack_quoted_context(event, bot_user_id).filter(|_| !drop_files) {
         Some(quote_block) if text.is_empty() => quote_block,
         Some(quote_block) => format!("{quote_block}\n{text}"),
         None => text.to_string(),
@@ -1685,7 +1699,7 @@ async fn send_message(
     };
 
     let request = http
-        .post(format!("{SLACK_API}/chat.postMessage"))
+        .post(slack_inbound_url(token, "chat.postMessage"))
         .header("Authorization", format!("Bearer {token}"));
     let request = if let Some((_, fallback)) = distributor_identity_blocks(text) {
         // A workspace rejecting markdown blocks still gets a safe literal
@@ -2670,3 +2684,7 @@ mod group_context_kind_tests {
         assert!(!super::slack_context_group(&serde_json::json!({"channel":"C123"})));
     }
 }
+
+#[cfg(test)]
+#[path = "slack_attachment_gate_tests.rs"]
+mod attachment_gate_tests;

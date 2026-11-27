@@ -807,8 +807,32 @@ async fn process_line_events(
                 // degrades gracefully rather than dropping the message.
                 let mut voice_text = String::new();
 
+                let mut drop_files = false;
+                if msg.msg_type != "text" && msg.id.is_some() {
+                    let session = format!("line:{}", ingress::line_conversation(&event));
+                    let reply_session = if route.as_ref().is_some_and(|r| r.labelled()) {
+                        crate::trigger_route::called_session(&session, agent_id)
+                    } else { session.clone() };
+                    match crate::channel_reply::attachment_gate::check(
+                        &state.ctx, &session, &reply_session,
+                        crate::ccr_runtime::reply_principal_for_sender(sender),
+                        &base_text, Some(agent_id), None,
+                    ).await {
+                        crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                        crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(text) => {
+                            drop_files = true;
+                            base_text = text;
+                        }
+                        crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                            let _ = send_reply_rich(&state.http, token, reply_token,
+                                vec![serde_json::json!({ "type": "text", "text": reply })]).await;
+                            continue;
+                        }
+                    }
+                }
+
                 // Handle non-text message types: download content and save to disk
-                if msg.msg_type != "text" {
+                if !drop_files && msg.msg_type != "text" {
                     if let Some(msg_id) = &msg.id {
                         let type_label = &msg.msg_type;
                         info!("📩 LINE [{sender}]: {type_label} message");
@@ -1792,3 +1816,7 @@ mod ccr_principal_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/line.rs"]
 mod f4_decision_route_tests;
+
+#[cfg(test)]
+#[path = "line/attachment_gate_tests.rs"]
+mod attachment_gate_tests;

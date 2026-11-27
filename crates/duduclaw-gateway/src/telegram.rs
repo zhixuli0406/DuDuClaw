@@ -1052,6 +1052,82 @@ async fn process_telegram_message(
         return;
     }
 
+    // Voice/audio also download bytes before transcription. Gate every media
+    // kind here, before either transcription or attachment persistence.
+    let has_files = msg.photo.as_ref().is_some_and(|p| !p.is_empty())
+        || msg.document.is_some() || msg.video.is_some() || msg.sticker.is_some()
+        || msg.voice.is_some() || msg.audio.is_some();
+    if has_files {
+        let session = telegram_gate_session(chat_id, thread_id);
+        let user = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+        let raw = strip_bot_mention(msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or(""), &bot_username);
+        // Telegram accepts /command@BotName; use the same token normalization
+        // as handle_command before asking the shared exemption parser.
+        let text = if raw.trim_start().starts_with('/') {
+            let mut words = raw.trim().splitn(2, char::is_whitespace);
+            let token = words.next().unwrap_or("");
+            let command = token.split('@').next().unwrap_or(token);
+            let args = words.next().unwrap_or("").trim();
+            if args.is_empty() { command.to_string() } else { format!("{command} {args}") }
+        } else { raw };
+        let mut selected = agent_name.clone();
+        let mut reply_session = own_bot_session(&session, agent_name.as_deref());
+        let mut check_employee = true;
+        if agent_name.is_none() {
+            let private_chat = msg.chat.chat_type.as_deref() == Some("private")
+                && is_private_chat_with(chat_id, &user);
+            let route = resolve_shared_route(&ctx, &user, private_chat).await;
+            reply_session = shared_route_session(&session, &route);
+            selected = match route {
+                SharedRoute::Bound(id) | SharedRoute::Primary(id) => Some(id),
+                SharedRoute::Unbound => None,
+                SharedRoute::Guide(_) => { check_employee = false; None }
+            };
+            if check_employee {
+                let routing = telegram_routing_text(&msg, &bot_username)
+                    .unwrap_or_else(|| format!("{text}\n\n[附件]"));
+                match telegram_trigger_decision(&ctx, &session, &user, &routing,
+                    selected.as_deref(), "attachment-preflight", false).await {
+                    crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger } => {
+                        if via_trigger {
+                            reply_session = crate::trigger_route::called_session(&session, &id);
+                        }
+                        selected = Some(id);
+                    }
+                    crate::trigger_route::turn::TurnDecision::Assign { id } => selected = Some(id),
+                    crate::trigger_route::turn::TurnDecision::Reply { .. } => check_employee = false,
+                    crate::trigger_route::turn::TurnDecision::Default => {
+                        if selected.is_none() {
+                            let registry = ctx.registry.read().await;
+                            selected = crate::channel_reply::resolve_fallback_agent(
+                                &ctx, &*registry, &session, &user,
+                            ).await.map(|agent| agent.config.agent.name.clone());
+                            check_employee = selected.is_some();
+                        }
+                    }
+                }
+            }
+        }
+        if check_employee {
+            match crate::channel_reply::attachment_gate::check(
+                &ctx, &session, &reply_session, &user, &text, selected.as_deref(), None,
+            ).await {
+                crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
+                    // The handler owns access/admin checks; no media reference
+                    // or quoted text may change the parsed exempt command.
+                    handle_command(&command, &client, &api_base, chat_id, thread_id,
+                        &ctx, &scope_id, agent_name.as_deref(), msg.from.as_ref().map(|u| u.id), msg_id).await;
+                    return;
+                }
+                crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                    send_reply(&ctx.home_dir, &client, &api_base, chat_id, &reply, thread_id, msg_id, None).await;
+                    return;
+                }
+            }
+        }
+    }
+
     // Extract text — from text field or transcribed from voice/audio
     // Also collect attachment references for photo/document/video/sticker
     let mut attachment_lines: Vec<String> = Vec::new();
@@ -4674,3 +4750,7 @@ mod routing_text_tests {
         assert_eq!(telegram_routing_text(&msg, "dudu_bot").unwrap().trim(), "嗨");
     }
 }
+
+#[cfg(test)]
+#[path = "telegram_attachment_gate_tests.rs"]
+mod attachment_gate_tests;

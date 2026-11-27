@@ -184,10 +184,20 @@ pub(crate) async fn misaligned_worker(extra: &str) -> (
 
 /// Inbound files must never land for a refused entry, on disk or in a ledger.
 pub(crate) fn assert_no_saved_attachments(home: &std::path::Path) {
+    let shared = home.join("attachments");
+    assert!(!shared.exists() || std::fs::read_dir(shared).unwrap().next().is_none());
     for agent in ["main", "worker"] {
         let path = home.join("agents").join(agent).join("attachments");
         assert!(!path.exists() || std::fs::read_dir(path).unwrap().next().is_none());
     }
     // Admission is before the upload reservation too.
     assert!(!home.join("webchat_upload_quota.db").exists());
+    let ledger = home.join(crate::artifacts::ARTIFACTS_FILE);
+    assert!(!ledger.exists() || std::fs::read_to_string(ledger).unwrap().trim().is_empty());
+    let authority = home.join("artifact_provenance.db");
+    if authority.exists() {
+        let db = rusqlite::Connection::open_with_flags(authority, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM artifact_provenance", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0, "no media provenance row");
+    }
 }
