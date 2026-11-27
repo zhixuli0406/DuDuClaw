@@ -8,6 +8,11 @@ impl ApprovalBroker {
         Self { store }
     }
 
+    #[cfg(test)]
+    pub(crate) fn store_for_tests(&self) -> &ApprovalStore {
+        &self.store
+    }
+
     /// Open the on-disk store and wrap it in a broker.
     pub fn open(home_dir: &Path) -> Result<Self, String> {
         Ok(Self::new(std::sync::Arc::new(ApprovalStore::open(

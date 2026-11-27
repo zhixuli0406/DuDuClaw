@@ -149,7 +149,7 @@ fn link_csrf_other_users_google_refused() {
     victim.email = "victim@example.test".into();
     TICKETS.lock().unwrap().insert(hash(&value), Ticket {
         credential_revision: pending.credential_revision,
-        purpose: pending.purpose, home: home.path().into(), cookie_sha256: [0;32], secure: true,
+        purpose: pending.purpose.clone(), home: home.path().into(), cookie_sha256: [0;32], secure: true,
         result: LoginResult::Identity(victim), created: Instant::now(),
     });
     assert_eq!(complete(home.path(), &db, &b, &value, false, 1000), Err("signin_link_email_mismatch"));
