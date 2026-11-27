@@ -365,6 +365,11 @@ impl ApprovalStore {
                     return Ok(false);
                 }
             }
+            // Count and insert under the same SQLite writer transaction, including
+            // other broker instances/processes. No in-memory quota can race this.
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                super::admin_ai::check_rate(&tx, rec)?;
+            }
             if let Some((session, turn)) = &origin {
                 let cancelled: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
@@ -572,6 +577,10 @@ impl ApprovalStore {
             .ok_or("chat-admin bound decisions require durable identity")?;
         if crate::google_identity::member_card::is_member_card(rec) {
             return Err("Only the requesting member may confirm".into());
+        }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND
+            && !crate::admin_ai::may_decide(home, rec, &entry.user_id.to_string()) {
+            return Err(crate::admin_ai::REFUSAL.into());
         }
         // chat_tier also excludes live mail-requester-eligible egress cards.
         if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
@@ -825,18 +834,31 @@ impl ApprovalStore {
         payload: &Value,
     ) -> Result<usize, String> {
         require_credential_free_payload(payload)?;
-        let mut connection = self.conn.lock().await;
-        let conn = begin_live_write(&mut connection)?;
-        verify_live_io()?;
-        let result = conn.execute(
-            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
-             status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
-             invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
-                END WHERE id = ?3",
-            params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
-        )
-        .map_err(|e| format!("scrub approval: {e}"))?;
-        commit_live_write(conn)?;
+        // End the transaction and connection guard's scope before any async readback.
+        let result = {
+            let mut connection = self.conn.lock().await;
+            let conn = begin_live_write(&mut connection)?;
+            verify_live_io()?;
+            let result = conn.execute(
+                "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
+                 status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
+                 invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
+                    END WHERE id = ?3",
+                params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
+            )
+            .map_err(|e| format!("scrub approval: {e}"))?;
+            commit_live_write(conn)?;
+            result
+        };
+        if result > 0 && let Some(home) = self.db_path.as_deref().and_then(Path::parent) {
+            match self.get(id).await {
+                Ok(Some(rec)) if rec.status == ApprovalStatus::Invalidated => {
+                    chat_admin::sync::spawn_expire(home.to_path_buf(), rec);
+                }
+                Ok(_) => (),
+                Err(_) => warn!("chat-admin scrubbed card snapshot unavailable"),
+            }
+        }
         Ok(result)
     }
 

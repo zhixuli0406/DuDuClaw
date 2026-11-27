@@ -275,6 +275,10 @@ pub async fn verify_and_consume(
     }
     // Live-I/O authority is re-verified around the IMMEDIATE transaction.
     let tx = super::begin_live_write(&mut conn).map_err(GrantRefusal::Store)?;
+    if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::admin_ai::decided_by_admin(&home, &rec, &tx) { return Err(GrantRefusal::Mismatch); }
+    }
     if rec.payload["drive_write_admin_confirmation"] == true {
         let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
         let by = rec.decided_by.as_deref().ok_or(GrantRefusal::Mismatch)?;

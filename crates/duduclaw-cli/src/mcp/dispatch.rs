@@ -640,6 +640,8 @@ impl GatewayHandler<'_> {
         "agent_status" => handle_agent_status(&arguments, home_dir, default_agent).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, record_actor.id()).await,
         "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, record_actor.id()).await,
+        "admin_settings_read" | "admin_settings_propose" => super::admin_ai_client::handle(
+            tool_name, &arguments, home_dir, acting_agent_id(caller_client_id, default_agent)).await,
         "agent_update" => handle_agent_update(&arguments, home_dir, record_actor).await,
         "agent_remove" => {
             handle_agent_remove(

@@ -331,9 +331,25 @@ two methods (`tasks.goal_create`, `tasks.skill_assign`) and runs normal dispatch
 The attachment and original-file routes retain their existing ownership and
 AI-employee checks. Other HTTP surfaces retain their JWT-only authentication;
 this does not authorize arbitrary endpoints. Status credentials and MCP keys
-cannot authenticate these member-key paths. Conversely, member keys are refused
-by the status endpoint, MCP HTTP authentication, MCP key validation, legacy
-Dashboard-token authentication and JWT-only account/security endpoints.
+cannot authenticate these member-key paths.
+
+MCP transports accept member keys through the HTTP `Authorization: Bearer`
+header or the stdio `DUDUCLAW_MCP_API_KEY` environment variable, for person
+tools only. Query-string credentials remain refused. The transports use the
+loopback-only `/api/internal/person-key` bridge for live member-key authority
+and gateway person-tool execution. Member keys are refused by OAuth consent,
+the status endpoint, MCP key validation, legacy Dashboard-token authentication
+and JWT-only account/security endpoints.
+
+The person tool `my_tasks_list` accepts a `limit` from 1 to 200 (default 50);
+out-of-range values return HTTP 400. It queries at most 50 visible employees
+in employee-id order and stops collecting at `5 * limit` rows (at most 1000).
+The collected rows are sorted newest-first before applying the result limit.
+The result includes `truncated: true` when employees or rows were omitted.
+The member contract exposes `tasks.list` without pagination; `tasks.list_page`
+is not available to member keys, so each queried employee's RPC still returns
+its full task list. Member stdio sessions do not poll for tool-list changes;
+the next real request observes current scopes.
 
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 **current** role/bindings, and all existing handler gates. Credential management,
@@ -378,3 +394,66 @@ Drive write confirmations are browser-session operations. `me.google.write_confi
 `me.google.write_confirm` accepts `{ "id": "...", "approve": true }` (or `false` to cancel)
 and returns `{ "decided": true }`. Only the authenticated requesting member may decide;
 managerial roles and chat-admin authority cannot substitute for that member.
+
+### Internal person-key MCP bridge (v1.86, 141K-P6a)
+
+`POST /api/internal/person-key` accepts only a loopback peer and exactly one
+`Authorization: Bearer ddc_member_…` header, with a 64 KiB request-body limit.
+The gateway derives the holder from that key on every request. JWTs, MCP keys
+and status credentials cannot authenticate this route. This is the gateway
+contract for the separate MCP process; MCP transport support is a separate
+delivery (141K-P6b).
+
+`{"op":"authenticate"}` returns HTTP 200
+`{"ok":true,"key_id":"…","user_id":"…","scopes":[…]}`. Scopes are sorted,
+deduplicated, and intersect the key's live `mcp_scopes` with the current
+`[member_api_keys] allow_mcp_scopes`. This operation records exactly one
+`mcp.authenticate` call.
+
+`{"op":"call","tool":"<name>","args":{…}}` returns HTTP 200
+`{"ok":true,"result":<value>}`. Only gateway-hosted person tools are accepted:
+
+| Tool | Required scope | Arguments and result |
+| --- | --- | --- |
+| `my_tasks_list` | `tasks:read` | Optional string `status` and positive integer `limit` (default 50); returns `{"tasks":[…]}`. |
+| `my_agents_status` | `agents:status` | Empty `{}`; returns `{"agents":[{"id":"…","name":"…","status":"…","can_call":true}]}`. |
+
+`my_tasks_list` calls the ordinary `tasks.list` handler for each employee
+permitted by the holder's live direct/team ACL, passing a gateway-derived
+`agent_id` and the optional `status`. Existing privacy projections remain in
+effect. Results are merged by descending `created_at` (id breaks ties) and
+then truncated to `limit`. The current `tasks.list` RPC does not accept a
+limit, and `tasks.list_page` is not in the member-key RPC contract. With no
+eligible employee, an ordinary `agents.list` call supplies the member-key
+gate and the result is an empty task list.
+
+`my_agents_status` calls `agents.list` and `agents.callable` with `{}`. Only
+employees returned by `agents.list` are included; `can_call` is membership
+in `agents.callable`. `id` is the RPC's `name`, while the output `name` is
+`display_name` (or the id when empty). Neither tool executes as a default
+employee. Each underlying RPC retains its normal rate/audit charge; the
+wrapper adds no charge. Each parsed tool call also writes a
+`person_key_mcp_call` security event with key id, holder id, canonical tool
+name and outcome, without credentials or arguments. Unauthenticated calls
+have null identity fields, and unknown tool names are recorded as `unknown`.
+
+Refusals have the shape `{"ok":false,"code":"…","message":"…"}`:
+
+| HTTP | Code | Meaning |
+| --- | --- | --- |
+| 400 | `person_key_bad_request` | Malformed/oversized body, unknown operation/tool, extra field, or invalid arguments. |
+| 401 | `person_key_invalid` | Wrong, expired, revoked or invalidated credential; inactive holder; feature disabled. |
+| 403 | `person_key_loopback` | Non-loopback peer. |
+| 403 | `person_key_scope` | Scope missing from the live key/config intersection. |
+| 403 | `person_key_forbidden` | Normal handler refused; its message is preserved. |
+| 429 | `member_key_rate_limited` | Existing per-key quota exhausted. |
+| 503 | `person_key_unavailable` | Authority/config/database unavailable or invalid internal response. |
+
+Both request variants reject unknown fields, including top-level `user_id`
+and `agent_id`; tool arguments cannot select either identity. Null optional
+arguments, non-integer/zero/negative limits, and non-object `args` are invalid.
+Revocation, password/epoch changes, offboarding and scope narrowing take
+effect on the next call; composite operations also recheck scope between RPCs
+and before releasing a result. The route tests were added without execution
+in the P6a implementation session; gateway compilation and tests remain to
+be run by the integration/review session.

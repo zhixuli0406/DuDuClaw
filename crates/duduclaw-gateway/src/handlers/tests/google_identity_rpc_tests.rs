@@ -45,6 +45,7 @@ fn owner_of(agent: &str) -> UserContext {
     let mut access = std::collections::HashMap::new();
     access.insert(agent.to_string(), AccessLevel::Owner);
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "owner-1".into(),

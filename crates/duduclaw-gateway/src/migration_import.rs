@@ -575,6 +575,53 @@ mod tests {
     }
 
     #[test]
+    fn rm143_migration_chat_admin_decision_never_carries_ledger_to_target() {
+        use crate::approval::{ApprovalRecord, ApprovalStore, chat_admin::ledger};
+        use duduclaw_migration::{confirmation::ConfirmationStore, contract::{ConfirmationCategory, ConfirmationStatus}};
+        let source = tempfile::tempdir().unwrap();
+        drop(ApprovalStore::open(source.path()).unwrap());
+        let conn = Connection::open(source.path().join("approvals.db")).unwrap();
+        let user = "3f2afc12-4f13-4a28-8b7f-df31eadbb013";
+        let id = uuid::Uuid::new_v4().to_string();
+        let by = format!("chat-admin:{user}:telegram:totp");
+        let record: ApprovalRecord = serde_json::from_value(serde_json::json!({
+            "id":id,"agent_id":"sales","action_kind":"expert_skills_enable","summary":"old",
+            "payload":{},"status":"approved","created_at":"2026-11-27T00:00:00Z",
+            "decided_at":"2026-11-27T00:01:00Z","decided_by":by,"ttl_seconds":3600
+        })).unwrap();
+        conn.execute("INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,decided_by)
+            VALUES (?1,'sales','expert_skills_enable','old','approved','now',?2)", params![id, by]).unwrap();
+        conn.execute("INSERT INTO chat_admin_cards VALUES ('card',?1,'rm143',?2,'telegram',
+            'source-bot','123456789','123456789','42','digest','T2','later','consumed','now')", params![id, user]).unwrap();
+        conn.execute("INSERT INTO chat_admin_decisions VALUES (?1,'card',?2,'telegram','totp',1,'digest',1,'now')",
+            params![id, user]).unwrap();
+        assert!(ledger::accepts(&conn, &record));
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        drop(conn);
+        let request = duduclaw_import::ImportRequest { version:1, migration_id:RequestId([4;16]), employee:None,
+            source_id:"old:approvals".into(), kind:duduclaw_import::SourceKind::AuthorityApprovalsSqlite,
+            title:"approvals.db".into(), legacy_agent:None, has_wal:false, blob_handle:None };
+        let extracted = duduclaw_import::authority::extract(&request,
+            std::fs::File::open(source.path().join("approvals.db")).unwrap(), None).unwrap();
+        let proposals: Vec<duduclaw_migration::import_manifest::PendingProposal> =
+            serde_json::from_value(serde_json::to_value(&extracted).unwrap()).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        drop(ApprovalStore::open(target.path()).unwrap());
+        crate::handlers::stage_import_proposals(target.path(), &proposals).unwrap();
+        let staged = ConfirmationStore::open_existing(&target.path().join("migration-confirmations.db")).unwrap().list().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].category, ConfirmationCategory::LegacyApproval);
+        assert_eq!(staged[0].status, ConfirmationStatus::ExpiredRejected);
+        let conn = Connection::open(target.path().join("approvals.db")).unwrap();
+        for table in ["approvals", "chat_admin_cards", "chat_admin_decisions"] {
+            assert_eq!(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        // Even presenting the old approved record verbatim supplies no authority.
+        assert!(!ledger::accepts(&conn, &record));
+        assert!(!target.path().join("protected/approval_step_up.db").exists());
+    }
+
+    #[test]
     fn migration_import_schema_catalog_matches_approval_channel_and_cron_stores() {
         fn schema(conn:&Connection)->Vec<(String,String,String,Option<String>)> {
             conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap()
@@ -584,9 +631,9 @@ mod tests {
         drop(crate::approval::ApprovalStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("approvals.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog (v1.81: v1.80.x plus the SR5
-        // employee_incarnation column); approvals-v1793/-v180.sql pin older releases.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v181.sql")).unwrap();
+        // Fresh v1.86 stores include RM-143 chat-admin receipts and decisions.
+        // Older pins remain accepted; these installation-local rows are never imported.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/approvals-v186.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
 
         let path=home.path().join("sessions.db");
@@ -615,9 +662,13 @@ mod tests {
         drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("autopilot.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog (v1.82: v1.79.3 plus the
-        // approval-gate ledger); autopilot-v1793.sql pins the older release.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v182.sql")).unwrap();
+        // Fresh stores use v1.86: v1.82 plus rule extensions and durable runs.
+        // v1793 and v182 remain pinned for older imports.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v186.sql")).unwrap();
+        assert!(include_str!("../../duduclaw-import/src/autopilot-v186.sql")
+            .replace("\r\n", "\n").contains(crate::autopilot_store::RUNS_SCHEMA_SQL));
+        assert!(include_str!("../../duduclaw-import/src/autopilot-v186.sql")
+            .replace("\r\n", "\n").contains(crate::autopilot_store::DISPATCH_SCHEMA_SQL));
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::workflow::WorkflowStore::open(home.path()).unwrap());
@@ -625,6 +676,35 @@ mod tests {
         let expected=Connection::open_in_memory().unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/workflow-v1793.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
+    }
+
+    #[test]
+    fn migration_import_schema_catalog_matches_upgraded_autopilot_stores() {
+        fn schema(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+            conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+                .map(Result::unwrap).collect()
+        }
+        let expected = Connection::open_in_memory().unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v186.sql")).unwrap();
+        let fresh_home = tempfile::tempdir().unwrap();
+        drop(crate::autopilot_store::AutopilotStore::open(fresh_home.path()).unwrap());
+        let fresh = Connection::open(fresh_home.path().join("autopilot.db")).unwrap();
+        assert_eq!(schema(&fresh), schema(&expected));
+        for catalog in [include_str!("../../duduclaw-import/src/autopilot-v182.sql"),
+            include_str!("../../duduclaw-import/src/autopilot-v1793.sql")] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("autopilot.db");
+            Connection::open(&path).unwrap().execute_batch(catalog).unwrap();
+            drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
+            let actual = Connection::open(&path).unwrap();
+            assert_eq!(schema(&actual), schema(&expected));
+            assert_eq!(schema(&actual), schema(&fresh));
+            drop(actual);
+            // Reopening repeats the ALTERs safely and preserves exact schema text.
+            drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
+            assert_eq!(schema(&Connection::open(&path).unwrap()), schema(&expected));
+        }
     }
 
     /// RM-173: a v1.80.x or v1.79.3 sessions.db opened by this release gets the

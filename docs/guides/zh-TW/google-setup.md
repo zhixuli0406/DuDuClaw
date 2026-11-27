@@ -31,6 +31,17 @@ Gmail 搜尋與讀信會在郵件文字交給 AI 員工前遮罩登入連結及�
 8. 儲存用戶端後，立即複製 Client ID 並下載 Client secret。密鑰只顯示一次，之後主控台只顯示末四碼，請保存到密碼管理器。
 9. 回到精靈填入 ID 與密鑰，確認資料使用說明，再按「連接 Google」。Google 若顯示「Google hasn't verified this app」，確認是自己建立的專案，選 Advanced，再選 Go to（專案名稱）。在同意畫面勾選每一項權限並繼續，等待儀表板結果。
 
+
+### 公司 Google 登入
+
+公司登入使用已設定的公司 Google OAuth 用戶端 ID 與密鑰，服務帳號委派及 Apps Script 無法提供這項登入。預設關閉，須由管理員確認風險並設定允許的 `hd` 網域，個人版不提供。儀表板頁面尚未實作；Google 設定提供後，請從該處設定登入。
+
+將 `[dashboard] public_url` 設為外部可連線的儀表板基底網址，包含路徑前綴。請使用 HTTPS，HTTP 僅接受 localhost 或 loopback 位址。在 Google Cloud Web OAuth 用戶端的 Authorized redirect URIs 完整登記 `<public_url>/api/login/google/callback`。例如 `public_url = "https://company.example/agents"` 應登記 `https://company.example/agents/api/login/google/callback`，基底網址不留結尾斜線。個人連線及遠端 MCP 需要的回呼網址須另外保留。
+
+公司正式使用時，只有所有使用者都屬於 Google Cloud 專案自身的 Workspace／Cloud Identity 組織，才能選 Internal。DuDuClaw 的允許網域無法擴大 Google 的使用對象。跨組織使用者需要 External，並發布為正式環境、完成必要的 Google 驗證。公司登入正式使用時，不要讓同意畫面停留在 Testing。Testing 一般限 100 位列名測試使用者，授權與更新權杖七天後到期。Google 對僅含基本身分權限的要求設有例外；此登入只要求 `openid email profile`，使用 online 存取。個人 Google 連線另要求服務權限，不適用該例外。請參閱 [Google 使用對象規則](https://support.google.com/cloud/answer/15549945?hl=en)。
+
+登入綁定與同仁的個人 Google 連線須使用同一個 Google 帳號（`sub`）。若已有不同帳號的個人連線，登入綁定會拒絕。單獨登入不會連接 Gmail、Drive 或其他個人服務。請參閱[登入安全說明](../../features/zh-TW/05-security-defense.md#公司-google-登入)及[設定對照](dashboard-settings.md#公司-google-登入)。
+
 ### 遠端主機或 Docker
 
 localhost 指的是執行瀏覽器的電腦。本機 Docker 安裝不需要 SSH 通道。只有 DuDuClaw 在另一台機器上時，才需要先轉送遠端連接埠。以下以畫面顯示 18889 為例：

@@ -31,7 +31,7 @@ impl Fixture {
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
-            auth: AuthManager::new(None), handler: MethodHandler::new(home.path().to_path_buf()).await,
+            auth: AuthManager::new(None), handler: Arc::new(MethodHandler::new(home.path().to_path_buf()).await),
             tx, event_tx, prepared_events: Default::default(), user_db, jwt_config,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
             home_dir: home.path().to_path_buf(),

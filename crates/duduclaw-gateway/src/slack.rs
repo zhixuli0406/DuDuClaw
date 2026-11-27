@@ -468,7 +468,7 @@ async fn run_socket_mode(
                     if let Some(payload) = envelope.payload {
                         // Decision callbacks never queue behind an agent awaiting
                         // the very decision this envelope can provide.
-                        handle_interactive_envelope(payload, ctx, &http, decision_account.as_ref())
+                        handle_interactive_envelope(payload, ctx, &http, decision_account.as_ref(), agent_name)
                             .await;
                     }
                 }
@@ -700,12 +700,21 @@ async fn handle_event(
     // press; non-verb replies fall through to normal chat.
     if let Some(parent_ts) = thread_ts.as_deref() {
         if !text.is_empty() {
-            if let Some(outcome) = crate::decision_text::route_text_reply(
-                &ctx.home_dir,
-                "slack",
-                user,
-                channel,
-                parent_ts,
+            if let Some(outcome) = crate::decision_text::route_verified_text_reply(
+                ctx,
+                &crate::approval::DecisionContext {
+                    channel: "slack".into(),
+                    account_id: decision_account.filter(|a| a.matches(payload)).map(|a| a.account_id.clone()).unwrap_or_default(),
+                    conversation_id: channel.into(), principal_id: user.into(),
+                },
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: Some(parent_ts.into()), private: is_dm,
+                    account: crate::chat_link_intercept::account_label("slack", agent_name), dm: channel.into(),
+                },
+                crate::decision_notify::DecisionAccessScope {
+                    channel_id: (!is_dm).then_some(channel), guild_id: None,
+                    session_id: Some(&if is_dm { format!("slack:{user}") } else { format!("slack:group:{channel}") }),
+                },
                 text,
             )
             .await
@@ -745,6 +754,21 @@ async fn handle_event(
     }
 
     info!("📩 Slack [{user}]: {}", truncate_bytes(&duduclaw_security::credential_detect::mask(&text), 80));
+
+    let drop_files = if has_files {
+        let session = if is_dm { format!("slack:{user}") } else { format!("slack:group:{channel}") };
+        match crate::channel_reply::attachment_gate::check(
+            ctx, &session, &session, user, text, agent_name, None,
+        ).await {
+            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
+                return;
+            }
+        }
+    } else { false };
 
     // Add thinking emoji reaction
     let _ = http
@@ -798,6 +822,19 @@ async fn handle_event(
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
             let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user);
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "slack", gate_session: &session_id, command_session: &session_id,
+                sender: user, text, shared: !is_dm,
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &cmd, ctx, &origin, &agent_id,
+            ).await {
+                if !refusal.is_empty() {
+                    send_message(http, bot_token, channel, &refusal, thread_ts.as_deref().or(Some(ts))).await;
+                }
+                remove_reaction_add_done(http, bot_token, channel, ts).await;
+                return;
+            }
             // A channel's session is shared by its members: only a verified
             // Admin/Manager may clear it (a DM resets its own as before).
             let reply = match crate::chat_commands::shared_reset_refusal(
@@ -910,7 +947,7 @@ async fn handle_event(
     // WP1.3: download Slack file attachments (url_private + Bearer bot token)
     // to the resolved agent's dir, then append markdown refs to the prompt.
     let mut attachment_lines: Vec<String> = Vec::new();
-    if let Some(files) = event.get("files").and_then(|v| v.as_array()) {
+    if !drop_files && let Some(files) = event.get("files").and_then(|v| v.as_array()) {
         let attach_base =
             crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name).await;
         for f in files {
@@ -949,7 +986,7 @@ async fn handle_event(
         }
     }
     // ── Quoted/shared-message context ──
-    let base_text = match slack_quoted_context(event, bot_user_id) {
+    let base_text = match slack_quoted_context(event, bot_user_id).filter(|_| !drop_files) {
         Some(quote_block) if text.is_empty() => quote_block,
         Some(quote_block) => format!("{quote_block}\n{text}"),
         None => text.to_string(),
@@ -1279,6 +1316,18 @@ async fn handle_slash_command_envelope(
                 // `slack:group:<channel>` is shared by the channel's members
                 // (only a `D…` direct-message channel is one person's).
                 let shared = !channel_id.starts_with('D');
+                let origin = crate::chat_commands::CommandOrigin {
+                    channel: "slack", gate_session: &session_id, command_session: &session_id,
+                    sender: user_id, text: &cmd_text, shared,
+                };
+                if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                    &cmd, ctx, &origin, &agent_id,
+                ).await {
+                    if !refusal.is_empty() {
+                        respond_via_response_url(http, response_url, "ephemeral", &refusal).await;
+                    }
+                    return;
+                }
                 let reply = match crate::chat_commands::shared_reset_refusal(
                     &ctx.home_dir,
                     "slack",
@@ -1345,6 +1394,7 @@ async fn handle_interactive_envelope(
     ctx: &Arc<ReplyContext>,
     http: &reqwest::Client,
     decision_account: Option<&SlackDecisionAccount>,
+    agent_name: Option<&str>,
 ) {
     if payload["type"].as_str() != Some("block_actions") {
         return;
@@ -1403,8 +1453,14 @@ async fn handle_interactive_envelope(
                     )
                 }),
             },
+            &crate::approval::chat_admin::press::PressOrigin {
+                message_id: payload["message"]["ts"].as_str().map(str::to_owned),
+                private: false,
+                account: crate::chat_link_intercept::account_label("slack", agent_name),
+                dm: payload["channel"]["id"].as_str().unwrap_or("").into(),
+            },
         )
-        .await
+        .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
         {
             // Retiring the card (clearing its buttons) happens inside the
             // decide path via `chat.update` — a detached best-effort edit
@@ -1660,7 +1716,7 @@ async fn send_message(
     };
 
     let request = http
-        .post(format!("{SLACK_API}/chat.postMessage"))
+        .post(slack_inbound_url(token, "chat.postMessage"))
         .header("Authorization", format!("Bearer {token}"));
     let request = if let Some((_, fallback)) = distributor_identity_blocks(text) {
         // A workspace rejecting markdown blocks still gets a safe literal
@@ -2052,7 +2108,7 @@ mod quoted_context_tests {
         // Windows CRLF checkout: rustc normalizes literals, but include_str! does not.
         let source = include_str!("slack.rs").replace("\r\n", "\n");
         let source = source.split("\n#[cfg(test)]").next().unwrap();
-        assert!(source.contains(r#"let base_text = match slack_quoted_context(event, bot_user_id) {
+        assert!(source.contains(r#"let base_text = match slack_quoted_context(event, bot_user_id).filter(|_| !drop_files) {
         Some(quote_block) if text.is_empty() => quote_block,
         Some(quote_block) => format!("{quote_block}\n{text}"),
         None => text.to_string(),
@@ -2600,6 +2656,7 @@ mod native_callback_acl_tests {
                 &fixture.ctx,
                 &reqwest::Client::new(),
                 Some(&account),
+                None,
             )
             .await;
             if allowed {
@@ -2645,3 +2702,7 @@ mod group_context_kind_tests {
         assert!(!super::slack_context_group(&serde_json::json!({"channel":"C123"})));
     }
 }
+
+#[cfg(test)]
+#[path = "slack_attachment_gate_tests.rs"]
+mod attachment_gate_tests;

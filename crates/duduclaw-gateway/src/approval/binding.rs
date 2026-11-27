@@ -388,6 +388,15 @@ impl ApprovalBroker {
         if let BoundAuthority::ChatAdmin(entry) = authority {
             self.store.validate_bound_chat_decision(&rec, entry)?;
         }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+            let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+            let user = match authority {
+                BoundAuthority::Dashboard(ctx) => ctx.user_id.clone(),
+                BoundAuthority::ChatAdmin(entry) => entry.user_id.to_string(),
+                BoundAuthority::Channel => return Err(crate::admin_ai::REFUSAL.into()),
+            };
+            if !crate::admin_ai::may_decide(&home, &rec, &user) { return Err(crate::admin_ai::REFUSAL.into()); }
+        }
         if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
             if !crate::google_identity::member_card::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
@@ -455,10 +464,25 @@ impl ApprovalBroker {
                 return Err("request expired or decided concurrently".into());
             }
             check_expected_digest(&current)?;
+            if current.action_kind == crate::admin_ai::card::ACTION_KIND {
+                let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+                let user = match authority {
+                    BoundAuthority::Dashboard(ctx) => ctx.user_id.clone(),
+                    BoundAuthority::ChatAdmin(entry) => entry.user_id.to_string(),
+                    BoundAuthority::Channel => return Err(crate::admin_ai::REFUSAL.into()),
+                };
+                if !crate::admin_ai::may_decide(&home, &current, &user) {
+                    return Err(crate::admin_ai::REFUSAL.into());
+                }
+            }
             if let BoundAuthority::ChatAdmin(entry) = authority {
                 // Re-read classification, requester exceptions and the receipt
                 // digest under the write transaction; this helper never locks.
                 self.store.validate_bound_chat_decision(&current, entry)?;
+                if current.action_kind == crate::admin_ai::card::ACTION_KIND
+                    && !crate::admin_ai::receipt_matches(&tx, &current, entry) {
+                    return Err(crate::admin_ai::REFUSAL.into());
+                }
             }
             let decided_at = Utc::now().to_rfc3339();
             let decided_by = match authority {
@@ -526,6 +550,10 @@ impl ApprovalBroker {
         approve: bool,
     ) -> Result<(), String> {
         let rec = self.get(id).await?.ok_or("request missing")?;
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+            let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
+            if !crate::admin_ai::may_decide(&home, &rec, &ctx.user_id) { return Err(crate::admin_ai::REFUSAL.into()); }
+        }
         if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
             if !crate::google_identity::member_card::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }

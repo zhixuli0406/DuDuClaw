@@ -358,10 +358,17 @@ impl MethodHandler {
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }
-        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
+        let scheduled = params.get("schedule").is_some_and(|value| !value.is_null());
+        let main_gate = if scheduled {
+            self.deny_main_for_non_admin(ctx, agent_id).await
+        } else {
+            self.deny_main_unless_admitted(ctx, agent_id, crate::on_behalf_of::access::MainUse::Assign).await
+        };
+        if let Err(frame) = main_gate { return frame; }
         // Assigning a goal: Operator on the agent, or a team grant that
         // derived Operator (a Manager handing work to a report's employee).
-        if !ctx.can_assign_to(agent_id) {
+        if !ctx.can_assign_to(agent_id)
+            && (scheduled || !self.main_assignment_admitted(ctx, agent_id).await) {
             return WsFrame::error_response("", "permission denied");
         }
         if !ctx.is_admin() {
@@ -400,6 +407,9 @@ impl MethodHandler {
             Ok(secs) => secs,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, agent_id) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+        }
         // Files handed over with the goal (交辦任務 page). All of them are
         // decoded and size-checked before anything is written; then they are
         // saved into the assigned employee's attachment area and their paths
@@ -992,6 +1002,10 @@ mod goal_decide_revision_tests {
         for action in ["retry", "done", "abort", "takeover", "continue"] {
             for mode in ["match", "mismatch", "absent", "wrong_type"] {
                 let home = tempfile::tempdir().unwrap();
+                let agent_dir = home.path().join("agents/sales");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                std::fs::write(agent_dir.join("agent.toml"),
+                    "[agent]\nname='sales'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
                 let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
                 let user = db.create_user("admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin).unwrap();
                 let mut ctx = UserContext::admin_fallback(); ctx.user_id = user.id;

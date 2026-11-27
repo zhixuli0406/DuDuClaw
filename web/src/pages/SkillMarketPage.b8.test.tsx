@@ -84,7 +84,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockWsClient.subscribe.mockImplementation(() => () => undefined);
   useConnectionStore.setState({ state: 'authenticated' });
-  useAuthStore.setState({ user: { id: 'u1', display_name: 'Owner', role: 'admin' } } as never);
+  useAuthStore.setState({ user: { id: 'u1', display_name: 'Owner', role: 'admin' }, deptGrants: [], deptGroups: new Set() } as never);
   try {
     localStorage.clear();
   } catch {
@@ -274,27 +274,64 @@ describe('Skill library — B3 scopes', () => {
 // Start these component scenarios after the gateway confirmed the admin roster.
 beforeEach(() => setConfirmedCallableAgents(true));
 
-import { api } from '@/lib/api';
-import { callableSubject, useCallableAgentsStore } from '@/stores/callable-agents-store';
 
-it('closes an open skill removal and sends no mutation after employee revocation', async () => {
+it('closes an open skill removal when refreshed server flags revoke management', async () => {
   const user = userEvent.setup();
   useAuthStore.setState({ user: { id: 'employee', role: 'employee' } as never,
     bindings: [{ agent_name: 'agnes', access_level: 'owner' }] as never });
-  vi.spyOn(api.agents, 'callable').mockResolvedValue({ agents: [{ name: 'agnes', display_name: 'agnes', via: 'binding', selectable: true }], unrestricted: false, default_agent: null } as never);
+  let allowed = true;
+  let changed: ((payload: unknown) => void) | undefined;
+  mockWsClient.subscribe.mockImplementation((event: string, callback: (payload: unknown) => void) => {
+    if (event === 'skill.changed') changed = callback;
+    return () => undefined;
+  });
+  mockWsClient.call.mockImplementation((method: string) => {
+    const payload = aggregate();
+    payload.agents[0].can_manage = allowed;
+    return Promise.resolve(method === 'skills.list' ? payload : method === 'agents.list' ? { agents: twoAgents } : {});
+  });
   renderAt('/skills?tab=mySkills');
-  const row = (await screen.findAllByRole('row')).find(r => within(r).queryByText('quote') && within(r).queryByText('agnes'));
-  await waitFor(() => expect(screen.getAllByText('quote')).toHaveLength(2));
-  const ownRow = row ?? screen.getAllByRole('row').find(r => within(r).queryByText('quote') && within(r).queryByText('agnes'))!;
+  await screen.findAllByText('quote');
+  const ownRow = screen.getAllByRole('row').find(r => within(r).queryByText('price list'))!;
   await user.click(within(ownRow).getByRole('button', { name: 'More actions' }));
   await user.click(await screen.findByRole('menuitem', { name: 'Remove' }));
-  const dialog = await screen.findByRole('dialog');
-  const submit = within(dialog).getByRole('button', { name: 'Remove' });
-  act(() => {
-    const key = JSON.stringify([callableSubject(), null]);
-    useCallableAgentsStore.setState({ entries: { [key]: { agents: [], unrestricted: false, loading: false, confirmedAt: Date.now() + 1 } } });
-    fireEvent.click(submit);
-  });
-  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'skills.remove')).toBe(false);
+  await screen.findByRole('dialog');
+  allowed = false;
+  act(() => changed?.({ agent_id: 'agnes' }));
   await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  expect(mockWsClient.call.mock.calls.some(([method]) => method === 'skills.remove')).toBe(false);
+});
+
+
+it.each([true, false])('uses server skill permissions for an unbound department manager (%s)', async (allowed) => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  const payload = aggregate();
+  payload.agents[0].skills = payload.agents[0].skills.map(skill => ({ ...skill, can_manage: allowed }));
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+    method === 'skills.list' ? payload : method === 'agents.list' ? { agents: twoAgents } : {}));
+  const user = userEvent.setup();
+  renderAt('/skills?tab=mySkills');
+  await screen.findAllByText('quote');
+  const row = screen.getAllByRole('row').find(r => within(r).queryByText('price list'))!;
+  await user.click(within(row).getByRole('button', { name: 'More actions' }));
+  const toggle = await screen.findByRole('menuitem', { name: 'Switch off' });
+  const remove = screen.getByRole('menuitem', { name: 'Remove' });
+  if (allowed) {
+    expect(toggle).not.toHaveAttribute('data-disabled');
+    expect(remove).not.toHaveAttribute('data-disabled');
+  } else {
+    expect(toggle).toHaveAttribute('data-disabled');
+    expect(remove).toHaveAttribute('data-disabled');
+  }
+});
+
+it('presents the market action as an installation request for a manager', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [] });
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+    method === 'skills.search' ? { skills: [{ name: 'example', description: '', tags: [], url: 'https://example.com/skill' }], total_indexed: 1 } : {}));
+  renderAt('/skills');
+  const input = screen.getByPlaceholderText(en['skills.market.searchPlaceholder']);
+  fireEvent.change(input, { target: { value: 'example' } });
+  fireEvent.keyDown(input, { key: 'Enter' });
+  expect(await screen.findByRole('button', { name: 'Request installation' })).toBeInTheDocument();
 });

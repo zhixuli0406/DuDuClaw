@@ -208,6 +208,7 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
+    if kind == "db_source_grant" { return true; }
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         // Adding a document to a shared knowledge collection: the decider
         // must be an Admin or the collection's editor at decision time, which
@@ -519,11 +520,20 @@ async fn push_dashboard_only(
     delivered
 }
 
+/// A successful receipt suppresses the old notice; zero deliveries preserves it.
+async fn chat_delivery_or_notice<F, Fut>(
+    result: crate::approval::chat_admin::deliver::DeliveryResult, notice: F,
+) -> Option<(String, String)>
+where F: FnOnce() -> Fut, Fut: std::future::Future<Output = Option<(String, String)>> {
+    if result.delivered > 0 { result.first } else { notice().await }
+}
+
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
     // SR2 round 4 (N4): the owner-only Personal delegation card is never
     // pushed or reminded through the generic chain (defence in depth behind
     // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
-    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || rec.action_kind == crate::admin_ai::card::ACTION_KIND { return None; }
     if crate::google_identity::member_card::is_member_card(rec) {
         if !crate::google_identity::member_card::eligible(home_dir, rec) { return None; }
         let binding = rec.binding.as_ref()?;
@@ -563,6 +573,9 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         crate::notify_push::push_person_notice(home_dir, uid,
             &body).await;
         return None;
+    }
+    if let Some(result) = crate::approval::chat_admin::deliver::try_push(home_dir, rec, reminder).await {
+        return chat_delivery_or_notice(result, || push_dashboard_only(home_dir, rec, reminder)).await;
     }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
@@ -688,6 +701,13 @@ pub(crate) async fn apply_decision(
     approval_id: &str,
     approve: bool,
 ) -> Result<String, String> {
+    apply_decision_in_session(home_dir, channel, channel_user_id, approval_id, approve, None).await
+}
+
+pub(crate) async fn apply_decision_in_session(
+    home_dir: &Path, channel: &str, channel_user_id: &str, approval_id: &str,
+    approve: bool, session: Option<&str>,
+) -> Result<String, String> {
     let broker = ApprovalBroker::open(home_dir).map_err(|e| format!("開啟審批資料庫失敗：{e}"))?;
     let id = ApprovalId::from(approval_id.to_string());
     let Some(rec) = broker.get(&id).await.map_err(|e| e.to_string())? else {
@@ -752,6 +772,16 @@ pub(crate) async fn apply_decision(
     ) {
         return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
     }
+
+    // WebChat must supply its audience; other adapters can use their verified
+    // channel identity when no conversation is available.
+    if channel == "webchat" && approve && session.is_none() {
+        return Err(crate::channel_decision_route::DECISION_REFUSED.into());
+    }
+    let channel_session = format!("{channel}:{channel_user_id}");
+    crate::entry_gate::check_approval_start(
+        home_dir, &rec, approve, session.unwrap_or(&channel_session),
+    ).await?;
 
     // ── decide ──────────────────────────────────────────────
     let decided_by = format!("channel:{channel}:{channel_user_id}");
@@ -889,7 +919,11 @@ pub(crate) fn spawn_dashboard_collapse(
     approve: bool,
     decider_name: Option<String>,
 ) {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
     tokio::spawn(async move {
+        authority.scope(crate::approval::chat_admin::sync::collapse_after_decision(
+            &home_dir, &rec, approve, decider_name.clone(),
+        )).await;
         let http = reqwest::Client::new();
         let verb = settled_verb_for(&rec, approve);
         let summary = approval_collapse_summary(&rec);
@@ -1591,5 +1625,27 @@ mod tests {
             })
             .await;
         assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod chat_admin_delivery_tests {
+    use super::chat_delivery_or_notice;
+    use crate::approval::chat_admin::deliver::DeliveryResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn no_recipients_falls_back_but_one_card_suppresses_plain_notice() {
+        let notices = AtomicUsize::new(0);
+        let fallback = || async {
+            notices.fetch_add(1, Ordering::SeqCst);
+            Some(("telegram".into(), "old-control-target".into()))
+        };
+        assert_eq!(chat_delivery_or_notice(DeliveryResult::default(), fallback).await,
+            Some(("telegram".into(), "old-control-target".into())));
+        let first = Some(("telegram".into(), "proven-private-dm".into()));
+        let result = DeliveryResult { delivered:1, first:first.clone() };
+        assert_eq!(chat_delivery_or_notice(result, fallback).await, first);
+        assert_eq!(notices.load(Ordering::SeqCst), 1);
     }
 }

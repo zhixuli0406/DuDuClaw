@@ -9,7 +9,7 @@ pub(crate) enum Tier {
     T3,
 }
 
-/// Stable configuration/UI keys: six action kinds and the record-level guard.
+/// Stable configuration/UI keys: selectable action kinds and the record-level guard.
 pub(crate) const STEP_UP_KIND_KEYS: &[&str] = &[
     crate::expert_skills::SKILLS_ACTION_KIND,
     crate::approval::WORKFLOW_ACTIVATION_KIND,
@@ -17,6 +17,7 @@ pub(crate) const STEP_UP_KIND_KEYS: &[&str] = &[
     crate::org_change_approval::ACTION_KIND,
     crate::autopilot_approval::ACTION_KIND,
     crate::approval::cli_egress::KIND,
+    crate::admin_ai::card::ACTION_KIND,
     "egress_guard",
 ];
 
@@ -96,6 +97,7 @@ mod tests {
             (crate::agent_files::approval::ACTION_KIND, Tier::T2),
             (crate::org_change_approval::ACTION_KIND, Tier::T2),
             (crate::autopilot_approval::ACTION_KIND, Tier::T2),
+            (crate::admin_ai::card::ACTION_KIND, Tier::T2),
             (crate::approval::cli_egress::KIND, Tier::T2),
             (crate::isolation_background::PERSONAL_DELEGATION_KIND, Tier::T3),
             ("unknown", Tier::T3),

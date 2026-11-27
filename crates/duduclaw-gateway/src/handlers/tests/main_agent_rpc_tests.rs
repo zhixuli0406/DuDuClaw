@@ -419,3 +419,100 @@ async fn unavailable_identity_precedes_main_target_refusal() {
     assert!(matches!(frame, WsFrame::Response { ok: false, error: Some(ref e), .. }
         if e.as_str() == Some("permission denied")));
 }
+
+// v1.86: role alone must not authorize another employee's data or execution.
+async fn az1_manager_fixture() -> (Fixture, UserContext) {
+    let f = fixture(false).await;
+    ok(f.handler.handle_agents_create_as(json!({"name": "b1", "role": "specialist"}), Some(&f.admin)).await);
+    f.handler.registry.write().await.scan().await.unwrap();
+    let db = UserDb::new(&f.home.join("users.db")).unwrap();
+    let manager = db.create_user("az1-manager@test.invalid", "Manager", "isolated-test-password", UserRole::Manager).unwrap();
+    db.bind_agent(&manager.id, "z1", AccessLevel::Operator).unwrap();
+    let manager = db.live_user_context(&manager.id).unwrap().unwrap();
+    (f, manager)
+}
+
+#[tokio::test]
+async fn az1_m1_incidents_filter_rows_and_aggregates_before_limit() {
+    let (f, manager) = az1_manager_fixture().await;
+    std::fs::write(f.home.join("budget_events.jsonl"), concat!(
+        "{\"agent_id\":\"z1\",\"event\":\"visible\"}\n",
+        "{\"agent_id\":\"b1\",\"event\":\"hidden\"}\n",
+        "{\"agent_id\":\"z10\",\"event\":\"prefix-hidden\"}\n",
+        "{\"event\":\"unattributed\"}\n"
+    )).unwrap();
+    let result = ok(f.handler.handle("budget.incidents", json!({"limit":1}), &manager).await);
+    assert_eq!(result["incidents"], json!([{"agent_id":"z1", "event":"visible"}]));
+    assert_eq!(result["by_agent"], json!([{"agent_id":"z1", "open_events":1}]));
+    let all = ok(f.handler.handle("budget.incidents", json!({"limit":50}), &f.admin).await);
+    assert_eq!(all["incidents"].as_array().unwrap().len(), 4);
+    assert_eq!(all["by_agent"].as_array().unwrap().len(), 3);
+    assert!(matches!(f.handler.handle("budget.incidents", json!({}), &f.employee).await,
+        WsFrame::Response { ok: false, .. }));
+}
+
+#[tokio::test]
+async fn az1_m2_m4_heartbeat_requires_operator_binding_before_scheduling() {
+    let (f, manager) = az1_manager_fixture().await;
+    let scheduler = Arc::new(duduclaw_agent::HeartbeatScheduler::new(f.home.clone(), f.handler.registry.clone()));
+    f.handler.set_heartbeat(scheduler.clone()).await;
+    let runner = tokio::spawn(scheduler.clone().run());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !scheduler.status().await.iter().any(|s| s.agent_id == "b1") {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    // Only populate the scheduler; never run the periodic loop or a real CLI.
+    scheduler.stop();
+    runner.abort();
+    let _ = runner.await;
+    let count = |rows: Vec<duduclaw_agent::heartbeat::HeartbeatStatus>, id: &str| {
+        rows.into_iter().find(|s| s.agent_id == id).unwrap().total_runs
+    };
+    let before = count(scheduler.status().await, "b1");
+    let denied = f.handler.handle("heartbeat.trigger", json!({"agent_id":"b1"}), &manager).await;
+    assert!(matches!(denied, WsFrame::Response { ok: false, error: Some(ref e), .. }
+        if e.as_str() == Some("permission denied")), "{denied:?}");
+    assert_eq!(count(scheduler.status().await, "b1"), before, "denial must not schedule");
+    let db = UserDb::new(&f.home.join("users.db")).unwrap();
+    db.bind_agent(&manager.user_id, "b1", AccessLevel::Viewer).unwrap();
+    assert!(matches!(f.handler.handle("heartbeat.trigger", json!({"agent_id":"b1"}), &manager).await,
+        WsFrame::Response { ok: false, .. }));
+    assert_eq!(count(scheduler.status().await, "b1"), before);
+    ok(f.handler.handle("heartbeat.trigger", json!({"agent_id":"z1"}), &manager).await);
+    assert_eq!(count(scheduler.status().await, "z1"), 1);
+    ok(f.handler.handle("heartbeat.trigger", json!({"agent_id":"b1"}), &f.admin).await);
+    assert_eq!(count(scheduler.status().await, "b1"), before + 1);
+    assert!(matches!(f.handler.handle("heartbeat.trigger", json!({"agent_id":"z1"}), &f.employee).await,
+        WsFrame::Response { ok: false, .. }));
+}
+
+#[tokio::test]
+async fn dashboard_approval_uses_operator_text_for_a_visitor_bound_card() {
+    use crate::approval::{ApprovalBroker, DecisionContext, ExecutionBinding, RequestKind, payload_hash, policy_revision};
+    let f = fixture(true).await;
+    let broker = ApprovalBroker::open(&f.home).unwrap();
+    let payload = json!({"task_id":"existing-normal"});
+    let binding = ExecutionBinding {
+        conversation_audience: Default::default(), schema_version: 1,
+        run_id: uuid::Uuid::new_v4().to_string(), run_origin_kind: "ingress".into(),
+        actor_principal: "a1".into(),
+        decision_context: DecisionContext {
+            channel: "webchat".into(), account_id: "fixture".into(),
+            conversation_id: "widget-visitor:public".into(), principal_id: f.admin.user_id.clone(),
+        },
+        task_id: None, task_revision: None, task_snapshot_hash: None,
+        payload_hash: payload_hash(&payload), policy_revision: policy_revision(&f.home, "a1").unwrap(),
+        cwd: None, environment_hash: payload_hash(&json!({})), file_hashes: Default::default(),
+        expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+        resume_handler: "live_only_v1".into(), resume_version: 1,
+    };
+    let id = broker.request_bound(RequestKind::Approval, "a1", "Start task", payload, binding).await.unwrap();
+    std::fs::write(f.home.join("agents/z1/agent.toml"), "[model").unwrap();
+    let record = broker.get(&id).await.unwrap().unwrap();
+    let digest = crate::approval::decision_digest_at(&f.home, &record);
+    let frame = f.handler.handle("approvals.decide", json!({"id":id.as_str(), "approve":true, "expected_digest":digest}), &f.admin).await;
+    let WsFrame::Response { ok: false, error: Some(error), .. } = frame else { panic!("expected refusal") };
+    assert!(error.as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+    assert_ne!(error.as_str().unwrap(), crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+}

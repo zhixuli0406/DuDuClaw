@@ -398,8 +398,8 @@ async fn model_alignment_refusal_has_a_specific_live_reason_code() {
 
 #[tokio::test]
 async fn unreadable_agent_config_refusal_has_a_specific_code_and_no_detail() {
-    let (_home, ctx) = fixture();
-    let text = agent_config_refusal(&ctx, "worker", "12345678-turn").await;
+    let text = crate::entry_gate::EntryRefusal::Config(crate::runtime_config::RuntimeSettingsError::Unreadable)
+        .user_text("webchat:operator", Some("zh-TW"), "12345678-turn");
     assert_eq!(TurnFailureReason::AgentConfigUnreadable.code(), "agent_config_unreadable");
     assert!(text.starts_with("無法讀取這位員工的設定"), "{text}");
     assert!(text.ends_with("（原因代碼：agent_config_unreadable｜參考編號：12345678）"), "{text}");

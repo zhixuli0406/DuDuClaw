@@ -121,7 +121,7 @@ pub(crate) fn validate_oauth_token(raw: &str, home: &Path, resource: &str) -> Re
     let grant = store.grants.get(&entry.family_id).ok_or(AuthError::UnknownKey)?;
     Ok(Principal {
         client_id: format!("oauth_{}", entry.client_id),
-        scopes: parse_scopes(&entry.scope.replace(' ', ","))?,
+        scopes: crate::mcp_auth::non_person_key_scopes(parse_scopes(&entry.scope.replace(' ', ","))?),
         is_external: true,
         created_at: chrono::DateTime::from_timestamp(grant.issued_unix, 0).ok_or(AuthError::UnknownKey)?,
     })
@@ -878,6 +878,15 @@ fn decision_response(home: &Path, client: RegisteredClient, f: DecisionForm, res
         .into_response();
     }
 
+    if duduclaw_auth::member_keys::is_member_key(&f.operator_key) {
+        return crate::mcp_auth_audit::tag(
+            html_error(StatusCode::UNAUTHORIZED,
+                "Personal keys cannot be used to authorize OAuth connectors yet; use the personal key directly as a bearer token."),
+            crate::mcp_auth_audit::FailureReason::WrongCredentialType,
+            None,
+        );
+    }
+
     // Operator proof: a valid INTERNAL key. External keys cannot mint grants
     // (no self-escalation), and failures never redirect a code anywhere.
     // v1.82: a refused key (not a valid external one) carries the
@@ -1296,3 +1305,7 @@ mod tests {
 #[cfg(test)]
 #[path = "mcp_oauth_server_tests.rs"]
 mod lifecycle_tests;
+
+#[cfg(test)]
+#[path = "mcp_oauth_person_tests.rs"]
+mod person_tests;

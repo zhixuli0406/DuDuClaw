@@ -2,7 +2,7 @@
 pub(crate) mod store;
 pub(crate) mod routes;
 pub(crate) mod resume;
-mod url;
+pub(crate) mod url;
 pub(crate) mod render;
 pub(crate) mod turn;
 #[cfg(test)] mod tests;

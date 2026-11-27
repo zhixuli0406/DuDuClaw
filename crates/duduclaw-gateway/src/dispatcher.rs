@@ -244,6 +244,17 @@ async fn check_autonomous_dispatch(
     Ok(())
 }
 
+/// Queue eligibility is not execution permission: broken targets must reach
+/// the strict entry gate and settle Failed, rather than remain Pending forever.
+async fn target_ready_for_dispatch(home: &Path, registry: &Arc<RwLock<AgentRegistry>>, agent_id: &str) -> bool {
+    let Ok(resolved) = resolve_dispatch_agent(registry, agent_id).await else { return true; };
+    if !crate::ephemeral::is_ephemeral_id(&resolved)
+        && crate::entry_gate::check_task_assignee(home, &resolved).is_err() {
+        return true;
+    }
+    check_autonomous_dispatch(home, registry, &resolved).await.is_ok()
+}
+
 /// Host-stamped delegation identities constrain admission along with the target.
 async fn check_dispatch_sources(
     home: &Path, registry: &Arc<RwLock<AgentRegistry>>,
@@ -441,7 +452,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             let allowed = if let Some(allowed) = eligibility.get(&msg.target) {
                 *allowed
             } else {
-                let allowed = check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_ok();
+                let allowed = target_ready_for_dispatch(home_dir, registry, &msg.target).await;
                 eligibility.insert(msg.target.clone(), allowed);
                 allowed
             };
@@ -470,7 +481,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         {
             continue;
         }
-        if check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_err()
+        if !target_ready_for_dispatch(home_dir, registry, &msg.target).await
             || check_dispatch_sources(home_dir, registry,
                 msg.sender_agent.as_deref().or(Some(msg.sender.as_str())),
                 msg.origin_agent.as_deref()).await.is_err() {
@@ -640,7 +651,7 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             }
         };
 
-        if check_autonomous_dispatch(home_dir, registry, &msg.target).await.is_err()
+        if !target_ready_for_dispatch(home_dir, registry, &msg.target).await
             || check_dispatch_sources(home_dir, registry,
                 msg.sender_agent.as_deref().or(Some(msg.sender.as_str())),
                 msg.origin_agent.as_deref()).await.is_err() {
@@ -983,6 +994,9 @@ impl DispatchError {
     }
 
     fn from_sandbox(error: crate::task_sandbox::SandboxFailure) -> Self {
+        if crate::entry_gate::background_refusal_code(&error.message).is_some() {
+            return Self::Other(error.message);
+        }
         if !crate::autonomous_runtime::was_handed_off()
             && (crate::autonomous_runtime::was_denied() || error.message.starts_with("AUTONOMY_PAUSED:")) {
             Self::AutonomyPaused("AUTONOMY_PAUSED: sandbox handoff refused".into())
@@ -1226,7 +1240,7 @@ async fn poll_and_dispatch(
                         continue;
                     }
                 }
-                if check_autonomous_dispatch(home_dir, registry, &msg.agent_id).await.is_err()
+                if !target_ready_for_dispatch(home_dir, registry, &msg.agent_id).await
                     || check_dispatch_sources(home_dir, registry,
                         msg.sender_agent.as_deref(), msg.origin_agent.as_deref()).await.is_err() {
                     remaining_lines.push(line.to_string());
@@ -1930,7 +1944,8 @@ async fn dispatch_to_agent_outcome(
     // Freeze `default` before awaiting the final gate: later registry changes
     // cannot retarget a dispatch that was admitted for another employee.
     let resolved_agent = resolve_dispatch_agent(registry, agent_id)
-        .await.map_err(DispatchError::AutonomyPaused)?;
+        .await.map_err(|_| DispatchError::Other(crate::entry_gate::background_refusal(
+            &crate::entry_gate::EntryRefusal::AgentNotFound)))?;
     let agent_id = resolved_agent.as_str();
     crate::responsibility::test_hooks::pause_point(
         "autonomy_dispatch_handoff", round_message_id.unwrap_or(agent_id),
@@ -1938,6 +1953,13 @@ async fn dispatch_to_agent_outcome(
     check_dispatch_sources(home_dir, registry, Some(&delegation.sender), Some(&delegation.origin))
         .await.map_err(DispatchError::AutonomyPaused)?;
 
+    // Also covers the task-sandbox branch, which bypasses claude_runner.
+    // Resolve before autonomy's lenient error envelope and credential ingestion.
+    let snapshot = if crate::ephemeral::is_ephemeral_id(agent_id) { None } else {
+        let reg = registry.read().await;
+        Some(Arc::new(crate::entry_gate::resolve_and_check(home_dir, &reg, agent_id)
+            .map_err(|refusal| DispatchError::Other(crate::entry_gate::background_refusal(&refusal)))?))
+    };
     check_autonomous_dispatch(home_dir, registry, agent_id)
         .await.map_err(DispatchError::AutonomyPaused)?;
     let mut callers: Vec<String> = [&delegation.sender, &delegation.origin].into_iter()
@@ -1960,23 +1982,26 @@ async fn dispatch_to_agent_outcome(
             callers.push(caller);
         }
     }
-    crate::autonomous_runtime::round_scope(home_dir, round_message_id,
+    let run = crate::autonomous_runtime::round_scope(home_dir, round_message_id,
     crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
         {
-            let reg = registry.read().await;
-            if let Some(agent) = reg.get(agent_id) {
+            let loaded = {
+                let reg = registry.read().await;
+                reg.get(agent_id).cloned().map(Box::new)
+            };
+            if let Some(agent) = loaded.as_deref() {
                 if delegation.credential_source.starts_with("message_queue:")
                     || delegation.credential_source.starts_with("bus:")
                 {
                     let sender = crate::delegation_gate::resolve_sender(
                         Some(&delegation.sender), Some(&delegation.origin),
                     ).unwrap_or_default();
-                    crate::on_behalf_of::access::check_loaded_queue_main_target(
+                    crate::on_behalf_of::access::check_loaded_queue_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                         crate::delegation_gate::is_background_system_sender(sender),
                     ).await.map_err(DispatchError::Other)?;
                 } else {
-                    crate::on_behalf_of::access::check_loaded_main_target(
+                    crate::on_behalf_of::access::check_loaded_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                     ).await.map_err(DispatchError::Other)?;
                 }
@@ -2066,7 +2091,11 @@ async fn dispatch_to_agent_outcome(
                 .map_err(DispatchError::from_runtime)
             }))
             .await
-    })).await
+    }));
+    match snapshot {
+        Some(snapshot) => crate::runtime_dispatch::with_chat_turn_config(snapshot, Box::pin(run)).await,
+        None => run.await,
+    }
 }
 
 /// Execute a task inside the per-agent task sandbox (`crate::task_sandbox`).
@@ -2086,7 +2115,8 @@ async fn dispatch_sandboxed(
     let runtime = {
         let reg = registry.read().await;
         let agent = if agent_id == "default" { reg.main_agent() } else { reg.get(agent_id) };
-        agent.map(|a| crate::runtime_config::load_runtime_settings(&a.dir).provider)
+        agent.and_then(|a| crate::runtime_dispatch::chat_turn_config(Some(&a.dir)))
+            .map(|turn| turn.runtime_settings.provider)
     };
     let _live_turn = crate::dashboard_feedback::LiveTurn::dispatch(
         home_dir, agent_id, crate::cost_telemetry::RequestType::Dispatch,
@@ -2268,7 +2298,7 @@ async fn dispatch_taskspec_inner(
         );
 
         // Check self-target steps too, including a role/default change since creation.
-        if let Err(reason) = crate::on_behalf_of::access::check_main_target(
+        if let Err(reason) = crate::on_behalf_of::access::check_main_target_for_execution(
             home_dir, crate::on_behalf_of::current().as_deref(), &target_agent,
         ).await {
             spec.steps[step_index].status = StepStatus::Failed;
@@ -2440,7 +2470,8 @@ async fn handle_step_failure(
 ) -> Result<(), String> {
     use crate::task_spec::*;
 
-    if crate::budget::budget_refusal_message(error).is_some() {
+    if crate::entry_gate::background_refusal_code(error).is_some()
+        || crate::budget::budget_refusal_message(error).is_some() {
         spec.steps[step_index].status = StepStatus::Failed;
         spec.status = TaskStatus::Failed;
         spec.save(agent_dir).ok();

@@ -7,6 +7,8 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 mod run;
+#[cfg(test)]
+pub(crate) mod entry_gate_all_helpers;
 mod progress;
 mod subscriptions;
 mod writer;

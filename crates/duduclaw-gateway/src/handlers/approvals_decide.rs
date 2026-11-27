@@ -205,6 +205,19 @@ impl MethodHandler {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                let env = crate::approval::decision_service::DecisionEnv {
+                    home: self.home_dir.clone(), registry: Some(self.registry.clone()),
+                    broker: broker.clone(), users: self.user_db.read().await.clone(),
+                };
+                return match Box::pin(crate::approval::decision_service::decide(
+                    &env, &approval_id, approve, &reason,
+                    &crate::approval::decision_service::Decider::Dashboard(decider),
+                )).await {
+                    Ok(outcome) => WsFrame::ok_response("", outcome.value),
+                    Err(error) => error.dashboard_frame(),
+                };
+            }
             let lock = decision_lock(approval_id.as_str());
             let _guard = lock.lock().await;
             // Chat-admin decisions share this lock; discard the pre-lock snapshot.
@@ -226,12 +239,20 @@ impl MethodHandler {
             if let Err(error) = crate::approval::check_expected_digest(rec) {
                 return WsFrame::error_response("", &error);
             }
+            let session = "dashboard:approval";
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, session).await {
+                return WsFrame::error_response("", &text);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
                 return WsFrame::error_response("", &e);
             }
             self.audit_activation_decision(rec, &decider, approve);
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            crate::approval_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(), rec.clone(), approve, decider_name,
+            );
             return WsFrame::ok_response(
                 "",
                 json!({
@@ -247,9 +268,10 @@ impl MethodHandler {
                 home: self.home_dir.clone(), registry: Some(self.registry.clone()),
                 broker: broker.clone(), users: self.user_db.read().await.clone(),
             };
-            return match Box::pin(crate::approval::decision_service::decide(
+            return match Box::pin(crate::approval::decision_service::decide_with_reach(
                 &env, &approval_id, approve, &reason,
                 &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+                params["reach_digest"].as_str(),
             )).await {
                 Ok(outcome) => WsFrame::ok_response("", outcome.value),
                 Err(error) => error.dashboard_frame(),
@@ -301,6 +323,11 @@ impl MethodHandler {
             .await
             {
                 return WsFrame::error_response("", &error);
+            }
+        }
+        if let Some(rec) = &record {
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, "dashboard:approval").await {
+                return WsFrame::error_response("", &text);
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
@@ -549,14 +576,35 @@ impl MethodHandler {
 
     /// WP14-T14.6: recent budget-breaker incidents from `budget_events.jsonl`,
     /// newest first, plus a per-agent open-count. `limit` default 50.
-    pub(crate) async fn handle_budget_incidents(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_budget_incidents(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let path = self.home_dir.join("budget_events.jsonl");
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return WsFrame::error_response("", "Budget incidents unavailable"),
+        };
+        // Same direct-binding and Personal visibility rule as agents.list.
+        // Filter before both pagination and aggregation; hidden rows contribute
+        // neither entries nor counts, including unattributed rows.
+        let hidden = if ctx.is_admin() {
+            Default::default()
+        } else {
+            match self.personal_hidden_agents(ctx).await {
+                Ok(hidden) => hidden,
+                Err(reason) => return WsFrame::error_response("", reason),
+            }
+        };
+        let visible = ctx.visible_agents();
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|event| match &visible {
+                None => true,
+                Some(ids) => event.get("agent_id").and_then(Value::as_str)
+                    .is_some_and(|id| !hidden.contains(id) && ids.iter().any(|visible_id| visible_id == id)),
+            })
             .collect();
         events.reverse(); // newest first
         let mut per_agent: std::collections::HashMap<String, u64> =

@@ -145,14 +145,16 @@ impl MethodHandler {
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
-                        "payload": if r.binding.is_some()
+                        "payload": if r.action_kind == crate::admin_ai::card::ACTION_KIND {
+                            crate::admin_ai::card::confirmation_display(r)
+                        } else if r.binding.is_some()
                             && !may_show_bound_egress(&r.payload, fresh.is_admin(), may_decide) {json!({
                             "redacted": true,
                             "payload_hash": r.binding.as_ref().map(|b|&b.payload_hash)
                         })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
                         "request_kind":r.request_kind,
                         "status":r.status,
-                        "binding": if may_decide { json!(r.binding) } else { Value::Null },
+                        "binding": if may_decide && r.action_kind != crate::admin_ai::card::ACTION_KIND { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
                         "mail_requester_approval_eligible": crate::approval::mail_requester::eligible(&self.home_dir, r),

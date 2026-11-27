@@ -10,6 +10,7 @@ use crate::approval::{ApprovalId, chat_admin::DecisionActor};
 use crate::protocol::WsFrame;
 use crate::agent_files::{approval as fa, flow};
 use crate::org_change_approval::{self as oc, journal, Proposal};
+use crate::dept_grants::reach;
 use duduclaw_core::org_change::{self, OrgChangeError};
 use duduclaw_core::org_store::{self, OrgEntry, OrgMutationGuard, OrgStore, OrgStoreError};
 
@@ -59,8 +60,9 @@ pub(super) fn audit_recovery_refusal(env: &DecisionEnv, rec: &crate::approval::A
 
 pub(super) async fn org_change(
     env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider, actor: &DecisionActor,
+    reach_digest: Option<&str>,
 ) -> Result<Value, DecisionRefusal> {
-    result(Box::pin(org_change_frame(env, actor, &env.broker, id, approve, reason, by)).await)
+    result(Box::pin(org_change_frame(env, actor, &env.broker, id, approve, reason, by, reach_digest)).await)
 }
 
 async fn agent_file_change_frame(
@@ -210,6 +212,26 @@ pub(crate) fn authority_error(e: &OrgStoreError) -> WsFrame {
     coded(e.code(), &e.to_string())
 }
 
+/// Always recompute from the locked org entry; a missing/unreadable grant
+/// store cannot prove an empty impact. Empty impact preserves legacy clients.
+pub(crate) fn confirm_reach(home: &Path, before: &OrgEntry, after: &OrgEntry, supplied: Option<&str>)
+    -> Result<Value, WsFrame> {
+    let lines = reach::for_move(home, &before.department, &after.department)
+        .map_err(|_| coded("reach_unavailable", reach::UNAVAILABLE))?;
+    let current = reach::preview(&lines);
+    if !lines.is_empty() && supplied != current["reach_digest"].as_str() {
+        return Err(coded_with("reach_changed", reach::CHANGED, json!({"current": current})));
+    }
+    Ok(current)
+}
+
+pub(crate) fn reach_refusal_code(frame: &WsFrame) -> &str {
+    match frame {
+        WsFrame::Response { error: Some(error), .. } => error["code"].as_str().unwrap_or("reach_unavailable"),
+        _ => "reach_unavailable",
+    }
+}
+
 /// Shown when the payload's proposer tries to approve their own request
 /// under `[approval] forbid_self_approval`.
 pub(super) const SELF_APPROVAL_REFUSAL: &str =
@@ -293,7 +315,7 @@ pub(crate) fn audit(home: &Path, event: &str, agent_id: &str, severity: duduclaw
 
 /// `org_change_rejected`: the request ended without being applied (`why`:
 /// `rejected` by the Admin, `expired`, `stale`, `invalid`, `malformed`).
-/// Written only after the terminal state was recorded.
+/// Reach refusals leave the card pending; other rows follow the terminal decision.
 fn audit_rejected(
     home: &Path,
     rec: &crate::approval::ApprovalRecord,
@@ -378,6 +400,7 @@ async fn org_change_frame(
     approve: bool,
     decision_reason: &str,
     by: &Decider,
+    reach_digest: Option<&str>,
 ) -> WsFrame {
     if require_dashboard_admin(&env.home, by).is_err() {
         return WsFrame::error_response("", "只有管理員可以在儀表板決定組織調整的審核");
@@ -467,7 +490,7 @@ async fn org_change_frame(
     // past that the applied journal's recovery records the outcome.
     let keeper =
         broker.keep_decision_lease(approval_id, &lease, oc::DECISION_LEASE_SECS, oc::COMMITTED_LEASE_MAX);
-    let frame = apply_leased(env, actor, broker, &lease, &keeper, approval_id, by, decision_reason).await;
+    let frame = apply_leased(env, actor, broker, &lease, &keeper, approval_id, by, decision_reason, reach_digest).await;
     drop(keeper);
     // A lease the decision did not consume is given back (no-op otherwise).
     broker.release_decision_lease(approval_id, &lease).await;
@@ -484,6 +507,7 @@ async fn apply_leased(
     approval_id: &crate::approval::ApprovalId,
     by: &Decider,
     decision_reason: &str,
+    reach_digest: Option<&str>,
 ) -> WsFrame {
     let Some(registry) = env.registry.as_ref() else {
         return WsFrame::error_response("", "agent registry unavailable");
@@ -549,6 +573,11 @@ async fn apply_leased(
         let message = format!("這份申請已不再適用，已拒絕：{e}");
         return deny_org_card(env, actor, broker, &rec, by, Some(&proposal), "invalid", decision_reason, &message, Some(lease))
             .await;
+    }
+    let before = org_change::effective_in(&store, &env.home, &proposal.agent_id).unwrap_or_default();
+    if let Err(frame) = confirm_reach(&env.home, &before, &proposal.after, reach_digest) {
+        audit_rejected(&env.home, &rec, by, Some(&proposal), reach_refusal_code(&frame), decision_reason);
+        return frame;
     }
     // No prepared journal entry ⇒ no apply: a crash after the commit must
     // always leave a trace a retry can complete from.

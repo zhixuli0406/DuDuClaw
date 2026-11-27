@@ -320,11 +320,29 @@ async fn receive_webhook(
                     }
 
                     let sender = &msg.from;
-                    let base_text = msg
+                    let mut base_text = msg
                         .text
                         .as_ref()
                         .map(|t| t.body.clone())
                         .unwrap_or_default();
+                    let mut drop_files = false;
+                    if msg.image.is_some() || msg.audio.is_some() || msg.video.is_some() || msg.document.is_some() {
+                        let session = format!("whatsapp:{sender}");
+                        match crate::channel_reply::attachment_gate::check(
+                            &state.ctx, &session, &session, sender, &base_text, None, None,
+                        ).await {
+                            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
+                            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(text) => {
+                                drop_files = true;
+                                base_text = text;
+                            }
+                            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                                send_text(&state.http, &access_token, &phone_id, sender, &reply).await;
+                                continue;
+                            }
+                        }
+                    }
                     let mut attachment_lines: Vec<String> = Vec::new();
                     // WP1.3: land inbound files under the resolved agent's dir.
                     let attach_base =
@@ -357,7 +375,7 @@ async fn receive_webhook(
                         _ => None,
                     };
 
-                    if let Some((media_id, mime, type_label)) = media_info {
+                    if !drop_files && let Some((media_id, mime, type_label)) = media_info {
                         info!("📩 WhatsApp [{sender}]: {type_label} message");
                         match download_media(&state.http, &access_token, media_id).await {
                             Ok(data) => {
@@ -384,7 +402,7 @@ async fn receive_webhook(
                     }
 
                     // Handle document (has filename)
-                    if let Some(doc) = &msg.document {
+                    if !drop_files && let Some(doc) = &msg.document {
                         let mime = doc
                             .mime_type
                             .as_deref()
@@ -423,7 +441,7 @@ async fn receive_webhook(
                     if let Some(wa_ctx) = msg
                         .context
                         .as_ref()
-                        .filter(|_| !base_text.trim_start().starts_with('/'))
+                        .filter(|_| !drop_files && !base_text.trim_start().starts_with('/'))
                     {
                         if wa_ctx.forwarded || wa_ctx.frequently_forwarded {
                             context_lines

@@ -54,7 +54,7 @@ import { useCommandPaletteStore } from '@/stores/command-palette-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useConversationsStore } from '@/stores/conversations-store';
 import { useTasksStore } from '@/stores/tasks-store';
-import { useAuthStore } from '@/stores/auth-store';
+import { useAuthStore, useDeptGroups } from '@/stores/auth-store';
 import { useThemeStore } from '@/stores/theme-store';
 import { useLocaleStore, localeNames } from '@/i18n';
 
@@ -233,6 +233,7 @@ export function CommandPalette() {
 
   const status = useSystemStore((s) => s.status);
   const user = useAuthStore((s) => s.user);
+  const deptGroups = useDeptGroups();
   const bindings = useAuthStore((s) => s.bindings);
   const agents = useSelectableAgents(true, undefined, open);
   const tasks = useTasksStore((s) => s.tasks);
@@ -362,6 +363,7 @@ export function CommandPalette() {
     // agent-jump commands below, so the org chart's progressive-disclosure
     // gate is a free read, not a second fetch.
     const visibilityCtx = {
+      deptGroups,
       hasOperatorAccess,
       forksExist,
       isDesktop: isTauri(),
@@ -488,7 +490,7 @@ export function CommandPalette() {
         }];
 
     return [...navCommands, ...manageCommands, ...agentCommands, ...agentFileCommands, ...taskCommands, ...themeActions, ...localeActions, ...logoutAction];
-  }, [t, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, protectedMode, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout, visibleAgentsForSearch]);
+  }, [t, deptGroups, user?.role, hasOperatorAccess, forksExist, isAppliance, decisionEnabled, protectedMode, agents, tasks, isPersonal, navigate, setTheme, setLocale, logout, visibleAgentsForSearch]);
 
   // Empty query → recent routes first, then all commands in natural order.
   const results = useMemo<ScoredCommand[]>(() => {

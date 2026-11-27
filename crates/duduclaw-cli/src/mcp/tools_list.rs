@@ -71,6 +71,8 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
 /// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
 /// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
 pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "admin_settings_read",
+    "admin_settings_propose",
     "code_map",
     "meeting_upload_link",
     "meeting_transcribe",
@@ -242,7 +244,8 @@ pub(crate) fn remote_process_agent_tool_refused(
     kind: Option<&crate::mcp_auth::PrincipalKind>,
     default_agent: &str,
 ) -> bool {
-    remote_non_gateway_internal(principal, kind, default_agent) && acts_for_process_agent(name)
+    super::admin_ai_client::TOOLS.contains(&name)
+        || (remote_non_gateway_internal(principal, kind, default_agent) && acts_for_process_agent(name))
 }
 
 /// What the HTTP MCP server makes of an authenticated principal (v1.82,
@@ -266,7 +269,8 @@ pub(crate) enum RemoteAccess {
 impl RemoteAccess {
     /// Whether this caller is refused the process-agent union for `name`.
     pub(crate) fn refuses_process_agent_tool(&self, name: &str) -> bool {
-        matches!(self, Self::Bound(_) | Self::Unbound(_)) && acts_for_process_agent(name)
+        super::admin_ai_client::TOOLS.contains(&name)
+            || (matches!(self, Self::Bound(_) | Self::Unbound(_)) && acts_for_process_agent(name))
     }
 }
 
@@ -533,6 +537,12 @@ pub(crate) async fn handle_tools_list_for_transport(
     default_agent: &str,
     remote_bearer: bool,
 ) -> Value {
+    if crate::mcp_auth::is_person_principal(principal) {
+        let tools: Vec<Value> = tools()
+            .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, principal))
+            .map(build_tool_schema).collect();
+        return jsonrpc_response(id, serde_json::json!({"tools":tools}));
+    }
     let access = remote_bearer.then(|| remote_access(home_dir, principal, default_agent));
     let tools: Vec<&'static ToolDef> = match &access {
         Some(RemoteAccess::Unbound(_)) => Vec::new(),
@@ -540,7 +550,7 @@ pub(crate) async fn handle_tools_list_for_transport(
             let bound_access = RemoteAccess::Bound(agent.clone());
             let listed = with_remote_binding(
                 RemoteBinding::Bound(agent.clone()),
-                visible_tools(principal, home_dir, agent),
+                visible_tools(principal, home_dir, agent, true),
             )
             .await;
             // `visible_tools` exempts an AI-employee client from the scope
@@ -552,7 +562,7 @@ pub(crate) async fn handle_tools_list_for_transport(
                 .filter(|t| remote_bound_key_can_call(&bound_access, t.name, principal))
                 .collect()
         }
-        _ => visible_tools(principal, home_dir, default_agent).await,
+        _ => visible_tools(principal, home_dir, default_agent, remote_bearer).await,
     };
     let native_rest = google_native_rest_available(home_dir, principal);
     let tools: Vec<Value> = tools.into_iter().map(|t| backend_tool_schema(t, native_rest)).collect();
@@ -588,7 +598,7 @@ pub(crate) async fn visible_tool_snapshot(
     principal: &crate::mcp_auth::Principal, home: &Path, default_agent: &str,
 ) -> Vec<String> {
     let native_rest = google_native_rest_available(home, principal);
-    visible_tools(principal, home, default_agent).await.into_iter().map(|tool| {
+    visible_tools(principal, home, default_agent, false).await.into_iter().map(|tool| {
         if tool.name == "gmail_create_draft" {
             tool_schema_snapshot(&backend_tool_schema(tool, native_rest)).unwrap()
         } else { tool.name.to_owned() }
@@ -617,7 +627,7 @@ pub(crate) async fn visible_tool_names(
     home_dir: &Path,
     default_agent: &str,
 ) -> Vec<&'static str> {
-    visible_tools(principal, home_dir, default_agent)
+    visible_tools(principal, home_dir, default_agent, false)
         .await
         .into_iter()
         .map(|t| t.name)
@@ -629,12 +639,15 @@ async fn visible_tools(
     principal: &crate::mcp_auth::Principal,
     home_dir: &Path,
     default_agent: &str,
+    remote_bearer: bool,
 ) -> Vec<&'static ToolDef> {
-    visible_tools_with(
+    visible_tools_in_lane_for_transport(
         principal,
         home_dir,
         default_agent,
         employee_process_from_env(),
+        &crate::mcp_isolation::process_lane(),
+        remote_bearer,
     )
     .await
 }
@@ -666,6 +679,49 @@ pub(crate) async fn visible_tools_in_lane(
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
+    let agent = acting_agent_id(&principal.client_id, default_agent);
+    let human = super::host_on_behalf_of(home_dir, agent);
+    visible_tools_for_principal(principal, home_dir, default_agent, employee_process, lane, human.as_deref()).await
+}
+
+/// Host principal injected separately from tool arguments and process env.
+/// Both tools/list and the listChanged snapshot use this same filter pipeline.
+pub(crate) async fn visible_tools_for_principal(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    human: Option<&str>,
+) -> Vec<&'static ToolDef> {
+    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human, false).await
+}
+
+async fn visible_tools_in_lane_for_transport(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    remote_bearer: bool,
+) -> Vec<&'static ToolDef> {
+    let agent = acting_agent_id(&principal.client_id, default_agent);
+    let human = super::host_on_behalf_of(home_dir, agent);
+    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human.as_deref(), remote_bearer).await
+}
+
+async fn visible_tools_for_principal_and_transport(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    human: Option<&str>,
+    remote_bearer: bool,
+) -> Vec<&'static ToolDef> {
+    if crate::mcp_auth::is_person_principal(principal) {
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+    }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
     // not act for the process's agent. Discovery filter only.
@@ -707,6 +763,9 @@ pub(crate) async fn visible_tools_in_lane(
     // clients are filtered separately by `external_tool_allowed` and carry no
     // per-agent capability config.
     let effective_agent = acting_agent_id(&principal.client_id, default_agent);
+    let main_restricted = (!principal.is_external || dedicated_google)
+        && super::main_principal_gate::restricted(home_dir, effective_agent, human);
+    let admin_ai = super::admin_ai_client::available_for(home_dir, principal, effective_agent, remote_bearer).await;
     let is_member =
         !principal.is_external && duduclaw_gateway::ephemeral::is_ephemeral_id(effective_agent);
     let member_caps = is_member
@@ -785,16 +844,10 @@ pub(crate) async fn visible_tools_in_lane(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
-    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant and
-    // the separate per-table opt-in in the employee's own Odoo settings, and
-    // the table must clear the never-writable list, the 功能模組 switch and
-    // the block list. The Odoo handler acts for `default_agent`, so the same
-    // agent and the same predicate (`generic_write_model_gate` over
-    // `allowed_models`) decide the listing.
-    let allow_odoo_create =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
-    let allow_odoo_write =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_write");
+    // RM-141: one policy adapter for listing and dispatch, with read-only
+    // identity metadata. A malformed artifact hides every Odoo tool.
+    let odoo_policy = (!member_invalid).then(||
+        super::odoo_access::ToolPolicy::load(home_dir, default_agent).ok()).flatten();
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -870,9 +923,9 @@ pub(crate) async fn visible_tools_in_lane(
     // — mirror of dispatch §3.458, same predicate with no arguments, so only
     // tools every call to which is refused are hidden. External callers are
     // outside that gate in dispatch, so they are outside it here too.
-    let delegation_none = !principal.is_external
-        && duduclaw_core::delegation_policy_from_home(home_dir)
-            == duduclaw_core::DelegationPolicy::Disabled;
+    let delegation_none = if principal.is_external { None } else {
+        Some(super::delegation_roles::none_policy(home_dir, effective_agent).await)
+    };
     // RM-137 (soft identity mode): the handler and the `none` exemption also
     // require a token-verified identity (`caller_token_verified`); a soft-mode
     // `Unverified` process declaring an `eph-*` id gets neither. Only a role
@@ -935,7 +988,10 @@ pub(crate) async fn visible_tools_in_lane(
     .is_some();
 
     tools()
+        .filter(|t| super::main_principal_gate::refusal(main_restricted, t.name).is_none())
         .filter(|t| super::drive_write_refusal(home_dir, effective_agent, t.name, principal, lane).is_none())
+        .filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal))
+        .filter(|t| !super::admin_ai_client::TOOLS.contains(&t.name) || admin_ai.permits(t.name))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
         // applies, so it is not listed there either (discoverable ⇔ callable).
@@ -983,8 +1039,8 @@ pub(crate) async fn visible_tools_in_lane(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
-        .filter(|t| t.name != "odoo_create" || allow_odoo_create)
-        .filter(|t| t.name != "odoo_write" || allow_odoo_write)
+        .filter(|t| !t.name.starts_with("odoo_")
+            || odoo_policy.as_ref().is_some_and(|policy| policy.listed_for_context(t.name)))
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))
@@ -1008,7 +1064,7 @@ pub(crate) async fn visible_tools_in_lane(
         })
         // RM-137: delegation policy `none` (mirror of dispatch §3.458).
         .filter(|t| {
-            !delegation_none
+            !delegation_none.as_ref().is_some_and(|policy| policy.blocks(t.name))
                 || !crate::mcp_dispatch::delegation_none_refuses_for(
                     home_dir,
                     t.name,

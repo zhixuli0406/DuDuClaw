@@ -11,6 +11,7 @@ pub const TOKEN: &str = "https://oauth2.googleapis.com/token";
 pub const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 pub const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
 pub(crate) const DRIVE_WRITE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
+pub const GOOGLE_JWKS: &str = "https://www.googleapis.com/oauth2/v3/certs";
 pub(crate) const DRIVE_TOOLS_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const MAX_RESPONSE: usize = 64 * 1024;
 
@@ -42,7 +43,17 @@ pub(crate) fn test_base() -> &'static std::sync::OnceLock<String> {
     &BASE
 }
 
-fn endpoint(url: &str) -> String {
+#[cfg(test)]
+tokio::task_local! {
+    /// Per-test override; never changes the process-wide Personal OAuth mock.
+    pub(crate) static TEST_ENDPOINT_BASE: String;
+}
+
+pub(crate) fn endpoint(url: &str) -> String {
+    #[cfg(test)]
+    if let Ok(base) = TEST_ENDPOINT_BASE.try_with(Clone::clone) {
+        return format!("{}/{}", base.trim_end_matches('/'), url.trim_start_matches("https://"));
+    }
     #[cfg(test)]
     if let Some(base) = test_base().get() {
         return format!(
@@ -248,6 +259,46 @@ pub async fn exchange(
         .await
         .map_err(|_| Error::Unavailable)?;
     parse_tokens(response_json(response).await?)
+}
+
+/// Sign-in needs only the ID token. Never construct a vault Secret or retain
+/// access/refresh tokens, and never include provider response text in errors.
+pub async fn exchange_for_id_token(
+    client_id: &str,
+    client_secret: &str,
+    code: &str,
+    verifier: &str,
+    redirect: &str,
+) -> Result<String, Error> {
+    let response = client()?
+        .post(endpoint(TOKEN))
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("redirect_uri", redirect),
+        ])
+        .send()
+        .await
+        .map_err(|_| Error::Unavailable)?;
+    let mut value = response_json(response).await?;
+    let id_token = value.as_object_mut()
+        .and_then(|object| object.remove("id_token"));
+    // Drop all other response fields before validating or returning the token.
+    drop(value);
+    let Some(Value::String(id_token)) = id_token else {
+        return Err(Error::Malformed);
+    };
+    if id_token.is_empty() || id_token.len() > 16 * 1024 {
+        return Err(Error::Malformed);
+    }
+    let mut parts = id_token.split('.');
+    if !(0..3).all(|_| parts.next().is_some_and(|part| !part.is_empty())) || parts.next().is_some() {
+        return Err(Error::Malformed);
+    }
+    Ok(id_token)
 }
 
 #[cfg(test)]

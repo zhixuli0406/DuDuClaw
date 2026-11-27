@@ -205,12 +205,16 @@ pub async fn scope<F: Future>(home: &Path, agent: &str, context: &RequestContext
                     .is_some_and(|proof| !proof.matches_turn(agent, &turn)) {
                 return Err(VerificationError::BindingMismatch);
             }
+            if !crate::on_behalf_of::context::refresh_isolated_requester(home, agent, &reference,
+                context, metadata.as_ref()) {
+                return Err(VerificationError::Unavailable);
+            }
             // The runtime owner keeps the guard alive across tool calls and
             // invalidates it on termination. A single request must not revoke it.
             (reference, None)
         }
         None => {
-            let guard = crate::on_behalf_of::context::register_isolated(home, agent, context)
+            let guard = crate::on_behalf_of::context::register_isolated(home, agent, context, metadata.as_ref())
                 .ok_or(VerificationError::Unavailable)?;
             (guard.reference().to_owned(), Some(guard))
         }

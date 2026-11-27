@@ -211,6 +211,11 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     // actual ToolDefs, not a source-text count or a duplicated name fixture.
     for tool in crate::mcp::tools() {
         assert!(seen.insert(tool.name), "duplicate ToolDef: {}", tool.name);
+        if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
+            assert_eq!(boundary_route(tool.name), None, "admin AI is unavailable in protected mode");
+            assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some());
+            continue;
+        }
         assert!(boundary_route(tool.name).is_some(), "missing route: {}", tool.name);
         assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some(),
             "missing effect: {}", tool.name);
@@ -315,8 +320,9 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     let tools: Vec<_> = crate::mcp::tools().collect();
     // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
+    // 141K-P5: +two person tools, intentionally refused for all employees.
     // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
-    assert_eq!(tools.len(), 280, "review every new tool's isolation disposition");
+    assert_eq!(tools.len(), 284, "review every new tool's isolation disposition");
     for tool in tools {
         if intentional_refusal(tool.name).is_some() { continue; }
         let route = boundary_route(tool.name).expect("exact route");
@@ -363,7 +369,11 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 280);
+    assert_eq!(manifest.len(), 284);
+    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+        assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
+            ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));
+    }
     assert_eq!(manifest.iter().find(|(name, _)| *name == "file_read").unwrap().1, ServiceState::Ready);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "execute_program").unwrap().1, ServiceState::MissingFactory);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "transcribe_audio").unwrap().1, ServiceState::MissingFactory);

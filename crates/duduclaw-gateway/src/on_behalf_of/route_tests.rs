@@ -294,3 +294,70 @@ async fn stored_provenance_parse_failure_never_gets_background_machine_authority
         }).await;
     }
 }
+
+async fn role_request(state: Arc<RouteState>, agent: &str, value: Value) -> (u16, Value) {
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let signed = headers(&state.home, agent, &bytes, &uuid::Uuid::new_v4().simple().to_string());
+    let mut request = HttpRequest::builder().method("POST").uri(DELEGATION_ROLES_ROUTE)
+        .body(axum::body::Body::from(bytes)).unwrap();
+    request.headers_mut().extend(signed);
+    request.extensions_mut().insert(ConnectInfo::<SocketAddr>("127.0.0.1:1234".parse().unwrap()));
+    let response = router(state).oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+    (status, serde_json::from_slice(&body).unwrap())
+}
+
+#[tokio::test]
+async fn delegation_roles_route_resolves_only_host_evidence_and_live_roles() {
+    let h = home();
+    let config = std::fs::read_to_string(h.path().join("config.toml")).unwrap();
+    std::fs::write(h.path().join("config.toml"), config.replace("[delegation]",
+        "[delegation]\npolicy='none'\nunrestricted_roles=['admin']")).unwrap();
+    let db = duduclaw_auth::UserDb::new(&h.path().join("users.db")).unwrap();
+    let admin = db.create_user("admin@test.invalid", "Admin", "test-password", duduclaw_auth::UserRole::Admin).unwrap().id;
+    let conn = rusqlite::Connection::open(h.path().join("users.db")).unwrap();
+    conn.execute("UPDATE users SET avatar_agent_id='avatar' WHERE id=?1", [&admin]).unwrap();
+    let state = Arc::new(RouteState::new(h.path().into(), None));
+    let guard = crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(
+        duduclaw_knowledge::requester::RequesterIdentity::DashboardUser { user_id: admin.clone() },
+        async { super::super::context::register(h.path(), "avatar").unwrap() }).await;
+    let request = json!({"context":guard.reference()});
+    let (status, result) = role_request(state.clone(), "avatar", request.clone()).await;
+    assert_eq!(status, 200);
+    assert_eq!(result["facts"]["owner_role"], "admin");
+    assert_eq!(result["facts"]["requester_role"], "admin");
+    assert_eq!(result["facts"]["requester_account_id"], admin);
+    assert_eq!(role_request(state.clone(), "avatar", json!({"context":guard.reference(),
+        "record":{"kind":"message","id":"new-job","target":"other"}})).await.0, 200);
+    assert!(crate::delegation_roles::initiators::lookup(h.path(), "message", "new-job", Some("avatar"), "other",
+        Some(&format!("user:{admin}"))).is_some());
+    for kind in ["cron", "reminder", "task", "task_spec"] {
+        assert_eq!(role_request(state.clone(), "avatar", json!({"context":guard.reference(),
+            "record":{"kind":kind,"id":"background-job","target":"other"}})).await.0, 403);
+    }
+    assert_eq!(role_request(state.clone(), "avatar", json!({"context":guard.reference(),
+        "record":{"kind":"message","id":"forged","target":"other","created_at":1}})).await.0, 400);
+    assert_eq!(role_request(state.clone(), "other", request.clone()).await.0, 403);
+    assert_eq!(role_request(state.clone(), "dashboard", request.clone()).await.0, 403);
+    let mut injected = request.clone();
+    injected["principal"] = json!("user:admin");
+    assert_eq!(role_request(state.clone(), "avatar", injected).await.0, 400);
+    conn.execute("UPDATE users SET role='employee' WHERE id=?1", [&admin]).unwrap();
+    let (_, result) = role_request(state.clone(), "avatar", request.clone()).await;
+    assert_eq!(result["facts"]["requester_role"], "employee");
+    conn.execute("UPDATE users SET status='disabled' WHERE id=?1", [&admin]).unwrap();
+    let (_, result) = role_request(state.clone(), "avatar", request.clone()).await;
+    assert!(result["facts"]["requester_role"].is_null());
+    drop(guard);
+    assert_eq!(role_request(state, "avatar", request).await.0, 403);
+}
+
+#[tokio::test]
+async fn delegation_roles_route_refuses_unreadable_database() {
+    let h = home();
+    std::fs::create_dir(h.path().join("users.db")).unwrap();
+    let state = Arc::new(RouteState::new(h.path().into(), None));
+    let guard = super::super::context::register(h.path(), "avatar").unwrap();
+    assert_eq!(role_request(state, "avatar", json!({"context":guard.reference()})).await.0, 403);
+}

@@ -18,6 +18,27 @@ pub(super) fn task_assignee_refusal(home: &std::path::Path, assignee: Option<&st
     })
 }
 
+/// Authorization is the caller's responsibility. Preserve roster errors, but
+/// classify a malformed profile with the same refusal used by task creation.
+fn task_reassignment_refusal(home: &std::path::Path, current: &str, dest: &str) -> Option<WsFrame> {
+    if let Some(frame) = task_assignee_refusal(home, Some(dest)) {
+        if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(home, dest) {
+            return Some(WsFrame::error_response("", &refusal.user_text(
+                "dashboard:task-update", None, "task-update",
+            )));
+        }
+        return Some(frame);
+    }
+    if !dest.is_empty() && dest != current {
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(home, dest) {
+            return Some(WsFrame::error_response("", &refusal.user_text(
+                "dashboard:task-update", None, "task-update",
+            )));
+        }
+    }
+    None
+}
+
 /// Preserve the structured assignee error from the shared goal core.
 pub(super) fn goal_create_refusal(message: &str) -> WsFrame {
     if message == duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE {
@@ -201,6 +222,14 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // Absence preserves the board API; every supplied value must narrow it.
+        let limit = match params.get("limit") {
+            None => None,
+            Some(value) => match value.as_u64().filter(|n| (1..=1000).contains(n)) {
+                Some(n) => Some(n as usize),
+                None => return WsFrame::error_response("", "limit must be an integer between 1 and 1000"),
+            },
+        };
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -215,10 +244,14 @@ impl MethodHandler {
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
-        match store
-            .list_tasks_filtered(status, agent_id, priority, goal_mode)
-            .await
-        {
+        let result = match limit {
+            Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
+                |id, assignee| !reader.hides(assignee)
+                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+            ).await,
+            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
+        };
+        match result {
             Ok(rows) => {
                 let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
                     && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
@@ -253,18 +286,28 @@ impl MethodHandler {
             .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("goal"));
         let raw_target = params.get(if is_goal { "agent_id" } else { "assigned_to" })
             .and_then(Value::as_str).unwrap_or("");
-        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(raw_target.trim())) {
-            return frame;
-        }
         if let Err(frame) = self.delegation_check(ctx, raw_target).await { return frame; }
         let target = raw_target.trim();
-        if let Err(frame) = self.deny_main_for_non_admin(ctx, target).await { return frame; }
+        let scheduled = params.get("schedule").is_some_and(|value| !value.is_null());
+        let main_gate = if scheduled || (!is_goal && params.get("kind").and_then(Value::as_str)
+            .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("discovery"))) {
+            self.deny_main_for_non_admin(ctx, target).await
+        } else {
+            self.deny_main_unless_admitted(ctx, target, crate::on_behalf_of::access::MainUse::Assign).await
+        };
+        if let Err(frame) = main_gate { return frame; }
         if !ctx.is_admin() {
             if let Err(refusal) = crate::machine_employee::check_target(
                 &self.home_dir, target, Some(&format!("user:{}", ctx.user_id)),
             ) {
                 return WsFrame::error_response("", &refusal);
             }
+        }
+        if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(target)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, target) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
+            return frame;
         }
         match params.get("kind").and_then(Value::as_str).unwrap_or("task").trim().to_ascii_lowercase().as_str() {
             "discovery" => return self.handle_discovery_create(params, ctx).await,
@@ -363,7 +406,14 @@ impl MethodHandler {
         row.created_via = row.on_behalf_of.as_ref().map(|_| "dashboard".to_string());
 
         if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(&row.assigned_to)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, &row.assigned_to) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
             return frame;
+        }
+        if !row.assigned_to.is_empty()
+            && let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &row.assigned_to) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
         }
         if let Err(e) = store.insert_task(&row).await {
             return WsFrame::error_response("", &format!("create task: {e}"));
@@ -452,21 +502,28 @@ impl MethodHandler {
         // that derived Operator (`can_assign_to`, on the live identity).
         if let Some(dest) = params.get("assigned_to").and_then(|v| v.as_str()) {
             if let Some(frame) = task_assignee_refusal(&self.home_dir, Some(dest.trim())) {
+                if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, dest.trim()) {
+                    return WsFrame::error_response("", &refusal.user_text(
+                        "dashboard:task-update", None, "task-update",
+                    ));
+                }
                 return frame;
             }
             // v1.81 P1d: canonical destination; owner-only for a Personal one
             // (also reached in-process from `tasks.assign`).
             if let Err(frame) = self.delegation_check(ctx, dest).await { return frame; }
-            if !dest.is_empty() && !ctx.can_assign_to(dest) {
+            if !dest.is_empty() {
+                if let Err(frame) = self.deny_main_unless_admitted(ctx, dest,
+                    crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
+            }
+            if !dest.is_empty() && !ctx.can_assign_to(dest)
+                && !self.main_assignment_admitted(ctx, dest).await {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
         }
-        // Both the existing executor and a new destination must be non-main.
+        // Both the existing executor and the destination require assignment admission.
         if let Some(agent) = owner_agent.as_deref() {
-            if let Err(frame) = self.deny_main_for_non_admin(ctx, agent).await { return frame; }
-        }
-        if let Some(dest) = params.get("assigned_to").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            if let Err(frame) = self.deny_main_for_non_admin(ctx, dest).await { return frame; }
+            if let Err(frame) = self.deny_main_unless_admitted(ctx, agent, crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
         }
         // HIGH-1 parity with the MCP layer: a depends_on rewire must reference
         // existing tasks only (fail-closed — the store validates shape+cycle,
@@ -514,10 +571,12 @@ impl MethodHandler {
         }
         // Capture previous status for TaskStatusChanged event emission.
         let prev_status = existing.map(|r| r.status);
-        if let Some(frame) = task_assignee_refusal(
-            &self.home_dir, params.get("assigned_to").and_then(Value::as_str).map(str::trim),
-        ) {
-            return frame;
+        if let Some(dest) = params.get("assigned_to").and_then(Value::as_str).map(str::trim) {
+            if let Some(frame) = task_reassignment_refusal(
+                &self.home_dir, owner_agent.as_deref().unwrap_or(""), dest,
+            ) {
+                return frame;
+            }
         }
         match store.update_task(task_id, &params).await {
             Ok(Some(row)) => {
@@ -888,7 +947,7 @@ mod live_assignee_tests {
         let dir = home.join("agents").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"),
-            format!("[agent]\nname = '{id}'\nstatus = '{status}'\n")).unwrap();
+            format!("[agent]\nname = '{id}'\nstatus = '{status}'\n[model]\npreferred = 'claude-sonnet-4-6'\n")).unwrap();
     }
 
     fn assert_ok(frame: WsFrame) {
@@ -948,6 +1007,82 @@ mod live_assignee_tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn reassignment_entry_gate_matrix() {
+        use crate::channel_reply::entry_gate_test_helpers::owned_channel;
+        use duduclaw_core::types::RuntimeType;
+        for malformed in [false, true] {
+            let (home, _reply, _runtime, calls) = owned_channel(RuntimeType::Codex).await;
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let store = Arc::new(TaskStore::open(home.path()).unwrap());
+            handler.set_task_store(store.clone()).await;
+            let ctx = UserContext::admin_fallback();
+            let path = home.path().join("agents/worker/agent.toml");
+            let healthy = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, if malformed { "[model".to_string() }
+                else { healthy.replace("provider='codex'", "provider='grok'") }).unwrap();
+            for (id, owner) in [("to", "main"), ("away", "worker"), ("unassign", "worker"), ("same", "worker")] {
+                store.insert_task(&TaskRow::new(id.into(), "work".into(), String::new(),
+                    "medium".into(), owner.into(), "system".into())).await.unwrap();
+            }
+            let before = task_row_to_json(&store.get_task("to").await.unwrap().unwrap());
+            for assign_rpc in [false, true] {
+                let frame = if assign_rpc {
+                    handler.handle_tasks_assign(json!({"task_id":"to", "agent_id":"worker"}), &ctx).await
+                } else {
+                    handler.handle_tasks_update(json!({"task_id":"to", "assigned_to":"worker", "description":"must not write"}), &ctx).await
+                };
+                match frame {
+                    WsFrame::Response { ok: false, error: Some(error), .. } => {
+                        assert!(error.as_str().unwrap().contains(
+                            if malformed { "agent_config_unreadable" } else { "model_provider_mismatch" }
+                        ), "{error}");
+                    }
+                    other => panic!("expected refusal: {other:?}"),
+                }
+                assert_eq!(task_row_to_json(&store.get_task("to").await.unwrap().unwrap()), before);
+            }
+            for (id, dest) in [("away", "main"), ("unassign", ""), ("same", "worker")] {
+                let before = task_row_to_json(&store.get_task(id).await.unwrap().unwrap());
+                let frame = handler.handle_tasks_update(json!({"task_id":id, "assigned_to":dest, "description":"edited"}), &ctx).await;
+                if id == "same" && malformed {
+                    match frame {
+                        WsFrame::Response { ok: false, error: Some(error), .. } => {
+                            assert!(error["message"].as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+                        }
+                        other => panic!("expected refusal: {other:?}"),
+                    }
+                    assert_eq!(task_row_to_json(&store.get_task(id).await.unwrap().unwrap()), before);
+                    continue;
+                }
+                // HEAD permits an empty destination, after its delegation check.
+                assert_ok(frame);
+                let saved = store.get_task(id).await.unwrap().unwrap();
+                assert_eq!(saved.assigned_to, dest);
+                assert_eq!(saved.description, "edited");
+            }
+            std::fs::write(path, healthy).unwrap();
+            assert_ok(handler.handle_tasks_update(json!({
+                "task_id":"same", "assigned_to":"worker", "description":"healthy edit"
+            }), &ctx).await);
+            let saved = store.get_task("same").await.unwrap().unwrap();
+            assert_eq!(saved.assigned_to, "worker");
+            assert_eq!(saved.description, "healthy edit");
+            // Canonical-id validation must still see the original, untrimmed value.
+            for dest in [" worker ", " "] {
+                let before = task_row_to_json(&store.get_task("to").await.unwrap().unwrap());
+                let frame = handler.handle_tasks_update(json!({
+                    "task_id":"to", "assigned_to":dest, "description":"must not write"
+                }), &ctx).await;
+                assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+                assert_eq!(task_row_to_json(&store.get_task("to").await.unwrap().unwrap()), before);
+            }
+            assert_ok(handler.handle_tasks_assign(json!({"task_id":"to", "agent_id":"worker"}), &ctx).await);
+            assert_eq!(store.get_task("to").await.unwrap().unwrap().assigned_to, "worker");
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+
     #[tokio::test]
     async fn update_rejects_deleted_destination_but_allows_other_edits() {
         let home = tempfile::tempdir().unwrap();
@@ -967,5 +1102,58 @@ mod live_assignee_tests {
         let saved = store.get_task("old").await.unwrap().unwrap();
         assert_eq!(saved.assigned_to, "deleted");
         assert_eq!(saved.description, "仍可編輯");
+    }
+}
+
+#[cfg(test)]
+mod main_assignment_tests {
+    use super::*;
+
+    fn error(frame: WsFrame) -> String {
+        match frame {
+            WsFrame::Response { ok: false, error: Some(error), .. } => error["message"].as_str().unwrap().into(),
+            other => panic!("expected refusal: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_employee_can_create_main_work_but_cannot_schedule_it() {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("emp@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+        let ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+        handler.registry.write().await.scan().await.unwrap();
+        let store = Arc::new(TaskStore::open(home.path()).unwrap());
+        handler.set_task_store(store.clone()).await;
+        let params = json!({"title":"work", "assigned_to":"main"});
+        assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
+        db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+        assert!(handler.main_assignment_admitted(&ctx, "main").await);
+        assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+        for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
+            let mut scheduled = params.clone();
+            scheduled["schedule"] = json!(schedule);
+            assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
+            assert_eq!(error(handler.handle_tasks_goal_create(json!({
+                "agent_id":"main", "description":"work", "schedule":schedule
+            }), &ctx).await), "主代理僅管理員可以使用。");
+        }
+        let rows = store.list_tasks(None, None, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+        handler.registry.write().await.scan().await.unwrap();
+        assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
+        assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
+            WsFrame::Response { ok: true, .. }));
+        db.set_main_agent_users(&admin.id, &[], true).unwrap();
+        assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
     }
 }

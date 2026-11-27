@@ -10508,6 +10508,22 @@ fn refuse_org_write_in_agent_session(claimed: &str) -> String {
 /// automatic re-import on every boot would let anyone who can write an
 /// `agent.toml` promote their edit to authority just by waiting for a restart.
 /// Making the adoption a typed command keeps that decision with a human.
+/// Operator-only advisory output: never create/migrate the user store and
+/// never prevent sync when grant impact cannot be read. Use sync's actual
+/// before/after authority entries, including for dry runs.
+fn org_sync_reach_line(home: &std::path::Path, before: Option<&duduclaw_core::org_store::OrgEntry>,
+    after: &duduclaw_core::org_store::OrgEntry) -> Option<String> {
+    use duduclaw_auth::dept_grants::{reach_change, reach_sentence_zh};
+    let from = before.map(|entry| entry.department.as_str()).filter(|d| !d.is_empty());
+    let to = (!after.department.is_empty()).then_some(after.department.as_str());
+    if from == to { return None; }
+    match duduclaw_auth::UserDb::open_read_only(&home.join("users.db"))
+        .and_then(|db| reach_change(&db, from, to)) {
+        Ok(lines) => reach_sentence_zh(&lines),
+        Err(_) => Some("警告：授權影響無法計算，請到儀表板確認部門主管的管理範圍。".to_owned()),
+    }
+}
+
 fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
@@ -10554,6 +10570,9 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
                 org_entry_label(&c.after)
             ),
             None => println!("  • {}(新增): {}", c.agent_id, org_entry_label(&c.after)),
+        }
+        if let Some(sentence) = org_sync_reach_line(&home, c.before.as_ref(), &c.after) {
+            println!("    {sentence}");
         }
     }
 
@@ -15817,3 +15836,6 @@ mod users_mfa_cmd;
 
 #[cfg(test)]
 mod third_party_mcp_tests;
+
+#[cfg(test)]
+mod org_sync_reach_tests;

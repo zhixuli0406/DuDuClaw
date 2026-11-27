@@ -26,6 +26,9 @@ export function isDelegationEffective(v: unknown): v is DelegationEffective {
     && (d.source === 'global' || d.source === 'agent_permissions')
     && typeof d.may_delegate === 'boolean' && typeof d.may_create_agents === 'boolean'
     && isPairList(d.allow_pairs) && isPairList(d.inactive_allow_pairs)
+    && (d.unrestricted === undefined || typeof d.unrestricted === 'boolean')
+    && [d.allow_one_way, d.inactive_allow_one_way].every((list) => list === undefined || (Array.isArray(list) && list.every((p) =>
+      p && typeof p.from === 'string' && typeof p.to === 'string' && ['outgoing', 'incoming'].includes(p.direction))))
     && (d.allow_warning_count === undefined || typeof d.allow_warning_count === 'number');
 }
 
@@ -109,6 +112,19 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
             <p className="text-xs text-muted-foreground">
               {t(data.may_create_agents ? 'agentDetail.delegation.mayCreate' : 'agentDetail.delegation.mayNotCreate')}
             </p>
+            {data.unrestricted && data.owner_role && ['admin', 'manager', 'employee'].includes(data.owner_role) && (
+              <p className="text-xs text-foreground">{t('agentDetail.delegation.unrestricted', { role: t(`settings.delegation.roles.${data.owner_role}`) })}</p>
+            )}
+            {data.unrestricted_error === 'users_unreadable' && (
+              <p className="text-xs text-muted-foreground">{t('agentDetail.delegation.unrestrictedUnknown')}</p>
+            )}
+            {[...(data.allow_one_way ?? []), ...(data.inactive_allow_one_way ?? [])].map((pair, index) => (
+              <p key={index} className="text-xs text-muted-foreground">
+                {t(`agentDetail.delegation.${pair.direction}`, { peer: peer(pair.direction === 'outgoing' ? pair.to : pair.from) })}
+                {' '}{peer(pair.from)} → {peer(pair.to)}
+                {(data.inactive_allow_one_way ?? []).includes(pair) && ` (${t('agentDetail.delegation.oneWayInactive')})`}
+              </p>
+            ))}
             {data.allow_pairs.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 {t('agentDetail.delegation.pairs', { pairs: pairText(data.allow_pairs) })}

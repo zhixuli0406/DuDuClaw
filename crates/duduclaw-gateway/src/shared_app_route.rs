@@ -75,7 +75,7 @@ pub(crate) async fn member_route_under(
     // dashboard account (an unmapped one would be a per-home keyed digest).
     let who = sender.audit_label(&ctx.home_dir, channel, user_id);
     let avatar_access =
-        sender.clone().for_webchat(crate::webchat::access::gateway_default_id(&ctx.home_dir).await);
+        sender.clone().for_webchat_converse(&ctx.home_dir).await;
     let usable = {
         let reg = ctx.registry.read().await;
         reg.get(&primary)

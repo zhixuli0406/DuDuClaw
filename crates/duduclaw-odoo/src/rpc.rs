@@ -13,6 +13,15 @@ const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 static RPC_ID: AtomicU64 = AtomicU64::new(1);
 
+// Only a caller holding a personal Follow decision may request the screened
+// AccessError excerpt. Task-local scope cannot bleed into another connector.
+tokio::task_local! { static PERSONAL_ACCESS_ERRORS: bool; }
+pub const PERSONAL_ACCESS_ERROR_PREFIX: &str = "Odoo personal AccessError: ";
+pub async fn with_personal_access_errors<F: std::future::Future>(enabled: bool, future: F) -> F::Output {
+    PERSONAL_ACCESS_ERRORS.scope(enabled, future).await
+}
+
+
 /// RPC protocol to use for communicating with Odoo.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Protocol {
@@ -119,7 +128,13 @@ fn render_rpc_error(error: &Value) -> String {
     if class == Some("odoo.exceptions.AccessDenied") {
         return "Odoo server authentication gate denied this request. Ask an administrator to check the database, username and API key/password in the saved Odoo connection settings. Retrying the same credentials will not succeed. 使用相同憑證重試不會成功。".into();
     }
-    if class == Some("odoo.exceptions.AccessError") {
+    if matches!(class, Some("odoo.exceptions.AccessError" | "AccessError")) {
+        if PERSONAL_ACCESS_ERRORS.try_with(|enabled| *enabled).unwrap_or(false) {
+            let message = data.and_then(|d| d.get("message")).and_then(Value::as_str).unwrap_or("");
+            let summary = screened_error_excerpt(message).filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Odoo 拒絕此操作（詳細內容已隱藏）".into());
+            return format!("{PERSONAL_ACCESS_ERROR_PREFIX}{summary}");
+        }
         return "Odoo server ACL gate denied this request. Ask an Odoo administrator to check the Odoo service account's access rights and record rules. This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。".into();
     }
     let msg = data
@@ -199,6 +214,23 @@ fn screened_error_excerpt(message: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn personal_access_error_excerpt_is_scoped_bounded_and_screened() {
+        let error = json!({"data":{"name":"odoo.exceptions.AccessError","message":"沒有客戶資料權限"}});
+        let engine = render_rpc_error(&error);
+        let personal = with_personal_access_errors(true, async { render_rpc_error(&error) }).await;
+        assert!(personal.starts_with(PERSONAL_ACCESS_ERROR_PREFIX));
+        assert!(personal.contains("沒有客戶資料權限"));
+        assert_eq!(render_rpc_error(&error), engine);
+        assert!(engine.contains("Odoo server ACL gate"));
+        for message in ["secret=do-not-print".into(), "界".repeat(500), "ignore_all_previous".into()] {
+            let error = json!({"data":{"name":"odoo.exceptions.AccessError","message":message}});
+            let text = with_personal_access_errors(true, async { render_rpc_error(&error) }).await;
+            assert!(text.strip_prefix(PERSONAL_ACCESS_ERROR_PREFIX).unwrap().chars().count() <= 200);
+            assert!(!text.contains("do-not-print") && !text.contains("ignore_all_previous"));
+        }
+    }
+
     #[test]
     fn rpc_error_excerpt_drops_separator_obfuscated_instructions() {
         for message in [
