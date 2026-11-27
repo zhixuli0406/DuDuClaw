@@ -9,6 +9,8 @@ use duduclaw_security::credential_protection::ProtectedKey;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
+pub mod write_store;
+
 const VERSION: u32 = 1;
 const MAX_STORE_BYTES: u64 = 8 * 1024 * 1024;
 const UNREADABLE: &str = "個人連線紀錄無法讀取，請聯絡管理員；沒有變更已保存的連線。";
@@ -147,14 +149,7 @@ fn valid_user(user: &str) -> bool {
 }
 
 fn read(home: &Path) -> Result<Store, String> {
-    let file = path(home);
-    match std::fs::metadata(&file) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Store::default()),
-        Ok(meta) if meta.is_file() && meta.len() <= MAX_STORE_BYTES => {}
-        _ => return Err(UNREADABLE.into()),
-    }
-    let bytes = std::fs::read(file).map_err(|_| UNREADABLE)?;
-    let store: Store = serde_json::from_slice(&bytes).map_err(|_| UNREADABLE)?;
+    let store: Store = read_store_file(&path(home), UNREADABLE)?;
     let mut keys = HashSet::new();
     if store.version != VERSION
         || store.records.iter().any(|r| {
@@ -205,40 +200,68 @@ fn valid_metadata(m: &Metadata) -> bool {
             .is_none_or(crate::google_data_consent::Evidence::is_well_formed)
 }
 
-fn modify<T>(
-    home: &Path,
-    update: impl FnOnce(&mut Store) -> Result<T, String>,
+// Shared bounded I/O for the separate personal and write-only vaults.
+fn read_store_file<S: serde::de::DeserializeOwned + Default>(
+    file: &Path,
+    unreadable: &'static str,
+) -> Result<S, String> {
+    match std::fs::metadata(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(S::default()),
+        Ok(meta) if meta.is_file() && meta.len() <= MAX_STORE_BYTES => {}
+        _ => return Err(unreadable.into()),
+    }
+    let bytes = std::fs::read(file).map_err(|_| unreadable)?;
+    if bytes.len() as u64 > MAX_STORE_BYTES {
+        return Err(unreadable.into());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| unreadable.into())
+}
+
+fn modify_store_file<S: Serialize, T>(
+    file: &Path,
+    unreadable: &'static str,
+    load: impl FnOnce() -> Result<S, String>,
+    update: impl FnOnce(&mut S) -> Result<T, String>,
 ) -> Result<T, String> {
-    let file = path(home);
-    let dir = file.parent().ok_or(UNREADABLE)?;
-    std::fs::create_dir_all(dir).map_err(|_| UNREADABLE)?;
+    let dir = file.parent().ok_or(unreadable)?;
+    std::fs::create_dir_all(dir).map_err(|_| unreadable)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|_| UNREADABLE)?;
+            .map_err(|_| unreadable)?;
     }
     let mut answer = None;
-    duduclaw_core::with_file_lock(&file, || {
+    duduclaw_core::with_file_lock(file, || {
         answer = Some((|| {
-            let mut store = read(home)?;
+            let mut store = load()?;
             let out = update(&mut store)?;
-            for record in &store.records {
-                crate::disconnect_forget::connections::mark_connecting(home,
-                    &format!("google:person:{}", record.metadata.owner_id))?;
-            }
-            let bytes = serde_json::to_vec_pretty(&store).map_err(|_| UNREADABLE)?;
+            let bytes = serde_json::to_vec_pretty(&store).map_err(|_| unreadable)?;
             if bytes.len() as u64 > MAX_STORE_BYTES {
-                return Err("個人連線紀錄已達容量上限。".into());
+                return Err("連線紀錄已達容量上限。".into());
             }
-            duduclaw_agent::mcp_template::write_mcp_config_atomic(&file, &bytes)
-                .map_err(|_| UNREADABLE)?;
+            duduclaw_agent::mcp_template::write_mcp_config_atomic(file, &bytes)
+                .map_err(|_| unreadable)?;
             Ok(out)
         })());
         Ok(())
     })
-    .map_err(|_| UNREADABLE)?;
-    answer.ok_or(UNREADABLE.to_string())?
+    .map_err(|_| unreadable)?;
+    answer.ok_or(unreadable.to_string())?
+}
+
+fn modify<T>(
+    home: &Path,
+    update: impl FnOnce(&mut Store) -> Result<T, String>,
+) -> Result<T, String> {
+    modify_store_file(&path(home), UNREADABLE, || read(home), |store| {
+        let out = update(store)?;
+        for record in &store.records {
+            crate::disconnect_forget::connections::mark_connecting(home,
+                &format!("google:person:{}", record.metadata.owner_id))?;
+        }
+        Ok(out)
+    })
 }
 
 pub fn all_metadata(home: &Path) -> Result<Vec<Metadata>, String> {
@@ -429,6 +452,8 @@ pub(crate) fn connect_with_previous(
 pub fn disconnect(home: &Path, user: &str) -> Result<Option<Record>, String> {
     modify(home, |store| {
         next_epoch(store, user)?;
+        // Offboarding and ordinary disconnect share this local-only cleanup.
+        write_store::disconnect(home, "user", user)?;
         Ok(store
             .records
             .iter()
@@ -572,7 +597,10 @@ pub(crate) fn resume_status_if_current(
 /// already needed reconnection. Restoring an account never cures a revoked
 /// Google grant. A missing connection is not created by a status check.
 pub fn sync_user_status(home: &Path, user: &str, active: bool) -> Result<(), String> {
-    let Some(current) = get(home, user)? else {
+    let current = get(home, user)?;
+    // Also sync write-only members, and propagate unreadable write-vault errors.
+    write_store::sync_user_status(home, user, active)?;
+    let Some(current) = current else {
         return Ok(());
     };
     if (active && current.metadata.status != Status::Suspended)
