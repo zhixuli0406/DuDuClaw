@@ -97,6 +97,7 @@ fn parse_tokens(body: Value, stored_scopes: &[String], now: u64) -> Result<Respo
 }
 async fn verify_refresh_scopes(home: &Path, client_id: &str, tokens: &mut ResponseTokens) -> Result<()> {
     if tokens.scope_missing {
+        // Shared guard also checks durable grants after local write disconnect.
         tokens.scopes = crate::google_identity::write_scope_guard::refresh_scopes(
             home, "home", "home", &tokens.scopes, None, &tokens.access, client_id,
         ).await.map_err(|_| Error::ScopeUnverified)?;

@@ -3,7 +3,7 @@ use serde_json::Value;
 
 fn record() -> DriveWriteAudit {
     DriveWriteAudit {
-        call_id: "call-1".into(), google_turn_id: Some("registered-turn-1".into()),
+        call_id: "call-1".into(), google_turn_id: "registered-turn-1".into(), id_source: "turn",
         run_id: Some("run-1".into()), agent_id: "bot".into(), identity_kind: "personal".into(),
         account_email: "holder@c.test".into(), requester: "holder".into(), action: "create".into(),
         tool: "drive_create".into(), file_id: Some("file-1".into()), file_name: Some("檔😀".repeat(60)),
@@ -27,10 +27,11 @@ fn audit_has_all_fields_preserves_google_turn_and_omits_content_and_tokens() {
     assert_eq!(row["agent_id"], "bot");
     assert_eq!(row["params_summary"], "drive_create");
     assert_eq!(row["google_turn_id"], "registered-turn-1");
+    assert_eq!(row["id_source"], "turn");
     assert_eq!(row["success"], true);
     assert_eq!(row["file_name"], duduclaw_core::truncate_chars(record.file_name.as_deref().unwrap(), 80));
     assert_eq!(row["file_name"].as_str().unwrap().chars().count(), 80);
-    for field in ["call_id", "google_turn_id", "run_id", "agent_id", "identity_kind", "account_email",
+    for field in ["call_id", "google_turn_id", "id_source", "run_id", "agent_id", "identity_kind", "account_email",
         "requester", "action", "tool", "file_id", "file_name", "parents_before", "parents_after",
         "destination_folder_id", "folder_rule", "approval", "bytes", "content_sha256", "outcome", "reason", "post_check"] {
         assert!(row.get(field).is_some(), "missing {field}");

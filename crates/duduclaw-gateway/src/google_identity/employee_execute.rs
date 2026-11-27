@@ -28,10 +28,10 @@ struct Binding {
 struct Pending { binding: Binding, created: Instant }
 #[derive(Default)]
 pub(super) struct Store(Mutex<HashMap<(String, String), Pending>>);
-fn valid_id(value: &str) -> bool {
+pub(super) fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
-fn requester(agent: &str, turn: Option<&str>, run: Option<&str>) -> Result<RequesterIdentity, Refusal> {
+pub(super) fn requester(agent: &str, turn: Option<&str>, run: Option<&str>) -> Result<RequesterIdentity, Refusal> {
     let mut selected = None;
     // Every supplied ID must be registered to this signed agent. A forged
     // run cannot be ignored just because a valid turn was supplied too.
@@ -78,6 +78,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         Request::Execute { tool, arguments, turn_id, run_id, call_id, approval_binding_digest } =>
             (tool, arguments, turn_id, run_id, call_id, Some(approval_binding_digest)),
     };
+    if gi::is_drive_write_tool(&tool) {
+        return super::drive_write::serve::serve(state, agent, &tool, &args, turn, run, call, approved, progress).await;
+    }
     if gi::native_google_scope(&tool).is_none() || !args.is_object() || !valid_id(&call) {
         return Err(changed());
     }
@@ -87,9 +90,6 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
     }
     let who = requester(agent, turn.as_deref(), run.as_deref())?;
-    if gi::is_drive_write_tool(&tool) {
-        return super::drive_write::serve::serve(state, agent, &tool, &args, who, turn, run, call, approved, progress).await;
-    }
     if tool == super::chat_send::TOOL {
         return super::chat_send::serve(state, agent, &args, who, turn, call, approved).await;
     }
@@ -188,6 +188,73 @@ pub(super) async fn verify_policy_approval(home: &std::path::Path, agent: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_drive_early_refusal(case: &str) {
+        for tool in gi::DRIVE_WRITE_TOOLS {
+            for execute in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                std::fs::write(home.path().join("config.toml"),
+                    format!("[integrations]\ngoogle_workspace={}\n", case != "disabled")).unwrap();
+                let state = ExecuteState::new(home.path().to_path_buf(), None);
+                let turn = uuid::Uuid::new_v4().to_string();
+                let who = if case == "unknown" { RequesterIdentity::Unknown }
+                    else { RequesterIdentity::DashboardUser { user_id: "member".into() } };
+                let _guard = if case == "unregistered" { None } else {
+                    Some(crate::knowledge::turn_requesters::register("bot", &turn, who).unwrap())
+                };
+                let arguments = if case == "malformed" { json!([]) } else { json!({}) };
+                let turn_id = (case != "missing_ids").then_some(turn.clone());
+                let call_id = if case == "invalid_call" { String::new() } else { "call".into() };
+                let request = if execute {
+                    Request::Execute { tool: (*tool).into(), arguments, turn_id, run_id: None,
+                        call_id, approval_binding_digest: "untrusted-digest".into() }
+                } else {
+                    Request::Prepare { tool: (*tool).into(), arguments, turn_id, run_id: None, call_id }
+                };
+                let result = serve(&state, "bot", request).await;
+                let code = if case == "disabled" { "disabled" } else { "changed" };
+                assert_eq!(result.unwrap_err().code, code, "{tool}: {case}");
+                let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+                let rows: Vec<Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(rows.len(), 1, "{tool}: {case}");
+                let row = &rows[0];
+                assert_eq!(row["tool_name"], "google_drive_write");
+                assert_eq!(row["tool"], *tool);
+                assert_eq!(row["outcome"], "refused");
+                assert_eq!(row["reason"], code);
+                assert_eq!(row["success"], false);
+                if case == "missing_ids" {
+                    assert_eq!(row["google_turn_id"], "");
+                } else {
+                    assert_eq!(row["google_turn_id"], turn);
+                    assert_eq!(row["id_source"], "turn");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_integration_disabled_is_audited_once_as_refused() {
+        assert_drive_early_refusal("disabled").await;
+    }
+
+    #[tokio::test]
+    async fn drive_malformed_arguments_are_audited_once_as_refused() {
+        assert_drive_early_refusal("malformed").await;
+    }
+
+    #[tokio::test]
+    async fn drive_unknown_requester_is_audited_once_as_refused() {
+        assert_drive_early_refusal("unknown").await;
+        assert_drive_early_refusal("unregistered").await;
+    }
+
+    #[tokio::test]
+    async fn drive_invalid_call_and_missing_ids_are_audited_once_as_refused() {
+        assert_drive_early_refusal("invalid_call").await;
+        assert_drive_early_refusal("missing_ids").await;
+    }
+
     #[test]
     fn d12_audit_preserves_google_turn_id() {
         let home = tempfile::tempdir().unwrap();

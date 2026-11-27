@@ -35,7 +35,7 @@ pub(crate) fn check_personal(home: &Path, metadata: &Metadata, scopes: &[String]
     Err(write_scope_isolated())
 }
 
-/// Omitted scopes retain the credential's grant unless a separate write grant
+/// Omitted scopes retain the credential's grant unless a past or present write grant
 /// makes a merged grant plausible. Store and tokeninfo failures never fall back.
 pub(crate) async fn refresh_scopes(
     home: &Path,
@@ -49,9 +49,9 @@ pub(crate) async fn refresh_scopes(
     if let Some(scopes) = scopes {
         return Ok(scopes.to_vec());
     }
-    match vault::write_store::get(home, owner_kind, owner_id) {
-        Ok(None) => Ok(stored_scopes.to_vec()),
-        Ok(Some(_)) => crate::google_personal::oauth::tokeninfo(access_token, client_id)
+    match vault::write_store::ever_granted(home, owner_kind, owner_id) {
+        Ok(false) => Ok(stored_scopes.to_vec()),
+        Ok(true) => crate::google_personal::oauth::tokeninfo(access_token, client_id)
             .await.map_err(|_| scope_unverified()),
         Err(_) => Err(scope_unverified()),
     }

@@ -179,13 +179,46 @@ async fn invoke(f: &Fixture, state: &ExecuteState, http: Arc<Http>, tool: &str, 
     let _guard = crate::knowledge::turn_requesters::register("bot", &turn, who.clone()).unwrap();
     let progress = AtomicUsize::new(0);
     TEST_HTTP.scope(http, async {
-        let prepared = serve(state, "bot", tool, &args, who.clone(), Some(turn.clone()), None, "call".into(), None, &progress).await?;
+        let prepared = serve(state, "bot", tool, &args, Some(turn.clone()), None, "call".into(), None, &progress).await?;
         let digest = prepared["approval_binding_digest"].as_str().unwrap().to_owned();
-        let result = serve(state, "bot", tool, &args, who, Some(turn), None, "call".into(), Some(digest), &progress).await;
+        let result = serve(state, "bot", tool, &args, Some(turn), None, "call".into(), Some(digest), &progress).await;
         assert!(std::fs::metadata(f.home.path().join("tool_calls.jsonl")).is_ok());
         result
     }).await
 }
+#[tokio::test]
+async fn run_only_employee_write_audits_run_id_for_prepare_and_execute() {
+    use crate::google_identity::employee_execute::{self, Request};
+    let f = Fixture::new(); let state = state(&f); policy(&f, ApprovalMode::None);
+    let run = uuid::Uuid::new_v4().to_string();
+    let _guard = crate::knowledge::turn_requesters::register("bot", &run,
+        RequesterIdentity::DashboardUser { user_id: f.user.clone() }).unwrap();
+    let http = Arc::new(Http::default());
+    TEST_HTTP.scope(http.clone(), async {
+        let prepared = employee_execute::serve(&state, "bot", Request::Prepare {
+            tool: "drive_create_file".into(), arguments: create_args(), turn_id: None,
+            run_id: Some(run.clone()), call_id: "run-call".into(),
+        }).await.unwrap();
+        let result = employee_execute::serve(&state, "bot", Request::Execute {
+            tool: "drive_create_file".into(), arguments: create_args(), turn_id: None,
+            run_id: Some(run.clone()), call_id: "run-call".into(),
+            approval_binding_digest: prepared["approval_binding_digest"].as_str().unwrap().into(),
+        }).await;
+        assert!(result.is_ok());
+        assert_audit(&f, &result, "confirmed");
+    }).await;
+    assert_eq!(http.writes(), 1);
+    let raw = std::fs::read_to_string(f.home.path().join("tool_calls.jsonl")).unwrap();
+    let rows: Vec<Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        assert_eq!(row["tool_name"], "google_drive_write");
+        assert_eq!(row["google_turn_id"], run);
+        assert_eq!(row["run_id"], run);
+        assert_eq!(row["id_source"], "run");
+    }
+}
+
 #[tokio::test]
 async fn policy_off_folder_required_and_unsupported_make_zero_requests() {
     let f = Fixture::new(); let state = state(&f); let http = Arc::new(Http::default());
@@ -305,8 +338,8 @@ async fn current_turn_attachment_is_sent_and_audited_by_hash_only() {
     let args = json!({"name":"upload", "attachment":"current.txt", "parent_folder_id":"Parent_folder_123"});
     let http = Arc::new(Http::default()); let progress = AtomicUsize::new(0);
     let result = TEST_HTTP.scope(http.clone(), async {
-        let prepared = serve(&state, "bot", "drive_create_file", &args, who.clone(), Some(turn.clone()), None, "upload-call".into(), None, &progress).await.unwrap();
-        serve(&state, "bot", "drive_create_file", &args, who, Some(turn), None, "upload-call".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress).await
+        let prepared = serve(&state, "bot", "drive_create_file", &args, Some(turn.clone()), None, "upload-call".into(), None, &progress).await.unwrap();
+        serve(&state, "bot", "drive_create_file", &args, Some(turn), None, "upload-call".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress).await
     }).await;
     assert!(result.is_ok()); assert_eq!(http.writes(), 1);
     let row = assert_audit(&f, &result, "confirmed"); assert_eq!(row["content_sha256"], hash);
@@ -364,11 +397,11 @@ async fn pending_is_single_use_and_changed_arguments_cannot_be_retried() {
     let turn = uuid::Uuid::new_v4().to_string();
     let _guard = crate::knowledge::turn_requesters::register("bot", &turn, who.clone()).unwrap();
     let progress = AtomicUsize::new(0); let args = create_args();
-    let prepared = serve(&state, "bot", "drive_create_file", &args, who.clone(), Some(turn.clone()), None, "once".into(), None, &progress).await.unwrap();
+    let prepared = serve(&state, "bot", "drive_create_file", &args, Some(turn.clone()), None, "once".into(), None, &progress).await.unwrap();
     let mut changed_args = args.clone(); changed_args["name"] = json!("different");
     let http = Arc::new(Http::default());
     for input in [changed_args, args] {
-        let result = TEST_HTTP.scope(http.clone(), serve(&state, "bot", "drive_create_file", &input, who.clone(), Some(turn.clone()), None, "once".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress)).await;
+        let result = TEST_HTTP.scope(http.clone(), serve(&state, "bot", "drive_create_file", &input, Some(turn.clone()), None, "once".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress)).await;
         assert_eq!(result.unwrap_err().code, "changed");
     }
     assert_eq!(http.writes(), 0); assert!(http.methods.lock().unwrap().is_empty());
@@ -443,7 +476,7 @@ async fn pending_store_rejects_duplicates_expires_and_caps_entries() {
     let turn = uuid::Uuid::new_v4().to_string();
     let _guard = crate::knowledge::turn_requesters::register("bot", &turn, who.clone()).unwrap();
     let progress = AtomicUsize::new(0); let args = create_args();
-    serve(&state, "bot", "drive_create_file", &args, who.clone(), Some(turn.clone()), None, "original".into(), None, &progress).await.unwrap();
+    serve(&state, "bot", "drive_create_file", &args, Some(turn.clone()), None, "original".into(), None, &progress).await.unwrap();
     let binding = {
         let mut entries = state.drive_writes.0.lock().unwrap();
         let pending = entries.get_mut(&("bot".into(), "original".into())).unwrap();
@@ -476,9 +509,9 @@ async fn member_card_expiry_in_executor_makes_zero_writes() {
     let progress = AtomicUsize::new(0);
     let raw = create_args();
     let executor = TEST_HTTP.scope(http.clone(), async {
-        let prepared = serve(&state, "bot", "drive_create_file", &raw, who.clone(), Some(turn.clone()), None,
+        let prepared = serve(&state, "bot", "drive_create_file", &raw, Some(turn.clone()), None,
             "expiry-call".into(), None, &progress).await.unwrap();
-        serve(&state, "bot", "drive_create_file", &raw, who.clone(), Some(turn.clone()), None,
+        serve(&state, "bot", "drive_create_file", &raw, Some(turn.clone()), None,
             "expiry-call".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress).await
     });
     let expire = async {

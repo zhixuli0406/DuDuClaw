@@ -253,18 +253,21 @@ impl Drop for AuditGuard<'_> {
 }
 
 pub(in crate::google_identity) async fn serve(state: &ExecuteState, agent: &str, tool: &str, args: &Value,
-    who: RequesterIdentity, turn: Option<String>, run: Option<String>, call: String,
+    turn: Option<String>, run: Option<String>, call: String,
     approved: Option<String>, progress: &AtomicUsize,
 ) -> Result<Value, Refusal> {
     let mut audit = AuditGuard { home: &state.home, progress, finished: false, record: audit::DriveWriteAudit {
-        call_id: call.clone(), google_turn_id: turn.clone(), run_id: run.clone(), agent_id: agent.into(),
-        identity_kind: String::new(), account_email: String::new(), requester: format!("{who:?}"),
+        // Missing IDs remain an empty string in the refusal audit, never null
+        // or an invented ID; requester() below rejects such requests.
+        call_id: call.clone(), google_turn_id: turn.as_ref().or(run.as_ref()).cloned().unwrap_or_default(),
+        id_source: if turn.is_some() { "turn" } else { "run" }, run_id: run.clone(), agent_id: agent.into(),
+        identity_kind: String::new(), account_email: String::new(), requester: format!("{:?}", RequesterIdentity::Unknown),
         action: policy::action_for_tool(tool).map(|a| a.as_str()).unwrap_or("unknown").into(), tool: tool.into(),
         file_id: None, file_name: None, parents_before: vec![], parents_after: vec![], destination_folder_id: None,
         folder_rule: None, approval: audit::Approval { mode: String::new(), approval_ids: vec![], decided_by: vec![] },
         bytes: None, content_sha256: None, outcome: audit::Outcome::NotSent, reason: None, post_check: audit::PostCheck::None,
     } };
-    let result = serve_inner(state, agent, tool, args, &who, turn, run, call, approved, progress, &mut audit.record).await;
+    let result = serve_inner(state, agent, tool, args, turn, run, call, approved, progress, &mut audit.record).await;
     if let Err(error) = &result {
         audit.record.reason = audit::Reason::from_code(error.code).or_else(|| audit::Reason::from_code("failed"));
         audit.record.outcome = if progress.load(Ordering::SeqCst) != 0 { audit::Outcome::MayHaveSent }
@@ -274,12 +277,25 @@ pub(in crate::google_identity) async fn serve(state: &ExecuteState, agent: &str,
     result
 }
 
-async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value, who: &RequesterIdentity,
+async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     turn: Option<String>, run: Option<String>, call: String, approved: Option<String>,
     progress: &AtomicUsize, record: &mut audit::DriveWriteAudit,
 ) -> Result<Value, Refusal> {
     // Consume before recomputing anything: a failed execute cannot reuse a grant.
-    let pending = if approved.is_some() { Some(state.drive_writes.take(agent, &call)?) } else { None };
+    let pending = if approved.is_some() { Some(state.drive_writes.take(agent, &call)) } else { None };
+    if gi::native_google_scope(tool).is_none() || !raw.is_object()
+        || !crate::google_identity::employee_execute::valid_id(&call) {
+        return Err(changed());
+    }
+    crate::google_workspace::validate_native_tool_inputs(tool, raw)
+        .map_err(|m| Refusal::hard("native_arguments_invalid", m))?;
+    if !crate::google_workspace::integration_enabled(&state.home) {
+        return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
+    }
+    let who = crate::google_identity::employee_execute::requester(agent, turn.as_deref(), run.as_deref())?;
+    record.requester = format!("{who:?}");
+    let who = &who;
+    let pending = pending.transpose()?;
     let args = args::parse_any(tool, raw).map_err(arg_error)?;
     let coordinator = AuthorityCoordinator::new(&state.home);
     if approved.is_none() { coordinator.initialize().map_err(|_| changed())?; }

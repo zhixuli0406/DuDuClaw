@@ -1,6 +1,6 @@
 //! Gateway-only Drive-write vault. It never writes the ordinary store.json.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 use duduclaw_security::credential_protection::ProtectedKey;
@@ -95,11 +95,13 @@ struct Store {
     records: Vec<Record>,
     #[serde(default)]
     epochs: BTreeMap<String, u64>,
+    #[serde(default)]
+    ever_granted: BTreeSet<String>,
 }
 
 impl Default for Store {
     fn default() -> Self {
-        Self { version: super::VERSION, records: Vec::new(), epochs: BTreeMap::new() }
+        Self { version: super::VERSION, records: Vec::new(), epochs: BTreeMap::new(), ever_granted: BTreeSet::new() }
     }
 }
 
@@ -163,6 +165,10 @@ fn read(home: &Path) -> Result<Store, String> {
             *epoch == 0 || !matches!(parts.as_slice(), [kind, id, purpose]
                 if valid_owner(kind, id) && *purpose == PURPOSE)
         })
+        || store.ever_granted.iter().any(|key| {
+            let parts: Vec<_> = key.split(':').collect();
+            !matches!(parts.as_slice(), [kind, id] if valid_owner(kind, id))
+        })
     {
         return Err(UNREADABLE.into());
     }
@@ -170,7 +176,22 @@ fn read(home: &Path) -> Result<Store, String> {
 }
 
 fn modify<T>(home: &Path, update: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
-    super::modify_store_file(&path(home), UNREADABLE, || read(home), update)
+    super::modify_store_file(&path(home), UNREADABLE, || read(home), |store| {
+        // Migrate legacy records under the same lock before any removal.
+        for record in &store.records {
+            store.ever_granted.insert(format!("{}:{}", record.metadata.owner_kind, record.metadata.owner_id));
+        }
+        update(store)
+    })
+}
+
+pub fn ever_granted(home: &Path, owner_kind: &str, owner_id: &str) -> Result<bool, String> {
+    owner_key(owner_kind, owner_id)?;
+    let store = read(home)?;
+    Ok(store.ever_granted.contains(&format!("{owner_kind}:{owner_id}"))
+        || store.records.iter().any(|r| {
+            r.metadata.owner_kind == owner_kind && r.metadata.owner_id == owner_id
+        }))
 }
 
 pub fn get(home: &Path, owner_kind: &str, owner_id: &str) -> Result<Option<Record>, String> {
@@ -265,12 +286,16 @@ pub fn connect(
         store.records.retain(|r| {
             r.metadata.owner_kind != metadata.owner_kind || r.metadata.owner_id != metadata.owner_id
         });
+        store.ever_granted.insert(format!("{}:{}", metadata.owner_kind, metadata.owner_id));
         store.records.push(Record { metadata, secret: sealed });
         Ok(())
     })
 }
 
 /// Local-only removal; never calls Google's revocation endpoint.
+/// Keep grant tombstones through write/ordinary disconnect and suspension.
+/// Offboarding may clear one only together with deletion of the ordinary
+/// credential; this shared cleanup conservatively retains it even then.
 pub fn disconnect(home: &Path, owner_kind: &str, owner_id: &str) -> Result<Option<Record>, String> {
     modify(home, |store| {
         next_epoch(store, owner_kind, owner_id)?;
