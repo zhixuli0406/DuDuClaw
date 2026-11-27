@@ -47,6 +47,14 @@ interface AuthMe extends MeGrantFields {
 
 const EMPTY_DEPT_GROUPS: ReadonlySet<GrantGroup> = new Set();
 
+function isMinimalMeUser(v: unknown): v is Pick<AuthUser, 'id' | 'email' | 'role'> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const user = v as Record<string, unknown>;
+  return typeof user.id === 'string'
+    && typeof user.email === 'string'
+    && (user.role === 'admin' || user.role === 'manager' || user.role === 'employee');
+}
+
 function isAuthUser(v: unknown): v is AuthUser {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
   const user = v as Record<string, unknown>;
@@ -619,14 +627,19 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     const stillCurrent = () => get().authAttempt === authAttempt && get().jwt === jwt
       && get().user?.id === user.id && get().isAuthenticated;
     try {
-      const me = await client.call('users.me') as AuthMe;
+      const me = await client.call('users.me') as MeGrantFields & { user: unknown; bindings: unknown };
       if (!stillCurrent()) return;
-      if (!me || !isAuthUser(me.user) || me.user.id !== user.id
-        || !Array.isArray(me.bindings) || !me.bindings.every(isAgentBinding)) {
+      if (!me || !Array.isArray(me.bindings) || !me.bindings.every(isAgentBinding)) {
         set(grantState());
         return;
       }
-      set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      if (isAuthUser(me.user) && me.user.id === user.id) {
+        set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      } else if (isMinimalMeUser(me.user) && me.user.id === user.id) {
+        set({ user: { ...get().user!, role: me.user.role }, bindings: me.bindings, ...grantState(me) });
+      } else {
+        set(grantState());
+      }
     } catch {
       if (stillCurrent()) set(grantState());
     }

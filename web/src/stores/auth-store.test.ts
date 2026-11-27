@@ -262,11 +262,42 @@ describe('refresh (#1 — only 401/403 logs out)', () => {
 
 describe('department grant state', () => {
   it.each([
+    { bindings: [], dept_grants: [], main_agent_access: false },
+    {
+      bindings: [{ user_id: 'u1', agent_name: 'support', access_level: 'viewer', bound_at: '' }],
+      dept_grants: [{ department: 'support', groups: ['skills'] }],
+      main_agent_access: true,
+    },
+  ])('accepts a minimal users.me user and replaces authority: %j', async (response) => {
+    const user = { ...ME_OK.user, avatar_agent_id: 'agnes', department: 'sales' };
+    const bindings = [{ user_id: 'u1', agent_name: 'agnes', access_level: 'owner' as const, bound_at: '' }];
+    useAuthStore.setState({ isAuthenticated: true, jwt: 'jwt-1' });
+    useAuthStore.getState().setUser(user as never, bindings, {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true,
+    });
+    mockWsClient.call.mockResolvedValueOnce({
+      ...response,
+      user: { id: 'u1', email: 'fallback@b.c', role: 'manager' },
+    });
+
+    await useAuthStore.getState().refreshMe();
+
+    expect(useAuthStore.getState().user).toEqual({ ...user, role: 'manager' });
+    expect(useAuthStore.getState().bindings).toBe(response.bindings);
+    expect(useAuthStore.getState().deptGrants).toEqual(response.dept_grants);
+    expect([...useAuthStore.getState().deptGroups]).toEqual(response.dept_grants.flatMap((grant) => grant.groups));
+    expect(useAuthStore.getState().mainAgentAccess).toBe(response.main_agent_access);
+  });
+
+  it.each([
     null,
     { agents: [], tasks: [], events: [] },
     { user: null, bindings: [] },
     { user: 'u1', bindings: [] },
     { user: { ...ME_OK.user, id: 'another-user' }, bindings: [] },
+    { user: { id: 'another-user', email: 'a@b.c', role: 'manager' }, bindings: [] },
+    { user: { id: 'u1', email: 'a@b.c', role: 'unknown' }, bindings: [] },
+    { user: { id: 'u1', email: 'a@b.c', role: 'manager' }, bindings: {} },
     { user: ME_OK.user },
     { user: ME_OK.user, bindings: {} },
     { user: { id: 'u1', role: 'admin' }, bindings: [] },
