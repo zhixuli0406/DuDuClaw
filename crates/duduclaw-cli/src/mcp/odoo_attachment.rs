@@ -18,12 +18,47 @@ pub(super) fn verified_employee(home: &Path, agent: &str) -> bool {
         && super::caller_token_verified(home, agent)
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Attachment {
     model: String,
     res_id: i64,
     file: String,
     name: String,
+}
+
+/// Owned, sanitized content. Only local validation can construct this value;
+/// no file handles or path lookups cross the credential/connection boundary.
+pub(crate) struct ValidatedAttachment {
+    call: Attachment,
+    home: std::path::PathBuf,
+    agent: String,
+    bytes: Vec<u8>,
+    mime: &'static str,
+    name: String,
+}
+
+impl ValidatedAttachment {
+    fn recheck(&self, home: &Path, agent: &str, call: &Attachment, max_mb: u8)
+        -> AttachmentResult<()> {
+        if self.home.as_path() != home || self.agent != agent || &self.call != call {
+            return Err(FILE_REFUSED.into());
+        }
+        if !(1..=25).contains(&max_mb) || self.bytes.len() as u64 > u64::from(max_mb) * 1024 * 1024 {
+            return Err(SIZE_REFUSED.into());
+        }
+        if !display_name_matches(&self.name, self.mime) { return Err(FILE_REFUSED.into()); }
+        let image = match self.mime {
+            "image/png" => Some(image::ImageFormat::Png),
+            "image/jpeg" => Some(image::ImageFormat::Jpeg),
+            _ => None,
+        };
+        if let Some(format) = image {
+            if image::guess_format(&self.bytes).ok() != Some(format) { return Err(FILE_REFUSED.into()); }
+        } else if mimetype(&self.name, &self.bytes)? != self.mime {
+            return Err(FILE_REFUSED.into());
+        }
+        Ok(())
+    }
 }
 
 fn relative_parts(file: &str) -> AttachmentResult<Vec<&str>> {
@@ -655,20 +690,52 @@ fn prepare_file(call: &Attachment, bytes: Vec<u8>, limit: u64)
     Ok((bytes, mime, name))
 }
 
-pub(crate) fn odoo_attachment_precheck(home: &Path, agent: &str, params: &Value) -> AttachmentResult<()> {
+/// All filesystem and content validation completes before selecting/resolving
+/// an identity or preparing a bound connector. Directory fds die in this task.
+pub(crate) async fn validate_attachment(home: &Path, agent: &str, params: &Value)
+    -> AttachmentResult<ValidatedAttachment> {
     if !verified_employee(home, agent) { return Err("附件操作需要已驗證的員工身分。".into()); }
-    ToolPolicy::load(home, agent)?.check_call(TOOL, params, None)?;
-    parse(params)?;
-    Ok(())
+    let policy = ToolPolicy::load(home, agent)?;
+    policy.data_preconnect(TOOL, params, None)?;
+    let call = parse(params)?;
+    let home = home.to_path_buf();
+    let agent = agent.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let (bytes, mime, name) = read_file(&home, &agent, &call, policy.access.attachment_max_mb)?;
+        Ok::<_, String>(ValidatedAttachment { call, home, agent, bytes, mime, name })
+    }).await.map_err(|_| "附件讀取或檢查失敗。".to_owned())?
 }
 
 pub(super) async fn handle(
     params: &Value, home: &Path, odoo: &OdooState, agent: &str, bound: Option<Arc<OdooConnector>>,
+    validated: Option<ValidatedAttachment>,
 ) -> Value {
     if !verified_employee(home, agent) { return mcp_error("附件操作需要已驗證的員工身分。"); }
     let call = match parse(params) { Ok(call) => call, Err(error) => return mcp_error(&error) };
     let policy = match ToolPolicy::load(home, agent) {
         Ok(policy) => policy, Err(error) => return mcp_error(&error),
+    };
+    if let Err(error) = policy.data_preconnect(TOOL, params, None) { return mcp_error(&error); }
+    let validated = match validated {
+        Some(validated) => validated,
+        None if bound.is_some() => return mcp_error("缺少連線前已驗證的附件。"),
+        None => match validate_attachment(home, agent, params).await {
+            Ok(validated) => validated, Err(error) => return mcp_error(&error),
+        },
+    };
+    // Recheck the owned bytes and their request binding, never reopen the path.
+    let check_home = home.to_path_buf();
+    let check_agent = agent.to_owned();
+    let check_call = call.clone();
+    let max_mb = policy.access.attachment_max_mb;
+    let checked = tokio::task::spawn_blocking(move || {
+        validated.recheck(&check_home, &check_agent, &check_call, max_mb)?;
+        Ok::<_, String>(validated)
+    }).await;
+    let validated = match checked {
+        Ok(Ok(validated)) => validated,
+        Ok(Err(error)) => return mcp_error(&error),
+        Err(_) => return mcp_error("附件讀取或檢查失敗。"),
     };
     odoo.register_agent(agent, policy.agent.clone()).await;
     if let Err(error) = odoo.load_global_for_gate(home).await { return mcp_error(&error); }
@@ -681,22 +748,13 @@ pub(super) async fn handle(
     };
     let result = async {
         policy.check_call(TOOL, params, decision.as_ref())?;
-        // File I/O and bounded content scans stay off the async runtime. Upload
-        // the original PDF bytes owned by this task after all checks pass.
-        let read_home = home.to_path_buf();
-        let read_agent = agent.to_owned();
-        let read_call = call.clone();
-        let max_mb = policy.access.attachment_max_mb;
-        let (bytes, mime, name) = tokio::task::spawn_blocking(move ||
-            read_file(&read_home, &read_agent, &read_call, max_mb)).await
-            .map_err(|_| "附件讀取或檢查失敗。".to_owned())??;
         let records = conn.search_read(&call.model, vec![json!(["id", "=", call.res_id])], &["id"], 1).await?;
         if !records.as_array().is_some_and(|rows| rows.len() == 1 && rows[0]["id"].as_i64() == Some(call.res_id)) {
             return Err("找不到目標記錄，或連線帳號無法讀取這筆資料。".into());
         }
         // An upstream traceback can include submitted values (including datas).
         // Do not reflect any upload error payload back to the model or audit.
-        conn.attachment_create(&call.model, call.res_id, &name, mime, &bytes).await
+        conn.attachment_create(&call.model, call.res_id, &validated.name, validated.mime, &validated.bytes).await
             .map_err(|_| "Odoo 附件建立失敗，請檢查目標記錄與帳號權限；重試前先確認是否已建立附件。".to_owned())
     }.await;
     let suffix = identity_suffix(decision.as_ref(), "create");

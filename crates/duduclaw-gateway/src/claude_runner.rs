@@ -6992,7 +6992,7 @@ mod background_entry_tests {
             let path = crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path;
             let mut document: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
             document["model"]["preferred"] = toml::Value::String("opus".into());
-            document["model"]["effort"] = toml::Value::String("high".into());
+            document["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("high".into()));
             document["model"]["fallback"] = toml::Value::String("gpt-5.4-mini".into());
             std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
             Arc::new(crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap())
@@ -7000,7 +7000,7 @@ mod background_entry_tests {
         let mut changed = snapshot.document.clone();
         changed["runtime"]["provider"] = toml::Value::String("claude".into());
         changed["model"]["preferred"] = toml::Value::String("claude-sonnet-4-6".into());
-        changed["model"]["effort"] = toml::Value::String("low".into());
+        changed["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("low".into()));
         changed["model"]["fallback"] = toml::Value::String("claude-haiku-4-5".into());
         std::fs::write(&snapshot.config_path, toml::to_string(&changed).unwrap()).unwrap();
         let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();

@@ -318,6 +318,16 @@ pub(crate) async fn handle_tasks_create(
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
     }
+    // Report unavailable assignees before any main-target or delegation advice.
+    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
+        if let Some(refusal) = duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, &assigned_to) {
+            return tool_error(&format!(
+                "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+                refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+            ));
+        }
+        return tool_error(message);
+    }
     // Scheduling keeps its Admin-only boundary, including the self-target path.
     let principal = host_on_behalf_of(home_dir, default_agent);
     let main_gate = if schedule.is_some() {
@@ -354,15 +364,6 @@ pub(crate) async fn handle_tasks_create(
         // mode the person it is for must still be allowed to hand this
         // employee work (no laundering a hand-over through self-assignment).
         return tool_error(&reason);
-    }
-    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
-        if let Some(refusal) = duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, &assigned_to) {
-            return tool_error(&format!(
-                "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
-                refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
-            ));
-        }
-        return tool_error(message);
     }
     // Giving a goal more time than its employee's own `[runtime]
     // timeout_secs` is an Admin decision made on the dashboard; no MCP

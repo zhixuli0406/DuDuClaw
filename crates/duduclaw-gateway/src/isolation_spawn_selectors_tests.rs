@@ -163,16 +163,26 @@ fn spawn_agent_personal_source_to_shared_target_defers_to_owner_card() {
 #[test]
 fn spawn_agent_target_must_pass_delegation_policy() {
     let (home, resolver, context) = fixture(None);
+    let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let admin = users.create_user("spawn-admin@test.invalid", "Admin", "test-password",
+        duduclaw_auth::UserRole::Admin).unwrap();
+    std::fs::create_dir_all(home.path().join("agents/target")).unwrap();
+    let mut record = context.record().clone();
+    record.principal = Principal::Human { user_id: t(&admin.id), generation: 1 };
+    let context = RequestContext::from_verified_record(record);
+    let principal = duduclaw_core::HumanPrincipal::user(&admin.id).unwrap().to_string();
     let spawn = duduclaw_mcp_boundary::tool_policy::policy("spawn_agent").unwrap();
     let args = json!({"agent_id":"target", "task":"Prepare the report."});
     // Hierarchy: unrelated (unknown) employees fail closed before any binding read.
     policy(home.path(), "hierarchy");
+    let boundaries = crate::delegation_roles::sync_boundaries(home.path(), "employee-a", "target", Some(&principal));
+    assert!(boundaries.main_target_allowed, "main boundary must not mask the delegation-policy refusal");
+    assert!(boundaries.personal_target_allowed);
     assert_eq!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Invalid));
     // Open: the policy passes, so the refusal now comes from the binding read
     // (no apply.db: unavailable, never a grant).
     policy(home.path(), "open");
-    assert_ne!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Invalid));
-    assert!(resolver.resolve(&context, spawn, &args).is_err());
+    assert_eq!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Unavailable));
     // Self-delegation and ephemeral/reserved targets are refused outright.
     for target in ["employee-a", "eph-1a2b3c4d5e6f", "cron"] {
         let args = json!({"agent_id": target, "task":"work"});

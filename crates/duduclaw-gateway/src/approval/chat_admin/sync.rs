@@ -164,7 +164,10 @@ pub(super) async fn maintain_live(home: &Path, store: &ApprovalStore, live: Vec<
             let expired = cards.into_iter().filter(|r|
                 !DateTime::parse_from_rfc3339(&r.valid_until).is_ok_and(|at| at > Utc::now())).collect();
             rewrite(store, expired, &card::expired_text(card::kind_label(&rec, lang), lang), TerminalStatus::Expired, sender).await;
-        } else if matches!(rec.status, ApprovalStatus::Approved | ApprovalStatus::Denied) {
+        } else if matches!(rec.status, ApprovalStatus::Approved | ApprovalStatus::Denied)
+            && rec.decided_by.as_deref().is_some_and(|by|
+                by.strip_prefix("dashboard:").is_some_and(|user| !user.is_empty() && !user.contains(':'))
+                    || by.parse::<ledger::DecidedBy>().is_ok()) {
             let label = decision_channel_label(&rec, lang);
             collapse_with_sender(store, &rec, rec.status == ApprovalStatus::Approved,
                 recorded_name(home, &rec).await, &label, lang, sender).await;

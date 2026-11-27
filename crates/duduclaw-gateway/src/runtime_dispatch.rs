@@ -41,6 +41,19 @@ pub(crate) fn chat_turn_config(
     }).ok().flatten()
 }
 
+/// Prompt assembly shares the admitted employee document just like runtime routing.
+pub(crate) fn chat_profile(agent_dir: &Path) -> std::io::Result<duduclaw_core::profile_sections::ProfileSections> {
+    use duduclaw_core::profile_sections::ProfileSections;
+    match chat_turn_config(Some(agent_dir)) {
+        Some(turn) => {
+            let config = turn.document.as_table().ok_or_else(||
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "turn configuration is not a table"))?;
+            ProfileSections::load_with_config(agent_dir, config)
+        }
+        None => ProfileSections::load(agent_dir),
+    }
+}
+
 /// Preserve read_agent_effort's parser semantics, including absence/invalid
 /// values meaning provider default, without falling through to another read.
 pub(crate) fn chat_effort(agent_dir: Option<&Path>) -> Option<duduclaw_core::effort::Effort> {
