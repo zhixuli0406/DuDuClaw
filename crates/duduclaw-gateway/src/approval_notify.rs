@@ -524,12 +524,12 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
     // pushed or reminded through the generic chain (defence in depth behind
     // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
     if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
-    if crate::google_identity::chat_send::is_member_card(rec) {
-        if !crate::google_identity::chat_send::eligible(home_dir, rec) { return None; }
+    if crate::google_identity::member_card::is_member_card(rec) {
+        if !crate::google_identity::member_card::eligible(home_dir, rec) { return None; }
         let binding = rec.binding.as_ref()?;
         if binding.conversation_audience == crate::approval::ConversationAudience::Private {
             if let Some(target) = crate::turn_context::target_for(&rec.agent_id, &binding.run_id) {
-                let body = crate::google_identity::chat_send::card_body(rec);
+                let body = crate::google_identity::member_card::card_body(rec);
                 if target.context == binding.decision_context
                     && target.conversation_audience == crate::approval::ConversationAudience::Private
                     && body.chars().count() <= 1800 {
@@ -537,7 +537,27 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
                 }
             }
         }
-        let uid = rec.payload["chat_snapshot"]["member"].as_str()?;
+        let uid = crate::google_identity::member_card::member_id(rec)?;
+        if rec.payload["drive_write_member_confirmation"] == true {
+            // Group/thread targets receive no names, account or content.
+            if binding.conversation_audience == crate::approval::ConversationAudience::MultiParty {
+                if let Some(target) = crate::turn_context::target_for(&rec.agent_id, &binding.run_id) {
+                    if target.context == binding.decision_context
+                        && target.conversation_audience == crate::approval::ConversationAudience::MultiParty {
+                        let _ = crate::notify_push::push_exact_confirmation(&target,
+                            crate::google_identity::drive_write::approval::GROUP_NOTICE).await;
+                    }
+                }
+            }
+            // The dashboard RPC always carries the full escaped projection.
+            // Verified private destinations may read it too; group-origin
+            // decisions still require the authenticated dashboard member.
+            let body = crate::google_identity::member_card::card_body(rec);
+            let notice = "有一則雲端硬碟操作等待你本人確認。請到儀表板「我的連線」閱讀完整內容並決定。";
+            crate::notify_push::push_person_notice(home_dir, uid,
+                if body.chars().count() <= 1800 { &body } else { notice }).await;
+            return None;
+        }
         let body = duduclaw_security::credential_protection::sanitize_output_text(
             "有一則 Google Chat 訊息等待你本人確認。請開啟儀表板「我的連線」閱讀完整內容，五分鐘內確認或取消。");
         crate::notify_push::push_person_notice(home_dir, uid,

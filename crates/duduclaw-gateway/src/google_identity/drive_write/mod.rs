@@ -2,6 +2,7 @@
 //! separate work packages; this module does not grant permission to write.
 
 pub(in crate::google_identity) mod serve;
+pub(crate) mod approval;
 pub(in crate::google_identity) mod credential;
 pub(in crate::google_identity) mod audit;
 

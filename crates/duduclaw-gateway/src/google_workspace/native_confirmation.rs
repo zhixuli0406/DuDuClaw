@@ -35,7 +35,7 @@ pub(crate) fn ensure_json_size<T: serde::Serialize + ?Sized>(value: &T) -> Resul
     ensure_json_budget(value, MAX_CONFIRMATION_BYTES)
 }
 
-fn ensure_approval_size(payload: &Value, summary: &str) -> Result<(), String> {
+pub(crate) fn ensure_approval_size(payload: &Value, summary: &str) -> Result<(), String> {
     let budget = MAX_CONFIRMATION_BYTES.checked_sub(summary.len()).ok_or_else(size_error)?;
     ensure_json_budget(payload, budget)
 }
@@ -162,22 +162,23 @@ impl HostContext {
     }
 }
 
+pub(crate) fn escaped(value: &Value) -> String {
+    // Escape controls in strings before JSON quoting, including nested
+    // attendee/attachment data. Reuse the shared core diagnostic boundary.
+    let safe = duduclaw_security::credential_protection::sanitize_output_value(value.clone());
+    let text = safe.to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    let mut out = String::new();
+    for ch in text.chars() {
+        if matches!(ch, '*' | '_' | '`' | '[' | ']' | '#' | '!') { out.push('\\'); }
+        out.push(ch);
+    }
+    out
+}
+
 /// Escape all untrusted card data, including Markdown and line controls.
 /// Each value is quoted JSON, so provider text cannot impersonate a card label.
 pub(crate) fn card(tool: &str, snapshot: &Value) -> Result<String, String> {
     validate_snapshot(snapshot, &[])?;
-    fn escaped(value: &Value) -> String {
-        // Escape controls in strings before JSON quoting, including nested
-        // attendee/attachment data. Reuse the shared core diagnostic boundary.
-        let safe = duduclaw_security::credential_protection::sanitize_output_value(value.clone());
-        let text = safe.to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-        let mut out = String::new();
-        for ch in text.chars() {
-            if matches!(ch, '*' | '_' | '`' | '[' | ']' | '#' | '!') { out.push('\\'); }
-            out.push(ch);
-        }
-        out
-    }
     let mut text = format!("確認這一次 Google 操作：{tool}\n（核准用過即失效；內容改變須重新確認）\n");
     if let Some(fields) = snapshot.as_object() {
         let ordered = ["account", "from", "to", "cc", "bcc", "subject", "calendar", "calendar_info", "title", "start", "end", "attendees",

@@ -570,7 +570,7 @@ impl ApprovalStore {
     ) -> Result<(), String> {
         let home = self.db_path.as_deref().and_then(Path::parent)
             .ok_or("chat-admin bound decisions require durable identity")?;
-        if crate::google_identity::chat_send::is_member_card(rec) {
+        if crate::google_identity::member_card::is_member_card(rec) {
             return Err("Only the requesting member may confirm".into());
         }
         // chat_tier also excludes live mail-requester-eligible egress cards.

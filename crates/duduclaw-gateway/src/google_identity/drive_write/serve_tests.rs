@@ -7,14 +7,14 @@ use duduclaw_auth::{AccessLevel, UserDb, UserRole};
 use duduclaw_security::credential_protection::ProtectedKey;
 use std::sync::Arc;
 
-struct Fixture {
-    home: tempfile::TempDir,
+pub(crate) struct Fixture {
+    pub(crate) home: tempfile::TempDir,
     key: ProtectedKey,
-    db: UserDb,
-    user: String,
+    pub(crate) db: UserDb,
+    pub(crate) user: String,
 }
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         duduclaw_core::gateway_instance::acquire(home.path()).unwrap();
         crate::handlers::credential_protection_rpc::protection_for(home.path()).enable(false).unwrap();
@@ -76,6 +76,7 @@ pub(super) struct Http {
     forbidden: bool,
     stall: bool,
     changed_scope: std::sync::atomic::AtomicBool,
+    renamed_folder: std::sync::atomic::AtomicBool,
 }
 impl WriteHttp for Arc<Http> {
     fn send(&self, request: BuiltRequest) -> Pin<Box<dyn Future<Output = Result<(u16, Vec<u8>), SendError>> + Send + '_>> {
@@ -111,9 +112,9 @@ impl WriteHttp for Arc<Http> {
             }
             let id = if write && method == "POST" { "Created_file_123" } else { id.as_str() };
             let parent = if (write && self.violation) || self.changed_scope.load(Ordering::SeqCst) { "Outside_folder_123" } else { added_parent.as_deref().unwrap_or("Parent_folder_123") };
-            Ok((200, serde_json::to_vec(&json!({"id":id,"name":"Google name","mimeType":
+            Ok((200, serde_json::to_vec(&json!({"id":id,"name":if id == "Parent_folder_123" && self.renamed_folder.load(Ordering::SeqCst) { "Changed folder" } else { "Google name" },"mimeType":
                 if matches!(id, "Parent_folder_123" | "Destination_folder_123") { "application/vnd.google-apps.folder" } else { "text/plain" },
-                "parents":[parent],"trashed":payload["trashed"].as_bool().unwrap_or(false),"capabilities":{"canAddChildren":true,"canEdit":true,"canRename":true,"canTrash":true,"canMoveItemWithinDrive":true}})).unwrap()))
+                "parents":if id == "Parent_folder_123" && !self.changed_scope.load(Ordering::SeqCst) { vec![] } else { vec![parent] },"trashed":payload["trashed"].as_bool().unwrap_or(false),"capabilities":{"canAddChildren":true,"canEdit":true,"canRename":true,"canTrash":true,"canMoveItemWithinDrive":true}})).unwrap()))
         })
     }
 }
@@ -143,7 +144,7 @@ impl DriveWriteConfirmer for Confirmer {
         })
     }
 }
-fn policy(f: &Fixture, mode: ApprovalMode) {
+pub(crate) fn policy(f: &Fixture, mode: ApprovalMode) {
     let mut p = policy::DriveWritePolicy::all_off();
     p.create = true; p.modify = true; p.move_ = true; p.trash = true;
     p.approval.create = mode; p.approval.modify = mode;
@@ -154,13 +155,13 @@ fn policy(f: &Fixture, mode: ApprovalMode) {
     })).unwrap();
     std::fs::write(f.home.path().join("config.toml"), config).unwrap();
 }
-fn state(f: &Fixture) -> ExecuteState {
+pub(crate) fn state(f: &Fixture) -> ExecuteState {
     f.connect(f.metadata("user"), false);
     std::fs::write(f.home.path().join("agents/bot/agent.toml"),
         "[google]\nidentity='owner'\nfallback='none'\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n").unwrap();
     ExecuteState::new(f.home.path().to_path_buf(), None)
 }
-fn create_args() -> Value { json!({"name":"new.txt", "text":"private content", "parent_folder_id":"Parent_folder_123"}) }
+pub(crate) fn create_args() -> Value { json!({"name":"new.txt", "text":"private content", "parent_folder_id":"Parent_folder_123"}) }
 fn assert_audit(f: &Fixture, result: &Result<Value, Refusal>, outcome: &str) -> Value {
     let raw = std::fs::read_to_string(f.home.path().join("tool_calls.jsonl")).unwrap();
     for secret in ["write-fixture-secret", "write-refresh-secret", "private content"] {
@@ -204,7 +205,8 @@ async fn policy_off_folder_required_and_unsupported_make_zero_requests() {
 #[tokio::test]
 async fn member_requires_confirmation_even_with_allowed_tool_and_none_sends() {
     for mode in [ApprovalMode::Member, ApprovalMode::MemberAndAdmin, ApprovalMode::None] {
-        let f = Fixture::new(); let state = state(&f); policy(&f, mode);
+        let f = Fixture::new(); let mut state = state(&f); policy(&f, mode);
+        state.drive_write_confirmer = Arc::new(UnavailableConfirmer);
         std::fs::write(f.home.path().join("agents/bot/agent.toml"),
             "[google]\nidentity='owner'\nfallback='none'\n[capabilities]\nallowed_tools=['drive_create_file']\n").unwrap();
         let http = Arc::new(Http::default());
@@ -457,4 +459,77 @@ async fn pending_store_rejects_duplicates_expires_and_caps_entries() {
     }
     let mut next = binding; next.snapshot.call_id = "over-limit".into();
     assert_eq!(state.drive_writes.insert(next).unwrap_err().code, "changed");
+}
+
+#[tokio::test]
+async fn member_card_expiry_in_executor_makes_zero_writes() {
+    let f = Fixture::new(); let state = state(&f); policy(&f, ApprovalMode::Member);
+    let turn = uuid::Uuid::new_v4().to_string();
+    let who = RequesterIdentity::DashboardUser { user_id:f.user.clone() };
+    let _requester = crate::knowledge::turn_requesters::register("bot", &turn, who.clone()).unwrap();
+    let _context = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.user.clone(),
+        crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(who.clone(),
+        duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(Some(format!("expiry-{turn}")), async {
+            crate::turn_context::register("bot", &turn, &format!("webchat:expiry-{turn}")).unwrap()
+        }))).await;
+    let http = Arc::new(Http::default());
+    let progress = AtomicUsize::new(0);
+    let raw = create_args();
+    let executor = TEST_HTTP.scope(http.clone(), async {
+        let prepared = serve(&state, "bot", "drive_create_file", &raw, who.clone(), Some(turn.clone()), None,
+            "expiry-call".into(), None, &progress).await.unwrap();
+        serve(&state, "bot", "drive_create_file", &raw, who.clone(), Some(turn.clone()), None,
+            "expiry-call".into(), Some(prepared["approval_binding_digest"].as_str().unwrap().into()), &progress).await
+    });
+    let expire = async {
+        let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter()
+                    .find(|r| r.payload["drive_write_member_confirmation"] == true) {
+                    rusqlite::Connection::open(f.home.path().join("approvals.db")).unwrap().execute(
+                        "UPDATE approvals SET created_at=?1 WHERE id=?2",
+                        rusqlite::params![(chrono::Utc::now()-chrono::Duration::minutes(10)).to_rfc3339(), rec.id.as_str()],
+                    ).unwrap();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }).await.expect("member card created");
+    };
+    let (result, ()) = tokio::join!(executor, expire);
+    assert_eq!(result.as_ref().unwrap_err().code, "not_sent");
+    assert_eq!(http.writes(), 0);
+    assert_audit(&f, &result, "not_sent");
+}
+
+#[tokio::test]
+async fn public_visitor_executor_creates_no_card_and_makes_zero_writes() {
+    let f = Fixture::new(); let state = state(&f); policy(&f, ApprovalMode::Member);
+    let http = Arc::new(Http::default());
+    for channel in ["widget", "odoolivechat"] {
+        let result = invoke(&f, &state, http.clone(), "drive_create_file", create_args(), RequesterIdentity::ChannelUser {
+            channel:channel.into(), chat:"public".into(), sender:"visitor".into(), user_id:Some(f.user.clone()), attested_private:false,
+        }).await;
+        assert_eq!(result.unwrap_err().code, "public_visitor");
+    }
+    assert_eq!(http.writes(), 0);
+    assert!(http.methods.lock().unwrap().is_empty());
+    let broker = crate::approval::ApprovalBroker::open(f.home.path()).unwrap();
+    assert!(broker.list_by_kind("bound_action").await.unwrap().is_empty());
+    assert!(broker.list_by_kind("mcp_call").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn displayed_folder_path_change_after_confirmation_never_writes() {
+    let f = Fixture::new(); let mut state = state(&f); policy(&f, ApprovalMode::Member);
+    let http = Arc::new(Http::default());
+    let changing = http.clone();
+    state.drive_write_confirmer = Arc::new(Confirmer { outcome:0, change:Some(Box::new(move || {
+        changing.renamed_folder.store(true, Ordering::SeqCst);
+    })) });
+    let result = invoke(&f, &state, http.clone(), "drive_create_file", create_args(),
+        RequesterIdentity::DashboardUser { user_id:f.user.clone() }).await;
+    assert_eq!(result.unwrap_err().code, "changed");
+    assert_eq!(http.writes(), 0);
 }

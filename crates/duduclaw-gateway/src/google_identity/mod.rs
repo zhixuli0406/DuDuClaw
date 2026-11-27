@@ -27,6 +27,7 @@
 
 pub mod check;
 pub(crate) mod chat_send;
+pub(crate) mod member_card;
 pub(crate) mod personal_check;
 pub(crate) mod delegated_scopes;
 pub(crate) mod delegate_owner;

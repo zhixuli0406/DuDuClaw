@@ -30,22 +30,24 @@ impl MethodHandler {
         }
         let result: Result<Value, String> = async {
             match method {
-                "me.google.chat_confirmations" => {
+                "me.google.chat_confirmations" | "me.google.write_confirmations" => {
+                    let marker = if method == "me.google.write_confirmations" { "drive_write_member_confirmation" } else { "chat_member_confirmation" };
                     let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
                     let rows = broker.list_by_kind("bound_action").await?;
                     Ok(json!({"requests":rows.into_iter().filter(|r|
-                        r.status == crate::approval::ApprovalStatus::Pending
-                        && crate::google_identity::chat_send::may_decide(&self.home_dir, r, &ctx.user_id))
-                        .map(|r| crate::google_identity::chat_send::confirmation_display(&r)).collect::<Vec<_>>()}))
+                        r.status == crate::approval::ApprovalStatus::Pending && r.payload[marker] == true
+                        && crate::google_identity::member_card::may_decide(&self.home_dir, r, &ctx.user_id))
+                        .map(|r| crate::google_identity::member_card::confirmation_display(&r)).collect::<Vec<_>>()}))
                 }
-                "me.google.chat_confirm" => {
+                "me.google.chat_confirm" | "me.google.write_confirm" => {
+                    let marker = if method == "me.google.write_confirm" { "drive_write_member_confirmation" } else { "chat_member_confirmation" };
                     let _session = google_personal::session_for(&ctx.user_id)?;
                     let id = params["id"].as_str().ok_or("Missing confirmation")?;
                     let approve = params["approve"].as_bool().ok_or("Missing decision")?;
                     let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
                     let id = crate::approval::ApprovalId::from(id.to_owned());
                     let rec = broker.get(&id).await?.ok_or("Confirmation missing")?;
-                    if !crate::google_identity::chat_send::may_decide(&self.home_dir, &rec, &ctx.user_id) {
+                    if rec.payload[marker] != true || !crate::google_identity::member_card::may_decide(&self.home_dir, &rec, &ctx.user_id) {
                         return Err("僅限提出要求的本人確認，或這則確認已失效。".into());
                     }
                     broker.decide_bound_dashboard(&id, ctx, approve).await?;

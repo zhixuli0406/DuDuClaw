@@ -20,6 +20,8 @@ pub(in crate::google_identity) trait DriveWriteConfirmer: Send + Sync {
         -> Pin<Box<dyn Future<Output = ConfirmOutcome> + Send + 'a>>;
 }
 pub(in crate::google_identity) struct ConfirmRequest {
+    pub arguments: Value,
+    pub version: String,
     pub agent: String,
     pub tool: String,
     pub action: DriveWriteAction,
@@ -42,6 +44,7 @@ pub(in crate::google_identity) struct ConfirmRequest {
     pub run_id: Option<String>,
     pub call_id: String,
     pub parents_before: Vec<String>,
+    pub source_names: Vec<String>,
 }
 pub(in crate::google_identity) enum ConfirmOutcome {
     Approved { approval_ids: Vec<String>, decided_by: Vec<String> },
@@ -214,6 +217,25 @@ impl Snapshot {
     }
 }
 
+/// Recompute the executor's local identity/credential/policy snapshot at decision time.
+pub(super) fn confirmation_version(home: &Path, agent: &str, tool: &str, args: &Value,
+    who: &RequesterIdentity, turn: &Option<String>, run: &Option<String>, call: &str,
+) -> Result<String, Refusal> {
+    let (snapshot, _, _) = Snapshot::capture(home, agent, tool, args, who, turn, run, call)?;
+    Ok(gi::google_arguments_digest(&json!(snapshot)))
+}
+
+pub(super) fn confirmation_identity_matches(home: &Path, rec: &crate::approval::ApprovalRecord,
+    who: &RequesterIdentity, turn: &Option<String>, run: &Option<String>, call: &str,
+) -> bool {
+    let Some(tool) = rec.payload["name"].as_str() else { return false; };
+    let Ok((snapshot, _, _)) = Snapshot::capture(home, &rec.agent_id, tool,
+        &rec.payload["arguments"], who, turn, run, call) else { return false; };
+    let displayed = &rec.payload["drive_snapshot"];
+    displayed["account"] == snapshot.account_email && displayed["route_kind"] == snapshot.route_kind
+        && snapshot.approval_mode != ApprovalMode::None
+}
+
 /// Cancellation (including the outer timeout) still records the last known
 /// write boundary. Never infer a successful write from cancellation.
 struct AuditGuard<'a> {
@@ -335,16 +357,27 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
         _ => metadata.as_ref().map(|m| m.name.clone()),
     };
     record.destination_folder_id = destination(&plan(&args)).map(|id| id.as_str().into());
+    let mut confirmation_folders = Vec::new();
     if binding.snapshot.approval_mode != ApprovalMode::None {
         let destination_name = if let Some(id) = destination(&plan(&args)) {
-            Some(get_metadata(&mut transport, &mut budget, id).await?.name)
+            Some(folder_path(&mut transport, &mut budget, id, &mut confirmation_folders).await?)
+        } else if matches!(plan(&args), scope::Plan::Create { .. }) {
+            Some("我的雲端硬碟".into())
         } else { None };
+        let mut source_names = Vec::new();
+        if matches!(policy::action_for_tool(tool), Some(DriveWriteAction::Move)) {
+            for parent in &record.parents_before {
+                let id = GoogleId::new(parent.clone()).map_err(|_| changed())?;
+                source_names.push(folder_path(&mut transport, &mut budget, &id, &mut confirmation_folders).await?);
+            }
+        }
         let (attachment_name, rename_after) = match &args {
             ToolArgs::Drive(DriveArgs::Create { content: CreateContent::Attachment { file_name }, .. }) => (Some(file_name.clone()), None),
             ToolArgs::Drive(DriveArgs::Update { name, .. }) => (None, name.clone()),
             _ => (None, None),
         };
         let request = ConfirmRequest {
+            arguments: raw.clone(), version: gi::google_arguments_digest(&json!(binding.snapshot)),
             agent: agent.into(), tool: tool.into(), action: policy::action_for_tool(tool).ok_or_else(changed)?,
             approval_mode: binding.snapshot.approval_mode, requester: who.clone(), route_kind: binding.snapshot.route_kind.clone(),
             account_email: binding.snapshot.account_email.clone(), target_file_id: record.file_id.clone(),
@@ -356,7 +389,7 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
             content_preview: content_text(&args).map(|s| duduclaw_core::truncate_chars(s, 500)), attachment_name,
             rename_before: rename_after.as_ref().and(record.file_name.clone()), rename_after,
             snapshot_digest: digest.clone(), scope_digest: initial_scope.clone(), turn_id: turn.clone(), run_id: run.clone(),
-            call_id: call, parents_before: record.parents_before.clone(),
+            call_id: call, parents_before: record.parents_before.clone(), source_names,
         };
         match state.drive_write_confirmer.confirm(request).await {
             ConfirmOutcome::Approved { approval_ids, decided_by } if !approval_ids.is_empty() && !decided_by.is_empty() => {
@@ -376,6 +409,12 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     transport.check_failure()?;
     if scope::scope_digest(&fresh) != initial_scope { return Err(changed()); }
     require_scope(&fresh).map_err(|_| changed())?;
+    // Folder paths are part of what the member read. Revalidate every displayed
+    // ancestor under the same bounded metadata budget before writing.
+    for folder in &confirmation_folders {
+        let id = GoogleId::new(folder.id.clone()).map_err(|_| changed())?;
+        if get_metadata(&mut transport, &mut budget, &id).await? != *folder { return Err(changed()); }
+    }
     // MIME/name changes and Docs index changes also invalidate the approved plan.
     if checked_metadata(&args, &mut transport, &mut budget).await? != metadata { return Err(changed()); }
     if let ToolArgs::DocsSheets(args) = &args {
@@ -437,6 +476,34 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     }
     Ok(json!({"ok":true, "file_id":file_id, "file_name":file_name, "link":link,
         "message":format!("已使用 {} 寫入。", binding.snapshot.account_email)}))
+}
+
+/// Display paths use the same bounded Google metadata source as scope checks.
+/// Missing visibility, cycles or ambiguous parents cannot produce a guessed path.
+async fn folder_path(transport: &mut ScopedTransport<'_>, budget: &mut scope::Budget,
+    id: &GoogleId, displayed: &mut Vec<scope::FileMeta>,
+) -> Result<String, Refusal> {
+    let mut current = id.clone();
+    let mut seen = std::collections::HashSet::new();
+    let mut names = Vec::new();
+    loop {
+        if !seen.insert(current.as_str().to_owned()) { return Err(changed()); }
+        let folder = get_metadata(transport, budget, &current).await?;
+        if folder.mime_type != "application/vnd.google-apps.folder" || folder.trashed
+            || folder.shortcut_target.is_some() { return Err(changed()); }
+        names.push(folder.name.clone());
+        let next = match folder.parents.as_deref().unwrap_or_default() {
+            [] => None,
+            [parent] => Some(GoogleId::new(parent.clone()).map_err(|_| changed())?),
+            _ => return Err(changed()),
+        };
+        if !displayed.iter().any(|existing| existing.id == folder.id) { displayed.push(folder); }
+        let Some(next) = next else { break; };
+        current = next;
+    }
+    names.reverse();
+    // JSON quoting retains component boundaries even when a folder name contains '/'.
+    Ok(names.iter().map(|name| json!(name).to_string()).collect::<Vec<_>>().join(" / "))
 }
 
 async fn checked_metadata(args: &ToolArgs, transport: &mut ScopedTransport<'_>, budget: &mut scope::Budget) -> Result<Option<scope::FileMeta>, Refusal> {
@@ -552,7 +619,7 @@ tokio::task_local! { static TEST_HTTP: std::sync::Arc<tests::Http>; }
 
 #[cfg(test)]
 #[path = "serve_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 /// Preserve insufficientPermissions while the generic scope layer maps HTTP
 /// failures to non-visibility. The token invalidation is always revision-bound.

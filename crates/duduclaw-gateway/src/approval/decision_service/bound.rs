@@ -7,6 +7,9 @@ pub(super) async fn decide(
     env: &DecisionEnv, rec: &ApprovalRecord, approve: bool,
     by: &Decider, actor: &DecisionActor,
 ) -> Result<Value, DecisionRefusal> {
+    if crate::google_identity::member_card::is_member_card(rec) {
+        return Err(DecisionRefusal::Forbidden("Only the requesting member may confirm".into()));
+    }
     let DecisionActor::ChatAdmin(entry) = actor else {
         return Err(DecisionRefusal::NotSupportedInChat);
     };

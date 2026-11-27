@@ -117,7 +117,8 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mfa_rpc(method, params, ctx).await
             }
-            "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            "me.google.write_confirmations" | "me.google.write_confirm"
+            | "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
             | "me.google.write_connect_start"
             | "me.google.write_disconnect"
             | "me.google.connect_start"

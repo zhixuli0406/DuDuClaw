@@ -186,6 +186,11 @@ async fn decide_locked(
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
         .ok_or(DecisionRefusal::NotFound)?;
+    if crate::google_identity::member_card::is_member_card(&rec)
+        && (matches!(by, Decider::ChatAdmin(_))
+            || !crate::google_identity::member_card::may_decide(&env.home, &rec, by.user_id())) {
+        return Err(DecisionRefusal::Forbidden("Only the requesting member may confirm".into()));
+    }
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
         Decider::ChatAdmin(proof) => {
@@ -366,6 +371,12 @@ async fn chat_preflight(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, 
 }
 
 async fn general(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, by: &Decider, actor: &DecisionActor) -> Result<Value, DecisionRefusal> {
+    if rec.payload["drive_write_admin_confirmation"] == true {
+        let principal = duduclaw_core::HumanPrincipal::user(by.user_id()).map(|p| p.to_string());
+        if crate::on_behalf_of::self_approval::refuses(&env.home, rec.on_behalf_of.as_deref(), principal.as_deref(), approve) {
+            return Err(DecisionRefusal::Forbidden(crate::on_behalf_of::self_approval::REFUSAL.into()));
+        }
+    }
     let decision = match by {
         Decider::Dashboard(ctx) if rec.payload.get("egress_guard").is_some() =>
             env.broker.decide_egress_dashboard(&rec.id, ctx, approve).await,
