@@ -192,10 +192,77 @@ async fn task_status_filter_and_argument_types_are_enforced() {
     let response = call(&f, "my_tasks_list", json!({"status":"completed"})).await;
     assert_eq!(response.0, StatusCode::OK);
     assert_eq!(response.1["result"]["tasks"], json!([]));
-    for args in [json!({"limit":0}), json!({"limit":-1}), json!({"limit":"1"}),
+    for args in [json!({"limit":0}), json!({"limit":201}), json!({"limit":u64::MAX}),
+        json!({"limit":-1}), json!({"limit":"1"}),
         json!({"limit":null}), json!({"status":null}), json!({"status":1})] {
         assert_refusal(call(&f, "my_tasks_list", args).await, StatusCode::BAD_REQUEST, "person_key_bad_request");
     }
+}
+
+#[tokio::test]
+async fn task_limit_default_and_upper_boundary_are_accepted() {
+    let f = fixture(&["tasks:read"]).await;
+    assert_eq!(default_limit(), 50);
+    assert_eq!(MAX_TASK_LIMIT * TASK_ROW_MULTIPLIER, 1000);
+    for args in [json!({}), json!({"limit":200})] {
+        let response = call(&f, "my_tasks_list", args).await;
+        assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+        assert_eq!(response.1["result"]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(response.1["result"]["truncated"], false);
+    }
+}
+
+fn add_visible_agent(f: &Fixture, id: &str) {
+    crate::trigger_route::tests::write_agent(
+        &f.home.path().join("agents"), id, id, "", "specialist", "",
+    );
+    f.state.user_db.bind_agent(&f.user, id, AccessLevel::Owner).unwrap();
+}
+
+#[tokio::test]
+async fn task_fan_out_stops_at_first_fifty_employee_ids() {
+    let f = fixture(&["tasks:read"]).await;
+    write_config(f.home.path(), &["tasks:read"], 50);
+    // Reverse insertion order must not affect which employees are queried.
+    for index in (0..51).rev() {
+        add_visible_agent(&f, &format!("cap-{index:03}"));
+    }
+    let store = TaskStore::open(f.home.path()).unwrap();
+    for (id, agent) in [("last-included", "cap-049"), ("first-excluded", "cap-050")] {
+        let row = TaskRow::new(id.into(), id.into(), "".into(), "normal".into(), agent.into(), "system".into());
+        store.insert_task(&row).await.unwrap();
+    }
+    let response = call(&f, "my_tasks_list", json!({})).await;
+    // A 51st RPC would exhaust the configured rate and refuse the whole call.
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    let tasks = response.1["result"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], "last-included");
+    assert_eq!(response.1["result"]["truncated"], true);
+}
+
+#[tokio::test]
+async fn task_row_ceiling_bounds_collection_and_stops_further_rpcs() {
+    let f = fixture(&["tasks:read"]).await;
+    write_config(f.home.path(), &["tasks:read"], 1);
+    add_visible_agent(&f, "cap-000");
+    let store = TaskStore::open(f.home.path()).unwrap();
+    for index in 1..=6 {
+        let id = format!("bounded-{index}");
+        let mut row = TaskRow::new(id.clone(), id, "".into(), "normal".into(), "cap-000".into(), "system".into());
+        // tasks.list orders by updated_at; the bridge sorts collected rows by
+        // created_at. The sixth fetched row must not enter that sort.
+        row.updated_at = format!("2026-01-0{index}T00:00:00Z");
+        row.created_at = format!("2026-01-0{}T00:00:00Z", 7 - index);
+        store.insert_task(&row).await.unwrap();
+    }
+    let response = call(&f, "my_tasks_list", json!({"limit":1})).await;
+    // Querying sales after reaching five rows would fail the one-call quota.
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    let tasks = response.1["result"]["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], "bounded-2");
+    assert_eq!(response.1["result"]["truncated"], true);
 }
 
 #[tokio::test]
@@ -243,6 +310,22 @@ async fn call_audit_contains_identity_tool_and_outcome_without_credentials() {
     assert_eq!(events[0]["details"]["tool"], "my_tasks_list");
     assert_eq!(events[0]["details"]["outcome"], "ok");
     assert_eq!(events[1]["details"]["outcome"], "person_key_scope");
+}
+
+#[tokio::test]
+async fn unwritable_audit_target_refuses_instead_of_releasing_tasks() {
+    let f = fixture(&["tasks:read"]).await;
+    let control = call(&f, "my_tasks_list", json!({})).await;
+    assert_eq!(control.0, StatusCode::OK);
+    assert_eq!(control.1["result"]["tasks"][0]["id"], "visible-task");
+    let audit_path = f.home.path().join("security_audit.jsonl");
+    std::fs::remove_file(&audit_path).unwrap();
+    // A directory cannot be opened as an append target, including as root.
+    std::fs::create_dir(&audit_path).unwrap();
+    let response = call(&f, "my_tasks_list", json!({})).await;
+    assert!(response.1.get("result").is_none());
+    assert!(!response.1.to_string().contains("visible-task"));
+    assert_refusal(response, StatusCode::SERVICE_UNAVAILABLE, "person_key_unavailable");
 }
 
 #[tokio::test]

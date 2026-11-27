@@ -1,5 +1,11 @@
 use super::*;
 
+fn tools_list_watcher_enabled(member_transport: bool) -> bool {
+    // Member authentication charges the shared gateway quota. Scope changes
+    // are observed by the next real request, never by background polling.
+    !member_transport
+}
+
 pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw MCP server");
 
@@ -208,6 +214,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let mut legacy_initialized = false;
     let mut modern_seen = false;
     let mut tool_subscriptions: Vec<Value> = Vec::new();
+    let watch_tools = tools_list_watcher_enabled(member_transport);
     let mut watch = tokio::time::interval(TOOLS_LIST_WATCH_INTERVAL);
     watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First tick completes immediately; burn it so the watcher does not fire
@@ -228,7 +235,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                     }
                 }
             }
-            _ = watch.tick() => {
+            _ = watch.tick(), if watch_tools => {
                 if last_advertised.is_some()
                     && let Ok(p) = authenticate_stdio(home_dir, &auth_cache).await
                 {
@@ -311,6 +318,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         }
         let capabilities = || {
             let mut caps = stdio_capabilities();
+            caps["tools"]["listChanged"] = json!(watch_tools);
             if workflow_available {
                 caps["experimental"] = serde_json::json!({"duduclaw_workflow":{"version":1}});
             }
@@ -342,7 +350,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // Acknowledge first (spec MUST), then deliver tagged
                 // `list_changed` until the client cancels. No response is
                 // written now: the request stays open.
-                let wants = crate::mcp_protocol::wants_tools_list_changed(&params);
+                let wants = watch_tools && crate::mcp_protocol::wants_tools_list_changed(&params);
                 if wants
                     && !tool_subscriptions.contains(&id)
                     && tool_subscriptions.len() >= crate::mcp_protocol::MAX_SUBSCRIPTIONS
@@ -565,6 +573,14 @@ pub(super) fn tools_list_change_notifications(
 mod startup_auth_error_tests {
     use super::startup_auth_error;
     use crate::mcp_auth::AuthError;
+
+    #[test]
+    fn member_transport_disables_background_authentication_and_subscription_baseline() {
+        // The same switch guards the tick branch and subscription acceptance:
+        // false skips both authenticate_stdio calls, even after tools/list.
+        assert!(!super::tools_list_watcher_enabled(true));
+        assert!(super::tools_list_watcher_enabled(false));
+    }
 
     #[test]
     fn missing_key_names_the_init_command() {

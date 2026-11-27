@@ -5,8 +5,9 @@
 //! - {"op":"authenticate"} -> {ok:true,key_id,user_id,scopes}; one call charged.
 //! - {"op":"call","tool":...,"args":{...}} -> {ok:true,result}.
 //! my_tasks_list accepts only optional string `status` and positive integer
-//! `limit` (default 50). It calls tasks.list per live ACL employee,
-//! passes status, merges newest-first and applies the limit across employees.
+//! `limit` (1..=200, default 50). It calls tasks.list for at most 50 live ACL
+//! employees in id order, collects at most 5 * limit rows, and sorts the
+//! collected rows newest-first. Omitted employees/rows set `truncated: true`.
 //! my_agents_status accepts {} and projects agents.list with agents.callable
 //! membership into {agents:[{id,name,status,can_call}]} (name is display_name).
 //! Only the ordinary handler charges RPCs; no extra charge for a tool wrapper.
@@ -27,7 +28,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use duduclaw_auth::{AccessLevel, UserContext, UserDb};
 use duduclaw_core::mcp_person_tools::{PersonTool, PersonToolHost, person_tool};
-use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
+use duduclaw_security::audit::{AuditEvent, Severity, try_append_audit_event};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 
@@ -36,6 +37,9 @@ use crate::protocol::WsFrame;
 
 pub const ROUTE: &str = "/api/internal/person-key";
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
+const MAX_TASK_LIMIT: usize = 200;
+const MAX_TASK_EMPLOYEES: usize = 50;
+const TASK_ROW_MULTIPLIER: usize = 5;
 
 pub struct PersonKeyRouteState {
     pub home: PathBuf,
@@ -92,7 +96,7 @@ impl ToolCall {
         let call = match tool.name {
             "my_tasks_list" => {
                 let args: TaskArgs = serde_json::from_value(args).map_err(|_| Refusal::bad_request())?;
-                if args.limit == 0 { return Err(Refusal::bad_request()); }
+                if !(1..=MAX_TASK_LIMIT).contains(&args.limit) { return Err(Refusal::bad_request()); }
                 Self::Tasks(args)
             }
             "my_agents_status" => {
@@ -222,7 +226,7 @@ async fn handle(
                 json!({"key_id":context.as_ref().and_then(|ctx| ctx.member_key_id.as_deref()),
                     "user_id":context.as_ref().map(|ctx| ctx.user_id.as_str()), "tool":audit_tool, "outcome":outcome}));
             let home = state.home.clone();
-            if tokio::task::spawn_blocking(move || append_audit_event(&home, &event)).await.is_err() {
+            if !matches!(tokio::task::spawn_blocking(move || try_append_audit_event(&home, &event)).await, Ok(Ok(()))) {
                 return Refusal::unavailable().into_response();
             }
             result
@@ -285,21 +289,32 @@ async fn execute(state: &PersonKeyRouteState, ctx: &UserContext, tool: &PersonTo
                     && (ctx.has_agent_access(id, AccessLevel::Viewer) || ctx.can_assign_to(id)))
                 .cloned().collect();
             let mut tasks = Vec::new();
+            let row_ceiling = args.limit * TASK_ROW_MULTIPLIER;
+            let mut truncated = agents.len() > MAX_TASK_EMPLOYEES;
             if agents.is_empty() {
                 // Still traverse a normal member-key gate for rate/audit accounting.
                 rpc(state, ctx, tool, "agents.list", json!({})).await?;
             }
-            for agent in agents {
+            for agent in agents.into_iter().take(MAX_TASK_EMPLOYEES) {
+                if tasks.len() == row_ceiling {
+                    truncated = true;
+                    break;
+                }
                 let mut params = json!({"agent_id":agent});
                 if let Some(status) = &args.status { params["status"] = json!(status); }
+                // tasks.list has no limit; tasks.list_page is not in the member
+                // contract. Never bypass that gate to obtain a bounded page.
                 let payload = rpc(state, ctx, tool, "tasks.list", params).await?;
                 let rows = payload.get("tasks").and_then(Value::as_array).ok_or_else(Refusal::unavailable)?;
-                tasks.extend(rows.iter().cloned());
+                let remaining = row_ceiling - tasks.len();
+                truncated |= rows.len() > remaining;
+                tasks.extend(rows.iter().take(remaining).cloned());
             }
             tasks.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str())
                 .then_with(|| a["id"].as_str().cmp(&b["id"].as_str())));
+            truncated |= tasks.len() > args.limit;
             tasks.truncate(args.limit);
-            Ok(json!({"tasks":tasks}))
+            Ok(json!({"tasks":tasks, "truncated":truncated}))
         }
         ToolCall::Agents => {
             let listed = rpc(state, ctx, tool, "agents.list", json!({})).await?;

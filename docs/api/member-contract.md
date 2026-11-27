@@ -327,9 +327,25 @@ two methods (`tasks.goal_create`, `tasks.skill_assign`) and runs normal dispatch
 The attachment and original-file routes retain their existing ownership and
 AI-employee checks. Other HTTP surfaces retain their JWT-only authentication;
 this does not authorize arbitrary endpoints. Status credentials and MCP keys
-cannot authenticate these member-key paths. Conversely, member keys are refused
-by the status endpoint, MCP HTTP authentication, MCP key validation, legacy
-Dashboard-token authentication and JWT-only account/security endpoints.
+cannot authenticate these member-key paths.
+
+MCP transports accept member keys through the HTTP `Authorization: Bearer`
+header or the stdio `DUDUCLAW_MCP_API_KEY` environment variable, for person
+tools only. Query-string credentials remain refused. The transports use the
+loopback-only `/api/internal/person-key` bridge for live member-key authority
+and gateway person-tool execution. Member keys are refused by OAuth consent,
+the status endpoint, MCP key validation, legacy Dashboard-token authentication
+and JWT-only account/security endpoints.
+
+The person tool `my_tasks_list` accepts a `limit` from 1 to 200 (default 50);
+out-of-range values return HTTP 400. It queries at most 50 visible employees
+in employee-id order and stops collecting at `5 * limit` rows (at most 1000).
+The collected rows are sorted newest-first before applying the result limit.
+The result includes `truncated: true` when employees or rows were omitted.
+The member contract exposes `tasks.list` without pagination; `tasks.list_page`
+is not available to member keys, so each queried employee's RPC still returns
+its full task list. Member stdio sessions do not poll for tool-list changes;
+the next real request observes current scopes.
 
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 **current** role/bindings, and all existing handler gates. Credential management,
