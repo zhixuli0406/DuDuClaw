@@ -155,6 +155,8 @@ struct TgMessage {
     forward_origin: Option<TgForwardOrigin>,
     // Legacy forwarding markers also disqualify handshake identity.
     forward_from: Option<serde_json::Value>,
+    forward_from_chat: Option<serde_json::Value>,
+    forward_sender_name: Option<serde_json::Value>,
     forward_date: Option<serde_json::Value>,
 }
 
@@ -833,6 +835,9 @@ async fn poll_loop(
                 let Some(msg) = update.message else { continue };
                 // Control-plane exemption: before decisions, access/pairing,
                 // group capture, and the bounded conversation executor.
+                if telegram_totp_intercept(&msg, &client, &api_base, &ctx, agent_name.as_deref(), &verified_account_id).await {
+                    continue;
+                }
                 if telegram_handshake_intercept(&msg, &client, &api_base, &ctx, agent_name.as_deref()).await {
                     continue;
                 }
@@ -913,6 +918,9 @@ async fn process_telegram_message(
     bot_username: String,
 ) {
     // Defence in depth for internal callers that bypass the polling receiver.
+    if telegram_totp_intercept(&msg, &client, &api_base, &ctx, agent_name.as_deref(), &verified_account_id).await {
+        return;
+    }
     if telegram_handshake_route(&msg, false) != crate::chat_link_intercept::CodeRoute::Conversation {
         return;
     }
@@ -1770,6 +1778,8 @@ fn telegram_handshake_sender(msg: &TgMessage) -> bool {
         && msg.sender_chat.is_none()
         && msg.forward_origin.is_none()
         && msg.forward_from.is_none()
+        && msg.forward_from_chat.is_none()
+        && msg.forward_sender_name.is_none()
         && msg.forward_date.is_none()
 }
 
@@ -1781,6 +1791,74 @@ fn telegram_handshake_private(msg: &TgMessage) -> bool {
 
 fn telegram_handshake_route(msg: &TgMessage, edited: bool) -> crate::chat_link_intercept::CodeRoute {
     crate::chat_link_intercept::route(telegram_handshake_text(msg), !edited && telegram_handshake_sender(msg))
+}
+
+/// Identity is derived only from the verified polling account and Telegram
+/// message envelope. Quoted prompt text is only a suppression hint.
+fn telegram_totp_event(msg: &TgMessage, agent: Option<&str>) -> crate::approval::chat_admin::step_up::dm_totp::Event {
+    use crate::approval::chat_admin::step_up::dm_totp;
+    dm_totp::Event {
+        account: crate::chat_link_intercept::account_label("telegram", agent),
+        dm: msg.chat.id.to_string(),
+        principal: msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default(),
+        private: telegram_handshake_private(msg),
+        reply_to: msg.reply_to_message.as_ref().and_then(|m| m.message_id).map(|m| m.to_string()),
+        prompt_hint: msg.reply_to_message.as_ref().is_some_and(|m| dm_totp::is_prompt(telegram_handshake_text(m))),
+        text: telegram_handshake_text(msg).to_owned(),
+    }
+}
+
+struct TelegramTotpSink<'a> {
+    msg: &'a TgMessage,
+    client: &'a reqwest::Client,
+    api: &'a str,
+    home: &'a Path,
+}
+#[async_trait::async_trait]
+impl crate::approval::chat_admin::step_up::dm_totp::ReplySink for TelegramTotpSink<'_> {
+    async fn delete_code(&self) {
+        use crate::isolation_http::LiveRequest;
+        let Some(mid) = self.msg.message_id.filter(|m| *m > 0) else { return; };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3),
+            self.client.post(format!("{}/deleteMessage", self.api))
+                .json(&json!({"chat_id":self.msg.chat.id,"message_id":mid})).send_authorized()).await;
+    }
+    async fn reply(&self, text: &str) {
+        // The code message was just deleted; do not quote/reply to it.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3),
+            send_reply(self.home, self.client, self.api, self.msg.chat.id, text, None, None, None)).await;
+    }
+}
+
+async fn telegram_totp_intercept(msg: &TgMessage, client: &reqwest::Client, api: &str,
+    ctx: &ReplyContext, agent: Option<&str>, verified_account: &str) -> bool {
+    use crate::approval::chat_admin::step_up::dm_totp::{self, ReplySink};
+    let mut event = telegram_totp_event(msg, agent);
+    if event.reply_to.is_none() && (!event.private || !dm_totp::code_shaped(&event.text)) { return false; }
+    let sink = TelegramTotpSink { msg, client, api, home: &ctx.home_dir };
+    if event.private {
+        let context = crate::approval::DecisionContext { channel:"telegram".into(),
+            account_id:verified_account.into(), principal_id:event.principal.clone(), conversation_id:event.dm.clone() };
+        event.private = crate::decision_notify::check_trusted_decision_access(ctx, &context,
+            crate::decision_notify::DecisionAccessScope { channel_id:None, guild_id:None, session_id:None }, "").await.is_ok();
+    }
+    let home = ctx.home_dir.clone();
+    let opened = tokio::task::spawn_blocking(move || {
+        let broker = crate::approval::ApprovalBroker::open(&home)?;
+        let users = crate::decision_notify::open_user_db(&home)?.map(Arc::new);
+        Ok::<_, String>((broker, users))
+    }).await;
+    let Ok(Ok((broker, users))) = opened else {
+        if !event.private || !(dm_totp::code_shaped(&event.text) || event.prompt_hint) { return false; }
+        // Storage failure must not send a possible code to any conversation.
+        sink.delete_code().await;
+        sink.reply("目前無法確認，請到儀表板處理。").await;
+        return true;
+    };
+    let env = crate::approval::decision_service::DecisionEnv { home:ctx.home_dir.clone(),
+        registry:Some(ctx.registry.clone()), broker, users };
+    let lang = crate::approval::chat_admin::press::language(&ctx.home_dir).await;
+    dm_totp::intercept(&env, event, lang, &sink).await
 }
 
 async fn telegram_handshake_intercept(
@@ -3100,7 +3178,10 @@ fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
                 .and_then(|u| u.first_name.clone().or_else(|| u.username.clone()))
                 .unwrap_or_else(|| "對方".to_string())
         };
-        lines.push(channel_format::format_quoted_context(crate::chat_link_intercept::context_text(&who), &excerpt));
+        lines.push(channel_format::format_quoted_context(crate::chat_link_intercept::context_text(&who),
+            if crate::approval::chat_admin::step_up::dm_totp::code_shaped(excerpt.trim()) {
+                "[驗證碼已隱藏]"
+            } else { &excerpt }));
     }
 
     if lines.is_empty() {

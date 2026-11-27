@@ -773,3 +773,45 @@ fn mfa_issuance_holds_policy_write_lock_through_token_callback() {
         record_enforcement(&mut admin, true, 3001).unwrap();
     }
 }
+
+#[test]
+fn dm_totp_rejects_recovery_code() {
+    let (_dir, db, user) = setup();
+    let (_, codes) = enroll(&db, &user);
+    let count = || db.conn().query_row("SELECT count(*) FROM mfa_recovery_codes WHERE user_id=?1",
+        [&user], |r| r.get::<_, i64>(0)).unwrap();
+    let before = count();
+    assert!(db.mfa_step_up_verify_totp_only(&user, &codes[0], &Cipher, 3030).is_err());
+    assert_eq!(count(), before);
+    // Prove the refused code is still usable through the recovery-capable API.
+    db.mfa_step_up_verify(&user, &codes[0], &Cipher, 3030).unwrap();
+    assert_eq!(count(), before - 1);
+}
+
+#[test]
+fn dm_totp_replay_refused() {
+    let (dir, db, user) = setup();
+    let (secret, _) = enroll(&db, &user);
+    let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
+    db.mfa_step_up_verify_totp_only(&user, &code, &Cipher, 3030).unwrap();
+    let reopened = UserDb::new(&dir.path().join("users.db")).unwrap();
+    assert!(reopened.mfa_step_up_verify_totp_only(&user, &code, &Cipher, 3030).is_err());
+}
+
+#[test]
+fn dm_totp_format_failures_throttle_and_audit() {
+    let (dir, db, user) = setup();
+    let (secret, codes) = enroll(&db, &user);
+    for code in ["12345", "1234567", "12a456", "１２３", codes[0].as_str()] {
+        assert!(db.mfa_step_up_verify_totp_only(&user, code, &Cipher, 3030).is_err());
+    }
+    assert_eq!(db.conn().query_row("SELECT failed_attempts FROM mfa_credentials WHERE user_id=?1",
+        [&user], |r| r.get::<_, i64>(0)).unwrap(), 5);
+    let reopened = UserDb::new(&dir.path().join("users.db")).unwrap();
+    let code = hotp(&decode_secret(&secret).unwrap(), 101, 6);
+    assert!(reopened.mfa_step_up_verify_totp_only(&user, &code, &Cipher, 3030).is_err());
+    assert_eq!(db.conn().query_row("SELECT count(*) FROM auth_audit_log WHERE user_id=?1 AND action='mfa.verification_failed'",
+        [&user], |r| r.get::<_, i64>(0)).unwrap(), 6);
+    let code = hotp(&decode_secret(&secret).unwrap(), 132, 6);
+    reopened.mfa_step_up_verify_totp_only(&user, &code, &Cipher, 3960).unwrap();
+}

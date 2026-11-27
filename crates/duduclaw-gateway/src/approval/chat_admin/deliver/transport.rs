@@ -12,6 +12,18 @@ pub(in crate::approval::chat_admin) struct Network<'a> {
 impl<'a> Network<'a> {
     pub(in crate::approval::chat_admin) fn new(home: &'a Path) -> Self { Self { home, http: reqwest::Client::new() } }
 
+    pub(in crate::approval::chat_admin) async fn totp_prompt(&self, receipt: &super::receipts::Receipt, text: &str) -> Option<String> {
+        duduclaw_mcp_boundary::io_authority::verify_before_io().ok()?;
+        if receipt.channel != "telegram" { return None; }
+        let target = super::super::sync::target(receipt)?;
+        let mid = receipt.message_id.as_deref()?.parse::<i64>().ok().filter(|m| *m > 0)?;
+        let token = self.token(&target).await?;
+        let response = self.telegram(&token, "sendMessage", json!({"chat_id":receipt.dm,
+            "text":text, "reply_parameters":{"message_id":mid,"allow_sending_without_reply":false},
+            "reply_markup":{"force_reply":true,"selective":true}})).await.ok()?;
+        response["result"]["message_id"].as_i64().filter(|m| *m > 0).map(|m| m.to_string())
+    }
+
     async fn token(&self, target: &Target) -> Option<String> {
         let channel = target.proof.channel.as_str();
         match &target.agent {

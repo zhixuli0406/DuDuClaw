@@ -46,6 +46,7 @@
 //! Concurrent POSTs have one winner. Invalid digest/step-up does not spend it.
 
 mod store;
+pub(crate) mod dm_totp;
 pub(crate) mod routes;
 #[cfg(test)]
 mod tests;
@@ -120,33 +121,72 @@ fn landing_base(home: &Path) -> Option<String> {
         .then(|| format!("{}approvals/confirm", base.as_str()))
 }
 
-/// Only issues a locator and asks the verified receiving adapter to edit its
-/// pressed card. It never decides and never consumes the delivery receipt.
+/// Issues web locators and/or a receipt-bound Telegram prompt, then asks the
+/// receiving adapter to edit its card. Never decides or consumes the receipt.
 pub(crate) async fn begin(env: &DecisionEnv, row: &ApprovalRecord, receipt: &Receipt, lang: Lang) -> PressOutcome {
-    let (home, db, receipt, row) = (env.home.clone(), env.users.clone(), receipt.clone(), row.clone());
-    let fallback_home = home.clone();
+    begin_with_prompt(env, row, receipt, lang, |receipt, text| async move {
+        let network = super::deliver::transport::Network::new(&env.home);
+        tokio::time::timeout(std::time::Duration::from_secs(15), network.totp_prompt(&receipt, &text))
+            .await.ok().flatten()
+    }).await
+}
+
+async fn begin_with_prompt<F, Fut>(env: &DecisionEnv, row: &ApprovalRecord, receipt: &Receipt, lang: Lang, send: F) -> PressOutcome
+where F: FnOnce(Receipt, String) -> Fut, Fut: std::future::Future<Output = Option<String>>,
+{
+    let original = receipt.clone();
     let fallback_id = row.id.to_string();
-    let issued = tokio::task::spawn_blocking(move || -> Option<String> {
+    let (home, db, receipt, row) = (env.home.clone(), env.users.clone(), receipt.clone(), row.clone());
+    let issued = tokio::task::spawn_blocking(move || -> Option<(Option<String>, Option<String>)> {
         let db = db.as_deref()?;
         let cfg = config::effective(&home, Some(db))?;
-        if !cfg.step_up_methods.contains(&config::StepMethod::Web) { return None; }
-        let base = landing_base(&home)?;
         let user = db.live_user_context(&receipt.user_id).ok()??;
         if user.role != UserRole::Admin || user.must_change_password
             || !has_totp(db, &receipt.user_id).ok()? || receipt.status != "live"
             || receipt.purpose != "rm143" || receipt.approval_id != row.id.as_str()
-            || receipt.digest != crate::approval::decision_digest_at(&home, &row) { return None; }
-        let raw = store::Store::open(&home).ok()?.issue(&receipt).ok()?;
-        Some(format!("{base}#ticket={raw}"))
+            || receipt.digest != crate::approval::decision_digest_at(&home, &row)
+            || !chrono::DateTime::parse_from_rfc3339(&receipt.valid_until).is_ok_and(|t| t > chrono::Utc::now()) {
+            return None;
+        }
+        let mut store = store::Store::open(&home).ok()?;
+        // Google Chat has no user reply-to-message binding. The research does
+        // not establish a dedicated DM thread as equivalent proof of intent.
+        // Never solicit TOTP there (HTTP or Pub/Sub). Apps also cannot delete a
+        // user's code from Google Chat history; use web/dashboard instead.
+        // Reserve the default web option first when only one slot remains.
+        let web = if cfg.step_up_methods.contains(&config::StepMethod::Web) {
+            landing_base(&home).and_then(|base| store.issue(&receipt).ok().map(|raw| format!("{base}#ticket={raw}")))
+        } else { None };
+        let totp = if receipt.channel == "telegram" && cfg.step_up_methods.contains(&config::StepMethod::DmTotp) {
+            store.issue_totp(&receipt).ok()
+        } else { None };
+        Some((web, totp))
     }).await.ok().flatten();
-    if let Some(url) = issued {
-        let text = card::step_up_needed_text(lang).to_owned();
+    let (web, totp) = issued.unwrap_or_default();
+    let mut prompted = false;
+    if let Some(id) = totp {
+        let message = send(original, dm_totp::prompt_text(lang)).await;
+        let home = env.home.clone();
+        prompted = tokio::task::spawn_blocking(move || {
+            let Ok(store) = store::Store::open(&home) else { return false; };
+            if let Some(message) = message {
+                if store.attach_prompt(&id, &message).is_ok() { return true; }
+            }
+            let _ = store.void_totp(&id);
+            false
+        }).await.unwrap_or(false);
+    }
+    if web.is_some() || prompted {
+        let text = if prompted {
+            words(lang, "請回覆剛送出的提示訊息，輸入驗證碼。", "Reply to the new prompt with your verification code.", "送信された案内メッセージに確認コードを返信してください。")
+        } else { card::step_up_needed_text(lang).to_owned() };
         return PressOutcome { reply: text.clone(), card_text: Some(text),
-            card_link: Some(CardLink { label: words(lang, "前往確認", "Review request", "確認する"), url }),
+            card_link: web.map(|url| CardLink { label: words(lang, "前往確認", "Review request", "確認する"), url }),
             refused_reason: Some("step_up_required") };
     }
+    let (home, id) = (env.home.clone(), fallback_id);
     let link = tokio::task::spawn_blocking(move || crate::deep_link::public_deep_link(
-        &fallback_home, crate::deep_link::DeepLinkKind::Approval, &fallback_id)).await.ok().flatten();
+        &home, crate::deep_link::DeepLinkKind::Approval, &id)).await.ok().flatten();
     let mut text = words(lang, "這類審批請到儀表板核准", "Please approve this request on the dashboard.", "この依頼はダッシュボードで承認してください。");
     if let Some(link) = link { text.push(' '); text.push_str(&link); }
     PressOutcome::refused(text, "step_up_required", true)

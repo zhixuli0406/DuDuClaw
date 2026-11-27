@@ -157,3 +157,91 @@ async fn step_up_replaces_buttons_with_url_without_ticket_in_toast() {
     assert_eq!(calls[1].body["reply_markup"]["inline_keyboard"], json!([[{"text":"前往確認","url":url}]]));
     assert_eq!(calls[1].body["link_preview_options"]["is_disabled"], true);
 }
+
+#[test]
+fn totp_event_requires_private_human_unforwarded_sender_and_exact_prompt_reply() {
+    use crate::approval::chat_admin::step_up::dm_totp;
+    let raw = json!({"message_id":44,"text":"123456","chat":{"id":123456789,"type":"private"},
+        "from":{"id":123456789,"is_bot":false},"reply_to_message":{"message_id":43,
+            "chat":{"id":123456789,"type":"private"},"text":dm_totp::prompt_text(crate::trigger_route::texts::Lang::ZhTw)}});
+    let msg: TgMessage = serde_json::from_value(raw.clone()).unwrap();
+    let event = telegram_totp_event(&msg, Some("support"));
+    assert!(event.private);
+    assert_eq!(event.account, "telegram:support");
+    assert_eq!(event.reply_to.as_deref(), Some("43"));
+    assert_eq!(event.principal, "123456789");
+    assert!(event.prompt_hint);
+    for case in ["group", "different_chat", "bot", "unknown_bot", "forward", "legacy_forward", "forward_chat", "forward_name", "forward_date", "sender_chat"] {
+        let mut raw = raw.clone();
+        match case {
+            "group" => raw["chat"]["type"] = json!("group"),
+            "different_chat" => raw["chat"]["id"] = json!(999),
+            "bot" => raw["from"]["is_bot"] = json!(true),
+            "unknown_bot" => raw["from"].as_object_mut().unwrap().remove("is_bot").map(|_| ()).unwrap(),
+            "forward" => raw["forward_origin"] = json!({"type":"hidden_user","sender_user_name":"X"}),
+            "legacy_forward" => raw["forward_from"] = json!({"id":123}),
+            "forward_chat" => raw["forward_from_chat"] = json!({"id":123}),
+            "forward_name" => raw["forward_sender_name"] = json!("X"),
+            "forward_date" => raw["forward_date"] = json!(1),
+            _ => raw["sender_chat"] = json!({"id":123456789,"type":"private"}),
+        }
+        let msg: TgMessage = serde_json::from_value(raw).unwrap();
+        assert!(!telegram_totp_event(&msg, None).private, "{case}");
+    }
+}
+
+#[tokio::test]
+async fn totp_sink_deletes_exact_code_message_on_receiving_bot_and_ignores_failure() {
+    use crate::approval::chat_admin::step_up::dm_totp::ReplySink;
+    let home = tempfile::tempdir().unwrap();
+    let provider = TestChannelProvider::start().await;
+    let api = telegram_poll_api_base(&provider.token);
+    let client = reqwest::Client::new();
+    let msg: TgMessage = serde_json::from_value(json!({"message_id":44,"text":"123456",
+        "chat":{"id":123456789,"type":"private"},"from":{"id":123456789,"is_bot":false}})).unwrap();
+    let sink = TelegramTotpSink { msg:&msg, client:&client, api:&api, home:home.path() };
+    sink.delete_code().await;
+    provider.refuse();
+    sink.delete_code().await;
+    let calls = provider.requests();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(call.path, format!("/bot{}/deleteMessage", provider.token));
+        assert_eq!(call.body, json!({"chat_id":123456789,"message_id":44}));
+        assert!(!String::from_utf8_lossy(&call.raw_body).contains("123456\""));
+    }
+}
+
+#[test]
+fn quoting_an_undeleted_code_never_reintroduces_it_to_model_context() {
+    let msg: TgMessage = serde_json::from_value(json!({"message_id":45,"text":"hello",
+        "chat":{"id":123456789,"type":"private"}, "from":{"id":123456789,"is_bot":false},
+        "reply_to_message":{"message_id":44,"text":"123456","chat":{"id":123456789,"type":"private"}}})).unwrap();
+    let context = build_quoted_context(&msg, "fixture_bot").unwrap();
+    assert!(!context.contains("123456"));
+    assert!(context.contains("驗證碼已隱藏"));
+}
+
+#[tokio::test]
+async fn totp_unbound_codes_pass_through_without_provider_requests() {
+    let f = Fixture::new();
+    let ctx = crate::channel_reply::access_gate_tests::reply_ctx(&f.env.home);
+    let provider = TestChannelProvider::start().await;
+    let client = reqwest::Client::new();
+    let api = telegram_poll_api_base(&provider.token);
+    // This principal has no Admin identity and no step-up ticket.
+    for chat_type in ["group", "private"] {
+        for text in ["123456", "0123456789abcdef0123456789abcdef"] {
+            let msg: TgMessage = serde_json::from_value(json!({"message_id":44,"text":text,
+                "chat":{"id":777,"type":chat_type},"from":{"id":777,"is_bot":false}})).unwrap();
+            assert!(!telegram_totp_intercept(&msg, &client, &api, &ctx, None, "telegram|7").await);
+            assert!(provider.requests().is_empty(), "{chat_type}: no delete or reply");
+        }
+    }
+    let msg: TgMessage = serde_json::from_value(json!({"message_id":45,"text":"123456",
+        "chat":{"id":-777,"type":"group"},"from":{"id":777,"is_bot":false},
+        "reply_to_message":{"message_id":43,"chat":{"id":-777,"type":"group"},
+            "text":crate::approval::chat_admin::step_up::dm_totp::prompt_text(crate::trigger_route::texts::Lang::ZhTw)}})).unwrap();
+    assert!(!telegram_totp_intercept(&msg, &client, &api, &ctx, None, "telegram|7").await);
+    assert!(provider.requests().is_empty());
+}

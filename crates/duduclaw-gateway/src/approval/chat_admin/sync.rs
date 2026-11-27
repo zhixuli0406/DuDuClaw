@@ -176,7 +176,7 @@ pub(super) async fn maintain_live(home: &Path, store: &ApprovalStore, live: Vec<
     }
 }
 
-fn target(receipt: &Receipt) -> Option<Target> {
+pub(super) fn target(receipt: &Receipt) -> Option<Target> {
     ledger::parse_channel(&receipt.channel).ok()?;
     let agent = if receipt.account == receipt.channel { None } else {
         let (channel, agent) = receipt.account.split_once(':')?;
@@ -188,7 +188,7 @@ fn target(receipt: &Receipt) -> Option<Target> {
             proof_account: receipt.account.clone(), proof_dm: receipt.dm.clone(), proven_at: 0 } })
 }
 
-/// A web decision consumes its receipt before any provider edit. Re-read the
+/// A step-up decision consumes its receipt before any provider edit. Re-read the
 /// committed result and edit that exact original delivery, never another bot.
 pub(crate) async fn collapse_step_up_card(home: &Path, store: &ApprovalStore, receipt: &Receipt) {
     let Ok(Some(current)) = store.get(&ApprovalId::from(receipt.approval_id.clone())).await else { return; };
@@ -202,7 +202,7 @@ pub(crate) async fn collapse_step_up_card(home: &Path, store: &ApprovalStore, re
     let message = PushedMessage { edit_chat_id: receipt.dm.clone(), message_id: mid.clone() };
     let sender = Network::new(home);
     if !tokio::time::timeout(Duration::from_secs(15), sender.edit(&target, &message, &text)).await.unwrap_or(false) {
-        tracing::warn!("chat-admin web result card edit failed");
+        tracing::warn!("chat-admin step-up result card edit failed");
     }
 }
 
