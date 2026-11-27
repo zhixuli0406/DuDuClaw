@@ -311,7 +311,9 @@ async fn home_write_status_is_safe_and_unreadable_store_fails_closed() {
     assert_eq!(status["home_write"]["connected"], false);
     assert_eq!(status["home_write"]["status"], "disconnected");
     assert!(status["home_write"]["account_email"].is_null());
-    std::fs::write(crate::person_credentials::write_store::path(dir.path()), "broken").unwrap();
+    let store = crate::person_credentials::write_store::path(dir.path());
+    std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+    std::fs::write(store, "broken").unwrap();
     let status = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
     assert_eq!(status["home_write"]["connected"], false);
     assert_eq!(status["home_write"]["status"], "unreadable");
