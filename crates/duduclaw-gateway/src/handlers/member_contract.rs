@@ -425,6 +425,13 @@ pub(crate) fn member_key_agent_update_params(params: &serde_json::Value) -> Resu
     visit(params, "")
 }
 
+/// Reads that can expose the holder's conversation content or derived memory.
+pub(crate) const MEMBER_KEY_CONVERSATION_METHODS: &[&str] = &[
+    "chat.sessions.list", "chat.sessions.history", "chat.sessions.restore",
+    "knowledge.citations.for_session", "memory.search", "memory.browse",
+    "memory.key_facts", "memory.history", "me.memory.list",
+];
+
 /// Contract membership is necessary, never sufficient: existing ACL and
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
@@ -433,6 +440,7 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
+        || method.split('.').take(2).eq(["me", "odoo"])
         || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));
     if excluded { return None; }
     MEMBER_CONTRACT_METHODS.iter().find(|entry| entry.name == method).map(|entry| entry.kind)
@@ -446,7 +454,9 @@ mod member_key_tests {
         for method in ["users.change_password", "users.change_email", "me.status_tokens.list",
             "me.member_keys.create", "me.google.connect_start", "me.google.disconnect",
             "me.google.consents.set", "sessions.list", "mfa.status", "config.get",
-            "system.update_config", "agents.delete", "unknown.method"] {
+            "system.update_config", "agents.delete", "unknown.method",
+            "me.odoo.status", "me.odoo.connect", "me.odoo.test", "me.odoo.disconnect",
+            "me.odoo.future", "me.member_keys.narrow", "member_keys.admin_narrow"] {
             assert_eq!(member_key_method(method), None, "{method}");
         }
         assert_eq!(member_key_method("tasks.create"), Some(MemberContractKind::Write));

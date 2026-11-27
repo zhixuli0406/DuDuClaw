@@ -11,7 +11,7 @@ async fn member_key_owner_socket_resumes_only_stored_own_webchat() {
     let (user, _) = fixture.employee("resume-key", &["finance"], Some("finance")).await;
     let db = &fixture.state.user_db;
     let epoch = db.get_user(&user).unwrap().unwrap().credential_epoch;
-    let key = db.member_key_create(&user, "resume", 1, epoch).unwrap();
+    let key = db.member_key_create(&user, "resume", 1, epoch, false, &[]).unwrap();
     let tag = webchat_owner_tag(&user);
     let own = format!("webchat:webchat:{tag}:own");
     let other = format!("webchat:webchat:{}:other", webchat_owner_tag("other-member"));

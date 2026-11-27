@@ -19457,7 +19457,7 @@ mod live_events_socket_tests {
             let base = MfaSocket::new().await;
             std::fs::write(base._home.path().join("config.toml"), "[member_api_keys]\nenabled=true\n").unwrap();
             let user = base.state.user_db.create_user("member@socket.test", "Member", "password-test", duduclaw_auth::UserRole::Employee).unwrap();
-            let key = base.state.user_db.member_key_create(&user.id, "x", 1, user.credential_epoch).unwrap();
+            let key = base.state.user_db.member_key_create(&user.id, "x", 1, user.credential_epoch, false, &[]).unwrap();
             let ctx = crate::member_keys::authenticate(base._home.path(), &base.state.user_db, &key.secret).unwrap();
             let mut socket = MfaSocket::connect_credential(base._home.clone(), base.state.clone(), user.clone(), json!({"member_key":key.secret}), ctx.clone()).await;
             assert_eq!(socket.rpc("users.me", json!({})).await["ok"], true);

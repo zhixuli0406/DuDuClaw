@@ -23,7 +23,7 @@ async fn fixture(level: AccessLevel, privacy: bool) -> Fixture {
     let user = db.create_user("holder@test.invalid", "Holder", "Test-Password-12345", UserRole::Employee).unwrap();
     db.bind_agent(&user.id, "sales", level).unwrap();
     let browser = db.live_user_context(&user.id).unwrap().unwrap();
-    let issued = db.member_key_create(&user.id, "history", 1, browser.credential_epoch).unwrap();
+    let issued = db.member_key_create(&user.id, "history", 1, browser.credential_epoch, true, &[]).unwrap();
     let key = crate::member_keys::authenticate(home.path(), &db, &issued.secret).unwrap();
     assert!(key.member_key_id.is_some());
     let handler = MethodHandler::new(home.path().into()).await;

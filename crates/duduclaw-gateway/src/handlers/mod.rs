@@ -135,6 +135,7 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;

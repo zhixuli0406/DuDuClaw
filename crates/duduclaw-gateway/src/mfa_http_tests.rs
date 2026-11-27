@@ -1367,7 +1367,7 @@ async fn member_key_http_and_prefix_separation() {
     let (_dir, state, _) = fixture(false, false).await;
     std::fs::write(state.home_dir.join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
     let member = state.user_db.create_user("member@http.test", "Member", "test-password", UserRole::Employee).unwrap();
-    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch).unwrap();
+    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch, false, &[]).unwrap();
     let status = state.user_db.status_token_create(&member.id, "x").unwrap();
     let jwt = state.jwt_config.issue_access_token(&member, &[]).unwrap();
     assert!(authenticate_jwt(&state, &key.secret).is_err());

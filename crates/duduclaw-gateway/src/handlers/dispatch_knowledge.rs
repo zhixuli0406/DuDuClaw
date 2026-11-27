@@ -243,15 +243,18 @@ impl MethodHandler {
                 }
             }
             "memory.search" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_search(params)).await
             }
             "memory.browse" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_browse(params)).await
             }
             "memory.key_facts" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_key_facts(params)).await
             }
             // Freshness histogram + top-N + accumulation trend for the memory
@@ -263,7 +266,8 @@ impl MethodHandler {
             }
             // F1 Temporal Memory (v1.19.0): supersession chain + point-in-time.
             "memory.history" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_history(params)).await
             }
             "memory.at" => {
