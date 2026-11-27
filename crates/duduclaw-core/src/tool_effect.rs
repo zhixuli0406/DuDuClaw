@@ -254,6 +254,8 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 /// that return existing records count as private too. A write acknowledgement
 /// or a public model-catalog search does not introduce private data.
 pub fn reads_private(tool_name: &str) -> Option<bool> {
+    if tool_name == "admin_settings_read" { return Some(true); }
+    if tool_name == "admin_settings_propose" { return Some(false); }
     if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(true); }
     if matches!(tool_name, "gmail_send_draft" | "calendar_delete_event") { return Some(true); }
     match tool_name {
@@ -427,6 +429,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
 /// negative entries independent of the private-read table, so completeness
 /// tests require a separate egress decision whenever a tool is added.
 pub fn egress_capable(tool_name: &str) -> Option<bool> {
+    if matches!(tool_name, "admin_settings_read" | "admin_settings_propose") { return Some(false); }
     if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(false); }
     if EGRESS_CAPABLE_READS.contains(&tool_name) {
         return Some(true);

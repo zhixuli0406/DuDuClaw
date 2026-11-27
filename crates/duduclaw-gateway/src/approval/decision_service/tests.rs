@@ -244,7 +244,9 @@ async fn all_t2_kinds_require_step_up_by_default_and_exemptions_are_exact() {
     let f = Fixture::new();
     for key in chat_admin::STEP_UP_KIND_KEYS {
         let kind = if *key == "egress_guard" { "other_outgoing" } else { *key };
-        let id = f.simple(kind).await;
+        let id = if kind == crate::admin_ai::card::ACTION_KIND {
+            f.admin_ai().await
+        } else { f.simple(kind).await };
         let rec = f.env.broker.get(&id).await.unwrap().unwrap();
         let proof = f.proof(&id).await;
         f.config(true, "telegram", &[]);

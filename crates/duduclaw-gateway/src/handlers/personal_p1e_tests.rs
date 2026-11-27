@@ -565,6 +565,7 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
 /// Namespaces that must never name an employee: the scan fails if any arm
 /// (or the handler it calls) reads an employee key.
 const NO_EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
+    ("admin_ai", "administrator AI settings"),
     ("connect", "connection handshake"),
     ("ping", "liveness"),
     ("hello-ok", "connection handshake"),
