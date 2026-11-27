@@ -1,3 +1,4 @@
+import { formatDateTime } from '@/lib/company-time';
 import { useIntl, type IntlShape } from 'react-intl';
 import {
   Button, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
@@ -27,13 +28,13 @@ export function statusTokenErrorMessage(intl: IntlShape, err: unknown): string {
 
 export function formatTokenDate(intl: IntlShape, iso: string): string {
   const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : date.toLocaleDateString(intl.locale);
+  return Number.isNaN(date.getTime()) ? iso : formatDateTime(date, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric' });
 }
 
 export function formatTokenLastUsed(intl: IntlShape, iso: string | null): string {
   if (!iso) return intl.formatMessage({ id: 'externalStatus.neverUsed' });
   const date = new Date(iso);
-  return Number.isNaN(date.getTime()) ? iso : date.toLocaleString(intl.locale);
+  return Number.isNaN(date.getTime()) ? iso : formatDateTime(date, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 }
 
 /** Shared red confirm dialog for the self and admin revoke flows. */

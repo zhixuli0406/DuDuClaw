@@ -983,11 +983,13 @@ async fn rm141_follow_and_engine_write_success_refusal_matrix() {
                 let decision = super::odoo_identity_client::OdooIdentity {
                     kind: super::odoo_identity_client::IdentityKind::Personal,
                     permission: super::odoo_identity_client::IdentityPermission::Engine,
+                    url: Some(url.clone()), db: Some("test".into()),
+                    server_fp: Some(super::odoo_identity_client::tests::fingerprint(&url, "test")),
                     user_id: Some("alice".into()), odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None,
                 };
                 let connector = pool.cached_connector("agnes", &decision).await.unwrap();
                 let snapshot = lead_snapshot(&connector.connection_identity(), Some(full_access(serde_json::json!(true), serde_json::json!(true))));
-                duduclaw_odoo::schema::save_snapshot(home.path(), &connector.schema_profile("person:alice:1"), &snapshot).unwrap();
+                duduclaw_odoo::schema::save_snapshot(home.path(), &connector.schema_profile(&decision.personal_profile().unwrap()), &snapshot).unwrap();
             }
             let result = personal_call(mode, "odoo_write", serde_json::json!({"model":model,"ids":[1],"values":{"name":"new"}}), home.path(), &pool).await;
             let text = text_of(&result);

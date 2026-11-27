@@ -378,7 +378,7 @@ async fn approvals_raised_in_a_run_carry_its_person_and_the_card_names_them() {
     assert_eq!(reopened.on_behalf_of, rec.on_behalf_of);
     let label = label::display_label(h, &principal);
     assert_eq!(label, "emp1");
-    let body = crate::approval_notify::approval_body_with(&rec, false, Some(&label));
+    let body = crate::approval_notify::approval_body_with(h, &rec, false, Some(&label));
     assert!(body.contains("由 emp1 交辦"), "{body}");
     assert!(!body.contains(&o.emp1), "the card never shows the account id");
     let plain = broker.request("sales", "mcp_tool", "own work", serde_json::json!({}), 600).await.unwrap();

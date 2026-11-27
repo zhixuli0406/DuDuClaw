@@ -196,10 +196,10 @@ async fn bounded_list_skips_newer_hidden_personal_tasks() {
     }
     let admin = h.db.live_user_context(&h.admin).unwrap().unwrap();
     let reader = TaskReader::build(h.path(), &admin, true).unwrap();
-    let rows = store.list_tasks_filtered_bounded(None, None, None, None, 2,
-        |id, assignee| !reader.hides(assignee)
-            && super::super::task_privacy::a2a_owner_allows(h.path(), reader.live(), id)
+    let (rows, more_may_exist) = store.list_tasks_filtered_bounded(None, None, None, None, 2,
+        &format!("user:{}", reader.live().user_id), |assignee| !reader.hides(assignee)
     ).await.unwrap();
+    assert!(!more_may_exist);
     assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["visible-a", "visible-b"]);
 }
 

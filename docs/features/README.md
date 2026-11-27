@@ -81,6 +81,7 @@ This directory contains detailed introductions to DuDuClaw's standout features. 
 | 77 | [Native Linux protected mode (planned for a later release)](77-protected-mode.md) | Not available in the current release. Per-employee accounts and execution environments on native Linux: Personal vs Shared, connectors, retire/restore/adopt/purge, recording gate, host acceptance status |
 | 78 | [Action claim check](78-action-claim-check.md) | Chat replies that say an email was sent, an event or task was created, or a sheet or doc was written are checked against the same conversation's tool records; staff-only notice by default, `[action_claims] mode = "shadow"` to only record |
 
+| 79 | [Administrator AI Settings](79-admin-ai-settings.md) | Bulk everyday settings with confirmation by the proposing administrator in the dashboard |
 ---
 
 ## Companion Articles

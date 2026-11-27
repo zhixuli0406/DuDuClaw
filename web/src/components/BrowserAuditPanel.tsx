@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useBrowserStore } from '@/stores/browser-store';
@@ -21,6 +22,7 @@ const tierIcons: Record<string, typeof Globe> = {
 
 export function BrowserAuditPanel() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const { auditEntries, auditLoading, fetchAuditLog } = useBrowserStore();
   const [agentFilter, setAgentFilter] = useState('');
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -100,7 +102,7 @@ export function BrowserAuditPanel() {
                   {/* Timestamp */}
                   <span className="flex items-center gap-1 text-xs text-muted-foreground">
                     <Clock className="h-3 w-3" />
-                    {new Date(entry.timestamp).toLocaleTimeString()}
+                    {formatDateTime(entry.timestamp, { locale: intl.locale, hour: 'numeric', minute: 'numeric', second: 'numeric' })}
                   </span>
 
                   {/* Expand toggle */}

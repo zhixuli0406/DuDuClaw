@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useSelectableCallableAgents } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -58,6 +59,7 @@ const COLUMNS = 'minmax(0,2.2fr) minmax(0,1fr) minmax(0,0.7fr) minmax(0,0.5fr) m
 type LoadState = 'loading' | 'ready' | 'error';
 
 export function ConversationsPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const navigate = useNavigate();
 
@@ -375,7 +377,7 @@ export function ConversationsPage() {
                   <ListGridCell className="justify-end">
                     <span
                       className="truncate text-xs text-muted-foreground"
-                      title={new Date(s.last_active).toLocaleString()}
+                      title={formatDateTime(s.last_active, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}
                     >
                       {timeAgo(s.last_active)}
                     </span>

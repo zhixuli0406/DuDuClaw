@@ -30,6 +30,7 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod company_timezone_init;
 pub mod isolation_mcp;
 pub mod isolation_background;
 /// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).
@@ -469,6 +470,7 @@ pub mod decision_task_board_shadow;
 pub mod defensive_prompt;
 /// One-time upgrade migration for `[odoo] allow_private_network`.
 pub mod odoo_private_network_migration;
+pub(crate) mod odoo_access_migration;
 /// RM-166: identity-token transition (first-start notice record, dashboard
 /// status, bounded manual grace). Never weakens strict mode on its own.
 pub mod identity_transition;

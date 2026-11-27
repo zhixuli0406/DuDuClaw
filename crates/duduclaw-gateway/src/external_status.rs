@@ -65,7 +65,7 @@ use std::time::{Duration, Instant};
 use axum::extract::ConnectInfo;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use duduclaw_auth::UserDb;
 use duduclaw_auth::status_tokens::{StatusTokenLookup, is_status_token};
 use serde::Serialize;
@@ -561,14 +561,29 @@ pub(crate) fn safe_title(home: &Path, raw: &str) -> Option<String> {
     title_mask::external_title(home, raw, TITLE_MAX_CHARS)
 }
 
-/// `(start of today in the gateway's local time zone, now − 7 days)`, in UTC.
-pub(crate) fn day_bounds(now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
-    let local = now.with_timezone(&Local);
+/// `(start of today in the company time zone, now − 7 days)`, in UTC.
+/// An unset or invalid company time zone uses UTC.
+pub(crate) fn day_bounds(home: &Path, now: DateTime<Utc>) -> (DateTime<Utc>, DateTime<Utc>) {
+    use duduclaw_core::company_timezone::{self, CompanyZone};
+
+    let zone = match company_timezone::read(home) {
+        CompanyZone::Set(zone) => zone,
+        CompanyZone::Unset | CompanyZone::Invalid => chrono_tz::UTC,
+    };
+    let local = now.with_timezone(&zone);
     let today = local
         .date_naive()
         .and_hms_opt(0, 0, 0)
-        .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
+        .and_then(|midnight| {
+            // Try midnight first, choosing its earlier occurrence if ambiguous.
+            // A midnight gap advances to the first valid local second that day.
+            (0..86_400).find_map(|seconds| {
+                let candidate = midnight.checked_add_signed(chrono::Duration::seconds(seconds))?;
+                zone.from_local_datetime(&candidate).earliest()
+            })
+        })
         .map(|t| t.with_timezone(&Utc))
+        // The date contains `now`, so a day with no valid instant is impossible.
         .unwrap_or_else(|| now - chrono::Duration::hours(24));
     (today, now - chrono::Duration::days(7))
 }
@@ -1060,9 +1075,46 @@ mod tests {
 
     #[test]
     fn day_bounds_are_ordered() {
+        let home = tempfile::tempdir().unwrap();
         let now = Utc::now();
-        let (today, week) = day_bounds(now);
+        let (today, week) = day_bounds(home.path(), now);
         assert!(today <= now && now - today <= chrono::Duration::hours(25));
         assert_eq!(now - week, chrono::Duration::days(7));
+    }
+
+    #[test]
+    fn day_bounds_use_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 1, 30, 0).unwrap();
+        let utc_midnight = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        assert_eq!(day_bounds(home.path(), now).0, utc_midnight);
+
+        std::fs::write(home.path().join("config.toml"),
+            "[general]\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+        let (today, week) = day_bounds(home.path(), now);
+        assert_eq!(today, Utc.with_ymd_and_hms(2026, 11, 26, 16, 0, 0).unwrap());
+        assert_eq!(week, now - chrono::Duration::days(7));
+
+        std::fs::write(home.path().join("config.toml"),
+            "[general]\ncompany_timezone = 'Not/AZone'\n").unwrap();
+        assert_eq!(day_bounds(home.path(), now).0, utc_midnight);
+    }
+
+    #[test]
+    fn day_bounds_handle_midnight_transitions() {
+        let home = tempfile::tempdir().unwrap();
+        for (zone, now, expected) in [
+            // Midnight is skipped: the day starts at 01:00 local time.
+            ("America/Sao_Paulo", "2018-11-04T12:00:00Z", "2018-11-04T03:00:00Z"),
+            // Midnight occurs twice: choose the earlier occurrence.
+            ("America/Havana", "2020-11-01T12:00:00Z", "2020-11-01T04:00:00Z"),
+        ] {
+            std::fs::write(home.path().join("config.toml"),
+                format!("[general]\ncompany_timezone = '{zone}'\n")).unwrap();
+            let now = now.parse::<DateTime<Utc>>().unwrap();
+            let (today, week) = day_bounds(home.path(), now);
+            assert_eq!(today, expected.parse::<DateTime<Utc>>().unwrap(), "{zone}");
+            assert_eq!(week, now - chrono::Duration::days(7));
+        }
     }
 }

@@ -217,6 +217,7 @@ async fn outbound_open_audit_failure_returns_only_redacted_card_and_error() {
 
 #[test]
 fn outbound_list_summary_is_fixed_for_every_card_marker() {
+    let home = tempfile::tempdir().unwrap();
     // Exercise the shared projection used by task timelines as well as lists.
     let mut rec: ApprovalRecord = serde_json::from_value(json!({
         "id":"summary", "agent_id":"a1", "action_kind":"cli_egress", "summary":SECRET_SUMMARY,
@@ -228,8 +229,8 @@ fn outbound_list_summary_is_fixed_for_every_card_marker() {
     for marker in [Value::Null, json!(false), json!({})] {
         rec.payload["egress_guard"] = marker;
         assert_eq!(list_summary(&rec), NOTICE_SUMMARY);
-        assert!(!crate::approval::pending_summary_for_channel(&rec).contains(SECRET_SUMMARY));
-        assert!(!crate::approval_notify::approval_body(&rec, false).contains(SECRET_SUMMARY));
+        assert!(!crate::approval::pending_summary_for_channel(home.path(), &rec).contains(SECRET_SUMMARY));
+        assert!(!crate::approval_notify::approval_body(home.path(), &rec, false).contains(SECRET_SUMMARY));
     }
 }
 

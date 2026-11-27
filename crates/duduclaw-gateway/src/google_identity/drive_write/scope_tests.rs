@@ -233,7 +233,7 @@ async fn shortcuts_modify_denied_move_and_trash_bind_the_shortcut() {
     let mut src = FakeSource::new(vec![target.clone(), meta(LISTED, None), meta(DEST, Some(&[LISTED]))]);
     assert_eq!(run(&mut src, &scoped_policy(), Plan::Modify { target: id(TARGET), rename: false }).await,
         denied(ScopeReason::ShortcutNotAllowed));
-    assert_eq!(ScopeReason::ShortcutNotAllowed.user_text(), "這是捷徑，請改用原始檔案");
+    assert_eq!(ScopeReason::ShortcutNotAllowed.user_text(), "這是捷徑，無法執行這項操作，請改用原始檔案。");
     for plan in [Plan::Trash { target: id(TARGET) },
         Plan::Move { target: id(TARGET), destination: id(DEST) }]
     {

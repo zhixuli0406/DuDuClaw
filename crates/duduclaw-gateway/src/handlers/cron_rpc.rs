@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use duduclaw_core::company_timezone;
 
 impl MethodHandler {
     // ── Cron ────────────────────────────────────────────────
@@ -195,6 +196,16 @@ impl MethodHandler {
             }
         }
 
+        let (cron_timezone, zone_note) = match cron_timezone {
+            Some(zone) => (Some(zone), None),
+            None => {
+                let choice = company_timezone::default_for_new_schedule(
+                    &company_timezone::read(&self.home_dir), false, Utc::now(),
+                );
+                (Some(choice.zone), company_timezone::zone_note_zh(&choice.source))
+            }
+        };
+
         // G3 event-trigger fields. `trigger_kind` defaults to "time" (legacy).
         // Unknown kinds are rejected (strict) so a typo surfaces here rather
         // than silently degrading to a schedule-only task.
@@ -279,7 +290,7 @@ impl MethodHandler {
         info!(name = %name, cron = %cron_expr, agent_id = %agent_id, "Cron task added");
         WsFrame::ok_response(
             "",
-            json!({ "success": true, "task": Self::cron_row_to_json(&row) }),
+            json!({ "success": true, "task": Self::cron_row_to_json(&row), "zone_note": zone_note }),
         )
     }
 
@@ -664,5 +675,59 @@ mod delivery_fields_tests {
         assert_eq!(value["last_status"], "success");
         assert_eq!(value["last_delivery_status"], "delivery_failed");
         assert_eq!(value["last_delivery_reason"], "notification_delivery_failed");
+    }
+}
+
+#[cfg(test)]
+mod company_timezone_tests {
+    use super::*;
+
+    fn payload(frame: WsFrame) -> Value {
+        match frame {
+            WsFrame::Response { ok: true, payload: Some(value), .. } => value,
+            other => panic!("expected success: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn company_zone_change_does_not_move_rows_created_earlier() {
+        use chrono::TimeZone;
+        let home = tempfile::tempdir().unwrap();
+        let config = home.path().join("config.toml");
+        std::fs::write(&config, "[general]\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let store = Arc::new(CronStore::open(home.path()).unwrap());
+        handler.set_cron_store(store.clone()).await;
+        let first = payload(handler.handle_cron_add(json!({
+            "name": "First", "agent_id": "worker", "cron": "0 9 * * *", "task": "report",
+        })).await);
+        assert_eq!(first["task"]["cron_timezone"], "Asia/Taipei");
+        assert!(first["zone_note"].is_null());
+        let id = first["task"]["id"].as_str().unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        let expected = Some(Utc.with_ymd_and_hms(2026, 11, 27, 1, 0, 0).unwrap());
+        assert_eq!(crate::cron_scheduler::next_run(&store.get(id).await.unwrap().unwrap(), now), expected);
+        std::fs::write(&config, "[general]\ncompany_timezone = 'Asia/Tokyo'\n").unwrap();
+        payload(handler.handle_cron_update(json!({"id": id, "task": "updated report"})).await);
+        let stored = store.get(id).await.unwrap().unwrap();
+        assert_eq!(stored.cron_timezone.as_deref(), Some("Asia/Taipei"));
+        assert_eq!(crate::cron_scheduler::next_run(&stored, now), expected);
+        let second = payload(handler.handle_cron_add(json!({
+            "name": "Second", "agent_id": "worker", "cron": "0 9 * * *", "task": "report",
+        })).await);
+        assert_eq!(second["task"]["cron_timezone"], "Asia/Tokyo");
+    }
+
+    #[tokio::test]
+    async fn admin_default_with_dst_company_zone_keeps_zone() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'America/New_York'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        handler.set_cron_store(Arc::new(CronStore::open(home.path()).unwrap())).await;
+        let created = payload(handler.handle_cron_add(json!({
+            "name": "Morning", "agent_id": "worker", "cron": "0 9 * * *", "task": "report",
+        })).await);
+        assert_eq!(created["task"]["cron_timezone"], "America/New_York");
+        assert!(created["zone_note"].is_null());
     }
 }

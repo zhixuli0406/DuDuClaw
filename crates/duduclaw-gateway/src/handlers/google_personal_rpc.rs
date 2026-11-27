@@ -201,7 +201,7 @@ impl MethodHandler {
         .await;
         match result {
             Ok(payload) => WsFrame::ok_response("", payload),
-            Err(e) => WsFrame::error_response("", &e),
+            Err(e) => WsFrame::error_response("", flow::error_message(&e)),
         }
     }
 

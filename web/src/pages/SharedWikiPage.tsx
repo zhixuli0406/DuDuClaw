@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useAuthStore } from '@/stores/auth-store';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useState, useCallback, useEffect, useMemo } from 'react';
@@ -357,6 +358,7 @@ function SearchView() {
 // ── Stats view ──────────────────────────────────────────────
 
 function StatsView() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [stats, setStats] = useState<SharedWikiStats | null>(null);
   const [loading, setLoading] = useState(true);
@@ -405,7 +407,7 @@ function StatsView() {
         <KpiTile
           icon={BarChart3Icon}
           label={intl.formatMessage({ id: 'sharedWiki.stats.lastUpdated' })}
-          value={stats.most_recent?.updated ? new Date(stats.most_recent.updated).toLocaleDateString() : '—'}
+          value={stats.most_recent?.updated ? formatDateTime(stats.most_recent.updated, { year: 'numeric', month: 'numeric', day: 'numeric' }) : '—'}
         />
       </div>
 

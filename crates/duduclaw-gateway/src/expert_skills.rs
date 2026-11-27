@@ -408,10 +408,10 @@ fn promote_all(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn skill(agent: &str, name: &str) -> QuarantinedSkill {
+    pub(crate) fn skill(agent: &str, name: &str) -> QuarantinedSkill {
         QuarantinedSkill {
             agent: agent.into(),
             name: name.into(),
@@ -422,7 +422,7 @@ mod tests {
         }
     }
 
-    fn seed(home: &Path, slug: &str, s: &mut QuarantinedSkill) {
+    pub(crate) fn seed(home: &Path, slug: &str, s: &mut QuarantinedSkill) {
         let q = quarantined_skill_dir(home, slug, &s.agent, &s.name);
         std::fs::create_dir_all(q.join("scripts")).unwrap();
         std::fs::write(q.join("SKILL.md"), "---\nname: x\n---\n").unwrap();

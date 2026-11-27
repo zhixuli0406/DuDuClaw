@@ -111,6 +111,7 @@ impl MethodHandler {
                     { "name": "cron.run_now", "description": "Run a cron job once now (test execution)" },
                     { "name": "cron.templates", "description": "List built-in office scheduling templates" },
                     { "name": "system.status", "description": "System status" },
+                    { "name": "system.company_timezone", "description": "Read the company time zone name and whether it is set (any signed-in account, read-only)" },
                     { "name": "system.doctor", "description": "Health checks" },
                     { "name": "system.doctor_repair", "description": "Health checks with repair hints" },
                     { "name": "models.list", "description": "List available cloud and local models" },

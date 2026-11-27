@@ -10,6 +10,7 @@ const DENIED: &str = "這位 AI 員工目前沒有這項 Odoo 操作權限。";
 
 #[derive(Clone)]
 pub(super) struct ToolPolicy {
+    pub person_key: bool,
     pub agent_id: String,
     pub agent: AgentOdooConfig,
     pub access: OdooAccessConfig,
@@ -50,7 +51,7 @@ pub(super) fn personal_facts(home: &Path, agent: &str) -> PossibleIdentities {
 
 /// Fixed methods must also be supplied during listing. Existing dedicated
 /// business tools use Execute (ordinary grants), not generic-write opt-ins.
-fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Option<&'a str>, Option<&'a str>)> {
+pub(super) fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Option<&'a str>, Option<&'a str>)> {
     let model = params.and_then(|p| p.get("model")).and_then(Value::as_str);
     Some(match tool {
         "odoo_connect" | "odoo_status" => (ToolClass::Read, None, Some("read")),
@@ -58,6 +59,10 @@ fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Op
         "odoo_schema_fields" | "odoo_schema_overview" => (ToolClass::Read, model.filter(|s| !s.is_empty()), Some("fields_get")),
         "odoo_create" => (ToolClass::GenericCreate, model.map(str::trim), Some("create")),
         "odoo_write" => (ToolClass::GenericWrite, model.map(str::trim), Some("write")),
+        "odoo_activity_create" => (ToolClass::Activity, model, Some("activity_schedule")),
+        "odoo_note_post" => (ToolClass::Note, model, Some("message_post")),
+        "odoo_message_send" => (ToolClass::Message, model, Some("message_post")),
+        "odoo_attachment_add" => (ToolClass::Attach, model, Some("create")),
         "odoo_execute" => (ToolClass::Execute, model, params.and_then(|p| p.get("method")).and_then(Value::as_str)),
         "odoo_crm_leads" => (ToolClass::Read, Some("crm.lead"), Some("search_read")),
         "odoo_crm_create_lead" => (ToolClass::Execute, Some("crm.lead"), Some("create")),
@@ -94,7 +99,63 @@ impl ToolPolicy {
         let chain = duduclaw_core::autonomy_gate::effective_identities(home, agent_id,
             duduclaw_core::autonomy_gate::AutonomyPath::Dispatcher).map_err(|_| DENIED)?;
         let parent = chain.last().ok_or(DENIED)?.clone();
-        Ok(Self { agent_id: parent, agent, access, global, identities })
+        Ok(Self { person_key: false, agent_id: parent, agent, access, global, identities })
+    }
+
+    /// Personal keys have no employee policy, autonomy chain or local identity facts.
+    pub fn load_person(home: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| UNREADABLE)?;
+        let access = OdooAccessConfig::parse_config_toml(&raw)?;
+        let mut table: toml::Table = raw.parse().map_err(|_| UNREADABLE)?;
+        let mut config = table.remove("odoo").ok_or(UNREADABLE)?;
+        let fields = config.as_table_mut().ok_or(UNREADABLE)?;
+        // Keep endpoint and feature configuration, never a configured account.
+        for key in ["username", "api_key_enc", "password_enc"] { fields.remove(key); }
+        let global = config.try_into::<OdooConfig>().map_err(|_| UNREADABLE)?;
+        Ok(Self { person_key: true, agent_id: String::new(), agent: AgentOdooConfig::default(),
+            access, global, identities: PossibleIdentities::default() })
+    }
+
+    /// The gateway uses this same effective_mode (including the acknowledgement)
+    /// for person keys. Availability never supplies a runtime identity.
+    pub fn person_listed(&self, tool: &str, params: Option<&Value>) -> bool {
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        if !person_tool(tool).is_some_and(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+            return false;
+        }
+        let Some((class, model, method)) = operation(tool, params) else { return false };
+        if class != ToolClass::Read && effective_mode(policy::IdentityKind::Personal,
+            &self.access, PermissionOverride::Inherit) != EffectiveMode::Follow { return false; }
+        let candidates: Vec<String> = model.map(|m| vec![m.to_owned()]).unwrap_or_else(||
+            (0..=self.access.always_refuse.len()).map(|n| format!("policy_model_{n}")).collect());
+        let Some(method) = method else { return false };
+        candidates.iter().any(|model| self.common_tool(tool, model, method).is_ok()
+            && (method != "search_read" || self.common(model, "fields_get").is_ok()))
+            && self.auxiliary(tool).iter().all(|(m, v)|
+                self.common(m, v).is_ok() && self.common(m, "fields_get").is_ok())
+    }
+
+    fn check_person_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        if !person_tool(tool).is_some_and(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+            return Err("本人金鑰不提供這項 Odoo 工具。".into());
+        }
+        let decision = decision.filter(|d| d.kind == DecisionKind::Personal
+            && d.permission != IdentityPermission::Engine).ok_or("無法確認本人 Odoo 權限。")?;
+        let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
+        if decision.permission == IdentityPermission::ReadOnly && class != ToolClass::Read {
+            return Err("目前是唯讀模式，只能查詢 Odoo 資料，不能新增或修改。".into());
+        }
+        if let (Some(model), Some(method)) = (model, method) {
+            self.common_tool(tool, model, method)?;
+            if method == "search_read" { self.common(model, "fields_get")?; }
+        }
+        for (model, method) in self.auxiliary(tool) {
+            self.common(model, method)?;
+            self.common(model, "fields_get")?;
+        }
+        if !self.person_listed(tool, Some(params)) { return Err(DENIED.into()); }
+        Ok(())
     }
 
     /// Preserve the old dedicated tools' search/execute grant vocabulary while
@@ -148,7 +209,29 @@ impl ToolPolicy {
     }
 
     pub(super) fn common(&self, model: &str, method: &str) -> Result<(), String> {
-        let op = OdooOp { tool: ToolKind::Generic, model, method, verb: method_verb(method) };
+        self.common_operation(ToolKind::Generic, method_verb(method), model, method)
+    }
+
+    fn common_tool(&self, tool: &str, model: &str, method: &str) -> Result<(), String> {
+        let (kind, verb) = match tool {
+            "odoo_activity_create" => (ToolKind::Activity, Verb::Activity),
+            "odoo_note_post" => (ToolKind::Note, Verb::Note),
+            "odoo_message_send" => (ToolKind::Message, Verb::Message),
+            "odoo_attachment_add" => (ToolKind::Attachment, Verb::Attach),
+            _ => (ToolKind::Generic, method_verb(method)),
+        };
+        self.common_operation(kind, verb, model, method)?;
+        // The dedicated tools read the target before writing. This read is
+        // intrinsic to the dedicated grant, but still obeys fixed/company gates.
+        if matches!(kind, ToolKind::Activity | ToolKind::Note | ToolKind::Message | ToolKind::Attachment) {
+            self.common(model, "search_read")?;
+            self.common(model, "fields_get")?;
+        }
+        Ok(())
+    }
+
+    fn common_operation(&self, tool: ToolKind, verb: Verb, model: &str, method: &str) -> Result<(), String> {
+        let op = OdooOp { tool, model, method, verb };
         if let Some(refusal) = fixed_refusal(&op) { return Err(fixed_refusal_message(refusal)); }
         if self.access.always_refuses(&op) {
             return Err(list_refusal_message(&format!("{}：{model}", match op.verb {
@@ -165,7 +248,8 @@ impl ToolPolicy {
         if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
             return super::odoo_generic_write::generic_write_model_gate(Some(&self.agent), &self.global, unblock, verb, model).is_ok();
         }
-        if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview") {
+        if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview"
+            | "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add") {
             let kind = if method_verb(method) == Verb::Read { duduclaw_odoo::AccessKind::Read } else { duduclaw_odoo::AccessKind::Mutate };
             if duduclaw_odoo::check_blocklist(model, kind, unblock).is_err() { return false; }
         }
@@ -204,7 +288,7 @@ impl ToolPolicy {
         }
         if let Some(method) = method { methods = vec![method.to_owned()]; }
         let allowed = candidates.iter().any(|model| methods.iter().any(|method| {
-            self.common(model, method).is_ok()
+            self.common_tool(tool, model, method).is_ok()
                 && (method != "search_read" || self.common(model, "fields_get").is_ok())
                 && self.pure(tool, class, Some(model), Some(method), false)
                 && (self.prospective_follow() || self.engine_model(tool, model, method))
@@ -226,7 +310,7 @@ impl ToolPolicy {
     pub fn precheck(&self, tool: &str, params: &Value) -> Result<(), String> {
         let (_, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
         if let (Some(model), Some(method)) = (model, method) {
-            self.common(model, method)?;
+            self.common_tool(tool, model, method)?;
             if method == "search_read" { self.common(model, "fields_get")?; }
         }
         for (model, method) in self.auxiliary(tool) { self.common(model, method)?; }
@@ -234,9 +318,10 @@ impl ToolPolicy {
     }
 
     pub fn check_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
+        if self.person_key { return self.check_person_call(tool, params, decision); }
         let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
         if let (Some(model), Some(method)) = (model, method) {
-            self.common(model, method)?;
+            self.common_tool(tool, model, method)?;
             if method == "search_read" { self.common(model, "fields_get")?; }
         }
         let permission = decision.map_or(IdentityPermission::Engine, |d| d.permission);
@@ -247,6 +332,9 @@ impl ToolPolicy {
             return Err(DENIED.into());
         }
         if permission == IdentityPermission::Engine {
+            if tool == "odoo_activity_create" && params.get("user_id").is_some() {
+                return Err("引擎模式不接受 user_id；活動只能指派給連線帳號本人。".into());
+            }
             if let (Some(model), Some(method)) = (model, method) {
                 if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
                     let unblock = self.agent.unblock_models.as_ref().unwrap_or(&self.global.unblock_models);

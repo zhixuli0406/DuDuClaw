@@ -56,6 +56,10 @@ impl MethodHandler {
             "autopilot.affecting_me" => {
                 boxed_frame(|| self.handle_autopilot_affecting_me(params, ctx)).await
             }
+            method if method.split('.').next() == Some("skill_trust") => {
+                require_admin!();
+                boxed_frame(|| self.handle_skill_trust_rpc(method, params, ctx, conn)).await
+            }
             "autopilot.create" => {
                 boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }

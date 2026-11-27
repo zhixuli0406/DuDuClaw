@@ -152,7 +152,7 @@ pub(in crate::google_identity) async fn mint_delegate_for_drive_write(
     let key = super::protection_gate_async(home).await?;
     let home = home.to_path_buf();
     let sa_key = tokio::task::spawn_blocking(move || delegation_key::load(&home, &key))
-        .await.map_err(|_| Refusal::hard("credential_protection", "讀取服務帳號金鑰中斷，請稍後再試。"))??;
+        .await.map_err(|_| Refusal::hard("credential_protection", "無法使用公司 Google 連線，這次沒有執行，請管理員檢查連線後再試。"))??;
     validate_drive_write_mint(sa::mint_for_subject(
         &sa_key, email, super::delegated_scopes::for_drive_write(), mode,
     ).await, email)
@@ -160,7 +160,7 @@ pub(in crate::google_identity) async fn mint_delegate_for_drive_write(
 
 pub(in crate::google_identity) fn drive_write_admin_scope_missing() -> Refusal {
     Refusal::hard("drive_write_admin_scope_missing",
-        "公司管理員還沒在 Google 管理控制台開放雲端硬碟寫入範圍。")
+        "公司管理員尚未允許雲端硬碟寫入，這次沒有執行，請公司管理員在 Google 管理控制台開放寫入權限。")
 }
 
 pub(in crate::google_identity) fn validate_drive_write_mint(
@@ -194,7 +194,7 @@ pub async fn resolve_person(
     if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,"google_remote_mcp").await {
         return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
     }
-    resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes)).await
+    resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes), None).await
 }
 
 pub async fn resolve_person_for_tool(
@@ -204,23 +204,33 @@ pub async fn resolve_person_for_tool(
     people: &dyn People,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    resolve_token_route(home, agent, requester, people, tool, None).await
+}
+
+/// The bearer route lends its shared lease so refresh can release it before
+/// waiting on grant work, then revalidate the original Personal selection.
+pub(crate) async fn resolve_token_route(
+    home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
+    tool: &str, authority: Option<&mut Option<duduclaw_core::authority_coordinator::SharedLease>>,
+) -> Result<Resolved, Refusal> {
     if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,tool).await {
         // A missing own-account purpose pauses this live human turn before
         // any configured home-account fallback can execute the task.
         return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
     }
-    resolve_person_scoped(home, agent, requester, people, tool, None).await
+    resolve_person_scoped(home, agent, requester, people, tool, None, authority).await
 }
 
 /// Scopes originate only in the gateway's pinned employee context.
 pub(crate) async fn resolve_employee_scoped(home: &Path, agent: &str, requester: &RequesterIdentity,
     people: &dyn People, tool: &str, scopes: &[&str]) -> Result<Resolved, Refusal> {
-    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes)).await
+    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes), None).await
 }
 
 async fn resolve_person_scoped(
     home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
     tool: &str, endpoint_scopes: Option<&[&str]>,
+    authority: Option<&mut Option<duduclaw_core::authority_coordinator::SharedLease>>,
 ) -> Result<Resolved, Refusal> {
     if !crate::google_personal::scopes::token_tool(tool) {
         return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
@@ -238,7 +248,7 @@ async fn resolve_person_scoped(
     let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
         let outcome =
-            crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool)
+            crate::google_personal::access::resolve_with_authority(home, agent, requester, people, &eff, tool, authority)
                 .await;
         return match outcome {
             // v1.81 E3: inside an isolated request the only home fallback is

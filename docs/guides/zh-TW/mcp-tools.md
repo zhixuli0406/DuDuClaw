@@ -191,7 +191,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 |---|---|---|
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個舊白名單工具加上明確授予 scope 的工具，接著再套下一列的 scope 規則 |
 | 非員工呼叫者的 scope | `principal.scopes`，適用於不持有 `admin`、也不是 AI 員工的金鑰（不是 gateway 內部金鑰、不是單一員工金鑰、也不是 gateway 為員工啟動的行程） | 只列金鑰持有其最低 scope 的工具；替行程本身的 agent 動作的工具（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` 與三個整併狀態查詢等）不列，對所有外部金鑰也不列；呼叫時 dispatch 閘依同一條規則拒絕（`process_agent_tool`）。見 [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 29 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
+| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 38 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
 | Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 29 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
@@ -281,6 +281,12 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 這些提示給 MCP 用戶端參考（例如呼叫前要不要先問人），不代表任何授權，DuDuClaw 的每道閘門照常檢查。它們不計入上面的說明字數預算：Claude Code 與 Codex 交給模型的工具清單只有名稱、說明與輸入 schema。
 
 ## 從說明搬出來的長版細節
+
+### `tasks_create` 排程
+
+cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未設定或無效時改用 UTC，並在確認訊息說明。公司時區有夏令時間時，成員建立的例行工作以 UTC 儲存並提示。一次性 `schedule` 時間必須包含 UTC 偏移，例如 `2026-11-28T09:00:00+08:00`。
+
+
 
 ### `tasks_create`／`tasks_update` — 目標費用上限
 
@@ -442,6 +448,8 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 每次最多保留 **400 個模型、每模型 500 個欄位**。中繼資料與欄位探索上限 **5 分鐘**，`fields_get` 同時最多四個；帳號權限探測另外設 30 秒整體上限。優先順序為內建工具模型、已安裝業務模組的模型（CRM、銷售、採購、庫存、會計、專案、人資、製造、客服及網站），其餘按名稱排序。逾時會標記不完整；身分、版本與模組未變時，下輪沿用已取得的完整欄位，接續處理未完成模型。模組／模型目錄各上限 5,000 筆；不完整的差異不代表資料已刪除。
 
+以下既有通用寫入與結構查詢的員工授權／敏感模型限制適用於引擎模式。依 Odoo 帳號模式改用本人 Odoo 權限，仍保留公司功能開關及共同拒絕規則。
+
 ### `odoo_create` / `odoo_write`：通用新增與修改（v1.81.0）
 
 - `odoo_create {model, values}` 新增一筆紀錄並回傳 ID；`odoo_write {model, ids, values}` 修改 1–100 筆紀錄（重複 ID 只算一次）並回傳 `ok`。兩者都需要 **`odoo:write`**，效果類別為 `modify`，`action_rules`、審批清單與探索通道的規則與 `odoo_crm_create_lead` 相同。
@@ -535,8 +543,94 @@ Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App �
 
 `google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
 
-個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。新增服務同意會明列已同意的一般服務，再加上 `https://www.googleapis.com/auth/chat.messages.create`，不要求 Google 自動合併先前授權；必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
 
 每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
 
 Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。
+
+## 管理員 AI 設定
+
+`admin_settings_read` 讀取管理員 AI 功能開放的日常設定；`admin_settings_propose` 只會建立待檢視的確認卡，不會直接套用變更。兩者只在符合資格的管理員本人親自參與、且使用其專屬 AI 分身的對話中提供。只有私訊或已登入的 WebChat 能提出變更。群組讀取不包含排程提示全文與技能說明。管理員必須先閱讀風險說明並確認後啟用功能。每份提案即使只有一項，也必須由提出者在十分鐘內到儀表板收件匣確認。
+
+此功能可修改一般資料、模型、執行上限、定時喚醒、純提示型排程及已安裝技能的啟用狀態。權限、通道與憑證、隔離、執行引擎、預算放寬、組織與委派權限、外部工具連線、人格與工作合約、刪除員工及安裝外部技能仍只能在儀表板處理。
+
+AI 呼叫者使用 `agent_update` 時只能調低預算；調高預算及其他受保護的安全設定會遭拒。新增資料庫來源會建立只能由管理員在儀表板決定的核准卡；移除來源仍可作為權限縮減。這些限制適用於所有委派政策，包括 `open`。
+
+## 雲端硬碟寫入工具
+
+這九個原生工具需要 `google:write`。管理員分別決定是否開放建立、修改、搬移與移到垃圾桶，四項預設全關。開啟動作或放寬規則前，須明確確認了解風險，系統會記錄管理員與時間；這項設定變更不要求額外重新登入。儀表板控制項會隨本版設定頁交付，目前 Google 整合與個人寫入連線區塊尚未提供。
+
+每項動作預設由成員本人確認。管理員可逐項關閉確認，也可要求本人確認後再由管理員核准。本人確認有效五分鐘，只有該成員可以決定；工具允許清單、Admin 權杖與工作流程常駐授權都不能代替。需要確認時，排程與背景工作會被拒絕。使用本人連線或委派給主要擁有者時，請求者必須是帳號持有人；公司共用帳號與固定委派則由已驗證的請求成員確認。
+
+| 工具 | 參數與結果 | 動作開關 | 效果類別 |
+|---|---|---|---|
+| `drive_create_file` | 必填 `name`，選填 `parent_folder_id`。`text`（最多 100,000 字元）、`attachment`（這次對話的附件檔名）、`folder=true` 三選一。選填 `convert_to`：`document`／`spreadsheet`；`mime_type`：`text/plain`／`text/csv`／`text/markdown`。建立檔案或資料夾。 | 建立 | Publish |
+| `drive_copy_file` | 必填 `file_id`、`parent_folder_id`，選填 `name`。將可讀取的來源檔案複製到目的資料夾。 | 建立 | Publish |
+| `drive_update_file` | 必填 `file_id`；`name`、`description`、`text` 至少一項。改名、修改說明或取代文字內容（最多 100,000 字元，只限非 Google 格式文字檔）。 | 修改 | Modify |
+| `drive_move_file` | 必填 `file_id`、`destination_folder_id`。在同一雲端硬碟內搬移，原有上層位置由 Google 讀取。 | 搬移 | Publish |
+| `drive_trash_file` | 必填 `file_id`。只移到垃圾桶。 | 移到垃圾桶 | Delete |
+| `docs_insert_text` | 必填 `document_id`、`text`（1～20,000 字元）。位置三選一：`at="start"`、`at="end"`、`after_text`（全文唯一的定位文字，1～1,000 字元）；選填 `tab_id`。 | 修改 | Modify |
+| `docs_format` | 必填 `document_id`、`operations`（1～50 項）。支援段落與文字樣式、表格儲存格背景、頁首與新增文件分頁，細節見下方。 | 修改 | Modify |
+| `sheets_add_sheet` | 必填 `spreadsheet_id`、`title`，選填 `copy_from_sheet`（既有分頁名稱）。在同一試算表新增空白分頁或複製分頁。 | 修改 | Modify |
+| `sheets_add_note` | 必填 `spreadsheet_id`、`range`（A1，最多 1,000 格）、`note`（最多 5,000 字元，空字串會清除）。設定儲存格註解，不建立討論串留言。 | 修改 | Modify |
+
+ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `parent_folder_id` 代表「我的雲端硬碟」根目錄，只能在資料夾清單為空時使用。上傳只接受這輪對話附上的檔案，最多 5 MB（5 MiB），不接受任意本機路徑或員工工作資料夾中的檔案。可選擇轉成 Google 文件或試算表。不提供永久刪除、清空垃圾桶、分享或變更權限。
+
+`docs_format` 每項操作使用 `type`，並只接受對應欄位：
+
+- `paragraph_style`：`text` 為唯一定位文字；`named_style` 可用 `NORMAL_TEXT`、`TITLE`、`SUBTITLE`、`HEADING_1`～`HEADING_6`；選填 `alignment`（`START`、`CENTER`、`END`、`JUSTIFIED`）。
+- `text_style`：唯一的 `text`，以及 `bold`、`italic`、`underline`、`font_size_pt`（6～96）至少一項。
+- `table_cell_style`：從零起算的 `table_index`（0～99）、`row`（0～499）、`column`（0～49），以及 `background_hex`（`#RRGGBB`）。
+- `header`：`text`（最多 1,000 字元）。
+- `add_tab`：`title`（1～100 字元）。
+
+### 資料夾規則與限制
+
+管理員可列出資料夾或整個共用雲端硬碟。檔案位於清單中的共用雲端硬碟內，即符合範圍；其餘情況，每一條上層路徑都須在十二層內到達清單中的資料夾。上層無法讀取、目標或上層已在垃圾桶、超出檢查上限，或 Google 權限不足，都會拒絕操作。每次呼叫連同重新檢查，最多讀取十六次中繼資料。
+
+建立與複製檢查目的資料夾；複製來源須可讀取且未在垃圾桶。修改、搬移與移到垃圾桶會檢查目標位置。清單上的資料夾本身不能改名、搬移或丟進垃圾桶。搬移的來源與目的都須在範圍內，不能跨「我的雲端硬碟」與共用雲端硬碟，也不能跨不同共用雲端硬碟。捷徑不能列入允許資料夾或當作目的位置；修改會拒絕捷徑，搬移與丟垃圾桶只作用於捷徑本身，依捷徑自己的上層位置檢查，不跟隨原始檔案。
+
+資料夾清單為空時，建立與修改可在帳號能寫入的任何位置執行；搬移與移到垃圾桶不能使用。寫入前後都會檢查資料夾，核准後也會再查一次。這是盡力檢查：Google 本身沒有資料夾允許清單，檢查期間仍可能有其他人變更位置。事後發現超出範圍會通知管理員；無法完成的檢查也會記錄。每次嘗試（含拒絕與結果不明）都留紀錄，不記檔案內容與權杖。結果不明不會自動重試，請先到 Google 確認再要求寫入。
+
+既有 `docs_append`、`docs_create`、`docs_replace_text`、`sheets_append`、`sheets_create`、`sheets_update` 沿用原本的授權規則，不受這四項開關與資料夾規則控制。上表四個新增的 Docs／Sheets 工具歸入「修改」。Google 官方 Drive 遠端 MCP 永遠拿不到完整 Drive 權限的權杖；這九個寫入工具只在主 gateway 行程內執行。
+
+帳號需求見[連線設定](google-setup.md)與[個人寫入同意](google-personal-connections.md)。Google OAuth 隔離與撤銷、委派範圍、文件分頁、格式轉換、共用雲端硬碟角色及私訊確認送達仍待實際帳號驗收；本文不代表這些項目已通過驗證。
+
+## 人工具與 Odoo 權限（v1.86.0）
+
+本人金鑰只提供下列工具，並與金鑰範圍、管理員目前的 `allow_mcp_scopes` 取交集：
+
+| 範圍 | 工具 |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`：目前有權查看的任務，預設 50 筆、範圍 1～200；結果受限或省略時以 `truncated` 標示。 |
+| `agents:status` | `my_agents_status {}`：可見員工的 ID、名稱、狀態與 `can_call`。 |
+| `odoo:read` | `odoo_search`、`odoo_crm_leads`、`odoo_sale_orders`、`odoo_inventory_products`、`odoo_inventory_check`、`odoo_invoice_list`、`odoo_payment_status`、`odoo_partner_search`、`odoo_schema_overview`、`odoo_schema_fields`、`odoo_status`。 |
+| `odoo:write` | `odoo_create`、`odoo_write`、`odoo_activity_create`、`odoo_note_post`，須已確認啟用 `follow_odoo_account`。 |
+
+工具依持有人目前權限執行。Odoo 只用本人已連接的帳號，不借用員工或公司憑證。`odoo_execute`、`odoo_report`、`odoo_connect`、`odoo_message_send`、`odoo_attachment_add` 及 CRM／銷售專用修改工具不在本人金鑰子集中。兩個 `my_*` 工具只供本人金鑰，不是員工工具。
+
+### 四個 Odoo 專用寫入工具
+
+四者都需要 `odoo:write`，目標記錄必須存在且可讀。文字採純文字、HTML 跳脫，不接受提及或呼叫者指定的收件人清單。
+
+| 工具／參數 | 用途 |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | 建立活動，文字欄位各限 10,000 字元，期限格式 `YYYY-MM-DD`，預設類型 `mail.mail_activity_data_todo`。引擎模式指派給連線帳號，只有依 Odoo 帳號模式接受 `user_id`。 |
+| `odoo_note_post {model, res_id, body}` | 新增內部備註，本文限 10,000 字元。 |
+| `odoo_message_send {model, res_id, body}` | 通知記錄追蹤者，本文限 10,000 字元；每次都須綁定完整內容的人工核准，且須有員工身分。 |
+| `odoo_attachment_add {model, res_id, file, name?}` | 從呼叫員工自己的附件資料夾建立私人附件。不接受內嵌／base64、絕對路徑、路徑跳脫、符號連結或共用資料夾。接受經內容驗證且格式相符的 PDF、PNG、JPEG、WebP、UTF-8 TXT／CSV、OOXML XLSX／DOCX／PPTX。原檔及編碼後檔案都須符合 `attachment_max_mb`（預設 10 MiB、範圍 1～25）。須有員工身分。 |
+
+引擎模式須在 `allowed_models` 明列目標，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`，空清單不授權。依 Odoo 帳號模式以本人 Odoo 帳號權限取代員工模型／動作授權及引擎敏感模型封鎖清單；公司功能開關、`always_refuse`、固定拒絕、輸入檢查、核准與 Odoo ACL 仍適用。公司／AI 自有帳號仍用引擎模式。員工 `permission_override=engine` 保留引擎模式，`read_only` 移除寫入。全域 Follow 缺少有效管理員確認時退回引擎模式。
+
+`always_refuse` 預設：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。規則可用完整模型、`*` 或 `ir.*` 等點號子模型；`method:<name>` 精確比對方法。專用工具以目標模型與 `activity:`、`note:`、`message:`、`attach:` 動作比對。
+
+| 規則 | 固定拒絕的操作 |
+| --- | --- |
+| F1 | 修改、刪除 `ir.attachment`，或透過通用工具新增附件。新增附件請用 `odoo_attachment_add`，從檔案建立。 |
+| F2 | 修改 `ir.model`、所有 `ir.model.*` 子模型及 `ir.rule`。 |
+| F3 | 修改 `res.users.apikeys` 及其點號分隔的子模型。 |
+| F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
+| F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |
+
+所有會修改資料的 `odoo_execute` 與 `action_*`、`button_*`、`toggle_*` 方法，在所有模式都須人工核准；`odoo_message_send` 也一律須核准。Allow 規則不能略過核准或拒絕規則；核准只用一次，綁定工具與完整參數。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。

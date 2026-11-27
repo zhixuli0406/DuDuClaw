@@ -648,7 +648,7 @@ mod tests {
     fn the_kind_is_dashboard_only_with_its_own_texts() {
         assert!(crate::approval_notify::is_dashboard_only_kind(ACTION_KIND));
         assert_eq!(crate::approval_notify::dashboard_only_expired_text(ACTION_KIND), EXPIRED_TEXT);
-        let body = crate::approval_notify::dashboard_only_notice_body(&rec(json!({}), "rep"), false);
+        let body = crate::approval_notify::dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &rec(json!({}), "rep"), false);
         assert!(body.contains("組織調整") && body.contains("rep"), "{body}");
         assert!(!body.contains("知識"), "must not be worded as a knowledge review: {body}");
     }

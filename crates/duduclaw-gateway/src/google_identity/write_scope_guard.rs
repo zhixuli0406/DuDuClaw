@@ -8,11 +8,11 @@ pub(crate) fn carries_write_scope(scopes: &[String]) -> bool {
 }
 
 pub(crate) fn write_scope_isolated() -> Refusal {
-    Refusal::hard("write_scope_isolated", "這個 Google 連線已帶有雲端硬碟寫入權限，不能交給工具使用。請到「我的連線」重新連結。")
+    Refusal::hard("write_scope_isolated", "這個 Google 連線目前無法供 AI 使用，這次沒有執行，請帳號本人到「我的連線」重新連結。")
 }
 
 pub(crate) fn scope_unverified() -> Refusal {
-    Refusal::hard("scope_unverified", "Google 沒有回傳這次權杖的授權範圍，為了安全沒有交給工具使用；請稍後再試，若一直發生請重新連結。")
+    Refusal::hard("scope_unverified", "無法確認這個 Google 連線允許哪些操作，這次沒有執行。請稍後再試，若持續發生，請帳號本人重新連結。")
 }
 
 pub(crate) fn check_requested(scopes: &[&str]) -> Result<(), Refusal> {

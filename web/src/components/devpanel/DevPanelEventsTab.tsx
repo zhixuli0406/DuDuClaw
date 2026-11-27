@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -206,11 +207,12 @@ function EventRow({
   readonly onAgentClick: (agentId: string) => void;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const agentName = useAgentsStore((s) => s.agents.find((a) => a.name === event.agent_id)?.display_name || event.agent_id);
   const sourceLabel = intl.formatMessage({ id: `logs.filter.source.${event.source}` });
   const time = (() => {
     try {
-      return new Date(event.timestamp).toLocaleTimeString('zh-TW', {
+      return formatDateTime(event.timestamp, { locale: 'zh-TW',
         hour12: false,
         hour: '2-digit',
         minute: '2-digit',

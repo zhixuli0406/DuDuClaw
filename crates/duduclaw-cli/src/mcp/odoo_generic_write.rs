@@ -47,6 +47,7 @@
 //! run after authentication but before any create / write RPC.
 
 use super::*;
+use super::odoo_actor::OdooActor;
 
 /// Largest accepted `values` object, serialized.
 pub(crate) const GENERIC_WRITE_MAX_VALUES_BYTES: usize = 64 * 1024;
@@ -684,7 +685,7 @@ pub(crate) async fn handle_odoo_generic_write(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    super::odoo_access::sanitize_result(super::odoo_identity_client::with_call(generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None)).await)
+    super::odoo_access::sanitize_result(super::odoo_identity_client::with_call(handle_actor(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None)).await)
 }
 
 /// Protected mode: the same gate chain on the employee's own isolation
@@ -699,17 +700,19 @@ pub(crate) async fn handle_bound_odoo_generic_write(
     caller_agent: &str,
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
 ) -> Value {
-    super::odoo_access::sanitize_result(generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, Some(connector)).await)
+    super::odoo_access::sanitize_result(handle_actor(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector)).await)
 }
 
-async fn generic_write_with_connection(
+pub(super) async fn handle_actor(
     tool: &str,
     params: &Value,
     home_dir: &Path,
     odoo: &OdooState,
-    caller_agent: &str,
+    actor: OdooActor<'_>,
     bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
 ) -> Value {
+    let audit_name = actor.audit_name();
+    let caller_agent = audit_name.as_ref();
     let Some(verb) = generic_write_verb(tool) else {
         return super::egress_gate::pre_dispatch_error(&format!("Odoo: '{tool}' is not offered. {UNAVAILABLE_SUFFIX}"));
     };
@@ -724,14 +727,16 @@ async fn generic_write_with_connection(
     };
     let model = model_name.as_str();
 
-    let policy = match super::odoo_access::ToolPolicy::load(home_dir, caller_agent) {
+    let policy = match actor.policy(home_dir) {
         Ok(policy) => policy, Err(error) => return mcp_error(&error),
     };
-    let cfg = Some(policy.agent.clone());
-    odoo.register_agent(caller_agent, policy.agent.clone()).await;
-    if let Err(error) = odoo.load_global_for_gate(home_dir).await { return mcp_error(&error); }
-    let global = odoo.global_config().await;
-    let unblock_models = odoo.unblock_models(caller_agent).await;
+    let cfg = actor.employee().map(|_| policy.agent.clone());
+    let global = policy.global.clone();
+    let unblock_models = if let Some(agent) = actor.employee() {
+        odoo.register_agent(agent, policy.agent.clone()).await;
+        if let Err(error) = odoo.load_global_for_gate(home_dir).await { return mcp_error(&error); }
+        odoo.unblock_models(agent).await
+    } else { vec![] };
 
     // ── 5. values / ids shape, size, x2many codes, archiving (local) ────
     let args = match parse_generic_write_args(tool, params) {
@@ -748,7 +753,7 @@ async fn generic_write_with_connection(
     let (conn, decision) = if let Some(connector) = bound {
         (connector, None)
     } else {
-        match super::odoo::connect_odoo_pool_checked(home_dir, odoo, caller_agent, tool, params).await {
+        match actor.connect(home_dir, odoo, tool, params).await {
             Ok((conn, identity)) => (conn, Some(identity)),
             Err(error) => return mcp_error(&error),
         }
@@ -756,11 +761,8 @@ async fn generic_write_with_connection(
     if conn.verify_io().is_err() {
         return mcp_error("Odoo authority revoked");
     }
-    let profile = match &decision {
-        Some(identity) => match odoo.key_for_identity(caller_agent, identity).await {
-            Ok(key) => key.1, Err(error) => return mcp_error(&error),
-        },
-        None => odoo.pool_key(caller_agent).await.1,
+    let profile = match actor.profile(odoo, decision.as_ref()).await {
+        Ok(profile) => profile, Err(error) => return mcp_error(&error),
     };
 
     let follow = super::odoo_access::follows(decision.as_ref());
@@ -868,6 +870,11 @@ async fn generic_write_with_connection(
             Err(error) => Err(error),
         },
     }}).await;
+    if follow || actor.employee().is_none() || super::odoo_identity_client::sensitive_model(model) {
+        let raw = match &result { Ok(text) | Err(text) => text.as_str() };
+        super::odoo_identity_client::audit_result(home_dir, caller_agent, tool, params,
+            result.is_ok(), raw, true);
+    }
     let result = result.map(|text| format!("{text}\n{}", super::odoo_access::identity_suffix(decision.as_ref(), verb)));
     let fields: Vec<&str> = args.values.keys().map(String::as_str).collect();
     let summary = format!(
@@ -882,6 +889,7 @@ async fn generic_write_with_connection(
         Ok(text) => text.clone(),
         Err(error) => format!("error class={}; length={}", error_class(error), error.len()),
     };
+    if !follow && actor.employee().is_some() && !super::odoo_identity_client::sensitive_model(model) {
     super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
@@ -890,6 +898,7 @@ async fn generic_write_with_connection(
         result.is_ok(),
         Some(result_text.as_str()),
     );
+    }
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
         Err(error) => serde_json::json!({

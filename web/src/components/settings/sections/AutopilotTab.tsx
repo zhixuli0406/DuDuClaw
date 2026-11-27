@@ -1,3 +1,4 @@
+import { formatDateTime, getCompanyTimeZone, useCompanyTimeZone, zoneLabel } from '@/lib/company-time';
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
@@ -26,6 +27,7 @@ import { AutopilotRuleDialog, useActionLabel, useTriggerLabel } from './Autopilo
 
 export function AutopilotTab() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [rules, setRules] = useState<AutopilotRule[]>([]);
   const [loading, setLoading] = useState(true);
   // P05: `setRules([])` on failure made a broken fetch look like "no rules
@@ -141,6 +143,7 @@ export function AutopilotTab() {
         />
       ) : (
         <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'companyTime.displayZone' }, { zone: zoneLabel(getCompanyTimeZone()) })}</p>
           {rules.map((rule) => (
             <Card key={rule.id} className="gap-3 p-5">
               <div className="flex items-start justify-between">
@@ -201,7 +204,7 @@ export function AutopilotTab() {
                 <span>{intl.formatMessage({ id: 'autopilot.triggerCount' }, { count: rule.trigger_count })}</span>
                 {rule.last_triggered_at && (
                   <span>
-                    {intl.formatMessage({ id: 'autopilot.lastTriggered' })}: {new Date(rule.last_triggered_at).toLocaleString('zh-TW')}
+                    {intl.formatMessage({ id: 'autopilot.lastTriggered' })}: {formatDateTime(rule.last_triggered_at, { locale: intl.locale })}
                   </span>
                 )}
               </div>
@@ -277,11 +280,12 @@ function AutopilotHistoryDialog({
   onClose: () => void;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>{intl.formatMessage({ id: 'autopilot.history' })}</DialogTitle>
+          <DialogTitle>{intl.formatMessage({ id: 'autopilot.history' })}{' '}{intl.formatMessage({ id: 'companyTime.zoneSuffix' }, { zone: zoneLabel(getCompanyTimeZone()) })}</DialogTitle>
         </DialogHeader>
         <div className="max-h-[400px] space-y-2 overflow-y-auto">
           {error != null ? (
@@ -303,7 +307,7 @@ function AutopilotHistoryDialog({
               >
                 <div>
                   <span className="text-sm text-foreground">
-                    {new Date(entry.triggered_at).toLocaleString('zh-TW')}
+                    {formatDateTime(entry.triggered_at, { locale: intl.locale })}
                   </span>
                   {entry.details && (
                     <p className="mt-0.5 text-xs text-muted-foreground">{entry.details}</p>

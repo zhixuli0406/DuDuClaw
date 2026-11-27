@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
@@ -182,6 +183,7 @@ function DoctorRow({ check }: { check: OsDoctorCheck }) {
 // ── Main page ───────────────────────────────────────────────────────────────
 
 export function OSPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const t = useCallback(
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
@@ -385,7 +387,7 @@ export function OSPage() {
   }, [t]);
 
   const formatTs = (iso: string) =>
-    new Date(iso).toLocaleString('zh-TW', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    formatDateTime(iso, { locale: 'zh-TW', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 
   return (
     <TooltipProvider delay={500}>
