@@ -30,17 +30,19 @@ impl Fixture {
         let env = DecisionEnv { home: home.path().to_path_buf(), registry: None,
             broker: ApprovalBroker::open(home.path()).unwrap(), users: Some(db) };
         let f = Self { _home: home, env, user: user.id, ack: ack.id };
-        f.config(true, "telegram", &[]);
+        // Effect/receipt tests explicitly exempt all T2 kinds; default policy
+        // is exercised separately with an empty exemption list.
+        f.config(true, "telegram", chat_admin::STEP_UP_KIND_KEYS);
         crate::knowledge::test_fixtures::agent(&f.env.home, "support", "[agent]\nname='support'\n");
         f
     }
 
-    pub(crate) fn config(&self, enabled: bool, channel: &str, step_up: &[&str]) {
+    pub(crate) fn config(&self, enabled: bool, channel: &str, exempt: &[&str]) {
         // Local discovery treats encrypted credentials as configured. An
         // intentionally undecryptable fixture prevents notification HTTP calls.
         std::fs::write(self.env.home.join("config.toml"), format!(
-            "[channels]\ntelegram_bot_token_enc='invalid-encrypted-fixture'\n[approval.chat_admin]\nenabled={enabled}\nchannels=['{channel}']\nstep_up_kinds={}\nenabled_ack={{by='{}',at='2026-11-27T00:00:00Z'}}\n",
-            serde_json::to_string(step_up).unwrap(), self.ack,
+            "[channels]\ntelegram_bot_token_enc='invalid-encrypted-fixture'\n[approval.chat_admin]\nenabled={enabled}\nchannels=['{channel}']\nstep_up_exempt_kinds={}\nenabled_ack={{by='{}',at='2026-11-27T00:00:00Z'}}\n",
+            serde_json::to_string(exempt).unwrap(), self.ack,
         )).unwrap();
     }
 
@@ -238,12 +240,39 @@ async fn removed_configured_account_refused() {
 }
 
 #[tokio::test]
+async fn all_t2_kinds_require_step_up_by_default_and_exemptions_are_exact() {
+    let f = Fixture::new();
+    for key in chat_admin::STEP_UP_KIND_KEYS {
+        let kind = if *key == "egress_guard" { "other_outgoing" } else { *key };
+        let id = f.simple(kind).await;
+        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+        let proof = f.proof(&id).await;
+        f.config(true, "telegram", &[]);
+        assert!(matches!(identity::authorize(&f.env, &rec, true, &proof).await,
+            Err(DecisionRefusal::StepUpRequired)), "{key}");
+        assert!(!identity::authorize(&f.env, &rec, false, &proof).await.unwrap().step_required);
+        f.config(true, "telegram", &[*key]);
+        assert!(!identity::authorize(&f.env, &rec, true, &proof).await.unwrap().step_required);
+        let other = chat_admin::STEP_UP_KIND_KEYS.iter().copied().find(|other| other != key).unwrap();
+        f.config(true, "telegram", &[other]);
+        assert!(matches!(identity::authorize(&f.env, &rec, true, &proof).await,
+            Err(DecisionRefusal::StepUpRequired)), "{key}");
+    }
+    f.config(true, "telegram", &[]);
+    for kind in [crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE, sources::ACTION_KIND] {
+        let id = f.simple(kind).await;
+        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+        assert!(!identity::authorize(&f.env, &rec, true, &f.proof(&id).await).await.unwrap().step_required);
+    }
+}
+
+#[tokio::test]
 async fn step_up_kind_with_tap_requires_step_but_denial_does_not() {
     let f = Fixture::new();
     let kind = crate::expert_skills::SKILLS_ACTION_KIND;
     let id = f.simple(kind).await;
     let proof = f.proof(&id).await;
-    f.config(true, "telegram", &[kind]);
+    f.config(true, "telegram", &[]);
     let by = Decider::ChatAdmin(proof);
     assert!(matches!(decide(&f.env, &id, true, "", &by).await, Err(DecisionRefusal::StepUpRequired)));
     assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
@@ -437,7 +466,7 @@ async fn bound_egress_uses_verified_admin_and_receipt() {
 #[tokio::test]
 async fn bound_activation_service_reports_submitter_and_web_step() {
     let f = Fixture::new();
-    f.config(true, "telegram", &[crate::approval::WORKFLOW_ACTIVATION_KIND]);
+    f.config(true, "telegram", &[]);
     for submitter in [&f.user, &f.ack] {
         let id = f.bound(json!({"kind":crate::approval::WORKFLOW_ACTIVATION_KIND}), submitter).await;
         let mut proof = f.proof(&id).await;
@@ -821,7 +850,7 @@ async fn org_change_chat_proposer_cannot_self_approve_but_can_deny() {
 #[tokio::test]
 async fn file_change_step_up_tap_refused_and_web_succeeds() {
     let f = Fixture::files_org().await;
-    f.config(true, "telegram", &[crate::agent_files::approval::ACTION_KIND]);
+    f.config(true, "telegram", &[]);
     let id = f.file_change().await;
     let mut proof = f.proof(&id).await;
     assert!(matches!(Box::pin(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof.clone()))).await,

@@ -207,6 +207,35 @@ async fn unbound_admin_old_card_refused() {
 }
 
 #[tokio::test]
+async fn proof_revoked_admin_old_card_refused_without_unbinding() {
+    let f = Fixture::new().await;
+    assert!(f.service.db().clear_approval_proof(&f.service.user, "telegram", &f.context.principal_id).unwrap());
+    assert_eq!(f.service.db().find_verified_user_id_by_channel("telegram", &f.context.principal_id).unwrap(),
+        Some(f.service.user.clone()));
+    f.refused("forbidden").await;
+    assert_eq!(f.saved_receipt().await.status, "live");
+}
+
+#[tokio::test]
+async fn unsupported_adapter_press_with_matching_proof_and_receipt_is_refused() {
+    for channel in ["line", "slack", "discord"] {
+        let mut f = Fixture::new().await;
+        // Include Telegram so filtering does not simply disable the feature.
+        f.service.config(true, &format!("telegram','{channel}"), &[]);
+        f.context.channel = channel.into();
+        f.origin.account = channel.into();
+        rusqlite::Connection::open(f.service.env.home.join("users.db")).unwrap().execute(
+            "UPDATE channel_identities SET channel=?1, proof_account=?1 WHERE user_id=?2",
+            rusqlite::params![channel, f.service.user]).unwrap();
+        f.service.env.broker.store.conn.lock().await.execute(
+            "UPDATE chat_admin_cards SET channel=?1, account=?1,
+                message_id=CASE WHEN ?1='line' THEN NULL ELSE message_id END WHERE card_id=?2",
+            rusqlite::params![channel, f.receipt.card_id]).unwrap();
+        f.refused("feature_off").await;
+    }
+}
+
+#[tokio::test]
 async fn double_press_executes_once() {
     let f = Fixture::with_kind(true).await;
     let (first, second) = tokio::join!(f.press(), f.press());
@@ -226,7 +255,7 @@ async fn double_press_executes_once() {
 #[tokio::test]
 async fn step_up_approve_is_stub_but_deny_decides() {
     let mut f = Fixture::new().await;
-    f.service.config(true, "telegram", &[crate::expert_skills::SKILLS_ACTION_KIND]);
+    f.service.config(true, "telegram", &[]);
     let outcome = f.refused("step_up_required").await;
     assert!(outcome.reply.starts_with("這類審批請到儀表板核准"));
     assert_eq!(outcome.card_text.as_ref(), Some(&outcome.reply));
@@ -328,7 +357,7 @@ async fn dashboard_decision_retires_old_chat_card() {
     let f = Fixture::new().await;
     let user = f.service.db().live_user_context(&f.service.user).unwrap().unwrap();
     decision_service::decide(&f.service.env, &f.row.id, true, "", &Decider::Dashboard(user)).await.unwrap();
-    super::super::sync::collapse_after_decision(&f.ctx.home_dir, &f.row, true, None, "儀表板").await;
+    super::super::sync::collapse_after_decision(&f.ctx.home_dir, &f.row, true, None).await;
     assert_eq!(f.saved_receipt().await.status, "retired");
     let reply = f.press().await;
     assert_eq!(reply.refused_reason, Some("receipt_not_live"));

@@ -216,12 +216,12 @@ impl MethodHandler {
                 }
                 Request::Remove { channel, principal } => {
                     let proof = db.approval_proofs(user).map_err(|_| UNAVAILABLE)?.into_iter()
-                        .find(|p| p.channel == channel && p.channel_user_id == principal);
-                    if !db.unbind_channel_identity_authorized(user, &channel, &principal, user)
+                        .find(|p| p.channel == channel && p.channel_user_id == principal).ok_or(NOT_FOUND)?;
+                    if !db.clear_approval_proof(user, &channel, &principal)
                         .map_err(|_| UNAVAILABLE)? { return Err(NOT_FOUND); }
-                    audit(&db, &home, user, "channel_identity_unbound", &channel, &otp::mask_target(&principal),
-                        proof.as_ref().map(|p| p.proof_account.as_str()))?;
-                    Ok(json!({"removed": true}))
+                    audit(&db, &home, user, "channel_identity_proof_revoked", &channel, &otp::mask_target(&principal),
+                        Some(&proof.proof_account))?;
+                    Ok(json!({"revoked": true}))
                 }
             }
         }).await;

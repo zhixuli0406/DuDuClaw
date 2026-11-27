@@ -194,10 +194,29 @@ async fn chat_link_status_list_and_remove_keep_owner_scope() {
     let remove = json!({"channel": "telegram", "channel_user_id": PRINCIPAL});
     assert!(!ok(&call(&handler, &other, SESSION_A, "me.chat_link.remove", remove.clone()).await));
     let generation = db.live_user_context(&ctx.user_id).unwrap().unwrap().acl_generation;
-    assert!(ok(&call(&handler, &ctx, SESSION_A, "me.chat_link.remove", remove).await));
+    assert_eq!(payload(call(&handler, &ctx, SESSION_A, "me.chat_link.remove", remove.clone()).await),
+        json!({"revoked": true}));
+    let repeat = call(&handler, &ctx, SESSION_A, "me.chat_link.remove", remove).await;
+    assert!(!ok(&repeat));
+    assert!(serde_json::to_string(&repeat).unwrap().contains(NOT_FOUND));
+    let rows = db.channel_identities_for_user(&ctx.user_id).unwrap();
+    assert!(rows.iter().any(|row| row.channel == "telegram" && row.channel_user_id == PRINCIPAL && row.verified));
+    assert_eq!(db.find_verified_user_id_by_channel("telegram", PRINCIPAL).unwrap(), Some(ctx.user_id.clone()));
+    let unproven = call(&handler, &ctx, SESSION_A, "me.chat_link.remove",
+        json!({"channel": "googlechat", "channel_user_id": "users/12"})).await;
+    assert!(!ok(&unproven));
+    assert!(serde_json::to_string(&unproven).unwrap().contains(NOT_FOUND));
     assert!(db.approval_proofs(&ctx.user_id).unwrap().is_empty());
     assert!(db.live_user_context(&ctx.user_id).unwrap().unwrap().acl_generation > generation);
-    assert_eq!(db.query_audit_log(Some(&ctx.user_id), Some("channel_identity_unbound"), 10).unwrap().len(), 1);
+    let audit = db.query_audit_log(Some(&ctx.user_id), Some("channel_identity_proof_revoked"), 10).unwrap();
+    assert_eq!(audit.len(), 1);
+    let detail: Value = serde_json::from_str(audit[0].detail.as_deref().unwrap()).unwrap();
+    assert_eq!(detail["user_id"], ctx.user_id);
+    assert_eq!(detail["channel"], "telegram");
+    assert_eq!(detail["masked_principal"], otp::mask_target(PRINCIPAL));
+    assert_eq!(detail["account"], "telegram");
+    assert!(!audit[0].detail.as_deref().unwrap().contains(PRINCIPAL));
+    assert!(db.query_audit_log(Some(&ctx.user_id), Some("channel_identity_unbound"), 10).unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -882,10 +882,8 @@ pub(crate) fn spawn_dashboard_collapse(
 ) {
     let authority = duduclaw_mcp_boundary::io_authority::capture();
     tokio::spawn(async move {
-        let lang = crate::approval::chat_admin::press::language(&home_dir).await;
-        let label = crate::approval::chat_admin::press::words(lang, "儀表板", "Dashboard", "ダッシュボード");
         authority.scope(crate::approval::chat_admin::sync::collapse_after_decision(
-            &home_dir, &rec, approve, decider_name.clone(), &label,
+            &home_dir, &rec, approve, decider_name.clone(),
         )).await;
         let http = reqwest::Client::new();
         let verb = settled_verb_for(&rec, approve);

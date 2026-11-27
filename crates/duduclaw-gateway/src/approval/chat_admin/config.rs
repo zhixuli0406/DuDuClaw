@@ -1,4 +1,6 @@
-use std::path::Path;
+use std::{path::Path, sync::Once};
+
+static UNSUPPORTED_CHANNEL_WARNING: Once = Once::new();
 
 use chrono::{DateTime, FixedOffset, Utc};
 use serde::Deserialize;
@@ -44,7 +46,9 @@ pub(crate) struct EnabledAck {
 pub(crate) struct ChatAdminConfig {
     pub(crate) enabled: bool,
     pub(crate) channels: Vec<ChatChannel>,
-    pub(crate) step_up_kinds: Vec<String>,
+    /// Empty means every T2 kind requires step-up. Changes must go through
+    /// the settings RPC with an audit record. T1 never requires step-up.
+    pub(crate) step_up_exempt_kinds: Vec<String>,
     pub(crate) step_up_methods: Vec<StepMethod>,
     pub(crate) card_valid_hours: u16,
     pub(crate) enabled_ack: Option<EnabledAck>,
@@ -55,7 +59,7 @@ impl Default for ChatAdminConfig {
         Self {
             enabled: false,
             channels: vec![ChatChannel::Telegram, ChatChannel::Googlechat],
-            step_up_kinds: Vec::new(),
+            step_up_exempt_kinds: Vec::new(),
             step_up_methods: vec![StepMethod::Web],
             card_valid_hours: 168,
             enabled_ack: None,
@@ -80,7 +84,7 @@ struct RawAck {
 struct RawConfig {
     enabled: bool,
     channels: Vec<ChatChannel>,
-    step_up_kinds: Vec<String>,
+    step_up_exempt_kinds: Vec<String>,
     step_up_methods: Vec<StepMethod>,
     card_valid_hours: i64,
     enabled_ack: Option<RawAck>,
@@ -92,7 +96,7 @@ impl Default for RawConfig {
         Self {
             enabled: cfg.enabled,
             channels: cfg.channels,
-            step_up_kinds: cfg.step_up_kinds,
+            step_up_exempt_kinds: cfg.step_up_exempt_kinds,
             step_up_methods: cfg.step_up_methods,
             card_valid_hours: i64::from(cfg.card_valid_hours),
             enabled_ack: None,
@@ -104,18 +108,28 @@ impl Default for RawConfig {
 /// Sibling approval settings therefore do not enter this strict schema.
 pub(crate) fn parse(table: Option<&toml::Value>) -> Result<ChatAdminConfig, ConfigError> {
     let Some(table) = table else { return Ok(ChatAdminConfig::default()); };
-    let raw: RawConfig = table.clone().try_into()
+    let mut raw: RawConfig = table.clone().try_into()
         .map_err(|_| ConfigError("invalid approval.chat_admin keys, types or values"))?;
-    if raw.enabled && raw.channels.is_empty() {
-        return Err(ConfigError("enabled chat_admin requires a channel"));
-    }
+    raw.channels.retain(|channel| {
+        if matches!(channel, ChatChannel::Telegram | ChatChannel::Googlechat) { return true; }
+        UNSUPPORTED_CHANNEL_WARNING.call_once(|| {
+            tracing::warn!("chat-admin ignores LINE, Slack and Discord; only Telegram and Google Chat are supported");
+        });
+        false
+    });
+    if raw.channels.is_empty() { raw.enabled = false; }
     for (index, channel) in raw.channels.iter().enumerate() {
         if raw.channels.iter().take(index).any(|previous| previous == channel) {
             return Err(ConfigError("duplicate chat_admin channel"));
         }
     }
-    if raw.step_up_kinds.iter().any(|key| !step_up_selectable(key)) {
-        return Err(ConfigError("step_up_kinds must contain only T2 keys"));
+    for (index, key) in raw.step_up_exempt_kinds.iter().enumerate() {
+        if !step_up_selectable(key) {
+            return Err(ConfigError("step_up_exempt_kinds must contain only T2 keys"));
+        }
+        if raw.step_up_exempt_kinds.iter().take(index).any(|previous| previous == key) {
+            return Err(ConfigError("duplicate step_up_exempt_kinds entry"));
+        }
     }
     if raw.step_up_methods.is_empty() {
         return Err(ConfigError("step_up_methods must not be empty"));
@@ -135,7 +149,7 @@ pub(crate) fn parse(table: Option<&toml::Value>) -> Result<ChatAdminConfig, Conf
     Ok(ChatAdminConfig {
         enabled: raw.enabled,
         channels: raw.channels,
-        step_up_kinds: raw.step_up_kinds,
+        step_up_exempt_kinds: raw.step_up_exempt_kinds,
         step_up_methods: raw.step_up_methods,
         card_valid_hours: raw.card_valid_hours as u16,
         enabled_ack,
@@ -210,7 +224,7 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.channels.iter().map(|channel| channel.as_str()).collect::<Vec<_>>(),
             vec!["telegram", "googlechat"]);
-        assert!(cfg.step_up_kinds.is_empty());
+        assert!(cfg.step_up_exempt_kinds.is_empty());
         assert_eq!(cfg.step_up_methods, vec![StepMethod::Web]);
         assert_eq!(cfg.card_valid_hours, 168);
         assert!(cfg.enabled_ack.is_none());
@@ -223,10 +237,11 @@ mod tests {
         for text in [
             "unknown = true", "enabled = 'true'", "channels = ['unknown']",
             "channels = 'telegram'", "channels = ['Telegram']", "channels = [1]",
-            "channels = ['telegram', 'telegram']", "enabled = true\nchannels = []",
-            "step_up_kinds = ['knowledge_quarantine']",
-            "step_up_kinds = ['knowledge_add_source']", "step_up_kinds = ['unknown']",
-            "step_up_kinds = 'cli_egress'", "step_up_methods = []",
+            "channels = ['telegram', 'telegram']",
+            "step_up_exempt_kinds = ['cli_egress', 'cli_egress']",
+            "step_up_exempt_kinds = ['knowledge_quarantine']",
+            "step_up_exempt_kinds = ['knowledge_add_source']", "step_up_exempt_kinds = ['unknown']",
+            "step_up_exempt_kinds = 'cli_egress'", "step_up_methods = []",
             "step_up_methods = ['unknown']", "step_up_methods = 'web'",
             "card_valid_hours = 0", "card_valid_hours = 721",
             "card_valid_hours = 1.5", "card_valid_hours = '168'",
@@ -243,16 +258,40 @@ mod tests {
     #[test]
     fn valid_settings_and_boundaries() {
         for hours in [1, 720] {
-            let text = format!("enabled = true\nchannels = ['telegram', 'googlechat', 'line', 'slack', 'discord']\nstep_up_methods = ['web', 'dm_totp']\ncard_valid_hours = {hours}\nstep_up_kinds = [{}]",
+            let text = format!("enabled = true\nchannels = ['telegram', 'googlechat', 'line', 'slack', 'discord']\nstep_up_methods = ['web', 'dm_totp']\ncard_valid_hours = {hours}\nstep_up_exempt_kinds = [{}]",
                 super::super::STEP_UP_KIND_KEYS.iter().map(|key| format!("\"{key}\""))
                     .collect::<Vec<_>>().join(","));
             let cfg = parse_text(&text).unwrap();
             assert!(cfg.enabled);
             assert_eq!(cfg.card_valid_hours, hours);
-            assert_eq!(cfg.channels.len(), 5);
+            assert_eq!(cfg.channels, vec![ChatChannel::Telegram, ChatChannel::Googlechat]);
             assert_eq!(cfg.step_up_methods, vec![StepMethod::Web, StepMethod::DmTotp]);
         }
         assert!(parse_text("channels = []").is_ok());
+    }
+
+    #[test]
+    fn unsupported_channels_are_ignored_and_empty_selection_disables() {
+        for channels in ["[]", "['line']", "['slack']", "['discord']", "['line','slack','discord']"] {
+            let cfg = parse_text(&format!("enabled = true\nchannels = {channels}")).unwrap();
+            assert!(!cfg.enabled);
+            assert!(cfg.channels.is_empty());
+        }
+        let cfg = parse_text("enabled = true\nchannels = ['line','googlechat','slack','telegram','discord']").unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.channels, vec![ChatChannel::Googlechat, ChatChannel::Telegram]);
+        assert!(parse_text("channels = ['line', 'unknown']").is_err());
+    }
+
+    #[test]
+    fn old_opt_in_key_is_unknown_and_disables_feature() {
+        let home = tempfile::tempdir().unwrap();
+        for value in ["[]", "['cli_egress']"] {
+            let text = format!("enabled = true\nstep_up_kinds = {value}");
+            assert!(parse_text(&text).is_err());
+            std::fs::write(home.path().join("config.toml"), format!("[approval.chat_admin]\n{text}")).unwrap();
+            assert_eq!(load(home.path()), ChatAdminConfig::default());
+        }
     }
 
     #[test]

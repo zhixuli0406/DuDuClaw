@@ -7,6 +7,11 @@ use duduclaw_security::audit::{AuditEvent, Severity};
 
 fn forbidden() -> DecisionRefusal { DecisionRefusal::Forbidden("請到儀表板處理".into()) }
 
+fn requires_step_up(approve: bool, tier: chat_admin::Tier, key: Option<&str>, exempt: &[String]) -> bool {
+    approve && tier == chat_admin::Tier::T2
+        && key.is_none_or(|key| !exempt.iter().any(|kind| kind == key))
+}
+
 pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, proof: &ChatAdminProof) -> Result<LedgerEntry, DecisionRefusal> {
     let agents = match &env.registry {
         Some(registry) => Some(registry.read().await.list().iter().map(|a| a.config.agent.name.clone()).collect::<Vec<_>>()),
@@ -59,8 +64,8 @@ pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: 
         let accounts = crate::chat_link_intercept::configured_accounts(&home, proof.channel.as_str(), &agents)
             .map_err(|_| forbidden())?;
         if !accounts.iter().any(|account| account.account == proof.account) { return Err(forbidden()); }
-        let step_required = approve && chat_admin::kind_key(&rec)
-            .is_some_and(|key| cfg.step_up_kinds.iter().any(|kind| kind == key));
+        let step_required = requires_step_up(approve, chat_admin::tier(&rec),
+            chat_admin::kind_key(&rec), &cfg.step_up_exempt_kinds);
         if step_required && proof.step == Step::Tap { return Err(DecisionRefusal::StepUpRequired); }
         Ok(LedgerEntry { user_id, channel: proof.channel, step: proof.step, step_required,
             card_id: proof.card_id, digest: proof.digest })
@@ -148,6 +153,20 @@ pub(crate) async fn audit_refusal_reason(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_up_defaults_to_all_t2_and_unknown_t2_keys_fail_closed() {
+        for key in chat_admin::STEP_UP_KIND_KEYS {
+            assert!(requires_step_up(true, chat_admin::Tier::T2, Some(key), &[]));
+            assert!(!requires_step_up(false, chat_admin::Tier::T2, Some(key), &[]));
+            let exempt = vec![(*key).to_owned()];
+            assert!(!requires_step_up(true, chat_admin::Tier::T2, Some(key), &exempt));
+            assert!(requires_step_up(true, chat_admin::Tier::T2, Some("different"), &exempt));
+            assert!(requires_step_up(true, chat_admin::Tier::T2, None, &exempt));
+        }
+        assert!(!requires_step_up(true, chat_admin::Tier::T1, None, &[]));
+        assert!(!requires_step_up(true, chat_admin::Tier::T1, Some("knowledge_quarantine"), &[]));
+    }
 
     #[test]
     fn refusal_audit_is_limited_to_five_per_sender_per_minute() {

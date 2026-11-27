@@ -205,6 +205,30 @@ impl UserDb {
         rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
     }
 
+    /// Revoke only the authenticated caller's self-proof for this exact binding.
+    /// Keep the verified binding for notifications and channel login codes.
+    /// Returns false for an absent, unproven, or differently owned row.
+    pub fn clear_approval_proof(
+        &self, user_id: &str, channel: &str, channel_user_id: &str,
+    ) -> Result<bool, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| format!("revoke approval proof failed: {e}"))?;
+        let changed = tx.execute(
+            "UPDATE channel_identities SET proof_method = NULL, proof_user_id = NULL,
+                proven_at = NULL, proof_account = NULL, proof_dm = NULL
+             WHERE user_id = ?1 AND channel = ?2 AND channel_user_id = ?3
+                AND verified = 1 AND proof_method = 'chat_handshake' AND proof_user_id = user_id
+                AND proof_account IS NOT NULL AND proof_account != ''
+                AND proof_dm IS NOT NULL AND proof_dm != '' AND proven_at IS NOT NULL",
+            params![user_id, channel, channel_user_id],
+        ).map_err(|e| format!("revoke approval proof failed: {e}"))?;
+        if changed == 0 { return Ok(false); }
+        bump_acl_generation(&tx).map_err(|e| format!("revoke approval proof failed: {e}"))?;
+        tx.commit().map_err(|e| format!("revoke approval proof failed: {e}"))?;
+        Ok(true)
+    }
+
     /// Dashboard label for one exact row; missing rows return None. Unknown or
     /// incomplete proof never counts as self-confirmed. No role/bot checks.
     pub fn channel_identity_proof_status(

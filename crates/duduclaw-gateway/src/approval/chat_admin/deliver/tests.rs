@@ -17,7 +17,7 @@ impl Fixture {
         let admin = db.create_user("admin@example.com", "Admin", "fixture-password-only", UserRole::Admin).unwrap().id;
         let ack = db.create_user("ack@example.com", "Ack", "fixture-password-only", UserRole::Admin).unwrap().id;
         let f = Self { home, db, admin, ack };
-        f.config("['telegram','line','googlechat']", "", true, false);
+        f.config("['telegram','googlechat']", "", true, false);
         f
     }
 
@@ -123,9 +123,8 @@ async fn cards_never_target_control_channel_or_group() {
 async fn one_card_per_admin_uses_configured_channel_order() {
     let f = Fixture::new();
     f.prove(&f.admin, "telegram", "123", "123", "telegram");
-    let line = format!("U{}", "1".repeat(32));
-    f.prove(&f.admin, "line", &line, &line, "line");
-    for (channels, expected) in [("['telegram','line']", "telegram"), ("['line','telegram']", "line")] {
+    f.prove(&f.admin, "googlechat", "users/123", "spaces/dm", "googlechat");
+    for (channels, expected) in [("['telegram','googlechat']", "telegram"), ("['googlechat','telegram']", "googlechat")] {
         f.config(channels, "", true, false);
         let rec = f.record();
         let store = ApprovalStore::open_in_memory().unwrap();
@@ -135,19 +134,18 @@ async fn one_card_per_admin_uses_configured_channel_order() {
         assert_eq!(sender.sent.lock().unwrap()[0].1, expected);
         let live = receipts::list_live(&store, &rec.id).await.unwrap();
         assert_eq!(live.len(), 1);
-        assert_eq!(live[0].message_id.is_none(), expected == "line");
+        assert!(live[0].message_id.is_some());
     }
 }
 
 #[tokio::test]
 async fn failed_send_or_missing_message_tries_next_channel_but_success_stops() {
     let f = Fixture::new();
-    f.config("['telegram','line']", "", true, false);
+    f.config("['telegram','googlechat']", "", true, false);
     f.prove(&f.admin, "telegram", "123", "123", "telegram");
-    let line = format!("U{}", "1".repeat(32));
-    f.prove(&f.admin, "line", &line, &line, "line");
+    f.prove(&f.admin, "googlechat", "users/123", "spaces/dm", "googlechat");
     for (fail_first, missing_message, expected) in [
-        (true, false, "line"), (false, true, "line"), (false, false, "telegram"),
+        (true, false, "googlechat"), (false, true, "googlechat"), (false, false, "telegram"),
     ] {
         let rec = f.record();
         let store = ApprovalStore::open_in_memory().unwrap();
@@ -156,11 +154,11 @@ async fn failed_send_or_missing_message_tries_next_channel_but_success_stops() {
         sender.no_message_channel = missing_message.then_some("telegram");
         let result = run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
         assert_eq!(result.delivered, 1);
-        let expected_dm = if expected == "line" { line.clone() } else { "123".into() };
+        let expected_dm = if expected == "googlechat" { "spaces/dm".to_owned() } else { "123".into() };
         assert_eq!(result.first, Some((expected.into(), expected_dm.clone())));
         let mut expected_sends = vec![(f.admin.clone(), "telegram".into(), "123".into())];
-        if expected == "line" {
-            expected_sends.push((f.admin.clone(), "line".into(), line.clone()));
+        if expected == "googlechat" {
+            expected_sends.push((f.admin.clone(), "googlechat".into(), "spaces/dm".to_owned()));
         }
         assert_eq!(*sender.sent.lock().unwrap(), expected_sends);
         let live = receipts::list_live(&store, &rec.id).await.unwrap();
@@ -168,9 +166,33 @@ async fn failed_send_or_missing_message_tries_next_channel_but_success_stops() {
         assert_eq!(live[0].user_id, f.admin);
         assert_eq!(live[0].channel, expected);
         assert_eq!(live[0].dm, expected_dm);
-        assert_eq!(live[0].message_id.as_deref(), if expected == "line" { None } else { Some("1") });
+        assert_eq!(live[0].message_id.as_deref(), if expected == "googlechat" { Some("2") } else { Some("1") });
         assert_eq!(sender.replaced.lock().unwrap().len(), usize::from(missing_message));
     }
+}
+
+#[tokio::test]
+async fn unsupported_channel_proofs_never_receive_cards() {
+    let f = Fixture::new();
+    f.config("['line','slack','discord','telegram','googlechat']",
+        "slack_bot_token_enc='invalid-encrypted-fixture'\nslack_app_token_enc='invalid-encrypted-fixture'\ndiscord_bot_token_enc='invalid-encrypted-fixture'",
+        true, false);
+    for (channel, principal, dm) in [
+        ("line", format!("U{}", "1".repeat(32)), format!("U{}", "1".repeat(32))),
+        ("slack", "U123456789".into(), "D123456789".into()),
+        ("discord", "123456789012345678".into(), "123456789012345678".into()),
+    ] {
+        f.prove(&f.admin, channel, &principal, &dm, channel);
+    }
+    assert_eq!(f.db.approval_proofs(&f.admin).unwrap().len(), 3);
+    let rec = f.record();
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    let plan = f.plan(&rec);
+    assert!(plan.recipients.is_empty());
+    assert_eq!(run(f.home.path(), &store, &rec, plan, &sender).await.delivered, 0);
+    assert!(sender.sent.lock().unwrap().is_empty());
+    assert!(receipts::list_live(&store, &rec.id).await.unwrap().is_empty());
 }
 
 #[test]
@@ -357,8 +379,9 @@ async fn chat_decision_rewrites_other_admins_but_never_consumed_card() {
     ApprovalBroker::new(store.clone()).decide_as(&rec.id, true,
         &super::super::DecisionActor::ChatAdmin(entry)).await.unwrap();
     let rec = store.get(&rec.id).await.unwrap().unwrap();
-    sync::collapse_with_sender(&store, &rec, true, Some("Admin".into()), "Telegram",
-        crate::trigger_route::texts::Lang::ZhTw, &sender).await;
+    let lang = crate::trigger_route::texts::Lang::ZhTw;
+    sync::collapse_with_sender(&store, &rec, true, Some("Admin".into()),
+        &sync::decision_channel_label(&rec, lang), lang, &sender).await;
     let edits = sender.edits.lock().unwrap();
     assert_eq!(edits.len(), 1);
     assert!(edits[0].2.contains("已核准"));
@@ -445,17 +468,18 @@ async fn edit_failure_still_retires_and_line_needs_no_edit() {
     use super::super::sync;
     for line in [false, true] {
         let f = Fixture::new();
-        if line {
-            f.config("['line']", "", true, false);
-            let dm = format!("U{}", "1".repeat(32));
-            f.prove(&f.admin, "line", &dm, &dm, "line");
-        } else { f.prove(&f.admin, "telegram", "123", "123", "telegram"); }
+        f.prove(&f.admin, "telegram", "123", "123", "telegram");
         let mut rec = f.record();
         let store = ApprovalStore::open_in_memory().unwrap();
         let mut sender = Recording::new(&store);
         sender.fail_edit = true;
         run(f.home.path(), &store, &rec, f.plan(&rec), &sender).await;
         let receipt = receipts::list_live(&store, &rec.id).await.unwrap().pop().unwrap();
+        if line {
+            // Historical receipt only: current config never delivers LINE cards.
+            store.conn.lock().await.execute("UPDATE chat_admin_cards SET channel='line' WHERE card_id=?1",
+                [&receipt.card_id]).unwrap();
+        }
         rec.status = ApprovalStatus::Denied;
         rec.decided_at = Some(Utc::now().to_rfc3339());
         sync::collapse_with_sender(&store, &rec, false, None, "儀表板", crate::trigger_route::texts::Lang::ZhTw, &sender).await;
@@ -555,4 +579,25 @@ async fn maintenance_reconciles_invalidated_and_withdrawn_cards() {
     assert_eq!(sender.edits.lock().unwrap().len(), 2);
     assert!(sender.edits.lock().unwrap().iter().all(|(_, _, text)| text.starts_with("已失效")));
     for receipt in cards { assert_eq!(receipt_status(&store, &receipt.card_id).await, "expired"); }
+}
+
+#[test]
+fn collapse_label_uses_recorded_actor_and_defaults_to_dashboard() {
+    use super::super::{ledger::{DecidedBy, Step}, sync};
+    use crate::trigger_route::texts::Lang;
+    let f = Fixture::new();
+    let mut rec = f.record();
+    for (channel, label) in [(config::ChatChannel::Telegram, "Telegram"),
+        (config::ChatChannel::Googlechat, "Google Chat")] {
+        rec.decided_by = Some(DecidedBy::new(f.admin.parse().unwrap(), channel, Step::Web).to_string());
+        assert_eq!(sync::decision_channel_label(&rec, Lang::ZhTw), label);
+        assert_eq!(sync::decision_channel_label(&rec, Lang::En), label);
+    }
+    for by in [None, Some(format!("dashboard:{}", f.admin)), Some("system".into()),
+        Some("chat-admin:invalid:telegram:tap".into()),
+        Some(format!("chat-admin:{}:telegram:tap:extra", f.admin))] {
+        rec.decided_by = by;
+        assert_eq!(sync::decision_channel_label(&rec, Lang::ZhTw), "儀表板");
+        assert_eq!(sync::decision_channel_label(&rec, Lang::En), "Dashboard");
+    }
 }

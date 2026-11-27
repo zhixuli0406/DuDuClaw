@@ -251,7 +251,7 @@ fn target(channel: &str, agent: Option<&str>, name: &str, project: Option<&str>)
 /// Local configuration only: never resolve SecretRefs or call getMe. Like the
 /// existing channel status RPC, encrypted credentials count as configured.
 pub(crate) fn configured_accounts(home: &Path, channel: &str, agents: &[String]) -> Result<Vec<ConfiguredAccount>, &'static str> {
-    if !matches!(channel, "telegram" | "googlechat" | "line" | "slack" | "discord") {
+    if !chat_link::CHANNELS.contains(&channel) {
         return Err(CONFIG_UNAVAILABLE);
     }
     let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| CONFIG_UNAVAILABLE)?;
@@ -259,11 +259,7 @@ pub(crate) fn configured_accounts(home: &Path, channel: &str, agents: &[String])
     let mut result = Vec::new();
     if let Some(value) = config.get("channels") {
         let ch = value.as_table().ok_or(CONFIG_UNAVAILABLE)?;
-        if (channel == "discord" && configured_secret(ch, "discord_bot_token"))
-            || (channel == "slack" && configured_secret(ch, "slack_bot_token") && configured_secret(ch, "slack_app_token"))
-            || (channel == "line" && configured_secret(ch, "line_channel_token") && configured_secret(ch, "line_channel_secret")) {
-            result.push(target(channel, None, channel, None));
-        } else if channel == "telegram" && configured_secret(ch, "telegram_bot_token") {
+        if channel == "telegram" && configured_secret(ch, "telegram_bot_token") {
             result.push(target(channel, None, "共用 Telegram 機器人", None));
         } else if channel == "googlechat" {
             let allowed = ["project_number", "service_account_json", "service_account_json_enc",
@@ -290,11 +286,7 @@ pub(crate) fn configured_accounts(home: &Path, channel: &str, agents: &[String])
         let Some(channels) = config.get("channels") else { continue; };
         let Some(value) = channels.as_table().ok_or(CONFIG_UNAVAILABLE)?.get(channel) else { continue; };
         let section = value.as_table().ok_or(CONFIG_UNAVAILABLE)?;
-        if (channel == "discord" && configured_secret(section, "bot_token"))
-            || (channel == "slack" && configured_secret(section, "bot_token") && configured_secret(section, "app_token"))
-            || (channel == "line" && configured_secret(section, "channel_token") && configured_secret(section, "channel_secret")) {
-            result.push(target(channel, Some(id), id, None));
-        } else if channel == "telegram" && configured_secret(section, "bot_token") {
+        if channel == "telegram" && configured_secret(section, "bot_token") {
             result.push(target(channel, Some(id), id, None));
         } else if channel == "googlechat" {
             let cfg: duduclaw_core::types::GoogleChatChannelConfig = value.clone().try_into()

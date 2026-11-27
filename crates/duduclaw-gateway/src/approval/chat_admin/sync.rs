@@ -19,7 +19,7 @@ async fn open_store(home: &Path) -> Option<ApprovalStore> {
 /// The caller may still hold the pre-decision snapshot. Re-read the durable
 /// decision, including its timestamp and actor, before rendering any result.
 pub(crate) async fn collapse_after_decision(
-    home: &Path, rec: &ApprovalRecord, approve: bool, decider_name: Option<String>, decided_channel_label: &str,
+    home: &Path, rec: &ApprovalRecord, approve: bool, decider_name: Option<String>,
 ) {
     let Some(store) = open_store(home).await else { return; };
     let current = match store.get(&rec.id).await {
@@ -32,22 +32,20 @@ pub(crate) async fn collapse_after_decision(
         return;
     }
     if !matches!(current.status, ApprovalStatus::Approved | ApprovalStatus::Denied) { return; }
-    let recorded_label = decision_channel_label(&current, lang);
-    let label = if recorded_label.is_empty() { decided_channel_label } else { &recorded_label };
+    let label = decision_channel_label(&current, lang);
     let name = recorded_name(home, &current).await.or(decider_name);
     let approve = match current.status {
         ApprovalStatus::Approved => true, ApprovalStatus::Denied => false, _ => approve,
     };
-    collapse_with_sender(&store, &current, approve, name, label, lang, &Network::new(home)).await;
+    collapse_with_sender(&store, &current, approve, name, &label, lang, &Network::new(home)).await;
 }
 
 pub(crate) fn decision_channel_label(rec: &ApprovalRecord, lang: Lang) -> String {
-    let Some(by) = rec.decided_by.as_deref() else { return String::new(); };
-    if let Ok(chat) = by.parse::<ledger::DecidedBy>() {
+    if let Some(chat) = rec.decided_by.as_deref().and_then(|by| by.parse::<ledger::DecidedBy>().ok()) {
         press::channel_label(chat.channel()).into()
-    } else if by.strip_prefix("dashboard:").is_some_and(|id| uuid::Uuid::parse_str(id).is_ok()) {
+    } else {
         press::words(lang, "儀表板", "Dashboard", "ダッシュボード")
-    } else { String::new() }
+    }
 }
 
 async fn recorded_name(home: &Path, rec: &ApprovalRecord) -> Option<String> {
@@ -166,8 +164,7 @@ pub(super) async fn maintain_live(home: &Path, store: &ApprovalStore, live: Vec<
             let expired = cards.into_iter().filter(|r|
                 !DateTime::parse_from_rfc3339(&r.valid_until).is_ok_and(|at| at > Utc::now())).collect();
             rewrite(store, expired, &card::expired_text(card::kind_label(&rec, lang), lang), TerminalStatus::Expired, sender).await;
-        } else if matches!(rec.status, ApprovalStatus::Approved | ApprovalStatus::Denied)
-            && !decision_channel_label(&rec, lang).is_empty() {
+        } else if matches!(rec.status, ApprovalStatus::Approved | ApprovalStatus::Denied) {
             let label = decision_channel_label(&rec, lang);
             collapse_with_sender(store, &rec, rec.status == ApprovalStatus::Approved,
                 recorded_name(home, &rec).await, &label, lang, sender).await;
