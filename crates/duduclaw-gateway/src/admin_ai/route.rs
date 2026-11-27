@@ -1,4 +1,4 @@
-//! Signed, loopback-only read access. Request bodies never carry authority.
+//! Signed, loopback-only administrator settings access. Request bodies never carry authority.
 use std::{net::SocketAddr, path::{Path, PathBuf}, sync::Arc, time::Instant};
 
 use axum::{body::Bytes, extract::{rejection::BytesRejection, ConnectInfo, DefaultBodyLimit, State},
@@ -39,6 +39,7 @@ enum Section { Profile, Model, Limits, Heartbeat, Schedules, Skills }
 enum Request {
     Proof { context: String },
     Read { context: String, agent_ids: Option<Vec<String>>, sections: Option<Vec<Section>> },
+    Propose { context: String, items: Vec<duduclaw_core::admin_ai_settings::Item>, reason: String },
 }
 
 // Only selects the size/rate bucket; never grants authority or accepts op fields.
@@ -84,9 +85,31 @@ async fn handle(
     if !state.replay.record(&caller.nonce, now) { return refusal(StatusCode::UNAUTHORIZED, "replayed_nonce"); }
     if proof && body.len() > PROOF_LIMIT { return refusal(StatusCode::PAYLOAD_TOO_LARGE, "body_limit"); }
     let Ok(request) = serde_json::from_slice::<Request>(&body) else {
+        if selector.as_ref().is_some_and(|s| s.op == "propose") {
+            let _ = denied(&state.home, &caller.agent_id, "admin_ai_invalid_proposal");
+        }
         return refusal(StatusCode::BAD_REQUEST, "invalid_request");
     };
     match request {
+        Request::Propose { context, items, reason } => {
+            let turn = match admin_turn(&state.home, &caller.agent_id, &context, AdminTurnLevel::Write) {
+                Ok(turn) => turn,
+                Err(error) => return denied(&state.home, &caller.agent_id, error.code()),
+            };
+            let proposal = match serde_json::from_value(json!({"items": items, "reason": reason})) {
+                Ok(proposal) => proposal,
+                Err(_) => return denied(&state.home, &caller.agent_id, "admin_ai_invalid_proposal"),
+            };
+            let result = super::proposal::propose(&state.home, &turn, &context, proposal).await;
+            match result {
+                Ok(value) => Json(value).into_response(),
+                Err(error) => {
+                    let _ = denied(&state.home, &caller.agent_id, error.code);
+                    (StatusCode::FORBIDDEN, Json(json!({"ok": false, "code": error.code,
+                        "message": error.message}))).into_response()
+                }
+            }
+        }
         Request::Proof { context } => {
             let read = admin_turn(&state.home, &caller.agent_id, &context, AdminTurnLevel::Read).is_ok();
             let write = admin_turn(&state.home, &caller.agent_id, &context, AdminTurnLevel::Write).is_ok();
@@ -132,7 +155,7 @@ fn field_section(field: AdminAiField) -> Section {
         HeartbeatEnabled | HeartbeatCron | HeartbeatInterval | HeartbeatCronTimezone => Section::Heartbeat,
     }
 }
-fn fresh_user(home: &Path, id: &str) -> Result<UserContext, &'static str> {
+pub(super) fn fresh_user(home: &Path, id: &str) -> Result<UserContext, &'static str> {
     crate::decision_notify::open_user_db_read_only(home)
         .map_err(|_| "admin_ai_account_unavailable")?
         .ok_or("admin_ai_account_unavailable")?
@@ -140,7 +163,7 @@ fn fresh_user(home: &Path, id: &str) -> Result<UserContext, &'static str> {
         .filter(|ctx| ctx.is_admin() && !ctx.must_change_password)
         .ok_or("admin_ai_account_unavailable")
 }
-fn target_allowed(home: &Path, ctx: &UserContext, id: &str, dir: &Path, table: &toml::Value) -> bool {
+pub(super) fn target_allowed(home: &Path, ctx: &UserContext, id: &str, dir: &Path, table: &toml::Value) -> bool {
     if !duduclaw_core::is_valid_agent_id(id) || duduclaw_core::is_reserved_agent_id(id)
         || crate::ephemeral::is_ephemeral_id(id) || dir != home.join("agents").join(id)
         || table.get(crate::ephemeral::ROLE_MEMBER_SECTION).is_some()
@@ -162,10 +185,21 @@ fn target_allowed(home: &Path, ctx: &UserContext, id: &str, dir: &Path, table: &
         Err(_) => false,
     }
 }
-fn effective(dir: &Path) -> Result<toml::Value, &'static str> {
-    duduclaw_core::agent_toml::read_effective_text(dir)
-        .map_err(|_| "admin_ai_settings_unavailable")?
-        .parse().map_err(|_| "admin_ai_settings_unavailable")
+pub(super) fn effective_text(dir: &Path) -> Result<String, &'static str> {
+    // Match the strict runtime reader: an existing resolved artifact that cannot
+    // be read must not silently fall back to the employee's source profile.
+    if let (Some(home), Some(id)) = (duduclaw_core::preset::agent_home_dir(dir), dir.file_name().and_then(|s| s.to_str())) {
+        let resolved = duduclaw_core::preset::agent_resolved_path(&home, id);
+        match std::fs::symlink_metadata(&resolved) {
+            Ok(_) => return std::fs::read_to_string(resolved).map_err(|_| "admin_ai_settings_unavailable"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(_) => return Err("admin_ai_settings_unavailable"),
+        }
+    }
+    duduclaw_core::agent_toml::read_effective_text(dir).map_err(|_| "admin_ai_settings_unavailable")
+}
+pub(super) fn effective(dir: &Path) -> Result<toml::Value, &'static str> {
+    effective_text(dir)?.parse().map_err(|_| "admin_ai_settings_unavailable")
 }
 fn fields(table: &toml::Value, sections: Option<&[Section]>) -> Result<Value, &'static str> {
     let mut fields = Map::new();
@@ -259,11 +293,11 @@ async fn read(home: &Path, turn: &AdminTurn, ids: Option<&[String]>, sections: O
     if ids.is_none() { not_available.clear(); }
     Ok(json!({"ok": true, "agents": agents, "not_available": not_available}))
 }
-fn prompt_only(row: &crate::cron_store::CronTaskRow) -> bool {
+pub(super) fn prompt_only(row: &crate::cron_store::CronTaskRow) -> bool {
     row.trigger_kind == "time" && row.condition_script.is_none() && row.watch_command.is_none()
         && row.notify_channel.is_none() && row.notify_chat_id.is_none() && row.notify_thread_id.is_none()
 }
-async fn skills(home: &Path, id: &str, dir: &Path, private: bool) -> Result<Value, &'static str> {
+pub(super) async fn skills(home: &Path, id: &str, dir: &Path, private: bool) -> Result<Value, &'static str> {
     use duduclaw_agent::{skill_loader, skill_state};
     let global = AgentRegistry::load_skills(&home.join("skills")).await;
     let local = AgentRegistry::load_skills(&dir.join("SKILLS")).await;

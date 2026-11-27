@@ -348,3 +348,6 @@ fn read_projection_rejects_nested_values_at_whitelisted_leaves() {
     assert_eq!(projection.as_object().unwrap().len(), AdminAiField::ALL.len());
     assert_no_sensitive_keys(&projection);
 }
+
+#[path = "proposal_tests.rs"]
+mod proposal_tests;

@@ -334,6 +334,11 @@ impl ApprovalStore {
                     return Ok(false);
                 }
             }
+            // Count and insert under the same SQLite writer transaction, including
+            // other broker instances/processes. No in-memory quota can race this.
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                super::admin_ai::check_rate(&tx, rec)?;
+            }
             if let Some((session, turn)) = &origin {
                 let cancelled: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
