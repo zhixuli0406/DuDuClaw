@@ -54,6 +54,7 @@ pub struct OdooAccessConfig {
     pub permission_mode_ack: Option<PermissionModeAck>,
     pub company_key_agents: Vec<String>,
     pub company_key_agents_migrated: String,
+    pub upgrade_notice_pending: bool,
     pub always_refuse: Vec<String>,
     pub attachment_max_mb: u8,
 }
@@ -65,6 +66,7 @@ impl Default for OdooAccessConfig {
             permission_mode_ack: None,
             company_key_agents: Vec::new(),
             company_key_agents_migrated: String::new(),
+            upgrade_notice_pending: false,
             always_refuse: DEFAULT_ALWAYS_REFUSE.iter().map(|s| (*s).to_owned()).collect(),
             attachment_max_mb: 10,
         }
@@ -80,6 +82,7 @@ struct RawAccessConfig {
     permission_mode_ack: Option<toml::Value>,
     company_key_agents: Vec<String>,
     company_key_agents_migrated: String,
+    upgrade_notice_pending: bool,
     always_refuse: Vec<String>,
     attachment_max_mb: u8,
 }
@@ -92,6 +95,7 @@ impl Default for RawAccessConfig {
             permission_mode_ack: None,
             company_key_agents: defaults.company_key_agents,
             company_key_agents_migrated: defaults.company_key_agents_migrated,
+            upgrade_notice_pending: defaults.upgrade_notice_pending,
             always_refuse: defaults.always_refuse,
             attachment_max_mb: defaults.attachment_max_mb,
         }
@@ -135,6 +139,7 @@ impl OdooAccessConfig {
             permission_mode_ack: ack,
             company_key_agents: raw.company_key_agents,
             company_key_agents_migrated: raw.company_key_agents_migrated,
+            upgrade_notice_pending: raw.upgrade_notice_pending,
             always_refuse: raw.always_refuse,
             attachment_max_mb: raw.attachment_max_mb,
         };

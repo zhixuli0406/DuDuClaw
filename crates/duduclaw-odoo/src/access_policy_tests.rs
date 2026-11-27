@@ -394,3 +394,12 @@ fn fixed_model_families_are_segment_aware_in_every_mode() {
         assert_eq!(fixed_refusal(&op(kind, "crm.lead", "message_post", Verb::Message)), None);
     }
 }
+
+#[test]
+fn upgrade_notice_flag_is_strict_and_defaults_off() {
+    assert!(!OdooAccessConfig::parse_config_toml("").unwrap().upgrade_notice_pending);
+    let config = OdooAccessConfig::parse_config_toml("[odoo_access]\nupgrade_notice_pending=true\n").unwrap();
+    assert!(config.upgrade_notice_pending);
+    assert_eq!(config.permission_mode, PermissionMode::Engine);
+    assert!(OdooAccessConfig::parse_config_toml("[odoo_access]\nupgrade_notice_pending='yes'\n").is_err());
+}

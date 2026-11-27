@@ -2846,6 +2846,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
 
+    // Only the lock-owning gateway migrates, before serving Odoo tools.
+    if duduclaw_core::gateway_instance::held(&home_dir) {
+        if let Err(error) = crate::odoo_access_migration::run(&home_dir).await {
+            tracing::warn!(%error, "Odoo company account migration not applied");
+        }
+    }
+
     // One-time upgrade migration: keep an Odoo on an internal address working
     // (writes `[odoo] allow_private_network = true` once, with an audit event).
     // Awaited because the connector reads the switch on its first use; a
