@@ -512,13 +512,7 @@ impl RestoreStageReport {
 }
 
 fn strip_restore_drive_write(text: &str) -> Result<(String, bool), String> {
-    let mut table: toml::Table = text.parse()
-        .map_err(|e| format!("無法解析還原設定：{e}"))?;
-    let removed = table.get_mut("google").and_then(toml::Value::as_table_mut)
-        .and_then(|google| google.remove("drive_write")).is_some();
-    if !removed { return Ok((text.to_owned(), false)); }
-    let rendered = crate::handlers::config_commit::render_preserving(text, &table)?;
-    Ok((rendered, true))
+    crate::handlers::config_commit::strip_drive_write_preserving(text)
 }
 
 /// Serialize staging and boot swaps on a stable inode under the live locks/.

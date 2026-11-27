@@ -24,7 +24,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use unicode_normalization::UnicodeNormalization;
 use duduclaw_gateway::backup_restore::RestoreLimits;
-use duduclaw_gateway::handlers::config_commit::{render_preserving, refuse_drive_write_text_edit};
+use duduclaw_gateway::handlers::config_commit::{refuse_drive_write_text_edit, strip_drive_write_preserving};
 
 pub(crate) const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[
     duduclaw_core::OperatorCommand { name: "duduclaw import", path: &["import"] },
@@ -1706,13 +1706,8 @@ fn validate_import_policy_with_limits(
                     return Err(io_err("import policy", "duplicate configuration entry"));
                 }
                 // Consent is local to the admin settings RPC, never portable.
-                let mut sanitized = table.clone();
-                if let Some(google) = sanitized.get_mut("google").and_then(toml::Value::as_table_mut) {
-                    removed_drive_write |= google.remove("drive_write").is_some();
-                }
-                let text = if removed_drive_write {
-                    render_preserving(&text, &sanitized).map_err(DuDuClawError::Config)?
-                } else { text };
+                let (text, removed) = strip_drive_write_preserving(&text).map_err(DuDuClawError::Config)?;
+                removed_drive_write |= removed;
                 refuse_drive_write_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
                 duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
                     .map_err(DuDuClawError::Config)?;
@@ -1742,15 +1737,14 @@ fn validate_import_policy_with_limits(
     }
     // The unchanged MFA rule guarantees that an accepted identity replacement
     // carries true in the prepared text whenever the current policy is strict.
-    let mut prepared_table: toml::Table = prepared.parse()
-        .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
     // Imported identities must never inherit local consent, even when the
     // archive omits config.toml and the current configuration is retained.
-    if prepared_table.get_mut("google").and_then(toml::Value::as_table_mut)
-        .is_some_and(|google| google.remove("drive_write").is_some()) {
-        removed_drive_write = true;
-        prepared = render_preserving(&prepared, &prepared_table).map_err(DuDuClawError::Config)?;
-    }
+    let (stripped, removed) = strip_drive_write_preserving(&prepared).map_err(DuDuClawError::Config)?;
+    removed_drive_write |= removed;
+    prepared = stripped;
+    refuse_drive_write_text_edit(&retained, &prepared).map_err(DuDuClawError::Config)?;
+    let prepared_table: toml::Table = prepared.parse()
+        .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
     let strict = prepared_table.get("auth").and_then(|auth| auth.get("mfa_enforced"))
         .and_then(|value| value.as_bool()) == Some(true);
     Ok(ImportDecision {
