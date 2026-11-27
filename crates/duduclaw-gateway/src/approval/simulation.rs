@@ -341,7 +341,7 @@ fn xml_escape(s: &str) -> String {
 /// `is_confirmation_reply` / `is_denial_reply` word lists and calls
 /// [`ApprovalBroker::decide`].
 pub fn pending_summary_for_channel(record: &ApprovalRecord) -> String {
-    if record.payload.get("egress_guard").is_some() {
+    if super::is_outbound_data_card(record) {
         return crate::approval_notify::dashboard_only_notice_body(record, false);
     }
     let agent = xml_escape(&record.agent_id);

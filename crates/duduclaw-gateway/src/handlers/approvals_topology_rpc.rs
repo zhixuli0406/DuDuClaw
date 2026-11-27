@@ -8,7 +8,18 @@ impl MethodHandler {
 
     /// WP14-T14.7: list pending approvals for the approval center. Optional
     /// `agent_id` filter. Read-only; opens approvals.db per call.
-    pub(crate) async fn handle_approvals_list(&self, mut params: Value, ctx:&UserContext) -> WsFrame {
+    pub(crate) async fn handle_approvals_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        self.approvals_read(params, ctx, false).await
+    }
+
+    pub(crate) async fn handle_approvals_get(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        if params.get("id").and_then(Value::as_str).is_none_or(|id| id.is_empty()) {
+            return WsFrame::error_response("", "id is required");
+        }
+        self.approvals_read(params, ctx, true).await
+    }
+
+    async fn approvals_read(&self, mut params: Value, ctx: &UserContext, detail: bool) -> WsFrame {
         let step_up = super::personal_data_gate::take_step_up(&mut params);
         let agent_filter = params.get("agent_id").and_then(|v| v.as_str());
         // Optional exact `action_kind` filter (e.g. "knowledge_quarantine" for the
@@ -47,6 +58,7 @@ impl MethodHandler {
                 _ => return WsFrame::error_response("", "permission denied"),
             }
         };
+        let grants = crate::dept_grants::DeptGrantView::load(self, ctx).await;
         match rows {
             Ok(rows) => {
                 // v1.81 P1b: another person's Personal employee → metadata-only
@@ -76,9 +88,15 @@ impl MethodHandler {
                     }
                     // Binding data and question answers go only to a viewer
                     // who may decide this card.
-                    let may_decide = self.authorize_egress_decider(r, &fresh).is_ok()
+                    let outbound = crate::approval::is_outbound_data_card(r);
+                    let reviewer = outbound && crate::approval::outbound_reviewer(&grants, &fresh, r);
+                    let may_decide = (!outbound || reviewer)
                         && (r.binding.is_none()
-                            || Box::pin(self.authorize_bound_decider(r, &fresh)).await.is_ok());
+                            || Box::pin(self.authorize_bound_decider(r, ctx)).await.is_ok());
+                    let full_outbound = outbound && detail && reviewer;
+                    if full_outbound && !fresh.is_admin() {
+                        crate::approval::outbound::audit(&self.home_dir, r, &fresh.user_id, false, None);
+                    }
                     let activation = super::approval_decider::is_activation_record(r);
                     let kind = crate::governance::ApprovalKind::parse(&r.action_kind);
                     // E8 reverse handoff: "在 <通道> 中開啟" — the WP20
@@ -141,21 +159,25 @@ impl MethodHandler {
                     };
                     items.push(json!({
                         "id": r.id.as_str(),
-                        "digest": viewer_digest(r, &activation_facts, fresh.is_admin(), may_decide),
+                        "digest": if outbound {
+                            if full_outbound && may_decide { json!(crate::approval::decision_digest_with_activation(r, &activation_facts)) }
+                            else { Value::Null }
+                        } else { viewer_digest(r, &activation_facts, fresh.is_admin(), may_decide) },
                         "agent_id": r.agent_id,
                         "kind": kind.as_str(),
                         "summary": r.summary,
-                        "payload": if r.action_kind == crate::admin_ai::card::ACTION_KIND {
+                        "payload": if outbound {
+                            if full_outbound { r.payload.clone() } else { json!({"redacted": true}) }
+                        } else if r.action_kind == crate::admin_ai::card::ACTION_KIND {
                             crate::admin_ai::card::confirmation_display(r)
-                        } else if r.binding.is_some()
-                            && !may_show_bound_egress(&r.payload, fresh.is_admin(), may_decide) {json!({
+                        } else if r.binding.is_some() {json!({
                             "redacted": true,
                             "payload_hash": r.binding.as_ref().map(|b|&b.payload_hash)
                         })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
                         "request_kind":r.request_kind,
                         "status":r.status,
-                        "binding": if may_decide && r.action_kind != crate::admin_ai::card::ACTION_KIND { json!(r.binding) } else { Value::Null },
-                        "answer": if may_decide { json!(r.answer) } else { Value::Null },
+                        "binding": if may_decide && (!outbound || full_outbound) && r.action_kind != crate::admin_ai::card::ACTION_KIND { json!(r.binding) } else { Value::Null },
+                        "answer": if may_decide && (!outbound || full_outbound) { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
                         "mail_requester_approval_eligible": crate::approval::mail_requester::eligible(&self.home_dir, r),
                         "decided_in_dashboard_only": crate::approval_notify::is_dashboard_only_record(Some(&self.home_dir), r),
@@ -178,7 +200,7 @@ impl MethodHandler {
                         // approval kind ran that judge. `null` for every other
                         // kind (the overwhelming majority) — the dashboard
                         // renders nothing when this is absent, purely additive.
-                        "simulation": r.simulation,
+                        "simulation": if outbound && !full_outbound { Value::Null } else { json!(r.simulation) },
                         // E8: platform name (safe to expose — no internal id)
                         // + a fully-resolved "open in channel" URL, or `null`
                         // when nothing could be constructed.
@@ -456,14 +478,10 @@ mod live_event_tests {
     }
 }
 
-/// Full outbound content is only delivered to the dashboard administrator.
-fn may_show_bound_egress(payload: &Value, admin: bool, may_decide: bool) -> bool {
-    admin && may_decide && payload.get("egress_guard").is_some()
-}
-
 /// An unbound digest must never become an oracle for redacted payload fields.
 pub(super) fn digest_hidden_by_redaction(rec: &crate::approval::ApprovalRecord, admin: bool) -> bool {
-    rec.binding.is_none() && dashboard_action_payload(&rec.payload, admin) != rec.payload
+    rec.binding.is_none() && ((crate::approval::is_outbound_data_card(rec) && !admin)
+        || dashboard_action_payload(&rec.payload, admin) != rec.payload)
 }
 
 /// Only disclose a digest when the viewer can see every field it hashes.
@@ -483,8 +501,7 @@ fn viewer_digest(
 }
 
 fn dashboard_action_payload(payload: &Value, admin: bool) -> Value {
-    let outbound = payload.get("egress_guard").is_some()
-        || matches!(payload.get("action_grant").and_then(|g| g.get("effect")).and_then(Value::as_str),
+    let outbound = matches!(payload.get("action_grant").and_then(|g| g.get("effect")).and_then(Value::as_str),
             Some("send" | "publish" | "purchase"));
     if outbound && !admin { json!({"redacted": true}) } else { payload.clone() }
 }
@@ -494,18 +511,8 @@ mod egress_payload_tests {
     use super::*;
 
     #[test]
-    fn bound_egress_requires_fresh_decision_authority() {
-        let payload = json!({"egress_guard": {"sources": ["memory_read"]}});
-        assert!(may_show_bound_egress(&payload, true, true));
-        assert!(!may_show_bound_egress(&payload, true, false));
-        assert!(!may_show_bound_egress(&payload, false, true));
-        assert!(!may_show_bound_egress(&json!({}), true, true));
-    }
-
-    #[test]
     fn full_outbound_arguments_are_admin_only() {
-        for marker in [json!({"egress_guard": {"sources": ["memory_read"]}}),
-            json!({"action_grant": {"effect": "send"}}),
+        for marker in [json!({"action_grant": {"effect": "send"}}),
             json!({"action_grant": {"effect": "publish"}}),
             json!({"action_grant": {"effect": "purchase"}})] {
             let mut payload = marker;

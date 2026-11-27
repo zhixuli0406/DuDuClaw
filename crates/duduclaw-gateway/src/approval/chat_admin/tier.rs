@@ -34,7 +34,7 @@ pub(crate) fn tier(rec: &ApprovalRecord) -> Tier {
     let kind = rec.action_kind.as_str();
     if dashboard_only(kind) {
         Tier::T3
-    } else if rec.payload.get("egress_guard").is_some() {
+    } else if crate::approval::is_outbound_data_card(rec) {
         Tier::T2
     } else if kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         || kind == crate::knowledge::add_source_approval::ACTION_KIND {
@@ -64,7 +64,7 @@ pub(crate) fn kind_key(rec: &ApprovalRecord) -> Option<&'static str> {
     }
     let kind = rec.action_kind.as_str();
     if kind != crate::approval::cli_egress::KIND
-        && rec.payload.get("egress_guard").is_some() {
+        && crate::approval::is_outbound_data_card(rec) {
         return Some("egress_guard");
     }
     [crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE,

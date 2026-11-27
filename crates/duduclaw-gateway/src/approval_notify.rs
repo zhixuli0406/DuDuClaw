@@ -134,7 +134,7 @@ pub(crate) fn approval_body_with(
     assigner: Option<&str>,
 ) -> String {
     // Private mail details have a separate, audience-gated renderer.
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         return dashboard_only_notice_body(rec, reminder);
     }
     let head = if reminder {
@@ -232,8 +232,7 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
 /// Record-level restrictions also cover outbound guards on arbitrary kinds.
 pub(crate) fn is_dashboard_only_record(home: Option<&Path>, rec: &ApprovalRecord) -> bool {
     is_dashboard_only_kind(&rec.action_kind)
-        || rec.action_kind == crate::approval::cli_egress::KIND
-        || (rec.payload.get("egress_guard").is_some()
+        || (crate::approval::is_outbound_data_card(rec)
             && !home.is_some_and(|home| crate::approval::mail_requester::eligible(home, rec)))
 }
 
@@ -278,9 +277,9 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
-    if rec.action_kind == crate::approval::cli_egress::KIND || rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
-        return format!("{head}\n請管理員開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
+        return format!("{head}\n請管理員或被授權的部門主管開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
             deadline_phrase(rec), rec.id.as_str());
     }
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
@@ -382,6 +381,22 @@ pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
 /// channel, else the approvers' linked chats — never the originating
 /// conversation, which is excluded explicitly rather than by relying on the
 /// reply-channel task-local being absent.
+fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<(String, String)> {
+    let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return vec![]; };
+    let Ok(users) = db.list_users() else { return vec![]; };
+    let mut targets = std::collections::BTreeSet::new();
+    for user in users {
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { continue; }
+        let allowed = user.role == duduclaw_auth::UserRole::Admin
+            || (user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, &user.id, &rec.agent_id));
+        if allowed && let Ok(destinations) = db.verified_dm_destinations_for_user(&user.id) {
+            targets.extend(destinations.into_iter().map(|dest| (dest.channel, dest.channel_user_id)));
+        }
+    }
+    targets.into_iter().collect()
+}
+
 fn dashboard_only_targets(
     home_dir: &Path,
     rec: &ApprovalRecord,
@@ -390,7 +405,10 @@ fn dashboard_only_targets(
     let origin = origin_target();
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let owners = if kb { crate::knowledge::add_source_chat::owner_targets(home_dir, rec) } else { vec![] };
-    let base = if kb {
+    let base = if crate::approval::is_outbound_data_card(rec) {
+        // Recompute even for reminders; a previous destination is not authority.
+        outbound_targets(home_dir, rec)
+    } else if kb {
         let mut targets: Vec<_> = crate::knowledge::add_source_chat::decider_targets(home_dir, rec)
             .into_iter().map(|(_, ch, id)| (ch, id)).collect();
         if let Some(target) = crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id) { targets.push(target); }
@@ -465,7 +483,7 @@ async fn push_dashboard_only(
         return None;
     }
     let mut text = if rec.action_kind == crate::autopilot_approval::ACTION_KIND
-        && rec.payload.get("egress_guard").is_none()
+        && !crate::approval::is_outbound_data_card(rec)
     {
         crate::autopilot_approval::pending_notice_body(
             rec,
@@ -512,7 +530,7 @@ async fn push_dashboard_only(
             crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
         };
         if sent {
-            if !kb { return Some((channel, chat_id)); }
+            if !kb && !crate::approval::is_outbound_data_card(rec) { return Some((channel, chat_id)); }
             if let Some(uid) = uid { notified_users.insert(uid); }
             if delivered.is_none() { delivered = Some((channel, chat_id)); }
         }
@@ -575,12 +593,17 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         return None;
     }
     if let Some(result) = crate::approval::chat_admin::deliver::try_push(home_dir, rec, reminder).await {
+        if crate::approval::is_outbound_data_card(rec) {
+            // Admin chat receipts do not suppress department reviewers' dashboard notices.
+            let notice = push_dashboard_only(home_dir, rec, reminder).await;
+            return result.first.or(notice);
+        }
         return chat_delivery_or_notice(result, || push_dashboard_only(home_dir, rec, reminder)).await;
     }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         // A config/identity change between checks must never enter the legacy
         // fallback chain with private mail content.
         if !crate::approval::mail_requester::eligible(home_dir, rec) { return None; }
@@ -854,7 +877,7 @@ fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card
 /// decision alike) so the collapsed card always reads the same regardless of
 /// where the decision was made.
 fn approval_collapse_summary(rec: &ApprovalRecord) -> String {
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         return "郵件或對外操作審核".into();
     }
     format!(

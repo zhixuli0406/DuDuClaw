@@ -850,7 +850,11 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", "id is required");
                 }
-                boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                if method == "approvals.get" {
+                    boxed_frame(|| self.handle_approvals_get(params, ctx)).await
+                } else {
+                    boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                }
             }
             "approvals.decide" => {
                 require_manager!();

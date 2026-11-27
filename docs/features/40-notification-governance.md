@@ -10,6 +10,10 @@ DuDuClaw's AI employees reach out on their own: a task is stuck, the budget ran 
 
 Notification governance is the layer standing in front of every push outlet. It does four things: labels each notification with a level, defers the non-urgent ones during quiet hours, rolls up one digest per day, and measures whether anyone actually acts on each notification type.
 
+Outbound-data approval notices go to active Admins and department managers granted **EgressReview** for the requesting employee's department. This applies to reminders too: a previous notification destination does not retain access after a grant is revoked. Managers follow the notice to the dashboard; chat decisions retain the existing Admin verification and step-up rules.
+
+Approval lists redact outbound payloads for every reader. Opening a card through `approvals.get` reveals its full parameters only to an Admin or its designated department reviewer. Department review requires a signed-in dashboard session, is checked again when deciding, and cannot be used on a request made on that manager's own behalf. Each non-Admin opening records `outbound_card_opened`; decisions record `outbound_decided` with the reviewer type. These events contain identifiers and the decision, not the outbound content.
+
 ---
 
 ## How it works

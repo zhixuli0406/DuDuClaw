@@ -15,7 +15,7 @@ pub(crate) async fn gateway_default_id(home: &std::path::Path) -> Result<String,
     parse_gateway_default(&raw)
 }
 
-fn parse_gateway_default(raw: &str) -> Result<String, String> {
+pub(crate) fn parse_gateway_default(raw: &str) -> Result<String, String> {
     let config: toml::Value = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let general = match config.get("general") {
         None => return Ok(String::new()),
