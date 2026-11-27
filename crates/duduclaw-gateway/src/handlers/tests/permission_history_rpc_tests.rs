@@ -25,6 +25,7 @@ fn admin() -> UserContext {
 
 fn employee() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "emp-1".into(),

@@ -126,6 +126,7 @@ async fn fixture(edition: duduclaw_core::EditionProfile) -> Fixture {
 /// role, bindings and team per RPC).
 fn jwt_ctx(user_id: &str, role: UserRole) -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: user_id.to_string(),

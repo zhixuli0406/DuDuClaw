@@ -5710,6 +5710,9 @@ fn authorize_file_access(
         return Err(unauthorized());
     }
     if authenticated.member_key_id.is_some() && ctx.is_admin() { return Err(unauthorized()); }
+    ctx.origin = if authenticated.member_key_id.is_some() {
+        duduclaw_auth::acl::ContextOrigin::MemberKey
+    } else { authenticated.origin };
     ctx.member_key_id = authenticated.member_key_id;
     require_password_changed(&ctx)?;
 
@@ -16725,6 +16728,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "lockscreen".to_string(),
@@ -16836,7 +16840,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 }
                             } else if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
-                                    Ok(ctx) => {
+                                    Ok(mut ctx) => {
+                                        ctx.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
                                         access_expires = Some(0);

@@ -13,6 +13,7 @@ fn admin_ctx() -> UserContext {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),

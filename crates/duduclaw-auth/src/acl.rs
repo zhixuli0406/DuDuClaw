@@ -41,10 +41,22 @@ pub fn personal_restriction() -> Option<&'static dyn PersonalRestriction> {
     PERSONAL_RESTRICTION.get().map(|restriction| restriction.as_ref())
 }
 
+/// Server-established authentication provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextOrigin {
+    DashboardSession,
+    MemberKey,
+    AdminToken,
+    Other,
+}
+
 /// Per-connection user context extracted from JWT claims.
 /// Carried through the entire WebSocket session for ACL checks.
 #[derive(Debug, Clone)]
 pub struct UserContext {
+    /// Server-set provenance, never read from client parameters; department
+    /// grants apply only to DashboardSession.
+    pub origin: ContextOrigin,
     /// Server-issued provenance; never accepted from client parameters.
     pub member_key_id: Option<String>,
     pub credential_epoch: u64,
@@ -85,6 +97,7 @@ impl UserContext {
     /// Do NOT call this for JWT-authenticated users — use `from_claims` instead.
     pub fn admin_fallback() -> Self {
         Self {
+            origin: ContextOrigin::AdminToken,
             member_key_id: None,
             credential_epoch: 0,
             user_id: "system".to_string(),
@@ -102,6 +115,7 @@ impl UserContext {
     /// forced-password-change flag all come from here.
     pub fn from_live(user: &User, access: &EffectiveAccess) -> Self {
         Self {
+            origin: ContextOrigin::Other,
             member_key_id: None,
             credential_epoch: user.credential_epoch,
             user_id: user.id.clone(),
@@ -134,6 +148,7 @@ impl UserContext {
             agent_access.insert(agent.clone(), level);
         }
         Ok(Self {
+            origin: ContextOrigin::Other,
             member_key_id: None,
             credential_epoch: claims.credential_epoch,
             user_id: claims.sub.clone(),
@@ -365,6 +380,7 @@ mod tests {
         let mut access = HashMap::new();
         access.insert("my-agent".to_string(), AccessLevel::Owner);
         UserContext {
+            origin: crate::acl::ContextOrigin::Other,
             member_key_id: None,
             credential_epoch: 0,
             user_id: "u1".to_string(),
@@ -394,6 +410,16 @@ mod tests {
             token_type: "access".to_string(),
             jti: None,
         }
+    }
+
+    #[test]
+    fn context_origin_constructors() {
+        assert_eq!(UserContext::admin_fallback().origin, ContextOrigin::AdminToken);
+        assert_eq!(UserContext::from_claims(&claims("manager"), false).unwrap().origin, ContextOrigin::Other);
+        let (db, _path) = crate::test_support::test_db();
+        let user = db.create_user("origin@example.test", "Origin", "password-test", UserRole::Manager).unwrap();
+        let (user, access) = crate::org::load_access_on(&db.conn(), &user.id).unwrap().unwrap();
+        assert_eq!(UserContext::from_live(&user, &access).origin, ContextOrigin::Other);
     }
 
     #[test]

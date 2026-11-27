@@ -18,6 +18,7 @@ fn viewer_ctx(agent: &str) -> UserContext {
     let mut agent_access = std::collections::HashMap::new();
     agent_access.insert(agent.to_string(), AccessLevel::Viewer);
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "u1".to_string(),
