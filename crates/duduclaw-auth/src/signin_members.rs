@@ -118,6 +118,7 @@ fn pending(tx: &Transaction<'_>, identity: &VerifiedGoogleIdentity, request_id: 
 }
 
 fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+    grant_lease_held: bool,
     personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>) -> Result<SigninOutcome, String> {
     // 1. An immutable subject link always wins, even if the token email changed.
     let linked: Option<String> = tx.query_row("SELECT user_id FROM google_signin_links WHERE google_sub=?1",
@@ -141,6 +142,9 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(|_| STORAGE)?
     };
     for (user_id, status, attested_by, credential_epoch) in attestations {
+        // An attestation may have appeared after the caller's read-only probe.
+        // Never consult personal material or link without grant serialization.
+        if !grant_lease_held { return Ok(SigninOutcome::ExistingAccount); }
         if personal_sub(&user_id)?.is_some_and(|sub| sub != id.sub) {
             return Ok(SigninOutcome::ExistingAccount);
         }
@@ -186,8 +190,18 @@ fn resolve_tx(tx: &Transaction<'_>, id: &VerifiedGoogleIdentity, policy: &Signin
 }
 
 impl UserDb {
-    /// The caller holds the personal grant lease; the lookup must not access users.db.
-    pub fn resolve_google_signin(&self, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
+    /// A read-only hint; resolve still checks provenance inside its transaction.
+    pub fn signin_attestation_candidate_exists(&self, email: &str, now: i64) -> Result<bool, String> {
+        self.conn().query_row("SELECT EXISTS(SELECT 1 FROM users u
+            JOIN google_signin_attestations a ON a.user_id=u.id
+            WHERE u.email=?1 COLLATE NOCASE AND a.expires_at>?2
+            AND NOT EXISTS(SELECT 1 FROM google_signin_links l WHERE l.user_id=u.id))",
+            params![email, now], |r| r.get(0)).map_err(|_| STORAGE.into())
+    }
+
+    /// `grant_lease_held` permits attestation only while the caller holds the
+    /// personal grant lease. The lookup must not access users.db.
+    pub fn resolve_google_signin(&self, grant_lease_held: bool, id: &VerifiedGoogleIdentity, policy: &SigninPolicy, now: i64,
         personal_sub: &dyn Fn(&str) -> Result<Option<String>, String>) -> Result<SigninOutcome, String> {
         let identity = validated_identity(id)?;
         timestamp(now)?;
@@ -196,7 +210,7 @@ impl UserDb {
         let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
-        let outcome = resolve_tx(&tx, &identity, policy, now, personal_sub)?;
+        let outcome = resolve_tx(&tx, &identity, policy, now, grant_lease_held, personal_sub)?;
         tx.commit().map_err(|_| STORAGE)?;
         Ok(outcome)
     }

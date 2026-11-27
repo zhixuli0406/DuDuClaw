@@ -52,7 +52,7 @@ impl Fixture {
             hd: "company.test".into(), display_name: "新同仁".into() };
         let policy = SigninPolicy { approval, daily_cap: 100, settings_version: "v1".into(),
             ack_by: self.admin.user_id.clone(), ack_at: Utc::now().to_rfc3339() };
-        match self.db.resolve_google_signin(&identity, &policy, Utc::now().timestamp(), &|_| Ok(None)).unwrap() {
+        match self.db.resolve_google_signin(true, &identity, &policy, Utc::now().timestamp(), &|_| Ok(None)).unwrap() {
             SigninOutcome::PendingApproval { request_id } => request_id,
             SigninOutcome::Ok { user_id, .. } => user_id,
             other => panic!("unexpected provisioning result: {other:?}"),

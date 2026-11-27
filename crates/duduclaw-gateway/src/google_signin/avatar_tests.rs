@@ -27,7 +27,7 @@ async fn fixture() -> Fixture {
     let home = tempfile::tempdir().unwrap();
     let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
     // Exercise the real provisioning API: no admin is present in this home.
-    let member = match db.resolve_google_signin(&VerifiedGoogleIdentity {
+    let member = match db.resolve_google_signin(true, &VerifiedGoogleIdentity {
         sub: "123456789".into(), email: "member@company.test".into(),
         hd: "company.test".into(), display_name: "新同仁".into(),
     }, &SigninPolicy {

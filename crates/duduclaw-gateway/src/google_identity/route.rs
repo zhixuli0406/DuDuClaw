@@ -38,7 +38,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::requester_gate::people_for;
-use super::resolve::{Resolved, resolve_person_for_tool};
+use super::resolve::{Resolved, resolve_token_route};
 use super::{Refusal, audit_issue};
 use crate::computer_use_sessions::auth::{RateLimiter, ReplayGuard, authenticate, check_peer};
 
@@ -196,8 +196,8 @@ pub(crate) async fn serve(
         audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
         return outcome.map(|_| Value::Null);
     }
-    let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
-        .shared().await.map_err(|_| super::owner_snapshot::changed())?;
+    let mut authority = Some(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
+        .shared().await.map_err(|_| super::owner_snapshot::changed())?);
     refuse_owner_token(&state.home, agent)?;
     if tool == "google_chat_send" || !crate::google_personal::scopes::token_tool(tool) {
         let outcome = Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
@@ -221,7 +221,7 @@ pub(crate) async fn serve(
     }
     let people = people_for(&state.home, state.users.as_ref());
     let outcome =
-        resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await
+        resolve_token_route(&state.home, agent, requester, people.as_ref(), tool, Some(&mut authority)).await
             .and_then(|resolved| {
                 match &resolved {
                     Resolved::Delegated { token, .. } => {

@@ -310,6 +310,22 @@ async fn ticket_replay() {
     assert_eq!(f.complete(&ticket, &flow.cookie).await, json!({"result":"expired"}));
 }
 #[tokio::test]
+async fn login_without_attestation_does_not_take_grant_lease() {
+    let f = Fixture::ready().await;
+    let provider = Provider::new().await;
+    let (flow, first) = successful_callback(&f, &provider).await;
+    let first_login = f.complete(&first, &flow.cookie).await;
+    assert!(first_login["access_token"].is_string());
+    let held = crate::google_personal::grants::acquire(&f.state.home_dir).await.unwrap();
+    let (flow, ticket) = tokio::time::timeout(Duration::from_secs(2),
+        successful_callback(&f, &provider)).await.expect("linked login must not wait for grant work");
+    let login = f.complete(&ticket, &flow.cookie).await;
+    assert!(login["access_token"].is_string());
+    assert_eq!(login["user"]["id"], first_login["user"]["id"]);
+    drop(held);
+}
+
+#[tokio::test]
 async fn complete_issues_tokens_when_mfa_not_enforced() {
     let f = Fixture::ready().await;
     let provider = Provider::new().await;

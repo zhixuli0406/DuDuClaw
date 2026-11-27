@@ -194,7 +194,7 @@ pub async fn resolve_person(
     if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,"google_remote_mcp").await {
         return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
     }
-    resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes)).await
+    resolve_person_scoped(home, agent, requester, people, "google_remote_mcp", Some(scopes), None).await
 }
 
 pub async fn resolve_person_for_tool(
@@ -204,23 +204,33 @@ pub async fn resolve_person_for_tool(
     people: &dyn People,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    resolve_token_route(home, agent, requester, people, tool, None).await
+}
+
+/// The bearer route lends its shared lease so refresh can release it before
+/// waiting on grant work, then revalidate the original Personal selection.
+pub(crate) async fn resolve_token_route(
+    home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
+    tool: &str, authority: Option<&mut Option<duduclaw_core::authority_coordinator::SharedLease>>,
+) -> Result<Resolved, Refusal> {
     if crate::google_authorization_requests::turn::probe_for_requester(home,agent,requester,tool).await {
         // A missing own-account purpose pauses this live human turn before
         // any configured home-account fallback can execute the task.
         return Err(Refusal::hard("not_connected",crate::google_authorization_requests::DASHBOARD_HINT));
     }
-    resolve_person_scoped(home, agent, requester, people, tool, None).await
+    resolve_person_scoped(home, agent, requester, people, tool, None, authority).await
 }
 
 /// Scopes originate only in the gateway's pinned employee context.
 pub(crate) async fn resolve_employee_scoped(home: &Path, agent: &str, requester: &RequesterIdentity,
     people: &dyn People, tool: &str, scopes: &[&str]) -> Result<Resolved, Refusal> {
-    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes)).await
+    resolve_person_scoped(home, agent, requester, people, tool, Some(scopes), None).await
 }
 
 async fn resolve_person_scoped(
     home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
     tool: &str, endpoint_scopes: Option<&[&str]>,
+    authority: Option<&mut Option<duduclaw_core::authority_coordinator::SharedLease>>,
 ) -> Result<Resolved, Refusal> {
     if !crate::google_personal::scopes::token_tool(tool) {
         return Err(Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
@@ -238,7 +248,7 @@ async fn resolve_person_scoped(
     let eff = crate::google_identity::delegate_owner::effective_for(home, Some(agent));
     if matches!(eff.effective, Effective::Personal { .. }) {
         let outcome =
-            crate::google_personal::access::resolve(home, agent, requester, people, &eff, tool)
+            crate::google_personal::access::resolve_with_authority(home, agent, requester, people, &eff, tool, authority)
                 .await;
         return match outcome {
             // v1.81 E3: inside an isolated request the only home fallback is

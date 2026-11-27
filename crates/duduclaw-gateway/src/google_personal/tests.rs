@@ -485,6 +485,46 @@ async fn unknown_external_requester_needs_explicit_anyone_and_personal_consent_b
 }
 
 #[tokio::test]
+async fn token_refresh_does_not_hold_authority_while_waiting_for_grant() {
+    use crate::google_identity::route::{self, GoogleTokenRouteState};
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+
+    let f = Fixture::new();
+    f.connect().await;
+    f.db.set_google_consent(&f.alice.id, "bot", true, &f.alice.id).unwrap();
+    let key = crate::google_identity::protection_gate(&f.home).unwrap();
+    let old = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    let secret = vault::Secret {
+        access_token: "expired".into(), refresh_token: Some("refresh-alice".into()), expires_at: Some(0),
+    };
+    assert!(vault::finish_refresh(&f.home, &key, &old.metadata, &secret).unwrap());
+    access::pinned_test::install(&f.home);
+    let held = grants::acquire(&f.home).await.unwrap();
+    let state = GoogleTokenRouteState::new(f.home.clone(), Some(f.db.clone()));
+    let requester = RequesterIdentity::DashboardUser { user_id: f.alice.id.clone() };
+    let refresh = tokio::spawn(async move { route::serve(&state, "bot", "gmail_read", &requester).await });
+    // Observe the real refresh boundary, not an assumed scheduling delay.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !access::pinned_test::events(&f.home).contains(&"token_refresh_waiting_for_grant") {
+            assert!(!refresh.is_finished(), "request must reach the refresh grant wait");
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("refresh did not reach the grant wait");
+    let coordinator = AuthorityCoordinator::new(&f.home);
+    let writer = tokio::task::spawn_blocking(move || coordinator.write());
+    let exclusive = tokio::time::timeout(Duration::from_secs(1), writer).await
+        .expect("refresh must release shared authority while waiting for the grant")
+        .unwrap().unwrap();
+    assert!(!refresh.is_finished());
+    drop(exclusive);
+    drop(held);
+    let value = tokio::time::timeout(Duration::from_secs(2), refresh).await.unwrap().unwrap().unwrap();
+    assert_eq!(value["access_token"], "access-alice");
+    access::pinned_test::remove(&f.home);
+}
+
+#[tokio::test]
 async fn invalid_grant_transitions_once_and_disconnect_fences_inflight_connection() {
     let f = Fixture::new();
     f.connect().await;
