@@ -98,6 +98,7 @@ mod memory_rpc;
 mod memory_history_rpc;
 pub(crate) mod my_memory_rpc;
 mod chat_link_rpc;
+mod chat_admin_settings_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -136,6 +137,7 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod skill_trust_rpc;
 mod odoo_member_rpc;
 mod odoo_access_rpc;
 mod member_key_activity;
@@ -228,6 +230,8 @@ mod approvals_decide;
 pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
+mod autopilot_department_rpc;
+mod autopilot_affecting_rpc;
 mod ticks_rpc;
 mod os_rpc;
 mod redaction_status_rpc;
@@ -709,6 +713,16 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_chat_link_rpc(method, params, ctx)).await;
         }
 
+        if method.split('.').take(2).eq(["approvals", "chat_admin"]) {
+            let Some(role) = chat_admin_settings_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此聊天核准操作。");
+            };
+            if ctx.role != role {
+                return WsFrame::error_response("", "只有管理員可以設定聊天核准。");
+            }
+            return boxed_frame(|| self.handle_chat_admin_settings_rpc(method, params, ctx)).await;
+        }
+
         // RM-039 "my memory" is gateway-owned self-service: an extension must
         // never answer it, and every method has an explicit role entry. The
         // handler scopes every read and delete to the caller's own subjects.
@@ -774,6 +788,10 @@ impl MethodHandler {
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route
         // before extension dispatch so no plugin sees a freshly issued one.
+        // Pin parameters contain fresh credentials; never pass them to extensions.
+        if method.split('.').next() == Some("skill_trust") {
+            return boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await;
+        }
         if member_keys_rpc::owns(method) {
             return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx, conn)).await;
         }

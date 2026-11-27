@@ -35,6 +35,8 @@ async fn child(env: &Env, id: &str, parent: &str) {
 
 fn heartbeat_message(id: &str, task_id: &str) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.into(),
         sender: crate::responsibility::HEARTBEAT_SENDER.into(),
         target: OWNER.into(),

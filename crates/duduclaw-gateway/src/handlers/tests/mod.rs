@@ -121,6 +121,7 @@ mod status_tokens_rpc_tests;
 mod member_keys_rpc_tests;
 mod mcp_keys_rpc_tests;
 
+mod skill_trust_rpc_tests;
 mod odoo_member_rpc_tests;
 mod dept_grant_matrix_tests;
 mod dept_grants_rpc_tests;

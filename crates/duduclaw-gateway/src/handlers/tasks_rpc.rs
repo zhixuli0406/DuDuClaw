@@ -444,6 +444,7 @@ impl MethodHandler {
         self.broadcast_event("activity.new", activity_row_to_json(&activity))
             .await;
         self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::gateway(),
             task: task_json.clone(),
         })
         .await;
@@ -591,6 +592,7 @@ impl MethodHandler {
                 self.broadcast_event("task.updated", task_json.clone())
                     .await;
                 self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskUpdated {
+                    origin: crate::autopilot_engine::EventOrigin::gateway(),
                     task: task_json.clone(),
                 })
                 .await;
@@ -603,6 +605,7 @@ impl MethodHandler {
                     if prev != new_status {
                         self.emit_autopilot_event(
                             crate::autopilot_engine::AutopilotEvent::TaskStatusChanged {
+                                origin: crate::autopilot_engine::EventOrigin::gateway(),
                                 task_id: task_id.to_string(),
                                 from: prev.to_string(),
                                 to: new_status.to_string(),

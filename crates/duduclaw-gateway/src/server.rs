@@ -1354,6 +1354,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // committed but did not deliver (held rows included). Only the gateway
     // lock holder drains.
     if duduclaw_core::gateway_instance::held(&home_dir) {
+        crate::company_timezone_init::run_once(&home_dir);
         crate::handlers::drain_reset_audit_outbox(&home_dir, &user_db, true);
     }
     let jwt_config = Arc::new(JwtConfig::load_or_generate(&home_dir).map_err(|e| {
@@ -18138,6 +18139,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -18189,6 +18191,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -18244,6 +18247,7 @@ mod personal_google_callback_tests {
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
+                expected_home_write: None,
                 created: std::time::Instant::now(),
                 code: None,
             });
@@ -20086,6 +20090,8 @@ struct GoogleAuthorizationConfirmation {
     ticket: String,
     acknowledge_google_data: bool,
     confirm_shared_access: bool,
+    #[serde(default)]
+    acknowledge_write: bool,
 }
 async fn handle_google_authorization_confirm(State(state): State<Arc<AppState>>, headers: axum::http::HeaderMap,
     body: Result<Json<GoogleAuthorizationConfirmation>, axum::extract::rejection::JsonRejection>) -> axum::response::Response {
@@ -20103,7 +20109,7 @@ async fn handle_google_authorization_confirm(State(state): State<Arc<AppState>>,
             let origin_ok=routes::valid_origin(origin,&allowed);
             match body {
                 Ok(Json(body)) if origin_ok => match routes::confirm(&state.home_dir,&state.user_db,&user,&session,
-                    &body.ticket,origin,body.acknowledge_google_data,body.confirm_shared_access).await {
+                    &body.ticket,origin,body.acknowledge_google_data,body.confirm_shared_access,body.acknowledge_write).await {
                     Ok(value)=>Json(value).into_response(),
                     Err(_)=>(axum::http::StatusCode::FORBIDDEN,Json(serde_json::json!({"error":crate::google_authorization_requests::store::REFUSED}))).into_response(),
                 },

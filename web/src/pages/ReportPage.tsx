@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useAuthStore } from '@/stores/auth-store';
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -516,6 +517,7 @@ function cacheHealthClass(h: CacheHealth): string | undefined {
  * per-agent cache ranking, and a recent-usage table.
  */
 function CostEfficiencySection({ hours }: { hours: number }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
   const [summary, setSummary] = useState<CostSummary | null>(null);
@@ -726,7 +728,7 @@ function CostEfficiencySection({ hours }: { hours: number }) {
                       {formatMillicents(r.cost_millicents)}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs text-muted-foreground">
-                      {new Date(r.created_at).toLocaleString()}
+                      {formatDateTime(r.created_at, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}
                     </TableCell>
                   </TableRow>
                 ))}

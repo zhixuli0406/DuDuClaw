@@ -166,7 +166,8 @@ fn totp_event_requires_private_human_unforwarded_sender_and_exact_prompt_reply()
             "chat":{"id":123456789,"type":"private"},"text":dm_totp::prompt_text(crate::trigger_route::texts::Lang::ZhTw)}});
     let msg: TgMessage = serde_json::from_value(raw.clone()).unwrap();
     let event = telegram_totp_event(&msg, Some("support"));
-    assert!(event.private);
+    assert!(event.envelope_private);
+    assert!(!event.authorized);
     assert_eq!(event.account, "telegram:support");
     assert_eq!(event.reply_to.as_deref(), Some("43"));
     assert_eq!(event.principal, "123456789");
@@ -186,7 +187,7 @@ fn totp_event_requires_private_human_unforwarded_sender_and_exact_prompt_reply()
             _ => raw["sender_chat"] = json!({"id":123456789,"type":"private"}),
         }
         let msg: TgMessage = serde_json::from_value(raw).unwrap();
-        assert!(!telegram_totp_event(&msg, None).private, "{case}");
+        assert!(!telegram_totp_event(&msg, None).envelope_private, "{case}");
     }
 }
 

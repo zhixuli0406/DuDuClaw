@@ -746,7 +746,7 @@ async fn drive_write_listing_admission_and_snapshot_follow_policy() {
                     assert_eq!(result["error"]["message"], refusal.unwrap(), "{result}");
                 }
                 if move_ && *tool == "drive_move_file" && lane == ProcessLane::Normal {
-                    assert_eq!(crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane).as_deref(), Some("需要先限定資料夾。"));
+                    assert_eq!(crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane).as_deref(), Some("這項操作需要先限定可使用的資料夾，請管理員設定。"));
                 }
             }
         }

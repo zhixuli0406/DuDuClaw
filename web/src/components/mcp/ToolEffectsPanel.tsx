@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type McpServerToolEffects } from '@/lib/api';
@@ -19,6 +20,7 @@ const VERDICT_CLASS: Record<string, string> = {
  */
 export function ToolEffectsPanel({ agents }: { agents: ReadonlyArray<AgentLite> }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [agentId, setAgentId] = useState(agents[0]?.name ?? '');
   const [servers, setServers] = useState<McpServerToolEffects[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -80,7 +82,7 @@ export function ToolEffectsPanel({ agents }: { agents: ReadonlyArray<AgentLite> 
                 {intl.formatMessage({ id: srv.read_hint_trusted ? 'mcp.toolEffects.trusted' : 'mcp.toolEffects.untrusted' })}
               </Badge>
               <span className="text-xs text-muted-foreground">
-                {intl.formatMessage({ id: 'mcp.toolEffects.observed' }, { at: new Date(srv.observed_at).toLocaleString() })}
+                {intl.formatMessage({ id: 'mcp.toolEffects.observed' }, { at: formatDateTime(srv.observed_at, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) })}
               </span>
             </div>
             <ul className="divide-y divide-surface-border">

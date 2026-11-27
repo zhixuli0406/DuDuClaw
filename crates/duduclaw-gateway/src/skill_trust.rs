@@ -50,30 +50,55 @@ struct Config {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TrustConfig {
+pub(crate) struct TrustConfig {
     #[serde(default)]
-    auto_approve: Vec<PinnedKey>,
+    pub(crate) auto_approve: Vec<PinnedKey>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PinnedKey {
-    publisher: String,
-    key: String,
-    key_id: String,
-    added_by: String,
-    added_at: String,
+pub(crate) struct PinnedKey {
+    pub(crate) publisher: String,
+    pub(crate) key: String,
+    pub(crate) key_id: String,
+    pub(crate) added_by: String,
+    pub(crate) added_at: String,
 }
 impl PinnedKey {
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.publisher != "duduclaw" && validate_publisher_id(&self.publisher).is_ok()
             && !self.added_by.is_empty() && !self.added_at.is_empty()
             && minisign_key_id(&self.key).is_ok_and(|id| id == self.key_id)
     }
 }
+/// A minisign key id is not a fingerprint. Check all entries, including invalid
+/// ones, before selecting usable pins so a collision cannot be filtered away.
+pub(crate) fn conflicting_pin_ids(entries: &[PinnedKey]) -> BTreeSet<(String, String)> {
+    let mut keys = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for entry in entries {
+        let claimed = (entry.publisher.clone(), entry.key_id.clone());
+        let Ok(key_id) = minisign_key_id(&entry.key) else {
+            conflicts.insert(claimed);
+            continue;
+        };
+        let identity = (entry.publisher.clone(), key_id);
+        if claimed != identity {
+            conflicts.insert(claimed);
+            conflicts.insert(identity.clone());
+        }
+        if keys.insert(identity.clone(), entry.key.as_str()).is_some_and(|key| key != entry.key.as_str()) {
+            conflicts.insert(identity);
+        }
+    }
+    conflicts
+}
 fn read_config(root: &Directory) -> Result<TrustConfig, String> {
     let raw = root.read("config.toml", 2 * 1024 * 1024).map_err(|_| CONFIG)?;
     let text = std::str::from_utf8(&raw).map_err(|_| CONFIG)?;
-    toml::from_str::<Config>(text).map(|c| c.skill_trust).map_err(|_| CONFIG.into())
+    let mut trust = toml::from_str::<Config>(text).map_err(|_| CONFIG)?.skill_trust;
+    let conflicts = conflicting_pin_ids(&trust.auto_approve);
+    trust.auto_approve.retain(|entry| !conflicts.contains(&(entry.publisher.clone(), entry.key_id.clone())));
+    Ok(trust)
 }
 
 #[derive(Deserialize)]

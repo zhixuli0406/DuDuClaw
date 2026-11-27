@@ -1,5 +1,6 @@
 //! Dashboard automation access uses stored ownership, live bindings and department grants.
 use super::*;
+use duduclaw_core::company_timezone;
 use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows, record_grant_use};
 
 // v1.81 P1g: a routine of another person's Personal employee is never
@@ -25,7 +26,7 @@ fn prompt_only(row: &CronTaskRow) -> bool {
 
 fn member_cron_row(row: &CronTaskRow, writable: bool, can_edit: bool, can_resume: bool, can_run: bool) -> Value {
     json!({ "id": row.id, "name": row.name, "agent_id": row.agent_id,
-        "cron": row.cron, "schedule": row.cron, "task": row.task, "enabled": row.enabled,
+        "cron": row.cron, "schedule": row.cron, "cron_timezone": row.cron_timezone, "task": row.task, "enabled": row.enabled,
         "last_run_at": row.last_run_at, "last_status": row.last_status,
         "skip_reason": row.skip_reason(),
         "last_delivery_status": row.last_delivery_status,
@@ -233,13 +234,18 @@ impl MethodHandler {
             row.on_behalf_of = Some(principal);
             row.created_by_user_id = Some(ctx.user_id.clone());
             row.scoped_by_user_id = Some(ctx.user_id.clone());
+            let choice = company_timezone::default_for_new_schedule(
+                &company_timezone::read(&self.home_dir), true, Utc::now(),
+            );
+            let zone_note = company_timezone::zone_note_zh(&choice.source);
+            row.cron_timezone = Some(choice.zone);
             if let Err(error) = store.insert_scoped(&row).await { return WsFrame::error_response("", &error); }
             if !operator {
                 record_grant_use(self, ctx, agent, GrantGroup::Schedules, GrantAction::Create, method).await;
             }
             self.notify_cron_reload().await;
             self.emit_cron_changed(json!({ "action": "created", "id": row.id })).await;
-            return WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row) }));
+            return WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row), "zone_note": zone_note }));
         }
         // Resolve once by id; legacy name-only changes are deliberately not employee APIs.
         let action = match method {
@@ -347,6 +353,44 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_member_default(company: &str, expected: &str, source: company_timezone::ZoneSource) {
+        use chrono::TimeZone;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            format!("[general]\ncompany_timezone = '{company}'\n")).unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        let choice = company_timezone::default_for_new_schedule(&company_timezone::read(home.path()), true, now);
+        assert_eq!(choice.source, source);
+        assert_eq!(choice.zone, expected);
+        let mut row = CronTaskRow::new("member-zone".into(), "Morning".into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        row.on_behalf_of = Some("user:member".into());
+        row.created_by_user_id = Some("member".into());
+        row.scoped_by_user_id = Some("member".into());
+        row.cron_timezone = Some(choice.zone);
+        store.insert_scoped(&row).await.unwrap();
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(stored.cron_timezone.as_deref(), Some(expected));
+        assert_eq!(member_cron_row(&stored, true, true, true, true)["cron_timezone"], expected);
+        match source {
+            company_timezone::ZoneSource::Company => assert_eq!(company_timezone::zone_note_zh(&source), None),
+            company_timezone::ZoneSource::UtcMemberDst => assert_eq!(company_timezone::zone_note_zh(&source),
+                Some("公司時區有夏令時間，成員自建的例行工作以 UTC 計時；要依當地時間請管理員建立。")),
+            _ => panic!("unexpected fixture source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn member_default_with_dst_company_zone_is_utc_with_note() {
+        assert_member_default("America/New_York", "UTC", company_timezone::ZoneSource::UtcMemberDst).await;
+    }
+
+    #[tokio::test]
+    async fn member_default_with_taipei_is_taipei() {
+        assert_member_default("Asia/Taipei", "Asia/Taipei", company_timezone::ZoneSource::Company).await;
+    }
 
     #[test]
     fn member_row_only_exposes_the_fixed_skip_reason() {

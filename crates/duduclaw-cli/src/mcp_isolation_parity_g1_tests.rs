@@ -33,7 +33,7 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-// Includes the nine RM-131 Drive writes, intentionally refused in protected mode.
+// Includes RM-194 admin settings, nine RM-131 Drive writes and the four RM-141 Odoo write-back tools.
 const CATALOG_TOOLS: usize = 288;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";

@@ -33,9 +33,10 @@ fn steps_action(rule: &AutopilotRuleRow) -> Result<Vec<Value>, String> {
 
 impl AutopilotEngine {
     pub(super) async fn start_run(
-        &self, rule: &AutopilotRuleRow, event_name: &str,
+        &self, origin: EventOrigin, rule: &AutopilotRuleRow, event_name: &str,
         fields: &serde_json::Map<String, Value>, now: DateTime<Utc>,
     ) -> Result<(), String> {
+        if !self.admit_department_rule(origin, rule, fields, now).await { return Ok(()); }
         let actions = match steps_action(rule) {
             Ok(actions) => actions,
             Err(detail) => {
@@ -55,7 +56,7 @@ impl AutopilotEngine {
             event_name: event_name.into(), fields_json: serde_json::to_string(fields).map_err(|e| e.to_string())?,
             state: RUN_PENDING.into(), step_index: 0, step_count: actions.len() as i64,
             next_at: None, lease_owner: None, lease_until: None,
-            owner_department: rule.owner_department.clone(), outcome: None, detail: None,
+            gateway_origin: origin.is_gateway(), owner_department: rule.owner_department.clone(), outcome: None, detail: None,
             created_at: run_ts(now), updated_at: run_ts(now),
             notice_pending: false, notice_push_state: None, notice_push_attempts: 0, notice_push_next_at: None,
         };
@@ -153,7 +154,7 @@ impl AutopilotEngine {
                         Some(gate::RESULT_EXPIRED) => "expired",
                         Some(gate::RESULT_STALE) => "stale_rule_changed",
                         Some(gate::RESULT_BREAKER_OPEN) => "blocked_breaker_open",
-                        Some(gate::RESULT_SKIPPED) if detail == Some("scope_denied") => "scope_denied",
+                        Some(gate::RESULT_SKIPPED) if matches!(detail, Some("scope_denied" | DEPARTMENT_CONTAINMENT_SKIP)) => "scope_denied",
                         Some(gate::RESULT_SKIPPED) => "autonomy_paused",
                         Some(gate::RESULT_FAILURE) => "step_failed",
                         Some(gate::RESULT_UNCERTAIN) => "execution_uncertain",
@@ -253,10 +254,10 @@ impl AutopilotEngine {
                 WindowDecision::ZoneUnresolved { detail } => return Err(("outside_window_tz_unresolved".into(), detail)),
                 WindowDecision::Invalid { detail } => return Err(("active_window_invalid".into(), detail)),
             }
-            if let crate::autopilot_scope::ScopeDecision::Deny { reason } =
-                crate::autopilot_scope::check(&self.home_dir, &rule, Some(&step), fields)
+            if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
+                crate::autopilot_scope::check(&self.home_dir, &rule, Some(&step), fields, run.event_origin())
             {
-                return Err(("scope_denied".into(), reason));
+                return Err(("scope_denied".into(), DEPARTMENT_CONTAINMENT_SKIP.into()));
             }
             Ok(())
         }.await;
@@ -311,6 +312,11 @@ impl AutopilotEngine {
                 Some(action) => action,
                 None => return self.settle_run(&run, "invalid_action", None, now).await,
             };
+            if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
+                crate::autopilot_scope::check(&self.home_dir, &rule, Some(action), &fields, run.event_origin())
+            {
+                return self.settle_run(&run, "scope_denied", Some(DEPARTMENT_CONTAINMENT_SKIP), now).await;
+            }
             let rows = self.store.list_run_steps(id).await?;
             let Some(step) = rows.iter().find(|s| s.step_index == run.step_index) else {
                 return self.settle_run(&run, "invalid_state", Some("step missing"), now).await;
@@ -422,7 +428,7 @@ impl AutopilotEngine {
                             Ok(Some(FrozenAction::Delegate { target_agent, prompt, lane }))
                             | Ok(Some(FrozenAction::RunSkill { target_agent, prompt, lane, .. })) => {
                                 let expected = Self::prompt_queue_message(target_agent, prompt,
-                                    lane.clone(), Some(&message_id), now);
+                                    lane.clone(), Some(&message_id), now, Some(&rule));
                                 if existing.matches_enqueue(&expected) { Ok(()) }
                                 else { Err("queue id delivery mismatch".to_string()) }
                             }
@@ -470,7 +476,7 @@ impl AutopilotEngine {
             let queue_message_id = queue_action.then_some(message_id.as_str());
             let outcome = match prepared {
                 Ok(None) => Ok(STEP_SKIPPED),
-                Ok(Some(prepared)) => self.perform_action_with_queue_id(&prepared, queue_message_id, now).await.map(|()| STEP_DONE),
+                Ok(Some(prepared)) => self.perform_action_with_queue_id(&prepared, queue_message_id, now, Some(&rule)).await.map(|()| STEP_DONE),
                 Err(error) => Err(error),
             };
             match outcome {
@@ -538,6 +544,11 @@ impl AutopilotEngine {
     }
 
     async fn announce_run_notice(&self, run: &AutopilotRunRow, now: DateTime<Utc>) -> Result<(), String> {
+        if crate::autopilot_scope::notice_targets(&self.home_dir, &self.store,
+            &run.rule_id, run.owner_department.as_deref()).await.is_err()
+        {
+            return self.store.deny_run_notice(&run.run_id).await;
+        }
         let outcome = run.outcome.as_deref().ok_or("settled run has no outcome")?;
         let summary = match outcome {
             "missed_late" => format!("自動化規則「{}」系統停機超過一小時，後續步驟沒有補做", run.rule_name),
@@ -579,8 +590,9 @@ impl AutopilotEngine {
             let home = self.home_dir.clone();
             let run_id = run.run_id.clone();
             let rule_id = run.rule_id.clone();
+            let department = run.owner_department.clone();
             tokio::spawn(async move {
-                let result = crate::autopilot_approval::push_admin_notice(&home, &rule_id, &body).await;
+                let result = crate::autopilot_approval::push_scoped_notice(&home, &store, &rule_id, department.as_deref(), &body).await;
                 if let Err(error) = store.record_run_notice_push(&run_id, attempt, result, Utc::now()).await {
                     warn!(%run_id, %error, "autopilot: run notice result not recorded; lease will expire");
                 }

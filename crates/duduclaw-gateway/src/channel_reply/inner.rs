@@ -4346,6 +4346,9 @@ async fn build_reply_with_session_inner_impl(
     drop(reg);
 
     let failure = last_cli_error.unwrap_or_else(||ReplyFailure::simple(ReplyOrigin::Unknown,"No error info".into()));
+    if failure.to_string() == crate::on_behalf_of::access::MAIN_TURN_REFUSAL {
+        return crate::on_behalf_of::access::MAIN_TURN_REFUSAL.into();
+    }
     let reason = failure.reason();
     super::health::mark(&agent_id, Some(if mcp_gate_refused && !crate::work_outcome::is_work_result(&failure) { "gate_refused" } else { super::health::reason(reason) }));
     let diagnostic = failure.audit();

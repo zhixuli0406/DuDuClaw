@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useEffect, useState, useCallback, type ComponentType, type ReactNode } from 'react';
 import { isRemovedRuntime } from '@/lib/deprecated-runtimes';
@@ -169,6 +170,7 @@ function CredentialStateBadge({
  */
 export function AccountsPage() {
   const policy = useProductPolicy();
+  useCompanyTimeZone();
   const intl = useIntl();
   const [budget, setBudget] = useState<BudgetSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -463,7 +465,7 @@ export function AccountsPage() {
                       {c.present && c.modified_at
                         ? intl.formatMessage(
                             { id: 'accounts.cliCreds.updatedAt' },
-                            { date: new Date(c.modified_at * 1000).toLocaleString() },
+                            { date: formatDateTime(c.modified_at * 1000, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) },
                           )
                         : ' '}
                     </p>

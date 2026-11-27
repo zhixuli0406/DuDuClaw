@@ -1893,6 +1893,23 @@ mod tests {
     }
 
 
+    #[tokio::test]
+    async fn legacy_null_cron_row_still_fires_utc_with_company_zone_set() {
+        use chrono::TimeZone;
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::cron_store::CronStore::open(home.path()).unwrap();
+        let row = CronTaskRow::new("legacy".into(), "Legacy".into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        store.insert(&row).await.unwrap();
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+        assert_eq!(duduclaw_core::company_timezone::read(home.path()),
+            duduclaw_core::company_timezone::CompanyZone::Set(chrono_tz::Asia::Taipei));
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(stored.cron_timezone, None);
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        assert_eq!(next_run(&stored, now), Some(Utc.with_ymd_and_hms(2026, 11, 27, 9, 0, 0).unwrap()));
+    }
+
     #[test]
     fn cron_next_run_matches_scheduler_in_taipei_and_new_york() {
         use chrono::TimeZone;

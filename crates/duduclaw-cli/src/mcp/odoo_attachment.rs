@@ -570,10 +570,13 @@ fn ooxml_type(extension: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
     };
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).map_err(|_| invalid)?;
     // Metadata and one bounded XML read only: never expand the whole archive.
-    if archive.len() > 4096 || archive.file_names().any(|name| {
-        let lower = name.to_ascii_lowercase();
-        lower.ends_with("vbaproject.bin") || lower.split('/').any(|component| component == "activex")
-    }) { return Err(invalid.into()); }
+    if archive.len() > 4096 { return Err(invalid.into()); }
+    for name in archive.file_names() {
+        let lower = name.map_err(|_| invalid)?.to_ascii_lowercase();
+        if lower.ends_with("vbaproject.bin") || lower.split('/').any(|component| component == "activex") {
+            return Err(invalid.into());
+        }
+    }
     // Bound both each relationship part and total expanded relationship bytes.
     // Reject entities/DTDs and non-UTF-8 rather than guessing XML encodings.
     let mode = regex::Regex::new(r"(?i)\bTargetMode\b").map_err(|_| invalid)?;
@@ -581,7 +584,7 @@ fn ooxml_type(extension: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
     let mut remaining = 4 * 1024 * 1024usize;
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(|_| invalid)?;
-        if !entry.name().to_ascii_lowercase().ends_with(".rels") { continue; }
+        if !entry.name().map_err(|_| invalid)?.to_ascii_lowercase().ends_with(".rels") { continue; }
         let mut xml = Vec::new();
         entry.take(256 * 1024 + 1).read_to_end(&mut xml).map_err(|_| invalid)?;
         if xml.len() > 256 * 1024 || xml.len() > remaining || xml.contains(&0) || xml.contains(&b'&') {

@@ -354,6 +354,7 @@ const EMPLOYEE_KEYS: &[&str] = &["agent_id", "agent", "agent_name", "from_agent"
 /// an employee, method by method, each with its reason. Required for every
 /// such arm in a namespace that also has a gated method.
 const EMPLOYEE_ARMS: &[(&str, &str)] = &[
+    ("autopilot.affecting_me", "live direct Viewer binding; explicit owner-only Personal rule filter before projection; P1g default deny on agent_id and hidden rows"),
     // The shared broadcast_event helper reads assigned_to only for task events;
     // these system-status events neither select nor expose employee content.
     ("license.activate", "Admin-only signed license installation; request contains a license key, no employee; broadcasts system status"),

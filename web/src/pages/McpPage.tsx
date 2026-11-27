@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
@@ -963,6 +964,7 @@ function OAuthTab({
   providers: ReadonlyArray<McpOAuthProvider>;
   showToast: (type: 'success' | 'error', message: string) => void;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [pendingProvider, setPendingProvider] = useState<string | null>(null);
   /** Consent URL of the in-flight authorization — kept on the card as a
@@ -1113,7 +1115,7 @@ function OAuthTab({
                   {/* Expires at */}
                   {provider.token_status === 'authenticated' && provider.expires_at && (
                     <p className="text-xs text-muted-foreground">
-                      {intl.formatMessage({ id: 'mcp.oauth.expiresAt' }, { date: new Date(provider.expires_at).toLocaleDateString() })}
+                      {intl.formatMessage({ id: 'mcp.oauth.expiresAt' }, { date: formatDateTime(provider.expires_at, { year: 'numeric', month: 'numeric', day: 'numeric' }) })}
                     </p>
                   )}
 

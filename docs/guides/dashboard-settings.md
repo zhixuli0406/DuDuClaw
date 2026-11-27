@@ -1,5 +1,19 @@
 # Dashboard settings map (v1.80.0)
 
+## Department and main employee access settings (Enterprise, v1.86.0)
+
+| Location | Controls and current availability |
+|---|---|
+| Manage → Members → department grants | Admin chooses an active Manager, department and schedules, automation rules, skills or usage. Outbound-data review is also an option, to be documented separately. The gateway supports saving grants; the Members-page editor still needs dashboard integration. |
+| Main AI employee → Who may use | Admin maintains the initially empty list for conversation and ordinary work. The gateway supports saving the list and explains when it is inactive; the dashboard control still needs integration. It grants access only in protected mode with isolated employee execution. Otherwise only Admins can use these entry points. |
+| Routines | A Manager with schedules access can filter by department and manage eligible routines, reminders and scheduled assignments. Creation is limited to prompt-only routines. Employees needing an Admin org sync are counted in a notice. Department automation editing and member read-only rule screens still need integration. |
+| Skills | Granted Managers can switch skills on or off, remove, restore and choose **Request installation** for an employee. Installation still requires Admin approval. |
+| Budget / billing → Department usage | Granted Managers can choose a department and 7, 30 or 90 days, then read per-employee usage, totals and recent records. They cannot change budgets through this grant. |
+
+Adding or widening a grant, or adding people to the main list, requires reading the risk note and ticking **I understand**. Changes are audited. Department grants apply only to signed-in dashboard sessions, not personal API keys or chat apps. They end automatically when the person stops being an active Manager. The main list warns that listed people may ask about memories, including Admin conversations; personal API keys can never use the main employee. Scheduling the main employee, creating employees and changing their settings stay Admin-only.
+
+See [Department managers](../features/79-department-managers.md) for exact permissions, rule execution limits, revocation and existing work. Company-wide analytics and billing summaries remain visible to all Managers.
+
 ## Skill archive recovery
 
 Automatic skill staleness and archiving have been removed. `[skill_curator]`
@@ -124,9 +138,9 @@ Automations are checked on the server for each record: employees can read their 
 
 New conversations show up to five recently submitted skills for the signed-in account, with short descriptions. Select one or more chips to insert `/skill-name` into the draft, then add your instructions and send. Selecting a chip sends nothing. The server records accepted chat/task submissions and filters the history by current skill access; this is not a claim that the AI finished executing the skill. Assign task uses the same history when that page is enabled.
 
-Non-Admin cron uses UTC schedules (a schedule that already carries a timezone without daylight saving, such as Asia/Taipei, also runs and stays editable) and requires a host-running agent with task sandbox disabled. Limits are 20 enabled jobs per user, 50 per agent, 20 creations per rolling hour and a minimum 15-minute interval. Add/update messages pass the chat input protection; denied messages are audited. The organization chart shows directly bound agents and your own department; out-of-scope ancestors expose only name and role. Admin behavior remains unchanged.
+Non-Admin cron schedules without an explicit timezone use the company time zone when it has no daylight saving; when it has daylight saving, member-created routines use UTC with a notice. The existing restriction to a host-running agent with task sandbox disabled remains. Limits are 20 enabled jobs per user, 50 per agent, 20 creations per rolling hour and a minimum 15-minute interval. Add/update messages pass the chat input protection; denied messages are audited. The organization chart shows directly bound agents and your own department; out-of-scope ancestors expose only name and role. Admin behavior remains unchanged.
 
-These limits also apply to human-origin schedules created or edited through MCP. Such MCP schedules default to UTC and accept an explicit timezone without daylight saving; timezones with daylight saving are refused, and an older schedule that has one is skipped until an Admin changes it. Skipped schedules show “Skipped” with an explanation on the Automations page, and administrators receive a one-time notification. Unmarked Admin/background schedules keep local-timezone detection. Manual runs allow 3 accepted attempts per schedule and 10 per account per 10 minutes, with at most 2 outstanding per account and 4 globally. Busy requests are rejected immediately. The manual-run window resets when the gateway restarts. Employee cron expressions are limited to 256 bytes.
+These limits also apply to human-origin schedules created or edited through MCP. For member-origin MCP routines without an explicit timezone, the company time zone is used when it has no daylight saving; otherwise the routine is stored in UTC with a notice. Explicit member time zones with daylight saving remain refused, and an older schedule that has one is skipped until an Admin changes it. Skipped schedules show “Skipped” with an explanation on the Automations page, and administrators receive a one-time notification. New Admin/background schedules without an explicit timezone use the company time zone, or UTC when it is unset or invalid. Existing schedules keep their stored behavior. Manual runs allow 3 accepted attempts per schedule and 10 per account per 10 minutes, with at most 2 outstanding per account and 4 globally. Busy requests are rejected immediately. The manual-run window resets when the gateway restarts. Employee cron expressions are limited to 256 bytes.
 
 Task board (`/tasks`), Goals (`/goals`) and Assign task (`/assign`) entry points are hidden for every role, including Admin and Personal. The sidebar’s primary button and the mobile centre ＋ start a new conversation; existing prefilled text becomes an unsent draft. `/assign` redirects to `/chat`. Direct links to `/tasks`, `/tasks/:id` and `/goals` still work under their existing permissions, including notification and task-card links. Tasks, schedules and backend APIs are unchanged. Responsibilities (`/responsibilities`) and Foresight (`/foresight`) retain their existing visibility and permissions.
 
@@ -196,6 +210,14 @@ Conversation storage (v1.81.0, Enterprise edition, Manage → Advanced → Membe
 - A save edits the file in place: only the keys you changed are rewritten. Comments, blank lines, key order and the formatting of every untouched key stay exactly as you wrote them, and a changed value keeps the comment at the end of its line. A new key goes at the end of its section and a new section at the end of the file. This holds for every settings page that writes `config.toml` or `inference.toml`, not only the Advanced config editor.
 - Keys that only take effect after a restart come back in `restart_required`. The Settings and Channels pages show "These settings take effect after the gateway restarts" until the gateway has restarted (you can also dismiss it). The Inference page and the employee edit page do not show this banner.
 - Each change to one of these keys also writes the audit event `config_protected_key_changed` with the old and new value: `acp.trusted`, `tick.allow_command_sources`, `container.sandbox.when_unavailable`, `container.sandbox.script_when_unavailable`, `memory.supersession_trust_guard`, `dashboard.public_url`.
+
+## Settings → General → Company time zone (v1.86.0)
+
+Admins can set **Company time zone** in System settings → General (`[general] company_timezone`) to an IANA name such as `Asia/Taipei`. It is the default for new routines, scheduled assignments and chat schedules. Dashboard times, reminder confirmations, channel notices, AI wake-up context and data export calendar dates also use it. If unset or invalid, new schedules use UTC and confirmations say so; dashboard times use each viewer’s browser time zone.
+
+On the first v1.86 gateway start, if `config.toml` exists and the setting is absent, DuDuClaw fills it once from the host time zone and marks it **Filled in automatically, please confirm**. If detection fails it remains unset. It never detects again, including after an Admin clears the setting. Member-created routines in a company time zone with daylight saving are stored in UTC with a notice; the existing member time zone restriction remains. Existing schedules do not move: routines without a zone remain UTC, and pre-v1.86 scheduled assignments without a zone remain on the host time zone.
+
+Heartbeat `cron_timezone`, digest `timezone`, and proactive notification quiet-hours `[proactive] timezone` are separate settings; an empty value does not mean the company time zone.
 
 ## Settings → General → Dashboard public URL
 
@@ -616,7 +638,7 @@ RPCs `agent_files.list / get / diff / history / save / rollback / withdraw / pen
 - **Saving:** under the file lock, with the hash the editor read (`base_hash`); a file changed by someone else in between is refused as a conflict. The new text takes effect from the employee's next turn; channels get a one-line notice with the next reply.
 - **Versions:** kept outside the employee folder in `<home>/agent_file_history/<employee>/<file>/` (owner-only files), 20 per file by default (`[agent_files] history_keep`, 5–100). The first change also keeps what the file contained before. Restoring a version runs the same check. Removing an employee moves its history to `agent_file_history/_trash/`; a new employee with the same id starts with none.
 - **Baselines:** saving SOUL.md, IDENTITY.md, USER.md or INSTRUCTIONS.md updates its approved fingerprint (INSTRUCTIONS.md has one now too, checked by the heartbeat as `_instructions_integrity_drift`). A file changed outside the system shows as changed-outside; restore the approved version or check and accept the current content (save it as it is: the whole file is checked, at least a reason or an approval request is needed, and once confirmed the file is not rewritten; the current text is kept as a version and becomes the approved baseline. Saving an unchanged file that was not changed outside is still "unchanged"). Renaming an employee updates the name inside SOUL.md / IDENTITY.md and keeps an approved SOUL approved, while a SOUL that had already changed outside stays flagged. The name must be plain text (1–64 characters, no line breaks, invisible characters or `< > [ ] { }` / backticks), and a renamed file that trips a fixed rule is left as it was (listed in `identity_files_skipped`).
-- **Approval requests:** kind `agent_file_change`, decided only in the dashboard by a current admin, 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
+- **Approval requests:** kind `agent_file_change`, decided in the dashboard by a current admin (or, when [Approve in chat apps](#security--approve-in-chat-apps-v186) is on, from a chat card by a self-confirmed Admin after a second confirmation by default), 3 days to decide (expiry counts as a denial). Channels only get a notice without buttons. The proposed text is stored in `<home>/agent_file_pending/` until the request ends. Approving applies first; if the file changed while the request waited, the request is denied and the requester has to send it again.
 - **Audit:** `agent_file_changed`, `agent_file_change_refused`, `agent_file_review_failed`, `agent_file_change_requested` (hashes only, never the text).
 
 ### Change an employee's persona after creation (v1.82.0)
@@ -635,7 +657,7 @@ The persona you give at creation (the optional Persona box on the blank create f
 
 | Control | Writes | Effect |
 |---|---|---|
-| Chat assignment or RPC: once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins); the dashboard creation form is hidden | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the browser's zone) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
+| Chat assignment or RPC: once at a date and time / every day / weekdays / weekly on chosen days / every hour / custom cron (Admins); the dashboard creation form is hidden | a row in `tasks.db` `assign_schedules` (through `tasks.goal_create` with `schedule` and `schedule_timezone` = the company time zone; when unset, the form temporarily uses the browser time zone and says so) | Nothing is assigned now. At each due time the gateway creates the goal on your behalf, after re-reading your account; no right left means the run is skipped and the schedule paused. |
 | Open `/goals` directly → Assigned by me → Scheduled: **Pause / Resume / Remove** | the row's `status` | At once. Resume re-checks the creator's right and continues from the next slot after now; a one-time schedule whose time passed cannot resume. Remove keeps the row as `removed` (never listed or run again). |
 | **Show everyone's** (Admins) | — | Lists every person's schedules with the creator's name. |
 
@@ -787,6 +809,22 @@ The gateway adds the current source conversation and verified `users.db` Owner b
 **Let the requester confirm outgoing mail** writes `config.toml [security] mail_requester_approval` through the locked, Admin-only `system.update_config` writer. It accepts a boolean and defaults to `true`. A missing file or key uses that default. An unreadable or malformed configuration, an invalid value, or `false` means dashboard-Admin-only approval.
 
 When enabled, only the gateway-attested, verified company account that started the turn may confirm a held `mail_send` in the same one-to-one conversation or authenticated dashboard WebChat, and only while it has Operator access to that AI employee. The card shows full recipients, subject, body summary and private-read status. Group conversations, unverified/external senders and automated turns cannot decide; a dashboard Admin can still decide. This changes no other outgoing tool. Single-use argument binding, dispatch-time revalidation and expiry-as-deny still apply. See [the complete rule](../features/05-security-defense.md#requester-confirmation-for-mail). Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
+
+## Security → Approve in chat apps (v1.86)
+
+Off by default. Admin only. The section is written only through its own settings call; the advanced config editor and the generic settings writer refuse any change to `[approval.chat_admin]`, so the feature cannot be turned on without the risk screen. Turning it on needs only the risk acknowledgement ("I understand"), no password. See [the complete rule](../features/05-security-defense.md#admin-approval-in-chat-apps-v186).
+
+| Control | `config.toml [approval.chat_admin]` | Notes |
+|---|---|---|
+| Approve in chat apps | `enabled` (default `false`) and `enabled_ack = { by, at }` | `enabled_ack` is written by the settings call with the Admin who acknowledged the risk; if it is missing or that user is no longer an Active Admin, the feature is off |
+| Channels | `channels` (default `["telegram", "googlechat"]`) | Only Telegram and Google Chat in this version; other values are ignored with a warning |
+| Categories that need a second confirmation | `step_up_exempt_kinds` (default empty = every T2 category needs it) | Each entry is a T2 category to exempt; exempting one needs a per-category risk acknowledgement and is audited; switching it back is audited too |
+| Confirmation method | `step_up_methods` (default `["web"]`; `"dm_totp"` optional) | Web = one-time dashboard link with password + authenticator code; `dm_totp` = 6-digit code in the Telegram private chat (not offered on Google Chat; the code message is deleted) |
+| Card validity | `card_valid_hours` (default `168`, 1–720) | Never longer than the request's own expiry |
+
+Any read or parse error, an unknown key or value turns the feature off; the screen then shows every T2 category as needing a second confirmation and refuses to save until the file is fixed. Every change is logged and audited as `approval_chat_admin_settings_changed`. The section also lists Admins who have not proven a chat account yet and whether the confirmation link is usable (it needs an external https address).
+
+**My Connections → Chat accounts (Admins).** Generate a code, paste it in a private chat with the listed bot or Chat app within 10 minutes, then come back and confirm "this is me". A binding filled in by an Admin shows "not self-confirmed" on the Members page. **Cancel chat approval eligibility** clears only the proof.
 
 ## Action claim check (advanced config editor only)
 

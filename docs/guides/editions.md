@@ -4,6 +4,12 @@ DuDuClaw runs as the Personal edition by default and switches to the Enterprise 
 
 Principle: the free core is not crippled. The editions differ in quantities and in management surfaces for several people, not in what an AI employee can do.
 
+## Department managers and main employee access (v1.86.0)
+
+Both features are Enterprise-only. Admins can grant active Managers schedules, automation rules, skills and usage for named departments; outbound-data review is also a grant option and will be documented separately. Department grants apply only in signed-in dashboard sessions. They start empty and do not apply to personal API keys or chat apps.
+
+The main AI employee access list also starts empty. Listed people gain conversation and ordinary work only in protected mode with isolated employee execution; otherwise these entry points remain Admin-only. Personal API keys can never use the main employee. See [Department managers](../features/79-department-managers.md) for permissions, risk acknowledgement and current availability.
+
 ## Comparison
 
 | Item | Personal | Enterprise |

@@ -271,6 +271,15 @@ See [docs/features/05-security-defense.md](docs/features/05-security-defense.md#
 
 An AI employee with Bash can get past the checks of `duduclaw ops users mfa-setup-code` (they are a speed bump, not containment); see "Known limitation" under [Two-factor login](docs/features/05-security-defense.md#two-factor-login).
 
+### Admin approval in chat apps: trust premises (v1.86)
+
+Turning on **Approve in chat apps** lets an Active Admin decide some dashboard-only approvals from a chat card. It rests on these premises, which the operator should accept knowingly:
+
+- The Admin's chat account is as safe as the phone and the chat service account behind it. Keep two-step verification on for Telegram and Google accounts, and remove the chat proof (My Connections) when a phone is lost. Second confirmation is required by default for every higher-risk category; switching it off is a recorded decision.
+- Telegram and Google deliver the button press. The gateway accepts a press only when it matches a receipt for a card the gateway itself sent to that Admin's proven private chat; Google Chat presses are accepted only from JWT-verified HTTP events.
+- The private-chat code option leaves the code in Telegram until the bot deletes the message; Google Chat does not offer it because a Chat app cannot delete a user's message.
+- An AI employee with unrestricted Bash running as the same OS user can edit local databases, including `approvals.db`; this pre-existing limit applies to dashboard decisions as well. See [Admin approval in chat apps](docs/features/05-security-defense.md#admin-approval-in-chat-apps-v186).
+
 ## Binary Distribution Security
 
 DuDuClaw binaries are:
