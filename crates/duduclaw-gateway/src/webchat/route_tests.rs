@@ -631,7 +631,8 @@ async fn listed_shell_free_main_conversation_needs_no_binding() {
         assert!(matches!(*refused, ChatMessage::Error { message, .. }
             if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
     }
-    crate::isolation_io_test_support::with_isolation(async {
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(f._dir.path());
     assert!(f.state.agent_access_allowed(&f.emp, "dudu").await);
     assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_ok());
     assert_eq!(route(&f, "你好", Some("dudu")).await.unwrap().agent.as_deref(), Some("dudu"));
@@ -661,7 +662,7 @@ async fn listed_shell_free_main_conversation_needs_no_binding() {
         )
     }).await.expect("listed shell-free conversation must reach the model seam");
     assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{reply}");
-    }).await;
+    }
     }).await;
 }
 

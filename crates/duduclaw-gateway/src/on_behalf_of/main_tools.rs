@@ -10,7 +10,7 @@ use super::MAIN_TURN_REFUSAL;
 /// The person list takes effect only when employee execution is isolated.
 pub async fn listed_access_effective(home: &Path, agent: &str) -> Result<bool, String> {
     listed_access_effective_with_isolation(
-        home, agent, duduclaw_core::execution_gate::isolation_required(),
+        home, agent, super::list_in_effect(home),
     ).await
 }
 
@@ -24,6 +24,10 @@ pub(super) async fn listed_access_effective_with_isolation(
 
 /// Recheck isolation against the executing registry snapshot.
 pub(crate) fn loaded_access_effective(_agent: &LoadedAgent) -> Result<bool, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if duduclaw_core::preset::agent_home_dir(&_agent.dir)
+        .is_some_and(|home| super::main_list_test_support::enabled(&home))
+    { return Ok(true); }
     Ok(duduclaw_core::execution_gate::isolation_required())
 }
 
@@ -54,7 +58,7 @@ pub(crate) async fn snapshot_access_effective(
     home: &Path, agents: &[LoadedAgent],
 ) -> Result<bool, String> {
     snapshot_access_effective_with_isolation(home, agents,
-        duduclaw_core::execution_gate::isolation_required()).await
+        super::list_in_effect(home)).await
 }
 
 pub(super) async fn snapshot_access_effective_with_isolation(

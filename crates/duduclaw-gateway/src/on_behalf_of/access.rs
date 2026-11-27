@@ -24,6 +24,10 @@ use duduclaw_core::{
 mod main_target;
 pub(crate) use main_target::{check_loaded_queue_main_target, check_loaded_queue_main_target_for_execution, check_queue_main_target};
 pub(crate) use main_target::{main_default_targets, main_entry_available, main_access_listed};
+pub(crate) use main_target::main_list_refusal;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use main_target::{test_list_in_effect_for, TestListInEffectGuard};
 pub(crate) use main_target::{loaded_access_effective, check_final_main_spawn, check_main_runtime_attempt};
 pub(crate) use main_target::MAIN_TURN_USE;
 pub use main_target::{

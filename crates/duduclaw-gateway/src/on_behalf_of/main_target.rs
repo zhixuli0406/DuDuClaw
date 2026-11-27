@@ -16,6 +16,20 @@ pub use main_tools::listed_access_effective;
 pub(crate) use main_tools::main_default_targets;
 pub(crate) use main_tools::loaded_access_effective;
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "main_list_test_support.rs"]
+mod main_list_test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use main_list_test_support::{test_list_in_effect_for, TestListInEffectGuard};
+
+/// Only the list decision uses the test seam; native execution never does.
+fn list_in_effect(_home: &Path) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if main_list_test_support::enabled(_home) { return true; }
+    duduclaw_core::execution_gate::isolation_required()
+}
+
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainUse {
@@ -35,7 +49,7 @@ tokio::task_local! {
 /// Missing accounts deny; identity-store read failures are errors (callers deny).
 pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     main_access_allowed_with_isolation(home, user_id, use_,
-        duduclaw_core::execution_gate::isolation_required())
+        list_in_effect(home))
 }
 
 fn main_access_allowed_with_isolation(
@@ -51,6 +65,16 @@ fn main_access_allowed_with_isolation(
 /// Membership alone is used only to select refusal text, never to grant a turn.
 pub(crate) fn main_access_listed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     admitted_main_role(home, user_id, use_).map(|role| role.is_some())
+}
+
+/// Read membership only to explain a refusal, including an inactive list.
+/// This never establishes account, edition, credential or execution authority.
+pub(crate) fn main_list_refusal(home: &Path, principal: Option<&str>) -> &'static str {
+    let super::super::PrincipalState::Human(HumanPrincipal::User(id)) =
+        super::super::PrincipalState::from_wire(principal) else { return REFUSAL; };
+    let listed = crate::decision_notify::open_user_db_read_only(home).ok().flatten()
+        .and_then(|db| db.is_main_agent_user(&id).ok()).unwrap_or(false);
+    if listed { MAIN_TURN_REFUSAL } else { REFUSAL }
 }
 
 fn admitted_main_role(home: &Path, user_id: &str, use_: MainUse) -> Result<Option<UserRole>, String> {
@@ -77,7 +101,7 @@ pub async fn main_turn_allowed(
     home: &Path, user_id: &str, agent: &str, use_: MainUse,
 ) -> Result<bool, String> {
     main_turn_allowed_with_isolation(home, user_id, agent, use_,
-        duduclaw_core::execution_gate::isolation_required()).await
+        list_in_effect(home)).await
 }
 
 async fn main_turn_allowed_with_isolation(
@@ -189,12 +213,7 @@ pub async fn check_loaded_main_target_for(
             return Ok(());
         }
     }
-    let listed = match super::super::PrincipalState::from_wire(principal) {
-        super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
-            main_access_listed(home, &id, use_).unwrap_or(false),
-        _ => false,
-    };
-    Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
+    Err(main_list_refusal(home, principal).into())
 }
 
 /// Last gate for turns admitted under the main-person rule. Every runtime
@@ -205,7 +224,7 @@ pub(crate) async fn check_final_main_spawn(
     home: &Path, dir: Option<&Path>, command: Option<&tokio::process::Command>,
 ) -> Result<(), String> {
     check_final_main_spawn_with_isolation(home, dir, command,
-        duduclaw_core::execution_gate::isolation_required()).await
+        list_in_effect(home)).await
 }
 
 // Private injection boundary; production callers always read the trusted gate.
