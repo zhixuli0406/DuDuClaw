@@ -702,6 +702,19 @@ async fn mcp_streamable_invalid_json_returns_parse_error() {
     assert_eq!(j["error"]["code"].as_i64(), Some(-32700), "body: {j}");
 }
 
+/// A member-key gateway outage cannot replace the JSON-RPC parse error.
+#[tokio::test]
+async fn mcp_streamable_invalid_json_precedes_member_gateway_auth() {
+    let dir = TempDir::new().unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[gateway]\nport = 0\n").unwrap();
+    let app = build_router(&make_cfg(dir.path()), make_dispatcher(dir.path()));
+    let key = "ddc_member_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let resp = app.oneshot(post_mcp("{not json at all", Some(key))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let j = body_json(resp).await;
+    assert_eq!(j["error"]["code"].as_i64(), Some(-32700), "body: {j}");
+}
+
 /// Session handling, asserted as it actually is: this endpoint is **stateless**
 /// (spec-legal). It never issues an `Mcp-Session-Id`, `GET`/`DELETE` answer 405,
 /// and a client that sends a session id anyway is still served — continuation

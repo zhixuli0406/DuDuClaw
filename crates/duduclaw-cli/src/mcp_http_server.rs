@@ -1349,6 +1349,43 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_bearer_and_malformed_json_do_not_contact_person_gateway() {
+        let home = tempfile::tempdir().unwrap();
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        stub.status.store(503, std::sync::atomic::Ordering::SeqCst);
+        let key = "ddc_dev_0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!(
+            "{config}\n[mcp_keys.\"{key}\"]\nclient_id=\"ordinary-client\"\nscopes=[\"memory:read\"]\ncreated_at=\"{}\"\nis_external=true\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+        let auth_home = home.path().to_path_buf();
+        let (authenticated, _) = tokio::task::spawn_blocking(move || {
+            authenticate_bearer_call(&headers, &auth_home, "http://127.0.0.1:8765/mcp")
+        }).await.unwrap().unwrap();
+        assert!(!authenticated.kind().is_person_key());
+        assert_eq!(authenticated.principal().client_id, "ordinary-client");
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for bearer in [key, crate::mcp::person_key_client::tests::RAW] {
+            let request = Request::builder().method("POST").uri("/mcp")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json at all")).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error"]["code"], -32700);
+        }
+        assert!(stub.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn member_query_credential_is_refused_without_contacting_gateway() {
         let home = tempfile::tempdir().unwrap();
         let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
