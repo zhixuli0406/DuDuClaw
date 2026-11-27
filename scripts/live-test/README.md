@@ -101,6 +101,56 @@ The old evidence did not retain the close code or distinguish transport errors
 from JSON errors; the transport diagnosis follows the shutdown path and the
 existing socket contract, and the rerun must capture those details.
 
+## Authorization scope reproduction (K / M / U)
+
+`authz-scope-repro.mjs` observes member-key history reads (K1–K3), Manager
+budget/heartbeat access (M1–M3), and employee MCP `agent_update` authority
+(U1–U4). Requires Node 20+, macOS `sandbox-exec`, `sqlite3`, `lsof`, and an
+already-built executable; other operating systems fail closed before boot.
+
+```sh
+node scripts/live-test/authz-scope-repro.mjs --bin /absolute/path/to/duduclaw
+node scripts/live-test/authz-scope-repro.mjs --bin /absolute/path/to/duduclaw --scenario K1 --scenario U3 --keep --verbose
+```
+
+Each run creates fresh OS/product homes, production wildcard employee
+allowlists, a locally signed disposable OEM entitlement and a pre-MFA upgrade
+store, following `v185-acceptance.mjs`. Scenario accounts and bindings use
+Admin RPCs. PATH contains only local CLI shims plus `/usr/bin:/bin`; shims use
+the running Node executable. No inherited provider credentials are passed.
+Only generated internal MCP credentials and employee identity are forwarded
+from each employee's registration. An inherited OS sandbox blocks external
+network, real CLI fallback paths and access to the operator's product/Claude
+homes and keychains. Gateway, MCP and fake CLI processes use isolated HOME and
+DUDUCLAW_HOME. All owned process groups stop on completion or SIGINT/SIGTERM;
+the temporary home is deleted unless `--keep` is supplied (its path is in the
+summary). Retained homes contain disposable credentials; keep them private.
+
+Stdout is JSON Lines: one record per executed scenario, then a summary.
+`http_status` reports the WebSocket upgrade (normally 101), not the RPC
+outcome; `rpc_error` and per-call success fields record that separately.
+Stdio MCP has no HTTP status. No vulnerability verdict is assumed, and a
+refusal is a completed observation. Summary `null` means not observed;
+`false` means a completed observation did not find the named behavior.
+Consult `scenario_status` and the per-call evidence. Shared setup/helper
+failures emit one top-level `status: "harness_error"` record with a
+`harness_error` message and exit 2; scenarios that never ran emit no records.
+Exit 1 indicates scenario/cleanup errors, not an authorization verdict.
+Verbose, redacted logs go to stderr. Fake CLI records distinguish `probe`
+(`--help`, `--version`, `auth status`) from `run`; invocation evidence counts
+only matching runs.
+
+M2 runs before budget seeding. B has its automatic heartbeat disabled, with a
+local proactive check enabled to make an explicit trigger observable. M1
+seeds synthetic spend into the isolated telemetry database, as the budget
+unit tests do, then calls Admin `heartbeat.trigger`. Only a budget event
+written by the actual gateway gate qualifies; otherwise M1 is skipped with
+the reason. M3's heartbeat runs after seeding, so budget denial can prevent a
+CLI invocation even if its RPC was accepted. U4 is skipped if the tested
+binary does not advertise the database grant parameter. Nothing connects to
+a real model or database service. Implementation verification was limited to
+`node --check`; this harness has not been live-run in the restricted sandbox.
+
 ## Why `prod-shaped` exists
 
 v1.68.1 fixed a regression present since v1.67.0: an employee whose
