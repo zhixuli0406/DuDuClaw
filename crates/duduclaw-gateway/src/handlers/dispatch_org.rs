@@ -217,6 +217,16 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_dept_grants_options()).await
             }
             "users.dept_grants.mine" => boxed_frame(|| self.handle_dept_grants_mine(params, ctx)).await,
+            "me.google_signin.status" | "me.google_signin.link_start" | "me.google_signin.link_complete"
+            | "me.google_signin.unlink" | "me.google_signin.reauth_start" | "me.google_signin.reauth_complete" => {
+                boxed_frame(|| self.handle_google_signin_me_rpc(method, params, ctx)).await
+            }
+            "google.signin.get" | "google.signin.set"
+            | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+            | "users.google_signin.attest" | "users.google_signin.unlink"
+            | "users.signin_onboarding.retry_avatar" => {
+                boxed_frame(|| self.handle_google_signin_rpc(method, params, ctx)).await
+            }
             "users.invite" | "users.invite_status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_user_invites(method, params, ctx)).await

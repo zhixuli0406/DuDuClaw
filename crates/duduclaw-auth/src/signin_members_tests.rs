@@ -18,7 +18,10 @@ fn password_user(db: &UserDb, email: &str, role: UserRole) -> User {
 fn admin(db: &UserDb) -> User { password_user(db, "admin@company.test", UserRole::Admin) }
 fn direct(db: &UserDb, id: &VerifiedGoogleIdentity) -> String {
     match db.resolve_google_signin(id, &policy(SigninApproval::Direct, 100), NOW).unwrap() {
-        SigninOutcome::Ok { user_id, created: true, linked_via: Some("jit_direct") } => user_id,
+        SigninOutcome::Ok { user_id, credential_epoch, created: true, linked_via: Some("jit_direct") } => {
+            assert_eq!(credential_epoch, db.get_user(&user_id).unwrap().unwrap().credential_epoch);
+            user_id
+        },
         other => panic!("unexpected outcome: {other:?}"),
     }
 }
@@ -188,9 +191,10 @@ fn attestation_links_once() {
     let (db, _path) = test_db();
     let id = identity("1");
     let user = password_user(&db, &id.email.to_ascii_uppercase(), UserRole::Employee);
+    db.conn().execute("UPDATE users SET credential_epoch=7 WHERE id=?1", [&user.id]).unwrap();
     db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
     assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 0), NOW).unwrap(),
-        SigninOutcome::Ok { user_id: user.id.clone(), created: false, linked_via: Some("admin_attest") });
+        SigninOutcome::Ok { user_id: user.id.clone(), credential_epoch: 7, created: false, linked_via: Some("admin_attest") });
     assert_eq!(count(&db, "google_signin_attestations"), 0);
     let link = db.google_signin_link_for_user(&user.id).unwrap().unwrap();
     assert_eq!(link.linked_by, "attesting-admin");
@@ -261,7 +265,7 @@ fn approve_creates_account_and_onboarding_row() {
     assert_eq!(detail, json!({"linked_via":"jit_approved", "hd":"company.test", "request_id":request_id, "mfa_preauthorized":true}));
     assert_eq!(db.count_signin_jit_since(NOW - 86400).unwrap(), 1);
     assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Admin, 0), NOW + 20).unwrap(),
-        SigninOutcome::Ok { user_id, created: false, linked_via: None });
+        SigninOutcome::Ok { credential_epoch: db.get_user(&user_id).unwrap().unwrap().credential_epoch, user_id, created: false, linked_via: None });
     assert_eq!(db.approve_signin_request(&admin.id, admin.credential_epoch, &request_id, false, NOW + 20), Err("signin_request_not_pending"));
 }
 
@@ -335,9 +339,10 @@ fn signin_existing_link_tracks_sub_and_touches_last_signin() {
     let (db, _path) = test_db();
     let mut id = identity("1");
     let user_id = direct(&db, &id);
+    db.conn().execute("UPDATE users SET credential_epoch=9 WHERE id=?1", [&user_id]).unwrap();
     id.email = "renamed@company.test".into();
     assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Admin, 0), NOW + 42).unwrap(),
-        SigninOutcome::Ok { user_id: user_id.clone(), created: false, linked_via: None });
+        SigninOutcome::Ok { user_id: user_id.clone(), credential_epoch: 9, created: false, linked_via: None });
     let link = db.google_signin_link_for_user(&user_id).unwrap().unwrap();
     assert_eq!(link.last_signin_at, Some(NOW + 42));
     assert_eq!(link.email_at_link, identity("1").email);
@@ -395,4 +400,23 @@ fn signin_attested_disabled_user_never_links() {
     assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::AccountDisabled);
     assert_eq!(count(&db, "google_signin_links"), 0);
     assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, UserStatus::Suspended);
+}
+
+#[test]
+fn user_update_google_only_account_cannot_be_admin() {
+    let (db, _path) = test_db();
+    let id = direct(&db, &identity("123"));
+    for role in [UserRole::Admin, UserRole::Manager] {
+        let update = crate::UserUpdate { role: Some(role), display_name: Some("Changed"), password: Some("new-password"), ..Default::default() };
+        assert_eq!(db.apply_user_update(&id, &update).unwrap_err().to_string(), "role_requires_local_password");
+        assert_eq!(db.update_user(&id, None, Some(role), None).unwrap_err(), "role_requires_local_password");
+        assert_eq!(db.get_user(&id).unwrap().unwrap().display_name, "新同仁");
+        assert_passwordless_employee(&db, &id);
+    }
+    db.update_user(&id, None, Some(UserRole::Employee), None).unwrap();
+    let password = password_user(&db, "password@company.test", UserRole::Employee);
+    for role in [UserRole::Manager, UserRole::Admin, UserRole::Employee] {
+        db.update_user(&password.id, None, Some(role), None).unwrap();
+        assert_eq!(db.get_user(&password.id).unwrap().unwrap().role, role);
+    }
 }

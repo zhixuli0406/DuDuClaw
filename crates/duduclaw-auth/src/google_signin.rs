@@ -12,7 +12,8 @@ pub const SIGNIN_REJECT_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
 pub fn valid_google_sub(s: &str) -> bool {
     (1..=255).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
 }
-fn error(e: rusqlite::Error) -> String { format!("google_signin_storage: {e}") }
+const STORAGE: &str = "signin_storage_unavailable";
+fn error(_: rusqlite::Error) -> String { STORAGE.into() }
 
 pub(crate) fn migration_needed(conn: &Connection) -> Result<bool, String> {
     for table in ["google_signin_links", "google_signin_requests", "google_signin_attestations"] {
@@ -87,6 +88,71 @@ fn request_row(r: &Row<'_>) -> rusqlite::Result<SigninRequest> {
         expires_at: r.get(7)?, decided_by: r.get(8)?, decided_at: r.get(9)?, user_id: r.get(10)?, mfa_preauthorized: r.get(11)? })
 }
 impl UserDb {
+    pub fn has_local_password(&self, user: &str) -> Result<bool, String> {
+        self.conn().query_row("SELECT password_hash<>'' FROM users WHERE id=?1", [user], |r| r.get(0)).map_err(error)
+    }
+
+    /// Credential changes also fence epoch-zero accounts, whose first password
+    /// change deliberately preserves epoch zero for legacy login compatibility.
+    pub fn google_signin_credential_revision(&self, user: &str) -> Result<i64, String> {
+        self.conn().query_row("SELECT COALESCE(MAX(seq),0) FROM credential_changes WHERE user_id=?1", [user], |r| r.get(0)).map_err(error)
+    }
+
+    /// Runs on the caller's blocking pool. Never accepts another user's identity.
+    pub fn google_signin_verify_password(&self, user: &str, epoch: u64, password: &str) -> Result<(), &'static str> {
+        if !self.has_local_password(user).map_err(|_| STORAGE)? { return Err("signin_link_needs_password"); }
+        if password.is_empty() || password.len()>4096 { return Err("signin_password_invalid"); }
+        let account = self.get_user(user).map_err(|_| STORAGE)?.ok_or("signin_session_expired")?;
+        let verified = self.verify_password(&account.email, password).map_err(|_| "signin_password_invalid")?;
+        if verified.id != user || verified.status != crate::UserStatus::Active || verified.credential_epoch != epoch {
+            return Err("signin_session_expired");
+        }
+        Ok(())
+    }
+
+    /// The verified OIDC identity comes only from the gateway's session-bound ticket.
+    pub fn self_link_google_signin(&self, user: &str, epoch: u64, revision: i64, identity: &crate::signin_members::VerifiedGoogleIdentity, now: i64) -> Result<(), &'static str> {
+        let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active' AND credential_epoch=?2 AND password_hash<>'')",
+            params![user,epoch], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if !valid { return Err("signin_session_expired"); }
+        let current_revision: i64 = tx.query_row("SELECT COALESCE(MAX(seq),0) FROM credential_changes WHERE user_id=?1", [user], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if current_revision != revision { return Err("signin_session_expired"); }
+        let email: String = tx.query_row("SELECT email FROM users WHERE id=?1", [user], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if !email.eq_ignore_ascii_case(&identity.email) { return Err("signin_link_email_mismatch"); }
+        let sub_used: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM google_signin_links WHERE google_sub=?1)", [&identity.sub], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if sub_used { return Err("signin_sub_linked"); }
+        let linked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM google_signin_links WHERE user_id=?1)", [user], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if linked { return Err("signin_already_linked"); }
+        Self::insert_google_signin_link_tx(&tx, &NewGoogleSigninLink {
+            user_id: user.into(), google_sub: identity.sub.clone(), hd: identity.hd.clone(),
+            email_at_link: identity.email.clone(), linked_via: "self_link".into(), linked_by: user.into(), linked_at: now,
+        }).map_err(|_| STORAGE)?;
+        crate::signin_members::audit(&tx, user, "google_signin.self_linked", user, &serde_json::json!({}), now)?;
+        tx.commit().map_err(|_| STORAGE)
+    }
+
+    pub fn self_unlink_google_signin(&self, user: &str, epoch: u64, password: &str, now: i64) -> Result<(), &'static str> {
+        let snapshot: String = self.conn().query_row("SELECT password_hash FROM users WHERE id=?1", [user], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if snapshot.is_empty() { return Err("signin_unlink_needs_password"); }
+        self.google_signin_verify_password(user, epoch, password)?;
+        let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active' AND credential_epoch=?2 AND password_hash=?3)",
+            params![user,epoch,snapshot], |r| r.get(0)).map_err(|_| STORAGE)?;
+        if !valid { return Err("signin_session_expired"); }
+        if tx.execute("DELETE FROM google_signin_links WHERE user_id=?1", [user]).map_err(|_| STORAGE)? != 1 { return Err("signin_not_linked"); }
+        tx.execute("DELETE FROM google_signin_attestations WHERE user_id=?1", [user]).map_err(|_| STORAGE)?;
+        crate::mfa::bump_epoch(&tx, user).map_err(|_| STORAGE)?;
+        // Invalidate already-issued management capabilities as well as sessions.
+        tx.execute("DELETE FROM mfa_challenges WHERE user_id=?1", [user]).map_err(|_| STORAGE)?;
+        crate::signin_members::audit(&tx, user, "google_signin.self_unlinked", user, &serde_json::json!({}), now)?;
+        tx.commit().map_err(|_| STORAGE)
+    }
+
     pub fn google_signin_link_by_sub(&self, sub: &str) -> Result<Option<GoogleSigninLink>, String> {
         self.conn().query_row(&format!("SELECT {LINK_COLUMNS} FROM google_signin_links WHERE google_sub=?1"), [sub], link_row).optional().map_err(error)
     }
@@ -160,17 +226,57 @@ impl UserDb {
     pub fn count_signin_jit_since_tx(tx: &Transaction<'_>, since: i64) -> Result<u32, String> {
         tx.query_row(COUNT_JIT_SINCE_SQL, [since], |r| r.get(0)).map_err(error)
     }
-    pub fn upsert_google_signin_attestation(&self, user_id: &str, attested_by: &str, now: i64) -> Result<(), String> {
-        let expires = now.checked_add(SIGNIN_ATTESTATION_TTL_SECS).ok_or("signin_timestamp_overflow")?;
+    pub(crate) fn upsert_google_signin_attestation(&self, user_id: &str, attested_by: &str, now: i64) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+        Self::upsert_google_signin_attestation_tx(&tx, user_id, attested_by, now)?;
+        tx.commit().map_err(error)
+    }
+
+    fn upsert_google_signin_attestation_tx(tx: &Transaction<'_>, user_id: &str, attested_by: &str, now: i64) -> Result<(), String> {
+        let expires = now.checked_add(SIGNIN_ATTESTATION_TTL_SECS).ok_or("signin_timestamp_overflow")?;
         let email: String = tx.query_row("SELECT email FROM users WHERE id=?1", [user_id], |r| r.get(0)).map_err(error)?;
-        let seq = crate::credential_changes::high_water(&tx)?;
+        let seq = crate::credential_changes::high_water(tx).map_err(|_| STORAGE)?;
         tx.execute("INSERT INTO google_signin_attestations(user_id,email_at_attestation,credential_seq,attested_by,attested_at,expires_at)
             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(user_id) DO UPDATE SET email_at_attestation=excluded.email_at_attestation,
             credential_seq=excluded.credential_seq,attested_by=excluded.attested_by,attested_at=excluded.attested_at,expires_at=excluded.expires_at",
             params![user_id,email,seq,attested_by,now,expires]).map_err(error)?;
-        tx.commit().map_err(error)
+        Ok(())
+    }
+
+    /// Authorize, validate and attest the whole batch in one write transaction.
+    pub fn attest_google_signin_users(&self, admin_id: &str, admin_epoch: u64, user_ids: &[String], now: i64) -> Result<usize, &'static str> {
+        let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
+        crate::signin_members::live_admin(&tx, admin_id, admin_epoch)?;
+        let unique: std::collections::HashSet<_> = user_ids.iter().collect();
+        if user_ids.len() > 100 || unique.len() != user_ids.len() { return Err("signin_attest_invalid_target"); }
+        for user_id in user_ids {
+            let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users u WHERE u.id=?1 AND u.status='active'
+                AND NOT EXISTS(SELECT 1 FROM google_signin_links l WHERE l.user_id=u.id))",
+                [user_id], |r| r.get(0)).map_err(|_| STORAGE)?;
+            if !valid { return Err("signin_attest_invalid_target"); }
+            Self::upsert_google_signin_attestation_tx(&tx, user_id, admin_id, now).map_err(|_| STORAGE)?;
+            crate::signin_members::audit(&tx, admin_id, "google_signin.attested", user_id, &serde_json::json!({}), now)?;
+        }
+        tx.commit().map_err(|_| STORAGE)?;
+        Ok(user_ids.len())
+    }
+
+    /// Unlinking invalidates dashboard tokens and live ACL snapshots atomically.
+    pub fn unlink_google_signin(&self, admin_id: &str, admin_epoch: u64, user_id: &str, now: i64) -> Result<(), &'static str> {
+        let _authority = self.google_authority_write().map_err(|_| STORAGE)?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
+        crate::signin_members::live_admin(&tx, admin_id, admin_epoch)?;
+        if tx.execute("DELETE FROM google_signin_links WHERE user_id=?1", [user_id]).map_err(|_| STORAGE)? != 1 {
+            return Err("signin_not_linked");
+        }
+        tx.execute("DELETE FROM google_signin_attestations WHERE user_id=?1", [user_id]).map_err(|_| STORAGE)?;
+        crate::mfa::bump_epoch(&tx, user_id).map_err(|_| STORAGE)?;
+        crate::signin_members::audit(&tx, admin_id, "google_signin.unlinked", user_id, &serde_json::json!({}), now)?;
+        tx.commit().map_err(|_| STORAGE)
     }
     /// Any later credential change of this user invalidates the captured high-water mark.
     /// A token-email mismatch alone leaves an otherwise valid attestation for its owner.

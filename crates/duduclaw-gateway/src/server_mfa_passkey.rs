@@ -87,14 +87,20 @@ pub(super) async fn register_begin(State(state): State<Arc<AppState>>, ConnectIn
         let now=chrono::Utc::now().timestamp();
         let (user,token,session)=if let Some((ctx,session))=account {
             let token=if let Some(token)=body.enrollment_token {
-                let user=state.user_db.get_user(&ctx.user_id)?.ok_or("帳號不存在。")?;
-                let verified=state.user_db.verify_password(&user.email,body.password.as_deref().unwrap_or(""))?;
-                if verified.id!=ctx.user_id || verified.credential_epoch!=ctx.credential_epoch { return Err("請重新登入。".into()); }
-                state.user_db.mfa_check_session(&token,&ctx.user_id,&session,now)?;
+                if state.user_db.has_local_password(&ctx.user_id)? {
+                    let user=state.user_db.get_user(&ctx.user_id)?.ok_or("帳號不存在。")?;
+                    let verified=state.user_db.verify_password(&user.email,body.password.as_deref().unwrap_or(""))?;
+                    if verified.id!=ctx.user_id || verified.credential_epoch!=ctx.credential_epoch { return Err("請重新登入。".into()); }
+                    state.user_db.mfa_check_session(&token,&ctx.user_id,&session,now)?;
+                } else {
+                    crate::google_signin::routes::me::retry(&state.home_dir,&state.user_db,&ctx.user_id,&session,ctx.credential_epoch,
+                        body.password.as_deref().unwrap_or(""),&token,now)?;
+                }
                 state.user_db.mfa_prove_enrollment(&token,body.proof_code.as_deref().unwrap_or(""),now)?;
                 token
             } else {
-                let token=state.user_db.mfa_password_challenge(&ctx.user_id,body.password.as_deref().unwrap_or(""),&session,now)?;
+                let token=crate::google_signin::routes::me::challenge(&state.home_dir,&state.user_db,&ctx.user_id,&session,ctx.credential_epoch,
+                    body.password.as_deref().unwrap_or(""),now,false)?;
                 let required=crate::mfa::enforced(&state.home_dir,personal)? && !state.user_db.mfa_active(&ctx.user_id)?;
                 let delivery=state.user_db.mfa_prepare_enrollment(&token,required,now)?;
                 if required {
@@ -182,7 +188,7 @@ pub(super) async fn login_finish(State(state): State<Arc<AppState>>, ConnectInfo
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Delete { id: String, password: String }
+pub(super) struct Delete { id: String, password: Option<String> }
 pub(super) async fn delete(State(state): State<Arc<AppState>>, ConnectInfo(addr): ConnectInfo<SocketAddr>, headers: HeaderMap, Json(body): Json<Delete>) -> axum::response::Response {
     if !check_login_rate_limit(addr.ip(),"mfa-passkey") { return limited(); }
     if checked_origin(&state.home_dir,&headers).is_err() { return denied(); }
@@ -192,7 +198,8 @@ pub(super) async fn delete(State(state): State<Arc<AppState>>, ConnectInfo(addr)
     let work=state.clone();
     let result=tokio::task::spawn_blocking(move || -> Result<Value,String> {
         let now=chrono::Utc::now().timestamp();
-        let token=work.user_db.mfa_factor_password_challenge(&ctx.user_id,&body.password,&session,now)?;
+        let token=crate::google_signin::routes::me::challenge(&work.home_dir,&work.user_db,&ctx.user_id,&session,ctx.credential_epoch,
+            body.password.as_deref().unwrap_or(""),now,true)?;
         work.user_db.mfa_passkey_delete(&ctx.user_id,&body.id,&token,&session,now,personal,
             |user,access,codes|issue(&work.jwt_config,user,access,codes))
     }).await;

@@ -74,7 +74,7 @@ static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (
 const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// The address the login limiter keys on for a peer `ip`.
-fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn login_throttle_ip(ip: IpAddr) -> IpAddr {
     if ip.is_loopback() {
         LOOPBACK_THROTTLE_IP
     } else {
@@ -102,7 +102,7 @@ pub(crate) fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
 
 /// Clear the failed-attempt counter for `(ip, email)` after a successful login
 /// so a legitimate user is never penalised for earlier typos (M2).
-fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+pub(crate) fn reset_login_rate_limit(ip: IpAddr, email: &str) {
     let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&(ip, email.to_string()));
@@ -178,23 +178,23 @@ pub struct GatewayConfig {
 }
 
 /// Internal shared state for the Axum application.
-struct AppState {
-    auth: AuthManager,
-    handler: Arc<MethodHandler>,
-    tx: broadcast::Sender<String>,
+pub(crate) struct AppState {
+    pub(crate) auth: AuthManager,
+    pub(crate) handler: Arc<MethodHandler>,
+    pub(crate) tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
-    event_tx: broadcast::Sender<String>,
-    prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
+    pub(crate) event_tx: broadcast::Sender<String>,
+    pub(crate) prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
     /// User database for multi-user authentication.
-    user_db: Arc<UserDb>,
+    pub(crate) user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
-    jwt_config: Arc<JwtConfig>,
+    pub(crate) jwt_config: Arc<JwtConfig>,
     /// Channel-DM delivery for passwordless login OTP codes (WP12). Injected so
     /// the pre-auth OTP handler never needs raw channel config / secret manager.
-    otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
+    pub(crate) otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
     /// DuDuClaw home directory (`~/.duduclaw`). Used by the voice endpoints to
     /// read `[voice]` STT/TTS config from `config.toml`.
-    home_dir: std::path::PathBuf,
+    pub(crate) home_dir: std::path::PathBuf,
 }
 
 /// Identity policy and initial key creation are mandatory startup gates.
@@ -2913,6 +2913,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
 
+    // Google provisioning maintenance belongs exclusively to the lock holder.
+    if crate::google_signin::onboarding::should_run(&home_dir) {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if crate::google_signin::onboarding::should_run(&bg_state.home_dir) {
+                    crate::google_signin::onboarding::run_once(
+                        &bg_state.handler, chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
+
     // M1/M60: open the shared audit index once and refresh it on a background
     // interval, so audit/reliability requests reuse one connection instead of
     // opening + full-syncing per request.
@@ -3008,6 +3024,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/login/methods", get(crate::google_signin::routes::methods))
+        .route("/api/login/google/start", post(crate::google_signin::routes::start).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/login/google/callback", get(crate::google_signin::routes::callback))
+        .route("/api/login/google/complete", post(crate::google_signin::routes::complete).layer(DefaultBodyLimit::max(4096)))
         .route("/api/invite/check", post(server_invites::check_invite))
         .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))
@@ -19932,7 +19952,7 @@ mod live_events_socket_tests {
 }
 
 #[path = "server_mfa.rs"]
-mod server_mfa;
+pub(crate) mod server_mfa;
 
 #[cfg(test)]
 mod tts_limit_tests {

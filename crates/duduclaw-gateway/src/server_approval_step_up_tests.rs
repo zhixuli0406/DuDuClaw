@@ -31,7 +31,7 @@ impl HttpFixture {
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState { auth:AuthManager::new(Some("fixture-legacy-system-token".into())),
-            handler, tx, event_tx, prepared_events:Default::default(), user_db, jwt_config,
+            handler: Arc::new(handler), tx, event_tx, prepared_events:Default::default(), user_db, jwt_config,
             otp_delivery:Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
             home_dir:home });
         Self { service, state, token, raw }

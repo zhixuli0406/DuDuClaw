@@ -31,6 +31,17 @@ Use this guide with the setup wizard to connect your Google account.
 8. Save the client. Copy the client ID and download the client secret immediately. Google shows the secret only once and later displays its last four characters. Keep it in a password manager.
 9. Return to the wizard, enter the client ID and secret, confirm the data disclosure and select **Connect Google**. If Google shows “Google hasn't verified this app”, confirm it is your own project, select Advanced, then Go to (project name). Tick every permission on the consent screen and continue. Wait for the dashboard result.
 
+
+### Company Google sign-in
+
+Company sign-in uses the configured company Google OAuth client ID and secret. Service-account delegation and Apps Script do not supply this login. It is off by default, requires an administrator's risk acknowledgement and allowed `hd` domains, and is unavailable in the personal edition. Its dashboard pages are not built yet; configure sign-in from the dashboard's Google settings once available.
+
+Set `[dashboard] public_url` to the externally reachable dashboard base URL, including any path prefix. Use HTTPS; HTTP is accepted only for localhost or loopback addresses. Register `<public_url>/api/login/google/callback` exactly in the Google Cloud Web OAuth client's **Authorized redirect URIs**. For `public_url = "https://company.example/agents"`, register `https://company.example/agents/api/login/google/callback`. The base has no trailing slash. Keep any callbacks needed by personal connections or remote MCP separately.
+
+For a company rollout, choose **Internal** only when every user belongs to the Google Cloud project's own Workspace / Cloud Identity organization. An allowed domain in DuDuClaw cannot extend that Google audience. Users from other organizations need **External**, published for production with any required Google verification. Do not deploy company sign-in with a Testing-status consent screen. Testing normally limits access to 100 listed test users and expires authorization and refresh tokens after seven days. Google exempts requests limited to basic identity scopes; this sign-in requests only `openid email profile` with online access. Personal Google connections request additional service scopes and do not share that exception. See [Google's audience rules](https://support.google.com/cloud/answer/15549945?hl=en).
+
+The sign-in link and the member's personal Google connection must use the same Google account (`sub`). Linking sign-in refuses a different existing personal Google account. Sign-in alone does not connect Gmail, Drive or other personal services. See [sign-in security](../features/05-security-defense.md#company-google-sign-in) and [settings](dashboard-settings.md#company-google-sign-in).
+
 ### Remote host or Docker
 
 localhost refers to the computer running your browser. A local Docker install needs no SSH tunnel. Only forward a port when DuDuClaw runs on a remote machine. This example assumes the screen shows 18889:

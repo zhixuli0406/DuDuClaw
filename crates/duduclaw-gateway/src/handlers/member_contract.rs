@@ -454,8 +454,13 @@ pub(crate) const MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS: &[&str] = &[
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
     let excluded = matches!(method, "users.change_password" | "users.change_email"
         | "me.google.write_connect_start" | "me.google.write_disconnect"
-        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm")
+        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm"
+        | "google.signin.get" | "google.signin.set"
+        | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+        | "users.google_signin.attest" | "users.google_signin.unlink"
+        | "users.signin_onboarding.retry_avatar")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
+        || method.split('.').take(2).eq(["me", "google_signin"])
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
         || method.split('.').take(2).eq(["me", "chat_link"])

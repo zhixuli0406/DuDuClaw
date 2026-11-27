@@ -59,7 +59,7 @@ The following are in scope for security reports:
 - **Input Guard** bypass (prompt injection scanner)
 - **Credential handling** key leakage (encrypted config, `secret_ref`, spawn-env allowlist)
 - **AES-256 encryption** weaknesses
-- **Dashboard authentication** bypass (JWT account login, admin token; these are the only two dashboard authentication paths)
+- **Dashboard authentication** bypass (JWT account login (password, channel one-time code or company Google sign-in), admin token)
 - **Authorization** privilege escalation (delegation policy, MCP scopes, `[capabilities]`)
 - **CONTRACT.toml** validation bypass
 - **Browser automation / computer use** capability bypass (`[capabilities] computer_use`, `denied_tools`, SSRF gate), the internal computer-use route (`/api/internal/computer-use`) and the computer-use site allowlist
@@ -73,6 +73,11 @@ The following are in scope for security reports:
 - Vulnerabilities in the Claude API or Claude Code SDK itself
 
 ## Security Architecture
+
+### Company Google sign-in
+
+Company Google sign-in is off by default and unavailable in the personal edition. It requires an administrator's risk acknowledgement, configured OAuth credentials, a public dashboard URL and an explicit domain allowlist. The server verifies the Google ID token, requires `email_verified=true`, matches its lowercased `hd` exactly, and keys links by `sub`; matching email addresses never merge accounts automatically. Company MFA remains required by policy; Google MFA does not satisfy it and Email codes cannot be the second factor after Google sign-in. Unlinking invalidates all member sessions. Suspend the DuDuClaw account or unlink for offboarding: disabling the Workspace account alone does not end existing sessions. See [Company Google sign-in](docs/features/05-security-defense.md#company-google-sign-in) for enrollment, approval and downgrade limits. Dashboard pages are not yet available.
+
 
 DuDuClaw implements defense in depth. Each layer below is what the code does today:
 

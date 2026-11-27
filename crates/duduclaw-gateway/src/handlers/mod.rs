@@ -163,6 +163,8 @@ mod org_change_rpc;
 mod users_rpc;
 mod dept_grants_rpc;
 mod user_invites_rpc;
+mod google_signin_rpc;
+mod google_signin_me_rpc;
 pub(crate) mod company_rpc;
 mod members_rpc;
 mod onboarding_rpc;
@@ -711,6 +713,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_my_memory_rpc(method, params, ctx)).await;
+        }
+
+        // Google sign-in administration must never reach extension handlers.
+        // The role floor also covers unknown operations in reserved namespaces.
+        if let Some(role) = gates::google_signin_minimum_role(method) {
+            if acl::require_role(ctx, role).is_err() {
+                return google_signin_rpc::signin_error("signin_admin_required");
+            }
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // Invitations are gateway-owned authentication methods. An extension

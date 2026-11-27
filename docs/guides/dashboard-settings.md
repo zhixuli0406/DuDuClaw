@@ -1044,3 +1044,20 @@ recovery code. Expiry is mandatory (1–365 days); the UI offers 30/90/365 and d
 to 90. Each member can have five active keys. The secret is shown once. Password
 changes and MFA resets invalidate existing keys. Do not put keys in browser
 front-end code; call from your server. See the [member API contract](../api/member-contract.md#personal-member-api-keys-1850).
+
+## Company Google sign-in
+
+`[google_signin]` is administered through `google.signin.set`. Set these values from the dashboard's Google settings once available; its pages are not built yet. Personal edition does not offer this feature. Enabling sign-in, switching to direct creation, or enabling approval-based MFA enrollment requires explicit risk acknowledgement. A configured company Google OAuth client and valid `[dashboard] public_url` are also required for sign-in.
+
+| Key | Default / meaning |
+|---|---|
+| `enabled` | `false`. Requests Google sign-in; effective only with acknowledgement and a nonempty valid domain list. |
+| `enabled_ack` | Absent. `{ by, at }` records the administrator and time, both nonblank strings; written only by the settings method. |
+| `allowed_hd` | Empty. Settings accepts 1–50 ASCII domains, trims and lowercases them, and removes duplicates. Matches the verified ID-token `hd` in full; no subdomain matching. |
+| `approval` | `"admin"` for approval requests; `"direct"` creates accounts directly. |
+| `daily_new_accounts` | `20`, range 1–200. Rolling 24-hour new-account limit, including pending requests. |
+| `avatar_template` | Absent or `""` selects a blank avatar; `"company:<key>"` selects a non-premium, single-employee company template. |
+| `avatar_template_revision` | Positive integer required for a company template. A revision mismatch waits for an administrator. |
+| `approval_grants_mfa_enrollment` | `false`. Allows an administrator to grant first MFA enrollment explicitly when approving; one use within 72 hours. Enabling this key alone grants nothing. |
+
+Settings are reread at start, callback and completion. An unreadable or malformed config disables sign-in. Missing/wrong-type `enabled`, missing or blank acknowledgement fields, or an empty/invalid `allowed_hd` list disables it too; one malformed domain invalidates the entire list. Only exact `"direct"` selects direct creation; other approval values require admin approval. A missing cap uses 20; an invalid cap becomes zero and blocks new admissions. An invalid template blocks avatar creation without selecting a blank fallback. MFA preauthorization is enabled only by boolean `true`. The raw config editor can only disable sign-in, remove its acknowledgement or delete the section; it cannot enable or expand this feature.

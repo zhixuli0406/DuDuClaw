@@ -849,7 +849,7 @@ fn issue_mfa_result<T>(
     issue(&user, &bindings, codes)
 }
 
-fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
+pub(crate) fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
     tx.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [user]).map_err(|e|e.to_string())?;
     crate::user_row::bump_acl_generation(tx).map_err(|e|e.to_string())
 }
@@ -947,3 +947,6 @@ mod issuance_tests;
 
 #[cfg(test)]
 mod signin_approval_tests;
+
+#[cfg(test)]
+mod reauth_tests;

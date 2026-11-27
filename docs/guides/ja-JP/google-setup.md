@@ -31,6 +31,17 @@ Gmail の検索と読取では、AI 従業員に渡す前にログインリン�
 8. 保存直後に Client ID と Client secret を保管します。シークレットの表示・ダウンロードは一度だけで、その後は末尾四文字しか表示されません。パスワード管理ツールに保存してください。
 9. ウィザードに ID とシークレットを入力し、データ利用の説明を確認して **Google を接続** を選びます。「Google hasn't verified this app」が出たら、自分のプロジェクトであることを確認し、Advanced、Go to（プロジェクト名）の順に選びます。同意画面の権限をすべて選択して続行し、ダッシュボードの結果を待ちます。
 
+
+### 会社の Google ログイン
+
+会社ログインは設定済みの会社 Google OAuth クライアント ID とシークレットを使用します。サービスアカウントの委任や Apps Script ではログインできません。既定は無効で、管理者のリスク確認と許可する `hd` ドメインが必要です。個人版では利用できません。ダッシュボード画面は未実装です。Google 設定が提供されたら、そこからログインを設定してください。
+
+`[dashboard] public_url` に外部から接続できるダッシュボードのベース URL を設定し、パスのプレフィックスも含めます。HTTPS を使ってください。HTTP は localhost またはループバックだけ利用できます。Google Cloud の Web OAuth クライアントの **Authorized redirect URIs** に `<public_url>/api/login/google/callback` を完全一致で登録します。`public_url = "https://company.example/agents"` なら `https://company.example/agents/api/login/google/callback` です。ベース URL の末尾にはスラッシュを付けません。個人接続やリモート MCP のコールバックは別途残してください。
+
+会社の本番利用で Internal を選べるのは、全員が Google Cloud プロジェクト自身の Workspace／Cloud Identity 組織に所属する場合だけです。DuDuClaw の許可ドメインは Google の対象ユーザーを拡大しません。他組織のユーザーには External が必要で、本番公開と必要な Google 検証を行います。会社ログインの本番運用で同意画面を Testing のままにしないでください。通常 Testing は登録済みテストユーザー 100 人までで、認可と更新トークンは 7 日で失効します。Google は基本的な本人情報のスコープだけを要求する場合を例外としています。このログインは online アクセスで `openid email profile` のみ要求します。個人 Google 接続はサービス用スコープも要求するため、その例外に該当しません。[Google の対象ユーザールール](https://support.google.com/cloud/answer/15549945?hl=en)を参照してください。
+
+ログイン連携と本人の個人 Google 接続は同じ Google アカウント（`sub`）を使う必要があります。既存の個人接続が別アカウントならログイン連携を拒否します。ログインだけでは Gmail、Drive などの個人サービスを接続しません。[ログインの安全性](../../features/ja-JP/05-security-defense.md#会社の-google-ログイン)と[設定](dashboard-settings.md#会社の-google-ログイン)も参照してください。
+
 ### リモートホストと Docker
 
 localhost はブラウザーを実行する端末です。ローカル Docker では SSH トンネルは不要です。DuDuClaw がリモート端末で動く場合だけポートを転送します。以下は画面に 18889 が表示される場合の例です。

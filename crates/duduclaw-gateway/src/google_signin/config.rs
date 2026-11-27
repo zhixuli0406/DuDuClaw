@@ -110,7 +110,8 @@ pub fn read_strict(home: &Path) -> GoogleSigninSettings {
     from_root(&root)
 }
 
-/// The caller (dedicated RPC) must enforce live Admin, step-up and audit.
+/// The caller (admin RPC) must enforce a live Admin session, step-up (except when turning sign-in off),
+/// the risk acknowledgement and the audit row.
 /// This synchronous adapter uses the same locked, hash-checked and
 /// format-preserving commit engine as commit_table_locked, without a runtime.
 pub fn write_settings(
