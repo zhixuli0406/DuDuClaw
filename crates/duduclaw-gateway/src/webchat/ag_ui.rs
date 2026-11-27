@@ -138,6 +138,13 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     if !state.chat.ctx.registry.read().await.get(&agent).is_some_and(|a| a.config.agent.status.is_operational()) {
         return error(StatusCode::FORBIDDEN, "agent_unavailable");
     }
+    let sid = session_id(&user, &agent, &input.thread_id);
+    if input.resume.is_empty() {
+        if let Err(text) = crate::webchat::entry::check(&state.chat, &user, &agent, &sid, &user,
+            text.as_deref().unwrap_or(""), false, &input.run_id).await {
+            return (StatusCode::CONFLICT, Json(json!({"error":"employee_entry_refused", "message":text}))).into_response();
+        }
+    }
     let lifetime = run_lifetime(&state.chat.ctx.home_dir, &agent);
     let Some(broker) = state.chat.approvals.clone() else { return error(StatusCode::SERVICE_UNAVAILABLE, "approvals_unavailable") };
     let principal = duduclaw_core::HumanPrincipal::user(&user).map(|p| p.to_string());
@@ -145,7 +152,6 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     if broker.check_webchat_turn_admission(&principal).await.is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "approval_capacity");
     }
-    let sid = session_id(&user, &agent, &input.thread_id);
     let _admission = state.admission.lock().await;
     let has_live_thread = match state.runs.lock() {
         Ok(runs) => runs.contains_key(&sid),

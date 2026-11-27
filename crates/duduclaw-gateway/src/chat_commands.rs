@@ -13,7 +13,7 @@ use tracing::warn;
 #[path = "chat_commands/conversation_guard.rs"]
 mod conversation_guard;
 pub use conversation_guard::{
-    CommandOrigin, GROUP_RESET_REFUSED, clears_conversation, command_preflight,
+    CommandOrigin, GROUP_RESET_REFUSED, clears_conversation, command_preflight, command_entry_refusal,
     handle_gated_command, shared_clear_refused, shared_reset_refusal,
 };
 

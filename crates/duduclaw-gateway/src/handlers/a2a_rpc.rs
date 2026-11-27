@@ -169,6 +169,9 @@ impl MethodHandler {
             return Err(Error::denied());
         }
         self.deny_main_for_non_admin(ctx, &send.agent).await.map_err(|_| Error::denied())?;
+        crate::entry_gate::check_task_assignee(&self.home_dir, &send.agent).map_err(|_| Error::new(
+            -32000, "Target employee settings are unavailable or incompatible; an administrator must fix them before task creation", "EMPLOYEE_CONFIGURATION_REFUSED",
+        ))?;
         let scan = duduclaw_security::input_guard::scan_input_with_audit(&send.text,
             duduclaw_security::input_guard::DEFAULT_BLOCK_THRESHOLD, &self.home_dir, &send.agent);
         if scan.blocked { return Err(Error::denied()); }

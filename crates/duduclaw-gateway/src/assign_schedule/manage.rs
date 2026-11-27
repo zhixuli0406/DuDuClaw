@@ -51,6 +51,8 @@ pub struct NewSchedule {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateError {
+    Entry(crate::entry_gate::EntryRefusal),
+    AssigneeUnavailable,
     Spec(SpecError),
     /// The creator already holds `max` active or paused schedules.
     TooMany {
@@ -67,6 +69,8 @@ impl CreateError {
     /// Machine code (RPC errors, audit).
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Entry(e) => e.code(),
+            Self::AssigneeUnavailable => duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_CODE,
             Self::Spec(e) => e.code(),
             Self::TooMany { .. } => "too_many_schedules",
             Self::RiskBoundaryAdminOnly => "risk_boundary_admin_only",
@@ -87,6 +91,13 @@ pub async fn create(
     crate::on_behalf_of::access::check_main_target(
         home, Some(&creator.principal()), &req.agent_id,
     ).await.map_err(CreateError::Store)?;
+    if duduclaw_core::agent_seats::validate_task_assignee(home, Some(&req.agent_id)).is_err() {
+        return Err(match crate::entry_gate::malformed_assignee_refusal(home, &req.agent_id) {
+            Some(refusal) => CreateError::Entry(refusal),
+            None => CreateError::AssigneeUnavailable,
+        });
+    }
+    crate::entry_gate::check_task_assignee(home, &req.agent_id).map_err(CreateError::Entry)?;
     if let Some(cap) = req.payload.cost_cap_cents {
         if req.kind != AssignKind::Goal || cap == 0 || cap > i64::MAX as u64 {
             return Err(CreateError::Store("cost_cap_cents must be a positive integer for a goal".into()));

@@ -156,7 +156,7 @@ async fn handler_with_task_store(home: &std::path::Path) -> MethodHandler {
         let dir = home.join("agents").join(id);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("agent.toml"),
-            format!("[agent]\nname = '{id}'\nstatus = 'active'\n")).unwrap();
+            format!("[agent]\nname = '{id}'\nstatus = 'active'\n[model]\npreferred = 'claude-sonnet-4-6'\n")).unwrap();
     }
     let handler = MethodHandler::new(home.to_path_buf()).await;
     handler
@@ -240,4 +240,26 @@ async fn operator_can_edit_the_mutable_acceptance_criteria_via_tasks_update() {
         "the frozen baseline must stay untouched even when an operator edits \
              the mutable field: {updated}"
     );
+}
+
+#[tokio::test]
+async fn plain_task_creation_refuses_broken_assignees_and_preserves_roster_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = handler_with_task_store(home.path()).await;
+    for (body, expected) in [
+        ("[model", "agent_config_unreadable"),
+        ("[agent]\nname='agent-x'\nstatus='active'\n[model]\npreferred='gpt-5.4'\n", "model_provider_mismatch"),
+        ("[agent]\nname='agent-x'\nstatus='archived'\n", "task_assignee_unavailable"),
+        ("[agent]\nname='agent-x'\nstatus='deleted'\n", "task_assignee_unavailable"),
+    ] {
+        std::fs::write(home.path().join("agents/agent-x/agent.toml"), body).unwrap();
+        let frame = handler.handle_tasks_create(json!({"title":"work", "assigned_to":"agent-x"}), &admin_ctx()).await;
+        let WsFrame::Response { ok: false, error: Some(error), .. } = frame else { panic!("expected refusal") };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!error.to_string().contains("agent.toml"));
+    }
+    let frame = handler.handle_tasks_create(json!({"title":"work", "assigned_to":"missing"}), &admin_ctx()).await;
+    let WsFrame::Response { ok: false, error: Some(error), .. } = frame else { panic!("expected refusal") };
+    assert_eq!(error["code"], "task_assignee_unavailable");
+    assert!(TaskStore::open(home.path()).unwrap().list_tasks(None, None, None).await.unwrap().is_empty());
 }

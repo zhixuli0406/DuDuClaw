@@ -486,3 +486,33 @@ async fn az1_m2_m4_heartbeat_requires_operator_binding_before_scheduling() {
     assert!(matches!(f.handler.handle("heartbeat.trigger", json!({"agent_id":"z1"}), &f.employee).await,
         WsFrame::Response { ok: false, .. }));
 }
+
+#[tokio::test]
+async fn dashboard_approval_uses_operator_text_for_a_visitor_bound_card() {
+    use crate::approval::{ApprovalBroker, DecisionContext, ExecutionBinding, RequestKind, payload_hash, policy_revision};
+    let f = fixture(true).await;
+    let broker = ApprovalBroker::open(&f.home).unwrap();
+    let payload = json!({"task_id":"existing-normal"});
+    let binding = ExecutionBinding {
+        conversation_audience: Default::default(), schema_version: 1,
+        run_id: uuid::Uuid::new_v4().to_string(), run_origin_kind: "ingress".into(),
+        actor_principal: "a1".into(),
+        decision_context: DecisionContext {
+            channel: "webchat".into(), account_id: "fixture".into(),
+            conversation_id: "widget-visitor:public".into(), principal_id: f.admin.user_id.clone(),
+        },
+        task_id: None, task_revision: None, task_snapshot_hash: None,
+        payload_hash: payload_hash(&payload), policy_revision: policy_revision(&f.home, "a1").unwrap(),
+        cwd: None, environment_hash: payload_hash(&json!({})), file_hashes: Default::default(),
+        expires_at: (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339(),
+        resume_handler: "live_only_v1".into(), resume_version: 1,
+    };
+    let id = broker.request_bound(RequestKind::Approval, "a1", "Start task", payload, binding).await.unwrap();
+    std::fs::write(f.home.join("agents/z1/agent.toml"), "[model").unwrap();
+    let record = broker.get(&id).await.unwrap().unwrap();
+    let digest = crate::approval::decision_digest_at(&f.home, &record);
+    let frame = f.handler.handle("approvals.decide", json!({"id":id.as_str(), "approve":true, "expected_digest":digest}), &f.admin).await;
+    let WsFrame::Response { ok: false, error: Some(error), .. } = frame else { panic!("expected refusal") };
+    assert!(error.as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+    assert_ne!(error.as_str().unwrap(), crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+}

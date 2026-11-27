@@ -304,7 +304,7 @@ pub(super) async fn pending_assign_reply(
         pending::cancel(&key, &event, seq);
         return None;
     }
-    let agent = pending::claim_kind(&key, &event, seq, PendingKind::Assign)?;
+    let (agent, _) = pending::peek_kind(&key, seq)?;
     let fallback = selected.unwrap_or(&default_id);
     let caller = crate::trigger_route::assign::AssignCaller {
         home: &state.ctx.home_dir,
@@ -316,8 +316,24 @@ pub(super) async fn pending_assign_reply(
         fallback: Some(fallback),
         access,
     };
-    let reply =
-        Box::pin(crate::trigger_route::assign::run_pending(&state.ctx, &agent, text, &caller)).await;
+    if let Some(frame) = pending_target_refusal(state, auth_user, &agent, text, &caller, assign_event.unwrap_or(&event)).await {
+        return Some(frame);
+    }
+    #[cfg(test)]
+    if let Ok(barrier) = BEFORE_PENDING_CLAIM.try_with(Clone::clone) {
+        barrier.wait().await;
+        barrier.wait().await;
+    }
+    let claimed = pending::claim_kind(&key, &event, seq, PendingKind::Assign)?;
+    if claimed != agent {
+        if let Some(frame) = pending_target_refusal(state, auth_user, &claimed, text, &caller, assign_event.unwrap_or(&event)).await {
+            return Some(frame);
+        }
+    }
+    let reply = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+        auth_user.to_string(),
+        Box::pin(crate::trigger_route::assign::run_pending(&state.ctx, &claimed, text, &caller)),
+    ).await;
     Some(ChatMessage::AssistantDone {
         content: reply.text,
         tokens_used: 0,
@@ -337,3 +353,33 @@ pub(super) async fn pending_assign_reply(
 #[cfg(test)]
 #[path = "route_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static BEFORE_PENDING_CLAIM: std::sync::Arc<tokio::sync::Barrier>;
+}
+
+async fn pending_target_refusal(
+    state: &WebChatState, auth_user: &str, agent: &str, text: &str,
+    caller: &crate::trigger_route::assign::AssignCaller<'_>, turn: &str,
+) -> Option<ChatMessage> {
+    let result = {
+        let registry = state.ctx.registry.read().await;
+        let plan = crate::trigger_route::assign::plan_pending(
+            &registry, crate::trigger_route::texts::lang_for(&state.ctx.home_dir), agent, text, caller,
+        );
+        match plan {
+            crate::trigger_route::assign::Plan::Create(_) | crate::trigger_route::assign::Plan::ScheduleCreate { .. } =>
+                crate::entry_gate::resolve_and_check(&state.ctx.home_dir, &*registry, agent).map(|_| ()),
+            _ => Ok(()),
+        }
+    };
+    if let Err(refusal) = result {
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&state.ctx.home_dir, agent).await;
+        let text = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(auth_user.to_string(), async {
+            refusal.user_text(caller.conversation, language.as_deref(), turn)
+        }).await;
+        return Some(ChatMessage::error(&text));
+    }
+    None
+}

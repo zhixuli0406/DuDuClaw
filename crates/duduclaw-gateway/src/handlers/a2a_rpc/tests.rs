@@ -453,3 +453,23 @@ async fn a2a_list_snapshot_excludes_later_insertions_and_binds_query_and_owner()
         assert_eq!(error_code(call(&f, "ListTasks", params, ctx).await), -32602);
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn send_refuses_broken_employee_before_task_creation() {
+    for broken in [false, true] {
+        let f = fixture().await;
+        let path = f.home.path().join("agents/sales/agent.toml");
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["model"]["preferred"] = toml::Value::String("gpt-5.4".into());
+        doc.as_table_mut().unwrap().insert("runtime".into(), toml::Value::Table(toml::map::Map::from_iter([("provider".into(), toml::Value::String("grok".into()))])));
+        std::fs::write(path, if broken { "[model".into() } else { toml::to_string(&doc).unwrap() }).unwrap();
+        let before = crate::model_call_probe::calls();
+        let frame = call(&f, "SendMessage", send_params("Prepare a report"), &f.alice).await;
+        let WsFrame::Response { ok:false, error:Some(error), .. } = frame else { panic!("must refuse") };
+        assert_eq!(error["data"][0]["reason"], "EMPLOYEE_CONFIGURATION_REFUSED", "{error}");
+        assert!(error["message"].as_str().unwrap().contains("administrator must fix"));
+        assert!(f.store.list_tasks(None, None, None).await.unwrap().is_empty());
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert!(!f.home.path().join("agents/sales/attachments").exists());
+    }
+}

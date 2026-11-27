@@ -218,6 +218,10 @@ impl MethodHandler {
             if let Err(error) = crate::approval::check_expected_digest(rec) {
                 return WsFrame::error_response("", &error);
             }
+            let session = "dashboard:approval";
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, session).await {
+                return WsFrame::error_response("", &text);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
@@ -329,6 +333,11 @@ impl MethodHandler {
             .await
             {
                 return WsFrame::error_response("", &error);
+            }
+        }
+        if let Some(rec) = &record {
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, "dashboard:approval").await {
+                return WsFrame::error_response("", &text);
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
