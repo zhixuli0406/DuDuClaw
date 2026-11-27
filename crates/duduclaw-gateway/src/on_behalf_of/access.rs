@@ -22,10 +22,11 @@ use duduclaw_core::{
 
 #[path = "main_target.rs"]
 mod main_target;
-pub(crate) use main_target::{check_loaded_queue_main_target, check_queue_main_target};
+pub(crate) use main_target::{check_loaded_queue_main_target, check_loaded_queue_main_target_for_execution, check_queue_main_target};
 pub(crate) use main_target::{main_default_targets, main_entry_available};
 pub(crate) use main_target::loaded_access_effective;
 pub use main_target::{
+    check_loaded_main_target_for_execution, check_main_target_for_execution, check_main_target_for,
     check_loaded_main_target, check_loaded_main_target_for, check_main_target, main_access_allowed, requires_main_restriction,
     requires_main_restriction_for, listed_access_effective, main_turn_allowed,
     requires_main_restriction_for_target, MainUse, MAIN_TURN_REFUSAL,

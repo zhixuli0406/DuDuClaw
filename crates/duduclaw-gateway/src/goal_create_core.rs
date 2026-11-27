@@ -257,9 +257,16 @@ async fn create_goal_task_inner(
     admission: Option<duduclaw_core::autonomy_handoff::AdmissionFuture>,
 ) -> Result<GoalCreated, GoalCreateError> {
     crate::machine_employee::check_target(home_dir, &req.agent_id, req.on_behalf_of.as_deref())?;
-    crate::on_behalf_of::access::check_main_target(
-        home_dir, req.on_behalf_of.as_deref(), &req.agent_id,
-    ).await?;
+    if slot.is_some() {
+        crate::on_behalf_of::access::check_main_target(
+            home_dir, req.on_behalf_of.as_deref(), &req.agent_id,
+        ).await?;
+    } else {
+        Box::pin(crate::on_behalf_of::access::check_main_target_for(
+            home_dir, req.on_behalf_of.as_deref(), &req.agent_id,
+            crate::on_behalf_of::access::MainUse::Assign,
+        )).await?;
+    }
     check_creation_assignee(home_dir, &req.agent_id)?;
     let description = req.description.trim();
     if description.is_empty() {
@@ -555,6 +562,29 @@ mod tests {
             .await.unwrap_err();
         assert_eq!(error, duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE);
         assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn listed_main_goal_is_allowed_but_scheduled_goal_is_not() {
+        let home = tempfile::tempdir().unwrap();
+        let store = store_in(home.path()).await;
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("employee@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+        db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+        let mut request = req("main");
+        request.on_behalf_of = Some(format!("user:{}", employee.id));
+        assert!(create_goal_task(home.path(), &store, request.clone()).await.is_ok());
+        let slot = crate::task_store::AssignScheduleSlot {
+            id: "schedule", slot: "slot", next: None, now: Utc::now(),
+        };
+        assert_eq!(create_scheduled_goal_task(home.path(), &store, request, &slot).await.unwrap_err(),
+            "主代理僅管理員可以使用。");
+        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]

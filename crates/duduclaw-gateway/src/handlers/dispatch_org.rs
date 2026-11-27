@@ -571,7 +571,15 @@ impl MethodHandler {
                 // Assigning work: a direct Operator/Owner binding, Admin, or
                 // a team grant that derived Operator (a Manager handing work
                 // to a report's employee). Never wider than that.
-                if !ctx.can_assign_to(assigned_to) {
+                let ordinary = params.get("schedule").is_none_or(|v| v.is_null())
+                    && params.get("kind").and_then(Value::as_str)
+                        .is_none_or(|kind| matches!(kind.trim().to_ascii_lowercase().as_str(), "" | "task" | "goal"));
+                if ordinary {
+                    if let Err(frame) = self.deny_main_unless_admitted(ctx, assigned_to,
+                        crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
+                }
+                if !ctx.can_assign_to(assigned_to)
+                    && !(ordinary && self.main_assignment_admitted(ctx, assigned_to).await) {
                     return WsFrame::error_response("", "permission denied");
                 }
                 boxed_frame(|| self.handle_tasks_create(params, ctx)).await

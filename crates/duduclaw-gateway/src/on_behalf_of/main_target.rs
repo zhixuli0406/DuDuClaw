@@ -162,6 +162,54 @@ pub async fn check_loaded_main_target_for(
     Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
 }
 
+/// Execution accepts either explicitly admitted use, and validates the loaded artifact.
+pub async fn check_loaded_main_target_for_execution(
+    home: &Path, principal: Option<&str>, agent: &LoadedAgent,
+) -> Result<(), String> {
+    let assign = Box::pin(check_loaded_main_target_for(home, principal, agent, MainUse::Assign)).await;
+    if assign.is_ok() { return Ok(()); }
+    let converse = Box::pin(check_loaded_main_target_for(home, principal, agent, MainUse::Converse)).await;
+    if converse.is_ok() { return Ok(()); }
+    if assign.as_ref().err().is_some_and(|reason| reason == MAIN_TURN_REFUSAL) {
+        assign
+    } else {
+        converse
+    }
+}
+
+/// Load the concrete target for an opt-in assignment or execution check.
+/// Legacy management and scheduling callers keep `check_main_target`.
+pub async fn check_main_target_for(
+    home: &Path, principal: Option<&str>, target: &str, use_: MainUse,
+) -> Result<(), String> {
+    if !requires_main_restriction(home, principal)? { return Ok(()); }
+    let agent = Box::pin(load_main_target(home, target)).await?;
+    Box::pin(check_loaded_main_target_for(home, principal, &agent, use_)).await
+}
+
+pub async fn check_main_target_for_execution(
+    home: &Path, principal: Option<&str>, target: &str,
+) -> Result<(), String> {
+    if !requires_main_restriction(home, principal)? { return Ok(()); }
+    let agent = Box::pin(load_main_target(home, target)).await?;
+    Box::pin(check_loaded_main_target_for_execution(home, principal, &agent)).await
+}
+
+async fn load_main_target(home: &Path, target: &str) -> Result<LoadedAgent, String> {
+    let mut registry = AgentRegistry::new(home.join("agents"));
+    registry.scan().await.map_err(|_| REFUSAL.to_owned())?;
+    let agent = if target == "default" { registry.main_agent() } else {
+        registry.get(target).or_else(|| registry.list().into_iter().find(|agent|
+            agent.dir.file_name().and_then(|name| name.to_str()) == Some(target)))
+    };
+    if let Some(agent) = agent { return Ok(agent.clone()); }
+    if crate::ephemeral::is_ephemeral_id(target) {
+        return AgentRegistry::load_agent(&home.join("agents/.ephemeral").join(target))
+            .await.map_err(|_| REFUSAL.to_owned());
+    }
+    Err(REFUSAL.into())
+}
+
 async fn check_loaded_restricted_target(home: &Path, agent: &LoadedAgent) -> Result<(), String> {
     let default = crate::webchat::access::gateway_default_id(home).await
         .map_err(|_| REFUSAL.to_owned())?;
@@ -192,6 +240,17 @@ pub(crate) async fn check_loaded_queue_main_target(
         check_loaded_restricted_target(home, agent).await
     } else {
         check_loaded_main_target(home, principal, agent).await
+    }
+}
+
+/// Execution-only sibling: delegation_gate keeps the legacy queue boundary.
+pub(crate) async fn check_loaded_queue_main_target_for_execution(
+    home: &Path, principal: Option<&str>, agent: &LoadedAgent, background_system: bool,
+) -> Result<(), String> {
+    if principal.is_none() && !background_system {
+        check_loaded_restricted_target(home, agent).await
+    } else {
+        Box::pin(check_loaded_main_target_for_execution(home, principal, agent)).await
     }
 }
 

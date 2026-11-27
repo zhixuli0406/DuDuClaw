@@ -277,9 +277,15 @@ pub(crate) async fn check_record_change_allowed(
     // The predicate audits its own refusal as `delegation_denied`; its text
     // is written for an assigner and suggests org edits an AI employee cannot
     // make, so the reply here is phrased for this situation instead.
-    check_delegation_allowed(home_dir, caller, target, tool)
-        .await
-        .map_err(|_| {
+    let delegated = if tool == "tasks_update" {
+        super::delegation::check_assignment_delegation_allowed(home_dir, caller, target, tool).await
+    } else {
+        check_delegation_allowed(home_dir, caller, target, tool).await
+    };
+    delegated.map_err(|reason| {
+            if reason == duduclaw_gateway::on_behalf_of::access::MAIN_TURN_REFUSAL {
+                return reason;
+            }
             let target_short = duduclaw_core::truncate_chars(target, 64);
             format!(
                 "{tool} 遭拒：這筆{label}屬於「{target_short}」，而「{caller_short}」與「{target_short}」\

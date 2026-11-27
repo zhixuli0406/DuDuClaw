@@ -260,3 +260,35 @@ fn claude_proof_reuses_both_spawn_tool_surfaces_and_qualified_denies() {
     caps.allowed_tools = vec!["Read".into()];
     assert!(!main_tools::claude_has_shell(&caps, false));
 }
+
+#[tokio::test]
+async fn assignment_and_execution_recheck_list_and_loaded_shell_without_opening_management() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    let wire = format!("user:{}", f.emp);
+    let loaded = AgentRegistry::load_agent(&f.dir.path().join("agents/main")).await.unwrap();
+    assert_eq!(check_main_target_for(f.dir.path(), Some(&wire), "main", MainUse::Assign).await,
+        Err(REFUSAL.into()));
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    assert!(check_main_target_for(f.dir.path(), Some(&wire), "main", MainUse::Assign).await.is_ok());
+    assert!(check_loaded_main_target_for_execution(f.dir.path(), Some(&wire), &loaded).await.is_ok());
+    assert!(check_loaded_queue_main_target_for_execution(f.dir.path(), Some(&wire), &loaded, false).await.is_ok());
+    assert!(check_loaded_queue_main_target(f.dir.path(), Some(&wire), &loaded, false).await.is_err());
+    assert!(check_main_target(f.dir.path(), Some(&wire), "main").await.is_err());
+    assert!(check_loaded_queue_main_target_for_execution(f.dir.path(), None, &loaded, false).await.is_err());
+    assert!(check_loaded_queue_main_target_for_execution(f.dir.path(), None, &loaded, true).await.is_ok());
+    let mut stale_shell = loaded.clone();
+    stale_shell.config.capabilities.allowed_tools = vec!["Bash".into()];
+    stale_shell.config.capabilities.denied_tools.clear();
+    assert_eq!(check_loaded_main_target_for_execution(f.dir.path(), Some(&wire), &stale_shell).await,
+        Err(MAIN_TURN_REFUSAL.into()));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+    assert_eq!(check_main_target_for(f.dir.path(), Some(&wire), "main", MainUse::Assign).await,
+        Err(MAIN_TURN_REFUSAL.into()));
+    assert!(check_loaded_main_target_for_execution(f.dir.path(),
+        Some(&format!("user:{}", f.admin)), &stale_shell).await.is_ok());
+    f.db.set_main_agent_users(&f.admin, &[], true).unwrap();
+    assert_eq!(check_loaded_main_target_for_execution(f.dir.path(), Some(&wire), &loaded).await,
+        Err(REFUSAL.into()));
+}

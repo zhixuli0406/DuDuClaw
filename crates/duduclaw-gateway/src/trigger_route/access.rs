@@ -55,6 +55,8 @@ pub struct WebChatScope {
     pub available: bool,
     /// Directory identities admitted for this sender's conversation only.
     main_converse: BTreeSet<String>,
+    main_assign: BTreeSet<String>,
+    main_assign_listed: bool,
 }
 
 impl SenderAccess {
@@ -95,11 +97,16 @@ impl SenderAccess {
     }
 
     pub(crate) fn for_webchat(mut self, default_agent: Result<String, String>) -> Self {
-        let main_converse = self.webchat_scope.take().map(|s| s.main_converse).unwrap_or_default();
+        let old = self.webchat_scope.take();
+        let main_converse = old.as_ref().map(|s| s.main_converse.clone()).unwrap_or_default();
+        let main_assign = old.as_ref().map(|s| s.main_assign.clone()).unwrap_or_default();
+        let main_assign_listed = old.is_some_and(|s| s.main_assign_listed);
         self.webchat_scope = Some(WebChatScope {
             available: default_agent.is_ok(),
             default_agent: default_agent.unwrap_or_default(),
             main_converse,
+            main_assign,
+            main_assign_listed,
         });
         self
     }
@@ -130,6 +137,50 @@ impl SenderAccess {
         sender
     }
 
+    /// Assignment admission is precomputed separately, before the registry lock.
+    pub(crate) async fn for_assign(self, home: &Path) -> Self {
+        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
+        let scope = sender.webchat_scope.as_mut().expect("assignment scope was set");
+        scope.main_assign.clear();
+        scope.main_assign_listed = false;
+        if !scope.available { return sender; }
+        if let Sender::Account { user_id, .. } = &sender.sender {
+            if !crate::webchat::is_widget_visitor(user_id)
+                && main_access_allowed(home, user_id, MainUse::Assign).unwrap_or(false)
+            {
+                scope.main_assign_listed = true;
+                if let Ok(targets) = Box::pin(main_default_targets(home)).await {
+                    for target in targets {
+                        if Box::pin(main_turn_allowed(home, user_id, &target, MainUse::Assign))
+                            .await.unwrap_or(false)
+                        {
+                            scope.main_assign.insert(target);
+                        }
+                    }
+                }
+            }
+        }
+        sender
+    }
+
+    pub(crate) fn main_assign_allowed(&self, agent: &LoadedAgent) -> bool {
+        matches!(self.sender, Sender::Account { .. })
+            && self.webchat_scope.as_ref().is_some_and(|scope| {
+                scope.available && is_main_target(scope, agent)
+                    && agent.dir.file_name().and_then(|id| id.to_str())
+                        .is_some_and(|id| scope.main_assign.contains(id))
+                    && crate::on_behalf_of::access::loaded_access_effective(agent).unwrap_or(false)
+            })
+    }
+
+    pub(crate) fn main_assign_refusal(&self, agent: &LoadedAgent) -> Option<&'static str> {
+        (self.webchat_scope.as_ref().is_some_and(|scope|
+            scope.main_assign_listed && is_main_target(scope, agent))
+            && !self.main_assign_allowed(agent))
+            .then_some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL)
+    }
+
     pub(crate) fn main_converse_allowed(&self, agent: &LoadedAgent) -> bool {
         matches!(self.sender, Sender::Account { .. })
             && self.webchat_scope.as_ref().is_some_and(|scope| {
@@ -140,7 +191,7 @@ impl SenderAccess {
             })
     }
 
-    /// Assignment and management keep the legacy Admin-only main gate.
+    /// Management keeps the legacy Admin-only main gate.
     pub(crate) fn webchat_allows_work(&self, agent: &LoadedAgent) -> bool {
         matches!(self.sender, Sender::Admin { .. })
             || self.webchat_scope.as_ref().is_none_or(|scope|
