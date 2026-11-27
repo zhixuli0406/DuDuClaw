@@ -1,7 +1,7 @@
 //! Isolation changes execution location, not employee permissions.
-//! Operator-only tools are refused by the existing gates, never this table.
+//! Operator-only tools retain their existing gates; admin settings are also explicitly refused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, DriveWriteUnavailable, PersonalKeyRequired }
+pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, AdminSettingsUnavailable, DriveWriteUnavailable, PersonalKeyRequired }
 impl Refusal {
     pub fn message(self) -> &'static str {
         self.message_for_language(None)
@@ -11,6 +11,7 @@ impl Refusal {
             Self::HostAuthority => "隔離執行沒有主機桌面、裝置或系統服務的控制權。",
             Self::ForkNextRelease => duduclaw_mcp_boundary::fork_policy::message(language),
             Self::ProposalRequired => PROPOSAL_REQUIRED,
+            Self::AdminSettingsUnavailable => "受保護模式下無法使用管理員設定工具。",
             Self::DriveWriteUnavailable => "受保護模式尚不支援雲端硬碟寫入。",
             Self::PersonalKeyRequired => "This tool is only available to a personal key",
         }
@@ -41,6 +42,8 @@ pub fn intentional_refusal(name: &str) -> Option<Refusal> {
         "model_download" | "llamafile_start" | "llamafile_stop" => HostAuthority,
         // Employee creation goes through the Employee proposal path only.
         "create_agent" => ProposalRequired,
+        // Admin settings require a non-isolated administrator conversation.
+        "admin_settings_read" | "admin_settings_propose" => AdminSettingsUnavailable,
         _ => return None,
     })
 }

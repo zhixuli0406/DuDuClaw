@@ -5537,6 +5537,9 @@ effect = "forbid"
         "my_agents_status",
         "activity_list",
         "activity_post",
+        // Governed by the admin AI proof gate; unavailable in protected mode.
+        "admin_settings_read",
+        "admin_settings_propose",
         "agent_remove",
         "agent_status",
         "agent_update",

@@ -163,6 +163,8 @@ pub const POLICIES: &[ToolPolicy] = &[
     ToolPolicy { name: "os_audio_get", route: Route::Execution, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "os_audio_set", route: Route::Execution, required: &[ResourceKind::Employee] },
     // agents
+    ToolPolicy { name: "admin_settings_read", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "admin_settings_propose", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "create_agent", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "list_agents", route: Route::Service, required: &[ResourceKind::Employee] },
     // H8: a TaskSpec plan is host-queue work under the run's own live task

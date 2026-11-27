@@ -939,6 +939,10 @@ Creation, revocation and write calls are audited; repeated use is aggregated.
 [member API authentication reference](../api/member-contract.md#personal-member-api-keys-1850)
 for transport examples and the precise method restrictions.
 
+## Administrator AI: proof of the person in the conversation
+
+The administrator AI settings tools are offered only when the gateway verifies an active Admin who has changed the initial password, the Admin’s uniquely assigned avatar, and an attended turn from that person. The gateway checks the signed conversation context and re-resolves the requester’s identity; tool parameters cannot assert who the person is. Writes additionally require a private conversation or signed-in WebChat. Scheduled, delegated, background and protected-mode turns are refused. Each proposed write still requires the proposing Admin’s dashboard confirmation.
+
 ## Company Google sign-in
 
 The server supports Google sign-in alongside passwords and channel one-time codes. It is off by default and unavailable in the personal edition. Availability requires an administrator's risk acknowledgement, allowed company domains, a configured company Google OAuth client ID and secret, and a valid `[dashboard] public_url` (HTTPS, or HTTP on localhost/loopback). Dashboard pages for this feature are not available yet.

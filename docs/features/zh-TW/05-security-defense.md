@@ -922,6 +922,10 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 **不要把金鑰放進瀏覽器前端程式碼，請由你的伺服器呼叫。**
 完整用法與限制見[成員 API 驗證說明](../../api/member-contract.md#personal-member-api-keys-1850)。
 
+## 管理員 AI：確認對話中的本人
+
+只有閘道確認提出者是已更改初始密碼的啟用中管理員、使用其唯一指派的 AI 分身，且該回合由本人親自參與時，才會提供管理員 AI 設定工具。閘道會驗證簽署的對話脈絡並重新解析發話者身分；工具參數不能自行宣稱使用者身分。寫入還必須來自私訊或已登入的 WebChat。排程、委派、背景及受保護模式回合一律拒絕。每份變更提案仍須由提出的管理員在儀表板確認。
+
 ## 公司 Google 登入
 
 伺服器支援以 Google 登入，與密碼、通道一次性驗證碼並列。預設關閉，個人版不提供。使用前須由管理員確認風險、設定允許的公司網域、公司 Google OAuth 用戶端 ID 與密鑰，以及有效的 `[dashboard] public_url`（HTTPS，或 localhost／loopback 的 HTTP）。此功能的儀表板頁面尚未提供。
