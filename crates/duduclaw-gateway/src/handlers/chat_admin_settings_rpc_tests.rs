@@ -217,9 +217,7 @@ fn commit_error_after_rename_is_unconfirmed_and_sweeps() {
             Err("injected directory fsync failure".into())
         }).unwrap_err();
     assert!(swept.get());
-    assert!(error.contains("設定已儲存"));
-    assert!(error.contains("持久寫入"));
-    assert!(error.contains("重新整理"));
+    assert_eq!(error, "設定已儲存，但無法確認資料已持久寫入，請重新整理確認設定。");
     let rows = audits(home.path());
     assert_eq!(rows.len(), 4);
     assert_eq!(rows[2]["details"]["phase"], "intent");
@@ -231,6 +229,35 @@ fn commit_error_after_rename_is_unconfirmed_and_sweeps() {
     let all_rows: Vec<Value> = std::fs::read_to_string(home.path().join("security_audit.jsonl"))
         .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
     assert_eq!(all_rows.iter().filter(|row| row["event_type"] == "config_changed").count(), 2);
+}
+
+#[test]
+fn commit_error_after_rename_and_audit_failure_reports_both_and_sweeps() {
+    let (home, db, ctx) = fixture();
+    let mut value = params(home.path(), true);
+    value["acknowledge_risk"] = json!(true);
+    write(home.path(), &db, &ctx, value).unwrap();
+    let swept = std::cell::Cell::new(false);
+    let error = set_with_commit(home.path(), &db, &ctx,
+        request(params(home.path(), false)).unwrap(), || {
+            assert!(!read(home.path()).unwrap().2.enabled);
+            swept.set(true);
+        }, |path, hash, render| {
+            let current = std::fs::read_to_string(path).unwrap();
+            assert_eq!(config_commit::content_hash(&current), hash);
+            let rendered = render(&current)?;
+            let temporary = home.path().join("config.toml.test-tmp");
+            std::fs::write(&temporary, rendered).unwrap();
+            std::fs::rename(&temporary, path).unwrap();
+            // Preserve the intent, then reject committed audit appends even as root.
+            let audit_path = home.path().join("security_audit.jsonl");
+            std::fs::rename(&audit_path, home.path().join("security_audit.before-failure.jsonl")).unwrap();
+            std::fs::create_dir(&audit_path).unwrap();
+            Err("injected directory fsync failure".into())
+        }).unwrap_err();
+    assert!(swept.get());
+    assert_eq!(error, "設定可能已經生效，但無法確認已持久寫入，而且這次變更的稽核紀錄也沒有寫進去。請重新整理確認設定，並檢查安全紀錄。");
+    assert!(home.path().join("security_audit.jsonl").is_dir());
 }
 
 #[test]

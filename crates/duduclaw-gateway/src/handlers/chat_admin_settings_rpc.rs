@@ -296,11 +296,14 @@ fn set_with_commit(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
     event.details["phase"] = json!(if durability_unconfirmed { "committed_unconfirmed" } else { "committed" });
     let audit_result = duduclaw_security::audit::try_append_audit_event(home, &event);
     if !durability_unconfirmed {
-        audit_result.map_err(|_| "設定已儲存，但稽核紀錄寫入失敗，請重新整理並聯絡管理員。")?;
+        audit_result.as_ref().map_err(|_| "設定已儲存，但稽核紀錄寫入失敗，請重新整理並聯絡管理員。")?;
     }
     crate::security_autopilot::emit_security_autopilot_event(&event.severity, &event.event_type,
         Some(&event.agent_id), crate::security_autopilot::SOURCE_AUDIT);
     if durability_unconfirmed {
+        if audit_result.is_err() {
+            return Err("設定可能已經生效，但無法確認已持久寫入，而且這次變更的稽核紀錄也沒有寫進去。請重新整理確認設定，並檢查安全紀錄。".into());
+        }
         return Err("設定已儲存，但無法確認資料已持久寫入，請重新整理確認設定。".into());
     }
     Ok(json!({"success": true, "hash": saved_hash}))
