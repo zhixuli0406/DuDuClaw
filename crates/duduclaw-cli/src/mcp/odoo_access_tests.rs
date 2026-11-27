@@ -43,6 +43,39 @@ fn decision_engine_never_inherits_follow_and_read_only_refuses_write() {
 }
 
 #[test]
+fn bound_preconnect_intersects_all_engine_gates_even_with_possible_follow() {
+    let mut p = policy();
+    // Exercise the explicit bound API without relying on an isolation task local.
+    let read = json!({"model":"crm.lead","method":"read"});
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_ok());
+    for (model, method) in [("crm.lead", "unlink"), ("res.partner", "read"),
+        ("ir.model", "write"), ("res.users.apikeys", "create"), ("crm.lead", "message_post")] {
+        assert!(p.data_preconnect_engine("odoo_execute", &json!({"model":model,"method":method})).is_err());
+    }
+    p.agent.allowed_models = vec!["sale.order".into()];
+    assert!(p.data_preconnect("odoo_execute", &read, None).is_ok());
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_err());
+    p.agent.allowed_models.clear();
+    p.agent.allowed_actions = vec!["write:crm.lead".into()];
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_err());
+    p.agent.allowed_actions.clear();
+    p.access.always_refuse = vec!["read:crm.lead".into()];
+    assert!(p.data_preconnect_engine("odoo_execute", &read).unwrap_err().contains("一律不允許"));
+    p.access.always_refuse.clear();
+    p.global.features_crm = false;
+    assert!(p.data_preconnect_engine("odoo_crm_leads", &json!({})).is_err());
+    p.global.features_crm = true;
+    let attach = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
+    assert!(p.data_preconnect("odoo_attachment_add", &attach, None).is_ok());
+    assert!(p.data_preconnect_engine("odoo_attachment_add", &attach).is_err());
+    p.agent.allowed_actions = vec!["attach:crm.lead".into(), "attach:res.partner".into()];
+    assert!(p.data_preconnect_engine("odoo_attachment_add", &attach).is_ok());
+    assert!(p.data_preconnect_engine("odoo_attachment_add",
+        &json!({"model":"res.partner","res_id":9,"file":"x.pdf"})).is_err());
+    assert!(p.data_preconnect_engine("odoo_unknown", &json!({})).is_err());
+}
+
+#[test]
 fn listing_and_dispatch_share_possible_identity_matrix() {
     for personal in [false, true] {
         for own in [false, true] {

@@ -8,6 +8,13 @@ use super::odoo_identity_client::{IdentityKind as DecisionKind, IdentityPermissi
 const UNREADABLE: &str = "Odoo 權限設定讀不到或格式有誤，請管理員檢查設定後再試。";
 const DENIED: &str = "這位 AI 員工目前沒有這項 Odoo 操作權限。";
 
+/// Bound connectors always intersect Engine policy, even without task-local
+/// isolation context (for example when called directly by a host adapter).
+pub(crate) fn odoo_bound_preconnect(home: &Path, agent: &str, tool: &str, params: &Value)
+    -> Result<(), String> {
+    ToolPolicy::load(home, agent)?.data_preconnect_engine(tool, params)
+}
+
 #[derive(Clone)]
 pub(super) struct ToolPolicy {
     pub person_key: bool,
@@ -312,6 +319,15 @@ impl ToolPolicy {
     /// against the actual decision before connection.
     pub fn data_preconnect(&self, tool: &str, params: &Value,
         registered: Option<AgentOdooConfig>) -> Result<(), String> {
+        self.data_preconnect_mode(tool, params, registered, crate::mcp_isolation::current().is_some())
+    }
+
+    pub fn data_preconnect_engine(&self, tool: &str, params: &Value) -> Result<(), String> {
+        self.data_preconnect_mode(tool, params, None, true)
+    }
+
+    fn data_preconnect_mode(&self, tool: &str, params: &Value,
+        registered: Option<AgentOdooConfig>, isolation: bool) -> Result<(), String> {
         let mut local = self.clone();
         if let Some(agent) = registered { local.agent = agent; }
         let (_, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
@@ -327,7 +343,7 @@ impl ToolPolicy {
         for (model, method) in local.auxiliary(tool) { local.common(model, method)?; }
         // A possible Follow identity must still be decided by the gateway.
         // Isolation has no personal handoff and always intersects Engine gates.
-        if crate::mcp_isolation::current().is_some() || !local.prospective_follow() {
+        if isolation || !local.prospective_follow() {
             if tool == "odoo_execute" && let Some(method) = method {
                 if super::odoo::blocked_odoo_method(method) {
                     return Err(super::odoo::method_denial_message(method));
@@ -350,6 +366,9 @@ impl ToolPolicy {
                     .map_err(|reason| format!("Odoo permission denied: {reason}"))?;
             }
         }
+        // Includes the pure Engine table/action predicate and dedicated tool
+        // grants. Possible Follow credentials must not relax bound execution.
+        if isolation { local.check_call(tool, params, None)?; }
         if !local.identities.has_agent_credential
             && !local.identities.owner_has_personal_credential
             && !(local.agent.act_as_requester && local.identities.requester_has_personal_credential)
