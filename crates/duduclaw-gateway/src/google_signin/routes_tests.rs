@@ -28,7 +28,8 @@ impl Fixture {
             daily_new_accounts=20\n[google_signin.enabled_ack]\nby=\"admin\"\nat=\"2026-11-27T00:00:00Z\"\n")).unwrap();
         crate::mcp_oauth::upsert_client_config(&home, crate::mcp_oauth::McpOAuthClientConfig {
             provider_id: "google".into(), client_id: CLIENT.into(), client_secret: "test-secret".into(),
-            auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![], redirect_uri: String::new(),
+            auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![],
+            redirect_uri: format!("{}/api/mcp/oauth/callback", base.unwrap_or(BASE)),
         }).unwrap();
         let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
         let jwt = Arc::new(JwtConfig::new(b"google-login-http-test-at-least-32-bytes"));
