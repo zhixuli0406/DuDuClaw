@@ -43,7 +43,7 @@ pub fn build_minimal_system_prompt(
     pinned_instructions: &str,
     default_language: Option<&str>,
 ) -> std::io::Result<String> {
-    let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&agent.dir)?;
+    let mut profile = crate::runtime_dispatch::chat_profile(&agent.dir)?;
     let display_name = if agent.config.agent.display_name.trim().is_empty() {
         &agent.config.agent.name
     } else {
@@ -227,7 +227,7 @@ mod tests {
         let prompt = build_minimal_inner(input(Some("Be helpful."), None, "", "", 2));
         assert_eq!(prompt.matches(fragment).count(), 1);
         assert!(prompt.contains("被拒時照工具回傳的原因"));
-        assert!(prompt.contains("受保護模式下沒有本人在場"));
+        assert!(prompt.contains("排程、提醒等背景工作一律依一般交辦範圍判斷，受保護模式也一樣。"));
     }
 
     #[test]
@@ -344,11 +344,11 @@ mod tests {
         let big_id = "id\n".repeat(2000); // ~6 KB
         let prompt = build_minimal_inner(input(Some("soul"), Some(&big_id), "", "", 5));
         // Identity section length is bounded.
-        // The whole prompt minus the SOUL/MCP-index parts should be < 2.5KB.
+        // The identity prefix excludes the separate delegation guidance section.
         // Budget: identity_directive preamble (~190B incl. separator) + soul
         // "soul" + sep + identity 2K (IDENTITY_MAX_BYTES) + sep.
-        let mcp_pos = prompt.find("Available MCP Tools").unwrap();
-        let identity_slice = &prompt[..mcp_pos];
+        let guidance_pos = prompt.find(crate::prompt_identity::DELEGATION_GUIDANCE).unwrap();
+        let identity_slice = &prompt[..guidance_pos];
         assert!(
             identity_slice.len() < 2 * 1024 + 500,
             "identity section ({} bytes) must respect IDENTITY_MAX_BYTES",

@@ -399,7 +399,7 @@ github = true
             assert_eq!(policy.required, &[ResourceKind::Employee, ResourceKind::Connector], "{name}");
             assert_eq!(crate::mcp_isolation_disposition::intentional_refusal(name),
                 Some(crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable), "{name}");
-            assert_eq!(provider_for_tool(name), Some("google"), "{name}");
+            assert_eq!(provider_for_tool(name), None, "{name}");
             for manifest in &manifests {
                 assert!(matches!(manifest.get(name), Some(ServiceState::IntentionalRefusal(_))), "{name}");
             }

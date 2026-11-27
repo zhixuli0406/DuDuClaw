@@ -25,7 +25,14 @@ async fn broken_bot_employee_decline_with_attachment_reaches_decision_fastlane()
         channel: "discord".into(), account_id: "A1".into(),
         conversation_id: "C1".into(), principal_id: "42".into(),
     }).await;
-    std::fs::write(fixture.home.path().join("agents/alice/agent.toml"), "[model").unwrap();
+    let path = fixture.home.path().join("agents/alice/agent.toml");
+    let policy = crate::approval::policy_revision(fixture.home.path(), "alice").unwrap();
+    let raw = std::fs::read_to_string(&path).unwrap();
+    // Keep the approval's authority binding current while breaking model admission.
+    std::fs::write(path, format!("{raw}\n[runtime]\nprovider='codex'\n[model]\npreferred='claude-opus-4-6'\n")).unwrap();
+    assert_eq!(crate::approval::policy_revision(fixture.home.path(), "alice").unwrap(), policy);
+    assert_eq!(crate::entry_gate::check_task_assignee(fixture.home.path(), "alice").unwrap_err().code(),
+        "model_provider_mismatch");
     assert!(agent_selection::explicit_agent(&fixture.ctx, Some("alice"), "").await.is_err());
     let records = ordinary_dispatch_probe::install(&provider.token);
 

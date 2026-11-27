@@ -110,8 +110,9 @@ async fn personal_employee_excluded() {
 async fn workflow_bound_and_non_prompt_schedules_refused() {
     let f = &fixture();
     let store = crate::cron_store::CronStore::open(f.home.path()).unwrap();
-    let base = crate::cron_store::CronTaskRow::new("bound".into(), "Routine".into(),
+    let mut base = crate::cron_store::CronTaskRow::new("bound".into(), "Routine".into(),
         "worker".into(), "0 9 * * *".into(), "Summarize".into());
+    base.enabled = false;
     store.insert(&base).await.unwrap();
     store.bind_workflow("bound", "activation", "hash").await.unwrap();
     let mut scripted = base.clone(); scripted.id = "scripted".into(); scripted.condition_script = Some("exit 0".into());
@@ -150,10 +151,10 @@ async fn proposal_rate_limit() {
         assert_eq!(status, 403);
         assert_eq!(value["code"], "admin_ai_pending_limit");
         // Simulate decisions without invoking the out-of-scope P6 decider hooks.
-        f.sql("UPDATE approvals SET status='denied'");
+        f.approvals_sql("UPDATE approvals SET status='denied'");
         for _ in 3..20 {
             let r = f.request(&f.agent, request.clone()).await; assert_eq!(r.0, 200, "{:?}", r);
-            f.sql("UPDATE approvals SET status='denied'");
+            f.approvals_sql("UPDATE approvals SET status='denied'");
         }
         let (status, value) = f.request(&f.agent, request.clone()).await;
         assert_eq!(status, 403);
@@ -161,7 +162,7 @@ async fn proposal_rate_limit() {
         // A fresh RouteState cannot reset the durable rolling-hour quota.
         let restarted = Arc::new(RouteState::new(f.home.path().into()));
         assert_eq!(super::request(restarted, &f.agent, request.clone()).await.1["code"], "admin_ai_hourly_limit");
-        f.sql("UPDATE approvals SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-61 minutes')");
+        f.approvals_sql("UPDATE approvals SET created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now','-61 minutes')");
         assert_eq!(f.request(&f.agent, request).await.0, 200);
     }).await;
 }

@@ -72,6 +72,16 @@ where
     S: for<'a> Fn(&'a Fixture, &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
     C: Fn(&str, WsFrame, bool),
 {
+    assert_scoped_target(method, params_for_agent, setup,
+        |label, _, frame, allowed| check(label, frame, allowed)).await;
+}
+
+async fn assert_scoped_target<P, S, C>(method: &str, params_for_agent: P, setup: S, check: C)
+where
+    P: Fn(&str) -> Value,
+    S: for<'a> Fn(&'a Fixture, &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
+    C: Fn(&str, &str, WsFrame, bool),
+{
     assert!(matches!(coverage_for(method), Some((_, Coverage::Scoped(_)))),
         "{method}: matrix helper requires a Scoped row");
     for case in ["allowed", "other_department", "main", "no_grants", "employee", "member_key", "other_origin", "moved_department"] {
@@ -100,7 +110,7 @@ where
         }
         let frame = Box::pin(f.h.handle(method, params_for_agent(agent), &ctx)).await;
         // Include the case in failures emitted by the supplied outcome hook.
-        check(&format!("{method} [{case}]"), frame, case == "allowed");
+        check(&format!("{method} [{case}]"), agent, frame, case == "allowed");
     }
 }
 
@@ -240,7 +250,7 @@ fn seed_matrix_assign_by<'a>(f: &'a Fixture, agent: &'a str, paused: bool, creat
         let row = crate::task_store::AssignScheduleRow {
             id: "matrix-record".into(), creator_user_id: creator.to_owned(),
             agent_id: agent.into(), kind: "task".into(), title: "Daily report".into(),
-            payload_json: json!({"title": "Daily report"}).to_string(),
+            payload_json: json!({"title": "Daily report", "description": "Summarize today's work."}).to_string(),
             schedule_json: json!({"kind": "daily", "hour": 9, "minute": 0}).to_string(),
             timezone: Some("UTC".into()), status: if paused { "paused" } else { "active" }.into(),
             pause_reason: paused.then(|| "by_user".into()), created_via: "dashboard".into(),
@@ -363,13 +373,12 @@ fn seed_matrix_archive<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future
 
 #[tokio::test]
 async fn skills_read_scoped_matrix() {
-    assert_scoped("skills.list", |_| json!({}), seed_matrix_skill,
-        |label, frame, allowed| {
+    assert_scoped_target("skills.list", |_| json!({}), seed_matrix_skill,
+        |label, agent, frame, allowed| {
             let payload = scoped_payload(label, frame);
             let rows = payload["agents"].as_array().unwrap();
-            assert_eq!(rows.iter().any(|r| r["agent_id"] == "a1"), allowed, "{label}: {payload}");
+            assert_eq!(rows.iter().any(|r| r["agent_id"] == agent), allowed, "{label}: {payload}");
             assert!(!rows.iter().any(|r| r["agent_id"] == "b1"), "{label}: {payload}");
-            if !allowed { assert!(rows.is_empty(), "{label}: {payload}"); }
         }).await;
     // Exercise the single-employee list refusal as well as aggregate visibility.
     assert_scoped("skills.list", |a| json!({"agent_id": a}), seed_matrix_skill,

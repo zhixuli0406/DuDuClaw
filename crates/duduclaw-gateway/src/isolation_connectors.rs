@@ -567,9 +567,15 @@ fn verify_private_files(home: &Path) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Classified Connector routes that deliberately have no protected executor.
+/// These count as covered at boot, but can never select a provider or execute.
+pub fn intentionally_refused_connector(tool: &str) -> bool {
+    duduclaw_core::google_identity::is_drive_write_tool(tool)
+}
+
 pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
     // A boundary route is classification, not support for protected execution.
-    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Some("google"); }
+    if intentionally_refused_connector(tool) { return None; }
     Some(match tool {
         "google_status" | "gmail_search" | "gmail_read" | "gmail_create_draft" |
         "google_chat_spaces" | "google_chat_messages" | "google_chat_send" |
@@ -582,7 +588,8 @@ pub fn provider_for_tool(tool: &str) -> Option<&'static str> {
         "odoo_sale_orders" | "odoo_sale_create_quotation" | "odoo_sale_confirm" | "odoo_inventory_products" |
         "odoo_inventory_check" | "odoo_invoice_list" | "odoo_payment_status" | "odoo_search" | "odoo_execute" |
         "odoo_report" | "odoo_partner_search" | "odoo_schema_overview" | "odoo_schema_fields" |
-        "odoo_create" | "odoo_write" => "odoo",
+        "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" |
+        "odoo_message_send" | "odoo_attachment_add" => "odoo",
         "db_sources" | "db_tables" | "db_select" | "db_query" => "database",
         "group_history_read" | "send_message" | "send_photo" | "send_sticker" |
         "channel_config" | "channel_config_list" | "channel_status" | "pairing_manage" => "channel",

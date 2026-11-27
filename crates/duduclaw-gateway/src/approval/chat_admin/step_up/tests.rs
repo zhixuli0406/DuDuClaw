@@ -53,7 +53,8 @@ impl WebFixture {
         // the REAL password+TOTP migration_step_up API to issue the proof.
         Connection::open(self.service.env.home.join("users.db")).unwrap().execute(
             "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,?2,0)",
-            params![self.service.user, "fixture:GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"]).unwrap();
+            params![self.service.user, format!("fixture:{}", serde_json::to_string(
+                &(&self.service.user, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")).unwrap())]).unwrap();
     }
     pub(crate) fn step_up(&self) -> [u8;32] {
         self.factor();

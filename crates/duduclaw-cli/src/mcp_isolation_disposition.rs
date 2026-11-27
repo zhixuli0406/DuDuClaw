@@ -29,9 +29,10 @@ pub const PROPOSAL_REQUIRED: &str = "受保護模式下 AI 員工不能自行建
 pub fn intentional_refusal(name: &str) -> Option<Refusal> {
     use Refusal::*;
     if duduclaw_core::google_identity::is_drive_write_tool(name) { return Some(DriveWriteUnavailable); }
-    if duduclaw_core::mcp_person_tools::is_person_tool(name) { return Some(PersonalKeyRequired); }
     if duduclaw_mcp_boundary::fork_policy::deferred(name) { return Some(ForkNextRelease); }
     Some(match name {
+        // Odoo tools also serve employees; only these gateway tools are person-only.
+        "my_agents_status" | "my_tasks_list" => PersonalKeyRequired,
         "os_notify" | "os_watch_status" | "os_open" | "os_frontmost" | "os_spotlight_search" |
         "os_calendar_today" | "os_device_status" | "os_system_status" | "os_check_update" |
         "os_backup_list" | "os_network_info" | "os_wifi_status" | "os_wifi_scan" | "os_wifi_connect" |

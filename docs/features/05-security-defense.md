@@ -77,6 +77,49 @@ Ownership comes from `users.db`, plus, for a removed Personal employee whose dat
 
 Non-admin members (Employee and Manager) see only employees explicitly marked selectable by `agents.callable` in the sidebar, conversation filters, command palette, WebChat `@` suggestions and other employee pickers. The main AI employee stays hidden unless that response explicitly makes it selectable. The full roster is shown only after `agents.callable` confirms `unrestricted: true` from the live Admin identity, including the local Personal principal. Initial loading and failed permission reads show no employees for any account. Grants refresh every 60 seconds while the page is visible, when it becomes visible again, and when selection menus open. Refreshing preserves the same identity’s confirmed grants; a failed refresh clears them. File and settings pickers additionally require direct access; team calling rights do not grant file or configuration access. New conversations continue to use the server assignment resolver. This dashboard filtering does not change RPC authorization.
 
+## A misconfigured employee is refused at every entry (v1.86)
+
+Every way of handing an employee work now runs the same check first: find the employee, read its effective settings once (the preset-resolved profile when there is one, otherwise `agent.toml`), and check that they can run. When the check fails, the work is refused before anything happens: no model call, no saved attachment, no task or schedule row, no message accepted into the queue, no approval recorded.
+
+**What counts as misconfigured.** The reason code shown to people who may see it:
+
+- `model_provider_mismatch`: the model does not belong to the engine.
+- `agent_config_unreadable`: the settings file is missing, unreadable or malformed, a `[runtime]`/`[model]` field has the wrong type, the engine name is unknown, or an engine that needs a model (OpenAI-compatible) has none.
+- `runtime_unavailable`: the engine (or a team role's engine) is removed or not active.
+- `runtime_policy_refused`: the product policy does not allow the engine or the substituted model.
+- `agent_not_found`: no such employee.
+
+An employee without `[model] preferred` keeps working as in v1.85: it uses the engine's default model, and Kiro uses the model chosen in its own CLI settings.
+
+**Entries covered.**
+
+- Chat: ordinary messages on every channel and in WebChat; WebChat checks at arrival and again after waiting in the queue; AG-UI runs.
+- Chat commands on all eleven channels and in WebChat. The check runs after the channel's access check, so a blocked sender still gets silence, and a `/交辦` command checks the employee it assigns to.
+- Attachments: checked before any file is downloaded or saved (Telegram, LINE, Discord, Slack, WhatsApp, Feishu, Google Chat, Teams, WebChat). A sender the channel blocks gets no files downloaded and no refusal text.
+- Trigger words: `@employee` assignment, and a bare `@employee` that would wait for the next message, are checked against that employee.
+- Task creation: the dashboard (tasks, goals, skill assignment, schedules), MCP `tasks_create` (goals, board tasks, cron and reminders), A2A `SendMessage`, and chat `/交辦` and `/goal`. Reassigning a task to a misconfigured employee is refused the same way (dashboard `tasks.update`/`tasks.assign`, MCP `tasks_update`, and MCP `tasks_claim` by an employee); un-assigning a task or moving it away from a misconfigured employee is not affected.
+- Decisions: "approve", "start", "retry" and "continue" check the employee the task is actually assigned to (never the card's label); "decline", "cancel", "abort" and "done" never read settings. A decision sent with a file still reaches the decision handler; the file is dropped.
+- Background work: dispatch, the goal loop (including Team-as-Agent rounds), cron, reminders, heartbeats, the mail worker, automation rules, the workflow queue, scheduled assignments and the task sandbox.
+
+Authorization comes first. A caller who may not hand work to an employee gets the existing refusal and learns nothing about that employee's settings; a deleted, archived or unknown employee keeps the existing "employee unavailable" error.
+
+**What people see.** Chat users get the same notice as the v1.84 chat refusal, with the reason code and a turn reference. Website visitors (Odoo live chat, website widget sessions and widget accounts) only ever get 「抱歉，目前暫時無法回覆，請稍後再試一次。」. The dashboard shows the operator notice. An AI calling MCP gets "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work." (or "Task reassignment refused: …"). A2A callers get `EMPLOYEE_CONFIGURATION_REFUSED`. No message contains a file path or parser output; those go to the gateway log.
+
+**Commands that still work when settings are broken.** `!STOP`, `!STOP ALL`, `!RESUME`, `!STATUS`, `/takeover`, `/status`, `/help`, `/new`, `/pair` and `/model` skip the settings check, so you can stop, resume, take over, start over, pair and repair the model. Skipping the settings check never skips the access and admin checks: `!STOP`, `!STOP ALL`, `!RESUME` and `/model <name>` still need an administrator, also when they arrive through a channel without its own command handling. A command with a file attached runs without the file.
+
+Two more flows stay outside the check because they repair access or routing and never run the employee:
+
+- Telegram `/start <token>`: links a Telegram account to its dashboard account (shared bot only). It restores access, like `/pair`.
+- Discord native `/config`, `/session` and `/agent`: channel settings, session management and choosing which employee answers. Choosing another employee is one way to route around a broken one.
+
+**One read per turn.** A chat turn and a background run use the settings read at the start for the whole run: engine, model, fallback engine and model, local model, reasoning effort and minimal context. Editing `agent.toml` mid-turn affects the next message only and can never switch a running turn to another engine. Before v1.86, a file that became unreadable between two reads could make the rest of the turn run with Claude defaults.
+
+**Background work no longer falls back to Claude.** Before v1.86, scheduled and dispatched work took the engine from a lenient read: a mistyped `[runtime] provider` or an unreadable file ran the work with Claude, and an engine/model mismatch on the Claude engine was started anyway. That work is now refused. The refusal is a configuration error, so it does not rotate accounts, switch to the fallback engine or count as an engine failure. A goal is parked as needing a decision (`goal_loop.entry_refused` in its activity, with the reason code) and is not retried; Observer mode does not close it while the settings are still broken. Cron and reminders record a failed run. A scheduled assignment whose employee is broken when it fires is paused as `agent_unavailable`.
+
+**Behaviour changes.** Assigning or reassigning work to a misconfigured employee is refused at once instead of failing later. A scheduled assignment for a broken employee pauses. Team-as-Agent role members keep their frozen model and are no longer re-routed to another model tier. On Discord with automatic threads, a message with files downloads them after the thread is created (the new thread can be bound to a different employee); a thread for a files-only message starts with a temporary name and is renamed to the usual name after the download.
+
+**Known limits.** An MCP server started before the gateway has ever run reads the raw `agent.toml`, because the preset-resolved profile is written by the gateway; an employee whose model comes only from its preset can then be refused task creation through MCP until the gateway has started once. The employee's tool restrictions and account pool are still read from `agent.toml` at spawn time, outside the one-read rule.
+
 ## `code_map` stays inside the employee's own directory (v1.81)
 
 Before v1.81 `code_map` scanned any directory the MCP server could read (default: its working directory), so a caller could map source anywhere on the host and read its signatures. Now:

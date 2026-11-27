@@ -32,7 +32,7 @@ async fn none_refuses_every_pair_at_the_front_door() {
         let err = check_delegation_allowed(home, sender, target, "send_to_agent")
             .await
             .expect_err("`none` must refuse");
-        assert!(err.contains("none"), "{sender} -> {target}: {err}");
+        assert!(err.contains("不允許委派"), "{sender} -> {target}: {err}");
     }
     let audit = fs::read_to_string(home.join("tool_calls.jsonl")).unwrap_or_default()
         + &fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default();
@@ -370,7 +370,7 @@ async fn none_refuses_channel_agent_override_to_another_employee() {
     let err = check_agent_override_allowed(home, lead, "sales-rep")
         .await
         .expect_err("another employee is refused under none");
-    assert!(err.contains("none"), "{err}");
+    assert!(err.contains("不允許委派"), "{err}");
     for ok in ["", "  ", "sales-lead"] {
         assert!(check_agent_override_allowed(home, lead, ok).await.is_ok(), "{ok:?}");
     }

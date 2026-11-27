@@ -9021,7 +9021,7 @@ can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
-allowed_channels = ["*"]
+allowed_channels = []
 permissions_enforced_since = "1.68.0"
 
 [evolution]
@@ -13889,6 +13889,17 @@ mod agent_scaffold_tests {
     use duduclaw_core::types::RuntimeType;
 
     #[test]
+    fn scaffold_agent_toml_has_no_allowed_channels() {
+        let scaffold = AgentScaffold {
+            name: "fresh".into(), display_name: "Fresh".into(), role: "worker".into(),
+            reports_to: String::new(), icon: "🐾".into(), trigger: "@Fresh".into(),
+            provider: RuntimeType::Claude, model_preferred: None, soul_body: None,
+        };
+        let config: toml::Table = scaffold_agent_toml(&scaffold).parse().unwrap();
+        assert!(config["permissions"]["allowed_channels"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn context_filenames_per_provider() {
         assert_eq!(
             provider_context_filenames(RuntimeType::Claude),
@@ -15777,7 +15788,7 @@ can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
-allowed_channels = ["*"]
+allowed_channels = []
 permissions_enforced_since = "1.68.0"
 
 [evolution]

@@ -391,7 +391,7 @@ get_by_ids(namespace, ids)
 [knowledge_guard]
 enabled = true          # 同來源爆量偵測器的總開關。預設 true
 window_secs = 3600      # 滑動窗長度（秒）。預設 3600（1 小時）
-max_per_subject = 5     # 一個來源在窗內對同一 subject 可寫入的事實上限，超過即隔離。預設 5
+max_per_subject = 5     # 一個來源在窗內對同一 subject 寫入的事實數，達到這個數量就先隔離待確認。預設 5
 ```
 
 取代時的可信度檢查預設開啟：

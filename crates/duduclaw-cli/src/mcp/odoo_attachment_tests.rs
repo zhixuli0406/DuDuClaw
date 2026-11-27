@@ -217,14 +217,20 @@ fn shallow_jpeg_webp_and_wrong_image_formats_are_refused() {
 fn image_dimensions_and_both_input_and_output_sizes_are_bounded() {
     for (width, height) in [(IMAGE_MAX_DIMENSION + 1, 1), (1, IMAGE_MAX_DIMENSION + 1)] {
         let png = image_bytes(image::ImageFormat::Png, width, height);
-        assert!(prepare_file(&attachment("x.png"), png, 1024 * 1024).is_err());
+        let error = prepare_file(&attachment("x.png"), png, 1024 * 1024).unwrap_err();
+        assert!(error.contains("圖片尺寸"), "{error}");
     }
     let png = valid_png();
-    assert!(prepare_file(&attachment("x.png"), png.clone(), png.len() as u64 - 1).is_err());
-    let webp = image_bytes(image::ImageFormat::WebP, 2, 2);
+    assert_eq!(prepare_file(&attachment("x.png"), png.clone(), png.len() as u64 - 1).unwrap_err(), SIZE_REFUSED);
+    // One pixel uses single-symbol WebP Huffman trees. The 2x2 fixture adds
+    // a run-length tree whose overhead can make it larger than the PNG output.
+    let webp = image_bytes(image::ImageFormat::WebP, 1, 1);
     let (output, _, _) = prepare_file(&attachment("x.webp"), webp.clone(), 1024 * 1024).unwrap();
     assert!(output.len() > webp.len());
-    assert!(prepare_file(&attachment("x.webp"), webp.clone(), webp.len() as u64).is_err());
+    assert_eq!(prepare_file(&attachment("x.webp"), webp.clone(), output.len() as u64).unwrap().0, output);
+    // Input fits exactly, so this refusal must come from the output bound.
+    let error = prepare_file(&attachment("x.webp"), webp.clone(), webp.len() as u64).unwrap_err();
+    assert!(error.contains("附件大小限制"), "{error}");
 }
 
 fn deflate(bytes: &[u8]) -> Vec<u8> {
@@ -430,4 +436,50 @@ fn office_refuses_external_relationships_in_any_part() {
             assert!(mimetype("x.docx", &writer.finish().unwrap().into_inner()).is_err(), "{rel}: {mode}");
         }
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn protected_attachment_uses_verified_employee_host_root() {
+    use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
+        EmployeeBinding, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
+    use duduclaw_mcp_boundary::{RequestContext, resources::ResourceRoots};
+    use crate::mcp_isolation::{IsolatedCall, ISOLATED_CALL};
+    let home = fixture();
+    std::fs::write(home.path().join("config.toml"),
+        "[odoo]\nurl='https://odoo.example.com'\ndb='test'\n").unwrap();
+    std::fs::write(home.path().join("agents/bot/agent.toml"),
+        "[odoo]\nusername='bot'\napi_key_enc='private-key'\nallowed_models=['crm.lead']\nallowed_actions=['attach:crm.lead']\n").unwrap();
+    let record = CapabilityRecord {
+        id: CapabilityId(Sha256Digest([1; 32])), employee: EmployeeId([2; 16]), run: RunId([3; 16]),
+        task: None, principal: Principal::Human { user_id: Text::new("owner".into()).unwrap(), generation: 1 },
+        employee_binding: EmployeeBinding::Personal(Text::new("owner".into()).unwrap()), lane: Lane::Standard,
+        tools: List::new(vec![Text::new("odoo_attachment_add".into()).unwrap()]).unwrap(),
+        resources: List::new(vec![]).unwrap(), policy_revision: 1, gateway_epoch: [4; 16],
+        issued_at: 1, not_before: 1, expires_at: u64::MAX, nonce: [5; 32], jti: [6; 16],
+    };
+    let isolated = Arc::new(IsolatedCall { home: home.path().to_path_buf(),
+        context: RequestContext::from_verified_record(record), agent: "bot".into(),
+        roots: Arc::new(ResourceRoots::default()), parser: None, services: None,
+        worker: None, execution: None, forks: None, record_resolver: None });
+    ISOLATED_CALL.scope(isolated, async {
+        let args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
+        assert!(validate_attachment(home.path(), "bot", &args).await.is_ok());
+        assert!(validate_attachment(home.path(), "other", &args).await.is_err());
+        assert!(!verified_employee(&home.path().join("other-home"), "bot"));
+        let expected = clean_pdf();
+        std::fs::write(home.path().join("attachments/x.pdf"), b"host secret").unwrap();
+        std::fs::write(home.path().join("agents/other/attachments/x.pdf"), b"other employee secret").unwrap();
+        assert_eq!(read_file(home.path(), "bot", &attachment("x.pdf"), 1).unwrap().0, expected);
+        for file in ["../../other/attachments/x.pdf", "../../../attachments/x.pdf"] {
+            let call = Attachment { file: file.into(), ..attachment("x.pdf") };
+            assert!(read_file(home.path(), "bot", &call, 1).is_err());
+        }
+        let root = home.path().join("agents/bot/attachments");
+        std::os::unix::fs::symlink(home.path().join("agents/other/attachments/x.pdf"), root.join("link.pdf")).unwrap();
+        assert!(read_file(home.path(), "bot", &attachment("link.pdf"), 1).is_err());
+        std::fs::rename(&root, home.path().join("saved-attachments")).unwrap();
+        std::os::unix::fs::symlink(home.path().join("saved-attachments"), &root).unwrap();
+        assert!(read_file(home.path(), "bot", &attachment("x.pdf"), 1).is_err());
+    }).await;
 }
