@@ -134,6 +134,7 @@ fn masked_approval_value(value: &Value) -> Value {
 
 pub mod action_grant;
 pub(crate) mod chat_admin;
+pub(crate) mod decision_service;
 mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
