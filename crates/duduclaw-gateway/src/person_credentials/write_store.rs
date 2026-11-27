@@ -7,10 +7,10 @@ use duduclaw_security::credential_protection::ProtectedKey;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::google_personal::oauth::DRIVE_WRITE_SCOPE as DRIVE_SCOPE;
 pub use super::{Secret, Status};
 
 const PURPOSE: &str = "drive_write";
-const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 const UNREADABLE: &str = "雲端硬碟寫入連線紀錄無法讀取，請聯絡管理員；沒有變更已保存的連線。";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +332,13 @@ pub fn mark_needs_reconnect(home: &Path, expected: &Metadata) -> Result<bool, St
 }
 
 pub(super) fn sync_user_status(home: &Path, user: &str, active: bool) -> Result<(), String> {
+    // Avoid creating or rewriting the write vault for ordinary-only members.
+    // Re-read under the write lock below before applying any actual change.
+    let Some(record) = get(home, "user", user)? else { return Ok(()); };
+    if (active && record.metadata.status != Status::Suspended)
+        || (!active && record.metadata.status == Status::Suspended) {
+        return Ok(());
+    }
     modify(home, |store| {
         let Some(index) = store.records.iter().position(|r| {
             r.metadata.owner_kind == "user" && r.metadata.owner_id == user

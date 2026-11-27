@@ -121,7 +121,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
             granted,
             &[
                 "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/drive",
+                super::oauth::DRIVE_WRITE_SCOPE,
             ],
         ),
         "docs_read" => has(

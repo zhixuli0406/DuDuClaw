@@ -253,3 +253,12 @@ fn concurrent_epoch_updates_are_serialized_by_the_shared_file_lock() {
     for thread in threads { thread.join().unwrap(); }
     assert_eq!(begin_connection(home.path(), "user", "user-a").unwrap(), 65);
 }
+
+#[test]
+fn syncing_absent_user_does_not_create_write_store() {
+    let home = tempfile::tempdir().unwrap();
+    for active in [true, false] {
+        sync_user_status(home.path(), "user-a", active).unwrap();
+        assert!(!path(home.path()).exists());
+    }
+}

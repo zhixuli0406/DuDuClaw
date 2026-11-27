@@ -347,7 +347,17 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
     MemberContractMethod {
         name: "me.google.status", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read personal Google connection and consent status (Enterprise)",
-        key_fields: &["connection", "login_email", "client_configured", "chat_read", "chat_send", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
+        key_fields: &["connection", "drive_write", "enabled_by_admin", "login_email", "client_configured", "chat_read", "chat_send", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
+    },
+    MemberContractMethod {
+        name: "me.google.write_connect_start", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Start separate personal Google Drive write authorization (browser session only)",
+        key_fields: &[],
+    },
+    MemberContractMethod {
+        name: "me.google.write_disconnect", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Remove the local Google Drive write connection (browser session only)",
+        key_fields: &["disconnected", "provider_note"],
     },
     MemberContractMethod {
         name: "me.google.connect_start", since: "1.85.0", kind: MemberContractKind::Write,
@@ -429,6 +439,7 @@ pub(crate) fn member_key_agent_update_params(params: &serde_json::Value) -> Resu
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
     let excluded = matches!(method, "users.change_password" | "users.change_email"
+        | "me.google.write_connect_start" | "me.google.write_disconnect"
         | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
         || method.split('.').take(2).eq(["me", "status_tokens"])
@@ -445,6 +456,7 @@ mod member_key_tests {
     fn keys_use_contract_intersected_with_credential_exclusions() {
         for method in ["users.change_password", "users.change_email", "me.status_tokens.list",
             "me.member_keys.create", "me.google.connect_start", "me.google.disconnect",
+            "me.google.write_connect_start", "me.google.write_disconnect",
             "me.google.consents.set", "sessions.list", "mfa.status", "config.get",
             "system.update_config", "agents.delete", "unknown.method"] {
             assert_eq!(member_key_method(method), None, "{method}");

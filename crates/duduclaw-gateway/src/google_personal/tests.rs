@@ -117,6 +117,9 @@ async fn token(
         );
     }
     let (account, scope) = match who {
+        code if code.strip_prefix("write-for-").is_some() => (code.strip_prefix("write-for-").unwrap(), format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
+        "write-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", oauth::DRIVE_WRITE_SCOPE)),
+        "write-bob" => ("bob", format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "chat-send-alice" => ("alice", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
         "chat-send-bob" => ("bob", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
         "chat-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", crate::google_workspace::CHAT_READ_SCOPES.join(" "))),
@@ -1291,4 +1294,43 @@ async fn administrator_personal_test_uses_only_oauth_metadata_and_notifies_the_m
         let notices = crate::notify_push::person_notice_test::take(&f.home);
         assert!(notices.iter().any(|(user, text)| user == &f.alice.id && text.contains("管理員準備測試")));
     }
+}
+
+
+#[tokio::test]
+async fn rejected_write_consent_and_local_disconnect_never_revoke_google() {
+    let f = Fixture::new();
+    let account = format!("write-norevoke-{}", uuid::Uuid::new_v4());
+    let start = flow::start(&f.home, &f.db, &f.alice.id, "login-a",
+        "http://127.0.0.1:18889", &[], true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, &account).unwrap();
+    flow::finish(&f.home, &f.db, &f.alice.id, "login-a", state).await.unwrap();
+    let delay = Arc::new(RevokeDelay::default());
+    // An erroneous revoke must be counted without blocking this regression.
+    delay.release.notify_one();
+    delays().lock().unwrap().insert(account.clone(), delay.clone());
+    use crate::google_workspace::drive_write_policy as policy;
+    let mut enabled = policy::DriveWritePolicy::all_off();
+    enabled.create = true;
+    let section = policy::render_section(&enabled,
+        &policy::sign(&enabled, "admin", "admin@c.test", chrono::Utc::now()));
+    let config = format!("[integrations]\ngoogle_workspace=true\n[google.drive_write]\n{}",
+        toml::to_string(&section).unwrap());
+    std::fs::write(f.home.join("config.toml"), &config).unwrap();
+    let start = flow::start_drive_write(&f.home, &f.db, &f.alice.id, "login-a",
+        "http://127.0.0.1:18889", &[], true, true).await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(&f.home, state, &format!("write-for-{account}")).unwrap();
+    // Change the client after obtaining consent, so refusal happens after exchange.
+    let mut client = crate::mcp_oauth::get_client_config(&f.home, "google").unwrap();
+    client.client_secret = "changed-secret".into();
+    crate::mcp_oauth::upsert_client_config(&f.home, client).unwrap();
+    let before = std::fs::read(vault::path(&f.home)).unwrap();
+    assert!(flow::finish(&f.home, &f.db, &f.alice.id, "login-a", state).await.is_err());
+    flow::write_disconnect(&f.home, &f.db, &f.alice.id).unwrap();
+    assert_eq!(delay.revoke_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read(vault::path(&f.home)).unwrap(), before);
+    assert!(crate::person_credentials::write_store::get(&f.home, "user", &f.alice.id).unwrap().is_none());
+    delays().lock().unwrap().remove(&account);
 }

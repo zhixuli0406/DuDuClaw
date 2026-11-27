@@ -2,7 +2,7 @@
 //! can claim and exchange it. Neither path returns a bearer credential.
 
 use super::{access, oauth, pending};
-use crate::person_credentials::{self as vault, Metadata, Status};
+use crate::person_credentials::{self as vault, write_store, Metadata, Status};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use duduclaw_auth::{User, UserDb, UserStatus};
 use serde_json::{Value, json};
@@ -40,7 +40,7 @@ pub async fn start_with_meetings(
     acknowledge_google_data: bool,
     meeting_recordings: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, false, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, meeting_recordings, false, false, false, None).await
 }
 
 pub async fn start_drive_tools(
@@ -52,7 +52,7 @@ pub async fn start_drive_tools(
     allowed: &[String],
     acknowledge_google_data: bool,
 ) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, false, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge_google_data, false, true, false, false, None).await
 }
 
 pub(crate) async fn start_authorization_request(
@@ -60,11 +60,37 @@ pub(crate) async fn start_authorization_request(
     allowed: &[String], request: &crate::google_authorization_requests::store::Request,
 ) -> Result<Value,String> {
     start_consent(home,db,user,session,origin,allowed,true,false,
-        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,Some(request)).await
+        matches!(request.purpose.as_str(), "drive_tools" | "workspace"),false,false,Some(request)).await
 }
 
 pub async fn start_chat_send(home: &Path, db: &UserDb, user: &str, session: &str, origin: &str, allowed: &[String], acknowledge: bool) -> Result<Value, String> {
-    start_consent(home, db, user, session, origin, allowed, acknowledge, false, false, true, None).await
+    start_consent(home, db, user, session, origin, allowed, acknowledge, false, false, true, false, None).await
+}
+
+pub async fn start_drive_write(
+    home: &Path, db: &UserDb, user: &str, session: &str, origin: &str,
+    allowed: &[String], acknowledge_google_data: bool, acknowledge_write: bool,
+) -> Result<Value, String> {
+    if !acknowledge_google_data {
+        return Err("請先閱讀並確認 Google 資料的存取、分享、保存與刪除說明。".into());
+    }
+    if !acknowledge_write {
+        return Err("請先確認要開放 AI 在雲端硬碟寫入。".into());
+    }
+    start_consent(home, db, user, session, origin, allowed, true, false, false, false, true, None).await
+}
+
+fn require_write_policy(home: &Path) -> Result<(), String> {
+    if !crate::google_workspace::drive_write_policy::load(home).any_enabled() {
+        return Err("管理員還沒開放 AI 在雲端硬碟寫入。".into());
+    }
+    Ok(())
+}
+
+fn ordinary_for_write(home: &Path, user: &str) -> Result<Metadata, String> {
+    vault::get(home, user)?.filter(|r| r.metadata.status == Status::Connected)
+        .map(|r| r.metadata)
+        .ok_or_else(|| "請先重新連結自己的 Google 帳號，再開放雲端硬碟寫入。".into())
 }
 
 async fn start_consent(
@@ -78,10 +104,12 @@ async fn start_consent(
     meeting_recordings: bool,
     drive_tools: bool,
     chat_send: bool,
+    drive_write: bool,
     authorization_request: Option<&crate::google_authorization_requests::store::Request>,
 ) -> Result<Value, String> {
+    if drive_write { require_write_policy(home)?; }
     if chat_send && !crate::google_workspace::chat_send_enabled(home) { return Err(crate::google_workspace::chat_send::GUIDANCE.into()); }
-    if [meeting_recordings, drive_tools, chat_send].iter().filter(|v| **v).count() > 1 {
+    if [meeting_recordings, drive_tools, chat_send, drive_write].iter().filter(|v| **v).count() > 1 {
         return Err("請每次選擇一項 Google 額外服務。".into());
     }
     if !acknowledge_google_data {
@@ -106,7 +134,9 @@ async fn start_consent(
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     // Incremental consent extends this person's existing Google account;
     // choosing another account cannot silently replace it.
-    let expected_connection = if chat_send {
+    let expected_connection = if drive_write {
+        Some(ordinary_for_write(home, user)?)
+    } else if chat_send {
         Some(vault::get(home, user)?.ok_or("請先連結自己的 Google 帳號，再開放 Chat 傳送。")?.metadata)
     } else if authorization_request.is_some() {
         vault::get(home,user)?.map(|r|r.metadata)
@@ -117,8 +147,24 @@ async fn start_consent(
     } else {
         None
     };
-    let chat_read = !chat_send && !meeting_recordings && !drive_tools && crate::google_workspace::chat_read_enabled(home);
-    let epoch = vault::begin_connection(home, user)?;
+    let chat_read = !drive_write && !chat_send && !meeting_recordings && !drive_tools && crate::google_workspace::chat_read_enabled(home);
+    let requested = if drive_write {
+        vec![oauth::DRIVE_WRITE_SCOPE, "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/spreadsheets", "openid", "email"]
+    } else {
+        let purpose = if chat_send { "chat_send" } else if drive_tools { "drive_tools" }
+            else if meeting_recordings { "meeting_recordings" } else { "base" };
+        let mut purposes = expected_connection.as_ref().map(|old|
+            old.local_purposes.iter().map(String::as_str).collect::<Vec<_>>()
+        ).unwrap_or_default();
+        purposes.push(purpose);
+        if authorization_request.is_some_and(|request| request.purpose == "workspace") {
+            purposes.extend(["base", "drive_tools"]);
+        }
+        oauth::scopes_for_purposes(&purposes, chat_read)
+    };
+    let epoch = if drive_write { write_store::begin_connection(home, "user", user)? }
+        else { vault::begin_connection(home, user)? };
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
     pending::cancel_user(home, user);
     let state = pending::insert(pending::Pending {
@@ -134,6 +180,7 @@ async fn start_consent(
         epoch,
         meeting_recordings,
         drive_tools,
+        drive_write,
         chat_read,
         chat_send,
         expected_connection,
@@ -141,20 +188,11 @@ async fn start_consent(
         created: Instant::now(),
         code: None,
     });
-    let mut authorization_url = oauth::authorization_url_for(
-        &client.client_id, &redirect_uri, &state, &challenge,
-        meeting_recordings, drive_tools, chat_read, chat_send,
+    let mut authorization_url = oauth::authorization_url_for_scopes(
+        &client.client_id, &redirect_uri, &state, &challenge, &requested,
     )?;
     if let Some(request) = authorization_request {
         let mut url = url::Url::parse(&authorization_url).map_err(|_| "Google 授權網址無效。")?;
-        if request.purpose == "workspace" {
-            let mut scopes=oauth::requested_scopes(false,false);
-            scopes.extend(oauth::requested_scopes(false,true));
-            scopes.sort_unstable(); scopes.dedup();
-            let pairs=url.query_pairs().filter(|(key,_)|key!="scope").map(|(k,v)|(k.into_owned(),v.into_owned())).collect::<Vec<_>>();
-            url.set_query(None);
-            url.query_pairs_mut().extend_pairs(pairs).append_pair("scope",&scopes.join(" "));
-        }
         url.query_pairs_mut().append_pair("login_hint", &request.email);
         authorization_url = url.to_string();
     }
@@ -178,6 +216,12 @@ pub async fn finish(
     }
     let pending = pending::take(home, state, user, session)?;
     crate::google_data_consent::require_current(Some(&pending.google_data_consent))?;
+    if pending.drive_write {
+        if authorization_request.is_some() {
+            return Err("這次 Google 連結已失效，請重新開始。".into());
+        }
+        return finish_drive_write(home, db, user, &pending).await;
+    }
     let grant_lease = super::grants::acquire(home).await?;
     let tokens = oauth::exchange(
         &pending.client_id,
@@ -200,6 +244,9 @@ pub async fn finish(
     let scopes = tokens
         .granted_scopes
         .ok_or("Google 沒有回傳實際授權範圍，請重新連結。")?;
+    if scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE) {
+        return Err("一般 Google 連線收到不應持有的雲端硬碟寫入權限，這次沒有保存。請到「我的連線」移除寫入連線，再重新連結。".into());
+    }
     if pending.expected_connection.as_ref().is_some_and(|old| old.google_sub != info.sub) {
         return Err("請使用原本連結的 Google 帳號開放額外服務。這次沒有取代既有連線。".into());
     }
@@ -235,21 +282,10 @@ pub async fn finish(
     }
     local_purposes.sort();
     local_purposes.dedup();
-    let mut expected_scopes = oauth::requested_scopes(pending.meeting_recordings, pending.drive_tools)
+    // Provider-returned scopes never become locally consented purposes.
+    let purposes = local_purposes.iter().map(String::as_str).collect::<Vec<_>>();
+    let expected_scopes = oauth::scopes_for_purposes(&purposes, pending.chat_read)
         .into_iter().map(str::to_string).collect::<Vec<_>>();
-    // Previously returned but locally unconsented scopes remain unexpected
-    // on later flows; receiving them once must not bless them in the audit.
-    for granted_purpose in &local_purposes {
-        expected_scopes.extend(oauth::requested_scopes(
-            granted_purpose == "meeting_recordings", granted_purpose == "drive_tools",
-        ).into_iter().map(str::to_string));
-    }
-    if local_purposes.iter().any(|purpose| purpose == "chat_read") {
-        expected_scopes.extend(crate::google_workspace::CHAT_READ_SCOPES.iter().map(|s| s.to_string()));
-    }
-    if local_purposes.iter().any(|purpose| purpose == "chat_send") {
-        expected_scopes.extend(crate::google_workspace::CHAT_SEND_SCOPES.iter().map(|s| s.to_string()));
-    }
     let mut unexpected_scopes: Vec<_> = scopes.iter()
         .filter(|scope| !expected_scopes.contains(scope)).cloned().collect();
     unexpected_scopes.sort();
@@ -329,6 +365,91 @@ pub async fn finish(
         None,
     );
     Ok(json!({"connection": metadata}))
+}
+
+/// This path never revokes a rejected token: Google revocation can affect
+/// the whole project, including the member's ordinary connection.
+async fn finish_drive_write(
+    home: &Path, db: &UserDb, user: &str, pending: &pending::Pending,
+) -> Result<Value, String> {
+    if pending.meeting_recordings || pending.drive_tools || pending.chat_read || pending.chat_send {
+        return Err("請每次選擇一項 Google 額外服務。".into());
+    }
+    require_write_policy(home)?;
+    let expected = pending.expected_connection.as_ref()
+        .ok_or("請先連結自己的 Google 帳號，再重新開始。")?;
+    let _grant_lease = super::grants::acquire(home).await?;
+    let tokens = oauth::exchange(
+        &pending.client_id, &pending.client_secret,
+        pending.code.as_deref().ok_or("尚未收到 Google 回覆。")?,
+        &pending.code_verifier, &pending.redirect_uri,
+    ).await.map_err(|_| "Google 連結未完成，請重新開始。沒有保存這次的憑證。")?;
+    let info = oauth::userinfo(&tokens.secret.access_token).await
+        .map_err(|_| "無法確認 Google 帳號或信箱尚未驗證，沒有保存連線。")?;
+    if info.sub != expected.google_sub {
+        return Err("請使用原本連結的 Google 帳號開放雲端硬碟寫入，這次沒有保存。".into());
+    }
+    let scopes = tokens.granted_scopes
+        .ok_or("Google 沒有回傳實際授權範圍，請重新連結。")?;
+    if !scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE) {
+        return Err("Google 尚未授予雲端硬碟寫入權限，這次沒有保存。".into());
+    }
+    if tokens.secret.refresh_token.as_deref().is_none_or(str::is_empty) {
+        return Err("Google 沒有提供背景更新憑證；請重新連結，並同意背景存取。".into());
+    }
+    // Domain validation uses the newly verified provider identity, not the
+    // old ordinary account's email/domain. This clone is never published.
+    let mut identity = expected.clone();
+    identity.account_email = info.email.clone();
+    identity.google_sub = info.sub.clone();
+    identity.hosted_domain = info.hd.clone();
+    if !access::domain_allowed(home, &identity)? {
+        return Err("這個 Google 帳號不在管理員允許的網域內，沒有保存連線。".into());
+    }
+    active_user(db, user)?;
+    if crate::mcp_oauth::get_client_config(home, "google").is_none_or(|c| {
+        c.client_id != pending.client_id || c.client_secret != pending.client_secret
+    }) {
+        return Err("管理員已變更 Google 連結設定，請重新開始。".into());
+    }
+    let key = crate::google_identity::protection_gate_async(home).await
+        .map_err(|r| r.message_zh)?;
+    active_user(db, user)?;
+    require_write_policy(home)?;
+    if crate::mcp_oauth::get_client_config(home, "google").is_none_or(|c| {
+        c.client_id != pending.client_id || c.client_secret != pending.client_secret
+    }) {
+        return Err("管理員已變更 Google 連結設定，請重新開始。".into());
+    }
+    if !access::domain_allowed(home, &identity)? {
+        return Err("管理員已變更允許的 Google 網域，請重新開始。".into());
+    }
+    let current = ordinary_for_write(home, user)?;
+    if current.google_sub != expected.google_sub || current.credential_id != expected.credential_id {
+        return Err("原本的 Google 連線已變更，這次沒有保存。請重新開始。".into());
+    }
+    let metadata = write_store::Metadata {
+        owner_kind: "user".into(), owner_id: user.into(), purpose: "drive_write".into(),
+        provider: "google".into(), credential_id: uuid::Uuid::new_v4().to_string(),
+        revision: 1, account_email: info.email, google_sub: info.sub, hosted_domain: info.hd,
+        granted_scopes: scopes, status: Status::Connected, status_before_suspension: None,
+        connected_at: chrono::Utc::now().to_rfc3339(), last_refresh_at: None,
+        oauth_client_id: pending.client_id.clone(),
+        google_data_consent: Some(pending.google_data_consent.clone()),
+    };
+    write_store::connect(home, &key, metadata.clone(), &tokens.secret, pending.epoch)?;
+    let detail = json!({"google_email": metadata.account_email,
+        "scope_count": metadata.granted_scopes.len(),
+        "scope_digest": scope_digest(&metadata.granted_scopes)}).to_string();
+    let _ = db.log_action(Some(user), "user.google_write_connect", Some(user), Some(&detail), None);
+    Ok(json!({"connection": metadata}))
+}
+
+pub fn write_disconnect(home: &Path, db: &UserDb, user: &str) -> Result<(), String> {
+    active_user(db, user)?;
+    write_store::disconnect(home, "user", user)?;
+    let _ = db.log_action(Some(user), "user.google_write_disconnect", Some(user), None, None);
+    Ok(())
 }
 
 /// Stable set digest: ordering and duplicate provider entries do not affect it.
