@@ -20,14 +20,14 @@ Configure `[delegation] policy` in `config.toml` or under "Advanced settings" in
 |--------|----------|----------|
 | `department` (default) | Up/down the hierarchy, same-department horizontal collaboration, and white-listed pairs are all allowed | Most teams |
 | `hierarchy` | Only hierarchy and white-listed pairs; no same-department horizontal | Strict chain of command |
-| `open` | Legacy behavior — no checks except "cannot delegate to yourself" | Emergency fallback |
-| `none` (v1.82) | No AI employee delegates to, messages, spawns, creates or assigns work to another; white-list pairs do not apply. People and schedules (dashboard, cron, heartbeat, goal loop) still give work to employees | Every employee works alone; only people hand out work |
+| `open` | Allows delegation within the always-deny boundaries below | Emergency fallback |
+| `none` (v1.82) | Unless the role exception below applies, no AI employee delegates to, messages, spawns, creates or assigns work to another; white-list pairs do not apply. People and schedules (dashboard, cron, heartbeat, goal loop) still give work to employees | Every employee works alone; only people hand out work |
 
 White-list pairs work under both `department` and `hierarchy`; `open` has no use for them (everything is already allowed) and `none` ignores them.
 
 The default `department` suits everyday collaboration — it fixes the skip-level assignment gap while keeping the flexibility for colleagues to back each other up.
 
-**`none` in detail (v1.82.0).** One predicate decides every route below, so `send_to_agent`, `spawn_agent`, `tasks_create` / `tasks_update` naming another employee, `create_task` steps, routines for someone else, record changes on another employee's records, the co-drive mail hand-off and the bus dispatch gate all refuse with reason `delegation_disabled`. The MCP dispatch gate also refuses `spawn_ephemeral` and `create_agent` for every employee (a protected-mode `spawn_ephemeral` child is not released either), and an employee's tool list no longer shows `send_to_agent`, `spawn_agent`, `spawn_ephemeral` or `create_agent`; `tasks_create` and `create_task` stay listed for the employee's own work. `list_agents` no longer widens visibility through white-list pairs. The one exception is Team-as-Agent: an employee's planner, executor and verifier roles exchange task packets within one goal round through `team_handoff`. Under every policy, `team_handoff` accepts only a verified team member — a role member the gateway scaffolded under `agents/.ephemeral/eph-*` whose `[team_member]` record names the same parent as its `ephemeral.toml`; an ordinary employee is refused (`not_a_team_member`) and does not see the tool, even if it writes a `[team_member]` section into its own `agent.toml` (that section is frozen for employees anyway). The caller's identity must also be token-verified (`DUDUCLAW_AGENT_TOKEN`): during the operator-enabled 30-day soft identity migration (`require_identity_token = false`) a process without a valid token runs as unverified, and declaring an existing `eph-*` id then gets it neither the tool, nor the listing, nor the `none` exception (refused with `not_a_team_member`); nothing else changes in soft mode. The team composer runs those role members itself, so they never pass through the delegation predicate. Also under `none`: `agent_update` refuses to change another employee's `status`, `heartbeat_enabled` or `heartbeat_cron` (those start or reschedule its background work; under the other policies the change must pass the delegation predicate, checked again inside the locked write); `channel_config` refuses an `agent_override` that routes a channel to another employee; and ACP reaches only the default (main) employee.
+**`none` in detail (v1.82.0).** Unless the role exception described below qualifies, the following restrictions apply. One predicate decides every route below, so `send_to_agent`, `spawn_agent`, `tasks_create` / `tasks_update` naming another employee, `create_task` steps, routines for someone else, record changes on another employee's records, the co-drive mail hand-off and the bus dispatch gate all refuse with reason `delegation_disabled`. The MCP dispatch gate also refuses `spawn_ephemeral` and `create_agent` for every employee (a protected-mode `spawn_ephemeral` child is not released either), and an employee's tool list no longer shows `send_to_agent`, `spawn_agent`, `spawn_ephemeral` or `create_agent`; `tasks_create` and `create_task` stay listed for the employee's own work. `list_agents` no longer widens visibility through white-list pairs. A separate exception is Team-as-Agent: an employee's planner, executor and verifier roles exchange task packets within one goal round through `team_handoff`. Under every policy, `team_handoff` accepts only a verified team member — a role member the gateway scaffolded under `agents/.ephemeral/eph-*` whose `[team_member]` record names the same parent as its `ephemeral.toml`; an ordinary employee is refused (`not_a_team_member`) and does not see the tool, even if it writes a `[team_member]` section into its own `agent.toml` (that section is frozen for employees anyway). The caller's identity must also be token-verified (`DUDUCLAW_AGENT_TOKEN`): during the operator-enabled 30-day soft identity migration (`require_identity_token = false`) a process without a valid token runs as unverified, and declaring an existing `eph-*` id then gets it neither the tool, nor the listing, nor the `none` exception (refused with `not_a_team_member`); nothing else changes in soft mode. The team composer runs those role members itself, so they never pass through the delegation predicate. Also under `none`: `agent_update` refuses to change another employee's `status`, `heartbeat_enabled` or `heartbeat_cron` (those start or reschedule its background work; under the other policies the change must pass the delegation predicate, checked again inside the locked write); `channel_config` refuses an `agent_override` that routes a channel to another employee; and ACP reaches only the default (main) employee.
 
 **Boundary.** `none` and every sender check rely on AI employees not having write access to the gateway's queue files (`bus_queue.jsonl`, `message_queue.db` and their side files): queue rows carry no admission signature, so a process that can write those files as the gateway's OS user can claim a system sender. The employee file guard refuses those writes on the Write/Edit and Bash lanes, but an employee with unrestricted Bash is outside this boundary; native Linux employee isolation (not available yet) is what provides it.
 
@@ -118,29 +118,60 @@ The dashboard card "Advanced settings → Delegation permissions" provides the e
 
 ---
 
+## Role exceptions and one-way pairs (v1.86.0)
+
+In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin or Manager. Both are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
+
+Only Admin and Manager (`admin` / `manager`) are eligible. Employee is not offered because selecting it would exempt every ordinary member’s AI avatar; legacy `employee` entries in `unrestricted_roles` are ignored. Adding a role requires reading the risk notice and checking **I understand** before saving. The gateway requires `acknowledge_risk: true` for additions through both `delegation.set` and `config.raw.set`. The `delegation_config_changed` audit record includes `roles_added`, the enabling user ID (`acknowledged_by`) and a server-generated RFC3339 timestamp (`acknowledged_at`). Removing roles requires no acknowledgement and is still audited.
+
+The account's status and role are checked each time. Disabling the account or changing its role to an unchecked role ends the exception immediately. The exception applies only while the member personally asks in that conversation; schedules, reminders and other background work of that AI follow the ordinary delegation rules in every mode, including protected mode.
+
+Cross-department pairs now offer **Two-way** or **One-way A → B**. Existing pairs remain two-way. A one-way pair permits A to hand work to B; it does not grant B permission to hand work to A. Other applicable rules can still allow B → A. Use the swap button to reverse the pair.
+
+Decisions follow this order:
+
+1. Always-deny boundaries: self-delegation, another owner's personal employee, the main-agent boundary for non-admin requests, machine employees, and an employee whose **Can Send Cross-Agent Messages** switch is off. Human-principal enforcement still applies.
+2. The role exception, when the member and attended turn qualify.
+3. Cross-department pairs, in their saved direction, except under **No delegation**.
+4. The selected delegation mode.
+
+The role exception applies even under **No delegation**. The dashboard warns when roles are checked in this mode. Both kinds of cross-department pair remain inactive in this mode. The restrictions described above for this mode apply when the role exception does not qualify.
+
+
+When delegation is refused, the AI and the person receive one consistent explanation: the rule in effect, why this sender cannot hand work to this recipient, and the next step. Ask an administrator to check Delegation permissions or the employee's Delegation card; do not work around the refusal.
+
+---
+
 ## Dashboard settings (admin only)
 
 **Advanced settings → Delegation permissions**
 
-Three controls:
+Four controls:
 
 1. **Policy selection** (radio): department / hierarchy / open / no delegation (`none`, v1.82)
    - Each option carries a one-line explanation
-   - `open` carries a red risk warning: "abandons all checks, back to legacy behavior"
+   - `open` carries a red risk warning: "allows broad cross-employee delegation"
    - `none` notes that the pairs below do not apply and that team mode keeps working
 
 2. **Cross-department collaboration** (pair list)
-   - Each row shows two AI employee names + department badges
+   - Each row shows two AI employee names + department badges, a two-way / one-way direction selector and a swap button
    - Click "+" to add a pair (agent picker dropdown), "✕" to delete
    - Changes take effect immediately, no restart needed
 
-3. **Status indicators**
+3. **Roles exempt from delegation scope** (v1.86.0)
+   - Admin / Manager; all unchecked by default
+   - Applies to the member's administrator-assigned avatar only while they personally ask in that conversation; the recipient cannot delegate back by this exception
+   - Also applies under No delegation, with a warning; background work follows ordinary rules in every mode
+
+4. **Status indicators**
    - Current policy, pair count
    - Configuration warnings (e.g. invalid IDs, an unrecognised policy value) are shown if present
 
 If the current setting cannot be loaded, the page shows the error and keeps every control and Save disabled until a retry succeeds (v1.82.0); before, a failed load left `department` + no pairs on screen and Save wrote them over the real setting. `delegation.set` refuses, without writing, when `config.toml` is not valid TOML.
 
 **Employee page → Overview → Delegation (v1.82.0).** A read-only card (`delegation.effective {agent_id}`, Admin and Managers with access to the employee) shows the policy that applies to that employee, whether it comes from the company-wide setting or the employee's own `[permissions] can_send_cross_agent` switch (`false` makes it `none` for that employee), whether it may create employees, the pairs naming it (inactive ones listed separately) and `config_error` / the policy warning when there is one. Warnings about malformed white-list entries quote the raw entry, which can name any employee, so the card receives only their number (`allow_warning_count`, "N delegation setting warnings — an administrator can review them in Settings"); the texts reach an Admin viewer only (`allow_warnings`) and stay in full in `delegation.get` (Admin-only). The same applies to a config problem: `config_error` is only a category — `unreadable` / `unparsable` (config.toml), `permissions_unreadable` (this employee's `[permissions]`) or `unknown` — and the card shows a fixed message for it, because the detail can quote raw config text (the TOML parse excerpt). The detail reaches an Admin viewer only (`config_error_detail`); the card does not render it, and Settings › Delegation permissions shows it to an Admin through `delegation.get`.
+
+The card also shows the role exception and one-way pairs, separately as outgoing and incoming. This indicates eligibility; each request still checks the current account and work context.
 
 ---
 
@@ -181,6 +212,8 @@ Troubleshooting checklist:
 ---
 
 ## Upgrade notes
+
+Upgrading to v1.86.0: roles start unchecked and existing pairs remain two-way. Saving any delegation setting invalidates pending approval cards bound to that setting and pauses enabled workflows until their next run.
 
 When upgrading from earlier versions to 1.52:
 
@@ -227,7 +260,7 @@ Not covered (known boundaries by design, not bugs):
 
 - **Legacy-format tasks**: 1.52 still lets queued tasks with no sender field at all pass, logging only a warning (to avoid wiping out work still queued during an upgrade). The next version switches to rejection.
 - **Config-file-level changes**: since v1.52 a PreToolUse hook freezes the sensitive org data fields — an agent cannot rewrite `agent.toml`'s `name` / `reports_to` / `department`, its whole `[capabilities]` permission envelope (added after the Team-as-Agent review), the `[delegation]` / `[acp]` sections of `config.toml`, `.claude/settings.json`, or `identity.key` through the Write/Edit/Bash tools. Since 2026-10 an AI employee cannot write any `.mcp.json` in its directory at all (not only the identity block), nor CLI configuration there (`.claude/` and `.claude.json` at any depth, `.codex/`, `.gemini/`, `.grok/`, `.agents/` at the top); operators keep the identity-only `.mcp.json` rule. Changing these settings must go through the dashboard or the `agent_update` MCP tool — the vetted official channels. The same hook also keeps an AI employee from changing its own `agent.toml` security settings and DuDuClaw home state; the rules and their limits are in [Security defense](05-security-defense.md). Cross-employee file edits (e.g. modifying someone else's SOUL.md) are also rejected. Non-Claude runtimes (codex etc.) cannot write to the `~/.duduclaw/` directory under the workspace-write sandbox, adding a sandbox-level line of defense. Only the FullAccess sandbox is exempt — an extreme permission the operator chooses explicitly.
-- **System- and human-initiated operations**: dashboard, webhooks, schedules, and automation rules are the operator's will to begin with, and always pass.
+- People-created schedules, tasks and skills on the dashboard, plus webhooks, timers and automation rules, are operator actions and are not limited by AI-to-AI delegation rules.
 
 ### Visibility filtering
 

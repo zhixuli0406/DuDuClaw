@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone)]
 pub(crate) struct AttendedInputProof {
     session: String,
+    verified_webchat: bool,
     live: Arc<AtomicBool>,
     bound: Arc<Mutex<Option<(String, String)>>>,
     final_route: Arc<Mutex<Option<FinalRoute>>>,
@@ -24,6 +25,8 @@ struct FinalRoute {
     turn: String,
 }
 impl AttendedInputProof {
+    pub(crate) fn verified_webchat(&self) -> bool { self.verified_webchat }
+
     pub(crate) fn valid_for(&self, agent: &str, turn: &str) -> bool {
         self.live.load(Ordering::Acquire)
             && self
@@ -70,7 +73,7 @@ pub(crate) fn verified_channel_message<F: Future>(
         && !session.starts_with("widget:")
         && real_sender(sender)
         && !bot;
-    scope(recognized.then(|| session.to_owned()), future)
+    scope(recognized.then(|| session.to_owned()), false, future)
 }
 
 /// `principal` must be the authenticated socket principal, before the turn
@@ -82,16 +85,17 @@ pub(crate) fn verified_webchat_message<F: Future>(
 ) -> impl Future<Output = F::Output> {
     let recognized = session.starts_with("webchat:")
         && principal.is_some_and(|p| real_sender(p) && !p.starts_with("widget-visitor:"));
-    scope(recognized.then(|| session.to_owned()), future)
+    scope(recognized.then(|| session.to_owned()), true, future)
 }
 
-fn scope<F: Future>(session: Option<String>, future: F) -> impl Future<Output = F::Output> {
+fn scope<F: Future>(session: Option<String>, verified_webchat: bool, future: F) -> impl Future<Output = F::Output> {
     // Box before constructing another task-local wrapper, preserving the
     // gateway's debug-build future/stack-size contract.
     let future = Box::pin(future);
     async move {
         let proof = session.map(|session| AttendedInputProof {
             session,
+            verified_webchat,
             live: Arc::new(AtomicBool::new(true)),
             bound: Arc::new(Mutex::new(None)),
             final_route: Arc::new(Mutex::new(None)),

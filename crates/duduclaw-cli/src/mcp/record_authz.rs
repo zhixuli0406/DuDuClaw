@@ -274,24 +274,19 @@ pub(crate) async fn check_record_change_allowed(
     if caller == target {
         return Ok(());
     }
-    // The predicate audits its own refusal as `delegation_denied`; its text
-    // is written for an assigner and suggests org edits an AI employee cannot
-    // make, so the reply here is phrased for this situation instead.
+    // The predicate audits the refusal and returns the shared AI explanation.
     let delegated = if tool == "tasks_update" {
         super::delegation::check_assignment_delegation_allowed(home_dir, caller, target, tool).await
     } else {
         check_delegation_allowed(home_dir, caller, target, tool).await
     };
-    delegated.map_err(|reason| {
-            if reason == duduclaw_gateway::on_behalf_of::access::MAIN_TURN_REFUSAL {
-                return reason;
+    delegated.map_err(|explanation| {
+            if explanation == duduclaw_gateway::on_behalf_of::access::MAIN_TURN_REFUSAL {
+                return explanation;
             }
             let target_short = duduclaw_core::truncate_chars(target, 64);
             format!(
-                "{tool} 遭拒：這筆{label}屬於「{target_short}」，而「{caller_short}」與「{target_short}」\
-                 之間沒有委派關係（同部門、上下級或白名單配對），未做任何變更。\
-                 可行處理：① 用 send_to_agent 請「{target_short}」自己處理（若你們之間允許傳訊）；\
-                 ② 請你的主管或操作者代為調整。",
+                "{tool} 遭拒：這筆{label}屬於「{target_short}」。{explanation}未做任何變更。",
                 label = kind.label_zh()
             )
         })

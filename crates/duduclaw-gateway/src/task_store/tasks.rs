@@ -20,12 +20,6 @@ pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
 ];
 
 impl TaskStore {
-    pub(super) fn revoke_initiator(&self, id: &str) {
-        if let Some(home) = self.db_path.parent() {
-            crate::delegation_roles::initiators::revoke_before_write(home, "task", id);
-        }
-    }
-
     /// Bounded metadata read for untrusted dashboard invalidation hints.
     /// Never migrate a database or create an absent installation on this path.
     pub(crate) fn live_metadata(home: &Path, id: &str) -> Result<Option<(String, String)>, String> {
@@ -272,7 +266,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        self.revoke_initiator(id);
         let n = conn
             .execute(
                 "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to='' AND kind IN ('task','goal')",
@@ -301,15 +294,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        if from_agent != to_agent {
-            let ids = conn.prepare("SELECT id FROM tasks WHERE assigned_to=?1 AND status!='done'
-                AND kind IN ('task','goal') AND NOT EXISTS
-                (SELECT 1 FROM responsibility_occurrences o WHERE o.task_id=tasks.id)")
-                .map_err(|e| e.to_string())?
-                .query_map(params![from_agent], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-            for id in &ids { self.revoke_initiator(id); }
-        }
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -544,14 +528,6 @@ impl TaskStore {
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
             verify_before_io().map_err(|e| e.to_string())?;
-            let assigned_changed = if let Some(assignee) = fields.get("assigned_to").and_then(|v| v.as_str()) {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND assigned_to<>?2)",
-                    params![id, assignee], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())?
-            } else { false };
-            if assigned_changed || fields.get("archived").and_then(|v| v.as_bool()) == Some(true)
-                || matches!(fields.get("status").and_then(|v| v.as_str()), Some("cancelled" | "failed" | "done")) {
-                self.revoke_initiator(id);
-            }
             tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update task: {e}"))?;
             verify_before_io().map_err(|e| e.to_string())?;
@@ -658,7 +634,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        self.revoke_initiator(id);
         let count = conn
             .execute(
                 "DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'",

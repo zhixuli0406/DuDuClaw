@@ -21,9 +21,8 @@ impl OwnerRoleView for RoleFacts {
         Ok((self.agent == agent).then(|| self.owner_role.clone()).flatten())
     }
     fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError> {
-        Ok(self.requester_role.clone().map(|role| if self.background {
-            DelegationRequesterRole::BackgroundStartedBy(role)
-        } else { DelegationRequesterRole::Account(role) }))
+        if self.background { return Ok(None); }
+        Ok(self.requester_role.clone().map(DelegationRequesterRole::Account))
     }
 }
 
@@ -34,29 +33,32 @@ pub(crate) struct Requester {
     background: bool,
 }
 impl Requester {
+    pub(crate) fn identity(&self) -> &RequesterIdentity { &self.who }
+
+    /// Reuse the RM-183 live channel binding check without inferring an account role.
+    pub(crate) fn verified_account_id(&self, home: &Path) -> Result<Option<String>, OwnerRoleLookupError> {
+        GatewayOwnerRoles::new(home, self.clone()).requester_id()
+            .map(|requester| requester.map(|(id, _)| id))
+    }
+
     #[cfg(test)]
     pub(crate) fn attended(user_id: &str) -> Self {
         Self { who: RequesterIdentity::DashboardUser { user_id: user_id.into() },
             background: false }
     }
 
-    pub(crate) fn current(home: &Path, agent: &str) -> Self {
-        if let Some(requester) = initiators::current(agent) {
-            return requester.unwrap_or_else(|| Self::background());
+    pub(crate) fn current(_home: &Path, _agent: &str) -> Self {
+        let dispatched = crate::memory_provenance::DISPATCH_RUN
+            .try_with(|run| run.is_some()).unwrap_or(false);
+        if dispatched || crate::runtime::round_task_env().is_some() {
+            return Self::background();
         }
-        let run = crate::memory_provenance::DISPATCH_RUN.try_with(Clone::clone).ok().flatten();
-        let mut who = run.as_ref().and_then(|(_, run)| crate::knowledge::turn_requesters::lookup(agent, run))
-            .unwrap_or_else(crate::knowledge::turn_requesters::current_requester);
-        if matches!(who, RequesterIdentity::Unknown) && (run.is_some() || crate::runtime::round_task_env().is_some()) {
-            who = RequesterIdentity::System { kind: "background".into(), on_behalf_of: None };
+        let who = crate::knowledge::turn_requesters::current_requester();
+        match who {
+            RequesterIdentity::DashboardUser { .. } | RequesterIdentity::ChannelUser { .. } =>
+                Self { who, background: false },
+            _ => Self::background(),
         }
-        let principal = crate::on_behalf_of::current();
-        if run.is_some() || matches!(who, RequesterIdentity::System { .. }) {
-            return crate::runtime::round_task_env().and_then(|(_, task)|
-                initiators::lookup(home, "task", &task, None, agent, principal.as_deref()))
-                .unwrap_or_else(|| Self::background());
-        }
-        Self { who, background: false }
     }
     pub(crate) fn background() -> Self {
         Self { who: RequesterIdentity::System { kind: "delegation".into(), on_behalf_of: None },
@@ -68,7 +70,7 @@ impl Requester {
             Principal::Human { user_id, .. } => duduclaw_core::HumanPrincipal::user(user_id.as_str()).map(|p| p.to_string()),
             Principal::Background { .. } => None,
         };
-        // Protected-mode background jobs are not covered in v1.86.
+        // Only a protected run with interactive ingress can carry an attended requester.
         let mut requester = Self::background();
         if let (Some(id), Some(ingress)) = (principal.as_deref()
             .and_then(|p| duduclaw_core::HumanPrincipal::parse(p).ok())
@@ -98,6 +100,7 @@ impl<'a> GatewayOwnerRoles<'a> {
             .map_err(|_| OwnerRoleLookupError)
     }
     fn requester_id(&self) -> Result<Option<(String, bool)>, OwnerRoleLookupError> {
+        if self.requester.background { return Ok(None); }
         let id = match &self.requester.who {
             RequesterIdentity::DashboardUser { user_id } => Some((user_id.clone(), self.requester.background)),
             RequesterIdentity::ChannelUser { user_id: Some(user_id), channel, sender, .. } => {
@@ -131,12 +134,11 @@ impl OwnerRoleView for GatewayOwnerRoles<'_> {
             .optional().map_err(|_| OwnerRoleLookupError)
     }
     fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError> {
-        let Some((id, background)) = self.requester_id()? else { return Ok(None); };
+        let Some((id, _)) = self.requester_id()? else { return Ok(None); };
         let role: Option<String> = self.db()?.query_row(
             "SELECT role FROM users WHERE id=?1 AND status='active'", [id], |r| r.get(0))
             .optional().map_err(|_| OwnerRoleLookupError)?;
-        Ok(role.map(|role| if background { DelegationRequesterRole::BackgroundStartedBy(role) }
-            else { DelegationRequesterRole::Account(role) }))
+        Ok(role.map(DelegationRequesterRole::Account))
     }
 }
 

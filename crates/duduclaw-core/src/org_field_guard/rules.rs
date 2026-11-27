@@ -243,7 +243,7 @@ pub(super) const HOME_EVIDENCE_BASENAMES: &[&str] = &[
 ///
 /// `[delegation]` carries the policy + whitelist; `[acp] trusted` widens the
 /// system-sender allowlist to the external A2A client.
-pub const CONFIG_PROTECTED_SECTIONS: &[&str] = &["delegation", "acp"];
+pub const CONFIG_PROTECTED_SECTIONS: &[&str] = &["delegation", "acp", "admin_ai"];
 
 /// Directory holding ephemeral agent scaffolds under `<home>/agents/`.
 ///
@@ -485,6 +485,12 @@ pub(super) const FROZEN_FIELDS: &[FrozenField] = &[
         verdict: FrozenVerdict::ProtectedSection,
         callers: FrozenCallers::Everyone,
     },
+    FrozenField {
+        kind: ProtectedTomlKind::HomeConfigToml,
+        shape: FrozenShape::WholeSection { section: CONFIG_PROTECTED_SECTIONS[2] },
+        verdict: FrozenVerdict::ProtectedSection,
+        callers: FrozenCallers::Everyone,
+    },
     // G1 round 3: every top-level section that is not on the editable
     // allow-list, so a section added in a later release is frozen the day it
     // lands. `AGENT_SECURITY_SECTIONS` documents why the known ones matter.
@@ -540,7 +546,7 @@ pub(super) const AGENT_SECTION: &str = "agent";
 /// Keep the `[delegation]` / `[acp]` rows above indexable: they read
 /// [`CONFIG_PROTECTED_SECTIONS`] by index so the table cannot silently drift
 /// out of sync with the constant other code imports.
-const _: () = assert!(CONFIG_PROTECTED_SECTIONS.len() == 2);
+const _: () = assert!(CONFIG_PROTECTED_SECTIONS.len() == 3);
 
 const _: () = assert!(AGENT_SECURITY_KEYS.len() == 4);
 

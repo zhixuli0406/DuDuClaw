@@ -208,6 +208,7 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
+    if kind == "db_source_grant" { return true; }
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         // Adding a document to a shared knowledge collection: the decider
         // must be an Admin or the collection's editor at decision time, which
@@ -531,7 +532,8 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
     // SR2 round 4 (N4): the owner-only Personal delegation card is never
     // pushed or reminded through the generic chain (defence in depth behind
     // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
-    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || rec.action_kind == crate::admin_ai::card::ACTION_KIND { return None; }
     if crate::google_identity::chat_send::is_member_card(rec) {
         if !crate::google_identity::chat_send::eligible(home_dir, rec) { return None; }
         let binding = rec.binding.as_ref()?;

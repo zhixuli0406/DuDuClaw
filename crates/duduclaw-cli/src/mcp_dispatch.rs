@@ -443,11 +443,13 @@ pub(crate) fn delegation_none_refuses_for(
 
 /// zh-TW refusal for [`delegation_none_refuses`].
 pub(crate) fn delegation_none_message(tool_name: &str) -> String {
-    format!(
-        "目前的委派政策是「不允許委派(none)」:AI 員工之間不能互相委派、傳訊、建立員工或指派工作,\
-         工具「{tool_name}」已拒絕(跨部門協作配對在這個政策下也不生效)。請把需要別位員工處理的事回報給管理員,\
-         或請管理員在儀表板「委派權限」改成其他模式。"
-    )
+    let denied = duduclaw_core::DelegationDenied {
+        sender: String::new(),
+        target: String::new(),
+        policy: duduclaw_core::DelegationPolicy::Disabled,
+        reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
+    };
+    format!("工具「{tool_name}」已拒絕。{}", denied.explain(duduclaw_core::DenialAudience::Ai))
 }
 
 /// `true` only when the flag is written as `false` (the role-resolved
@@ -1018,6 +1020,19 @@ impl McpDispatcher {
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 return Some((jsonrpc_error(id, -32003, &msg), "explore_lane", msg, None));
+            }
+
+            // RM-194: exactly the tools/list predicate; gateway rechecks the live turn.
+            if crate::mcp::admin_ai_client::TOOLS.contains(&tool_name)
+                && !crate::mcp::admin_ai_client::available_for(
+                    &self.home_dir, principal,
+                    crate::mcp::acting_agent_id(&principal.client_id, &self.default_agent),
+                    self.is_remote_bearer(),
+                ).await.permits(tool_name)
+            {
+                let message = "目前無法使用管理員設定工具，請在有效的管理員分身對話中重試。".to_owned();
+                return Some((jsonrpc_response(id, crate::mcp::tool_error(&message)),
+                    "admin_ai_unavailable", message, None));
             }
 
             // ── 1. Scope check ───────────────────────────────────────────────────
@@ -5813,7 +5828,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            282,
+            284,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -6394,7 +6409,7 @@ effect = "forbid"
             && result["error"]["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("不允許委派(none)")
+                .contains("不允許委派")
     }
 
     /// Every employee-to-employee entry point is refused under `none` (allow

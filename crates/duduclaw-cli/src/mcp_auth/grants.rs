@@ -128,6 +128,7 @@ const fn scope_of(s: &str) -> Scope {
 /// `process_agent_tool_refused`), so callable ⇔ discoverable holds for the
 /// combination, not for this predicate alone.
 pub fn external_tool_allowed(tool_name: &str, principal: &Principal) -> bool {
+    if matches!(tool_name, "admin_settings_read" | "admin_settings_propose") { return false; }
     if crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name) {
         return true;
     }

@@ -1003,3 +1003,21 @@ async fn org_change_malformed_new_journal_identity_never_uses_legacy_fallback() 
         assert!(f.org_journal_path(&id).exists());
     }
 }
+
+#[path = "admin_ai_tests.rs"]
+mod admin_ai_tests;
+
+#[tokio::test]
+async fn db_source_grant_only_admin_dashboard_can_decide() {
+    let f = Fixture::new();
+    let id = f.simple("db_source_grant").await;
+    let manager = f.db().create_user("db-manager@test.invalid", "Manager", "fixture-password", UserRole::Manager).unwrap();
+    let manager = Decider::Dashboard(f.db().live_user_context(&manager.id).unwrap().unwrap());
+    assert!(matches!(decide(&f.env, &id, true, "", &manager).await, Err(DecisionRefusal::Forbidden(_))));
+    let proof = f.proof(&id).await;
+    assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await, Err(DecisionRefusal::NotSupportedInChat)));
+    assert!(f.env.broker.decide(&id, true, "dashboard:forged").await.is_err());
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    decide(&f.env, &id, true, "", &f.dashboard()).await.unwrap();
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+}

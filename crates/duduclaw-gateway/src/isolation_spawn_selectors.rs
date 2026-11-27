@@ -67,17 +67,6 @@ impl GatewayResourceResolver {
             || target == duduclaw_core::UNTRUSTED_AGENT_ID || crate::ephemeral::is_ephemeral_id(target) {
             return Err(VerificationError::Invalid);
         }
-        let receipt = crate::isolation_lifecycle::confirmed_receipt(&self.home, target).map_err(|error| match error {
-            crate::isolation_lifecycle::LifecycleError::Unavailable => VerificationError::Unavailable,
-            _ => VerificationError::Revoked,
-        })?;
-        target_binding_allowed(&context.record().employee_binding, receipt.as_ref())?;
-        // H13b: a same-owner Personal target also needs the owner to have
-        // started this run (the record principal is the Human owner).
-        if matches!(receipt.as_ref().and_then(|receipt| receipt.principal_binding.as_ref()),
-            Some(EmployeeBinding::Personal(_))) {
-            tool_policy::spawn::ephemeral_parent_allowed(context)?;
-        }
         let read = duduclaw_core::delegation_policy::read_delegation_config(&self.home);
         let roles = crate::delegation_roles::GatewayOwnerRoles::new(&self.home,
             crate::delegation_roles::Requester::isolated(context, crate::isolation_egress::run_metadata().as_ref()));
@@ -95,6 +84,17 @@ impl GatewayResourceResolver {
             }).map_err(|_| VerificationError::Invalid)?;
         crate::delegation_roles::audit_allow(&self.home, &self.agent, target, source,
             facts.as_ref().and_then(|f| f.requester_account_id.as_deref()), "isolation_spawn");
+        let receipt = crate::isolation_lifecycle::confirmed_receipt(&self.home, target).map_err(|error| match error {
+            crate::isolation_lifecycle::LifecycleError::Unavailable => VerificationError::Unavailable,
+            _ => VerificationError::Revoked,
+        })?;
+        target_binding_allowed(&context.record().employee_binding, receipt.as_ref())?;
+        // H13b: a same-owner Personal target also needs the owner to have
+        // started this run (the record principal is the Human owner).
+        if matches!(receipt.as_ref().and_then(|receipt| receipt.principal_binding.as_ref()),
+            Some(EmployeeBinding::Personal(_))) {
+            tool_policy::spawn::ephemeral_parent_allowed(context)?;
+        }
         Ok(())
     }
 }

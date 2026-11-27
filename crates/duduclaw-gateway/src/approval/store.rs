@@ -365,6 +365,11 @@ impl ApprovalStore {
                     return Ok(false);
                 }
             }
+            // Count and insert under the same SQLite writer transaction, including
+            // other broker instances/processes. No in-memory quota can race this.
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                super::admin_ai::check_rate(&tx, rec)?;
+            }
             if let Some((session, turn)) = &origin {
                 let cancelled: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
@@ -572,6 +577,10 @@ impl ApprovalStore {
             .ok_or("chat-admin bound decisions require durable identity")?;
         if crate::google_identity::chat_send::is_member_card(rec) {
             return Err("Only the requesting member may confirm".into());
+        }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND
+            && !crate::admin_ai::may_decide(home, rec, &entry.user_id.to_string()) {
+            return Err(crate::admin_ai::REFUSAL.into());
         }
         // chat_tier also excludes live mail-requester-eligible egress cards.
         if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {

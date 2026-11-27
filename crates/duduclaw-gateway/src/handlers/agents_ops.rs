@@ -195,7 +195,7 @@ impl MethodHandler {
     where
         F: FnOnce(&mut toml::Table) -> Result<(), String>,
     {
-        self.update_agent_toml_as_within(agent_id, source, caller, session, None, mutate).await
+        self.update_agent_toml_as_within(agent_id, source, caller, session, None, None, mutate).await
     }
 
     /// [`Self::update_agent_toml_as`] with an optional bound on the
@@ -208,6 +208,7 @@ impl MethodHandler {
         caller: Option<&UserContext>,
         session: Option<&UserContext>,
         lock_wait: Option<std::time::Duration>,
+        expected_snapshot: Option<crate::agent_files::writer::AdminAiSnapshot>,
         mutate: F,
     ) -> Result<bool, String>
     where
@@ -240,12 +241,9 @@ impl MethodHandler {
         };
         #[cfg(test)]
         main_commit_test_seam::reached(&self.home_dir);
-        match lock_wait {
-            None => crate::channel_reply::update_agent_toml_edit(&self.registry, agent_id, edit, mutate).await,
-            Some(wait) => {
-                crate::channel_reply::update_agent_toml_edit_bounded(&self.registry, agent_id, edit, wait, mutate).await
-            }
-        }
+        crate::channel_reply::update_agent_toml_edit_expected(
+            &self.registry, agent_id, edit, lock_wait, expected_snapshot.as_ref(), mutate,
+        ).await
     }
 
     /// Update status with the caller's role and binding re-checked inside the file lock.

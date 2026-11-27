@@ -205,6 +205,19 @@ impl MethodHandler {
                 Ok(c) => c,
                 Err(e) => return WsFrame::error_response("", &e),
             };
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                let env = crate::approval::decision_service::DecisionEnv {
+                    home: self.home_dir.clone(), registry: Some(self.registry.clone()),
+                    broker: broker.clone(), users: self.user_db.read().await.clone(),
+                };
+                return match Box::pin(crate::approval::decision_service::decide(
+                    &env, &approval_id, approve, &reason,
+                    &crate::approval::decision_service::Decider::Dashboard(decider),
+                )).await {
+                    Ok(outcome) => WsFrame::ok_response("", outcome.value),
+                    Err(error) => error.dashboard_frame(),
+                };
+            }
             let lock = decision_lock(approval_id.as_str());
             let _guard = lock.lock().await;
             // Chat-admin decisions share this lock; discard the pre-lock snapshot.

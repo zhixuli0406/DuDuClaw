@@ -7,6 +7,7 @@ use super::attended::AttendedInputProof;
 pub(crate) struct AttendedCall {
     agent: String,
     turn: String,
+    session: Option<String>,
     proof: AttendedInputProof,
     runtime_live: Arc<AtomicBool>,
 }
@@ -36,9 +37,14 @@ pub(crate) fn capture(agent: &str) -> Option<AttendedCall> {
     { return None; }
     let turn = duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten()?;
     let proof = super::attended::capture(agent, &turn)?;
-    Some(AttendedCall {agent: agent.into(),turn,proof,runtime_live:Arc::new(AtomicBool::new(true))})
+    let session = duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten();
+    Some(AttendedCall {agent: agent.into(),turn,session,proof,runtime_live:Arc::new(AtomicBool::new(true))})
 }
 impl AttendedCall {
+    pub(crate) fn turn(&self) -> &str { &self.turn }
+    pub(crate) fn session(&self) -> Option<&str> { self.session.as_deref() }
+    pub(crate) fn verified_webchat(&self) -> bool { self.proof.verified_webchat() }
+
     pub(crate) fn valid_for(&self, agent: &str) -> bool {
         self.runtime_live.load(Ordering::Acquire) && self.agent == agent && self.proof.valid_for(agent,&self.turn)
     }
@@ -55,6 +61,22 @@ pub(crate) fn current_turn(agent:&str)->Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn capture_refuses_live_turn_without_session_id() {
+        let agent = "attended-no-session";
+        let session = "telegram:attended-no-session";
+        super::super::attended::verified_channel_message(session, "human", false, async {
+            assert!(super::super::attended::bind_final_route(session, session, agent, "live-turn"));
+            duduclaw_memory::feedback::CURRENT_TURN_ID.scope(Some("live-turn".into()), async {
+                // Cover both an unset task-local and an explicitly absent session.
+                assert!(capture(agent).is_none());
+                duduclaw_memory::feedback::CURRENT_SESSION_ID.scope(None, async {
+                    assert!(capture(agent).is_none());
+                }).await;
+            }).await;
+        }).await;
+    }
+
     #[tokio::test]
     async fn background_scope_cannot_mint_from_inherited_live_human_turn_and_principal() {
         let agent="local-source-agent";

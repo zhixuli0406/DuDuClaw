@@ -468,15 +468,6 @@ impl TaskSpec {
         let path = tasks_dir.join(format!("{}.json", self.task_id));
         let json = serde_json::to_string_pretty(self).map_err(|e| format!("Serialize: {e}"))?;
 
-        if matches!(self.status, TaskStatus::Cancelled | TaskStatus::Failed | TaskStatus::Completed) {
-            // Production specs live at <home>/agents/<agent>/tasks/<id>.json.
-            if let Some(agents) = agent_dir.parent().filter(|dir| dir.file_name().is_some_and(|name| name == "agents")) {
-                if let Some(home) = agents.parent() {
-                    crate::delegation_roles::initiators::revoke_before_write(home, "task_spec", &self.task_id);
-                }
-            }
-        }
-
         // Atomic write: temp → rename
         let tmp_path = path.with_extension("json.tmp");
         std::fs::write(&tmp_path, &json).map_err(|e| format!("Write tmp: {e}"))?;

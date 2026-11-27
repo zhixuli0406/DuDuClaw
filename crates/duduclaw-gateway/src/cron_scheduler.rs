@@ -735,10 +735,9 @@ async fn enqueue_routine_trigger(
     let principal = crate::on_behalf_of::from_stored(
         home_dir, task.on_behalf_of.as_deref(), &task.agent_id, "cron_workflow",
     );
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "cron", &task.id, None, &task.agent_id, principal.as_deref());
-    crate::delegation_roles::initiators::scope(&task.agent_id, requester, crate::on_behalf_of::scope_first(principal,
+    crate::on_behalf_of::scope_first(principal,
         service.enqueue_trigger(&activation_id, trigger, serde_json::json!({})),
-    )).await
+    ).await
 }
 
 /// Route a due cron task through its trigger gate (G3), then execute it if the
@@ -824,14 +823,12 @@ async fn dispatch_cron_task_checked(
         }
     }
     let material = crate::isolation_background::material::cron(&task);
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "cron", &effective_task.id,
-        None, &effective_task.agent_id, principal.as_deref());
-    crate::delegation_roles::initiators::scope(&effective_task.agent_id, requester, crate::on_behalf_of::scope_first(principal, crate::isolation_background::scope_record(
+    crate::on_behalf_of::scope_first(principal, crate::isolation_background::scope_record(
         home_dir, "cron", &effective_task.id, &effective_task.agent_id,
         effective_task.on_behalf_of.as_deref(), &material, crate::autonomous_runtime::scope(
         home_dir, &effective_task.agent_id, &[],
         dispatch_effective_cron_task(home_dir, store, registry, &effective_task, invoker, slot),
-    )))).await;
+    ))).await;
 }
 
 async fn dispatch_effective_cron_task(

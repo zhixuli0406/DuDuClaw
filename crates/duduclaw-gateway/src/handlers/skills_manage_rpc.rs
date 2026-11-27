@@ -152,18 +152,27 @@ impl MethodHandler {
 
     /// `skills.set_enabled {items, enabled}`.
     pub(crate) async fn handle_skills_set_enabled(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        frame(self.skills_set_enabled(&params, ctx).await)
+        frame(self.skills_set_enabled(&params, ctx, None).await)
     }
 
-    async fn skills_set_enabled(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
+    pub(crate) async fn handle_admin_ai_skills_set_enabled(
+        &self, params: Value, ctx: &UserContext, expected_hash: &str,
+    ) -> WsFrame {
+        if !ctx.is_admin() { return WsFrame::error_response("", "permission denied"); }
+        frame(self.skills_set_enabled(&params, ctx, Some(expected_hash)).await)
+    }
+
+    async fn skills_set_enabled(&self, params: &Value, ctx: &UserContext, expected_hash: Option<&str>) -> Result<Value, String> {
         let enabled = params
             .get("enabled")
             .and_then(|v| v.as_bool())
             .ok_or("`enabled` (true or false) is required")?;
         let targets = parse_targets(params)?;
         let agents = agents_of(&targets);
+        if expected_hash.is_some() && agents.len() != 1 { return Err(crate::admin_ai::proposal::STALE.into()); }
         let view = DeptGrantView::load(self, ctx).await;
         let (fresh, granted) = self.require_owner_of_all(ctx, &agents, &view, GrantAction::Toggle)?;
+        let mut state_hash = None;
         let mut results: Vec<Value> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
         for agent in &agents {
@@ -172,7 +181,21 @@ impl MethodHandler {
                 .filter(|t| &t.agent_id == agent)
                 .map(|t| t.skill_name.clone())
                 .collect();
-            let outcome = skill_state::set_disabled(&self.home_dir, agent, &names, !enabled);
+            let outcome = skill_state::set_disabled_checked(&self.home_dir, agent, &names, !enabled, |state| {
+                if let Some(expected) = expected_hash {
+                    let actual = crate::admin_ai::proposal::hash_skills(state)
+                        .map_err(|_| crate::admin_ai::proposal::STALE.to_string())?;
+                    if actual != expected { return Err(crate::admin_ai::proposal::STALE.into()); }
+                }
+                Ok(())
+            });
+            if expected_hash.is_some() {
+                let state = outcome.as_ref().map_err(Clone::clone)?;
+                // This is the exact state returned by the locked write, never a
+                // later reread that could accept somebody else's concurrent edit.
+                state_hash = Some(crate::admin_ai::proposal::hash_skills(state)
+                    .map_err(|_| crate::admin_ai::proposal::STALE.to_string())?);
+            }
             let error = outcome.as_ref().err().cloned();
             if error.is_none() {
                 changed.push(agent.clone());
@@ -191,7 +214,9 @@ impl MethodHandler {
             self.audit_skill_grants(&fresh, &changed, &granted, GrantAction::Toggle, "skills.set_enabled").await;
             self.after_skill_change(if enabled { "enabled" } else { "disabled" }, &changed).await?;
         }
-        Ok(json!({ "results": results, "enabled": enabled }))
+        let mut result = json!({ "results": results, "enabled": enabled });
+        if let Some(hash) = state_hash { result["state_hash"] = json!(hash); }
+        Ok(result)
     }
 
     /// `skills.remove {items}` — archive skills from employees' own layers.

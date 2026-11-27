@@ -275,6 +275,10 @@ pub async fn verify_and_consume(
     }
     // Live-I/O authority is re-verified around the IMMEDIATE transaction.
     let tx = super::begin_live_write(&mut conn).map_err(GrantRefusal::Store)?;
+    if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::admin_ai::decided_by_admin(&home, &rec, &tx) { return Err(GrantRefusal::Mismatch); }
+    }
     if let Some(binding) = mail_binding {
         ApprovalBroker::check_task(&tx, binding).map_err(GrantRefusal::Store)?;
         let home = broker.home_dir().ok_or_else(|| GrantRefusal::Store("missing policy home".into()))?;

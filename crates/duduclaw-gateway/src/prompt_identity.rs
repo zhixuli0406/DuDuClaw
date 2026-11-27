@@ -29,6 +29,13 @@
 //! per-agent file. Absent/empty config ⇒ unchanged behaviour (follow the
 //! user's input language).
 
+/// Fixed platform guidance shared by full and minimal employee prompts.
+/// Like the channel delivery/pacing rules, this fragment is not localized.
+pub(crate) const DELEGATION_GUIDANCE: &str = "交辦範圍由管理員在「設定 › 委派權限」決定；被拒時照工具回傳的原因向對方說明，不要嘗試繞過，也不要建議改成不設限制。\n\
+人從儀表板建立的排程、任務與技能（以及定時與自動化規則）是操作者的指令，不受 AI 員工之間的交辦範圍限制。\n\
+管理員若勾選「不受委派範圍限制的角色」，該角色成員本人的 AI 分身，在本人於該次對話中親自要求時可以交辦給任何 AI 員工；對方不會因此能反向交辦。\n\
+排程、提醒等背景工作一律依一般交辦範圍判斷，受保護模式也一樣。";
+
 use std::path::Path;
 
 pub use duduclaw_core::profile_sections::{identity_preamble, language_instruction, identity_and_language_section};

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, ArrowLeftRight, Plus, Trash2 } from 'lucide-react';
-import { api, type AgentDetail, type DelegationPolicy } from '@/lib/api';
+import { api, type AgentDetail, type DelegationPolicy, type DelegationRole } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
@@ -17,7 +17,8 @@ import { OptionSelect, type SelectOption } from '@/components/settings/controls'
 export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy', 'open', 'none'];
 
 /** A whitelist row while it is being edited — either side may still be blank. */
-type PairDraft = { a: string; b: string };
+type PairDraft = { a: string; b: string; direction?: 'two_way' | 'one_way' };
+const ROLES: DelegationRole[] = ['admin', 'manager'];
 
 /**
  * 委派權限 (WP21 §2.8) — who may hand work to whom, org-wide.
@@ -44,6 +45,9 @@ export function DelegationTab() {
   // Placeholders only: nothing below is shown as a setting or submitted
   // until `loaded` is true.
   const [policy, setPolicy] = useState<DelegationPolicy>('department');
+  const [roles, setRoles] = useState<DelegationRole[]>([]);
+  const [savedRoles, setSavedRoles] = useState<DelegationRole[]>([]);
+  const [riskAck, setRiskAck] = useState(false);
   const [pairs, setPairs] = useState<PairDraft[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [agents, setAgents] = useState<AgentDetail[]>([]);
@@ -69,7 +73,11 @@ export function DelegationTab() {
         api.agents.list(),
       ]);
       setPolicy(settings.policy);
-      setPairs(settings.allow.map(([a, b]) => ({ a, b })));
+      setPairs([...settings.allow.map(([a, b]) => ({ a, b })), ...(settings.allow_one_way ?? []).map(([a, b]) => ({ a, b, direction: 'one_way' as const }))]);
+      const loadedRoles = (settings.unrestricted_roles ?? []).filter((role) => ROLES.includes(role));
+      setRoles(loadedRoles);
+      setSavedRoles(loadedRoles);
+      setRiskAck(false);
       setWarnings(settings.warnings ?? []);
       setAgents(list.agents ?? []);
       setLoaded(true);
@@ -111,7 +119,8 @@ export function DelegationTab() {
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
   // Editing is possible only on a successfully loaded setting.
   const editable = loaded && !loading && loadError == null;
-  const canSave = editable && !saving && !incomplete && !hasSelfPair;
+  const addsRole = roles.some((role) => !savedRoles.includes(role));
+  const canSave = editable && !saving && !incomplete && !hasSelfPair && (!addsRole || riskAck);
 
   const updatePair = (index: number, side: 'a' | 'b', value: string) => {
     setPairs((prev) => prev.map((p, i) => (i === index ? { ...p, [side]: value } : p)));
@@ -126,7 +135,10 @@ export function DelegationTab() {
     try {
       await api.delegation.set({
         policy,
-        allow: pairs.map((p) => [p.a, p.b] as [string, string]),
+        allow: pairs.filter((p) => p.direction !== 'one_way').map((p) => [p.a, p.b] as [string, string]),
+        allow_one_way: pairs.filter((p) => p.direction === 'one_way').map((p) => [p.a, p.b] as [string, string]),
+        unrestricted_roles: roles,
+        ...(addsRole ? { acknowledge_risk: true } : {}),
       });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
@@ -209,6 +221,36 @@ export function DelegationTab() {
         )}
       </SettingsSection>
 
+      <SettingsSection title={t('settings.delegation.roles.title')}>
+        <p className="text-xs text-muted-foreground">{t('settings.delegation.roles.help')}</p>
+        <p className="text-xs text-muted-foreground">{t('settings.delegation.saveImpact')}</p>
+        <SettingsCard>
+          {ROLES.map((role) => (
+            <label key={role} className="flex items-center gap-3 px-4 py-3">
+              <input type="checkbox" className="accent-primary" checked={loaded && roles.includes(role)} disabled={!editable}
+                onChange={(e) => {
+                  setRiskAck(false);
+                  setRoles((prev) => e.target.checked ? [...prev, role] : prev.filter((r) => r !== role));
+                }} />
+              <span className="text-sm">{t(`settings.delegation.roles.${role}`)}</span>
+            </label>
+          ))}
+        </SettingsCard>
+        {loaded && addsRole && (
+          <div className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
+            <p className="text-xs text-foreground">{t('settings.delegation.roles.risk')}</p>
+            <label className="flex items-start gap-2 text-xs font-medium text-foreground">
+              <input type="checkbox" className="accent-primary" checked={riskAck}
+                onChange={(e) => setRiskAck(e.target.checked)} disabled={!editable || saving} />
+              <span>{t('settings.delegation.roles.acknowledge')}</span>
+            </label>
+          </div>
+        )}
+        {loaded && policy === 'none' && roles.length > 0 && (
+          <p role="alert" className="text-xs text-warning">{t('settings.delegation.roles.noneWarning')}</p>
+        )}
+      </SettingsSection>
+
       {/* ② Cross-department pairs */}
       <SettingsSection
         title={t('settings.delegation.pairs')}
@@ -248,7 +290,16 @@ export function DelegationTab() {
                   <Badge variant="secondary" className="shrink-0">{agentDepartment(pair.a)}</Badge>
                 )}
               </div>
-              <ArrowLeftRight className="size-4 shrink-0 text-muted-foreground" />
+              <label htmlFor={`delegation-direction-${index}`} className="sr-only">{t('settings.delegation.pair.direction')}</label>
+              <OptionSelect id={`delegation-direction-${index}`} className="w-auto max-w-40 shrink-0" value={pair.direction ?? 'two_way'} showRaw={false} disabled={!editable}
+                options={[{ value: 'two_way', label: t('settings.delegation.pair.twoWay') }, { value: 'one_way', label: t('settings.delegation.pair.oneWay') }]}
+                onChange={(value) => setPairs((prev) => prev.map((p, i) => i === index ? { ...p, direction: value as 'two_way' | 'one_way' } : p))} />
+              {pair.direction === 'one_way' && (
+                <Button variant="ghost" size="sm" disabled={!editable} aria-label={t('settings.delegation.pair.swap')}
+                  onClick={() => setPairs((prev) => prev.map((p, i) => i === index ? { ...p, a: p.b, b: p.a } : p))}>
+                  <ArrowLeftRight className="size-4" />
+                </Button>
+              )}
               <div className="flex min-w-0 flex-1 items-center gap-2">
                 <OptionSelect
                   value={pair.b}

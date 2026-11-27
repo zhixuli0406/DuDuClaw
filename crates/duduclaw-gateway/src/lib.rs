@@ -395,6 +395,7 @@ pub mod memory_privacy;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
+pub mod admin_ai;
 pub mod on_behalf_of;
 pub(crate) mod machine_employee;
 pub mod wiki_host_sources;
