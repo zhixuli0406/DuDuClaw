@@ -12,7 +12,8 @@ fn fixture() -> (tempfile::TempDir, UserDb, SessionBinding) {
     std::fs::write(home.path().join("config.toml"), "[dashboard]\npublic_url='https://company.test'\n[google_signin]\nenabled=true\nallowed_hd=['example.test']\napproval='admin'\ndaily_new_accounts=20\n[google_signin.enabled_ack]\nby='admin'\nat='2026-11-27T00:00:00Z'\n").unwrap();
     crate::mcp_oauth::upsert_client_config(home.path(), crate::mcp_oauth::McpOAuthClientConfig {
         provider_id: "google".into(), client_id: "client".into(), client_secret: "test-secret".into(),
-        auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![], redirect_uri: String::new(),
+        auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![],
+        redirect_uri: "https://company.test/api/mcp/oauth/callback".into(),
     }).unwrap();
     let db = UserDb::new(&home.path().join("users.db")).unwrap();
     let user = db.create_user("member@example.test", "Member", "password123", UserRole::Employee).unwrap();

@@ -34,6 +34,11 @@ pub(super) struct Directory {
 }
 
 impl Directory {
+    // Resolve only the home root. Evidence descendants still use no-follow opens.
+    pub(super) fn open_home(home: &Path) -> io::Result<Self> {
+        Self::open(&std::fs::canonicalize(home)?)
+    }
+
     pub(super) fn open(home: &Path) -> io::Result<Self> {
         let meta = std::fs::symlink_metadata(home)?;
         if is_link_metadata(&meta) || !meta.is_dir() { return Err(denied()); }

@@ -224,6 +224,10 @@ fn every_connector_policy_has_an_exact_catalog_provider_mapping() {
     let catalog = ConnectorCatalog::new(Connection::open_in_memory().unwrap()).unwrap();
     let mut count = 0;
     for policy in POLICIES.iter().filter(|policy| policy.route == Route::Connector) {
+        if intentionally_refused_connector(policy.name) {
+            assert!(provider_for_tool(policy.name).is_none());
+            continue;
+        }
         let provider = provider_for_tool(policy.name)
             .unwrap_or_else(|| panic!("missing connector provider for {}", policy.name));
         let account = catalog.register(policy.name, provider, ConnectorKind::Personal, &alice()).unwrap();
@@ -232,6 +236,11 @@ fn every_connector_policy_has_an_exact_catalog_provider_mapping() {
         count += 1;
     }
     assert!(count > 50, "connector inventory unexpectedly empty");
+    for tool in ["odoo_activity_create", "odoo_note_post", "odoo_message_send", "odoo_attachment_add"] {
+        assert_eq!(provider_for_tool(tool), Some("odoo"));
+        assert!(!intentionally_refused_connector(tool));
+        assert!(provider_for_tool(&format!("{tool}_suffix")).is_none());
+    }
     assert_eq!(provider_for_tool("computer_login"), Some("computer"));
     assert!(provider_for_tool("unknown_tool").is_none());
 }
@@ -728,6 +737,6 @@ fn isolated_drive_writes_refused_before_product_selection() {
         assert_eq!(provider_for_tool(name), None, "{name}");
         assert!(matches!(SelectedConnector::select_with_policy(&context, name, &json!({}),
             bindings.clone(), catalog.clone(), Some(Arc::new(UnexpectedSelection))),
-            Err(VerificationError::Invalid)), "{name}");
+            Err(VerificationError::Unavailable)), "{name}");
     }
 }

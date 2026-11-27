@@ -378,7 +378,7 @@ mod tests {
                 "entries":[{"agent":"anna","name":"one","digest":"hash"}]}), "套件：support"),
             ("workflow_activation", json!({"kind":"workflow_activation", "request":{"revision":{"definition":{
                 "workflow_id":"wf-1", "steps":[{"step_id":"one"},{"step_id":"two"}]}}}}), "步驟數：2"),
-            ("agent_file_change", json!({"agent_id":"anna","file":"SOUL.md","base_hash":"base","content_sha256":"sha"}), "修改項目：人格設定"),
+            ("agent_file_change", json!({"agent_id":"anna","file":"soul","base_hash":"base","content_sha256":"sha"}), "修改項目：人格設定"),
             ("org_change", json!({"agent_id":"anna", "before":{"reports_to":"amy","department":"業務"},
                 "after":{"reports_to":"bob","department":"客服"}, "base":"hash"}), "上級：amy → bob"),
             ("autopilot_action", json!({"autopilot_dispatch":{"rule_name":"提醒", "action":{
@@ -404,7 +404,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let current = "old\n";
         let proposed = format!("new\n{}\n", "界".repeat(10000));
-        let mut rec = record("agent_file_change", json!({"agent_id":"anna","file":"SOUL.md",
+        let mut rec = record("agent_file_change", json!({"agent_id":"anna","file":"soul",
             "base_hash":crate::agent_files::hash_of(current),
             "content_sha256":crate::agent_files::hash_of(&proposed)}));
         std::fs::create_dir_all(home.path().join("agents/anna")).unwrap();

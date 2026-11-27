@@ -178,7 +178,7 @@ pub async fn evaluate(home: &Path, rec: &ApprovalRecord) -> Result<AutoApproval,
     if !candidate(rec) || rec.is_stale(chrono::Utc::now()) { return Err(APPROVAL.into()); }
     let slug = rec.payload.get("slug").and_then(serde_json::Value::as_str).ok_or(APPROVAL)?;
     if slug != rec.agent_id || !segment(slug) { return Err(APPROVAL.into()); }
-    let root = Directory::open(home).map_err(|_| EVIDENCE)?;
+    let root = Directory::open_home(home).map_err(|_| EVIDENCE)?;
     let expert = root.descend(&format!("experts/{slug}")).map_err(|_| EVIDENCE)?;
     let evidence = expert.child("provenance").map_err(|_| EVIDENCE)?;
     let provenance: Provenance = serde_json::from_slice(&evidence.read("provenance.json", 1024 * 1024)
@@ -352,7 +352,7 @@ impl From<&AutoApproval> for HighestVersion {
     }
 }
 fn load_state(home: &Path) -> Result<State, String> {
-    let root = Directory::open(home).map_err(|_| INTERNAL)?;
+    let root = Directory::open_home(home).map_err(|_| INTERNAL)?;
     let bytes = match root.read(STATE_FILE, MAX_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
@@ -390,7 +390,7 @@ fn check_version(state: &State, approved: &AutoApproval) -> Result<(), String> {
     Ok(())
 }
 fn update_state<T>(home: &Path, change: impl FnOnce(&mut State) -> Result<T, String>) -> Result<T, String> {
-    let _root = Directory::open(home).map_err(|_| INTERNAL)?;
+    let _root = Directory::open_home(home).map_err(|_| INTERNAL)?;
     // with_file_lock uses a sidecar; reject pre-existing link/special locks.
     let lock = home.join(format!("{STATE_FILE}.lock"));
     match std::fs::symlink_metadata(&lock) {
@@ -435,9 +435,25 @@ async fn refuse(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord, reas
     }
 }
 
-/// Evaluate each candidate once. A process without the gateway lock does no IO.
+/// Evaluate each candidate once. Only the gateway lock holder touches approval state.
 pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
-    if !duduclaw_core::gateway_instance::held(home) || broker.home_dir().as_deref() != Some(home) { return; }
+    let canonical_home = match std::fs::canonicalize(home) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "skill trust home cannot be canonicalized; auto-approval skipped");
+            return;
+        }
+    };
+    if !duduclaw_core::gateway_instance::held(home) { return; }
+    let Some(broker_home) = broker.home_dir() else { return; };
+    let canonical_broker_home = match std::fs::canonicalize(broker_home) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "skill trust broker home cannot be canonicalized; auto-approval skipped");
+            return;
+        }
+    };
+    if canonical_broker_home != canonical_home { return; }
     // Serializes overlapping ticks/callers without holding a filesystem lock
     // across awaits. The cross-process state mutation still uses with_file_lock.
     static RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
