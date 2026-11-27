@@ -252,3 +252,27 @@ async fn google_only_account_cannot_be_admin_through_users_update() {
     payload(f.admin("users.update", json!({"user_id": f.employee.user_id, "role": "manager"})).await);
     assert_eq!(f.db.get_user(&f.employee.user_id).unwrap().unwrap().role, UserRole::Manager);
 }
+
+#[tokio::test]
+async fn me_google_signin_member_api_keys_refused_for_every_method() {
+    let f = fixture().await;
+    let key = f.db.member_key_create(&f.employee.user_id, "Self service", 1, f.employee.credential_epoch).unwrap();
+    let key_ctx = crate::member_keys::authenticate(f.home.path(), &f.db, &key.secret).unwrap();
+    for method in ["me.google_signin.status", "me.google_signin.link_start", "me.google_signin.link_complete",
+        "me.google_signin.unlink", "me.google_signin.reauth_start", "me.google_signin.reauth_complete"] {
+        assert_eq!(super::super::gates::google_signin_minimum_role(method), Some(UserRole::Employee));
+        assert_eq!(super::super::member_contract::member_key_method(method), None);
+        assert_eq!(code(f.handler.handle(method, json!({}), &key_ctx).await), "member_key_forbidden");
+        assert_eq!(code(f.handler.handle(method, json!({}), &f.employee).await), "signin_dashboard_required");
+        assert!(!duduclaw_core::mcp_tool_defs::tools().any(|tool| tool.name == method || tool.name == method.replace('.', "_")));
+    }
+    for ctx in [&f.admin, &f.manager, &f.employee] {
+        let value = payload(f.call(ctx, "me.google_signin.status", json!({})).await);
+        assert_eq!(value["has_password"], true);
+        assert_eq!(value["linked"], false);
+        assert!(value.get("sub").is_none());
+        assert!(refused(f.call(ctx, "me.google_signin.status", json!({"user_id": f.admin.user_id})).await));
+    }
+    assert_eq!(super::super::member_contract::member_key_method("me.google_signin.future"), None);
+    assert!(refused(f.admin("me.google_signin.future", json!({})).await));
+}

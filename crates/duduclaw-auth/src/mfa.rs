@@ -930,3 +930,6 @@ mod issuance_tests;
 
 #[cfg(test)]
 mod signin_approval_tests;
+
+#[cfg(test)]
+mod reauth_tests;

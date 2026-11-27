@@ -435,6 +435,7 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
         | "users.google_signin.attest" | "users.google_signin.unlink"
         | "users.signin_onboarding.retry_avatar")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
+        || method.split('.').take(2).eq(["me", "google_signin"])
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
         || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));

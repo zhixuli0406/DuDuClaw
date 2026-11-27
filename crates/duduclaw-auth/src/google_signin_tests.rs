@@ -249,3 +249,100 @@ fn google_signin_storage_errors_do_not_expose_sqlite_details() {
     db.conn().execute("DROP TABLE google_signin_requests", []).unwrap();
     assert_eq!(db.list_pending_signin_requests().unwrap_err(), "signin_storage_unavailable");
 }
+
+#[test]
+fn link_requires_password() {
+    let (db, _path) = test_db();
+    let id = user(&db, "self");
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    assert_eq!(db.google_signin_verify_password(&id, epoch, "wrong"), Err("signin_password_invalid"));
+    db.google_signin_verify_password(&id, epoch, "password123").unwrap();
+    db.conn().execute("UPDATE users SET password_hash='' WHERE id=?1", [&id]).unwrap();
+    assert_eq!(db.google_signin_verify_password(&id, epoch, "password123"), Err("signin_link_needs_password"));
+}
+
+#[test]
+fn link_refuses_sub_linked_elsewhere() {
+    let (db, _path) = test_db();
+    let a = user(&db, "first");
+    let b = user(&db, "second");
+    insert(&db, &link(&a, "123", "jit_direct", 1)).unwrap();
+    let identity = crate::signin_members::VerifiedGoogleIdentity {
+        sub: "123".into(), email: "second@test.invalid".into(), hd: "test.invalid".into(), display_name: "Second".into(),
+    };
+    let epoch = db.get_user(&b).unwrap().unwrap().credential_epoch;
+    assert_eq!(db.self_link_google_signin(&b, epoch, db.google_signin_credential_revision(&b).unwrap(), &identity, 2), Err("signin_sub_linked"));
+    assert!(db.google_signin_link_for_user(&b).unwrap().is_none());
+}
+
+#[test]
+fn unlink_passwordless_refused() {
+    let (db, _path) = test_db();
+    let id = user(&db, "self");
+    insert(&db, &link(&id, "123", "jit_direct", 1)).unwrap();
+    db.conn().execute("UPDATE users SET password_hash='' WHERE id=?1", [&id]).unwrap();
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    assert_eq!(db.self_unlink_google_signin(&id, epoch, "password123", 2), Err("signin_unlink_needs_password"));
+    assert!(db.google_signin_link_for_user(&id).unwrap().is_some());
+}
+
+#[test]
+fn unlink_bumps_epoch() {
+    let (db, _path) = test_db();
+    let id = user(&db, "self");
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let identity = crate::signin_members::VerifiedGoogleIdentity {
+        sub: "123".into(), email: "self@test.invalid".into(), hd: "test.invalid".into(), display_name: "Self".into(),
+    };
+    db.self_link_google_signin(&id, epoch, db.google_signin_credential_revision(&id).unwrap(), &identity, 1).unwrap();
+    let row = db.google_signin_link_for_user(&id).unwrap().unwrap();
+    assert_eq!(row.linked_via, "self_link");
+    assert_eq!(row.linked_by, id);
+    assert!(db.self_unlink_google_signin(&id, epoch+1, "password123", 2).is_err());
+    assert!(db.self_unlink_google_signin(&id, epoch, "wrong", 2).is_err());
+    db.self_unlink_google_signin(&id, epoch, "password123", 2).unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, epoch+1);
+    assert!(db.google_signin_link_for_user(&id).unwrap().is_none());
+    let actions: Vec<String> = db.conn().prepare("SELECT action FROM auth_audit_log WHERE user_id=?1 ORDER BY id").unwrap()
+        .query_map([&id], |r| r.get(0)).unwrap().collect::<std::result::Result<_,_>>().unwrap();
+    assert!(actions.iter().any(|a| a=="google_signin.self_linked"));
+    assert!(actions.iter().any(|a| a=="google_signin.self_unlinked"));
+}
+
+#[test]
+fn google_signin_link_password_change_invalidates_epoch_zero_proof() {
+    let (db, _path) = test_db();
+    let id = user(&db, "self");
+    let revision = db.google_signin_credential_revision(&id).unwrap();
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    db.google_signin_verify_password(&id, epoch, "password123").unwrap();
+    db.change_own_password(&id, "replacement123").unwrap();
+    assert_eq!(db.get_user(&id).unwrap().unwrap().credential_epoch, epoch);
+    let identity = crate::signin_members::VerifiedGoogleIdentity {
+        sub: "123".into(), email: "self@test.invalid".into(), hd: "test.invalid".into(), display_name: "Self".into(),
+    };
+    assert_eq!(db.self_link_google_signin(&id, epoch, revision, &identity, 2), Err("signin_session_expired"));
+}
+
+#[test]
+fn self_link_requires_matching_email() {
+    let (db, _path) = test_db();
+    let id = user(&db, "self");
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let revision = db.google_signin_credential_revision(&id).unwrap();
+    let mut identity = crate::signin_members::VerifiedGoogleIdentity {
+        sub: "123".into(), email: "victim@test.invalid".into(), hd: "test.invalid".into(), display_name: "Victim".into(),
+    };
+    assert_eq!(db.self_link_google_signin(&id, epoch, revision, &identity, 1), Err("signin_link_email_mismatch"));
+    assert!(db.google_signin_link_for_user(&id).unwrap().is_none());
+    // Completion must compare the current email, not an earlier account snapshot.
+    db.conn().execute("UPDATE users SET email='current@test.invalid' WHERE id=?1", [&id]).unwrap();
+    let epoch = db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let revision = db.google_signin_credential_revision(&id).unwrap();
+    identity.email = "self@test.invalid".into();
+    assert_eq!(db.self_link_google_signin(&id, epoch, revision, &identity, 2), Err("signin_link_email_mismatch"));
+    assert!(db.google_signin_link_for_user(&id).unwrap().is_none());
+    identity.email = "CURRENT@TEST.INVALID".into();
+    db.self_link_google_signin(&id, epoch, revision, &identity, 3).unwrap();
+    assert_eq!(db.google_signin_link_for_user(&id).unwrap().unwrap().google_sub, "123");
+}

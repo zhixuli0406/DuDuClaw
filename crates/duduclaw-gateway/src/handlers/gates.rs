@@ -467,6 +467,8 @@ pub(crate) fn power_local_result_frame(result: crate::device_ops::OpResult) -> W
 /// operations within these exact namespaces are Admin-only and then denied.
 pub(super) fn google_signin_minimum_role(method: &str) -> Option<UserRole> {
     match method {
+        "me.google_signin.status" | "me.google_signin.link_start" | "me.google_signin.link_complete"
+        | "me.google_signin.unlink" | "me.google_signin.reauth_start" | "me.google_signin.reauth_complete" => Some(UserRole::Employee),
         "google.signin.get" | "google.signin.set"
         | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
         | "users.google_signin.attest" | "users.google_signin.unlink"
@@ -474,7 +476,8 @@ pub(super) fn google_signin_minimum_role(method: &str) -> Option<UserRole> {
         _ => {
             let mut parts = method.split('.');
             match (parts.next(), parts.next()) {
-                (Some("google"), Some("signin"))
+                (Some("me"), Some("google_signin"))
+                | (Some("google"), Some("signin"))
                 | (Some("users"), Some("signin_requests" | "google_signin" | "signin_onboarding")) => Some(UserRole::Admin),
                 _ => None,
             }

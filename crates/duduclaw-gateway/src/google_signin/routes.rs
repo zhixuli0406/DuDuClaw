@@ -54,7 +54,29 @@ fn same_hash(a: &Hash, b: &Hash) -> bool {
     ring::constant_time::verify_slices_are_equal(a, b).is_ok()
 }
 
+#[path = "routes_me.rs"]
+pub(crate) mod me;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionBinding {
+    pub user_id: String,
+    pub session_id: String,
+    pub epoch: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Purpose { Login, Link(SessionBinding), Reauth(SessionBinding) }
+impl Purpose {
+    fn binding(&self) -> Option<&SessionBinding> {
+        match self { Self::Login => None, Self::Link(b) | Self::Reauth(b) => Some(b) }
+    }
+    fn path(&self) -> &'static str {
+        match self { Self::Login => LOGIN_PATH, Self::Link(_) => "/me/connections", Self::Reauth(_) => "/me/account" }
+    }
+}
+
 struct Pending {
+    credential_revision: Option<i64>,
+    purpose: Purpose,
     home: PathBuf,
     ip: IpAddr,
     cookie_sha256: Hash,
@@ -71,10 +93,13 @@ impl Drop for Pending {
 }
 
 enum LoginResult {
+    Identity(oidc::VerifiedIdToken),
     Code(&'static str),
     Ok { user_id: String, credential_epoch: u64 },
 }
 struct Ticket {
+    credential_revision: Option<i64>,
+    purpose: Purpose,
     home: PathBuf,
     cookie_sha256: Hash,
     secure: bool,
@@ -160,7 +185,10 @@ fn clear_cookie(response: Response) -> Response {
     response
 }
 fn redirect(base: &str, fragment: &str) -> Response {
-    let mut response = no_store(Redirect::to(&format!("{base}{LOGIN_PATH}#{fragment}")).into_response());
+    redirect_to(base, LOGIN_PATH, fragment)
+}
+fn redirect_to(base: &str, path: &str, fragment: &str) -> Response {
+    let mut response = no_store(Redirect::to(&format!("{base}{path}#{fragment}")).into_response());
     response.headers_mut().insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     response
 }
@@ -195,7 +223,7 @@ pub(crate) async fn start(
         &state_value, &nonce, &oidc::pkce_challenge_s256(&verifier), &available.settings.allowed_hd,
         oidc::SigninPurpose::Login, None);
     let ip = login_throttle_ip(addr.ip());
-    let pending = Pending { home: state.home_dir.clone(), ip, cookie_sha256: hash(&cookie_value),
+    let pending = Pending { credential_revision: None, purpose: Purpose::Login, home: state.home_dir.clone(), ip, cookie_sha256: hash(&cookie_value),
         nonce_sha256: hash(&nonce), verifier, redirect_uri, client_id: available.client.client_id,
         settings_revision: available.settings.revision, secure: available.secure, created: Instant::now() };
     {
@@ -225,7 +253,7 @@ fn put_ticket(pending: &Pending, result: LoginResult) -> Option<String> {
     let mut map = TICKETS.lock().ok()?;
     map.retain(|_, ticket| ticket.created.elapsed() < TICKET_TTL);
     if map.len() >= MAX_TICKETS || map.contains_key(&hash(&value)) { return None; }
-    map.insert(hash(&value), Ticket { home: pending.home.clone(), cookie_sha256: pending.cookie_sha256,
+    map.insert(hash(&value), Ticket { credential_revision: pending.credential_revision, purpose: pending.purpose.clone(), home: pending.home.clone(), cookie_sha256: pending.cookie_sha256,
         secure: pending.secure, result, created: Instant::now() });
     Some(value)
 }
@@ -262,30 +290,41 @@ pub(crate) async fn callback(
         else { return expired(&state.home_dir); };
     // Consume before checking the cookie, settings, or contacting any provider.
     let Some(pending) = take_pending(&state_value) else { return expired(&state.home_dir); };
+    let failed = || {
+        let base = public_base(&state.home_dir).map(|(base, _)| base).unwrap_or_default();
+        redirect_to(&base, pending.purpose.path(), "gsi_error=expired")
+    };
     if pending.home != state.home_dir || provider_error
-        || !cookie_hash(&headers, pending.secure).is_some_and(|h| same_hash(&h, &pending.cookie_sha256))
-    { return expired(&state.home_dir); }
+        || (pending.purpose == Purpose::Login && !cookie_hash(&headers, pending.secure).is_some_and(|h| same_hash(&h, &pending.cookie_sha256)))
+    { return failed(); }
     let Some(code) = code.filter(|c| !c.is_empty() && c.len() <= 4096 && !c.chars().any(char::is_control))
-        else { return expired(&state.home_dir); };
-    let Ok(available) = availability(&state).await else { return expired(&state.home_dir); };
+        else { return failed(); };
+    let Ok(available) = availability(&state).await else { return failed(); };
     if available.settings.revision != pending.settings_revision
         || available.client.client_id != pending.client_id
         || redirect_uri(&available.base) != pending.redirect_uri
-    { return expired(&state.home_dir); }
+    { return failed(); }
+    if let Some(binding) = pending.purpose.binding().cloned() {
+        let db = state.user_db.clone();
+        if !matches!(tokio::task::spawn_blocking(move || me::live_user(&db, &binding)).await, Ok(Ok(_))) {
+            return failed();
+        }
+    }
     let Ok(id_token) = oauth::exchange_for_id_token(&pending.client_id, &available.client.client_secret,
-        &code, &pending.verifier, &pending.redirect_uri).await else { return expired(&state.home_dir); };
+        &code, &pending.verifier, &pending.redirect_uri).await else { return failed(); };
     let Ok(http) = reqwest::Client::builder().timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::none()).build() else { return expired(&state.home_dir); };
+        .redirect(reqwest::redirect::Policy::none()).build() else { return failed(); };
     let now = chrono::Utc::now().timestamp();
     let decision = match oidc::verify_google_id_token(&http, &id_token, &pending.client_id,
         &pending.nonce_sha256, &available.settings.allowed_hd, now).await {
-        Err(oidc::IdTokenError::Invalid) => return expired(&state.home_dir),
+        Err(oidc::IdTokenError::Invalid) => return failed(),
         Err(oidc::IdTokenError::PersonalAccount) => LoginResult::Code("personal_account"),
         Err(oidc::IdTokenError::DomainNotAllowed) => LoginResult::Code("domain_not_allowed"),
+        Ok(identity) if pending.purpose != Purpose::Login => LoginResult::Identity(identity),
         Ok(identity) => {
             let identity = VerifiedGoogleIdentity { sub: identity.sub, email: identity.email,
                 hd: identity.hd, display_name: identity.name };
-            let Some((ack_by, ack_at)) = available.settings.ack else { return expired(&state.home_dir); };
+            let Some((ack_by, ack_at)) = available.settings.ack else { return failed(); };
             let policy = SigninPolicy {
                 approval: match available.settings.approval {
                     config::Approval::Admin => SigninApproval::Admin,
@@ -306,8 +345,11 @@ pub(crate) async fn callback(
         }
     };
     match put_ticket(&pending, decision) {
-        Some(ticket) => redirect(&available.base, &format!("gsi={ticket}")),
-        None => expired(&state.home_dir),
+        Some(ticket) => {
+            let key = match pending.purpose { Purpose::Login => "gsi", Purpose::Link(_) => "gsi_link", Purpose::Reauth(_) => "gsi_reauth" };
+            redirect_to(&available.base, pending.purpose.path(), &format!("{key}={ticket}"))
+        },
+        None => failed(),
     }
 }
 
@@ -380,11 +422,12 @@ async fn complete_inner(state: &Arc<AppState>, addr: SocketAddr, headers: &Heade
     if !check_google_rate_limit(addr.ip(), "complete") { return error(StatusCode::TOO_MANY_REQUESTS); }
     let Ok(Json(body)) = body else { return error(StatusCode::BAD_REQUEST); };
     let Some(ticket) = take_ticket(&body.ticket) else { return result("expired"); };
-    if ticket.home != state.home_dir
+    if ticket.purpose != Purpose::Login || ticket.home != state.home_dir
         || !cookie_hash(headers, ticket.secure).is_some_and(|h| same_hash(&h, &ticket.cookie_sha256))
     { return result("expired"); }
     let (user_id, epoch) = match ticket.result {
         LoginResult::Code(code) => return result(code),
+        LoginResult::Identity(_) => return result("expired"),
         LoginResult::Ok { user_id, credential_epoch } => (user_id, credential_epoch),
     };
     if availability(state).await.is_err() { return result("expired"); }

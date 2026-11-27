@@ -199,6 +199,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list(ctx)).await
             }
+            "me.google_signin.status" | "me.google_signin.link_start" | "me.google_signin.link_complete"
+            | "me.google_signin.unlink" | "me.google_signin.reauth_start" | "me.google_signin.reauth_complete" => {
+                boxed_frame(|| self.handle_google_signin_me_rpc(method, params, ctx)).await
+            }
             "google.signin.get" | "google.signin.set"
             | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
             | "users.google_signin.attest" | "users.google_signin.unlink"

@@ -160,6 +160,7 @@ mod org_change_rpc;
 mod users_rpc;
 mod user_invites_rpc;
 mod google_signin_rpc;
+mod google_signin_me_rpc;
 pub(crate) mod company_rpc;
 mod members_rpc;
 mod onboarding_rpc;

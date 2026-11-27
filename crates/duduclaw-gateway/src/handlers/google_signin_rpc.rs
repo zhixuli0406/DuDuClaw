@@ -7,6 +7,20 @@ use serde::Deserialize;
 
 pub(super) fn signin_error(code: &str) -> WsFrame {
     let message = match code {
+        "signin_unavailable" => "公司 Google 登入目前無法使用，請聯絡管理員。",
+        "signin_session_expired" => "這次驗證已失效，請重新登入後再試。",
+        "signin_password_invalid" => "密碼不正確，請重新輸入。",
+        "signin_link_email_mismatch" => "這個 Google 帳號的信箱和你的帳號信箱不同，無法綁定。請改用相同信箱的公司帳號，或請管理員協助。",
+        "signin_link_needs_password" => "請先設定本機密碼，再綁定 Google 登入。",
+        "signin_unlink_needs_password" => "這個帳號沒有本機密碼，取消 Google 登入會無法登入，請先聯絡管理員。",
+        "signin_already_linked" => "這個帳號已綁定 Google 登入。",
+        "signin_personal_sub_mismatch" => "請使用與個人 Google 連線相同的 Google 帳號。",
+        "signin_reauth_password_account" => "這個帳號有本機密碼，請使用密碼驗證身分。",
+        "signin_reauth_sub_mismatch" => "請使用原本綁定的公司 Google 帳號驗證身分。",
+        "signin_reauth_unavailable" => "Google 未提供近期身分驗證紀錄，請聯絡管理員重設兩步驟驗證。",
+        "signin_personal_account" => "請使用公司 Google 帳號，不能使用個人帳號。",
+        "signin_domain_not_allowed" => "這個 Google 帳號不在公司允許的網域內。",
+        "signin_rate_limited" => "嘗試次數過多，請稍後再試。",
         "signin_admin_required" => "請以管理員帳號重新登入後再操作。",
         "signin_dashboard_required" => "請登入儀表板後再操作，不能使用 API 金鑰。",
         "signin_request_not_found" => "找不到這筆登入申請，請重新整理清單。",

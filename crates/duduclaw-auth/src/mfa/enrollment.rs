@@ -84,6 +84,35 @@ impl UserDb {
         Ok(token)
     }
 
+    /// Gateway-only entry after consuming a Google reauthentication grant.
+    /// The epoch is captured by the authenticated transport, never a request field.
+    pub fn mfa_reauth_challenge(&self, user: &str, session: &str, epoch: u64, now: i64) -> Result<String> {
+        if session.is_empty() { return Err(DENIED.into()); }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users u JOIN google_signin_links l ON l.user_id=u.id
+            WHERE u.id=?1 AND u.status='active' AND u.password_hash='' AND u.credential_epoch=?2)",
+            params![user,epoch], |r|r.get(0)).map_err(|_|DENIED)?;
+        if !valid { return Err(DENIED.into()); }
+        let recent: i64 = tx.query_row("SELECT COUNT(*) FROM mfa_challenges WHERE user_id=?1 AND purpose='enroll' AND expires_at>?2",
+            params![user,now+TTL-60], |r|r.get(0)).map_err(|e|e.to_string())?;
+        if recent>=3 { return Err("嘗試次數過多，請稍後再試。".into()); }
+        let existing = any_factor(&tx,user)?;
+        let token = random_hex(32)?;
+        tx.execute("INSERT INTO mfa_challenges(token_hash,user_id,first_factor,purpose,expires_at) VALUES(?1,?2,'google_oidc','enroll',?3)",
+            params![token_hash(&token),user,now+TTL]).map_err(|e|e.to_string())?;
+        // Preserve the password entry's independent-proof policy. The proof
+        // kind describes step-up; first_factor remains google_oidc for Email.
+        tx.execute("INSERT INTO mfa_enrollment_proofs(token_hash,session,kind,verified) VALUES(?1,?2,?3,?4)",
+            params![token_hash(&token),session,if existing {"password"} else {"pending"},existing]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(token)
+    }
+
+    pub fn mfa_factor_reauth_challenge(&self, user: &str, session: &str, epoch: u64, now: i64) -> Result<String> {
+        self.mfa_reauth_challenge(user, session, epoch, now)
+    }
+
     pub fn mfa_check_session(&self, token: &str, user: &str, session: &str, now: i64) -> Result<()> {
         let conn = self.conn();
         if challenge_user(&conn, token, "enroll", now)? != user { return Err(DENIED.into()); }
