@@ -1757,6 +1757,7 @@ async fn process_telegram_message(
     let voice_enabled = ctx.voice_sessions.lock().await.contains(&session_key);
     let tts_router = crate::tts::TtsRouter::for_home(&ctx.home_dir);
     let markup = conversation_markup(
+        &ctx.home_dir,
         &reply_session,
         &reply,
         tts_router.is_available(),
@@ -2563,6 +2564,7 @@ async fn handle_command(
                 thread_id,
                 None,
                 Some(conversation_markup(
+                    &ctx.home_dir,
                     &reply_session,
                     &reply,
                     crate::tts::TtsRouter::for_home(&ctx.home_dir).is_available(),
@@ -3588,10 +3590,10 @@ const TG_MARKDOWN_CHUNK: usize = 3400;
 /// — e.g. a fast `1`/`2`/`3` text reply already beat this send) degrades to
 /// the ordinary buttons; the text menu embedded in `reply` still works fine
 /// on its own.
-fn conversation_markup(session_id: &str, reply: &str, voice_available: bool) -> serde_json::Value {
+fn conversation_markup(home_dir: &std::path::Path, session_id: &str, reply: &str, voice_available: bool) -> serde_json::Value {
     if crate::goal_intent::reply_has_confirmation_menu(reply) {
         if let Some(nonce) = crate::goal_intent::pending_button_nonce(session_id) {
-            return channel_format::telegram_gintent_buttons(&nonce);
+            return channel_format::telegram_gintent_buttons(&nonce, crate::trigger_route::texts::lang_for(home_dir));
         }
     }
     let mut markup = channel_format::telegram_conversation_buttons();
@@ -3926,10 +3928,10 @@ mod callback_tests {
 
     #[test]
     fn unavailable_voice_button_is_hidden() {
-        let without_voice = conversation_markup("telegram:42", "hello", false);
+        let without_voice = conversation_markup(std::path::Path::new("/nonexistent-test-home"), "telegram:42", "hello", false);
         assert!(!without_voice.to_string().contains("duduclaw:voice_toggle"));
         assert!(without_voice.to_string().contains("duduclaw:new_session"));
-        let with_voice = conversation_markup("telegram:42", "hello", true);
+        let with_voice = conversation_markup(std::path::Path::new("/nonexistent-test-home"), "telegram:42", "hello", true);
         assert!(with_voice.to_string().contains("duduclaw:voice_toggle"));
     }
 

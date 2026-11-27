@@ -5,8 +5,8 @@
 //! autonomous goal loop — a user typing "整理這批客戶資料成月報並寄出" into
 //! Telegram gets an ordinary chat reply and never learns the feature exists.
 //! This module upgrades plain-language delegation into a **suggestion**
-//! (never an automatic goal), confirmed by the user with a bare `1`/`2`/`3`
-//! reply (or, on the four button-capable channels, three inline buttons —
+//! (never an automatic goal), confirmed by the user with explicit menu words
+//! in zh-TW, English or Japanese (or, on the four button-capable channels, three inline buttons —
 //! see [`encode_gintent_action`]/[`handle_gintent_button`]).
 //!
 //! ## Three layers, model confirmation for every suggestion
@@ -38,15 +38,13 @@
 //! Starting a goal loop spends tokens autonomously across many rounds — a
 //! "maybe-irreversible" action per the platform's own capability model. This
 //! module NEVER creates a task on its own. A hit only appends a short menu
-//! ("回覆「1」立為目標任務／「2」想一想／「3」繼續聊天", or the equivalent
-//! three inline buttons) to the reply that was already being sent; the next
-//! turn's bare `1`/`2`/`3` reply — or a button press — is the one thing this
-//! module will act on (bare digits are ignored if the AI reply itself had
-//! a numbered list), via [`intercept_pending_confirmation`] /
-//! [`handle_gintent_button`] (one shared `settle_pending` implementation
-//! underneath both). Every other reply — including no reply, a `/` command,
-//! or a completely unrelated new message — invalidates the pending
-//! suggestion and changes nothing. "1"/[`GIntentChoice::AcceptGoal`] walks
+//! ("開始任務 / 先給計畫 / 繼續聊", localised to the home's language,
+//! or three inline buttons). Explicit menu words in any supported language
+//! or a button press settle the suggestion. Legacy bare `1`/`2`/`3` shortcuts
+//! only work when the AI reply has no numbered list. See
+//! [`intercept_pending_confirmation`] / [`handle_gintent_button`] (one shared
+//! `settle_pending` implementation). Every other reply invalidates the
+//! pending suggestion and continues normal chat. AcceptGoal walks
 //! the EXACT SAME path as typing `/goal <description>` by hand
 //! (`chat_commands::handle_goal_create`, made `pub(crate)` for this reuse) —
 //! the intent router never gets its own, laxer, permission surface.
@@ -78,6 +76,7 @@ use std::sync::{Mutex, OnceLock};
 use chrono::{DateTime, Utc};
 use duduclaw_core::word_contains_ci;
 use tracing::warn;
+use crate::trigger_route::texts::{Lang, lang_for};
 
 use crate::channel_reply::ReplyContext;
 
@@ -835,10 +834,20 @@ async fn resolve_gray_band_with_screener(
 // Finalize — after the AI reply exists, append the menu (or not)
 // ═══════════════════════════════════════════════════════════════════════
 
-const CONFIRMATION_MENU: &str = "\n\n———\n看起來你在交辦一件任務。回覆「1」立為目標任務／「2」想一想（先給計畫）／「3」繼續聊天。";
+const CONFIRMATION_MENU_ZH: &str = "\n\n———\n這看起來是一件要分好幾步完成的工作。想讓我當成任務自己一步步做完，請回覆「開始任務」；想先看我打算怎麼做，請回覆「先給計畫」；只是聊聊的話，直接繼續說就好。";
+const CONFIRMATION_MENU_EN: &str = "\n\n———\nThis looks like a job that will take several steps. Reply with 「start task」 if you'd like me to work through it on my own, or 「plan first」 to see how I'd approach it. If you're just chatting, keep talking as usual.";
+const CONFIRMATION_MENU_JA: &str = "\n\n———\nこれは、いくつかの手順に分けて進める仕事のようです。タスクとして最後まで任せるなら「タスク開始」、まず進め方を見たいなら「先に計画」と返信してください。会話を続けたいだけなら、そのまま話しかけてください。";
 
-fn append_confirmation_menu(reply: &str) -> String {
-    format!("{reply}{CONFIRMATION_MENU}")
+fn confirmation_menu(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhTw => CONFIRMATION_MENU_ZH,
+        Lang::En => CONFIRMATION_MENU_EN,
+        Lang::Ja => CONFIRMATION_MENU_JA,
+    }
+}
+
+fn append_confirmation_menu(reply: &str, lang: Lang) -> String {
+    format!("{reply}{}", confirmation_menu(lang))
 }
 
 /// Whether `reply` carries the confirmation menu [`finalize`] appends this
@@ -846,7 +855,7 @@ fn append_confirmation_menu(reply: &str) -> String {
 /// button-capable channel should attach gintent confirmation buttons to
 /// (P1), rather than the ordinary conversation-control buttons.
 ///
-/// This is a plain substring check on the literal [`CONFIRMATION_MENU`] —
+/// This is a plain substring check on the three fixed localised menu strings —
 /// safe here despite coding convention #2 (no unanchored `contains` for
 /// security/routing decisions): the string is generated ENTIRELY by this
 /// module and appended strictly AFTER the model's own turn finishes (see
@@ -856,7 +865,8 @@ fn append_confirmation_menu(reply: &str) -> String {
 /// would find nothing pending and the caller falls back to ordinary
 /// conversation buttons — no suggestion is fabricated, no task is created.
 pub fn reply_has_confirmation_menu(reply: &str) -> bool {
-    reply.contains(CONFIRMATION_MENU)
+    [Lang::ZhTw, Lang::En, Lang::Ja].into_iter()
+        .any(|lang| reply.contains(confirmation_menu(lang)))
 }
 
 /// Detect list markers at line starts, ignoring whitespace, markdown emphasis,
@@ -930,7 +940,7 @@ pub async fn finalize(
                 ctx, session_id, agent_id, user_text, reply_has_numbered_list(&stripped),
             )
             .await;
-            append_confirmation_menu(&stripped)
+            append_confirmation_menu(&stripped, lang_for(&ctx.home_dir))
         }
         GoalIntentAction::GrayCandidate => {
             let (stripped, tag_summary) = strip_goal_suggest_tag(reply_text);
@@ -950,7 +960,7 @@ pub async fn finalize(
                         ctx, session_id, agent_id, &summary, reply_has_numbered_list(&stripped),
                     )
                     .await;
-                    append_confirmation_menu(&stripped)
+                    append_confirmation_menu(&stripped, lang_for(&ctx.home_dir))
                 }
                 None => stripped,
             }
@@ -1215,18 +1225,33 @@ fn commit_daily_cap(agent_id: &str) {
 // for a machine employee, using the verified adapter's pressing sender.
 
 /// The three choices a channel button offers — mirrors the text menu's
-/// bare `1`/`2`/`3`.
+/// localised menu words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GIntentChoice {
-    /// "1" — 立為目標任務.
+    /// Start the task.
     AcceptGoal,
-    /// "2" — 想一想（先給計畫）.
+    /// Show a plan first.
     PlanFirst,
-    /// "3" — 繼續聊天.
+    /// Keep chatting.
     DismissChat,
 }
 
 impl GIntentChoice {
+    /// The exact confirmation word, also used for button labels and LINE displayText.
+    pub(crate) fn word(self, lang: Lang) -> &'static str {
+        match (lang, self) {
+            (Lang::ZhTw, Self::AcceptGoal) => "開始任務",
+            (Lang::ZhTw, Self::PlanFirst) => "先給計畫",
+            (Lang::ZhTw, Self::DismissChat) => "繼續聊",
+            (Lang::En, Self::AcceptGoal) => "start task",
+            (Lang::En, Self::PlanFirst) => "plan first",
+            (Lang::En, Self::DismissChat) => "keep chatting",
+            (Lang::Ja, Self::AcceptGoal) => "タスク開始",
+            (Lang::Ja, Self::PlanFirst) => "先に計画",
+            (Lang::Ja, Self::DismissChat) => "このまま会話",
+        }
+    }
+
     fn token(self) -> &'static str {
         match self {
             Self::AcceptGoal => "goal",
@@ -1277,7 +1302,7 @@ pub fn parse_gintent_action(data: &str) -> Option<(GIntentChoice, String)> {
 /// Apply an already-resolved choice against `pending` — the ONE
 /// implementation both the text path (`intercept_pending_confirmation`) and
 /// the button path (`handle_gintent_button`) settle through, per the task
-/// brief's "1/2/3 文字路徑與按鈕路徑同一實作". `session_id` is needed only
+/// brief's shared text/button settlement requirement. `session_id` is needed only
 /// for [`accept_as_goal`]/[`accept_as_plan_first`]'s own downstream calls
 /// (task provenance stamping via `chat_commands::source_from_session`) —
 /// the pending slot itself has already been taken by the caller.
@@ -1286,6 +1311,7 @@ async fn settle_pending(
     session_id: &str,
     pending: &PendingSuggest,
     choice: GIntentChoice,
+    confirmation: Confirmation<'_>,
 ) -> String {
     if choice != GIntentChoice::DismissChat {
         if let Err(refusal) = crate::machine_employee::check_chat_goal(ctx, &pending.agent_id, session_id).await {
@@ -1293,11 +1319,15 @@ async fn settle_pending(
         }
     }
     match choice {
-        GIntentChoice::AcceptGoal => accept_as_goal(ctx, session_id, pending).await,
-        GIntentChoice::PlanFirst => accept_as_plan_first(ctx, session_id, pending).await,
+        GIntentChoice::AcceptGoal => accept_as_goal(ctx, session_id, pending, confirmation).await,
+        GIntentChoice::PlanFirst => accept_as_plan_first(ctx, session_id, pending, confirmation).await,
         GIntentChoice::DismissChat => {
             record_outcome(ctx, "dismissed", pending, None).await;
-            "好，那我們繼續聊。".to_string()
+            match lang_for(&ctx.home_dir) {
+                Lang::ZhTw => "好，那我們繼續聊。",
+                Lang::En => "Sure, let's keep chatting.",
+                Lang::Ja => "わかりました。このまま会話を続けましょう。",
+            }.to_string()
         }
     }
 }
@@ -1306,7 +1336,7 @@ async fn settle_pending(
 /// Discord component interaction / Slack `block_actions` / LINE `postback`).
 /// Looks the nonce up across every pending conversation (no session id
 /// needed — the nonce alone identifies the slot), applies the SAME
-/// expiry/settle logic as the text path, and returns the zh-TW message to
+/// expiry/settle logic as the text path, and returns a localised message to
 /// show. Never panics, never silently no-ops: a stale/consumed/unknown nonce
 /// gets an honest "already invalid" reply rather than dropping the press.
 ///
@@ -1320,15 +1350,15 @@ pub async fn handle_gintent_button(
     nonce: &str,
 ) -> String {
     let Some((session_id, pending)) = take_pending_by_nonce(nonce) else {
-        return "⏰ 這個建議已經失效了（可能已被新訊息取代或逾時），如果還想立案請重新描述一次。"
-            .to_string();
+        return invalid_suggestion(lang_for(&ctx.home_dir), false).to_string();
     };
     let age_minutes = (Utc::now() - pending.created_at).num_minutes();
     if age_minutes >= pending.ttl_minutes.max(1) {
         record_outcome(ctx, "expired", &pending, None).await;
-        return "⏰ 剛剛那個目標建議已經逾時作廢了，若還想立案請重新描述一次。".to_string();
+        return invalid_suggestion(lang_for(&ctx.home_dir), true).to_string();
     }
-    settle_pending(ctx, &session_id, &pending, choice).await
+    settle_pending(ctx, &session_id, &pending, choice,
+        Confirmation::Button(choice.word(lang_for(&ctx.home_dir)))).await
 }
 
 /// Verified adapters supply the pressing sender so a machine employee's
@@ -1347,11 +1377,31 @@ pub async fn handle_gintent_button_for_sender(
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Confirmation intercept — bare "1"/"2"/"3" reply to a pending suggestion
+// Confirmation intercept — explicit words, plus unambiguous legacy digits
 // ═══════════════════════════════════════════════════════════════════════
 
-fn parse_choice(trimmed: &str) -> Option<GIntentChoice> {
-    parse_digit_choice(trimmed)
+fn parse_choice(text: &str) -> Option<GIntentChoice> {
+    let trimmed = text.trim();
+    if let Some(choice) = parse_digit_choice(trimmed) {
+        return Some(choice);
+    }
+    let unpunctuated = trimmed.trim_end_matches(['。', '．', '.', '！', '!']).trim();
+    let mut word = unpunctuated;
+    for (open, close) in [('「', '」'), ('『', '』'), ('"', '"'), ('“', '”')] {
+        if let Some(inner) = word.strip_prefix(open).and_then(|s| s.strip_suffix(close)) {
+            word = inner.trim();
+            break;
+        }
+    }
+    let word = word.trim_end_matches(['。', '．', '.', '！', '!']).trim();
+    for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
+        for choice in [GIntentChoice::AcceptGoal, GIntentChoice::PlanFirst, GIntentChoice::DismissChat] {
+            if word.eq_ignore_ascii_case(choice.word(lang)) {
+                return Some(choice);
+            }
+        }
+    }
+    None
 }
 
 fn parse_digit_choice(trimmed: &str) -> Option<GIntentChoice> {
@@ -1384,7 +1434,7 @@ pub async fn intercept_pending_confirmation(
     let expired = age_minutes >= pending.ttl_minutes.max(1);
 
     let choice = parse_choice(trimmed).filter(|_| {
-        // Future non-digit menu words remain valid even after a numbered list.
+        // Menu words remain valid even after a numbered list.
         !pending.reply_had_numbered_list || parse_digit_choice(trimmed).is_none()
     });
     let Some(choice) = choice else {
@@ -1399,7 +1449,7 @@ pub async fn intercept_pending_confirmation(
 
     if expired {
         record_outcome(ctx, "expired", &pending, None).await;
-        return Some("⏰ 剛剛那個目標建議已經逾時作廢了，若還想立案請重新描述一次。".to_string());
+        return Some(invalid_suggestion(lang_for(&ctx.home_dir), true).to_string());
     }
 
     // A confirmed suggestion records the person it was created for, like a
@@ -1409,7 +1459,7 @@ pub async fn intercept_pending_confirmation(
     Some(
         crate::chat_commands::with_goal_principal(
             principal,
-            settle_pending(ctx, session_id, &pending, choice),
+            settle_pending(ctx, session_id, &pending, choice, Confirmation::Text(trimmed)),
         )
         .await,
     )
@@ -1443,24 +1493,78 @@ async fn record_outcome(
     .await;
 }
 
-/// "1" — identical path to typing `/goal <description>` by hand.
-async fn accept_as_goal(ctx: &ReplyContext, session_id: &str, pending: &PendingSuggest) -> String {
-    let reply = crate::chat_commands::handle_goal_create(
-        ctx,
-        session_id,
-        &pending.agent_id,
-        &pending.description,
-        None,
-        None,
-        None,
-        None,
-        // "1" (立為目標任務) accepts the suggestion as-is — "2" (想一想) is
-        // the separate `accept_as_plan_first` path below, never this one.
-        false,
-    )
-    .await;
+/// How the user confirmed, preserving their trimmed text verbatim.
+#[derive(Clone, Copy)]
+enum Confirmation<'a> {
+    Text(&'a str),
+    Button(&'a str),
+}
+
+fn confirmation_reason(lang: Lang, confirmation: Confirmation<'_>) -> String {
+    match (lang, confirmation) {
+        (Lang::ZhTw, Confirmation::Text(word)) => format!("你剛剛回覆建議「{word}」，所以我已建立任務。"),
+        (Lang::ZhTw, Confirmation::Button(word)) => format!("你剛剛按了「{word}」，所以我已建立任務。"),
+        (Lang::En, Confirmation::Text(word)) => format!("I created the task because you just replied 「{word}」 to the suggestion."),
+        (Lang::En, Confirmation::Button(word)) => format!("I created the task because you just pressed 「{word}」."),
+        (Lang::Ja, Confirmation::Text(word)) => format!("提案に「{word}」と返信したので、タスクを作成しました。"),
+        (Lang::Ja, Confirmation::Button(word)) => format!("「{word}」を押したので、タスクを作成しました。"),
+    }
+}
+
+fn invalid_suggestion(lang: Lang, expired: bool) -> &'static str {
+    match (lang, expired) {
+        (Lang::ZhTw, true) => "⏰ 剛剛那個建議已經逾時了。如果還想建立任務，請再說一次要做什麼。",
+        (Lang::ZhTw, false) => "⏰ 這個建議已經失效了，可能已被新訊息取代或逾時。如果還想建立任務，請再說一次要做什麼。",
+        (Lang::En, true) => "⏰ That suggestion has expired. Please describe the job again if you'd still like to create a task.",
+        (Lang::En, false) => "⏰ That suggestion is no longer available. It may have expired or been replaced by a new message. Please describe the job again if you'd still like to create a task.",
+        (Lang::Ja, true) => "⏰ 先ほどの提案は期限が切れました。タスクを作成したい場合は、依頼内容をもう一度教えてください。",
+        (Lang::Ja, false) => "⏰ この提案は無効になりました。期限切れか、新しいメッセージで取り消された可能性があります。タスクを作成したい場合は、依頼内容をもう一度教えてください。",
+    }
+}
+
+fn created_reply(lang: Lang, confirmation: Confirmation<'_>, description: &str,
+    enabled: bool, steps: usize) -> String {
+    let reason = confirmation_reason(lang, confirmation);
+    let description = duduclaw_core::truncate_chars(description, 200);
+    let mut reply = match lang {
+        Lang::ZhTw => format!("✅ {reason}\n\n要做的事：{description}\nAI 員工會一步步處理，完成或卡住時會在這裡回報。\n想取消的話，請打開儀表板的「目標任務」頁面，在那裡停止任務。"),
+        Lang::En => format!("✅ {reason}\n\nThe task: {description}\nYour AI employee will work through it step by step and report back here when done or stuck.\nTo cancel, open the dashboard's 「Goal tasks」 page and stop the task there."),
+        Lang::Ja => format!("✅ {reason}\n\n依頼内容：{description}\nAI 社員が順番に作業し、完了したときや行き詰まったときはここで報告します。\n取り消すには、ダッシュボードの「ゴールタスク」ページでタスクを停止してください。"),
+    };
+    if steps > 1 {
+        reply.push_str(&match lang {
+            Lang::ZhTw => format!("\n已分成 {steps} 個步驟。"),
+            Lang::En => format!("\nSplit into {steps} steps."),
+            Lang::Ja => format!("\n{steps} 個の手順に分けました。"),
+        });
+    }
+    if !enabled {
+        reply.push_str(automatic_execution_off(lang));
+    }
+    reply
+}
+
+fn automatic_execution_off(lang: Lang) -> &'static str {
+    match lang {
+        Lang::ZhTw => "\n\n目前沒有開啟自動執行，任務已建立，但不會自己開始。請找管理員協助開啟。",
+        Lang::En => "\n\nAutomatic execution is off. The task was created but will not start by itself. Please ask your administrator to enable it.",
+        Lang::Ja => "\n\n自動実行が無効のため、タスクは作成されましたが自動では始まりません。管理者に有効化を依頼してください。",
+    }
+}
+
+/// Same creation, validation and principal stamping as a typed goal command.
+async fn accept_as_goal(ctx: &ReplyContext, session_id: &str, pending: &PendingSuggest,
+    confirmation: Confirmation<'_>) -> String {
+    let created = crate::chat_commands::create_goal(
+        ctx, session_id, &pending.agent_id, &pending.description,
+        None, None, None, None, false,
+    ).await;
     record_outcome(ctx, "accepted", pending, None).await;
-    format!("✅ 已依建議立案。\n\n{reply}")
+    match created {
+        Ok(created) => created_reply(lang_for(&ctx.home_dir), confirmation,
+            &pending.description, created.dispatch_enabled, created.steps),
+        Err(reply) => reply,
+    }
 }
 
 /// Pure: build the task row for the "2" (想一想) confirmation and apply a
@@ -1530,6 +1634,7 @@ async fn accept_as_plan_first(
     ctx: &ReplyContext,
     session_id: &str,
     pending: &PendingSuggest,
+    confirmation: Confirmation<'_>,
 ) -> String {
     let store = match crate::task_store::TaskStore::open(&ctx.home_dir) {
         Ok(s) => s,
@@ -1560,12 +1665,26 @@ async fn accept_as_plan_first(
     }
     record_outcome(ctx, "plan_first", pending, Some(task.id.clone())).await;
 
-    let review_hint = crate::goal_loop::plan_review::channel_hint(task.plan_review.as_deref());
-    match task.plan_pending {
-        Some(plan) => format!(
-            "🧭 已產生執行計畫，等你核准後才會開始執行：\n\n{plan}\n\n{review_hint}請到 /goals 儀表板核准或修改。"
-        ),
-        None => "⚠️ 計畫生成失敗，任務已標記為待你決定，請到 /goals 儀表板處理。".to_string(),
+    let lang = lang_for(&ctx.home_dir);
+    let mut reply = plan_first_reply(lang, confirmation, &pending.description,
+        task.plan_pending.as_deref());
+    if !crate::dispatch_engine::dispatch_engine_enabled(&ctx.home_dir) {
+        reply.push_str(automatic_execution_off(lang));
+    }
+    reply
+}
+
+fn plan_first_reply(lang: Lang, confirmation: Confirmation<'_>, description: &str,
+    plan: Option<&str>) -> String {
+    let reason = confirmation_reason(lang, confirmation);
+    let description = duduclaw_core::truncate_chars(description, 200);
+    match (lang, plan) {
+        (Lang::ZhTw, Some(plan)) => format!("🧭 {reason}\n要做的事：{description}\n\n這是我打算怎麼做，等你核准後才會開始：\n\n{plan}\n\n請到儀表板的「目標任務」頁面核准或修改；想取消也可以在那裡停止任務。開始後，AI 員工會一步步處理，完成或卡住時會在這裡回報。"),
+        (Lang::ZhTw, None) => format!("⚠️ {reason}\n要做的事：{description}\n計畫沒能產生，任務還不會開始。請到儀表板的「目標任務」頁面處理或停止任務。"),
+        (Lang::En, Some(plan)) => format!("🧭 {reason}\nThe task: {description}\n\nHere's how I'd approach it. Work will wait for your approval:\n\n{plan}\n\nOpen the dashboard's 「Goal tasks」 page to approve, edit or stop the task. Once started, your AI employee will work step by step and report back here when done or stuck."),
+        (Lang::En, None) => format!("⚠️ {reason}\nThe task: {description}\nI couldn't generate the plan, so work has not started. Open the dashboard's 「Goal tasks」 page to resolve this or stop the task."),
+        (Lang::Ja, Some(plan)) => format!("🧭 {reason}\n依頼内容：{description}\n\nこの進め方でどうでしょうか。承認するまで作業は始まりません：\n\n{plan}\n\nダッシュボードの「ゴールタスク」ページで承認、修正、停止ができます。開始後は AI 社員が順番に作業し、完了したときや行き詰まったときはここで報告します。"),
+        (Lang::Ja, None) => format!("⚠️ {reason}\n依頼内容：{description}\n計画を生成できなかったため、作業は始まっていません。ダッシュボードの「ゴールタスク」ページで確認するか、タスクを停止してください。"),
     }
 }
 
@@ -1576,6 +1695,128 @@ async fn accept_as_plan_first(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_choice_accepts_all_languages_quotes_punctuation_and_ascii_case() {
+        for (words, choice) in [
+            (["開始任務", "start task", "タスク開始"], GIntentChoice::AcceptGoal),
+            (["先給計畫", "plan first", "先に計画"], GIntentChoice::PlanFirst),
+            (["繼續聊", "keep chatting", "このまま会話"], GIntentChoice::DismissChat),
+        ] {
+            for word in words {
+                for decorated in [word.to_string(), format!("  {word}  "),
+                    format!("「{word}」。"), format!("『{word}』．"),
+                    format!("\"{word}\"."), format!("“{word}”！"),
+                    format!("{}!", word.to_ascii_uppercase()), format!("「{word}！」")] {
+                    assert_eq!(parse_choice(&decorated), Some(choice), "{decorated}");
+                }
+            }
+        }
+        for text in ["開始任務吧", "start", "task", "start tasks", "先給計畫吧",
+            "「開始任務』", "please start task", "keep chatting please", "タスク開始して"] {
+            assert_eq!(parse_choice(text), None, "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn finalize_localises_each_fixed_menu_and_detection() {
+        for (code, lang, word) in [("zh-TW", Lang::ZhTw, "開始任務"),
+            ("en", Lang::En, "start task"), ("ja-JP", Lang::Ja, "タスク開始")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"),
+                format!("[general]\ndefault_language = \"{code}\"\n")).unwrap();
+            let ctx = test_ctx(dir.path());
+            for action in [GoalIntentAction::DirectSuggest, GoalIntentAction::GrayCandidate] {
+                let session = format!("test:{}", uuid::Uuid::new_v4());
+                let reply = finalize(&ctx, &session, "agent-a", action, "整理報表並寄出",
+                    "OK<goal_suggest>整理報表並寄出</goal_suggest>").await;
+                assert!(reply.ends_with(confirmation_menu(lang)), "{reply}");
+                assert!(reply.contains(word), "{reply}");
+                assert!(reply_has_confirmation_menu(&reply));
+                assert!(!reply.contains("「1」"));
+                assert!(take_pending(&session).is_some());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn word_confirmation_after_numbered_reply_creates_plain_language_task() {
+        for (code, text, page) in [("zh-TW", "  開始任務  ", "目標任務"),
+            ("zh-TW", "start task", "目標任務"), ("en-US", "  START TASK!  ", "Goal tasks"),
+            ("ja-JP", "タスク開始", "ゴールタスク")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"),
+                format!("[general]\ndefault_language = \"{code}\"\n[dispatch]\nenabled = false\n")).unwrap();
+            let ctx = test_ctx(dir.path());
+            let session = format!("test:{}", uuid::Uuid::new_v4());
+            let description = "整理客戶資料成月報並寄出";
+            finalize(&ctx, &session, "agent-a", GoalIntentAction::DirectSuggest,
+                description, "1. 先整理\n2. 再寄出").await;
+            let reply = intercept_pending_confirmation(&ctx, &session, "user-1", text).await.unwrap();
+            assert!(reply.contains(&format!("「{}」", text.trim())), "{reply}");
+            assert!(reply.contains(description), "{reply}");
+            assert!(reply.contains(page), "{reply}");
+            for forbidden in ["/goal", "#", "風險邊界", "驗收", "outcome", "config.toml"] {
+                assert!(!reply.contains(forbidden), "{reply}");
+            }
+            let disabled = match code {
+                "en-US" => "will not start by itself",
+                "ja-JP" => "自動では始まりません",
+                _ => "不會自己開始",
+            };
+            assert!(reply.contains(disabled), "{reply}");
+            let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+            let tasks = store.list_tasks(None, None, None).await.unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert!(tasks[0].goal_mode);
+            assert_eq!(tasks[0].description, description);
+        }
+    }
+
+    #[tokio::test]
+    async fn button_confirmation_uses_localised_word_and_plain_reply() {
+        for (code, word, page) in [("zh-TW", "開始任務", "目標任務"),
+            ("en", "start task", "Goal tasks"), ("ja", "タスク開始", "ゴールタスク")] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"),
+                format!("[general]\ndefault_language = \"{code}\"\n")).unwrap();
+            let ctx = test_ctx(dir.path());
+            let session = format!("test:{}", uuid::Uuid::new_v4());
+            store_pending(&session, "agent-a", "整理報表並寄出", 10, true);
+            let nonce = pending_button_nonce(&session).unwrap();
+            let reply = handle_gintent_button(&ctx, GIntentChoice::AcceptGoal, &nonce).await;
+            for expected in [word, page, "整理報表並寄出"] {
+                assert!(reply.contains(expected), "{reply}");
+            }
+            for forbidden in ["/goal", "#", "風險邊界", "驗收", "outcome", "config.toml"] {
+                assert!(!reply.contains(forbidden), "{reply}");
+            }
+            let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
+            let tasks = store.list_tasks(None, None, None).await.unwrap();
+            assert_eq!(tasks.len(), 1);
+            assert!(tasks[0].goal_mode);
+        }
+    }
+
+    #[test]
+    fn plan_first_and_stale_replies_are_localised_without_commands() {
+        for (lang, page) in [(Lang::ZhTw, "目標任務"), (Lang::En, "Goal tasks"), (Lang::Ja, "ゴールタスク")] {
+            for plan in [Some("A plain plan"), None] {
+                let reply = plan_first_reply(lang, Confirmation::Text("plan first"), "Prepare report", plan);
+                assert!(reply.contains(page), "{reply}");
+                assert!(reply.contains("Prepare report"), "{reply}");
+                assert!(reply.contains("plan first"), "{reply}");
+                assert!(!reply.contains("/goal"), "{reply}");
+                assert!(!reply.contains('#'), "{reply}");
+            }
+            for expired in [false, true] {
+                assert!(!invalid_suggestion(lang, expired).contains("立案"));
+            }
+        }
+        let split = created_reply(Lang::En, Confirmation::Text("start task"), "Report", true, 3);
+        assert!(split.contains("Split into 3 steps."));
+        assert!(!split.contains("/goal"));
+    }
 
     // ── L0/L1 classifier ────────────────────────────────────────────────
 
@@ -1957,7 +2198,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_choice_accepts_only_bare_digits() {
+    fn parse_choice_keeps_legacy_digit_shortcuts() {
         assert_eq!(parse_choice("1"), Some(GIntentChoice::AcceptGoal));
         assert_eq!(parse_choice("2"), Some(GIntentChoice::PlanFirst));
         assert_eq!(parse_choice("3"), Some(GIntentChoice::DismissChat));
@@ -2064,7 +2305,7 @@ mod tests {
             "好的，我來處理。",
         )
         .await;
-        assert!(reply.contains("回覆「1」立為目標任務"));
+        assert!(reply.contains("回覆「開始任務」"));
         assert!(
             take_pending(&session).is_some(),
             "a pending suggestion must be stored"
@@ -2106,7 +2347,7 @@ mod tests {
         )
         .await;
         assert!(!reply.contains("goal_suggest"));
-        assert!(reply.contains("回覆「1」立為目標任務"));
+        assert!(reply.contains("回覆「開始任務」"));
         let pending = take_pending(&session).expect("tag must promote to a pending suggestion");
         assert_eq!(
             pending.description, "整理客戶資料成月報並寄出",
@@ -2371,7 +2612,7 @@ mod tests {
                 build_plan_first_task(home.path(), "telegram:123:abc", &pending, Ok("- 一".into()));
             // "1" 立為目標任務.
             let ctx = test_ctx(home.path());
-            let _ = accept_as_goal(&ctx, "telegram:123:abc", &pending).await;
+            let _ = accept_as_goal(&ctx, "telegram:123:abc", &pending, Confirmation::Text("開始任務")).await;
             let store = crate::task_store::TaskStore::open(home.path()).unwrap();
             let tasks = store
                 .list_tasks_filtered(None, Some("agent-g"), None, Some(true))
@@ -2525,7 +2766,7 @@ mod tests {
         assert!(!reply_has_confirmation_menu(
             "普通的回覆，沒有任何建議選單。"
         ));
-        let with_menu = append_confirmation_menu("好的，我來處理。");
+        let with_menu = append_confirmation_menu("好的，我來處理。", Lang::ZhTw);
         assert!(reply_has_confirmation_menu(&with_menu));
     }
 
@@ -2651,7 +2892,7 @@ mod tests {
         let nonce = pending_button_nonce(&session).unwrap();
 
         let reply = handle_gintent_button(&ctx, GIntentChoice::AcceptGoal, &nonce).await;
-        assert!(reply.contains("已依建議立案"), "{reply}");
+        assert!(reply.contains("按了「開始任務」"), "{reply}");
 
         let store = crate::task_store::TaskStore::open(dir.path()).unwrap();
         let tasks = store.list_tasks(None, None, None).await.unwrap();
@@ -2763,7 +3004,8 @@ mod tests {
     #[tokio::test]
     async fn chat_grade_does_not_poll_model_arbitration() {
         let action = resolve_intent_grade(IntentGrade::Chat, async {
-            panic!("plain chat must not call a model");
+            if true { panic!("plain chat must not call a model"); }
+            GoalIntentAction::DirectSuggest
         }).await;
         assert_eq!(action, GoalIntentAction::None);
     }

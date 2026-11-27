@@ -1291,7 +1291,7 @@ async fn process_line_events(
                     last["quickReply"] = if crate::goal_intent::reply_has_confirmation_menu(&reply)
                     {
                         crate::goal_intent::pending_button_nonce(&turn_session)
-                            .map(|nonce| channel_format::line_gintent_quick_reply(&nonce))
+                            .map(|nonce| channel_format::line_gintent_quick_reply(&nonce, crate::trigger_route::texts::lang_for(&state.home_dir)))
                             .unwrap_or_else(channel_format::line_quick_reply)
                     } else {
                         channel_format::line_quick_reply()
