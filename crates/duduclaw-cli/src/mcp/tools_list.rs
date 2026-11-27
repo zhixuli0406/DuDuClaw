@@ -935,6 +935,7 @@ pub(crate) async fn visible_tools_in_lane(
     .is_some();
 
     tools()
+        .filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
         // applies, so it is not listed there either (discoverable ⇔ callable).

@@ -121,7 +121,7 @@ pub(crate) fn validate_oauth_token(raw: &str, home: &Path, resource: &str) -> Re
     let grant = store.grants.get(&entry.family_id).ok_or(AuthError::UnknownKey)?;
     Ok(Principal {
         client_id: format!("oauth_{}", entry.client_id),
-        scopes: parse_scopes(&entry.scope.replace(' ', ","))?,
+        scopes: crate::mcp_auth::non_person_key_scopes(parse_scopes(&entry.scope.replace(' ', ","))?),
         is_external: true,
         created_at: chrono::DateTime::from_timestamp(grant.issued_unix, 0).ok_or(AuthError::UnknownKey)?,
     })

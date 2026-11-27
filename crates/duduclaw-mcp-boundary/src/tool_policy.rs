@@ -90,6 +90,10 @@ pub struct ToolPolicy {
 }
 
 pub const POLICIES: &[ToolPolicy] = &[
+    // Inventory only: the CLI's isolation disposition explicitly refuses
+    // person tools for every employee, even with a signed tool grant.
+    ToolPolicy { name: "my_tasks_list", route: Route::Service, required: &[ResourceKind::Employee] },
+    ToolPolicy { name: "my_agents_status", route: Route::Service, required: &[ResourceKind::Employee] },
     // google
     ToolPolicy { name: "google_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "gmail_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector, ResourceKind::Mailbox] },

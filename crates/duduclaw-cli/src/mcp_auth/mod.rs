@@ -82,6 +82,30 @@ pub(crate) enum PrincipalKind {
     Other,
 }
 
+impl PrincipalKind {
+    /// 141K-P6b will add the PersonKey arm. No existing key kind is a person.
+    pub(crate) fn is_person_key(&self) -> bool {
+        match self {
+            Self::GatewayInternal | Self::Stored { .. } | Self::Other => false,
+        }
+    }
+}
+
+/// Shared early listing/dispatch gate, before Admin and employee exemptions.
+/// Identity is taken only from the matching authentication decision.
+pub(crate) fn person_tool_refused(name: &str, principal: &Principal) -> bool {
+    duduclaw_core::mcp_person_tools::is_person_tool(name)
+        && !current_call_matches(principal).is_some_and(|call| call.kind().is_person_key())
+}
+
+/// 141K-P6b will retain these scopes only for PersonKey. Existing credentials
+/// (including hand-edited stored rows) never carry them. Odoo stays unchanged.
+pub(crate) fn non_person_key_scopes(mut scopes: HashSet<Scope>) -> HashSet<Scope> {
+    scopes.remove(&Scope::TasksRead);
+    scopes.remove(&Scope::AgentsStatus);
+    scopes
+}
+
 /// The same successful authentication that produced this call's principal.
 /// OAuth and explicitly unauthenticated calls have no Google execution receipt.
 #[derive(Debug, Clone)]
@@ -652,7 +676,7 @@ fn stored_principal(
     }
     // Same rule as the legacy registry: an unknown scope string (a newer
     // binary's row read by an older one) collapses to no scopes.
-    let scopes = parse_scopes(&key.scopes.join(",")).unwrap_or_default();
+    let scopes = non_person_key_scopes(parse_scopes(&key.scopes.join(",")).unwrap_or_default());
     // RM-134 fourth review (Medium 2): a key bound to an employee carries
     // only per-employee scopes, whatever its row says — `admin` (or any
     // other scope) on such a row never takes effect, so it can never stand
@@ -727,7 +751,7 @@ fn legacy_principal(entry: &KeyEntry) -> Result<Principal, AuthError> {
 
     Ok(Principal {
         client_id: entry.client_id.clone(),
-        scopes: entry.scopes.clone(),
+        scopes: non_person_key_scopes(entry.scopes.clone()),
         is_external: entry.is_external,
         created_at: entry.created_at,
     })

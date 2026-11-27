@@ -725,6 +725,10 @@ impl McpDispatcher {
         params: &Value,
         id: &Value,
     ) -> Value {
+        let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        if crate::mcp_auth::person_tool_refused(tool_name, principal) {
+            return jsonrpc_error(id, -32003, "This tool is only available to a personal key");
+        }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────
         // On the HTTP MCP server every non-external principal other than the
         // verified gateway-internal key is classified from its authenticated
@@ -2419,6 +2423,50 @@ mod tests {
             RateLimiter::new(),
             DailyQuota::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn person_tools_are_hidden_and_refused_for_every_existing_key_kind() {
+        use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let now = chrono::Utc::now();
+        let cases = [
+            ("admin", false, PrincipalKind::Stored { agent_binding: None, key_created_at: now }),
+            ("external", true, PrincipalKind::Stored { agent_binding: None, key_created_at: now }),
+            ("dudu", false, PrincipalKind::Stored { agent_binding: Some("dudu".into()), key_created_at: now }),
+            ("dudu", true, PrincipalKind::Stored { agent_binding: Some("dudu".into()), key_created_at: now }),
+            ("gateway-internal", false, PrincipalKind::GatewayInternal),
+            ("legacy", false, PrincipalKind::Other),
+            ("oauth_client", true, PrincipalKind::Other),
+            ("", false, PrincipalKind::Other),
+        ];
+        for (client, external, kind) in cases {
+            // Even fabricated Admin + person scopes cannot bypass the kind gate.
+            let mut principal = make_principal(vec![Scope::Admin, Scope::TasksRead, Scope::AgentsStatus], external);
+            principal.client_id = client.into();
+            for remote in [false, true] {
+                let call = AuthenticatedCall::without_reference(principal.clone()).with_kind(kind.clone());
+                let dispatcher = if remote { dispatcher.clone().for_remote_bearer() } else { dispatcher.clone() };
+                with_authenticated_call(call, async {
+                    let listed = crate::mcp::handle_tools_list_for_transport(
+                        &serde_json::json!(1), &principal, tmp.path(), "dudu", remote,
+                    ).await;
+                    let names = crate::mcp::advertised_tool_names(&listed);
+                    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+                        assert!(!names.iter().any(|name| name == tool.name), "{client}: {listed}");
+                        let response = dispatcher.dispatch_tool_call(
+                            &principal, &make_ns_ctx(external),
+                            &make_params(tool.name, serde_json::json!({"user_id":"another-person", "agent_id":"dudu"})),
+                            &serde_json::json!(2),
+                        ).await;
+                        assert_eq!(response["error"]["code"], -32003, "{client}: {response}");
+                        assert!(response["error"]["message"].as_str().unwrap().contains("only available to a personal key"),
+                            "{client}: {response}");
+                    }
+                }).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -5198,6 +5246,9 @@ effect = "forbid"
     /// Tools deliberately NOT governed by a `[permissions]` flag (read-only,
     /// self-scoped, or governed by their own capability / approval gates).
     const NOT_PERMISSION_GATED: &[&str] = &[
+        // Refused by the earlier personal-key gate, never employee permissions.
+        "my_tasks_list",
+        "my_agents_status",
         "activity_list",
         "activity_post",
         "agent_remove",
@@ -5486,7 +5537,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            271,
+            273,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

@@ -9,6 +9,14 @@ use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
+        name: "my_tasks_list",
+        description: "List only tasks visible to the personal key's holder. Requires a personal key; never acts as the server's employee.",
+        params: &[
+            ParamDef { name: "status", description: "Filter by task status, as in the dashboard task board", required: false },
+            ParamDef { name: "limit", description: "Maximum number of results (default 50)", required: false },
+        ],
+    },
+    ToolDef {
         name: "credential_declare",
         description: "Declare a service identifier for a credential you hold. Never supply a secret value. Administrator service labels take precedence.",
         params: &[
