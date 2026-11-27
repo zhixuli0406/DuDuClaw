@@ -552,6 +552,7 @@ pub mod skill_lifecycle;
 pub mod slack;
 pub mod stt;
 pub mod task_spec;
+mod chat_link_intercept;
 pub mod telegram;
 mod telegram_send;
 pub mod tts;

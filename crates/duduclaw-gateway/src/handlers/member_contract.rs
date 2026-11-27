@@ -444,6 +444,7 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
+        || method.split('.').take(2).eq(["me", "chat_link"])
         || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));
     if excluded { return None; }
     MEMBER_CONTRACT_METHODS.iter().find(|entry| entry.name == method).map(|entry| entry.kind)
@@ -452,6 +453,15 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
 #[cfg(test)]
 mod member_key_tests {
     use super::*;
+    #[test]
+    fn chat_link_methods_are_never_in_member_key_contract() {
+        for method in ["me.chat_link.start", "me.chat_link.status", "me.chat_link.confirm",
+            "me.chat_link.cancel", "me.chat_link.reject", "me.chat_link.list", "me.chat_link.remove",
+            "me.chat_link.future"] {
+            assert_eq!(member_key_method(method), None, "{method}");
+            assert!(!MEMBER_CONTRACT_METHODS.iter().any(|entry| entry.name == method));
+        }
+    }
     #[test]
     fn keys_use_contract_intersected_with_credential_exclusions() {
         for method in ["users.change_password", "users.change_email", "me.status_tokens.list",

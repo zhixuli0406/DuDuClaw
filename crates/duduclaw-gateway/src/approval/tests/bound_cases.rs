@@ -570,6 +570,7 @@ async fn corrupt_non_null_binding_never_downgrades_to_legacy_authority() {
 mod store_identity_cases;
 mod preset_policy_cases;
 mod resume_cases;
+mod chat_admin_cases;
 mod f1b_cases;
 mod stop_case;
 
