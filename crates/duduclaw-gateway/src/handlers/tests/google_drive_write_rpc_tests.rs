@@ -181,7 +181,11 @@ async fn all_off_is_signed_and_hand_edit_invalidates_effective_switches() {
 #[tokio::test]
 async fn raw_editor_and_shared_commit_only_allow_whole_section_removal() {
     let (dir, h) = fixture().await;
-    ok(rpc(&h, "google.drive_write.set", input(), &admin()).await);
+    let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+    let user = db.create_user("admin@example.test", "Admin", "fixture-password", UserRole::Admin).unwrap();
+    let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+    let refusal = "請到 Google 整合設定頁調整雲端硬碟寫入權限。";
+    ok(rpc(&h, "google.drive_write.set", input(), &ctx).await);
     let path = dir.path().join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap();
     let before = raw.parse::<toml::Table>().unwrap();
@@ -190,16 +194,20 @@ async fn raw_editor_and_shared_commit_only_allow_whole_section_removal() {
         let mut changed = before.clone();
         if key == "trash" { changed["google"]["drive_write"]["trash"] = toml::Value::Boolean(true); }
         else { changed["google"]["drive_write"]["ack"]["by_email"] = toml::Value::String("forged@test.invalid".into()); }
-        assert!(guard(&before, &changed).is_err());
+        assert_eq!(guard(&before, &changed).unwrap_err(), refusal);
         assert!(super::super::config_commit::commit_table_locked(&path,
-            super::super::config_commit::content_hash(&raw), &changed).await.is_err());
-        refused(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&changed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &admin()).await);
+            super::super::config_commit::content_hash(&raw), &changed).await.unwrap_err().contains(refusal));
+        let response = rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&changed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &ctx).await;
+        match response {
+            WsFrame::Response { ok:false, error:Some(error), .. } => assert_eq!(error.as_str(), Some(refusal)),
+            other => panic!("expected Drive write refusal: {other:?}"),
+        }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
     let mut removed = before.clone(); removed["google"].as_table_mut().unwrap().remove("drive_write");
     assert!(guard(&before, &removed).is_ok());
-    assert!(guard(&removed, &before).is_err());
-    ok(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&removed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &admin()).await);
+    assert_eq!(guard(&removed, &before).unwrap_err(), refusal);
+    ok(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&removed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &ctx).await);
     assert_eq!(policy::load(dir.path()), policy::DriveWritePolicy::all_off());
 }
 

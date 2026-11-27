@@ -768,6 +768,7 @@ impl SelectedConnector {
     pub fn select_with_policy(context: &RequestContext, tool: &str, arguments: &Value,
         bindings: Arc<dyn BindingAuthority>, catalog: Arc<ConnectorCatalog>,
         product_policy: Option<Arc<dyn LiveConnectorSelectionPolicy>>) -> Result<Self, VerificationError> {
+        if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Err(VerificationError::Unavailable); }
         let provider = provider_for_tool(tool).ok_or(VerificationError::Invalid)?;
         let employee_scope = context.record().employee_scope()
             && duduclaw_mcp_boundary::tool_policy::policy(tool)

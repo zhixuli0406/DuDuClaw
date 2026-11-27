@@ -1058,7 +1058,7 @@ mod live_assignee_tests {
                 if id == "same" && malformed {
                     match frame {
                         WsFrame::Response { ok: false, error: Some(error), .. } => {
-                            assert!(error["message"].as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+                            assert!(error.as_str().unwrap().contains("agent_config_unreadable"), "{error}");
                         }
                         other => panic!("expected refusal: {other:?}"),
                     }
@@ -1121,7 +1121,7 @@ mod main_assignment_tests {
 
     fn error(frame: WsFrame) -> String {
         match frame {
-            WsFrame::Response { ok: false, error: Some(error), .. } => error["message"].as_str().unwrap().into(),
+            WsFrame::Response { ok: false, error: Some(error), .. } => error.as_str().unwrap().into(),
             other => panic!("expected refusal: {other:?}"),
         }
     }
@@ -1135,7 +1135,8 @@ mod main_assignment_tests {
         let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
         let employee = db.create_user("emp@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
-        let ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        let mut ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        ctx.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
         handler.registry.write().await.scan().await.unwrap();
@@ -1144,26 +1145,30 @@ mod main_assignment_tests {
         let params = json!({"title":"work", "assigned_to":"main"});
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
         db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
-        assert!(handler.main_assignment_admitted(&ctx, "main").await);
-        assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
-        for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
-            let mut scheduled = params.clone();
-            scheduled["schedule"] = json!(schedule);
-            assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
-            assert_eq!(error(handler.handle_tasks_goal_create(json!({
-                "agent_id":"main", "description":"work", "schedule":schedule
-            }), &ctx).await), "主代理僅管理員可以使用。");
-        }
-        let rows = store.list_tasks(None, None, None).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
-        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
-            "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
-        handler.registry.write().await.scan().await.unwrap();
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
-        assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
-            WsFrame::Response { ok: true, .. }));
-        db.set_main_agent_users(&admin.id, &[], true).unwrap();
-        assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
+        crate::isolation_io_test_support::with_isolation(async {
+            assert!(handler.main_assignment_admitted(&ctx, "main").await);
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+            for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
+                let mut scheduled = params.clone();
+                scheduled["schedule"] = json!(schedule);
+                assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
+                assert_eq!(error(handler.handle_tasks_goal_create(json!({
+                    "agent_id":"main", "description":"work", "schedule":schedule
+                }), &ctx).await), "主代理僅管理員可以使用。");
+            }
+            let rows = store.list_tasks(None, None, None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
+            crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+                "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+            handler.registry.write().await.scan().await.unwrap();
+            // Tool names do not replace the protected-mode requirement.
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
+                WsFrame::Response { ok: true, .. }));
+            db.set_main_agent_users(&admin.id, &[], true).unwrap();
+            assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
+        }).await;
     }
 }

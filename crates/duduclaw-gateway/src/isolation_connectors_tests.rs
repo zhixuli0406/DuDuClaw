@@ -737,6 +737,6 @@ fn isolated_drive_writes_refused_before_product_selection() {
         assert_eq!(provider_for_tool(name), None, "{name}");
         assert!(matches!(SelectedConnector::select_with_policy(&context, name, &json!({}),
             bindings.clone(), catalog.clone(), Some(Arc::new(UnexpectedSelection))),
-            Err(VerificationError::Invalid)), "{name}");
+            Err(VerificationError::Unavailable)), "{name}");
     }
 }

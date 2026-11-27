@@ -260,7 +260,8 @@ async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
             if case.healthy() {
                 assert_eq!(f.calls.load(Ordering::SeqCst), 1);
                 if case.public() {
-                    assert_eq!(text, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+                    assert!(text.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{text}");
+                    assert!(!text.contains("原因代碼"), "{text}");
                 } else {
                     assert!(text.contains("Actual Worker"), "{text}");
                 }
@@ -420,7 +421,9 @@ async fn all_entries_share_the_effective_configuration_contract() {
                     assert!(!outcome.proceeded, "{} {case:?}", row.name);
                     let refusal = outcome.refusal.expect(row.name);
                     if case.public() {
-                        assert_eq!(refusal, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE, "{} {case:?}", row.name);
+                        assert!(refusal.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{} {case:?}: {refusal}", row.name);
+                        assert!(!refusal.contains(f.expected_code.unwrap()), "{refusal}");
+                        assert!(!refusal.contains("原因代碼"), "{refusal}");
                     } else {
                         assert!(refusal.contains(f.expected_code.unwrap()), "{} {case:?}: {refusal}", row.name);
                     }

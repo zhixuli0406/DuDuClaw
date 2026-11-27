@@ -79,7 +79,7 @@ fn methods(f: &Fixture, channel: &str, exempt: &[&str], enabled_methods: &[&str]
     f.config(true, channel, exempt);
     let path = f.env.home.join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap()
-        .replace("[approval.chat_admin]", "googlechat_project_number='1'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
+        .replace("[approval.chat_admin]", "googlechat_project_number='123456789012'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
     std::fs::write(path, format!("{raw}step_up_methods={}\n", serde_json::to_string(enabled_methods).unwrap())).unwrap();
     if channel == "googlechat" {
         f.db().bind_channel_identity(&f.user, "googlechat", "users/123", true).unwrap();

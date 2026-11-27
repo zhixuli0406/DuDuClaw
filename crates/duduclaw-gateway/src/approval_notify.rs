@@ -561,7 +561,7 @@ async fn push_dashboard_only_targets(
         // Re-read owner and destinations at delivery time. Never reuse a
         // queued content preview after an ACL or identity change.
         let uid = if kb {
-            crate::decision_notify::open_user_db(home_dir).ok().flatten().and_then(|db| {
+            crate::decision_notify::open_user_db_read_only(home_dir).ok().flatten().and_then(|db| {
                 db.list_users().ok()?.into_iter().find_map(|u| {
                     db.verified_dm_destinations_for_user(&u.id).ok()?.iter()
                         .any(|d| d.channel == channel && d.channel_user_id == chat_id).then_some(u.id)

@@ -172,11 +172,14 @@ async fn assert_unverified(f: &Fixture, before: &vault::Record) {
 #[tokio::test]
 async fn google_token_refresh_without_scope_with_write_credential_uses_tokeninfo_scopes() {
     let f = ready().await;
-    let before = expire(&f, "missing").await;
+    let old = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
     let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
-    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
-    let mut scopes = before.metadata.granted_scopes.clone();
+    let secret = vault::unseal(&key, &old).unwrap();
+    let mut scopes = old.metadata.granted_scopes.clone();
     scopes.push(oauth::DRIVE_TOOLS_SCOPE.into());
+    assert!(vault::finish_refresh_with_scopes(&f.home, &key, &old.metadata, &secret, Some(&scopes)).unwrap());
+    let before = expire(&f, "missing").await;
+    install_write_credential(&f.home, &key, "user", &f.alice.id, &before.metadata.oauth_client_id);
     let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id,
         Some(&scopes.join(" "))).await;
     let (status, response) = oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), request(&f)).await;
@@ -194,7 +197,12 @@ async fn google_token_refresh_without_scope_and_unreadable_write_store_fails_clo
     let before = expire(&f, "missing").await;
     std::fs::write(vault::write_store::path(&f.home), "invalid-json").unwrap();
     let wire = TokeninfoWire::new("isolation-fresh-secret", &before.metadata.oauth_client_id, None).await;
-    oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), assert_unverified(&f, &before)).await;
+    let (status, response) = oauth::TEST_TOKENINFO_URL.scope(wire.url.clone(), request(&f)).await;
+    assert_eq!(status, 403);
+    assert_eq!(response["code"], "config_invalid");
+    assert!(response.get("access_token").is_none());
+    let current = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+    assert_eq!(current.metadata.revision, before.metadata.revision);
     assert_eq!(wire.calls(), 0);
 }
 

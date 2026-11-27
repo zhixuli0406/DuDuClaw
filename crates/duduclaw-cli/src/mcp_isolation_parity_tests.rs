@@ -680,6 +680,10 @@ fn every_connector_checks_executor_for_its_effective_route() {
         .filter(|p| p.route == Route::Connector).collect();
     assert!(connectors.len() > 28, "must cover providers beyond Google/Notion/GitHub");
     for policy in connectors {
+        if duduclaw_gateway::isolation_connectors::intentionally_refused_connector(policy.name) {
+            assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_none(), "{}", policy.name);
+            continue;
+        }
         assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_some(), "{}", policy.name);
         dispatcher.services = Some(Arc::new(WithoutOne { omitted: policy.name, inner: complete.clone() }));
         let state = dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1;

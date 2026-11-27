@@ -308,8 +308,8 @@ impl GoalLoopDriver {
             // The autonomy gate does not validate provider/model compatibility.
             // Refuse every admitted candidate before kickoff or planning can run.
             if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
-                let error = crate::entry_gate::background_refusal(&refusal);
-                self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
                 active = inflight.len();
                 continue;
             }
@@ -547,8 +547,8 @@ impl GoalLoopDriver {
                 continue;
             }
             if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
-                let error = crate::entry_gate::background_refusal(&refusal);
-                self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
                 active = inflight.len();
                 continue;
             }
@@ -1110,8 +1110,8 @@ impl GoalLoopDriver {
                 if let Some(lease) = acquired_lease.take() {
                     duduclaw_core::concurrency_release(&self.home_dir, &lease);
                 }
-                let error = crate::entry_gate::background_refusal(&refusal);
-                self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
                 active = inflight.len();
                 continue;
             }
@@ -1136,24 +1136,8 @@ impl GoalLoopDriver {
                     if let Some(lease) = acquired_lease.take() {
                         duduclaw_core::concurrency_release(&self.home_dir, &lease);
                     }
-                    let entry_error = if crate::entry_gate::background_refusal_code(&detail).is_some() {
-                        Some(detail.clone())
-                    } else {
-                        crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to).err()
-                            .map(|refusal| crate::entry_gate::background_refusal(&refusal))
-                    };
-                    if let Some(error) = entry_error {
-                        self.on_dispatch_failed(&mut inflight, &task.id, &error).await?;
-                        active = inflight.len();
-                        continue;
-                    }
-                    self.escalate(
-                        &mut inflight,
-                        task,
-                        &detail,
-                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
-                    )
-                    .await?;
+                    self.handle_dispatch_failure(&mut inflight, &task.id,
+                        dispatch::DispatchFailure::TeamConfig(&detail)).await?;
                     active = inflight.len();
                     continue;
                 }

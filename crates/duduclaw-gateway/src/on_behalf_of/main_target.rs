@@ -145,7 +145,7 @@ pub fn requires_main_restriction(home: &Path, principal: Option<&str>) -> Result
         super::super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
         super::super::PrincipalState::Unknown => return Err(REFUSAL.into()),
     };
-    let db = crate::decision_notify::open_user_db(home)
+    let db = crate::decision_notify::open_user_db_read_only(home)
         .map_err(|_| REFUSAL.to_owned())?.ok_or_else(|| REFUSAL.to_owned())?;
     let account = db.get_user(&user).map_err(|_| REFUSAL.to_owned())?
         .ok_or_else(|| REFUSAL.to_owned())?;

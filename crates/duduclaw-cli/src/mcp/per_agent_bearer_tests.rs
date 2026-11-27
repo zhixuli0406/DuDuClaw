@@ -500,9 +500,11 @@ fn predicate_refuses_the_union_to_every_non_gateway_internal_principal() {
         .chain(super::KNOWLEDGE_TOOLS)
         .chain(["odoo_search", "odoo_create"].iter())
     {
+        // Admin settings require attended stdio proof and refuse all HTTP keys.
+        let admin_settings = super::admin_ai_client::TOOLS.contains(name);
         assert!(remote_process_agent_tool_refused(name, &alice, Some(&bound("alice")), "bob"), "{name}");
-        assert!(!remote_process_agent_tool_refused(name, &internal, Some(&gw), "bob"), "internal: {name}");
-        assert!(!remote_process_agent_tool_refused(name, &external, None, "bob"), "external: {name}");
+        assert_eq!(remote_process_agent_tool_refused(name, &internal, Some(&gw), "bob"), admin_settings, "internal: {name}");
+        assert_eq!(remote_process_agent_tool_refused(name, &external, None, "bob"), admin_settings, "external: {name}");
         // Formerly pinned as allowed ("not an employee"): now refused.
         assert!(remote_process_agent_tool_refused(name, &alias, Some(&unbound()), "bob"), "alias: {name}");
         assert!(remote_process_agent_tool_refused(name, &alice, None, "bob"), "no authority decision: {name}");

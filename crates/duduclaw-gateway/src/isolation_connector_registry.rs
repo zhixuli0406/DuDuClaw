@@ -1,5 +1,6 @@
-//! Boot registry for account-bound provider adapters. A registered adapter must
-//! implement both live product selection and execution for its declared tools.
+//! Boot registry for account-bound provider adapters supporting selection and execution.
+//! Intentionally refused Connector routes (Drive writes) count as covered without
+//! any adapter and never select a provider.
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use duduclaw_mcp_boundary::{tool_policy::{AuthorizedToolCall, POLICIES, Route}, RequestContext, VerificationError};
 use serde_json::Value;
@@ -14,8 +15,9 @@ struct Adapter {
 #[derive(Default)]
 pub struct ConnectorProviderRegistry { adapters: BTreeMap<&'static str, Adapter> }
 impl ConnectorProviderRegistry {
-    /// Registration is explicit and immutable after boot. Overlap, unknown
-    /// tools and a policy/executor disagreement all refuse the registration.
+    /// Registration is explicit and immutable after boot. Overlap, unknown tools
+    /// and a policy/executor disagreement refuse registration. Intentionally refused
+    /// Connector routes (Drive writes) need no adapter and never select a provider.
     pub fn register(&mut self, tools: &[&'static str], policy: Arc<dyn LiveConnectorSelectionPolicy>,
         executor: Arc<dyn BoundConnectorExecutor>) -> Result<(), VerificationError> {
         let mut seen = std::collections::BTreeSet::new();
@@ -27,8 +29,8 @@ impl ConnectorProviderRegistry {
         for tool in tools { self.adapters.insert(tool, Adapter { policy: policy.clone(), executor: executor.clone() }); }
         Ok(())
     }
-    /// Register a whole provider atomically. Partial policy/executor support
-    /// refuses before changing the registry; the table is the sole inventory.
+    /// Register a whole provider atomically. Partial support for executable
+    /// tools refuses before changing the registry; the table is the inventory.
     pub fn register_provider(&mut self, provider: &str,
         policy: Arc<dyn LiveConnectorSelectionPolicy>, executor: Arc<dyn BoundConnectorExecutor>)
         -> Result<(), VerificationError> {
@@ -47,7 +49,8 @@ impl ConnectorProviderRegistry {
             .map(|p| p.name).collect()
     }
     fn ready(&self, tool: &str) -> bool {
-        self.adapters.get(tool).is_some_and(|a| a.policy.supports(tool) && a.executor.supports(tool))
+        !duduclaw_core::google_identity::is_drive_write_tool(tool)
+            && self.adapters.get(tool).is_some_and(|a| a.policy.supports(tool) && a.executor.supports(tool))
     }
 }
 impl LiveConnectorSelectionPolicy for ConnectorProviderRegistry {
@@ -68,6 +71,7 @@ impl BoundConnectorExecutor for ConnectorProviderRegistry {
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
+            if duduclaw_core::google_identity::is_drive_write_tool(call.name()) { return Err(VerificationError::Unavailable); }
             selected.verify_call(&call)?;
             if !self.ready(call.name()) { return Err(VerificationError::Unavailable); }
             let executor = &self.adapters.get(call.name()).ok_or(VerificationError::Unavailable)?.executor;
@@ -120,11 +124,15 @@ mod tests {
         assert!(registry.register_provider("unrecognized", Arc::new(AdapterStub), Arc::new(AdapterStub)).is_err());
         struct Complete;
         impl LiveConnectorSelectionPolicy for Complete {
-            fn supports(&self, tool: &str) -> bool { provider_for_tool(tool).is_some() }
+            fn supports(&self, tool: &str) -> bool {
+                !duduclaw_core::google_identity::is_drive_write_tool(tool) && provider_for_tool(tool).is_some()
+            }
             fn candidates(&self, _: &RequestContext, _: &str, _: &str) -> Result<Vec<ProductConnectorAccount>, VerificationError> { Ok(vec![]) }
         }
         impl BoundConnectorExecutor for Complete {
-            fn supports(&self, tool: &str) -> bool { provider_for_tool(tool).is_some() }
+            fn supports(&self, tool: &str) -> bool {
+                !duduclaw_core::google_identity::is_drive_write_tool(tool) && provider_for_tool(tool).is_some()
+            }
             fn execute<'a>(&'a self, _: SelectedConnector, _: AuthorizedToolCall)
                 -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
                 Box::pin(async { Err(VerificationError::Unavailable) })
@@ -132,6 +140,10 @@ mod tests {
         }
         for provider in ["google", "notion", "github", "odoo", "database", "channel", "search", "model", "computer"] {
             registry.register_provider(provider, Arc::new(Complete), Arc::new(Complete)).unwrap();
+        }
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert!(!LiveConnectorSelectionPolicy::supports(&registry, tool), "{tool}");
+            assert!(!BoundConnectorExecutor::supports(&registry, tool), "{tool}");
         }
         assert!(registry.missing_tools().is_empty());
         assert!(registry.require_complete().is_ok());

@@ -142,6 +142,12 @@ where F: FnOnce(&duduclaw_auth::UserDb, &std::path::Path, &str, &str, i64) -> Re
     let (home, db, current) = (env.home.clone(), env.users.clone(), row.clone());
     let verified = tokio::task::spawn_blocking(move || -> Result<Option<i64>, Error> {
         let db = db.as_deref().ok_or_else(Error::forbidden)?;
+        // A live setting can disable an already-issued prompt. Refuse before
+        // verifying the factor or changing ticket status/attempts.
+        if !config::effective(&home, Some(db))
+            .is_some_and(|cfg| cfg.step_up_methods.contains(&config::StepMethod::DmTotp)) {
+            return Err(Error::forbidden());
+        }
         if !has_totp(db, &bound.ticket.user_id)? { return Err(Error::forbidden()); }
         if crate::approval::decision_digest_at(&home, &current) != bound.ticket.digest { return Err(Error::digest()); }
         let mut store = Store::open(&home)?;
