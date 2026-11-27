@@ -24,13 +24,6 @@ fn assert_success(method: &str, frame: WsFrame) {
 
 fn admin_only_params(method: &str) -> Value {
     match method {
-        "autopilot.create" => json!({
-            "name": "matrix rule", "trigger_event": "task_created", "conditions": {},
-            "action": {"type": "notify", "channel": "webchat", "chat_id": "matrix", "text": "matrix"}, "agent_id": "a1",
-        }),
-        "autopilot.update" | "autopilot.remove" | "autopilot.history" => {
-            json!({"rule_id": "matrix-rule", "enabled": false, "agent_id": "a1"})
-        }
         "skills.install" => json!({"scope": "a1", "content": MATRIX_SKILL}),
         _ => json!({"agent_id": "a1", "days": 7, "limit": 10}),
     }
@@ -789,3 +782,6 @@ async fn creator_access_lost_assign_schedules_keep_running_after_revocation() {
         }
     }
 }
+
+#[path = "dept_automation_tests.rs"]
+mod automation;

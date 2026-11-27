@@ -30,13 +30,12 @@ pub(crate) const METHOD_COVERAGE: &[(&str, GrantGroup, Coverage)] = &[
     ("cron.templates", Schedules, NotDelegated("no agent data")),
     ("heartbeat.trigger", Schedules, NotDelegated("pending: binding check lands with the MGR-1 fix; grant alternative added after it merges")),
     ("heartbeat.status", Schedules, NotDelegated("company-wide summary, unchanged in v1.86")),
-    // Schema migration pending: list/create/update/remove/history become Scoped
-    // with the department-rule package; breakers and ticks remain AdminOnly.
-    ("autopilot.list", Automation, AdminOnly),
-    ("autopilot.create", Automation, AdminOnly),
-    ("autopilot.update", Automation, AdminOnly),
-    ("autopilot.remove", Automation, AdminOnly),
-    ("autopilot.history", Automation, AdminOnly),
+    // Rules are department-scoped; breakers and ticks remain AdminOnly.
+    ("autopilot.list", Automation, Scoped(Read)),
+    ("autopilot.create", Automation, Scoped(Create)),
+    ("autopilot.update", Automation, Scoped(Edit)),
+    ("autopilot.remove", Automation, Scoped(Remove)),
+    ("autopilot.history", Automation, Scoped(Read)),
     ("autopilot.breakers", Automation, AdminOnly),
     ("ticks.sources", Automation, AdminOnly),
     ("ticks.recent", Automation, AdminOnly),

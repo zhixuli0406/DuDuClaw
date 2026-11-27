@@ -927,14 +927,13 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_budget_incidents(params, ctx)).await
             }
 
-            // ── Autopilot (admin only) ──────────────────────
+            // ── Autopilot (department-scoped rules; admin-only breakers) ──────────────────────
             "autopilot.breakers" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_breakers()).await
             }
             "autopilot.list" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_list()).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
 
             _ => boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await,

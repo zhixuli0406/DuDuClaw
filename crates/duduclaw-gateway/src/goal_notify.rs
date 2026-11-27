@@ -55,16 +55,26 @@ use crate::task_store::{ActivityRow, TaskRow, TaskStore};
 /// convention proactive-style pushes already use here, rather than a second
 /// resolver reading a different config shape.
 pub(crate) fn agent_notify_target(home_dir: &Path, agent_id: &str) -> Option<(String, String)> {
+    try_agent_notify_target(home_dir, agent_id).ok().flatten()
+}
+
+/// Authorization callers must distinguish an absent destination from a read error.
+pub(crate) fn try_agent_notify_target(home_dir: &Path, agent_id: &str)
+    -> Result<Option<(String, String)>, ()>
+{
     let agent_toml = home_dir.join("agents").join(agent_id).join("agent.toml");
-    let content = std::fs::read_to_string(&agent_toml).ok()?;
-    let table: toml::Value = content.parse().ok()?;
-    let proactive = table.get("proactive").and_then(|v| v.as_table())?;
-    let channel = proactive.get("notify_channel").and_then(|v| v.as_str())?;
-    let chat_id = proactive.get("notify_chat_id").and_then(|v| v.as_str())?;
+    let content = std::fs::read_to_string(&agent_toml).map_err(|_| ())?;
+    let table: toml::Value = content.parse().map_err(|_| ())?;
+    let Some(proactive) = table.get("proactive") else { return Ok(None); };
+    let proactive = proactive.as_table().ok_or(())?;
+    let (Some(channel), Some(chat_id)) = (proactive.get("notify_channel"), proactive.get("notify_chat_id"))
+        else { return Ok(None); };
+    let channel = channel.as_str().ok_or(())?;
+    let chat_id = chat_id.as_str().ok_or(())?;
     if channel.trim().is_empty() || chat_id.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
-    Some((channel.to_string(), chat_id.to_string()))
+    Ok(Some((channel.to_string(), chat_id.to_string())))
 }
 
 /// Resolve the bot token for `channel`: the agent's own (walking `reports_to`)

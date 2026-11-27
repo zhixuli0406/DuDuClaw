@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 
 mod runs;
+mod department;
 pub use runs::{
     AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, RunNext,
     is_known_run_state, run_ts, step_idempotency_key,
@@ -482,8 +483,28 @@ impl AutopilotStore {
         id: &str,
         fields: &serde_json::Value,
     ) -> Result<Option<AutopilotRuleRow>, String> {
+        self.update_rule_inner(id, fields, false).await
+    }
+
+    /// Legacy RPC admission must not race a typed department reassignment.
+    pub(crate) async fn update_company_rule(
+        &self, id: &str, fields: &serde_json::Value,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        self.update_rule_inner(id, fields, true).await
+    }
+
+    async fn update_rule_inner(
+        &self, id: &str, fields: &serde_json::Value, company_only: bool,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
         let conn = self.conn.lock().await;
         in_immediate_tx(&conn, "update rule", |conn| {
+            if company_only {
+                let current = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                    .optional().map_err(|e| format!("read rule scope: {e}"))?;
+                if current.is_some_and(|row| row.owner_department.is_some()) {
+                    return Err("permission denied".into());
+                }
+            }
             let mut sets: Vec<String> = Vec::new();
             let mut binds: Vec<String> = Vec::new();
 

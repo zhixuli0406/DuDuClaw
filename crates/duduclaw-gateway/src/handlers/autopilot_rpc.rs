@@ -153,7 +153,7 @@ impl MethodHandler {
                 }
             }
         }
-        match store.update_rule(rule_id, &params).await {
+        match store.update_company_rule(rule_id, &params).await {
             Ok(Some(row)) => {
                 WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) }))
             }
