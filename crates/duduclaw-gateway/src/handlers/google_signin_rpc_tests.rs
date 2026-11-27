@@ -145,6 +145,48 @@ async fn disable_needs_no_step_up() {
 }
 
 #[tokio::test]
+async fn concurrent_tightening_survives_unauthenticated_disable() {
+    let f = fixture().await;
+    let now = Utc::now().to_rfc3339();
+    let old = SettingsUpdate {
+        enabled: true, allowed_hd: vec!["company.test".into(), "other.test".into()],
+        approval: Approval::Direct, daily_new_accounts: 100,
+        avatar_template: AvatarTemplate::Company { key: "sales".into(), revision: 7 },
+        approval_grants_mfa_enrollment: true,
+    };
+    config::write_settings(f.home.path(), &f.admin.user_id, &old, true, &now).unwrap();
+    let mut stale_disable = old.clone();
+    stale_disable.enabled = false;
+    // Run the production exemption decision before the other admin tightens.
+    let pure_disable = is_pure_disable(f.home.path(), &stale_disable);
+    assert!(pure_disable);
+    assert!(step_up(&f.db, &f.admin, &f.session, None).is_err());
+    let other_admin = f.db.create_user("other-admin@company.test", "Other admin", "password123", UserRole::Admin).unwrap();
+    let tightened = SettingsUpdate {
+        allowed_hd: vec!["company.test".into()], approval: Approval::Admin,
+        daily_new_accounts: 5, approval_grants_mfa_enrollment: false, ..old
+    };
+    let (_, tightened_before_disable) = config::write_settings(
+        f.home.path(), &other_admin.id, &tightened, true, &now,
+    ).unwrap();
+    assert!(tightened_before_disable.enabled);
+    // Resume the same production write branch with the stale exemption result.
+    let (before, after) = apply_settings(
+        f.home.path(), &f.admin.user_id, &stale_disable, pure_disable, false, &now,
+    ).unwrap();
+    assert_eq!(before, tightened_before_disable);
+    assert_eq!(after, config::read_strict(f.home.path()));
+    assert!(!after.enabled);
+    assert!(!after.enabled_requested);
+    assert!(after.ack.is_none());
+    assert_eq!(after.allowed_hd, tightened.allowed_hd);
+    assert_eq!(after.approval, Approval::Admin);
+    assert_eq!(after.daily_new_accounts, 5);
+    assert_eq!(after.avatar_template, tightened.avatar_template);
+    assert!(!after.approval_grants_mfa_enrollment);
+}
+
+#[tokio::test]
 async fn disable_with_other_changes_needs_step_up() {
     let f = fixture().await;
     f.fresh_proof();
