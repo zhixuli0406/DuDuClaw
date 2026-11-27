@@ -48,7 +48,7 @@ fn text(value: &str, max: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn identifier(value: &str) -> bool {
+pub(crate) fn identifier(value: &str) -> bool {
     !value.is_empty() && value.len() <= 64
         && value.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }

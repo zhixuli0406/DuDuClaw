@@ -9,6 +9,17 @@ pub struct AvatarConflict {
     pub user_ids: Vec<String>,
 }
 
+/// Authority for publishing a new Personal avatar; never accepted from client JSON.
+pub enum AvatarActor<'a> {
+    Admin(&'a str),
+    SigninPolicy {
+        revision: &'a str,
+        /// Re-read strict gateway settings and require sign-in enabled at this
+        /// revision. Runs under the user DB transaction; must not re-enter it.
+        policy_check: &'a dyn Fn() -> Result<(), String>,
+    },
+}
+
 /// The column and backfill commit together. Reopening never assigns an avatar
 /// that an administrator deliberately cleared after the upgrade.
 pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
@@ -278,6 +289,17 @@ impl UserDb {
         admission: &duduclaw_core::agent_seats::SeatAdmission, max: usize,
         publish: impl FnOnce(&Connection) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.publish_new_avatar_under_as(AvatarActor::Admin(actor), member, agent, admission, max, publish)
+    }
+
+    /// Publish a NEW Personal avatar under live admin or Google onboarding
+    /// authority. All identity changes and onboarding completion commit together.
+    /// The caller must remove its newly published directory on recount/commit failure.
+    pub fn publish_new_avatar_under_as(
+        &self, actor: AvatarActor<'_>, member: &str, agent: &str,
+        admission: &duduclaw_core::agent_seats::SeatAdmission, max: usize,
+        publish: impl FnOnce(&Connection) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.home.as_deref() != Some(admission.home()) {
             return Err("分身名額資料來源不一致，未建立。".into());
         }
@@ -287,12 +309,26 @@ impl UserDb {
         }
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1
-            AND role='admin' AND status='active')", [actor], |r| r.get(0)).map_err(|e| e.to_string())?;
-        if !admin { return Err("avatar_admin_required".into()); }
+        match &actor {
+            AvatarActor::Admin(id) => {
+                let admin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1
+                    AND role='admin' AND status='active')", [id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if !admin { return Err("avatar_admin_required".into()); }
+            }
+            AvatarActor::SigninPolicy { .. } => {
+                let signin: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM user_onboarding
+                    WHERE user_id=?1 AND source='google_signin')
+                    AND EXISTS(SELECT 1 FROM google_signin_links WHERE user_id=?1)",
+                    [member], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if !signin { return Err("avatar_signin_required".into()); }
+            }
+        }
         let eligible: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1
             AND status='active' AND avatar_agent_id IS NULL)", [member], |r| r.get(0)).map_err(|e| e.to_string())?;
         if !eligible { return Err("成員必須啟用且尚未設定 AI 分身。".into()); }
+        if let AvatarActor::SigninPolicy { policy_check, .. } = &actor {
+            policy_check()?;
+        }
         let stale: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM user_agent_bindings WHERE agent_name=?1)
             OR EXISTS(SELECT 1 FROM isolation_personal_agents WHERE agent_name=?1)
             OR EXISTS(SELECT 1 FROM users WHERE avatar_agent_id=?1)", [agent], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -305,8 +341,15 @@ impl UserDb {
         check_available(&tx, member, agent)?;
         tx.execute("UPDATE users SET avatar_agent_id=?1, primary_agent_id=?1, updated_at=?2 WHERE id=?3",
             params![agent, now, member]).map_err(|e| e.to_string())?;
+        tx.execute("UPDATE user_onboarding SET avatar='done' WHERE user_id=?1 AND source='google_signin'",
+            [member]).map_err(|e| e.to_string())?;
+        let (audit_actor, detail) = match actor {
+            AvatarActor::Admin(id) => (id, agent.to_owned()),
+            AvatarActor::SigninPolicy { revision, .. } => ("system:google_signin",
+                serde_json::json!({ "agent": agent, "revision": revision }).to_string()),
+        };
         tx.execute("INSERT INTO auth_audit_log(user_id,action,target,detail,timestamp)
-            VALUES(?1,'user.create_avatar',?2,?3,?4)", params![actor, member, agent, now]).map_err(|e| e.to_string())?;
+            VALUES(?1,'user.create_avatar',?2,?3,?4)", params![audit_actor, member, detail, now]).map_err(|e| e.to_string())?;
         bump_acl_generation(&tx).map_err(|e| e.to_string())?;
         crate::avatar_seats::grant_personal_incarnation(&tx, agent, member)?;
         admission.recount_in(&tx, max)?;

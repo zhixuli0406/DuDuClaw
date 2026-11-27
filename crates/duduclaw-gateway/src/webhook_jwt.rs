@@ -155,6 +155,51 @@ pub async fn verify_rs256(
     expected_issuer: &str,
     expected_audience: &str,
 ) -> Result<serde_json::Value, String> {
+    verify_rs256_impl(http, token, jwks_url, &[expected_issuer], expected_audience, 300, None).await
+}
+
+/// Verify RS256 against an explicit issuer allowlist, sharing the webhook
+/// cache and rotation limiter. Errors never expose provider or claim values.
+pub async fn verify_rs256_any_issuer(
+    http: &reqwest::Client,
+    token: &str,
+    jwks_url: &str,
+    issuers: &[&str],
+    audience: &str,
+    leeway_secs: u64,
+) -> Result<serde_json::Value, String> {
+    verify_rs256_impl(http, token, jwks_url, issuers, audience, leeway_secs, None)
+        .await.map_err(|_| "JWT verification failed".to_owned())
+}
+
+/// OIDC uses one caller-supplied clock for exp, iat and reauthentication.
+/// Signature/issuer/audience checks are identical to the public variant;
+/// expiration is checked here instead of against jsonwebtoken's wall clock.
+pub(crate) async fn verify_rs256_any_issuer_at(
+    http: &reqwest::Client,
+    token: &str,
+    jwks_url: &str,
+    issuers: &[&str],
+    audience: &str,
+    leeway_secs: u64,
+    now: i64,
+) -> Result<serde_json::Value, String> {
+    verify_rs256_impl(http, token, jwks_url, issuers, audience, leeway_secs, Some(now))
+        .await.map_err(|_| "JWT verification failed".to_owned())
+}
+
+async fn verify_rs256_impl(
+    http: &reqwest::Client,
+    token: &str,
+    jwks_url: &str,
+    issuers: &[&str],
+    audience: &str,
+    leeway_secs: u64,
+    now: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    if issuers.is_empty() {
+        return Err("JWT issuer allowlist is empty".into());
+    }
     let header = decode_header(token).map_err(|e| format!("JWT header: {e}"))?;
     if header.alg != Algorithm::RS256 {
         return Err(format!("unexpected alg {:?}", header.alg));
@@ -169,12 +214,22 @@ pub async fn verify_rs256(
     let key = DecodingKey::from_rsa_components(&n, &e).map_err(|e| format!("JWKS key: {e}"))?;
 
     let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_issuer(&[expected_issuer]);
-    validation.set_audience(&[expected_audience]);
-    validation.leeway = 300; // 5-min clock skew
+    validation.set_issuer(issuers);
+    validation.set_audience(&[audience]);
+    validation.leeway = leeway_secs;
+    if now.is_some() {
+        validation.validate_exp = false;
+    }
 
     let data = decode::<serde_json::Value>(token, &key, &validation)
         .map_err(|e| format!("JWT verify: {e}"))?;
+    if let Some(now) = now {
+        let exp = data.claims.get("exp").and_then(serde_json::Value::as_i64)
+            .ok_or("JWT invalid expiration")?;
+        if i128::from(exp) < i128::from(now) - i128::from(leeway_secs) {
+            return Err("JWT expired".into());
+        }
+    }
     Ok(data.claims)
 }
 

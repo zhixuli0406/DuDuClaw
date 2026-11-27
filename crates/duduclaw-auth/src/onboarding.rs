@@ -11,7 +11,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         google TEXT NOT NULL DEFAULT 'pending',
         example TEXT NOT NULL DEFAULT 'pending',
         capabilities TEXT NOT NULL DEFAULT 'pending'
-    );").map_err(|_| "onboarding_unavailable".to_owned())
+    );").map_err(|_| "onboarding_unavailable".to_owned())?;
+    for (column, kind) in [
+        ("source", "TEXT"), ("avatar", "TEXT"), ("google_chat", "TEXT"),
+        ("odoo", "TEXT"), ("mfa", "TEXT"), ("avatar_agent_name", "TEXT"),
+        ("avatar_attempts", "INTEGER NOT NULL DEFAULT 0"), ("avatar_next_at", "INTEGER"),
+        ("avatar_error", "TEXT"),
+    ] {
+        if !crate::user_row::has_column(conn, "user_onboarding", column)? {
+            conn.execute_batch(&format!("ALTER TABLE user_onboarding ADD COLUMN {column} {kind};"))
+                .map_err(|_| "onboarding_unavailable".to_owned())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
