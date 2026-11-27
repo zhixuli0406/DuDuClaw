@@ -467,6 +467,8 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 上限は **400 モデル、各 500 フィールド**です。メタデータとフィールド探索の上限は **5 分**、`fields_get` は最大 4 件同時実行です。アカウント権限の確認には別途 30 秒の全体上限を設けます。組み込みモデル、インストール済み業務モジュール（CRM、販売、購買、在庫、会計、プロジェクト、人事、製造、ヘルプデスク、Web）のモデル、残りの名前順で優先します。時間切れは打ち切りと表示し、接続・バージョン・モジュールが同じなら次回は取得済みフィールドを再利用して続行します。モジュール／モデル一覧は各 5,000 件までです。不完全な差分を削除の証拠にはしません。
 
+以下の既存の汎用書き込み・構造照会に関する社員権限と機密モデル制限は Engine モードに適用します。Follow は本人の Odoo 権限を使い、会社の機能スイッチと共通の拒否は維持します。
+
 ### `odoo_create` / `odoo_write`：汎用の作成と更新（v1.81.0）
 
 - `odoo_create {model, values}` はレコードを 1 件作成して ID を返し、`odoo_write {model, ids, values}` は 1〜100 件のレコードを更新して（重複 ID は 1 件として扱います）`ok` を返します。どちらも **`odoo:write`** が必要で、効果クラスは `modify` です。`action_rules`、承認リスト、探索レーンは `odoo_crm_create_lead` と同じように適用されます。
@@ -615,3 +617,41 @@ ID の代わりに、対応する Google ファイル・フォルダ URL も使�
 既存の `docs_append`、`docs_create`、`docs_replace_text`、`sheets_append`、`sheets_create`、`sheets_update` は従来の認可を維持し、この四つのスイッチやフォルダ規則の対象外です。新しい Docs／Sheets の四ツールは「変更」に分類します。Google 公式 Drive リモート MCP に完全な Drive 権限を持つトークンを渡すことはありません。この九つの書き込みツールはメイン gateway プロセス内だけで実行します。
 
 アカウントの準備は[接続設定](google-setup.md)と[個人の書き込み同意](google-personal-connections.md)を参照してください。Google OAuth の分離・取消、委任スコープ、文書タブ、変換、共有ドライブのロール、個人メッセージでの確認配信は実アカウントでの受け入れ確認が必要です。本書はこれらの検証済みを意味しません。
+
+## 本人用ツールと Odoo 権限（v1.86.0）
+
+個人キーは次のツールのみを提供し、キーのスコープと管理者の現在の `allow_mcp_scopes` の共通部分を適用します。
+
+| スコープ | ツール |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`：参照可能なタスク。既定 50 件、範囲 1–200。上限や省略は `truncated` で示します。 |
+| `agents:status` | `my_agents_status {}`：参照可能な社員の ID、名前、状態、`can_call`。 |
+| `odoo:read` | `odoo_search`、`odoo_crm_leads`、`odoo_sale_orders`、`odoo_inventory_products`、`odoo_inventory_check`、`odoo_invoice_list`、`odoo_payment_status`、`odoo_partner_search`、`odoo_schema_overview`、`odoo_schema_fields`、`odoo_status`。 |
+| `odoo:write` | `odoo_create`、`odoo_write`、`odoo_activity_create`、`odoo_note_post`。確認済みの `follow_odoo_account` が必要です。 |
+
+所有者本人の現在の権限で実行します。Odoo は本人の接続済みアカウントのみを使い、社員・会社の認証情報を借用しません。`odoo_execute`、`odoo_report`、`odoo_connect`、`odoo_message_send`、`odoo_attachment_add` と CRM／販売の専用変更ツールは対象外です。2 つの `my_*` ツールは個人キー専用で、社員用ツールではありません。
+
+### Odoo の専用書き込みツール 4 種
+
+すべて `odoo:write` と既存の読み取り可能な対象レコードが必要です。テキストはプレーンテキストとして HTML エスケープし、メンションや任意の宛先リストは受け付けません。
+
+| ツール／引数 | 動作 |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | 活動を作成。各テキストは最大 10,000 文字、期限は `YYYY-MM-DD`、既定の種類は `mail.mail_activity_data_todo`。Engine は接続アカウントに割り当て、`user_id` は Follow のみ受け付けます。 |
+| `odoo_note_post {model, res_id, body}` | 内部メモを追加。本文は最大 10,000 文字。 |
+| `odoo_message_send {model, res_id, body}` | レコードのフォロワーに通知。本文は最大 10,000 文字。内容に結び付いた人の承認が毎回必要で、社員の認証主体が必要です。 |
+| `odoo_attachment_add {model, res_id, file, name?}` | 呼び出し元社員自身の添付フォルダーから非公開添付を作成。インライン／base64、絶対パス、親への移動、シンボリックリンク、共有フォルダーは不可。内容と形式が一致する PDF、PNG、JPEG、WebP、UTF-8 TXT／CSV、OOXML XLSX／DOCX／PPTX のみ。元ファイルと再エンコード後の両方に `attachment_max_mb`（既定 10 MiB、範囲 1–25）を適用します。社員の認証主体が必要です。 |
+
+Engine は `allowed_models` の正確な対象と `allowed_actions` の `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` を必要とし、空リストでは許可しません。Follow は社員のモデル／操作権限と Engine の機密モデルブロックリストに代えて本人の Odoo 権限を使用します。会社の機能スイッチ、`always_refuse`、固定拒否、入力確認、承認、Odoo ACL は残ります。会社／AI 自身のアカウントは Engine のままです。社員の `permission_override=engine` は Engine を維持し、`read_only` は書き込みを除きます。有効な管理者確認がないグローバル Follow は Engine に戻ります。
+
+`always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。モデル完全一致、`*`、`ir.*` のようなドット区切りの子モデル、正確なメソッド名の `method:<name>` を使用します。専用操作は対象モデルと `activity:`、`note:`、`message:`、`attach:` で照合します。
+
+| ルール | 常に拒否する操作 |
+| --- | --- |
+| F1 | `ir.attachment` の更新・削除、汎用ツールによる作成。ファイルからの作成には `odoo_attachment_add` を使います。 |
+| F2 | `ir.model`、すべての `ir.model.*` 子モデル、`ir.rule` の変更。 |
+| F3 | `res.users.apikeys` とドット区切りの子モデルの変更。 |
+| F4 | `mail` とすべての `mail.*` 子モデルの変更。汎用ツールでの `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。メモ・メッセージには専用ツールを使います。 |
+| F5 | `_` で始まるメソッド、および `init`、`uninstall_hook`。 |
+
+変更を行う `odoo_execute` とすべての `action_*`、`button_*`、`toggle_*` は、全モードで人の承認が必要です。`odoo_message_send` も常に承認が必要です。Allow ルールで承認や拒否を回避できません。承認はツールと正確な引数に結び付き、一度だけ使えます。ほかの書き込みも既存の承認・データ送信チェックを受けます。管理者は監査付き `odoo.access_get/set` で管理し、Follow・会社アカウント一覧・拒否リストの権限拡大には `acknowledge_risk` が必要です。

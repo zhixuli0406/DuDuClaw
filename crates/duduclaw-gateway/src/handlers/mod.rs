@@ -139,6 +139,7 @@ mod status_tokens_rpc;
 mod member_keys_rpc;
 mod skill_trust_rpc;
 mod odoo_member_rpc;
+mod odoo_access_rpc;
 mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;

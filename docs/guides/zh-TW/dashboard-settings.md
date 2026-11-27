@@ -1021,3 +1021,32 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 | `approval_grants_mfa_enrollment` | `false`。允許管理員核准時明確授權首次 MFA 註冊，72 小時內限用一次。單獨開啟此鍵不會核發授權。 |
 
 開始登入、回呼及完成登入時都會重讀設定。設定檔無法讀取或解析時關閉登入。`enabled` 缺漏或型別錯誤、確認紀錄缺漏或欄位空白、`allowed_hd` 為空或無效時也關閉；任何一個網域格式錯誤會使整份清單無效。只有完整的 `"direct"` 值會直接建立帳號，其他核准模式值皆要求管理員核准。上限未設定時採 20，無效值轉為 0 並阻擋新增申請或帳號。無效範本會阻擋分身建立，不會自動改用空白分身。MFA 預先授權僅在值為布林 `true` 時開啟。原始設定編輯器只能關閉登入、移除風險確認紀錄或刪除整段，無法啟用或擴大此功能。
+
+## 本人金鑰與 Odoo 權限設定（v1.86.0）
+
+以下新增項目目前透過設定／RPC 操作，儀表板控制項會隨儀表板更新提供。
+
+| 區段／鍵 | 預設與用途 |
+| --- | --- |
+| `[member_api_keys] allow_conversation_content` | `false`；允許建立 `include_conversations=true` 的金鑰，只管建立時授權，不會移除既有權限。升級前的金鑰保留對話權限並標示已遷移。 |
+| `[member_api_keys] allow_mcp_scopes` | `[]`；只接受 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`。每次使用時與金鑰範圍取交集。 |
+| `[odoo] member_credentials` | `false`；是否允許同仁連接本人 Odoo 帳號。透過 `odoo.member_credentials.set_enabled` 啟用時須帶 `acknowledge_risk=true`。 |
+| `[odoo_access] permission_mode` | 預設 `"engine"`，也可設為 `"follow_odoo_account"`；後者只對本人身分生效且須有有效確認紀錄，員工／公司帳號仍用引擎模式。 |
+| `[odoo_access] permission_mode_ack` | 預設無。管理員 RPC 記錄 `{by, at}`，包含操作人與 RFC 3339 時間。缺少或無效時退回引擎模式。 |
+| `[odoo_access] company_key_agents` | `[]`；允許使用公司帳號的 AI 員工 ID。 |
+| `[odoo_access] company_key_agents_migrated` | 遷移前為空，由系統維護的完成標記。 |
+| `[odoo_access] upgrade_notice_pending` | 預設 `false`，升級補入清單時設為 `true`；權限 RPC 的 `dismiss_upgrade_notice=true` 可清除。 |
+| `[odoo_access] always_refuse` | 預設清單如下，所有模式均適用。移除規則須確認風險，F1～F5 固定拒絕仍保留。 |
+| `[odoo_access] attachment_max_mb` | `10` MiB，範圍 1～25；原始檔與重新編碼後的附件都須符合。 |
+| 員工 `[odoo] permission_override` | 預設 `"inherit"`，也可選 `"engine"`、`"read_only"`，只能收窄。未知值視為唯讀。 |
+| 員工 `[odoo] act_as_requester` | `false`；允許使用經驗證請求者的本人 Odoo 身分，分身不能借用別人的帳號。 |
+
+`always_refuse` 預設清單：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
+
+管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
+
+已有公司 Odoo URL／資料庫的安裝在升級時會一次將所有沒有自己 Odoo 帳號的既有正式 AI 補入 `company_key_agents`，記錄完成標記與升級提示，不更改權限模式。自身 Odoo 帳號設定不完整的 AI 不會加入，必須由管理員明確指派。 新 AI 不會自動加入，升級後請檢查清單。
+
+同仁透過瀏覽器限定的 `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` 管理連線。先讀 status 查看伺服器／資料庫；位址變更後，須在同一瀏覽器工作階段重新讀取再驗證。Connect 與 test 共用每位同仁每分鐘五次限制，包含失敗與格式錯誤。改密碼、登出所有裝置或停權後須重新輸入金鑰。管理員可用 `odoo.member_credentials.list`、`.revoke {user_id}` 列出／撤銷，但不能代填別人的秘密。
+
+降回 v1.85.x 前，請移除 `[member_api_keys]` 的 `allow_conversation_content`、`allow_mcp_scopes`。舊版會將未知鍵視為整段無效，停用所有本人金鑰。v1.85 忽略 `[odoo_access]` 並退回全域 Odoo 帳號，新版公司帳號清單與拒絕政策不會保護降版後的安裝。

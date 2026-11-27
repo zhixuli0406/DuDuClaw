@@ -649,6 +649,10 @@ impl MethodHandler {
             }
 
             // ── Odoo (admin only) ────────────────────────────
+            "odoo.access_get" | "odoo.access_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_odoo_access_rpc(method, params, ctx)).await
+            }
             "odoo.status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_status()).await

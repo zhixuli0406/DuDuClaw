@@ -205,6 +205,11 @@ pub const POLICIES: &[ToolPolicy] = &[
     // explicit-grant gate chain runs in the bound handler (owner decision C).
     ToolPolicy { name: "odoo_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "odoo_write", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_attachment_add", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_activity_create", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_note_post", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+    ToolPolicy { name: "odoo_message_send", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
+
     // exec
     // H12a: own skill tools read host-owned skill files of the record's own
     // employee and publish only into its own wiki/SKILLS; no workspace input.

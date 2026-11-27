@@ -733,7 +733,7 @@ impl McpDispatcher {
         }
         if crate::mcp_auth::is_person_principal(principal) {
             let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
-            let result = crate::mcp::person_tools::call(&self.home_dir, principal, tool_name, &args).await;
+            let result = crate::mcp::person_tools::call(&self.home_dir, &self.odoo, principal, tool_name, &args).await;
             return jsonrpc_response(id, result);
         }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────
@@ -2086,6 +2086,7 @@ impl McpDispatcher {
         // RM-103 S3: a role member's intrinsic skips this gate's inherited
         // approval lists / action-rule `ask`; an egress-guard ask still runs.
         if (employee_policy_applies && !intrinsic_exempt)
+            || crate::mcp::approval::odoo_requires_approval(tool_name, &params_owned)
             || params_owned.get("egress_guard").is_some()
         {
             // Keyed by the ACTING agent: with the internal key the client_id
@@ -2496,7 +2497,10 @@ mod tests {
         use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
         let tmp = tempfile::tempdir().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
-        for scopes in ["", "tasks:read", "agents:status", "tasks:read,agents:status"] {
+        std::fs::write(tmp.path().join("config.toml"),
+            "[odoo]\nurl='https://erp.example.com'\ndb='test'\n[odoo_access]\npermission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}\nalways_refuse=[]\n").unwrap();
+        for scopes in ["", "tasks:read", "agents:status", "tasks:read,agents:status",
+            "odoo:read", "odoo:read,odoo:write", "odoo:write"] {
             let principal = Principal {
                 client_id: "person:holder".into(), scopes: crate::mcp_auth::parse_scopes(scopes).unwrap(),
                 is_external: true, created_at: chrono::Utc::now(),
@@ -2513,8 +2517,18 @@ mod tests {
                         .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, &principal)).map(|tool| tool.name).collect();
                     assert_eq!(names.len(), expected.len());
                     assert!(expected.iter().all(|name| names.contains(name)));
+                    for name in ["odoo_execute", "odoo_report", "odoo_connect", "odoo_message_send", "odoo_attachment_add"] {
+                        assert!(!names.contains(&name));
+                    }
+                    let has_read = principal.scopes.contains(&Scope::OdooRead);
+                    let has_write = principal.scopes.contains(&Scope::OdooWrite);
+                    assert_eq!(names.contains(&"odoo_search"), has_read);
+                    assert_eq!(names.contains(&"odoo_status"), has_read);
+                    for name in ["odoo_create", "odoo_write", "odoo_activity_create", "odoo_note_post"] {
+                        assert_eq!(names.contains(&name), has_write);
+                    }
                 }
-                for name in ["tasks_list", "memory_search", "odoo_search", "list_agents", "agent_status", "wiki_read", "unknown"] {
+                for name in ["tasks_list", "memory_search", "odoo_execute", "odoo_message_send", "odoo_attachment_add", "list_agents", "agent_status", "wiki_read", "unknown"] {
                     let result = dispatcher.dispatch_tool_call(&principal, &ns, &json!({"name":name,"arguments":{}}), &json!(2)).await;
                     assert_eq!(result["error"]["code"], -32003, "{name}: {result}");
                 }
@@ -2552,7 +2566,8 @@ mod tests {
                         &serde_json::json!(1), &principal, tmp.path(), "dudu", remote,
                     ).await;
                     let names = crate::mcp::advertised_tool_names(&listed);
-                    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+                    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS.iter().filter(|t|
+                        t.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::Gateway) {
                         assert!(!names.iter().any(|name| name == tool.name), "{client}: {listed}");
                         let response = dispatcher.dispatch_tool_call(
                             &principal, &make_ns_ctx(external),
@@ -5694,6 +5709,10 @@ effect = "forbid"
         "notion_search",
         "notion_status",
         "odoo_connect",
+        "odoo_attachment_add",
+        "odoo_activity_create",
+        "odoo_note_post",
+        "odoo_message_send",
         "odoo_create",
         "odoo_crm_create_lead",
         "odoo_crm_leads",
@@ -5835,7 +5854,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            284,
+            288,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

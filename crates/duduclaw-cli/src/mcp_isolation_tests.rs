@@ -318,7 +318,8 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     // 141K-P5: +two person tools, intentionally refused for all employees.
     // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
     // RM-194: both admin settings tools are refused and hidden in protected mode.
-    assert_eq!(tools.len(), 284, "review every new tool's isolation disposition");
+    // RM-141: includes four Odoo write-back tools with connector routes.
+    assert_eq!(tools.len(), 288, "review every new tool's isolation disposition");
     for tool in tools {
         if intentional_refusal(tool.name).is_some() { continue; }
         let route = boundary_route(tool.name).expect("exact route");
@@ -365,7 +366,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 284);
+    assert_eq!(manifest.len(), 288);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
             ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));

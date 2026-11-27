@@ -1006,3 +1006,21 @@ New colleagues receive an AI avatar automatically, using a blank avatar or a non
 Admin or self-service unlinking invalidates all of that member's sessions. Self-service unlinking requires a local password and a password re-check. For offboarding, suspend the DuDuClaw account or unlink Google sign-in. Disabling the Google Workspace account alone does not terminate existing DuDuClaw sessions. Google-only accounts without a local password cannot sign in after downgrading to v1.85.0 or older.
 
 See [settings](../guides/dashboard-settings.md#company-google-sign-in) and [OAuth setup](../guides/google-setup.md#company-google-sign-in).
+
+## Personal keys and Odoo account boundaries (v1.86.0)
+
+A member key sees only its holder's own web conversations. Owner access to an AI employee never opens other members' conversations or external-channel conversations. New keys default to `include_conversations=false`; without it they cannot read conversation methods, resume or subscribe to existing WebChat conversations, or download conversation attachments or conversation-derived files. `activity.list` exposes conversation text only for the holder's own conversations with this option enabled. Memory reads are restricted to the holder's assigned avatar or their own personal employee under active isolation; ownership of a shared employee is insufficient.
+
+`[member_api_keys] allow_conversation_content` (default `false`) governs creation only. Turning it off does not strip existing grants. Keys created before the upgrade retain conversation access and carry `conversations_migrated=true`, within the same own-web-conversation boundary. Browser-only `me.member_keys.narrow` and Admin `member_keys.admin_narrow` can remove conversation access or MCP scopes, never add them. Creation still requires the existing password/MFA re-verification.
+
+Odoo identity selection uses this order: the avatar owner's personal credential; a verified requester's personal credential when `act_as_requester` is enabled; the AI employee's own account; the company account only when the AI is in `company_key_agents`; otherwise not connected. An avatar cannot borrow a different requester's credential. A personal API key uses only its holder's personal credential, with no employee/company fallback.
+
+Personal Odoo credentials are sealed with the gateway's machine encryption key and an owner-bound envelope. Only the gateway unseals them. Use requires an active member, matching account credential epoch and the verified server fingerprint (URL and database). After a server change, read the new address/database through `me.odoo.status` in the same browser session before testing again. Password changes, sign-out-everywhere or suspension invalidate use; when the account is available again, re-enter the key. Offboarding deletes the saved credential, and an administrator can revoke it without seeing its secret. The gateway supplies the authorized MCP process with the identity decision, verified endpoint, account metadata and credential revision, plus the selected secret when its cached revision differs; it never supplies the machine sealing key. This is an application boundary, not OS isolation from unrestricted processes running as the gateway user.
+
+| Rule | Always refused |
+| --- | --- |
+| F1 | Updating or deleting `ir.attachment`; creating it through a generic tool. Use `odoo_attachment_add` to create an attachment from a file. |
+| F2 | Mutations of `ir.model`, every `ir.model.*` descendant, and `ir.rule`. |
+| F3 | Mutations of `res.users.apikeys` and its dot descendants. |
+| F4 | Mutations of `mail` and every `mail.*` descendant; generic calls to `message_post`, `message_notify`, `message_subscribe`, `send_mail`, or `action_send_mail`. Use the dedicated note/message tools. |
+| F5 | Methods starting with `_`, plus `init` and `uninstall_hook`. |

@@ -8,7 +8,7 @@
 //!
 //! ## Pool key
 //!
-//! A gateway decision is mandatory: personal uses `person:<user>:<rev>`,
+//! A gateway decision is mandatory: personal uses `person:<user>:<rev>:<server_fp>`,
 //! company uses `company`, and an agent account uses its configured profile.
 //! Reserved personal/company profiles cannot be selected by agent config.
 //!
@@ -29,6 +29,9 @@ use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 use crate::mcp::odoo_identity_client::{IdentityCache, IdentityKind, OdooIdentity};
+
+// NUL is not a valid employee id. Employee APIs also reject this slot explicitly.
+pub(crate) const PERSON_KEY_SLOT: &str = "\0person-key";
 
 /// Resolved credentials ready to hand to [`OdooConnector::connect`].
 #[derive(Clone)]
@@ -279,11 +282,10 @@ impl OdooConnectorPool {
 
     pub(crate) async fn key_for_identity(&self, agent: &str, identity: &OdooIdentity)
         -> Result<(String, String), String> {
+        if agent == PERSON_KEY_SLOT { return Err("Reserved person-key pool namespace".into()); }
         let profile = match identity.kind {
             IdentityKind::Company => "company".to_owned(),
-            IdentityKind::Personal => format!("person:{}:{}",
-                identity.user_id.as_deref().ok_or("Missing personal user")?,
-                identity.rev.ok_or("Missing personal revision")?),
+            IdentityKind::Personal => identity.personal_profile()?,
             IdentityKind::Agent => {
                 let profile = self.pool_key(agent).await.1;
                 if profile == "company" || profile.split_once(':').map(|(kind, _)| kind) == Some("person") {
@@ -315,7 +317,10 @@ impl OdooConnectorPool {
 
         let creds = if identity.kind == IdentityKind::Personal {
             // Never decrypt a config secret or apply agent url/db to a person.
+            let (url, db, _) = identity.personal_endpoint()?;
             let mut config = global;
+            config.url = url.to_owned();
+            config.db = db.to_owned();
             config.auth_method = "api_key".into();
             config.username = identity.login.clone().ok_or("Missing personal login")?;
             config.api_key_enc.clear();
@@ -325,6 +330,51 @@ impl OdooConnectorPool {
         } else {
             Self::merge_credentials(&global, agent_override.as_ref(), identity.kind, resolve).await?
         };
+        let companies: Vec<i64> = agent_override.as_ref().map(|cfg| cfg.company_ids.iter().map(|&id| id as i64).collect()).unwrap_or_default();
+        let expected_uid = if identity.kind == IdentityKind::Personal { identity.odoo_uid } else { None };
+        self.connect_resolved(key, creds, companies, expected_uid).await
+    }
+
+    /// Person-key entry: no resolver, employee override or secret-resolution closure.
+    /// Only the gateway-issued personal login/key can reach connect_resolved.
+    pub(crate) async fn connect_person_key(&self, mut config: OdooConfig, identity: &OdooIdentity)
+        -> Result<Arc<OdooConnector>, String> {
+        use crate::mcp::odoo_identity_client::IdentityPermission;
+        if identity.kind != IdentityKind::Personal || identity.permission == IdentityPermission::Engine {
+            return Err("Personal Odoo identity required".into());
+        }
+        let user = identity.user_id.as_deref().ok_or("Missing personal user")?;
+        let (url, db, _) = identity.personal_endpoint()?;
+        config.url = url.to_owned();
+        config.db = db.to_owned();
+        let uid = identity.odoo_uid.filter(|uid| *uid > 0).ok_or("Missing personal uid")?;
+        config.auth_method = "api_key".into();
+        config.username = identity.login.clone().ok_or("Missing personal login")?;
+        config.api_key_enc.clear();
+        config.password_enc.clear();
+        let credential = identity.secret.clone().ok_or("Missing personal credential")?;
+        let key = (PERSON_KEY_SLOT.to_owned(), identity.personal_profile()?);
+        // Serialized by identity_cache at the actor boundary. Retire old revisions
+        // and cap this namespace without touching any employee's entries.
+        {
+            let mut pool = self.pool.write().await;
+            pool.retain(|(slot, profile), _| slot != PERSON_KEY_SLOT
+                || !profile.strip_prefix("person:").and_then(|s| s.rsplit_once(':')).and_then(|(s, _)| s.rsplit_once(':')).is_some_and(|(u, _)| u == user) || profile == &key.1);
+            if !pool.contains_key(&key) && pool.keys().filter(|(slot, _)| slot == PERSON_KEY_SLOT).count() >= 32 {
+                let evict = pool.keys().find(|(slot, _)| slot == PERSON_KEY_SLOT).cloned();
+                if let Some(evict) = evict { pool.remove(&evict); }
+            }
+        }
+        self.connect_resolved(key, ResolvedCredentials { config, credential }, vec![], Some(uid)).await
+    }
+
+    pub(crate) async fn forget_person_key(&self, user: &str) {
+        self.pool.write().await.retain(|(slot, profile), _|
+            slot != PERSON_KEY_SLOT || !profile.strip_prefix("person:").and_then(|s| s.rsplit_once(':')).and_then(|(s, _)| s.rsplit_once(':')).is_some_and(|(u, _)| u == user));
+    }
+
+    async fn connect_resolved(&self, key: (String, String), creds: ResolvedCredentials,
+        companies: Vec<i64>, expected_uid: Option<i64>) -> Result<Arc<OdooConnector>, String> {
         let endpoint = (creds.config.url.clone(), creds.config.db.clone());
         if !creds.config.is_configured() { return Err("Odoo not configured: url and db are required".into()); }
         if creds.credential.is_empty() { return Err("Odoo credential is empty".into()); }
@@ -339,23 +389,22 @@ impl OdooConnectorPool {
 
         let mut guard = slot.lock().await;
         let home = self.cache_home.read().await.clone();
-        let companies: Vec<i64> = agent_override.as_ref().map(|cfg| cfg.company_ids.iter().map(|&id| id as i64).collect()).unwrap_or_default();
         if let Some(conn) = guard.connector_for(&endpoint) {
             if conn.matches_connection(&creds.config, &creds.credential, &companies)
-                && (identity.kind != IdentityKind::Personal || conn.status().uid == identity.odoo_uid) { return Ok(conn); }
+                && (expected_uid.is_none() || conn.status().uid == expected_uid) { return Ok(conn); }
         }
         guard.connector = None;
         guard.endpoint = None;
         let conn = OdooConnector::connect_cached(&creds.config, &creds.credential, home.as_deref(), companies).await
             .map_err(|error| error.replace(creds.credential.as_str(), "[REDACTED]"))?;
-        if identity.kind == IdentityKind::Personal && identity.odoo_uid != conn.status().uid {
+        if expected_uid.is_some() && expected_uid != conn.status().uid {
             return Err("Odoo 本人帳號驗證結果已變更，請重新連接。".into());
         }
         let arc = Arc::new(conn);
         guard.connector = Some(arc.clone());
         guard.endpoint = Some((creds.config.url.clone(), creds.config.db.clone()));
         info!(
-            agent_id = %agent_id,
+            actor = %key.0,
             profile = %key.1,
             "Odoo connector established"
         );
@@ -489,7 +538,7 @@ mod tests {
     fn company_identity() -> OdooIdentity {
         OdooIdentity { kind: IdentityKind::Company,
             permission: crate::mcp::odoo_identity_client::IdentityPermission::Engine,
-            user_id: None, odoo_uid: None, login: None, rev: None, secret: None }
+            user_id: None, url: None, db: None, server_fp: None, odoo_uid: None, login: None, rev: None, secret: None }
     }
     fn agent_identity() -> OdooIdentity {
         OdooIdentity { kind: IdentityKind::Agent, ..company_identity() }

@@ -3,6 +3,76 @@
 use super::*;
 
 #[tokio::test]
+async fn bounded_list_caps_hidden_a2a_candidates_in_the_same_snapshot() {
+    let (store, dir) = temp_store();
+    for (id, owner, at) in [("own", Some("user:alice"), "2100"),
+        ("ordinary-a", None, "2020"), ("ordinary-b", None, "2020")] {
+        let mut row = TaskRow::new(id.into(), id.into(), String::new(), "medium".into(), "bot".into(), "system".into());
+        row.a2a_owner = owner.map(str::to_owned);
+        row.created_at = at.into();
+        store.insert_task(&row).await.unwrap();
+    }
+    for index in 0..2000 {
+        let id = format!("hidden-{index:04}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "medium".into(), "bot".into(), "system".into());
+        row.a2a_owner = Some("user:bob".into());
+        row.created_at = "2099".into();
+        store.insert_task(&row).await.unwrap();
+    }
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET title = X'FF' WHERE a2a_owner = 'user:bob'", []).unwrap();
+    let mut scanned = 0;
+    let (rows, more_may_exist) = store.list_tasks_filtered_bounded(None, None, None, None, 2,
+        "user:alice", |_| { scanned += 1; true }).await.unwrap();
+    assert_eq!(scanned, 2 + super::super::tasks::TASK_LIST_SCAN_ALLOWANCE);
+    assert!(more_may_exist);
+    assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["own"]);
+}
+
+#[tokio::test]
+async fn bounded_list_matches_unbounded_visibility_then_newest_cut_without_cap() {
+    let (store, dir) = temp_store();
+    for index in 0..30 {
+        let id = format!("task-{index:02}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "medium".into(),
+            if index % 5 == 0 { "hidden".into() } else { "bot".into() }, "system".into());
+        row.a2a_owner = match index % 3 {
+            0 => Some("user:bob".into()),
+            1 => Some("user:alice".into()),
+            _ => None,
+        };
+        row.created_at = format!("2026-01-{:02}T00:00:00Z", index / 2 + 1);
+        row.pinned = index == 0;
+        store.insert_task(&row).await.unwrap();
+    }
+    let mut expected = store.list_tasks_filtered(None, None, None, None).await.unwrap();
+    expected.retain(|r| r.assigned_to != "hidden"
+        && TaskStore::a2a_principal_allows(dir.path(), &r.id, "user:alice"));
+    expected.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.id.cmp(&b.id)));
+    for limit in [1, 7, 100] {
+        let (rows, more_may_exist) = store.list_tasks_filtered_bounded(None, None, None, None, limit,
+            "user:alice", |assignee| assignee != "hidden").await.unwrap();
+        assert!(!more_may_exist);
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            expected.iter().take(limit).map(|r| r.id.as_str()).collect::<Vec<_>>());
+    }
+}
+
+#[tokio::test]
+async fn bounded_list_denies_missing_or_invalid_owner_registry() {
+    let (store, dir) = temp_store();
+    let row = TaskRow::new("task".into(), "task".into(), String::new(), "medium".into(), "bot".into(), "system".into());
+    store.insert_task(&row).await.unwrap();
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    conn.execute("DROP TABLE task_access_principals", []).unwrap();
+    assert!(store.list_tasks_filtered_bounded(None, None, None, None, 1,
+        "user:alice", |_| true).await.is_err());
+    conn.execute("CREATE VIEW task_access_principals AS SELECT id AS task_id, a2a_owner AS principal FROM tasks", []).unwrap();
+    assert!(store.list_tasks_filtered_bounded(None, None, None, None, 1,
+        "user:alice", |_| true).await.is_err());
+}
+
+#[tokio::test]
 async fn bounded_list_filters_metadata_and_stops_at_n_visible_rows() {
     let (store, dir) = temp_store();
     for index in 0..6 {
@@ -34,12 +104,13 @@ async fn bounded_list_filters_metadata_and_stops_at_n_visible_rows() {
     conn.execute("UPDATE tasks SET title = X'FF' WHERE assigned_to = 'hidden'", []).unwrap();
     conn.execute("UPDATE tasks SET assigned_to = X'FF' WHERE id = 'candidate-4'", []).unwrap();
     let mut visited = Vec::new();
-    let rows = store.list_tasks_filtered_bounded(Some("todo"), None, Some("medium"), Some(false), 2,
-        |id, assignee| {
-            visited.push(id.to_owned());
+    let (rows, more_may_exist) = store.list_tasks_filtered_bounded(Some("todo"), None, Some("medium"), Some(false), 2, "user:alice",
+        |assignee| {
+            visited.push(assignee.to_owned());
             assignee != "hidden"
         }).await.unwrap();
-    assert_eq!(visited, ["candidate-0", "candidate-1", "candidate-2", "candidate-3"]);
+    assert!(!more_may_exist);
+    assert_eq!(visited, ["hidden", "hidden", "bot", "bot"]);
     assert_eq!(rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(), ["candidate-2", "candidate-3"]);
 }
 
@@ -60,15 +131,16 @@ async fn bounded_list_limits_sql_materialization_and_orders_newest_first() {
     // implementation would fail even when the caller only asks for one row.
     conn.execute("UPDATE tasks SET title = X'FF' WHERE id = 'bounded-0'", []).unwrap();
     for (limit, expected) in [(1, vec!["bounded-4"]), (2, vec!["bounded-4", "bounded-5"])] {
-        let rows = store.list_tasks_filtered_bounded(Some("todo"), Some("bot"), Some("medium"), Some(false), limit, |_, _| true).await.unwrap();
+        let (rows, more_may_exist) = store.list_tasks_filtered_bounded(Some("todo"), Some("bot"), Some("medium"), Some(false), limit, "user:alice", |_| true).await.unwrap();
+        assert!(!more_may_exist);
         assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), expected);
     }
-    assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, 6, |_, _| true).await.is_err());
+    assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, 6, "user:alice", |_| true).await.is_err());
     assert!(store.list_tasks_filtered(None, Some("bot"), None, None).await.is_err());
     for invalid in [0, 1001, usize::MAX] {
-        assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, invalid, |_, _| true).await.is_err());
+        assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, invalid, "user:alice", |_| true).await.is_err());
     }
-    assert!(store.list_tasks_filtered_bounded(None, Some("other"), None, None, 1, |_, _| true).await.unwrap().is_empty());
+    assert!(store.list_tasks_filtered_bounded(None, Some("other"), None, None, 1, "user:alice", |_| true).await.unwrap().0.is_empty());
 }
 
 // ── W2-7: source_discord_guild_id column round trip ──────
