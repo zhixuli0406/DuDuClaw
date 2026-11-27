@@ -340,7 +340,14 @@ async fn disabled_dm_totp_has_no_prompt_and_service_refuses_proof() {
         assert_eq!(f.state(), ("live".into(), 0));
         f.pending().await;
     }
-    assert!(f.receive(f.event(&code(&f.secret, chrono::Utc::now().timestamp()/30)), &Recording::default()).await);
+    let before = f.state();
+    let sink = Recording::default();
+    assert!(intercept_with_verify(&f.service.env,
+        f.event(&code(&f.secret, chrono::Utc::now().timestamp()/30)), Lang::ZhTw, &sink,
+        |_, _, _, _, _| panic!("disabled method must not verify the factor")).await);
+    assert_eq!(sink.replies.lock().unwrap().as_slice(), [dashboard(Lang::ZhTw)]);
+    assert_eq!(sink.deletes.load(Ordering::SeqCst), 1);
+    assert_eq!(f.state(), before, "disabled method must preserve ticket and attempts");
     assert_eq!(f.state(), ("live".into(), 0));
     f.pending().await;
 }
