@@ -227,6 +227,7 @@ pub mod google_apps_script;
 pub(crate) mod google_data_consent;
 pub mod google_identity;
 pub mod google_personal;
+mod google_signin;
 pub mod google_service_account;
 pub mod google_workspace;
 mod shared_app_route;
