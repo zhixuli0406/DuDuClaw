@@ -1,4 +1,5 @@
 pub mod module_lease;
+pub mod admin_ai_settings;
 pub mod autonomy_gate;
 pub mod autonomy_handoff;
 pub mod agent_guard;
