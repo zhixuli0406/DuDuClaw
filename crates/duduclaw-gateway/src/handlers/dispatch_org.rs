@@ -123,6 +123,14 @@ impl MethodHandler {
             | "agents.primary_owner_set" => {
                 boxed_frame(|| self.handle_personal_google_rpc(method, params, ctx)).await
             }
+            "agents.main_access.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_get()).await
+            }
+            "agents.main_access.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_set(params, ctx)).await
+            }
             "users.my_history_views" => boxed_frame(|| self.handle_my_history_views(params, ctx)).await,
             "users.team_history.list" => boxed_frame(|| self.handle_team_history_list(params, ctx)).await,
             "users.team_history.get" => boxed_frame(|| self.handle_team_history_get(params, ctx)).await,

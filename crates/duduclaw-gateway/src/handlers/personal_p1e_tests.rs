@@ -376,6 +376,8 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.list", "(a) people and their binding metadata (label, owner); no employee data"),
     ("users.repair_primary_agents", "Admin only; request names no employee (digest only); protected-mode candidates exclude all Personal employees via the ownership authority; reply contains Shared candidate rows, digest and excluded member count only; hidden-row filter remains active"),
     ("users.me", "(a) the caller's own account"),
+    ("agents.main_access.get", "(a) Admin-only main-agent person-list metadata; no employee content"),
+    ("agents.main_access.set", "(a) Admin-only audited main-agent person list; no employee content"),
     ("users.dept_grants.list", "(a) Admin-only department authority metadata; no employee content"),
     ("users.dept_grants.set", "(a) Admin-only audited department grants; names a person and department, not employee content"),
     ("users.dept_grants.reach_preview", "(a) Admin-only department reach metadata; no employee content"),
@@ -601,7 +603,8 @@ const P1F_CEILING: usize = 0;
 /// P1h (N6): 13 — `topology.list` left the allowlist.
 /// RM-142 P4: four explicitly requested department-grant metadata methods.
 /// RM-142 P12: one Admin-only reach preview joins the four department metadata RPCs.
-const METADATA_CEILING: usize = 18;
+/// RM-142 P13: two explicitly requested Admin-only main-agent list RPCs.
+const METADATA_CEILING: usize = 20;
 
 struct Arm {
     methods: Vec<String>,

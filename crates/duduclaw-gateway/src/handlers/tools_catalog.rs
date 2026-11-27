@@ -17,6 +17,8 @@ impl MethodHandler {
                     { "name": "users.invite_status", "description": "List per-user invitation states without links or tokens (Admin only)" },
                     { "name": "agents.list", "description": "List all registered agents" },
                     { "name": "agents.status", "description": "Get agent status" },
+                    { "name": "agents.main_access.get", "description": "Read the main AI employee access list and risk notice (Admin, Enterprise only)" },
+                    { "name": "agents.main_access.set", "description": "Replace and audit the main AI employee access list (Admin, Enterprise only)" },
                     { "name": "presets.list", "description": "WP-6F: list agent presets (\"職務組合\") under ~/.duduclaw/presets/" },
                     { "name": "presets.status", "description": "WP-6F: one agent's current preset binding + live resolution outcome (read-only, P1)" },
                     { "name": "agents.create", "description": "Create a new agent" },

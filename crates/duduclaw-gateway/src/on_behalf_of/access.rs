@@ -23,7 +23,10 @@ use duduclaw_core::{
 #[path = "main_target.rs"]
 mod main_target;
 pub(crate) use main_target::{check_loaded_queue_main_target, check_queue_main_target};
-pub use main_target::{check_loaded_main_target, check_main_target, requires_main_restriction};
+pub use main_target::{
+    check_loaded_main_target, check_main_target, main_access_allowed, requires_main_restriction,
+    requires_main_restriction_for, MainUse,
+};
 
 /// May `principal` have work of kind `right` handed to `target`?
 /// `Err` when the identity store cannot be read (callers deny).

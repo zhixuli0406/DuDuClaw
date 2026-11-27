@@ -1,5 +1,6 @@
-//! Main-agent admission is an edition-independent authority rule, not the
-//! optional human-principal delegation policy. Bindings never override it.
+//! Legacy main-agent admission is Admin-only in every edition. The separate
+//! opt-in use-aware decision also admits Enterprise's explicit person list.
+//! Neither decision is the optional delegation policy; bindings never override it.
 use std::path::Path;
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
@@ -8,8 +9,52 @@ use duduclaw_core::{types::AgentRole, HumanPrincipal};
 
 const REFUSAL: &str = "主代理僅管理員可以使用。";
 
+/// Declare the intended use explicitly so future policy can narrow either one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainUse {
+    Converse,
+    Assign,
+}
+
+/// RM-142 P13: the list is editable and exposed through users.me, but no
+/// conversation or assignment admission path consults it yet. Later packages
+/// switch those callers; management and scheduling retain the Admin-only gate.
+/// Missing accounts deny; identity-store read failures are errors (callers deny).
+pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
+    let db = crate::decision_notify::open_user_db(home)
+        .map_err(|_| REFUSAL.to_owned())?.ok_or_else(|| REFUSAL.to_owned())?;
+    let Some(account) = db.get_user(user_id).map_err(|_| REFUSAL.to_owned())? else {
+        return Ok(false);
+    };
+    if account.status != UserStatus::Active { return Ok(false); }
+    if account.role == UserRole::Admin { return Ok(true); }
+    // This is the gateway's home-bound, license-capped edition authority, not
+    // an environment/config guess. Personal and unresolved editions ignore rows.
+    if !crate::team_edition::team_grants_enabled(home) { return Ok(false); }
+    match use_ {
+        MainUse::Converse | MainUse::Assign =>
+            db.is_main_agent_user(user_id).map_err(|_| REFUSAL.to_owned()),
+    }
+}
+
+/// Opt-in list-aware admission. Unlike requires_main_restriction, this allows
+/// active listed users on Enterprise for the explicitly declared use only.
+pub fn requires_main_restriction_for(
+    home: &Path, principal: Option<&str>, use_: MainUse,
+) -> Result<bool, String> {
+    match super::super::PrincipalState::from_wire(principal) {
+        super::super::PrincipalState::Background
+        | super::super::PrincipalState::Human(HumanPrincipal::Unmapped { .. }) => Ok(false),
+        super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
+            Ok(!main_access_allowed(home, &id, use_)?),
+        super::super::PrincipalState::Unknown => Err(REFUSAL.into()),
+    }
+}
+
 /// Only a live account can establish Admin authority. Background and unmapped
 /// channel senders retain their existing policy; they are not dashboard users.
+/// Deliberately Admin-only even for listed users; opt-in callers use
+/// requires_main_restriction_for instead. Existing callers are unchanged in P13.
 pub fn requires_main_restriction(home: &Path, principal: Option<&str>) -> Result<bool, String> {
     let user = match super::super::PrincipalState::from_wire(principal) {
         super::super::PrincipalState::Background
@@ -99,3 +144,7 @@ async fn check_restricted_target(home: &Path, target: &str) -> Result<(), String
         Err(REFUSAL.into())
     }).await
 }
+
+#[cfg(test)]
+#[path = "main_target_tests.rs"]
+mod tests;
