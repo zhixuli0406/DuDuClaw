@@ -1334,7 +1334,18 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     // Authenticated users retain a stable ownership tag across
                                     // sockets. Widget identities rotate per connection; their
                                     // previous visit and every other user's sessions stay denied.
-                                    let owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    let mut owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    if owns_session {
+                                        if let Some(ChatCredential::Member(ctx)) = credential.as_ref() {
+                                            // A matching id is not stored-origin authority. Missing,
+                                            // unknown or external origins never admit a key resume.
+                                            owns_session = match state.ctx.session_manager.session_origin(&want).await {
+                                                Ok(origin) => crate::history_privacy::key_class_allowed(ctx,
+                                                    &crate::history_privacy::classify(&want, origin.as_ref(), &ctx.user_id)),
+                                                Err(_) => false,
+                                            };
+                                        }
+                                    }
                                     if !owns_session {
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"

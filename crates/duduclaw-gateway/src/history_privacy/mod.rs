@@ -42,11 +42,19 @@ pub fn mode(home: &Path, ctx: &UserContext, agent: &str) -> Result<Mode, String>
     if ctx.requires_password_change() || !ctx.has_agent_access(agent, AccessLevel::Viewer) {
         return Err("permission denied".into());
     }
+    if ctx.member_key_id.is_some() {
+        return Ok(Mode::Filtered);
+    }
     if ctx.is_admin() || ctx.has_agent_access(agent, AccessLevel::Owner) || !configured(home) {
         Ok(Mode::Full)
     } else {
         Ok(Mode::Filtered)
     }
+}
+/// Credential restrictions only narrow the existing history policy.
+/// Browser readers still need their ordinary mode and classification gates.
+pub fn key_class_allowed(ctx: &UserContext, class: &Class) -> bool {
+    ctx.member_key_id.is_none() || matches!(class, Class::Own)
 }
 pub fn classify(id: &str, origin: Option<&SessionOrigin>, user: &str) -> Class {
     match origin_class::classify(id, origin, user, &BTreeSet::new()) {

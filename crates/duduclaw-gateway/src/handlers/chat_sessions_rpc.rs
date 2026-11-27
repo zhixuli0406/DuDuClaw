@@ -41,7 +41,7 @@ impl MethodHandler {
         let live = match self.bound_history_live(ctx) { Ok(c) => c, Err(e) => return WsFrame::error_response("", &e) };
         let initial = if let Some(agent) = agent_filter {
             match privacy::mode(&self.home_dir, &live, agent) { Ok(m) => m, Err(_) => return WsFrame::error_response("", "session not found") }
-        } else if live.is_admin() { Mode::Full } else { return WsFrame::error_response("", "agent_id required"); };
+        } else if live.is_admin() && live.member_key_id.is_none() { Mode::Full } else { return WsFrame::error_response("", "agent_id required"); };
         if initial == Mode::Filtered {
             return match self.bound_history_list(&live, agent_filter.unwrap(), limit, archived).await {
                 Ok(sessions) => WsFrame::ok_response("",json!({"sessions":sessions})),
@@ -138,7 +138,9 @@ impl MethodHandler {
                 let _permit = permit;
                 read::metadata_in(&read::open(&home)?, &user, &raw, archived)
             }).await.map_err(|_| "session not found")??.ok_or("session not found")?;
-            if metadata.agent != owner || metadata.class == Class::Hidden { return Err("session not found".into()); }
+            if metadata.agent != owner || metadata.class == Class::Hidden
+                || !privacy::key_class_allowed(&live, &metadata.class)
+            { return Err("session not found".into()); }
             metadata.class
         } else { Class::Own };
         self.bound_history_recheck(&live, &owner, mode)?;
