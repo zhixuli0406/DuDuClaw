@@ -64,6 +64,90 @@ async fn task_assignee_checks_directory_resolved_from_registry_name() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn missing_or_empty_models_use_provider_defaults_at_both_entry_points() {
+    let (home, ctx, _runtime, calls) = owned_channel(RuntimeType::Codex).await;
+    let registry = ctx.registry.read().await;
+    let raw = home.path().join("agents/worker/agent.toml");
+    let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+    let before = crate::model_call_probe::calls();
+    for preset_resolved in [false, true] {
+        let path = if preset_resolved {
+            std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+            &resolved
+        } else { &raw };
+        for provider in [RuntimeType::Claude, RuntimeType::Codex, RuntimeType::Kiro] {
+            let expected = if provider == RuntimeType::Kiro { String::new() }
+                else { runtime_config::default_preferred_model(provider).unwrap() };
+            for model in ["", "[model]", "[model]\npreferred=''", "[model]\npreferred='  '"] {
+                let text = format!("[agent]\nname='worker'\nstatus='active'\n[runtime]\nprovider='{}'\n{model}\n", provider.as_str());
+                std::fs::write(path, &text).unwrap();
+                let turn = resolve_and_check(home.path(), &registry, "worker").unwrap();
+                assert_eq!(turn.config_path, *path);
+                assert_eq!(turn.preset_resolved, preset_resolved);
+                assert_eq!(turn.runtime_settings.provider, provider);
+                assert_eq!(turn.model, expected, "{text}");
+                assert_eq!(turn.runtime_settings.preferred_model.as_deref(), Some(expected.as_str()));
+                let utility = if provider == RuntimeType::Claude {
+                    runtime_config::DEFAULT_UTILITY_MODEL
+                } else { expected.as_str() };
+                assert_eq!(turn.runtime_settings.utility_model, utility);
+                assert_eq!(check_task_assignee(home.path(), "worker"), Ok(()), "{text}");
+            }
+        }
+    }
+    assert_eq!(crate::model_call_probe::calls(), before);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[test]
+fn kiro_empty_model_retains_the_cli_selected_model_through_alignment() {
+    assert_eq!(runtime_config::runnable_model("worker", "", RuntimeType::Kiro).as_ref(), "");
+    assert_eq!(runtime_config::ensure_model_provider("", RuntimeType::Kiro), Ok(()));
+    assert_eq!(check_model("worker", "", RuntimeType::Kiro), Ok(String::new()));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn model_defaults_do_not_hide_missing_required_models_or_malformed_fields() {
+    let (home, ctx, _runtime, _calls) = owned_channel(RuntimeType::Codex).await;
+    let registry = ctx.registry.read().await;
+    let raw = home.path().join("agents/worker/agent.toml");
+    let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+    for preset_resolved in [false, true] {
+        let path = if preset_resolved {
+            std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+            &resolved
+        } else { &raw };
+        for (text, expected) in [
+            ("[runtime]\nprovider='openai_compat'", RuntimeSettingsError::MissingModel),
+            ("[runtime]\nprovider='openai_compat'\n[model]", RuntimeSettingsError::MissingModel),
+            ("[runtime]\nprovider='openai_compat'\n[model]\npreferred=''", RuntimeSettingsError::MissingModel),
+            ("[runtime]\nprovider='openai_compat'\n[model]\npreferred='  '", RuntimeSettingsError::MissingModel),
+            ("model=3\n[runtime]\nprovider='claude'", RuntimeSettingsError::Malformed),
+            ("[runtime]\nprovider='claude'\n[model]\npreferred=42", RuntimeSettingsError::Malformed),
+            ("[runtime]\nprovider='kiro'\n[model]\npreferred=42", RuntimeSettingsError::Malformed),
+            ("[runtime]\nprovider='claude'\n[model]\nutility=42", RuntimeSettingsError::Malformed),
+            ("[runtime]\nprovider='claude'\n[model]\nlocal=42", RuntimeSettingsError::Malformed),
+            ("[runtime]\nprovider='claude'\n[model.local]\nmodel=42", RuntimeSettingsError::Malformed),
+        ] {
+            std::fs::write(path, format!("{text}\n[agent]\nname='worker'\nstatus='active'\n")).unwrap();
+            let refusal = EntryRefusal::Config(expected);
+            assert_eq!(resolve_and_check(home.path(), &registry, "worker").unwrap_err(), refusal, "{text}");
+            assert_eq!(check_task_assignee(home.path(), "worker").unwrap_err(), refusal, "{text}");
+        }
+    }
+}
+
+#[test]
+fn default_preferred_model_preserves_explicit_utility_and_local_models() {
+    let doc = "[runtime]\nprovider='claude'\n[model]\nutility='custom-utility'\n[model.local]\nmodel='local-model'"
+        .parse::<toml::Value>().unwrap();
+    let (_, settings, local) = strict_settings(&doc, Path::new("agent.toml")).unwrap();
+    assert_eq!(settings.preferred_model, runtime_config::default_preferred_model(RuntimeType::Claude));
+    assert_eq!(settings.utility_model, "custom-utility");
+    assert_eq!(local.as_deref(), Some("local-model"));
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn strict_refusals_cover_every_config_failure_without_registry_rescan() {
     let (home, ctx, _runtime, _calls) = owned_channel(RuntimeType::Codex).await;
     let registry = ctx.registry.read().await;
@@ -73,8 +157,8 @@ async fn strict_refusals_cover_every_config_failure_without_registry_rescan() {
         ("[runtime]\nprovider=42\n[model]\npreferred='gpt-5.4'", RuntimeSettingsError::Malformed),
         ("[runtime]\nprovider='typo'\n[model]\npreferred='gpt-5.4'", RuntimeSettingsError::UnknownProvider),
         ("[runtime]\nprovider='codex'\nfallback='typo'\n[model]\npreferred='gpt-5.4'", RuntimeSettingsError::UnknownProvider),
-        ("[runtime]\nprovider='codex'", RuntimeSettingsError::MissingModel),
-        ("[runtime]\nprovider='claude'\n[model]\npreferred='  '", RuntimeSettingsError::MissingModel),
+        ("[runtime]\nprovider='openai_compat'", RuntimeSettingsError::MissingModel),
+        ("[runtime]\nprovider='openai_compat'\n[model]\npreferred='  '", RuntimeSettingsError::MissingModel),
         ("[runtime]\nprovider='openai_compat'\n[model]", RuntimeSettingsError::MissingModel),
         ("[runtime]\nprovider='codex'\n[model]\npreferred=42", RuntimeSettingsError::Malformed),
         ("[runtime]\nprovider='codex'\n[model]\npreferred='gpt-5.4'\n[team.roles.planner]\nruntime='typo'", RuntimeSettingsError::UnknownProvider),
@@ -116,6 +200,7 @@ async fn active_model_and_product_checks_share_the_effective_document() {
     let turn = resolve_and_check(home.path(), &registry, "worker").unwrap();
     assert_eq!(turn.model, runtime_config::runnable_model("worker", "opus", RuntimeType::Codex).as_ref());
     assert_eq!(turn.runtime_settings.provider, RuntimeType::Codex);
+    assert_eq!(turn.runtime_settings.preferred_model.as_deref(), Some(turn.model.as_str()));
     std::fs::write(home.path().join("config.toml"), "[team.roles.planner]\nruntime='gemini'").unwrap();
     assert!(matches!(resolve_and_check(home.path(), &registry, "worker"), Err(EntryRefusal::InactiveRuntime { .. })));
     // A readable global file with an invalid policy is a policy refusal.

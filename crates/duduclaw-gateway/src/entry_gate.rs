@@ -340,7 +340,7 @@ fn check_artifact_with_settings(
         else { RuntimeSettingsError::Unreadable }
     ))?;
     let document: toml::Value = text.parse().map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
-    let (sections, settings, local_model_id) = strict_settings(&document, &path)?;
+    let (sections, mut settings, local_model_id) = strict_settings(&document, &path)?;
     on_settings(&settings);
     let global_team = crate::team_composer::read_global_team_config(home)
         .map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
@@ -354,9 +354,8 @@ fn check_artifact_with_settings(
             strict_provider(runtime)?;
         }
     }
-    let configured = settings.preferred_model.as_deref()
-        .ok_or(EntryRefusal::Config(RuntimeSettingsError::MissingModel))?;
-    let model = check_model(agent_id, configured, settings.provider)?;
+    let configured = settings.preferred_or_default().map_err(EntryRefusal::Config)?;
+    let model = check_model(agent_id, &configured, settings.provider)?;
     crate::product_policy::require_runtime(home, settings.provider.as_str())
         .map_err(|diagnostic| EntryRefusal::ProductPolicy { diagnostic })?;
     if model != configured {
@@ -364,6 +363,7 @@ fn check_artifact_with_settings(
             crate::product_policy::require_substituted_catalog_model(policy, settings.provider, &model)
         ).map_err(|diagnostic| EntryRefusal::ProductPolicy { diagnostic })?;
     }
+    settings.preferred_model = Some(model.clone());
     Ok(CheckedArtifact { path, preset_resolved, settings, model, local_model_id, sections, document })
 }
 
@@ -396,18 +396,14 @@ fn strict_settings(
         .unwrap_or(RuntimeType::Claude); // Absent selector retains the schema default, never an error fallback.
     let fallback = runtime.fallback.as_deref().map(strict_provider).transpose()?;
     let model = doc.get("model").map(|value| value.as_table().ok_or_else(malformed))
-        .transpose()?.ok_or(EntryRefusal::Config(RuntimeSettingsError::MissingModel))?;
-    let preferred = match model.get("preferred") {
-        Some(value) => value.as_str().ok_or_else(malformed)?.trim(),
-        None => return Err(EntryRefusal::Config(RuntimeSettingsError::MissingModel)),
-    };
-    if preferred.is_empty() { return Err(EntryRefusal::Config(RuntimeSettingsError::MissingModel)); }
-    let utility = model.get("utility").map(|value| value.as_str().ok_or_else(malformed)).transpose()?
-        .filter(|value| !value.trim().is_empty()).map(str::to_string)
-        .unwrap_or_else(|| if provider == RuntimeType::Claude {
-            runtime_config::DEFAULT_UTILITY_MODEL.to_string()
-        } else { preferred.to_string() });
-    let local_model_id = model.get("local").map(|value| value.as_table().ok_or_else(malformed))
+        .transpose()?;
+    let preferred = model.and_then(|model| model.get("preferred"))
+        .map(|value| value.as_str().map(str::to_string).ok_or_else(malformed)).transpose()?;
+    let utility = model.and_then(|model| model.get("utility"))
+        .map(|value| value.as_str().ok_or_else(malformed)).transpose()?
+        .filter(|value| !value.trim().is_empty()).map(str::to_string);
+    let local_model_id = model.and_then(|model| model.get("local"))
+        .map(|value| value.as_table().ok_or_else(malformed))
         .transpose()?.and_then(|local| local.get("model"))
         .map(|value| value.as_str().map(str::to_string).ok_or_else(malformed)).transpose()?;
     let team = runtime_config::strict_team_config(doc, path).map_err(|_| malformed())?;
@@ -417,9 +413,15 @@ fn strict_settings(
     let mut sections = doc.clone().try_into::<AgentTomlSections>().map_err(|_| malformed())?;
     sections.runtime = runtime;
     sections.team = team;
-    let settings = RuntimeSettings {
-        provider, fallback, preferred_model: Some(preferred.to_string()), utility_model: utility,
+    let mut settings = RuntimeSettings {
+        provider, fallback, preferred_model: preferred, utility_model: String::new(),
     };
+    // Retain the strict reader's catalog defaults and Kiro's CLI-selected model.
+    let preferred = settings.preferred_or_default().map_err(EntryRefusal::Config)?;
+    settings.utility_model = utility.unwrap_or_else(|| if provider == RuntimeType::Claude {
+        runtime_config::DEFAULT_UTILITY_MODEL.to_string()
+    } else { preferred.clone() });
+    settings.preferred_model = Some(preferred);
     Ok((sections, settings, local_model_id))
 }
 

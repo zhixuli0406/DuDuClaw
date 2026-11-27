@@ -36,7 +36,10 @@ impl Config {
             match self {
                 Self::Mismatch => document["runtime"]["provider"] = toml::Value::String("grok".into()),
                 Self::UnknownEngine => document["runtime"]["provider"] = toml::Value::String("typo".into()),
-                Self::MissingModel => { document["model"].as_table_mut().unwrap().remove("preferred"); }
+                Self::MissingModel => {
+                    document["runtime"]["provider"] = toml::Value::String("openai_compat".into());
+                    document["model"].as_table_mut().unwrap().remove("preferred");
+                }
                 Self::Healthy => {}
                 Self::Malformed => unreachable!(),
             }
