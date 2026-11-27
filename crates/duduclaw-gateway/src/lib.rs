@@ -523,6 +523,7 @@ pub mod run_steps;
 pub(crate) mod autonomous_runtime;
 pub mod runtime;
 pub mod runtime_config;
+pub mod entry_gate;
 pub mod runtime_dispatch;
 mod runtime_turn;
 pub mod runtime_install;

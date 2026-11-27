@@ -1,6 +1,7 @@
 //! #210 B source-first origin/formatter contracts, UNRUN.
 use super::reply_origin::*;
 use super::*;
+use super::entry_gate_test_helpers::{owned_channel, misaligned_worker, assert_refused_before_any_side_effect};
 use duduclaw_core::types::RuntimeType;
 #[test]
 fn nonclaude_auth_does_not_emit_claude_advice_or_signal_claude_outage() {
@@ -45,137 +46,6 @@ fn anthropic_api_error_does_not_instruct_cli_login_and_local_notice_uses_known_o
     assert!(!notice.contains("自動切回 Claude"));
 }
 
-struct PrimaryFailure {
-    id: RuntimeType,
-    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-}
-#[async_trait::async_trait]
-impl crate::runtime::AgentRuntime for PrimaryFailure {
-    fn name(&self) -> &str {
-        self.id.as_str()
-    }
-    async fn execute(
-        &self,
-        _: &str,
-        _: &crate::runtime::RuntimeContext,
-    ) -> Result<crate::runtime::RuntimeResponse, String> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err("401 invalid bearer token; misleading Claude /login text".into())
-    }
-    async fn is_available(&self) -> bool {
-        true
-    }
-}
-async fn owned_channel(
-    provider: RuntimeType,
-) -> (
-    tempfile::TempDir,
-    ReplyContext,
-    crate::runtime_dispatch::testing::RegistryGuard,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) {
-    let home = tempfile::tempdir().unwrap();
-    std::fs::write(home.path().join("config.toml"),"[general]\ninference_mode='claude'\n[goal_intent]\nenabled=false\nmode='off'\n[[accounts]]\nid='owned-fake-api'\ntype='api_key'\nprovider='anthropic'\napi_key='owned-not-a-real-key'\n").unwrap();
-    for (id, role, display, model, runtime) in [
-        ("main", "main", "Wrong Main", "claude-sonnet-4-6", "claude"),
-        (
-            "worker",
-            "specialist",
-            "Actual Worker",
-            "gpt-5.4",
-            provider.as_str(),
-        ),
-    ] {
-        let dir = home.path().join("agents").join(id);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("agent.toml"),
-            format!(
-                r#"[agent]
-name='{id}'
-display_name='{display}'
-role='{role}'
-status='active'
-trigger='@{display}'
-reports_to=''
-icon='🤖'
-[model]
-preferred='{model}'
-fallback=''
-account_pool=[]
-[runtime]
-provider='{runtime}'
-[container]
-timeout_ms=1800000
-[heartbeat]
-enabled=false
-interval_seconds=3600
-max_concurrent_runs=1
-cron=''
-[budget]
-monthly_limit_cents=5000
-warn_threshold_percent=80
-hard_stop=true
-[permissions]
-can_create_agents=false
-can_send_cross_agent=false
-can_modify_own_skills=false
-can_modify_own_soul=false
-can_schedule_tasks=false
-allowed_channels=['*']
-[goal_intent]
-enabled=false
-mode='off'
-[evolution]
-enabled=false
-"#
-            ),
-        )
-        .unwrap();
-    }
-    let registry = std::sync::Arc::new(tokio::sync::RwLock::new(
-        duduclaw_agent::AgentRegistry::new(home.path().join("agents")),
-    ));
-    registry.write().await.scan().await.unwrap();
-    {
-        let loaded = registry.read().await;
-        assert_eq!(loaded.list().len(), 2);
-        assert_eq!(
-            loaded.get("main").unwrap().config.agent.display_name,
-            "Wrong Main"
-        );
-        let worker = loaded.get("worker").unwrap();
-        assert_eq!(worker.config.agent.display_name, "Actual Worker");
-        assert_eq!(worker.config.model.preferred, "gpt-5.4");
-        assert_eq!(
-            worker.config.runtime.provider.as_deref(),
-            Some(provider.as_str())
-        );
-    }
-    let sessions =
-        std::sync::Arc::new(SessionManager::new(&home.path().join("sessions.db")).unwrap());
-    let status = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    let (tx, _rx) = tokio::sync::broadcast::channel(16);
-    let context = ReplyContext::new(registry, home.path().to_owned(), sessions, status, tx);
-    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let mut runtimes: std::collections::HashMap<
-        RuntimeType,
-        Box<dyn crate::runtime::AgentRuntime>,
-    > = std::collections::HashMap::new();
-    runtimes.insert(
-        provider,
-        Box::new(PrimaryFailure {
-            id: provider,
-            calls: calls.clone(),
-        }),
-    );
-    let owned = crate::runtime_dispatch::testing::RegistryGuard::install(
-        home.path(),
-        crate::runtime::RuntimeRegistry::with_runtimes(runtimes),
-    )
-    .await;
-    (home, context, owned, calls)
-}
 #[tokio::test(flavor = "current_thread")]
 async fn actual_shared_channel_pipeline_uses_effective_agent_and_never_implicit_claude_or_direct_api()
  {
@@ -352,53 +222,6 @@ async fn disk_provider_and_model_edits_take_effect_without_registry_rescan() {
     }
 }
 
-/// Nothing of the turn exists after an early gate refusal: no session row or
-/// message (for the conversation or the employee's called bucket), no stored
-/// notice, no runtime call.
-async fn assert_refused_before_any_side_effect(
-    ctx: &ReplyContext, sid: &str, calls: &std::sync::atomic::AtomicUsize, model_calls_before: usize,
-) {
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no runtime call");
-    assert_eq!(crate::model_call_probe::calls(), model_calls_before, "no utility, plan or model entry point reached");
-    for bucket in [sid.to_string(), crate::trigger_route::called_session(sid, "worker")] {
-        assert_eq!(ctx.session_manager.session_agent(&bucket).await.unwrap(), None, "{bucket}: no session row");
-        assert!(ctx.session_manager.get_messages(&bucket).await.unwrap().is_empty(), "{bucket}: no message");
-    }
-    assert_eq!(ctx.skill_bank.lock().await.len(), 0, "no extracted skill");
-    assert!(ctx.skill_cache.lock().await.all().is_empty(), "no skill refresh");
-    for bucket in [sid.to_string(), crate::trigger_route::called_session(sid, "worker")] {
-        assert!(!ctx.skill_recorder.lock().await.is_recording(&format!("{bucket}:worker")));
-        assert!(ctx.failsafe.as_ref().unwrap().get_state(&bucket).await.is_none(), "no failsafe mutation");
-    }
-    for (file, table) in [("tasks.db", "tasks"), ("approvals.db", "approvals")] {
-        let path = ctx.home_dir.join(file);
-        if path.exists() {
-            let db = rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-            let count: i64 = db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0)).unwrap();
-            assert_eq!(count, 0, "no {table} created");
-        }
-    }
-    assert!(!ctx.home_dir.join("recent_skills.db").exists());
-    assert!(!ctx.home_dir.join("credentials/ledger.db").exists());
-    assert!(!ctx.home_dir.join("skill_extraction_audit.jsonl").exists());
-}
-
-/// The worker on disk is misaligned (`gpt-5.4` on Grok); the fake runtime
-/// counts every Grok call, model or utility.
-async fn misaligned_worker(extra: &str) -> (
-    tempfile::TempDir, ReplyContext, crate::runtime_dispatch::testing::RegistryGuard,
-    std::sync::Arc<std::sync::atomic::AtomicUsize>,
-) {
-    let (home, ctx, registry, calls) = owned_channel(RuntimeType::Grok).await;
-    if !extra.is_empty() {
-        let path = home.path().join("agents/worker/agent.toml");
-        let text = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(&path, format!("{text}{extra}")).unwrap();
-        ctx.registry.write().await.scan().await.unwrap();
-    }
-    (home, ctx, registry, calls)
-}
-
 #[tokio::test(flavor = "current_thread")]
 async fn disk_provider_only_mismatch_is_refused_before_any_session_or_model_call() {
     let model_calls_before = crate::model_call_probe::calls();
@@ -492,14 +315,35 @@ async fn misaligned_employee_is_refused_before_os_intent_goal_confirmation_and_k
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn misaligned_employee_cannot_change_failsafe_with_safety_words() {
+async fn broken_employee_can_stop_resume_and_query_failsafe_before_config_gate() {
+    use duduclaw_security::failsafe::FailsafeLevel;
     let model_calls_before = crate::model_call_probe::calls();
-    let (_home, ctx, _registry, calls) = misaligned_worker("").await;
-    for text in ["!STOP", "!RESUME"] {
+    let (home, ctx, _registry, calls) = misaligned_worker("").await;
+    let path = home.path().join("agents/worker/agent.toml");
+    // Cover both a readable mismatch and a file that cannot be parsed.
+    for broken in [false, true] {
+        if broken { std::fs::write(&path, "[runtime").unwrap(); }
         let sid = "discord:gate-safety";
-        let reply = build_reply_for_agent(text, &ctx, "worker", sid, "owned-user", None).await;
-        assert!(reply.contains("model_provider_mismatch"), "{reply}");
-        assert_refused_before_any_side_effect(&ctx, sid, &calls, model_calls_before).await;
+        let failsafe = ctx.failsafe.as_ref().unwrap();
+        for (text, expected) in [
+            ("!STOP", FailsafeLevel::L4Halted),
+            ("!STATUS", FailsafeLevel::L4Halted),
+            ("!RESUME", FailsafeLevel::L0Normal),
+            ("!STOP ALL", FailsafeLevel::L4Halted),
+            ("!RESUME", FailsafeLevel::L0Normal),
+        ] {
+            let reply = build_reply_for_agent(text, &ctx, "worker", sid, "owned-user", None).await;
+            assert!(!reply.is_empty(), "{text}");
+            assert!(!reply.contains("model_provider_mismatch"), "{reply}");
+            assert!(!reply.contains("agent_config_unreadable"), "{reply}");
+            assert_eq!(failsafe.get_level(sid).await, expected, "{text}");
+            // Inline STOP ALL must retain the old scope-only restriction.
+            assert_eq!(failsafe.get_level("__global__").await, FailsafeLevel::L0Normal);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(crate::model_call_probe::calls(), model_calls_before);
+            assert!(ctx.session_manager.get_messages(sid).await.unwrap().is_empty());
+            assert!(ctx.session_manager.session_agent(sid).await.unwrap().is_none());
+        }
     }
 }
 
@@ -541,8 +385,8 @@ async fn missing_openai_compat_model_is_refused_with_a_specific_code_and_no_mode
     assert_ne!(broken, original, "fixture must remove the configured model");
     std::fs::write(&path, &broken).unwrap();
     assert_eq!(
-        crate::runtime_config::load_runtime_settings_strict(path.parent().unwrap()),
-        Err(crate::runtime_config::RuntimeSettingsError::MissingModel),
+        crate::entry_gate::resolve_and_check(home.path(), &ctx.registry.read().await, "worker").unwrap_err(),
+        crate::entry_gate::EntryRefusal::Config(crate::runtime_config::RuntimeSettingsError::MissingModel),
     );
     let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
     let sid = "discord:missing-model";
@@ -563,4 +407,33 @@ async fn missing_openai_compat_model_is_refused_with_a_specific_code_and_no_mode
     let reply = build_reply_for_agent("hello", &ctx, "worker", &visitor, "owned-visitor", None).await;
     assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn system_prompt_read_failure_uses_entry_refusal_for_public_and_operator_audiences() {
+    let model_calls_before = crate::model_call_probe::calls();
+    let (home, ctx, _registry, calls) = owned_channel(RuntimeType::Codex).await;
+    let raw = home.path().join("agents/worker/agent.toml");
+    let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    std::fs::copy(&raw, &resolved).unwrap();
+    // Entry preflight reads the valid effective artifact. ProfileSections
+    // still reads the source in W1, so this fails at system-prompt assembly.
+    std::fs::write(&raw, "[broken-source").unwrap();
+    for sid in ["odoolivechat:owned:44", "widget-visitor:profile", "webchat:operator-profile"] {
+        let reply = build_reply_for_agent("hello", &ctx, "worker", sid, "owned-user", None).await;
+        if super::assembly::public_session(sid) {
+            assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+        } else {
+            assert!(reply.contains("agent_config_unreadable"), "{reply}");
+            assert!(reply.contains("無法讀取這位員工的設定"), "{reply}");
+        }
+    }
+    let reply = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
+        "widget-visitor:profile-account".into(),
+        build_reply_for_agent("hello", &ctx, "worker", "webchat:widget-profile", "owned-user", None),
+    ).await;
+    assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(crate::model_call_probe::calls(), model_calls_before);
 }
