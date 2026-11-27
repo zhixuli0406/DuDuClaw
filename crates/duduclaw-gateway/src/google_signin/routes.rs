@@ -49,13 +49,6 @@ fn check_google_rate_limit(ip: IpAddr, route: &'static str) -> bool {
     true
 }
 
-fn reset_google_rate_limit(ip: IpAddr) {
-    let ip = login_throttle_ip(ip);
-    if let Ok(mut map) = GOOGLE_RATE_LIMITER.lock() {
-        for route in ["start", "callback", "complete"] { map.remove(&(ip, route)); }
-    }
-}
-
 fn hash(value: &str) -> Hash { Sha256::digest(value.as_bytes()).into() }
 fn same_hash(a: &Hash, b: &Hash) -> bool {
     ring::constant_time::verify_slices_are_equal(a, b).is_ok()
@@ -410,7 +403,6 @@ async fn complete_inner(state: &Arc<AppState>, addr: SocketAddr, headers: &Heade
         Ok(tokens) => tokens,
         Err(_) => return server_mfa::require_after_first_factor(state, &user, FirstFactor::GoogleOidc).await,
     };
-    reset_google_rate_limit(addr.ip());
     let _ = state.user_db.update_last_login(&user.id);
     let _ = state.user_db.log_action(Some(&user.id), "login", None,
         Some(r#"{"method":"google"}"#), Some(&addr.ip().to_string()));

@@ -180,14 +180,8 @@ async fn settings_checks_reuse_redirect_and_personal_edition_refuses_writes() {
     }
     f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Personal)).await;
     assert_eq!(code(f.admin("google.signin.set", settings()).await), "signin_personal_edition");
-    let get = payload(f.admin("google.signin.get", json!({})).await);
-    assert_eq!(get["checks"]["personal_edition"], true);
-    assert!(get["checks"]["personal_connection_domains_cover"].is_null());
+    assert_eq!(code(f.admin("google.signin.get", json!({})).await), "signin_personal_edition");
     for method in &METHODS[2..] { assert!(refused(f.admin(method, json!({})).await)); }
-    std::fs::write(f.home.path().join("config.toml"), "[dashboard]\npublic_url='http://localhost.evil.test'\n").unwrap();
-    let get = payload(f.admin("google.signin.get", json!({})).await);
-    assert!(get["redirect_uri"].is_null());
-    assert_eq!(get["checks"]["public_url_ok"], false);
 }
 
 #[tokio::test]

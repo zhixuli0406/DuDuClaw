@@ -79,23 +79,21 @@ fn settings_value(s: &GoogleSigninSettings) -> Value {
         "approval_grants_mfa_enrollment": s.approval_grants_mfa_enrollment,
         "ack": s.ack.as_ref().map(|(by, at)| json!({"by": by, "at": at}))})
 }
-fn settings_get(home: &Path, personal: bool) -> Value {
+fn settings_get(home: &Path) -> Value {
     let s = config::read_strict(home);
     let base = routes::public_base(home);
     // This is the exact domain policy used by google_personal::access.
     // A malformed policy is a failed check, never a permissive fallback.
-    let covers = if personal { None } else {
-        Some(duduclaw_core::google_identity::read_home_config(home).is_ok_and(|c|
-            c.allowed_domains.is_empty() || s.allowed_hd.iter().all(|hd| c.allowed_domains.contains(hd))))
-    };
-    let mfa = match crate::mfa::enforced(home, personal) {
+    let covers = Some(duduclaw_core::google_identity::read_home_config(home).is_ok_and(|c|
+        c.allowed_domains.is_empty() || s.allowed_hd.iter().all(|hd| c.allowed_domains.contains(hd))));
+    let mfa = match crate::mfa::enforced(home, false) {
         Ok(true) => "enforced", Ok(false) => "not_enforced", Err(_) => "unknown",
     };
     json!({"settings": settings_value(&s),
         "redirect_uri": base.as_ref().map(|(base, _)| routes::redirect_uri(base)),
         "checks": {"client_configured": routes::configured_client(home).is_some(),
             "public_url_ok": base.is_some(), "domains_set": !s.allowed_hd.is_empty(),
-            "mfa_policy": mfa, "personal_edition": personal, "personal_connection_domains_cover": covers}})
+            "mfa_policy": mfa, "personal_edition": false, "personal_connection_domains_cover": covers}})
 }
 fn step_up(db: &UserDb, ctx: &UserContext, session: &str, csrf: Option<[u8; 32]>) -> Result<(), WsFrame> {
     let csrf = csrf.ok_or_else(|| signin_error("signin_step_up_required"))?;
@@ -115,7 +113,7 @@ impl MethodHandler {
             Ok(session) => session, Err(_) => return signin_error("signin_dashboard_required"),
         };
         let personal = self.resolve_edition_profile().await.is_personal();
-        if personal && method != "google.signin.get" { return signin_error("signin_personal_edition"); }
+        if personal { return signin_error("signin_personal_edition"); }
         let Some(db) = self.user_db.read().await.clone() else { return signin_error("signin_storage_unavailable"); };
         let (home, ctx, method) = (self.home_dir.clone(), ctx.clone(), method.to_owned());
         let cache = self.live_ctx_cache.clone();
@@ -125,7 +123,7 @@ impl MethodHandler {
             match method.as_str() {
                 "google.signin.get" => {
                     let _: Empty = parse(params)?;
-                    Ok(settings_get(&home, personal))
+                    Ok(settings_get(&home))
                 }
                 "google.signin.set" => {
                     let input: SetRequest = parse(params)?;
