@@ -6986,7 +6986,7 @@ mod background_entry_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn background_run_keeps_gated_model_runtime_effort_and_fallback_after_edit() {
-        let (home, ctx, _initial_runtime, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let (home, ctx, initial_runtime, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
         let snapshot = {
             let reg = ctx.registry.read().await;
             let path = crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path;
@@ -7006,6 +7006,7 @@ mod background_entry_tests {
         let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();
         let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
         runtimes.insert(RuntimeType::Codex, Box::new(crate::runtime_dispatch::testing::RecordingCodex(calls.clone())));
+        drop(initial_runtime);
         let _runtime = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(),
             crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
         crate::runtime_dispatch::with_chat_turn_config(snapshot.clone(), async {

@@ -10,6 +10,7 @@ import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
+import authorityFields from './__fixtures__/authority-fields.json';
 
 // v1.68 W1 — partial writes, typed key/value editor, new controls, admin gating.
 
@@ -413,6 +414,56 @@ describe('typed key/value editor', () => {
 });
 
 describe('admin-only fields', () => {
+  it.each([false, true])('prevents an owner from enabling unlimited skill content (server paths: %s)', async (serverPaths) => {
+    const user = userEvent.setup();
+    setRole('employee');
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      ...(serverPaths ? {
+        admin_only_fields: authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths),
+      } : {}),
+    });
+    renderAt('/agents/my-bot/edit?tab=skills');
+    const unlimited = await screen.findByRole('switch', { name: en['agents.adv.skillBudgetUnlimited'] });
+    expect(unlimited).toHaveAttribute('data-disabled');
+    expect(screen.getByText(en['agents.adv.skillBudgetUnlimited.ownerHint'])).toBeInTheDocument();
+    expect(screen.getByRole('spinbutton', { name: en['agents.adv.skillTokenBudget'] })).not.toBeDisabled();
+    await user.click(unlimited);
+    expect(unlimited).not.toBeChecked();
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])('lets an owner turn unlimited skill content off (server paths: %s)', async (serverPaths) => {
+    const user = userEvent.setup();
+    setRole('employee');
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      evolution: { skill_budget_unlimited: true },
+      ...(serverPaths ? {
+        admin_only_fields: authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths),
+      } : {}),
+    });
+    renderAt('/agents/my-bot/edit?tab=skills');
+    const unlimited = await screen.findByRole('switch', { name: en['agents.adv.skillBudgetUnlimited'] });
+    expect(unlimited).toBeChecked();
+    expect(unlimited).not.toHaveAttribute('data-disabled');
+    expect(screen.getByText(en['agents.adv.skillBudgetUnlimited.ownerHint'])).toBeInTheDocument();
+    await user.click(unlimited);
+    expect(unlimited).not.toBeChecked();
+    expect(unlimited).toHaveAttribute('data-disabled');
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith('my-bot', { skill_budget_unlimited: false }), { timeout: 3000 });
+  });
+
+  it('lets an admin enable unlimited skill content and save it', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=skills');
+    const unlimited = await screen.findByRole('switch', { name: en['agents.adv.skillBudgetUnlimited'] });
+    expect(unlimited).not.toHaveAttribute('data-disabled');
+    expect(screen.queryByText(en['agents.adv.skillBudgetUnlimited.ownerHint'])).not.toBeInTheDocument();
+    await user.click(unlimited);
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith('my-bot', { skill_budget_unlimited: true }), { timeout: 3000 });
+  });
+
   it('disables org, capability and sandbox controls for a non-admin and never sends them', async () => {
     const user = userEvent.setup();
     setRole('manager');
@@ -688,3 +739,40 @@ describe('boundaries (contract) review', () => {
 });
 
 import { api } from '@/lib/api';
+
+describe('RM-227 displayed runtime limits and external signals', () => {
+  it.each([
+    ['codex', ''], ['grok', ''], ['qwen', ''],
+    ['claude', 'codex'], ['claude', 'grok'], ['claude', 'qwen'],
+  ])('shows the tool-limit hint for provider %s and fallback %s', async (provider, fallback) => {
+    mockWsClient.call.mockResolvedValue({ ...FULL, runtime: { provider, fallback } });
+    renderAt('/agents/my-bot/edit?tab=brain');
+    expect((await screen.findAllByText(en['agents.v168.genericCli.note'])).length).toBeGreaterThan(0);
+  });
+
+  it('does not show the coarse tool-limit hint for Claude alone', async () => {
+    renderAt('/agents/my-bot/edit?tab=brain');
+    await waitFor(() => expect(screen.getByRole('combobox', { name: 'Reasoning effort' })).toHaveTextContent('High'));
+    expect(screen.queryByText(en['agents.v168.genericCli.note'])).not.toBeInTheDocument();
+  });
+
+  it.each([false, true])('shows external signals as %s from inspect, defaulting missing values off', async (enabled) => {
+    const factors = {
+      user_feedback: true, security_events: true, channel_metrics: true,
+      business_context: true, peer_signals: true,
+    };
+    mockWsClient.call.mockResolvedValue({
+      ...FULL, evolution: enabled ? { external_factors: factors } : {},
+    });
+    renderAt('/agents/my-bot/edit?tab=automation');
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'Turn on night-time tidy-up' })).toBeChecked());
+    for (const id of [
+      'agents.evo.userFeedback', 'agents.evo.securityEvents', 'agents.evo.channelMetrics',
+      'agents.evo.businessContext', 'agents.evo.peerSignals',
+    ] as const) {
+      const toggle = await screen.findByRole('switch', { name: en[id] });
+      await waitFor(() => expect(toggle).toHaveAttribute('aria-checked', String(enabled)));
+    }
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+});

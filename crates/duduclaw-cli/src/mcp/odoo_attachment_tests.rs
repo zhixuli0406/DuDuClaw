@@ -217,14 +217,20 @@ fn shallow_jpeg_webp_and_wrong_image_formats_are_refused() {
 fn image_dimensions_and_both_input_and_output_sizes_are_bounded() {
     for (width, height) in [(IMAGE_MAX_DIMENSION + 1, 1), (1, IMAGE_MAX_DIMENSION + 1)] {
         let png = image_bytes(image::ImageFormat::Png, width, height);
-        assert!(prepare_file(&attachment("x.png"), png, 1024 * 1024).is_err());
+        let error = prepare_file(&attachment("x.png"), png, 1024 * 1024).unwrap_err();
+        assert!(error.contains("圖片尺寸"), "{error}");
     }
     let png = valid_png();
-    assert!(prepare_file(&attachment("x.png"), png.clone(), png.len() as u64 - 1).is_err());
-    let webp = image_bytes(image::ImageFormat::WebP, 2, 2);
+    assert_eq!(prepare_file(&attachment("x.png"), png.clone(), png.len() as u64 - 1).unwrap_err(), SIZE_REFUSED);
+    // One pixel uses single-symbol WebP Huffman trees. The 2x2 fixture adds
+    // a run-length tree whose overhead can make it larger than the PNG output.
+    let webp = image_bytes(image::ImageFormat::WebP, 1, 1);
     let (output, _, _) = prepare_file(&attachment("x.webp"), webp.clone(), 1024 * 1024).unwrap();
     assert!(output.len() > webp.len());
-    assert!(prepare_file(&attachment("x.webp"), webp.clone(), webp.len() as u64).is_err());
+    assert_eq!(prepare_file(&attachment("x.webp"), webp.clone(), output.len() as u64).unwrap().0, output);
+    // Input fits exactly, so this refusal must come from the output bound.
+    let error = prepare_file(&attachment("x.webp"), webp.clone(), webp.len() as u64).unwrap_err();
+    assert!(error.contains("附件大小限制"), "{error}");
 }
 
 fn deflate(bytes: &[u8]) -> Vec<u8> {

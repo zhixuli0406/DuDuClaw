@@ -320,7 +320,7 @@ impl MethodHandler {
             can_modify_own_skills = true
             can_modify_own_soul = false
             can_schedule_tasks = true
-            allowed_channels = ["*"]
+            allowed_channels = []
             permissions_enforced_since = "1.68.0"
 
             // v1.68: the `*_reflection`, `skill_auto_activate` and
