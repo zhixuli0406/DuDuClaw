@@ -64,7 +64,8 @@ impl SpecError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Zone {
     Named(chrono_tz::Tz),
-    /// The host's local zone (`TZ` / `/etc/localtime`).
+    /// The host's local zone (`TZ` / `/etc/localtime`), for rows created before v1.86.
+    /// New rows always store an explicit timezone name.
     Local,
 }
 

@@ -8,6 +8,8 @@
 #[allow(unused_imports)]
 use super::*;
 
+use duduclaw_core::company_timezone;
+
 use crate::assign_schedule::{
     AssignKind, AssignPayload, CreateError, Creator, ManageAction, NewSchedule, ScheduleSpec, Zone,
     manage, natural, spec,
@@ -162,6 +164,15 @@ impl MethodHandler {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string);
+        let (timezone, zone_note) = match timezone {
+            Some(name) => (Some(name), None),
+            None => {
+                let choice = company_timezone::default_for_new_schedule(
+                    &company_timezone::read(&self.home_dir), false, Utc::now(),
+                );
+                (Some(choice.zone), company_timezone::zone_note_zh(&choice.source))
+            }
+        };
         let zone = match Zone::parse(timezone.as_deref()) {
             Ok(z) => z,
             Err(e) => return WsFrame::error_response("", e.code()),
@@ -196,7 +207,7 @@ impl MethodHandler {
                 let view = manage::row_json(&row, None);
                 self.broadcast_event("assign_schedule.changed", json!({}))
                     .await;
-                WsFrame::ok_response("", json!({ "schedule": view }))
+                WsFrame::ok_response("", json!({ "schedule": view, "zone_note": zone_note }))
             }
             Err(e) => WsFrame::error_response("", &create_error(&e)),
         }

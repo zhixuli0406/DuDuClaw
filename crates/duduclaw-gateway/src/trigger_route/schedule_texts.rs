@@ -2,6 +2,7 @@
 //! `/交辦 排程`), in the home's configured language.
 
 use chrono::{DateTime, Utc};
+use duduclaw_core::company_timezone::{ZoneSource, zone_note_zh};
 
 use super::texts::Lang;
 use crate::assign_schedule::{ScheduleSpec, SpecError, Zone};
@@ -80,6 +81,8 @@ pub struct Created<'a> {
     pub agent_name: &'a str,
     pub when: &'a str,
     pub next: &'a str,
+    pub zone: &'a str,
+    pub zone_source: ZoneSource,
     pub short_id: &'a str,
     pub description: &'a str,
     pub boundary_ignored: bool,
@@ -90,21 +93,27 @@ pub fn created(lang: Lang, c: &Created<'_>) -> String {
         agent_name,
         when,
         next,
+        zone,
+        zone_source,
         short_id,
         description,
         boundary_ignored,
     } = c;
     let mut out = match lang {
         Lang::ZhTw => format!(
-            "🗓 已排程（#{short_id}）：{when} 交辦給「{agent_name}」\n{description}\n下次：{next}。每次執行前都會重新確認你的權限。用「/交辦 排程」查看、暫停或刪除。"
+            "🗓 已排程（#{short_id}）：{when} 交辦給「{agent_name}」\n{description}\n下次：{next}（{zone}）。每次執行前都會重新確認你的權限。用「/交辦 排程」查看、暫停或刪除。"
         ),
         Lang::En => format!(
-            "🗓 Scheduled (#{short_id}): {when}, assigned to {agent_name}\n{description}\nNext: {next}. Your permission is checked again before every run. Use \"/assign schedules\" to list, pause or remove."
+            "🗓 Scheduled (#{short_id}): {when}, assigned to {agent_name}\n{description}\nNext: {next} ({zone}). Your permission is checked again before every run. Use \"/assign schedules\" to list, pause or remove."
         ),
         Lang::Ja => format!(
-            "🗓 予約しました（#{short_id}）：{when}「{agent_name}」に依頼\n{description}\n次回：{next}。毎回の実行前に権限を確認し直します。「/交辦 排程」で確認・一時停止・削除できます。"
+            "🗓 予約しました（#{short_id}）：{when}「{agent_name}」に依頼\n{description}\n次回：{next}（{zone}）。毎回の実行前に権限を確認し直します。「/交辦 排程」で確認・一時停止・削除できます。"
         ),
     };
+    if let Some(note) = zone_note(lang, zone_source) {
+        out.push('\n');
+        out.push_str(note);
+    }
     if *boundary_ignored {
         out.push('\n');
         out.push_str(match lang {
@@ -114,6 +123,27 @@ pub fn created(lang: Lang, c: &Created<'_>) -> String {
         });
     }
     out
+}
+
+pub fn zone_name(lang: Lang, name: Option<&str>) -> &str {
+    name.map(str::trim).filter(|s| !s.is_empty()).unwrap_or(match lang {
+        Lang::ZhTw => "主機時區",
+        Lang::En => "host time zone",
+        Lang::Ja => "ホストのタイムゾーン",
+    })
+}
+
+fn zone_note(lang: Lang, source: &ZoneSource) -> Option<&'static str> {
+    match (lang, source) {
+        (Lang::ZhTw, _) => zone_note_zh(source),
+        (_, ZoneSource::Company) => None,
+        (Lang::En, ZoneSource::UtcUnset) => Some("The company time zone is not set. This schedule uses UTC."),
+        (Lang::En, ZoneSource::UtcInvalid) => Some("The company time zone is invalid. This schedule uses UTC."),
+        (Lang::En, ZoneSource::UtcMemberDst) => Some("The company time zone has daylight saving time. Member schedules use UTC; ask an administrator to use local time."),
+        (Lang::Ja, ZoneSource::UtcUnset) => Some("会社のタイムゾーンが未設定のため、この予約は UTC で実行します。"),
+        (Lang::Ja, ZoneSource::UtcInvalid) => Some("会社のタイムゾーンが無効なため、この予約は UTC で実行します。"),
+        (Lang::Ja, ZoneSource::UtcMemberDst) => Some("会社のタイムゾーンには夏時間があるため、メンバーの予約は UTC で実行します。現地時間を使う場合は管理者に依頼してください。"),
+    }
 }
 
 pub fn spec_error(lang: Lang, e: &SpecError) -> String {

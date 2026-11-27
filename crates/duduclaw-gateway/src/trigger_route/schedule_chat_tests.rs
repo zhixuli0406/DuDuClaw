@@ -249,3 +249,64 @@ async fn a_bad_time_or_a_non_admin_cron_is_explained() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn chat_schedule_uses_company_zone_and_shows_it() {
+    let (home, reg) = registry(false).await;
+    let (mgr, _) = org(home.path());
+    std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'America/New_York'\n").unwrap();
+    let c = caller(home.path(), "U_mgr");
+    let reply = run(&reg, &c, "/交辦 @sales-rep 寫週報 || 時間:每天 9:00").await;
+    assert!(reply.text.contains("已排程"), "{}", reply.text);
+    assert!(reply.text.contains("（America/New_York）"), "{}", reply.text);
+    assert!(!reply.text.contains("以 UTC 計時"));
+    let store = TaskStore::open(home.path()).unwrap();
+    let rows = store.list_assign_schedules(Some(&mgr), 10).await.unwrap();
+    assert_eq!(rows[0].timezone.as_deref(), Some("America/New_York"));
+    let next = crate::assign_schedule::spec::parse_utc(rows[0].next_fire_at.as_deref().unwrap()).unwrap();
+    assert_eq!(next.with_timezone(&chrono_tz::America::New_York).format("%H:%M").to_string(), "09:00");
+    assert!(run(&reg, &c, "/交辦 排程").await.text.contains("America/New_York"));
+    let mut legacy = rows[0].clone();
+    legacy.timezone = None;
+    for (lang, label) in [(Lang::ZhTw, "主機時區"), (Lang::En, "host time zone"), (Lang::Ja, "ホストのタイムゾーン")] {
+        assert!(list_text(home.path(), lang, &[legacy.clone()]).contains(label));
+    }
+}
+
+#[test]
+fn chat_schedule_confirmation_labels_zone_and_fallback_in_each_language() {
+    use duduclaw_core::company_timezone::ZoneSource;
+    for (source, zh, en, ja) in [
+        (ZoneSource::UtcUnset, "公司時區尚未設定", "not set", "未設定"),
+        (ZoneSource::UtcInvalid, "公司時區設定無效", "invalid", "無効"),
+    ] {
+        for (lang, note) in [(Lang::ZhTw, zh), (Lang::En, en), (Lang::Ja, ja)] {
+            let text = t::created(lang, &t::Created {
+                agent_name: "Sales", when: "daily", next: "12/01 09:00", zone: "UTC",
+                zone_source: source, short_id: "12345678", description: "Report", boundary_ignored: false,
+            });
+            assert!(text.contains(note), "{text}");
+            assert!(text.contains("09:00（UTC）") || text.contains("09:00 (UTC)"), "{text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn chat_schedule_unset_and_invalid_use_utc_with_note() {
+    let (home, reg) = registry(false).await;
+    let (mgr, _) = org(home.path());
+    let c = caller(home.path(), "U_mgr");
+    for (config, note) in [
+        ("", "公司時區尚未設定，這個排程以 UTC 計時。"),
+        ("[general]\ncompany_timezone = 'Bad/Zone'\n", "公司時區設定無效，這個排程以 UTC 計時。"),
+    ] {
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let reply = run(&reg, &c, "/交辦 @sales-rep 寫週報 || 時間:每天 9:00").await;
+        assert!(reply.text.contains("（UTC）"), "{}", reply.text);
+        assert!(reply.text.contains(note), "{}", reply.text);
+    }
+    let store = TaskStore::open(home.path()).unwrap();
+    let rows = store.list_assign_schedules(Some(&mgr), 10).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|row| row.timezone.as_deref() == Some("UTC")));
+}
