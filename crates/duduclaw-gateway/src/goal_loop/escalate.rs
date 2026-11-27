@@ -175,8 +175,8 @@ impl GoalLoopDriver {
                     "pause_reason": task.pause_reason }));
             let level = AutonomyLevel::for_agent(&self.home_dir, &task.assigned_to);
             if level == AutonomyLevel::Observer
-                // Broken employee settings require repair, even in Observer mode.
-                && task.judge_feedback.as_deref().and_then(crate::entry_gate::background_refusal_code).is_none()
+                // Persisted feedback outlives refusal tokens; check the durable assignee now.
+                && crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to).is_ok()
                 && crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
                     .observer_may_autoclose()
             {

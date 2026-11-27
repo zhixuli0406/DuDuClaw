@@ -79,16 +79,19 @@ impl GoalLoopDriver {
             debug!(task = %task_id, "goal loop: durable round fenced by the dispatcher — slot released");
             return Ok(false);
         }
-        // Employee configuration is not a provider failure. Park on the first
-        // refusal, after returning unrun directions, without a retry/backoff.
-        if let Some(code) = crate::entry_gate::background_refusal_code(error) {
-            self.dispatch_failures.lock().await.remove(task_id);
-            let Some(task) = self.store.get_task(task_id).await? else { return Ok(false); };
-            self.escalate(inflight, &task, error,
-                crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
-            self.post_activity("goal_loop.entry_refused", &task.assigned_to, Some(task_id),
-                &format!("blocked_needs_decision: {code}")).await;
-            return Ok(true);
+        // Queue errors survive restarts and token expiry. Recheck the durable
+        // assignee instead of authenticating a persisted refusal token.
+        if let Some(task) = self.store.get_task(task_id).await? {
+            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                let code = refusal.code();
+                let error = crate::entry_gate::background_refusal(&refusal);
+                self.dispatch_failures.lock().await.remove(task_id);
+                self.escalate(inflight, &task, &error,
+                    crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+                self.post_activity("goal_loop.entry_refused", &task.assigned_to, Some(task_id),
+                    &format!("blocked_needs_decision: {code}")).await;
+                return Ok(true);
+            }
         }
         // Admission may change after enqueue but before the runtime handoff.
         // These refusals are not infrastructure failures and must not enter

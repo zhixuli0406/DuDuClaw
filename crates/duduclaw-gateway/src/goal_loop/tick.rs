@@ -90,7 +90,7 @@ impl GoalLoopDriver {
             //    Free the slot NOW — before the candidate check below, because
             //    such a task is still `todo` and therefore a candidate — so the
             //    Personal-edition cap is not held by a round that never ran. ──
-            // The anchored entry-refusal code parks this round immediately in
+            // A fresh strict assignee check parks a broken employee immediately in
             // on_dispatch_failed; escalated_this_tick prevents a stale candidate
             // from being enqueued again in this same pass.
             if let Some(failed_error) = self.dispatch_failure_for(&inflight, &id).await {
