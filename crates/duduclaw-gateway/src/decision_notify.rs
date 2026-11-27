@@ -576,7 +576,7 @@ pub(crate) async fn googlechat_card_markup(
     decision_id: &str,
 ) -> Option<serde_json::Value> {
     let markup = crate::channel_format::decision_markup("googlechat", source, decision_id)?;
-    crate::googlechat::sending_app_takes_http_clicks(home_dir, sender, space)
+    crate::googlechat::sending_app_takes_http_clicks(home_dir, sender, space, false)
         .await
         .then_some(markup)
 }

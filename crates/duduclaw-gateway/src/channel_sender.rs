@@ -567,8 +567,10 @@ pub(crate) async fn send_untrusted_card(
 ) -> Result<Option<crate::decision_card::PushedMessage>, String> {
     if channel == "googlechat" {
         let body = card_message_payload(channel, chat_id, text, serde_json::Value::Null, true)?;
-        crate::googlechat::send_untrusted_card(home, chat_id, body).await?;
-        return Ok(None);
+        let name = crate::googlechat::send_untrusted_card(home, chat_id, body).await?;
+        return Ok(name.map(|message_id| crate::decision_card::PushedMessage {
+            edit_chat_id: chat_id.to_owned(), message_id,
+        }));
     }
     let markup = markup.ok_or_else(|| "unsupported card channel".to_string())?;
     send_with_markup_inner(http, channel, token, chat_id, text, markup, true).await
@@ -631,8 +633,9 @@ async fn send_with_markup_inner(
                 ));
             }
             let ts = data.get("ts").and_then(|v| v.as_str()).map(str::to_string);
+            let edit_chat_id = data.get("channel").and_then(|v| v.as_str()).unwrap_or(chat_id).to_owned();
             Ok(ts.map(|t| crate::decision_card::PushedMessage {
-                edit_chat_id: chat_id.to_string(),
+                edit_chat_id,
                 message_id: t,
             }))
         }

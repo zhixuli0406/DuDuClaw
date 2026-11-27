@@ -221,6 +221,8 @@ mod tests {
     }
 }
 
+pub(crate) const NO_CONFIGURED_ACCOUNTS: &str = "目前沒有可連結的機器人或聊天應用程式，請先完成設定；Google Chat 需使用 HTTP 連線。";
+
 const CONFIG_UNAVAILABLE: &str = "目前無法處理聊天連結，請重新整理後再試。";
 
 fn configured_string(table: &toml::Table, key: &str) -> bool {
@@ -305,7 +307,7 @@ pub(crate) fn configured_accounts(home: &Path, channel: &str, agents: &[String])
         }
     }
     if result.is_empty() {
-        return Err("目前沒有可連結的機器人或聊天應用程式，請先完成設定；Google Chat 需使用 HTTP 連線。");
+        return Err(NO_CONFIGURED_ACCOUNTS);
     }
     Ok(result)
 }

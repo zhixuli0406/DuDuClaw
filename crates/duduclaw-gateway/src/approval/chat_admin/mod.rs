@@ -1,5 +1,6 @@
 pub(crate) mod card;
 pub(crate) mod config;
+pub(crate) mod deliver;
 pub(crate) mod ledger;
 pub(crate) mod receipts;
 pub(crate) mod tier;
