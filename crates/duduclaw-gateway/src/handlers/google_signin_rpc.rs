@@ -116,6 +116,34 @@ fn step_up(db: &UserDb, ctx: &UserContext, session: &str, csrf: Option<[u8; 32]>
         .map_err(|_| signin_error("signin_step_up_required"))
 }
 
+fn is_pure_disable(home: &Path, update: &SettingsUpdate) -> bool {
+    let current = config::read_strict(home);
+    let allowed_hd = update.allowed_hd.iter().try_fold(Vec::new(), |mut domains, domain| {
+        let domain = crate::google_signin::oidc::normalize_allowed_hd(domain)?;
+        if !domains.contains(&domain) { domains.push(domain); }
+        Some(domains)
+    });
+    !update.enabled
+        && allowed_hd.as_ref() == Some(&current.allowed_hd)
+        && update.approval == current.approval
+        && update.daily_new_accounts == current.daily_new_accounts
+        && update.avatar_template == current.avatar_template
+        && update.approval_grants_mfa_enrollment == current.approval_grants_mfa_enrollment
+}
+
+fn apply_settings(
+    home: &Path, actor_user_id: &str, update: &SettingsUpdate, pure_disable: bool,
+    acknowledge_risk: bool, now_rfc3339: &str,
+) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    if pure_disable {
+        // The exemption may have been decided before another admin's update.
+        // Never write request settings through the unauthenticated branch.
+        config::disable_settings(home, actor_user_id, now_rfc3339)
+    } else {
+        config::write_settings(home, actor_user_id, update, acknowledge_risk, now_rfc3339)
+    }
+}
+
 impl MethodHandler {
     pub(crate) async fn handle_google_signin_rpc(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         if ctx.role != UserRole::Admin || ctx.must_change_password {
@@ -153,23 +181,12 @@ impl MethodHandler {
                     let update = SettingsUpdate { enabled: input.enabled, allowed_hd: input.allowed_hd, approval,
                         daily_new_accounts: input.daily_new_accounts, avatar_template: template,
                         approval_grants_mfa_enrollment: input.approval_grants_mfa_enrollment };
-                    let current = config::read_strict(&home);
-                    let allowed_hd = update.allowed_hd.iter().try_fold(Vec::new(), |mut domains, domain| {
-                        let domain = crate::google_signin::oidc::normalize_allowed_hd(domain)?;
-                        if !domains.contains(&domain) { domains.push(domain); }
-                        Some(domains)
-                    });
-                    let pure_disable = !update.enabled
-                        && allowed_hd.as_ref() == Some(&current.allowed_hd)
-                        && update.approval == current.approval
-                        && update.daily_new_accounts == current.daily_new_accounts
-                        && update.avatar_template == current.avatar_template
-                        && update.approval_grants_mfa_enrollment == current.approval_grants_mfa_enrollment;
+                    let pure_disable = is_pure_disable(&home, &update);
                     if !pure_disable { step_up(&db, &ctx, &session, input.step_up_csrf)?; }
                     // Refuse before touching config if the audit store is unavailable.
                     db.log_action(Some(&ctx.user_id), "google_signin.settings_change_requested", None, None, None)
                         .map_err(|_| signin_error("signin_storage_unavailable"))?;
-                    let (before, after) = config::write_settings(&home, &ctx.user_id, &update, input.acknowledge_risk, &now.to_rfc3339())
+                    let (before, after) = apply_settings(&home, &ctx.user_id, &update, pure_disable, input.acknowledge_risk, &now.to_rfc3339())
                         .map_err(|message| WsFrame::error_response("", &message))?;
                     let detail = json!({"before": settings_value(&before), "after": settings_value(&after)}).to_string();
                     duduclaw_security::audit::log_config_changed(&home, &ctx.email, "admin", &[detail.clone()]);
