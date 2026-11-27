@@ -47,9 +47,10 @@ impl Fixture {
     fn plan(&self, rec: &ApprovalRecord) -> Plan { prepare(self.home.path(), rec).unwrap() }
 }
 
-struct Recording<'a> {
+pub(crate) struct Recording<'a> {
     store: &'a ApprovalStore,
-    sent: Mutex<Vec<(String, String, String)>>,
+    pub(crate) message_offset: usize,
+    pub(crate) sent: Mutex<Vec<(String, String, String)>>,
     replaced: Mutex<Vec<String>>,
     reminders: Mutex<Vec<(String, Option<String>)>>,
     fail_send: bool,
@@ -57,14 +58,14 @@ struct Recording<'a> {
     no_message_channel: Option<&'static str>,
     no_google_clicks: bool,
     mutate_on_send: bool,
-    edits: Mutex<Vec<(String, Option<String>, String)>>,
-    edit_destinations: Mutex<Vec<(String, String)>>,
+    pub(crate) edits: Mutex<Vec<(String, Option<String>, String)>>,
+    pub(crate) edit_destinations: Mutex<Vec<(String, String)>>,
     fail_edit: bool,
 }
 
 impl<'a> Recording<'a> {
-    fn new(store: &'a ApprovalStore) -> Self {
-        Self { store, sent: Mutex::new(Vec::new()), replaced: Mutex::new(Vec::new()),
+    pub(crate) fn new(store: &'a ApprovalStore) -> Self {
+        Self { store, message_offset:0, sent: Mutex::new(Vec::new()), replaced: Mutex::new(Vec::new()),
             reminders: Mutex::new(Vec::new()), fail_send:false, fail_channel:None, no_message_channel:None,
             no_google_clicks:false, mutate_on_send:false, edits:Mutex::new(Vec::new()),
             edit_destinations:Mutex::new(Vec::new()), fail_edit:false }
@@ -87,7 +88,7 @@ impl Sender for Recording<'_> {
         };
         if self.fail_send || self.fail_channel == Some(target.proof.channel.as_str()) { return Err(()); }
         if self.no_message_channel == Some(target.proof.channel.as_str()) { return Ok(None); }
-        Ok(Some(PushedMessage { edit_chat_id:target.proof.proof_dm.clone(), message_id:count.to_string() }))
+        Ok(Some(PushedMessage { edit_chat_id:target.proof.proof_dm.clone(), message_id:(count + self.message_offset).to_string() }))
     }
     async fn replace(&self, target: &Target, _: Option<&PushedMessage>) -> bool {
         self.replaced.lock().unwrap().push(target.user_id.clone()); true
@@ -599,5 +600,13 @@ fn collapse_label_uses_recorded_actor_and_defaults_to_dashboard() {
         rec.decided_by = by;
         assert_eq!(sync::decision_channel_label(&rec, Lang::ZhTw), "儀表板");
         assert_eq!(sync::decision_channel_label(&rec, Lang::En), "Dashboard");
+    }
+}
+
+// Shared P22 seam: retain the production plan and receipt write ordering.
+pub(crate) async fn deliver_record(home: &Path, store: &ApprovalStore, rec: &ApprovalRecord, sender: &Recording<'_>) -> usize {
+    match prepare(home, rec) {
+        Some(plan) => run(home, store, rec, plan, sender).await.delivered,
+        None => 0,
     }
 }

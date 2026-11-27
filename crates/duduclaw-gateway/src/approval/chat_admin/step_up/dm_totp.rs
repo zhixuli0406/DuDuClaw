@@ -185,4 +185,4 @@ fn matches_receipt(bound: &TotpTicket, receipt: &Receipt) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

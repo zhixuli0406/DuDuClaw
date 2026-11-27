@@ -10,7 +10,7 @@ pub(crate) struct Fixture {
     _home: tempfile::TempDir,
     pub(crate) env: DecisionEnv,
     pub(crate) user: String,
-    ack: String,
+    pub(crate) ack: String,
 }
 
 impl Fixture {
@@ -97,7 +97,7 @@ impl Fixture {
                 "promote_on_approve":true, "claim_digest":digest}), 3600).await.unwrap()
     }
 
-    async fn add_source(&self) -> ApprovalId {
+    pub(crate) async fn add_source(&self) -> ApprovalId {
         use duduclaw_knowledge::acl::{PrincipalKind, Role};
         let (collection, _, _) = crate::knowledge::test_fixtures::collection(&self.env.home, "hr", "internal",
             &[(PrincipalKind::Agent, "support", Role::Viewer)], "既有內容。");
@@ -431,7 +431,7 @@ async fn personal_employee_card_refused_even_for_its_admin_owner() {
 }
 
 impl Fixture {
-    async fn bound(&self, payload: Value, submitter: &str) -> ApprovalId {
+    pub(crate) async fn bound(&self, payload: Value, submitter: &str) -> ApprovalId {
         let binding = crate::approval::ExecutionBinding {
             schema_version:1, run_id:uuid::Uuid::new_v4().to_string(), run_origin_kind:"ingress".into(),
             actor_principal:"support".into(), conversation_audience:Default::default(),
@@ -640,7 +640,7 @@ const FILE_BEFORE: &str = "我是客服，協助回答產品問題。\n";
 const FILE_AFTER: &str = "我是客服，先確認問題，再說明處理方式。\n";
 
 impl Fixture {
-    async fn files_org() -> Self {
+    pub(crate) async fn files_org() -> Self {
         let mut f = Self::new();
         // Registry scans require all non-default AgentConfig sections.
         crate::knowledge::test_fixtures::agent(&f.env.home, "support", r#"
@@ -693,7 +693,7 @@ skill_security_scan = true
         f
     }
 
-    async fn file_change(&self) -> ApprovalId {
+    pub(crate) async fn file_change(&self) -> ApprovalId {
         use crate::agent_files::{FileKey, approval, verdict::{Analysis, Verdict}};
         let analysis = Analysis {
             user_id: self.ack.clone(), agent_id: "support".into(), file: FileKey::Soul,
@@ -706,7 +706,7 @@ skill_security_scan = true
             "proposer@example.test", "調整說明方式").await.unwrap())
     }
 
-    async fn org_change(&self, proposer: &str) -> ApprovalId {
+    pub(crate) async fn org_change(&self, proposer: &str) -> ApprovalId {
         use crate::org_change_approval::{self as oc, Proposal};
         let before = duduclaw_core::org_store::load_for_write(&self.env.home).unwrap()
             .get("support").cloned().unwrap();
@@ -724,7 +724,7 @@ skill_security_scan = true
         if org { self.org_change(&self.ack).await } else { self.file_change().await }
     }
 
-    fn files_org_effect(&self, org: bool) -> Value {
+    pub(crate) fn files_org_effect(&self, org: bool) -> Value {
         if org {
             let authority = duduclaw_core::org_store::load_for_write(&self.env.home).unwrap();
             let mirror = duduclaw_core::org_store::read_mirror(&self.env.home.join("agents/support/agent.toml")).unwrap();
@@ -735,7 +735,7 @@ skill_security_scan = true
         }
     }
 
-    async fn assert_ledger(&self, id: &ApprovalId, chat: bool) {
+    pub(crate) async fn assert_ledger(&self, id: &ApprovalId, chat: bool) {
         let rec = self.env.broker.get(id).await.unwrap().unwrap();
         let conn = self.env.broker.store.conn.lock().await;
         let count: i64 = conn.query_row("SELECT count(*) FROM chat_admin_decisions WHERE approval_id=?1",

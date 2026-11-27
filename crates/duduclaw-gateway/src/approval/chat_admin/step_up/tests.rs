@@ -6,12 +6,12 @@ use crate::approval::chat_admin::receipts;
 use chrono::Utc;
 use rusqlite::{Connection, params};
 
-struct WebFixture {
-    service: Fixture,
-    id: ApprovalId,
-    receipt: Receipt,
-    raw: String,
-    session: String,
+pub(crate) struct WebFixture {
+    pub(crate) service: Fixture,
+    pub(crate) id: ApprovalId,
+    pub(crate) receipt: Receipt,
+    pub(crate) raw: String,
+    pub(crate) session: String,
 }
 impl WebFixture {
     async fn new() -> Self {
@@ -20,15 +20,18 @@ impl WebFixture {
         let id = service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
         let proof = service.proof(&id).await;
         let receipt = receipts::by_card_id(&service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
+        Self::from_service(service, id, receipt)
+    }
+    pub(crate) fn from_service(service: Fixture, id: ApprovalId, receipt: Receipt) -> Self {
         let raw = Store::open(&service.env.home).unwrap().issue(&receipt).unwrap();
         Self { service, id, receipt, raw, session:uuid::Uuid::new_v4().to_string() }
     }
-    fn ctx(&self) -> UserContext { self.service.db().live_user_context(&self.service.user).unwrap().unwrap() }
-    fn input(&self, approve: bool, csrf: Option<[u8;32]>) -> Decision {
+    pub(crate) fn ctx(&self) -> UserContext { self.service.db().live_user_context(&self.service.user).unwrap().unwrap() }
+    pub(crate) fn input(&self, approve: bool, csrf: Option<[u8;32]>) -> Decision {
         Decision { decision:if approve { Choice::Approve } else { Choice::Reject },
             expected_digest:self.receipt.digest.clone(), step_up_csrf:csrf }
     }
-    async fn post(&self, input: Decision) -> Result<Value, Error> {
+    pub(crate) async fn post(&self, input: Decision) -> Result<Value, Error> {
         routes::confirm(&self.service.env, &self.ctx(), &self.session, &self.raw, input).await
     }
     async fn handler(&self) -> crate::handlers::MethodHandler {
@@ -37,7 +40,7 @@ impl WebFixture {
             std::sync::Arc::new(duduclaw_auth::JwtConfig::new(b"step-up-test-secret-32-bytes!!!!!"))).await;
         handler
     }
-    async fn get(&self) -> Result<Value, Error> {
+    pub(crate) async fn get(&self) -> Result<Value, Error> {
         routes::preview(&self.handler().await, &self.service.env, &self.ctx(), &self.session, &self.raw).await
     }
     fn sql(&self, query: &str) {
@@ -51,7 +54,7 @@ impl WebFixture {
             "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,?2,0)",
             params![self.service.user, "fixture:GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"]).unwrap();
     }
-    fn step_up(&self) -> [u8;32] {
+    pub(crate) fn step_up(&self) -> [u8;32] {
         self.factor();
         let now = Utc::now().timestamp();
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE, b"12345678901234567890");

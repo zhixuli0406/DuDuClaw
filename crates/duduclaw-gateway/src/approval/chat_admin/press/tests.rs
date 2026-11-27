@@ -4,18 +4,18 @@ use crate::approval::decision_service::tests::Fixture as ServiceFixture;
 use duduclaw_auth::UserRole;
 use tokio::sync::RwLock;
 
-const PRIVATE: DecisionAccessScope<'static> = DecisionAccessScope {
+pub(crate) const PRIVATE: DecisionAccessScope<'static> = DecisionAccessScope {
     channel_id: None, guild_id: None, session_id: None,
 };
 
-struct Fixture {
-    service: ServiceFixture,
-    ctx: ReplyContext,
-    context: DecisionContext,
-    origin: PressOrigin,
-    row: ApprovalRecord,
-    action: DecisionAction,
-    receipt: receipts::Receipt,
+pub(crate) struct Fixture {
+    pub(crate) service: ServiceFixture,
+    pub(crate) ctx: ReplyContext,
+    pub(crate) context: DecisionContext,
+    pub(crate) origin: PressOrigin,
+    pub(crate) row: ApprovalRecord,
+    pub(crate) action: DecisionAction,
+    pub(crate) receipt: receipts::Receipt,
 }
 
 impl Fixture {
@@ -27,13 +27,12 @@ impl Fixture {
             else { service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await };
         service.proof(&id).await;
         let receipt = receipts::list_live(&service.env.broker.store, &id).await.unwrap().pop().unwrap();
-        let home = &service.env.home;
-        let registry = duduclaw_agent::AgentRegistry::new(home.join("agents"));
-        let (event_tx, _) = tokio::sync::broadcast::channel(16);
-        let ctx = ReplyContext::new(Arc::new(RwLock::new(registry)), home.clone(),
-            Arc::new(crate::session::SessionManager::new(&home.join("sessions.db")).unwrap()),
-            Arc::new(RwLock::new(std::collections::HashMap::new())), event_tx);
-        let context = DecisionContext { channel: "telegram".into(), account_id: "verified-bot-id".into(),
+        Self::from_service(service, id, receipt).await
+    }
+
+    pub(crate) async fn from_service(service: ServiceFixture, id: ApprovalId, receipt: receipts::Receipt) -> Self {
+        let ctx = reply_context(&service.env);
+        let context = DecisionContext { channel: receipt.channel.clone(), account_id: receipt.account.clone(),
             conversation_id: receipt.dm.clone(), principal_id: receipt.principal.clone() };
         let origin = PressOrigin { message_id: receipt.message_id.clone(), private: true,
             account: receipt.account.clone(), dm: receipt.dm.clone() };
@@ -42,11 +41,11 @@ impl Fixture {
         Self { service, ctx, context, origin, row, action, receipt }
     }
 
-    async fn press(&self) -> PressOutcome {
+    pub(crate) async fn press(&self) -> PressOutcome {
         handle(&self.ctx, &self.context, &self.action, &self.row, &self.origin, PRIVATE).await
     }
 
-    async fn pending(&self) {
+    pub(crate) async fn pending(&self) {
         assert_eq!(self.service.status(&self.row.id).await, ApprovalStatus::Pending);
         let conn = self.service.env.broker.store.conn.lock().await;
         let count: i64 = conn.query_row("SELECT count(*) FROM chat_admin_decisions WHERE approval_id=?1",
@@ -62,7 +61,7 @@ impl Fixture {
         outcome
     }
 
-    async fn saved_receipt(&self) -> receipts::Receipt {
+    pub(crate) async fn saved_receipt(&self) -> receipts::Receipt {
         receipts::lookup_message(&self.service.env.broker.store, &self.receipt.channel,
             &self.receipt.account, &self.receipt.dm, self.receipt.message_id.as_deref().unwrap())
             .await.unwrap().unwrap()
@@ -361,4 +360,21 @@ async fn dashboard_decision_retires_old_chat_card() {
     assert_eq!(f.saved_receipt().await.status, "retired");
     let reply = f.press().await;
     assert_eq!(reply.refused_reason, Some("receipt_not_live"));
+}
+
+pub(crate) fn reply_context(env: &DecisionEnv) -> ReplyContext {
+    let registry = env.registry.clone().unwrap_or_else(|| Arc::new(RwLock::new(
+        duduclaw_agent::AgentRegistry::new(env.home.join("agents")))));
+    let (event_tx, _) = tokio::sync::broadcast::channel(16);
+    ReplyContext::new(registry, env.home.clone(),
+        Arc::new(crate::session::SessionManager::new(&env.home.join("sessions.db")).unwrap()),
+        Arc::new(RwLock::new(std::collections::HashMap::new())), event_tx)
+}
+
+pub(crate) async fn resend_with_recording(f: &Fixture, sender: &super::super::deliver::tests::Recording<'_>) -> PressOutcome {
+    handle_with_resend(&f.ctx, &f.context, &f.action, &f.row, &f.origin, PRIVATE,
+        |home, broker, row, user| async move {
+            assert_eq!(user, f.service.user);
+            super::super::deliver::tests::deliver_record(&home, &broker.store, &row, sender).await > 0
+        }).await
 }

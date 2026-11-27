@@ -21,3 +21,6 @@ pub(crate) use config::{
     EnabledAck, StepMethod,
 };
 pub(crate) use tier::{chat_tier, kind_key, step_up_selectable, tier, Tier, STEP_UP_KIND_KEYS};
+
+#[cfg(test)]
+mod tests;
