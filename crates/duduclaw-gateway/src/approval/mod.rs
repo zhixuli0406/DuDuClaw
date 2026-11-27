@@ -133,6 +133,7 @@ fn masked_approval_value(value: &Value) -> Value {
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+pub(crate) mod chat_admin;
 mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
