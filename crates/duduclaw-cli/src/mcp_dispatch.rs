@@ -1341,7 +1341,13 @@ impl McpDispatcher {
                     ),
                 );
             } else {
-                self.audit_dispatch_denial(principal, tool_name, &params_owned, error_class, &detail);
+                // This refusal records metadata only, never caller arguments.
+                let audit_params = if error_class == "main_principal_restricted" {
+                    &Value::Null
+                } else {
+                    &params_owned
+                };
+                self.audit_dispatch_denial(principal, tool_name, audit_params, error_class, &detail);
             }
             return response;
         }
@@ -4749,6 +4755,7 @@ effect = "forbid"
         use crate::mcp::main_principal_gate::{refusal, restricted, REFUSAL};
         let (home, _, human) = main_principal_fixture();
         let dispatcher = make_dispatcher(&home).await;
+        let argument_marker = "main-principal-refusal-private-soul-marker";
         // Explicit true and the unwritten main-role default are both narrowed.
         for permission in ["can_create_agents = true", ""] {
             write_acting_agent_toml(&home, &format!(
@@ -4759,7 +4766,10 @@ effect = "forbid"
             for tool in ["create_agent", "agent_create", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
                 let result = dispatcher.dispatch_admitted_for_principal(
                     &internal_principal(), &make_ns_ctx(false),
-                    &make_params(tool, serde_json::json!({"on_behalf_of":"user:forged-admin"})),
+                    &make_params(tool, serde_json::json!({
+                        "on_behalf_of": "user:forged-admin",
+                        "soul_md": argument_marker,
+                    })),
                     &serde_json::json!(14216), None, Some(&human),
                 ).await;
                 assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
@@ -4776,6 +4786,12 @@ effect = "forbid"
         for tool in ["create_agent", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
             assert!(rows.iter().any(|row| row["tool_name"] == tool
                 && row["error_class"] == "main_principal_restricted"), "{tool}: {rows:?}");
+        }
+        for row in rows.iter().filter(|row| row["error_class"] == "main_principal_restricted") {
+            assert_eq!(row["agent_id"], "dudu");
+            assert_eq!(row["params_summary"], format!("denied (main_principal_restricted): {REFUSAL}"));
+            assert!(row.get("input").is_none(), "{row}");
+            assert!(!row.to_string().contains(argument_marker), "{row}");
         }
     }
 
@@ -4806,10 +4822,47 @@ effect = "forbid"
         assert!(restricted(home.path(), "dudu", Some(&human)), "main role");
         assert!(!restricted(home.path(), "eph-abc123", Some(&human)));
         // The permission loader's effective preset artifact also supplies role.
-        write_acting_agent_toml(&home, "[agent]\nrole = 'worker'\n");
+        write_acting_agent_toml(&home, "[agent]\nname = 'dudu'\nrole = 'worker'\n");
         std::fs::create_dir(home.path().join("agent_resolved")).unwrap();
-        std::fs::write(home.path().join("agent_resolved/dudu.toml"), "[agent]\nrole = 'main'\n").unwrap();
+        std::fs::write(home.path().join("agent_resolved/dudu.toml"), "[agent]\nname = 'dudu'\nrole = 'main'\n").unwrap();
         assert!(restricted(home.path(), "dudu", Some(&human)), "resolved role");
+    }
+
+    #[test]
+    fn main_principal_identity_matches_default_name_or_directory() {
+        use crate::mcp::main_principal_gate::restricted;
+        let (home, _, human) = main_principal_fixture();
+        let dir = home.path().join("agents/ceo");
+        std::fs::create_dir(&dir).unwrap();
+        for (default, expected) in [("dudu", true), ("ceo", true), ("other", false)] {
+            std::fs::write(home.path().join("config.toml"),
+                format!("[general]\ndefault_agent = '{default}'\n")).unwrap();
+            std::fs::write(dir.join("agent.toml"),
+                "[agent]\nname = 'dudu'\nrole = 'worker'\n").unwrap();
+            assert_eq!(restricted(home.path(), "ceo", Some(&human)), expected, "{default}");
+        }
+        // The effective preset name, not the local name, identifies main too.
+        std::fs::create_dir(home.path().join("agent_resolved")).unwrap();
+        std::fs::write(home.path().join("agent_resolved/ceo.toml"),
+            "[agent]\nname = 'other'\nrole = 'worker'\n").unwrap();
+        assert!(restricted(home.path(), "ceo", Some(&human)), "resolved name");
+    }
+
+    #[test]
+    fn main_principal_invalid_identity_fails_closed() {
+        use crate::mcp::main_principal_gate::restricted;
+        let (home, _, human) = main_principal_fixture();
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'other'\n").unwrap();
+        for (role, expected) in [("worker", false), ("engineer", false), ("MAIN", true),
+            ("Worker", true), ("unknown-role", true)] {
+            write_acting_agent_toml(&home, &format!("[agent]\nname = 'dudu'\nrole = '{role}'\n"));
+            assert_eq!(restricted(home.path(), "dudu", Some(&human)), expected, "{role}");
+        }
+        for bad in ["", "[agent]\nrole = 'worker'\n", "[agent]\nname = 'dudu'\n",
+            "[agent]\nname = 12\nrole = 'worker'\n"] {
+            std::fs::write(home.path().join("agents/dudu/agent.toml"), bad).unwrap();
+            assert!(restricted(home.path(), "dudu", Some(&human)), "{bad:?}");
+        }
     }
 
     #[test]
@@ -4820,7 +4873,7 @@ effect = "forbid"
         let agent = home.path().join("agents/dudu/agent.toml");
         for path in [&config, &agent] {
             std::fs::write(&config, "[general]\ndefault_agent = 'other'\n").unwrap();
-            std::fs::write(&agent, "[agent]\nrole = 'worker'\n").unwrap();
+            std::fs::write(&agent, "[agent]\nname = 'dudu'\nrole = 'worker'\n").unwrap();
             assert!(!restricted(home.path(), "dudu", Some(&human)));
             for bad in ["[broken", "agent = 12\ngeneral = 12", "[agent]\nrole = 12\n[general]\ndefault_agent = 12"] {
                 std::fs::write(path, bad).unwrap();

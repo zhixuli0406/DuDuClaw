@@ -36,11 +36,20 @@ fn is_main(home: &Path, agent: &str) -> Result<bool, String> {
     let raw = duduclaw_core::agent_toml::read_effective_text(&dir)
         .map_err(|e| e.to_string())?;
     let config: toml::Value = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
-    let role = string_field(&config, "agent", "role")?;
+    // Require the loader's identity fields and use its exact role serde rules.
+    #[derive(serde::Deserialize)]
+    struct AgentIdentity {
+        name: String,
+        role: duduclaw_core::types::AgentRole,
+    }
+    let identity: AgentIdentity = config.get("agent")
+        .ok_or_else(|| "missing agent table".to_string())?
+        .clone().try_into().map_err(|e: toml::de::Error| e.to_string())?;
     let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|e| e.to_string())?;
     let config: toml::Value = raw.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let default = string_field(&config, "general", "default_agent")?;
-    Ok(role == Some("main") || default == Some(agent))
+    Ok(identity.role == duduclaw_core::types::AgentRole::Main
+        || default == Some(identity.name.as_str()) || default == Some(agent))
 }
 
 fn string_field<'a>(config: &'a toml::Value, section: &str, key: &str) -> Result<Option<&'a str>, String> {
