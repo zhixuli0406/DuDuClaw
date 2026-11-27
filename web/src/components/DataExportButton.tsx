@@ -13,6 +13,7 @@ const knownErrors = new Set(['EXPORT_PERMISSION_DENIED','EXPORT_SOURCE_CHANGED',
 export function DataExportButton({ dataset, agentId='', scope='agent' }: {dataset:ExportDataset; agentId?:string; scope?:'shared'|'agent'}) {
   const intl=useIntl();
   useCompanyTimeZone();
+  const companyZone=getCompanyTimeZone();
   const t=(id:string)=>intl.formatMessage({id:`exports.${id}`});
   const [open,setOpen]=useState(false);
   const [selected,setSelected]=useState(dataset);
@@ -70,7 +71,8 @@ export function DataExportButton({ dataset, agentId='', scope='agent' }: {datase
         <label className="grid gap-1 text-sm">{t('dataset')}<select className="rounded border border-surface-border bg-background p-2" value={selected} disabled={busy||active} onChange={e=>{setSelected(e.target.value as ExportDataset);setJob(null);}}>{datasets.map(d=><option key={d} value={d}>{t(`dataset.${d}`)}</option>)}</select></label>
         {selected==='wiki' && <label className="grid gap-1 text-sm">{t('scope')}<select className="rounded border border-surface-border bg-background p-2" value={wikiScope} disabled={busy||active} onChange={e=>{setWikiScope(e.target.value as 'shared'|'agent');setJob(null);}}><option value="agent">{t('scope.agent')}</option><option value="shared">{t('scope.shared')}</option></select></label>}
         {!(selected==='wiki' && wikiScope==='shared') && <label className="grid gap-1 text-sm">{t('agent')}<select className="rounded border border-surface-border bg-background p-2" value={agent} disabled={busy||active} onChange={e=>{setAgent(e.target.value);setJob(null);}}><option value="">{t(requiresAgent?'agent':'allAgents')}</option>{agents.map(a=><option key={a.name} value={a.name}>{a.display_name||a.name}</option>)}</select></label>}
-        <p className="text-xs text-muted-foreground">{t(`date.${selected}`)} {intl.formatMessage({ id: 'exports.timezone' }, { zone: zoneLabel(getCompanyTimeZone()) })}</p>
+        <p className="text-xs text-muted-foreground">{t(`date.${selected}`)}</p>
+        <p className="text-xs text-muted-foreground">{intl.formatMessage({ id: companyZone ? 'exports.timezone' : 'exports.timezoneBrowser' }, { zone: zoneLabel(companyZone) })}</p>
         <div className="grid grid-cols-2 gap-3"><label className="grid gap-1 text-sm">{t('from')}<Input type="date" value={start} disabled={busy||active} onChange={e=>{setStart(e.target.value);setJob(null);}}/></label><label className="grid gap-1 text-sm">{t('through')}<Input type="date" value={end} disabled={busy||active} onChange={e=>{setEnd(e.target.value);setJob(null);}}/></label></div>
         <label className="grid gap-1 text-sm">{t('format')}<select className="rounded border border-surface-border bg-background p-2" value={format} disabled={busy||active} onChange={e=>{setFormat(e.target.value as ExportFormat);setJob(null);}}><option value="csv">CSV (UTF-8)</option><option value="xlsx">Excel (.xlsx)</option></select></label>
         <p className="text-xs text-muted-foreground">{t('rowsNote')}</p>
