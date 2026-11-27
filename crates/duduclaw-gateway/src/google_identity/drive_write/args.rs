@@ -45,6 +45,10 @@ pub(crate) enum ArgError {
     ScopeUnconfirmed,
     TargetMimeRequired,
     GoogleNativeContent,
+    AnchorNotUnique,
+    InvalidState,
+    SheetConflict,
+    SheetNotUnique,
 }
 
 impl ArgError {
@@ -59,6 +63,10 @@ impl ArgError {
             Self::ScopeUnconfirmed => "scope_unconfirmed",
             Self::TargetMimeRequired => "target_mime_required",
             Self::GoogleNativeContent => "google_native_content",
+            Self::AnchorNotUnique => "anchor_not_unique",
+            Self::InvalidState => "invalid_document_state",
+            Self::SheetConflict => "sheet_title_exists",
+            Self::SheetNotUnique => "sheet_not_unique",
         }
     }
 
@@ -73,6 +81,10 @@ impl ArgError {
             Self::ScopeUnconfirmed => "無法確認這個檔案或資料夾的操作範圍。",
             Self::TargetMimeRequired => "無法確認檔案格式，請稍後再試。",
             Self::GoogleNativeContent => "這是 Google 文件格式，請改用文件編輯工具。",
+            Self::AnchorNotUnique => "找不到唯一的位置，請提供更精確的文字。",
+            Self::InvalidState => "無法確認文件或試算表的目前內容。",
+            Self::SheetConflict => "已經有同名工作表，請使用其他名稱。",
+            Self::SheetNotUnique => "找不到唯一的工作表，請確認名稱。",
         }
     }
 }
@@ -113,7 +125,7 @@ pub(crate) fn attachment_name(value: &str) -> Result<(), ArgError> {
 
 /// Reject normalization tricks before URL parsing. Percent escapes are not
 /// needed in any supported ID/path; query decorations such as usp are allowed.
-fn id(value: &str) -> Result<GoogleId, ArgError> {
+pub(crate) fn id(value: &str) -> Result<GoogleId, ArgError> {
     if let Ok(id) = GoogleId::new(value) { return Ok(id); }
     if value.chars().any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | '%'))
         || value.split(['/', '?', '#']).any(|s| matches!(s, "." | ".."))
@@ -213,4 +225,16 @@ pub(crate) fn plan(args: &DriveArgs) -> Plan {
         DriveArgs::Move { target, destination } => Plan::Move { target: target.clone(), destination: destination.clone() },
         DriveArgs::Trash { target } => Plan::Trash { target: target.clone() },
     }
+}
+
+/// Unified executor entry point for all nine RM-131 tools.
+#[derive(Clone)]
+pub(crate) enum ToolArgs {
+    Drive(DriveArgs),
+    DocsSheets(super::args_docs::DocsSheetsArgs),
+}
+
+pub(crate) fn parse_any(tool: &str, value: &Value) -> Result<ToolArgs, ArgError> {
+    if is_drive_tool(tool) { parse(tool, value).map(ToolArgs::Drive) }
+    else { super::args_docs::parse(tool, value).map(ToolArgs::DocsSheets) }
 }
