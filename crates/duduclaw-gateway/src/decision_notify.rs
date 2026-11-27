@@ -576,7 +576,7 @@ pub(crate) async fn googlechat_card_markup(
     decision_id: &str,
 ) -> Option<serde_json::Value> {
     let markup = crate::channel_format::decision_markup("googlechat", source, decision_id)?;
-    crate::googlechat::sending_app_takes_http_clicks(home_dir, sender, space)
+    crate::googlechat::sending_app_takes_http_clicks(home_dir, sender, space, false)
         .await
         .then_some(markup)
 }
@@ -1343,6 +1343,9 @@ pub async fn route_bound_text(
     text: &str,
 ) -> Option<Result<String, String>> {
     let command = crate::channel_decision_route::parse_strict_decision(text)?;
+    if let Some(reply) = crate::channel_decision_route::refuse_chat_admin_text(home, context, &command.id).await {
+        return Some(Err(reply));
+    }
     if command.is_answer() {
         let Some(answer) = command.rest else {
             return Some(Err("請在請求編號後填寫答案。".into()));
@@ -1528,7 +1531,9 @@ pub(crate) async fn route_verified_bound_press(
     context: &crate::approval::DecisionContext,
     data: &str,
     scope: DecisionAccessScope<'_>,
-) -> Option<Result<String, String>> {
+    origin: &crate::approval::chat_admin::press::PressOrigin,
+) -> Option<crate::approval::chat_admin::press::PressOutcome> {
+    use crate::approval::chat_admin::press::{self, PressOutcome};
     let action = crate::decision_action::parse(data)?;
     if action.source == DecisionSource::Digest {
         // P9: a digest feedback press passes the same channel access check
@@ -1540,7 +1545,7 @@ pub(crate) async fn route_verified_bound_press(
                 .await
                 .is_err()
         {
-            return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+            return Some(PressOutcome::from_result(Err(crate::channel_decision_route::DECISION_REFUSED.into())));
         }
     }
     if action.source == DecisionSource::Approval {
@@ -1554,7 +1559,7 @@ pub(crate) async fn route_verified_bound_press(
             .is_ok();
         let broker = match crate::approval::ApprovalBroker::open(&ctx.home_dir) {
             Ok(b) => b,
-            Err(e) => return Some(Err(e)),
+            Err(e) => return Some(PressOutcome::from_result(Err(e))),
         };
         let row = match broker
             .get(&crate::approval::ApprovalId::from(action.id.clone()))
@@ -1562,20 +1567,26 @@ pub(crate) async fn route_verified_bound_press(
         {
             Ok(Some(row)) => row,
             Ok(None) => {
-                return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+                return Some(PressOutcome::from_result(Err(crate::channel_decision_route::DECISION_REFUSED.into())));
             }
             Err(e) => {
                 tracing::warn!(error = %e, "bound press: request row unreadable");
-                return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+                return Some(PressOutcome::from_result(Err(crate::channel_decision_route::DECISION_REFUSED.into())));
             }
         };
+        // A delivered RM-143 card stays receipt-bound after disabling or
+        // retirement; it must never fall back to legacy decision authority.
+        if press::owns(&ctx.home_dir, &row).await
+            || broker.has_chat_admin_receipt(&row.id).await.unwrap_or(true) {
+            return Some(press::handle(ctx, context, &action, &row, origin, scope).await);
+        }
         if (row.binding.is_some() || row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND) && !access_ok {
-            return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+            return Some(PressOutcome::from_result(Err(crate::channel_decision_route::DECISION_REFUSED.into())));
         }
         // Only the successfully parsed persisted row can identify a legacy
         // domain request. Corrupt/non-NULL bindings never downgrade here.
     }
-    route_bound_press(&ctx.home_dir, context, data).await
+    route_bound_press(&ctx.home_dir, context, data).await.map(PressOutcome::from_result)
 }
 
 /// Strict request replies are control traffic, processed by the authenticated
@@ -1629,6 +1640,9 @@ pub(crate) async fn route_trusted_decision_fastlane_with_scope(
             return refused();
         }
     };
+    if let Some(reply) = crate::channel_decision_route::refuse_chat_admin_row(&ctx.home_dir, context, &row).await {
+        return Some(Err(reply));
+    }
     if row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
         return route_bound_text(&ctx.home_dir, context, text).await;
     }

@@ -360,6 +360,9 @@ impl MethodHandler {
                 WsFrame::ok_response("", json!({"status": "updated"}))
             }
             Ok(Err(duduclaw_auth::UserWriteError::Org(e))) => org_error_frame(&e),
+            Ok(Err(duduclaw_auth::UserWriteError::Other(e))) if e == "role_requires_local_password" => {
+                super::google_signin_rpc::signin_error(&e)
+            }
             Ok(Err(duduclaw_auth::UserWriteError::Other(e))) => {
                 WsFrame::error_response("", &format!("failed to update user: {e}"))
             }

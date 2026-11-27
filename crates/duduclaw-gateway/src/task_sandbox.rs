@@ -424,21 +424,27 @@ pub async fn dispatch(
     agent_id: &str,
     prompt: &str,
 ) -> SandboxDispatch {
-    let spec = {
+    // Dispatch normally supplies this snapshot; direct callers use the same
+    // strict gate. Never reread provider/model after admission.
+    let resolved = {
         let reg = registry.read().await;
-        let agent = if agent_id == "default" {
-            reg.main_agent()
-        } else {
-            reg.get(agent_id)
-        };
-        let Some(agent) = agent else {
-            let failure = SandboxFailure::failed(
-                failure_code::AGENT_NOT_FOUND,
-                "the agent is not registered",
-            );
-            failure.log(agent_id);
-            return SandboxDispatch::Completed(Err(failure));
-        };
+        let agent = if agent_id == "default" { reg.main_agent() } else { reg.get(agent_id) };
+        match agent {
+            Some(agent) => match crate::runtime_dispatch::chat_turn_config(Some(&agent.dir)) {
+                Some(turn) => Ok(turn),
+                None => crate::entry_gate::resolve_loaded_and_check(home, agent, &agent.config.agent.name).map(Arc::new),
+            },
+            None => Err(crate::entry_gate::EntryRefusal::AgentNotFound),
+        }
+    };
+    let snapshot = match resolved {
+        Ok(turn) => turn,
+        Err(refusal) => return SandboxDispatch::Completed(Err(SandboxFailure::failed(
+            "entry_refused", crate::entry_gate::background_refusal(&refusal),
+        ))),
+    };
+    let spec = {
+        let agent = &snapshot.registry_agent;
         if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
             home, crate::on_behalf_of::current().as_deref(), agent,
         ).await {
@@ -454,7 +460,7 @@ pub async fn dispatch(
             },
             agent_dir: agent.dir.clone(),
             runtime: RuntimeType::Claude,
-            model: agent.config.model.preferred.clone(),
+            model: snapshot.model.clone(),
             system_prompt: match sandbox_system_prompt(home, agent).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
@@ -473,13 +479,7 @@ pub async fn dispatch(
             account_pool: agent.config.model.account_pool.clone(),
         }
     };
-    if let Err(error) = crate::runtime_config::ensure_active_agent_provider(&spec.agent_dir) {
-        return SandboxDispatch::Completed(Err(SandboxFailure::failed(
-            failure_code::REMOVED_RUNTIME,
-            error,
-        )));
-    }
-    let runtime_settings = crate::runtime_config::load_runtime_settings(&spec.agent_dir);
+    let runtime_settings = &snapshot.runtime_settings;
     // Security refusal is terminal, before routing, accounts or sandbox preparation.
     if runtime_settings.provider == RuntimeType::Codex {
         if let Err(reason) = crate::runtime::codex::require_mcp_isolation() {
@@ -491,15 +491,13 @@ pub async fn dispatch(
     }
     // O1 confidence-aware delegation routing applies to Claude runtimes only
     // (tier models are Claude ids); identical to the unsandboxed path.
-    let model = crate::delegation_router::resolve_delegation_model(
-        home,
-        &spec.agent_dir,
-        &spec.agent_id,
-        prompt,
-        &spec.model,
-        &runtime_settings.utility_model,
-        runtime_settings.non_claude_provider().is_none(),
-    );
+    let model = crate::claude_runner::resolve_background_model(home, &snapshot, prompt);
+    if crate::runtime_config::ensure_model_provider(&model, runtime_settings.provider).is_err() {
+        return SandboxDispatch::Completed(Err(SandboxFailure::failed("entry_refused",
+            crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::ModelProviderMismatch {
+                model, provider: runtime_settings.provider,
+            }))));
+    }
     let spec = TaskSpec {
         runtime: runtime_settings.provider,
         model,
@@ -1272,8 +1270,8 @@ mod instructions_slot_tests {
                 let SandboxDispatch::Completed(Err(failure)) = result else {
                     panic!("a removed runtime must terminate dispatch");
                 };
-                assert_eq!(failure.code, failure_code::REMOVED_RUNTIME);
-                assert!(failure.message.contains(removed.removed_in), "{failure:?}");
+                assert_eq!(failure.code, "entry_refused");
+                assert_eq!(crate::entry_gate::background_refusal_code(&failure.message), Some("runtime_unavailable"));
                 assert!(!failure.message.contains(&home.path().display().to_string()), "{failure:?}");
             }
         }

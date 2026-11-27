@@ -92,6 +92,12 @@ fn build_system_prompt(
         parts.push(section.content);
     }
 
+    audit.push(crate::prompt_audit::PromptSection::new(
+        "delegation_guidance",
+        crate::prompt_identity::DELEGATION_GUIDANCE,
+    ));
+    parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
     // Sort skills by name for deterministic ordering (cache-friendly).
     // Apply the employee's budget (with a 10 KB floor) or explicit unlimited
     // setting, and report any omitted skills in the truncation footer.
@@ -816,6 +822,54 @@ async fn call_claude_for_agent_impl(
     overrides: DispatchOverrides,
 ) -> Result<String, String> {
     crate::isolation_readiness::check_execution()?;
+    // Resolve before credential ingestion, hook installation or model probes.
+    // The owned snapshot releases the registry guard before any run awaits.
+    let resolved = if let Some(agent) = preloaded {
+        crate::entry_gate::resolve_loaded_for_background(home_dir, agent, agent_id)
+            .and_then(|mut turn| {
+                // Preloaded callers may select an ephemeral tier. Team roles
+                // must retain their frozen pair, never substitute another model.
+                let model = &agent.config.model.preferred;
+                if !overrides.allow_cross_family_failover {
+                    crate::runtime_config::ensure_model_provider(model, turn.runtime_settings.provider)
+                        .map_err(|_| (crate::entry_gate::EntryRefusal::ModelProviderMismatch {
+                            model: model.clone(), provider: turn.runtime_settings.provider,
+                        }, turn.runtime_settings.fallback))?;
+                }
+                turn.model = crate::entry_gate::check_model(agent_id, model, turn.runtime_settings.provider)
+                    .map_err(|refusal| (refusal, turn.runtime_settings.fallback))?;
+                Ok(turn)
+            })
+    } else {
+        let reg = registry.read().await;
+        let resolved_id = if agent_id == "default" {
+            reg.main_agent().map(|agent| agent.config.agent.name.as_str()).unwrap_or(agent_id)
+        } else { agent_id };
+        match reg.get(resolved_id) {
+            Some(agent) => match crate::runtime_dispatch::chat_turn_config(Some(&agent.dir)) {
+                Some(turn) => Ok((*turn).clone()),
+                None => crate::entry_gate::resolve_loaded_for_background(home_dir, agent, resolved_id),
+            },
+            None => Err((crate::entry_gate::EntryRefusal::AgentNotFound, None)),
+        }
+    };
+    let snapshot = Arc::new(resolved.map_err(|(refusal, fallback)| {
+        warn!(agent = %agent_id, code = refusal.code(), ?refusal, "background entry refused");
+        crate::entry_gate::background_refusal_with_fallback(&refusal, fallback)
+    })?);
+    crate::runtime_dispatch::with_chat_turn_config(snapshot.clone(), Box::pin(
+        call_claude_for_agent_resolved(home_dir, agent_id, prompt, request_type, &snapshot, overrides),
+    )).await
+}
+
+async fn call_claude_for_agent_resolved(
+    home_dir: &Path,
+    agent_id: &str,
+    prompt: &str,
+    request_type: crate::cost_telemetry::RequestType,
+    snapshot: &crate::entry_gate::ResolvedTurnConfig,
+    overrides: DispatchOverrides,
+) -> Result<String, String> {
     #[cfg(test)]
     crate::model_call_probe::record("claude_runner");
     // Cron and direct task calls do not pass through the bus dispatcher.
@@ -830,23 +884,8 @@ async fn call_claude_for_agent_impl(
         Some(crate::credential_ledger::process_message(home_dir, prompt, &source, &sender, agent_id, "dispatch").await)
     } else { None };
     let prompt = credential_prompt.as_deref().unwrap_or(prompt);
-    let reg = registry.read().await;
+    let agent = &snapshot.registry_agent;
 
-    let agent = match preloaded {
-        Some(a) => a,
-        None => {
-            let found = if agent_id == "default" {
-                reg.main_agent()
-            } else {
-                reg.get(agent_id)
-            };
-            found.ok_or_else(|| format!("Agent '{agent_id}' not found in registry"))?
-        }
-    };
-
-    let loaded = Box::new(agent.clone());
-    drop(reg);
-    let agent = loaded.as_ref();
     Box::pin(crate::on_behalf_of::access::check_loaded_main_target_for_execution(
         home_dir, crate::on_behalf_of::current().as_deref(), agent,
     )).await?;
@@ -887,10 +926,10 @@ async fn call_claude_for_agent_impl(
     // that resolved name, so the alias alone must not be the ledger key.
     crate::runtime_turn::register_current(&agent_name);
     let agent_id = if agent_id == "default" { agent_name.as_str() } else { agent_id };
-    let claude_model = agent.config.model.preferred.clone();
+    let claude_model = snapshot.model.clone();
     // OTel: record the resolved model on the `invoke_agent` span.
     tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, claude_model.as_str());
-    let fallback_model = agent.config.model.fallback.clone();
+    let fallback_model = snapshot.sections.model.fallback.clone().unwrap_or_default();
     let local_config = agent.config.model.local.clone();
     let api_mode = agent.config.model.api_mode.clone();
     let capabilities = agent.config.capabilities.clone();
@@ -1006,21 +1045,14 @@ async fn call_claude_for_agent_impl(
     };
     // Effort is normally read from the cwd (which is the agent dir); resolve
     // it explicitly here so an overridden cwd cannot lose it.
-    let dispatch_effort = duduclaw_core::effort::read_agent_effort(&agent_dir);
+    let dispatch_effort = crate::runtime_dispatch::chat_effort(Some(&agent_dir));
 
     // RFC-25 Phase 2: when the delegated agent's [runtime] provider is not
     // Claude, route the whole task through the provider-agnostic choke-point
     // (Codex / Gemini / OpenAI-compat). Claude keeps the optimized rotation +
     // local/hybrid path below. This makes sub-agent delegation respect the
     // responding agent's runtime — and is the foundation A2A (Phase 3) builds on.
-    // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
-    crate::runtime_config::ensure_active_agent_provider(&agent_dir)?;
-    let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
-    if delegation_settings.provider == duduclaw_core::types::RuntimeType::Claude {
-        crate::runtime_config::ensure_model_provider(&claude_model, delegation_settings.provider)
-            .map_err(|error| crate::runtime_config::alignment_refusal_with_fallback(error, delegation_settings.fallback))?;
-    }
-
+    let delegation_settings = &snapshot.runtime_settings;
 
     // OTel (WP-B): stamp the ACTUAL runtime on the `invoke_agent` span, now
     // that `[runtime] provider` is known. Recorded here rather than in the
@@ -1075,16 +1107,9 @@ async fn call_claude_for_agent_impl(
     // ids, so tier re-routing only applies when the resolved runtime provider
     // is Claude — a gemini/codex agent keeps its own model untouched (the
     // `provider_is_claude` flag below; the non-Claude branch follows).
-    let claude_model = if matches!(request_type, crate::cost_telemetry::RequestType::Dispatch) {
-        let routed = crate::delegation_router::resolve_delegation_model(
-            home_dir,
-            &agent_dir,
-            agent_id,
-            prompt,
-            &claude_model,
-            &delegation_settings.utility_model,
-            delegation_settings.non_claude_provider().is_none(),
-        );
+    let claude_model = if overrides.allow_cross_family_failover
+        && matches!(request_type, crate::cost_telemetry::RequestType::Dispatch) {
+        let routed = resolve_background_model(home_dir, snapshot, prompt);
         if routed != claude_model {
             // Routing changed the model — re-record it on the OTel span.
             tracing::Span::current().record(crate::otel::attrs::REQUEST_MODEL, routed.as_str());
@@ -1093,6 +1118,11 @@ async fn call_claude_for_agent_impl(
     } else {
         claude_model
     };
+
+    crate::runtime_config::ensure_model_provider(&claude_model, delegation_settings.provider)
+        .map_err(|_| crate::entry_gate::background_refusal_with_fallback(&crate::entry_gate::EntryRefusal::ModelProviderMismatch {
+            model: claude_model.clone(), provider: delegation_settings.provider,
+        }, delegation_settings.fallback))?;
 
     // HIGH-A (2026-07 review): `moa:<name>` virtual models are API-mode only —
     // they must NEVER reach a CLI spawn (`claude -p --model moa:x` 404s
@@ -1163,7 +1193,7 @@ async fn call_claude_for_agent_impl(
                 // there (A1).
                 conversation_history: &[],
                 request_type: crate::cost_telemetry::RequestType::Dispatch,
-                runtime_settings: Some(&delegation_settings),
+                runtime_settings: Some(delegation_settings),
                 effort: None,
                 // P0/WP-B: ordinary caller passes `true` — failover
                 // behavior unchanged. A team role member passes `false`
@@ -1499,7 +1529,8 @@ async fn call_claude_for_agent_impl(
     // G1: when the agent configures `[model] fallbacks`, run the cross-provider
     // fallback chain (preferred → fallbacks). Absent/empty ⇒ fall through to the
     // byte-identical single-shot path below.
-    let model_fallbacks = crate::runtime_config::agent_direct_api_model_fallbacks(&agent_dir);
+    let model_fallbacks: Vec<String> = snapshot.sections.model.fallbacks.iter()
+        .map(|model| model.trim()).filter(|model| !model.is_empty()).map(str::to_string).collect();
     if !model_fallbacks.is_empty() {
         info!(
             agent = %agent_name,
@@ -1576,10 +1607,34 @@ async fn call_claude_for_agent_impl(
     }
 }
 
+/// Confidence routing reads employee tiers from the admitted artifact too.
+pub(crate) fn resolve_background_model(
+    home: &Path, snapshot: &crate::entry_gate::ResolvedTurnConfig, prompt: &str,
+) -> String {
+    if snapshot.runtime_settings.provider != duduclaw_core::types::RuntimeType::Claude
+        || !snapshot.sections.model.delegation_routing
+            .unwrap_or_else(|| crate::runtime_config::global_delegation_routing(home)) {
+        return snapshot.model.clone();
+    }
+    let decision = crate::delegation_router::score_delegation(prompt);
+    let model = crate::delegation_router::tier_model(decision.tier, &snapshot.model,
+        snapshot.sections.model.standard.as_deref(), &snapshot.runtime_settings.utility_model);
+    tracing::info!(
+        agent = %snapshot.registry_agent.config.agent.name,
+        tier = decision.tier.as_str(),
+        reason = %decision.reason,
+        preferred = %snapshot.model,
+        chosen = %model,
+        "delegation confidence routing (O1)"
+    );
+    model
+}
+
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
     if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return true; }
-    crate::work_outcome::is_work_result(error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
+    crate::entry_gate::background_refusal_code(error).is_some()
+        || crate::work_outcome::is_work_result(error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
         || crate::budget::budget_refusal_message(error).is_some()
         || crate::autonomous_runtime::was_denied()
         || error.starts_with("AUTONOMY_PAUSED:")
@@ -3596,10 +3651,7 @@ async fn call_with_rotation(
     // P1/WP-3: explicit effort wins, else the dispatched agent's own
     // `agent.toml [model] effort` (`work_dir` is the agent directory).
     let effort = effort.or_else(|| {
-        identity
-            .config_dir
-            .or(work_dir)
-            .and_then(duduclaw_core::effort::read_agent_effort)
+        crate::runtime_dispatch::chat_effort(identity.config_dir.or(work_dir))
     });
 
     // Pre-flight: check 200K price cliff
@@ -6589,6 +6641,7 @@ mod instructions_slot_tests {
             .await
             .unwrap();
         let p = super::build_system_prompt(&agent, None, None).unwrap();
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         let pinned_system = super::build_system_prompt(&agent, None, Some("en")).unwrap();
         for message in ["First dispatch", "Next cron turn"] {
             let user = crate::prompt_identity::with_reply_language_reminder(message.into(), Some("en"));
@@ -6800,6 +6853,27 @@ mod runtime_fallback_tests {
     use super::*;
     use duduclaw_core::types::RuntimeType;
     #[test]
+    fn healthy_claude_background_run_still_uses_claude() {
+        crate::runtime_dispatch::testing::isolated_claude_test(
+            concat!(module_path!(), "::healthy_claude_background_run_still_uses_claude"), |cli_home| {
+            crate::test_exec::write_executable(&cli_home.join("bin/claude"),
+                "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n/bin/cat \"$HOME/stream.jsonl\"\n", 0o755);
+            std::fs::write(cli_home.join("stream.jsonl"),
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"CLAUDE_BACKGROUND_OK"}
+"#).unwrap();
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let (home, ctx, _runtime, fallback_calls) = crate::channel_reply::origin_tests::owned_claude_fallback("").await;
+                std::fs::write(home.path().join("config.toml"), "[general]\ninference_mode='claude'\n").unwrap();
+                *INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None)).write().await = None;
+                let result = call_claude_for_agent_impl(home.path(), &ctx.registry, "worker", "work",
+                    crate::cost_telemetry::RequestType::Cron, None, DispatchOverrides::default()).await;
+                assert_eq!(result.unwrap(), "CLAUDE_BACKGROUND_OK");
+                assert!(fallback_calls.lock().unwrap().is_empty());
+            });
+        });
+    }
+
+    #[test]
     fn claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes() {
         crate::runtime_dispatch::testing::isolated_claude_test(
             concat!(module_path!(), "::claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes"), |cli_home| {
@@ -6825,6 +6899,126 @@ mod runtime_fallback_tests {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod background_entry_tests {
+    use super::*;
+    use crate::cost_telemetry::RequestType;
+    use duduclaw_core::types::RuntimeType;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_mismatch_preserves_effective_runtime_fallback_note() {
+        let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let role = ctx.registry.read().await.get("worker").unwrap().clone();
+        let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+        let before = crate::model_call_probe::calls();
+        for fallback in ["", "fallback='codex'"] {
+            std::fs::write(&resolved, format!(
+                "[runtime]\nprovider='claude'\n{fallback}\n[model]\npreferred='gpt-5.4'\n"
+            )).unwrap();
+            for preloaded in [None, Some(&role)] {
+                let error = call_claude_for_agent_impl(home.path(), &ctx.registry, "worker", "work",
+                    RequestType::Cron, preloaded, DispatchOverrides::default()).await.unwrap_err();
+                assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"));
+                assert_eq!(error.contains("A fallback runtime is configured, but it was not used because the model setting itself is incorrect."),
+                    !fallback.is_empty());
+                assert!(is_admission_refusal(&error));
+                assert!(!crate::failover::claude_runtime_fallback_eligible(&error, Some(&RuntimeType::Codex)));
+            }
+        }
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn broken_background_profiles_never_reach_a_model_or_rotation() {
+        // Heartbeat and agent-callback reminders both use RequestType::Cron.
+        for kind in [RequestType::Dispatch, RequestType::Cron] {
+            for (provider, unreadable, code) in [
+                ("typo", false, "agent_config_unreadable"),
+                ("codex", true, "agent_config_unreadable"),
+                ("claude", false, "model_provider_mismatch"),
+                ("gemini", false, "runtime_unavailable"),
+            ] {
+                let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+                let path = {
+                    let reg = ctx.registry.read().await;
+                    crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path
+                };
+                if unreadable {
+                    std::fs::write(&path, [0xff, 0xfe]).unwrap();
+                } else {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let mut document: toml::Value = text.parse().unwrap();
+                    document["runtime"]["provider"] = toml::Value::String(provider.into());
+                    std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+                }
+                let before = crate::model_call_probe::calls();
+                let error = call_claude_for_agent_with_type(home.path(), &ctx.registry, "worker", "work", kind)
+                    .await.unwrap_err();
+                assert_eq!(crate::entry_gate::background_refusal_code(&error), Some(code));
+                assert_eq!(crate::model_call_probe::calls(), before);
+                assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(is_admission_refusal(&error));
+                assert!(!crate::failover::claude_runtime_fallback_eligible(&error, Some(&RuntimeType::Codex)));
+                assert!(FailoverManager::model_fallback_for("claude-sonnet-4-6", "claude-haiku-4-5", &error).is_none());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn frozen_role_model_must_match_its_scaffold_runtime() {
+        let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let mut role = ctx.registry.read().await.get("worker").unwrap().clone();
+        // Scaffold is healthy Codex, but a frozen role supplies a Claude model.
+        role.config.model.preferred = "claude-sonnet-4-6".into();
+        let before = crate::model_call_probe::calls();
+        let error = call_claude_for_agent_preloaded_with(home.path(), &ctx.registry, &role, "work",
+            RequestType::Dispatch, DispatchOverrides { allow_cross_family_failover: false, ..Default::default() })
+            .await.unwrap_err();
+        assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"));
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn background_run_keeps_gated_model_runtime_effort_and_fallback_after_edit() {
+        let (home, ctx, _initial_runtime, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let snapshot = {
+            let reg = ctx.registry.read().await;
+            let path = crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path;
+            let mut document: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            document["model"]["preferred"] = toml::Value::String("opus".into());
+            document["model"]["effort"] = toml::Value::String("high".into());
+            document["model"]["fallback"] = toml::Value::String("gpt-5.4-mini".into());
+            std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            Arc::new(crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap())
+        };
+        let mut changed = snapshot.document.clone();
+        changed["runtime"]["provider"] = toml::Value::String("claude".into());
+        changed["model"]["preferred"] = toml::Value::String("claude-sonnet-4-6".into());
+        changed["model"]["effort"] = toml::Value::String("low".into());
+        changed["model"]["fallback"] = toml::Value::String("claude-haiku-4-5".into());
+        std::fs::write(&snapshot.config_path, toml::to_string(&changed).unwrap()).unwrap();
+        let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();
+        let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
+        runtimes.insert(RuntimeType::Codex, Box::new(crate::runtime_dispatch::testing::RecordingCodex(calls.clone())));
+        let _runtime = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(),
+            crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
+        crate::runtime_dispatch::with_chat_turn_config(snapshot.clone(), async {
+            assert_eq!(crate::runtime_dispatch::chat_fallback_model(&snapshot.registry_agent.dir).as_deref(), Some("gpt-5.4-mini"));
+            let result = call_claude_for_agent_impl(home.path(), &ctx.registry, "worker", "work",
+                RequestType::Dispatch, None, DispatchOverrides::default()).await;
+            assert!(result.is_ok(), "{result:?}");
+        }).await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].model, snapshot.model);
+        assert_ne!(calls[0].model, "opus");
+        assert_eq!(calls[0].effort, Some(duduclaw_core::effort::Effort::High));
     }
 }
 

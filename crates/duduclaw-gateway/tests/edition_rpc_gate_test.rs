@@ -146,6 +146,8 @@ async fn personal_edition_keeps_ordinary_methods_working() {
         "users.me",
         "users.change_password",
         // 委派權限 / 授權升級路徑 / 審批 / 稽核 / kill switch / 帳務 / 共享 wiki
+        "admin_ai.get",
+        "admin_ai.set",
         "delegation.get",
         "license.status",
         "approvals.list",

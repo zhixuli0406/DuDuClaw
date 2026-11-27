@@ -71,7 +71,7 @@ mod templates_library;
 mod agents_ops;
 mod main_agent_access;
 mod autonomy_rpc;
-mod agents_update;
+pub(crate) mod agents_update;
 mod contract_rpc;
 mod redaction_rpc;
 mod identity_rpc;
@@ -146,6 +146,7 @@ mod channel_util;
 mod runtime_models_rpc;
 mod system_update_config;
 mod delegation_rpc;
+mod admin_ai_rpc;
 mod task_forward_rpc;
 mod accounts_add_rpc;
 mod config_io;
@@ -164,6 +165,8 @@ mod users_rpc;
 mod dept_grants_rpc;
 mod main_access_rpc;
 mod user_invites_rpc;
+mod google_signin_rpc;
+mod google_signin_me_rpc;
 pub(crate) mod company_rpc;
 mod members_rpc;
 mod onboarding_rpc;
@@ -178,6 +181,7 @@ mod mcp_oauth;
 mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
+mod google_drive_write_rpc;
 mod google_identity_rpc;
 // v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
 mod google_tenant_settings_rpc;
@@ -220,7 +224,7 @@ mod approvals_topology_rpc;
 pub(crate) mod approval_visibility;
 mod mail_rpc;
 mod approvals_decide;
-mod approval_decider;
+pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
 mod autopilot_department_rpc;
@@ -249,7 +253,7 @@ mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
 mod dispatch_ops;
-pub(crate) mod config_commit;
+pub mod config_commit;
 mod config_schema;
 mod system_update_config_v168;
 mod tick_sources_rpc;
@@ -717,6 +721,15 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_my_memory_rpc(method, params, ctx)).await;
+        }
+
+        // Google sign-in administration must never reach extension handlers.
+        // The role floor also covers unknown operations in reserved namespaces.
+        if let Some(role) = gates::google_signin_minimum_role(method) {
+            if acl::require_role(ctx, role).is_err() {
+                return google_signin_rpc::signin_error("signin_admin_required");
+            }
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // Invitations are gateway-owned authentication methods. An extension

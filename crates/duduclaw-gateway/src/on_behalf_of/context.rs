@@ -19,6 +19,8 @@ struct Entry {
     attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
     task: Option<String>,
     run: Option<String>,
+    turn: Option<String>,
+    session: Option<String>,
 }
 fn entries() -> &'static Mutex<HashMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -111,6 +113,8 @@ fn register_details_with_requester(home: &Path, agent: &str, principal: Option<S
             agent: agent.into(),
             principal,
             requester,
+            turn: duduclaw_memory::feedback::CURRENT_TURN_ID.try_with(Clone::clone).ok().flatten(),
+            session: duduclaw_memory::feedback::CURRENT_SESSION_ID.try_with(Clone::clone).ok().flatten(),
             created: now,
             attendance,
             task,
@@ -374,3 +378,33 @@ pub(crate) fn refresh_isolated_requester(home: &Path, agent: &str, reference: &s
     entry.requester = crate::delegation_roles::Requester::isolated(context, metadata);
     true
 }
+
+/// Owned read-only snapshot: the registry lock never leaves this function.
+/// Host turn/session are captured independently of attendance at registration.
+pub(crate) struct AdminTurnContext {
+    pub requester: crate::delegation_roles::Requester,
+    pub attendance: Option<crate::computer_use_sessions::attended_call::AttendedCall>,
+    pub task: Option<String>,
+    pub run: Option<String>,
+    pub turn: Option<String>,
+    pub session: Option<String>,
+}
+
+pub(crate) fn admin_turn_context(home: &Path, agent: &str, reference: &str) -> Option<AdminTurnContext> {
+    lookup(home, agent, reference)?;
+    let home = home.canonicalize().ok()?;
+    let entries = entries().lock().ok()?;
+    let entry = entries.get(reference)?;
+    if entry.home != home || entry.agent != agent || entry.created.elapsed() >= MAX_AGE {
+        return None;
+    }
+    Some(AdminTurnContext {
+        requester: entry.requester.clone(), attendance: entry.attendance.clone(),
+        task: entry.task.clone(), run: entry.run.clone(),
+        turn: entry.turn.clone(), session: entry.session.clone(),
+    })
+}
+
+#[cfg(test)]
+#[path = "admin_turn_tests.rs"]
+mod admin_turn_tests;

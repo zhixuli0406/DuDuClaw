@@ -301,13 +301,19 @@ pub async fn exchange_for_id_token(
     Ok(id_token)
 }
 
+#[cfg(test)]
+tokio::task_local! { pub(crate) static TEST_REFRESH_URL: String; }
+
 pub async fn refresh(
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<Tokens, Error> {
+    let token_url = endpoint(TOKEN);
+    #[cfg(test)]
+    let token_url = TEST_REFRESH_URL.try_with(Clone::clone).unwrap_or(token_url);
     let response = client()?
-        .post(endpoint(TOKEN))
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", client_id),
@@ -650,7 +656,7 @@ pub(crate) mod mcp_refresh_test {
         );
         Guard(home)
     }
-    pub(super) fn endpoint(home: &Path) -> Option<String> {
+    pub(crate) fn endpoint(home: &Path) -> Option<String> {
         fixtures()
             .lock()
             .unwrap()

@@ -145,6 +145,43 @@ pub async fn mint_delegate(
     Ok(token)
 }
 
+/// Only gateway identity code can mint the fixed write scope group.
+pub(in crate::google_identity) async fn mint_delegate_for_drive_write(
+    home: &Path, email: &str, mode: CacheMode,
+) -> Result<MintedToken, Refusal> {
+    let key = super::protection_gate_async(home).await?;
+    let home = home.to_path_buf();
+    let sa_key = tokio::task::spawn_blocking(move || delegation_key::load(&home, &key))
+        .await.map_err(|_| Refusal::hard("credential_protection", "讀取服務帳號金鑰中斷，請稍後再試。"))??;
+    validate_drive_write_mint(sa::mint_for_subject(
+        &sa_key, email, super::delegated_scopes::for_drive_write(), mode,
+    ).await, email)
+}
+
+pub(in crate::google_identity) fn drive_write_admin_scope_missing() -> Refusal {
+    Refusal::hard("drive_write_admin_scope_missing",
+        "公司管理員還沒在 Google 管理控制台開放雲端硬碟寫入範圍。")
+}
+
+pub(in crate::google_identity) fn validate_drive_write_mint(
+    result: Result<MintedToken, ServiceAccountError>, email: &str,
+) -> Result<MintedToken, Refusal> {
+    let token = result.map_err(|error| {
+        if sa::rejection_code(&error) == Some("unauthorized_client") {
+            drive_write_admin_scope_missing()
+        } else {
+            let refusal = explain_mint_error(&error, email);
+            Refusal { fallback_eligible: false, ..refusal }
+        }
+    })?;
+    if token.granted_scopes.as_ref().is_some_and(|scopes| {
+        !scopes.iter().any(|scope| scope == "https://www.googleapis.com/auth/drive")
+    }) {
+        return Err(drive_write_admin_scope_missing());
+    }
+    Ok(token)
+}
+
 /// The full decision for one employee and one turn.
 pub async fn resolve_person(
     home: &Path,

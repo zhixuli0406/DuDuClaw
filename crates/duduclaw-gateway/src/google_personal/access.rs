@@ -320,7 +320,13 @@ pub async fn resolve(
                 if tokens.secret.refresh_token.is_none() {
                     tokens.secret.refresh_token = secret.refresh_token.take();
                 }
-                write_scope_guard::check_personal_refresh(home, &record.metadata, tokens.granted_scopes.as_deref())?;
+                tokens.granted_scopes = Some(write_scope_guard::check_personal_refresh(
+                    home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+                ).await?);
+                if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() {
+                    zeroize::Zeroize::zeroize(&mut tokens.secret.access_token);
+                    return Err(refresh_route_changed());
+                }
                 let current_scopes = tokens.granted_scopes.as_deref();
                 if !vault::finish_refresh_with_scopes(
                     home,
@@ -704,7 +710,12 @@ async fn resolve_pinned_core(
         #[cfg(test)]
         pinned_test::run_before_publish(home);
         read_mode.check()?;
-        write_scope_guard::check_personal_refresh(home, &record.metadata, tokens.granted_scopes.as_deref())?;
+        tokens.granted_scopes = Some(read_mode.wait(write_scope_guard::check_personal_refresh(
+            home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+        )).await??);
+        read_mode.check()?;
+        validate_pinned_selection(home, agent, requester, people, selected, purpose_key)?;
+        before.validate(home, agent, requester, people, purpose_key)?;
         if !vault::finish_refresh_with_scopes(
             home,
             &key,

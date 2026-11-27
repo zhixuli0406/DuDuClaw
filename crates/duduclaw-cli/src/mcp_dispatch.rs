@@ -443,11 +443,13 @@ pub(crate) fn delegation_none_refuses_for(
 
 /// zh-TW refusal for [`delegation_none_refuses`].
 pub(crate) fn delegation_none_message(tool_name: &str) -> String {
-    format!(
-        "目前的委派政策是「不允許委派(none)」:AI 員工之間不能互相委派、傳訊、建立員工或指派工作,\
-         工具「{tool_name}」已拒絕(跨部門協作配對在這個政策下也不生效)。請把需要別位員工處理的事回報給管理員,\
-         或請管理員在儀表板「委派權限」改成其他模式。"
-    )
+    let denied = duduclaw_core::DelegationDenied {
+        sender: String::new(),
+        target: String::new(),
+        policy: duduclaw_core::DelegationPolicy::Disabled,
+        reason: duduclaw_core::DelegationDenyReason::DelegationDisabled,
+    };
+    format!("工具「{tool_name}」已拒絕。{}", denied.explain(duduclaw_core::DenialAudience::Ai))
 }
 
 /// `true` only when the flag is written as `false` (the role-resolved
@@ -725,6 +727,15 @@ impl McpDispatcher {
         params: &Value,
         id: &Value,
     ) -> Value {
+        let tool_name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        if crate::mcp_auth::person_tool_refused(tool_name, principal) {
+            return jsonrpc_error(id, -32003, "This tool is only available to a personal key");
+        }
+        if crate::mcp_auth::is_person_principal(principal) {
+            let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let result = crate::mcp::person_tools::call(&self.home_dir, principal, tool_name, &args).await;
+            return jsonrpc_response(id, result);
+        }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────
         // On the HTTP MCP server every non-external principal other than the
         // verified gateway-internal key is classified from its authenticated
@@ -798,9 +809,6 @@ impl McpDispatcher {
         }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if duduclaw_core::google_identity::is_drive_write_tool(tool_name) {
-            return jsonrpc_error(id, -32003, "雲端硬碟寫入只能由主程式執行。");
-        }
         if let Err(message) = duduclaw_gateway::google_workspace::validate_native_tool_inputs(
             tool_name, params.get("arguments").unwrap_or(&Value::Null),
         ) {
@@ -822,6 +830,12 @@ impl McpDispatcher {
         // whitelist, namespace isolation and the per-key rate limiter stay on
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
+        if let Some(message) = crate::mcp::drive_write_refusal(
+            &self.home_dir, gate_agent, tool_name, principal,
+            &crate::mcp_isolation::process_lane(),
+        ) {
+            return jsonrpc_error(id, -32003, &message);
+        }
         // RM-134 fourth review (Medium 2): a principal acting as its bound
         // employee over HTTP exercises only per-employee scopes — `admin`
         // never stands in for another scope on it (scope gates below,
@@ -1009,6 +1023,19 @@ impl McpDispatcher {
             {
                 duduclaw_gateway::otel::record_tool_outcome(&tracing::Span::current(), false);
                 return Some((jsonrpc_error(id, -32003, &msg), "explore_lane", msg, None));
+            }
+
+            // RM-194: exactly the tools/list predicate; gateway rechecks the live turn.
+            if crate::mcp::admin_ai_client::TOOLS.contains(&tool_name)
+                && !crate::mcp::admin_ai_client::available_for(
+                    &self.home_dir, principal,
+                    crate::mcp::acting_agent_id(&principal.client_id, &self.default_agent),
+                    self.is_remote_bearer(),
+                ).await.permits(tool_name)
+            {
+                let message = "目前無法使用管理員設定工具，請在有效的管理員分身對話中重試。".to_owned();
+                return Some((jsonrpc_response(id, crate::mcp::tool_error(&message)),
+                    "admin_ai_unavailable", message, None));
             }
 
             // ── 1. Scope check ───────────────────────────────────────────────────
@@ -2338,6 +2365,7 @@ mod tests {
     use super::*;
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
+    use serde_json::json;
 
     #[tokio::test]
     async fn role_member_gate_reads_ephemeral_config_and_refuses_missing_scaffold() {
@@ -2461,6 +2489,83 @@ mod tests {
             RateLimiter::new(),
             DailyQuota::new(),
         )
+    }
+
+    #[tokio::test]
+    async fn person_principals_list_exact_scopes_and_refuse_employee_tools() {
+        use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
+        let tmp = tempfile::tempdir().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        for scopes in ["", "tasks:read", "agents:status", "tasks:read,agents:status"] {
+            let principal = Principal {
+                client_id: "person:holder".into(), scopes: crate::mcp_auth::parse_scopes(scopes).unwrap(),
+                is_external: true, created_at: chrono::Utc::now(),
+            };
+            let call = AuthenticatedCall::without_reference(principal.clone()).with_kind(
+                PrincipalKind::PersonKey { key_id: "key".into(), user_id: "holder".into() });
+            let ns = call.namespace().unwrap();
+            with_authenticated_call(call, async {
+                for remote in [false, true] {
+                    let listed = crate::mcp::handle_tools_list_for_transport(&json!(1), &principal, tmp.path(), "dudu", remote).await;
+                    let names: Vec<_> = listed["result"]["tools"].as_array().unwrap().iter()
+                        .map(|tool| tool["name"].as_str().unwrap()).collect();
+                    let expected: Vec<_> = duduclaw_core::mcp_person_tools::PERSON_TOOLS.iter()
+                        .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, &principal)).map(|tool| tool.name).collect();
+                    assert_eq!(names.len(), expected.len());
+                    assert!(expected.iter().all(|name| names.contains(name)));
+                }
+                for name in ["tasks_list", "memory_search", "odoo_search", "list_agents", "agent_status", "wiki_read", "unknown"] {
+                    let result = dispatcher.dispatch_tool_call(&principal, &ns, &json!({"name":name,"arguments":{}}), &json!(2)).await;
+                    assert_eq!(result["error"]["code"], -32003, "{name}: {result}");
+                }
+            }).await;
+        }
+        assert!(!tmp.path().join("agents/person:holder").exists());
+        assert!(!tmp.path().join("external").exists());
+    }
+
+    #[tokio::test]
+    async fn person_tools_are_hidden_and_refused_for_every_existing_key_kind() {
+        use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_dispatcher(&tmp).await;
+        let now = chrono::Utc::now();
+        let cases = [
+            ("admin", false, PrincipalKind::Stored { agent_binding: None, key_created_at: now }),
+            ("external", true, PrincipalKind::Stored { agent_binding: None, key_created_at: now }),
+            ("dudu", false, PrincipalKind::Stored { agent_binding: Some("dudu".into()), key_created_at: now }),
+            ("dudu", true, PrincipalKind::Stored { agent_binding: Some("dudu".into()), key_created_at: now }),
+            ("gateway-internal", false, PrincipalKind::GatewayInternal),
+            ("legacy", false, PrincipalKind::Other),
+            ("oauth_client", true, PrincipalKind::Other),
+            ("", false, PrincipalKind::Other),
+        ];
+        for (client, external, kind) in cases {
+            // Even fabricated Admin + person scopes cannot bypass the kind gate.
+            let mut principal = make_principal(vec![Scope::Admin, Scope::TasksRead, Scope::AgentsStatus], external);
+            principal.client_id = client.into();
+            for remote in [false, true] {
+                let call = AuthenticatedCall::without_reference(principal.clone()).with_kind(kind.clone());
+                let dispatcher = if remote { dispatcher.clone().for_remote_bearer() } else { dispatcher.clone() };
+                with_authenticated_call(call, async {
+                    let listed = crate::mcp::handle_tools_list_for_transport(
+                        &serde_json::json!(1), &principal, tmp.path(), "dudu", remote,
+                    ).await;
+                    let names = crate::mcp::advertised_tool_names(&listed);
+                    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+                        assert!(!names.iter().any(|name| name == tool.name), "{client}: {listed}");
+                        let response = dispatcher.dispatch_tool_call(
+                            &principal, &make_ns_ctx(external),
+                            &make_params(tool.name, serde_json::json!({"user_id":"another-person", "agent_id":"dudu"})),
+                            &serde_json::json!(2),
+                        ).await;
+                        assert_eq!(response["error"]["code"], -32003, "{client}: {response}");
+                        assert!(response["error"]["message"].as_str().unwrap().contains("only available to a personal key"),
+                            "{client}: {response}");
+                    }
+                }).await;
+            }
+        }
     }
 
     #[tokio::test]
@@ -5427,6 +5532,9 @@ effect = "forbid"
     /// Tools deliberately NOT governed by a `[permissions]` flag (read-only,
     /// self-scoped, or governed by their own capability / approval gates).
     const NOT_PERMISSION_GATED: &[&str] = &[
+        // Refused by the earlier personal-key gate, never employee permissions.
+        "my_tasks_list",
+        "my_agents_status",
         "activity_list",
         "activity_post",
         "agent_remove",
@@ -5724,7 +5832,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            280,
+            284,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
@@ -6305,7 +6413,7 @@ effect = "forbid"
             && result["error"]["message"]
                 .as_str()
                 .unwrap_or("")
-                .contains("不允許委派(none)")
+                .contains("不允許委派")
     }
 
     /// Every employee-to-employee entry point is refused under `none` (allow

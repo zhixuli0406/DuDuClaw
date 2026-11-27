@@ -653,8 +653,7 @@ pub enum RuntimeSettingsError {
     Malformed,
     /// `[runtime] provider` names no known runtime.
     UnknownProvider,
-    /// No usable preferred model. Legacy readers may use a catalog default;
-    /// the shared entry gate requires an explicitly configured model.
+    /// No usable preferred model or catalog default for a runtime that requires one.
     MissingModel,
 }
 

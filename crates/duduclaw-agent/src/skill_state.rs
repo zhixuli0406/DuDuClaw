@@ -175,6 +175,17 @@ pub fn set_disabled(
     names: &[String],
     disabled: bool,
 ) -> Result<DisabledSkills, String> {
+    set_disabled_checked(home, agent_id, names, disabled, |_| Ok(()))
+}
+
+/// Check an approved snapshot under the same lock as the read-modify-write.
+pub fn set_disabled_checked(
+    home: &Path,
+    agent_id: &str,
+    names: &[String],
+    disabled: bool,
+    check: impl FnOnce(&DisabledSkills) -> Result<(), String>,
+) -> Result<DisabledSkills, String> {
     let path = state_path(home, agent_id).ok_or_else(|| format!("invalid agent id '{agent_id}'"))?;
     for n in names {
         validate_skill_name(n)?;
@@ -190,6 +201,9 @@ pub fn set_disabled(
                 )));
             }
         };
+        let current = DisabledSkills::Names(current);
+        if let Err(error) = check(&current) { return Ok(Err(error)); }
+        let DisabledSkills::Names(current) = current else { unreachable!() };
         let next = apply(current, names, disabled);
         if next.len() > MAX_DISABLED_PER_AGENT {
             return Ok(Err("too many switched-off skills for one employee".into()));

@@ -172,6 +172,9 @@ impl MethodHandler {
             }
             "system.update_config" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_system_update_config(params, ctx)).await
             }
             // ── v1.68: raw config editor (admin; masked read, validated +
@@ -188,6 +191,14 @@ impl MethodHandler {
             // Who may hand work to whom, org-wide. Admin-gated like every
             // other config-writing RPC; the write takes effect on the next
             // delegation decision (enforcement re-reads config.toml).
+            "admin_ai.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_get(ctx)).await
+            }
+            "admin_ai.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_set(params, ctx)).await
+            }
             "delegation.get" => {
                 require_admin!();
                 boxed_frame(|| self.handle_delegation_get()).await

@@ -1,28 +1,15 @@
 //! Write-side department rule validation. Runtime containment is wired separately.
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use super::*;
 use crate::autopilot_store::AutopilotRuleRow;
-use crate::handlers::{validate_autopilot_action, validate_autopilot_conditions};
 
 const DENIED: &str = "permission denied";
 
-/// Keep approval on the step and screening on the envelope when upgrading a
-/// legacy single action. Department rules must fail closed on older engines.
-pub(crate) fn normalize_department_action(mut action: Value) -> Result<Value, String> {
-    if action.get("type").and_then(Value::as_str) == Some("steps") {
-        return Ok(action);
-    }
-    validate_autopilot_action(&action)?;
-    let screen = action.as_object_mut().and_then(|obj| obj.remove("screen"));
-    let mut envelope = json!({"type": "steps", "steps": [action]});
-    if let Some(screen) = screen { envelope["screen"] = screen; }
-    Ok(envelope)
-}
-
 /// `None` is the Admin path, selected only by the authenticated RPC context.
-/// Always validate the normalized row, including fields omitted by an update.
+/// Apply containment to the shared builder's validated, normalized row,
+/// including fields omitted by an update.
 pub(crate) async fn validate_department_rule(
     h: &MethodHandler, view: Option<&DeptGrantView>, row: &AutopilotRuleRow,
 ) -> Result<(), String> {
@@ -34,16 +21,6 @@ pub(crate) async fn validate_department_rule(
             | "task_status_changed" | "activity_new" | "channel_message" | "agent_idle" | "run_at_risk")
         || row.sequence.is_some() || row.metadata.is_some()
     { return Err(DENIED.into()); }
-    let conditions: Value = serde_json::from_str(&row.conditions).map_err(|_| DENIED)?;
-    validate_autopilot_conditions(&conditions)?;
-    if let Some(window) = &row.active_window {
-        crate::autopilot_window::parse_active_window(
-            &serde_json::from_str::<Value>(window).map_err(|_| DENIED)?)?;
-    }
-    if let Some(policy) = &row.run_policy {
-        crate::autopilot_window::parse_run_policy(
-            &serde_json::from_str::<Value>(policy).map_err(|_| DENIED)?)?;
-    }
     let admin_targets;
     let targets = if let Some(view) = view { view } else {
         admin_targets = DeptGrantView::load_targets(h).await.ok_or(DENIED)?;
@@ -65,30 +42,11 @@ pub(crate) async fn validate_department_rule(
     }
 
     let action: Value = serde_json::from_str(&row.action).map_err(|_| DENIED)?;
-    let envelope = action.as_object().ok_or(DENIED)?;
-    if action.get("type").and_then(Value::as_str) != Some("steps")
-        || envelope.keys().any(|key| !matches!(key.as_str(), "type" | "steps" | "screen"))
-    { return Err(DENIED.into()); }
-    if let Some(screen) = action.get("screen").filter(|v| !v.is_null()) {
-        crate::autopilot_screen::validate_screen_spec(screen)?;
-    }
+    // The shared save validator has checked the normalized envelope, templates,
+    // screen, window and run policy. Only department containment remains here.
     let steps = action.get("steps").and_then(Value::as_array).ok_or(DENIED)?;
-    if steps.is_empty() || steps.len() > 5 { return Err(DENIED.into()); }
-    let mut wait_minutes = 0;
-    let mut previous_wait = false;
-    for (index, step) in steps.iter().enumerate() {
-        if step.get("type").and_then(Value::as_str) == Some("wait") {
-            let minutes = step.get("minutes").and_then(Value::as_u64)
-                .filter(|n| (1..=1440).contains(n)).ok_or(DENIED)?;
-            wait_minutes += minutes;
-            if previous_wait || index + 1 == steps.len() || wait_minutes > 1440
-                || step.as_object().ok_or(DENIED)?.keys().any(|k| !matches!(k.as_str(), "type" | "minutes"))
-            { return Err(DENIED.into()); }
-            previous_wait = true;
-            continue;
-        }
-        previous_wait = false;
-        validate_autopilot_action(step)?;
+    for step in steps {
+        if step.get("type").and_then(Value::as_str) == Some("wait") { continue; }
         match step.get("type").and_then(Value::as_str) {
             Some("delegate" | "run_skill") => {
                 let target = step.get("target_agent").and_then(Value::as_str).ok_or(DENIED)?;

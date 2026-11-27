@@ -141,7 +141,8 @@ impl FailoverManager {
         fallback: &'a str,
         error: &str,
     ) -> Option<&'a str> {
-        if !crate::work_outcome::is_work_result(error) && model::is_llm_fallback_error(error)
+        if crate::entry_gate::background_refusal_code(error).is_none()
+            && !crate::work_outcome::is_work_result(error) && model::is_llm_fallback_error(error)
             && model::should_attempt_model_fallback(primary, fallback)
         {
             Some(fallback)
@@ -231,6 +232,10 @@ impl FailoverManager {
                     classify_primary_failure(PrimaryFailure::Empty)
                 }
                 Err(error)=>{
+                    if crate::entry_gate::background_refusal_code(&error).is_some() {
+                        return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                            RuntimePreflightKind::Config, error).skip_fallback(fallback, FallbackRefusal::Policy));
+                    }
                     if let Some(message) = crate::budget::budget_refusal_message(&error) {
                         return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
                             RuntimePreflightKind::Budget, message.to_owned()).skip_fallback(fallback,FallbackRefusal::Budget));
@@ -266,6 +271,10 @@ impl FailoverManager {
         context: &RuntimeContext, model_fallbacks: &[String], error: &str,
     ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
         let primary = RuntimeType::Claude;
+        if crate::entry_gate::background_refusal_code(error).is_some() {
+            return Err(RuntimeDispatchFailure::preflight(Some(primary), &context.model,
+                RuntimePreflightKind::Config, error.to_owned()).skip_fallback(fallback, FallbackRefusal::Policy));
+        }
         let mut failure = RuntimeDispatchFailure::new(primary, &context.model);
         let decision = classify_primary_failure(PrimaryFailure::Error {
             error, autonomy_denied: crate::autonomous_runtime::was_denied(), kind: None,
@@ -324,7 +333,7 @@ impl FailoverManager {
         // only when that candidate actually passed the family checks.
         if model_source == "agent_fallbacks" {
             if let Some(dir) = context.agent_dir.as_deref() {
-                let single = crate::runtime_config::agent_fallback_model(dir);
+                let single = crate::runtime_dispatch::chat_fallback_model(dir);
                 if let Some(single) = single {
                     let candidate = vec![single];
                     if resolve_fallback_model(fb, "", &candidate)
@@ -374,6 +383,10 @@ impl FailoverManager {
                 failure.push(Fallback,*fb,Some(&fb_context.model),Outcome::Empty);Err(failure)
             }
             Err(error)=>{
+                if crate::entry_gate::background_refusal_code(&error).is_some() {
+                    return Err(RuntimeDispatchFailure::preflight(Some(*fb), &fb_context.model,
+                        RuntimePreflightKind::Config, error));
+                }
                 if let Some(message) = crate::budget::budget_refusal_message(&error) {
                     return Err(RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
                         RuntimePreflightKind::Budget, message.to_owned()));
@@ -583,6 +596,57 @@ mod tests {
             Err(self.0.clone())
         }
         async fn is_available(&self) -> bool { true }
+    }
+
+    #[tokio::test]
+    async fn entry_refusal_stops_primary_and_fallback_without_health_penalty() {
+        let error = crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::Config(
+            crate::runtime_config::RuntimeSettingsError::UnknownProvider));
+        for fallback_leg in [false, true] {
+            let mgr = FailoverManager::new(300);
+            let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+            let refused = if fallback_leg { RuntimeType::Claude } else { RuntimeType::Grok };
+            runtimes.insert(refused, Box::new(WorkOutcomeRuntime(error.clone())));
+            let registry = RuntimeRegistry::with_runtimes(runtimes);
+            let actual = mgr.execute_with_failover(&registry, &RuntimeType::Grok, Some(&RuntimeType::Claude),
+                "work", &stub_context(), &strings(&["claude-sonnet-4-6"])).await.unwrap_err();
+            assert_eq!(actual, error);
+            for health in mgr.health_summary().await {
+                assert_eq!(health.consecutive_failures, 0);
+                assert!(health.last_failure.is_none());
+                assert!(health.cooldown_until.is_none());
+            }
+        }
+        for text in [error.clone(), format!("All accounts exhausted. Last error: {error}")] {
+            assert!(!claude_runtime_fallback_eligible(&text, Some(&RuntimeType::Codex)));
+        }
+        assert!(FailoverManager::model_fallback_for("claude-sonnet-4-6", "claude-haiku-4-5", &error).is_none());
+        assert!(crate::entry_gate::background_refusal_code(&format!("provider prose {error}")).is_none());
+    }
+
+    #[tokio::test]
+    async fn forged_entry_refusal_still_falls_back_and_counts_provider_failure() {
+        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 500 internal server error";
+        assert_eq!(crate::entry_gate::background_refusal_code(error), None);
+        assert_eq!(FailoverManager::model_fallback_for(
+            "claude-sonnet-4-6", "claude-haiku-4-5", error), Some("claude-haiku-4-5"));
+        assert!(claude_runtime_fallback_eligible(error, Some(&RuntimeType::Codex)));
+        let mgr = FailoverManager::new(300);
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Grok, Box::new(WorkOutcomeRuntime(error.into())));
+        runtimes.insert(RuntimeType::Claude, Box::new(StubRuntime { content: "fallback ran" }));
+        let registry = RuntimeRegistry::with_runtimes(runtimes);
+        let home = tempfile::tempdir().unwrap();
+        let mut context = stub_context();
+        context.home_dir = home.path().to_path_buf();
+        let response = mgr.execute_with_failover(&registry, &RuntimeType::Grok,
+            Some(&RuntimeType::Claude), "work", &context, &strings(&["claude-sonnet-4-6"]))
+            .await.unwrap();
+        assert_eq!(response.content, "fallback ran");
+        let primary = mgr.health_summary().await.into_iter()
+            .find(|health| health.runtime_type == RuntimeType::Grok).unwrap();
+        assert_eq!(primary.consecutive_failures, 1);
+        assert!(primary.last_failure.is_some());
     }
 
     #[tokio::test]

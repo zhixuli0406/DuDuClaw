@@ -365,6 +365,11 @@ impl ApprovalStore {
                     return Ok(false);
                 }
             }
+            // Count and insert under the same SQLite writer transaction, including
+            // other broker instances/processes. No in-memory quota can race this.
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                super::admin_ai::check_rate(&tx, rec)?;
+            }
             if let Some((session, turn)) = &origin {
                 let cancelled: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
@@ -540,6 +545,61 @@ impl ApprovalStore {
         ).await
     }
 
+    /// Shared by ordinary and leased writes, inside the status transaction.
+    fn validate_chat_decision(&self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry) -> Result<(), String> {
+        // Re-read classification and binding under the write lock.
+        // Live Admin/proof checks belong to the decision service.
+        if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
+            return Err("bound requests require authenticated decision context".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
+            Some(home) => decision_digest_at(home, rec),
+            None => decision_digest(rec),
+        };
+        if entry.digest != digest {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
+    /// Bound decisions have their own gates; never relax the unbound writer.
+    /// Called before and inside resolve_bound's transaction. No store re-locks.
+    pub(super) fn validate_bound_chat_decision(
+        &self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry,
+    ) -> Result<(), String> {
+        let home = self.db_path.as_deref().and_then(Path::parent)
+            .ok_or("chat-admin bound decisions require durable identity")?;
+        if crate::google_identity::member_card::is_member_card(rec) {
+            return Err("Only the requesting member may confirm".into());
+        }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND
+            && !crate::admin_ai::may_decide(home, rec, &entry.user_id.to_string()) {
+            return Err(crate::admin_ai::REFUSAL.into());
+        }
+        // chat_tier also excludes live mail-requester-eligible egress cards.
+        if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_none() || rec.request_kind != RequestKind::Approval {
+            return Err("chat-admin bound decisions require a bound approval".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        // Identical to the dashboard digest: activation facts include live
+        // pricing. A bare decision_digest would omit those displayed facts.
+        if entry.digest != decision_digest_at(home, rec) {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
     async fn decide_if_pending_inner(
         &self,
         id: &ApprovalId,
@@ -565,24 +625,7 @@ impl ApprovalStore {
                     check_expected_digest(rec)?;
                 }
                 if let Some(entry) = ledger {
-                    // Re-read classification and binding under the write lock.
-                    // Live Admin/proof checks belong to the decision service.
-                    if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
-                        return Err("chat-admin decisions refuse T3 approvals".into());
-                    }
-                    if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
-                        return Err("bound requests require authenticated decision context".into());
-                    }
-                    if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
-                        return Err("chat-admin decision requires step-up".into());
-                    }
-                    let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
-                        Some(home) => decision_digest_at(home, rec),
-                        None => decision_digest(rec),
-                    };
-                    if entry.digest != digest {
-                        return Err("approval digest mismatch; refetch the approval before deciding".into());
-                    }
+                    self.validate_chat_decision(rec, entry)?;
                 }
             }
             let n = tx.execute(
@@ -698,13 +741,30 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
+        self.decide_leased_inner(id, token, status, decided_by, decided_at, None).await
+    }
+
+    pub(super) async fn decide_leased_with_ledger(
+        &self, id: &ApprovalId, token: &str, approve: bool,
+        entry: &chat_admin::LedgerEntry, decided_at: &str,
+    ) -> Result<usize, String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        self.decide_leased_inner(id, token, status, &entry.decided_by().to_string(), decided_at, Some(entry)).await
+    }
+
+    async fn decide_leased_inner(
+        &self, id: &ApprovalId, token: &str, status: ApprovalStatus,
+        decided_by: &str, decided_at: &str, ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| format!("begin leased approval decision: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
             let rec = record_in_connection(&tx, id)?;
             match &rec {
-                Some(r) if r.status == ApprovalStatus::Pending => check_expected_digest(r)?,
+                Some(r) if r.status == ApprovalStatus::Pending => {
+                    check_expected_digest(r)?;
+                    if let Some(entry) = ledger { self.validate_chat_decision(r, entry)?; }
+                }
                 _ => return Ok(0),
             }
             let n = tx.execute(
@@ -716,7 +776,10 @@ impl ApprovalStore {
                     live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                 params![status.as_str(), decided_by, decided_at, id.as_str(), token],
             ).map_err(|e| format!("decide leased approval: {e}"))?;
-            tx.commit().map_err(|e| format!("commit leased approval decision: {e}"))?;
+            if n > 0 && let Some(entry) = ledger {
+                chat_admin::ledger::insert_and_consume(&tx, id, status.is_granted(), entry, decided_at)?;
+            }
+            commit_live_write(tx)?;
             (n, rec)
         };
         if n > 0 && let Some(rec) = rec {
@@ -771,18 +834,31 @@ impl ApprovalStore {
         payload: &Value,
     ) -> Result<usize, String> {
         require_credential_free_payload(payload)?;
-        let mut connection = self.conn.lock().await;
-        let conn = begin_live_write(&mut connection)?;
-        verify_live_io()?;
-        let result = conn.execute(
-            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
-             status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
-             invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
-                END WHERE id = ?3",
-            params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
-        )
-        .map_err(|e| format!("scrub approval: {e}"))?;
-        commit_live_write(conn)?;
+        // End the transaction and connection guard's scope before any async readback.
+        let result = {
+            let mut connection = self.conn.lock().await;
+            let conn = begin_live_write(&mut connection)?;
+            verify_live_io()?;
+            let result = conn.execute(
+                "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
+                 status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
+                 invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
+                    END WHERE id = ?3",
+                params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
+            )
+            .map_err(|e| format!("scrub approval: {e}"))?;
+            commit_live_write(conn)?;
+            result
+        };
+        if result > 0 && let Some(home) = self.db_path.as_deref().and_then(Path::parent) {
+            match self.get(id).await {
+                Ok(Some(rec)) if rec.status == ApprovalStatus::Invalidated => {
+                    chat_admin::sync::spawn_expire(home.to_path_buf(), rec);
+                }
+                Ok(_) => (),
+                Err(_) => warn!("chat-admin scrubbed card snapshot unavailable"),
+            }
+        }
         Ok(result)
     }
 

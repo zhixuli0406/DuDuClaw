@@ -6873,6 +6873,9 @@ fn agent_file_guard_decision(
                             duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, portability::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
                             // RM-137 H3: an employee may not run its own ACP server.
                             duduclaw_core::bash_operator_command_decision(command, &caller, acp::server::OPERATOR_COMMANDS)
                         })
@@ -12355,6 +12358,7 @@ async fn cmd_export_data(out: Option<PathBuf>) -> duduclaw_core::error::Result<(
 
 /// `duduclaw import <file>` — restore a personal-edition `.tar.gz` into `~/.duduclaw/`.
 async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Result<()> {
+    portability::refuse_import_in_ai_session()?;
     let home = duduclaw_home();
     println!("Importing personal-edition data...");
     println!("  Archive: {}", file.display());
@@ -15362,6 +15366,28 @@ mod removed_name_hook_tests {
         }
         let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
+    }
+
+    #[test]
+    fn import_bash_is_operator_only_through_agent_file_guard() {
+        let h = home_with_trash();
+        for binary in ["duduclaw", "duduclaw-pro", "duduclaw.exe", "duduclaw-pro.exe", "/opt/bin/duduclaw"] {
+            for suffix in ["import input.tar.gz --force", "--redact on import input.tar.gz", "im''port input.tar.gz"] {
+                let command = format!("{binary} {suffix}");
+                for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+                    let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &caller).unwrap();
+                    assert!(!decision.is_allowed(), "{command}: {decision:?}");
+                    if matches!(caller, HookCaller::Agent(_)) {
+                        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
+                    }
+                }
+                let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &HookCaller::Absent);
+                assert!(decision.is_none_or(|d| d.is_allowed()), "{command}");
+            }
+        }
+        let command = "bash -c 'env -u DUDUCLAW_AGENT_ID duduclaw import input.tar.gz --force'";
+        let decision = agent_file_guard_decision("Bash", &bash(command), h.path(), &agent("ceo")).unwrap();
+        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
     }
 
     /// P2-A appendix D.1 (moved from core onto the shared operator-command

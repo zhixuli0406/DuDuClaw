@@ -101,75 +101,17 @@ fn status_value(handshake: chat_link::Handshake) -> Value {
     })
 }
 
-fn configured_string(table: &toml::Table, key: &str) -> bool {
-    table.get(key).and_then(toml::Value::as_str).is_some_and(|s| !s.trim().is_empty())
-}
-
-fn configured_secret(table: &toml::Table, key: &str) -> bool {
-    configured_string(table, key) || configured_string(table, &format!("{key}_enc"))
-}
-
-fn target(channel: &str, agent: Option<&str>, name: &str, project: Option<&str>) -> Value {
-    // Runtime labels distinguish the shared bot from an employee named "shared".
-    let label = crate::chat_link_intercept::account_label(channel, agent);
-    let identity = crate::agent_channels::identity::get(&label);
-    json!({"channel": channel, "account": label, "agent_id": agent, "display_name": name,
-        "bot_username": if channel == "telegram" { identity.as_deref() } else { None },
-        "service_account_email": if channel == "googlechat" { identity.as_deref() } else { None },
-        "project_number": project})
-}
-
-/// Local configuration only: never resolve SecretRefs or call getMe. Like the
-/// existing channel status RPC, encrypted credentials count as configured.
 fn targets(home: &Path, channel: &str, agents: &[String]) -> Result<Vec<Value>, &'static str> {
-    let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| UNAVAILABLE)?;
-    let config: toml::Table = raw.parse().map_err(|_| UNAVAILABLE)?;
-    let mut result = Vec::new();
-    if let Some(value) = config.get("channels") {
-        let ch = value.as_table().ok_or(UNAVAILABLE)?;
-        if channel == "telegram" && configured_secret(ch, "telegram_bot_token") {
-            result.push(target(channel, None, "共用 Telegram 機器人", None));
-        } else if channel == "googlechat" {
-            let allowed = ["project_number", "service_account_json", "service_account_json_enc",
-                "connection", "pubsub_subscription"];
-            let valid_fields = ch.keys().filter_map(|k| k.strip_prefix("googlechat_"))
-                .all(|k| allowed.contains(&k));
-            // Same fail-closed transport rules as shared_http_enabled and
-            // sending_app_takes_http_clicks: default HTTP, empty subscription.
-            let http = ch.get("googlechat_connection").map_or(true, |v| v.as_str() == Some("http"))
-                && ch.get("googlechat_pubsub_subscription").map_or(true, |v| v.as_str() == Some(""));
-            if valid_fields && http && configured_secret(ch, "googlechat_service_account_json") {
-                if let Some(project) = ch.get("googlechat_project_number").and_then(toml::Value::as_str)
-                    .filter(|p| crate::agent_channels::googlechat_config::validate_project_number(p).is_ok()) {
-                    result.push(target(channel, None, "共用 Google Chat 應用程式", Some(project)));
-                }
-            }
-        }
-    }
-    for id in agents {
-        if !duduclaw_core::is_valid_agent_id(id) { return Err(UNAVAILABLE); }
-        let raw = std::fs::read_to_string(home.join("agents").join(id).join("agent.toml"))
-            .map_err(|_| UNAVAILABLE)?;
-        let config: toml::Table = raw.parse().map_err(|_| UNAVAILABLE)?;
-        let Some(channels) = config.get("channels") else { continue; };
-        let Some(value) = channels.as_table().ok_or(UNAVAILABLE)?.get(channel) else { continue; };
-        let section = value.as_table().ok_or(UNAVAILABLE)?;
-        if channel == "telegram" && configured_secret(section, "bot_token") {
-            result.push(target(channel, Some(id), id, None));
-        } else if channel == "googlechat" {
-            let cfg: duduclaw_core::types::GoogleChatChannelConfig = value.clone().try_into()
-                .map_err(|_| UNAVAILABLE)?;
-            if cfg.connection == "http" && cfg.pubsub_subscription.trim().is_empty()
-                && crate::agent_channels::store::googlechat_configured(Some(&cfg))
-                && crate::agent_channels::googlechat_config::validate_project_number(&cfg.project_number).is_ok() {
-                result.push(target(channel, Some(id), id, Some(&cfg.project_number)));
-            }
-        }
-    }
-    if result.is_empty() {
-        return Err("目前沒有可連結的機器人或聊天應用程式，請先完成設定；Google Chat 需使用 HTTP 連線。");
-    }
-    Ok(result)
+    crate::chat_link_intercept::configured_accounts(home, channel, agents).map(|accounts| {
+        accounts.into_iter().map(|account| {
+            let identity = crate::agent_channels::identity::get(&account.account);
+            json!({"channel": account.channel, "account": account.account,
+                "agent_id": account.agent_id, "display_name": account.display_name,
+                "bot_username": if channel == "telegram" { identity.as_deref() } else { None },
+                "service_account_email": if channel == "googlechat" { identity.as_deref() } else { None },
+                "project_number": account.project_number})
+        }).collect()
+    })
 }
 
 fn audit(db: &UserDb, home: &Path, user: &str, event: &str,
@@ -274,12 +216,12 @@ impl MethodHandler {
                 }
                 Request::Remove { channel, principal } => {
                     let proof = db.approval_proofs(user).map_err(|_| UNAVAILABLE)?.into_iter()
-                        .find(|p| p.channel == channel && p.channel_user_id == principal);
-                    if !db.unbind_channel_identity_authorized(user, &channel, &principal, user)
+                        .find(|p| p.channel == channel && p.channel_user_id == principal).ok_or(NOT_FOUND)?;
+                    if !db.clear_approval_proof(user, &channel, &principal)
                         .map_err(|_| UNAVAILABLE)? { return Err(NOT_FOUND); }
-                    audit(&db, &home, user, "channel_identity_unbound", &channel, &otp::mask_target(&principal),
-                        proof.as_ref().map(|p| p.proof_account.as_str()))?;
-                    Ok(json!({"removed": true}))
+                    audit(&db, &home, user, "channel_identity_proof_revoked", &channel, &otp::mask_target(&principal),
+                        Some(&proof.proof_account))?;
+                    Ok(json!({"revoked": true}))
                 }
             }
         }).await;

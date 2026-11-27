@@ -102,6 +102,10 @@ impl MethodHandler {
         }
 
         match method {
+            "google.drive_write.get" | "google.drive_write.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_drive_write_rpc(method, params, ctx)).await
+            }
             "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
             | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove"
             | "mfa.recovery_regenerate" | "mfa.disable" => {
@@ -116,7 +120,8 @@ impl MethodHandler {
             method if super::odoo_member_rpc::owns(method) => {
                 boxed_frame(|| self.handle_odoo_member_rpc(method, params, ctx)).await
             }
-            "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            "me.google.write_confirmations" | "me.google.write_confirm"
+            | "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
             | "me.google.write_connect_start"
             | "me.google.write_disconnect"
             | "me.google.connect_start"
@@ -225,6 +230,16 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_dept_grants_options()).await
             }
             "users.dept_grants.mine" => boxed_frame(|| self.handle_dept_grants_mine(params, ctx)).await,
+            "me.google_signin.status" | "me.google_signin.link_start" | "me.google_signin.link_complete"
+            | "me.google_signin.unlink" | "me.google_signin.reauth_start" | "me.google_signin.reauth_complete" => {
+                boxed_frame(|| self.handle_google_signin_me_rpc(method, params, ctx)).await
+            }
+            "google.signin.get" | "google.signin.set"
+            | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+            | "users.google_signin.attest" | "users.google_signin.unlink"
+            | "users.signin_onboarding.retry_avatar" => {
+                boxed_frame(|| self.handle_google_signin_rpc(method, params, ctx)).await
+            }
             "users.dept_grants.reach_preview" => {
                 require_admin!();
                 boxed_frame(|| self.handle_dept_grants_reach_preview(params)).await
@@ -405,6 +420,9 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────

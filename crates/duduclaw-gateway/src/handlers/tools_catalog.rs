@@ -124,6 +124,8 @@ impl MethodHandler {
                     { "name": "tick.sources.list", "description": "List [[tick.sources]] entries with validation state; header values never returned (admin)" },
                     { "name": "tick.sources.upsert", "description": "Add or update one tick source by id, validated like the boot loader (admin)" },
                     { "name": "tick.sources.remove", "description": "Remove one tick source by id (admin)" },
+                    { "name": "admin_ai.get", "description": "Read administrator AI settings (admin)" },
+                    { "name": "admin_ai.set", "description": "Update administrator AI settings with risk acknowledgement (admin)" },
                     { "name": "delegation.get", "description": "Read the org-wide delegation policy + cross-department pairs (admin)" },
                     { "name": "delegation.set", "description": "Update the delegation policy / cross-department pairs (admin)" },
                     { "name": "delegation.effective", "description": "Read-only effective delegation for one AI employee: policy, its source (global or the employee's own switch), applying pairs, config_error (Manager and visible employee)" },

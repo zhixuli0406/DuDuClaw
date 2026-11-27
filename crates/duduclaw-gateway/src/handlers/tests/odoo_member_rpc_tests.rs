@@ -58,7 +58,7 @@ async fn fixture(stub: &Stub) -> Fixture {
         session: uuid::Uuid::new_v4().to_string() }
 }
 fn configure(home: &Path, stub: &Stub) {
-    std::fs::write(home.join("config.toml"), format!("[odoo]\nurl='{}'\ndb='test'\n", stub.url)).unwrap();
+    std::fs::write(home.join("config.toml"), format!("[odoo]\nmember_credentials=true\nurl='{}'\ndb='test'\n", stub.url)).unwrap();
 }
 async fn rpc(f: &Fixture, ctx: &UserContext, method: &str, args: Value) -> WsFrame {
     let frame = crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), f.session.clone())),
@@ -86,7 +86,7 @@ async fn odoo_member_connect_status_disconnect_and_admin_management() {
     payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     payload(connect(&f).await);
     let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
-    assert_eq!(status, json!({"connected":true,"state":"ok","login":"member@example.test","odoo_name":"Member",
+    assert_eq!(status, json!({"member_credentials_enabled":true,"connected":true,"state":"ok","login":"member@example.test","odoo_name":"Member",
         "server":format!("{}/", s.url),"database":"test","verified_at":status["verified_at"],"last_used_at":null}));
     let list = payload(rpc(&f, &f.admin, "odoo.member_credentials.list", json!({})).await);
     assert_eq!(list["credentials"][0]["user_id"], f.member.user_id);
@@ -191,13 +191,19 @@ async fn odoo_member_config_fails_closed() {
     assert_eq!(status["server"], Value::Null);
     assert_eq!(status["database"], Value::Null);
     refused(connect(&f).await);
-    for text in ["broken [", "[odoo]\nurl=7\ndb='test'"] {
+    for text in ["broken [", "[odoo]\nmember_credentials=true\nurl=7\ndb='test'"] {
         std::fs::write(f.home.path().join("config.toml"), text).unwrap();
-        refused(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+        // Malformed TOML turns the switch off; status still answers. A valid
+        // opt-in with an invalid destination retains its configuration error.
+        if text == "broken [" {
+            assert_eq!(payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await)["member_credentials_enabled"], false);
+        } else {
+            refused(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+        }
         refused(connect(&f).await);
     }
     std::fs::remove_file(f.home.path().join("config.toml")).unwrap();
-    refused(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    assert_eq!(payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await)["member_credentials_enabled"], false);
     assert_eq!(s.calls.load(Ordering::SeqCst), 0);
 }
 
@@ -208,7 +214,7 @@ async fn odoo_member_unreachable_is_audited_without_storing() {
     let unavailable = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", unavailable.local_addr().unwrap());
     drop(unavailable);
-    std::fs::write(f.home.path().join("config.toml"), format!("[odoo]\nurl='{url}'\ndb='test'\n")).unwrap();
+    std::fs::write(f.home.path().join("config.toml"), format!("[odoo]\nmember_credentials=true\nurl='{url}'\ndb='test'\n")).unwrap();
     payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     refused(connect(&f).await);
     assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
@@ -257,7 +263,7 @@ async fn odoo_member_status_shows_full_destination_and_database() {
         ("https://odoo.example.test:8443/other", "third", "https://odoo.example.test:8443/other"),
     ] {
         std::fs::write(f.home.path().join("config.toml"),
-            format!("[odoo]\nurl='{url}'\ndb='{database}'\n")).unwrap();
+            format!("[odoo]\nmember_credentials=true\nurl='{url}'\ndb='{database}'\n")).unwrap();
         let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
         assert_eq!(status["server"], shown);
         assert_eq!(status["database"], database);
@@ -265,7 +271,7 @@ async fn odoo_member_status_shows_full_destination_and_database() {
     for url in ["https://user:secret@odoo.example.test", "https://odoo.example.test/?secret=hidden",
         "https://odoo.example.test/#hidden"] {
         std::fs::write(f.home.path().join("config.toml"),
-            format!("[odoo]\nurl='{url}'\ndb='test'\n")).unwrap();
+            format!("[odoo]\nmember_credentials=true\nurl='{url}'\ndb='test'\n")).unwrap();
         refused(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     }
     assert_eq!(s.calls.load(Ordering::SeqCst), 0);
@@ -280,4 +286,142 @@ async fn odoo_member_missing_machine_key_refuses_connect_before_network() {
     refused(connect(&f).await);
     assert_eq!(s.calls.load(Ordering::SeqCst), 0);
     assert!(!f.home.path().join(".keyfile").exists());
+}
+
+
+fn stored_credential(f: &Fixture) {
+    let server = crate::odoo_identity::server::company_server(f.home.path()).unwrap().unwrap();
+    let sealer = crate::odoo_credentials::Sealer::load(f.home.path()).unwrap();
+    f.db.odoo_credential_put(&f.member.user_id, "member@example.test", 7, "Member", KEY, &server.fp, &sealer).unwrap();
+}
+
+#[tokio::test]
+async fn odoo_member_switch_off_refuses_before_unseal_or_network_and_keeps_rows() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    stored_credential(&f);
+    // No machine key: a test that reached unseal would fail for another reason.
+    std::fs::remove_file(f.home.path().join(".keyfile")).unwrap();
+    let base = format!("[odoo]\nurl='{}'\ndb='test'\n", s.url);
+    for setting in ["", "member_credentials=false\n", "member_credentials='true'\n", "member_credentials=1\n"] {
+        std::fs::write(f.home.path().join("config.toml"), format!("{base}{setting}")).unwrap();
+        let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+        assert_eq!(status["member_credentials_enabled"], false);
+        assert_eq!(status["connected"], true);
+        assert_eq!(status["state"], "ok");
+        for frame in [connect(&f).await, rpc(&f, &f.member, "me.odoo.test", json!({})).await] {
+            assert!(serde_json::to_string(&frame).unwrap().contains("公司尚未開放同仁連接自己的 Odoo 帳號"));
+            refused(frame);
+        }
+        assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_some());
+        let list = payload(rpc(&f, &f.admin, "odoo.member_credentials.list", json!({})).await);
+        assert_eq!(list["enabled"], false);
+        assert_eq!(list["credentials"].as_array().unwrap().len(), 1);
+    }
+    // Unreadable and invalid TOML also fail closed, including status.
+    for raw in [Some("[broken"), None] {
+        let path = f.home.path().join("config.toml");
+        if let Some(raw) = raw { std::fs::write(&path, raw).unwrap(); }
+        else { std::fs::remove_file(&path).unwrap(); std::fs::create_dir(&path).unwrap(); }
+        assert_eq!(payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await)["member_credentials_enabled"], false);
+        refused(connect(&f).await);
+        refused(rpc(&f, &f.member, "me.odoo.test", json!({})).await);
+    }
+    payload(rpc(&f, &f.member, "me.odoo.disconnect", json!({})).await);
+    assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn odoo_member_switch_admin_commit_is_guarded_and_audited() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    stored_credential(&f);
+    let path = f.home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=true # keep comment");
+    std::fs::write(&path, &raw).unwrap();
+    for args in [json!({}), json!({"enabled":"false"}), json!({"enabled":false,"user_id":f.admin.user_id})] {
+        refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", args).await);
+    }
+    refused(rpc(&f, &f.member, "odoo.member_credentials.set_enabled", json!({"enabled":false})).await);
+    let mut key = f.admin.clone();
+    key.member_key_id = Some("member-key-context".into());
+    refused(rpc(&f, &key, "odoo.member_credentials.set_enabled", json!({"enabled":false})).await);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
+    let result = payload(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":false})).await);
+    assert_eq!(result, json!({"enabled":false}));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("# keep comment"));
+    let doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(doc["odoo"]["member_credentials"].as_bool(), Some(false));
+    assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_some());
+    let list = payload(rpc(&f, &f.admin, "odoo.member_credentials.list", json!({})).await);
+    assert_eq!(list["enabled"], false);
+    assert_eq!(list["credentials"].as_array().unwrap().len(), 1);
+    let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    let event: Value = audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["event_type"] == "odoo_member_credentials_toggled").unwrap();
+    assert_eq!(event["details"]["actor_user_id"], f.admin.user_id);
+    assert_eq!(event["details"]["enabled"], false);
+    assert_eq!(event["details"]["acknowledged"], false);
+    assert_eq!(event["details"]["phase"], "before_commit");
+    assert!(chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap()).is_ok());
+    payload(rpc(&f, &f.admin, "odoo.member_credentials.revoke", json!({"user_id":f.member.user_id})).await);
+    assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
+    let disabled_config = std::fs::read_to_string(&path).unwrap();
+    let audit_before = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    for args in [json!({"enabled":true}), json!({"enabled":true,"acknowledge_risk":false})] {
+        let frame = rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", args).await;
+        assert!(serde_json::to_string(&frame).unwrap().contains("請先確認你已了解風險"));
+        refused(frame);
+    }
+    for ack in [json!("true"), json!(1), Value::Null] {
+        refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled",
+            json!({"enabled":true,"acknowledge_risk":ack})).await);
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), disabled_config);
+    assert_eq!(std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap(), audit_before);
+    payload(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true,"acknowledge_risk":true})).await);
+    let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    let event = audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event_type"] == "odoo_member_credentials_toggled").last().unwrap();
+    assert_eq!(event["details"]["enabled"], true);
+    assert_eq!(event["details"]["acknowledged"], true);
+    assert_eq!(payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await)["member_credentials_enabled"], true);
+    // The supplied Admin context cannot override a live demotion.
+    let db = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    db.execute("UPDATE users SET role='employee' WHERE id=?1", [&f.admin.user_id]).unwrap();
+    refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":false})).await);
+    assert!(crate::odoo_identity::server::member_credentials_enabled(f.home.path()));
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn odoo_member_switch_audit_failure_leaves_config_unchanged() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    let path = f.home.path().join("config.toml");
+    let original = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=false");
+    std::fs::write(&path, &original).unwrap();
+    std::fs::create_dir(f.home.path().join("security_audit.jsonl")).unwrap();
+    refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true,"acknowledge_risk":true})).await);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn odoo_member_epoch_requires_new_key_after_fresh_browser_login() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    stored_credential(&f);
+    let db = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    db.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&f.member.user_id]).unwrap();
+    let live = f.db.live_user_context(&f.member.user_id).unwrap().unwrap();
+    let status = payload(rpc(&f, &live, "me.odoo.status", json!({})).await);
+    assert_eq!(status["state"], "needs_reverify");
+    let frame = rpc(&f, &live, "me.odoo.test", json!({})).await;
+    assert!(serde_json::to_string(&frame).unwrap().contains("請重新輸入 Odoo 登入名稱和金鑰"));
+    refused(frame);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+    payload(rpc(&f, &live, "me.odoo.connect", json!({"login":"member@example.test","api_key":KEY})).await);
+    assert_eq!(f.db.odoo_credential_status(&live.user_id).unwrap().unwrap().state, "ok");
 }

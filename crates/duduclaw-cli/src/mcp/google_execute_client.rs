@@ -219,7 +219,12 @@ pub(crate) mod test_transport {
         );
         Guard(home)
     }
-    pub(super) fn invoke(home: &Path, body: &Value) -> Result<Value, String> {
+    pub(crate) fn installed(home: &Path) -> bool {
+        home.canonicalize()
+            .map(|home| handlers().lock().unwrap().contains_key(&home))
+            .unwrap_or(false)
+    }
+    pub(crate) fn invoke(home: &Path, body: &Value) -> Result<Value, String> {
         let home = home
             .canonicalize()
             .map_err(|_| "isolated execute home unavailable")?;

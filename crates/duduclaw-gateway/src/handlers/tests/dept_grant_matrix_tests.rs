@@ -24,6 +24,9 @@ fn assert_success(method: &str, frame: WsFrame) {
 
 fn admin_only_params(method: &str) -> Value {
     match method {
+        "autopilot.template_fields" => json!({"trigger_event": "task_created"}),
+        "autopilot.runs.list" => json!({"rule_id": "matrix-rule", "limit": 10}),
+        "autopilot.runs.cancel" => json!({"run_id": "matrix-run"}),
         "skills.install" => json!({"scope": "a1", "content": MATRIX_SKILL}),
         _ => json!({"agent_id": "a1", "days": 7, "limit": 10}),
     }

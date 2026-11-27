@@ -22,6 +22,8 @@ pub(super) struct InstallCtx {
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
     pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
+    /// Preserve the original transport after resolution to a local snapshot.
+    pub source_is_github: bool,
     pub rename: bool,
     /// Explicit operator grant for pack hooks (`--trust-hooks`). Without it
     /// hooks land disabled behind an ApprovalBroker request (fail-closed).
@@ -53,6 +55,8 @@ pub(crate) struct PipelineOpts {
     pub dry_run: bool,
     pub confirm_profile: Option<String>,
     pub signature_status: Option<duduclaw_core::publishers::SignatureStatus>,
+    /// Preserve the original transport after resolution to a local snapshot.
+    pub source_is_github: bool,
     pub rename: bool,
     pub trust_hooks: bool,
     pub attach_under: Option<String>,
@@ -268,6 +272,7 @@ async fn install_inner(home: &Path, source: &str, opts: &PipelineOpts, report: &
         dry_run,
         confirm_profile: opts.confirm_profile.clone(),
         signature_status: opts.signature_status.clone(),
+        source_is_github: opts.source_is_github || source.starts_with("github:"),
         rename: opts.rename || opts.reimport == super::reimport::ReimportMode::Copy,
         trust_hooks: opts.trust_hooks,
         attach_under,
@@ -1314,7 +1319,7 @@ mod native_plan_tests {
 
     fn ctx(home: &Path) -> InstallCtx {
         InstallCtx {
-            home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None,
+            home: home.to_path_buf(), dry_run: true, confirm_profile: None, signature_status: None, source_is_github: false,
             rename: false, trust_hooks: false, attach_under: None,
             reimport: Default::default(), replace: None, agent_cap: None,
             replace_state: Default::default(), seat_admission: Default::default(),

@@ -139,6 +139,61 @@ fn writes_require_ack_record_actor_and_remove_ack_when_disabled() {
 }
 
 #[test]
+fn disable_settings_keeps_other_fields() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let text = "# preserve formatting and unknown keys\n\
+[google_signin]\n\
+enabled = true # emergency switch\n\
+enabled_ack={by='admin',at='2026-11-27T00:00:00Z'}\n\
+allowed_hd = [ 'EXAMPLE.COM', 'other.com' ] # keep original case\n\
+approval = 'direct'\n\
+daily_new_accounts = 1_00\n\
+avatar_template = 'company:sales'\n\
+avatar_template_revision = 7\n\
+approval_grants_mfa_enrollment = true\n\
+future_key = { label = '保留', count = 3 }\n\
+[general]\n\
+name = 'unchanged'\n";
+    std::fs::write(&path, text).unwrap();
+    let original = read_strict(home.path());
+    assert!(original.enabled);
+    let (before, after) = disable_settings(home.path(), "other-admin", NOW).unwrap();
+    assert_eq!(before, original);
+    assert!(!after.enabled);
+    assert!(!after.enabled_requested);
+    assert!(after.ack.is_none());
+    assert_eq!(after, read_strict(home.path()));
+    let expected = text.replace("enabled = true", "enabled = false")
+        .replace("enabled_ack={by='admin',at='2026-11-27T00:00:00Z'}\n", "");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    let mut expected_root: toml::Table = text.parse().unwrap();
+    let section = expected_root.get_mut("google_signin").unwrap().as_table_mut().unwrap();
+    section.insert("enabled".into(), false.into());
+    section.remove("enabled_ack");
+    assert_eq!(std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap(), expected_root);
+    let (again_before, again_after) = disable_settings(home.path(), "other-admin", NOW).unwrap();
+    assert_eq!(again_before, after);
+    assert_eq!(again_after, after);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[test]
+fn disable_settings_no_section_is_harmless() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let text = "# no Google sign-in configured\n[general]\nname = 'unchanged'\n";
+    std::fs::write(&path, text).unwrap();
+    let original = read_strict(home.path());
+    let (before, after) = disable_settings(home.path(), "admin", NOW).unwrap();
+    assert_eq!(before, original);
+    assert_eq!(after, original);
+    assert!(!after.enabled);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert!(!text.parse::<toml::Table>().unwrap().contains_key("google_signin"));
+}
+
+#[test]
 fn invalid_updates_never_write() {
     let home = tempfile::tempdir().unwrap();
     for list in [vec![], vec!["bad/domain".into()], vec!["example.com".into(), "bad/domain".into()], vec!["example.com".into(); 51]] {

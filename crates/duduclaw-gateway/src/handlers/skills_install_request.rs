@@ -182,7 +182,7 @@ impl MethodHandler {
                 &format!("{:?}", scan.risk_level),
                 &scan_json,
                 &payload,
-                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+                crate::skill_ttl::skill_approval_ttl_secs(&self.home_dir),
             )
             .await
         {
@@ -300,7 +300,7 @@ impl MethodHandler {
                 &format!("{:?}", scan.risk_level),
                 &scan_json,
                 &payload,
-                crate::install_requests::DEFAULT_INSTALL_TTL_SECONDS,
+                crate::skill_ttl::skill_approval_ttl_secs(&self.home_dir),
             )
             .await
         {

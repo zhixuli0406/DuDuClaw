@@ -38,14 +38,17 @@ fn loopback_refusal_malformed_answer_and_wrong_employee_grant_no_pass() {
     let roles = LoopbackOwnerRoles(decode("avatar", &encoded));
     assert!(unrestricted(h.path(), "avatar", &read(), &roles));
     assert!(!unrestricted(h.path(), "avatar", &read(), &facts("employee")));
-    let mut background = facts("employee").facts().unwrap();
+    let mut background = facts("admin").facts().unwrap();
     background.background = true;
     assert!(!unrestricted(h.path(), "avatar", &read(), &LoopbackOwnerRoles(Ok(background))));
 }
 #[tokio::test]
 async fn front_door_none_listing_and_call_share_turn_eligibility() {
     let h = home();
+    let mut background = facts("admin").facts().unwrap();
+    background.background = true;
     for (roles, allowed) in [(facts("admin"), true), (facts("employee"), false),
+        (LoopbackOwnerRoles(Ok(background)), false),
         (LoopbackOwnerRoles(Err(OwnerRoleLookupError)), false)] {
         TEST_ROLES.scope((h.path().into(), "avatar".into(), roles), async {
             let policy = none_policy(h.path(), "avatar").await;
@@ -55,8 +58,10 @@ async fn front_door_none_listing_and_call_share_turn_eligibility() {
             assert_eq!(!none_blocks(h.path(), "avatar").await, allowed);
             assert_eq!(crate::mcp::check_delegation_allowed(h.path(), "avatar", "other", "send_to_agent").await.is_ok(), allowed);
             assert_eq!(crate::mcp::check_delegation_allowed_blocking(h.path(), "avatar", "other", "send_to_agent").is_ok(), allowed);
+            let mut principal = crate::mcp::tools_list::test_principal(false);
+            principal.client_id = "avatar".into();
             let listed = crate::mcp::tools_list::visible_tools_with(
-                &crate::mcp::tools_list::test_principal(false), h.path(), "avatar", true).await;
+                &principal, h.path(), "avatar", true).await;
             // Same predicate/tools at list and dispatch; no reverse authority.
             for name in ["send_to_agent", "spawn_agent"] {
                 assert_eq!(listed.iter().any(|tool| tool.name == name), allowed, "{name}");
@@ -203,8 +208,10 @@ async fn pass_holder_agent_update_keeps_none_listing_and_dispatch_behavior() {
         let policy = none_policy(h.path(), "avatar").await;
         assert!(!policy.blocks("send_to_agent"));
         assert!(policy.blocks("agent_update"));
+        let mut principal = crate::mcp::tools_list::test_principal(false);
+        principal.client_id = "avatar".into();
         let listed = crate::mcp::tools_list::visible_tools_with(
-            &crate::mcp::tools_list::test_principal(false), h.path(), "avatar", true).await;
+            &principal, h.path(), "avatar", true).await;
         // v1.85 lists argument-dependent tools for self-work; no exemption
         // applies when dispatch supplies another employee's background edit.
         assert!(listed.iter().any(|tool| tool.name == "agent_update"));
@@ -212,9 +219,13 @@ async fn pass_holder_agent_update_keeps_none_listing_and_dispatch_behavior() {
         assert!(crate::mcp_dispatch::delegation_none_refuses_for(h.path(), "agent_update", &args, "avatar", || false));
         let result = dispatch(h.path(), "agent_update", args).await;
         assert_eq!(result["error"]["code"], -32003, "{result}");
-        assert!(result["error"]["message"].as_str().unwrap().contains("none"), "{result}");
-        let audit = std::fs::read_to_string(h.path().join("security_audit.jsonl")).unwrap();
-        assert!(audit.contains("delegation_disabled"));
+        assert!(result["error"]["message"].as_str().unwrap().contains("不允許委派"), "{result}");
+        let audit = std::fs::read_to_string(h.path().join("tool_calls.jsonl")).unwrap();
+        let rows: Vec<serde_json::Value> = audit.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(rows.iter().any(|row| row["tool_name"] == "agent_update"
+            && row["agent_id"] == "avatar" && row["error_class"] == "delegation_disabled"
+            && row["success"] == false), "{audit}");
     }).await;
 }
 

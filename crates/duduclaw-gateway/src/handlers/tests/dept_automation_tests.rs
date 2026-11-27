@@ -1,6 +1,11 @@
 use super::*;
 use crate::autopilot_store::{AutopilotHistoryRow, AutopilotRuleRow, AutopilotStore};
 
+fn assert_validation_error(frame: WsFrame, expected: &str) {
+    assert!(matches!(&frame, WsFrame::Response { ok: false, error: Some(error), .. }
+        if error.as_str().is_some_and(|message| message.contains(expected))), "{frame:?}");
+}
+
 fn create_params(agent: &str) -> Value {
     json!({"name": "Department rule", "owner_department": "sales", "trigger_event": "agent_idle",
         "action": {"type": "delegate", "target_agent": agent, "prompt": "Prepare report"}})
@@ -105,7 +110,10 @@ async fn automation_update_validates_result_and_audits_remove() {
         json!({"action": {"type": "delegate", "target_agent": "b1", "prompt": "x"}})] {
         let mut params = patch;
         params["rule_id"] = json!("sales-rule");
-        assert_permission_denied("update", Box::pin(f.h.handle("autopilot.update", params, &f.mgr_a)).await);
+        let invalid_sequence = params.get("sequence").is_some();
+        let frame = Box::pin(f.h.handle("autopilot.update", params, &f.mgr_a)).await;
+        if invalid_sequence { assert_validation_error(frame, "sequence"); }
+        else { assert_permission_denied("update", frame); }
     }
     assert!(schedule_grant_audits(&f).is_empty());
     assert_success("update", Box::pin(f.h.handle("autopilot.update",
@@ -143,7 +151,9 @@ async fn automation_department_triggers_and_provenance_are_closed() {
     for trigger in ["tick", "odoo_event", "mcp_event", "os_file", "os_frontmost", "security_event", "cron_tick", "unknown"] {
         let mut params = create_params("a2");
         params["trigger_event"] = json!(trigger);
-        assert_permission_denied(trigger, Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await);
+        let frame = Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await;
+        if matches!(trigger, "cron_tick" | "unknown") { assert_validation_error(frame, "trigger_event"); }
+        else { assert_permission_denied(trigger, frame); }
     }
     for (field, value) in [("sequence", json!({"first":{"event":"task_created"}, "then":{"event":"task_updated"}, "within_secs":60})),
         ("metadata", json!({"induced":true})), ("owner_department", json!("sales-extra")),
@@ -249,7 +259,7 @@ async fn automation_steps_validate_every_target_and_preserve_approval() {
     assert_permission_denied("later step", Box::pin(f.h.handle("autopilot.create", params.clone(), &f.mgr_a)).await);
     params["action"] = json!({"type":"steps", "require_approval":false, "steps":[
         {"type":"delegate", "target_agent":"a2", "prompt":"x"}]});
-    assert_permission_denied("envelope approval", Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await);
+    assert_validation_error(Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await, "require_approval");
     let store = seed_rows(&f).await;
     // A legacy RPC cannot modify a department row even if scope changed since routing.
     assert!(store.update_company_rule("sales-rule", &json!({"metadata":{"induced":true}})).await.is_err());
@@ -292,4 +302,50 @@ async fn automation_dm_read_failure_never_falls_back_to_department_destination()
         .execute("DROP TABLE channel_identities", []).unwrap();
     assert_permission_denied("unreadable DM source", Box::pin(f.h.handle("autopilot.create",
         notify_params("line", "department-chat"), &f.mgr_a)).await);
+}
+
+#[tokio::test]
+async fn department_create_and_update_share_normalized_save_validation() {
+    let f = fixture().await;
+    seed(&f, "a2").await;
+    let mut params = create_params("a2");
+    params["trigger_event"] = json!("channel_message");
+    params["action"] = json!({"type":"run_skill", "target_agent":"a2", "skill_name":"report",
+        "params":{"note":"{{text}}"}, "require_approval":true,
+        "screen":{"mode":"local", "prompt":"Check relevance"}});
+    params["active_window"] = json!({"days":[1], "start":"09:00", "end":"18:00", "timezone":"UTC"});
+    params["run_policy"] = json!({"outside_window":"skip"});
+    let created = scoped_payload("department params", Box::pin(f.h.handle("autopilot.create", params.clone(), &f.mgr_a)).await);
+    let id = created["rule"]["id"].as_str().unwrap();
+    let store = f.h.ap_store().await.unwrap();
+    let before = store.get_rule(id).await.unwrap().unwrap();
+    let action: Value = serde_json::from_str(&before.action).unwrap();
+    assert_eq!(action["screen"]["mode"], "local");
+    assert_eq!(action["steps"][0]["params"]["note"], "{{text}}");
+    assert_eq!(action["steps"][0]["require_approval"], true);
+    assert!(action["steps"][0].get("screen").is_none());
+    for (key, value, message) in [
+        ("trigger_event", json!(42), "trigger_event"),
+        ("active_window", json!("invalid"), "active_window"),
+        ("run_policy", json!("invalid"), "run_policy"),
+        ("action", json!({"type":"run_skill", "target_agent":"a2", "skill_name":"report",
+            "params":{"note":"{{unavailable_field}}"}}), "placeholder"),
+        ("action", json!({"type":"steps", "steps":[{"type":"run_skill", "target_agent":"a2",
+            "skill_name":"report", "screen":{"mode":"local", "prompt":"invalid step screen"}}]}), "screen"),
+    ] {
+        let mut invalid_create = params.clone();
+        invalid_create[key] = value.clone();
+        assert_validation_error(Box::pin(f.h.handle("autopilot.create", invalid_create, &f.mgr_a)).await, message);
+        let mut patch = json!({"rule_id":id});
+        patch[key] = value;
+        assert_validation_error(Box::pin(f.h.handle("autopilot.update", patch, &f.mgr_a)).await, message);
+    }
+    let after = store.get_rule(id).await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(&after).unwrap(), serde_json::to_value(&before).unwrap());
+    assert_eq!(store.list_rules().await.unwrap().len(), 1);
+    // Admin department edits use the same path; a valid legacy action is wrapped.
+    assert_success("admin department update", Box::pin(f.h.handle("autopilot.update",
+        json!({"rule_id":id, "action":create_params("a2")["action"]}), &f.admin)).await);
+    let updated = store.get_rule(id).await.unwrap().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&updated.action).unwrap()["type"], "steps");
 }

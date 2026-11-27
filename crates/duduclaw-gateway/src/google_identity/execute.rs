@@ -35,12 +35,16 @@ pub struct ExecuteState {
     selections: selection::SelectionStore,
     pub(super) chats: super::chat_send::Store,
     pub(super) employees: super::employee_execute::Store,
+    pub(super) drive_writes: super::drive_write::serve::Store,
+    pub(super) drive_write_confirmer: Arc<dyn super::drive_write::serve::DriveWriteConfirmer>,
 }
 impl ExecuteState {
     pub fn new(home: PathBuf, users: Option<Arc<UserDb>>) -> Self {
         Self {
             chats: super::chat_send::Store::default(),
             employees: super::employee_execute::Store::default(),
+            drive_writes: super::drive_write::serve::Store::default(),
+            drive_write_confirmer: Arc::new(super::drive_write::approval::MemberConfirmer::new(home.clone())),
             home,
             users,
             replay: ReplayGuard::default(),

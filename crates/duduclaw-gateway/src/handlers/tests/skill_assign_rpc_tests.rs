@@ -448,7 +448,7 @@ async fn goal_create_refuses_bad_files_before_writing_anything() {
             &f.admin,
         )
         .await;
-    assert_eq!(err(&ghost), "Agent not found: ghost");
+    assert!(err(&ghost).contains("agent_not_found"), "{}", err(&ghost));
     assert!(!f.home.join("agents/ghost").exists());
     assert_eq!(task_count(&f).await, 0);
     assert!(attachment_files(&f, "a1").is_empty());

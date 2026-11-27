@@ -222,6 +222,14 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_tasks_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        // Absence preserves the board API; every supplied value must narrow it.
+        let limit = match params.get("limit") {
+            None => None,
+            Some(value) => match value.as_u64().filter(|n| (1..=1000).contains(n)) {
+                Some(n) => Some(n as usize),
+                None => return WsFrame::error_response("", "limit must be an integer between 1 and 1000"),
+            },
+        };
         let store = match self.task_store().await {
             Ok(s) => s,
             Err(f) => return f,
@@ -236,10 +244,14 @@ impl MethodHandler {
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
-        match store
-            .list_tasks_filtered(status, agent_id, priority, goal_mode)
-            .await
-        {
+        let result = match limit {
+            Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
+                |id, assignee| !reader.hides(assignee)
+                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+            ).await,
+            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
+        };
+        match result {
             Ok(rows) => {
                 let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
                     && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
@@ -1022,7 +1034,7 @@ mod live_assignee_tests {
                 };
                 match frame {
                     WsFrame::Response { ok: false, error: Some(error), .. } => {
-                        assert!(error["message"].as_str().unwrap().contains(
+                        assert!(error.as_str().unwrap().contains(
                             if malformed { "agent_config_unreadable" } else { "model_provider_mismatch" }
                         ), "{error}");
                     }

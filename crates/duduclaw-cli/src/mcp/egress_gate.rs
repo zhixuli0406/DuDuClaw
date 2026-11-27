@@ -22,7 +22,13 @@ pub(crate) fn model_visible_payload(response: &Value) -> bool {
 /// Never infer completion from arbitrary content or a generic success shape:
 /// search aggregators and background launchers can hide unfinished effects.
 pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
-    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
+    // The gateway reports Drive writes as confirmed only with an explicit ok.
+    // Refusals and uncertain transport outcomes must not clear egress taint.
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) {
+        return response.get("error").is_none() && response.get("result").is_some_and(|result|
+            result.get("ok") == Some(&Value::Bool(true))
+                && result.get("isError") != Some(&Value::Bool(true)));
+    }
     let terminal_contract = matches!(tool,
         "send_message" | "send_photo" | "send_sticker" | "web_search"
         | "web_fetch_cached" | "web_extract"
@@ -199,5 +205,20 @@ mod dispatch_observation_tests {
         assert_eq!(duduclaw_core::tool_effect::effect_of_builtin("credential_declare"), Some(duduclaw_core::ToolEffect::Modify));
         assert_eq!(duduclaw_core::tool_effect::egress_capable("credential_declare"), Some(false));
         assert_eq!(duduclaw_core::tool_effect::reads_private("credential_declare"), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod drive_write_tests {
+    use super::*;
+    #[test]
+    fn drive_writes_are_egress_sinks_and_require_confirmed_completion() {
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert_eq!(duduclaw_core::tool_effect::egress_capable(tool), Some(true));
+            assert!(confirmed_sink_completion(tool, &json!({"result":{"ok":true}})));
+            for result in [json!({}), json!({"isError":true}), json!({"ok":false})] {
+                assert!(!confirmed_sink_completion(tool, &json!({"result":result})));
+            }
+        }
     }
 }

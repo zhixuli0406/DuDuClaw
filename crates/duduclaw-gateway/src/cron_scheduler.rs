@@ -277,7 +277,11 @@ impl CronScheduler {
                 }
                 let Some(slot) = latest_routine_slot(&row, cursor, now)? else { return Ok(None) };
                 if let Err(pause) = cron_autonomy_check(&self.home_dir, &self.registry, &row.agent_id).await {
-                    self.store.record_autonomy_skip(&row.id, &pause).await?;
+                    if crate::entry_gate::background_refusal_code(&pause).is_some() {
+                        self.store.record_run(&row.id, false, Some(&pause)).await?;
+                    } else {
+                        self.store.record_autonomy_skip(&row.id, &pause).await?;
+                    }
                     self.store.advance_routine_cursor(&row.id, &material_hash, slot.timestamp()).await?;
                     return Ok(None);
                 }
@@ -731,10 +735,9 @@ async fn enqueue_routine_trigger(
     let principal = crate::on_behalf_of::from_stored(
         home_dir, task.on_behalf_of.as_deref(), &task.agent_id, "cron_workflow",
     );
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "cron", &task.id, None, &task.agent_id, principal.as_deref());
-    crate::delegation_roles::initiators::scope(&task.agent_id, requester, crate::on_behalf_of::scope_first(principal,
+    crate::on_behalf_of::scope_first(principal,
         service.enqueue_trigger(&activation_id, trigger, serde_json::json!({})),
-    )).await
+    ).await
 }
 
 /// Route a due cron task through its trigger gate (G3), then execute it if the
@@ -810,21 +813,22 @@ async fn dispatch_cron_task_checked(
     match cron_autonomy_check(home_dir, registry, &task.agent_id).await {
         Ok(agent) => effective_task.agent_id = agent,
         Err(reason) => {
-            if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+            let recorded = if crate::entry_gate::background_refusal_code(&reason).is_some() {
+                store.record_run(&task.id, false, Some(&reason)).await
+            } else { store.record_autonomy_skip(&task.id, &reason).await };
+            if let Err(error) = recorded {
                 warn!(id = %task.id, %error, "cron autonomy skip could not be recorded");
             }
             return;
         }
     }
     let material = crate::isolation_background::material::cron(&task);
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "cron", &effective_task.id,
-        None, &effective_task.agent_id, principal.as_deref());
-    crate::delegation_roles::initiators::scope(&effective_task.agent_id, requester, crate::on_behalf_of::scope_first(principal, crate::isolation_background::scope_record(
+    crate::on_behalf_of::scope_first(principal, crate::isolation_background::scope_record(
         home_dir, "cron", &effective_task.id, &effective_task.agent_id,
         effective_task.on_behalf_of.as_deref(), &material, crate::autonomous_runtime::scope(
         home_dir, &effective_task.agent_id, &[],
         dispatch_effective_cron_task(home_dir, store, registry, &effective_task, invoker, slot),
-    )))).await;
+    ))).await;
 }
 
 async fn dispatch_effective_cron_task(
@@ -995,6 +999,8 @@ async fn cron_autonomy_check(home: &Path, registry: &Arc<RwLock<AgentRegistry>>,
     } else {
         agent.to_string()
     };
+    crate::entry_gate::check_task_assignee(home, &effective)
+        .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
     autonomy_gate::check(home, &effective, AutonomyPath::Cron)
         .map_err(|pause| {
             let reason = format!("autonomy paused: {pause}");
@@ -1851,6 +1857,25 @@ mod principal_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_cron_invoker_refuses_bad_employee_before_model_call() {
+        let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(
+            duduclaw_core::types::RuntimeType::Codex).await;
+        let path = {
+            let reg = ctx.registry.read().await;
+            crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path
+        };
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["runtime"]["provider"] = toml::Value::String("claude".into());
+        std::fs::write(path, toml::to_string(&doc).unwrap()).unwrap();
+        let before = crate::model_call_probe::calls();
+        let error = RealAgentInvoker.invoke(home.path(), &ctx.registry, "worker", "work").await.unwrap_err();
+        assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"));
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
 
     #[tokio::test]
     async fn cron_delivery_strips_markers_before_text_clamp() {

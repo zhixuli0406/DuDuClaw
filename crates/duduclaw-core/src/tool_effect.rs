@@ -153,6 +153,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     use ToolEffect::*;
     let effect = match tool_name {
         // ── read ────────────────────────────────────────────────────────
+        "my_tasks_list" | "my_agents_status" => Read,
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
         | "belief_stats" | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses"
         | "code_map" | "codrive_status" | "computer_screenshot" | "computer_workspace_list"
@@ -187,7 +188,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search" | "wiki_stats"
         | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get" | "xlsx_read"
         | "calendar_list_events" | "discovery_catalog" | "discovery_list" | "discovery_tree"
-        | "discovery_artifact" | "meeting_transcribe_status" => Read,
+        | "discovery_artifact" | "meeting_transcribe_status" | "admin_settings_read" => Read,
 
         // ── draft ───────────────────────────────────────────────────────
         "gmail_create_draft" | "canvas_push" | "plan_start" | "skill_from_recording"
@@ -232,7 +233,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "working_state_set" | "discovery_cancel" => Modify,
 
         // ── admin ───────────────────────────────────────────────────────
-        "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
+        "admin_settings_propose" | "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
         | "codrive_run" | "create_agent" | "evolution_toggle" | "execute_program"
         | "llamafile_start" | "llamafile_stop" | "model_download" | "model_load"
         | "model_unload" | "odoo_execute" | "os_apply_update" | "os_doctor_repair"
@@ -253,6 +254,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 /// that return existing records count as private too. A write acknowledgement
 /// or a public model-catalog search does not introduce private data.
 pub fn reads_private(tool_name: &str) -> Option<bool> {
+    if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(true); }
     if matches!(tool_name, "gmail_send_draft" | "calendar_delete_event") { return Some(true); }
     match tool_name {
         "meeting_upload_link" => Some(false),
@@ -421,6 +423,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
 /// negative entries independent of the private-read table, so completeness
 /// tests require a separate egress decision whenever a tool is added.
 pub fn egress_capable(tool_name: &str) -> Option<bool> {
+    if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(false); }
     if EGRESS_CAPABLE_READS.contains(&tool_name) {
         return Some(true);
     }

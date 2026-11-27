@@ -1395,6 +1395,7 @@ async fn prepare_discord_attachments(
         ctx, session, session, sender, text, selected, Some(policy),
     ).await {
         crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+        crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => return Ok(combined.to_string()),
         crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => return Ok(command),
         crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => return Err(reply),
     }
@@ -1676,12 +1677,16 @@ async fn handle_message_create(
             .and_then(|m| m.get("id"))
             .and_then(|v| v.as_str())
         {
-            if let Some(outcome) = crate::decision_text::route_text_reply(
-                &ctx.home_dir,
-                "discord",
-                author_id,
-                channel_id,
-                ref_mid,
+            if let Some(outcome) = crate::decision_text::route_verified_text_reply(
+                ctx, &decision_context,
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: Some(ref_mid.into()), private: false,
+                    account: crate::chat_link_intercept::account_label("discord", agent_name), dm: channel_id.into(),
+                },
+                crate::decision_notify::DecisionAccessScope {
+                    channel_id: (!guild_id.is_empty()).then_some(channel_id),
+                    guild_id: (!guild_id.is_empty()).then_some(guild_id), session_id: Some(current_session_id),
+                },
                 content,
             )
             .await
@@ -2619,6 +2624,7 @@ async fn handle_interaction(
                 app_id,
                 http,
                 ctx,
+                agent_name,
             )
             .await;
         }
@@ -2807,6 +2813,7 @@ async fn handle_component_interaction(
     app_id: &str,
     http: &reqwest::Client,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     let cdata = match data.get("data") {
         Some(d) => d,
@@ -2906,8 +2913,14 @@ async fn handle_component_interaction(
                     guild_id: data["guild_id"].as_str(),
                     session_id: Some(&discord_component_session(data)),
                 },
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: data["message"]["id"].as_str().map(str::to_owned),
+                    private: false,
+                    account: crate::chat_link_intercept::account_label("discord", agent_name),
+                    dm: data["channel_id"].as_str().unwrap_or("").into(),
+                },
             )
-            .await
+            .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
         };
         match outcome {
             // Decision landed → light ephemeral ack. The persistent card
@@ -3987,6 +4000,7 @@ mod native_callback_acl_tests {
                 "A1",
                 &reqwest::Client::new(),
                 &fixture.ctx,
+                None,
             )
             .await;
             if allowed {
@@ -4081,6 +4095,7 @@ mod thread_type_decision_acl_tests {
                             "A1",
                             &reqwest::Client::new(),
                             &fixture.ctx,
+                            None,
                         )
                         .await;
                     } else {

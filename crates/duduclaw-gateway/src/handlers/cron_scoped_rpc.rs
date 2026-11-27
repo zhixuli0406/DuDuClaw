@@ -66,6 +66,80 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_scoped_cron(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        self.handle_scoped_cron_inner(method, params, ctx, false).await
+    }
+
+    /// Internal Admin-AI path. The creator cannot be supplied by RPC callers.
+    pub(crate) async fn handle_admin_ai_cron(
+        &self, method: &str, params: Value, ctx: &UserContext, expected_hash: Option<&str>,
+    ) -> WsFrame {
+        use crate::admin_ai::proposal::STALE;
+        if !ctx.is_admin() { return WsFrame::error_response("", PERMISSION_DENIED); }
+        if method == "cron.add" {
+            return self.handle_scoped_cron_inner(method, params, ctx, true).await;
+        }
+        let Some(expected_hash) = expected_hash else { return WsFrame::error_response("", STALE); };
+        if let Err(frame) = self.p1g_admin_cron_guard(method, &params, ctx).await { return frame; }
+        let store = match self.cron_store().await { Ok(s) => s, Err(f) => return f };
+        let id = params["id"].as_str().unwrap_or("");
+        let row = match store.get(id).await {
+            Ok(Some(row)) if prompt_only(&row) => row,
+            _ => return WsFrame::error_response("", STALE),
+        };
+        let mut changed = row.clone();
+        match method {
+            "cron.update" => {
+                if !params.as_object().is_some_and(|p| p.keys().all(|k|
+                    matches!(k.as_str(), "id" | "name" | "cron" | "cron_timezone" | "task"))) {
+                    return WsFrame::error_response("", PERMISSION_DENIED);
+                }
+                for key in ["name", "cron", "task", "cron_timezone"] {
+                    if let Some(value) = params.get(key) {
+                        let Some(value) = value.as_str() else { return WsFrame::error_response("", "Invalid automation field"); };
+                        match key {
+                            "name" => changed.name = value.into(),
+                            "cron" => changed.cron = value.into(),
+                            "task" => changed.task = value.into(),
+                            _ => changed.cron_timezone = Some(value.into()),
+                        }
+                    }
+                }
+                if changed.name != row.name {
+                    if let Err(error) = crate::scheduled_webchat::check_name(&changed.name) {
+                        return WsFrame::error_response("", &error);
+                    }
+                }
+                if changed.name.trim().is_empty() || changed.task.len() > 16_384
+                    || changed.cron.len() > crate::cron_store::MAX_CRON_BYTES
+                    || crate::cron_scheduler::normalise_cron(&changed.cron).parse::<cron::Schedule>().is_err()
+                    || changed.cron_timezone.as_deref().is_some_and(|tz| duduclaw_core::parse_timezone(tz).is_none()) {
+                    return WsFrame::error_response("", "Invalid automation name, schedule or message");
+                }
+                if self.cron_task_input_blocked(&changed.agent_id, &changed.name, &changed.task) {
+                    return WsFrame::error_response("", "Automation message rejected by input protection");
+                }
+            }
+            "cron.pause" => changed.enabled = false,
+            "cron.resume" => changed.enabled = true,
+            "cron.remove" => (),
+            _ => return WsFrame::error_response("", PERMISSION_DENIED),
+        }
+        match store.edit_admin_ai(&row, (method != "cron.remove").then_some(&changed), expected_hash).await {
+            Ok(true) => {
+                if method == "cron.remove" {
+                    crate::recipient_guard::origin::forget_async(&self.home_dir,
+                        row.notify_origin_proof.into_iter().collect()).await;
+                }
+                self.notify_cron_reload().await;
+                self.emit_cron_changed(json!({"action":"updated", "id":id})).await;
+                WsFrame::ok_response("", json!({"success":true}))
+            }
+            Ok(false) => WsFrame::error_response("", STALE),
+            Err(error) => WsFrame::error_response("", &error),
+        }
+    }
+
+    async fn handle_scoped_cron_inner(&self, method: &str, params: Value, ctx: &UserContext, record_creator: bool) -> WsFrame {
         if ctx.is_admin() {
             // v1.81 P1g: a cron routine makes its employee run work, so on
             // another person's Personal employee it is owner-only — the
@@ -77,7 +151,7 @@ impl MethodHandler {
             }
             return match method {
                 "cron.list" => self.handle_cron_list().await,
-                "cron.add" => self.handle_cron_add(params).await,
+                "cron.add" => self.handle_cron_add_with_creator(params, record_creator.then_some(ctx)).await,
                 "cron.update" => self.handle_cron_update(params).await,
                 "cron.pause" => self.handle_cron_set_enabled(params, false).await,
                 "cron.resume" => self.handle_cron_set_enabled(params, true).await,

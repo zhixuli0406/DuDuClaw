@@ -44,6 +44,13 @@ impl TerminalStatus {
 const COLUMNS: &str = "card_id, approval_id, purpose, user_id, channel, account, principal,
     dm, message_id, digest, tier, valid_until, status, sent_at";
 
+pub(crate) async fn by_card_id(store: &ApprovalStore, card_id: &str) -> Result<Option<Receipt>, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    conn.query_row(&format!("SELECT {COLUMNS} FROM chat_admin_cards WHERE card_id=?1"),
+        [card_id], from_row).optional().map_err(|e| format!("read chat-admin receipt: {e}"))
+}
+
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Receipt> {
     Ok(Receipt {
         card_id: row.get(0)?, approval_id: row.get(1)?, purpose: row.get(2)?,
@@ -113,6 +120,27 @@ pub(crate) async fn list_live(store: &ApprovalStore, approval_id: &ApprovalId) -
     let rows = stmt.query_map([approval_id.as_str()], from_row)
         .map_err(|e| format!("list live chat-admin receipts: {e}"))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("read live chat-admin receipts: {e}"))
+}
+
+/// A delivered card stays in the receipt-bound route even after retirement.
+pub(crate) async fn has_for_approval(store: &ApprovalStore, approval_id: &ApprovalId) -> Result<bool, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM chat_admin_cards WHERE approval_id=?1 AND purpose='rm143')",
+        [approval_id.as_str()], |r| r.get(0))
+        .map_err(|e| format!("read chat-admin receipt ownership: {e}"))
+}
+
+/// Only RM-143 owns these maintenance edits; never sweep another purpose.
+pub(crate) async fn list_all_live(store: &ApprovalStore) -> Result<Vec<Receipt>, String> {
+    let conn = store.conn.lock().await;
+    verify_live_io()?;
+    let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM chat_admin_cards
+        WHERE purpose = 'rm143' AND status = 'live' ORDER BY sent_at, card_id"))
+        .map_err(|e| format!("prepare live chat-admin card sweep: {e}"))?;
+    let rows = stmt.query_map([], from_row)
+        .map_err(|e| format!("list live chat-admin card sweep: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("read live chat-admin card sweep: {e}"))
 }
 
 /// Terminal transitions never revive a receipt. Successful approval decisions

@@ -386,7 +386,7 @@ pub(crate) async fn call_claude_cli_rotated(
     // choke-point) wins; otherwise fall back to the answering agent's own
     // `agent.toml [model] effort`. `work_dir` is the agent directory. Both
     // absent ⇒ `None` and the argv is byte-identical.
-    let effort = effort.or_else(|| work_dir.and_then(duduclaw_core::effort::read_agent_effort));
+    let effort = effort.or_else(|| crate::runtime_dispatch::chat_effort(work_dir));
     let rotator = match crate::claude_runner::get_rotator_cached(home_dir).await {
         Ok(r) => r,
         Err(e) => {

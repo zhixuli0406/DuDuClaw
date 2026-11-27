@@ -33,7 +33,8 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 280;
+// Includes the nine RM-131 Drive writes, intentionally refused in protected mode.
+const CATALOG_TOOLS: usize = 284;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -382,16 +383,6 @@ github = true
     println!("G1\ttool\tpolicy_route\tboundary\trequired\tshared\tpersonal");
     for name in &tools {
         let name = *name;
-        if duduclaw_core::google_identity::is_drive_write_tool(name) {
-            assert!(policy_table::policy(name).is_none(), "{name}");
-            assert!(boundary_route(name).is_none(), "{name}");
-            for (index, employee) in employees.iter().enumerate() {
-                assert!(!policy_table::eligible(&employee.context, name), "{name}");
-                assert!(matches!(manifests[index].get(name),
-                    Some(ServiceState::IntentionalRefusal(_))), "{name}");
-            }
-            continue;
-        }
         let policy = policy_table::policy(name).unwrap_or_else(|| panic!("{name}: catalog tool without a tool_policy entry"));
         let boundary = boundary_route(name).unwrap_or_else(|| panic!("{name}: catalog tool without an exact boundary route"));
         // Required grants: never empty; the own Employee grant first, except
@@ -403,7 +394,16 @@ github = true
         } else {
             assert!(policy.required[0] == ResourceKind::Employee, "{name}: policy must start with the own Employee grant");
         }
-        if policy.route == Route::Connector {
+        if duduclaw_core::google_identity::is_drive_write_tool(name) {
+            assert_eq!(policy.route, Route::Connector, "{name}");
+            assert_eq!(policy.required, &[ResourceKind::Employee, ResourceKind::Connector], "{name}");
+            assert_eq!(crate::mcp_isolation_disposition::intentional_refusal(name),
+                Some(crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable), "{name}");
+            assert_eq!(provider_for_tool(name), None, "{name}");
+            for manifest in &manifests {
+                assert!(matches!(manifest.get(name), Some(ServiceState::IntentionalRefusal(_))), "{name}");
+            }
+        } else if policy.route == Route::Connector {
             assert!(provider_for_tool(name).is_some(), "{name}: connector policy without a provider");
         }
         if policy_table::IN_RUN_HELPER_TOOLS.contains(&name) || policy_table::IN_RUN_RECORDING_TOOLS.contains(&name) {

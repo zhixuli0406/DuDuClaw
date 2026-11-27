@@ -4,6 +4,8 @@ use super::ReplyContext;
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AttachmentEntry {
     Proceed,
+    /// Keep text and the existing access/pairing flow, without files or a reply.
+    SkipFiles,
     /// The original parsed command text, without file references or quotes.
     DropFilesAndContinue(String),
     Refuse(String),
@@ -32,7 +34,12 @@ pub(crate) async fn check(
         None => super::check_command_access_gate(ctx, gate_session, sender, "").await,
     };
     if denied.is_some() {
-        return AttachmentEntry::Proceed;
+        return AttachmentEntry::SkipFiles;
+    }
+    // Decisions validate the task's assignee in their own lane. Never let
+    // an unrelated answering employee or an attachment block a decline.
+    if crate::channel_decision_route::is_strict_decision(text) {
+        return AttachmentEntry::DropFilesAndContinue(text.to_string());
     }
     let (target, session) = {
         let registry = ctx.registry.read().await;

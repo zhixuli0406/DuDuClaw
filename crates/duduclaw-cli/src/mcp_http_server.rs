@@ -368,10 +368,17 @@ async fn pre_auth_admission(
 
 // Keep the permit inside the blocking job, including when its HTTP future is
 // cancelled. An attacker cannot accumulate unbounded queued flock waiters.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_BLOCKING_IO_SLOTS: Arc<tokio::sync::Semaphore>;
+}
+
 pub(crate) async fn blocking_io<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Result<T, Response> {
     static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let permit = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4)))
-        .clone().try_acquire_owned().map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))?;
+    let slots = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))).clone();
+    #[cfg(test)]
+    let slots = TEST_BLOCKING_IO_SLOTS.try_with(Arc::clone).unwrap_or(slots);
+    let permit = slots.try_acquire_owned().map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))?;
     tokio::task::spawn_blocking(move || { let _permit = permit; work() }).await
         .map_err(|_| busy_response(StatusCode::SERVICE_UNAVAILABLE))
 }
@@ -383,6 +390,21 @@ pub(crate) async fn blocking_http(work: impl FnOnce() -> Response + Send + 'stat
 pub(crate) async fn authenticate_http_call(
     headers: &HeaderMap, state: &HttpState,
 ) -> Result<(crate::mcp_auth::AuthenticatedCall, NamespaceContext), Response> {
+    if let Some(raw) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|raw| duduclaw_auth::member_keys::is_member_key(raw)) {
+        // Gateway I/O must never hold one of the shared blocking permits.
+        // A refusal returns here; member credentials never fall through to static keys.
+        let authenticated = crate::mcp::person_key_client::authenticate(&state.home_dir, raw).await
+            .map_err(|error| bearer_auth_refusal(crate::mcp_auth::Refusal::from(error)))?;
+        let namespace = authenticated.namespace().ok_or_else(|| {
+            bearer_auth_refusal(crate::mcp_auth::Refusal::from(crate::mcp_auth::AuthError::UnknownKey))
+        })?;
+        if state.dispatcher.rate_limiter.check(&authenticated.principal().client_id, OpType::HttpRequest).is_err() {
+            return Err(http_rate_response());
+        }
+        return Ok((authenticated, namespace));
+    }
     let headers = headers.clone();
     let home = state.home_dir.clone();
     let resource = state.resource.clone();
@@ -447,6 +469,15 @@ pub(crate) fn authenticate_bearer(
         .map(|(call, namespace)| (call.principal().clone(), namespace))
 }
 
+fn bearer_auth_refusal(refusal: crate::mcp_auth::Refusal) -> Response {
+    crate::mcp_auth_audit::tag_refusal(
+        (StatusCode::UNAUTHORIZED, Json(crate::mcp_dispatch::jsonrpc_error(
+            &Value::Null, -32003, &format!("Authentication failed: {}", refusal.error),
+        ))).into_response(),
+        &refusal,
+    )
+}
+
 pub(crate) fn authenticate_bearer_call(
     headers: &HeaderMap,
     home_dir: &std::path::Path,
@@ -456,7 +487,7 @@ pub(crate) fn authenticate_bearer_call(
     // (`mcp_auth_audit::tag*`, a response extension — status, headers and
     // body are unchanged) that the admission middleware turns into the
     // bounded `mcp_auth_failed` audit. Nothing from the header is kept.
-    use crate::mcp_auth_audit::{FailureReason, tag, tag_refusal};
+    use crate::mcp_auth_audit::{FailureReason, tag};
     let auth_header = headers
         .get("Authorization")
         .ok_or_else(|| {
@@ -529,8 +560,7 @@ pub(crate) fn authenticate_bearer_call(
     // RM-064: a `ddc_status_` credential belongs to the gateway's status
     // endpoint only. Refuse the type outright — it must never reach the
     // `[mcp_keys]` / OAuth lookups or any scope table.
-    if duduclaw_auth::status_tokens::is_status_token(raw_key)
-            || duduclaw_auth::member_keys::is_member_key(raw_key) {
+    if duduclaw_auth::status_tokens::is_status_token(raw_key) {
         return Err(tag(status_credential_refused(), FailureReason::WrongCredentialType, None));
     }
 
@@ -538,28 +568,21 @@ pub(crate) fn authenticate_bearer_call(
     // in their own store (hashed at rest); everything else stays the static
     // mcp_keys path. Both produce a Principal that flows through the SAME
     // scope/namespace enforcement below.
-    let auth_result = if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
+    let auth_result = if duduclaw_auth::member_keys::is_member_key(raw_key) {
+        crate::mcp::person_key_client::authenticate_blocking(home_dir, raw_key)
+            .map_err(crate::mcp_auth::Refusal::from)
+    } else if crate::mcp_oauth_server::is_oauth_access_token(raw_key) {
         crate::mcp_oauth_server::validate_oauth_token(raw_key, home_dir, resource)
             .map(crate::mcp_auth::AuthenticatedCall::without_reference)
             .map_err(crate::mcp_auth::Refusal::from)
     } else {
         crate::mcp_auth::authenticate_with_key_call_refusal(raw_key, home_dir)
     };
-    let authenticated = auth_result.map_err(|refusal| {
-        tag_refusal(
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(crate::mcp_dispatch::jsonrpc_error(
-                    &Value::Null,
-                    -32003,
-                    &format!("Authentication failed: {}", refusal.error),
-                )),
-            )
-                .into_response(),
-            &refusal,
-        )
-    })?;
+    let authenticated = auth_result.map_err(bearer_auth_refusal)?;
 
+    if let Some(namespace) = authenticated.namespace() {
+        return Ok((authenticated, namespace));
+    }
     let principal = authenticated.principal();
     let ns_ctx = resolve_for_caller(
         principal,
@@ -1286,6 +1309,56 @@ pub mod tests {
     use crate::mcp_rate_limit::RateLimiter;
 
     #[tokio::test]
+    async fn member_auth_and_call_bypass_exhausted_blocking_slots() {
+        use crate::mcp::person_key_client::tests::{Stub, RAW};
+        let home = tempfile::tempdir().unwrap();
+        let stub = Stub::start(home.path()).await;
+        let state = hint_test_state(home.path()).http;
+        // Task-local permits keep this saturation test isolated from other tests.
+        let slots = Arc::new(tokio::sync::Semaphore::new(4));
+        let held = slots.clone().acquire_many_owned(4).await.unwrap();
+        TEST_BLOCKING_IO_SLOTS.scope(slots, async {
+            let mut headers = HeaderMap::new();
+            headers.insert("authorization", "Bearer ddc_dev_ordinary".parse().unwrap());
+            let refusal = authenticate_http_call(&headers, &state).await.unwrap_err();
+            assert_eq!(refusal.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            headers.insert("authorization", format!("Bearer {RAW}").parse().unwrap());
+            let (call, namespace) = authenticate_http_call(&headers, &state).await.unwrap();
+            assert!(call.kind().is_person_key());
+            assert_eq!(call.raw_person_key(), Some(RAW));
+            assert!(namespace.read_namespaces.is_empty() && namespace.write_namespace.is_empty());
+            let principal = call.principal().clone();
+            crate::mcp_auth::with_authenticated_call(call, async {
+                let result = crate::mcp::person_tools::call(home.path(), &principal, "my_tasks_list", &serde_json::json!({})).await;
+                assert_eq!(result["structuredContent"]["tasks"][0]["id"], "visible");
+            }).await;
+            let seen = stub.seen.lock().unwrap();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].1["op"], "authenticate");
+            assert_eq!(seen[1].1["op"], "call");
+        }).await;
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn member_auth_timeout_is_an_audited_refusal_without_fallback() {
+        use crate::mcp::person_key_client::tests::{Stub, RAW};
+        let home = tempfile::tempdir().unwrap();
+        let stub = Stub::start(home.path()).await;
+        stub.delay_ms.store(10_000, std::sync::atomic::Ordering::SeqCst);
+        let state = hint_test_state(home.path()).http;
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {RAW}").parse().unwrap());
+        let response = tokio::time::timeout(Duration::from_secs(6), authenticate_http_call(&headers, &state))
+            .await.expect("member authentication must stop after five seconds").unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(stub.seen.lock().unwrap().len(), 1);
+        let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        assert!(!String::from_utf8_lossy(&body).contains(RAW));
+    }
+
+    #[tokio::test]
     async fn ddc_refresh_is_stdio_only_on_http_and_sse() {
         let home = tempfile::tempdir().unwrap();
         let scopes = crate::mcp_auth::parse_scopes("memory:read").unwrap();
@@ -1344,20 +1417,74 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn member_credentials_are_refused_on_every_mcp_surface() {
+    async fn ordinary_bearer_and_malformed_json_do_not_contact_person_gateway() {
         let home = tempfile::tempdir().unwrap();
-        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
-        let user = db
-            .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Employee)
-            .unwrap();
-        let raw = db.member_key_create(&user.id, "odoo", 90, user.credential_epoch, false, &[]).unwrap().secret;
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        stub.status.store(503, std::sync::atomic::Ordering::SeqCst);
+        let key = "ddc_dev_0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let path = home.path().join("config.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!(
+            "{config}\n[mcp_keys.\"{key}\"]\nclient_id=\"ordinary-client\"\nscopes=[\"memory:read\"]\ncreated_at=\"{}\"\nis_external=true\n",
+            chrono::Utc::now().to_rfc3339(),
+        )).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Bearer {key}").parse().unwrap());
+        let auth_home = home.path().to_path_buf();
+        let (authenticated, _) = tokio::task::spawn_blocking(move || {
+            authenticate_bearer_call(&headers, &auth_home, "http://127.0.0.1:8765/mcp")
+        }).await.unwrap().unwrap();
+        assert!(!authenticated.kind().is_person_key());
+        assert_eq!(authenticated.principal().client_id, "ordinary-client");
+
+        let cfg = HttpServerConfig::new("127.0.0.1:0".parse().unwrap(), home.path().into());
+        let router = build_router(&cfg, make_test_dispatcher());
+        for bearer in [key, crate::mcp::person_key_client::tests::RAW] {
+            let request = Request::builder().method("POST").uri("/mcp")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{not json at all")).unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 8192).await.unwrap();
+            let error: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(error["error"]["code"], -32700);
+        }
+        assert!(stub.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn member_query_credential_is_refused_without_contacting_gateway() {
+        let home = tempfile::tempdir().unwrap();
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        let response = authenticate_bearer_or_query(
+            &HeaderMap::new(), Some(crate::mcp::person_key_client::tests::RAW),
+            home.path(), "http://127.0.0.1:8765/mcp",
+        ).unwrap_err();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(response.extensions().get::<crate::mcp_auth_audit::AuthFailureTag>().unwrap().reason,
+            crate::mcp_auth_audit::FailureReason::WrongCredentialType);
+        assert!(stub.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn member_credentials_without_gateway_are_refused_on_every_mcp_surface() {
+        let home = tempfile::tempdir().unwrap();
+        let raw = crate::mcp::person_key_client::tests::RAW.to_owned();
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
         let resource = "http://127.0.0.1:8765/mcp";
-        for response in [
-            authenticate_bearer(&headers, home.path(), resource).unwrap_err(),
-            authenticate_bearer_or_query(&HeaderMap::new(), Some(&raw), home.path(), resource).unwrap_err(),
-        ] {
+        // A rejecting stub keeps this test isolated from any real gateway.
+        let stub = crate::mcp::person_key_client::tests::Stub::start(home.path()).await;
+        stub.status.store(401, std::sync::atomic::Ordering::SeqCst);
+        let auth_home = home.path().to_path_buf();
+        let auth_raw = raw.clone();
+        let responses = tokio::task::spawn_blocking(move || [
+
+            authenticate_bearer(&headers, &auth_home, resource).unwrap_err(),
+            authenticate_bearer_or_query(&HeaderMap::new(), Some(&auth_raw), &auth_home, resource).unwrap_err(),
+        ]).await.unwrap();
+        for response in responses {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         }
 
@@ -1370,7 +1497,7 @@ pub mod tests {
         let status = router.oneshot(request).await.unwrap().status();
         assert!(
             status == StatusCode::UNAUTHORIZED || status == StatusCode::TOO_MANY_REQUESTS,
-            "a member credential must never be served by /mcp: {status}"
+            "a member credential rejected by the gateway must not be served by /mcp: {status}"
         );
     }
 

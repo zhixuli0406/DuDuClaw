@@ -9,7 +9,6 @@ impl CronStore {
         let receipt:Option<(String,String)>=tx.query_row("SELECT operation,digest FROM cron_migration_receipts WHERE id=?1",[&row.id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
         if let Some(receipt)=receipt {
             if receipt!=(operation.into(),digest.into()) || !matches_row(&tx,row,false)? {return Err("migration schedule changed".into());}
-            self.revoke_initiator(&row.id);
             tx.execute("UPDATE cron_tasks SET enabled=1 WHERE id=?1",[&row.id]).map_err(|e|e.to_string())?;
         } else {
             insert_cron_row(&tx,row)?;
@@ -30,7 +29,6 @@ impl CronStore {
         if !exists {return Ok(());}
         let valid:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM cron_migration_receipts WHERE id=?1 AND operation=?2 AND digest=?3)",params![row.id,operation,digest],|r|r.get(0)).map_err(|e|e.to_string())?;
         if !valid || !matches_row(&tx,row,false)? {return Err("migration schedule compensation changed".into());}
-        self.revoke_initiator(&row.id);
         tx.execute("UPDATE cron_tasks SET enabled=0 WHERE id=?1",[&row.id]).map_err(|e|e.to_string())?;
         tx.execute("INSERT INTO cron_migration_receipts VALUES(?1,?2,?3)",params![row.id,operation,digest]).map_err(|e|e.to_string())?;
         commit_write(tx)

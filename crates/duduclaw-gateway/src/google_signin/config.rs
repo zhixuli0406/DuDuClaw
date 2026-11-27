@@ -110,7 +110,35 @@ pub fn read_strict(home: &Path) -> GoogleSigninSettings {
     from_root(&root)
 }
 
-/// The caller (dedicated RPC) must enforce live Admin, step-up and audit.
+/// The only settings write allowed without step-up; it can only narrow.
+/// Reads and edits the current settings inside the locked render callback.
+/// A missing section or an already disabled section without an acknowledgement
+/// commits unchanged text. Existing sections always lose their acknowledgement;
+/// no actor or timestamp acknowledgement is created by this operation.
+pub fn disable_settings(
+    home: &Path, _actor_user_id: &str, _now_rfc3339: &str,
+) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    let path = home.join("config.toml");
+    let current = read_text_or_empty(&path).map_err(|_| "無法讀取設定，請稍後再試。")?;
+    let mut result = None;
+    commit_rendered_locked(&path, &content_hash(&current), |text| {
+        let mut root: toml::Table = text.parse().map_err(|_| "設定內容格式不正確，請先到設定頁修正。")?;
+        let before = from_root(&root);
+        if let Some(section) = root.get_mut("google_signin") {
+            let table = section.as_table_mut().ok_or("設定內容格式不正確，請先到設定頁修正。")?;
+            table.insert("enabled".into(), false.into());
+            table.remove("enabled_ack");
+        }
+        let after = from_root(&root);
+        let rendered = if before == after { text.to_owned() } else { render_preserving(text, &root)? };
+        result = Some((before, after));
+        Ok(rendered)
+    }).map_err(|_| "無法儲存設定，設定可能已變更，請重新載入後再試。")?;
+    result.ok_or_else(|| "無法儲存設定，請稍後再試。".into())
+}
+
+/// The caller (admin RPC) must enforce a live Admin session, step-up,
+/// the risk acknowledgement and the audit row.
 /// This synchronous adapter uses the same locked, hash-checked and
 /// format-preserving commit engine as commit_table_locked, without a runtime.
 pub fn write_settings(

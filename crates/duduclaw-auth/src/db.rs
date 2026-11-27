@@ -756,6 +756,7 @@ impl UserDb {
         self.apply_user_update(user_id, &update).map_err(|e| match e {
             UserWriteError::Org(OrgError::HasReports) => crate::org::MANAGER_HAS_REPORTS.to_string(),
             UserWriteError::Org(OrgError::UserNotFound) => "user not found".to_string(),
+            UserWriteError::Other(code) if code == "role_requires_local_password" => code,
             other => format!("update error: {other}"),
         })
     }

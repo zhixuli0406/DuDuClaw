@@ -13,6 +13,7 @@ fn run(id: &str, rule_id: &str, count: i64) -> (AutopilotRunRow, Vec<AutopilotRu
         fields_json: "{}".into(), state: RUN_PENDING.into(), step_index: 0, step_count: count,
         next_at: None, lease_owner: None, lease_until: None, owner_department: None,
         outcome: None, detail: None, created_at: run_ts(now()), updated_at: run_ts(now()),
+        notice_pending: false, notice_push_state: None, notice_push_attempts: 0, notice_push_next_at: None,
     };
     let steps = (0..count).map(|i| AutopilotRunStepRow {
         run_id: id.into(), step_index: i, step_type: "delegate".into(), state: STEP_PENDING.into(),
@@ -44,8 +45,11 @@ async fn await_approval(store: &AutopilotStore) {
     insert(store, "r", 1).await;
     assert!(store.claim_run("r", "owner", now()).await.unwrap());
     assert!(store.mark_step_running("r", 0, "owner", now()).await.unwrap());
-    assert!(store.complete_step("r", "owner", 0, STEP_RUNNING, None, None,
-        RunNext::AwaitApproval { dispatch_id: "d".into() }, now()).await.unwrap());
+    assert!(store.insert_dispatch(&dispatch("d", "r", 0)).await.unwrap());
+    assert!(store.bind_step_dispatch_awaiting("d", "approval", "r", 0, "owner", now(),
+        StepApprovalBindMode::Filing).await.unwrap());
+    // These rejection tests supply a missing or corrupt replacement ledger.
+    store.conn.lock().await.execute("DELETE FROM autopilot_approval_dispatch WHERE dispatch_id='d'", []).unwrap();
 }
 
 async fn assert_resume_rejected(store: &AutopilotStore, dispatch_id: &str) {
@@ -349,14 +353,14 @@ async fn complete_step_continues_and_approval_resumes_once() {
         } else {
             let dispatch_id = format!("d-{i}");
             assert!(store.insert_dispatch(&dispatch(&dispatch_id, "r", i)).await.unwrap());
+            assert!(store.bind_step_dispatch_awaiting(&dispatch_id, &format!("approval-{i}"),
+                "r", i, "owner", now(), StepApprovalBindMode::Filing).await.unwrap());
             {
                 let conn = store.conn.lock().await;
                 conn.execute("UPDATE autopilot_approval_dispatch SET state=?1, outcome=?2 WHERE dispatch_id=?3",
                     params![if i == 1 { DISPATCH_EXECUTING } else { DISPATCH_SETTLED },
                         if i == 1 { None } else { Some(RESULT_SUCCESS) }, dispatch_id]).unwrap();
             }
-            assert!(store.complete_step("r", "owner", i, STEP_RUNNING, None, None,
-                RunNext::AwaitApproval { dispatch_id: format!("d-{i}") }, now()).await.unwrap());
             let awaiting = store.get_run("r").await.unwrap().unwrap();
             assert_eq!(awaiting.state, RUN_AWAITING_APPROVAL);
             assert!(awaiting.lease_owner.is_none() && awaiting.lease_until.is_none());
@@ -369,6 +373,8 @@ async fn complete_step_continues_and_approval_resumes_once() {
     let completed = store.get_run("r").await.unwrap().unwrap();
     assert_eq!(completed.state, RUN_SETTLED);
     assert_eq!(completed.outcome.as_deref(), Some("completed"));
+    assert!(completed.notice_pending);
+    assert!(completed.notice_push_state.is_none());
     assert!(store.list_run_steps("r").await.unwrap().iter().all(|s| s.state == STEP_DONE));
 }
 
@@ -413,4 +419,167 @@ fn run_states_are_closed_and_timestamps_have_fixed_precision() {
     for state in ["", "Pending", "pending-other", "unknown"] { assert!(!is_known_run_state(state)); }
     assert_eq!(run_ts(now()), "2026-11-27T00:00:00.000Z");
     assert!(run_ts(now()) < run_ts(now() + Duration::milliseconds(1)));
+}
+
+#[tokio::test]
+async fn reset_running_step_requires_current_live_lease() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "r", 2).await;
+    assert!(store.claim_run("r", "old", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "old", now()).await.unwrap());
+    assert!(store.mark_step_running("r", 0, "old", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "other", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 1, "old", now()).await.unwrap());
+    let later = now() + Duration::seconds(RUN_LEASE_SECS + 1);
+    assert!(!store.reset_running_step("r", 0, "old", later).await.unwrap());
+    assert!(store.reclaim_expired_run("r", "new", later).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "old", later).await.unwrap());
+    assert!(store.reset_running_step("r", 0, "new", later).await.unwrap());
+    let steps = store.list_run_steps("r").await.unwrap();
+    assert_eq!(steps[0].state, STEP_PENDING);
+    assert!(steps[0].started_at.is_none());
+    assert!(store.mark_step_running("r", 0, "new", later).await.unwrap());
+    assert!(store.complete_step("r", "new", 0, STEP_DONE, None, None,
+        RunNext::Continue { step_index: 1 }, later).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "new", later).await.unwrap());
+}
+
+#[tokio::test]
+async fn unsupported_run_scan_excludes_known_reserved_states() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "bad", 1).await;
+    insert(&store, "reserved", 1).await;
+    insert(&store, "pending", 1).await;
+    {
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE autopilot_runs SET state='future' WHERE run_id='bad'", []).unwrap();
+        conn.execute("UPDATE autopilot_runs SET state='deferred' WHERE run_id='reserved'", []).unwrap();
+    }
+    let rows = store.list_unsupported_runs(50).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, "bad");
+    assert!(store.list_unsupported_runs(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_run_at_capacity_is_not_a_limit_rejection() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    for i in 0..MAX_UNSETTLED_RUNS_PER_RULE {
+        insert(&store, &format!("r{i}"), 1).await;
+    }
+    let (mut replay, steps) = run("replay", "rule", 1);
+    replay.dedupe_key = "dedupe:r0".into();
+    assert_eq!(store.insert_run(&replay, &steps, now()).await.unwrap(), RunInsertOutcome::Duplicate);
+    assert!(store.get_run("replay").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn fenced_step_start_requires_lease_and_commit() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "r", 1).await;
+    assert!(store.claim_run("r", "owner", now()).await.unwrap());
+    {
+        let (fence, _) = store.fence_rule("rule").await.unwrap();
+        assert!(!fence.mark_step_running("r", 0, "other", now()).unwrap());
+        assert!(!fence.mark_step_running("r", 0, "owner", now() + Duration::seconds(61)).unwrap());
+        assert!(fence.mark_step_running("r", 0, "owner", now()).unwrap());
+        // Dropping an uncommitted point of no return rolls it back.
+    }
+    assert_eq!(store.list_run_steps("r").await.unwrap()[0].state, STEP_PENDING);
+    let (fence, _) = store.fence_rule("rule").await.unwrap();
+    assert!(fence.mark_step_running("r", 0, "owner", now()).unwrap());
+    fence.release().unwrap();
+    assert_eq!(store.list_run_steps("r").await.unwrap()[0].state, STEP_RUNNING);
+}
+
+#[tokio::test]
+async fn fenced_wait_completion_is_atomic_and_lease_guarded() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    let (row, mut steps) = run("r", "rule", 2);
+    steps[0].step_type = "wait".into();
+    store.insert_run(&row, &steps, now()).await.unwrap();
+    assert!(store.claim_run("r", "owner", now()).await.unwrap());
+    let next_at = now() + Duration::minutes(60);
+    {
+        let (fence, _) = store.fence_rule("rule").await.unwrap();
+        assert!(!fence.complete_wait_step("r", 0, "other", next_at, now()).unwrap());
+        assert!(!fence.complete_wait_step("r", 0, "owner", next_at, now() + Duration::seconds(61)).unwrap());
+        assert!(fence.complete_wait_step("r", 0, "owner", next_at, now()).unwrap());
+    }
+    assert_eq!(store.get_run("r").await.unwrap().unwrap().state, RUN_RUNNING);
+    assert_eq!(store.list_run_steps("r").await.unwrap()[0].state, STEP_PENDING);
+    let (fence, _) = store.fence_rule("rule").await.unwrap();
+    assert!(fence.complete_wait_step("r", 0, "owner", next_at, now()).unwrap());
+    fence.release().unwrap();
+    let waiting = store.get_run("r").await.unwrap().unwrap();
+    assert_eq!(waiting.state, RUN_WAITING);
+    assert_eq!(waiting.step_index, 1);
+    assert_eq!(waiting.next_at, Some(run_ts(next_at)));
+    assert!(waiting.lease_owner.is_none() && waiting.lease_until.is_none());
+    let steps = store.list_run_steps("r").await.unwrap();
+    assert_eq!(steps[0].state, STEP_DONE);
+    assert_eq!(steps[0].started_at, Some(run_ts(now())));
+    assert_eq!(steps[0].finished_at, Some(run_ts(now())));
+}
+
+#[tokio::test]
+async fn settlement_transitions_persist_notice_outbox() {
+    for outcome in ["completed", "missed_late", "execution_uncertain"] {
+        for path in ["unclaimed", "claimed", "step"] {
+            let home = tempfile::tempdir().unwrap();
+            let store = AutopilotStore::open(home.path()).unwrap();
+            insert(&store, "r", 1).await;
+            if path == "unclaimed" {
+                assert!(store.settle_unclaimed_run("r", &[RUN_PENDING], outcome, None, now()).await.unwrap());
+            } else {
+                assert!(store.claim_run("r", "owner", now()).await.unwrap());
+                if path == "claimed" {
+                    assert!(store.settle_claimed_run("r", "owner", outcome, None, now()).await.unwrap());
+                } else {
+                    assert!(store.mark_step_running("r", 0, "owner", now()).await.unwrap());
+                    assert!(store.complete_step("r", "owner", 0, STEP_DONE, None, None,
+                        RunNext::Settle { outcome: outcome.into(), detail: None }, now()).await.unwrap());
+                }
+            }
+            let row = store.get_run("r").await.unwrap().unwrap();
+            assert!(row.notice_pending);
+            assert_eq!(row.notice_push_state.as_deref(), if outcome == "completed" { None } else { Some("pending") });
+            assert_eq!(row.notice_push_attempts, 0);
+            assert!(row.notice_push_next_at.is_none());
+            assert_eq!(store.list_run_notices_due(now(), 10).await.unwrap(), vec![row]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn run_notice_push_lease_fences_results_and_bounds_crash_retries() {
+    use crate::autopilot_approval::{NoticePush, MAX_NOTICE_PUSH_ATTEMPTS};
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "r", 1).await;
+    assert!(store.settle_unclaimed_run("r", &[RUN_PENDING], "missed_late", None, now()).await.unwrap());
+    store.clear_run_notice_pending("r").await.unwrap();
+    let mut due = now();
+    for attempt in 1..=MAX_NOTICE_PUSH_ATTEMPTS {
+        assert!(store.lease_run_notice_push("r", due).await.unwrap());
+        assert!(!store.lease_run_notice_push("r", due).await.unwrap());
+        let row = store.get_run("r").await.unwrap().unwrap();
+        assert_eq!(row.notice_push_attempts, attempt);
+        assert_eq!(row.notice_push_next_at, Some(run_ts(due + Duration::seconds(60))));
+        assert!(store.list_run_notices_due(due, 10).await.unwrap().is_empty());
+        // A result from the prior lease cannot overwrite the current attempt.
+        assert!(!store.record_run_notice_push("r", attempt - 1, NoticePush::Sent, due).await.unwrap());
+        due += Duration::seconds(60);
+    }
+    assert!(!store.lease_run_notice_push("r", due).await.unwrap());
+    let row = store.get_run("r").await.unwrap().unwrap();
+    assert_eq!(row.notice_push_attempts, MAX_NOTICE_PUSH_ATTEMPTS);
+    assert_eq!(row.notice_push_state.as_deref(), Some("gave_up"));
+    assert!(row.notice_push_next_at.is_none());
+    assert!(store.list_run_notices_due(due, 10).await.unwrap().is_empty());
 }

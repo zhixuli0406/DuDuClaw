@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, record_grant_use};
-use crate::dept_grants::rules::{normalize_department_action, validate_department_rule};
+use crate::dept_grants::rules::validate_department_rule;
+use super::autopilot_rpc::{autopilot_create_definition, autopilot_update_definition};
 
 const DENIED: &str = "permission denied";
 
@@ -26,7 +27,7 @@ impl MethodHandler {
                 "autopilot.remove" => return self.handle_autopilot_remove(params).await,
                 "autopilot.history" => return self.handle_autopilot_history(params).await,
                 "autopilot.create" if params.get("owner_department").is_none_or(Value::is_null) => {
-                    return self.handle_autopilot_create(params).await;
+                    return self.handle_autopilot_create(params, ctx).await;
                 }
                 _ => {}
             }
@@ -48,7 +49,7 @@ impl MethodHandler {
             let id = params.get("rule_id").and_then(Value::as_str).unwrap_or("");
             match store.get_rule(id).await {
                 Ok(Some(row)) if row.owner_department.is_some() => {}
-                Ok(_) => return self.handle_autopilot_update(params).await,
+                Ok(_) => return self.handle_autopilot_update(params, ctx).await,
                 Err(error) => return WsFrame::error_response("", &error),
             }
         }
@@ -71,23 +72,11 @@ impl MethodHandler {
         }
         if method == "autopilot.create" {
             let now = Utc::now().to_rfc3339();
-            let name = params.get("name").and_then(Value::as_str)
-                .filter(|s| !s.is_empty()).ok_or("name is required")?;
             let department = params.get("owner_department").and_then(Value::as_str).ok_or(DENIED)?;
-            let action = normalize_department_action(params.get("action").cloned().unwrap_or(Value::Null))?;
-            let row = AutopilotRuleRow {
-                id: uuid::Uuid::new_v4().to_string(), name: name.to_owned(), enabled: true,
-                trigger_event: params.get("trigger_event").and_then(Value::as_str)
-                    .unwrap_or("task_created").to_owned(),
-                conditions: params.get("conditions").cloned().unwrap_or(json!({})).to_string(),
-                action: action.to_string(), created_at: now.clone(),
-                last_triggered_at: None, trigger_count: 0,
-                sequence: optional_json(params, "sequence"), metadata: optional_json(params, "metadata"),
-                active_window: optional_json(params, "active_window"), run_policy: optional_json(params, "run_policy"),
-                owner_department: Some(department.to_owned()),
-                created_by_user_id: Some(ctx.user_id.clone()), updated_by_user_id: Some(ctx.user_id.clone()),
-                updated_at: Some(now),
-            };
+            let mut row = autopilot_create_definition(&self.home_dir, params, ctx, Some(department.to_owned()))?;
+            row.metadata = optional_json(params, "metadata");
+            row.updated_by_user_id = Some(ctx.user_id.clone());
+            row.updated_at = Some(now);
             validate_department_rule(self, view, &row).await?;
             store.insert_rule(&row).await?;
             if view.is_some() {
@@ -106,24 +95,9 @@ impl MethodHandler {
                 if params.get("owner_department").is_some_and(|v| v.as_str() != Some(department.as_str())) {
                     return Err(DENIED.into());
                 }
-                if let Some(name) = params.get("name") {
-                    row.name = name.as_str().filter(|s| !s.is_empty()).ok_or("name is required")?.to_owned();
-                }
-                if let Some(enabled) = params.get("enabled") {
-                    row.enabled = enabled.as_bool().ok_or("enabled must be a boolean")?;
-                }
-                if let Some(trigger) = params.get("trigger_event") {
-                    row.trigger_event = trigger.as_str().ok_or(DENIED)?.to_owned();
-                }
-                if let Some(conditions) = params.get("conditions") { row.conditions = conditions.to_string(); }
-                if let Some(action) = params.get("action") {
-                    row.action = normalize_department_action(action.clone())?.to_string();
-                }
-                for (key, slot) in [
-                    ("sequence", &mut row.sequence), ("metadata", &mut row.metadata),
-                    ("active_window", &mut row.active_window), ("run_policy", &mut row.run_policy),
-                ] {
-                    if params.get(key).is_some() { *slot = optional_json(params, key); }
+                row = autopilot_update_definition(&self.home_dir, params, &row)?;
+                if params.get("metadata").is_some() {
+                    row.metadata = optional_json(params, "metadata");
                 }
                 row.updated_by_user_id = Some(ctx.user_id.clone());
                 row.updated_at = Some(Utc::now().to_rfc3339());

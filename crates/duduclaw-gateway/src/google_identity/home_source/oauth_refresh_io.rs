@@ -10,6 +10,7 @@ struct ResponseTokens {
     refresh: Option<Zeroizing<String>>,
     expires_at: chrono::DateTime<chrono::Utc>,
     scopes: Vec<String>,
+    scope_missing: bool,
 }
 pub(super) struct Refreshed {
     pub(super) access: Zeroizing<String>,
@@ -33,7 +34,7 @@ impl Drop for JsonBody {
         scrub(&mut self.0);
     }
 }
-fn parse_tokens(body: Value, now: u64) -> Result<ResponseTokens> {
+fn parse_tokens(body: Value, stored_scopes: &[String], now: u64) -> Result<ResponseTokens> {
     let body = JsonBody(body);
     let value = &body.0;
     let access = value["access_token"]
@@ -65,7 +66,7 @@ fn parse_tokens(body: Value, now: u64) -> Result<ResponseTokens> {
         .and_then(|n| n.checked_add_signed(chrono::Duration::seconds(seconds as i64)))
         .ok_or(Error::Invalid)?;
     let scopes = match value.get("scope") {
-        None => return Err(Error::ScopeUnverified),
+        None => stored_scopes.to_vec(),
         Some(Value::String(scope)) if !scope.is_empty() && scope.len() <= 128 * 2049 => {
             let pieces: Vec<_> = scope.split(' ').map(str::to_owned).collect();
             if pieces.len() > 128
@@ -91,7 +92,20 @@ fn parse_tokens(body: Value, now: u64) -> Result<ResponseTokens> {
         refresh,
         expires_at,
         scopes,
+        scope_missing: value.get("scope").is_none(),
     })
+}
+async fn verify_refresh_scopes(home: &Path, client_id: &str, tokens: &mut ResponseTokens) -> Result<()> {
+    if tokens.scope_missing {
+        // Shared guard also checks durable grants after local write disconnect.
+        tokens.scopes = crate::google_identity::write_scope_guard::refresh_scopes(
+            home, "home", "home", &tokens.scopes, None, &tokens.access, client_id,
+        ).await.map_err(|_| Error::ScopeUnverified)?;
+    }
+    if crate::google_identity::write_scope_guard::carries_write_scope(&tokens.scopes) {
+        return Err(Error::WriteScopeIsolated);
+    }
+    Ok(())
 }
 fn client(budget: ResolveBudget<'_>) -> Result<reqwest::Client> {
     let builder = match budget {
@@ -286,10 +300,14 @@ pub(super) async fn refresh_once_budget(
         }
         return Err(Error::Io);
     }
-    let parsed = parse_tokens(
+    let mut parsed = parse_tokens(
         serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?,
+        &capture.row.scopes,
         home_store::wall_time_now(home),
     )?;
+    let verified = budget.wait(verify_refresh_scopes(home, &client_id, &mut parsed)).await?;
+    validate_capture(home, receipt, capture)?;
+    verified?;
     #[cfg(test)]
     testing_owner::boundary(home, 7);
     let retained_cipher = if parsed.refresh.is_none() {

@@ -2141,6 +2141,10 @@ mod tests {
     #[tokio::test]
     async fn dashboard_decide_matches_channel_semantics() {
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
         let store = TaskStore::open(dir.path()).unwrap();
         let mut t = mk_task("g1");
         t.status = "needs_human".into();
@@ -2227,6 +2231,10 @@ mod tests {
     #[tokio::test]
     async fn dashboard_continue_reopens_a_done_task_and_logs_activity() {
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
         let store = TaskStore::open(dir.path()).unwrap();
         let mut t = mk_task("g3");
         t.status = "done".into();
@@ -2260,6 +2268,10 @@ mod tests {
     #[tokio::test]
     async fn dashboard_continue_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agents/alice");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
         let store = TaskStore::open(dir.path()).unwrap();
         let mut t = mk_task("g4");
         t.status = "failed".into();

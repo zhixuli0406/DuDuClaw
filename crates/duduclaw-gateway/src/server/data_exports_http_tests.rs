@@ -189,7 +189,7 @@ skill_security_scan = true
     let (event_tx, _) = broadcast::channel(16);
     let state = Arc::new(AppState {
         auth: AuthManager::new(None),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
         prepared_events: Default::default(),

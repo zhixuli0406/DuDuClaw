@@ -20,12 +20,6 @@ pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
 ];
 
 impl TaskStore {
-    pub(super) fn revoke_initiator(&self, id: &str) {
-        if let Some(home) = self.db_path.parent() {
-            crate::delegation_roles::initiators::revoke_before_write(home, "task", id);
-        }
-    }
-
     /// Bounded metadata read for untrusted dashboard invalidation hints.
     /// Never migrate a database or create an absent installation on this path.
     pub(crate) fn live_metadata(home: &Path, id: &str) -> Result<Option<(String, String)>, String> {
@@ -56,8 +50,42 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
     ) -> Result<Vec<TaskRow>, String> {
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, None, |_, _| true).await
+    }
+
+    /// Stream metadata through the visibility gate before cutting the page.
+    /// Only selected rows are materialized, newest-created first with a stable ID tie-break.
+    /// Unlike the board view, pinned/updated rows do not outrank newer tasks.
+    pub async fn list_tasks_filtered_bounded<F>(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: usize,
+        visible: F,
+    ) -> Result<Vec<TaskRow>, String>
+    where F: FnMut(&str, &str) -> bool + Send {
+        if !(1..=1000).contains(&limit) {
+            return Err("limit must be an integer between 1 and 1000".into());
+        }
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, Some(limit), visible).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_tasks_filtered_inner<F>(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: Option<usize>,
+        mut visible: F,
+    ) -> Result<Vec<TaskRow>, String>
+    where F: FnMut(&str, &str) -> bool + Send {
         let conn = self.conn.lock().await;
-        let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
+        let columns = if limit.is_some() { "id, assigned_to, created_at" } else { TASK_COLUMNS };
+        let mut sql = format!("SELECT {columns} FROM tasks WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
         if let Some(s) = status {
             binds.push(s.to_string());
@@ -89,8 +117,12 @@ impl TaskStore {
         // a caller actually archives something. Callers that need to browse
         // the archive explicitly use `list_tasks_paginated` instead.
         sql.push_str(" AND archived = 0");
-        // Pinned tasks float to the top of every list (I-3b "置頂").
-        sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        if limit.is_some() {
+            sql.push_str(" ORDER BY created_at DESC, id ASC");
+        } else {
+            // Preserve the unlimited board view's pinned/updated ordering.
+            sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        }
 
         let mut stmt = conn
             .prepare(&sql)
@@ -99,6 +131,27 @@ impl TaskStore {
             .iter()
             .map(|s| s as &dyn rusqlite::types::ToSql)
             .collect();
+        if let Some(limit) = limit {
+            let mut ids = Vec::with_capacity(limit);
+            {
+                let mut candidates = stmt.query(params_ref.as_slice())
+                    .map_err(|e| format!("query list metadata: {e}"))?;
+                // Test the bound before advancing SQLite: do not read one extra row.
+                while ids.len() < limit {
+                    let Some(row) = candidates.next()
+                        .map_err(|e| format!("read list metadata: {e}"))? else { break; };
+                    let id: String = row.get(0).map_err(|e| format!("read task id: {e}"))?;
+                    let assignee: String = row.get(1).map_err(|e| format!("read task assignee: {e}"))?;
+                    if visible(&id, &assignee) {
+                        ids.push(id);
+                    }
+                }
+            }
+            let mut selected = conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))
+                .map_err(|e| format!("prepare selected tasks: {e}"))?;
+            return ids.iter().map(|id| selected.query_row(params![id], row_to_task)
+                .map_err(|e| format!("read selected task: {e}"))).collect();
+        }
         let rows = stmt
             .query_map(params_ref.as_slice(), row_to_task)
             .map_err(|e| format!("query list: {e}"))?
@@ -213,7 +266,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        self.revoke_initiator(id);
         let n = conn
             .execute(
                 "UPDATE tasks SET assigned_to=?2, updated_at=?3 WHERE id=?1 AND assigned_to='' AND kind IN ('task','goal')",
@@ -242,15 +294,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        if from_agent != to_agent {
-            let ids = conn.prepare("SELECT id FROM tasks WHERE assigned_to=?1 AND status!='done'
-                AND kind IN ('task','goal') AND NOT EXISTS
-                (SELECT 1 FROM responsibility_occurrences o WHERE o.task_id=tasks.id)")
-                .map_err(|e| e.to_string())?
-                .query_map(params![from_agent], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
-                .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-            for id in &ids { self.revoke_initiator(id); }
-        }
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -485,14 +528,6 @@ impl TaskStore {
                 .map(|s| s as &dyn rusqlite::types::ToSql)
                 .collect();
             verify_before_io().map_err(|e| e.to_string())?;
-            let assigned_changed = if let Some(assignee) = fields.get("assigned_to").and_then(|v| v.as_str()) {
-                tx.query_row("SELECT EXISTS(SELECT 1 FROM tasks WHERE id=?1 AND assigned_to<>?2)",
-                    params![id, assignee], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())?
-            } else { false };
-            if assigned_changed || fields.get("archived").and_then(|v| v.as_bool()) == Some(true)
-                || matches!(fields.get("status").and_then(|v| v.as_str()), Some("cancelled" | "failed" | "done")) {
-                self.revoke_initiator(id);
-            }
             tx.execute(&sql, params_ref.as_slice())
                 .map_err(|e| format!("update task: {e}"))?;
             verify_before_io().map_err(|e| e.to_string())?;
@@ -599,7 +634,6 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_before_io().map_err(|e| e.to_string())?;
-        self.revoke_initiator(id);
         let count = conn
             .execute(
                 "DELETE FROM tasks WHERE id = ?1 AND kind <> 'discovery'",

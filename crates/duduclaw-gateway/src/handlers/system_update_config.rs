@@ -57,6 +57,17 @@ impl MethodHandler {
             }
         };
         let mut changes: Vec<String> = Vec::new();
+        if let Some(value) = params.get("skill_ttl_days") {
+            let Some(days) = value.as_i64().filter(|days| (1..=30).contains(days)) else {
+                return WsFrame::error_response("", "approval.skill_ttl_days must be an integer from 1 to 30");
+            };
+            let Some(approval) = table.entry("approval")
+                .or_insert_with(|| toml::Value::Table(toml::Table::new())).as_table_mut() else {
+                return WsFrame::error_response("", "Invalid approval section");
+            };
+            approval.insert("skill_ttl_days".into(), toml::Value::Integer(days));
+            changes.push(format!("approval.skill_ttl_days = {days}"));
+        }
         if let Some(value) = params.get("transcription") {
             let live = match super::task_privacy::live_reader_context(&self.home_dir, ctx) {
                 Ok(live) if live.is_admin() => live,
@@ -746,7 +757,7 @@ impl MethodHandler {
         //     dispatch.policy, topology_evolution.enabled) — a long-lived driver
         //     captured the value at boot, so we abort+respawn the driver after the
         //     write; surfaced as `hot_reloaded`.
-        let mut applied_immediate = false;
+        let mut applied_immediate = params.get("skill_ttl_days").is_some();
         let mut reload_goal_loop = false;
         let mut reload_topology = false;
         let mut reload_dispatch = false;
@@ -1118,7 +1129,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language/company_timezone), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map), takeover, mail, webchat, tick, files.allowed_roots, night.llm_enabled, dispatch(judge_provider/judge_model), acp.trusted, telemetry.otlp_endpoint, container.sandbox, computer_use.image, memory.supersession_trust_guard, team, integrations.github, redaction.purge_after_expire_days",
+                "No valid fields to update. Supported: approval.skill_ttl_days, log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language/company_timezone), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map), takeover, mail, webchat, tick, files.allowed_roots, night.llm_enabled, dispatch(judge_provider/judge_model), acp.trusted, telemetry.otlp_endpoint, container.sandbox, computer_use.image, memory.supersession_trust_guard, team, integrations.github, redaction.purge_after_expire_days",
             );
         }
 
@@ -1369,6 +1380,53 @@ mod company_timezone_tests {
             ).await;
             assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
             assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_ttl_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn skill_ttl_setting_accepts_bounds_in_flat_dotted_and_nested_forms() {
+        for days in [1, 30] {
+            for params in [
+                json!({"skill_ttl_days": days}),
+                json!({"approval.skill_ttl_days": days}),
+                json!({"approval": {"skill_ttl_days": days}}),
+            ] {
+                let home = tempfile::tempdir().unwrap();
+                std::fs::write(home.path().join("config.toml"), "[approval]\nother = true\n").unwrap();
+                let handler = MethodHandler::new(home.path().to_path_buf()).await;
+                let frame = handler.handle_system_update_config(params, &UserContext::admin_fallback()).await;
+                assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+                let text = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+                let table: toml::Table = text.parse().unwrap();
+                assert_eq!(table["approval"]["skill_ttl_days"].as_integer(), Some(days));
+                assert_eq!(table["approval"]["other"].as_bool(), Some(true));
+                assert_eq!(crate::skill_ttl::skill_approval_ttl_secs(home.path()), days * 86_400);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_ttl_setting_rejects_invalid_values_without_writing() {
+        let home = tempfile::tempdir().unwrap();
+        let original = "[approval]\nskill_ttl_days = 7 # preserve me\n[general]\nname = 'original'\n";
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        for value in [json!(0), json!(31), json!(1.5), json!("7"), json!(null), json!(true)] {
+            for params in [
+                json!({"skill_ttl_days": value, "name": "changed"}),
+                json!({"approval.skill_ttl_days": value, "name": "changed"}),
+                json!({"approval": {"skill_ttl_days": value}, "name": "changed"}),
+            ] {
+                let frame = handler.handle_system_update_config(params, &UserContext::admin_fallback()).await;
+                assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            }
         }
     }
 }

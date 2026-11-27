@@ -492,8 +492,6 @@ pub(crate) async fn handle_tasks_create(
         ).await
         {
             Ok(created) => {
-                super::delegation_roles::record_initiator(home_dir, "task", default_agent,
-                    &created.task.assigned_to, &created.task.id).await;
                 // The goal already exists. A pause here suppresses only its
                 // best-effort wake event, never reports a retryable create failure.
                 match admit_background_caller(home_dir, actor, "tasks_create").await {
@@ -702,9 +700,15 @@ pub(crate) async fn handle_tasks_create(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
-    super::delegation_roles::record_initiator(home_dir, "task", default_agent, &row.assigned_to, &row.id).await;
     if let Err(message) = validate_created_task_assignee(home_dir, &row.assigned_to, implicit_operator_task) {
         return tool_error(message);
+    }
+    if !implicit_operator_assignee(home_dir, &row.assigned_to, implicit_operator_task)
+        && let Err(refusal) = duduclaw_gateway::entry_gate::check_task_assignee(home_dir, &row.assigned_to) {
+        return tool_error(&format!(
+            "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+            refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+        ));
     }
     if let Err(e) = store.insert_task(&row).await {
         return tool_error(&format!("insert task: {e}"));
@@ -1054,12 +1058,6 @@ pub(crate) async fn handle_tasks_update(
                 "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
             }));
         }
-    }
-    if !updated.archived && !matches!(updated.status.as_str(), "cancelled" | "failed" | "done")
-        && (current.status != updated.status || current.archived != updated.archived
-            || duduclaw_gateway::isolation_background::material::task(&current)
-                != duduclaw_gateway::isolation_background::material::task(&updated)) {
-        super::delegation_roles::record_initiator(home_dir, "task", caller, &updated.assigned_to, &updated.id).await;
     }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
@@ -1760,17 +1758,52 @@ mod live_assignee_tests {
     }
 
     #[tokio::test]
+    async fn mcp_create_rechecks_effective_settings_immediately_before_insert() {
+        for explicit in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            employee(home.path(), "live", "active");
+            let mut params = serde_json::json!({"title": "work"});
+            if explicit { params["assigned_to"] = serde_json::json!("live"); }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let call = TASK_CREATE_BEFORE_COMMIT.scope(
+                barrier.clone(), handle_tasks_create(&params, home.path(), RecordActor::Operator("live")),
+            );
+            let break_settings = async {
+                barrier.wait().await;
+                // Keep the employee active so the roster-only check passes.
+                std::fs::write(home.path().join("agents/live/agent.toml"),
+                    "[agent]\nname='live'\nstatus='active'\n[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='grok'\n").unwrap();
+                barrier.wait().await;
+            };
+            let (response, ()) = tokio::time::timeout(
+                std::time::Duration::from_secs(10), async { tokio::join!(call, break_settings) },
+            ).await.expect("handler must reach the commit barrier");
+            assert_eq!(response["isError"], true, "{response}");
+            let text = response["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("Task creation refused: "), "{text}");
+            assert!(text.contains("model_provider_mismatch"), "{text}");
+            let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+            assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_create_accepts_live_and_rejects_unavailable_assignees() {
         let home = tempfile::tempdir().unwrap();
+        // Unavailable targets must fail the live gate before department policy
+        // can return delegation advice for a target with no department.
+        std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='department'").unwrap();
         employee(home.path(), "live", "active");
         employee(home.path(), "deleted", "deleted");
         employee(home.path(), "archived", "archived");
+        employee(home.path(), "unreadable", "active");
+        std::fs::write(home.path().join("agents/unreadable/agent.toml"), "[agent").unwrap();
         let actor = RecordActor::Operator("live");
         let result = handle_tasks_create(&serde_json::json!({
             "title": "工作", "assigned_to": "live"
         }), home.path(), actor).await;
         assert_ne!(result["isError"], true, "{result}");
-        for id in ["deleted", "archived", "unknown"] {
+        for id in ["deleted", "archived", "unknown", "unreadable"] {
             assert_unavailable(handle_tasks_create(&serde_json::json!({
                 "title": "工作", "assigned_to": id
             }), home.path(), actor).await);

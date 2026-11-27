@@ -1,7 +1,10 @@
 //! Shared employee entry preflight. One read and TOML parse of the effective
 //! employee artifact; all checks and the returned settings use that document.
 //! Callers must handle an exempt command without entering a model pipeline.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
 use duduclaw_core::agent_toml::AgentTomlSections;
@@ -92,6 +95,71 @@ impl EntryRefusal {
     }
 }
 
+/// Anchored operator-only marker shared by background producers and failover.
+pub(crate) const ENTRY_REFUSAL_PREFIX: &str = "ENTRY_REFUSED:";
+
+const REFUSAL_CAPACITY: usize = 1024;
+const REFUSAL_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct BackgroundRefusals {
+    issued: HashMap<String, (&'static str, Instant)>,
+}
+
+impl BackgroundRefusals {
+    fn mint(&mut self, refusal: &EntryRefusal, now: Instant) -> String {
+        self.issued.retain(|_, (_, issued)| now.duration_since(*issued) < REFUSAL_TTL);
+        if self.issued.len() >= REFUSAL_CAPACITY {
+            if let Some(oldest) = self.issued.iter().min_by_key(|(_, (_, issued))| *issued)
+                .map(|(id, _)| id.clone()) {
+                self.issued.remove(&oldest);
+            }
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let code = refusal.code();
+        self.issued.insert(id.clone(), (code, now));
+        format!("{ENTRY_REFUSAL_PREFIX}{code}:{id}: employee configuration refused")
+    }
+
+    /// One parser for all consumers. Provider text cannot mint an admission refusal.
+    fn code<'a>(&self, error: &'a str, now: Instant) -> Option<&'a str> {
+        let (code, rest) = error.strip_prefix(ENTRY_REFUSAL_PREFIX)?.split_once(':')?;
+        match code {
+            "agent_not_found" | "agent_config_unreadable" | "runtime_unavailable"
+            | "model_provider_mismatch" | "runtime_policy_refused" => {}
+            _ => return None,
+        }
+        let (id, _) = rest.split_once(':')?;
+        let (registered_code, issued) = self.issued.get(id)?;
+        (*registered_code == code && now.duration_since(*issued) < REFUSAL_TTL).then_some(code)
+    }
+}
+
+fn background_refusals() -> &'static Mutex<BackgroundRefusals> {
+    static REFUSALS: OnceLock<Mutex<BackgroundRefusals>> = OnceLock::new();
+    REFUSALS.get_or_init(|| Mutex::new(BackgroundRefusals::default()))
+}
+
+pub(crate) fn background_refusal(refusal: &EntryRefusal) -> String {
+    background_refusals().lock().unwrap_or_else(|e| e.into_inner())
+        .mint(refusal, Instant::now())
+}
+
+pub(crate) fn background_refusal_with_fallback(
+    refusal: &EntryRefusal, fallback: Option<RuntimeType>,
+) -> String {
+    let error = background_refusal(refusal);
+    if matches!(refusal, EntryRefusal::ModelProviderMismatch { .. }) {
+        runtime_config::alignment_refusal_with_fallback(error, fallback)
+    } else { error }
+}
+
+/// Never infer admission from provider prose or substring matches.
+pub(crate) fn background_refusal_code(error: &str) -> Option<&str> {
+    background_refusals().lock().unwrap_or_else(|e| e.into_inner())
+        .code(error, Instant::now())
+}
+
 /// Owned so a caller can release the registry lock before running commands or
 /// spawning. `registry_agent` retains cached prompt assets/metadata explicitly;
 /// `document` and `sections` are the fresh effective configuration for this turn.
@@ -123,7 +191,41 @@ fn resolve_with_reader(
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) -> Result<ResolvedTurnConfig, EntryRefusal> {
     let agent = registry.get(agent_id).ok_or(EntryRefusal::AgentNotFound)?;
-    let artifact = check_artifact(home, &agent.dir, agent_id, read)?;
+    resolve_loaded_with_reader(home, agent, agent_id, read)
+}
+
+/// Ephemeral/team members have an authoritative scaffold outside the registry.
+/// Check that artifact once, just as for a registered employee.
+pub(crate) fn resolve_loaded_and_check(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    resolve_loaded_with_reader(home, agent, agent_id, |path| std::fs::read_to_string(path))
+}
+
+fn resolve_loaded_with_reader(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    resolve_loaded_with_settings(home, agent, agent_id, read, |_| {})
+}
+
+/// Preserve fallback diagnostics from the same strict read, even when model
+/// alignment refuses admission before a complete turn snapshot can be returned.
+pub(crate) fn resolve_loaded_for_background(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+) -> Result<ResolvedTurnConfig, (EntryRefusal, Option<RuntimeType>)> {
+    let mut fallback = None;
+    resolve_loaded_with_settings(home, agent, agent_id,
+        |path| std::fs::read_to_string(path), |settings| fallback = settings.fallback)
+        .map_err(|refusal| (refusal, fallback))
+}
+
+fn resolve_loaded_with_settings(
+    home: &Path, agent: &LoadedAgent, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+    on_settings: impl FnOnce(&RuntimeSettings),
+) -> Result<ResolvedTurnConfig, EntryRefusal> {
+    let artifact = check_artifact_with_settings(home, &agent.dir, agent_id, read, on_settings)?;
     Ok(ResolvedTurnConfig {
         registry_agent: agent.clone(), config_path: artifact.path,
         preset_resolved: artifact.preset_resolved,
@@ -210,6 +312,14 @@ fn check_artifact(
     home: &Path, agent_dir: &Path, agent_id: &str,
     read: impl FnOnce(&Path) -> std::io::Result<String>,
 ) -> Result<CheckedArtifact, EntryRefusal> {
+    check_artifact_with_settings(home, agent_dir, agent_id, read, |_| {})
+}
+
+fn check_artifact_with_settings(
+    home: &Path, agent_dir: &Path, agent_id: &str,
+    read: impl FnOnce(&Path) -> std::io::Result<String>,
+    on_settings: impl FnOnce(&RuntimeSettings),
+) -> Result<CheckedArtifact, EntryRefusal> {
     // Use the same effective artifact selection as load_runtime_settings_strict.
     let mut path = agent_dir.join("agent.toml");
     let mut preset_resolved = false;
@@ -230,7 +340,8 @@ fn check_artifact(
         else { RuntimeSettingsError::Unreadable }
     ))?;
     let document: toml::Value = text.parse().map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
-    let (sections, settings, local_model_id) = strict_settings(&document, &path)?;
+    let (sections, mut settings, local_model_id) = strict_settings(&document, &path)?;
+    on_settings(&settings);
     let global_team = crate::team_composer::read_global_team_config(home)
         .map_err(|_| EntryRefusal::Config(RuntimeSettingsError::Malformed))?;
     runtime_config::ensure_active_team_providers(&global_team, &sections.team)
@@ -243,9 +354,8 @@ fn check_artifact(
             strict_provider(runtime)?;
         }
     }
-    let configured = settings.preferred_model.as_deref()
-        .ok_or(EntryRefusal::Config(RuntimeSettingsError::MissingModel))?;
-    let model = check_model(agent_id, configured, settings.provider)?;
+    let configured = settings.preferred_or_default().map_err(EntryRefusal::Config)?;
+    let model = check_model(agent_id, &configured, settings.provider)?;
     crate::product_policy::require_runtime(home, settings.provider.as_str())
         .map_err(|diagnostic| EntryRefusal::ProductPolicy { diagnostic })?;
     if model != configured {
@@ -253,6 +363,7 @@ fn check_artifact(
             crate::product_policy::require_substituted_catalog_model(policy, settings.provider, &model)
         ).map_err(|diagnostic| EntryRefusal::ProductPolicy { diagnostic })?;
     }
+    settings.preferred_model = Some(model.clone());
     Ok(CheckedArtifact { path, preset_resolved, settings, model, local_model_id, sections, document })
 }
 
@@ -285,18 +396,14 @@ fn strict_settings(
         .unwrap_or(RuntimeType::Claude); // Absent selector retains the schema default, never an error fallback.
     let fallback = runtime.fallback.as_deref().map(strict_provider).transpose()?;
     let model = doc.get("model").map(|value| value.as_table().ok_or_else(malformed))
-        .transpose()?.ok_or(EntryRefusal::Config(RuntimeSettingsError::MissingModel))?;
-    let preferred = match model.get("preferred") {
-        Some(value) => value.as_str().ok_or_else(malformed)?.trim(),
-        None => return Err(EntryRefusal::Config(RuntimeSettingsError::MissingModel)),
-    };
-    if preferred.is_empty() { return Err(EntryRefusal::Config(RuntimeSettingsError::MissingModel)); }
-    let utility = model.get("utility").map(|value| value.as_str().ok_or_else(malformed)).transpose()?
-        .filter(|value| !value.trim().is_empty()).map(str::to_string)
-        .unwrap_or_else(|| if provider == RuntimeType::Claude {
-            runtime_config::DEFAULT_UTILITY_MODEL.to_string()
-        } else { preferred.to_string() });
-    let local_model_id = model.get("local").map(|value| value.as_table().ok_or_else(malformed))
+        .transpose()?;
+    let preferred = model.and_then(|model| model.get("preferred"))
+        .map(|value| value.as_str().map(str::to_string).ok_or_else(malformed)).transpose()?;
+    let utility = model.and_then(|model| model.get("utility"))
+        .map(|value| value.as_str().ok_or_else(malformed)).transpose()?
+        .filter(|value| !value.trim().is_empty()).map(str::to_string);
+    let local_model_id = model.and_then(|model| model.get("local"))
+        .map(|value| value.as_table().ok_or_else(malformed))
         .transpose()?.and_then(|local| local.get("model"))
         .map(|value| value.as_str().map(str::to_string).ok_or_else(malformed)).transpose()?;
     let team = runtime_config::strict_team_config(doc, path).map_err(|_| malformed())?;
@@ -306,9 +413,15 @@ fn strict_settings(
     let mut sections = doc.clone().try_into::<AgentTomlSections>().map_err(|_| malformed())?;
     sections.runtime = runtime;
     sections.team = team;
-    let settings = RuntimeSettings {
-        provider, fallback, preferred_model: Some(preferred.to_string()), utility_model: utility,
+    let mut settings = RuntimeSettings {
+        provider, fallback, preferred_model: preferred, utility_model: String::new(),
     };
+    // Retain the strict reader's catalog defaults and Kiro's CLI-selected model.
+    let preferred = settings.preferred_or_default().map_err(EntryRefusal::Config)?;
+    settings.utility_model = utility.unwrap_or_else(|| if provider == RuntimeType::Claude {
+        runtime_config::DEFAULT_UTILITY_MODEL.to_string()
+    } else { preferred.clone() });
+    settings.preferred_model = Some(preferred);
     Ok((sections, settings, local_model_id))
 }
 

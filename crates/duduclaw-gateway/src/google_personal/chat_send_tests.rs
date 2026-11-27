@@ -1,6 +1,7 @@
 //! RM-062 regressions use the owned OAuth fixture, never a live Google account.
 use super::{tests::Fixture, flow, pending, scopes};
 use crate::google_identity::chat_send::{self, Snapshot, TOOL};
+use crate::google_identity::member_card;
 use crate::approval::{ApprovalBroker, ApprovalId, ExecutionBinding, RequestKind, ConversationAudience,
     action_grant::{ActionGrant, verify_and_consume}};
 use duduclaw_knowledge::requester::RequesterIdentity;
@@ -172,10 +173,10 @@ async fn chat_send_full_text_is_bound_and_foreign_account_edits_invalidate() {
     let _turn = register(&f, "chat-card").await;
     let (broker, id, _) = card(&f, "chat-card").await;
     let mut rec = broker.get(&id).await.unwrap().unwrap();
-    assert!(chat_send::card_body(&rec).contains("完整的私人文字"));
-    assert!(chat_send::eligible(&f.home, &rec));
+    assert!(member_card::card_body(&rec).contains("完整的私人文字"));
+    assert!(member_card::eligible(&f.home, &rec));
     rec.payload["chat_snapshot"]["account"] = json!("other@c.test");
-    assert!(!chat_send::eligible(&f.home, &rec));
+    assert!(!member_card::eligible(&f.home, &rec));
 }
 
 #[tokio::test]
@@ -191,8 +192,8 @@ async fn chat_send_card_escapes_controls_in_all_display_fields() {
     rec.payload["chat_snapshot"]["account"] = json!(raw);
     for field in ["space", "thread", "text"] { rec.payload["arguments"][field] = json!(raw); }
     let original = rec.payload.clone();
-    let body = chat_send::card_body(&rec);
-    let display = chat_send::confirmation_display(&rec);
+    let body = member_card::card_body(&rec);
+    let display = member_card::confirmation_display(&rec);
     assert!(body.contains(escaped));
     for field in ["employee", "account", "space", "thread", "text_display"] {
         assert_eq!(display[field], escaped);
@@ -238,13 +239,13 @@ async fn chat_send_display_rpc_preserves_raw_approval_digest_and_sent_bytes() {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             let broker = ApprovalBroker::open(&f.home).unwrap();
             loop {
-                if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter().find(|r| chat_send::is_member_card(r)) {
+                if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter().find(|r| member_card::is_member_card(r)) {
                     let original = rec.payload.clone();
                     let payload_hash = rec.binding.as_ref().unwrap().payload_hash.clone();
                     let grant = ActionGrant::build("bot", TOOL, &original);
                     assert_eq!(original["arguments"]["text"].as_str().unwrap().as_bytes(), raw.as_bytes());
                     assert_eq!(duduclaw_core::google_identity::google_arguments_digest(&original["arguments"]), digest);
-                    assert!(chat_send::card_body(&rec).contains(escaped));
+                    assert!(member_card::card_body(&rec).contains(escaped));
                     let response = handler.handle_personal_google_rpc("me.google.chat_confirmations", json!({}), &ctx(&f)).await;
                     // Inspect decoded strings: JSON encoding would hide raw controls from a serialized check.
                     let crate::protocol::WsFrame::Response { ok:true, payload:Some(response), .. } = response else {
@@ -287,9 +288,9 @@ async fn chat_send_group_requires_member_page_and_expired_card_refuses() {
     let mut rec = broker.get(&id).await.unwrap().unwrap();
     let context = rec.binding.as_ref().unwrap().decision_context.clone();
     assert!(broker.decide_bound(&id, &context, true).await.is_err());
-    assert!(chat_send::may_decide(&f.home, &rec, &f.alice.id));
+    assert!(member_card::may_decide(&f.home, &rec, &f.alice.id));
     rec.binding.as_mut().unwrap().expires_at = (chrono::Utc::now()-chrono::Duration::seconds(1)).to_rfc3339();
-    assert!(!chat_send::may_decide(&f.home, &rec, &f.alice.id));
+    assert!(!member_card::may_decide(&f.home, &rec, &f.alice.id));
     broker.decide_bound_dashboard(&id, &ctx(&f), true).await.unwrap();
     verify_and_consume(&broker, &id, &grant).await.unwrap();
 }
@@ -326,7 +327,7 @@ async fn chat_send_revocation_at_transport_boundary_and_unknown_outcome_never_re
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 let broker = ApprovalBroker::open(&f.home).unwrap();
                 loop {
-                    if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter().find(|r| chat_send::is_member_card(r)) {
+                    if let Some(rec) = broker.list_by_kind("bound_action").await.unwrap().into_iter().find(|r| member_card::is_member_card(r)) {
                         broker.decide_bound_dashboard(&rec.id, &ctx(&f), true).await.unwrap();
                         break;
                     }

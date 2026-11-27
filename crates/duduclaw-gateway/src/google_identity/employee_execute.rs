@@ -28,10 +28,10 @@ struct Binding {
 struct Pending { binding: Binding, created: Instant }
 #[derive(Default)]
 pub(super) struct Store(Mutex<HashMap<(String, String), Pending>>);
-fn valid_id(value: &str) -> bool {
+pub(super) fn valid_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
 }
-fn requester(agent: &str, turn: Option<&str>, run: Option<&str>) -> Result<RequesterIdentity, Refusal> {
+pub(super) fn requester(agent: &str, turn: Option<&str>, run: Option<&str>) -> Result<RequesterIdentity, Refusal> {
     let mut selected = None;
     // Every supplied ID must be registered to this signed agent. A forged
     // run cannot be ignored just because a valid turn was supplied too.
@@ -51,12 +51,13 @@ impl Binding {
 
 pub(super) async fn serve(state: &ExecuteState, agent: &str, request: Request) -> Result<Value, Refusal> {
     let execute = matches!(&request, Request::Execute { .. });
-    let chat = match &request {
-        Request::Prepare { tool, .. } | Request::Execute { tool, .. } => tool == super::chat_send::TOOL,
+    let (chat, drive) = match &request {
+        Request::Prepare { tool, .. } | Request::Execute { tool, .. } =>
+            (tool == super::chat_send::TOOL, gi::is_drive_write_tool(tool)),
     };
     let progress = AtomicUsize::new(0);
     let mut binding = None;
-    let result = match tokio::time::timeout(Duration::from_secs(if chat { 420 } else { 120 }),
+    let result = match tokio::time::timeout(Duration::from_secs(if drive { 660 } else if chat { 420 } else { 120 }),
         serve_inner(state, agent, request, &progress, &mut binding)).await {
         Ok(result) => result,
         Err(_) => Err(Refusal::hard(if !chat && progress.load(Ordering::SeqCst) == 0 { "not_sent" } else { "result_unconfirmed" },
@@ -77,9 +78,8 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         Request::Execute { tool, arguments, turn_id, run_id, call_id, approval_binding_digest } =>
             (tool, arguments, turn_id, run_id, call_id, Some(approval_binding_digest)),
     };
-    // Package 131-P9a will route these tools to the gateway executor.
-    if duduclaw_core::google_identity::is_drive_write_tool(&tool) {
-        return Err(Refusal::hard("drive_write_unavailable", "雲端硬碟寫入只能由主程式執行。"));
+    if gi::is_drive_write_tool(&tool) {
+        return super::drive_write::serve::serve(state, agent, &tool, &args, turn, run, call, approved, progress).await;
     }
     if gi::native_google_scope(&tool).is_none() || !args.is_object() || !valid_id(&call) {
         return Err(changed());
@@ -135,7 +135,7 @@ fn audit(home: &std::path::Path, binding: &Binding, steps: usize, success: bool,
     let outcome = if steps == 0 { "not_sent" } else if success { "confirmed" } else { "may_have_sent" };
     duduclaw_security::audit::append_tool_call_with_extras(home, &binding.agent, "google_execute", &binding.tool,
         success, &[("call_id", json!(binding.call_id)), ("run_id", json!(binding.run_id)),
-        ("turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
+        ("google_turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
         ("authority_epoch", json!(binding.snapshot.epoch)), ("args_digest", json!(binding.args_digest)),
         ("step_count", json!(steps)), ("outcome", json!(outcome)), ("reason", json!(reason))]);
 }
@@ -188,6 +188,94 @@ pub(super) async fn verify_policy_approval(home: &std::path::Path, agent: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn assert_drive_early_refusal(case: &str) {
+        for tool in gi::DRIVE_WRITE_TOOLS {
+            for execute in [false, true] {
+                let home = tempfile::tempdir().unwrap();
+                std::fs::write(home.path().join("config.toml"),
+                    format!("[integrations]\ngoogle_workspace={}\n", case != "disabled")).unwrap();
+                let state = ExecuteState::new(home.path().to_path_buf(), None);
+                let turn = uuid::Uuid::new_v4().to_string();
+                let who = if case == "unknown" { RequesterIdentity::Unknown }
+                    else { RequesterIdentity::DashboardUser { user_id: "member".into() } };
+                let _guard = if case == "unregistered" { None } else {
+                    Some(crate::knowledge::turn_requesters::register("bot", &turn, who).unwrap())
+                };
+                let arguments = if case == "malformed" { json!([]) } else { json!({}) };
+                let turn_id = (case != "missing_ids").then_some(turn.clone());
+                let call_id = if case == "invalid_call" { String::new() } else { "call".into() };
+                let request = if execute {
+                    Request::Execute { tool: (*tool).into(), arguments, turn_id, run_id: None,
+                        call_id, approval_binding_digest: "untrusted-digest".into() }
+                } else {
+                    Request::Prepare { tool: (*tool).into(), arguments, turn_id, run_id: None, call_id }
+                };
+                let result = serve(&state, "bot", request).await;
+                let code = if case == "disabled" { "disabled" } else { "changed" };
+                assert_eq!(result.unwrap_err().code, code, "{tool}: {case}");
+                let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+                let rows: Vec<Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                assert_eq!(rows.len(), 1, "{tool}: {case}");
+                let row = &rows[0];
+                assert_eq!(row["tool_name"], "google_drive_write");
+                assert_eq!(row["tool"], *tool);
+                assert_eq!(row["outcome"], "refused");
+                assert_eq!(row["reason"], code);
+                assert_eq!(row["success"], false);
+                if case == "missing_ids" {
+                    assert_eq!(row["google_turn_id"], "");
+                } else {
+                    assert_eq!(row["google_turn_id"], turn);
+                    assert_eq!(row["id_source"], "turn");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_integration_disabled_is_audited_once_as_refused() {
+        assert_drive_early_refusal("disabled").await;
+    }
+
+    #[tokio::test]
+    async fn drive_malformed_arguments_are_audited_once_as_refused() {
+        assert_drive_early_refusal("malformed").await;
+    }
+
+    #[tokio::test]
+    async fn drive_unknown_requester_is_audited_once_as_refused() {
+        assert_drive_early_refusal("unknown").await;
+        assert_drive_early_refusal("unregistered").await;
+    }
+
+    #[tokio::test]
+    async fn drive_invalid_call_and_missing_ids_are_audited_once_as_refused() {
+        assert_drive_early_refusal("invalid_call").await;
+        assert_drive_early_refusal("missing_ids").await;
+    }
+
+    #[test]
+    fn d12_audit_preserves_google_turn_id() {
+        let home = tempfile::tempdir().unwrap();
+        let binding = Binding {
+            agent: "bot".into(), tool: "gmail_read".into(), args_digest: "digest".into(),
+            turn_id: Some("registered-d12-turn".into()), run_id: None, call_id: "call".into(),
+            approval_nonce: "nonce".into(),
+            snapshot: OwnerSnapshot {
+                owner_id: "holder".into(), email: "holder@c.test".into(), employee_nonce: "nonce".into(),
+                employee_id: "employee".into(), incarnation: 1, owner_generation: 1,
+                attestation_revision: "revision".into(), epoch: "epoch".into(), policy_digest: "policy".into(),
+                user_epoch: "user-epoch".into(), credential_epoch: 1, policy_epoch: "policy-epoch".into(),
+            },
+        };
+        audit(home.path(), &binding, 1, true, None);
+        let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["tool_name"], "google_execute");
+        assert_eq!(row["google_turn_id"], "registered-d12-turn");
+    }
+
     #[test]
     fn no_wire_subject_or_forged_run() {
         for field in ["subject", "email", "owner_id", "credential_ref"] {

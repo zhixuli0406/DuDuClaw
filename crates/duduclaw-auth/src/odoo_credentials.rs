@@ -53,11 +53,21 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
         login TEXT NOT NULL, odoo_uid INTEGER NOT NULL, odoo_name TEXT NOT NULL,
         secret_ct BLOB NOT NULL, server_fp TEXT NOT NULL,
+        credential_epoch INTEGER NOT NULL DEFAULT -1,
         rev INTEGER NOT NULL, state TEXT NOT NULL CHECK (state IN ('ok','invalid','needs_reverify')),
         verified_at TEXT NOT NULL, last_used_at TEXT, updated_at TEXT NOT NULL);
         CREATE TRIGGER IF NOT EXISTS member_odoo_credentials_offboarded AFTER UPDATE OF status ON users
         WHEN NEW.status = 'offboarded' BEGIN DELETE FROM member_odoo_credentials WHERE user_id = NEW.id; END;")
-        .map_err(|_| UNAVAILABLE.to_owned())
+        .map_err(store_error)?;
+    // Probe before ALTER so reopening an upgraded database is idempotent.
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate).map_err(store_error)?;
+    let present: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('member_odoo_credentials')
+        WHERE name='credential_epoch')", [], |r| r.get(0)).map_err(store_error)?;
+    if !present {
+        tx.execute_batch("ALTER TABLE member_odoo_credentials ADD COLUMN credential_epoch INTEGER NOT NULL DEFAULT -1;")
+            .map_err(store_error)?;
+    }
+    tx.commit().map_err(store_error)
 }
 fn store_error(_: rusqlite::Error) -> String { UNAVAILABLE.to_owned() }
 fn aad(user_id: &str) -> Vec<u8> { format!("odoo-member-v1|{user_id}").into_bytes() }
@@ -70,8 +80,10 @@ fn require_admin(conn: &Connection, id: &str) -> Result<(), String> {
 impl UserDb {
     /// This query deliberately never reads secret_ct (also used by onboarding).
     pub fn odoo_credential_status(&self, user_id: &str) -> Result<Option<OdooCredentialStatus>, String> {
-        self.conn().query_row("SELECT login,odoo_uid,odoo_name,server_fp,rev,state,verified_at,last_used_at
-            FROM member_odoo_credentials WHERE user_id=?1", [user_id], |r| Ok(OdooCredentialStatus {
+        self.conn().query_row("SELECT c.login,c.odoo_uid,c.odoo_name,c.server_fp,c.rev,
+            CASE WHEN c.credential_epoch < 0 OR c.credential_epoch != u.credential_epoch
+                THEN 'needs_reverify' ELSE c.state END,c.verified_at,c.last_used_at
+            FROM member_odoo_credentials c JOIN users u ON u.id=c.user_id WHERE c.user_id=?1", [user_id], |r| Ok(OdooCredentialStatus {
                 login: r.get(0)?, odoo_uid: r.get(1)?, odoo_name: r.get(2)?, server_fp: r.get(3)?,
                 rev: r.get(4)?, state: r.get(5)?, verified_at: r.get(6)?, last_used_at: r.get(7)?,
             })).optional().map_err(store_error)
@@ -85,19 +97,19 @@ impl UserDb {
         }
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
-        let active: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active')",
-            [user_id], |r| r.get(0)).map_err(store_error)?;
-        if !active { return Err(UNAVAILABLE.into()); }
+        let epoch: Option<i64> = tx.query_row("SELECT credential_epoch FROM users WHERE id=?1 AND status='active'",
+            [user_id], |r| r.get(0)).optional().map_err(store_error)?;
+        let epoch = epoch.filter(|epoch| *epoch >= 0).ok_or(UNAVAILABLE)?;
         let ct = sealer.seal(secret.as_bytes(), &aad(user_id)).map_err(|_| UNAVAILABLE.to_owned())?;
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute("INSERT INTO member_odoo_credentials
-            (user_id,login,odoo_uid,odoo_name,secret_ct,server_fp,rev,state,verified_at,updated_at)
-            VALUES(?1,?2,?3,?4,?5,?6,1,'ok',?7,?7)
+            (user_id,login,odoo_uid,odoo_name,secret_ct,server_fp,rev,state,verified_at,updated_at,credential_epoch)
+            VALUES(?1,?2,?3,?4,?5,?6,1,'ok',?7,?7,?8)
             ON CONFLICT(user_id) DO UPDATE SET login=excluded.login,odoo_uid=excluded.odoo_uid,
             odoo_name=excluded.odoo_name,secret_ct=excluded.secret_ct,server_fp=excluded.server_fp,
             rev=member_odoo_credentials.rev+1,state='ok',verified_at=excluded.verified_at,
-            last_used_at=NULL,updated_at=excluded.updated_at",
-            params![user_id, login, odoo_uid, odoo_name, ct, server_fp, now]).map_err(store_error)?;
+            last_used_at=NULL,updated_at=excluded.updated_at,credential_epoch=excluded.credential_epoch",
+            params![user_id, login, odoo_uid, odoo_name, ct, server_fp, now, epoch]).map_err(store_error)?;
         tx.commit().map_err(store_error)
     }
 
@@ -109,7 +121,8 @@ impl UserDb {
     }
     pub fn odoo_credential_touch(&self, user_id: &str) -> Result<(), String> {
         self.conn().execute("UPDATE member_odoo_credentials SET last_used_at=?2,updated_at=?2 WHERE user_id=?1
-            AND state='ok' AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active')",
+            AND state='ok' AND credential_epoch >= 0 AND EXISTS(SELECT 1 FROM users u WHERE u.id=?1 AND u.status='active'
+                AND u.credential_epoch=member_odoo_credentials.credential_epoch)",
             params![user_id, chrono::Utc::now().to_rfc3339()]).map_err(store_error)?;
         Ok(())
     }
@@ -133,13 +146,13 @@ impl UserDb {
         if user_id.contains('\0') { return Err(UNAVAILABLE.into()); }
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
-        let row = tx.query_row("SELECT c.login,c.odoo_uid,c.rev,c.state,c.server_fp FROM member_odoo_credentials c
+        let row = tx.query_row("SELECT c.login,c.odoo_uid,c.rev,c.state,c.server_fp,c.credential_epoch,u.credential_epoch FROM member_odoo_credentials c
             JOIN users u ON u.id=c.user_id WHERE c.user_id=?1 AND u.status='active'", [user_id], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?, r.get::<_, String>(4)?))
+                    r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?))
             }).optional().map_err(store_error)?;
-        let Some((login, odoo_uid, rev, state, server_fp)) = row else { return Ok(None); };
-        if fp.is_some_and(|fp| fp != server_fp) {
+        let Some((login, odoo_uid, rev, state, server_fp, epoch, live_epoch)) = row else { return Ok(None); };
+        if epoch < 0 || epoch != live_epoch || fp.is_some_and(|fp| fp != server_fp) {
             tx.execute("UPDATE member_odoo_credentials SET state='needs_reverify',updated_at=?2 WHERE user_id=?1",
                 params![user_id, chrono::Utc::now().to_rfc3339()]).map_err(store_error)?;
             tx.commit().map_err(store_error)?;
@@ -161,7 +174,8 @@ impl UserDb {
         if odoo_uid <= 0 || server_fp.is_empty() { return Err(UNAVAILABLE.into()); }
         self.conn().execute("UPDATE member_odoo_credentials SET odoo_uid=?3,odoo_name=?4,server_fp=?5,
             rev=rev+1,state='ok',verified_at=?6,updated_at=?6 WHERE user_id=?1 AND rev=?2
-            AND EXISTS(SELECT 1 FROM users WHERE id=?1 AND status='active')",
+            AND credential_epoch >= 0 AND EXISTS(SELECT 1 FROM users u WHERE u.id=?1 AND u.status='active'
+                AND u.credential_epoch=member_odoo_credentials.credential_epoch)",
             params![user_id, expected_rev, odoo_uid, odoo_name, server_fp, chrono::Utc::now().to_rfc3339()])
             .map(|n| n != 0).map_err(store_error)
     }
@@ -169,7 +183,9 @@ impl UserDb {
         let mut conn = self.conn();
         let tx = conn.transaction().map_err(store_error)?;
         require_admin(&tx, admin_id)?;
-        let mut stmt = tx.prepare("SELECT c.user_id,u.email,u.display_name,c.login,c.state,c.verified_at,c.last_used_at
+        let mut stmt = tx.prepare("SELECT c.user_id,u.email,u.display_name,c.login,
+            CASE WHEN c.credential_epoch < 0 OR c.credential_epoch != u.credential_epoch
+                THEN 'needs_reverify' ELSE c.state END,c.verified_at,c.last_used_at
             FROM member_odoo_credentials c JOIN users u ON u.id=c.user_id ORDER BY c.user_id").map_err(store_error)?;
         stmt.query_map([], |r| Ok(OdooCredentialAdminEntry { user_id: r.get(0)?, email: r.get(1)?,
             display_name: r.get(2)?, login: r.get(3)?, state: r.get(4)?, verified_at: r.get(5)?, last_used_at: r.get(6)? }))

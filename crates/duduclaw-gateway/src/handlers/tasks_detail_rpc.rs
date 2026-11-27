@@ -1002,6 +1002,10 @@ mod goal_decide_revision_tests {
         for action in ["retry", "done", "abort", "takeover", "continue"] {
             for mode in ["match", "mismatch", "absent", "wrong_type"] {
                 let home = tempfile::tempdir().unwrap();
+                let agent_dir = home.path().join("agents/sales");
+                std::fs::create_dir_all(&agent_dir).unwrap();
+                std::fs::write(agent_dir.join("agent.toml"),
+                    "[agent]\nname='sales'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
                 let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
                 let user = db.create_user("admin@test.invalid", "Admin", "isolated-test-password", UserRole::Admin).unwrap();
                 let mut ctx = UserContext::admin_fallback(); ctx.user_id = user.id;

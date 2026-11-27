@@ -62,8 +62,20 @@ impl MethodHandler {
             "autopilot.update" => {
                 boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
+            "autopilot.template_fields" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_template_fields(params)).await
+            }
             "autopilot.remove" => {
                 boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
+            }
+            "autopilot.runs.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_list(params)).await
+            }
+            "autopilot.runs.cancel" => {
+                require_admin!();
+                boxed_frame(|| self.handle_autopilot_runs_cancel(params, ctx)).await
             }
             "autopilot.history" => {
                 boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await

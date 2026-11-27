@@ -338,6 +338,14 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
         key_fields: &[],
     },
     MemberContractMethod {
+        name: "me.google.write_confirmations", since: "1.86.0", kind: MemberContractKind::Read,
+        summary_en: "Read only your pending Google Drive write confirmations", key_fields: &["requests"],
+    },
+    MemberContractMethod {
+        name: "me.google.write_confirm", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Confirm or cancel your single Google Drive write", key_fields: &["decided"],
+    },
+    MemberContractMethod {
         name: "me.google.chat_confirmations", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read only your pending Google Chat confirmations", key_fields: &["requests"],
     },
@@ -454,8 +462,14 @@ pub(crate) const MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS: &[&str] = &[
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
     let excluded = matches!(method, "users.change_password" | "users.change_email"
         | "me.google.write_connect_start" | "me.google.write_disconnect"
-        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm")
+        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm"
+        | "google.signin.get" | "google.signin.set"
+        | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+        | "users.google_signin.attest" | "users.google_signin.unlink"
+        | "users.signin_onboarding.retry_avatar"
+        | "me.google.write_confirmations" | "me.google.write_confirm")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
+        || method.split('.').take(2).eq(["me", "google_signin"])
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
         || method.split('.').take(2).eq(["me", "chat_link"])

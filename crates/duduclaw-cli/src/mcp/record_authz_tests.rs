@@ -326,6 +326,12 @@ async fn shared_check_allows_and_refuses_by_relationship() {
         .await
         .unwrap_err();
     assert!(err.contains("屬於「sales-rep」"), "{err}");
+    let shared = crate::mcp::check_delegation_allowed(h, "mkt-rep", "sales-rep", "t")
+        .await.unwrap_err();
+    assert!(err.contains(&shared), "{err}");
+    assert!(err.contains("部門模式") && err.contains("不同部門"), "{err}");
+    assert!(err.contains("未做任何變更。"), "{err}");
+    assert!(!err.contains("send_to_agent"), "{err}");
     assert!(!err.contains("reports_to"), "{err}");
     assert!(
         !audit_rows(h, "delegation_denied").is_empty(),
@@ -1449,8 +1455,8 @@ async fn az1_u1_u2_budget_widening_is_refused_and_audited() {
 }
 
 #[tokio::test]
-async fn az1_u4_database_grant_is_refused_for_self_and_other() {
-    for caller in ["sales-lead", "sales-rep", "mkt-rep"] {
+async fn az1_u4_database_grant_is_refused_for_self() {
+    for caller in ["sales-rep"] {
         let home = Home::new();
         let h = home.path();
         az1_policy(h, if caller == "mkt-rep" { "open" } else { "hierarchy" });

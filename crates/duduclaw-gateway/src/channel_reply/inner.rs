@@ -337,20 +337,34 @@ async fn build_reply_with_session_inner_impl(
             fallback
         } else {
             let channel = session_id.split(':').next().unwrap_or("unknown");
-            let decision = crate::trigger_route::turn::decide_channel_turn(
-                &ctx.home_dir,
-                &reg,
-                crate::trigger_route::turn::ChannelTurn {
-                    channel,
-                    conversation: session_id,
-                    sender: user_id,
-                    text,
-                    fallback: fallback.map(|a| a.config.agent.name.as_str()),
-                    event: &turn_id,
-                    seq: crate::trigger_route::pending::next_seq(),
-                    quiet: false,
-                    pending: crate::trigger_route::turn::PendingPolicy::Live,
-                },
+            let turn = crate::trigger_route::turn::ChannelTurn {
+                channel,
+                conversation: session_id,
+                sender: user_id,
+                text,
+                fallback: fallback.map(|a| a.config.agent.name.as_str()),
+                event: &turn_id,
+                seq: crate::trigger_route::pending::next_seq(),
+                quiet: false,
+                pending: crate::trigger_route::turn::PendingPolicy::Live,
+            };
+            let access = if crate::trigger_route::may_mention(text) {
+                crate::trigger_route::access::for_channel_sender(&ctx.home_dir, channel, user_id)
+            } else {
+                crate::trigger_route::access::SenderAccess::unmapped()
+            };
+            let route = crate::trigger_route::decide(&reg, text, &access, turn.fallback);
+            // A bare mention arms a future model turn without reaching the
+            // normal gate. Authorize the route first, then check its actual
+            // target before decision_for_route can mutate pending state.
+            if let crate::trigger_route::TriggerRoute::Routed { agent: id, bare: true } = &route {
+                if let Err(refusal) = crate::entry_gate::resolve_and_check(&ctx.home_dir, &reg, id) {
+                    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, id).await;
+                    return refusal.user_text(session_id, language.as_deref(), &turn_id);
+                }
+            }
+            let decision = crate::trigger_route::turn::decision_for_route(
+                &ctx.home_dir, &reg, turn, &access, route,
             );
             match decision {
                 crate::trigger_route::turn::TurnDecision::Default => fallback,
@@ -386,9 +400,7 @@ async fn build_reply_with_session_inner_impl(
                         fallback: fallback_id.as_deref(),
                         access: crate::trigger_route::access::for_channel_sender(&ctx.home_dir, channel, user_id),
                     };
-                    return Box::pin(crate::trigger_route::assign::run_pending(ctx, &id, text, &caller))
-                        .await
-                        .text;
+                    return run_trigger_assignment(ctx, &id, text, &caller).await;
                 }
             }
         }
@@ -536,9 +548,15 @@ async fn build_reply_with_session_inner_impl(
     // ── L0: Safety word check (highest priority, zero latency) ──
     // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
     let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
-    if crate::chat_commands::parse_safety_word_with_config(text, &ctx.killswitch.safety_words)
-        .as_ref().is_some_and(crate::entry_gate::command_is_exempt)
+    if let Some(command) = crate::chat_commands::parse_safety_word_with_config(text, &ctx.killswitch.safety_words)
+        .filter(crate::entry_gate::command_is_exempt)
     {
+        let channel = session_id.split(':').next().unwrap_or("");
+        if command.requires_admin()
+            && (public_visitor || !super::is_channel_admin(ctx, channel, &[user_id, session_id]).await)
+        {
+            return "只有管理員可以使用這個指令。".to_string();
+        }
         // Safety words are handled by chat_commands.rs, but if we reach here
         // (e.g., direct call without command parsing), handle inline
         match &safety_action {
@@ -562,14 +580,13 @@ async fn build_reply_with_session_inner_impl(
                             );
                         }
                         duduclaw_security::safety_word::SafetyWordScope::Global => {
-                            // Global stop requires admin — this inline path has no
-                            // admin context, so only halt the current scope as a
-                            // safeguard. The full !STOP ALL is handled via
-                            // chat_commands::handle_command which enforces admin.
+                            // Channel admin is verified above, but this inline
+                            // path has no global admin context. Keep the halt
+                            // scoped; the command handler owns global stops.
                             warn!(
                                 session_id,
                                 user_id,
-                                "!STOP ALL via inline path — halting scope only (admin check unavailable)"
+                                "!STOP ALL via inline path — halting scope only (no global admin context)"
                             );
                             failsafe
                                 .force_halt(session_id, "safety word: STOP ALL (scope-only)")
@@ -622,24 +639,21 @@ async fn build_reply_with_session_inner_impl(
         }
     }
 
-    // W1: one strict employee snapshot for the entry checks. W2 will carry
-    // it through spawn and remove the legacy downstream re-reads.
-    let resolved_turn = agent.map(|_| crate::entry_gate::resolve_and_check(
-        &ctx.home_dir, &reg, &agent_id,
-    ));
-    if let Some(Err(ref refusal)) = resolved_turn {
-        warn!(agent = %agent_id, code = refusal.code(), ?refusal, "employee entry refused");
-        super::health::receive(ctx, &agent_id, session_id).await;
-        super::health::mark(&agent_id, Some("other"));
-        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
-        let text = refusal.user_text(session_id, language.as_deref(), &turn_id);
-        return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
-    }
-    let model = match resolved_turn.as_ref() {
-        Some(Ok(turn)) => turn.model.clone(),
-        Some(Err(_)) => unreachable!("entry refusal returned above"),
-        None => duduclaw_core::types::DEFAULT_PREFERRED_MODEL.to_string(),
+    // One owned effective configuration for admission, routing and every
+    // runtime leg. The no-responder path already returned above.
+    let resolved_turn = match crate::entry_gate::resolve_and_check(&ctx.home_dir, &reg, &agent_id) {
+        Ok(turn) => std::sync::Arc::new(turn),
+        Err(refusal) => {
+            warn!(agent = %agent_id, code = refusal.code(), ?refusal, "employee entry refused");
+            super::health::receive(ctx, &agent_id, session_id).await;
+            super::health::mark(&agent_id, Some("other"));
+            let text = super::failure_notice::entry_refusal_text(ctx, session_id, &agent_id, &turn_id, &refusal).await;
+            return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
+        }
     };
+    let model = resolved_turn.model.clone();
+    #[cfg(test)]
+    let _ = AFTER_ENTRY_SNAPSHOT.try_with(|hook| hook(&resolved_turn));
 
     let internal_sender = sender_is_internal_for_reply(&ctx.home_dir, session_id, user_id, &agent_id);
     let on_progress = on_progress.map(|callback| -> ProgressCallback {
@@ -1913,28 +1927,10 @@ async fn build_reply_with_session_inner_impl(
     // route the whole reply through the multi-runtime choke-point (Codex /
     // Gemini / OpenAI-compat). Claude keeps its optimized OAuth-rotation + PTY
     // path below (unchanged, zero regression).
-    // Parse agent.toml once (L7 followup): the routing decision and the
-    // choke-point both need it, so load here and thread the settings through
-    // `AgentPrompt.runtime_settings` instead of re-reading inside the choke-point.
-    if let Some(dir) = agent_dir.as_deref() {
-        if let Err(e) = super::active_provider_gate(ctx, session_id, &agent_id, &turn_id, dir, turn_generation.as_deref()).await {
-            super::health::mark(&agent_id, Some("other"));
-            return if public_visitor { crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into() } else { format!("⚠️ {e}") };
-        }
-    }
-    let runtime_settings = agent_dir
-        .as_deref()
-        .map(crate::runtime_config::load_runtime_settings);
-    let non_claude = runtime_settings
-        .as_ref()
-        .and_then(|s| s.non_claude_provider());
-    if let Some(settings)=&runtime_settings {
-        if let Err(error)=super::model_alignment_gate(ctx, session_id, &agent_id, &turn_id, &model, settings.provider, turn_generation.as_deref()).await {
-            super::health::mark(&agent_id, Some("other"));
-            return if public_visitor {crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE.into()} else {format!("⚠️ {error}")};
-        }
-    }
-
+    // Entry already checked active team/runtime selectors, model alignment
+    // and product policy against this artifact. Never reopen it mid-turn.
+    let runtime_settings = &resolved_turn.runtime_settings;
+    let non_claude = runtime_settings.non_claude_provider();
 
     // A channel reply needs the platform tools and the conversation state the
     // task sandbox does not provide, so it runs on the host — reported once
@@ -1949,7 +1945,7 @@ async fn build_reply_with_session_inner_impl(
 
     let _live_turn = crate::dashboard_feedback::LiveTurn::start(
         &ctx.home_dir, &agent_id, None, "channel",
-        runtime_settings.as_ref().map(|s| s.provider.as_str()).unwrap_or("claude"),
+        runtime_settings.provider.as_str(),
     );
 
     let reply_assembly = super::assembly::Assembly::new(
@@ -2009,7 +2005,7 @@ async fn build_reply_with_session_inner_impl(
         let hb_system = full_system_prompt.as_str();
         let hb_model = model.as_str();
         let hb_history = conversation_history.as_slice();
-        let hb_settings = runtime_settings.as_ref();
+        let hb_settings = Some(runtime_settings);
         let hb_layout = prompt_layout.clone();
         // Observability fix (2026-07-23 distributor incident): a silent
         // failover — the configured provider's CLI missing/unavailable so
@@ -2125,7 +2121,7 @@ async fn build_reply_with_session_inner_impl(
                     prompt: &effective_message, system_prompt: &full_system_prompt, model: &model,
                     max_tokens: 8192, provider_override: None, conversation_history: &conversation_history,
                     request_type: crate::cost_telemetry::RequestType::Chat,
-                    runtime_settings: runtime_settings.as_ref(), effort: None,
+                    runtime_settings: Some(runtime_settings), effort: None,
                     allow_cross_family_failover: true, purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
                 }, &error);
             let fallback = Box::pin(crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), fallback)).await;
@@ -2154,7 +2150,11 @@ async fn build_reply_with_session_inner_impl(
         })
     }
     };
-    let cli_future = reply_assembly.run(make_cli_future);
+    // Task-local scope follows in-task retries/rotation and runtime fallback,
+    // but is not inherited by background tokio::spawn calls.
+    let cli_future = crate::runtime_dispatch::with_chat_turn_config(
+        resolved_turn.clone(), reply_assembly.run(make_cli_future),
+    );
     let is_channel_session = duduclaw_core::SUPPORTED_CHANNEL_TYPES
         .iter()
         .any(|t| session_id.starts_with(&format!("{t}:")));
@@ -2167,21 +2167,8 @@ async fn build_reply_with_session_inner_impl(
     // inference FIRST here too, keeping the Claude CLI as the fallback.
     // Absent / "hybrid" / "claude" ⇒ behavior unchanged (config-gated).
     //
-    // The agent's `[model] local.model` (agent.toml) is resolved once here
-    // and shared with the step-2 fallback below.
-    let local_model_id = agent_dir.as_ref().and_then(|d| {
-        let toml_path = d.join("agent.toml");
-        let content = std::fs::read_to_string(&toml_path).ok()?;
-        let table: toml::Table = content.parse().ok()?;
-        table
-            .get("model")?
-            .as_table()?
-            .get("local")?
-            .as_table()?
-            .get("model")?
-            .as_str()
-            .map(|s| s.to_string())
-    });
+    // Local-first and local fallback share the effective artifact's model.
+    let local_model_id = turn_local_model(&resolved_turn);
     let inference_mode = crate::claude_runner::get_inference_mode(&ctx.home_dir).await;
     let mut local_attempted_first = false;
     let mut local_first_reply: Option<String> = None;
@@ -2192,7 +2179,7 @@ async fn build_reply_with_session_inner_impl(
             &ctx.home_dir,
             &sanitized_text,
             &full_system_prompt,
-            local_model_id.as_deref(),
+            local_model_id,
             Some(&agent_id),
             capabilities.as_ref(),
         )
@@ -2335,7 +2322,7 @@ async fn build_reply_with_session_inner_impl(
                 &ctx.home_dir,
                 &sanitized_text,
                 &full_system_prompt,
-                local_model_id.as_deref(),
+                local_model_id,
                 Some(&agent_id),
                 capabilities.as_ref(),
             )
@@ -2374,7 +2361,7 @@ async fn build_reply_with_session_inner_impl(
     // for OAuth-only setups to avoid the misleading "未設定任何 API 帳號" error.
     let allow_direct_api = direct_api_allowed(non_claude,duduclaw_llm::is_moa_model_id(&model),mcp_gate_refused);
     let fallback_api_key = if reply.is_none() && allow_direct_api {
-        #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,true);
+        #[cfg(test)] super::reply_origin::testing::before_direct_api_credentials(&ctx.home_dir);
         get_api_key(&ctx.home_dir).await
     } else { None };
     let reply = match reply {
@@ -2383,6 +2370,7 @@ async fn build_reply_with_session_inner_impl(
         // A `moa:` id is not an Anthropic model — the MoA branch above was
         // this request's API path; don't re-send the ensemble id upstream.
         None if allow_direct_api && fallback_api_key.is_some() => {
+            #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir, true);
             let key = fallback_api_key.as_deref().unwrap_or_default();
             // P34 #4: a `system_operator`-capable agent gets one attempt at
             // the real MCP tool loop before falling through to the plain
@@ -5113,4 +5101,113 @@ mod released_repro_source_tests {
         assert!(source.contains("crate::memory_reference::validate_pinned_task(&extracted).is_none()"));
         assert!(source.contains("sm.set_pinned_if_unchanged(&sid, &extracted, &pin_generation)"));
     }
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    // Runs immediately after admission, before any downstream settings reader.
+    static AFTER_ENTRY_SNAPSHOT: Box<dyn Fn(&crate::entry_gate::ResolvedTurnConfig) + Send + Sync>;
+}
+
+#[cfg(test)]
+mod turn_snapshot_tests {
+    use super::*;
+    use crate::runtime_dispatch::testing::{RecordedFallback, RecordingCodex, RegistryGuard};
+    use duduclaw_core::types::RuntimeType;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mid_turn_rewrites_never_change_the_gated_runtime_or_model() {
+        for replacement in [
+            "[runtime",
+            "[runtime]\nprovider='grok'\n[model]\npreferred='opus'\n",
+            "[runtime]\nprovider='gemini'\n[model]\npreferred='opus'\n",
+            "[model]\npreferred='opus'\n",
+        ] {
+            let (home, ctx, original_runtime, _) = super::super::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+            drop(original_runtime);
+            let calls: RecordedFallback = Default::default();
+            let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
+            runtimes.insert(RuntimeType::Codex, Box::new(RecordingCodex(calls.clone())));
+            let _runtime = RegistryGuard::install(home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
+            let spy = super::super::reply_origin::testing::NoImplicitCloud::at(home.path());
+            let mutated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = mutated.clone();
+            let hook = Box::new(move |snapshot: &crate::entry_gate::ResolvedTurnConfig| {
+                assert_eq!(snapshot.runtime_settings.provider, RuntimeType::Codex);
+                assert_eq!(snapshot.model, "gpt-5.4");
+                std::fs::write(&snapshot.config_path, replacement).unwrap();
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            let reply = AFTER_ENTRY_SNAPSHOT.scope(hook,
+                build_reply_for_agent("hello", &ctx, "worker", "discord:snapshot", "owned-user", None),
+            ).await;
+            assert!(mutated.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(spy.counts(), [0, 0]);
+            let calls = calls.lock().unwrap();
+            if replacement == "[runtime" {
+                // The independent live budget gate still refuses malformed
+                // configuration; it must never reroute to a default provider.
+                assert!(calls.is_empty(), "{reply}");
+                assert!(reply.contains("目前無法確認預算"), "{reply}");
+            } else {
+                assert_eq!(calls.len(), 1, "{reply}");
+                assert_eq!(calls[0].model, "gpt-5.4");
+                assert!(reply.contains("CODEX_FALLBACK_OK"), "{reply}");
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn preset_snapshot_supplies_local_model_context_and_effort_without_disk_fallback() {
+        let (home, ctx, _runtime, _) = super::super::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let dir = home.path().join("agents/worker");
+        let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+        let effective = raw.replace("preferred='gpt-5.4'", "preferred='gpt-5.4'\neffort=' X-HIGH '")
+            .replace("provider='codex'", "provider='codex'\nminimal_context=false");
+        let path = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{effective}\n[model.local]\nmodel='effective-local'\n")).unwrap();
+        std::fs::write(dir.join("agent.toml"), format!("{raw}\n[model.local]\nmodel='raw-local'\n")).unwrap();
+        let snapshot = {
+            let registry = ctx.registry.read().await;
+            crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").unwrap()
+        };
+        assert!(snapshot.preset_resolved);
+        assert_eq!(turn_local_model(&snapshot), Some("effective-local"));
+        std::fs::write(&path, "[runtime").unwrap();
+        std::fs::write(dir.join("agent.toml"), "[model]\neffort='low'\n[runtime]\nminimal_context=true\n").unwrap();
+        crate::runtime_dispatch::with_chat_turn_config(std::sync::Arc::new(snapshot), async {
+            assert_eq!(crate::runtime_dispatch::chat_effort(Some(&dir)), Some(duduclaw_core::effort::Effort::XHigh));
+            // Exercise the pure env precedence helper without process-global mutation.
+            assert!(!super::super::cli_env::minimal_context_with_override(Some(&dir), None));
+            assert!(super::super::cli_env::minimal_context_with_override(Some(&dir), Some(" YES ")));
+            assert!(!super::super::cli_env::minimal_context_with_override(Some(&dir), Some("unknown")));
+        }).await;
+        // An absent/invalid effort in a snapshot never falls through to disk.
+        for value in [None, Some(toml::Value::Integer(3)), Some(toml::Value::String("turbo".into()))] {
+            std::fs::write(&path, &effective).unwrap();
+            let mut snapshot = {
+                let registry = ctx.registry.read().await;
+                crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").unwrap()
+            };
+            snapshot.document["model"].as_table_mut().unwrap().remove("effort");
+            if let Some(value) = value { snapshot.document["model"]["effort"] = value; }
+            crate::runtime_dispatch::with_chat_turn_config(std::sync::Arc::new(snapshot), async {
+                assert_eq!(crate::runtime_dispatch::chat_effort(Some(&dir)), None);
+            }).await;
+        }
+    }
+}
+
+/// The assignee gate in run_pending formats refusals with caller.conversation.
+/// Keep that source session (including public visitors), not a called bucket.
+pub(super) async fn run_trigger_assignment(
+    ctx: &ReplyContext, id: &str, text: &str,
+    caller: &crate::trigger_route::assign::AssignCaller<'_>,
+) -> String {
+    Box::pin(crate::trigger_route::assign::run_pending(ctx, id, text, caller)).await.text
+}
+
+fn turn_local_model(turn: &crate::entry_gate::ResolvedTurnConfig) -> Option<&str> {
+    turn.local_model_id.as_deref()
 }

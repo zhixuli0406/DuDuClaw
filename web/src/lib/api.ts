@@ -957,7 +957,12 @@ export interface CredentialInventoryReport {
  *  unrecognised value or an unreadable config is enforced as `none` too. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 
+export type DelegationRole = 'admin' | 'manager';
+export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
+
 export interface DelegationSettings {
+  unrestricted_roles?: DelegationRole[];
+  allow_one_way?: Array<[string, string]>;
   /** The policy the gateway enforces (an unrecognised value reads `none`). */
   policy: DelegationPolicy;
   /** The value as written in config.toml, when present (v1.82+). */
@@ -973,6 +978,12 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 
 /** `delegation.effective` (v1.82, RM-137) — what applies to one employee. */
 export interface DelegationEffective {
+  unrestricted?: boolean;
+  owner_role?: DelegationRole | 'employee' | null;
+  /** Owner role lookup failed; role exceptions cannot be confirmed. */
+  unrestricted_error?: 'users_unreadable' | null;
+  allow_one_way?: DelegationOneWayPair[];
+  inactive_allow_one_way?: DelegationOneWayPair[];
   agent_id: string;
   /** Effective for this employee: `none` when the global policy or its own switch stops it. */
   policy: DelegationPolicy;
@@ -2957,6 +2968,8 @@ export interface OdooPermissionOptions {
 }
 
 export interface OdooConfig {
+  /** Admin opt-in, default false; changed via odoo.member_credentials.set_enabled. */
+  member_credentials?: boolean;
   blocked_models?: string[];
   read_only_models?: string[];
   url: string;
@@ -8268,12 +8281,14 @@ export const api = {
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]> }) =>
+    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;
         allow: Array<[string, string]>;
         applied: boolean;
+        unrestricted_roles: DelegationRole[];
+        allow_one_way: Array<[string, string]>;
       }>,
     /** Read-only effective delegation for one employee (Manager+ with view access). */
     effective: (agentId: string) =>
