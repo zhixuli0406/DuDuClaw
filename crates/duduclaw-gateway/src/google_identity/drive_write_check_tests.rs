@@ -38,7 +38,7 @@ async fn private_delegate_write_mint_requests_exact_scopes_and_checks_response()
         let refusal = resolve::mint_delegate_for_drive_write(home.p(), email, CacheMode::Bypass).await.unwrap_err();
         assert_eq!(refusal.code, "drive_write_admin_scope_missing");
         assert!(!refusal.fallback_eligible);
-        assert_eq!(refusal.message_zh, "公司管理員還沒在 Google 管理控制台開放雲端硬碟寫入範圍。");
+        assert_eq!(refusal.message_zh, "公司管理員尚未允許雲端硬碟寫入，這次沒有執行，請公司管理員在 Google 管理控制台開放寫入權限。");
     }
     assert_eq!(resolve::mint_delegate(home.p(), "p8-mint@c.test",
         delegated_scopes::for_drive_write(), CacheMode::Bypass).await.unwrap_err().code, "write_scope_isolated");
@@ -110,7 +110,7 @@ async fn drive_write_check_delegate_probe_and_admin_scope_missing() {
             assert_eq!(reads[0].1, "/drive/v3/files?pageSize=1&fields=files(id)&supportsAllDrives=true&includeItemsFromAllDrives=true");
         } else {
             assert_eq!(data_endpoint_reads_for(email), 0);
-            assert_eq!(step.detail, "公司管理員還沒在 Google 管理控制台開放雲端硬碟寫入範圍。");
+            assert_eq!(step.detail, "公司管理員尚未允許雲端硬碟寫入，這次沒有執行，請公司管理員在 Google 管理控制台開放寫入權限。");
         }
     }
 }

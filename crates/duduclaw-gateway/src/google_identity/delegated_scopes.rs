@@ -34,7 +34,7 @@ pub(crate) fn for_service(home: &Path, service: &str) -> Result<&'static [&'stat
 
 pub(crate) fn for_tool(home: &Path, tool: &str) -> Result<&'static [&'static str], super::Refusal> {
     if duduclaw_core::google_identity::is_drive_write_tool(tool) {
-        return Err(super::Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
+        return Err(super::Refusal::hard("scope_missing", "此連線不支援雲端硬碟寫入，請管理員檢查 Google 連線設定。"));
     }
     if tool == "google_chat_send" {
         return if crate::google_workspace::chat_send_enabled(home) { Ok(crate::google_workspace::CHAT_SEND_SCOPES) }

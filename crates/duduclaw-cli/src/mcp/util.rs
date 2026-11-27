@@ -626,7 +626,7 @@ pub(crate) fn drive_write_refusal(
         let current = policy::load(home);
         if (tool == "drive_move_file" && current.move_
             || tool == "drive_trash_file" && current.trash) && current.folders.is_empty() {
-            return Some("需要先限定資料夾。".into());
+            return Some("這項操作需要先限定可使用的資料夾，請管理員設定。".into());
         }
         let verb = match action {
             policy::DriveWriteAction::Create => "建立檔案",
@@ -644,17 +644,17 @@ pub(crate) fn drive_write_refusal(
     let caps = std::fs::read_to_string(dir.join("agent.toml")).ok()
         .and_then(|raw| toml::from_str::<crate::mcp_dispatch::PolicyOnlyConfig>(&raw).ok());
     let Some(config) = caps else {
-        return Some("無法確認這位 AI 員工的工具權限。".into());
+        return Some("無法確認這位 AI 員工的工具權限，這次沒有執行，請管理員檢查 AI 員工設定。".into());
     };
     if duduclaw_core::tool_catalog::tool_list_verdict(
         tool, &config.capabilities.denied_tools, &config.capabilities.allowed_tools,
     ) != duduclaw_core::tool_catalog::ToolListVerdict::Allowed {
-        return Some("這位 AI 員工的 denied_tools／allowed_tools 不允許此工具。".into());
+        return Some("這位 AI 員工沒有使用這項工具的權限，可請管理員在 AI 員工設定中調整。".into());
     }
     if crate::mcp_dispatch::action_rule_verdict(
         &duduclaw_core::agent_toml::load_action_rules(&dir), tool,
     ) == Some(duduclaw_core::ActionVerdict::Block) {
-        return Some("這位 AI 員工的 action_rules 不允許此動作。".into());
+        return Some("這位 AI 員工的動作規則不允許這項操作，可請管理員調整。".into());
     }
     None
 }

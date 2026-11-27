@@ -284,7 +284,7 @@ fn requester_matrix_rejects_visitors_nonholders_and_unattended_approval() {
             for public in ["widget", "odoolivechat"] {
                 for user in [None, Some("holder")] {
                     let result = requester_check(route, &channel(public, user), approval);
-                    assert_eq!(result.as_ref().unwrap_err().message_zh, "這個對話無法執行這項操作。");
+                    assert_eq!(result.as_ref().unwrap_err().message_zh, "這個對話無法執行雲端硬碟寫入，請帳號本人登入後提出操作。");
                     refusal(result, "public_visitor");
                 }
             }

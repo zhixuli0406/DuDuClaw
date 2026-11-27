@@ -372,7 +372,7 @@ base_url = "${base}/model/v1"
     // #7: empty allowlist does not permit moves.
     await setPolicy({ folders: [] }); from = requests.length;
     observation = await turn('drive_move_file', { file_id: 'fixture-file-inside', destination_folder_id: folder });
-    checkReply(observation, false, /folder_required|需要先限定資料夾|限定資料夾/); assert(!observation.listed.includes('drive_move_file')); assert.equal(writes(from).length, 0);
+    checkReply(observation, false, /folder_required|這項操作需要先限定可使用的資料夾，請管理員設定。|限定資料夾/); assert(!observation.listed.includes('drive_move_file')); assert.equal(writes(from).length, 0);
     passed(7, 'empty folder list hides and refuses move');
 
     // #8: decide the real member card through the dashboard, without a bot.
