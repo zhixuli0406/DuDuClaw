@@ -278,7 +278,7 @@ id = "parity-group"
 "#)
 }
 
-fn fixture(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
+pub(super) fn fixture(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
     fixture_with_principal(home, false)
 }
 

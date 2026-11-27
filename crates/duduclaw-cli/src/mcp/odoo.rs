@@ -47,7 +47,7 @@ pub(crate) async fn handle_odoo_tool(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None, None)).await)
+    super::odoo_access::sanitize_result(identity_client::with_call(Box::pin(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None, None))).await)
 }
 
 /// Isolation supplies the already selected connector; no account resolution or
@@ -57,7 +57,7 @@ pub(crate) async fn handle_bound_odoo_tool(
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
     attachment: Option<super::ValidatedAttachment>,
 ) -> Value {
-    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector), attachment).await)
+    super::odoo_access::sanitize_result(Box::pin(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector), attachment)).await)
 }
 
 /// Person tools enter here before employee dispatch, isolation or approvals.
@@ -68,7 +68,7 @@ pub(super) async fn handle_odoo_actor(
         .is_some_and(|t| t.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::McpWithPersonalOdoo) {
         return mcp_error("本人金鑰不提供這項 Odoo 工具。");
     }
-    handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None, None).await
+    Box::pin(handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None, None)).await
 }
 
 async fn handle_odoo_tool_with_connector(
@@ -100,7 +100,7 @@ async fn handle_odoo_tool_with_connector(
 
     // odoo_connect doesn't require an existing connection
     if tool == "odoo_connect" {
-        return handle_odoo_connect(home_dir, odoo, caller_agent).await;
+        return Box::pin(handle_odoo_connect(home_dir, odoo, caller_agent)).await;
     }
 
     if tool == "odoo_status" && actor.employee().is_none() {
@@ -134,11 +134,11 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if tool == "odoo_attachment_add" {
-        return super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound, attachment).await;
+        return Box::pin(super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound, attachment)).await;
     }
 
     if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
-        return super::odoo_writeback::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
+        return Box::pin(super::odoo_writeback::handle_actor(tool, params, home_dir, odoo, actor, bound)).await;
     }
 
     // RM-120: generic create / write carry their own explicit-grant gate
@@ -146,7 +146,7 @@ async fn handle_odoo_tool_with_connector(
     // never authorizes them. Protected mode (owner decision C) runs the same
     // chain on the employee's own isolation connector: no pool lookup.
     if matches!(tool, "odoo_create" | "odoo_write") {
-        return super::odoo_generic_write::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
+        return Box::pin(super::odoo_generic_write::handle_actor(tool, params, home_dir, odoo, actor, bound)).await;
     }
 
     if !matches!(tool,

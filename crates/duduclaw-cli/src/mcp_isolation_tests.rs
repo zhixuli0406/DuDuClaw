@@ -363,13 +363,33 @@ async fn isolated_round4_intentional_refusals_stay_hidden_with_grants() {
 
 #[test]
 fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
+    use duduclaw_core::mcp_person_tools::PersonToolHost;
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
+    // Reuse production resource-service wiring with discovery-only providers.
+    let connected_home = tempfile::tempdir().unwrap();
+    let (connected, _) = parity_tests::fixture(connected_home.path());
+    let connected_manifest = connected.service_manifest();
     assert_eq!(manifest.len(), 288);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+        let (without_provider, with_provider) = match tool.executes_in {
+            PersonToolHost::Gateway => {
+                let refused = ServiceState::IntentionalRefusal(
+                    crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired);
+                (refused, refused)
+            }
+            PersonToolHost::McpWithPersonalOdoo => {
+                assert_eq!(boundary_route(tool.name), Some(BoundaryRoute::Resource), "{}", tool.name);
+                assert_eq!(duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name),
+                    Some("odoo"), "{}", tool.name);
+                (ServiceState::MissingFactory, ServiceState::Ready)
+            }
+        };
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
-            ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));
+            without_provider, "{} without provider", tool.name);
+        assert_eq!(connected_manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
+            with_provider, "{} with provider", tool.name);
     }
     assert_eq!(manifest.iter().find(|(name, _)| *name == "file_read").unwrap().1, ServiceState::Ready);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "execute_program").unwrap().1, ServiceState::MissingFactory);
