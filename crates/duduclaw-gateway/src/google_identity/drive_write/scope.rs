@@ -222,6 +222,13 @@ impl Budget {
     pub(crate) fn new() -> Self { Self::default() }
     pub(crate) fn requests(&self) -> usize { self.requests }
 
+    /// Discard metadata from the previous phase without resetting the request cap.
+    /// The executor must call this before the post-approval `check`, reusing the
+    /// same Budget from the initial check so all phases share the 16 requests.
+    pub(crate) fn begin_fresh_phase(&mut self) {
+        self.memo.clear();
+    }
+
     pub(crate) async fn get<S: MetadataSource + ?Sized>(
         &mut self, src: &mut S, id: &GoogleId,
     ) -> Result<FileMeta, ScopeVerdict> {
@@ -459,7 +466,7 @@ pub(crate) fn post_check_parents(
 pub(crate) async fn recheck<S: MetadataSource + ?Sized>(
     src: &mut S, budget: &mut Budget, policy: &DriveWritePolicy, target_id: &GoogleId,
 ) -> PostCheck {
-    budget.memo.clear();
+    budget.begin_fresh_phase();
     let mut target = match budget.get(src, target_id).await {
         Ok(meta) => meta,
         Err(_) => return PostCheck::Incomplete,

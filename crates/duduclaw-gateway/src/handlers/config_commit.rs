@@ -348,8 +348,8 @@ pub(crate) fn commit_rendered_locked(
 ) -> Result<(), String> {
     commit_rendered_policy(path,expected_hash,render,true,None)
 }
-/// Used by backup restore too, including its final swap validation.
-pub(crate) fn refuse_drive_write_text_edit(before: &str, after: &str) -> Result<(), String> {
+/// Used by backup restore and CLI import, including final publication validation.
+pub fn refuse_drive_write_text_edit(before: &str, after: &str) -> Result<(), String> {
     let parse = |text: &str| text.parse::<toml::Table>()
         .map_err(|_| "無法讀取設定，這次沒有變更寫入權限。".to_string());
     super::config_raw_rpc::refuse_drive_write_edit(&parse(before)?, &parse(after)?)
@@ -664,7 +664,7 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 /// `toml::to_string_pretty`, as before. If the edited document would not
 /// read back as exactly `new_table` (a bug here), the full re-serialisation
 /// is used instead, which is always correct, only not format-preserving.
-pub(crate) fn render_preserving(original_text: &str, new_table: &toml::Table) -> Result<String, String> {
+pub fn render_preserving(original_text: &str, new_table: &toml::Table) -> Result<String, String> {
     let pretty = || toml::to_string_pretty(new_table).map_err(|e| format!("failed to serialize config: {e}"));
     if original_text.trim().is_empty() {
         return pretty();

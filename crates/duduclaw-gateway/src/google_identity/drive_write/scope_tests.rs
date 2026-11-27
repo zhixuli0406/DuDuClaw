@@ -430,6 +430,52 @@ fn post_check_parents_compares_sets_and_reports_missing_or_wrong_parents() {
 }
 
 #[tokio::test]
+async fn fresh_phase_rechecks_moved_target_destination_and_ancestor() {
+    for moved in [TARGET, DEST, PARENT] {
+        let mut src = FakeSource::new(vec![meta(TARGET, Some(&[PARENT])),
+            meta(PARENT, Some(&[LISTED])), meta(DEST, Some(&[LISTED])),
+            meta(LISTED, None), meta(OUTSIDE, Some(&[]))]);
+        let mut budget = Budget::new();
+        let plan = Plan::Move { target: id(TARGET), destination: id(DEST) };
+        assert_allowed(&check(&mut src, &mut budget, &scoped_policy(), plan.clone()).await);
+        let initial_requests = budget.requests();
+        assert_eq!(initial_requests, 4);
+        // A move while the approval dialog is open invalidates the old memo.
+        src.put(meta(moved, Some(&[OUTSIDE])));
+        budget.begin_fresh_phase();
+        assert_eq!(budget.requests(), initial_requests);
+        assert_eq!(check(&mut src, &mut budget, &scoped_policy(), plan).await,
+            denied(ScopeReason::FolderOutOfScope), "moved {moved}");
+        assert!(budget.requests() > initial_requests);
+        assert_eq!(budget.requests(), src.requests);
+    }
+}
+
+#[tokio::test]
+async fn fresh_phases_share_sixteen_request_folder_check_limit() {
+    let chain: Vec<String> = (0..7).map(|n| format!("ancestor_{n:03}")).collect();
+    let mut src = FakeSource::new(vec![meta(TARGET, Some(&[chain[0].as_str()])), meta(LISTED, None)]);
+    for (index, node) in chain.iter().enumerate() {
+        let parent = chain.get(index + 1).map(String::as_str).unwrap_or(LISTED);
+        src.put(meta(node, Some(&[parent])));
+    }
+    let plan = Plan::Modify { target: id(TARGET), rename: false };
+    let mut budget = Budget::new();
+    assert_allowed(&check(&mut src, &mut budget, &scoped_policy(), plan.clone()).await);
+    assert_eq!(budget.requests(), 9);
+    budget.begin_fresh_phase();
+    assert_eq!(budget.requests(), 9);
+    let verdict = check(&mut src, &mut budget, &scoped_policy(), plan.clone()).await;
+    assert_eq!(verdict, ScopeVerdict::LimitExceeded);
+    assert_eq!(verdict.reason_code(), Some("folder_check_limit"));
+    assert_eq!(budget.requests(), 16);
+    assert_eq!(src.requests, 16);
+    budget.begin_fresh_phase();
+    assert_eq!(check(&mut src, &mut budget, &scoped_policy(), plan).await, ScopeVerdict::LimitExceeded);
+    assert_eq!(src.requests, 16);
+}
+
+#[tokio::test]
 async fn recheck_refreshes_target_and_ancestor_cache_and_detects_violation() {
     for change_target in [true, false] {
         let mut src = FakeSource::new(vec![meta(TARGET, Some(&[PARENT])),

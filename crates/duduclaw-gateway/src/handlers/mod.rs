@@ -244,7 +244,7 @@ mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
 mod dispatch_ops;
-pub(crate) mod config_commit;
+pub mod config_commit;
 mod config_schema;
 mod system_update_config_v168;
 mod tick_sources_rpc;
