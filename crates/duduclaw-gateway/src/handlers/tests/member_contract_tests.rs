@@ -118,9 +118,10 @@ impl Fixture {
             "me.status_tokens.create" => json!({"name": "Contract fixture"}),
             "me.status_tokens.revoke" => json!({"id": uuid::Uuid::new_v4().to_string()}),
             "me.google.connect_start" => json!({"redirect_origin": "http://localhost:18889", "acknowledge_google_data": false}),
+            "me.google.write_connect_start" => json!({"redirect_origin": "http://localhost:18889", "acknowledge_google_data": false, "acknowledge_write": false}),
             "me.google.connect_finish" => json!({"state": "missing-fixture-state"}),
             "me.google.connect_paste" => json!({"url": "invalid-fixture-callback"}),
-            "me.google.disconnect" => json!({"confirm": false}),
+            "me.google.disconnect" | "me.google.write_disconnect" => json!({"confirm": false}),
             "me.google.chat_confirm" => json!({"id":"missing", "approve":false}),
             "me.google.consents.set" => json!({"agent_id": "sales", "allowed": false}),
             "agents.list" | "chat.sessions.list" | "tasks.list" | "activity.list"
@@ -203,5 +204,5 @@ fn member_contract_markdown_lists_exactly_the_contract_methods() {
     assert_eq!(names.len(), actual.len(), "duplicate method in Markdown");
     assert_eq!(MEMBER_CONTRACT_METHODS.len(), expected.len(), "duplicate contract method");
     assert_eq!(actual, expected);
-    assert!(MEMBER_CONTRACT_METHODS.iter().all(|m| m.since == "1.85.0" && !m.summary_en.is_empty()));
+    assert!(MEMBER_CONTRACT_METHODS.iter().all(|m| matches!(m.since, "1.85.0" | "1.86.0") && !m.summary_en.is_empty()));
 }

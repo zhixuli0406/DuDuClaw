@@ -201,8 +201,10 @@ async fn resolve_for(home: &Path, db: &UserDb, user: &str, drive_read: bool) -> 
         if tokens.secret.refresh_token.is_none() {
             tokens.secret.refresh_token = secret.refresh_token.take();
         }
-        crate::google_identity::write_scope_guard::check_personal_refresh(home, &record.metadata, tokens.granted_scopes.as_deref())
-            .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
+        tokens.granted_scopes = Some(crate::google_identity::write_scope_guard::check_personal_refresh(
+            home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+        ).await.map_err(|r| format!("{}: {}", r.code, r.message_zh))?);
+        material.validate(home, db)?;
         if !vault::finish_refresh_with_scopes(home, &key, &record.metadata, &tokens.secret, tokens.granted_scopes.as_deref())? {
             return Err(CHANGED.into());
         }

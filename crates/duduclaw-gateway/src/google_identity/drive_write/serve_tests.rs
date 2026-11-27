@@ -148,7 +148,11 @@ fn policy(f: &Fixture, mode: ApprovalMode) {
     p.create = true; p.modify = true; p.move_ = true; p.trash = true;
     p.approval.create = mode; p.approval.modify = mode;
     let section = policy::render_section(&p, &policy::sign(&p, "admin", "admin@c.test", chrono::Utc::now()));
-    std::fs::write(f.home.path().join("config.toml"), format!("[integrations]\ngoogle_workspace=true\n[google.drive_write]\n{}", toml::to_string(&section).unwrap())).unwrap();
+    let config = toml::to_string(&json!({
+        "integrations": {"google_workspace": true},
+        "google": {"drive_write": section},
+    })).unwrap();
+    std::fs::write(f.home.path().join("config.toml"), config).unwrap();
 }
 fn state(f: &Fixture) -> ExecuteState {
     f.connect(f.metadata("user"), false);
@@ -406,7 +410,11 @@ async fn all_nine_programs_and_header_phase_two_use_the_same_executor() {
             id:id.into(), name:"Folder".into(), kind:policy::FolderKind::Folder,
         }).collect();
         let section = policy::render_section(&p, &policy::sign(&p, "admin", "admin@c.test", chrono::Utc::now()));
-        std::fs::write(f.home.path().join("config.toml"), format!("[integrations]\ngoogle_workspace=true\n[google.drive_write]\n{}", toml::to_string(&section).unwrap())).unwrap();
+        let config = toml::to_string(&json!({
+            "integrations": {"google_workspace": true},
+            "google": {"drive_write": section},
+        })).unwrap();
+        std::fs::write(f.home.path().join("config.toml"), config).unwrap();
         let http = Arc::new(Http::default());
         let result = invoke(&f, &state, http.clone(), tool, args, RequesterIdentity::DashboardUser { user_id:f.user.clone() }).await;
         assert!(result.is_ok(), "{tool}: {result:?}"); assert_eq!(http.writes(), writes);

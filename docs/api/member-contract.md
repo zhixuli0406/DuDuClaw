@@ -198,6 +198,8 @@ cannot use `users.set_primary_agent` to replace it.
 | `me.google.chat_confirm` | Write | Confirm or cancel your single Google Chat send | `decided` | 1.85.0 |
 | `me.google.status` | Read | Read personal Google connection and consent status (Enterprise) | `connection`, `login_email`, `client_configured`, `chat_read`, `chat_send`, `integration_enabled`, `requests`, `delegated`, `requires_login`, `recent_usage` | 1.85.0 |
 | `me.google.connect_start` | Write | Start personal Google authorization (Enterprise) | — | 1.85.0 |
+| `me.google.write_connect_start` | Write | Start separate personal Google Drive write authorization (browser session only) | — | 1.86.0 |
+| `me.google.write_disconnect` | Write | Remove the local Google Drive write connection (browser session only) | — | 1.86.0 |
 | `me.google.connect_finish` | Write | Finish personal Google authorization (Enterprise) | — | 1.85.0 |
 | `me.google.connect_paste` | Write | Finish Google authorization using a pasted callback (Enterprise) | — | 1.85.0 |
 | `me.google.disconnect` | Write | Disconnect the personal Google account (Enterprise) | — | 1.85.0 |
@@ -334,7 +336,8 @@ Dashboard-token authentication and JWT-only account/security endpoints.
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 **current** role/bindings, and all existing handler gates. Credential management,
 `users.change_password`, `users.change_email`, `mfa.*`, `sessions.*`, `config.*`,
-`me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set`, `me.google.chat_confirm` and
+`me.google.connect_*`, `me.google.disconnect`, `me.google.write_connect_start`,
+`me.google.write_disconnect`, `me.google.consents.set`, `me.google.chat_confirm` and
 step-up operations are excluded. Unknown methods are denied. The compatibility
 table includes browser-only methods; its presence alone is not a key grant.
 
