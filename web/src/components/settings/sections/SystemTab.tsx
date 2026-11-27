@@ -155,7 +155,7 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
   const [cooldown, setCooldown] = useState('');
   // [general]
   const [defaultAgent, setDefaultAgent] = useState('');
-  const [inferenceMode, setInferenceMode] = useState('claude');
+  const [inferenceMode, setInferenceMode] = useState('hybrid');
   // [logging]
   const [logFormat, setLogFormat] = useState('pretty');
   // [secret_manager]
@@ -234,7 +234,7 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
       setHealthInterval(m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '');
       setCooldown(m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '');
       setDefaultAgent(m(/default_agent\s*=\s*"([^"]*)"/) ?? '');
-      setInferenceMode(m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude');
+      setInferenceMode(tomlStr(parseTomlSubset(raw), 'general', 'inference_mode', 'hybrid'));
       // `plain` is the contract spelling of the same output as `pretty`.
       setLogFormat(tomlStr(parseTomlSubset(raw), 'logging', 'format', 'pretty') === 'json' ? 'json' : 'pretty');
       // Gateway accepts local/vault/env/onepassword/infisical (serde default:
@@ -285,7 +285,7 @@ export function SystemTab({ section = 'all' }: { section?: 'all' | 'system' | 's
         healthInterval: m(/health_check_interval_seconds\s*=\s*(\d+)/) ?? '',
         cooldown: m(/cooldown_after_rate_limit_seconds\s*=\s*(\d+)/) ?? '',
         defaultAgent: m(/default_agent\s*=\s*"([^"]*)"/) ?? '',
-        inferenceMode: m(/inference_mode\s*=\s*"(\w+)"/) ?? 'claude',
+        inferenceMode: tomlStr(tables, 'general', 'inference_mode', 'hybrid'),
         logFormat: tomlStr(tables, 'logging', 'format', 'pretty') === 'json' ? 'json' : 'pretty',
         smBackend: SM_BACKENDS.includes(smRaw) ? smRaw : 'local',
         vaultAddr: m(/vault_addr\s*=\s*"([^"]*)"/) ?? '',

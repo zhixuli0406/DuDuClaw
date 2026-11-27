@@ -264,3 +264,21 @@ describe('<SystemTab> Telegram mini app ([miniapp] enabled)', () => {
     expect(lastCall[0].miniapp_enabled).toBe(true);
   });
 });
+
+describe('<SystemTab> RM-227 inference mode', () => {
+  it.each([
+    ['', 'Hybrid'],
+    ["[general]\ninference_mode = 'local'\n", 'Local model'],
+  ])('reads the effective mode from %s', async (config, label) => {
+    configMock.mockResolvedValue({ config, allowed_origins: ['dash.example.com'] });
+    renderWithProviders(<SystemTab />);
+    await screen.findByText('dash.example.com');
+    expect(screen.getByRole('combobox', { name: 'Inference Mode' })).toHaveTextContent(label);
+
+    // Saving an unrelated edit must not write a mode that the user never changed.
+    fireEvent.click(screen.getByLabelText('Remove dash.example.com'));
+    fireEvent.click(screen.getByRole('button', { name: /^Save$/i }));
+    await waitFor(() => expect(updateConfigMock).toHaveBeenCalled());
+    expect(updateConfigMock.mock.calls[0][0]).not.toHaveProperty('inference_mode');
+  });
+});
