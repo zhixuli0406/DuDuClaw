@@ -258,6 +258,11 @@ impl WriteCall {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(super) fn test_body(&self) -> Result<Option<(String, Vec<u8>)>, NotSentReason> {
+        self.body()
+    }
+
     fn body(&self) -> Result<Option<(String, Vec<u8>)>, NotSentReason> {
         match self {
             Self::DriveProbe | Self::DriveGetMetadata { .. } | Self::DocsGet { .. } | Self::SheetsGetProperties { .. } => Ok(None),
