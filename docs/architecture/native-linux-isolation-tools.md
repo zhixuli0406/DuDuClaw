@@ -270,6 +270,15 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `docs_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_replace_text` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `docs_format` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `docs_insert_text` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `drive_copy_file` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `drive_create_file` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `drive_move_file` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `drive_trash_file` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `drive_update_file` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `sheets_add_note` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
+| `sheets_add_sheet` | Connector route; Google; refused in protected mode (intentional refusal `DriveWriteUnavailable`); never listed or executed. |
 | `slides_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `os_notify` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_watch_status` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |

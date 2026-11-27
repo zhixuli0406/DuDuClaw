@@ -725,9 +725,9 @@ fn isolated_drive_writes_refused_before_product_selection() {
         record.resources = List::new(resources).unwrap();
         let context = RequestContext::with_live_verifier(record, Arc::new(FixtureAuthority));
         assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, name), "{name}");
-        assert_eq!(provider_for_tool(name), None, "{name}");
+        assert_eq!(provider_for_tool(name), Some("google"), "{name}");
         assert!(matches!(SelectedConnector::select_with_policy(&context, name, &json!({}),
             bindings.clone(), catalog.clone(), Some(Arc::new(UnexpectedSelection))),
-            Err(VerificationError::Invalid)), "{name}");
+            Err(VerificationError::Unavailable)), "{name}");
     }
 }

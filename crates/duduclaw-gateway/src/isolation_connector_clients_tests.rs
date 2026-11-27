@@ -291,6 +291,7 @@ async fn isolated_native_drive_writes_refused_before_credentials() {
         record.tools = List::new(vec![text(name)]).unwrap();
         let context = RequestContext::with_live_verifier(record, Arc::new(FixtureAuthority));
         let call = authorize(&context, name, &json!({}), &Fixed).unwrap();
+        assert_eq!(provider_for_tool(name), Some("google"), "{name}");
         assert!(!client.supports(name), "{name}");
         // Even a direct executor call carrying valid boundary grants is refused
         // before inspecting a selected account or acquiring credentials.

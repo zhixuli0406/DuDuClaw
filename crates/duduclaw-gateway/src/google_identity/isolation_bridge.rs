@@ -365,7 +365,9 @@ impl GoogleIsolationBridge {
     }
 }
 impl LiveConnectorSelectionPolicy for GoogleIsolationBridge {
-    fn supports(&self, tool: &str) -> bool { provider_for_tool(tool) == Some("google") }
+    fn supports(&self, tool: &str) -> bool {
+        !duduclaw_core::google_identity::is_drive_write_tool(tool) && provider_for_tool(tool) == Some("google")
+    }
     fn candidates(&self, context: &RequestContext, tool: &str, provider: &str)
         -> Result<Vec<ProductConnectorAccount>, VerificationError> {
         context.verify_live(duduclaw_mcp_boundary::authority::now_seconds()?)?;
@@ -396,6 +398,7 @@ impl BoundConnectorExecutor for GoogleIsolationBridge {
     fn execute<'a>(&'a self, selected: SelectedConnector, call: AuthorizedToolCall)
         -> Pin<Box<dyn Future<Output = Result<Value, VerificationError>> + Send + 'a>> {
         Box::pin(async move {
+            if duduclaw_core::google_identity::is_drive_write_tool(call.name()) { return Err(VerificationError::Unavailable); }
             selected.verify_call(&call)?;
             let selected = Arc::new(selected);
             let context = selected.binding_io_context();
