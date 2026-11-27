@@ -165,3 +165,7 @@ pub(in crate::approval) fn insert_and_consume(
 #[cfg(test)]
 #[path = "ledger_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "consumer_test_support.rs"]
+pub(crate) mod consumer_test_support;

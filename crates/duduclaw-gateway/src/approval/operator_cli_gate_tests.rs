@@ -2,6 +2,27 @@
 
 use super::*;
 
+#[tokio::test]
+async fn t3_consumers_refuse_chat_admin() {
+    use crate::approval::chat_admin::ledger::consumer_test_support::{self, Evidence};
+    for spec in OPERATOR_CLI_KINDS {
+        for evidence in [Evidence::Missing, Evidence::Matching] {
+            let (_home, broker) = broker();
+            let binding = bind("target", "digest", "state");
+            let id = requested(run(&broker, spec, &binding).await);
+            {
+                let conn = broker.store.conn.lock().await;
+                consumer_test_support::install(&conn, id.as_str(), evidence);
+            }
+            assert!(matches!(verdict(&broker, spec, "act", "target", "digest", None, Utc::now()).await.unwrap(),
+                Verdict::Refused { status, .. } if status == "not_dashboard_decision"), "{}: {evidence:?}", spec.kind);
+            let (result, voided) = gate(&broker, spec, &binding, filing(), None, Utc::now()).await.unwrap();
+            assert!(!matches!(result, Gate::Proceed(_)), "{}: {evidence:?}", spec.kind);
+            assert!(voided.iter().any(|(old, reason)| old == &id && *reason == VoidReason::NotDashboardDecision));
+        }
+    }
+}
+
 fn no_notice(_: &ApprovalRecord, _: bool, _: &str) -> String {
     String::new()
 }
