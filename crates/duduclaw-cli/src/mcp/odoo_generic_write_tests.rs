@@ -36,7 +36,13 @@ fn pool() -> OdooState {
 }
 
 async fn call(tool: &str, params: Value, home: &std::path::Path, pool: &OdooState) -> Value {
-    handle_odoo_tool(tool, &params, home, pool, "agnes").await
+    // Malformed config tests must retain their original artifact and refusal.
+    if std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok()).is_none() {
+        return handle_odoo_tool(tool, &params, home, pool, "agnes").await;
+    }
+    super::odoo_identity_client::tests::with_company(home,
+        handle_odoo_tool(tool, &params, home, pool, "agnes")).await
 }
 
 /// Minimal Odoo JSON-RPC mock on 127.0.0.1: authenticates as uid 7, answers
@@ -186,8 +192,8 @@ fn full_access(create: Value, write: Value) -> Value {
 async fn connect_and_snapshot(home: &std::path::Path, pool: &OdooState, access: Option<Value>) {
     let connected = call("odoo_connect", serde_json::json!({}), home, pool).await;
     assert!(!connected["isError"].as_bool().unwrap_or(false), "{connected}");
-    let conn = pool.cached_connector("agnes").await.unwrap();
-    let profile = conn.schema_profile(&pool.pool_key("agnes").await.1);
+    let conn = pool.cached_connector("agnes", &super::odoo_identity_client::tests::company()).await.unwrap();
+    let profile = conn.schema_profile("company");
     duduclaw_odoo::schema::save_snapshot(home, &profile, &lead_snapshot(&conn.connection_identity(), access)).unwrap();
 }
 
@@ -824,7 +830,11 @@ async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() 
     // mock, with a snapshot of its connection identity.
     let setup = pool();
     connect_and_snapshot(home.path(), &setup, Some(full_access(serde_json::json!(true), serde_json::json!(true)))).await;
-    let connector = setup.cached_connector("agnes").await.unwrap();
+    let connector = setup.cached_connector("agnes", &super::odoo_identity_client::tests::company()).await.unwrap();
+    // The isolation provider still supplies its own default-profile snapshot.
+    // This setup connector was acquired through the explicit company lane.
+    let snapshot = duduclaw_odoo::schema::load_snapshot(home.path(), &connector.schema_profile("company")).unwrap().unwrap();
+    duduclaw_odoo::schema::save_snapshot(home.path(), &connector.schema_profile("default"), &snapshot).unwrap();
     let bound = |tool: &'static str, params: Value| {
         let connector = connector.clone();
         let home = home.path().to_path_buf();

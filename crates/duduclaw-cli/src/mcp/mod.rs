@@ -216,6 +216,7 @@ mod memory_tools;
 mod messaging;
 mod notion_github;
 mod odoo;
+pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
 mod on_behalf_of;
 mod os_tools;

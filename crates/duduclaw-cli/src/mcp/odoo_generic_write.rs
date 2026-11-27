@@ -598,7 +598,7 @@ fn audit_safe(text: &str) -> String {
 }
 
 pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str, verb: &str, reason: &str) {
-    duduclaw_security::audit::append_tool_call(
+    super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
         tool,
@@ -608,6 +608,7 @@ pub(super) fn deny(home_dir: &Path, caller_agent: &str, tool: &str, model: &str,
             audit_safe(duduclaw_core::truncate_bytes(reason, 400))
         ),
         false,
+        None,
     );
 }
 
@@ -682,7 +683,7 @@ pub(crate) async fn handle_odoo_generic_write(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None).await
+    super::odoo_identity_client::with_call(generic_write_with_connection(tool, params, home_dir, odoo, caller_agent, None)).await
 }
 
 /// Protected mode: the same gate chain on the employee's own isolation
@@ -770,25 +771,23 @@ async fn generic_write_with_connection(
     // ── 6. connection (first credential use) ─────────────────────────────
     // Protected mode: the isolation connector the provider bound to this
     // employee, used as-is (no pool lookup / account resolution).
-    let conn = if let Some(connector) = bound {
-        connector
+    let (conn, decision) = if let Some(connector) = bound {
+        (connector, None)
     } else {
-        if let Err(error) = odoo.connect_precheck(caller_agent).await {
-            return super::egress_gate::pre_dispatch_error(&format!(
-                "Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"
-            ));
-        }
-        match connect_odoo_pool(home_dir, odoo, caller_agent).await {
-            Ok(conn) => conn,
-            Err(error) => {
-                return mcp_error(&format!("Odoo not connected for agent '{caller_agent}'. Call odoo_connect first. {error}"));
-            }
+        match connect_odoo_pool(home_dir, odoo, caller_agent, tool).await {
+            Ok((conn, identity)) => (conn, Some(identity)),
+            Err(error) => return mcp_error(&error),
         }
     };
     if conn.verify_io().is_err() {
         return mcp_error("Odoo authority revoked");
     }
-    let profile = odoo.pool_key(caller_agent).await.1;
+    let profile = match &decision {
+        Some(identity) => match odoo.key_for_identity(caller_agent, identity).await {
+            Ok(key) => key.1, Err(error) => return mcp_error(&error),
+        },
+        None => odoo.pool_key(caller_agent).await.1,
+    };
 
     // ── 7. account ACL from this identity's snapshot ─────────────────────
     let scan_first = "Odoo 結構正在背景準備中，尚未能確認這張資料表的欄位與帳號權限；請等結構準備完成後再試。 / \
@@ -881,13 +880,12 @@ async fn generic_write_with_connection(
         Ok(text) => text.clone(),
         Err(error) => format!("error class={}; length={}", error_class(error), error.len()),
     };
-    duduclaw_security::audit::append_tool_call_with_input(
+    super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
         tool,
         &summary,
         result.is_ok(),
-        None,
         Some(result_text.as_str()),
     );
     match result {
