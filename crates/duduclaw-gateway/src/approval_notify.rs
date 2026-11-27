@@ -377,21 +377,36 @@ pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
     )
 }
 
-/// Keep the granting identity attached until the actual delivery check.
+/// Keep every outbound reviewer's identity and role until the delivery check.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct NoticeTarget {
     destination: (String, String),
-    department_manager: Option<String>,
+    expected_user_id: Option<String>,
+    department_manager: bool,
 }
 
 impl NoticeTarget {
     fn unscoped(destination: (String, String)) -> Self {
-        Self { destination, department_manager: None }
+        Self { destination, expected_user_id: None, department_manager: false }
     }
 
     fn allows_send(&self, home: &Path, rec: &ApprovalRecord) -> bool {
-        self.department_manager.as_ref().is_none_or(|user|
-            crate::dept_grants::DeptGrantView::notification_allows(home, user, &rec.agent_id))
+        let Some(user_id) = self.expected_user_id.as_deref() else {
+            return !crate::approval::is_outbound_data_card(rec);
+        };
+        let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return false; };
+        let Ok(Some(user)) = db.get_user(user_id) else { return false; };
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { return false; }
+        let allowed = if self.department_manager {
+            user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, user_id, &rec.agent_id)
+        } else {
+            user.role == duduclaw_auth::UserRole::Admin
+        };
+        if !allowed { return false; }
+        db.verified_dm_destinations_for_user(user_id).is_ok_and(|destinations|
+            destinations.iter().any(|dest|
+                dest.channel == self.destination.0 && dest.channel_user_id == self.destination.1))
     }
 }
 
@@ -405,10 +420,10 @@ fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<NoticeTarget> {
             || (user.role == duduclaw_auth::UserRole::Manager
                 && crate::dept_grants::DeptGrantView::notification_allows(home, &user.id, &rec.agent_id));
         if allowed && let Ok(destinations) = db.verified_dm_destinations_for_user(&user.id) {
-            let department_manager = (user.role == duduclaw_auth::UserRole::Manager).then(|| user.id.clone());
             targets.extend(destinations.into_iter().map(|dest| NoticeTarget {
                 destination: (dest.channel, dest.channel_user_id),
-                department_manager: department_manager.clone(),
+                expected_user_id: Some(user.id.clone()),
+                department_manager: user.role == duduclaw_auth::UserRole::Manager,
             }));
         }
     }
@@ -554,9 +569,12 @@ async fn push_dashboard_only_targets(
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return delivered; }
         let is_owner = kb && crate::knowledge::add_source_chat::owner_targets(home_dir, rec)
             .contains(&(channel.clone(), chat_id.clone()));
-        // Check after token resolution and immediately before either send. A
-        // destination queued before revocation is not authority for a reminder.
-        if !target.allows_send(home_dir, rec) { continue; }
+        // Recheck the expected user, role/grant and exact verified DM after
+        // token resolution, immediately before each first send or reminder.
+        if !target.allows_send(home_dir, rec) {
+            tracing::debug!("approval notice skipped: recipient authority or verified DM unavailable");
+            continue;
+        }
         let sent = if is_owner {
             crate::knowledge::add_source_chat::push_owner_card(home_dir, &http, rec, &channel, &token, &chat_id).await
         } else {
@@ -1652,8 +1670,11 @@ mod tests {
         assert!(reminder.contains("快到期") && reminder.contains("不會啟用"));
     }
 
-    #[tokio::test]
-    async fn outbound_notice_rechecks_queued_manager_before_first_send_and_reminder() {
+    async fn outbound_notice_fixture() -> (
+        crate::dept_grants::tests::Fixture,
+        crate::test_channel_provider::TestChannelProvider,
+        ApprovalRecord,
+    ) {
         let f = crate::dept_grants::tests::fixture().await;
         let provider = crate::test_channel_provider::TestChannelProvider::start().await;
         let config = std::fs::read_to_string(f.home.join("config.toml")).unwrap();
@@ -1670,12 +1691,29 @@ mod tests {
         record.payload = json!({"egress_guard":{}, "arguments":{"text":"secret content"}});
         record.notify_channel = Some("telegram".into());
         record.notify_chat_id = Some("22222".into());
+        // Neither an employee's verified DM nor the agent's notify target
+        // may enter the outbound reviewer list, including on reminders.
+        f.db.bind_channel_identity(&f.emp.user_id, "telegram", "33333", true).unwrap();
+        let agent_path = f.home.join("agents/a1/agent.toml");
+        let config = std::fs::read_to_string(&agent_path).unwrap();
+        std::fs::write(agent_path, format!(
+            "{config}\n[proactive]\nnotify_channel='telegram'\nnotify_chat_id='33333'\n",
+        )).unwrap();
+        (f, provider, record)
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_manager_before_first_send_and_reminder() {
+        let (f, provider, record) = outbound_notice_fixture().await;
         for reminder in [false, true] {
             f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
                 &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
             let targets = dashboard_only_targets(&f.home, &record, reminder);
             assert_eq!(targets.len(), 2);
-            assert_eq!(targets[1].department_manager.as_deref(), Some(f.mgr_a.user_id.as_str()));
+            assert_eq!(targets[0].expected_user_id.as_deref(), Some(f.admin.user_id.as_str()));
+            assert!(!targets[0].department_manager);
+            assert_eq!(targets[1].expected_user_id.as_deref(), Some(f.mgr_a.user_id.as_str()));
+            assert!(targets[1].department_manager);
             let before = provider.requests().len();
             // Legitimate control proves the transport/token path is reachable.
             assert!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await.is_some());
@@ -1691,6 +1729,91 @@ mod tests {
                 assert!(!request.body.to_string().contains("private.example.invalid"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_dm_verification_and_owner() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        for reminder in [false, true] {
+            for (user, chat, other_user, other_chat) in [
+                (&f.admin.user_id, "11111", &f.mgr_a.user_id, "22222"),
+                (&f.mgr_a.user_id, "22222", &f.admin.user_id, "11111"),
+            ] {
+                for rebind in [false, true] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    f.db.bind_channel_identity(user, "telegram", chat, false).unwrap();
+                    if rebind {
+                        // The new owner is also an eligible reviewer. The old
+                        // queued target still belongs to the expected user.
+                        f.db.bind_channel_identity(other_user, "telegram", chat, true).unwrap();
+                    }
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, rebind={rebind}, chat={chat}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    f.db.unbind_channel_identity("telegram", chat).unwrap();
+                    f.db.bind_channel_identity(user, "telegram", chat, true).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_account_eligibility() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+        for reminder in [false, true] {
+            for (user, role, other_chat) in [
+                (&f.admin.user_id, "admin", "22222"),
+                (&f.mgr_a.user_id, "manager", "11111"),
+            ] {
+                for change in [
+                    "UPDATE users SET role='employee' WHERE id=?1",
+                    "UPDATE users SET status='suspended' WHERE id=?1",
+                    "UPDATE users SET must_change_password=1 WHERE id=?1",
+                    "UPDATE users SET id='removed-reviewer' WHERE id=?1",
+                ] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    // Leave the verified binding intact to isolate the live
+                    // account check from identity revocation side effects.
+                    assert_eq!(conn.execute(change, [user]).unwrap(), 1);
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, user={user}, change={change}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    conn.execute("UPDATE users SET id=?1, role=?2, status='active', must_change_password=0
+                        WHERE id=?1 OR id='removed-reviewer'", rusqlite::params![user, role]).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_skips_queued_targets_when_identity_reads_fail() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let targets = dashboard_only_targets(&f.home, &record, false);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+        let empty_home = tempfile::tempdir().unwrap();
+        assert!(targets.iter().all(|t| !t.allows_send(empty_home.path(), &record)));
+        assert!(!empty_home.path().join("users.db").exists());
+        assert!(!NoticeTarget::unscoped(("telegram".into(), "11111".into()))
+            .allows_send(&f.home, &record));
+        // Even a failed secondary DM lookup must discard the entire result.
+        rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+            .execute_batch("DROP TABLE verified_googlechat_dms").unwrap();
+        for reminder in [false, true] {
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await, None);
+        }
+        assert!(provider.requests().is_empty());
     }
 
     #[tokio::test]
