@@ -4,11 +4,11 @@
 //! calls; chat always scopes its receipt digest, including denials.
 mod bound;
 pub(crate) mod files_org;
-mod identity;
+pub(crate) mod identity;
 mod knowledge;
 mod locks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{path::PathBuf, sync::Arc};
 use duduclaw_agent::registry::AgentRegistry;
@@ -126,7 +126,7 @@ impl DecisionRefusal {
         }
     }
 
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found", Self::Expired(_) => "expired",
             Self::AlreadyDecided { .. } => "already_decided", Self::Forbidden(_) => "forbidden",
@@ -158,6 +158,21 @@ pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
         | crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE => false,
         _ => rec.payload.get("egress_guard").is_some()
             && chat_admin::tier(rec) != chat_admin::Tier::T3,
+    }
+}
+
+/// Read-only identity preflight for the press flow before retiring/resending a
+/// card. Reuse the exact service authority; decide rechecks under its lock.
+/// Step-up is not issued here: the receipt digest must be checked first.
+pub(crate) async fn validate_chat_identity(
+    env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, proof: &ChatAdminProof,
+) -> Result<(), DecisionRefusal> {
+    match identity::authorize(env, rec, approve, proof).await {
+        Ok(_) | Err(DecisionRefusal::StepUpRequired) => Ok(()),
+        Err(error) => {
+            identity::audit_refusal(env, &rec.id, proof, &error).await;
+            Err(error)
+        }
     }
 }
 

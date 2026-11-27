@@ -143,6 +143,24 @@ pub(crate) async fn deliver(home: &Path, broker: &ApprovalBroker, rec: &Approval
     run(home, &broker.store, rec, plan, &transport::Network::new(home)).await
 }
 
+/// Reuse the delivery plan, but retain only the receipt owner's destinations.
+/// Live role, proof, configuration and content are re-read before sending.
+pub(crate) async fn deliver_to_user(
+    home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord, user_id: &str,
+) -> DeliveryResult {
+    let (owned_home, owned_rec, user) = (home.to_path_buf(), rec.clone(), user_id.to_owned());
+    let Some(plan) = tokio::task::spawn_blocking(move || {
+        prepare_for_user(&owned_home, &owned_rec, &user)
+    }).await.ok().flatten() else { return DeliveryResult::default(); };
+    run(home, &broker.store, rec, plan, &transport::Network::new(home)).await
+}
+
+fn prepare_for_user(home: &Path, rec: &ApprovalRecord, user_id: &str) -> Option<Plan> {
+    let mut plan = prepare(home, rec)?;
+    plan.recipients.retain(|choices| choices.first().is_some_and(|t| t.user_id == user_id));
+    Some(plan)
+}
+
 #[async_trait::async_trait]
 trait Sender: Sync {
     async fn supports(&self, target: &Target) -> bool;

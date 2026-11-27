@@ -304,3 +304,21 @@ fn usable_proof_is_not_hidden_by_another_proof_for_removed_bot() {
     assert_eq!(plan.recipients.len(), 1);
     assert_eq!(plan.recipients[0][0].proof.proof_dm, "200");
 }
+
+#[tokio::test]
+async fn resend_plan_only_delivers_to_requested_live_admin() {
+    let f = Fixture::new();
+    f.prove(&f.admin, "telegram", "123", "123", "telegram");
+    f.prove(&f.ack, "telegram", "456", "456", "telegram");
+    let rec = f.record();
+    let store = ApprovalStore::open_in_memory().unwrap();
+    let sender = Recording::new(&store);
+    let plan = prepare_for_user(f.home.path(), &rec, &f.admin).unwrap();
+    assert_eq!(run(f.home.path(), &store, &rec, plan, &sender).await.delivered, 1);
+    let sent = sender.sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, f.admin);
+    drop(sent);
+    f.db.update_user(&f.admin, None, Some(UserRole::Manager), None).unwrap();
+    assert!(prepare_for_user(f.home.path(), &rec, &f.admin).unwrap().recipients.is_empty());
+}

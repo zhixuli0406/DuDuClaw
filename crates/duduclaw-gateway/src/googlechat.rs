@@ -808,9 +808,15 @@ async fn card_clicked(
                     guild_id: None,
                     session_id: None,
                 },
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: event["message"]["name"].as_str().map(str::to_owned),
+                    private: is_dm,
+                    account: crate::chat_link_intercept::account_label("googlechat", state.agent.as_deref()),
+                    dm: press.space.clone(),
+                },
             ),
         )
-        .await;
+        .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply);
     let text = match result {
         None => return ack(),
         Some(Ok(msg)) => msg,

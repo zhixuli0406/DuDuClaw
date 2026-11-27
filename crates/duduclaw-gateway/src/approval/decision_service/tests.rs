@@ -6,15 +6,15 @@ use duduclaw_auth::{UserRole, UserStatus};
 use crate::approval::chat_admin::receipts::{self, Receipt};
 use crate::knowledge::add_source_approval as sources;
 
-struct Fixture {
+pub(crate) struct Fixture {
     _home: tempfile::TempDir,
-    env: DecisionEnv,
-    user: String,
+    pub(crate) env: DecisionEnv,
+    pub(crate) user: String,
     ack: String,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let home = tempfile::tempdir().unwrap();
         let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
         let user = db.create_user("admin@example.com", "Ada", "fixture-password-only", UserRole::Admin).unwrap();
@@ -35,7 +35,7 @@ impl Fixture {
         f
     }
 
-    fn config(&self, enabled: bool, channel: &str, step_up: &[&str]) {
+    pub(crate) fn config(&self, enabled: bool, channel: &str, step_up: &[&str]) {
         // Local discovery treats encrypted credentials as configured. An
         // intentionally undecryptable fixture prevents notification HTTP calls.
         std::fs::write(self.env.home.join("config.toml"), format!(
@@ -44,18 +44,18 @@ impl Fixture {
         )).unwrap();
     }
 
-    fn db(&self) -> &UserDb { self.env.users.as_deref().unwrap() }
+    pub(crate) fn db(&self) -> &UserDb { self.env.users.as_deref().unwrap() }
 
     fn dashboard(&self) -> Decider {
         Decider::Dashboard(self.db().live_user_context(&self.user).unwrap().unwrap())
     }
 
-    async fn simple(&self, kind: &str) -> ApprovalId {
+    pub(crate) async fn simple(&self, kind: &str) -> ApprovalId {
         let payload = if kind == "other_outgoing" { json!({"egress_guard": {}}) } else { json!({}) };
         self.env.broker.request("support", kind, "review", payload, 3600).await.unwrap()
     }
 
-    async fn proof(&self, id: &ApprovalId) -> ChatAdminProof {
+    pub(crate) async fn proof(&self, id: &ApprovalId) -> ChatAdminProof {
         let rec = self.env.broker.get(id).await.unwrap().unwrap();
         let proof = ChatAdminProof { user_id: self.user.clone(), channel: ChatChannel::Telegram,
             account: "telegram".into(), principal: "123456789".into(), dm: "123456789".into(),
@@ -72,11 +72,11 @@ impl Fixture {
         proof
     }
 
-    async fn status(&self, id: &ApprovalId) -> ApprovalStatus {
+    pub(crate) async fn status(&self, id: &ApprovalId) -> ApprovalStatus {
         self.env.broker.get(id).await.unwrap().unwrap().status
     }
 
-    async fn quarantine(&self) -> ApprovalId {
+    pub(crate) async fn quarantine(&self) -> ApprovalId {
         let db = self.env.home.join("memory.db");
         let engine = duduclaw_memory::SqliteMemoryEngine::new(&db).unwrap();
         let entry = duduclaw_core::types::MemoryEntry {
@@ -107,7 +107,7 @@ impl Fixture {
         ApprovalId::from(approval_id)
     }
 
-    async fn effect(&self, id: &ApprovalId) -> Value {
+    pub(crate) async fn effect(&self, id: &ApprovalId) -> Value {
         let rec = self.env.broker.get(id).await.unwrap().unwrap();
         match rec.action_kind.as_str() {
             sources::ACTION_KIND => {

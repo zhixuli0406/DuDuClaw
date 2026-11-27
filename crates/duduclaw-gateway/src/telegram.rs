@@ -1035,17 +1035,22 @@ async fn process_telegram_message(
     // through to normal chat.
     if replied_to_bot && !text_content.is_empty() {
         if let Some(reply_mid) = msg.reply_to_message.as_deref().and_then(|q| q.message_id) {
-            let presser = msg
-                .from
-                .as_ref()
-                .map(|u| u.id.to_string())
-                .unwrap_or_default();
-            if let Some(outcome) = crate::decision_text::route_text_reply(
-                &ctx.home_dir,
-                "telegram",
-                &presser,
-                &chat_id.to_string(),
-                &reply_mid.to_string(),
+            if let Some(outcome) = crate::decision_text::route_verified_text_reply(
+                &ctx,
+                &crate::approval::DecisionContext {
+                    channel: "telegram".into(), account_id: verified_account_id.clone(),
+                    conversation_id: chat_id.to_string(), principal_id: telegram_message_principal(&msg),
+                },
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: Some(reply_mid.to_string()),
+                    private: msg.chat.chat_type.as_deref() == Some("private")
+                        && msg.from.as_ref().is_some_and(|from| from.id == chat_id),
+                    account: crate::chat_link_intercept::account_label("telegram", agent_name.as_deref()),
+                    dm: chat_id.to_string(),
+                },
+                crate::decision_notify::DecisionAccessScope {
+                    channel_id: is_group.then_some(chat_id.to_string().as_str()), guild_id: None, session_id: None,
+                },
                 text_content,
             )
             .await
@@ -1961,8 +1966,15 @@ async fn handle_callback_query(
                 guild_id: None,
                 session_id: None,
             },
+            &crate::approval::chat_admin::press::PressOrigin {
+                message_id: msg.message_id.map(|id| id.to_string()),
+                private: msg.chat.chat_type.as_deref() == Some("private")
+                    && cb.from.as_ref().is_some_and(|from| from.id == msg.chat.id),
+                account: crate::chat_link_intercept::account_label("telegram", agent_name),
+                dm: chat_id.to_string(),
+            },
         )
-        .await
+        .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
         {
             // The persistent card (this same message) is retired in place by
             // the decide path itself — a detached best-effort edit that

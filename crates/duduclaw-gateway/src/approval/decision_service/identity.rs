@@ -84,7 +84,7 @@ pub(super) async fn knowledge_user(env: &DecisionEnv, by: &Decider) -> Result<du
     }).await.map_err(|e| DecisionRefusal::Internal(e.to_string()))?
 }
 
-pub(super) async fn display_name(env: &DecisionEnv, user: &str) -> Option<String> {
+pub(crate) async fn display_name(env: &DecisionEnv, user: &str) -> Option<String> {
     let (db, user) = (env.users.clone()?, user.to_owned());
     tokio::task::spawn_blocking(move || db.get_user(&user).ok().flatten()
         .map(|u| u.display_name.trim().to_owned()).filter(|name| !name.is_empty()))
@@ -125,10 +125,20 @@ fn admit_refusal(channel: &str, account: &str, principal: &str) -> bool {
 }
 
 pub(super) async fn audit_refusal(env: &DecisionEnv, id: &ApprovalId, proof: &ChatAdminProof, error: &DecisionRefusal) {
-    if !admit_refusal(proof.channel.as_str(), &proof.account, &proof.principal) { return; }
-    let details = json!({"reason":error.code(), "approval_id":id.as_str(),
-        "channel":proof.channel.as_str(), "principal":duduclaw_auth::otp::mask_target(&proof.principal)});
-    let home = env.home.clone();
+    audit_refusal_reason(&env.home, id, proof.channel.as_str(), &proof.account,
+        &proof.principal, error.code()).await;
+}
+
+/// Shared rate limit for service and pre-service transport refusals. Identity
+/// here is for masked auditing only; it is never an authorization proof.
+pub(crate) async fn audit_refusal_reason(
+    home: &std::path::Path, id: &ApprovalId, channel: &str, account: &str,
+    principal: &str, reason: &'static str,
+) {
+    if !admit_refusal(channel, account, principal) { return; }
+    let details = json!({"reason":reason, "approval_id":id.as_str(),
+        "channel":channel, "principal":duduclaw_auth::otp::mask_target(principal)});
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || duduclaw_security::audit::try_append_audit_event(
         &home, &AuditEvent::new("approval_chat_admin_refused", "chat_admin", Severity::Warning, details),
     )).await;
