@@ -370,7 +370,7 @@ pub const MAX_ONE_WAY_PAIRS: usize = 200;
 
 /// Coupled to `duduclaw_auth::models::UserRole`. Auth depends on core, so core
 /// must keep a local closed list rather than introduce a dependency cycle.
-pub const DELEGATION_ROLE_NAMES: [&str; 3] = ["admin", "manager", "employee"];
+pub const UNRESTRICTABLE_ROLE_NAMES: [&str; 2] = ["admin", "manager"];
 
 /// Same validation and trimming as `allow`, with ordered deduplication.
 /// Entries beyond the first 200 are ignored with one limit warning.
@@ -462,7 +462,7 @@ impl DelegationAllowSource {
 }
 
 fn unrestricted_sender(view: &dyn OwnerRoleView, overrides: &DelegationOverrides, sender: &str) -> bool {
-    let configured = |role: &str| DELEGATION_ROLE_NAMES.contains(&role)
+    let configured = |role: &str| UNRESTRICTABLE_ROLE_NAMES.contains(&role)
         && overrides.unrestricted_roles.iter().any(|r| r == role);
     let Ok(Some(owner_role)) = view.avatar_owner_role(sender) else { return false };
     if !configured(&owner_role) { return false; }
@@ -1177,7 +1177,7 @@ impl DelegationConfig {
         let mut unrestricted_roles = Vec::new();
         let mut unknown = false;
         for role in &self.unrestricted_roles {
-            if DELEGATION_ROLE_NAMES.contains(&role.as_str()) {
+            if UNRESTRICTABLE_ROLE_NAMES.contains(&role.as_str()) {
                 if !unrestricted_roles.contains(role) {
                     unrestricted_roles.push(role.clone());
                 }
@@ -1186,7 +1186,7 @@ impl DelegationConfig {
             }
         }
         if unknown {
-            warnings.push("config.toml [delegation] unrestricted_roles 含無法辨識的角色,已忽略;僅接受 admin / manager / employee。".into());
+            warnings.push("config.toml [delegation] unrestricted_roles 含無法辨識的角色,已忽略;僅接受 admin / manager。".into());
         }
         if self.resolve().1.is_some() {
             return (DelegationOverrides::default(), warnings);
@@ -2567,14 +2567,15 @@ allow = [["sales-lead", "warehouse-lead"], ["a"], ["x", "x"]]
     }
 
     #[test]
-    fn delegation_role_closed_list_tracks_auth_user_role() {
+    fn delegation_unrestrictable_roles_are_privileged_account_roles() {
         // Auth depends on core: compare its source declaration without building
         // auth or creating a circular dev-dependency. New roles require review.
         let source = include_str!("../../duduclaw-auth/src/models.rs");
         let body = source.split("pub enum UserRole {").nth(1).unwrap().split('}').next().unwrap();
         let roles: Vec<_> = body.lines().map(str::trim).filter(|s| !s.is_empty())
             .map(|s| s.trim_end_matches(',').to_ascii_lowercase()).collect();
-        assert_eq!(roles, DELEGATION_ROLE_NAMES);
+        assert_eq!(UNRESTRICTABLE_ROLE_NAMES, ["admin", "manager"]);
+        assert!(UNRESTRICTABLE_ROLE_NAMES.iter().all(|role| roles.iter().any(|r| r == role)));
         assert!(source.contains("#[serde(rename_all = \"lowercase\")]"));
     }
 
@@ -2590,8 +2591,13 @@ unrestricted_roles = ["admin", "manager", "employee", "admin", "Admin", " admin 
         let read = delegation_config_read_from_table(&table);
         assert_eq!(read.rules.allow_pairs, vec![("a".into(), "b".into())]);
         assert_eq!(read.overrides.allow_one_way, vec![("a".into(), "b".into()), ("b".into(), "a".into())]);
-        assert_eq!(read.overrides.unrestricted_roles, DELEGATION_ROLE_NAMES);
+        assert_eq!(read.overrides.unrestricted_roles, UNRESTRICTABLE_ROLE_NAMES);
         assert_eq!(read.override_warnings.len(), 4); // 3 invalid pairs + 1 role warning.
+        assert!(read.override_warnings.iter().any(|w| w.contains("僅接受 admin / manager。")));
+        let employee: toml::Table = "[delegation]\nunrestricted_roles=['employee']".parse().unwrap();
+        let employee_read = delegation_config_read_from_table(&employee);
+        assert!(employee_read.overrides.unrestricted_roles.is_empty());
+        assert_eq!(employee_read.override_warnings.len(), 1);
         for value in ["false", "42", "'not-a-list'"] {
             let table = toml::from_str(&format!(
                 "[delegation]\npolicy = 'hierarchy'\nallow = [['a', 'b']]\nallow_one_way = {value}\nunrestricted_roles = {value}"

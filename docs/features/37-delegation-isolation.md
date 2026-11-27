@@ -120,7 +120,9 @@ The dashboard card "Advanced settings → Delegation permissions" provides the e
 
 ## Role exceptions and one-way pairs (v1.86.0)
 
-In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin, Manager or Employee. All three are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
+In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin or Manager. Both are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
+
+Only Admin and Manager (`admin` / `manager`) are eligible. Employee is not offered because selecting it would exempt every ordinary member’s AI avatar; legacy `employee` entries in `unrestricted_roles` are ignored. Adding a role requires reading the risk notice and checking **I understand** before saving. The gateway requires `acknowledge_risk: true` for additions through both `delegation.set` and `config.raw.set`. The `delegation_config_changed` audit record includes `roles_added`, the enabling user ID (`acknowledged_by`) and a server-generated RFC3339 timestamp (`acknowledged_at`). Removing roles requires no acknowledgement and is still audited.
 
 The account's status and role are checked each time. Disabling the account or changing its role to an unchecked role ends the exception immediately. The exception applies only while the member personally asks in that conversation; schedules, reminders and other background work of that AI follow the ordinary delegation rules in every mode, including protected mode.
 
@@ -157,7 +159,7 @@ Four controls:
    - Changes take effect immediately, no restart needed
 
 3. **Roles exempt from delegation scope** (v1.86.0)
-   - Admin / Manager / Employee; all unchecked by default
+   - Admin / Manager; all unchecked by default
    - Applies to the member's administrator-assigned avatar only while they personally ask in that conversation; the recipient cannot delegate back by this exception
    - Also applies under No delegation, with a warning; background work follows ordinary rules in every mode
 

@@ -952,7 +952,7 @@ export interface CredentialInventoryReport {
  *  unrecognised value or an unreadable config is enforced as `none` too. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 
-export type DelegationRole = 'admin' | 'manager' | 'employee';
+export type DelegationRole = 'admin' | 'manager';
 export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
 
 export interface DelegationSettings {
@@ -974,7 +974,7 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 /** `delegation.effective` (v1.82, RM-137) — what applies to one employee. */
 export interface DelegationEffective {
   unrestricted?: boolean;
-  owner_role?: DelegationRole | null;
+  owner_role?: DelegationRole | 'employee' | null;
   /** Owner role lookup failed; role exceptions cannot be confirmed. */
   unrestricted_error?: 'users_unreadable' | null;
   allow_one_way?: DelegationOneWayPair[];
@@ -8257,7 +8257,7 @@ export const api = {
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]> }) =>
+    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;

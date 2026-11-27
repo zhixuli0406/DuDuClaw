@@ -401,7 +401,6 @@ impl MethodHandler {
         let (before_policy, before_allow, _) = Self::parse_delegation_section(&table);
         let (before_overrides, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
         let after_one_way = new_one_way.clone().unwrap_or_else(|| before_overrides.allow_one_way.clone());
-        let after_roles = new_roles.clone().unwrap_or_else(|| before_overrides.unrestricted_roles.clone());
         let after_allow_check = new_allow.as_ref().unwrap_or(&before_allow);
         if pairs_overlap(&after_one_way, after_allow_check) {
             return WsFrame::error_response("", "單向配對與雙向配對重複，請移除其中一組。");
@@ -446,6 +445,16 @@ impl MethodHandler {
 
         write_optional_delegation_keys(section, new_roles.as_ref(), new_one_way.as_ref());
 
+        // Check the final effective table, including a policy edit that re-enables
+        // previously ignored role entries.
+        let (after_overrides, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
+        let after_roles = after_overrides.unrestricted_roles;
+        let roles_added = match require_delegation_role_ack(&before_overrides.unrestricted_roles, &after_roles,
+            params.get("acknowledge_risk").and_then(Value::as_bool) == Some(true)) {
+            Ok(roles) => roles,
+            Err(e) => return WsFrame::error_response("", e),
+        };
+
         // Atomic write: temp + rename (same discipline as system.update_config).
         if let Err(e)=super::config_commit::commit_table_locked(&config_path,config_expected_hash,&table).await {
             return WsFrame::error_response("",&format!("寫入設定失敗:{e}"));
@@ -466,13 +475,10 @@ impl MethodHandler {
                 "delegation_config_changed",
                 "dashboard",
                 duduclaw_security::audit::Severity::Warning,
-                json!({
-                    "actor_user_id": ctx.user_id,
-                    "actor_email": ctx.email,
-                    "actor_role": format!("{:?}", ctx.role).to_lowercase(),
-                    "before": { "policy": before_policy, "allow": pairs_json(&before_allow), "unrestricted_roles": before_overrides.unrestricted_roles, "allow_one_way": before_overrides.allow_one_way },
-                    "after": { "policy": after_policy, "allow": pairs_json(&after_allow), "unrestricted_roles": after_roles, "allow_one_way": after_one_way },
-                }),
+                delegation_audit_details(ctx,
+                    json!({ "policy": before_policy, "allow": pairs_json(&before_allow), "unrestricted_roles": before_overrides.unrestricted_roles, "allow_one_way": before_overrides.allow_one_way }),
+                    json!({ "policy": after_policy, "allow": pairs_json(&after_allow), "unrestricted_roles": after_roles, "allow_one_way": after_one_way }),
+                    &roles_added),
             ),
         );
 
@@ -724,13 +730,38 @@ pub(crate) const CONFIG_ERROR_PERMISSIONS_UNREADABLE: &str = "permissions_unread
 /// keeps the field non-null — fail closed toward "there is a problem").
 pub(crate) const CONFIG_ERROR_UNKNOWN: &str = "unknown";
 
+/// Compare effective roles, so ignored legacy entries cannot bypass acknowledgement.
+pub(super) fn require_delegation_role_ack(before: &[String], after: &[String], acknowledged: bool) -> Result<Vec<String>, &'static str> {
+    let added: Vec<_> = after.iter().filter(|role| !before.contains(role)).cloned().collect();
+    if !added.is_empty() && !acknowledged {
+        return Err("新增不受委派範圍限制的角色前，請先確認風險。");
+    }
+    Ok(added)
+}
+
+pub(super) fn delegation_audit_details(ctx: &UserContext, before: Value, after: Value, roles_added: &[String]) -> Value {
+    let mut details = json!({
+        "actor_user_id": ctx.user_id,
+        "actor_email": ctx.email,
+        "actor_role": format!("{:?}", ctx.role).to_lowercase(),
+        "before": before,
+        "after": after,
+    });
+    if !roles_added.is_empty() {
+        details["roles_added"] = json!(roles_added);
+        details["acknowledged_by"] = json!(ctx.user_id);
+        details["acknowledged_at"] = json!(chrono::Utc::now().to_rfc3339());
+    }
+    details
+}
+
 fn validate_unrestricted_roles(value: Option<&Value>) -> Result<Option<Vec<String>>, &'static str> {
     let Some(value) = value else { return Ok(None); };
     let items = value.as_array().ok_or("角色必須是清單。")?;
     let mut roles = Vec::new();
     for item in items {
-        let role = item.as_str().filter(|r| ["admin", "manager", "employee"].contains(r))
-            .ok_or("角色只能是管理員、主管或一般成員。");
+        let role = item.as_str().filter(|r| duduclaw_core::delegation_policy::UNRESTRICTABLE_ROLE_NAMES.contains(r))
+            .ok_or("不受委派範圍限制的角色只能是管理員或主管。");
         let role = role?;
         if !roles.iter().any(|r| r == role) { roles.push(role.to_string()); }
     }
@@ -774,6 +805,52 @@ fn pairs_overlap(one_way: &[(String, String)], two_way: &[(String, String)]) -> 
 mod rm183_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn delegation_role_additions_require_ack_and_record_server_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[delegation]\npolicy='none'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        for params in [json!({"unrestricted_roles": ["employee"], "acknowledge_risk": true}),
+            json!({"unrestricted_roles": ["admin"]}),
+            json!({"unrestricted_roles": ["admin"], "acknowledge_risk": "true"})] {
+            let response = handler.handle_delegation_set(params, &ctx).await;
+            assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "[delegation]\npolicy='none'\n");
+        }
+        let response = handler.handle_delegation_set(json!({"unrestricted_roles": ["admin"],
+            "acknowledge_risk": true, "acknowledged_by": "forged", "acknowledged_at": "forged"}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let event: Value = rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .find(|v| v["event_type"] == "delegation_config_changed").unwrap();
+        assert_eq!(event["details"]["roles_added"], json!(["admin"]));
+        assert_eq!(event["details"]["acknowledged_by"], ctx.user_id);
+        assert!(chrono::DateTime::parse_from_rfc3339(event["details"]["acknowledged_at"].as_str().unwrap()).is_ok());
+        let response = handler.handle_delegation_set(json!({"unrestricted_roles": []}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+        let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
+        let event: Value = rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|v| v["event_type"] == "delegation_config_changed").last().unwrap();
+        assert!(event["details"].get("acknowledged_by").is_none());
+    }
+
+    #[tokio::test]
+    async fn restoring_valid_policy_requires_ack_for_legacy_roles() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "[delegation]\npolicy='typo'\nunrestricted_roles=['admin']\n";
+        std::fs::write(&path, original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let response = handler.handle_delegation_set(json!({"policy": "none"}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        let response = handler.handle_delegation_set(json!({"policy": "none", "acknowledge_risk": true}), &ctx).await;
+        assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+    }
+
     fn pairs(values: &[(&str, &str)]) -> Vec<(String, String)> {
         values.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
     }
@@ -783,9 +860,10 @@ mod rm183_tests {
         for value in [json!(["root"]), json!(["Admin"]), json!([" admin "]), json!([1]), json!(null)] {
             assert!(validate_unrestricted_roles(Some(&value)).is_err());
         }
-        assert_eq!(validate_unrestricted_roles(Some(&json!(["admin", "admin", "employee"]))).unwrap(), Some(vec!["admin".to_string(), "employee".to_string()]));
+        assert_eq!(validate_unrestricted_roles(Some(&json!(["admin", "admin", "manager"]))).unwrap(), Some(vec!["admin".to_string(), "manager".to_string()]));
+        assert!(validate_unrestricted_roles(Some(&json!(["employee"]))).is_err());
         assert_eq!(validate_unrestricted_roles(None).unwrap(), None);
-        assert_eq!(validate_unrestricted_roles(Some(&json!(["root"]))).unwrap_err(), "角色只能是管理員、主管或一般成員。");
+        assert_eq!(validate_unrestricted_roles(Some(&json!(["root"]))).unwrap_err(), "不受委派範圍限制的角色只能是管理員或主管。");
     }
 
     #[test]
@@ -815,7 +893,7 @@ mod rm183_tests {
         let agent = home.path().join("agents/a");
         std::fs::create_dir_all(&agent).unwrap();
         std::fs::write(agent.join("agent.toml"), "[agent]\nname='a'\n[permissions]\ncan_send_cross_agent=true").unwrap();
-        for roles in ["", "\nunrestricted_roles=[]"] {
+        for roles in ["", "\nunrestricted_roles=[]", "\nunrestricted_roles=['employee']"] {
             std::fs::write(home.path().join("config.toml"), format!("[delegation]\npolicy='department'{roles}")).unwrap();
             let value = effective_delegation_json(home.path(), &agent, "a", &|_| true, true);
             assert_eq!(value["unrestricted"], false);

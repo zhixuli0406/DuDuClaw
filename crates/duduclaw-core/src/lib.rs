@@ -121,7 +121,7 @@ pub use delegation_policy::{
     can_delegate, can_delegate_ext, can_delegate_rules, can_delegate_rules_ext, evaluate_delegation,
     DelegationAllowSource, DelegationBoundaries, DelegationContext, DelegationOverrides,
     DelegationRequesterRole, OwnerRoleLookupError, OwnerRoleView, resolve_allow_one_way,
-    DELEGATION_ROLE_NAMES, MAX_ONE_WAY_PAIRS,
+    UNRESTRICTABLE_ROLE_NAMES, MAX_ONE_WAY_PAIRS,
     delegation_rules_from_home, is_ancestor as is_org_ancestor, is_reserved_agent_id,
     is_reserved_queue_sender, is_system_sender,
     policy_from_home as delegation_policy_from_home, read_delegation_config,

@@ -18,7 +18,7 @@ export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy
 
 /** A whitelist row while it is being edited — either side may still be blank. */
 type PairDraft = { a: string; b: string; direction?: 'two_way' | 'one_way' };
-const ROLES: DelegationRole[] = ['admin', 'manager', 'employee'];
+const ROLES: DelegationRole[] = ['admin', 'manager'];
 
 /**
  * 委派權限 (WP21 §2.8) — who may hand work to whom, org-wide.
@@ -46,6 +46,8 @@ export function DelegationTab() {
   // until `loaded` is true.
   const [policy, setPolicy] = useState<DelegationPolicy>('department');
   const [roles, setRoles] = useState<DelegationRole[]>([]);
+  const [savedRoles, setSavedRoles] = useState<DelegationRole[]>([]);
+  const [riskAck, setRiskAck] = useState(false);
   const [pairs, setPairs] = useState<PairDraft[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [agents, setAgents] = useState<AgentDetail[]>([]);
@@ -72,7 +74,10 @@ export function DelegationTab() {
       ]);
       setPolicy(settings.policy);
       setPairs([...settings.allow.map(([a, b]) => ({ a, b })), ...(settings.allow_one_way ?? []).map(([a, b]) => ({ a, b, direction: 'one_way' as const }))]);
-      setRoles(settings.unrestricted_roles ?? []);
+      const loadedRoles = (settings.unrestricted_roles ?? []).filter((role) => ROLES.includes(role));
+      setRoles(loadedRoles);
+      setSavedRoles(loadedRoles);
+      setRiskAck(false);
       setWarnings(settings.warnings ?? []);
       setAgents(list.agents ?? []);
       setLoaded(true);
@@ -114,7 +119,8 @@ export function DelegationTab() {
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
   // Editing is possible only on a successfully loaded setting.
   const editable = loaded && !loading && loadError == null;
-  const canSave = editable && !saving && !incomplete && !hasSelfPair;
+  const addsRole = roles.some((role) => !savedRoles.includes(role));
+  const canSave = editable && !saving && !incomplete && !hasSelfPair && (!addsRole || riskAck);
 
   const updatePair = (index: number, side: 'a' | 'b', value: string) => {
     setPairs((prev) => prev.map((p, i) => (i === index ? { ...p, [side]: value } : p)));
@@ -132,6 +138,7 @@ export function DelegationTab() {
         allow: pairs.filter((p) => p.direction !== 'one_way').map((p) => [p.a, p.b] as [string, string]),
         allow_one_way: pairs.filter((p) => p.direction === 'one_way').map((p) => [p.a, p.b] as [string, string]),
         unrestricted_roles: roles,
+        ...(addsRole ? { acknowledge_risk: true } : {}),
       });
       setSaved(true);
       savedTimerRef.current = setTimeout(() => setSaved(false), 2000);
@@ -221,11 +228,24 @@ export function DelegationTab() {
           {ROLES.map((role) => (
             <label key={role} className="flex items-center gap-3 px-4 py-3">
               <input type="checkbox" className="accent-primary" checked={loaded && roles.includes(role)} disabled={!editable}
-                onChange={(e) => setRoles((prev) => e.target.checked ? [...prev, role] : prev.filter((r) => r !== role))} />
+                onChange={(e) => {
+                  setRiskAck(false);
+                  setRoles((prev) => e.target.checked ? [...prev, role] : prev.filter((r) => r !== role));
+                }} />
               <span className="text-sm">{t(`settings.delegation.roles.${role}`)}</span>
             </label>
           ))}
         </SettingsCard>
+        {loaded && addsRole && (
+          <div className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
+            <p className="text-xs text-foreground">{t('settings.delegation.roles.risk')}</p>
+            <label className="flex items-start gap-2 text-xs font-medium text-foreground">
+              <input type="checkbox" className="accent-primary" checked={riskAck}
+                onChange={(e) => setRiskAck(e.target.checked)} disabled={!editable || saving} />
+              <span>{t('settings.delegation.roles.acknowledge')}</span>
+            </label>
+          </div>
+        )}
         {loaded && policy === 'none' && roles.length > 0 && (
           <p role="alert" className="text-xs text-warning">{t('settings.delegation.roles.noneWarning')}</p>
         )}
