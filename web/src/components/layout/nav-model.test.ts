@@ -9,6 +9,7 @@ import {
   personalPrimaryItems,
   manageAdvancedNav,
   manageNav,
+  manageEntry,
   personalAdvancedGroup,
   navGroupsForEdition,
   primaryItemsForEdition,
@@ -252,9 +253,12 @@ describe('nav-model — page titles for the people pages', () => {
 
 
 describe('nav RPC role alignment', () => {
-  it('cron and unified audit pages require admin in both editions', () => {
+  it('routines accepts schedules grants while audit pages retain their admin gate', () => {
     const routines = navGroups.flatMap(g => g.items).find(i => i.to === '/routines')!;
     expect(routines.minRole).toBe('admin');
+    expect(routines.orGrant).toBe('schedules');
+    expect(isVisible(routines, 'manager', false, { deptGroups: new Set(['schedules']) })).toBe(true);
+    expect(isVisible(manageEntry, 'manager', false)).toBe(true);
     expect(manageAdvancedNav.find(i => i.to === '/manage/logs')?.minRole).toBe('admin');
     expect(navGroups.flatMap(g => g.items).find(i => i.to === '/gallery')?.minRole).toBe('admin');
     expect(isVisible(routines, 'employee', false)).toBe(false);

@@ -124,9 +124,8 @@ fn report_names(db: Option<&UserDb>, grants: &[(String, GrantSource)]) -> HashMa
 impl MethodHandler {
     pub(crate) async fn handle_agents_callable(&self, ctx: &UserContext, params: Value) -> WsFrame {
         let access = Arc::new(effective_of(ctx));
-        let sender = SenderAccess::from_effective(access.clone()).for_webchat(
-            crate::webchat::access::gateway_default_id(&self.home_dir).await,
-        );
+        let sender = SenderAccess::from_effective(access.clone())
+            .for_webchat_converse(&self.home_dir).await;
         let reg = self.registry.read().await;
         let session = session_for(&params);
         let default_id = crate::channel_reply::resolve_fallback_agent_in(

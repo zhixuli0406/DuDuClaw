@@ -645,17 +645,18 @@ impl WebChatState {
         if let Err(e) = &lookup {
             warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        if !resolve_agent_acl(&lookup, agent_name) { return false; }
+        if is_widget_visitor(user_id) { return false; }
+        let Ok(snapshot) = &lookup else { return false; };
         if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
             return true;
         }
-        // This helper checks the named grant, not operational status (the
-        // execution/resume gate checks that separately). A binding never grants
-        // dashboard access to Main or the configured gateway default.
-        let sender = crate::trigger_route::SenderAccess::no_bindings(user_id)
-            .for_webchat(access::gateway_default_id(&self.ctx.home_dir).await);
+        // This helper checks named grants or effective main-list admission;
+        // execution/resume checks operational status separately.
+        let sender = crate::trigger_route::SenderAccess::from_effective(snapshot.access.clone())
+            .for_webchat_converse(&self.ctx.home_dir).await;
         self.ctx.registry.read().await.get(agent_name)
-            .is_some_and(|agent| sender.webchat_allows(agent))
+            .is_some_and(|agent| sender.webchat_allows(agent)
+                && (resolve_agent_acl(&lookup, agent_name) || sender.main_converse_allowed(agent)))
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {

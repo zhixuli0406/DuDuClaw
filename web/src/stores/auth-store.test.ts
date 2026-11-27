@@ -28,6 +28,9 @@ function resetStore() {
     isAuthenticated: false,
     initialized: false,
     bindings: [],
+    deptGrants: [],
+    deptGroups: new Set(),
+    mainAgentAccess: false,
     loading: false,
   });
   sessionStorage.clear();
@@ -253,5 +256,98 @@ describe('refresh (#1 — only 401/403 logs out)', () => {
     expect(useAuthStore.getState().isAuthenticated).toBe(true);
     expect(sessionStorage.getItem(STORAGE_KEY_REFRESH)).toBe('rt-1');
     expect(mockWsClient.disconnect).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('department grant state', () => {
+  it('loads grants from the authenticated users.me RPC', async () => {
+    useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
+    mockWsClient.call.mockResolvedValueOnce({
+      ...ME_OK,
+      dept_grants: [{ department: 'sales', groups: ['schedules', 'future'] }],
+      main_agent_access: true,
+    });
+    await useAuthStore.getState().refreshMe();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.me');
+    expect([...useAuthStore.getState().deptGroups]).toEqual(['schedules']);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(true);
+  });
+
+  it.each(['absent', 'rejected'] as const)('clears RPC grant state when %s', async (result) => {
+    useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
+    useAuthStore.getState().setUser(ME_OK.user as never, [], {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true,
+    });
+    if (result === 'absent') mockWsClient.call.mockResolvedValueOnce(ME_OK);
+    else mockWsClient.call.mockRejectedValueOnce(new Error('unavailable'));
+    await useAuthStore.getState().refreshMe();
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  it('ignores an RPC response after logout', async () => {
+    useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
+    let resolve!: (value: unknown) => void;
+    mockWsClient.call.mockReturnValueOnce(new Promise((done) => { resolve = done; }));
+    const pending = useAuthStore.getState().refreshMe();
+    useAuthStore.getState().logout();
+    resolve({ ...ME_OK, dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true });
+    await pending;
+    expect(useAuthStore.getState().user).toBeNull();
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  const grants = [
+    { department: 'sales', groups: ['schedules', 'unknown'] },
+    { department: 'support', groups: ['skills', 'schedules'] },
+  ];
+
+  it.each(['establishSession', 'refresh', 'loadFromStorage'] as const)(
+    'parses grants and main-agent access through %s', async (method) => {
+      sessionStorage.setItem(STORAGE_KEY_REFRESH, 'rt-1');
+      useAuthStore.setState({ refreshToken: 'rt-1' });
+      vi.stubGlobal('fetch', vi.fn(async (url: string) =>
+        String(url).includes('/api/me')
+          ? res(200, { ...ME_OK, dept_grants: grants, main_agent_access: true })
+          : res(200, { access_token: 'jwt-1' })));
+      if (method === 'establishSession') {
+        await useAuthStore.getState().establishSession({ access_token: 'jwt-1', refresh_token: 'rt-1' });
+      } else {
+        await useAuthStore.getState()[method]();
+      }
+      expect(useAuthStore.getState().deptGrants).toEqual([
+        { department: 'sales', groups: ['schedules'] },
+        { department: 'support', groups: ['skills', 'schedules'] },
+      ]);
+      expect([...useAuthStore.getState().deptGroups].sort()).toEqual(['schedules', 'skills']);
+      expect(useAuthStore.getState().mainAgentAccess).toBe(true);
+    },
+  );
+
+  it('keeps grants when setUser omits me, but clears them for explicit empty me and logout', () => {
+    const store = useAuthStore.getState();
+    store.setUser(ME_OK.user as never, [], { dept_grants: grants, main_agent_access: true });
+    expect(useAuthStore.getState().mainAgentAccess).toBe(true);
+    store.setUser(ME_OK.user as never, []);
+    expect([...useAuthStore.getState().deptGroups].sort()).toEqual(['schedules', 'skills']);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(true);
+    store.setUser(ME_OK.user as never, [], {});
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().deptGrants).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+    store.setUser(ME_OK.user as never, [], { dept_grants: grants, main_agent_access: true });
+    store.logout();
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  it('defaults absent fields when establishing a session', async () => {
+    useAuthStore.getState().setUser(ME_OK.user as never, [], { dept_grants: grants, main_agent_access: true });
+    vi.stubGlobal('fetch', vi.fn(async () => res(200, ME_OK)));
+    await useAuthStore.getState().establishSession({ access_token: 'jwt-1', refresh_token: 'rt-1' });
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
   });
 });

@@ -255,9 +255,10 @@ impl MethodHandler {
                 home: self.home_dir.clone(), registry: Some(self.registry.clone()),
                 broker: broker.clone(), users: self.user_db.read().await.clone(),
             };
-            return match Box::pin(crate::approval::decision_service::decide(
+            return match Box::pin(crate::approval::decision_service::decide_with_reach(
                 &env, &approval_id, approve, &reason,
                 &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+                params["reach_digest"].as_str(),
             )).await {
                 Ok(outcome) => WsFrame::ok_response("", outcome.value),
                 Err(error) => error.dashboard_frame(),

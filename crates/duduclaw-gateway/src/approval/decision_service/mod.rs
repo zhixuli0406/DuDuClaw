@@ -179,6 +179,13 @@ pub(crate) async fn validate_chat_identity(
 pub(crate) async fn decide(
     env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
 ) -> Result<DecisionOutcome, DecisionRefusal> {
+    decide_with_reach(env, id, approve, reason, by, None).await
+}
+
+pub(crate) async fn decide_with_reach(
+    env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
+    reach_digest: Option<&str>,
+) -> Result<DecisionOutcome, DecisionRefusal> {
     let expected = match by {
         Decider::Dashboard(_) => super::EXPECTED_DECISION_DIGEST.try_with(Clone::clone).ok().flatten(),
         Decider::ChatAdmin(proof) => Some((id.to_string(), proof.digest.clone())),
@@ -187,7 +194,7 @@ pub(crate) async fn decide(
     let _guard = lock.lock().await;
     let result = super::EXPECTED_DECISION_DIGEST.scope(expected,
         super::EXPECTED_DECISION_HOME.scope(env.home.clone(),
-            Box::pin(decide_locked(env, id, approve, reason, by))),
+            Box::pin(decide_locked(env, id, approve, reason, by, reach_digest))),
     ).await;
     if let (Decider::ChatAdmin(proof), Err(error)) = (by, &result) {
         identity::audit_refusal(env, id, proof, error).await;
@@ -197,6 +204,7 @@ pub(crate) async fn decide(
 
 async fn decide_locked(
     env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
+    reach_digest: Option<&str>,
 ) -> Result<DecisionOutcome, DecisionRefusal> {
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
@@ -271,7 +279,7 @@ async fn decide_locked(
             }
             // The kind owns state/expiry ordering: an applied journal must
             // be recovered before treating its original base as stale.
-            files_org::org_change(env, id, approve, reason, by, &actor).await?
+            files_org::org_change(env, id, approve, reason, by, &actor, reach_digest).await?
         }
         _ if handles(&rec) => {
             check_state(env, &rec, false).await?;

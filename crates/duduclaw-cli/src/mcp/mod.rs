@@ -223,6 +223,7 @@ mod odoo_access_tests;
 pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
 mod on_behalf_of;
+pub(crate) mod main_principal_gate;
 mod os_tools;
 mod personal_target;
 mod personal_wildcard;

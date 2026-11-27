@@ -304,7 +304,7 @@ async fn build_reply_with_session_inner_impl(
     );
 
     // Determine which agent to use
-    let reg = ctx.registry.read().await;
+    let mut reg = ctx.registry.read().await;
     let mut via_trigger = false;
     let agent = if let Some(name) = agent_override {
         // Explicit agent name (per-agent bot, WebChat selection, LINE route
@@ -422,29 +422,44 @@ async fn build_reply_with_session_inner_impl(
         let language = crate::prompt_identity::read_default_language(&ctx.home_dir).await;
         return no_responder_public_text(language.as_deref()).into();
     }
-    if let Some(a) = agent {
-        // Revalidate the actual LoadedAgent, not the earlier selected name.
-        // The authenticated account is host-owned task-local state; a model
-        // or a client-supplied message cannot replace it. This runs before
-        // any model seam/runtime and while the registry read lock is held.
-        if let Ok(user) = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone) {
-            // "system" is the already-authenticated legacy token Admin.
-            if user != "system" && !crate::webchat::is_widget_visitor(&user) {
-                let wire = format!("user:{user}");
-                if let Some(refusal) = crate::machine_employee::refusal_for_known_target(
-                    &ctx.home_dir, &user, &a.config.agent.name,
-                ) {
-                    return refusal.into();
-                }
-                if let Err(reason) = crate::on_behalf_of::access::check_loaded_main_target(
-                    &ctx.home_dir, Some(&wire), a,
-                ).await {
-                    tracing::warn!(user, agent = %a.config.agent.name, reason,
-                        "WebChat final reply target unavailable");
-                    return crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into();
-                }
+    // Only dashboard accounts opt into the new conversation gate. Channels,
+    // token Admin and widgets keep their existing route and lock lifetime.
+    let main_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone)
+        .ok().filter(|user| user != "system" && !crate::webchat::is_widget_visitor(user));
+    let selected_agent = agent.cloned().map(Box::new);
+    let agent = selected_agent.as_deref();
+    if let Some(user) = main_user {
+        // The asynchronous tool proof loads employees; release the live lock.
+        drop(reg);
+        if let Some(a) = agent {
+            let wire = format!("user:{user}");
+            if let Some(refusal) = crate::machine_employee::refusal_for_known_target(
+                &ctx.home_dir, &user, &a.config.agent.name,
+            ) {
+                return refusal.into();
+            }
+            if let Err(reason) = Box::pin(crate::on_behalf_of::access::check_loaded_main_target_for(
+                &ctx.home_dir, Some(&wire), a, crate::on_behalf_of::access::MainUse::Converse,
+            )).await {
+                tracing::warn!(user, agent = %a.config.agent.name, reason,
+                    "WebChat final reply target unavailable");
+                return if reason == crate::on_behalf_of::access::MAIN_TURN_REFUSAL {
+                    reason
+                } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into() };
             }
         }
+        reg = ctx.registry.read().await;
+        // Reject a reload during the proof instead of executing a replacement.
+        if let Some(selected) = agent {
+            let unchanged = reg.get(&selected.config.agent.name).is_some_and(|current| {
+                current.dir == selected.dir
+                    && matches!((serde_json::to_value(&current.config), serde_json::to_value(&selected.config)),
+                        (Ok(current), Ok(selected)) if current == selected)
+            });
+            if !unchanged { return crate::webchat::access::AGENT_UNAVAILABLE_TEXT.into(); }
+        }
+    }
+    if let Some(a) = agent {
         let principal = crate::on_behalf_of::current();
         // A failed requester lookup must not look like unattended work.
         let unknown = matches!(

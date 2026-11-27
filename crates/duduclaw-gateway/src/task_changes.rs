@@ -254,7 +254,7 @@ const DELETE_TOOLS: &[&str] = &["delete_file", "DeleteFile"];
 
 /// Shell-ish tools — a row is produced only when the command's own leading
 /// verb is a known mutator (see [`shell_command_mutates`]).
-const SHELL_TOOLS: &[&str] = &["Bash", "shell", "run_shell_command", "run_terminal_cmd"];
+use duduclaw_core::types::SHELL_TOOLS;
 
 /// MCP tools (`tool_calls.jsonl` names) whose effect a reviewer would call a
 /// file change. Deliberately short — a long speculative list would turn the

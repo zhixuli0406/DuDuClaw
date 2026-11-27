@@ -8,9 +8,19 @@ use chrono::Utc;
 use rusqlite::{params, Connection, Row, TransactionBehavior};
 
 use crate::user_row::{bump_acl_generation, load_user};
-use crate::{UserDb, UserRole, UserStatus};
+use crate::{AccessLevel, User, UserDb, UserRole, UserStatus};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub const ACKNOWLEDGEMENT_REQUIRED: &str = "acknowledgement required";
+
+/// Fresh database facts for display only; never an authorization context.
+pub struct DisplayCreatorAccess {
+    pub user: User,
+    pub bindings: BTreeMap<String, AccessLevel>,
+    pub grants: Vec<(String, Vec<GrantGroup>)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GrantGroup {
     Schedules,
     Automation,
@@ -44,6 +54,106 @@ pub struct DeptGrant {
     pub groups: Vec<GrantGroup>,
     pub granted_by: String,
     pub granted_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachChange {
+    Gains,
+    Loses,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReachLine {
+    pub user_id: String,
+    pub display_name: String,
+    /// The grant's department, never the manager's profile department.
+    pub department: String,
+    pub groups: Vec<GrantGroup>,
+    pub change: ReachChange,
+}
+
+/// Net group changes for one employee's move. Read grants and live users in
+/// one SQLite snapshot, including on a read-only connection. No profile,
+/// prefix, case folding or mirror is an authority source here.
+pub fn reach_change(db: &UserDb, from_dept: Option<&str>, to_dept: Option<&str>)
+    -> Result<Vec<ReachLine>, String> {
+    let from = from_dept.filter(|d| !d.is_empty());
+    let to = to_dept.filter(|d| !d.is_empty());
+    if from == to { return Ok(Vec::new()); }
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(store_error)?;
+    let mut groups: BTreeMap<String, (BTreeSet<GrantGroup>, BTreeSet<GrantGroup>)> = BTreeMap::new();
+    for grant in read_grants(&tx, None)? {
+        if Some(grant.department.as_str()) == from {
+            groups.entry(grant.user_id).or_default().0.extend(grant.groups);
+        } else if Some(grant.department.as_str()) == to {
+            groups.entry(grant.user_id).or_default().1.extend(grant.groups);
+        }
+    }
+    let mut lines = Vec::new();
+    for (user_id, (before, after)) in groups {
+        let Some(user) = load_user(&tx, &user_id)? else { continue; };
+        if user.role != UserRole::Manager || user.status != UserStatus::Active { continue; }
+        for (change, department, net) in [
+            (ReachChange::Gains, to, after.difference(&before).copied().collect::<Vec<_>>()),
+            (ReachChange::Loses, from, before.difference(&after).copied().collect::<Vec<_>>()),
+        ] {
+            if !net.is_empty() {
+                lines.push(ReachLine {
+                    user_id: user_id.clone(), display_name: user.display_name.clone(),
+                    department: department.expect("nonempty difference has a department").to_owned(),
+                    groups: net, change,
+                });
+            }
+        }
+    }
+    lines.sort_by(|a, b| (&a.user_id, &a.department, &a.groups, a.change)
+        .cmp(&(&b.user_id, &b.department, &b.groups, b.change)));
+    Ok(lines)
+}
+
+/// Canonical JSON tuples, sorted independently of caller order. Display names
+/// are deliberately excluded: a rename does not change authority.
+pub fn reach_digest(lines: &[ReachLine]) -> String {
+    let mut canonical: Vec<_> = lines.iter().map(|line| {
+        let mut groups: Vec<_> = line.groups.iter().map(|g| g.as_str()).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        (&line.user_id, &line.department, groups, line.change)
+    }).collect();
+    canonical.sort();
+    let bytes = serde_json::to_vec(&canonical).expect("reach tuples are JSON serializable");
+    // ring is already an auth dependency; no additional hash dependency.
+    ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref().iter()
+        .map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Org-change cards currently use zh-TW only.
+pub fn reach_sentence_zh(lines: &[ReachLine]) -> Option<String> {
+    if lines.is_empty() { return None; }
+    let clauses: Vec<_> = lines.iter().map(|line| {
+        let mut groups = line.groups.clone();
+        groups.sort();
+        groups.dedup();
+        let labels: Vec<_> = groups.iter().map(|group| match group {
+            GrantGroup::Schedules => "排程",
+            GrantGroup::Automation => "自動化規則",
+            GrantGroup::Skills => "技能",
+            GrantGroup::Cost => "用量",
+            GrantGroup::EgressReview => "對外傳送審核",
+        }).collect();
+        let label = match labels.split_last() {
+            Some((last, [])) => (*last).to_owned(),
+            Some((last, rest)) => format!("{}與{last}", rest.join("、")),
+            None => String::new(),
+        };
+        let name = if line.display_name.trim().is_empty() { "部門主管" } else { &line.display_name };
+        let verb = match line.change { ReachChange::Gains => "將可管理", ReachChange::Loses => "將不再能管理" };
+        format!("{}（{}）{verb}這位 AI 員工的{label}",
+            name.replace(['\r', '\n'], " "), line.department.replace(['\r', '\n'], " "))
+    }).collect();
+    Some(format!("核准後，{}。", clauses.join("；")))
 }
 
 fn store_error(error: rusqlite::Error) -> String {
@@ -93,8 +203,10 @@ impl UserDb {
     /// Replace a Manager's groups for one exact department. An unchanged set
     /// (including reordered/duplicate input) writes no audit and does not bump
     /// the ACL generation. Target validation still runs for unchanged sets.
+    /// Any added group requires acknowledgement, compared within the same
+    /// IMMEDIATE transaction as the write and audit (no re-authentication).
     pub fn set_dept_grants(&self, actor_user_id: &str, target_user_id: &str,
-        department: &str, groups: &[GrantGroup]) -> Result<(), String> {
+        department: &str, groups: &[GrantGroup], acknowledged: bool) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
         let user = load_user(&tx, target_user_id)?.ok_or("user not found")?;
@@ -113,6 +225,10 @@ impl UserDb {
                 .collect::<rusqlite::Result<_>>().map_err(store_error)?
         };
         let after: BTreeSet<String> = groups.iter().map(|group| group.as_str().to_owned()).collect();
+        // Compare under the IMMEDIATE write transaction, before any mutation.
+        if !acknowledged && !after.is_subset(&before) {
+            return Err(ACKNOWLEDGEMENT_REQUIRED.into());
+        }
         if before == after { return Ok(()); }
         tx.execute("DELETE FROM department_manager_grants WHERE user_id=?1 AND department=?2",
             params![target_user_id, department]).map_err(store_error)?;
@@ -123,11 +239,38 @@ impl UserDb {
                 params![target_user_id, department, group, actor_user_id, now]).map_err(store_error)?;
         }
         bump_acl_generation(&tx).map_err(store_error)?;
-        let detail = serde_json::json!({"department": department, "before": before, "after": after}).to_string();
+        let detail = serde_json::json!({"department": department, "before": before, "after": after, "acknowledged": acknowledged}).to_string();
         tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
             VALUES (?1, 'dept_grant_changed', ?2, ?3, NULL, ?4)",
             params![actor_user_id, target_user_id, detail, now]).map_err(store_error)?;
         tx.commit().map_err(store_error)
+    }
+
+    /// DISPLAY ONLY. Read one creator's account, direct bindings and grants in
+    /// one SQLite snapshot. A corrupt binding is unknown, not a missing grant.
+    pub fn display_creator_access(&self, user_id: &str) -> Result<Option<DisplayCreatorAccess>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(store_error)?;
+        let Some(user) = load_user(&tx, user_id)? else { return Ok(None); };
+        let mut bindings = BTreeMap::new();
+        if user.status == UserStatus::Active && user.role != UserRole::Admin {
+            let mut stmt = tx.prepare(
+                "SELECT agent_name, access_level FROM user_agent_bindings WHERE user_id=?1",
+            ).map_err(store_error)?;
+            let rows = stmt.query_map([user_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).map_err(store_error)?;
+            for row in rows {
+                let (agent, level) = row.map_err(store_error)?;
+                bindings.insert(agent, level.parse::<AccessLevel>()?);
+            }
+        }
+        let grants = if user.status == UserStatus::Active && user.role == UserRole::Manager {
+            read_grants(&tx, Some(user_id))?.into_iter()
+                .map(|grant| (grant.department, grant.groups)).collect()
+        } else { Vec::new() };
+        tx.commit().map_err(store_error)?;
+        Ok(Some(DisplayCreatorAccess { user, bindings, grants }))
     }
 
     pub fn dept_grants_for_user(&self, user_id: &str) -> Result<Vec<(String, Vec<GrantGroup>)>, String> {
@@ -155,7 +298,8 @@ impl UserDb {
 
     /// Replace the complete main-agent access set. Like department grants,
     /// unchanged sets do not write an audit or bump the ACL generation.
-    pub fn set_main_agent_users(&self, actor: &str, user_ids: &[String]) -> Result<(), String> {
+    /// Any added user requires acknowledgement in the same write transaction.
+    pub fn set_main_agent_users(&self, actor: &str, user_ids: &[String], acknowledged: bool) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
         let after: BTreeSet<String> = user_ids.iter().cloned().collect();
@@ -164,6 +308,10 @@ impl UserDb {
             if user.status != UserStatus::Active { return Err("main-agent access requires an active user".into()); }
         }
         let before: BTreeSet<String> = read_main_users(&tx)?.into_iter().collect();
+        // Compare under the IMMEDIATE write transaction, before any mutation.
+        if !acknowledged && !after.is_subset(&before) {
+            return Err(ACKNOWLEDGEMENT_REQUIRED.into());
+        }
         if before == after { return Ok(()); }
         tx.execute("DELETE FROM main_agent_users", []).map_err(store_error)?;
         let now = Utc::now().to_rfc3339();
@@ -172,7 +320,7 @@ impl UserDb {
                 params![id, actor, now]).map_err(store_error)?;
         }
         bump_acl_generation(&tx).map_err(store_error)?;
-        let detail = serde_json::json!({"before": before, "after": after}).to_string();
+        let detail = serde_json::json!({"before": before, "after": after, "acknowledged": acknowledged}).to_string();
         tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
             VALUES (?1, 'main_access_changed', 'main_agent_users', ?2, NULL, ?3)",
             params![actor, detail, now]).map_err(store_error)?;

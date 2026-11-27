@@ -343,3 +343,31 @@ async fn origin_only_background_queue_cannot_gain_system_authority_after_promoti
         crate::model_call_probe::set_dry_run(false);
     }
 }
+
+#[tokio::test]
+async fn dispatch_execution_accepts_listed_shell_free_main_and_rechecks_revocation() {
+    let f = Fixture::new("record").await;
+    crate::team_edition::record(f.home.path(), duduclaw_core::EditionProfile::Enterprise);
+    let db = duduclaw_auth::UserDb::new(&f.home.path().join("users.db")).unwrap();
+    db.set_main_agent_users(f.admin.strip_prefix("user:").unwrap(),
+        &[f.employee.strip_prefix("user:").unwrap().to_owned()], true).unwrap();
+    crate::trigger_route::tests::write_agent(&f.home.path().join("agents"), "main", "Main", "@main", "main",
+        "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+    f.registry.write().await.scan().await.unwrap();
+    let delegation = DelegationEnv {
+        credential_source: "task:listed:step:0".into(), depth: 0,
+        origin: String::new(), sender: String::new(), hop_depth: 0,
+    };
+    crate::model_call_probe::set_dry_run(true);
+    let before = crate::model_call_probe::calls();
+    let allowed = crate::on_behalf_of::scope_first(Some(f.employee.clone()),
+        dispatch_to_agent_outcome(f.home.path(), &f.registry, "main", "work", &delegation, None)).await;
+    assert!(allowed.is_ok(), "{allowed:?}");
+    assert_eq!(crate::model_call_probe::calls(), before + 1);
+    db.set_main_agent_users(f.admin.strip_prefix("user:").unwrap(), &[], true).unwrap();
+    let denied = crate::on_behalf_of::scope_first(Some(f.employee.clone()),
+        dispatch_to_agent_outcome(f.home.path(), &f.registry, "main", "work", &delegation, None)).await;
+    assert!(denied.is_err());
+    assert_eq!(crate::model_call_probe::calls(), before + 1);
+    crate::model_call_probe::set_dry_run(false);
+}

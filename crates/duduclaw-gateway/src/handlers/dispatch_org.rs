@@ -128,6 +128,14 @@ impl MethodHandler {
             | "agents.primary_owner_set" => {
                 boxed_frame(|| self.handle_personal_google_rpc(method, params, ctx)).await
             }
+            "agents.main_access.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_get()).await
+            }
+            "agents.main_access.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_set(params, ctx)).await
+            }
             "users.my_history_views" => boxed_frame(|| self.handle_my_history_views(params, ctx)).await,
             "users.team_history.list" => boxed_frame(|| self.handle_team_history_list(params, ctx)).await,
             "users.team_history.get" => boxed_frame(|| self.handle_team_history_get(params, ctx)).await,
@@ -226,6 +234,10 @@ impl MethodHandler {
             | "users.google_signin.attest" | "users.google_signin.unlink"
             | "users.signin_onboarding.retry_avatar" => {
                 boxed_frame(|| self.handle_google_signin_rpc(method, params, ctx)).await
+            }
+            "users.dept_grants.reach_preview" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_reach_preview(params)).await
             }
             "users.invite" | "users.invite_status" => {
                 require_admin!();
@@ -569,7 +581,15 @@ impl MethodHandler {
                 // Assigning work: a direct Operator/Owner binding, Admin, or
                 // a team grant that derived Operator (a Manager handing work
                 // to a report's employee). Never wider than that.
-                if !ctx.can_assign_to(assigned_to) {
+                let ordinary = params.get("schedule").is_none_or(|v| v.is_null())
+                    && params.get("kind").and_then(Value::as_str)
+                        .is_none_or(|kind| matches!(kind.trim().to_ascii_lowercase().as_str(), "" | "task" | "goal"));
+                if ordinary {
+                    if let Err(frame) = self.deny_main_unless_admitted(ctx, assigned_to,
+                        crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
+                }
+                if !ctx.can_assign_to(assigned_to)
+                    && !(ordinary && self.main_assignment_admitted(ctx, assigned_to).await) {
                     return WsFrame::error_response("", "permission denied");
                 }
                 boxed_frame(|| self.handle_tasks_create(params, ctx)).await

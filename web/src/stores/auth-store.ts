@@ -1,3 +1,4 @@
+import { isGrantGroup, type DepartmentGrant, type GrantGroup, type MeGrantFields } from '@/lib/dept-grants-types';
 import { dashboardEndpoint } from '@/lib/dashboard-base';
 import { create } from 'zustand';
 import { client } from '@/lib/ws-client';
@@ -39,7 +40,30 @@ export type LoginChallenge = FactorAvailability & (
   | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string; setup_code_required?: boolean });
 export type LoginResult = LoginChallenge | void;
 
+interface AuthMe extends MeGrantFields {
+  user: AuthUser;
+  bindings: AgentBinding[];
+}
+
+const EMPTY_DEPT_GROUPS: ReadonlySet<GrantGroup> = new Set();
+
+function grantState(me: MeGrantFields = {}) {
+  const deptGrants: DepartmentGrant[] = (me.dept_grants ?? []).map((grant) => ({
+    department: grant.department,
+    groups: grant.groups.filter(isGrantGroup),
+  }));
+  return {
+    deptGrants,
+    deptGroups: new Set(deptGrants.flatMap((grant) => grant.groups)) as ReadonlySet<GrantGroup>,
+    mainAgentAccess: me.main_agent_access === true,
+  };
+}
+
 interface AuthStore {
+  readonly deptGrants: readonly DepartmentGrant[];
+  readonly deptGroups: ReadonlySet<GrantGroup>;
+  readonly mainAgentAccess: boolean;
+  refreshMe: () => Promise<void>;
   readonly user: AuthUser | null;
   readonly jwt: string | null;
   readonly refreshToken: string | null;
@@ -74,7 +98,7 @@ interface AuthStore {
   logout: () => void;
   refresh: () => Promise<void>;
   loadFromStorage: () => Promise<boolean>;
-  setUser: (user: AuthUser, bindings: AgentBinding[]) => void;
+  setUser: (user: AuthUser, bindings: AgentBinding[], me?: MeGrantFields) => void;
 }
 
 const STORAGE_KEY_REFRESH = 'duduclaw-refresh-token';
@@ -271,6 +295,7 @@ export function resetLocalSessionProbe(): void {
 const LOCAL_SESSION_HEADER = 'X-DuDuClaw-Local';
 
 export const useAuthStore = create<AuthStore>((set, get) => ({
+  ...grantState(),
   user: null,
   jwt: null,
   refreshToken: null,
@@ -297,11 +322,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
     const token = data.remembered ? COOKIE_SESSION : data.refresh_token;
     if (!token) throw new Error('Missing session credential');
-    const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>('/api/me', data.access_token);
+    const me = await apiGet<AuthMe>('/api/me', data.access_token);
     if (attempt !== get().authAttempt || !isActive()) return false;
     refreshTokenStorage.set(token);
     pendingRemember = null;
-    set({ user: me.user, jwt: data.access_token, refreshToken: token,
+    set({ ...grantState(me), user: me.user, jwt: data.access_token, refreshToken: token,
       isAuthenticated: true, initialized: true, bindings: me.bindings });
     startRefreshTimer(get().refresh);
     return true;
@@ -427,6 +452,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     client.disconnect();
     refreshTokenStorage.clear();
     set({
+      ...grantState(),
       user: null,
       jwt: null,
       refreshToken: null,
@@ -454,7 +480,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
         if (!stillCurrent()) return;
 
-        const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        const me = await apiGet<AuthMe>(
           '/api/me',
           data.access_token
         );
@@ -462,6 +488,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         if (!stillCurrent()) return;
         set({
           jwt: data.access_token,
+          ...grantState(me),
           user: me.user,
           bindings: me.bindings,
           isAuthenticated: true,
@@ -514,12 +541,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           ? await cookieOperation(() => apiPost<SessionTokens>('/api/session/refresh', {}))
           : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
 
-        const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        const me = await apiGet<AuthMe>(
           '/api/me',
           data.access_token
         );
 
         set({
+          ...grantState(me),
           user: me.user,
           jwt: data.access_token,
           refreshToken,
@@ -553,7 +581,25 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     return false;
   },
 
-  setUser: (user: AuthUser, bindings: AgentBinding[]) => {
-    set({ user, bindings });
+  refreshMe: async () => {
+    const { authAttempt, jwt, user } = get();
+    if (!user || !get().isAuthenticated) return;
+    const stillCurrent = () => get().authAttempt === authAttempt && get().jwt === jwt
+      && get().user?.id === user.id && get().isAuthenticated;
+    try {
+      const me = await client.call('users.me') as AuthMe;
+      if (stillCurrent()) set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+    } catch {
+      if (stillCurrent()) set(grantState());
+    }
+  },
+
+  setUser: (user: AuthUser, bindings: AgentBinding[], me?: MeGrantFields) => {
+    set({ user, bindings, ...(me === undefined ? {} : grantState(me)) });
   },
 }));
+
+/** Stable store-owned union; never create a Set inside a Zustand selector. */
+export function useDeptGroups(): ReadonlySet<GrantGroup> {
+  return useAuthStore((state) => state.deptGroups ?? EMPTY_DEPT_GROUPS);
+}

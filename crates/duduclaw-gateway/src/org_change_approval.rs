@@ -183,13 +183,13 @@ pub(crate) fn expires_at(rec: &ApprovalRecord) -> Value {
 }
 
 /// zh-TW one-line summary for the approval card.
-pub(crate) fn summary(p: &Proposal) -> String {
+pub(crate) fn summary(p: &Proposal, sentence: Option<&str>) -> String {
     let label = |e: &OrgEntry| {
         let boss = if e.reports_to.is_empty() { "最上層".to_string() } else { format!("向「{}」回報", e.reports_to) };
         let dept = if e.department.is_empty() { "無部門".to_string() } else { format!("部門「{}」", e.department) };
         format!("{boss}、{dept}")
     };
-    format!(
+    let mut text = format!(
         "{who} 提議調整 AI 員工「{agent}」的組織位置：{before} → {after}。",
         who = duduclaw_core::truncate_chars(
             if p.proposer_email.is_empty() { p.proposer.as_str() } else { p.proposer_email.as_str() },
@@ -198,7 +198,12 @@ pub(crate) fn summary(p: &Proposal) -> String {
         agent = p.agent_id,
         before = label(&p.before),
         after = label(&p.after),
-    )
+    );
+    if let Some(sentence) = sentence {
+        text.push('\n');
+        text.push_str(sentence);
+    }
+    text
 }
 
 /// The `org_change` approval journal, keyed by approval id
@@ -540,10 +545,13 @@ pub(crate) fn notice_body(rec: &ApprovalRecord, reminder: bool, deadline: &str) 
     } else {
         "📥 有一則組織調整等待審核"
     };
+    let reach_line = rec.payload.get("sentence").and_then(Value::as_str)
+        .map(|sentence| format!("{}\n", crate::goal_state::xml_escape(sentence)))
+        .unwrap_or_default();
     format!(
         "{head}\n\
          AI 員工：{agent}\n\
-         這類調整只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
+         {reach_line}這類調整只能由管理員在儀表板的待辦清單決定，請開啟儀表板處理。\n\
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
@@ -594,7 +602,7 @@ mod tests {
         assert_eq!((back.before, back.after), (p.before.clone(), p.after.clone()));
         assert!(Proposal::from_record(&rec(p.to_payload(), "someone-else")).is_none());
         assert!(Proposal::from_record(&rec(json!({"agent_id": "rep"}), "rep")).is_none());
-        assert!(summary(&p).contains("rep"));
+        assert!(summary(&p, None).contains("rep"));
         assert!(expires_at(&rec(p.to_payload(), "rep")).is_string());
     }
 

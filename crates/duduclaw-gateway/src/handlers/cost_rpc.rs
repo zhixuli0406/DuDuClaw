@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
 
 impl MethodHandler {
     // ── Odoo ERP ─────────────────────────────────────────────────
@@ -22,7 +23,11 @@ impl MethodHandler {
 
     /// Resolve the process-wide telemetry singleton, initialising it on first
     /// use. Returns `None` only if init itself fails (disk/permission).
-    pub(crate) fn cost_telemetry(&self) -> Option<&'static crate::cost_telemetry::CostTelemetry> {
+    pub(crate) fn cost_telemetry(&self) -> Option<&crate::cost_telemetry::CostTelemetry> {
+        #[cfg(test)]
+        if let Some(telemetry) = self.cost_telemetry_fixture.get() {
+            return Some(telemetry);
+        }
         if crate::cost_telemetry::get_telemetry().is_none() {
             let _ = crate::cost_telemetry::init_telemetry(&self.home_dir);
         }
@@ -113,6 +118,111 @@ impl MethodHandler {
         }
     }
 
+    /// Build an exact department scope before reading any cost records.
+    async fn department_cost_agents(
+        &self,
+        params: &Value,
+        ctx: &UserContext,
+    ) -> Result<(String, Vec<(String, String)>), WsFrame> {
+        let department = params.get("department").and_then(Value::as_str)
+            .filter(|name| duduclaw_core::is_valid_department(name))
+            .ok_or_else(|| WsFrame::error_response("", "invalid department"))?
+            .to_owned();
+        // Load before acquiring registry guards: this revalidates the live
+        // account, credential epoch, provenance and grants on every request.
+        let view = if ctx.is_admin() { DeptGrantView::empty() }
+            else { DeptGrantView::load(self, ctx).await };
+        if !ctx.is_admin() && !view.departments_for(GrantGroup::Cost).contains(&department) {
+            return Err(WsFrame::error_response("", "permission denied"));
+        }
+        let org = duduclaw_core::org_store::load_for_write(&self.home_dir)
+            .map_err(|_| WsFrame::error_response("", "permission denied"))?;
+        let authoritative: std::collections::BTreeMap<String, String> = org.iter()
+            .filter_map(|(id, _)| {
+                duduclaw_agent::skill_loader::authoritative_department(&self.home_dir, id)
+                    .map(|department| (id.clone(), department))
+            }).collect();
+        if ctx.is_admin() && !authoritative.values().any(|name| name == &department) {
+            return Err(WsFrame::error_response("", "permission denied"));
+        }
+        let mut agents = {
+            let registry = self.registry().read().await;
+            registry.list().into_iter().filter_map(|agent| {
+                let id = agent.dir.file_name()?.to_str()?;
+                if authoritative.get(id) != Some(&department) || ctx.owner_only_denied(id) {
+                    return None;
+                }
+                if !ctx.is_admin()
+                    && !department_grant_allows(&view, id, GrantGroup::Cost, GrantAction::Read)
+                {
+                    return None;
+                }
+                Some((id.to_owned(), agent.config.agent.display_name.clone()))
+            }).collect::<Vec<_>>()
+        };
+        agents.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok((department, agents))
+    }
+
+    /// Per-employee department costs; totals contain only the returned rows.
+    pub(crate) async fn handle_cost_department_summary(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let (department, agents) = match self.department_cost_agents(&params, ctx).await {
+            Ok(scope) => scope,
+            Err(frame) => return frame,
+        };
+        let days = params.get("days").and_then(Value::as_u64).unwrap_or(30).clamp(1, 90);
+        let mut totals = crate::cost_telemetry::CostSummary::default();
+        let Some(tel) = self.cost_telemetry() else {
+            return WsFrame::ok_response("", json!({"available": false, "department": department,
+                "days": days, "agents": [], "totals": department_cost_numbers(&totals)}));
+        };
+        let mut rows = Vec::with_capacity(agents.len());
+        for (id, display_name) in agents {
+            // Reuse the per-agent query: no company-wide or ephemeral buckets
+            // can enter the result, and idle department employees get zero-valued rows.
+            let summary = match tel.summary_by_agent(&id, days * 24).await {
+                Ok(row) => row.summary,
+                Err(error) => return WsFrame::error_response("", &format!("Cost department summary failed: {error}")),
+            };
+            totals.total_requests += summary.total_requests;
+            totals.total_input_tokens += summary.total_input_tokens;
+            totals.total_output_tokens += summary.total_output_tokens;
+            totals.total_cost_millicents += summary.total_cost_millicents;
+            totals.total_cache_savings_millicents += summary.total_cache_savings_millicents;
+            // Weight each agent's average by its request count, then normalize below.
+            totals.avg_cache_efficiency += summary.avg_cache_efficiency * summary.total_requests as f64;
+            let mut row = department_cost_numbers(&summary);
+            row["agent_id"] = json!(id);
+            row["display_name"] = json!(display_name);
+            rows.push(row);
+        }
+        totals.avg_cache_efficiency = if totals.total_requests == 0 {
+            0.0
+        } else {
+            totals.avg_cache_efficiency / totals.total_requests as f64
+        };
+        WsFrame::ok_response("", json!({"available": true, "department": department,
+            "days": days, "agents": rows, "totals": department_cost_numbers(&totals)}))
+    }
+
+    /// Recent records for the admitted department ids only, newest first.
+    pub(crate) async fn handle_cost_department_recent(&self, params: Value, ctx: &UserContext) -> WsFrame {
+        let (department, agents) = match self.department_cost_agents(&params, ctx).await {
+            Ok(scope) => scope,
+            Err(frame) => return frame,
+        };
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(50).clamp(1, 200) as u32;
+        let Some(tel) = self.cost_telemetry() else {
+            return WsFrame::ok_response("", json!({"available": false, "department": department, "records": []}));
+        };
+        let ids: Vec<String> = agents.into_iter().map(|(id, _)| id).collect();
+        match tel.recent_records_for_agents(&ids, limit).await {
+            Ok(records) => WsFrame::ok_response("", json!({"available": true, "department": department,
+                "records": records.iter().map(cost_record_json).collect::<Vec<_>>()})),
+            Err(error) => WsFrame::error_response("", &format!("Cost department recent failed: {error}")),
+        }
+    }
+
     /// `cost.by_model` — per-model cost rollup (WP-A2), costliest model first.
     ///
     /// Params: `agent_id` (optional — omit for every agent), `days` (default 7,
@@ -169,7 +279,7 @@ impl MethodHandler {
     }
 
     /// `cost.by_role` — measured team-stage spend, with no attribution of
-    /// historical NULL-role rows. Admin only, like all `cost.*` methods.
+    /// historical NULL-role rows. Admin only.
     pub(crate) async fn handle_cost_by_role(&self, params: Value) -> WsFrame {
         let days = params
             .get("days")
@@ -214,27 +324,40 @@ impl MethodHandler {
             Ok(records) => {
                 let rows: Vec<Value> = records
                     .iter()
-                    .map(|r| {
-                        json!({
-                            "agent_id": r.agent_id,
-                            "request_type": r.request_type,
-                            "model": r.model,
-                            "input_tokens": r.input_tokens,
-                            "cache_read_tokens": r.cache_read_tokens,
-                            "cache_creation_tokens": r.cache_creation_tokens,
-                            "output_tokens": r.output_tokens,
-                            "cache_efficiency": r.cache_efficiency,
-                            "cost_millicents": r.cost_millicents,
-                            "cache_savings_millicents": r.cache_savings_millicents,
-                            "created_at": r.created_at,
-                        })
-                    })
+                    .map(cost_record_json)
                     .collect();
                 WsFrame::ok_response("", json!({ "available": true, "records": rows }))
             }
             Err(e) => WsFrame::error_response("", &format!("Cost recent failed: {e}")),
         }
     }
+}
+
+fn department_cost_numbers(summary: &crate::cost_telemetry::CostSummary) -> Value {
+    json!({
+        "total_requests": summary.total_requests,
+        "total_input_tokens": summary.total_input_tokens,
+        "total_output_tokens": summary.total_output_tokens,
+        "total_cost_millicents": summary.total_cost_millicents,
+        "total_cache_savings_millicents": summary.total_cache_savings_millicents,
+        "avg_cache_efficiency": summary.avg_cache_efficiency,
+    })
+}
+
+fn cost_record_json(r: &crate::cost_telemetry::CostRecord) -> Value {
+    json!({
+        "agent_id": r.agent_id,
+        "request_type": r.request_type,
+        "model": r.model,
+        "input_tokens": r.input_tokens,
+        "cache_read_tokens": r.cache_read_tokens,
+        "cache_creation_tokens": r.cache_creation_tokens,
+        "output_tokens": r.output_tokens,
+        "cache_efficiency": r.cache_efficiency,
+        "cost_millicents": r.cost_millicents,
+        "cache_savings_millicents": r.cache_savings_millicents,
+        "created_at": r.created_at,
+    })
 }
 
 fn price_cliff_status(

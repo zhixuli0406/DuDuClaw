@@ -358,10 +358,17 @@ impl MethodHandler {
         if agent_id.is_empty() || !is_valid_agent_id(agent_id) {
             return WsFrame::error_response("", "valid agent_id is required");
         }
-        if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
+        let scheduled = params.get("schedule").is_some_and(|value| !value.is_null());
+        let main_gate = if scheduled {
+            self.deny_main_for_non_admin(ctx, agent_id).await
+        } else {
+            self.deny_main_unless_admitted(ctx, agent_id, crate::on_behalf_of::access::MainUse::Assign).await
+        };
+        if let Err(frame) = main_gate { return frame; }
         // Assigning a goal: Operator on the agent, or a team grant that
         // derived Operator (a Manager handing work to a report's employee).
-        if !ctx.can_assign_to(agent_id) {
+        if !ctx.can_assign_to(agent_id)
+            && (scheduled || !self.main_assignment_admitted(ctx, agent_id).await) {
             return WsFrame::error_response("", "permission denied");
         }
         if !ctx.is_admin() {

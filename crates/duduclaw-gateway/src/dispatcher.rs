@@ -1999,20 +1999,23 @@ async fn dispatch_to_agent_outcome(
     let run = crate::autonomous_runtime::round_scope(home_dir, round_message_id,
     crate::autonomous_runtime::scope(home_dir, agent_id, &callers, async {
         {
-            let reg = registry.read().await;
-            if let Some(agent) = reg.get(agent_id) {
+            let loaded = {
+                let reg = registry.read().await;
+                reg.get(agent_id).cloned().map(Box::new)
+            };
+            if let Some(agent) = loaded.as_deref() {
                 if delegation.credential_source.starts_with("message_queue:")
                     || delegation.credential_source.starts_with("bus:")
                 {
                     let sender = crate::delegation_gate::resolve_sender(
                         Some(&delegation.sender), Some(&delegation.origin),
                     ).unwrap_or_default();
-                    crate::on_behalf_of::access::check_loaded_queue_main_target(
+                    crate::on_behalf_of::access::check_loaded_queue_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                         crate::delegation_gate::is_background_system_sender(sender),
                     ).await.map_err(DispatchError::Other)?;
                 } else {
-                    crate::on_behalf_of::access::check_loaded_main_target(
+                    crate::on_behalf_of::access::check_loaded_main_target_for_execution(
                         home_dir, crate::on_behalf_of::current().as_deref(), agent,
                     ).await.map_err(DispatchError::Other)?;
                 }
@@ -2312,7 +2315,7 @@ async fn dispatch_taskspec_inner(
         );
 
         // Check self-target steps too, including a role/default change since creation.
-        if let Err(reason) = crate::on_behalf_of::access::check_main_target(
+        if let Err(reason) = crate::on_behalf_of::access::check_main_target_for_execution(
             home_dir, crate::on_behalf_of::current().as_deref(), &target_agent,
         ).await {
             spec.steps[step_index].status = StepStatus::Failed;

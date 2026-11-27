@@ -535,11 +535,31 @@ pub(crate) async fn check_delegation_allowed(
     target: &str,
     path_kind: &str,
 ) -> std::result::Result<(), String> {
+    check_delegation_for_work(home_dir, sender, target, path_kind, false).await
+}
+
+/// Only ordinary task creation/hand-over opts into the main person list.
+/// Scheduling, discovery and message delegation retain the legacy entry point.
+pub(crate) async fn check_assignment_delegation_allowed(
+    home_dir: &Path, sender: &str, target: &str, path_kind: &str,
+) -> std::result::Result<(), String> {
+    check_delegation_for_work(home_dir, sender, target, path_kind, true).await
+}
+
+async fn check_delegation_for_work(
+    home_dir: &Path, sender: &str, target: &str, path_kind: &str, assignment: bool,
+) -> std::result::Result<(), String> {
     let read = duduclaw_core::delegation_policy::read_delegation_config(home_dir);
     let roles = super::delegation_roles::LoopbackOwnerRoles::load(home_dir, sender, &read).await;
     let principal = host_on_behalf_of(home_dir, sender);
-    duduclaw_gateway::on_behalf_of::access::check_main_target(home_dir, principal.as_deref(), target).await?;
-    let boundaries = duduclaw_gateway::delegation_roles::sync_boundaries(home_dir, sender, target, principal.as_deref());
+    let mut boundaries = duduclaw_gateway::delegation_roles::sync_boundaries(home_dir, sender, target, principal.as_deref());
+    if assignment {
+        boundaries = Box::pin(duduclaw_gateway::delegation_roles::assignment_boundaries(
+            home_dir, sender, target, principal.as_deref(),
+        )).await?;
+    } else {
+        duduclaw_gateway::on_behalf_of::access::check_main_target(home_dir, principal.as_deref(), target).await?;
+    }
     let org = org_snapshot(home_dir, &[sender, target]).await;
     match duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, sender, target,
         &duduclaw_core::delegation_policy::DelegationContext {
@@ -548,7 +568,10 @@ pub(crate) async fn check_delegation_allowed(
         // The employee tree allows it; the person the work is for must too
         // (`[delegation] human_principal = "enforce"`; record mode passes).
         Ok(source) => {
-            check_human_principal(home_dir, sender, target, path_kind, read.rules.policy).await?;
+            // This Assign operation still uses the live human-authority bridge.
+            // Its main boundary was proved above; legacy on_behalf_of callers stay Admin-only.
+            let human_path = if assignment { "tasks_assign_admitted" } else { path_kind };
+            check_human_principal(home_dir, sender, target, human_path, read.rules.policy).await?;
             super::delegation_roles::audit_allow(home_dir, sender, target, source, &roles, path_kind);
             Ok(())
         },
