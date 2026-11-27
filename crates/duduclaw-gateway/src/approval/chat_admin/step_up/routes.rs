@@ -108,9 +108,9 @@ pub(crate) async fn confirm(env: &DecisionEnv, ctx: &UserContext, session: &str,
     tokio::task::spawn_blocking(move || {
         let db = db.as_deref().ok_or_else(Error::forbidden)?;
         let live = active_admin(db, &ctx, &session)?;
+        let cfg = config::effective(&home, Some(db)).ok_or_else(Error::forbidden)?;
+        if !cfg.step_up_methods.contains(&config::StepMethod::Web) { return Err(Error::forbidden()); }
         if approve {
-            let cfg = config::effective(&home, Some(db)).ok_or_else(Error::forbidden)?;
-            if !cfg.step_up_methods.contains(&config::StepMethod::Web) { return Err(Error::forbidden()); }
             let csrf = input.step_up_csrf.ok_or_else(Error::step_up)?;
             let fresh = db.migration_confirmation_session(&live.user_id, &session,
                 live.credential_epoch, chrono::Utc::now().timestamp()).map_err(|_| Error::step_up())?

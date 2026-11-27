@@ -1,7 +1,7 @@
 //! P15 regression tests. Gateway compilation/execution is reserved for review.
 use super::*;
 use super::{store::Store, routes::{Choice, Decision}};
-use crate::approval::{ApprovalId, ApprovalStatus, decision_service::tests::Fixture};
+use crate::approval::{ApprovalId, ApprovalStatus, decision_service::{self, tests::Fixture}};
 use crate::approval::chat_admin::receipts;
 use chrono::Utc;
 use rusqlite::{Connection, params};
@@ -301,4 +301,31 @@ fn web_link_requires_external_https_and_preserves_base_path() {
     }
     std::fs::write(home.path().join("config.toml"), "[dashboard]\npublic_url='https://dashboard.example.test/dudu/'\n").unwrap();
     assert_eq!(landing_base(home.path()).as_deref(), Some("https://dashboard.example.test/dudu/approvals/confirm"));
+}
+
+#[tokio::test]
+async fn disabled_web_refuses_both_decisions_without_consuming_old_ticket() {
+    for enabled in [true, false] {
+        let f = WebFixture::new().await;
+        let csrf = f.step_up();
+        f.service.config(enabled, "telegram", &[]);
+        let path = f.service.env.home.join("config.toml");
+        let cfg = std::fs::read_to_string(&path).unwrap() + "step_up_methods=['dm_totp']\n";
+        std::fs::write(path, cfg).unwrap();
+        let proof = decision_service::ChatAdminProof { user_id:f.service.user.clone(), channel:config::ChatChannel::Telegram,
+            account:f.receipt.account.clone(), principal:f.receipt.principal.clone(), dm:f.receipt.dm.clone(),
+            card_id:f.receipt.card_id.clone(), digest:f.receipt.digest.clone(), step:super::super::ledger::Step::Web };
+        for approve in [true, false] {
+            assert!(f.post(f.input(approve, Some(csrf))).await.is_err());
+            let result = decision_service::decide(&f.service.env, &f.id, approve, "",
+                &decision_service::Decider::ChatAdmin(proof.clone())).await;
+            if enabled {
+                assert!(matches!(result, Err(decision_service::DecisionRefusal::StepUpRequired)));
+            } else {
+                assert!(matches!(result, Err(decision_service::DecisionRefusal::FeatureOff)));
+            }
+            assert!(Store::open(&f.service.env.home).unwrap().preview(&f.raw, &f.service.user).is_ok());
+            f.pending().await;
+        }
+    }
 }
