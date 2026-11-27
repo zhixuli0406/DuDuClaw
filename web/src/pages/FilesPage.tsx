@@ -1,3 +1,4 @@
+import { formatDateTime, getCompanyTimeZone, localDateToInstant, nextLocalMidnight, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useUrlState } from '@/lib/use-url-state';
 import { useIntl } from 'react-intl';
@@ -100,6 +101,8 @@ function isOfficePreviewable(name: string): boolean {
 }
 
 export function FilesPage() {
+  useCompanyTimeZone();
+  const companyZone = getCompanyTimeZone();
   const intl = useIntl();
   const jwt = useAuthStore((s) => s.jwt);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -150,15 +153,6 @@ export function FilesPage() {
     if (scope !== 'all' && selected && !visibleAgents.some(a => a.name === selected)) setSelected('');
   }, [scope, selected, visibleAgents, setSelected]);
 
-  const dateFmt = useMemo(
-    () =>
-      new Intl.DateTimeFormat(intl.locale, {
-        dateStyle: 'medium',
-        timeStyle: 'short',
-      }),
-    [intl.locale],
-  );
-
   const buildUrl = useCallback(
     (base: string, name?: string): string => {
       const params = new URLSearchParams();
@@ -170,19 +164,23 @@ export function FilesPage() {
     [effective],
   );
 
-  // I-4: `<input type="date">` gives a plain `YYYY-MM-DD`, parsed as LOCAL
-  // midnight (no timezone suffix ⇒ local time per the ES2015 Date grammar) so
-  // the boundary matches what `dateFmt` shows the user, not UTC midnight.
+  // Date inputs and displayed timestamps share the effective company/browser zone.
   const sinceMs = useMemo(() => {
     if (!sinceDate) return undefined;
-    const ms = Date.parse(`${sinceDate}T00:00:00`);
-    return Number.isNaN(ms) ? undefined : ms;
-  }, [sinceDate]);
+    try {
+      return localDateToInstant(sinceDate, getCompanyTimeZone());
+    } catch {
+      return undefined;
+    }
+  }, [sinceDate, companyZone]);
   const untilMs = useMemo(() => {
     if (!untilDate) return undefined;
-    const ms = Date.parse(`${untilDate}T23:59:59.999`);
-    return Number.isNaN(ms) ? undefined : ms;
-  }, [untilDate]);
+    try {
+      return nextLocalMidnight(untilDate, getCompanyTimeZone()) - 1;
+    } catch {
+      return undefined;
+    }
+  }, [untilDate, companyZone]);
 
   /** The listing endpoint alone gets the I-4 filters — download/preview keep
    *  using plain `buildUrl` (agent + name only). */
@@ -455,7 +453,7 @@ export function FilesPage() {
                       {formatSize(f.size)}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground tabular-nums">
-                      {f.mtime ? dateFmt.format(new Date(f.mtime)) : '—'}
+                      {f.mtime ? formatDateTime(f.mtime, { locale: intl.locale, dateStyle: 'medium', timeStyle: 'short' }) : '—'}
                     </TableCell>
                     <TableCell>
                       <div className="flex items-center justify-end gap-1">

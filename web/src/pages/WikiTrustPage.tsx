@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import {
@@ -281,6 +282,7 @@ function TrustDetailDialog({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [history, setHistory] = useState<ReadonlyArray<WikiTrustHistoryRow>>([]);
   const [loadingHistory, setLoadingHistory] = useState(true);
@@ -338,7 +340,7 @@ function TrustDetailDialog({
             <span className="flex flex-wrap items-center gap-3 text-xs">
               <span>agent: <strong className="text-foreground">{row.agent_id}</strong></span>
               <span>citations: {row.citation_count}</span>
-              <span>updated: {new Date(row.updated_at).toLocaleString()}</span>
+              <span>updated: {formatDateTime(row.updated_at, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</span>
             </span>
           </DialogDescription>
         </DialogHeader>
@@ -368,7 +370,7 @@ function TrustDetailDialog({
                 <tbody>
                   {history.map((h, idx) => (
                     <tr key={`${h.ts}-${idx}`} className="border-b border-surface-border last:border-0">
-                      <td className="px-3 py-1.5 text-muted-foreground">{new Date(h.ts).toLocaleString()}</td>
+                      <td className="px-3 py-1.5 text-muted-foreground">{formatDateTime(h.ts, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</td>
                       <td className="px-3 py-1.5 font-mono">
                         {h.old_trust.toFixed(3)} → {h.new_trust.toFixed(3)}{' '}
                         <span className={cn(h.applied_delta >= 0 ? 'text-success' : 'text-destructive')}>

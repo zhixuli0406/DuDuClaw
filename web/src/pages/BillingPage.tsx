@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { DataExportButton } from '@/components/DataExportButton';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -71,6 +72,7 @@ const INCIDENT_FILTERS = ['all', 'over'] as const;
 // ── Budget console (WP14-T14.6) — open-events per AI staff + recent incidents ──
 
 function BudgetConsole() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [incidents, setIncidents] = useState<BudgetIncident[]>([]);
   const [byAgent, setByAgent] = useState<BudgetByAgent[]>([]);
@@ -198,7 +200,7 @@ function BudgetConsole() {
                             <span className="text-muted-foreground"> / {fmtCents(inc.cap_cents)}</span>
                           </TableCell>
                           <TableCell className="font-mono text-xs text-muted-foreground">
-                            {new Date(inc.ts).toLocaleString('zh-TW', {
+                            {formatDateTime(inc.ts, { locale: 'zh-TW',
                               month: 'short',
                               day: 'numeric',
                               hour: '2-digit',
