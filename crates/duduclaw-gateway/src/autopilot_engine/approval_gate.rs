@@ -18,7 +18,7 @@ use crate::autopilot_approval::{
 use crate::autopilot_store::{
     AutopilotDispatchRow, DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_REQUESTING,
     DISPATCH_SETTLED, PUSH_GAVE_UP, PUSH_NO_TARGET, PUSH_PENDING, PUSH_QUEUED, PUSH_SENT,
-    PUSH_SUPPRESSED,
+    PUSH_SUPPRESSED, StepApprovalBindMode,
 };
 
 /// Test replacement of the outcome chat push: `(rule_id, body) -> result`.
@@ -270,11 +270,12 @@ impl AutopilotEngine {
                     if existing.state == DISPATCH_AWAITING && existing.rule_id == run.rule_id
                         && existing.rule_hash == run.rule_hash && existing.approval_id.is_some()
                     {
-                        let bound = self.bind_step_approval(run, &existing, lease_owner, now).await;
-                        if let Err(detail) = &bound {
-                            self.settle_with(&existing, DISPATCH_AWAITING, RESULT_APPROVAL_ERROR, detail, true, false).await;
-                        }
-                        return bound;
+                        // A duplicate may reuse only an already atomic binding.
+                        // Never repair an unbound awaiting row after the fact.
+                        let (fence, _) = self.store.fence_rule(&run.rule_id).await?;
+                        let bound = fence.approval_run(&run.run_id, run.step_index, &existing.dispatch_id)?;
+                        fence.release()?;
+                        if bound.is_some() { return Ok(()); }
                     }
                     if matches!(existing.state.as_str(), DISPATCH_REQUESTING | DISPATCH_AWAITING) {
                         self.settle_with(&existing, &existing.state, RESULT_APPROVAL_ERROR,
@@ -292,14 +293,16 @@ impl AutopilotEngine {
             let approval_id = broker.request(gate::REQUESTER, gate::ACTION_KIND, &summary, payload, ttl)
                 .await.map_err(|e| format!("無法建立核准單：{e}"))?;
             ledger.approval_id = Some(approval_id.to_string());
-            match self.store.mark_dispatch_awaiting(&ledger.dispatch_id, approval_id.as_str()).await {
+            match self.store.bind_step_dispatch_awaiting(&ledger.dispatch_id, approval_id.as_str(),
+                &run.run_id, run.step_index, lease_owner, chrono::Utc::now(), StepApprovalBindMode::Filing).await
+            {
                 Ok(true) => ledger.state = DISPATCH_AWAITING.into(),
                 other => {
                     let _ = broker.withdraw(&approval_id, "system:autopilot_ledger_error").await;
                     return Err(format!("核准單已撤回：無法更新核准紀錄（{other:?}）"));
                 }
             }
-            self.bind_step_approval(run, &ledger, lease_owner, now).await
+            Ok(())
         }.await;
         if let Err(detail) = &filed {
             if let Some(id) = &ledger.approval_id {
@@ -312,24 +315,6 @@ impl AutopilotEngine {
                 json_meta(&rule.id, &ledger.dispatch_id, ledger.approval_id.as_deref())).await;
         }
         filed
-    }
-
-    async fn bind_step_approval(
-        &self, run: &crate::autopilot_store::AutopilotRunRow, ledger: &AutopilotDispatchRow,
-        lease_owner: &str, now: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        if !self.store.complete_step(&run.run_id, lease_owner, run.step_index,
-            crate::autopilot_store::STEP_RUNNING, None, None,
-            crate::autopilot_store::RunNext::AwaitApproval { dispatch_id: ledger.dispatch_id.clone() }, now).await?
-        {
-            return Err("無法將流程連結到核准紀錄".into());
-        }
-        self.store.append_step_history(&AutopilotHistoryRow {
-            id: format!("run:{}:step:{}:approval", run.run_id, run.step_index),
-            rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(),
-            triggered_at: now.to_rfc3339(), result: RESULT_AWAITING.into(),
-            details: Some(format!("等待管理員核准（步驟 {}，核准紀錄 {}）", run.step_index + 1, ledger.dispatch_id)),
-        }).await
     }
 
     // ── Resumer ─────────────────────────────────────────────
@@ -657,7 +642,14 @@ impl AutopilotEngine {
             .filter(|rec| rec.agent_id == gate::REQUESTER && gate::verify_card_payload(row, &rec.payload).is_ok())
             .collect();
         if let [only] = matching.as_slice() {
-            if let Ok(true) = self.store.mark_dispatch_awaiting(&row.dispatch_id, only.id.as_str()).await {
+            let bound = match (row.run_id.as_deref(), row.step_index) {
+                (Some(run_id), Some(index)) => self.store.bind_step_dispatch_awaiting(
+                    &row.dispatch_id, only.id.as_str(), run_id, index, super::runs::lease_owner(),
+                    chrono::Utc::now(), StepApprovalBindMode::Recovery).await,
+                (None, None) => self.store.mark_dispatch_awaiting(&row.dispatch_id, only.id.as_str()).await,
+                _ => Ok(false),
+            };
+            if let Ok(true) = bound {
                 info!(dispatch_id = %row.dispatch_id, "autopilot: recovered an approval filed before a restart");
                 return;
             }
@@ -692,10 +684,16 @@ impl AutopilotEngine {
             // Back to awaiting; the resumer re-checks everything (including
             // the execution window).
             Some(rec) if rec.status == ApprovalStatus::Approved => {
-                let _ = self
+                let restored = self
                     .store
                     .transition_dispatch(&row.dispatch_id, DISPATCH_EXECUTING, DISPATCH_AWAITING)
                     .await;
+                if !matches!(restored, Ok(true)) {
+                    self.retire(broker, &rec, row, "recovery").await;
+                    self.settle(row, DISPATCH_EXECUTING, RESULT_APPROVAL_ERROR,
+                        "無法恢復核准紀錄與流程的連結，動作沒有執行", true).await;
+                    return;
+                }
                 info!(dispatch_id = %row.dispatch_id, "autopilot: approved action had not started before the restart; it is re-checked and may run once");
             }
             // Consumed by this dispatch: the action may have run. Never again.

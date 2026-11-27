@@ -12,7 +12,7 @@ use tracing::info;
 
 mod runs;
 pub use runs::{
-    AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, RunNext,
+    AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, RunNext, StepApprovalBindMode,
     is_known_run_state, run_ts, step_idempotency_key,
     RUN_PENDING, RUN_RUNNING, RUN_WAITING, RUN_AWAITING_APPROVAL, RUN_DEFERRED, RUN_SETTLED,
     STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED,
@@ -709,6 +709,12 @@ impl AutopilotStore {
     /// the insert run in one `BEGIN IMMEDIATE` transaction, so two writers
     /// (two gateway processes on one home) cannot both insert.
     pub async fn insert_dispatch(&self, row: &AutopilotDispatchRow) -> Result<bool, String> {
+        if (row.run_id.is_some() || row.step_index.is_some())
+            && (row.run_id.is_none() || row.step_index.is_none()
+                || row.state != DISPATCH_REQUESTING || row.approval_id.is_some())
+        {
+            return Err("step dispatch must start requesting and unbound".into());
+        }
         let conn = self.conn.lock().await;
         let cutoff = (chrono::Utc::now()
             - chrono::Duration::seconds(crate::autopilot_approval::DEDUPE_WINDOW_SECS))
@@ -901,13 +907,14 @@ impl AutopilotStore {
     }
 
     /// [`DISPATCH_REQUESTING`] → [`DISPATCH_AWAITING`] with the filed
-    /// approval id. `false` when the row is no longer requesting.
+    /// approval id for a single action. Run steps must use the atomic bind.
+    /// `false` when the row is no longer requesting or belongs to a run.
     pub async fn mark_dispatch_awaiting(&self, dispatch_id: &str, approval_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
                 "UPDATE autopilot_approval_dispatch SET state = ?1, approval_id = ?2, updated_at = ?3
-                 WHERE dispatch_id = ?4 AND state = ?5",
+                 WHERE dispatch_id = ?4 AND state = ?5 AND run_id IS NULL AND step_index IS NULL",
                 params![
                     DISPATCH_AWAITING,
                     approval_id,
@@ -927,7 +934,15 @@ impl AutopilotStore {
         let n = conn
             .execute(
                 "UPDATE autopilot_approval_dispatch SET state = ?1, updated_at = ?2
-                 WHERE dispatch_id = ?3 AND state = ?4",
+                 WHERE dispatch_id = ?3 AND state = ?4
+                   AND (?1 != 'awaiting' OR (run_id IS NULL AND step_index IS NULL)
+                     OR (state='executing' AND approval_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM autopilot_runs r JOIN autopilot_run_steps s
+                         ON s.run_id=r.run_id AND s.step_index=r.step_index
+                       WHERE r.run_id=autopilot_approval_dispatch.run_id
+                         AND r.step_index=autopilot_approval_dispatch.step_index
+                         AND r.state='awaiting_approval' AND s.state='running'
+                         AND s.dispatch_id=autopilot_approval_dispatch.dispatch_id)))",
                 params![to, chrono::Utc::now().to_rfc3339(), dispatch_id, from],
             )
             .map_err(|e| format!("transition dispatch: {e}"))?;

@@ -45,8 +45,11 @@ async fn await_approval(store: &AutopilotStore) {
     insert(store, "r", 1).await;
     assert!(store.claim_run("r", "owner", now()).await.unwrap());
     assert!(store.mark_step_running("r", 0, "owner", now()).await.unwrap());
-    assert!(store.complete_step("r", "owner", 0, STEP_RUNNING, None, None,
-        RunNext::AwaitApproval { dispatch_id: "d".into() }, now()).await.unwrap());
+    assert!(store.insert_dispatch(&dispatch("d", "r", 0)).await.unwrap());
+    assert!(store.bind_step_dispatch_awaiting("d", "approval", "r", 0, "owner", now(),
+        StepApprovalBindMode::Filing).await.unwrap());
+    // These rejection tests supply a missing or corrupt replacement ledger.
+    store.conn.lock().await.execute("DELETE FROM autopilot_approval_dispatch WHERE dispatch_id='d'", []).unwrap();
 }
 
 async fn assert_resume_rejected(store: &AutopilotStore, dispatch_id: &str) {
@@ -350,14 +353,14 @@ async fn complete_step_continues_and_approval_resumes_once() {
         } else {
             let dispatch_id = format!("d-{i}");
             assert!(store.insert_dispatch(&dispatch(&dispatch_id, "r", i)).await.unwrap());
+            assert!(store.bind_step_dispatch_awaiting(&dispatch_id, &format!("approval-{i}"),
+                "r", i, "owner", now(), StepApprovalBindMode::Filing).await.unwrap());
             {
                 let conn = store.conn.lock().await;
                 conn.execute("UPDATE autopilot_approval_dispatch SET state=?1, outcome=?2 WHERE dispatch_id=?3",
                     params![if i == 1 { DISPATCH_EXECUTING } else { DISPATCH_SETTLED },
                         if i == 1 { None } else { Some(RESULT_SUCCESS) }, dispatch_id]).unwrap();
             }
-            assert!(store.complete_step("r", "owner", i, STEP_RUNNING, None, None,
-                RunNext::AwaitApproval { dispatch_id: format!("d-{i}") }, now()).await.unwrap());
             let awaiting = store.get_run("r").await.unwrap().unwrap();
             assert_eq!(awaiting.state, RUN_AWAITING_APPROVAL);
             assert!(awaiting.lease_owner.is_none() && awaiting.lease_until.is_none());

@@ -13,7 +13,7 @@ use crate::autopilot_window::{rule_window_decision, WindowDecision};
 
 static RUN_LEASE_OWNER: OnceLock<String> = OnceLock::new();
 
-fn lease_owner() -> &'static str {
+pub(super) fn lease_owner() -> &'static str {
     RUN_LEASE_OWNER.get_or_init(|| format!("{}:{}", std::process::id(), uuid::Uuid::new_v4()))
 }
 
@@ -187,6 +187,22 @@ impl AutopilotEngine {
             return Ok(());
         }
         let run = self.store.get_run(id).await?.ok_or("reclaimed run missing")?;
+        if let Some(dispatch) = self.store.get_step_dispatch(id, run.step_index).await? {
+            if dispatch.state == crate::autopilot_store::DISPATCH_SETTLED
+                && dispatch.outcome.as_deref() == Some(crate::autopilot_approval::RESULT_APPROVAL_ERROR)
+            {
+                // Filing recovery could not bind this run. Once its lease is
+                // reclaimable, settle it without rendering or filing again.
+                if self.finish_run_step(&run, STEP_FAILED, dispatch.detail.as_deref(), None,
+                    RunNext::Settle { outcome: "approval_error".into(), detail: dispatch.detail.clone() }, now)
+                    .await?
+                {
+                    return Ok(());
+                }
+                // A missing/non-running step can itself make binding impossible.
+                return self.settle_run(&run, "approval_error", dispatch.detail.as_deref(), now).await;
+            }
+        }
         let steps = self.store.list_run_steps(id).await?;
         if let Some(step) = steps.iter().find(|s| s.step_index == run.step_index) {
             if step.state == STEP_RUNNING
@@ -202,7 +218,7 @@ impl AutopilotEngine {
             }
         }
         // Pending steps advance normally. Running queue actions are reconciled
-        // in advance_run, after checking the current rule and exact recipient.
+        // in advance_run, after checking the rule and exact rendered delivery.
         self.advance_run(id, now).await
     }
 
@@ -399,7 +415,20 @@ impl AutopilotEngine {
                 let queue = self.message_queue.as_ref().ok_or("message queue not available")?;
                 match queue.get_by_id(&message_id).await? {
                     Some(existing) => {
-                        reconciled = Some(Some(existing.target.as_str()) == action.get("target_agent").and_then(Value::as_str));
+                        use crate::autopilot_approval::FrozenAction;
+                        // `prepared` was rendered above from the persisted fields,
+                        // using the same sanitization and banners as a new step.
+                        reconciled = Some(match &prepared {
+                            Ok(Some(FrozenAction::Delegate { target_agent, prompt, lane }))
+                            | Ok(Some(FrozenAction::RunSkill { target_agent, prompt, lane, .. })) => {
+                                let expected = Self::prompt_queue_message(target_agent, prompt,
+                                    lane.clone(), Some(&message_id), now);
+                                if existing.matches_enqueue(&expected) { Ok(()) }
+                                else { Err("queue id delivery mismatch".to_string()) }
+                            }
+                            Err(error) => Err(error.clone()),
+                            _ => Err("queue recovery could not render a delivery".to_string()),
+                        });
                     }
                     None => {
                         if !self.store.reset_running_step(id, run.step_index, lease_owner(), now).await? {
@@ -427,10 +456,10 @@ impl AutopilotEngine {
                 }).await?;
                 return Ok(());
             }
-            if let Some(same_target) = reconciled {
-                if !same_target {
-                    return self.finish_run_step(&run, STEP_FAILED, Some("queue id target mismatch"), None,
-                        RunNext::Settle { outcome: "step_failed".into(), detail: Some("queue id target mismatch".into()) }, now).await.map(|_| ());
+            if let Some(verified) = reconciled {
+                if let Err(detail) = verified {
+                    return self.finish_run_step(&run, STEP_FAILED, Some(&detail), None,
+                        RunNext::Settle { outcome: "step_failed".into(), detail: Some(detail.clone()) }, now).await.map(|_| ());
                 }
                 if !self.finish_run_step(&run, STEP_DONE, None, Some(&message_id), Self::next_run_step(&run), now).await? {
                     return Ok(());

@@ -159,7 +159,12 @@ async fn restart_mid_step_no_duplicate_enqueue() {
         assert!(h.store.mark_step_running(&run.run_id, 2, "crashed-process", started).await.unwrap());
         let id = runs::queue_id(&run.run_id, 2);
         if sent {
-            engine.enqueue_prompt_with_id("other", "B frozen before crash", None, Some(&id), started).await.unwrap();
+            let rule = h.store.get_rule("r").await.unwrap().unwrap();
+            let action: Value = serde_json::from_str(&rule.action).unwrap();
+            let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
+            let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][2],
+                &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
+            engine.perform_action_with_queue_id(&prepared, Some(&id), started).await.unwrap();
         }
         drop(engine);
         // New engine + reopened connections, retaining only durable state.
@@ -396,13 +401,15 @@ async fn unreadable_frozen_fields_fail_closed() {
 }
 
 #[tokio::test]
-async fn deterministic_queue_id_requires_same_target() {
+async fn deterministic_queue_id_requires_exact_delivery() {
     let h = Harness::new();
     let engine = h.engine();
     let id = runs::queue_id("test", 0);
     engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
     engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
     assert!(engine.enqueue_prompt_with_id("other", "two", None, Some(&id), now()).await.is_err());
+    assert!(engine.enqueue_prompt_with_id("plain", "two", None, Some(&id), now()).await.is_err());
+    assert!(engine.enqueue_prompt_with_id("plain", "one", Some("explore".into()), Some(&id), now()).await.is_err());
     assert_eq!(h.queued().await.len(), 1);
 }
 
@@ -469,7 +476,11 @@ async fn run_skill_recovery_reconciles_or_requeues_once() {
         assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
         let id = runs::queue_id(&run.run_id, 0);
         if sent {
-            engine.enqueue_prompt_with_id("plain", "frozen skill prompt", None, Some(&id), now()).await.unwrap();
+            let action: Value = serde_json::from_str(&rule.action).unwrap();
+            let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
+            let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
+                &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
+            engine.perform_action_with_queue_id(&prepared, Some(&id), now()).await.unwrap();
         }
         let restarted = h.engine();
         restarted.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
@@ -687,7 +698,7 @@ async fn run_notice_no_target_stops_retrying() {
 use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
 use crate::autopilot_approval::{self as gate, FrozenAction, FrozenDispatch};
 use crate::autopilot_store::{
-    AutopilotDispatchRow, RunNext, RUN_AWAITING_APPROVAL,
+    AutopilotDispatchRow, StepApprovalBindMode, RUN_AWAITING_APPROVAL,
     DISPATCH_REQUESTING, DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_SETTLED,
 };
 
@@ -705,6 +716,55 @@ fn gated_flow(skill: bool, tail: bool) -> Value {
 
 impl Harness {
     fn broker(&self) -> ApprovalBroker { ApprovalBroker::open(&self.home).unwrap() }
+
+    /// Stop at the actual crash boundary: card filed, ledger still requesting,
+    /// step running but unbound, run retaining the filing process's lease.
+    async fn filed_step_before_bind(
+        &self, engine: &AutopilotEngine, owner: &str, at: DateTime<Utc>,
+    ) -> (AutopilotRunRow, AutopilotDispatchRow, ApprovalId) {
+        let rule = self.rule(json!({"type":"steps", "steps":[{
+            "type":"delegate", "target_agent":"plain", "prompt":"A {{task.title}}", "require_approval":true
+        }]})).await;
+        engine.start_run(&rule, "task_created", &fields(), at).await.unwrap();
+        let run = self.run().await;
+        self.acquire();
+        assert!(self.store.claim_run(&run.run_id, owner, at).await.unwrap());
+        assert!(self.store.mark_step_running(&run.run_id, 0, owner, at).await.unwrap());
+        let action: Value = serde_json::from_str(&rule.action).unwrap();
+        let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
+        let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
+            &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
+        let frozen = FrozenDispatch {
+            dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+            rule_hash: run.rule_hash.clone(), event: run.event_name.clone(), event_ref: run.event_ref.clone(),
+            source_agent: None, action: prepared,
+        };
+        let mut row = frozen.ledger_row(&at.to_rfc3339(),
+            &gate::step_dispatch_dedupe_key(&run.rule_id, &run.rule_hash, &run.run_id, 0));
+        row.run_id = Some(run.run_id.clone());
+        row.step_index = Some(0);
+        assert!(self.store.insert_dispatch(&row).await.unwrap());
+        let latest = gate::latest_execution_at(Utc::now(), crate::approval::DEFAULT_TTL_SECONDS);
+        let id = self.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+            frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+        (self.run().await, row, id)
+    }
+
+    async fn assert_awaiting_dispatches_bound(&self) {
+        for row in self.store.list_dispatches(DISPATCH_AWAITING, 100).await.unwrap() {
+            if let Some(id) = &row.run_id {
+                let run = self.store.get_run(id).await.unwrap().unwrap();
+                assert_eq!(run.state, RUN_AWAITING_APPROVAL);
+                assert_eq!(Some(run.step_index), row.step_index);
+                assert!(run.lease_owner.is_none() && run.lease_until.is_none());
+                let steps = self.store.list_run_steps(id).await.unwrap();
+                let step = steps.iter().find(|s| Some(s.step_index) == row.step_index).unwrap();
+                assert_eq!(step.state, STEP_RUNNING);
+                assert_eq!(step.dispatch_id.as_deref(), Some(row.dispatch_id.as_str()));
+                assert!(step.finished_at.is_none());
+            }
+        }
+    }
 
     fn approval_engine(&self) -> AutopilotEngine {
         let engine = self.engine().with_approval_broker(Arc::new(self.broker()));
@@ -740,6 +800,7 @@ async fn gated_step_waits_for_dashboard_approval() {
         h.acquire();
         let engine = h.approval_engine();
         let (run, id) = h.pending_approval(&engine, skill, false).await;
+        h.assert_awaiting_dispatches_bound().await;
         let card = h.broker().get(&id).await.unwrap().unwrap();
         assert!(card.summary.contains("第 2 步"));
         assert!(card.payload[gate::PAYLOAD_KEY]["action"]["prompt"].as_str().unwrap().contains("凍結標題"));
@@ -854,8 +915,6 @@ async fn duplicate_step_filing_reuses_one_card() {
         let at = Utc::now();
         {
             let conn = rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap();
-            conn.execute("UPDATE autopilot_runs SET state='running', lease_owner='filing-test', lease_until=?1 WHERE run_id=?2",
-                rusqlite::params![run_ts(at + ChronoDuration::seconds(60)), run.run_id]).unwrap();
             if old {
                 conn.execute("UPDATE autopilot_approval_dispatch SET created_at='2000-01-01T00:00:00+00:00' WHERE dispatch_id=?1",
                     [&original.dispatch_id]).unwrap();
@@ -918,9 +977,8 @@ async fn approved_run_step_scope_denied_under_fence() {
     let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
     let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
         frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
-    assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
-    assert!(h.store.complete_step(&run.run_id, "fixture", 0, STEP_RUNNING, None, None,
-        RunNext::AwaitApproval { dispatch_id: ledger.dispatch_id.clone() }, at).await.unwrap());
+    assert!(h.store.bind_step_dispatch_awaiting(&ledger.dispatch_id, id.as_str(), &run.run_id,
+        0, "fixture", at, StepApprovalBindMode::Filing).await.unwrap());
     h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
     engine.resume_approvals_once().await;
     h.assert_outcome("scope_denied", 0).await;
@@ -940,9 +998,14 @@ async fn step_ledger_recovery_preserves_requesting_and_executing_protocol() {
             let (run, id) = h.pending_approval(&engine, false, false).await;
             let row = h.step_dispatch(&run).await;
             if state == DISPATCH_REQUESTING {
-                rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+                let conn = rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap();
+                conn.execute(
                     "UPDATE autopilot_approval_dispatch SET state='requesting', approval_id=NULL WHERE dispatch_id=?1",
                     [&row.dispatch_id]).unwrap();
+                conn.execute("UPDATE autopilot_run_steps SET dispatch_id=NULL WHERE run_id=?1 AND step_index=?2",
+                    rusqlite::params![run.run_id, run.step_index]).unwrap();
+                conn.execute("UPDATE autopilot_runs SET state='running', lease_owner='crashed',
+                    lease_until='2000-01-01T00:00:00.000Z' WHERE run_id=?1", [&run.run_id]).unwrap();
             } else {
                 h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
                 assert!(h.store.transition_dispatch(&row.dispatch_id, DISPATCH_AWAITING, DISPATCH_EXECUTING).await.unwrap());
@@ -953,6 +1016,7 @@ async fn step_ledger_recovery_preserves_requesting_and_executing_protocol() {
             }
             let restarted = h.approval_engine();
             restarted.recover_approval_dispatches().await;
+            h.assert_awaiting_dispatches_bound().await;
             if consumed {
                 h.assert_outcome("execution_uncertain", 1).await;
                 assert_eq!(h.step_dispatch(&run).await.state, DISPATCH_SETTLED);
@@ -1053,4 +1117,246 @@ fn step_dispatch_dedupe_is_v2_and_separates_runs_and_steps() {
     assert_ne!(key, gate::step_dispatch_dedupe_key("r", "hash", "another", 1));
     assert_ne!(key, gate::step_dispatch_dedupe_key("r", "edited", "run", 1));
     assert_ne!(key, gate::step_dispatch_dedupe_key("another", "hash", "run", 1));
+}
+
+#[tokio::test]
+async fn requesting_step_recovery_binds_before_executing_downtime_approval_once() {
+    for approved_during_downtime in [false, true] {
+        let h = Harness::new();
+        let engine = h.approval_engine();
+        let (run, row, id) = h.filed_step_before_bind(&engine, "dead-process",
+            Utc::now() - ChronoDuration::seconds(61)).await;
+        assert_eq!(row.state, DISPATCH_REQUESTING);
+        assert!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].dispatch_id.is_none());
+        drop(engine);
+        if approved_during_downtime {
+            h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+        }
+        let restarted = h.approval_engine();
+        restarted.recover_approval_dispatches().await;
+        h.assert_awaiting_dispatches_bound().await;
+        assert_eq!(h.run().await.state, RUN_AWAITING_APPROVAL);
+        assert_eq!(h.step_dispatch(&run).await.approval_id.as_deref(), Some(id.as_str()));
+        assert!(h.queued().await.is_empty());
+        if !approved_during_downtime {
+            h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+        }
+        assert_eq!(restarted.resume_approvals_once().await, 1);
+        restarted.recover_approval_dispatches().await;
+        assert_eq!(restarted.resume_approvals_once().await, 0);
+        restarted.resume_runs_once(Utc::now()).await.unwrap();
+        h.assert_outcome("completed", 1).await;
+        assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn atomic_step_bind_enforces_filing_and_recovery_leases() {
+    for (mode, owner, expired, allowed) in [
+        (StepApprovalBindMode::Filing, "owner", false, true),
+        (StepApprovalBindMode::Filing, "owner", true, false),
+        (StepApprovalBindMode::Filing, "other", false, false),
+        (StepApprovalBindMode::Recovery, "owner", false, true),
+        (StepApprovalBindMode::Recovery, "owner", true, true),
+        (StepApprovalBindMode::Recovery, "other", false, false),
+        (StepApprovalBindMode::Recovery, "other", true, true),
+    ] {
+        let h = Harness::new();
+        let engine = h.approval_engine();
+        let at = Utc::now();
+        let (run, row, id) = h.filed_step_before_bind(&engine, "owner", at).await;
+        let before_steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+        // Neither legacy entry point can publish a run's unbound dispatch.
+        assert!(!h.store.mark_dispatch_awaiting(&row.dispatch_id, id.as_str()).await.unwrap());
+        assert!(!h.store.transition_dispatch(&row.dispatch_id, DISPATCH_REQUESTING, DISPATCH_AWAITING).await.unwrap());
+        let check_at = if expired { at + ChronoDuration::seconds(61) } else { at };
+        assert_eq!(h.store.bind_step_dispatch_awaiting(&row.dispatch_id, id.as_str(),
+            &run.run_id, 0, owner, check_at, mode).await.unwrap(), allowed);
+        if allowed {
+            h.assert_awaiting_dispatches_bound().await;
+            assert_eq!(h.step_dispatch(&run).await.state, DISPATCH_AWAITING);
+        } else {
+            assert_eq!(h.run().await, run);
+            assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap(), before_steps);
+            assert_eq!(h.step_dispatch(&run).await, row);
+        }
+    }
+}
+
+#[tokio::test]
+async fn atomic_step_bind_rolls_back_all_writes_on_error() {
+    let h = Harness::new();
+    let engine = h.approval_engine();
+    let at = Utc::now();
+    let (run, row, id) = h.filed_step_before_bind(&engine, "owner", at).await;
+    let before_steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+    let conn = rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_approval_bind BEFORE UPDATE OF state ON autopilot_runs
+        WHEN NEW.state='awaiting_approval' BEGIN SELECT RAISE(ABORT, 'injected bind failure'); END;").unwrap();
+    assert!(h.store.bind_step_dispatch_awaiting(&row.dispatch_id, id.as_str(), &run.run_id,
+        0, "owner", at, StepApprovalBindMode::Filing).await.is_err());
+    assert_eq!(h.run().await, run);
+    assert_eq!(h.step_dispatch(&run).await, row);
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap(), before_steps);
+    assert!(h.store.list_dispatches(DISPATCH_AWAITING, 100).await.unwrap().is_empty());
+    conn.execute_batch("DROP TRIGGER reject_approval_bind;").unwrap();
+    assert!(h.store.bind_step_dispatch_awaiting(&row.dispatch_id, id.as_str(), &run.run_id,
+        0, "owner", at, StepApprovalBindMode::Filing).await.unwrap());
+    h.assert_awaiting_dispatches_bound().await;
+}
+
+#[tokio::test]
+async fn requesting_recovery_rejects_live_foreign_lease_and_settles_run() {
+    let h = Harness::new();
+    let engine = h.approval_engine();
+    let at = Utc::now();
+    let (run, row, id) = h.filed_step_before_bind(&engine, "live-foreign-process", at).await;
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    engine.recover_approval_dispatches().await;
+    assert_eq!(h.run().await, run);
+    assert!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].dispatch_id.is_none());
+    let failed = h.store.get_dispatch(&row.dispatch_id).await.unwrap().unwrap();
+    assert_eq!(failed.state, DISPATCH_SETTLED);
+    assert_eq!(failed.outcome.as_deref(), Some(gate::RESULT_APPROVAL_ERROR));
+    assert_eq!(engine.resume_approvals_once().await, 0);
+    engine.resume_runs_once(at + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("approval_error", 0).await;
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
+    assert_eq!(h.cards().await.len(), 1);
+}
+
+fn change_delivery(msg: &mut QueueMessage, field: &str) {
+    match field {
+        "target" => msg.target = "plain".into(),
+        "payload" => msg.payload = "different prompt".into(),
+        "lane" => msg.lane = Some("explore".into()),
+        "sender" => msg.sender = "another-sender".into(),
+        "origin_agent" => msg.origin_agent = None,
+        "sender_agent" => msg.sender_agent = None,
+        "delegation_depth" => msg.delegation_depth = 1,
+        _ => panic!("unknown fixture field"),
+    }
+}
+
+#[tokio::test]
+async fn exact_enqueue_reuses_only_identical_masked_delivery() {
+    use crate::message_queue::EnqueueOutcome;
+    let h = Harness::new();
+    let prompt = format!("Process sk-{}", "x".repeat(40));
+    let msg = AutopilotEngine::prompt_queue_message("other", &prompt, None, Some("exact-id"), now());
+    assert_eq!(h.mq.enqueue_or_verify_exact(&msg).await.unwrap(), EnqueueOutcome::Inserted);
+    let stored = h.mq.get_by_id(&msg.id).await.unwrap().unwrap();
+    assert_ne!(stored.payload, prompt);
+    assert_eq!(stored.payload, duduclaw_security::credential_detect::mask(&prompt));
+    // A completed row still proves the identical delivery, without a new row.
+    h.mq.complete(&msg.id, "done").await.unwrap();
+    assert_eq!(h.mq.enqueue_or_verify_exact(&msg).await.unwrap(), EnqueueOutcome::AlreadyPresent);
+    h.engine().enqueue_prompt_with_id("other", &prompt, None, Some(&msg.id), now()).await.unwrap();
+    for field in ["target", "payload", "lane", "sender", "origin_agent", "sender_agent", "delegation_depth"] {
+        let mut different = msg.clone();
+        change_delivery(&mut different, field);
+        assert!(h.mq.enqueue_or_verify_exact(&different).await.is_err(), "{field}");
+    }
+    assert_eq!(h.mq.statuses_with_prefix("exact-id").await.unwrap().len(), 1);
+    assert_eq!(h.mq.get_by_id(&msg.id).await.unwrap().unwrap().payload, stored.payload);
+}
+
+#[tokio::test]
+async fn recovery_queue_delivery_mismatch_fails_step() {
+    for field in ["payload", "lane", "sender", "origin_agent", "sender_agent", "delegation_depth"] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        let run = h.waiting(&engine).await;
+        let started = now() + ChronoDuration::seconds(61);
+        assert!(h.store.claim_run(&run.run_id, "crashed", started).await.unwrap());
+        assert!(h.store.mark_step_running(&run.run_id, 2, "crashed", started).await.unwrap());
+        let id = runs::queue_id(&run.run_id, 2);
+        let rule = h.store.get_rule("r").await.unwrap().unwrap();
+        let action: Value = serde_json::from_str(&rule.action).unwrap();
+        let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
+        let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][2],
+            &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
+        let FrozenAction::Delegate { target_agent, prompt, lane } = prepared else { panic!("delegate expected") };
+        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&id), started);
+        change_delivery(&mut conflict, field);
+        h.mq.enqueue(&conflict).await.unwrap();
+        h.engine().resume_runs_once(started + ChronoDuration::seconds(61)).await.unwrap();
+        h.assert_outcome("step_failed", 2).await;
+        assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[2].state, STEP_FAILED, "{field}");
+    }
+}
+
+#[tokio::test]
+async fn approved_step_queue_delivery_mismatch_fails_dispatch() {
+    for field in ["payload", "lane", "sender"] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let (run, id) = h.pending_approval(&engine, false, false).await;
+        let row = h.step_dispatch(&run).await;
+        let frozen: FrozenDispatch = serde_json::from_str(&row.frozen_json).unwrap();
+        let FrozenAction::Delegate { target_agent, prompt, lane } = frozen.action else { panic!("delegate expected") };
+        let queue_id = runs::queue_id(&run.run_id, run.step_index);
+        let mut conflict = AutopilotEngine::prompt_queue_message(&target_agent, &prompt, lane, Some(&queue_id), Utc::now());
+        change_delivery(&mut conflict, field);
+        h.mq.enqueue(&conflict).await.unwrap();
+        h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 1);
+        assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(gate::RESULT_FAILURE), "{field}");
+        h.assert_outcome("step_failed", 2).await;
+        assert_eq!(engine.resume_approvals_once().await, 0);
+        assert_eq!(h.mq.get_by_id(&queue_id).await.unwrap().unwrap().payload, conflict.payload);
+    }
+}
+
+#[tokio::test]
+async fn recovery_render_failure_cannot_accept_existing_queue_row() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(json!({"type":"steps","steps":[{
+        "type":"run_skill","target_agent":"plain","skill_name":"test"
+    }]})).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    h.acquire();
+    assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+    assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
+    let action: Value = serde_json::from_str(&rule.action).unwrap();
+    let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
+        &fields(), &fields(), None).await.unwrap().unwrap();
+    engine.perform_action_with_queue_id(&prepared, Some(&runs::queue_id(&run.run_id, 0)), now()).await.unwrap();
+    std::fs::remove_file(h.home.join("agents/plain/SKILLS/test.md")).unwrap();
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("step_failed", 1).await;
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
+}
+
+#[tokio::test]
+async fn recovery_matches_masked_frozen_prompt() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let prompt = format!("Process sk-{} for {{{{task.title}}}}", "x".repeat(40));
+    let rule = h.rule(json!({"type":"steps","steps":[{
+        "type":"delegate","target_agent":"plain","prompt":prompt
+    }]})).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    h.acquire();
+    assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+    assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
+    let action: Value = serde_json::from_str(&rule.action).unwrap();
+    let frozen_fields = serde_json::from_str(&run.fields_json).unwrap();
+    let prepared = engine.prepare_action(&rule.id, &rule.name, &action["steps"][0],
+        &frozen_fields, &frozen_fields, None).await.unwrap().unwrap();
+    let id = runs::queue_id(&run.run_id, 0);
+    engine.perform_action_with_queue_id(&prepared, Some(&id), now()).await.unwrap();
+    let FrozenAction::Delegate { prompt, .. } = prepared else { panic!("delegate expected") };
+    let stored = h.mq.get_by_id(&id).await.unwrap().unwrap();
+    assert_ne!(stored.payload, prompt);
+    assert_eq!(stored.payload, duduclaw_security::credential_detect::mask(&prompt));
+    h.engine().resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("completed", 1).await;
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_DONE);
 }

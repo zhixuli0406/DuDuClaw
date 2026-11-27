@@ -136,8 +136,13 @@ pub enum RunInsertOutcome {
 pub enum RunNext {
     Continue { step_index: i64 },
     Wait { step_index: i64, next_at: DateTime<Utc> },
-    AwaitApproval { dispatch_id: String },
     Settle { outcome: String, detail: Option<String> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepApprovalBindMode {
+    Filing,
+    Recovery,
 }
 
 pub fn step_idempotency_key(run_id: &str, step_index: i64) -> String {
@@ -152,6 +157,57 @@ const STEP_COLUMNS: &str = "run_id, step_index, step_type, state, idempotency_ke
     dispatch_id, queue_message_id, started_at, finished_at, detail";
 
 impl AutopilotStore {
+    /// Publish an approvable dispatch and its run/step binding in one transaction.
+    /// Filing requires this owner's live lease. Recovery may also bind an expired
+    /// lease, but never a live lease belonging to another process.
+    pub async fn bind_step_dispatch_awaiting(
+        &self, dispatch_id: &str, approval_id: &str, run_id: &str, step_index: i64,
+        lease_owner: &str, now: DateTime<Utc>, mode: StepApprovalBindMode,
+    ) -> Result<bool, String> {
+        if approval_id.is_empty() || lease_owner.is_empty() { return Ok(false); }
+        let conn = self.conn.lock().await;
+        let now = run_ts(now);
+        in_immediate_tx(&conn, "bind step approval", |conn| {
+            let eligible: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM autopilot_approval_dispatch d
+                 JOIN autopilot_runs r ON r.run_id=d.run_id
+                 JOIN autopilot_run_steps s ON s.run_id=r.run_id AND s.step_index=r.step_index
+                 WHERE d.dispatch_id=?1 AND d.state='requesting' AND d.approval_id IS NULL
+                   AND d.run_id=?2 AND d.step_index=?3 AND r.step_index=?3
+                   AND d.rule_id=r.rule_id AND d.rule_hash=r.rule_hash
+                   AND r.state='running' AND s.state='running' AND s.dispatch_id IS NULL
+                   AND ((?6=0 AND r.lease_owner=?4 AND julianday(r.lease_until)>=julianday(?5))
+                     OR (?6=1 AND julianday(r.lease_until) IS NOT NULL
+                         AND (r.lease_owner=?4 OR julianday(r.lease_until)<julianday(?5)))))",
+                params![dispatch_id, run_id, step_index, lease_owner, now, mode == StepApprovalBindMode::Recovery],
+                |r| r.get(0),
+            ).map_err(|e| format!("check step approval binding: {e}"))?;
+            if !eligible { return Ok(false); }
+            let n = conn.execute("UPDATE autopilot_approval_dispatch
+                SET state='awaiting', approval_id=?1, updated_at=?2
+                WHERE dispatch_id=?3 AND state='requesting'",
+                params![approval_id, now, dispatch_id]).map_err(|e| format!("bind approval dispatch: {e}"))?;
+            if n != 1 { return Err("approval dispatch changed during binding".into()); }
+            let n = conn.execute("UPDATE autopilot_run_steps SET dispatch_id=?1
+                WHERE run_id=?2 AND step_index=?3 AND state='running' AND dispatch_id IS NULL",
+                params![dispatch_id, run_id, step_index]).map_err(|e| format!("bind approval step: {e}"))?;
+            if n != 1 { return Err("approval step changed during binding".into()); }
+            let n = conn.execute("UPDATE autopilot_runs SET state='awaiting_approval',
+                next_at=NULL, lease_owner=NULL, lease_until=NULL, updated_at=?1
+                WHERE run_id=?2 AND step_index=?3 AND state='running'",
+                params![now, run_id, step_index]).map_err(|e| format!("bind approval run: {e}"))?;
+            if n != 1 { return Err("approval run changed during binding".into()); }
+            conn.execute("INSERT OR IGNORE INTO autopilot_history
+                (id, rule_id, rule_name, triggered_at, result, details)
+                SELECT ?1, rule_id, rule_name, ?2, 'awaiting_approval', ?3
+                FROM autopilot_runs WHERE run_id=?4",
+                params![format!("run:{run_id}:step:{step_index}:approval"), now,
+                    format!("等待管理員核准（步驟 {}，核准紀錄 {dispatch_id}）", step_index + 1), run_id])
+                .map_err(|e| format!("record step approval: {e}"))?;
+            Ok(true)
+        })
+    }
+
     pub async fn list_awaiting_approval_runs(&self) -> Result<Vec<AutopilotRunRow>, String> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM autopilot_runs
@@ -326,15 +382,13 @@ impl AutopilotStore {
         Ok(n == 1)
     }
 
-    /// Finish a running step and advance its run atomically. AwaitApproval may
-    /// retain STEP_RUNNING until the approval executor calls resume_after_approval.
+    /// Finish a running step and advance its run atomically. Approval binding
+    /// uses bind_step_dispatch_awaiting instead, while the step stays running.
     pub async fn complete_step(
         &self, run_id: &str, lease_owner: &str, step_index: i64, step_state: &str,
         detail: Option<&str>, queue_message_id: Option<&str>, next: RunNext, now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        if !matches!(step_state, STEP_DONE | STEP_FAILED | STEP_SKIPPED)
-            && !(step_state == STEP_RUNNING && matches!(&next, RunNext::AwaitApproval { .. }))
-        {
+        if !matches!(step_state, STEP_DONE | STEP_FAILED | STEP_SKIPPED) {
             return Err("invalid completed step state".into());
         }
         let conn = self.conn.lock().await;
@@ -344,17 +398,16 @@ impl AutopilotStore {
                 params![run_id, step_index, lease_owner, run_ts(now)], |r| r.get(0))
                 .optional().map_err(|e| format!("check step lease: {e}"))?;
             let Some(count) = count else { return Ok(false); };
-            let (state, index, next_at, dispatch_id, outcome, run_detail) = match next {
-                RunNext::Continue { step_index } => (RUN_PENDING, step_index, None, None, None, None),
-                RunNext::Wait { step_index, next_at } => (RUN_WAITING, step_index, Some(run_ts(next_at)), None, None, None),
-                RunNext::AwaitApproval { dispatch_id } => (RUN_AWAITING_APPROVAL, step_index, None, Some(dispatch_id), None, None),
-                RunNext::Settle { outcome, detail } => (RUN_SETTLED, step_index, None, None, Some(outcome), detail),
+            let (state, index, next_at, outcome, run_detail) = match next {
+                RunNext::Continue { step_index } => (RUN_PENDING, step_index, None, None, None),
+                RunNext::Wait { step_index, next_at } => (RUN_WAITING, step_index, Some(run_ts(next_at)), None, None),
+                RunNext::Settle { outcome, detail } => (RUN_SETTLED, step_index, None, Some(outcome), detail),
             };
             if index < 0 || index >= count { return Err("next step index out of range".into()); }
             let now = run_ts(now);
             let n = conn.execute("UPDATE autopilot_run_steps SET state=?1, finished_at=?2, detail=?3,
-                queue_message_id=?4, dispatch_id=?5 WHERE run_id=?6 AND step_index=?7 AND state='running'",
-                params![step_state, now, detail, queue_message_id, dispatch_id, run_id, step_index])
+                queue_message_id=?4 WHERE run_id=?5 AND step_index=?6 AND state='running'",
+                params![step_state, now, detail, queue_message_id, run_id, step_index])
                 .map_err(|e| format!("complete run step: {e}"))?;
             if n == 0 { return Ok(false); }
             let n = conn.execute("UPDATE autopilot_runs SET state=?1, step_index=?2, next_at=?3,

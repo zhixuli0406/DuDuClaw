@@ -2568,7 +2568,19 @@ impl AutopilotEngine {
             Some(q) => q.clone(),
             None => return Err("message queue not available".into()),
         };
-        let msg = QueueMessage {
+        let msg = Self::prompt_queue_message(target, prompt, lane, queue_id, now);
+        if queue_id.is_some() {
+            mq.enqueue_or_verify_exact(&msg).await.map(|_| ())
+        } else {
+            mq.enqueue(&msg).await
+        }
+    }
+
+    fn prompt_queue_message(
+        target: &str, prompt: &str, lane: Option<String>, queue_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> QueueMessage {
+        QueueMessage {
             id: queue_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             sender: "autopilot".into(),
             target: target.to_string(),
@@ -2590,19 +2602,6 @@ impl AutopilotEngine {
             lane,
             // An event-woken run is for nobody in particular.
             on_behalf_of: None,
-        };
-        match mq.enqueue(&msg).await {
-            Ok(()) => Ok(()),
-            Err(error) if queue_id.is_some() => {
-                // Do not classify errors by their text. Only an existing exact
-                // primary key with the same recipient proves delivery to the queue.
-                match mq.get_by_id(&msg.id).await? {
-                    Some(existing) if existing.target == target => Ok(()),
-                    Some(_) => Err("autopilot queue id target mismatch".into()),
-                    None => Err(error),
-                }
-            }
-            Err(error) => Err(error),
         }
     }
 }
