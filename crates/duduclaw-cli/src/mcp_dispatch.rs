@@ -2365,6 +2365,7 @@ mod tests {
     use super::*;
     use crate::mcp_auth::{Principal, Scope};
     use crate::mcp_namespace::NamespaceContext;
+    use serde_json::json;
 
     #[tokio::test]
     async fn role_member_gate_reads_ephemeral_config_and_refuses_missing_scaffold() {
