@@ -8,6 +8,12 @@ use duduclaw_auth::{models::UserStatus, UserRole};
 use duduclaw_core::{types::AgentRole, HumanPrincipal};
 
 const REFUSAL: &str = "主代理僅管理員可以使用。";
+pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理工作，請聯絡管理員。";
+
+#[path = "main_tools.rs"]
+mod main_tools;
+pub use main_tools::listed_access_effective;
+pub(crate) use main_tools::main_default_targets;
 
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,20 +27,66 @@ pub enum MainUse {
 /// switch those callers; management and scheduling retain the Admin-only gate.
 /// Missing accounts deny; identity-store read failures are errors (callers deny).
 pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
+    admitted_main_role(home, user_id, use_).map(|role| role.is_some())
+}
+
+fn admitted_main_role(home: &Path, user_id: &str, use_: MainUse) -> Result<Option<UserRole>, String> {
     let db = crate::decision_notify::open_user_db(home)
         .map_err(|_| REFUSAL.to_owned())?.ok_or_else(|| REFUSAL.to_owned())?;
     let Some(account) = db.get_user(user_id).map_err(|_| REFUSAL.to_owned())? else {
-        return Ok(false);
+        return Ok(None);
     };
-    if account.status != UserStatus::Active { return Ok(false); }
-    if account.role == UserRole::Admin { return Ok(true); }
+    if account.status != UserStatus::Active { return Ok(None); }
+    if account.role == UserRole::Admin { return Ok(Some(account.role)); }
     // This is the gateway's home-bound, license-capped edition authority, not
     // an environment/config guess. Personal and unresolved editions ignore rows.
-    if !crate::team_edition::team_grants_enabled(home) { return Ok(false); }
+    if !crate::team_edition::team_grants_enabled(home) { return Ok(None); }
     match use_ {
         MainUse::Converse | MainUse::Assign =>
-            db.is_main_agent_user(user_id).map_err(|_| REFUSAL.to_owned()),
+            db.is_main_agent_user(user_id).map(|listed| listed.then_some(account.role))
+                .map_err(|_| REFUSAL.to_owned()),
     }
+}
+
+/// Opt-in admission for a concrete target. Only a live Admin bypasses the
+/// shell safeguard; listing a person never bypasses edition/account checks.
+pub async fn main_turn_allowed(
+    home: &Path, user_id: &str, agent: &str, use_: MainUse,
+) -> Result<bool, String> {
+    match admitted_main_role(home, user_id, use_)? {
+        Some(UserRole::Admin) => Ok(true),
+        Some(_) => listed_access_effective(home, agent).await,
+        None => Ok(false),
+    }
+}
+
+/// `principal` must be server-stamped, never taken from request tool arguments.
+pub async fn requires_main_restriction_for_target(
+    home: &Path, principal: Option<&str>, agent: &str, use_: MainUse,
+) -> Result<bool, String> {
+    match super::super::PrincipalState::from_wire(principal) {
+        super::super::PrincipalState::Background
+        | super::super::PrincipalState::Human(HumanPrincipal::Unmapped { .. }) => Ok(false),
+        super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
+            Ok(!main_turn_allowed(home, &id, agent, use_).await?),
+        super::super::PrincipalState::Unknown => Err(MAIN_TURN_REFUSAL.into()),
+    }
+}
+
+/// Visibility covers every main/default target: showing a single entry must
+/// not promise access to a main employee whose turns would be refused.
+pub(crate) async fn main_entry_available(home: &Path, user_id: &str) -> Result<bool, String> {
+    match admitted_main_role(home, user_id, MainUse::Converse)? {
+        Some(UserRole::Admin) => return Ok(true),
+        None => return Ok(false),
+        Some(_) => {},
+    }
+    for agent in main_default_targets(home).await? {
+        if !main_turn_allowed(home, user_id, &agent, MainUse::Converse).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Opt-in list-aware admission. Unlike requires_main_restriction, this allows

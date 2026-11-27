@@ -11,6 +11,7 @@ const UNAVAILABLE: &str = "無法讀取主要 AI 員工開放名單，請稍後�
 const SAVE_FAILED: &str = "無法儲存主要 AI 員工開放名單，請稍後再試。";
 const INVALID_USERS: &str = "請提供成員編號陣列，每個編號都必須是非空白文字，最多 500 筆。";
 const MAX_USERS: usize = 500;
+const INEFFECTIVE_REASON: &str = "主要 AI 員工目前可以執行命令列指令，名單暫時不會生效。請先在「工具與權限」移除命令列工具，或啟用受保護模式。";
 
 fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
     let ids = db.main_agent_users().map_err(|_| UNAVAILABLE)?;
@@ -23,6 +24,28 @@ fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
         }));
     }
     Ok(json!({"users": users, "risk_notice": RISK_NOTICE}))
+}
+
+async fn with_effectiveness(home: &std::path::Path, mut payload: Value) -> Value {
+    use crate::on_behalf_of::access::{listed_access_effective, main_default_targets};
+    let nonempty = payload["users"].as_array().is_some_and(|users| !users.is_empty());
+    let mut effective = true;
+    if nonempty {
+        match main_default_targets(home).await {
+            Ok(targets) => {
+                for target in targets {
+                    if !listed_access_effective(home, &target).await.unwrap_or(false) {
+                        effective = false;
+                        break;
+                    }
+                }
+            }
+            Err(_) => effective = false,
+        }
+    }
+    payload["effective"] = json!(effective);
+    if nonempty && !effective { payload["ineffective_reason"] = json!(INEFFECTIVE_REASON); }
+    payload
 }
 
 fn store_message(error: &str) -> &'static str {
@@ -39,7 +62,7 @@ impl MethodHandler {
     pub(crate) async fn handle_main_access_get(&self) -> WsFrame {
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", UNAVAILABLE); };
         match tokio::task::spawn_blocking(move || list_payload(&db)).await {
-            Ok(Ok(payload)) => WsFrame::ok_response("", payload),
+            Ok(Ok(payload)) => WsFrame::ok_response("", Box::pin(with_effectiveness(&self.home_dir, payload)).await),
             _ => WsFrame::error_response("", UNAVAILABLE),
         }
     }
@@ -67,7 +90,7 @@ impl MethodHandler {
             list_payload(&db)
         }).await;
         match result {
-            Ok(Ok(payload)) => WsFrame::ok_response("", payload),
+            Ok(Ok(payload)) => WsFrame::ok_response("", Box::pin(with_effectiveness(&self.home_dir, payload)).await),
             Ok(Err(duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED)) => acknowledgement_required(),
             Ok(Err(message)) => WsFrame::error_response("", message),
             Err(_) => WsFrame::error_response("", SAVE_FAILED),

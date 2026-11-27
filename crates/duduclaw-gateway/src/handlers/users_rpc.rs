@@ -743,13 +743,9 @@ impl MethodHandler {
         let main_agent_access = if ctx.origin == duduclaw_auth::acl::ContextOrigin::DashboardSession
             && ctx.member_key_id.is_none() && ctx.user_id != "system"
         {
-            let home = self.home_dir.clone();
-            let user_id = ctx.user_id.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::on_behalf_of::access::main_access_allowed(
-                    &home, &user_id, crate::on_behalf_of::access::MainUse::Converse,
-                ).unwrap_or(false)
-            }).await.unwrap_or(false)
+            Box::pin(crate::on_behalf_of::access::main_entry_available(
+                &self.home_dir, &ctx.user_id,
+            )).await.unwrap_or(false)
         } else { false };
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
