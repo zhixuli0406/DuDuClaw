@@ -380,8 +380,9 @@ impl CepMatcher {
         let mut out = Vec::new();
         let now = Instant::now();
         for rule in &rules {
-            // Temporary containment guard: exclude even disabled department
-            // rules before parsing conditions or retaining any event fields.
+            // Permanent containment: CEP has no single employee subject.
+            // Exclude even disabled department rules before parsing conditions
+            // or retaining any event fields.
             if rule.owner_department.is_some() {
                 self.pending.lock().await.remove(&rule.id);
                 continue;

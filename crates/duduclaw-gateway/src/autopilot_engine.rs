@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -43,14 +43,8 @@ mod runs_tests;
 #[cfg(test)]
 mod approval_gate_tests;
 
-const DEPARTMENT_CONTAINMENT_SKIP: &str = "部門範圍檢查尚未啟用，已略過";
-
-/// Allow only the first diagnostic without retaining any rule ids.
-fn first_department_skip(logged: &Once) -> bool {
-    let mut first = false;
-    logged.call_once(|| first = true);
-    first
-}
+const DEPARTMENT_CONTAINMENT_SKIP: &str = "部門範圍不符，已略過";
+const MAX_DEPARTMENT_DENIALS: usize = 1024;
 
 // ─── Event types ────────────────────────────────────────────
 
@@ -987,6 +981,9 @@ pub struct AutopilotEngine {
     /// gate, so a looping rule pushes at most one notice per hour
     /// (`autopilot_approval::NOTICE_INTERVAL`).
     approval_notices: std::sync::Mutex<HashMap<String, Instant>>,
+    /// Bounded last-denial state. Full capacity suppresses new diagnostics;
+    /// never evict a denial and turn repeated events into history spam.
+    department_denials: tokio::sync::Mutex<HashMap<String, String>>,
     /// Optional ProactiveGate (P2-2). When present, the `proactive_notify`
     /// action routes through the gate (LLM proactive score ≥ dynamic threshold)
     /// instead of firing directly. Absent → `proactive_notify` fail-closed
@@ -1088,6 +1085,7 @@ impl AutopilotEngine {
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             approval_broker: None,
             approval_notices: std::sync::Mutex::new(HashMap::new()),
+            department_denials: tokio::sync::Mutex::new(HashMap::new()),
             proactive_gate: None,
             os_goal_debounce: tokio::sync::Mutex::new(HashMap::new()),
             tick_hub: None,
@@ -1357,9 +1355,11 @@ impl AutopilotEngine {
             if !rule.enabled {
                 return Ok(());
             }
-            if self.skip_department_rule(&rule) {
-                return Ok(());
-            }
+            // CEP has no trustworthy single employee subject. Even a forged
+            // synthetic trigger naming a non-sequence department rule denies.
+            if rule.owner_department.is_some()
+                && !self.admit_department_rule(&rule, &serde_json::Map::new(), chrono::Utc::now()).await
+            { return Ok(()); }
             let fields_map = fields.as_object().cloned().unwrap_or_default();
             self.fire_matched_rule(&rule, &format!("sequence:{then_event}"), &fields_map)
                 .await;
@@ -1387,7 +1387,7 @@ impl AutopilotEngine {
                 // this event's name (it's an unused placeholder for such rules).
                 && r.sequence.is_none()
         }) {
-            if self.skip_department_rule(rule) {
+            if !self.admit_department_rule(rule, &fields, chrono::Utc::now()).await {
                 continue;
             }
             let conditions: Value = serde_json::from_str(&rule.conditions).unwrap_or(Value::Null);
@@ -1399,19 +1399,42 @@ impl AutopilotEngine {
         Ok(())
     }
 
-    /// Temporary fail-closed guard: replace this with the department containment
-    /// check when wired, keeping it before conditions, screening and approval.
-    fn skip_department_rule(&self, rule: &AutopilotRuleRow) -> bool {
-        if rule.owner_department.is_none() {
-            return false;
+    /// Admission precedes all content predicates, model calls and persistence.
+    /// Subject failures never change the marker: foreign events must not reveal
+    /// timing/counts or reset a configuration denial's deduplication state.
+    async fn admit_department_rule(
+        &self, rule: &AutopilotRuleRow, fields: &serde_json::Map<String, Value>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        use crate::autopilot_scope::{check, ScopeDecision};
+        match check(&self.home_dir, rule, None, fields) {
+            ScopeDecision::Allow => {
+                self.department_denials.lock().await.remove(&rule.id);
+                true
+            }
+            ScopeDecision::Deny { reason } => {
+                debug!(reason = %reason, "autopilot: department scope denied");
+                if matches!(reason.as_str(), "subject_missing" | "subject_invalid"
+                    | "subject_unavailable" | "subject_outside_department"
+                    | "trigger_unsupported" | "department_invalid" | "department_missing")
+                { return false; }
+                let mut markers = self.department_denials.lock().await;
+                if markers.get(&rule.id) == Some(&reason)
+                    || (!markers.contains_key(&rule.id) && markers.len() >= MAX_DEPARTMENT_DENIALS)
+                { return false; }
+                // Hold the marker lock through the write to deduplicate concurrent
+                // admissions too. A failed write retains the marker (no retry spam).
+                markers.insert(rule.id.clone(), reason);
+                if self.store.append_step_history(&AutopilotHistoryRow {
+                    id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+                    triggered_at: now.to_rfc3339(), result: "skipped".into(),
+                    details: Some(DEPARTMENT_CONTAINMENT_SKIP.into()),
+                }).await.is_err() {
+                    warn!("autopilot: department scope history write failed");
+                }
+                false
+            }
         }
-        // Per-event history would disclose company-wide event timing/counts
-        // and amplify SQLite writes. Log only the id, once per process.
-        static LOGGED: Once = Once::new();
-        if first_department_skip(&LOGGED) {
-            warn!(rule_id = %rule.id, "autopilot: department containment unavailable; rule skipped; further skips are not logged");
-        }
-        true
     }
 
     /// Run the circuit breaker, dispatch the rule's action, and record
@@ -1436,7 +1459,7 @@ impl AutopilotEngine {
         fields: &serde_json::Map<String, Value>,
         now: chrono::DateTime<chrono::Utc>,
     ) {
-        if self.skip_department_rule(rule) { return; }
+        if !self.admit_department_rule(rule, fields, now).await { return; }
         debug!(rule = %rule.name, event = event_name, "autopilot: rule matched");
 
         if rule.active_window.is_some() {
@@ -1624,19 +1647,8 @@ impl AutopilotEngine {
             crate::metrics::global_metrics().tick_wake(&rule.id).await;
         }
 
-        if let crate::autopilot_scope::ScopeDecision::Deny { reason } =
-            crate::autopilot_scope::check(&self.home_dir, rule, None, fields)
-        {
-            if let Err(error) = self.store.append_step_history(&AutopilotHistoryRow {
-                id: uuid::Uuid::new_v4().to_string(),
-                rule_id: rule.id.clone(), rule_name: rule.name.clone(),
-                triggered_at: now.to_rfc3339(), result: "scope_denied".into(),
-                details: Some(reason),
-            }).await {
-                warn!(rule_id = %rule.id, %error, "autopilot: scope history write failed");
-            }
-            return;
-        }
+        // Recheck after awaited screening before filing approvals or actions.
+        if !self.admit_department_rule(rule, fields, now).await { return; }
         if action.get("type").and_then(Value::as_str) == Some("steps") {
             if let Err(error) = self.start_run(rule, event_name, fields, now).await {
                 warn!(rule_id = %rule.id, %error, "autopilot: start run failed");
@@ -4910,7 +4922,7 @@ json_fields = { secret = "/secret" }
     }
 
     #[tokio::test]
-    async fn department_containment_blocks_channel_message_before_screening() {
+    async fn dept_rule_foreign_event_skipped() {
         // Also cover a non-matching content condition and malformed-but-present
         // ownership: every Some(_) must be rejected before condition evaluation.
         for (department, text) in [
@@ -4922,6 +4934,8 @@ json_fields = { secret = "/secret" }
             let screener = ScriptedScreener::ok("YES");
             let broker = Arc::new(crate::approval::ApprovalBroker::open(&tmp).unwrap());
             let engine = engine.with_screener(screener.clone()).with_approval_broker(broker.clone());
+            crate::dept_grants::rules::runtime_tests::employee(&tmp, "worker", "mfg");
+            crate::dept_grants::rules::runtime_tests::employee(&tmp, "trader", "sales");
             let rule = department_screened_steps_rule(Some(department));
             engine.store.insert_rule(&rule).await.unwrap();
             engine.process_event(&AutopilotEvent::ChannelMessage {
@@ -4985,23 +4999,6 @@ json_fields = { secret = "/secret" }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn department_skip_log_gate_allows_only_one_call_across_distinct_rules_and_threads() {
-        // Isolate the gate from other tests that skip department rules.
-        let logged = Once::new();
-        let rule_ids: Vec<_> = (0..128).map(|i| format!("department-rule-{i}")).collect();
-        let first_calls = std::thread::scope(|scope| {
-            let logged = &logged;
-            let handles: Vec<_> = rule_ids.iter()
-                .map(|rule_id| scope.spawn(move || (rule_id, first_department_skip(logged))))
-                .collect();
-            handles.into_iter()
-                .map(|h| usize::from(h.join().unwrap().1)).sum::<usize>()
-        });
-        assert_eq!(first_calls, 1);
-        assert!(!first_department_skip(&logged));
-    }
-
     #[tokio::test]
     async fn department_containment_preserves_company_wide_steps_screening() {
         let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
@@ -5037,11 +5034,13 @@ json_fields = { secret = "/secret" }
         let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
         let screener = ScriptedScreener::ok("YES");
         let engine = engine.with_screener(screener.clone());
+        crate::dept_grants::rules::runtime_tests::employee(&tmp, "worker", "sales");
+        crate::dept_grants::rules::runtime_tests::employee(&tmp, "trader", "sales");
         let rule = department_screened_steps_rule(Some("sales"));
         engine.store.insert_rule(&rule).await.unwrap();
         engine.process_event(&AutopilotEvent::CepTrigger {
             rule_id: rule.id.clone(), then_event: "channel_message".into(),
-            fields: serde_json::json!({"text": "finance confidential event"}),
+            fields: serde_json::json!({"agent_id":"worker", "text": "finance confidential event"}),
         }).await.unwrap();
 
         assert!(screener.calls().is_empty());
@@ -5049,6 +5048,97 @@ json_fields = { secret = "/secret" }
         assert!(mq.pending_messages(10).await.unwrap().is_empty());
         let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
         assert!(history.is_empty(), "synthetic triggers must not create skip history either");
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn dept_rule_target_moved_is_skipped() {
+        use crate::dept_grants::rules::runtime_tests::{employee, rule};
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        employee(&tmp, "a1", "sales");
+        employee(&tmp, "a2", "sales");
+        let mut row = rule(serde_json::json!({"type":"delegate", "target_agent":"a2", "prompt":"test"}));
+        // A false content condition proves containment records the bad target
+        // before evaluating the predicate, rather than merely before the model.
+        row.conditions = serde_json::json!({"field":"text","op":"eq","value":"never"}).to_string();
+        engine.store.insert_rule(&row).await.unwrap();
+        employee(&tmp, "a2", "mfg");
+        let event = AutopilotEvent::ChannelMessage { channel:"line".into(), agent_id:"a1".into(), text:"secret".into() };
+        for _ in 0..4 { engine.process_event(&event).await.unwrap(); }
+        let history = engine.store.list_history(Some(&row.id), 100).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].result, "skipped");
+        assert_eq!(history[0].details.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+        assert!(screener.calls().is_empty());
+        assert!(mq.pending_messages(100).await.unwrap().is_empty());
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(engine.store.get_rule(&row.id).await.unwrap().unwrap().trigger_count, 0);
+        // Foreign events cannot reset the marker. A valid state can.
+        employee(&tmp, "b1", "mfg");
+        engine.process_event(&AutopilotEvent::ChannelMessage {
+            channel:"line".into(), agent_id:"b1".into(), text:"secret".into(),
+        }).await.unwrap();
+        engine.process_event(&event).await.unwrap();
+        assert_eq!(engine.store.list_history(Some(&row.id), 100).await.unwrap().len(), 1);
+        employee(&tmp, "a2", "sales");
+        engine.process_event(&event).await.unwrap();
+        employee(&tmp, "a2", "mfg");
+        engine.process_event(&event).await.unwrap();
+        assert_eq!(engine.store.list_history(Some(&row.id), 100).await.unwrap().len(), 2);
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn valid_department_rule_runs() {
+        use crate::dept_grants::rules::runtime_tests::{employee, rule};
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        duduclaw_core::gateway_instance::acquire(&tmp).unwrap();
+        employee(&tmp, "a1", "sales");
+        employee(&tmp, "a2", "sales");
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        let mut row = rule(serde_json::json!({"type":"delegate", "target_agent":"a2", "prompt":"hello"}));
+        let mut action: Value = serde_json::from_str(&row.action).unwrap();
+        action["screen"] = local_screen("pass");
+        row.action = action.to_string();
+        engine.store.insert_rule(&row).await.unwrap();
+        engine.process_event(&AutopilotEvent::ChannelMessage {
+            channel:"line".into(), agent_id:"a1".into(), text:"team update".into(),
+        }).await.unwrap();
+        assert_eq!(screener.calls().len(), 1);
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let messages = mq.pending_messages(100).await.unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].target, "a2");
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn department_denial_markers_are_bounded_without_eviction_spam() {
+        use crate::dept_grants::rules::runtime_tests::{employee, rule};
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        employee(&tmp, "a1", "sales");
+        employee(&tmp, "a2", "mfg");
+        let row = rule(serde_json::json!({"type":"delegate", "target_agent":"a2"}));
+        engine.store.insert_rule(&row).await.unwrap();
+        {
+            let mut markers = engine.department_denials.lock().await;
+            for i in 0..MAX_DEPARTMENT_DENIALS { markers.insert(format!("other-{i}"), "target_outside_department".into()); }
+        }
+        let fields = serde_json::json!({"agent_id":"a1"}).as_object().unwrap().clone();
+        for _ in 0..3 {
+            assert!(!engine.admit_department_rule(&row, &fields, chrono::Utc::now()).await);
+        }
+        assert_eq!(engine.department_denials.lock().await.len(), MAX_DEPARTMENT_DENIALS);
+        assert!(engine.store.list_history(Some(&row.id), 100).await.unwrap().is_empty());
         drop(engine);
         drop(mq);
         let _ = std::fs::remove_dir_all(&tmp);

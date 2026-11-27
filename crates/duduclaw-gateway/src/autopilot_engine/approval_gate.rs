@@ -79,7 +79,7 @@ impl AutopilotEngine {
         fields: &serde_json::Map<String, Value>,
         screen_note: Option<String>,
     ) {
-        if self.skip_department_rule(rule) { return; }
+        if !self.admit_department_rule(rule, fields, chrono::Utc::now()).await { return; }
         let note = |base: String| match &screen_note {
             Some(n) => format!("{n}｜{base}"),
             None => base,
@@ -245,9 +245,14 @@ impl AutopilotEngine {
         frozen: gate::FrozenAction, fields: &serde_json::Map<String, Value>,
         lease_owner: &str, now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
-        if self.skip_department_rule(rule) || run.owner_department.is_some() {
-            return Err("department_containment_unavailable".into());
-        }
+        let action: Value = serde_json::from_str(&rule.action)
+            .map_err(|_| DEPARTMENT_CONTAINMENT_SKIP.to_string())?;
+        let step = usize::try_from(run.step_index).ok().and_then(|index|
+            action.get("steps").and_then(Value::as_array).and_then(|steps| steps.get(index)))
+            .ok_or(DEPARTMENT_CONTAINMENT_SKIP)?;
+        if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
+            crate::autopilot_scope::check(&self.home_dir, rule, Some(step), fields)
+        { return Err(DEPARTMENT_CONTAINMENT_SKIP.into()); }
         let broker = self.approval_broker.as_ref().ok_or("核准服務沒有接上")?;
         let dispatch = FrozenDispatch {
             dispatch_id: uuid::Uuid::new_v4().to_string(),
@@ -443,15 +448,6 @@ impl AutopilotEngine {
                 return false;
             }
         };
-        // Temporary fail-closed guard: replace with department containment when
-        // wired. Check the fenced current row before consuming/executing approval.
-        if rule.as_ref().is_some_and(|rule| self.skip_department_rule(rule)) {
-            drop(fence);
-            self.retire(broker, rec, row, "department_containment_unavailable").await;
-            return self
-                .settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, DEPARTMENT_CONTAINMENT_SKIP, false)
-                .await;
-        }
         // 3a. The rule must still exist, be enabled and be the frozen revision.
         let stale = match &rule {
             None => Some("規則在核准後被刪除"),
@@ -532,7 +528,7 @@ impl AutopilotEngine {
         if let crate::autopilot_scope::ScopeDecision::Deny { .. } = scope {
             drop(fence);
             self.retire(broker, rec, row, "scope_denied").await;
-            return self.settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, "scope_denied", false).await;
+            return self.settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, DEPARTMENT_CONTAINMENT_SKIP, false).await;
         }
         // 4. Consume the approval (approved → invalidated) — the point of no
         //    return — still under the fence.

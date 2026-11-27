@@ -36,7 +36,7 @@ impl AutopilotEngine {
         &self, rule: &AutopilotRuleRow, event_name: &str,
         fields: &serde_json::Map<String, Value>, now: DateTime<Utc>,
     ) -> Result<(), String> {
-        if self.skip_department_rule(rule) { return Ok(()); }
+        if !self.admit_department_rule(rule, fields, now).await { return Ok(()); }
         let actions = match steps_action(rule) {
             Ok(actions) => actions,
             Err(detail) => {
@@ -96,13 +96,6 @@ impl AutopilotEngine {
         Ok(())
     }
 
-    /// Both the frozen run scope and the live rule must permit resumption.
-    async fn skip_department_run(&self, run: &AutopilotRunRow) -> Result<bool, String> {
-        let rule = self.store.get_rule(&run.rule_id).await?;
-        Ok(rule.as_ref().is_some_and(|rule| self.skip_department_rule(rule))
-            || run.owner_department.is_some())
-    }
-
     pub(crate) async fn resume_runs_once(&self, now: DateTime<Utc>) -> Result<(), String> {
         // Defense in depth for callers outside the main resume tick.
         if !duduclaw_core::gateway_instance::held(&self.home_dir) {
@@ -111,7 +104,6 @@ impl AutopilotEngine {
         self.reconcile_approval_runs_once(now).await?;
         self.announce_run_notices_once(now).await?;
         for run in self.store.list_unsupported_runs(50).await? {
-            if self.skip_department_run(&run).await? { continue; }
             if self.store.settle_unclaimed_run(&run.run_id, &[&run.state], "unsupported_state", None, now).await? {
                 self.announce_run_notices_once(now).await?;
             }
@@ -122,9 +114,6 @@ impl AutopilotEngine {
             }
         }
         for id in self.store.list_due_runs(now, 50).await? {
-            if let Some(run) = self.store.get_run(&id).await? {
-                if self.skip_department_run(&run).await? { continue; }
-            }
             match self.store.claim_run(&id, lease_owner(), now).await {
                 Ok(true) => {
                     if let Err(error) = self.advance_run(&id, now).await {
@@ -145,7 +134,6 @@ impl AutopilotEngine {
         use crate::autopilot_store::{DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_REQUESTING, DISPATCH_SETTLED};
         if !duduclaw_core::gateway_instance::held(&self.home_dir) { return Ok(()); }
         for run in self.store.list_awaiting_approval_runs().await? {
-            if self.skip_department_run(&run).await? { continue; }
             let steps = self.store.list_run_steps(&run.run_id).await?;
             let step = steps.iter().find(|step| step.step_index == run.step_index);
             let dispatch = match step.and_then(|step| step.dispatch_id.as_deref()) {
@@ -166,7 +154,7 @@ impl AutopilotEngine {
                         Some(gate::RESULT_EXPIRED) => "expired",
                         Some(gate::RESULT_STALE) => "stale_rule_changed",
                         Some(gate::RESULT_BREAKER_OPEN) => "blocked_breaker_open",
-                        Some(gate::RESULT_SKIPPED) if detail == Some("scope_denied") => "scope_denied",
+                        Some(gate::RESULT_SKIPPED) if matches!(detail, Some("scope_denied" | DEPARTMENT_CONTAINMENT_SKIP)) => "scope_denied",
                         Some(gate::RESULT_SKIPPED) => "autonomy_paused",
                         Some(gate::RESULT_FAILURE) => "step_failed",
                         Some(gate::RESULT_UNCERTAIN) => "execution_uncertain",
@@ -196,9 +184,6 @@ impl AutopilotEngine {
     }
 
     async fn recover_run(&self, id: &str, now: DateTime<Utc>) -> Result<(), String> {
-        if let Some(run) = self.store.get_run(id).await? {
-            if self.skip_department_run(&run).await? { return Ok(()); }
-        }
         if !self.store.reclaim_expired_run(id, lease_owner(), now).await? {
             return Ok(());
         }
@@ -247,9 +232,6 @@ impl AutopilotEngine {
         let (fence, rule) = self.store.fence_rule(&run.rule_id).await?;
         let checked: Result<(), (String, String)> = async {
             let rule = rule.ok_or_else(|| ("rule_removed".into(), "規則已刪除".into()))?;
-            if self.skip_department_rule(&rule) || run.owner_department.is_some() {
-                return Err(("scope_denied".into(), "department_containment_unavailable".into()));
-            }
             if !rule.enabled {
                 return Err(("rule_disabled".into(), "規則已停用".into()));
             }
@@ -272,10 +254,10 @@ impl AutopilotEngine {
                 WindowDecision::ZoneUnresolved { detail } => return Err(("outside_window_tz_unresolved".into(), detail)),
                 WindowDecision::Invalid { detail } => return Err(("active_window_invalid".into(), detail)),
             }
-            if let crate::autopilot_scope::ScopeDecision::Deny { reason } =
+            if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
                 crate::autopilot_scope::check(&self.home_dir, &rule, Some(&step), fields)
             {
-                return Err(("scope_denied".into(), reason));
+                return Err(("scope_denied".into(), DEPARTMENT_CONTAINMENT_SKIP.into()));
             }
             Ok(())
         }.await;
@@ -308,7 +290,6 @@ impl AutopilotEngine {
             if run.state != RUN_RUNNING || run.lease_owner.as_deref() != Some(lease_owner()) {
                 return Ok(());
             }
-            if self.skip_department_run(&run).await? { return Ok(()); }
             let fields: serde_json::Map<String, Value> = match serde_json::from_str(&run.fields_json) {
                 Ok(fields) => fields,
                 Err(_) => return self.settle_run(&run, "fields_unreadable", None, now).await,
@@ -317,7 +298,6 @@ impl AutopilotEngine {
                 Some(rule) => rule,
                 None => return self.settle_run(&run, "rule_removed", None, now).await,
             };
-            if self.skip_department_rule(&rule) { return Ok(()); }
             if !rule.enabled {
                 return self.settle_run(&run, "rule_disabled", None, now).await;
             }
@@ -332,6 +312,11 @@ impl AutopilotEngine {
                 Some(action) => action,
                 None => return self.settle_run(&run, "invalid_action", None, now).await,
             };
+            if let crate::autopilot_scope::ScopeDecision::Deny { .. } =
+                crate::autopilot_scope::check(&self.home_dir, &rule, Some(action), &fields)
+            {
+                return self.settle_run(&run, "scope_denied", Some(DEPARTMENT_CONTAINMENT_SKIP), now).await;
+            }
             let rows = self.store.list_run_steps(id).await?;
             let Some(step) = rows.iter().find(|s| s.step_index == run.step_index) else {
                 return self.settle_run(&run, "invalid_state", Some("step missing"), now).await;
@@ -551,7 +536,6 @@ impl AutopilotEngine {
     pub(super) async fn announce_run_notices_once(&self, now: DateTime<Utc>) -> Result<(), String> {
         if !duduclaw_core::gateway_instance::held(&self.home_dir) { return Ok(()); }
         for run in self.store.list_run_notices_due(now, crate::autopilot_approval::NOTICE_SWEEP_BATCH).await? {
-            if self.skip_department_run(&run).await? { continue; }
             if let Err(error) = self.announce_run_notice(&run, now).await {
                 warn!(run_id = %run.run_id, %error, "autopilot: run notice remains in outbox");
             }

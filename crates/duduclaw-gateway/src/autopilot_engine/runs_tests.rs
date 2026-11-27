@@ -354,7 +354,7 @@ async fn gated_step_without_approval_service_is_blocked() {
 }
 
 #[tokio::test]
-async fn dept_rule_denied_until_predicate_wired() {
+async fn department_run_without_subject_denied_at_admission() {
     let h = Harness::new();
     h.acquire();
     let engine = h.engine();
@@ -933,7 +933,7 @@ async fn duplicate_step_filing_reuses_one_card() {
 }
 
 #[tokio::test]
-async fn department_gated_run_never_files_approval() {
+async fn department_gated_run_without_subject_never_files_approval() {
     let h = Harness::new();
     h.acquire();
     let engine = h.approval_engine();
@@ -1370,7 +1370,7 @@ async fn recovery_matches_masked_frozen_prompt() {
 }
 
 #[tokio::test]
-async fn persisted_department_runs_do_not_resume_from_live_or_frozen_scope() {
+async fn persisted_runs_with_changed_department_settle_stale() {
     for frozen in [false, true] {
         let h = Harness::new();
         let engine = h.engine();
@@ -1391,9 +1391,90 @@ async fn persisted_department_runs_do_not_resume_from_live_or_frozen_scope() {
         let before = h.store.list_history(Some("r"), 100).await.unwrap().len();
         h.acquire();
         engine.resume_runs_once(now()).await.unwrap();
-        assert_eq!(h.run().await.state, RUN_PENDING);
+        assert_eq!(h.run().await.state, RUN_SETTLED);
+        assert_eq!(h.run().await.outcome.as_deref(), Some("stale_rule_changed"));
         assert!(h.queued().await.is_empty());
         assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
-        assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap().len(), before);
+        assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap().len(), before + 1);
     }
+}
+
+
+async fn department_flow(h: &Harness, action: Value) -> AutopilotRuleRow {
+    use crate::dept_grants::rules::runtime_tests::employee;
+    employee(&h.home, "a1", "sales");
+    employee(&h.home, "plain", "sales");
+    employee(&h.home, "other", "sales");
+    h.rule(action).await;
+    h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: run_ts(now()),
+    }).await.unwrap().unwrap()
+}
+
+fn department_fields() -> serde_json::Map<String, Value> {
+    let mut fields = fields();
+    fields.get_mut("task").unwrap()["assigned_to"] = json!("a1");
+    fields
+}
+
+#[tokio::test]
+async fn department_run_step_denied_after_target_moves_mid_run() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    engine.start_run(&rule, "task_created", &department_fields(), now()).await.unwrap();
+    assert_eq!(h.run().await.state, RUN_WAITING);
+    assert_eq!(h.queued().await.len(), 1);
+    crate::dept_grants::rules::runtime_tests::employee(&h.home, "other", "mfg");
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    let run = h.assert_outcome("scope_denied", 1).await;
+    assert_eq!(run.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+    assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn department_approval_resume_rechecks_moved_target() {
+    for moved in [false, true] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let rule = department_flow(&h, gated_flow(false, false)).await;
+        engine.start_run(&rule, "task_created", &department_fields(), Utc::now()).await.unwrap();
+        let run = h.run().await;
+        assert_eq!(run.state, RUN_AWAITING_APPROVAL);
+        assert_eq!(h.queued().await.len(), 1);
+        if moved { crate::dept_grants::rules::runtime_tests::employee(&h.home, "other", "mfg"); }
+        let cards = h.cards().await;
+        assert_eq!(cards.len(), 1);
+        h.broker().decide(&cards[0].id, true, "dashboard:admin").await.unwrap();
+        engine.resume_approvals_once().await;
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        let dispatch = h.step_dispatch(&run).await;
+        if moved {
+            assert_eq!(dispatch.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+            assert_eq!(dispatch.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+            assert_eq!(h.run().await.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
+            assert_eq!(h.queued().await.len(), 1);
+        } else {
+            assert_eq!(dispatch.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+            h.assert_outcome("completed", 2).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn department_step_fence_rechecks_after_preparation() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = department_flow(&h, flow()).await;
+    let home = h.home.clone();
+    *engine.after_claim_hook.lock().unwrap() = Some(Box::new(move || {
+        crate::dept_grants::rules::runtime_tests::employee(&home, "plain", "mfg");
+    }));
+    engine.start_run(&rule, "task_created", &department_fields(), now()).await.unwrap();
+    let run = h.assert_outcome("scope_denied", 0).await;
+    assert_eq!(run.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
 }

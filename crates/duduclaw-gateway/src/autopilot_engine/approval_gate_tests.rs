@@ -227,7 +227,7 @@ async fn department_containment_blocks_approval_resume_before_perform_action() {
             let history = h.store.list_history(Some("r1"), 10).await.unwrap();
             let skipped: Vec<_> = history.iter().filter(|r| r.result == "skipped").collect();
             assert_eq!(skipped.len(), 1);
-            assert_eq!(skipped[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
+            assert_eq!(skipped[0].details.as_deref(), Some("部門範圍不符，已略過"));
             let card = h.broker().get(id).await.unwrap().unwrap();
             assert_eq!(card.status, ApprovalStatus::Invalidated);
             assert!(card.invalidated_reason.unwrap().starts_with(gate::RETIRED_PREFIX));
