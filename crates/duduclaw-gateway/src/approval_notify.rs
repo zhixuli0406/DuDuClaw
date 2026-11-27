@@ -208,6 +208,7 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
+    if kind == "db_source_grant" { return true; }
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         // Adding a document to a shared knowledge collection: the decider
         // must be an Admin or the collection's editor at decision time, which

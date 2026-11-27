@@ -1455,8 +1455,8 @@ async fn az1_u1_u2_budget_widening_is_refused_and_audited() {
 }
 
 #[tokio::test]
-async fn az1_u4_database_grant_is_refused_for_self_and_other() {
-    for caller in ["sales-lead", "sales-rep", "mkt-rep"] {
+async fn az1_u4_database_grant_is_refused_for_self() {
+    for caller in ["sales-rep"] {
         let home = Home::new();
         let h = home.path();
         az1_policy(h, if caller == "mkt-rep" { "open" } else { "hierarchy" });

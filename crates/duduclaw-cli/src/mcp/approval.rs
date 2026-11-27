@@ -1188,3 +1188,36 @@ fn home_account_card_never_invents_a_google_subject_or_personal_owner() {
     assert!(!card.contains("連線擁有者"));
     assert!(!card.contains("選用個人"));
 }
+
+/// Mandatory RM-194 approval, independent of action_rules and delegation policy.
+/// Only canonical source names enter this payload; never connection details.
+pub(crate) async fn approve_db_source_grant(
+    home: &Path, caller: &str, target: &str, sources: &[String],
+) -> std::result::Result<(String, String), String> {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus, action_grant::{ActionGrant, verify_and_consume}};
+    const REFUSED: &str = "管理員未核准，資料庫授權沒有變更。";
+    let broker = ApprovalBroker::open(home).map_err(|_| REFUSED.to_string())?;
+    let mut payload = serde_json::json!({
+        "name":"agent_update", "arguments":{"agent_id":target, "db_sources":sources},
+        "pending_message":"新增資料庫授權需要管理員在儀表板核准；已送出核准單。"
+    });
+    let grant = ActionGrant::build(caller, "agent_update", &payload);
+    payload["action_grant"] = grant.to_json();
+    let summary = format!("AI 員工要求授權資料庫來源\n目標員工：{target}\n提出要求的員工：{caller}\n來源：{}", sources.join("、"));
+    let id = broker.request(caller, "db_source_grant", &summary, payload, INSTALL_APPROVAL_TTL_SECONDS)
+        .await.map_err(|_| REFUSED.to_string())?;
+    broker.record_tool_pending_state(caller, "agent_update", &id, "pending");
+    tracing::info!(approval_id = %id, "新增資料庫授權需要管理員在儀表板核准；已送出核准單。");
+    let decision = broker.await_decision(&id, INSTALL_APPROVAL_POLL).await;
+    if !matches!(decision, Ok(ApprovalStatus::Approved)) {
+        broker.record_tool_pending_state(caller, "agent_update", &id, "cancelled");
+        return Err(REFUSED.into());
+    }
+    let rec = broker.get(&id).await.map_err(|_| REFUSED.to_string())?
+        .ok_or_else(|| REFUSED.to_string())?;
+    let user = rec.decided_by.as_deref().and_then(|by| by.strip_prefix("dashboard:"))
+        .filter(|user| !user.is_empty()).ok_or_else(|| REFUSED.to_string())?.to_string();
+    verify_and_consume(&broker, &id, &grant).await.map_err(|_| REFUSED.to_string())?;
+    broker.record_tool_pending_state(caller, "agent_update", &id, "completed");
+    Ok((id.to_string(), user))
+}

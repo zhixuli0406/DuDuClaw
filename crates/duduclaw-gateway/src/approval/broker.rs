@@ -357,6 +357,9 @@ impl ApprovalBroker {
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
+        if rec.action_kind == "db_source_grant" && (!egress_admin || ledger.is_some()) {
+            return Err("database grants require an authenticated dashboard Admin".into());
+        }
         if rec.payload.get("egress_guard").is_some() && !egress_admin {
             return Err("outgoing data approval requires an authenticated Admin".into());
         }

@@ -151,7 +151,7 @@ pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
         | crate::knowledge::add_source_approval::ACTION_KIND
         | crate::expert_skills::SKILLS_ACTION_KIND
         | crate::autopilot_approval::ACTION_KIND
-        | super::cli_egress::KIND
+        | super::cli_egress::KIND | "db_source_grant"
         | crate::agent_files::approval::ACTION_KIND | crate::org_change_approval::ACTION_KIND => true,
         super::WORKFLOW_ACTIVATION_KIND | "discovery"
         | crate::custom_skills::ACTION_KIND_SKILL_CREATE
@@ -193,6 +193,11 @@ async fn decide_locked(
             Decider::ChatAdmin(proof) => crate::admin_ai::may_decide_chat(&home, &record, proof),
         }).await.map_err(|e| DecisionRefusal::Internal(e.to_string()))?;
         if !allowed { return Err(DecisionRefusal::Forbidden(crate::admin_ai::REFUSAL.into())); }
+    }
+    if rec.action_kind == "db_source_grant" {
+        let Decider::Dashboard(ctx) = by else { return Err(DecisionRefusal::NotSupportedInChat); };
+        super::operator_cli_gate::require_admin_decider(&env.home, ctx)
+            .map_err(|_| DecisionRefusal::Forbidden("資料庫授權只能由管理員在儀表板決定。".into()))?;
     }
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
@@ -378,7 +383,7 @@ async fn chat_preflight(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, 
 
 async fn general(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, by: &Decider, actor: &DecisionActor) -> Result<Value, DecisionRefusal> {
     let decision = match by {
-        Decider::Dashboard(ctx) if rec.payload.get("egress_guard").is_some() =>
+        Decider::Dashboard(ctx) if rec.payload.get("egress_guard").is_some() || rec.action_kind == "db_source_grant" =>
             env.broker.decide_egress_dashboard(&rec.id, ctx, approve).await,
         _ => env.broker.decide_as(&rec.id, approve, actor).await,
     };
