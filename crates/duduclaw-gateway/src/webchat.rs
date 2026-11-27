@@ -339,6 +339,7 @@ const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
 const NO_REPLY_CODE: &str = "no_reply";
 mod route;
+mod entry;
 mod uploads;
 pub(crate) mod access;
 
@@ -1593,13 +1594,25 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     turn_sink.identity_unavailable(validity, true).await;
                                     continue;
                                 }
-                                let attachments = match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
+                                let entry_result = entry::check(
+                                    &state, &auth_user, effective_agent.as_deref().unwrap_or(&agent_id),
+                                    sid, &user_id, &content, !attachments.is_empty(), &msg_id,
+                                ).await;
+                                // A refused file must not disable an emergency stop or
+                                // a repair command. Report and discard the refused files,
+                                // then let the runner execute the exempt command.
+                                let exempt_files = entry_result.is_err() && !attachments.is_empty() && entry::continues_without_files(&content);
+                                if let Err(text) = entry_result {
+                                    turn_sink.frame(ChatMessage::error(&text)).await;
+                                    if !exempt_files { continue; }
+                                }
+                                let attachments = if exempt_files { Vec::new() } else { match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
                                     Ok(files) => files,
                                     Err(error) => {
                                         turn_sink.frame(ChatMessage::error_coded(error, "attachment_upload_refused")).await;
                                         continue;
                                     }
-                                };
+                                }};
                                 let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
                                 match Box::pin(state.turns.admit_persistent(
                                     state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
