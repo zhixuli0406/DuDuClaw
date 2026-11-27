@@ -321,6 +321,8 @@ impl ChatMessage {
 pub(crate) mod ag_ui;
 mod liveness;
 mod turns;
+#[cfg(test)]
+pub(crate) use turns::entry_gate_all_helpers;
 
 pub(crate) use turns::configured_global_limit;
 
