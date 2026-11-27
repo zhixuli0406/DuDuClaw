@@ -52,7 +52,6 @@ duduclaw-os = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-iana-time-zone = "0.1"
 cron = { workspace = true }
 uuid = { workspace = true }
 toml = { workspace = true }

@@ -1,31 +1,5 @@
 use super::*;
 
-/// Detect the host system's IANA timezone name (e.g. `"Asia/Taipei"`,
-/// `"America/New_York"`, `"UTC"`).
-///
-/// Uses `iana_time_zone::get_timezone()` which reads `/etc/localtime` on
-/// Unix / the registry on Windows. Validated against `chrono-tz` so we
-/// never return a name the scheduler would reject — defensive because
-/// `iana-time-zone` is allowed to surface historical aliases that
-/// `chrono-tz`'s database has dropped.
-///
-/// Returns `None` when the host has no discoverable TZ (extremely rare
-/// on real machines — typical in minimal Docker images with no
-/// `/etc/localtime`). Callers should fall back to UTC.
-///
-/// Used so a cron schedule created without `cron_timezone` is evaluated in
-/// the host's local zone rather than silently in UTC.
-pub(crate) fn detect_local_timezone() -> Option<String> {
-    let name = iana_time_zone::get_timezone().ok()?;
-    // Round-trip through chrono-tz so we only ever hand back names the
-    // scheduler's `duduclaw_core::parse_timezone` will accept.
-    if duduclaw_core::parse_timezone(&name).is_some() {
-        Some(name)
-    } else {
-        None
-    }
-}
-
 /// Validate agent ID is safe for filesystem paths (no traversal).
 ///
 /// WP-4I (2026-08): this hand-rolled copy had drifted from its two siblings

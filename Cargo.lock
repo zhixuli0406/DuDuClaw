@@ -1798,7 +1798,6 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
- "iana-time-zone",
  "json5",
  "libc",
  "minisign-verify",

@@ -30,6 +30,7 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod company_timezone_init;
 pub mod isolation_mcp;
 pub mod isolation_background;
 /// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).

@@ -616,3 +616,46 @@ async fn mcp_cron_shared_admission_checks_update_and_resume_adoption_at_caps() {
     assert_eq!(saved.task, "original");
     assert!(!saved.enabled);
 }
+
+#[tokio::test]
+async fn explicit_zone_is_kept() {
+    let _lock = OBO_LOCK.lock().await;
+    let tmp = home_with_queue();
+    let home = tmp.path();
+    fs::write(home.join("config.toml"), "[general]\ndefault_agent = 'main'\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+    let result = handle_schedule_task(&serde_json::json!({
+        "name": "Explicit zone", "agent_id": "worker", "cron": "0 9 * * *",
+        "task": "report", "cron_timezone": "America/New_York",
+    }), home, "worker").await;
+    assert_ne!(result["isError"], true, "{result}");
+    let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+    let row = store.list_all().await.unwrap().remove(0);
+    assert_eq!(row.on_behalf_of, None);
+    assert_eq!(row.cron_timezone.as_deref(), Some("America/New_York"));
+    let receipt = result["content"][0]["text"].as_str().unwrap();
+    assert!(receipt.contains("America/New_York"));
+    assert!(!receipt.contains("以 UTC 計時"));
+}
+
+#[tokio::test]
+async fn unset_and_invalid_company_zone_default_to_utc() {
+    let _lock = OBO_LOCK.lock().await;
+    for (setting, note) in [
+        ("", "公司時區尚未設定，這個排程以 UTC 計時。"),
+        ("company_timezone = ''\n", "公司時區尚未設定，這個排程以 UTC 計時。"),
+        ("company_timezone = 'Not/AZone'\n", "公司時區設定無效，這個排程以 UTC 計時。"),
+    ] {
+        let tmp = home_with_queue();
+        let home = tmp.path();
+        fs::write(home.join("config.toml"), format!("[general]\ndefault_agent = 'main'\n{setting}")).unwrap();
+        let result = handle_schedule_task(&serde_json::json!({
+            "name": "Fallback", "agent_id": "worker", "cron": "0 9 * * *", "task": "report",
+        }), home, "worker").await;
+        assert_ne!(result["isError"], true, "{result}");
+        let store = duduclaw_gateway::cron_store::CronStore::open(home).unwrap();
+        let row = store.list_all().await.unwrap().remove(0);
+        assert_eq!(row.cron_timezone.as_deref(), Some("UTC"));
+        let receipt = result["content"][0]["text"].as_str().unwrap();
+        assert!(receipt.contains(note), "{receipt}");
+    }
+}
