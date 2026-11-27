@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { useCompanyTimeStore } from '@/lib/company-time';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { createIntl } from 'react-intl';
 import en from '@/i18n/en.json';
 import zh from '@/i18n/zh-TW.json';
 import { formatError } from '@/lib/toast';
-import { WHEN_NOW, describeSchedule, scheduleErrorText, toScheduleInput } from './assign-schedule';
+import { WHEN_NOW, describeSchedule, formatWhen, scheduleErrorText, toScheduleInput } from './assign-schedule';
 
 const intlEn = createIntl({ locale: 'en', messages: en as Record<string, string> });
 const intlZh = createIntl({ locale: 'zh-TW', messages: zh as Record<string, string> });
+
+beforeEach(() => useCompanyTimeStore.setState({ zone: 'Asia/Taipei', status: 'set', source: null }));
 
 describe('assign-schedule', () => {
   it('turns the form value into the wire shape', () => {
@@ -45,4 +48,13 @@ describe('assign-schedule', () => {
     const other = new Error('something else');
     expect(scheduleErrorText(intlEn, other)).toBe(formatError(other));
   });
+});
+
+
+it('keeps one-off times in the stored zone even when the company uses another zone', () => {
+  const schedule = { kind: 'once' as const, at: '2026-10-01T01:00:00Z' };
+  expect(formatWhen(intlEn, schedule.at, 'Asia/Tokyo')).toContain('10:00');
+  expect(describeSchedule(intlEn, schedule, 'Asia/Tokyo')).toMatch(/10:00.*\(Asia\/Tokyo\)$/);
+  expect(describeSchedule(intlZh, { kind: 'daily', hour: 9, minute: 0 }, null)).toBe('每天 09:00 （主機時區）');
+  expect(describeSchedule(intlZh, { kind: 'daily', hour: 9, minute: 0 }, 'Asia/Taipei')).toBe('每天 09:00');
 });

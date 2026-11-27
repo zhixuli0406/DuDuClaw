@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -57,6 +58,7 @@ interface Routine {
   agent_id: string;
   cron: string;
   schedule?: string;
+  cron_timezone?: string | null;
   task?: string;
   enabled: boolean;
   can_manage?: boolean;
@@ -136,6 +138,7 @@ function RoutineFormDialog({
   const intl = useIntl();
   const errorText = useErrorMessage();
   const isEdit = !!task;
+  const companyTime = useCompanyTimeZone();
   const employee = useAuthStore((s) => !!s.user && s.user.role !== 'admin');
   const [name, setName] = useState(task?.name ?? '');
   const [schedule, setSchedule] = useState(task?.schedule ?? task?.cron ?? '0 * * * *');
@@ -178,13 +181,13 @@ function RoutineFormDialog({
         });
         toast.success(intl.formatMessage({ id: 'routines.savedToast' }));
       } else {
-        await api.cron.add({
+        const result = await api.cron.add({
           name: name.trim(),
           agent_id: agent.trim() || 'default',
           cron: schedule.trim(),
           task: body.trim() || undefined,
         });
-        toast.success(intl.formatMessage({ id: 'routines.addedToast' }));
+        toast.success([intl.formatMessage({ id: 'routines.addedToast' }), result?.zone_note].filter(Boolean).join(' '));
       }
       await onSaved();
       onClose();
@@ -241,6 +244,9 @@ function RoutineFormDialog({
               {intl.formatMessage({ id: 'settings.cron.schedule' })}
             </label>
             <ScheduleBuilder value={schedule} onChange={setSchedule} />
+            <p className="text-xs text-muted-foreground">
+              {intl.formatMessage({ id: isEdit ? 'routines.zone.edit' : companyTime.status === 'set' ? 'routines.zone.company' : 'routines.zone.unset' }, { zone: isEdit ? task?.cron_timezone ?? 'UTC' : companyTime.zone ?? 'UTC' })}
+            </p>
           </div>
 
           <div className="space-y-1.5">
@@ -307,7 +313,7 @@ function RoutineRow({
       </ListGridCell>
       <ListGridCell>
         <span className="truncate font-mono text-xs text-muted-foreground">
-          {routine.schedule || routine.cron}
+          {routine.schedule || routine.cron}{' '}{intl.formatMessage({ id: 'companyTime.zoneSuffix' }, { zone: routine.cron_timezone ?? 'UTC' })}
         </span>
       </ListGridCell>
       <ListGridCell className="gap-1.5">

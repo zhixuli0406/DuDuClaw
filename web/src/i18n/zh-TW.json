@@ -11754,5 +11754,14 @@
   "settings.general.companyTimezone.invalidStored": "目前的設定值無效，請重新選擇。",
   "settings.general.companyTimezone.invalidInput": "請從清單選擇時區。",
   "settings.general.companyTimezone.detected": "已依這台主機的時區自動帶入，請確認。",
-  "settings.general.companyTimezone.confirm": "確認"
+  "settings.general.companyTimezone.confirm": "確認",
+  "companyTime.zoneSuffix": "（{zone}）",
+  "companyTime.displayZone": "時間依（{zone}）顯示",
+  "assign.when.companyZone": "依公司時區（{zone}）",
+  "assign.when.browserZone": "公司時區尚未設定，暫用你電腦的時區（{zone}）",
+  "routines.zone.company": "依公司時區（{zone}）執行",
+  "routines.zone.unset": "公司時區尚未設定，以 UTC 執行",
+  "routines.zone.edit": "依（{zone}）執行",
+  "assignSchedule.hostZone": "主機時區",
+  "agents.adv.timezone.exampleHint": "例如 {zone}。此處無法清空；如需清除，請至進階設定。"
 }

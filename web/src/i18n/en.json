@@ -11754,5 +11754,14 @@
   "settings.general.companyTimezone.invalidStored": "The current setting is invalid. Please choose a time zone again.",
   "settings.general.companyTimezone.invalidInput": "Choose a time zone from the list.",
   "settings.general.companyTimezone.detected": "Filled in automatically from this host’s time zone. Please confirm.",
-  "settings.general.companyTimezone.confirm": "Confirm"
+  "settings.general.companyTimezone.confirm": "Confirm",
+  "companyTime.zoneSuffix": "({zone})",
+  "companyTime.displayZone": "Times shown in ({zone})",
+  "assign.when.companyZone": "Company time zone ({zone})",
+  "assign.when.browserZone": "Company time zone is not set; using your computer’s time zone ({zone})",
+  "routines.zone.company": "Runs in the company time zone ({zone})",
+  "routines.zone.unset": "Company time zone is not set; runs in UTC",
+  "routines.zone.edit": "Runs in ({zone})",
+  "assignSchedule.hostZone": "Host time zone",
+  "agents.adv.timezone.exampleHint": "For example, {zone}. To clear this value, use advanced settings."
 }

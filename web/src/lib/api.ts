@@ -8439,6 +8439,7 @@ export const api = {
           agent_id: string;
           cron: string;
           schedule?: string;
+          cron_timezone?: string | null;
           task?: string;
           enabled: boolean;
           last_run_at?: string | null;
@@ -8449,7 +8450,7 @@ export const api = {
         }>;
       }>,
     add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>
-      client.call('cron.add', params),
+      client.call('cron.add', params) as Promise<{ zone_note?: string | null }>,
     update: (
       id: string,
       params: {
@@ -9290,7 +9291,7 @@ export const api = {
       /** Saved once, when the schedule is created; every run points at the
        *  same saved copies. */
       attachments?: TaskAttachmentInput[];
-    }) => callTaskRpc<{ schedule: AssignScheduleInfo }>('tasks.goal_create', { ...params }),
+    }) => callTaskRpc<{ schedule: AssignScheduleInfo; zone_note?: string | null }>('tasks.goal_create', { ...params }),
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
     timeline: (taskId: string) =>

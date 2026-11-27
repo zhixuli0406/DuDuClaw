@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { CalendarClock, Pause, Play, Trash2 } from 'lucide-react';
@@ -17,6 +18,7 @@ import { Badge, Button, Card, CardContent, Spinner, Switch } from '@/components/
  */
 export function ScheduledAssignmentsSection({ enabled, isAdmin, accessible = false }: { enabled: boolean; isAdmin: boolean; accessible?: boolean }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id: `assignSchedule.${id}` }, values);
   const agents = useAgentsStore((s) => s.agents);

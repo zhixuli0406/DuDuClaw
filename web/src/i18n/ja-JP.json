@@ -11754,5 +11754,14 @@
   "settings.general.companyTimezone.invalidStored": "現在の設定値は無効です。選び直してください。",
   "settings.general.companyTimezone.invalidInput": "一覧からタイムゾーンを選択してください。",
   "settings.general.companyTimezone.detected": "このホストのタイムゾーンから自動入力しました。確認してください。",
-  "settings.general.companyTimezone.confirm": "確認"
+  "settings.general.companyTimezone.confirm": "確認",
+  "companyTime.zoneSuffix": "（{zone}）",
+  "companyTime.displayZone": "時刻は（{zone}）で表示",
+  "assign.when.companyZone": "会社のタイムゾーン（{zone}）",
+  "assign.when.browserZone": "会社のタイムゾーンが未設定のため、このパソコンのタイムゾーン（{zone}）を使用します",
+  "routines.zone.company": "会社のタイムゾーン（{zone}）で実行",
+  "routines.zone.unset": "会社のタイムゾーンが未設定のため、UTC で実行",
+  "routines.zone.edit": "（{zone}）で実行",
+  "assignSchedule.hostZone": "ホストのタイムゾーン",
+  "agents.adv.timezone.exampleHint": "例：{zone}。値を削除するには詳細設定を開いてください。"
 }

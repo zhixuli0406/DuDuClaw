@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useProductPolicy } from '@/lib/product-policy';
@@ -251,6 +252,8 @@ export function EditAgentPage() {
 }
 
 function EditAgentPageContent() {
+  const companyTime = useCompanyTimeZone();
+  const timezonePlaceholder = companyTime.status === 'set' ? companyTime.zone ?? 'Asia/Taipei' : 'Asia/Taipei';
   const policy = useProductPolicy();
   const intl = useIntl();
   const errorText = useErrorMessage();
@@ -2121,7 +2124,7 @@ function EditAgentPageContent() {
                 <DurationField seconds={form.heartbeat_interval ?? 3600} onChange={(s) => updateField('heartbeat_interval', s)} units={['sec', 'min', 'hour']} min={60} />
               </SettingsRow>
               <RowNumber label={t('agents.adv.maxConcurrentRuns')} value={adv.heartbeat_max_concurrent_runs} min={1} max={64} onChange={(v) => updateAdv('heartbeat_max_concurrent_runs', v)} />
-              <RowText label={t('agents.adv.cronTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
+              <RowText label={t('agents.adv.cronTimezone')} description={intl.formatMessage({ id: 'agents.adv.timezone.exampleHint' }, { zone: timezonePlaceholder })} tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder={timezonePlaceholder} onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
             </SettingsCard>
             <FieldBlock label={t('agents.edit.heartbeatCron')} description={t('agents.edit.heartbeatCron.help')}>
               <ScheduleBuilder value={form.heartbeat_cron ?? ''} onChange={(c) => updateField('heartbeat_cron', c)} />
@@ -2142,7 +2145,7 @@ function EditAgentPageContent() {
                   onChange={(e) => updateAdv('proactive_max_turns', e.target.value === '' ? null : Number(e.target.value))}
                 />
               </SettingsRow>
-              <RowText label={t('agents.adv.proactiveTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.proactive_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('proactive_timezone', v)} />
+              <RowText label={t('agents.adv.proactiveTimezone')} description={intl.formatMessage({ id: 'agents.adv.timezone.exampleHint' }, { zone: timezonePlaceholder })} tier="select-wide" value={adv.proactive_timezone} placeholder={timezonePlaceholder} onChange={(v) => updateAdv('proactive_timezone', v)} />
               <RowNumber label={t('agents.edit.maxSilenceHours')} value={form.max_silence_hours ?? 12} min={1} step={0.5} onChange={(v) => updateField('max_silence_hours', v)} />
             </SettingsCard>
           </SettingsSection>

@@ -1,3 +1,4 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
@@ -89,6 +90,7 @@ function mock(opts: { enabled?: boolean; rows?: ResponsibilityRow[]; onCall?: (m
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useCompanyTimeStore.setState({ zone: null, status: 'unset', source: null });
   useConnectionStore.setState({ state: 'authenticated' });
   useAuthStore.setState({
     user: { id: 'u', email: 'a@b', display_name: 'a', role: 'admin', status: 'active' },
@@ -165,4 +167,15 @@ describe('responsibility helpers', () => {
     expect(buildInput('custom', form).lane).toBeUndefined();
     expect(buildInput('custom', { ...form, readOnly: true }).lane).toBe('explore');
   });
+});
+
+
+it.each(['set', 'unset', 'invalid', 'unknown'] as const)('defaults a new responsibility to the appropriate zone (%s)', async (status) => {
+  useCompanyTimeStore.setState({ zone: 'Asia/Tokyo', status, source: null });
+  mock({ rows: [] });
+  renderPage();
+  await userEvent.setup().click(await screen.findByRole('button', { name: 'New responsibility' }));
+  expect(screen.getByLabelText(en['responsibilities.create.timezone'])).toHaveValue(
+    status === 'set' ? 'Asia/Tokyo' : Intl.DateTimeFormat().resolvedOptions().timeZone,
+  );
 });

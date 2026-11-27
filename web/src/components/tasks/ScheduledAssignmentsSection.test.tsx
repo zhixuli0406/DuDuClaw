@@ -1,3 +1,4 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -30,6 +31,7 @@ const row = (over: Partial<AssignScheduleInfo>): AssignScheduleInfo => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useCompanyTimeStore.setState({ zone: 'Asia/Taipei', status: 'set', source: null });
 });
 
 describe('ScheduledAssignmentsSection', () => {
@@ -104,4 +106,15 @@ describe('ScheduledAssignmentsSection', () => {
     expect(container).toBeEmptyDOMElement();
     expect(mockWsClient.call).not.toHaveBeenCalled();
   });
+});
+
+
+it('labels a legacy host zone and a zone different from the company', async () => {
+  mockWsClient.call.mockResolvedValue({ schedules: [
+    row({ timezone: null }),
+    row({ id: 'other', timezone: 'Asia/Tokyo' }),
+  ], max_active: 20, min_interval_minutes: 60 });
+  renderWithProviders(<ScheduledAssignmentsSection enabled isAdmin={false} />);
+  expect(await screen.findByText('Every Mon, Wed at 09:00 (Host time zone)')).toBeInTheDocument();
+  expect(screen.getByText('Every Mon, Wed at 09:00 (Asia/Tokyo)')).toBeInTheDocument();
 });

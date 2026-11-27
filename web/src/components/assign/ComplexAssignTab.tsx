@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents } from '@/lib/data-scope';
 import { RecentSkillChips } from '@/components/skills/RecentSkillChips';
@@ -72,6 +73,8 @@ export function ComplexAssignTab({
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
+  const companyTime = useCompanyTimeZone();
+  const scheduleZone = companyTime.status === 'set' ? companyTime.zone ?? viewerTimezone() : viewerTimezone();
 
   const agents = useSelectableAgents(false);
   const fetchAgents = useAgentsStore((s) => s.fetchAgents);
@@ -193,8 +196,8 @@ export function ComplexAssignTab({
     setSubmitting(true);
     if (schedule) {
       try {
-        await api.tasks.goalSchedule({ ...common, schedule, schedule_timezone: viewerTimezone() });
-        toast.success(intl.formatMessage({ id: 'assign.when.scheduled' }));
+        const result = await api.tasks.goalSchedule({ ...common, schedule, schedule_timezone: scheduleZone });
+        toast.success([intl.formatMessage({ id: 'assign.when.scheduled' }), result.zone_note].filter(Boolean).join(' '));
         // The schedule is listed under 我交辦的.
         navigate('/goals?assigned=me');
       } catch (e) {
@@ -312,7 +315,12 @@ export function ComplexAssignTab({
         {/* 想一想 still creates a goal task — only 問一問 skips these fields. */}
         {mode !== 'ask' && (
           <>
-            <ScheduleField value={when} onChange={setWhen} isAdmin={isAdmin} disabled={submitting} />
+            <div className="space-y-2">
+              <ScheduleField value={when} onChange={setWhen} isAdmin={isAdmin} disabled={submitting} />
+              <p className="text-xs text-muted-foreground">
+                {intl.formatMessage({ id: companyTime.status === 'set' ? 'assign.when.companyZone' : 'assign.when.browserZone' }, { zone: scheduleZone ?? '—' })}
+              </p>
+            </div>
 
             {/* 約束／完成標準 */}
             <section className="space-y-1.5">

@@ -1,3 +1,4 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
 import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { useConnectionStore } from '@/stores/connection-store';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -129,6 +130,7 @@ function fileInput(): HTMLInputElement {
 const fetchMock = vi.fn();
 
 beforeEach(() => {
+  useCompanyTimeStore.setState({ zone: null, status: 'unset', source: null });
   useConnectionStore.setState({ state: 'authenticated' });
   vi.clearAllMocks();
   useAgentsStore.setState({ agents: ROSTER as never, loaded: true });
@@ -585,3 +587,28 @@ describe('employee task navigation preference', () => {
 
 // Start these component scenarios after the gateway confirmed the admin roster.
 beforeEach(() => setConfirmedCallableAgents(true));
+
+
+describe('company time zone for scheduled assignments', () => {
+  it.each(['set', 'unset', 'invalid', 'unknown'] as const)('uses the correct zone and hint when %s', async (status) => {
+    const user = userEvent.setup();
+    const browserZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    const companyZone = browserZone === 'Asia/Tokyo' ? 'Asia/Taipei' : 'Asia/Tokyo';
+    useCompanyTimeStore.setState({ zone: companyZone, status, source: null });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+      method === 'tasks.goal_create' ? { schedule: {}, zone_note: 'Server time zone notice' } : {},
+    ));
+    renderAt('/assign?tab=complex');
+    await user.type(screen.getByLabelText('What should the AI employee do?'), 'Prepare report');
+    await user.click(screen.getByRole('combobox', { name: en['assign.when.label'] }));
+    await user.click(await screen.findByRole('option', { name: en['assign.when.kind.hourly'] }));
+    const zone = status === 'set' ? companyZone : browserZone;
+    const hint = status === 'set'
+      ? `Company time zone (${zone})`
+      : `Company time zone is not set; using your computer’s time zone (${zone})`;
+    expect(screen.getByText(hint)).toBeInTheDocument();
+    await user.click(within(visiblePanel()).getByRole('button', { name: en['assign.when.submit'] }));
+    await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('tasks.goal_create', expect.objectContaining({ schedule_timezone: zone })));
+    expect(toastSuccess).toHaveBeenCalledWith(expect.stringContaining('Server time zone notice'));
+  });
+});

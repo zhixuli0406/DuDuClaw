@@ -1,10 +1,14 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { mockWsClient } from '@/test/mocks';
 import { AutomationReminders } from './AutomationReminders';
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  useCompanyTimeStore.setState({ zone: null, status: 'unset', source: null });
+});
 describe('AutomationReminders', () => {
   it('keeps Viewer reminders read-only', async () => {
     mockWsClient.call.mockResolvedValue({ reminders: [{ id: 'r', agent_id: 'sales', message: 'Read only reminder',
@@ -21,4 +25,15 @@ describe('AutomationReminders', () => {
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Refresh' })).not.toBeInTheDocument());
   });
+});
+
+
+it('shows reminder times in the company zone and labels the list once', async () => {
+  useCompanyTimeStore.setState({ zone: 'Asia/Tokyo', status: 'set', source: null });
+  mockWsClient.call.mockResolvedValue({ reminders: [{ id: 'r', agent_id: 'sales', message: 'Morning reminder',
+    trigger_at: '2099-01-01T00:00:00Z', status: 'pending', can_manage: false }] });
+  renderWithProviders(<AutomationReminders enabled />);
+  await screen.findByText('Morning reminder');
+  expect(screen.getByRole('heading', { name: 'Reminders (Asia/Tokyo)' })).toBeInTheDocument();
+  expect(screen.getByText(/sales ·.*9:00/)).toBeInTheDocument();
 });

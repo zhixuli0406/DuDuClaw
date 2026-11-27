@@ -1,3 +1,4 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -42,6 +43,7 @@ const TEMPLATE_RULE = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useCompanyTimeStore.setState({ zone: null, status: 'unset', source: null });
   listMock.mockResolvedValue({ rules: [TEMPLATE_RULE] });
   agentsListMock.mockResolvedValue({
     agents: [{ name: 'sales-lead', display_name: 'Sales lead', icon: '' }],
@@ -132,3 +134,21 @@ describe('<AutopilotTab>', () => {
   });
 });
 
+
+
+it('shows the company zone and uses it for the last trigger and history', async () => {
+  useCompanyTimeStore.setState({ zone: 'Asia/Tokyo', status: 'set', source: null });
+  const timestamp = '2026-10-01T00:00:00Z';
+  listMock.mockResolvedValue({ rules: [{ ...TEMPLATE_RULE, last_triggered_at: timestamp }] });
+  const { api } = await import('@/lib/api');
+  vi.mocked(api.autopilot.history).mockResolvedValueOnce({ entries: [{
+    id: 'h1', rule_id: 'r1', rule_name: TEMPLATE_RULE.name, triggered_at: timestamp, result: 'success', details: null,
+  }] });
+  renderWithProviders(<AutopilotTab />);
+  expect(await screen.findByText('Times shown in (Asia/Tokyo)')).toBeInTheDocument();
+  expect(screen.getByText(/Last triggered:.*9:00/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Trigger History' }));
+  const dialog = await screen.findByRole('dialog');
+  expect(within(dialog).getByRole('heading', { name: 'Trigger History (Asia/Tokyo)' })).toBeInTheDocument();
+  expect(within(dialog).getByText(/9:00/)).toBeInTheDocument();
+});
