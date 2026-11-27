@@ -270,7 +270,9 @@ pub struct AutopilotStore {
 /// other process's rule write waits on SQLite's write lock, up to its busy
 /// timeout). Rule update / delete / disable therefore cannot land between
 /// the executor's final `enabled` + revision check and the point of no
-/// return. [`RuleFence::release`] commits (nothing is written under it);
+/// return. Multi-step execution may write only its lease-guarded step start
+/// or atomic wait completion on this connection. [`RuleFence::release`]
+/// commits those narrowly scoped writes;
 /// dropping it rolls back. Never call another store method while holding
 /// one — it would wait on the same connection.
 pub struct RuleFence<'a> {
@@ -279,7 +281,7 @@ pub struct RuleFence<'a> {
 }
 
 impl RuleFence<'_> {
-    /// End the fence (commit the empty write transaction).
+    /// End the fence, committing any step start or wait completion.
     pub fn release(mut self) -> Result<(), String> {
         self.open = false;
         match self.conn.execute_batch("COMMIT") {

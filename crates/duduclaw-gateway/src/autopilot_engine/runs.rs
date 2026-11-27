@@ -57,6 +57,7 @@ impl AutopilotEngine {
             next_at: None, lease_owner: None, lease_until: None,
             owner_department: rule.owner_department.clone(), outcome: None, detail: None,
             created_at: run_ts(now), updated_at: run_ts(now),
+            notice_pending: false, notice_push_state: None, notice_push_attempts: 0, notice_push_next_at: None,
         };
         let steps: Vec<_> = actions.iter().enumerate().map(|(i, action)| AutopilotRunStepRow {
             run_id: run_id.clone(), step_index: i as i64,
@@ -99,9 +100,10 @@ impl AutopilotEngine {
         if !duduclaw_core::gateway_instance::held(&self.home_dir) {
             return Ok(());
         }
+        self.announce_run_notices_once(now).await?;
         for run in self.store.list_unsupported_runs(50).await? {
             if self.store.settle_unclaimed_run(&run.run_id, &[&run.state], "unsupported_state", None, now).await? {
-                self.record_run_outcome(&run, "unsupported_state", None, now).await?;
+                self.announce_run_notices_once(now).await?;
             }
         }
         for id in self.store.list_expired_running_runs(now, 50).await? {
@@ -131,7 +133,7 @@ impl AutopilotEngine {
         let steps = self.store.list_run_steps(id).await?;
         if let Some(step) = steps.iter().find(|s| s.step_index == run.step_index) {
             if step.state == STEP_RUNNING
-                && matches!(step.step_type.as_str(), "notify" | "proactive_notify" | "wait")
+                && matches!(step.step_type.as_str(), "notify" | "proactive_notify")
             {
                 return self.settle_run(&run, "execution_uncertain", None, now).await;
             }
@@ -141,14 +143,14 @@ impl AutopilotEngine {
         self.advance_run(id, now).await
     }
 
-    /// No store calls are made while the rule fence is alive. Return owned data
-    /// so the guard is released before marking a step or performing an action.
+    /// Preparation must precede this fence: prepare_run_skill reads the store.
+    /// Only the fence's own connection may write the point of no return here.
     async fn checked_run_step(
         &self, run: &AutopilotRunRow, fields: &serde_json::Map<String, Value>, now: DateTime<Utc>,
-    ) -> Result<(AutopilotRuleRow, Value), (String, String)> {
-        let (fence, rule) = self.store.fence_rule(&run.rule_id).await
-            .map_err(|e| ("rule_unreadable".into(), e))?;
-        let checked: Result<(AutopilotRuleRow, Value), (String, String)> = async {
+        wait_deadline: Option<DateTime<Utc>>, reconcile_only: bool,
+    ) -> Result<Result<bool, (String, String)>, String> {
+        let (fence, rule) = self.store.fence_rule(&run.rule_id).await?;
+        let checked: Result<(), (String, String)> = async {
             let rule = rule.ok_or_else(|| ("rule_removed".into(), "規則已刪除".into()))?;
             if !rule.enabled {
                 return Err(("rule_disabled".into(), "規則已停用".into()));
@@ -177,13 +179,24 @@ impl AutopilotEngine {
             {
                 return Err(("scope_denied".into(), reason));
             }
-            Ok((rule, step))
+            Ok(())
         }.await;
-        // Residual window: a rule can change after release and before the side
-        // effect. Holding this fence across store writes would deadlock. The
-        // revision snapshot and a fresh fenced check before EVERY step bound it.
-        fence.release().map_err(|e| ("rule_unreadable".into(), e))?;
-        checked
+        if let Err(denied) = checked {
+            // Roll back and release the mutex before the caller settles the run.
+            drop(fence);
+            return Ok(Err(denied));
+        }
+        let changed = if let Some(next_at) = wait_deadline {
+            fence.complete_wait_step(&run.run_id, run.step_index, lease_owner(), next_at, now)?
+        } else if reconcile_only {
+            true
+        } else {
+            fence.mark_step_running(&run.run_id, run.step_index, lease_owner(), now)?
+        };
+        // A failed COMMIT must never authorize a side effect. Propagate the
+        // storage error and leave the lease/state for recovery, not settlement.
+        fence.release()?;
+        Ok(Ok(changed))
     }
 
     async fn advance_run(&self, id: &str, now: DateTime<Utc>) -> Result<(), String> {
@@ -197,22 +210,27 @@ impl AutopilotEngine {
             if run.state != RUN_RUNNING || run.lease_owner.as_deref() != Some(lease_owner()) {
                 return Ok(());
             }
-            if let Some(next_at) = &run.next_at {
-                match DateTime::parse_from_rfc3339(next_at) {
-                    Ok(due) if now.signed_duration_since(due.with_timezone(&Utc)) > ChronoDuration::minutes(60) => {
-                        return self.settle_run(&run, "missed_late", None, now).await;
-                    }
-                    Ok(_) => {}
-                    Err(_) => return self.settle_run(&run, "invalid_state", Some("invalid next_at"), now).await,
-                }
-            }
             let fields: serde_json::Map<String, Value> = match serde_json::from_str(&run.fields_json) {
                 Ok(fields) => fields,
                 Err(_) => return self.settle_run(&run, "fields_unreadable", None, now).await,
             };
-            let (rule, action) = match self.checked_run_step(&run, &fields, now).await {
-                Ok(checked) => checked,
-                Err((outcome, detail)) => return self.settle_run(&run, &outcome, Some(&detail), now).await,
+            let rule = match self.store.get_rule(&run.rule_id).await? {
+                Some(rule) => rule,
+                None => return self.settle_run(&run, "rule_removed", None, now).await,
+            };
+            if !rule.enabled {
+                return self.settle_run(&run, "rule_disabled", None, now).await;
+            }
+            if rule_revision_hash(&rule) != run.rule_hash || rule.owner_department != run.owner_department {
+                return self.settle_run(&run, "stale_rule_changed", None, now).await;
+            }
+            let actions = match steps_action(&rule) {
+                Ok(actions) if actions.len() as i64 == run.step_count => actions,
+                _ => return self.settle_run(&run, "invalid_action", None, now).await,
+            };
+            let action = match usize::try_from(run.step_index).ok().and_then(|i| actions.get(i)) {
+                Some(action) => action,
+                None => return self.settle_run(&run, "invalid_action", None, now).await,
             };
             let rows = self.store.list_run_steps(id).await?;
             let Some(step) = rows.iter().find(|s| s.step_index == run.step_index) else {
@@ -224,29 +242,67 @@ impl AutopilotEngine {
             {
                 return self.settle_run(&run, "invalid_state", Some("step identity mismatch"), now).await;
             }
+            // An interrupted legacy wait uses its own started_at deadline,
+            // not the wake-up timestamp left by an earlier wait.
+            if !(step.state == STEP_RUNNING && step.step_type == "wait") {
+                if let Some(next_at) = &run.next_at {
+                    match DateTime::parse_from_rfc3339(next_at) {
+                        Ok(due) if now.signed_duration_since(due.with_timezone(&Utc)) > ChronoDuration::minutes(60) => {
+                            return self.settle_run(&run, "missed_late", None, now).await;
+                        }
+                        Ok(_) => {}
+                        Err(_) => return self.settle_run(&run, "invalid_state", Some("invalid next_at"), now).await,
+                    }
+                }
+            }
             // 141A-P6: render/freeze this step and enter the approval ledger.
             // Until that package lands, no approval-gated step may execute.
-            if crate::approval::rule_requires_approval(&action) {
+            if crate::approval::rule_requires_approval(action) {
                 return self.settle_run(&run, "approval_step_unavailable", None, now).await;
             }
             let queue_action = matches!(step.step_type.as_str(), "delegate" | "run_skill");
             let message_id = queue_id(id, run.step_index);
-            if step.state == STEP_RUNNING {
+            let wait_deadline = if step.step_type == "wait" {
+                let minutes = action["minutes"].as_i64().filter(|n| (1..=1440).contains(n))
+                    .ok_or("invalid wait minutes")?;
+                let started = if step.state == STEP_RUNNING {
+                    match step.started_at.as_deref().and_then(|s| DateTime::parse_from_rfc3339(s).ok()) {
+                        Some(started) => started.with_timezone(&Utc),
+                        None => return self.settle_run(&run, "invalid_state", Some("invalid wait started_at"), now).await,
+                    }
+                } else { now };
+                let deadline = started.checked_add_signed(ChronoDuration::minutes(minutes)).ok_or("wait timestamp overflow")?;
+                if now.signed_duration_since(deadline) > ChronoDuration::minutes(60) {
+                    return self.settle_run(&run, "missed_late", None, now).await;
+                }
+                Some(deadline)
+            } else { None };
+            let perception = sanitize_perception_fields(&fields, &self.home_dir);
+            let effective = perception.as_ref().map(|(f, _)| f).unwrap_or(&fields);
+            let banner = perception.as_ref().and_then(|(_, b)| b.as_deref());
+            let prepared = if wait_deadline.is_some() {
+                Ok(None)
+            } else {
+                self.prepare_action(&rule.id, &rule.name, action, &fields, effective, banner).await
+            };
+            // Reuse the approval executor's one-shot race seam after rendering.
+            #[cfg(test)]
+            {
+                let hook = self.after_claim_hook.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if let Some(hook) = hook { hook(); }
+            }
+            let mut reconciled = None;
+            if step.state == STEP_RUNNING && wait_deadline.is_none() {
                 if !queue_action {
-                    return self.settle_run(&run, "execution_uncertain", None, now).await;
+                    let outcome = if matches!(step.step_type.as_str(), "notify" | "proactive_notify") {
+                        "execution_uncertain"
+                    } else { "unsupported_state" };
+                    return self.settle_run(&run, outcome, None, now).await;
                 }
                 let queue = self.message_queue.as_ref().ok_or("message queue not available")?;
                 match queue.get_by_id(&message_id).await? {
                     Some(existing) => {
-                        if Some(existing.target.as_str()) != action.get("target_agent").and_then(Value::as_str) {
-                            return self.finish_run_step(&run, STEP_FAILED, Some("queue id target mismatch"), None,
-                                RunNext::Settle { outcome: "step_failed".into(), detail: Some("queue id target mismatch".into()) }, now).await.map(|_| ());
-                        }
-                        if !self.finish_run_step(&run, STEP_DONE, None, Some(&message_id), Self::next_run_step(&run), now).await? {
-                            return Ok(());
-                        }
-                        if !self.store.claim_run(id, lease_owner(), now).await? { return Ok(()); }
-                        continue;
+                        reconciled = Some(Some(existing.target.as_str()) == action.get("target_agent").and_then(Value::as_str));
                     }
                     None => {
                         if !self.store.reset_running_step(id, run.step_index, lease_owner(), now).await? {
@@ -254,24 +310,37 @@ impl AutopilotEngine {
                         }
                     }
                 }
-            } else if step.state != STEP_PENDING {
+            } else if step.state != STEP_PENDING && !(step.state == STEP_RUNNING && wait_deadline.is_some()) {
                 return self.settle_run(&run, "unsupported_state", Some("unexpected current step state"), now).await;
             }
-            if !self.store.mark_step_running(id, run.step_index, lease_owner(), now).await? {
+            match self.checked_run_step(&run, &fields, now, wait_deadline, reconciled.is_some()).await {
+                Ok(Ok(true)) => {}
+                Ok(Ok(false)) => return Ok(()),
+                Ok(Err((outcome, detail))) => return self.settle_run(&run, &outcome, Some(&detail), now).await,
+                Err(error) => {
+                    warn!(run_id = id, %error, "autopilot: fenced step transition failed; left for recovery");
+                    return Err(error);
+                }
+            }
+            if wait_deadline.is_some() {
+                self.store.append_step_history(&AutopilotHistoryRow {
+                    id: format!("run:{}:step:{}", run.run_id, run.step_index),
+                    rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(), triggered_at: run_ts(now),
+                    result: "step_done".into(), details: None,
+                }).await?;
                 return Ok(());
             }
-            if step.step_type == "wait" {
-                let minutes = action["minutes"].as_i64().filter(|n| (1..=1440).contains(n))
-                    .ok_or("invalid wait minutes")?;
-                let next_at = now.checked_add_signed(ChronoDuration::minutes(minutes)).ok_or("wait timestamp overflow")?;
-                self.finish_run_step(&run, STEP_DONE, None, None,
-                    RunNext::Wait { step_index: run.step_index + 1, next_at }, now).await?;
-                return Ok(());
+            if let Some(same_target) = reconciled {
+                if !same_target {
+                    return self.finish_run_step(&run, STEP_FAILED, Some("queue id target mismatch"), None,
+                        RunNext::Settle { outcome: "step_failed".into(), detail: Some("queue id target mismatch".into()) }, now).await.map(|_| ());
+                }
+                if !self.finish_run_step(&run, STEP_DONE, None, Some(&message_id), Self::next_run_step(&run), now).await? {
+                    return Ok(());
+                }
+                if !self.store.claim_run(id, lease_owner(), now).await? { return Ok(()); }
+                continue;
             }
-            let perception = sanitize_perception_fields(&fields, &self.home_dir);
-            let effective = perception.as_ref().map(|(f, _)| f).unwrap_or(&fields);
-            let banner = perception.as_ref().and_then(|(_, b)| b.as_deref());
-            let prepared = self.prepare_action(&rule.id, &rule.name, &action, &fields, effective, banner).await;
             let queue_message_id = queue_action.then_some(message_id.as_str());
             let outcome = match prepared {
                 Ok(None) => Ok(STEP_SKIPPED),
@@ -309,13 +378,11 @@ impl AutopilotEngine {
         &self, run: &AutopilotRunRow, state: &str, detail: Option<&str>, queue_id: Option<&str>,
         next: RunNext, now: DateTime<Utc>,
     ) -> Result<bool, String> {
-        let settlement = match &next {
-            RunNext::Settle { outcome, detail } => Some((outcome.clone(), detail.clone())),
-            _ => None,
-        };
+        let settling = matches!(&next, RunNext::Settle { .. });
         if !self.store.complete_step(&run.run_id, lease_owner(), run.step_index, state, detail, queue_id, next, now).await? {
             return Ok(false);
         }
+        if settling { self.announce_run_notices_once(now).await?; }
         self.store.append_step_history(&AutopilotHistoryRow {
             id: format!("run:{}:step:{}", run.run_id, run.step_index),
             rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(), triggered_at: run_ts(now),
@@ -323,42 +390,75 @@ impl AutopilotEngine {
                 STEP_DONE => "step_done", STEP_SKIPPED => "step_skipped", _ => "step_failed",
             }.into(), details: detail.map(str::to_owned),
         }).await?;
-        if let Some((outcome, detail)) = settlement {
-            self.record_run_outcome(run, &outcome, detail.as_deref(), now).await?;
-        }
         Ok(true)
     }
 
     async fn settle_run(&self, run: &AutopilotRunRow, outcome: &str, detail: Option<&str>, now: DateTime<Utc>) -> Result<(), String> {
         if self.store.settle_claimed_run(&run.run_id, lease_owner(), outcome, detail, now).await? {
-            self.record_run_outcome(run, outcome, detail, now).await?;
+            self.announce_run_notices_once(now).await?;
         }
         Ok(())
     }
 
-    async fn record_run_outcome(&self, run: &AutopilotRunRow, outcome: &str, detail: Option<&str>, now: DateTime<Utc>) -> Result<(), String> {
-        self.store.append_step_history(&AutopilotHistoryRow {
-            id: format!("run:{}:outcome", run.run_id), rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(),
-            triggered_at: run_ts(now), result: outcome.into(), details: detail.map(str::to_owned),
-        }).await?;
+    /// Gateway-lock-owned outbox sweep. Retrying either durable audit write is safe.
+    pub(super) async fn announce_run_notices_once(&self, now: DateTime<Utc>) -> Result<(), String> {
+        if !duduclaw_core::gateway_instance::held(&self.home_dir) { return Ok(()); }
+        for run in self.store.list_run_notices_due(now, crate::autopilot_approval::NOTICE_SWEEP_BATCH).await? {
+            if let Err(error) = self.announce_run_notice(&run, now).await {
+                warn!(run_id = %run.run_id, %error, "autopilot: run notice remains in outbox");
+            }
+        }
+        Ok(())
+    }
+
+    async fn announce_run_notice(&self, run: &AutopilotRunRow, now: DateTime<Utc>) -> Result<(), String> {
+        let outcome = run.outcome.as_deref().ok_or("settled run has no outcome")?;
         let summary = match outcome {
             "missed_late" => format!("自動化規則「{}」系統停機超過一小時，後續步驟沒有補做", run.rule_name),
             "execution_uncertain" => format!("自動化規則「{}」在執行步驟時中斷，為避免重複沒有重送，請確認", run.rule_name),
             "completed" => format!("自動化規則「{}」已完成所有步驟", run.rule_name),
             _ => format!("自動化規則「{}」已停止，後續步驟沒有執行", run.rule_name),
         };
-        self.task_store.append_activity(&ActivityRow {
-            id: format!("run:{}:outcome", run.run_id), event_type: "autopilot_triggered".into(),
-            agent_id: "autopilot".into(), task_id: None, summary: summary.clone(), timestamp: run_ts(now),
-            metadata: Some(serde_json::json!({"rule_id": run.rule_id, "run_id": run.run_id,
-                "outcome": outcome, "success": outcome == "completed"}).to_string()),
-        }).await?;
-        if matches!(outcome, "missed_late" | "execution_uncertain") {
-            let body = crate::goal_state::xml_escape(&summary);
-            let result = crate::autopilot_approval::push_admin_notice(&self.home_dir, &run.rule_id, &body).await;
-            if result == crate::autopilot_approval::NoticePush::Failed {
-                warn!(run_id = %run.run_id, "autopilot: admin notice push failed; activity retained");
-            }
+        if run.notice_pending {
+            self.store.append_step_history(&AutopilotHistoryRow {
+                id: format!("run:{}:outcome", run.run_id), rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(),
+                triggered_at: run.updated_at.clone(), result: outcome.into(), details: run.detail.clone(),
+            }).await?;
+            self.task_store.append_activity_once(&ActivityRow {
+                id: format!("run:{}:outcome", run.run_id), event_type: "autopilot_triggered".into(),
+                agent_id: "autopilot".into(), task_id: None, summary: summary.clone(), timestamp: run.updated_at.clone(),
+                metadata: Some(serde_json::json!({"rule_id": run.rule_id, "run_id": run.run_id,
+                    "outcome": outcome, "success": outcome == "completed"}).to_string()),
+            }).await?;
+            self.store.clear_run_notice_pending(&run.run_id).await?;
+        }
+        if run.notice_push_state.as_deref() != Some("pending")
+            || !self.store.lease_run_notice_push(&run.run_id, now).await?
+        {
+            return Ok(());
+        }
+        let attempt = run.notice_push_attempts + 1;
+        let body = crate::goal_state::xml_escape(&summary);
+        #[cfg(test)]
+        {
+            // Never deliver to real channels from a unit test, even without a hook.
+            let pusher = self.notice_pusher.lock().unwrap_or_else(|p| p.into_inner()).clone();
+            let result = pusher.map(|push| push(&run.rule_id, &body))
+                .unwrap_or(crate::autopilot_approval::NoticePush::NoTarget);
+            self.store.record_run_notice_push(&run.run_id, attempt, result, now).await?;
+        }
+        #[cfg(not(test))]
+        {
+            let store = self.store.clone();
+            let home = self.home_dir.clone();
+            let run_id = run.run_id.clone();
+            let rule_id = run.rule_id.clone();
+            tokio::spawn(async move {
+                let result = crate::autopilot_approval::push_admin_notice(&home, &rule_id, &body).await;
+                if let Err(error) = store.record_run_notice_push(&run_id, attempt, result, Utc::now()).await {
+                    warn!(%run_id, %error, "autopilot: run notice result not recorded; lease will expire");
+                }
+            });
         }
         Ok(())
     }

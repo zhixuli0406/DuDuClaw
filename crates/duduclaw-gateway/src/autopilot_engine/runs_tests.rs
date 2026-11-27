@@ -100,6 +100,9 @@ impl Harness {
         let run = self.run().await;
         assert_eq!(run.state, RUN_WAITING);
         assert_eq!(run.step_index, 2);
+        let steps = self.store.list_run_steps(&run.run_id).await.unwrap();
+        assert_eq!(steps[1].state, STEP_DONE);
+        assert!(steps.iter().all(|step| step.state != STEP_RUNNING));
         assert_eq!(self.queued().await.len(), 1);
         run
     }
@@ -180,7 +183,6 @@ async fn notify_crash_settles_uncertain() {
     for step in [
         json!({"type":"notify","channel":"test","chat_id":"admin","text":"hello"}),
         json!({"type":"proactive_notify","channel":"test","chat_id":"admin","text":"hello"}),
-        json!({"type":"wait","minutes":1}),
     ] {
         let h = Harness::new();
         let engine = h.engine();
@@ -507,4 +509,171 @@ async fn malformed_stored_steps_fail_closed() {
         assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap()[0].result, "invalid_action");
         assert!(h.queued().await.is_empty());
     }
+}
+
+#[tokio::test]
+async fn rule_change_after_render_prevents_step_start() {
+    for outcome in ["rule_disabled", "stale_rule_changed", "rule_removed"] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        let rule = h.rule(json!({"type":"steps","steps":[
+            {"type":"run_skill","target_agent":"plain","skill_name":"test"}
+        ]})).await;
+        let home = h.home.clone();
+        *engine.after_claim_hook.lock().unwrap() = Some(Box::new(move || {
+            let conn = rusqlite::Connection::open(home.join("autopilot.db")).unwrap();
+            match outcome {
+                "rule_disabled" => { conn.execute("UPDATE autopilot_rules SET enabled=0 WHERE id='r'", []).unwrap(); }
+                "stale_rule_changed" => {
+                    conn.execute("UPDATE autopilot_rules SET action=?1 WHERE id='r'",
+                        rusqlite::params![json!({"type":"steps","steps":[
+                            {"type":"delegate","target_agent":"other","prompt":"changed"}
+                        ]}).to_string()]).unwrap();
+                }
+                "rule_removed" => { conn.execute("DELETE FROM autopilot_rules WHERE id='r'", []).unwrap(); }
+                _ => unreachable!(),
+            }
+        }));
+        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        let run = h.assert_outcome(outcome, 0).await;
+        let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+        assert_eq!(steps[0].state, "pending");
+        assert!(steps[0].started_at.is_none());
+        assert!(engine.after_claim_hook.lock().unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn running_wait_recovery_restores_deadline_or_settles_late() {
+    for elapsed_minutes in [30, 180] {
+        let h = Harness::new();
+        let engine = h.engine();
+        let rule = h.rule(json!({"type":"steps","steps":[
+            {"type":"wait","minutes":60},
+            {"type":"delegate","target_agent":"plain","prompt":"after wait"}
+        ]})).await;
+        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        let run = h.run().await;
+        assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+        assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
+        rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap()
+            .execute("UPDATE autopilot_runs SET next_at=?1 WHERE run_id=?2",
+                rusqlite::params![run_ts(now() - ChronoDuration::hours(3)), run.run_id]).unwrap();
+        h.acquire();
+        h.engine().resume_runs_once(now() + ChronoDuration::minutes(elapsed_minutes)).await.unwrap();
+        if elapsed_minutes == 30 {
+            let recovered = h.run().await;
+            assert_eq!(recovered.state, RUN_WAITING);
+            assert_eq!(recovered.step_index, 1);
+            assert_eq!(recovered.next_at, Some(run_ts(now() + ChronoDuration::minutes(60))));
+            let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+            assert_eq!(steps[0].state, STEP_DONE);
+            assert_eq!(steps[0].started_at, Some(run_ts(now())));
+        } else {
+            h.assert_outcome("missed_late", 0).await;
+        }
+        assert!(h.queued().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn settlement_outbox_survives_restart_and_duplicate_audit_writes() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+    // Crash after the settlement transaction, before any announcement.
+    assert!(h.store.settle_claimed_run(&run.run_id, "crashed", "missed_late", None, now()).await.unwrap());
+    drop(engine);
+    let reopened = AutopilotStore::open(&h.home).unwrap();
+    let persisted = reopened.get_run(&run.run_id).await.unwrap().unwrap();
+    assert!(persisted.notice_pending);
+    assert_eq!(persisted.notice_push_state.as_deref(), Some("pending"));
+    assert!(!h.store.list_history(Some("r"), 100).await.unwrap().iter()
+        .any(|row| row.id == format!("run:{}:outcome", run.run_id)));
+    assert!(h.tasks.list_activity(None, None, 100, 0).await.unwrap().0.is_empty());
+    h.acquire();
+    let restarted = h.engine();
+    restarted.announce_run_notices_once(now()).await.unwrap();
+    assert!(!h.run().await.notice_pending);
+    // Also simulate a crash after both audit inserts but before clearing the flag.
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap()
+        .execute("UPDATE autopilot_runs SET notice_pending=1 WHERE run_id=?1",
+            rusqlite::params![run.run_id]).unwrap();
+    restarted.announce_run_notices_once(now()).await.unwrap();
+    restarted.announce_run_notices_once(now()).await.unwrap();
+    h.assert_outcome("missed_late", 0).await;
+    assert!(!h.run().await.notice_pending);
+}
+
+#[tokio::test]
+async fn run_notice_failed_push_retries_until_gave_up() {
+    use crate::autopilot_approval::{NoticePush, MAX_NOTICE_PUSH_ATTEMPTS, notice_push_backoff};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_PENDING], "execution_uncertain", None, now()).await.unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    *engine.notice_pusher.lock().unwrap() = Some(Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        NoticePush::Failed
+    }));
+    h.acquire();
+    let mut due = now();
+    for attempt in 1..=MAX_NOTICE_PUSH_ATTEMPTS {
+        engine.announce_run_notices_once(due).await.unwrap();
+        let row = h.run().await;
+        assert_eq!(row.notice_push_attempts, attempt);
+        assert_eq!(calls.load(Ordering::SeqCst), attempt as usize);
+        if attempt < MAX_NOTICE_PUSH_ATTEMPTS {
+            let next = due + notice_push_backoff(attempt);
+            assert_eq!(row.notice_push_state.as_deref(), Some("pending"));
+            assert_eq!(row.notice_push_next_at, Some(run_ts(next)));
+            engine.announce_run_notices_once(next - ChronoDuration::milliseconds(1)).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), attempt as usize);
+            due = next;
+        }
+    }
+    let row = h.assert_outcome("execution_uncertain", 0).await;
+    assert_eq!(row.notice_push_state.as_deref(), Some("gave_up"));
+    assert!(row.notice_push_next_at.is_none());
+    engine.announce_run_notices_once(due + ChronoDuration::days(1)).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), MAX_NOTICE_PUSH_ATTEMPTS as usize);
+}
+
+#[tokio::test]
+async fn run_notice_no_target_stops_retrying() {
+    use crate::autopilot_approval::NoticePush;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_PENDING], "missed_late", None, now()).await.unwrap());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = calls.clone();
+    *engine.notice_pusher.lock().unwrap() = Some(Arc::new(move |_, _| {
+        counted.fetch_add(1, Ordering::SeqCst);
+        NoticePush::NoTarget
+    }));
+    // A non-holder cannot drain the outbox or call the test pusher.
+    engine.announce_run_notices_once(now()).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(h.run().await.notice_pending);
+    h.acquire();
+    engine.resume_runs_once(now()).await.unwrap();
+    engine.resume_runs_once(now() + ChronoDuration::days(1)).await.unwrap();
+    let row = h.assert_outcome("missed_late", 0).await;
+    assert_eq!(row.notice_push_state.as_deref(), Some("no_target"));
+    assert!(row.notice_push_next_at.is_none());
+    assert_eq!(row.notice_push_attempts, 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
 }

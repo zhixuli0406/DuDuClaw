@@ -85,6 +85,10 @@ CREATE TABLE IF NOT EXISTS autopilot_runs (
     owner_department TEXT,
     outcome TEXT,
     detail TEXT,
+    notice_pending INTEGER NOT NULL DEFAULT 0,
+    notice_push_state TEXT,
+    notice_push_attempts INTEGER NOT NULL DEFAULT 0,
+    notice_push_next_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
