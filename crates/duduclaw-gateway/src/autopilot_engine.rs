@@ -40,6 +40,8 @@ mod approval_gate;
 #[cfg(test)]
 mod approval_gate_tests;
 
+const DEPARTMENT_CONTAINMENT_SKIP: &str = "部門範圍檢查尚未啟用，已略過";
+
 // ─── Event types ────────────────────────────────────────────
 
 /// Strongly-typed events the AutopilotEngine can react to.
@@ -1016,6 +1018,9 @@ pub struct AutopilotEngine {
     /// would land.
     #[cfg(test)]
     after_claim_hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Count entry into the action sink, including calls that fail before dispatch.
+    #[cfg(test)]
+    performed_actions: std::sync::atomic::AtomicUsize,
     /// Test seam (v1.82 outbox): when set, `settle` returns right after the
     /// settling transaction committed — as if the process died there.
     #[cfg(test)]
@@ -1080,6 +1085,8 @@ impl AutopilotEngine {
             screen_default: std::sync::OnceLock::new(),
             #[cfg(test)]
             after_claim_hook: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            performed_actions: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             crash_after_settle: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -1337,6 +1344,9 @@ impl AutopilotEngine {
             if !rule.enabled {
                 return Ok(());
             }
+            if self.skip_department_rule(&rule).await {
+                return Ok(());
+            }
             let fields_map = fields.as_object().cloned().unwrap_or_default();
             self.fire_matched_rule(&rule, &format!("sequence:{then_event}"), &fields_map)
                 .await;
@@ -1364,6 +1374,9 @@ impl AutopilotEngine {
                 // this event's name (it's an unused placeholder for such rules).
                 && r.sequence.is_none()
         }) {
+            if self.skip_department_rule(rule).await {
+                continue;
+            }
             let conditions: Value = serde_json::from_str(&rule.conditions).unwrap_or(Value::Null);
             if !evaluate(&conditions, &fields) {
                 continue;
@@ -1371,6 +1384,27 @@ impl AutopilotEngine {
             self.fire_matched_rule(rule, event_name, &fields).await;
         }
         Ok(())
+    }
+
+    /// Temporary fail-closed guard: replace this with the department containment
+    /// check when wired, keeping it before conditions, screening and approval.
+    async fn skip_department_rule(&self, rule: &AutopilotRuleRow) -> bool {
+        if rule.owner_department.is_none() {
+            return false;
+        }
+        // Record only rule metadata and a fixed reason, never event content.
+        // A rejected candidate is not a fire: do not bump trigger bookkeeping.
+        if let Err(error) = self.store.append_step_history(&AutopilotHistoryRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            rule_id: rule.id.clone(),
+            rule_name: rule.name.clone(),
+            triggered_at: chrono::Utc::now().to_rfc3339(),
+            result: crate::autopilot_approval::RESULT_SKIPPED.into(),
+            details: Some(DEPARTMENT_CONTAINMENT_SKIP.into()),
+        }).await {
+            warn!(rule_id = %rule.id, %error, "autopilot: department skip history write failed");
+        }
+        true
     }
 
     /// Run the circuit breaker, dispatch the rule's action, and record
@@ -1840,6 +1874,8 @@ impl AutopilotEngine {
         &self,
         prepared: &crate::autopilot_approval::FrozenAction,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        self.performed_actions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         use crate::autopilot_approval::FrozenAction;
         match prepared {
             FrozenAction::Delegate { target_agent, prompt, lane } => {
@@ -4791,6 +4827,114 @@ json_fields = { secret = "/secret" }
             "on_unavailable": on_unavailable,
             "timeout_secs": 5,
         })
+    }
+
+    fn department_screened_steps_rule(department: Option<&str>) -> AutopilotRuleRow {
+        let mut rule = screened_rule(None);
+        rule.owner_department = department.map(str::to_string);
+        rule.trigger_event = "channel_message".into();
+        rule.conditions = serde_json::json!({
+            "field": "text", "op": "eq", "value": "finance confidential event"
+        }).to_string();
+        rule.action = serde_json::json!({
+            "type": "steps",
+            "screen": local_screen("pass"),
+            "steps": [{
+                "type": "delegate", "target_agent": "trader", "prompt": "{text}",
+                "require_approval": true
+            }]
+        }).to_string();
+        rule
+    }
+
+    #[tokio::test]
+    async fn department_containment_blocks_channel_message_before_screening() {
+        // Also cover a non-matching content condition and malformed-but-present
+        // ownership: every Some(_) must be rejected before condition evaluation.
+        for (department, text) in [
+            ("sales", "finance confidential event"),
+            ("sales", "non-matching confidential event"),
+            ("", "finance confidential event"),
+        ] {
+            let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+            let screener = ScriptedScreener::ok("YES");
+            let broker = Arc::new(crate::approval::ApprovalBroker::open(&tmp).unwrap());
+            let engine = engine.with_screener(screener.clone()).with_approval_broker(broker.clone());
+            let rule = department_screened_steps_rule(Some(department));
+            engine.store.insert_rule(&rule).await.unwrap();
+            engine.process_event(&AutopilotEvent::ChannelMessage {
+                channel: "finance".into(), agent_id: "worker".into(), text: text.into(),
+            }).await.unwrap();
+
+            assert!(screener.calls().is_empty(), "department events must not reach inference");
+            assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(mq.pending_messages(10).await.unwrap().is_empty());
+            assert!(broker.list_by_kind(crate::autopilot_approval::ACTION_KIND).await.unwrap().is_empty());
+            let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].result, "skipped");
+            assert_eq!(history[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
+            assert!(!serde_json::to_string(&history[0]).unwrap().contains(text));
+            let stored = engine.store.get_rule(&rule.id).await.unwrap().unwrap();
+            assert_eq!(stored.trigger_count, 0);
+            assert!(stored.last_triggered_at.is_none());
+            drop(engine);
+            drop(broker);
+            drop(mq);
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+    }
+
+    #[tokio::test]
+    async fn department_containment_preserves_company_wide_steps_screening() {
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        let rule = department_screened_steps_rule(None);
+        engine.store.insert_rule(&rule).await.unwrap();
+        engine.process_event(&AutopilotEvent::ChannelMessage {
+            channel: "finance".into(), agent_id: "worker".into(),
+            text: "finance confidential event".into(),
+        }).await.unwrap();
+
+        let calls = screener.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("finance confidential event"));
+        // Preserve the existing late rejection of unsupported steps for NULL
+        // department rules, including their screening call and failure history.
+        let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].result, "failure");
+        assert!(history[0].details.as_deref().unwrap().contains("unknown action.type steps"));
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(mq.pending_messages(10).await.unwrap().is_empty());
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn department_containment_blocks_cep_before_screening() {
+        let (engine, mq, tmp) = engine_with_ticks("unused", 0).await;
+        let screener = ScriptedScreener::ok("YES");
+        let engine = engine.with_screener(screener.clone());
+        let rule = department_screened_steps_rule(Some("sales"));
+        engine.store.insert_rule(&rule).await.unwrap();
+        engine.process_event(&AutopilotEvent::CepTrigger {
+            rule_id: rule.id.clone(), then_event: "channel_message".into(),
+            fields: serde_json::json!({"text": "finance confidential event"}),
+        }).await.unwrap();
+
+        assert!(screener.calls().is_empty());
+        assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(mq.pending_messages(10).await.unwrap().is_empty());
+        let history = engine.store.list_history(Some(&rule.id), 10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].result, "skipped");
+        assert_eq!(history[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
+        drop(engine);
+        drop(mq);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Fire one screened rule end-to-end. Returns (enqueued payloads,

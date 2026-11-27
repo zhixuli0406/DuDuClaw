@@ -184,6 +184,53 @@ async fn file_one(h: &Harness, engine: &AutopilotEngine) -> ApprovalId {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn department_containment_blocks_approval_resume_before_perform_action() {
+    // Seed a legacy pending approval directly, bypassing the new trigger guard.
+    // The hash includes department ownership, so a stale-revision rejection
+    // cannot mask a missing containment check in the resumer.
+    for department in [Some("sales"), None] {
+        let h = Harness::new();
+        h.insert_rule("r1", reproduced_action()).await;
+        let mut rule = h.store.get_rule("r1").await.unwrap().unwrap();
+        h.store.remove_rule("r1").await.unwrap();
+        rule.owner_department = department.map(str::to_string);
+        h.store.insert_rule(&rule).await.unwrap();
+        let engine = h.engine(true);
+        engine.gate_on_approval(
+            &rule, "task_created", &reproduced_action(),
+            &task_created("季報").to_fields(), None,
+        ).await;
+        let cards = h.cards().await;
+        assert_eq!(cards.len(), 1);
+        let id = &cards[0].id;
+        let pending = h.only_dispatch().await;
+        assert_eq!(pending.rule_hash, gate::rule_revision_hash(&rule));
+        h.broker().decide(id, true, "dashboard:admin").await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 1);
+
+        let row = h.only_dispatch().await;
+        assert_eq!(row.state, DISPATCH_SETTLED);
+        if department.is_some() {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 0);
+            assert!(h.queued().await.is_empty());
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+            let history = h.store.list_history(Some("r1"), 10).await.unwrap();
+            let skipped: Vec<_> = history.iter().filter(|r| r.result == "skipped").collect();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].details.as_deref(), Some("部門範圍檢查尚未啟用，已略過"));
+            let card = h.broker().get(id).await.unwrap().unwrap();
+            assert_eq!(card.status, ApprovalStatus::Invalidated);
+            assert!(card.invalidated_reason.unwrap().starts_with(gate::RETIRED_PREFIX));
+        } else {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 1);
+            assert_eq!(h.queued().await.len(), 1);
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+        }
+        assert_eq!(engine.resume_approvals_once().await, 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn reproduced_scenario_waits_for_approval_then_dispatches_the_frozen_prompt_once() {
     let h = Harness::new();
     h.insert_rule("r1", reproduced_action()).await;

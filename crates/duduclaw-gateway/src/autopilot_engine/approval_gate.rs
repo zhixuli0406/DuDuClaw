@@ -371,6 +371,15 @@ impl AutopilotEngine {
                 return false;
             }
         };
+        // Temporary fail-closed guard: replace with department containment when
+        // wired. Check the fenced current row before consuming/executing approval.
+        if rule.as_ref().is_some_and(|rule| rule.owner_department.is_some()) {
+            drop(fence);
+            self.retire(broker, rec, row, "department_containment_unavailable").await;
+            return self
+                .settle(row, DISPATCH_EXECUTING, RESULT_SKIPPED, DEPARTMENT_CONTAINMENT_SKIP, false)
+                .await;
+        }
         // 3a. The rule must still exist, be enabled and be the frozen revision.
         let stale = match &rule {
             None => Some("規則在核准後被刪除"),
