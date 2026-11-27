@@ -29,15 +29,29 @@ configuration cannot be determined. Saving still succeeds; the warning does not
 discard the list.
 
 The safeguard accepts isolated employee execution (`isolation_required()`), or
-a proven shell-free effective Claude CLI tool list. A protected-mode flag alone
-does not establish isolation. Other runtimes, cross-runtime fallback and API
-routes conservatively remain ineffective without isolation. Malformed tool
-lists fail closed. `users.me.main_agent_access` reflects this safeguard for
-active listed users; live Admin accounts retain access. Only dashboard sessions
-receive this availability flag.
+a proven command-free Claude CLI turn. Both built-in tools and MCP count:
+any third-party MCP server makes the proof fail; every command-capable DuDuClaw
+tool must be unavailable under the MCP server's actual allowed/denied selectors.
+A `mcp__duduclaw__*` allowlist includes command tools. The shared inventory
+`COMMAND_CAPABLE_MCP_TOOLS` in `duduclaw-core/src/types.rs` documents each tool;
+it includes `execute_program`, `office_script`, desktop input/session tools,
+workspace writes and `llamafile_start`. Screenshots and workspace reads cannot
+issue commands. Fixed-purpose data/OS queries are not general command interfaces.
 
-This package exposes target-aware admission helpers for later conversation and
-assignment integration; existing entry points retain their Admin-only gate.
+A protected-mode flag alone does not establish isolation. Non-Claude, local
+inference and API execution are refused for listed non-Admin main turns unless
+isolated. Both Claude spawn paths recheck the final tool arguments and the
+strict frozen MCP file; every runtime fallback attempt rechecks its actual
+provider. Mapped human channel turns use the host-owned principal for this gate.
+Unreadable or ambiguous inputs fail closed, with `MAIN_TURN_REFUSAL`.
+
+Only authenticated dashboard JWT sessions can obtain the list-based WebChat
+conversation/assignment grant. Member API keys and other credentials cannot
+inherit it from their account, even when that account appears on the list.
+`users.me.main_agent_access` and list effectiveness use the in-memory roster
+and strict read-only configuration checks; they never regenerate resolved
+employee configuration. Live Admin turns retain their existing access.
+Management and scheduling retain their separate Admin-only gate.
 
 [openapi.yaml](openapi.yaml) is a partial historical discovery reference,
 with selected sections maintained separately. Its `/rpc/<method>` paths are

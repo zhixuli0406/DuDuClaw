@@ -24,7 +24,8 @@ use duduclaw_core::{
 mod main_target;
 pub(crate) use main_target::{check_loaded_queue_main_target, check_loaded_queue_main_target_for_execution, check_queue_main_target};
 pub(crate) use main_target::{main_default_targets, main_entry_available};
-pub(crate) use main_target::loaded_access_effective;
+pub(crate) use main_target::{loaded_access_effective, snapshot_access_effective, check_final_main_spawn, check_main_runtime_attempt};
+pub(crate) use main_target::MAIN_TURN_USE;
 pub use main_target::{
     check_loaded_main_target_for_execution, check_main_target_for_execution, check_main_target_for,
     check_loaded_main_target, check_loaded_main_target_for, check_main_target, main_access_allowed, requires_main_restriction,

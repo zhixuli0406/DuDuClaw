@@ -292,3 +292,229 @@ async fn assignment_and_execution_recheck_list_and_loaded_shell_without_opening_
     assert_eq!(check_loaded_main_target_for_execution(f.dir.path(), Some(&wire), &loaded).await,
         Err(REFUSAL.into()));
 }
+
+
+fn frozen_command(home: &Path, tools: &str, servers: serde_json::Value) -> tokio::process::Command {
+    let path = home.join("frozen-mcp.json");
+    std::fs::write(&path, serde_json::to_vec(&serde_json::json!({"mcpServers": servers})).unwrap()).unwrap();
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.args(["--tools", tools, "--allowedTools", "Read,mcp__duduclaw__*",
+        "--disallowedTools", "AskUserQuestion", "--strict-mcp-config", "--mcp-config"]);
+    cmd.arg(path);
+    cmd
+}
+
+#[tokio::test]
+async fn mcp_commands_and_foreign_servers_are_not_shell_free() {
+    use duduclaw_core::types::COMMAND_CAPABLE_MCP_TOOLS;
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read', 'mcp__duduclaw__*']\n");
+    let dir = f.dir.path().join("agents/main");
+    let cmd = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}}));
+    let mut config = main_tools::read_config(&dir).unwrap();
+    assert!(!main_tools::final_command_shell_free(&cmd, &config));
+    // An execute_program-only deny leaves other program/desktop entry points.
+    config.capabilities.denied_tools = vec!["execute_program".into()];
+    assert!(!main_tools::final_command_shell_free(&cmd, &config));
+    config.capabilities.denied_tools = COMMAND_CAPABLE_MCP_TOOLS.iter().map(|name| name.to_string()).collect();
+    assert!(main_tools::final_command_shell_free(&cmd, &config));
+    let mut changed = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}}));
+    changed.arg("--tools=Read,Bash");
+    assert!(!main_tools::final_command_shell_free(&changed, &config));
+    // Both bare and server-qualified denies use the dispatcher's matcher.
+    config.capabilities.denied_tools = COMMAND_CAPABLE_MCP_TOOLS.iter()
+        .map(|name| format!("mcp__duduclaw__{name}")).collect();
+    assert!(main_tools::final_command_shell_free(&cmd, &config));
+    for tool in COMMAND_CAPABLE_MCP_TOOLS {
+        let mut unsafe_config = config.clone();
+        unsafe_config.capabilities.denied_tools.retain(|deny| deny != &format!("mcp__duduclaw__{tool}"));
+        assert!(!main_tools::final_command_shell_free(&cmd, &unsafe_config), "{tool}");
+    }
+    let foreign = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}, "third-party": {}}));
+    assert!(!main_tools::final_command_shell_free(&foreign, &config));
+    std::fs::write(dir.join(".mcp.json"), r#"{"mcpServers":{"third-party":{"command":"foreign"}}}"#).unwrap();
+    assert!(!listed_access_effective(f.dir.path(), "main").await.unwrap_or(false));
+}
+
+#[tokio::test]
+async fn member_and_unknown_credentials_never_get_listed_converse_or_assign() {
+    use duduclaw_auth::acl::ContextOrigin;
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let dir = f.dir.path().join("agents/main");
+    let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+    for origin in [ContextOrigin::MemberKey, ContextOrigin::Other, ContextOrigin::DashboardSession] {
+        let sender = crate::trigger_route::SenderAccess::no_bindings(&f.emp).with_credential_origin(origin);
+        let converse = sender.clone().for_webchat_converse(f.dir.path()).await;
+        let assign = sender.for_assign(f.dir.path()).await;
+        assert_eq!(converse.main_converse_allowed(&loaded), origin == ContextOrigin::DashboardSession);
+        assert_eq!(assign.main_assign_allowed(&loaded), origin == ContextOrigin::DashboardSession);
+        let cmd = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}}));
+        let result = crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(origin,
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+                check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+        assert_eq!(result.is_ok(), origin == ContextOrigin::DashboardSession);
+        if origin != ContextOrigin::DashboardSession { assert_eq!(result, Err(MAIN_TURN_REFUSAL.into())); }
+    }
+}
+
+#[tokio::test]
+async fn final_inputs_recheck_config_for_marked_main_turns() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let dir = f.dir.path().join("agents/main");
+    assert!(listed_access_effective(f.dir.path(), "main").await.unwrap());
+    let wire = format!("user:{}", f.emp);
+    for channel in ["telegram:123", "googlechat:spaces/test"] {
+        // Shared-app member routes explicitly carry the conversation marker,
+        // even though they have no AUTHENTICATED_WEBCHAT_PRINCIPAL.
+        let cmd = frozen_command(f.dir.path(), "Read,Bash", serde_json::json!({"duduclaw": {}}));
+        let result = crate::on_behalf_of::scope_first(Some(wire.clone()),
+            crate::claude_runner::REPLY_CHANNEL.scope(channel.to_owned(),
+                crate::shared_app_route::member_turn(
+                    check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd))))).await;
+        assert_eq!(result, Err(MAIN_TURN_REFUSAL.into()), "{channel}");
+    }
+    let cmd = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}}));
+    MAIN_TURN_USE.scope(MainUse::Assign, async {
+        assert!(crate::on_behalf_of::scope_first(Some(wire.clone()),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd))).await.is_ok());
+        // A changed MCP policy after admission is checked against the frozen file.
+        write_main(&f, "[capabilities]\nallowed_tools = ['Read', 'mcp__duduclaw__*']\n");
+        assert_eq!(crate::on_behalf_of::scope_first(Some(wire.clone()),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd))).await, Err(MAIN_TURN_REFUSAL.into()));
+        assert_eq!(crate::on_behalf_of::scope_first(Some(wire),
+            check_final_main_spawn(f.dir.path(), Some(&dir), None)).await, Err(MAIN_TURN_REFUSAL.into()));
+        // An account's Admin role must never promote its member credential.
+        let member_admin = crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(
+            duduclaw_auth::acl::ContextOrigin::MemberKey,
+            crate::on_behalf_of::scope_first(Some(format!("user:{}", f.admin)),
+                check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+        assert_eq!(member_admin, Err(MAIN_TURN_REFUSAL.into()));
+        // Admin and established background work do not need this proof.
+        assert!(crate::on_behalf_of::scope_first(Some(format!("user:{}", f.admin)),
+            check_final_main_spawn(f.dir.path(), Some(&dir), None)).await.is_ok());
+        assert!(check_final_main_spawn(f.dir.path(), Some(&dir), None).await.is_ok());
+    }).await;
+}
+
+#[tokio::test]
+async fn unlisted_channel_default_keeps_legacy_access_but_webchat_and_dispatch_refuse() {
+    use duduclaw_auth::acl::ContextOrigin;
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    let dir = f.dir.path().join("agents/main");
+    let loaded = AgentRegistry::load_agent(&dir).await.unwrap();
+    let wire = format!("user:{}", f.emp);
+    assert!(!f.db.is_main_agent_user(&f.emp).unwrap());
+    for (channel, sender_id) in [("telegram", "42"), ("line", "U-main-regression")] {
+        f.db.bind_channel_identity(&f.emp, channel, sender_id, true).unwrap();
+        let sender = crate::trigger_route::access::for_channel_sender(f.dir.path(), channel, sender_id);
+        assert!(matches!(&sender.sender, crate::trigger_route::Sender::Account { user_id, .. } if user_id == &f.emp));
+        assert!(sender.webchat_scope.is_none());
+        assert!(sender.may_call(&loaded, Some("main")));
+        let cmd = frozen_command(f.dir.path(), "Read,Bash", serde_json::json!({"duduclaw": {}}));
+        let result = crate::on_behalf_of::scope_first(Some(wire.clone()),
+            crate::claude_runner::REPLY_CHANNEL.scope(format!("{channel}:conversation"),
+                check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+        assert_eq!(result, Ok(()), "ordinary {channel} default");
+        assert!(crate::on_behalf_of::scope_first(Some(wire.clone()),
+            check_final_main_spawn(f.dir.path(), Some(&dir), None)).await.is_ok());
+    }
+    // Use a shell-free command to prove these refusals are list admission,
+    // not just a side effect of the command's shell capability.
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    let cmd = frozen_command(f.dir.path(), "Read", serde_json::json!({"duduclaw": {}}));
+    let web = crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(ContextOrigin::DashboardSession,
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+    assert_eq!(web, Err(MAIN_TURN_REFUSAL.into()));
+    let dispatch = MAIN_TURN_USE.scope(MainUse::Assign,
+        crate::on_behalf_of::scope_first(Some(wire.clone()),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+    assert_eq!(dispatch, Err(MAIN_TURN_REFUSAL.into()));
+    let shared = crate::shared_app_route::member_turn(
+        crate::on_behalf_of::scope_first(Some(wire.clone()),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+    assert_eq!(shared, Err(MAIN_TURN_REFUSAL.into()), "revoked shared-app list admission");
+    assert!(MAIN_TURN_USE.try_with(|_| ()).is_err(), "marker must end with the turn");
+    assert!(crate::on_behalf_of::scope_first(Some(wire),
+        check_final_main_spawn(f.dir.path(), Some(&dir), None)).await.is_ok());
+}
+
+#[tokio::test]
+async fn listed_webchat_final_bash_command_is_refused() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let dir = f.dir.path().join("agents/main");
+    let cmd = frozen_command(f.dir.path(), "Read,Bash", serde_json::json!({"duduclaw": {}}));
+    assert!(!duduclaw_core::execution_gate::isolation_required());
+    let result = crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(
+        duduclaw_auth::acl::ContextOrigin::DashboardSession,
+        crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+            check_final_main_spawn(f.dir.path(), Some(&dir), Some(&cmd)))).await;
+    assert_eq!(result, Err(MAIN_TURN_REFUSAL.into()));
+}
+
+#[tokio::test]
+async fn non_main_final_target_does_not_read_unreadable_users_db() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    crate::trigger_route::tests::write_agent(
+        &home.path().join("agents"), "worker", "Worker", "", "specialist", "",
+    );
+    let dir = home.path().join("agents/worker");
+    let db = home.path().join("users.db");
+    std::fs::create_dir(&db).unwrap();
+    for corrupt_file in [false, true] {
+        if corrupt_file {
+            std::fs::remove_dir(&db).unwrap();
+            std::fs::write(&db, b"not a SQLite database").unwrap();
+        }
+        assert!(admitted_main_role(home.path(), "employee", MainUse::Converse).is_err());
+        let web = crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(
+            duduclaw_auth::acl::ContextOrigin::DashboardSession,
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope("employee".into(),
+                check_final_main_spawn(home.path(), Some(&dir), None))).await;
+        assert_eq!(web, Ok(()));
+        let dispatch = MAIN_TURN_USE.scope(MainUse::Assign,
+            crate::on_behalf_of::scope_first(Some("user:employee".into()),
+                check_final_main_spawn(home.path(), Some(&dir), None))).await;
+        assert_eq!(dispatch, Ok(()));
+    }
+}
+
+#[tokio::test]
+async fn listed_access_reads_never_materialize_or_delete_agent_artifacts() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(dir: &Path, out: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() { out.insert(path.clone(), Vec::new()); visit(&path, out); }
+                else { out.insert(path.clone(), std::fs::read(path).unwrap()); }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        visit(root, &mut out);
+        out
+    }
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    let before = snapshot(f.dir.path());
+    assert!(listed_access_effective(f.dir.path(), "main").await.unwrap());
+    assert_eq!(snapshot(f.dir.path()), before);
+    // Stale resolved files used to be deleted by AgentRegistry::load_agent.
+    let resolved = duduclaw_core::preset::agent_resolved_path(f.dir.path(), "main");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    std::fs::write(&resolved, "[capabilities]\nallowed_tools = ['Read']\n").unwrap();
+    let before = snapshot(f.dir.path());
+    assert!(listed_access_effective(f.dir.path(), "main").await.is_err());
+    assert_eq!(snapshot(f.dir.path()), before);
+}

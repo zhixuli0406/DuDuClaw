@@ -2,8 +2,8 @@
 //! principal or task-local explore lane can establish this durable permission.
 use std::path::Path;
 
-use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
-use duduclaw_core::types::{AgentRole, AgentStatus, CapabilitiesConfig, RuntimeType, SHELL_TOOLS};
+use duduclaw_agent::registry::LoadedAgent;
+use duduclaw_core::types::{AgentConfig, AgentRole, AgentStatus, CapabilitiesConfig, RuntimeType, SHELL_TOOLS, COMMAND_CAPABLE_MCP_TOOLS};
 
 use super::MAIN_TURN_REFUSAL;
 
@@ -31,7 +31,7 @@ pub(super) async fn listed_access_effective_with_isolation(
     let agent = matches.next().ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
     // A name/directory collision must not prove safety for a different target.
     if matches.next().is_some() { return Err(MAIN_TURN_REFUSAL.into()); }
-    loaded_shell_free(agent)
+    config_shell_free(&agent.dir, &agent.config)
 }
 
 /// Synchronous half of the proof, also used against the executing registry
@@ -42,21 +42,34 @@ pub(crate) fn loaded_access_effective(agent: &LoadedAgent) -> Result<bool, Strin
 }
 
 fn loaded_shell_free(agent: &LoadedAgent) -> Result<bool, String> {
-    let settings = crate::runtime_config::load_runtime_settings_strict(&agent.dir)
+    // Check both the cached runtime config and the current MCP policy reader.
+    Ok(config_shell_free(&agent.dir, &agent.config)?
+        && config_shell_free(&agent.dir, &read_config(&agent.dir)?)?)
+}
+
+fn config_shell_free(dir: &Path, config: &AgentConfig) -> Result<bool, String> {
+    let settings = crate::runtime_config::load_runtime_settings_strict(dir)
         .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
     if settings.provider != RuntimeType::Claude
         || settings.fallback.is_some_and(|provider| provider != RuntimeType::Claude)
-        || agent.config.model.api_mode != "cli"
-    {
-        // Codex/Grok coarse sandboxes retain a shell; generic/removed CLI and
-        // API tool loops have no proven shell-free surface here. A Claude
-        // fallback or hybrid/direct-API route must not bypass this decision.
-        return Ok(false);
-    }
-    Ok(!claude_has_shell(
-        &agent.config.capabilities,
-        duduclaw_core::agent_toml::resolve_minimal_context(Some(&agent.dir)),
-    ))
+        || config.model.api_mode != "cli"
+    { return Ok(false); }
+    if claude_has_shell(&config.capabilities,
+        duduclaw_core::agent_toml::resolve_minimal_context(Some(dir))) { return Ok(false); }
+    // This is the read-only counterpart of the spawn gate: includes servers
+    // retained by repair, without rewriting .mcp.json or acquiring a write lock.
+    let mcp = duduclaw_agent::mcp_template::effective_mcp_config_for_probe(dir)
+        .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
+    Ok(mcp_shell_free(&mcp, &config.capabilities))
+}
+
+fn mcp_shell_free(mcp: &serde_json::Value, caps: &CapabilitiesConfig) -> bool {
+    use duduclaw_core::tool_catalog::{tool_list_verdict, ToolListVerdict};
+    let Some(servers) = mcp.get("mcpServers").and_then(serde_json::Value::as_object) else { return false; };
+    if servers.keys().any(|name| name != "duduclaw") { return false; }
+    servers.values().all(serde_json::Value::is_object)
+        && (!servers.contains_key("duduclaw") || COMMAND_CAPABLE_MCP_TOOLS.iter().all(|tool|
+            tool_list_verdict(tool, &caps.denied_tools, &caps.allowed_tools) != ToolListVerdict::Allowed))
 }
 
 fn shell_name(entry: &str) -> bool {
@@ -110,7 +123,35 @@ pub(crate) async fn main_default_targets(home: &Path) -> Result<Vec<String>, Str
     Ok(targets)
 }
 
-async fn load_agents(home: &Path) -> Result<Vec<LoadedAgent>, String> {
+/// Display reads the already-loaded roster. It must also prove the current
+/// file policy, so a stale registry cannot advertise a newly unsafe employee.
+pub(crate) async fn snapshot_access_effective(
+    home: &Path, agents: &[LoadedAgent],
+) -> Result<bool, String> {
+    let default = crate::webchat::access::gateway_default_id(home).await
+        .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
+    let mut found_default = default.is_empty();
+    let mut found_main = false;
+    for agent in agents {
+        let is_default = agent.config.agent.name == default
+            || agent.dir.file_name().and_then(|v| v.to_str()) == Some(default.as_str());
+        found_default |= is_default;
+        if agent.config.agent.role == AgentRole::Main || is_default {
+            found_main = true;
+            if !loaded_access_effective(agent)? { return Ok(false); }
+        }
+    }
+    Ok(found_default && found_main)
+}
+
+struct ReadAgent {
+    dir: std::path::PathBuf,
+    config: AgentConfig,
+}
+
+/// Pure reads only: display/admission must never materialize or delete a
+/// resolved artifact, reconcile incarnations, fence, or take an authority lock.
+async fn load_agents(home: &Path) -> Result<Vec<ReadAgent>, String> {
     let mut entries = tokio::fs::read_dir(home.join("agents")).await
         .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
     let mut agents = Vec::new();
@@ -119,29 +160,81 @@ async fn load_agents(home: &Path) -> Result<Vec<LoadedAgent>, String> {
         let name = name.to_str().ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
         if duduclaw_core::is_internal_agent_dir(name) { continue; }
         let dir = entry.path();
-        let metadata = tokio::fs::metadata(&dir).await.map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
-        if !metadata.is_dir() { continue; }
-        // Like the registry, skip non-agent directories, but unlike scan(),
-        // never silently drop a corrupt employee (it could be another Main).
+        if !entry.metadata().await.map_err(|_| MAIN_TURN_REFUSAL.to_owned())?.is_dir() { continue; }
         if !tokio::fs::try_exists(dir.join("agent.toml")).await
             .map_err(|_| MAIN_TURN_REFUSAL.to_owned())? { continue; }
-        // Validate before the registry refreshes/removes a resolved artifact.
-        validate_tool_config(&dir.join("agent.toml"), true)?;
-        let resolved = duduclaw_core::preset::agent_resolved_path(home, name);
-        validate_tool_config(&resolved, false)?;
-        crate::runtime_config::read_agent_sections_for_gate(&dir)
-            .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
-        let agent = Box::pin(AgentRegistry::load_agent(&dir)).await
-            .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
-        if matches!(agent.preset_resolution, duduclaw_core::preset::PresetResolution::Unresolved { .. }) {
-            return Err(MAIN_TURN_REFUSAL.into());
-        }
-        // A newly materialized preset must pass the same strict validation;
-        // a failed write must not silently switch shadow readers to raw config.
-        validate_tool_config(&resolved, agent.preset_resolution.is_applied())?;
-        if agent.config.agent.status != AgentStatus::Deleted { agents.push(agent); }
+        let config = read_config(&dir)?;
+        if config.agent.status != AgentStatus::Deleted { agents.push(ReadAgent { dir, config }); }
     }
     Ok(agents)
+}
+
+pub(super) fn read_config(dir: &Path) -> Result<AgentConfig, String> {
+    use duduclaw_core::preset;
+    let deny = |_| MAIN_TURN_REFUSAL.to_owned();
+    let source = dir.join("agent.toml");
+    validate_tool_config(&source, true)?;
+    let raw = crate::runtime_config::read_config_for_gate(&source).map_err(deny)?
+        .ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
+    let home = preset::agent_home_dir(dir).ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
+    let id = dir.file_name().and_then(|v| v.to_str()).ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
+    let bindings = preset::load_bindings_checked(&home).map_err(deny)?;
+    let (effective, resolution) = preset::resolve_for_agent_with_bindings(
+        &home, id, raw.as_table().ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?, &bindings);
+    if matches!(resolution, preset::PresetResolution::Unresolved { .. }) { return Err(MAIN_TURN_REFUSAL.into()); }
+    let resolved = preset::agent_resolved_path(&home, id);
+    validate_tool_config(&resolved, resolution.is_applied())?;
+    let written = crate::runtime_config::read_config_for_gate(&resolved).map_err(deny)?;
+    // Shadow readers must see exactly the policy the registry would load.
+    // A stale artifact is refused, never repaired as a side effect of a read.
+    if resolution.is_applied() {
+        if written.as_ref().and_then(toml::Value::as_table) != Some(&effective) { return Err(MAIN_TURN_REFUSAL.into()); }
+    } else if written.is_some() { return Err(MAIN_TURN_REFUSAL.into()); }
+    crate::runtime_config::read_agent_sections_for_gate(dir).map_err(deny)?;
+    toml::Value::Table(effective).try_into().map_err(|_| MAIN_TURN_REFUSAL.to_owned())
+}
+
+/// Inspect the final command, after MCP freezing and all CLI argument edits.
+/// Without a finite --tools schema and a strict, readable MCP file there is
+/// no proof. --allowedTools alone does not remove built-in schemas on the
+/// channel skip-permissions path; it also never limits foreign MCP servers.
+pub(super) fn final_command_shell_free(cmd: &tokio::process::Command, config: &AgentConfig) -> bool {
+    let Some(args) = cmd.as_std().get_args().map(|v| v.to_str()).collect::<Option<Vec<_>>>() else { return false; };
+    // Builders emit separate flag/value pairs. Do not accept an uninspected
+    // alternate spelling that could override the earlier checked arguments.
+    const SURFACE_FLAGS: &[&str] = &["--tools", "--allowedTools", "--disallowedTools",
+        "--mcp-config", "--strict-mcp-config"];
+    if args.iter().any(|arg| arg.split_once('=').is_some_and(|(flag, _)| SURFACE_FLAGS.contains(&flag))
+        || matches!(*arg, "--allowed-tools" | "--disallowed-tools")) { return false; }
+    let one = |flag: &str| -> Option<&str> {
+        let mut found = args.windows(2).filter(|pair| pair[0] == flag);
+        let value = found.next()?.get(1).copied()?;
+        if found.next().is_some() { None } else { Some(value) }
+    };
+    let Some(tools) = one("--tools") else { return false; };
+    for flag in ["--allowedTools", "--disallowedTools"] {
+        let count = args.iter().filter(|arg| **arg == flag).count();
+        if count > 1 || (count == 1 && one(flag).is_none_or(|value|
+            value.split(',').any(|selector| selector.trim().is_empty()))) { return false; }
+    }
+    let denied: Vec<&str> = one("--disallowedTools").map(|v| v.split(',').collect()).unwrap_or_default();
+    // Unknown built-ins are not a proof (Task/Agent, NotebookEdit and computer
+    // can execute too). Qualified denies remove only some invocations.
+    const DATA_ONLY: &[&str] = &["Read", "Glob", "Grep", "Write", "Edit", "MultiEdit",
+        "WebFetch", "WebSearch", "TodoRead", "TodoWrite", "AskUserQuestion"];
+    if tools.split(',').filter(|v| !v.is_empty()).any(|tool|
+        !denied.contains(&tool) && !DATA_ONLY.contains(&tool)) { return false; }
+    // --allowedTools controls auto-approval, not the complete tool surface.
+    // In particular it does not prove absence on skip-permissions spawns.
+    if args.iter().filter(|arg| **arg == "--strict-mcp-config").count() != 1 { return false; }
+    let Some(path) = one("--mcp-config") else { return false; };
+    let Ok(bytes) = std::fs::read(path) else { return false; };
+    let Ok(mcp) = serde_json::from_slice(&bytes) else { return false; };
+    // The MCP server independently enforces these live capability selectors;
+    // CLI allow/deny flags can only narrow this proven command-free surface.
+    if !mcp_shell_free(&mcp, &config.capabilities) { return false; };
+
+    true
 }
 
 fn validate_tool_config(path: &Path, required: bool) -> Result<(), String> {

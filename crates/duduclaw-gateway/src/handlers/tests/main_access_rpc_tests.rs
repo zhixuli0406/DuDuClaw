@@ -8,10 +8,11 @@ const SET: &str = "agents.main_access.set";
 const RISK_NOTICE: &str = "被加入的人可以和主要 AI 員工對話、交辦工作，也可能問到它記得的內容（包含管理員和它的對話）。建立員工、改其他員工設定、排程仍只限管理員。";
 const INEFFECTIVE_REASON: &str = "主要 AI 員工目前可以執行命令列指令，名單暫時不會生效。請先在「工具與權限」移除命令列工具，或啟用受保護模式。";
 
-fn remove_shell(f: &Fixture, agent: &str) {
+async fn remove_shell(f: &Fixture, agent: &str) {
     let path = f.home.join("agents").join(agent).join("agent.toml");
     let raw = std::fs::read_to_string(&path).unwrap();
     std::fs::write(path, format!("{raw}\n[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n")).unwrap();
+    f.h.registry.write().await.scan().await.unwrap();
 }
 
 async fn rpc(f: &Fixture, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
@@ -123,7 +124,7 @@ async fn users_me_main_access_requires_dashboard_session_and_new_rpcs_have_no_me
     f.db.set_main_agent_users("admin", &["emp".into()], true).unwrap();
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], false);
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.admin).await)["main_agent_access"], true);
-    remove_shell(&f, "main");
+    remove_shell(&f, "main").await;
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], true);
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.admin).await)["main_agent_access"], true);
     for origin in [ContextOrigin::MemberKey, ContextOrigin::Other] {
@@ -185,7 +186,7 @@ async fn shell_warning_does_not_prevent_save_and_disappears_after_tool_removal()
         assert_eq!(response["ineffective_reason"], INEFFECTIVE_REASON);
         assert_eq!(f.db.main_agent_users().unwrap(), vec!["emp".to_owned()]);
     }
-    remove_shell(&f, "main");
+    remove_shell(&f, "main").await;
     for method in [GET, SET] {
         let response = payload(rpc(&f, method, json!({"user_ids": ["emp"]}), &f.admin).await);
         assert_eq!(response["effective"], true);
@@ -197,20 +198,21 @@ async fn shell_warning_does_not_prevent_save_and_disappears_after_tool_removal()
 #[tokio::test]
 async fn every_main_and_configured_default_must_be_shell_free() {
     let f = fixture().await;
-    remove_shell(&f, "main");
+    remove_shell(&f, "main").await;
     // A specialist can still be the gateway default; its shell blocks the list.
     std::fs::write(f.home.join("config.toml"), "[general]\ndefault_agent = 'a1'\n").unwrap();
     let response = payload(rpc(&f, SET,
         json!({"user_ids": ["emp"], "acknowledged": true}), &f.admin).await);
     assert_eq!(response["effective"], false);
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], false);
-    remove_shell(&f, "a1");
+    remove_shell(&f, "a1").await;
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await)["effective"], true);
     crate::trigger_route::tests::write_agent(
         &f.home.join("agents"), "second-main", "Second", "", "main", "",
     );
+    f.h.registry.write().await.scan().await.unwrap();
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await)["effective"], false);
-    remove_shell(&f, "second-main");
+    remove_shell(&f, "second-main").await;
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await)["effective"], true);
 }
 

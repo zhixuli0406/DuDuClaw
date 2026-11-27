@@ -293,7 +293,7 @@ pub fn pick_from_list(
 pub fn calls_anyone(reg: &AgentRegistry, text: &str) -> bool {
     let everyone = SenderAccess {
         sender: super::Sender::Admin { user_id: None },
-        webchat_scope: None,
+        credential_origin: duduclaw_auth::acl::ContextOrigin::Other, webchat_scope: None,
     };
     super::decide(reg, text, &everyone, None).addresses_bot()
 }

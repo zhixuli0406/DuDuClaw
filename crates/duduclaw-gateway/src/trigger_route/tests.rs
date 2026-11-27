@@ -583,7 +583,7 @@ fn unmapped_audit_label_does_not_carry_the_platform_id() {
     assert_eq!(
         SenderAccess {
             sender: Sender::Admin { user_id: None },
-            webchat_scope: None,
+            credential_origin: duduclaw_auth::acl::ContextOrigin::Other, webchat_scope: None,
         }
         .audit_label(home.path(), "line", "x"),
         "admin"

@@ -592,7 +592,8 @@ where
                 // could not be confirmed. That is not this account's fault —
                 // do not book it against account health, and do not try the
                 // next account (the same file would be refused again).
-                if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
+                if e == crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+                    || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(&e) {
                     warn!(
                         account = %selected.id,
                         "MCP config could not be confirmed — not an account failure, not retried"

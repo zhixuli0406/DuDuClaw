@@ -112,6 +112,7 @@ impl RuntimeDispatchFailure {
     /// every secondary route. Typed callers retain all primary/fallback data.
     pub(crate) fn legacy_message(&self) -> String {
         if let Some(preflight) = &self.preflight {
+            if preflight.error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return preflight.error.clone(); }
             if preflight.kind == RuntimePreflightKind::Budget {
                 return format!("{}{}", crate::budget::BUDGET_REFUSAL_PREFIX, preflight.error);
             }
@@ -120,7 +121,8 @@ impl RuntimeDispatchFailure {
             .iter()
             .find_map(|step| match &step.outcome {
                 RuntimeStepOutcome::ExecutionError(error)
-                    if crate::work_outcome::is_work_result(error)
+                    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+                        || crate::work_outcome::is_work_result(error)
                         || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
                         || crate::budget::budget_refusal_message(error).is_some()
                         || error.starts_with("AUTONOMY_PAUSED:") =>

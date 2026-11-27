@@ -125,6 +125,7 @@ impl MethodHandler {
     pub(crate) async fn handle_agents_callable(&self, ctx: &UserContext, params: Value) -> WsFrame {
         let access = Arc::new(effective_of(ctx));
         let sender = SenderAccess::from_effective(access.clone())
+            .with_credential_origin(ctx.origin)
             .for_webchat_converse(&self.home_dir).await;
         let reg = self.registry.read().await;
         let session = session_for(&params);

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
 use duduclaw_auth::{models::UserStatus, UserRole};
-use duduclaw_core::{types::AgentRole, HumanPrincipal};
+use duduclaw_core::{types::{AgentRole, RuntimeType}, HumanPrincipal};
 
 const REFUSAL: &str = "主代理僅管理員可以使用。";
 pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理工作，請聯絡管理員。";
@@ -14,13 +14,20 @@ pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理
 mod main_tools;
 pub use main_tools::listed_access_effective;
 pub(crate) use main_tools::main_default_targets;
-pub(crate) use main_tools::loaded_access_effective;
+pub(crate) use main_tools::{loaded_access_effective, snapshot_access_effective};
 
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MainUse {
     Converse,
     Assign,
+}
+
+tokio::task_local! {
+    /// Host-only execution provenance for shared-app member routes and dispatch.
+    /// WebChat already carries AUTHENTICATED_WEBCHAT_PRINCIPAL. Never populate
+    /// this from message text, request parameters or a child process environment.
+    pub(crate) static MAIN_TURN_USE: MainUse;
 }
 
 /// RM-142: opt-in admission for conversation and assignment callers;
@@ -31,7 +38,7 @@ pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<
 }
 
 fn admitted_main_role(home: &Path, user_id: &str, use_: MainUse) -> Result<Option<UserRole>, String> {
-    let db = crate::decision_notify::open_user_db(home)
+    let db = crate::decision_notify::open_user_db_read_only(home)
         .map_err(|_| REFUSAL.to_owned())?.ok_or_else(|| REFUSAL.to_owned())?;
     let Some(account) = db.get_user(user_id).map_err(|_| REFUSAL.to_owned())? else {
         return Ok(None);
@@ -75,18 +82,13 @@ pub async fn requires_main_restriction_for_target(
 
 /// Visibility covers every main/default target: showing a single entry must
 /// not promise access to a main employee whose turns would be refused.
-pub(crate) async fn main_entry_available(home: &Path, user_id: &str) -> Result<bool, String> {
+pub(crate) async fn main_entry_available(home: &Path, user_id: &str, agents: &[LoadedAgent]) -> Result<bool, String> {
     match admitted_main_role(home, user_id, MainUse::Converse)? {
         Some(UserRole::Admin) => return Ok(true),
         None => return Ok(false),
         Some(_) => {},
     }
-    for agent in main_default_targets(home).await? {
-        if !main_turn_allowed(home, user_id, &agent, MainUse::Converse).await? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    snapshot_access_effective(home, agents).await
 }
 
 /// Opt-in list-aware admission. Unlike requires_main_restriction, this allows
@@ -137,13 +139,17 @@ pub async fn check_loaded_main_target_for(
     home: &Path, principal: Option<&str>, agent: &LoadedAgent, use_: MainUse,
 ) -> Result<(), String> {
     // Preserve Admin/background/unmapped behavior and reject unknown identities.
-    if !requires_main_restriction(home, principal)? { return Ok(()); }
+    let member = crate::webchat::main_credential_origin() == duduclaw_auth::acl::ContextOrigin::MemberKey;
+    if !requires_main_restriction(home, principal)? && !member { return Ok(()); }
     let default = crate::webchat::access::gateway_default_id(home).await
         .map_err(|_| REFUSAL.to_owned())?;
     if agent.config.agent.role != AgentRole::Main && agent.config.agent.name != default
         && agent.dir.file_name().and_then(|name| name.to_str()) != Some(default.as_str())
     {
         return Ok(());
+    }
+    if crate::webchat::main_credential_origin() == duduclaw_auth::acl::ContextOrigin::MemberKey {
+        return Err(MAIN_TURN_REFUSAL.into());
     }
     let target = agent.dir.file_name().and_then(|name| name.to_str())
         .ok_or_else(|| REFUSAL.to_owned())?;
@@ -160,6 +166,61 @@ pub async fn check_loaded_main_target_for(
         _ => false,
     };
     Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
+}
+
+/// Last gate for turns admitted under the main-person rule. `None` means an opaque runtime
+/// (non-Claude, API or local tool loop), never an assumed shell-free command.
+/// Ordinary channel conversations retain their pre-list policy. Channel
+/// identities come from on_behalf_of, not the WebChat-only task local.
+pub(crate) async fn check_final_main_spawn(
+    home: &Path, dir: Option<&Path>, command: Option<&tokio::process::Command>,
+) -> Result<(), String> {
+    let web_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
+        .filter(|id| id.as_str() != "system" && !crate::webchat::is_widget_visitor(id));
+    let origin = crate::webchat::main_credential_origin();
+    let use_ = MAIN_TURN_USE.try_with(|use_| *use_).ok()
+        .or_else(|| web_user.as_ref().map(|_| MainUse::Converse))
+        // Member-key provenance is itself host-set WebChat evidence. It must
+        // never lose its refusal merely because another scope has no marker.
+        .or_else(|| (origin == duduclaw_auth::acl::ContextOrigin::MemberKey).then_some(MainUse::Converse));
+    let Some(use_) = use_ else { return Ok(()); };
+    let wire = crate::on_behalf_of::current().or_else(|| web_user.as_ref()
+        .map(|id| format!("user:{id}")));
+    let user = match super::super::PrincipalState::from_wire(wire.as_deref()) {
+        super::super::PrincipalState::Background
+        | super::super::PrincipalState::Human(HumanPrincipal::Unmapped { .. }) => return Ok(()),
+        super::super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
+        super::super::PrincipalState::Unknown => return Err(MAIN_TURN_REFUSAL.into()),
+    };
+    // Resolve the final target before touching users.db: an identity-store
+    // failure in this main-only gate must not refuse an ordinary employee.
+    let dir = dir.ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
+    let config = main_tools::read_config(dir)?;
+    let default = crate::webchat::access::gateway_default_id(home).await
+        .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
+    if config.agent.role != AgentRole::Main && config.agent.name != default
+        && dir.file_name().and_then(|v| v.to_str()) != Some(default.as_str()) { return Ok(()); }
+    // Member credentials never gain Main, even when their account is promoted.
+    let role = admitted_main_role(home, &user, use_)
+        .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
+    if role == Some(UserRole::Admin) && origin != duduclaw_auth::acl::ContextOrigin::MemberKey {
+        return Ok(());
+    }
+    if role.is_none() || origin == duduclaw_auth::acl::ContextOrigin::MemberKey
+        || (web_user.is_some() && origin != duduclaw_auth::acl::ContextOrigin::DashboardSession)
+    { return Err(MAIN_TURN_REFUSAL.into()); }
+    if duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
+    if command.is_some_and(|cmd| main_tools::final_command_shell_free(cmd, &config)) { return Ok(()); }
+    Err(MAIN_TURN_REFUSAL.into())
+}
+
+/// Called at each actual provider attempt, including fallback. Claude's own
+/// spawn checks the final command; all other runtime surfaces are opaque.
+pub(crate) async fn check_main_runtime_attempt(
+    provider: RuntimeType, context: &crate::runtime::RuntimeContext,
+) -> Result<(), String> {
+    if provider == RuntimeType::Claude { return Ok(()); }
+    check_final_main_spawn(&context.home_dir, context.agent_dir.as_deref(), None).await
 }
 
 /// Execution accepts either explicitly admitted use, and validates the loaded artifact.

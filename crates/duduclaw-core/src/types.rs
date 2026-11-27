@@ -2028,6 +2028,26 @@ pub const SHELL_TOOLS: &[&str] = &[
     "run_terminal_command", "run_command", "shell_exec",
 ];
 
+/// Command-capable DuDuClaw MCP tools. Admission uses the MCP dispatcher's
+/// tool_list_verdict, not Claude's built-in --tools schema filter.
+/// Keep this inventory aligned with mcp_tool_defs (including indirect execution).
+pub const COMMAND_CAPABLE_MCP_TOOLS: &[&str] = &[
+    "execute_program", // Arbitrary Python, Bash or JavaScript in a container.
+    "office_script", // Runs bundled skill scripts with caller-supplied arguments.
+    "computer_session_start", // Starts/resumes a container that can run programs.
+    "computer_click", // Can launch a terminal/program through desktop controls.
+    "computer_type", // Can enter commands into a focused terminal.
+    "computer_key", // Can launch a terminal or submit a previously typed command.
+    "computer_scroll", // Can drive an existing desktop/program control.
+    "computer_navigate", // Drives browser applications, including web terminals.
+    "computer_login", // Types credentials into an existing desktop session.
+    "computer_workspace_write", // Can plant scripts/startup files in a resumed workspace.
+    "llamafile_start", // Starts a locally selected executable.
+];
+// Screenshot/workspace list/read and session stop do not issue commands to a
+// running application. Skill search/install/extract/feedback manipulate data;
+// office_script is the registered skill-script execution entry point.
+
 /// Map a runtime-specific tool name to its PolicyKernel canonical family
 /// (`fs_write` / `shell_exec` / `mcp_call`).
 ///

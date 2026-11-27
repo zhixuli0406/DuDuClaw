@@ -79,6 +79,7 @@ impl WebChatState {
         }
         match self.acl_snapshot(auth_user).await {
             Ok(s) => SenderAccess::from_effective(s.access)
+                .with_credential_origin(crate::webchat::main_credential_origin())
                 .for_webchat_converse(&self.ctx.home_dir).await,
             Err(e) => {
                 tracing::warn!(user = %auth_user, "WebChat ACL lookup failed — denying calls: {e}");

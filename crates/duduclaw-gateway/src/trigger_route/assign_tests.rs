@@ -445,7 +445,12 @@ async fn listed_main_assignment_is_precomputed_and_schedules_keep_the_legacy_gat
     let mut reg = AgentRegistry::new(home.path().join("agents"));
     reg.scan().await.unwrap();
     let mut caller = caller(home.path(), "line:main-list", "U_emp1", None);
-    caller.access = caller.access.for_assign(home.path()).await;
+    // A mapped channel account alone cannot acquire the dashboard-only grant.
+    let channel_access = caller.access.clone().for_assign(home.path()).await;
+    assert_eq!(assign_right(&reg, &channel_access, "main", None), AssignRight::Denied);
+    caller.channel = "webchat";
+    caller.access = caller.access.with_credential_origin(duduclaw_auth::acl::ContextOrigin::DashboardSession)
+        .for_assign(home.path()).await;
     assert!(matches!(assign_right(&reg, &caller.access, "main", None), AssignRight::Allowed(_)));
     assert!(!caller.access.webchat_allows_work(reg.get("main").unwrap()));
     let scheduled = plan(&reg, Lang::ZhTw, &cmd("/交辦 @main 工作 || 時間:每天早上九點"), &caller);
