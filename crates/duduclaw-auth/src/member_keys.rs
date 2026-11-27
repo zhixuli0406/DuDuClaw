@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn context_origin_member_key() {
         let (_home, db, user) = fixture();
-        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch).unwrap();
+        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch, false, &[]).unwrap();
         let ctx = db.member_key_context(&key.info.id, &user.id).unwrap();
         assert_eq!(ctx.origin, crate::acl::ContextOrigin::MemberKey);
         assert_eq!(ctx.member_key_id.as_deref(), Some(key.info.id.as_str()));
