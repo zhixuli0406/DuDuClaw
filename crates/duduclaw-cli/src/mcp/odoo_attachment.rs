@@ -349,6 +349,7 @@ struct PdfDictionary {
     // None = no filter; Some(0) = a sole image filter; Some(n) = n Flate stages.
     filter: Option<usize>,
     length: Option<usize>,
+    length_seen: bool,
 }
 
 fn pdf_filter(bytes: &[u8], pos: &mut usize) -> Result<usize, ()> {
@@ -389,6 +390,14 @@ fn pdf_stream_start(bytes: &[u8], mut pos: usize) -> Option<usize> {
         Some(b'\n') => Some(pos + 1),
         _ => None,
     }
+}
+
+fn pdf_has_nested_stream(bytes: &[u8]) -> bool {
+    // Refuse delimited stream + EOL syntax in every raw or inflated payload,
+    // including image bytes. Never recursively parse or inflate nested streams.
+    bytes.windows(6).enumerate().any(|(pos, window)| window == b"stream"
+        && pdf_keyword(bytes, pos, b"stream")
+        && pos.checked_add(6).and_then(|end| pdf_stream_start(bytes, end)).is_some())
 }
 
 fn pdf_stream_end(bytes: &[u8], start: usize, length: Option<usize>) -> Option<(usize, usize)> {
@@ -465,6 +474,8 @@ fn pdf_streams_valid(bytes: &[u8], names: &mut usize) -> Option<()> {
             }
             PdfToken::Name(name) if pdf_name_is(name, b"Length") => {
                 let dictionary = stack.last_mut()?.as_mut()?;
+                if dictionary.length_seen { return None; }
+                dictionary.length_seen = true;
                 let mut next = pos;
                 if let Some(PdfToken::Word(number)) = pdf_token(bytes, &mut next).ok()? {
                     // Indirect lengths are ignored unless the candidate is consistent.
@@ -481,6 +492,7 @@ fn pdf_streams_valid(bytes: &[u8], names: &mut usize) -> Option<()> {
                 let start = pdf_stream_start(bytes, pos)?;
                 let (end, after) = pdf_stream_end(bytes, start, dictionary.length)?;
                 let data = bytes.get(start..end)?;
+                if pdf_has_nested_stream(data) { return None; }
                 let stream_cap = data.len().saturating_mul(10).min(PDF_MAX_INFLATED);
                 let mut decoded = Vec::new();
                 for stage in 0..dictionary.filter.unwrap_or(0) {
@@ -489,11 +501,7 @@ fn pdf_streams_valid(bytes: &[u8], names: &mut usize) -> Option<()> {
                     let output = pdf_inflate(input, cap)?;
                     inflated_total = inflated_total.checked_add(output.len())?;
                     if !pdf_names_valid(&output, names) { return None; }
-                    // Object streams cannot contain other streams. Refuse nested
-                    // stream syntax without any recursive decompression.
-                    if output.windows(6).enumerate().any(|(i, w)| w == b"stream"
-                        && pdf_keyword(&output, i, b"stream")
-                        && pdf_stream_start(&output, i + 6).is_some()) { return None; }
+                    if pdf_has_nested_stream(&output) { return None; }
                     decoded = output;
                 }
                 pos = after;

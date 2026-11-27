@@ -313,6 +313,68 @@ fn pdf_scans_flate_object_streams_and_only_accepts_supported_filters() {
 }
 
 #[test]
+fn pdf_refuses_xref_addressable_flate_streams_inside_raw_streams() {
+    use std::io::Write;
+    let compressed = deflate(b"6 0 << /OpenAction null >>");
+    let mut nested = b"5 0 obj\n".to_vec();
+    nested.extend_from_slice(&stream_object("/Filter /FlateDecode", &compressed, compressed.len()));
+    nested.extend_from_slice(b"\nendobj\n");
+    for filter in ["", "/Filter /DCTDecode", "/Filter /JPXDecode",
+        "/Filter /CCITTFaxDecode", "/Filter /JBIG2Decode"] {
+        // The outer Length covers the entire inner object, so its endstream
+        // cannot accidentally terminate the outer stream during the scan.
+        let mut pdf = stream_pdf(filter, &nested);
+        let inner_offset = pdf.windows(8).position(|w| w == b"5 0 obj\n").unwrap();
+        let previous_xref = pdf.windows(5).position(|w| w == b"xref\n").unwrap();
+        pdf.push(b'\n');
+        let xref_offset = pdf.len();
+        write!(pdf, "xref\n5 1\n{inner_offset:010} 00000 n \ntrailer\n<< /Size 7 /Root 1 0 R /Prev {previous_xref} >>\nstartxref\n{xref_offset}\n%%EOF").unwrap();
+        // The active name is compressed; refusal must come from stream syntax.
+        assert!(pdf_names_valid(&pdf, &mut 0), "{filter}");
+        assert!(pdf_streams_valid(&pdf, &mut 0).is_none(), "{filter}");
+        assert!(!pdf_valid(&pdf), "{filter}");
+    }
+}
+
+#[test]
+fn pdf_nested_stream_check_requires_delimiters_and_eol() {
+    for data in [b"stream\n".as_slice(), b"stream\r", b"stream\r\n",
+        b">>stream \t\0\x0c\r\n", b"image\nstream\nmore image"] {
+        assert!(pdf_has_nested_stream(data), "{data:?}");
+        for filter in ["", "/Filter /DCTDecode", "/Filter /JPXDecode",
+            "/Filter /CCITTFaxDecode", "/Filter /JBIG2Decode"] {
+            assert!(!pdf_valid(&stream_pdf(filter, data)), "{filter}: {data:?}");
+        }
+        assert!(!pdf_valid(&stream_pdf("/Filter /Fl", &deflate(data))));
+    }
+    for data in [b"".as_slice(), b"s", b"strea", b"stream", b"stream ",
+        b"endstream\n", b"upstream\n", b"streaming\n", b"stream /Safe"] {
+        assert!(!pdf_has_nested_stream(data), "{data:?}");
+    }
+}
+
+#[test]
+fn pdf_refuses_nested_stream_syntax_in_raw_flate_bytes() {
+    use std::io::Write;
+    // Stored DEFLATE blocks retain the syntax in the compressed representation.
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+    encoder.write_all(b"\nstream\n").unwrap();
+    let compressed = encoder.finish().unwrap();
+    assert!(pdf_has_nested_stream(&compressed));
+    assert!(pdf_streams_valid(&stream_pdf("/Filter /FlateDecode", &compressed), &mut 0).is_none());
+}
+
+#[test]
+fn pdf_refuses_duplicate_lengths_even_if_the_first_is_invalid() {
+    for keys in ["/Length 0 /Length 0", "/Length 0 /L#65ngth 0",
+        "/Length 8 0 R /Length 0", "/Length null /Length 0",
+        "/Length -1 /Length 0", "/Length 184467440737095516160 /Length 0"] {
+        let object = format!("<< {keys} >>\nstream\n\nendstream");
+        assert!(!pdf_valid(&raw_object_pdf(object.as_bytes())), "{keys}");
+    }
+}
+
+#[test]
 fn pdf_stream_bounds_ignore_inconsistent_lengths_and_refuse_bombs() {
     let plain = b"5 0 << /Label /SafeName >>";
     let compressed = deflate(plain);
