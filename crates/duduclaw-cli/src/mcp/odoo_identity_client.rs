@@ -122,7 +122,7 @@ pub(crate) async fn request_identity(home: &Path, agent: &str, tool: &str, have_
 pub(crate) async fn request_identity_for_person_key(home: &Path, raw_member_key: &str,
     tool: &str, have_rev: Option<i64>) -> Result<OdooIdentity, IdentityRefusal> {
     let identity = post(home, None, Some(raw_member_key), json!({"tool":tool,"have_rev":have_rev}), have_rev).await?;
-    if identity.kind != IdentityKind::Personal { return Err(refuse(MALFORMED)); }
+    if identity.kind != IdentityKind::Personal || identity.permission == IdentityPermission::Engine { return Err(refuse(MALFORMED)); }
     Ok(identity)
 }
 
@@ -183,11 +183,22 @@ pub(super) async fn with_call<F: std::future::Future>(future: F) -> F::Output {
     if CALL_IDENTITY.try_with(|_| ()).is_ok() { return future.await; }
     CALL_IDENTITY.scope(std::cell::RefCell::new(None), future).await
 }
+pub(super) async fn with_new_call<F: std::future::Future>(future: F) -> F::Output {
+    CALL_IDENTITY.scope(std::cell::RefCell::new(None), future).await
+}
 pub(super) fn record(identity: &OdooIdentity) {
     let _ = CALL_IDENTITY.try_with(|cell| *cell.borrow_mut() = Some(identity.audit_value()));
 }
+// Person calls emit one metadata-only row at their boundary, including early
+// refusals. Handler summaries/results can contain business text or credentials.
+tokio::task_local! { static PERSON_CALL: (); }
+pub(super) async fn with_person_call<F: std::future::Future>(future: F) -> F::Output {
+    PERSON_CALL.scope((), future).await
+}
+
 pub(super) fn audit_call(home: &Path, agent: &str, tool: &str, summary: &str,
     success: bool, result: Option<&str>) {
+    if PERSON_CALL.try_with(|_| ()).is_ok() { return; }
     let stamp = CALL_IDENTITY.try_with(|cell| cell.borrow().clone()).ok().flatten().unwrap_or(Value::Null);
     let mut extras = vec![("odoo_identity", stamp)];
     if let Some(raw) = result {

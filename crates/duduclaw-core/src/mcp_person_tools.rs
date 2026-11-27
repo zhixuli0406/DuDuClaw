@@ -13,11 +13,26 @@ pub struct PersonTool {
     pub executes_in: PersonToolHost,
 }
 
-/// The separate person-tool contract. The Odoo read/write subset will be
-/// added by 141O-P10; no existing employee Odoo tools are admitted here.
+/// Person-key contract. Odoo names share schemas with employees, but execute
+/// with a personal actor and never inherit employee authority.
 pub const PERSON_TOOLS: &[PersonTool] = &[
     PersonTool { name: "my_tasks_list", scope: "tasks:read", executes_in: PersonToolHost::Gateway },
     PersonTool { name: "my_agents_status", scope: "agents:status", executes_in: PersonToolHost::Gateway },
+    PersonTool { name: "odoo_search", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_crm_leads", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_sale_orders", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_inventory_products", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_inventory_check", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_invoice_list", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_payment_status", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_partner_search", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_schema_overview", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_schema_fields", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_status", scope: "odoo:read", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_create", scope: "odoo:write", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_write", scope: "odoo:write", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_activity_create", scope: "odoo:write", executes_in: PersonToolHost::McpWithPersonalOdoo },
+    PersonTool { name: "odoo_note_post", scope: "odoo:write", executes_in: PersonToolHost::McpWithPersonalOdoo },
 ];
 
 pub fn person_tool(name: &str) -> Option<&'static PersonTool> {
@@ -36,7 +51,7 @@ mod tests {
 
     #[test]
     fn person_tools_are_exact_gateway_reads() {
-        assert_eq!(PERSON_TOOLS.len(), 2);
+        assert_eq!(PERSON_TOOLS.len(), 17);
         for (name, scope) in [("my_tasks_list", "tasks:read"), ("my_agents_status", "agents:status")] {
             let tool = person_tool(name).unwrap();
             assert_eq!(tool.scope, scope);
@@ -53,7 +68,7 @@ mod tests {
             assert!(!crate::tool_catalog::builtin_tool_catalog().iter().any(|entry| entry.name == name),
                 "person tools must not enter the employee dashboard picker");
         }
-        for name in ["", "tasks_list", "agent_status", "odoo_search", "my_tasks_list_extra",
+        for name in ["", "tasks_list", "agent_status", "odoo_execute", "my_tasks_list_extra",
             "MY_TASKS_LIST", " my_tasks_list", "my_agents_status "] {
             assert!(person_tool(name).is_none(), "{name}");
             assert!(!is_person_tool(name), "{name}");
@@ -61,8 +76,27 @@ mod tests {
     }
 
     #[test]
+    fn mcp_person_odoo_contract_is_closed() {
+        let reads = &["odoo_search", "odoo_crm_leads", "odoo_sale_orders", "odoo_inventory_products", "odoo_inventory_check", "odoo_invoice_list", "odoo_payment_status", "odoo_partner_search", "odoo_schema_overview", "odoo_schema_fields", "odoo_status"];
+        let writes = &["odoo_create", "odoo_write", "odoo_activity_create", "odoo_note_post"];
+        for (names, scope) in [(reads.as_slice(), "odoo:read"), (writes.as_slice(), "odoo:write")] {
+            for name in names {
+                let person = person_tool(name).unwrap();
+                assert_eq!(person.scope, scope);
+                assert_eq!(person.executes_in, PersonToolHost::McpWithPersonalOdoo);
+                assert!(crate::mcp_tool_defs::tools().any(|tool| tool.name == *name));
+            }
+        }
+        for name in ["odoo_execute", "odoo_report", "odoo_message_send", "odoo_attachment_add",
+            "odoo_connect", "odoo_read", "odoo_crm_create_lead", "odoo_crm_update_stage",
+            "odoo_sale_create_quotation", "odoo_sale_confirm"] {
+            assert!(person_tool(name).is_none(), "{name}");
+        }
+    }
+
+    #[test]
     fn person_tool_schemas_never_accept_identity() {
-        for person in PERSON_TOOLS {
+        for person in PERSON_TOOLS.iter().filter(|p| p.executes_in == PersonToolHost::Gateway) {
             let tool = crate::mcp_tool_defs::tools().find(|tool| tool.name == person.name).unwrap();
             let schema = crate::mcp_tool_defs::build_tool_schema(tool);
             assert!(schema["inputSchema"]["required"].as_array().unwrap().is_empty());

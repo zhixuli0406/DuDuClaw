@@ -11,6 +11,7 @@ fn identity(permission: IdentityPermission) -> OdooIdentity {
 
 fn policy() -> ToolPolicy {
     ToolPolicy {
+        person_key: false,
         agent_id: "bot".into(), agent: duduclaw_odoo::AgentOdooConfig::default(),
         access: OdooAccessConfig::parse_config_toml("[odoo_access]\npermission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}\nalways_refuse=[]").unwrap(),
         global: duduclaw_odoo::OdooConfig::default(),
@@ -165,4 +166,32 @@ fn exact_and_segment_refusals_and_feature_switches_apply_in_follow() {
     p.global.features_crm = false;
     assert!(!p.listed("odoo_crm_leads", None));
     assert!(p.check_call("odoo_crm_leads", &json!({}), Some(&identity(IdentityPermission::Follow))).is_err());
+}
+
+#[test]
+fn person_policy_never_uses_employee_tables_or_engine() {
+    let mut p = policy();
+    p.person_key = true;
+    p.agent.allowed_models = vec!["employee.only".into()];
+    p.agent.allowed_actions = vec!["read:employee.only".into()];
+    p.access.always_refuse = vec!["unlink:*".into()];
+    for permission in [IdentityPermission::Follow, IdentityPermission::ReadOnly] {
+        let decision = identity(permission);
+        assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), Some(&decision)).is_ok());
+        for tool in ["odoo_create", "odoo_write", "odoo_activity_create", "odoo_note_post"] {
+            assert_eq!(p.check_call(tool, &json!({"model":"res.partner"}), Some(&decision)).is_ok(),
+                permission == IdentityPermission::Follow, "{tool}");
+        }
+        assert!(p.common("res.partner", "unlink").unwrap_err().contains("一律不允許"));
+        for tool in ["odoo_execute", "odoo_report", "odoo_connect", "odoo_message_send", "odoo_attachment_add"] {
+            assert!(p.check_call(tool, &json!({"model":"res.partner"}), Some(&decision)).is_err());
+        }
+    }
+    let follow = identity(IdentityPermission::Follow);
+    for model in ["ir.model", "ir.model.fields", "ir.model.access", "ir.rule"] {
+        assert!(p.check_call("odoo_write", &json!({"model":model}), Some(&follow)).unwrap_err()
+            .starts_with("DuDuClaw 不讓 AI 做這件事："));
+    }
+    assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), None).is_err());
+    assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), Some(&identity(IdentityPermission::Engine))).is_err());
 }

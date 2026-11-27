@@ -146,7 +146,13 @@ async fn odoo_stub() -> OdooStub {
                     Some("alice") => json!(11), Some("bob") => json!(22), _ => json!(7),
                 },
                 "version" => json!({"server_version":"19.0"}),
-                _ => json!([]),
+                _ => match request["params"]["args"][4].as_str() {
+                    Some("fields_get") => json!({"id":{"type":"integer"}, "name":{"type":"char"}}),
+                    Some("search_read") => json!([{"id":1,"name":"Record"}]),
+                    Some("create" | "activity_schedule" | "message_post") => json!(44),
+                    Some("write") => json!(true),
+                    _ => json!([]),
+                },
             };
             seen.lock().unwrap().push(request);
             let body = json!({"result":result}).to_string();
@@ -333,4 +339,163 @@ async fn agent_decision_resolves_only_its_own_password() {
     let auth = calls.iter().find(|v| v["params"]["method"] == "authenticate").unwrap();
     assert_eq!(auth["params"]["args"][1], "agent-user");
     assert_eq!(auth["params"]["args"][2], "agent-password");
+}
+
+// P10 exercises the actual person-tools entry and shared Odoo handlers. The
+// gateway fixture stands in for already authenticated member-key validation.
+async fn person_call(home: &Path, pool: &crate::mcp::OdooState, user: &str, raw: &str,
+    tool: &str, args: Value) -> Value {
+    use crate::mcp_auth::{AuthenticatedCall, Principal, PrincipalKind, with_authenticated_call};
+    let principal = Principal { client_id: format!("person:{user}"),
+        scopes: crate::mcp_auth::parse_scopes("odoo:read,odoo:write").unwrap(),
+        is_external: true, created_at: chrono::Utc::now() };
+    let call = AuthenticatedCall::without_reference(principal.clone())
+        .with_kind(PrincipalKind::PersonKey { key_id: format!("key-{user}"), user_id: user.into() })
+        .with_person_key(raw.into());
+    with_authenticated_call(call, crate::mcp::person_tools::call(home, pool, &principal, tool, &args)).await
+}
+
+fn person_home(url: &str) -> tempfile::TempDir {
+    let home = home(url);
+    let path = home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("[general]\ndefault_agent='bot'\n{raw}\n[odoo_access]\ncompany_key_agents=['bot']\nalways_refuse=['unlink:*']\n")).unwrap();
+    // Neither this file nor a synthetic employee's config is usable. Person
+    // calls must still work without parsing them or the employee autonomy chain.
+    for name in ["bot", "person-key", "person:alice"] {
+        let dir = home.path().join("agents").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "not valid TOML [").unwrap();
+    }
+    home
+}
+
+const ALICE_KEY: &str = "ddc_member_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const BOB_KEY: &str = "ddc_member_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+#[tokio::test]
+async fn person_missing_or_invalid_identity_never_uses_company_even_when_cached() {
+    let odoo = odoo_stub().await;
+    let home = person_home(&odoo.url);
+    let pool = pool();
+    let gateway = gateway(home.path(), 403, json!({"ok":false,"code":"odoo_not_connected","message":"Odoo not connected"})).await;
+    let result = person_call(home.path(), &pool, "alice", ALICE_KEY, "odoo_search", json!({"model":"res.partner"})).await;
+    assert_eq!(result["isError"], true);
+    assert!(result.to_string().contains("not connected"));
+    assert!(pool.slots().await.is_empty());
+    assert!(odoo.calls.lock().unwrap().is_empty());
+
+    *gateway.answer.lock().unwrap() = (200, json!({"ok":true,"identity":"company","permission":"engine"}));
+    AUTH.scope((), crate::mcp::odoo::connect_odoo_pool(home.path(), &pool, "bot", "odoo_search")).await.unwrap();
+    let calls = odoo.calls.lock().unwrap().len();
+    let mut engine = personal("alice", 11, 1); engine["permission"] = json!("engine");
+    for response in [json!({"ok":true,"identity":"company","permission":"engine"}),
+        json!({"ok":true,"identity":"agent","permission":"read_only"}), engine, personal("bob", 22, 1)] {
+        *gateway.answer.lock().unwrap() = (200, response);
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, "odoo_search", json!({"model":"res.partner"})).await;
+        assert_eq!(result["isError"], true, "{result}");
+        assert_eq!(odoo.calls.lock().unwrap().len(), calls);
+    }
+    for code in ["odoo_not_connected", "odoo_member_credentials_off"] {
+        *gateway.answer.lock().unwrap() = (403, json!({"ok":false,"code":code,"message":code}));
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, "odoo_status", json!({})).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(odoo.calls.lock().unwrap().len(), calls);
+    }
+    assert_eq!(pool.slots().await, vec![("bot".into(), "company".into(), true)]);
+}
+
+#[tokio::test]
+async fn person_modes_fixed_refusals_uid_and_metadata_only_audit() {
+    let odoo = odoo_stub().await;
+    let home = person_home(&odoo.url);
+    let pool = pool();
+    let mut read_only = personal("alice", 11, 1); read_only["permission"] = json!("read_only");
+    let gateway = gateway(home.path(), 200, read_only).await;
+    let writes = [
+        ("odoo_create", json!({"model":"res.partner","values":{"name":"never-audit-values"}})),
+        ("odoo_write", json!({"model":"res.partner","ids":[1],"values":{"name":"never-audit-values"}})),
+        ("odoo_activity_create", json!({"model":"res.partner","res_id":1,"summary":"never-audit-values"})),
+        ("odoo_note_post", json!({"model":"res.partner","res_id":1,"body":"never-audit-values"})),
+    ];
+    for (tool, args) in &writes {
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, tool, args.clone()).await;
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+    }
+    assert!(odoo.calls.lock().unwrap().is_empty());
+    for tool in ["odoo_search", "odoo_schema_fields", "odoo_status"] {
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, tool, json!({"model":"res.partner"})).await;
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+    }
+    *gateway.answer.lock().unwrap() = (200, personal("alice", 11, 1));
+    for (tool, args) in &writes {
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, tool, args.clone()).await;
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+    }
+    let before = odoo.calls.lock().unwrap().len();
+    for (tool, args) in [
+        ("odoo_write", json!({"model":"ir.model.fields","ids":[1],"values":{"name":"x"}})),
+        ("odoo_create", json!({"model":"res.partner","values":{"child_ids":[[2,1,0]]}})),
+        ("odoo_execute", json!({"model":"res.partner","method":"unlink","ids":"1"})),
+        ("odoo_message_send", json!({"model":"res.partner","res_id":1,"body":"x"})),
+        ("odoo_attachment_add", json!({"model":"res.partner","res_id":1,"path":"x"})),
+    ] {
+        let result = person_call(home.path(), &pool, "alice", ALICE_KEY, tool, args).await;
+        assert_eq!(result["isError"], true, "{tool}: {result}");
+    }
+    assert_eq!(odoo.calls.lock().unwrap().len(), before);
+    let calls = odoo.calls.lock().unwrap();
+    for method in ["create", "write", "activity_schedule", "message_post"] {
+        let call = calls.iter().find(|v| v["params"]["args"][4] == method).unwrap();
+        assert_eq!(call["params"]["args"][1], 11);
+        assert_eq!(call["params"]["args"][2], "alice-key-1");
+    }
+    drop(calls);
+    let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+    for secret in [ALICE_KEY, "alice-key-1", "company-secret", "never-audit-values"] {
+        assert!(!audit.contains(secret));
+    }
+    let rows: Vec<Value> = audit.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert!(rows.iter().all(|row| row["agent_id"] == "person:alice"));
+    assert!(rows.iter().any(|row| row["odoo_identity"]["user_id"] == "alice"));
+    // Four refused writes + three reads + four writes + two locally refused
+    // generic writes. Tools outside the table never enter the Odoo handler.
+    assert_eq!(rows.len(), 13);
+}
+
+#[tokio::test]
+async fn person_keys_and_employee_personal_pool_entries_are_disjoint() {
+    use crate::mcp::odoo_actor::OdooActor;
+    let odoo = odoo_stub().await;
+    let home = person_home(&odoo.url);
+    let pool = pool();
+    let gateway = gateway(home.path(), 200, personal("alice", 11, 1)).await;
+    let (employee, _) = AUTH.scope((), crate::mcp::odoo::connect_odoo_pool(home.path(), &pool, "bot", "odoo_search")).await.unwrap();
+    let alice = OdooActor::Person { user_id:"alice", raw_key:ALICE_KEY };
+    let bob = OdooActor::Person { user_id:"bob", raw_key:BOB_KEY };
+    let args = json!({"model":"res.partner"});
+    let (first, decision) = alice.connect(home.path(), &pool, "odoo_search", &args).await.unwrap();
+    assert!(!Arc::ptr_eq(&employee, &first));
+    assert!(pool.key_for_identity(crate::odoo_pool::PERSON_KEY_SLOT, &decision).await.is_err());
+    let (again, _) = alice.connect(home.path(), &pool, "odoo_search", &args).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    *gateway.answer.lock().unwrap() = (200, personal("bob", 22, 1));
+    let (second, _) = bob.connect(home.path(), &pool, "odoo_search", &args).await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(second.status().uid, Some(22));
+    let slots = pool.slots().await;
+    for key in [("bot", "person:alice:1"), (crate::odoo_pool::PERSON_KEY_SLOT, "person:alice:1"),
+        (crate::odoo_pool::PERSON_KEY_SLOT, "person:bob:1")] {
+        assert!(slots.contains(&(key.0.into(), key.1.into(), true)));
+    }
+    *gateway.answer.lock().unwrap() = (200, personal("alice", 11, 2));
+    let (rotated, _) = alice.connect(home.path(), &pool, "odoo_search", &args).await.unwrap();
+    assert!(!Arc::ptr_eq(&rotated, &first));
+    assert!(pool.slots().await.contains(&("bot".into(), "person:alice:1".into(), true)));
+    *gateway.answer.lock().unwrap() = (403, json!({"ok":false,"code":"odoo_not_connected","message":"not connected"}));
+    assert!(alice.connect(home.path(), &pool, "odoo_search", &args).await.is_err());
+    let slots = pool.slots().await;
+    assert_eq!(slots.len(), 2);
+    assert!(slots.contains(&("bot".into(), "person:alice:1".into(), true)));
+    assert!(slots.contains(&(crate::odoo_pool::PERSON_KEY_SLOT.into(), "person:bob:1".into(), true)));
 }

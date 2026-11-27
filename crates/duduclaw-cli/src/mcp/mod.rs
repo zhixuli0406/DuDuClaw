@@ -217,6 +217,7 @@ mod messaging;
 mod notion_github;
 mod odoo;
 mod odoo_access;
+mod odoo_actor;
 #[cfg(test)]
 mod odoo_access_tests;
 pub(crate) mod odoo_identity_client;

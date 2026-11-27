@@ -1,4 +1,5 @@
 use super::*;
+use super::odoo_actor::OdooActor;
 use super::odoo_identity_client::{self as identity_client, IdentityKind, OdooIdentity, IdentityCache};
 
 pub(super) fn blocked_odoo_method(method: &str) -> bool {
@@ -46,7 +47,7 @@ pub(crate) async fn handle_odoo_tool(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, None)).await)
+    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None)).await)
 }
 
 /// Isolation supplies the already selected connector; no account resolution or
@@ -55,17 +56,30 @@ pub(crate) async fn handle_bound_odoo_tool(
     tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
 ) -> Value {
-    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, Some(connector)).await)
+    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector)).await)
+}
+
+/// Person tools enter here before employee dispatch, isolation or approvals.
+pub(super) async fn handle_odoo_actor(
+    tool: &str, params: &Value, home: &Path, odoo: &OdooState, actor: OdooActor<'_>,
+) -> Value {
+    if actor.employee().is_none() && !duduclaw_core::mcp_person_tools::person_tool(tool)
+        .is_some_and(|t| t.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::McpWithPersonalOdoo) {
+        return mcp_error("本人金鑰不提供這項 Odoo 工具。");
+    }
+    handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None).await
 }
 
 async fn handle_odoo_tool_with_connector(
-    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
+    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, actor: OdooActor<'_>,
     bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
 ) -> Value {
     use duduclaw_odoo::connector::OdooConnector;
     use duduclaw_odoo::models::{accounting, crm, inventory, sale};
 
-    let policy = match super::odoo_access::ToolPolicy::load(home_dir, caller_agent) {
+    let audit_name = actor.audit_name();
+    let caller_agent = audit_name.as_ref();
+    let policy = match actor.policy(home_dir) {
         Ok(policy) => policy,
         Err(error) => return mcp_error(&error),
     };
@@ -87,6 +101,12 @@ async fn handle_odoo_tool_with_connector(
         return handle_odoo_connect(home_dir, odoo, caller_agent).await;
     }
 
+    if tool == "odoo_status" && actor.employee().is_none() {
+        return match actor.connect(home_dir, odoo, tool, params).await {
+            Ok((conn, _)) => tool_text(&format!("Odoo connected; uid={}", conn.status().uid.unwrap_or_default())),
+            Err(error) => mcp_error(&error),
+        };
+    }
     if tool == "odoo_status" {
         let mut cache = odoo.identity_cache.lock().await;
         let identity = match select_odoo_identity(home_dir, odoo, caller_agent, tool, &mut cache).await {
@@ -116,7 +136,7 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
-        return super::odoo_writeback::handle(tool, params, home_dir, odoo, caller_agent, bound).await;
+        return super::odoo_writeback::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
     }
 
     // RM-120: generic create / write carry their own explicit-grant gate
@@ -124,11 +144,7 @@ async fn handle_odoo_tool_with_connector(
     // never authorizes them. Protected mode (owner decision C) runs the same
     // chain on the employee's own isolation connector: no pool lookup.
     if matches!(tool, "odoo_create" | "odoo_write") {
-        return match bound {
-            Some(connector) => super::odoo_generic_write::handle_bound_odoo_generic_write(
-                tool, params, home_dir, odoo, caller_agent, connector).await,
-            None => super::odoo_generic_write::handle_odoo_generic_write(tool, params, home_dir, odoo, caller_agent).await,
-        };
+        return super::odoo_generic_write::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
     }
 
     if !matches!(tool,
@@ -139,6 +155,7 @@ async fn handle_odoo_tool_with_connector(
         return super::egress_gate::pre_dispatch_error("This Odoo capability is not available. This is a policy decision; retrying the same call will not succeed. 這項 Odoo 功能不提供；這是政策限制，重試相同呼叫不會成功。");
     }
 
+    if let Some(caller_agent) = actor.employee() {
     // Local-only preparation. Preserve a registered override when no agent file exists.
     let config_result = odoo.load_global_for_gate(home_dir).await;
     let agent_path = caller_agent_dir(home_dir, caller_agent).join("agent.toml");
@@ -153,10 +170,11 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if let Err(error) = config_result { return mcp_error(&error); }
+    }
     // The gateway decision selects the mode. A bound isolation connector has
     // no personal decision and therefore retains the legacy Engine gates.
     let (conn_arc, decision) = if let Some(connector) = bound { (connector, None) } else {
-        match connect_odoo_pool_checked(home_dir, odoo, caller_agent, tool, params).await {
+        match actor.connect(home_dir, odoo, tool, params).await {
             Ok((conn, identity)) => (conn, Some(identity)),
             Err(error) => return mcp_error(&error),
         }
@@ -174,18 +192,15 @@ async fn handle_odoo_tool_with_connector(
             return super::egress_gate::pre_dispatch_error(&format!("Odoo permission denied: {reason}"));
         }
     }
-    let unblock_models = odoo.unblock_models(caller_agent).await;
+    let unblock_models = if let Some(agent) = actor.employee() { odoo.unblock_models(agent).await } else { vec![] };
     if conn_arc.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
     let conn: &OdooConnector = conn_arc.as_ref();
     // ── per-call audit attribution (RFC-21 §2 acceptance) ────────────────
     // Surface caller_agent + profile + tool + params summary to
     // tool_calls.jsonl so the audit trail attributes Odoo activity to a
     // specific agent rather than to the global admin user.
-    let _audit_profile = match &decision {
-        Some(identity) => match odoo.key_for_identity(caller_agent, identity).await {
-            Ok(key) => key.1, Err(error) => return mcp_error(&error),
-        },
-        None => odoo.pool_key(caller_agent).await.1,
+    let _audit_profile = match actor.profile(odoo, decision.as_ref()).await {
+        Ok(profile) => profile, Err(error) => return mcp_error(&error),
     };
     // A: effective block-list opt-out for this agent (per-agent override, else
     // global). Empty ⇒ the built-in security block list is fully in force.
@@ -405,11 +420,10 @@ async fn handle_odoo_tool_with_connector(
                 Err(error) => return mcp_error(&error),
             };
             // This tool also reads product totals; preserve both model gates.
-            if let Err(module) = odoo.feature_gate("product.product").await {
+            if let Err(module) = policy.global.feature_allows_model("product.product") {
                 return mcp_error(&format!("Odoo feature_gate: module '{module}' is switched off"));
             }
-            let cfg = odoo.agent_override(caller_agent).await;
-            if engine && let Err(reason) = crate::odoo_pool::check_action_permission(cfg.as_ref(), "search", "product.product") {
+            if engine && let Err(reason) = crate::odoo_pool::check_action_permission(Some(&policy.agent), "search", "product.product") {
                 return mcp_error(&format!("Odoo permission denied: {reason}"));
             }
             if follow {

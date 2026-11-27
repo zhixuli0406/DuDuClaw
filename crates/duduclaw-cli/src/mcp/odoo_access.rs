@@ -10,6 +10,7 @@ const DENIED: &str = "這位 AI 員工目前沒有這項 Odoo 操作權限。";
 
 #[derive(Clone)]
 pub(super) struct ToolPolicy {
+    pub person_key: bool,
     pub agent_id: String,
     pub agent: AgentOdooConfig,
     pub access: OdooAccessConfig,
@@ -98,7 +99,43 @@ impl ToolPolicy {
         let chain = duduclaw_core::autonomy_gate::effective_identities(home, agent_id,
             duduclaw_core::autonomy_gate::AutonomyPath::Dispatcher).map_err(|_| DENIED)?;
         let parent = chain.last().ok_or(DENIED)?.clone();
-        Ok(Self { agent_id: parent, agent, access, global, identities })
+        Ok(Self { person_key: false, agent_id: parent, agent, access, global, identities })
+    }
+
+    /// Personal keys have no employee policy, autonomy chain or local identity facts.
+    pub fn load_person(home: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| UNREADABLE)?;
+        let access = OdooAccessConfig::parse_config_toml(&raw)?;
+        let mut table: toml::Table = raw.parse().map_err(|_| UNREADABLE)?;
+        let mut config = table.remove("odoo").ok_or(UNREADABLE)?;
+        let fields = config.as_table_mut().ok_or(UNREADABLE)?;
+        // Keep endpoint and feature configuration, never a configured account.
+        for key in ["username", "api_key_enc", "password_enc"] { fields.remove(key); }
+        let global = config.try_into::<OdooConfig>().map_err(|_| UNREADABLE)?;
+        Ok(Self { person_key: true, agent_id: String::new(), agent: AgentOdooConfig::default(),
+            access, global, identities: PossibleIdentities::default() })
+    }
+
+    fn check_person_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        if !person_tool(tool).is_some_and(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+            return Err("本人金鑰不提供這項 Odoo 工具。".into());
+        }
+        let decision = decision.filter(|d| d.kind == DecisionKind::Personal
+            && d.permission != IdentityPermission::Engine).ok_or("無法確認本人 Odoo 權限。")?;
+        let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
+        if decision.permission == IdentityPermission::ReadOnly && class != ToolClass::Read {
+            return Err("目前是唯讀模式，只能查詢 Odoo 資料，不能新增或修改。".into());
+        }
+        if let (Some(model), Some(method)) = (model, method) {
+            self.common_tool(tool, model, method)?;
+            if method == "search_read" { self.common(model, "fields_get")?; }
+        }
+        for (model, method) in self.auxiliary(tool) {
+            self.common(model, method)?;
+            self.common(model, "fields_get")?;
+        }
+        Ok(())
     }
 
     /// Preserve the old dedicated tools' search/execute grant vocabulary while
@@ -261,6 +298,7 @@ impl ToolPolicy {
     }
 
     pub fn check_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
+        if self.person_key { return self.check_person_call(tool, params, decision); }
         let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
         if let (Some(model), Some(method)) = (model, method) {
             self.common_tool(tool, model, method)?;

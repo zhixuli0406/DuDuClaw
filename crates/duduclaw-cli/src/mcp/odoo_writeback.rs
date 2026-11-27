@@ -1,5 +1,6 @@
 //! RM-141 dedicated write-back: caller text never becomes markup or recipients.
 use super::*;
+use super::odoo_actor::OdooActor;
 use super::odoo_access::{ToolPolicy, error_text, follows, identity_suffix};
 use super::odoo_identity_client::{self, OdooIdentity};
 use duduclaw_odoo::OdooConnector;
@@ -101,16 +102,27 @@ pub(super) async fn handle(
     tool: &str, params: &Value, home: &Path, odoo: &OdooState, agent: &str,
     bound: Option<Arc<OdooConnector>>,
 ) -> Value {
-    let policy = match ToolPolicy::load(home, agent) {
+    handle_actor(tool, params, home, odoo, OdooActor::Employee(agent), bound).await
+}
+
+pub(super) async fn handle_actor(
+    tool: &str, params: &Value, home: &Path, odoo: &OdooState, actor: OdooActor<'_>,
+    bound: Option<Arc<OdooConnector>>,
+) -> Value {
+    let audit_name = actor.audit_name();
+    let agent = audit_name.as_ref();
+    let policy = match actor.policy(home) {
         Ok(policy) => policy, Err(error) => return mcp_error(&error),
     };
-    odoo.register_agent(agent, policy.agent.clone()).await;
-    if let Err(error) = odoo.load_global_for_gate(home).await { return mcp_error(&error); }
+    if let Some(employee) = actor.employee() {
+        odoo.register_agent(employee, policy.agent.clone()).await;
+        if let Err(error) = odoo.load_global_for_gate(home).await { return mcp_error(&error); }
+    }
     // Only the gateway decision chooses a runtime identity/mode. Isolation
     // already binds its connector and retains the conservative Engine policy.
     let (conn, decision): (_, Option<OdooIdentity>) = match bound {
         Some(conn) => (conn, None),
-        None => match super::odoo::connect_odoo_pool_checked(home, odoo, agent, tool, params).await {
+        None => match actor.connect(home, odoo, tool, params).await {
             Ok((conn, identity)) => (conn, Some(identity)),
             Err(error) => return mcp_error(&error),
         },

@@ -66,15 +66,16 @@ fn read_tool(tool: &str) -> bool {
 }
 
 fn person_write(tool: &str) -> Result<bool, Refusal> {
-    if read_tool(tool) { return Ok(false); }
-    match tool {
-        "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" => Ok(true),
+    use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+    match person_tool(tool).filter(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+        Some(t) if t.scope == "odoo:read" => Ok(false),
+        Some(t) if t.scope == "odoo:write" => Ok(true),
         _ => Err(Refusal::bad_request()),
     }
 }
 
 fn employee_tool(tool: &str) -> bool {
-    person_write(tool).is_ok() || matches!(tool, "odoo_connect" | "odoo_execute"
+    read_tool(tool) || person_write(tool).is_ok() || matches!(tool, "odoo_connect" | "odoo_execute"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
         | "odoo_sale_confirm" | "odoo_message_send" | "odoo_attachment_add")
 }
