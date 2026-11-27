@@ -37,6 +37,9 @@ impl WebFixture {
     }
     async fn handler(&self) -> crate::handlers::MethodHandler {
         let handler = crate::handlers::MethodHandler::new(self.service.env.home.clone()).await;
+        handler.set_task_store(std::sync::Arc::new(
+            crate::task_store::TaskStore::open(&self.service.env.home).unwrap(),
+        )).await;
         handler.set_user_db(self.service.env.users.clone().unwrap(),
             std::sync::Arc::new(duduclaw_auth::JwtConfig::new(b"step-up-test-secret-32-bytes!!!!!"))).await;
         handler

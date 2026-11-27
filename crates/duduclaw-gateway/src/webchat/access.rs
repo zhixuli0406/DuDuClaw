@@ -219,6 +219,9 @@ impl WebChatState {
         let reg = self.ctx.registry.read().await;
         let loaded = reg.get(agent).ok_or_else(|| denied("unknown_agent"))?;
         if !target_allowed(&sender, loaded, public) {
+            if let Some(reason) = sender.main_converse_refusal(loaded) {
+                return Err(ChatMessage::error_coded(reason, "agent_unavailable"));
+            }
             return Err(denied("agent_forbidden"));
         }
         Ok(())
