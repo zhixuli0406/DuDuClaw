@@ -500,6 +500,7 @@ The page writes the employee's `agent.toml` through `agents.update` and sends on
 | Brain & engine → Utility model | `[model] utility`: blank follows the main model on Codex and OpenAI-compatible APIs; Claude defaults to `claude-haiku-4-5`; Grok and generic CLIs use global background settings |
 | Brain & engine → One employee, four roles | `[team] enabled`, `[team.roles.<role>]` |
 | Automation → Night-time tidy-up | `[night_engine] enabled` |
+| Automation → Task suggestions → Suggest creating tasks in chat | `[goal_intent] enabled`: defaults to on. Turning it off stops suggestions for this employee only. The switch shows whether suggestions are currently on for this employee, including the global setting; saving it stores the employee’s own value. The employee’s own value in `agent.toml` overrides the global value in `config.toml`; without an employee value, the global value applies, falling back to on if neither is set. |
 | Integrations → Own channels (v1.76.0) | `[channels.telegram] bot_token_enc`, `[channels.googlechat] project_number` / `service_account_json_enc` through `agents.channels.*` (admin binds; the owner sees status; see [Own channels](per-employee-channels.md)) |
 | Channels & integrations → Callable by outside contacts (v1.76) | `[channels] public_trigger` (admin-only; see [Calling AI staff with `@`](../features/62-calling-ai-staff.md)) |
 | Automation → Memory → decision continuity, keep decisions for (days) | `[memory] decision_continuity`, `decision_ttl_days` (1 to 3650) |
