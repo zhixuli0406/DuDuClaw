@@ -3579,6 +3579,11 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     )));
     // Personal MCP keys execute through the same live dashboard handler.
     app = app.merge(crate::person_key_route::router(person_key_state));
+    app = app.merge(crate::odoo_identity::route::router(Arc::new(
+        crate::odoo_identity::route::OdooIdentityRouteState::new(
+            home_dir.clone(), knowledge_users.clone(),
+        ),
+    )));
     // ── Per-employee Google identity (internal, B2a) ──────────────
     // `POST /api/internal/google-token`: the MCP server's only way to a
     // delegated colleague's token. Same loopback + signed-identity

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
+use crate::odoo_identity::server::{Server, company_server};
 use zeroize::Zeroizing;
 use duduclaw_security::audit::{AuditEvent, Severity, append_audit_event};
 
@@ -43,32 +43,6 @@ struct Empty {}
 fn valid_input(value: &str, max: usize) -> bool {
     !value.is_empty() && value == value.trim() && value.chars().count() <= max
         && !value.chars().any(char::is_control)
-}
-#[derive(Deserialize)]
-struct ServerFields {
-    #[serde(default)] url: String,
-    #[serde(default)] db: String,
-    #[serde(default)] allow_private_network: bool,
-}
-struct Server { url: String, db: String, destination: String, fp: String, allow_private: bool }
-fn company_server(home: &Path) -> Result<Option<Server>, String> {
-    let text = std::fs::read_to_string(home.join("config.toml")).map_err(|_| CONFIG.to_owned())?;
-    let doc: toml::Value = toml::from_str(&text).map_err(|_| CONFIG.to_owned())?;
-    let Some(section) = doc.get("odoo") else { return Ok(None); };
-    let fields: ServerFields = section.clone().try_into().map_err(|_| CONFIG.to_owned())?;
-    if fields.url.is_empty() && fields.db.is_empty() { return Ok(None); }
-    if fields.url != fields.url.trim() || !duduclaw_odoo::url_guard::is_valid_odoo_db(&fields.db) {
-        return Err(CONFIG.into());
-    }
-    duduclaw_odoo::url_guard::check_url(&fields.url, fields.allow_private_network).map_err(|_| CONFIG.to_owned())?;
-    let parsed = url::Url::parse(&fields.url).map_err(|_| CONFIG.to_owned())?;
-    if parsed.query().is_some() || parsed.fragment().is_some() { return Err(CONFIG.into()); }
-    // check_url rejects userinfo; query/fragment are rejected above. Include
-    // the effective port and base path so same-host changes remain visible.
-    let destination = format!("{}://{}:{}{}", parsed.scheme(), parsed.host_str().ok_or(CONFIG)?,
-        parsed.port_or_known_default().ok_or(CONFIG)?, parsed.path());
-    let fp = format!("{:x}", Sha256::digest(format!("{}|{}", fields.url, fields.db).as_bytes()));
-    Ok(Some(Server { url: fields.url, db: fields.db, destination, fp, allow_private: fields.allow_private_network }))
 }
 
 #[derive(Default)]

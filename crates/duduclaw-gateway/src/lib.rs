@@ -536,6 +536,7 @@ pub mod run_identity;
 pub mod server;
 mod mfa;
 pub(crate) mod odoo_credentials;
+pub(crate) mod odoo_identity;
 mod mfa_email;
 /// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
 pub mod installation_identity;
