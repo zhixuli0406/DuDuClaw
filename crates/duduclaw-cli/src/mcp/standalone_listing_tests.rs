@@ -252,18 +252,20 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
         false,
     )
     .await;
-    // Pinned at 1.70.1 (CLAUDE.md: "a scaffold employee's tools/list is 167
-    // tools"). The four `knowledge_*` tools are not in it: a scaffold
-    // employee has no knowledge collection granted. Moves only with a
-    // deliberate CHANGELOG entry.
-    // The saved Odoo overview and credential declaration each add one tool.
-    // RM-137 H1 (v1.82): `team_handoff` is listed only for a verified team
-    // role member with a token-verified identity (`tools_list.rs`
-    // `team_handoff_listed`, the handler's own `not_a_team_member` check), so
-    // an ordinary employee no longer sees it: 169 → 168.
-    assert_eq!(per_agent.len(), 168, "{per_agent:?}");
+    // The old 168-tool budget included these 18 Odoo tools; generic writes
+    // needed explicit grants, and dedicated writeback tools were added later.
+    let previously_listed_odoo = [
+        "odoo_connect", "odoo_status", "odoo_crm_leads",
+        "odoo_crm_create_lead", "odoo_crm_update_stage", "odoo_sale_orders",
+        "odoo_sale_create_quotation", "odoo_sale_confirm", "odoo_inventory_products",
+        "odoo_inventory_check", "odoo_invoice_list", "odoo_payment_status",
+        "odoo_search", "odoo_execute", "odoo_report", "odoo_partner_search",
+        "odoo_schema_overview", "odoo_schema_fields",
+    ];
+    // Odoo tools are intentionally hidden without a configured company Odoo server.
+    assert!(!per_agent.iter().any(|name| name.starts_with("odoo_")), "{per_agent:?}");
+    assert_eq!(per_agent.len(), 168 - previously_listed_odoo.len(), "{per_agent:?}");
     assert!(!per_agent.contains("team_handoff"), "{per_agent:?}");
-    assert!(per_agent.contains("odoo_schema_overview"));
     assert!(per_agent.contains("credential_declare"));
     assert!(!per_agent.contains("odoo_schema_scan"));
 
@@ -299,6 +301,30 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
     .await;
     assert!(operator_view.contains("credential_declare"));
     assert_eq!(employee_view, operator_view);
+
+    std::fs::write(
+        home.path().join("config.toml"),
+        "[odoo]\nurl = 'https://erp.example.com'\ndb = 'test'\n[odoo_access]\ncompany_key_agents = ['scaffold']\n",
+    )
+    .unwrap();
+    let configured = names(
+        &principal("scaffold", "", false),
+        home.path(),
+        "scaffold",
+        false,
+    )
+    .await;
+    for tool in ["odoo_search", "odoo_status", "odoo_schema_overview"] {
+        assert!(configured.contains(tool), "{tool} must be listed: {configured:?}");
+    }
+    assert_eq!(
+        configured
+            .iter()
+            .copied()
+            .filter(|name| !name.starts_with("odoo_"))
+            .collect::<BTreeSet<_>>(),
+        per_agent
+    );
 }
 
 // ── code_map: listed ⇔ the caller resolves to an employee dir (v1.81 S2) ───

@@ -262,6 +262,33 @@ max_active_skills = 2
         }
     }
 
+    #[test]
+    fn allowed_channels_requires_exact_match_and_star_is_inert() {
+        let tmp = TempDir::new().unwrap();
+        write_agent(tmp.path(), "alpha-star");
+        let raw = std::fs::read_to_string(tmp.path().join("alpha-star/agent.toml")).unwrap();
+        let mut star: duduclaw_core::types::AgentConfig = toml::from_str(&raw).unwrap();
+        star.permissions.allowed_channels = vec!["*".into()];
+        let mut telegram: duduclaw_core::types::AgentConfig = toml::from_str(&raw).unwrap();
+        telegram.agent.name = "telegram-only".into();
+        telegram.permissions.allowed_channels = vec!["telegram".into()];
+
+        for channel in ["telegram", "line"] {
+            let mut message = discord_message();
+            message.channel = channel.into();
+            message.chat_id = format!("{channel}:999");
+            for conversation_routing in [false, true] {
+                assert!(resolve_config(&[&star], &message, conversation_routing).is_none());
+                let selected = resolve_config(&[&star, &telegram], &message, conversation_routing);
+                if channel == "telegram" {
+                    assert_eq!(selected.unwrap().agent.name, "telegram-only");
+                } else {
+                    assert!(selected.is_none());
+                }
+            }
+        }
+    }
+
     /// M40 regression: when several agents match the same message, resolution
     /// must be deterministic (same agent every time) instead of depending on
     /// HashMap iteration order. The resolver sorts by name, so the

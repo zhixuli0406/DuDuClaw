@@ -1002,8 +1002,12 @@ async fn approved_run_step_scope_denied_under_fence() {
     assert!(h.store.bind_step_dispatch_awaiting(&ledger.dispatch_id, id.as_str(), &run.run_id,
         0, "fixture", at, StepApprovalBindMode::Filing).await.unwrap());
     h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
-    engine.resume_approvals_once().await;
-    assert_eq!(h.run().await.state, RUN_AWAITING_APPROVAL);
+    assert_eq!(engine.resume_approvals_once().await, 1);
+    // Settling the dispatch immediately reconciles its bound run as well.
+    let settled_run = h.run().await;
+    assert_eq!(settled_run.state, RUN_SETTLED);
+    assert_eq!(settled_run.outcome.as_deref(), Some("scope_denied"));
+    assert_eq!(settled_run.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
     assert!(h.queued().await.is_empty());
     assert_eq!(engine.performed_actions.load(std::sync::atomic::Ordering::SeqCst), 0);
     let settled = h.step_dispatch(&run).await;
