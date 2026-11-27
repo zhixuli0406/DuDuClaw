@@ -18,6 +18,7 @@ fn viewer_ctx(agent: &str) -> UserContext {
     let mut agent_access = std::collections::HashMap::new();
     agent_access.insert(agent.to_string(), AccessLevel::Viewer);
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "u1".to_string(),
@@ -78,6 +79,10 @@ fn goal_task(id: &str, agent: &str, status: &str) -> TaskRow {
 #[tokio::test]
 async fn continue_reopens_a_done_goal_task_with_the_message() {
     let home = tempfile::tempdir().unwrap();
+    let agent_dir = home.path().join("agents/agent-c1");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='agent-c1'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     let handler = handler_with_task_store(home.path()).await;
     let store = TaskStore::open(home.path()).unwrap();
     store
@@ -108,6 +113,10 @@ async fn continue_reopens_a_done_goal_task_with_the_message() {
 #[tokio::test]
 async fn continue_reopens_a_failed_goal_task_with_the_message() {
     let home = tempfile::tempdir().unwrap();
+    let agent_dir = home.path().join("agents/agent-c2");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='agent-c2'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     let handler = handler_with_task_store(home.path()).await;
     let store = TaskStore::open(home.path()).unwrap();
     store

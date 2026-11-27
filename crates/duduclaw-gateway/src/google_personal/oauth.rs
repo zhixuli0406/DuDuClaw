@@ -10,6 +10,7 @@ pub const AUTHORIZE: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub const TOKEN: &str = "https://oauth2.googleapis.com/token";
 pub const USERINFO: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 pub const REVOKE: &str = "https://oauth2.googleapis.com/revoke";
+pub(crate) const DRIVE_WRITE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 pub const GOOGLE_JWKS: &str = "https://www.googleapis.com/oauth2/v3/certs";
 pub(crate) const DRIVE_TOOLS_SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
 const MAX_RESPONSE: usize = 64 * 1024;
@@ -300,13 +301,19 @@ pub async fn exchange_for_id_token(
     Ok(id_token)
 }
 
+#[cfg(test)]
+tokio::task_local! { pub(crate) static TEST_REFRESH_URL: String; }
+
 pub async fn refresh(
     client_id: &str,
     client_secret: &str,
     refresh_token: &str,
 ) -> Result<Tokens, Error> {
+    let token_url = endpoint(TOKEN);
+    #[cfg(test)]
+    let token_url = TEST_REFRESH_URL.try_with(Clone::clone).unwrap_or(token_url);
     let response = client()?
-        .post(endpoint(TOKEN))
+        .post(token_url)
         .form(&[
             ("grant_type", "refresh_token"),
             ("client_id", client_id),
@@ -479,11 +486,16 @@ pub(crate) fn authorization_url_for(
     chat_read: bool,
     chat_send: bool,
 ) -> Result<String, String> {
+    let purpose = if chat_send { "chat_send" } else if drive_tools { "drive_tools" }
+        else if meeting_recordings { "meeting_recordings" } else { "base" };
+    authorization_url_for_scopes(client_id, redirect, state, challenge,
+        &scopes_for_purposes(&[purpose], chat_read))
+}
+
+pub(crate) fn authorization_url_for_scopes(
+    client_id: &str, redirect: &str, state: &str, challenge: &str, scopes: &[&str],
+) -> Result<String, String> {
     let mut url = url::Url::parse(&endpoint(AUTHORIZE)).map_err(|_| "Google 連結網址無法建立。")?;
-    let mut scopes = if chat_send {
-        vec!["openid", "https://www.googleapis.com/auth/userinfo.email", "https://www.googleapis.com/auth/chat.messages.create"]
-    } else { requested_scopes(meeting_recordings, drive_tools) };
-    if chat_read { scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES); }
     url.query_pairs_mut().extend_pairs([
         ("response_type", "code"),
         ("client_id", client_id),
@@ -494,9 +506,28 @@ pub(crate) fn authorization_url_for(
         ("code_challenge_method", "S256"),
         ("access_type", "offline"),
         ("prompt", "consent"),
-        ("include_granted_scopes", "true"),
+        ("include_granted_scopes", "false"),
     ]);
     Ok(url.into())
+}
+
+/// Explicit local consent union; never inherit provider-side project grants.
+pub(crate) fn scopes_for_purposes(purposes: &[&str], chat_read: bool) -> Vec<&'static str> {
+    let mut scopes = vec!["openid", "email"];
+    for purpose in purposes {
+        match *purpose {
+            "base" => scopes.extend(requested_scopes(false, false)),
+            "drive_tools" => scopes.push(DRIVE_TOOLS_SCOPE),
+            "meeting_recordings" => scopes.extend(requested_scopes(true, false)),
+            "chat_read" => scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES),
+            "chat_send" => scopes.extend_from_slice(crate::google_workspace::CHAT_SEND_SCOPES),
+            _ => {},
+        }
+    }
+    if chat_read { scopes.extend_from_slice(crate::google_workspace::CHAT_READ_SCOPES); }
+    scopes.sort_unstable();
+    scopes.dedup();
+    scopes
 }
 
 pub(crate) fn requested_scopes(meeting_recordings: bool, drive_tools: bool) -> Vec<&'static str> {
@@ -516,6 +547,19 @@ pub(crate) fn requested_scopes(meeting_recordings: bool, drive_tools: bool) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn purpose_scope_union_is_sorted_deduplicated_and_keeps_chat_read() {
+        let scopes = scopes_for_purposes(&["base", "chat_send", "drive_tools", "base"], true);
+        assert!(scopes.windows(2).all(|pair| pair[0] < pair[1]));
+        for scope in requested_scopes(false, false).into_iter()
+            .chain(crate::google_workspace::CHAT_SEND_SCOPES.iter().copied())
+            .chain(crate::google_workspace::CHAT_READ_SCOPES.iter().copied())
+            .chain([DRIVE_TOOLS_SCOPE]) {
+            assert!(scopes.contains(&scope), "{scope}");
+        }
+        assert!(!scopes.contains(&DRIVE_WRITE_SCOPE));
+    }
 
     #[test]
     fn token_scope_is_actual_not_requested_and_malformed_tokens_refuse() {
@@ -543,6 +587,7 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         for (key, value) in [
             ("access_type", "offline"),
+            ("include_granted_scopes", "false"),
             ("prompt", "consent"),
             ("state", "state-fixture"),
             ("code_challenge_method", "S256"),
@@ -574,8 +619,8 @@ mod tests {
         assert_eq!(drive_scopes.len(), 3);
         assert!(drive_scopes.iter().any(|scope| scope == DRIVE_TOOLS_SCOPE));
         assert!(!drive_scopes.iter().any(|scope| scope == super::super::meeting_access::DRIVE_SCOPE || scope == super::super::meeting_access::MEET_SCOPE));
-        assert!(url::Url::parse(&drive_tools).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "true"));
-        assert!(url::Url::parse(&incremental).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "true"));
+        assert!(url::Url::parse(&drive_tools).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "false"));
+        assert!(url::Url::parse(&incremental).unwrap().query_pairs().any(|(key, value)| key == "include_granted_scopes" && value == "false"));
     }
 }
 
@@ -611,7 +656,7 @@ pub(crate) mod mcp_refresh_test {
         );
         Guard(home)
     }
-    pub(super) fn endpoint(home: &Path) -> Option<String> {
+    pub(crate) fn endpoint(home: &Path) -> Option<String> {
         fixtures()
             .lock()
             .unwrap()

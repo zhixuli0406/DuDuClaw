@@ -255,7 +255,7 @@ async fn create_forces_external_and_refuses_employee_ids_and_reserved_names() {
 #[tokio::test]
 async fn create_refuses_scopes_outside_the_effective_list() {
     let (_home, handler) = fixture().await;
-    for scope in ["admin", "odoo:read", "google:read", "messaging:read", "team:handoff"] {
+    for scope in ["admin", "odoo:read", "google:read", "messaging:read", "team:handoff", "tasks:read", "agents:status"] {
         let frame = create_with(&handler, json!({ "name": format!("s-{scope}"), "client_id": "c",
             "scopes": ["memory:read", scope], "expiry": { "kind": "days", "days": 30 } })).await;
         let error = err(&frame);
@@ -280,7 +280,7 @@ async fn per_agent_keys_need_agent_id_an_existing_employee_and_no_admin() {
     assert_eq!(ok["key_info"]["is_external"], false, "a per-agent key acts as the employee");
     assert_eq!(ok["key_info"]["employee_key"], true);
     assert_eq!(ok["key_info"]["ineffective_scopes"], json!([]));
-    for scope in ["admin", "team:handoff"] {
+    for scope in ["admin", "team:handoff", "tasks:read", "agents:status"] {
         let frame = create_with(&handler, json!({ "name": format!("x-{scope}"), "agent_id": "sales",
             "scopes": ["memory:read", scope], "expiry": expiry })).await;
         assert_eq!(err_code(&frame), "mcp_key_scope_not_grantable", "{scope}");

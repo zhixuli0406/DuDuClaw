@@ -71,7 +71,7 @@ mod templates_library;
 mod agents_ops;
 mod main_agent_access;
 mod autonomy_rpc;
-mod agents_update;
+pub(crate) mod agents_update;
 mod contract_rpc;
 mod redaction_rpc;
 mod identity_rpc;
@@ -97,6 +97,7 @@ mod accounts_basic;
 mod memory_rpc;
 mod memory_history_rpc;
 pub(crate) mod my_memory_rpc;
+mod chat_link_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -135,6 +136,8 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod odoo_member_rpc;
+mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -143,6 +146,7 @@ mod channel_util;
 mod runtime_models_rpc;
 mod system_update_config;
 mod delegation_rpc;
+mod admin_ai_rpc;
 mod task_forward_rpc;
 mod accounts_add_rpc;
 mod config_io;
@@ -158,6 +162,8 @@ mod widgets_custom;
 mod departments_rpc;
 mod org_change_rpc;
 mod users_rpc;
+mod dept_grants_rpc;
+mod main_access_rpc;
 mod user_invites_rpc;
 mod google_signin_rpc;
 mod google_signin_me_rpc;
@@ -175,6 +181,7 @@ mod mcp_oauth;
 mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
+mod google_drive_write_rpc;
 mod google_identity_rpc;
 // v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
 mod google_tenant_settings_rpc;
@@ -217,7 +224,7 @@ mod approvals_topology_rpc;
 pub(crate) mod approval_visibility;
 mod mail_rpc;
 mod approvals_decide;
-mod approval_decider;
+pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
 mod ticks_rpc;
@@ -244,7 +251,7 @@ mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
 mod dispatch_ops;
-pub(crate) mod config_commit;
+pub mod config_commit;
 mod config_schema;
 mod system_update_config_v168;
 mod tick_sources_rpc;
@@ -336,6 +343,9 @@ pub struct MethodHandler {
     /// Test seam: the agent cap `effective_agent_cap` returns (RM-149 tests).
     #[cfg(test)]
     agent_cap_fixture: RwLock<Option<usize>>,
+    /// Isolated cost ledger for RPC tests; production keeps the singleton.
+    #[cfg(test)]
+    cost_telemetry_fixture: std::sync::OnceLock<crate::cost_telemetry::CostTelemetry>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
@@ -686,6 +696,18 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_company(method, params, ctx)).await;
         }
 
+        // RM-143 is available in both editions. Reserve the entire namespace
+        // before extensions; no unknown member may bypass the JWT session gate.
+        if method.split('.').take(2).eq(["me", "chat_link"]) {
+            let Some(role) = chat_link_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此聊天連結操作。");
+            };
+            if ctx.role != role {
+                return WsFrame::error_response("", "只有管理員可以連結聊天帳號。");
+            }
+            return boxed_frame(|| self.handle_chat_link_rpc(method, params, ctx)).await;
+        }
+
         // RM-039 "my memory" is gateway-owned self-service: an extension must
         // never answer it, and every method has an explicit role entry. The
         // handler scopes every read and delete to the caller's own subjects.
@@ -742,6 +764,11 @@ impl MethodHandler {
         // this branch is embedded in the shared dispatcher future.
         if method.split('.').next() == Some("mcp_keys") {
             return boxed_frame(|| self.route_mcp_keys_rpc(method, params, ctx)).await;
+        }
+
+        // Personal Odoo secrets never pass through extension dispatch.
+        if odoo_member_rpc::owns(method) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route

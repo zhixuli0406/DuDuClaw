@@ -185,6 +185,10 @@ async fn fire_one(
     if !agent_operational(registry, &row.agent_id).await {
         return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
     }
+    if let Err(refusal) = crate::entry_gate::check_task_assignee(home, &row.agent_id) {
+        tracing::warn!(schedule = %row.id, code = refusal.code(), "scheduled assignment entry refused");
+        return auto_pause(home, store, row, &slot_s, "agent_unavailable").await;
+    }
     if duduclaw_core::autonomy_gate::check(
         home, &row.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::AssignSchedule,
     ).is_err() {

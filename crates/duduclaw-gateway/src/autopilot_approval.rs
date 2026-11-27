@@ -45,6 +45,12 @@
 //!    and is never run again. A `requesting` row is re-linked to its card or
 //!    settled `approval_error`.
 //!
+//! v1.86 multi-step runs use the same lifecycle for each gated step, with
+//! [`step_dispatch_dedupe_key`] and a permanent unique (run, step) binding.
+//! The executor checks that binding under the rule fence before consuming
+//! the card. A durable sweep reconciles settled dispatches back into their
+//! waiting runs; step dispatches never count another rule fire.
+//!
 //! ## Announcements (durable outbox)
 //!
 //! Settling a ledger row, writing its one history row and recording what
@@ -335,6 +341,8 @@ impl FrozenDispatch {
     /// The ledger row for this dispatch (state `requesting`).
     pub fn ledger_row(&self, now: &str, dedupe_key: &str) -> AutopilotDispatchRow {
         AutopilotDispatchRow {
+            run_id: None,
+            step_index: None,
             dispatch_id: self.dispatch_id.clone(),
             approval_id: None,
             rule_id: self.rule_id.clone(),
@@ -423,17 +431,22 @@ pub fn verify_card_payload(row: &AutopilotDispatchRow, payload: &Value) -> Resul
 // ── Rule revision, event reference, dedupe key ──────────────
 
 /// Revision hash of everything that decides what a rule does: id, trigger,
-/// conditions, action (including `require_approval`) and sequence. Name,
+/// conditions, action (including `require_approval`), sequence, and non-NULL
+/// active_window, run_policy and owner_department. Name,
 /// enabled flag and counters are excluded (enabled is checked separately).
 pub fn rule_revision_hash(rule: &AutopilotRuleRow) -> String {
     let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.to_string()));
-    let body = json!({
+    let mut body = json!({
         "id": rule.id,
         "trigger_event": rule.trigger_event,
         "conditions": parse(&rule.conditions),
         "action": parse(&rule.action),
         "sequence": rule.sequence.as_deref().map(parse),
     });
+    // Preserve the exact v1.82 body when all extension columns are NULL.
+    if let Some(value) = &rule.active_window { body["active_window"] = parse(value); }
+    if let Some(value) = &rule.run_policy { body["run_policy"] = parse(value); }
+    if let Some(value) = &rule.owner_department { body["owner_department"] = Value::String(value.clone()); }
     digest_value(&body)
 }
 
@@ -471,6 +484,25 @@ pub fn event_ref(event_name: &str, fields: &serde_json::Map<String, Value>) -> S
 pub fn dedupe_key(rule_id: &str, rule_hash: &str, event_name: &str, fields: &serde_json::Map<String, Value>) -> String {
     digest_value(&json!({
         "v": 1,
+        "rule_id": rule_id,
+        "rule_hash": rule_hash,
+        "event": event_name,
+        "fields_sha256": digest_value(&Value::Object(fields.clone())),
+    }))
+}
+
+/// One approval dispatch per run step, independent of the ingress dedupe window.
+pub fn step_dispatch_dedupe_key(rule_id: &str, rule_hash: &str, run_id: &str, step_index: i64) -> String {
+    digest_value(&json!({
+        "v": 2, "rule_id": rule_id, "rule_hash": rule_hash,
+        "run_id": run_id, "step_index": step_index,
+    }))
+}
+
+/// Durable run dedupe key; versioned separately from the v1.82 dispatch ledger.
+pub fn run_dedupe_key(rule_id: &str, rule_hash: &str, event_name: &str, fields: &serde_json::Map<String, Value>) -> String {
+    digest_value(&json!({
+        "v": 2,
         "rule_id": rule_id,
         "rule_hash": rule_hash,
         "event": event_name,
@@ -642,6 +674,12 @@ mod tests {
 
     fn rule(action: Value) -> AutopilotRuleRow {
         AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r1".into(),
             name: "gate".into(),
             enabled: true,
@@ -681,6 +719,46 @@ mod tests {
             edit(&mut d);
             assert_ne!(rule_revision_hash(&a), rule_revision_hash(&d));
         }
+    }
+
+    #[test]
+    fn revision_hash_preserves_legacy_body_and_tracks_only_present_extensions() {
+        let original = rule(json!({"type": "notify", "text": "hello"}));
+        // Literal pre-v1.86 body: adding even null extension keys would break this.
+        let old_body = json!({
+            "id": "r1", "trigger_event": "task_created", "conditions": {},
+            "action": {"type": "notify", "text": "hello"}, "sequence": null,
+        });
+        assert_eq!(rule_revision_hash(&original), digest_value(&old_body));
+        let edits: [fn(&mut AutopilotRuleRow); 3] = [
+            |r| r.active_window = Some(r#"{"days":[1]}"#.into()),
+            |r| r.run_policy = Some(r#"{"outside_window":"skip"}"#.into()),
+            |r| r.owner_department = Some("sales".into()),
+        ];
+        for edit in edits {
+            let mut changed = original.clone();
+            edit(&mut changed);
+            assert_ne!(rule_revision_hash(&changed), digest_value(&old_body));
+        }
+        let mut changed = original.clone();
+        changed.created_by_user_id = Some("creator".into());
+        changed.updated_by_user_id = Some("editor".into());
+        changed.updated_at = Some("later".into());
+        assert_eq!(rule_revision_hash(&changed), digest_value(&old_body));
+        changed.active_window = Some(r#"{"days":[1],"start":"09:00"}"#.into());
+        let hash = rule_revision_hash(&changed);
+        changed.active_window = Some(r#"{ "start": "09:00", "days": [1] }"#.into());
+        assert_eq!(rule_revision_hash(&changed), hash);
+    }
+
+    #[test]
+    fn run_dedupe_key_uses_v2_without_changing_dispatch_key() {
+        let fields = json!({"task_id":"t1"}).as_object().unwrap().clone();
+        let expected = digest_value(&json!({"v":2,"rule_id":"r","rule_hash":"h","event":"e",
+            "fields_sha256":digest_value(&Value::Object(fields.clone()))}));
+        assert_eq!(run_dedupe_key("r", "h", "e", &fields), expected);
+        assert_ne!(expected, dedupe_key("r", "h", "e", &fields));
+        assert_ne!(expected, run_dedupe_key("r", "other", "e", &fields));
     }
 
     fn dispatch() -> FrozenDispatch {

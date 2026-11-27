@@ -1384,6 +1384,63 @@ impl CostTelemetry {
         Ok(result)
     }
 
+    /// Recent records for exactly the supplied directory ids, newest first.
+    /// Reject oversized sets rather than silently returning a partial department.
+    pub async fn recent_records_for_agents(
+        &self,
+        agents: &[String],
+        limit: u32,
+    ) -> Result<Vec<CostRecord>, String> {
+        if agents.is_empty() { return Ok(Vec::new()); }
+        // Leave room for LIMIT even on SQLite builds with a 999-variable cap.
+        if agents.len() > 998 {
+            return Err("recent_records_for_agents: too many agents (maximum 998)".into());
+        }
+        let placeholders = vec!["?"; agents.len()].join(", ");
+        let sql = format!(
+            "SELECT agent_id, request_type, model, input_tokens, cache_read_tokens,
+                    cache_creation_tokens, output_tokens, cache_efficiency,
+                    cost_millicents, cache_hit_rate, cache_savings_millicents, created_at,
+                    compressed, compression_stages
+             FROM token_usage
+             WHERE agent_id IN ({placeholders})
+             ORDER BY id DESC
+             LIMIT ?"
+        );
+        let bindings = agents.iter().cloned().map(rusqlite::types::Value::Text)
+            .chain(std::iter::once(rusqlite::types::Value::Integer(i64::from(limit))));
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&sql)
+            .map_err(|e| format!("recent_records_for_agents prepare: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(bindings), |row| {
+                Ok(CostRecord {
+                    agent_id: row.get(0)?,
+                    request_type: row.get(1)?,
+                    model: row.get(2)?,
+                    input_tokens: safe_u64(row.get::<_, i64>(3)?),
+                    cache_read_tokens: safe_u64(row.get::<_, i64>(4)?),
+                    cache_creation_tokens: safe_u64(row.get::<_, i64>(5)?),
+                    output_tokens: safe_u64(row.get::<_, i64>(6)?),
+                    cache_efficiency: row.get(7)?,
+                    cost_millicents: safe_u64(row.get::<_, i64>(8)?),
+                    cache_hit_rate: row.get(9)?,
+                    cache_savings_millicents: safe_u64(row.get::<_, i64>(10)?),
+                    created_at: row.get(11)?,
+                    compressed: row.get::<_, i64>(12)? != 0,
+                    compression_stages: row.get(13)?,
+                })
+            })
+            .map_err(|e| format!("recent_records_for_agents query: {e}"))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.map_err(|e| format!("recent_records_for_agents row: {e}"))?);
+        }
+        Ok(result)
+    }
+
     /// Per-day total spend (millicents) for `agent_id` over the last `days`
     /// days, oldest first. Days with no spend are omitted (the returned series
     /// is the set of active days); callers treating it as a baseline should use
@@ -1874,6 +1931,29 @@ pub fn check_price_cliff(system_prompt: &str, user_prompt: &str) -> Option<u64> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn recent_records_for_agents_scopes_and_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let telemetry = CostTelemetry::new(&dir.path().join("cost.db")).unwrap();
+        assert!(telemetry.recent_records_for_agents(&[], 10).await.unwrap().is_empty());
+        for agent in ["a1", "b1", "a2", "main", "a1"] {
+            telemetry.record_priced(agent, RequestType::Chat, "matrix-model",
+                &TokenUsage::default(), 10, false, None).await.unwrap();
+        }
+        let agents = vec!["a1".to_string(), "a2".to_string()];
+        let rows = telemetry.recent_records_for_agents(&agents, 20).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.agent_id.as_str()).collect::<Vec<_>>(), vec!["a1", "a2", "a1"]);
+        let rows = telemetry.recent_records_for_agents(&agents, 2).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.agent_id.as_str()).collect::<Vec<_>>(), vec!["a1", "a2"]);
+        assert!(telemetry.recent_records_for_agents(&agents, 0).await.unwrap().is_empty());
+        assert!(telemetry.recent_records_for_agents(&["a1') OR 1=1 --".into()], 10).await.unwrap().is_empty());
+        assert!(telemetry.recent_records_for_agents(&vec!["a1".into(); 998], 1).await.is_ok());
+        assert!(telemetry.recent_records_for_agents(&vec!["a1".into(); 999], 1).await.is_err());
+        telemetry.conn.lock().await.execute("DROP TABLE token_usage", []).unwrap();
+        // Empty sets do not even query a missing table.
+        assert!(telemetry.recent_records_for_agents(&[], 10).await.unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn transcription_priced_usage_keeps_cents_and_attribution() {

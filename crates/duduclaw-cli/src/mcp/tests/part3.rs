@@ -352,9 +352,13 @@ async fn agent_update_reports_to_enforces_subtree_rule() {
     );
     assert_eq!(read_parent("mkt-rep"), "mkt-lead");
 
-    // Legitimate: sales-lead moves its own rep under its other rep.
+    // Even a superior cannot change protected org authority through AI.
     let params = serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" });
     let res = handle_agent_update(&params, home, "sales-lead").await;
+    assert_eq!(res["isError"], true, "{res}");
+    assert_eq!(read_parent("sales-rep"), "sales-lead");
+    assert!(update_text(&res).contains("管理介面"));
+    let res = handle_agent_update(&params, home, "dashboard").await;
     assert_ne!(res["isError"], true, "{res}");
     assert_eq!(read_parent("sales-rep"), "sales-rep2");
 }
@@ -443,9 +447,8 @@ async fn agent_update_gates_non_org_fields_too() {
 
 // ── WP-B: conversational database-source grants via agent_update ──────
 //
-// Chat route for 「把客戶 CRM 資料庫開給小美」. The grant list is
-// deny-by-default, so these tests pin both directions: what a legitimate
-// grant writes, and that an unknown id writes nothing at all.
+// Human-operator grant mechanics. AI narrowing / refusal is covered by
+// record_authz_tests; a superior is no longer a grant authority.
 
 /// `db_sources` REPLACES the list, and the success text names the result.
 #[tokio::test]
@@ -456,7 +459,7 @@ async fn agent_update_db_sources_replaces_the_grant_list() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm, hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -473,7 +476,7 @@ async fn agent_update_db_sources_replaces_the_grant_list() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -496,7 +499,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "CRM" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -510,7 +513,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -522,7 +525,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -539,14 +542,14 @@ async fn agent_update_db_sources_remove_ignores_unheld_ids() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
 
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "hr, crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -586,7 +589,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "old" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -595,7 +598,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "old" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -606,7 +609,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "../../etc/passwd" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -622,7 +625,7 @@ async fn agent_update_db_sources_precedence_is_replace_add_remove() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
 
@@ -635,7 +638,7 @@ async fn agent_update_db_sources_precedence_is_replace_add_remove() {
             "db_sources_remove": "crm",
         }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -654,7 +657,7 @@ async fn agent_update_db_sources_rejects_unknown_id_without_writing() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,payroll" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -680,7 +683,7 @@ async fn agent_update_db_sources_rejects_unknown_id_without_writing() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "nope" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -696,7 +699,7 @@ async fn agent_update_db_sources_empty_string_revokes_all() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm,hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(read_db_grants(home, "sales-rep").len(), 2);
@@ -704,7 +707,7 @@ async fn agent_update_db_sources_empty_string_revokes_all() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -735,7 +738,7 @@ async fn agent_update_db_sources_preserves_unrelated_sections() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -911,5 +914,89 @@ async fn synthesis_authorizes_subject_and_checks_caller_and_target_pause() {
         assert_eq!(result["isError"], true);
         assert!(result["content"][0]["text"].as_str().unwrap().contains("暫停"));
         assert!(!home.path().join("skills").exists());
+    }
+}
+
+#[tokio::test]
+async fn db_source_grant_needs_admin_card() {
+    use duduclaw_gateway::approval::{ApprovalBroker, action_grant::{ActionGrant, verify_and_consume}};
+    for policy in ["hierarchy", "open"] {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+        let cfg = fs::read_to_string(home.join("config.toml")).unwrap();
+        fs::write(home.join("config.toml"), format!("{cfg}\n[delegation]\npolicy='{policy}'\n")).unwrap();
+        let caller_path = home.join("agents/sales-lead/agent.toml");
+        let cfg = fs::read_to_string(&caller_path).unwrap();
+        fs::write(&caller_path, cfg.replace("[capabilities]", "[capabilities]\naction_rules=[{tool='agent_update',verdict='allow'}]")).unwrap();
+        let users = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let user = users.create_user("db-admin@test.invalid", "Admin", "fixture-password", duduclaw_auth::UserRole::Admin).unwrap();
+        let ctx = users.live_user_context(&user.id).unwrap().unwrap();
+        let broker = ApprovalBroker::open(home).unwrap();
+        let path = home.join("agents/sales-rep/agent.toml");
+        let before = fs::read(&path).unwrap();
+        let request = async {
+            handle_agent_update(&serde_json::json!({"agent_id":"sales-rep", "db_sources":"crm,hr"}), home, "sales-lead").await
+        };
+        let decision = async {
+            let card = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let cards = broker.list_pending(None).await.unwrap();
+                    if let Some(card) = cards.into_iter().find(|c| c.action_kind == "db_source_grant") { break card; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let changed = serde_json::json!({"arguments":{"agent_id":"sales-rep", "db_sources":["hr"]}});
+            assert!(verify_and_consume(&broker, &card.id, &ActionGrant::build("sales-lead", "agent_update", &changed)).await.is_err());
+            broker.decide_egress_dashboard(&card.id, &ctx, true).await.unwrap();
+            assert!(verify_and_consume(&broker, &card.id, &ActionGrant::build("sales-lead", "agent_update", &changed)).await.is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            card
+        };
+        let (out, card) = tokio::join!(request, decision);
+        assert_ne!(out["isError"], true, "{out}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["crm", "hr"]);
+        let grant = ActionGrant::build("sales-lead", "agent_update", &card.payload);
+        assert!(verify_and_consume(&broker, &card.id, &grant).await.is_err());
+        let out = handle_agent_update(&serde_json::json!({"agent_id":"sales-rep", "db_sources_remove":"crm"}), home, "sales-lead").await;
+        assert_ne!(out["isError"], true, "{out}");
+        assert_eq!(read_db_grants(home, "sales-rep"), vec!["hr"]);
+        assert!(broker.list_pending(None).await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn db_source_grant_denial_or_changed_baseline_never_writes() {
+    use duduclaw_gateway::approval::ApprovalBroker;
+    for approve in [false, true] {
+        let tmp = db_grant_home();
+        let home = tmp.path();
+        let users = duduclaw_auth::UserDb::new(&home.join("users.db")).unwrap();
+        let user = users.create_user("db-admin@test.invalid", "Admin", "fixture-password", duduclaw_auth::UserRole::Admin).unwrap();
+        let ctx = users.live_user_context(&user.id).unwrap().unwrap();
+        let broker = ApprovalBroker::open(home).unwrap();
+        let path = home.join("agents/sales-rep/agent.toml");
+        let original = fs::read_to_string(&path).unwrap();
+        let request = async {
+            handle_agent_update(&serde_json::json!({"agent_id":"sales-rep", "db_sources_add":"crm"}), home, "sales-lead").await
+        };
+        let decision = async {
+            let card = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(card) = broker.list_pending(None).await.unwrap().into_iter().find(|c| c.action_kind == "db_source_grant") { break card; }
+                    tokio::task::yield_now().await;
+                }
+            }).await.unwrap();
+            let expected = if approve {
+                original.replace("[capabilities]", "[capabilities]\ndb_sources=['hr']")
+            } else { original.clone() };
+            fs::write(&path, &expected).unwrap();
+            broker.decide_egress_dashboard(&card.id, &ctx, approve).await.unwrap();
+            expected
+        };
+        let (out, expected) = tokio::join!(request, decision);
+        assert_eq!(out["isError"], true, "{out}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        assert!(!fs::read_to_string(home.join("security_audit.jsonl")).unwrap_or_default().contains("db_source_grant_applied"));
     }
 }

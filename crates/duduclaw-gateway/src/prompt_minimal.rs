@@ -122,6 +122,12 @@ fn finish_minimal(
         parts.push(section.content);
     }
 
+    audit.push(crate::prompt_audit::PromptSection::new(
+        "delegation_guidance",
+        crate::prompt_identity::DELEGATION_GUIDANCE,
+    ));
+    parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
     // 4. Sender block (RFC-21) — small XML island, always include if present
     if !sender_block.is_empty() {
         audit.push(crate::prompt_audit::PromptSection::new(
@@ -212,6 +218,16 @@ mod tests {
             pinned_instructions: pinned,
             minimal_core_kb: core_kb,
         }
+    }
+
+    #[test]
+    fn delegation_guidance_is_short_and_injected_once() {
+        let fragment = crate::prompt_identity::DELEGATION_GUIDANCE;
+        assert!((3..=5).contains(&fragment.lines().count()));
+        let prompt = build_minimal_inner(input(Some("Be helpful."), None, "", "", 2));
+        assert_eq!(prompt.matches(fragment).count(), 1);
+        assert!(prompt.contains("被拒時照工具回傳的原因"));
+        assert!(prompt.contains("受保護模式下沒有本人在場"));
     }
 
     #[test]

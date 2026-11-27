@@ -77,7 +77,7 @@ fn refused(frame: WsFrame) -> bool { matches!(frame, WsFrame::Response { ok: fal
 #[tokio::test]
 async fn role_table_dashboard_only_and_member_keys_refused() {
     let f = fixture().await;
-    let key = f.db.member_key_create(&f.employee.user_id, "Test", 1, f.employee.credential_epoch).unwrap();
+    let key = f.db.member_key_create(&f.employee.user_id, "Test", 1, f.employee.credential_epoch, false, &[]).unwrap();
     let key_ctx = crate::member_keys::authenticate(f.home.path(), &f.db, &key.secret).unwrap();
     for method in METHODS {
         assert_eq!(super::super::gates::google_signin_minimum_role(method), Some(UserRole::Admin));
@@ -382,7 +382,7 @@ async fn google_only_account_cannot_be_admin_through_users_update() {
 #[tokio::test]
 async fn me_google_signin_member_api_keys_refused_for_every_method() {
     let f = fixture().await;
-    let key = f.db.member_key_create(&f.employee.user_id, "Self service", 1, f.employee.credential_epoch).unwrap();
+    let key = f.db.member_key_create(&f.employee.user_id, "Self service", 1, f.employee.credential_epoch, false, &[]).unwrap();
     let key_ctx = crate::member_keys::authenticate(f.home.path(), &f.db, &key.secret).unwrap();
     for method in ["me.google_signin.status", "me.google_signin.link_start", "me.google_signin.link_complete",
         "me.google_signin.unlink", "me.google_signin.reauth_start", "me.google_signin.reauth_complete"] {

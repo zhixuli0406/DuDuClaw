@@ -412,6 +412,25 @@ async fn personal_rpc_self_consent_owner_change_and_legacy_session_are_enforced(
     );
 }
 
+#[tokio::test]
+async fn personal_status_reports_unreadable_write_vault_without_failing() {
+    let f = PrimaryProfileFixture::new().await;
+    let ctx = f.db.live_user_context(&f.alice).unwrap().unwrap();
+    let path = crate::person_credentials::write_store::path(&f.home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"invalid json").unwrap();
+
+    let status = payload(rpc(&f.handler, "me.google.status", json!({}), &ctx).await);
+    assert_eq!(status["drive_write"], json!({
+        "connected": false,
+        "status": "unreadable",
+        "account_email": null,
+        "granted_scopes": [],
+    }));
+    assert!(status["connection"].is_null());
+    assert_eq!(std::fs::read(&path).unwrap(), b"invalid json");
+}
+
 #[test]
 fn personal_rpc_family_is_enterprise_only_including_future_members() {
     for method in [

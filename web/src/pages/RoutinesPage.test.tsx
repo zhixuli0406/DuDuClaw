@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import userEvent from '@testing-library/user-event';
 import { screen, waitFor, act, fireEvent } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
@@ -12,7 +13,7 @@ const wsHandlers = new Map<string, (payload: unknown) => void>();
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useAuthStore.setState({ user: null, bindings: [] });
+  useAuthStore.setState({ user: null, bindings: [], deptGrants: [], deptGroups: new Set() });
   wsHandlers.clear();
   mockWsClient.call.mockResolvedValue({ tasks: [] });
   mockWsClient.subscribe.mockImplementation((event: string, handler: (p: unknown) => void) => {
@@ -203,4 +204,44 @@ describe('routine delivery status', () => {
     expect(screen.getByText('Delivery refused')).toBeInTheDocument();
     expect(screen.getByText('Destination access changed. Review the notification destination.')).toBeInTheDocument();
   });
+});
+
+
+it('filters department schedules using granted employees and reports employees needing sync', async () => {
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [],
+    deptGrants: [{ department: 'Sales', groups: ['schedules'] }, { department: 'Support', groups: ['schedules'] }] });
+  useConnectionStore.setState({ state: 'authenticated' });
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+    method === 'users.dept_grants.mine' ? { agents: [{ id: 'agnes', display_name: 'Agnes', groups: ['schedules'] }, { id: 'bruno', display_name: 'Bruno', groups: ['schedules'] }], needs_sync: [{ id: 'drift', display_name: 'Drift' }] }
+    : method === 'agents.list' ? { agents: [{ name: 'agnes', department: 'Sales' }, { name: 'bruno', department: 'Support' }] }
+    : method === 'cron.list' ? { tasks: [{ id: 'a', name: 'Sales report', agent_id: 'agnes', enabled: true, can_manage: true }, { id: 'b', name: 'Support report', agent_id: 'bruno', enabled: true, can_manage: false }] } : {}));
+  renderWithProviders(<RoutinesPage />);
+  await screen.findByText('Sales report');
+  await screen.findByText('1 AI employee needs an administrator to sync their department details before you can manage them.');
+  fireEvent.change(screen.getByRole('combobox', { name: 'Department' }), { target: { value: 'Sales' } });
+  await waitFor(() => expect(screen.queryByText('Support report')).not.toBeInTheDocument());
+  expect(screen.getByText('Sales report')).toBeInTheDocument();
+  expect(screen.getByRole('switch')).not.toHaveAttribute('data-disabled');
+  expect(screen.getByText('New automation')).toBeInTheDocument();
+  expect(mockWsClient.call).toHaveBeenCalledWith('users.dept_grants.mine', { group: 'schedules' });
+});
+
+
+it('uses each server action flag for a department manager', async () => {
+  const user = userEvent.setup();
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [],
+    deptGrants: [{ department: 'Sales', groups: ['schedules'] }] });
+  useConnectionStore.setState({ state: 'authenticated' });
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'cron.list' ? {
+    tasks: [{ id: 'restricted', name: 'Restricted schedule', agent_id: 'agnes', enabled: false,
+      can_manage: true, can_edit: false, can_resume: false, can_run: false }],
+  } : {}));
+  renderWithProviders(<RoutinesPage />);
+  await screen.findByText('Restricted schedule');
+  expect(screen.getByRole('switch')).toHaveAttribute('data-disabled');
+  await user.click(screen.getByRole('button', { name: 'More actions' }));
+  expect(await screen.findByRole('menuitem', { name: 'Test run' })).toHaveAttribute('data-disabled');
+  expect(screen.getByRole('menuitem', { name: 'Edit' })).toHaveAttribute('data-disabled');
+  expect(screen.getByRole('menuitem', { name: 'Resume' })).toHaveAttribute('data-disabled');
+  expect(screen.getByRole('menuitem', { name: 'Remove' })).not.toHaveAttribute('data-disabled');
 });

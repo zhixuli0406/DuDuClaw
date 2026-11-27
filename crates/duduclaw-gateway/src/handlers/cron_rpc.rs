@@ -59,7 +59,13 @@ impl MethodHandler {
         };
         match store.list_all().await {
             Ok(rows) => {
-                let tasks: Vec<Value> = rows.iter().map(Self::cron_row_to_json).collect();
+                let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
+                let tasks: Vec<Value> = rows.iter().map(|row| {
+                    let mut value = Self::cron_row_to_json(row);
+                    value["creator_access_lost"] = json!(display.display_creator_access_lost(
+                        row.created_by_user_id.as_deref(), &row.agent_id));
+                    value
+                }).collect();
                 WsFrame::ok_response("", json!({ "tasks": tasks }))
             }
             Err(e) => WsFrame::error_response("", &format!("list cron tasks: {e}")),
@@ -86,6 +92,11 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_cron_add(&self, params: Value) -> WsFrame {
+        self.handle_cron_add_with_creator(params, None).await
+    }
+
+    // Creator identity is host-supplied, never read from RPC parameters.
+    pub(super) async fn handle_cron_add_with_creator(&self, params: Value, creator: Option<&UserContext>) -> WsFrame {
         let name = match params.get("name").and_then(|v| v.as_str()) {
             Some(n) if !n.is_empty() => n.to_string(),
             _ => return WsFrame::error_response("", "Missing 'name' parameter"),
@@ -242,6 +253,10 @@ impl MethodHandler {
             cron_expr.clone(),
             task_body,
         );
+        if let Some(ctx) = creator {
+            row.created_by_user_id = Some(ctx.user_id.clone());
+            row.on_behalf_of = Some(format!("user:{}", ctx.user_id));
+        }
         row.notify_channel = notify_channel;
         row.notify_chat_id = notify_chat_id;
         row.notify_thread_id = notify_thread_id;

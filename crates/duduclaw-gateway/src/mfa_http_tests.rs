@@ -52,7 +52,7 @@ async fn fixture_policy(
     let (event_tx, _) = broadcast::channel(4);
     let state = Arc::new(AppState {
         auth: AuthManager::new(None),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
         prepared_events: Default::default(),
@@ -1367,7 +1367,7 @@ async fn member_key_http_and_prefix_separation() {
     let (_dir, state, _) = fixture(false, false).await;
     std::fs::write(state.home_dir.join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
     let member = state.user_db.create_user("member@http.test", "Member", "test-password", UserRole::Employee).unwrap();
-    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch).unwrap();
+    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch, false, &[]).unwrap();
     let status = state.user_db.status_token_create(&member.id, "x").unwrap();
     let jwt = state.jwt_config.issue_access_token(&member, &[]).unwrap();
     assert!(authenticate_jwt(&state, &key.secret).is_err());
@@ -1378,13 +1378,13 @@ async fn member_key_http_and_prefix_separation() {
     for (raw, allowed) in [(key.secret.as_str(), true), (jwt.as_str(), true), (status.secret.as_str(), false), ("ddc_prod_0123456789abcdef0123456789abcdef", false)] {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("authorization", format!("Bearer {raw}").parse().unwrap());
-        assert_eq!(member_http_caller(&state, &headers, None).is_ok(), allowed);
+        assert_eq!(member_http_caller(&state, &headers, None).await.is_ok(), allowed);
         assert_eq!(handle_me(State(state.clone()), headers).await.into_response().status() == StatusCode::OK, allowed);
     }
     state.user_db.member_key_revoke_own(&member.id, &key.info.id).unwrap();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("authorization", format!("Bearer {}", key.secret).parse().unwrap());
-    assert!(member_http_caller(&state, &headers, None).is_err());
+    assert!(member_http_caller(&state, &headers, None).await.is_err());
 }
 
 #[tokio::test]

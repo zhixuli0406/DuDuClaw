@@ -1,3 +1,4 @@
+import type { GrantGroup } from './dept-grants-types';
 import { isTaskEntryVisible } from '@/lib/task-entry-visibility';
 import type { UserRole } from '@/stores/auth-store';
 import { hasMinRole } from '@/lib/roles';
@@ -28,6 +29,8 @@ import { hasMinRole } from '@/lib/roles';
 export interface Gated {
   readonly to?: string;
   readonly minRole?: UserRole;
+  /** Alternative to the role gate only; all other gates still apply. */
+  readonly orGrant?: GrantGroup;
   readonly enterprise?: boolean;
   /**
    * Hidden on the Personal edition (2026-07-29 client feedback): unlike
@@ -86,6 +89,7 @@ export const ORG_CHART_MIN_AGENTS = 3;
 /** Extra context needed to evaluate the finer-grained gates. All optional so
  *  existing call sites keep compiling; omitted facts fail closed. */
 export interface VisibilityContext {
+  readonly deptGroups?: ReadonlySet<GrantGroup>;
   /** True when the viewer holds at least one operator/owner agent binding. */
   readonly hasOperatorAccess?: boolean;
   /** True once at least one fork record exists (progressive disclosure). */
@@ -117,7 +121,8 @@ export function isVisible(
   ctx?: VisibilityContext,
 ): boolean {
   if (item.to && !isTaskEntryVisible(item.to)) return false;
-  if (!hasMinRole(userRole, item.minRole)) return false;
+  if (!hasMinRole(userRole, item.minRole)
+      && !(item.orGrant && ctx?.deptGroups?.has(item.orGrant))) return false;
   if (isPersonal && item.enterprise) return false;
   if (isPersonal && item.personalHidden) return false;
   // Desktop-only surfaces stay hidden unless we know we're in the app (fail-closed).

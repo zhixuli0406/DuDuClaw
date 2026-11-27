@@ -18,6 +18,8 @@ pub mod pending;
 pub mod scopes;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod write_flow_tests;
 /// v1.81 E3: refresh / consent-revoke recheck on the legacy Personal path.
 #[cfg(test)]
 mod e3_tests;

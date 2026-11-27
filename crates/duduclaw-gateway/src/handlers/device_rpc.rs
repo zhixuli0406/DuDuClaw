@@ -499,7 +499,7 @@ impl MethodHandler {
                 return WsFrame::error_response("", &format!("還原暫存時發生內部錯誤: {e}"));
             }
         };
-        let mfa_notice = report.mfa_notice.then_some(crate::mfa::RESTORE_POLICY_NOTICE);
+        let notice = report.notice();
 
         // Delete only after staged files, directories and marker are durably published.
         // A failed publication returns above and retains the uploaded archive.
@@ -511,7 +511,7 @@ impl MethodHandler {
                 "staged": true,
                 "files_written": report.extraction.files_written,
                 "restart_required": true,
-                "notice": mfa_notice,
+                "notice": notice,
             }),
         )
     }

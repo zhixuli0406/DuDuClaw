@@ -432,15 +432,21 @@ pub(crate) fn fresh_dashboard_context(
     // shut out of a task by an AI-written audience.
     if ctx.user_id == "system" {
         return if ctx.is_admin() {
-            Ok(duduclaw_auth::UserContext::admin_fallback())
+            let mut live = duduclaw_auth::UserContext::admin_fallback();
+            live.member_key_id = ctx.member_key_id.clone();
+            Ok(live)
         } else {
             Err("identity permission denied".into())
         };
     }
-    let live = trusted_dashboard_principal(home, &ctx.user_id)?;
+    let mut live = trusted_dashboard_principal(home, &ctx.user_id)?;
     if !duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, live.credential_epoch) {
         return Err("登入憑證已失效，請重新登入。".into());
     }
+    // users.db refreshes account authority, not the request's credential kind.
+    // Preserve this authenticated restriction for history and artifact readers;
+    // dropping it would turn a member key into a browser login with Full history.
+    live.member_key_id = ctx.member_key_id.clone();
     Ok(live)
 }
 /// Open an authority database read-only.
@@ -549,6 +555,7 @@ pub fn trusted_dashboard_principal(
         Default::default()
     };
     Ok(crate::machine_employee::without_restricted_access(home, duduclaw_auth::UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch,
         user_id: principal.into(),

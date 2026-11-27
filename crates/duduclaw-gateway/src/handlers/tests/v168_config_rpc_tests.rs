@@ -28,6 +28,7 @@ fn admin() -> UserContext {
 /// A non-admin user who owns agent `a1`.
 fn owner_of_a1() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "owner-7".into(),
@@ -960,4 +961,21 @@ async fn egress_guard_mode_is_validated_and_audited() {
         assert!(error.contains("security.egress_guard"));
         assert_eq!(config(home.path())["security"]["egress_guard"].as_str(), Some("block"));
     }
+}
+
+#[tokio::test]
+async fn az1_dashboard_admin_can_widen_and_owner_can_only_narrow() {
+    let (home, handler) = handler_with_agent().await;
+    let update = json!({"agent_id":"a1", "monthly_limit_cents":500,
+        "hard_stop":true, "budget":{"daily_cap_cents":100}, "when_unavailable":"deny",
+        "capabilities":{"git_credentials":true}});
+    ok(&handler.handle("agents.update", update, &admin()).await);
+    let widened = json!({"agent_id":"a1", "monthly_limit_cents":1500});
+    assert!(err(&handler.handle("agents.update", widened.clone(), &owner_of_a1()).await).contains("administrator"));
+    ok(&handler.handle("agents.update", widened, &admin()).await);
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "monthly_limit_cents":400,
+        "capabilities":{"git_credentials":false}}), &owner_of_a1()).await);
+    let table: toml::Table = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap().parse().unwrap();
+    assert_eq!(table["budget"]["monthly_limit_cents"].as_integer(), Some(400));
+    assert_eq!(table["capabilities"]["git_credentials"].as_bool(), Some(false));
 }

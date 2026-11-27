@@ -34,6 +34,9 @@ fn home_with_agent(agent_id: &str, body: &str) -> tempfile::TempDir {
     } else {
         format!("[agent]\nname = \"{agent_id}\"\nstatus = \"active\"\n{body}")
     };
+    let body = if body.contains("[model]") { body } else {
+        format!("{body}\n[model]\npreferred = \"claude-sonnet-4-6\"\n")
+    };
     std::fs::write(dir.join("agent.toml"), body).unwrap();
     home
 }
@@ -89,13 +92,13 @@ async fn open_stores(dir: &Path) -> (Arc<TaskStore>, Arc<MessageQueue>) {
     std::fs::create_dir_all(&bob_dir).unwrap();
     let bob_config = bob_dir.join("agent.toml");
     if !bob_config.exists() {
-        std::fs::write(bob_config, "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+        std::fs::write(bob_config, "[agent]\nname = \"bob\"\nstatus = \"active\"\n[model]\npreferred = \"claude-sonnet-4-6\"\n").unwrap();
     }
     let agent_dir = dir.join("agents/alice");
     std::fs::create_dir_all(&agent_dir).unwrap();
     let path = agent_dir.join("agent.toml");
     if !path.exists() {
-        std::fs::write(path, "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
+        std::fs::write(path, "[agent]\nname = \"alice\"\nstatus = \"active\"\n[model]\npreferred = \"claude-sonnet-4-6\"\n").unwrap();
     }
     let store = Arc::new(TaskStore::open(dir).unwrap());
     let queue = Arc::new(MessageQueue::open(dir).unwrap());
@@ -235,6 +238,9 @@ fn write_agent_toml(home: &Path, agent: &str, body: &str) {
         body.to_string()
     } else {
         format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n{body}")
+    };
+    let body = if body.contains("[model]") { body } else {
+        format!("{body}\n[model]\npreferred = \"claude-sonnet-4-6\"\n")
     };
     std::fs::write(dir.join("agent.toml"), body).unwrap();
 }

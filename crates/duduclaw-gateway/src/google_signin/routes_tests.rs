@@ -39,7 +39,7 @@ impl Fixture {
         let (tx, _) = tokio::sync::broadcast::channel(4);
         let (event_tx, _) = tokio::sync::broadcast::channel(4);
         let state = Arc::new(AppState {
-            auth: crate::auth::AuthManager::new(None), handler, tx, event_tx, prepared_events: Default::default(),
+            auth: crate::auth::AuthManager::new(None), handler: Arc::new(handler), tx, event_tx, prepared_events: Default::default(),
             user_db: db, jwt_config: jwt,
             otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
             home_dir: home,

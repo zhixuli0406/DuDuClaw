@@ -7,7 +7,9 @@ pub mod acl;
 pub mod admin_approval_rule;
 pub mod admin_eligibility;
 pub mod credential_changes;
+pub mod chat_link;
 pub mod db;
+pub mod dept_grants;
 pub mod jwt;
 pub mod google_delegate_attestation;
 pub mod google_identity;
@@ -50,3 +52,5 @@ pub mod member_keys;
 
 /// RM-134 (v1.82): hashed store for dashboard-issued MCP API keys.
 pub mod mcp_keys;
+
+pub mod odoo_credentials;

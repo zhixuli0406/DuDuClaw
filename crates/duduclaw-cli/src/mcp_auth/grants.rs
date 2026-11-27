@@ -45,6 +45,7 @@ pub(crate) fn dedicated_google_tool_allowed(
     tool: &str,
 ) -> bool {
     use duduclaw_core::google_identity::{NativeGoogleScope, native_google_scope};
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
     let required = match native_google_scope(tool) {
         Some(NativeGoogleScope::Read) => Scope::GoogleRead,
         Some(NativeGoogleScope::Write) => Scope::GoogleWrite,
@@ -127,6 +128,7 @@ const fn scope_of(s: &str) -> Scope {
 /// `process_agent_tool_refused`), so callable ⇔ discoverable holds for the
 /// combination, not for this predicate alone.
 pub fn external_tool_allowed(tool_name: &str, principal: &Principal) -> bool {
+    if matches!(tool_name, "admin_settings_read" | "admin_settings_propose") { return false; }
     if crate::mcp::EXTERNAL_TOOLS_WHITELIST.contains(&tool_name) {
         return true;
     }

@@ -9,6 +9,27 @@ use super::{ParamDef, ToolDef};
 
 pub(super) const TOOLS: &[ToolDef] = &[
     ToolDef {
+        name: "my_agents_status",
+        description: "Show only AI employee statuses visible to the personal key's holder. Requires a personal key; never acts as the server's employee.",
+        params: &[],
+    },
+    ToolDef {
+        name: "admin_settings_read",
+        description: "Read employee settings in a verified administrator avatar turn. Group conversations omit private schedule text and skill descriptions.",
+        params: &[
+            ParamDef { name: "agent_ids", description: "Employee IDs, at most 200. Omit for all visible employees.", required: false },
+            ParamDef { name: "sections", description: "Sections to read. Omit for all sections.", required: false },
+        ],
+    },
+    ToolDef {
+        name: "admin_settings_propose",
+        description: "Propose up to 300 setting changes for administrator confirmation. Returns only a fixed notice and item count; never applies changes without confirmation.",
+        params: &[
+            ParamDef { name: "items", description: "Changes for at most 100 employees: agent fields, prompt schedules, or skill switches.", required: true },
+            ParamDef { name: "reason", description: "Reason for the changes, at most 200 characters.", required: true },
+        ],
+    },
+    ToolDef {
         name: "create_agent",
         description: "Create a persistent sub-agent with its own identity, skills, and configuration. The agent is registered and available for delegation immediately.",
         params: &[
@@ -167,7 +188,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "agent_update",
-        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, container, and database-source-grant fields. Uses atomic write for safety.",
+        description: "Update an agent's configuration. AI callers may only narrow authority fields; widening budgets, capabilities, or database sources requires an administrator in the dashboard.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -231,7 +252,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "budget_cents",
-                description: "Monthly budget limit in cents",
+                description: "Monthly budget limit in cents. AI callers may only lower an existing cap (0 means unlimited), or cap an unlimited budget.",
                 required: false,
             },
             ParamDef {
@@ -256,7 +277,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "db_sources_add",
-                description: "GRANT these `[db_sources.<id>]` ids on top of what the agent holds (comma-separated). Idempotent; unknown ids are rejected with the configured ids listed.",
+                description: "Add configured DB source ids (comma-separated). A new grant requires an administrator in the admin console; AI callers can only resend sources already held or narrow the final list.",
                 required: false,
             },
             ParamDef {
@@ -292,3 +313,46 @@ pub(super) const TOOLS: &[ToolDef] = &[
         ],
     },
 ];
+
+/// Closed wire schemas mirror admin_ai_settings::Item (including flat schedule tags).
+pub(super) fn admin_settings_properties(name: &str, properties: &mut serde_json::Map<String, serde_json::Value>) {
+    use serde_json::json;
+    if name == "admin_settings_read" {
+        properties.get_mut("agent_ids").unwrap()["maxItems"] = json!(200);
+        properties.get_mut("sections").unwrap()["items"]["enum"] =
+            json!(["profile", "model", "limits", "heartbeat", "schedules", "skills"]);
+    }
+    if name != "admin_settings_propose" { return; }
+    let field_names: Vec<_> = crate::admin_ai_settings::AdminAiField::ALL.iter().map(|field| field.tool_name()).collect();
+    let mut variants = vec![
+        json!({"type":"object", "additionalProperties":false,
+            "properties":{"kind":{"const":"agent_field"}, "agent_id":{"type":"string"},
+                "field":{"type":"string", "enum":field_names}, "value":{}},
+            "required":["kind","agent_id","field","value"]}),
+        json!({"type":"object", "additionalProperties":false,
+            "properties":{"kind":{"const":"skill"}, "agent_id":{"type":"string"},
+                "skill":{"type":"string"}, "enabled":{"type":"boolean"}},
+            "required":["kind","agent_id","skill","enabled"]}),
+    ];
+    for op in ["create", "update", "pause", "resume", "delete"] {
+        let mut fields = serde_json::Map::new();
+        fields.insert("kind".into(), json!({"const":"schedule"}));
+        fields.insert("op".into(), json!({"const":op}));
+        let target = if op == "create" { "agent_id" } else { "schedule_id" };
+        fields.insert(target.into(), json!({"type":"string"}));
+        let mut required = vec!["kind", "op", target];
+        if matches!(op, "create" | "update") {
+            for field in ["name", "cron", "timezone", "task"] {
+                fields.insert(field.into(), json!({"type":"string"}));
+            }
+            if op == "create" { required.extend(["name", "cron", "task"]); }
+        }
+        variants.push(json!({"type":"object", "additionalProperties":false,
+            "properties":fields, "required":required}));
+    }
+    let items = properties.get_mut("items").unwrap();
+    items["minItems"] = json!(1);
+    items["maxItems"] = json!(crate::admin_ai_settings::MAX_ITEMS);
+    items["items"] = json!({"oneOf":variants});
+    properties.get_mut("reason").unwrap()["maxLength"] = json!(crate::admin_ai_settings::MAX_REASON_CHARS);
+}

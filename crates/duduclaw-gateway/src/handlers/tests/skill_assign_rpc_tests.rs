@@ -33,6 +33,7 @@ fn err(frame: &WsFrame) -> String {
 
 fn ctx(id: &str, role: UserRole, access: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: id.into(),
@@ -447,7 +448,7 @@ async fn goal_create_refuses_bad_files_before_writing_anything() {
             &f.admin,
         )
         .await;
-    assert_eq!(err(&ghost), "Agent not found: ghost");
+    assert!(err(&ghost).contains("agent_not_found"), "{}", err(&ghost));
     assert!(!f.home.join("agents/ghost").exists());
     assert_eq!(task_count(&f).await, 0);
     assert!(attachment_files(&f, "a1").is_empty());
@@ -473,4 +474,77 @@ async fn a_scheduled_goal_saves_its_files_once() {
     assert_eq!(p["schedule"]["agent_id"], "a1");
     assert_eq!(attachment_files(&f, "a1").len(), 1);
     assert_eq!(task_count(&f).await, 0, "nothing starts now");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn assignment_rpcs_refuse_broken_settings_before_attachments_or_planning() {
+    for broken in [false, true] {
+        let f = fixture().await;
+        disable(&f, "b1");
+        let path = {
+            let reg = f.h.registry.read().await;
+            crate::entry_gate::resolve_and_check(&f.home, &*reg, "a1").unwrap().config_path
+        };
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["model"]["preferred"] = toml::Value::String("gpt-5.4".into());
+        doc.as_table_mut().unwrap().insert("runtime".into(), toml::Value::Table(toml::map::Map::from_iter([("provider".into(), toml::Value::String("grok".into()))])));
+        std::fs::write(&path, if broken { "[model".into() } else { toml::to_string(&doc).unwrap() }).unwrap();
+        let code = if broken { "agent_config_unreadable" } else { "model_provider_mismatch" };
+        let before = crate::model_call_probe::calls();
+        for (method, params) in [
+            ("tasks.skill_assign", json!({"skill_name":SKILL,"attachments":[{"filename":"input.txt","data_base64":b64(b"input")}]})),
+            ("tasks.goal_create", json!({"agent_id":"a1","description":"Report","plan_first":true,"attachments":[{"filename":"input.txt","data_base64":b64(b"input")}]})),
+            ("tasks.goal_create", json!({"agent_id":"a1","description":"Report","schedule":{"kind":"weekly","days":[1],"hour":9,"minute":0},"attachments":[{"filename":"input.txt","data_base64":b64(b"input")}]})),
+        ] {
+            let frame = f.h.handle(method, params, &f.owner_a).await;
+            let text = err(&frame);
+            assert!(text.contains(code), "{method}: {frame:?}");
+            assert!(!text.contains("agent.toml"));
+            assert_eq!(task_count(&f).await, 0);
+            assert!(attachment_files(&f, "a1").is_empty());
+            assert_eq!(crate::model_call_probe::calls(), before);
+        }
+        let db = rusqlite::Connection::open(f.home.join("tasks.db")).unwrap();
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM assign_schedules", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn webchat_reachable_decision_rpcs_leave_broken_tasks_and_approvals_untouched() {
+    for broken in [false, true] {
+        let f = fixture().await;
+        let created = crate::goal_create_core::create_goal_task(&f.home, &f.store,
+            crate::goal_create_core::GoalCreateRequest { agent_id:"a1".into(), description:"Report".into(),
+                created_by:"goal:dashboard".into(), ..Default::default() }).await.unwrap();
+        let task_id = &created.task.id;
+        let db = rusqlite::Connection::open(f.home.join("tasks.db")).unwrap();
+        db.execute("UPDATE tasks SET status='needs_human' WHERE id=?1", [task_id]).unwrap();
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let id = broker.request("a1", "goal_kickoff", "Start", json!({"task_id":task_id}), 600).await.unwrap();
+        let path = { let reg = f.h.registry.read().await;
+            crate::entry_gate::resolve_and_check(&f.home, &*reg, "a1").unwrap().config_path };
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["model"]["preferred"] = toml::Value::String("gpt-5.4".into());
+        doc.as_table_mut().unwrap().insert("runtime".into(), toml::Value::Table(toml::map::Map::from_iter([("provider".into(), toml::Value::String("grok".into()))])));
+        std::fs::write(path, if broken { "[model".into() } else { toml::to_string(&doc).unwrap() }).unwrap();
+        let before = crate::model_call_probe::calls();
+        let code = if broken { "agent_config_unreadable" } else { "model_provider_mismatch" };
+        for (method, params) in [
+            ("tasks.goal_decide", json!({"task_id":task_id,"action":"retry"})),
+            ("approvals.decide", json!({"id":id.as_str(),"approve":true})),
+        ] {
+            let frame = f.h.handle(method, params, &f.admin).await;
+            assert!(err(&frame).contains(code), "{frame:?}");
+            assert_eq!(f.store.get_task(task_id).await.unwrap().unwrap().status, "needs_human");
+            assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Pending);
+        }
+        ok(&f.h.handle("approvals.decide", json!({"id":id.as_str(),"approve":false}), &f.admin).await);
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
+        ok(&f.h.handle("tasks.goal_decide", json!({"task_id":task_id,"action":"abort"}), &f.admin).await);
+        assert_eq!(f.store.get_task(task_id).await.unwrap().unwrap().status, "cancelled");
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(task_count(&f).await, 1);
+        assert!(attachment_files(&f, "a1").is_empty());
+    }
 }

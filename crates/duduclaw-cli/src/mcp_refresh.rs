@@ -263,7 +263,7 @@ pub fn authenticate_with_refresh_token(token: &str, home: &Path) -> Result<Princ
 
     Ok(Principal {
         client_id: meta.client_id,
-        scopes: meta.scopes,
+        scopes: crate::mcp_auth::non_person_key_scopes(meta.scopes),
         is_external: meta.is_external,
         created_at: meta.issued_at,
     })
@@ -353,6 +353,16 @@ mod tests {
         s.insert(Scope::MemoryRead);
         s.insert(Scope::WikiRead);
         s
+    }
+
+    #[test]
+    fn refresh_authentication_drops_person_only_scopes() {
+        let dir = TempDir::new().unwrap();
+        let scopes = parse_scopes("memory:read,tasks:read,agents:status,odoo:read,odoo:write").unwrap();
+        let (token, _) = issue_refresh_token(dir.path(), "dev", "client", &scopes, false).unwrap();
+        let principal = authenticate_with_refresh_token(&token, dir.path()).unwrap();
+        assert_eq!(principal.scopes,
+            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
     }
 
     #[test]

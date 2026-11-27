@@ -1,3 +1,5 @@
+import { useDepartmentAgents } from '@/lib/use-department-agents';
+import type { DeptGrantsMineResult } from '@/lib/dept-grants-types';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -83,7 +85,9 @@ const ROUTINE_COLUMNS =
   'minmax(0,1.4fr) minmax(0,1fr) minmax(0,0.9fr) auto minmax(0,0.8fr) 2.5rem';
 
 /** Agent picker shared by the routine create/edit dialog (MDS Select). */
-function AgentSelect({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+function AgentSelect({ value, onChange, departmentAgents }: {
+  value: string; onChange: (v: string) => void; departmentAgents: DeptGrantsMineResult['agents'];
+}) {
   const intl = useIntl();
   const { fetchAgents } = useAgentsStore();
   const agents = useSelectableAgents(false);
@@ -91,12 +95,14 @@ function AgentSelect({ value, onChange }: { value: string; onChange: (v: string)
     fetchAgents();
   }, [fetchAgents]);
   const { user, bindings } = useAuthStore();
-  const selectable = !user || user.role === 'admin' ? agents : agents.filter((a) =>
+  const bound = !user || user.role === 'admin' ? agents : agents.filter((a) =>
     bindings.some((b) => b.agent_name === a.name && b.access_level !== 'viewer'));
+  const selectable = [...bound, ...departmentAgents.filter(a => !bound.some(b => b.name === a.id))
+    .map(a => ({ name: a.id, display_name: a.display_name, icon: '' }))];
   useEffect(() => {
     if (value && !selectable.some(a => a.name === value)) onChange('');
   }, [value, selectable, onChange]);
-  const current = agents.find((a) => a.name === value);
+  const current = selectable.find((a) => a.name === value);
   const label = current
     ? `${glyphText(current.icon)} ${current.display_name || current.name}`
     : intl.formatMessage({ id: 'settings.system.none' });
@@ -128,7 +134,9 @@ function RoutineFormDialog({
   task,
   onClose,
   onSaved,
+  departmentAgents,
 }: {
+  departmentAgents: DeptGrantsMineResult['agents'];
   task: Routine | null;
   onClose: () => void;
   onSaved: () => Promise<void>;
@@ -166,7 +174,7 @@ function RoutineFormDialog({
   const canSave = !!schedule.trim() && (isEdit || !!name.trim()) && (!employee || !!agent.trim());
 
   const handleSave = async () => {
-    if ((agent && !canSelectAgent(agent)) || !canSave) return;
+    if ((agent && !canSelectAgent(agent) && !departmentAgents.some(a => a.id === agent) && !(isEdit && task?.can_edit === true && task.agent_id === agent)) || !canSave) return;
     setSaving(true);
     try {
       if (isEdit && task) {
@@ -247,7 +255,7 @@ function RoutineFormDialog({
             <label className="text-xs font-medium text-muted-foreground">
               {intl.formatMessage({ id: 'settings.cron.agentPick' })}
             </label>
-            {employee && isEdit ? <p className="text-sm">{agent}</p> : <AgentSelect value={agent} onChange={setAgent} />}
+            {employee && isEdit ? <p className="text-sm">{agent}</p> : <AgentSelect value={agent} onChange={setAgent} departmentAgents={departmentAgents} />}
           </div>
 
           <div className="space-y-1.5">
@@ -319,7 +327,7 @@ function RoutineRow({
       <ListGridCell className="justify-center" data-stop-row-nav>
         <Switch
           checked={routine.enabled}
-          disabled={busy || routine.can_manage === false || (!routine.enabled && routine.can_resume === false)}
+          disabled={busy || routine.can_manage !== true || (!routine.enabled && routine.can_resume !== true)}
           onCheckedChange={onToggle}
           aria-label={intl.formatMessage({
             id: routine.enabled ? 'routines.pause' : 'routines.resume',
@@ -355,7 +363,7 @@ function RoutineRow({
         )}
       </ListGridCell>
       <ListGridCell className="justify-end">
-        {routine.can_manage !== false && <DropdownMenu>
+        {routine.can_manage === true && <DropdownMenu>
           <DropdownMenuTrigger
             render={
               <Button
@@ -369,15 +377,15 @@ function RoutineRow({
             <MoreHorizontal />
           </DropdownMenuTrigger>
           <DropdownMenuContent>
-            <DropdownMenuItem onClick={onRunNow} disabled={busy || routine.can_run === false}>
+            <DropdownMenuItem onClick={onRunNow} disabled={busy || routine.can_run !== true}>
               <FlaskConical />
               {intl.formatMessage({ id: 'routines.runNow' })}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={onEdit} disabled={busy || routine.can_edit === false}>
+            <DropdownMenuItem onClick={onEdit} disabled={busy || routine.can_edit !== true}>
               <Pencil />
               {intl.formatMessage({ id: 'routines.edit' })}
             </DropdownMenuItem>
-            <DropdownMenuItem onClick={onToggle} disabled={busy || (!routine.enabled && routine.can_resume === false)}>
+            <DropdownMenuItem onClick={onToggle} disabled={busy || (!routine.enabled && routine.can_resume !== true)}>
               {routine.enabled ? <Pause /> : <Play />}
               {intl.formatMessage({ id: routine.enabled ? 'routines.pause' : 'routines.resume' })}
             </DropdownMenuItem>
@@ -400,8 +408,8 @@ function RoutineRow({
  * server-side record authorization.
  */
 export function RoutinesPage() {
-  const { user, bindings } = useAuthStore();
-  const accessKey = JSON.stringify([user?.id, user?.role,
+  const { user, bindings, deptGrants } = useAuthStore();
+  const accessKey = JSON.stringify([user?.id, user?.role, deptGrants,
     bindings.map((b) => [b.agent_name, b.access_level]).sort()]);
   return <RoutinesContent key={accessKey} />;
 }
@@ -412,8 +420,21 @@ function RoutinesContent() {
   const connectionState = useConnectionStore((s) => s.state);
   const { user, bindings } = useAuthStore();
   const isAdmin = !user || user.role === 'admin';
-  const canCreate = isAdmin || bindings.some((b) => b.access_level !== 'viewer');
+  const deptGrants = useAuthStore(s => s.deptGrants);
+  const departments = [...new Set(deptGrants.filter(g => g.groups.includes('schedules')).map(g => g.department))];
+  const manager = !isAdmin && departments.length > 0;
+  const { data: departmentAccess, error: departmentError } = useDepartmentAgents('schedules');
+  const agents = useAgentsStore(s => s.agents);
+  const fetchAgents = useAgentsStore(s => s.fetchAgents);
+  const [department, setDepartment] = useState('');
+  useEffect(() => {
+    if (manager && connectionState === 'authenticated') void fetchAgents();
+  }, [manager, connectionState, fetchAgents]);
+  const canCreate = isAdmin || bindings.some((b) => b.access_level !== 'viewer') || departmentAccess.agents.length > 0;
   const [routines, setRoutines] = useState<Routine[]>([]);
+  const filteredRoutines = manager && department ? routines.filter(r =>
+    departmentAccess.agents.some(a => a.id === r.agent_id) &&
+    agents.some(a => a.name === r.agent_id && a.department === department)) : routines;
   const [loading, setLoading] = useState(true);
   // A failed load must not read as "you have no routines" — that misleads the
   // user into creating duplicates (P05 Blocker, phase-4 audit).
@@ -531,7 +552,7 @@ function RoutinesContent() {
         hideTrigger
         icon={Clock}
         title={intl.formatMessage({ id: 'routines.title' })}
-        count={routines.length || undefined}
+        count={filteredRoutines.length || undefined}
         description={intl.formatMessage({ id: 'routines.subtitle' })}
         action={canCreate ? (
           <Button variant="brand" size="sm" onClick={() => setDialog(null)}>
@@ -544,12 +565,24 @@ function RoutinesContent() {
       {dialog !== undefined && (
         <RoutineFormDialog
           task={dialog}
+          departmentAgents={departmentAccess.agents}
           onClose={() => setDialog(undefined)}
           onSaved={load}
         />
       )}
 
-      <div className="flex flex-1 flex-col p-4 md:p-6">
+      <div className="flex flex-1 flex-col gap-4 p-4 md:p-6">
+        {manager && <label className="w-fit space-y-1 text-sm">
+          <span className="block">{intl.formatMessage({ id: 'department.filter' })}</span>
+          <select className="rounded-lg border border-input bg-surface px-3 py-2 focus-visible:outline-2 focus-visible:outline-ring" value={department} onChange={e => setDepartment(e.target.value)}>
+            <option value="">{intl.formatMessage({ id: 'department.all' })}</option>
+            {departments.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+        </label>}
+        {manager && departmentError != null && <p role="status" className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'department.loadFailed' })}</p>}
+        {manager && departmentAccess.needs_sync.length > 0 && <p role="status" className="text-sm text-muted-foreground">
+          {intl.formatMessage({ id: 'routines.department.needsSync' }, { count: departmentAccess.needs_sync.length })}
+        </p>}
         {loading ? (
           <CollectionPageState state="loading" />
         ) : loadError ? (
@@ -561,7 +594,7 @@ function RoutinesContent() {
               void load();
             }}
           />
-        ) : routines.length === 0 ? (
+        ) : filteredRoutines.length === 0 ? (
           <CollectionPageState
             state="empty"
             icon={Clock}
@@ -592,7 +625,7 @@ function RoutinesContent() {
                 </ListGridHeader>
               }
             >
-              {routines.map((r) => (
+              {filteredRoutines.map((r) => (
                 <RoutineRow
                   key={r.id}
                   routine={r}

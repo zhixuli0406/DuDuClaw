@@ -1,4 +1,11 @@
 use super::*;
+use serde_json::json;
+
+fn tools_list_watcher_enabled(member_transport: bool) -> bool {
+    // Member authentication charges the shared gateway quota. Scope changes
+    // are observed by the next real request, never by background polling.
+    !member_transport
+}
 
 pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     info!("Starting DuDuClaw MCP server");
@@ -9,7 +16,11 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // authorize anything, and dying at boot with a legible reason beats
     // running as `__untrusted__` and answering every tool call with a
     // confusing "not in your team".
-    if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+    // A member transport has no employee identity. Its gateway authentication
+    // below is mandatory; an employee claim never participates in this lane.
+    let member_transport = std::env::var("DUDUCLAW_MCP_API_KEY").ok()
+        .is_some_and(|raw| duduclaw_auth::member_keys::is_member_key(&raw));
+    if !member_transport && caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
         // A fresh standalone install lacks both credentials. Keep the identity
         // refusal first, while still pointing the operator to initialization.
         let init_hint = if std::env::var_os("DUDUCLAW_MCP_API_KEY").is_none()
@@ -61,9 +72,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     // instead of trusting a `Principal` resolved once at boot. Key
     // rotation/revocation in `config.toml [mcp_keys]` is now observed on the
     // very next call, not only after a restart.
-    let auth_cache = crate::mcp_auth::KeyRegistryCache::new();
-    let principal = match crate::mcp_auth::authenticate_from_env_cached_call_refusal(home_dir, &auth_cache) {
-        Ok(call) => call.principal().clone(),
+    let auth_cache = std::sync::Arc::new(crate::mcp_auth::KeyRegistryCache::new());
+    let initial_call = match stdio_auth_call(home_dir, &auth_cache).await {
+        Ok(call) => call,
         Err(refusal) => {
             // v1.82: the process exits right after this refusal, so wait for
             // its `mcp_auth_failed` record — at most
@@ -73,14 +84,18 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         }
     };
 
+    let principal = initial_call.principal().clone();
+
     // Memory namespace unification (v1.68.0): an internal-key caller whose
     // `DUDUCLAW_AGENT_ID` is proven by `DUDUCLAW_AGENT_TOKEN` reads and writes
     // memory under the bare employee id — the same rows the gateway distils,
     // injects and shows on the dashboard. The environment does not change for
     // the life of this process; identity is rechecked on each request below. Without it
     // the caller stays in the old shared pool (fail closed).
-    let verified_agent = crate::mcp_namespace::verified_employee_from_env(home_dir);
-    let resolve_ns = |p: &crate::mcp_auth::Principal| {
+    let verified_agent = if member_transport { None } else { crate::mcp_namespace::verified_employee_from_env(home_dir) };
+    let resolve_ns = |call: &crate::mcp_auth::AuthenticatedCall| {
+        if let Some(namespace) = call.namespace() { return Ok(namespace); }
+        let p = call.principal();
         crate::mcp_namespace::resolve_for_caller(
             p,
             crate::mcp_namespace::CallerIdentity {
@@ -89,8 +104,10 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
             },
         )
     };
-    let ns_ctx = resolve_ns(&principal)
+    let ns_ctx = resolve_ns(&initial_call)
         .map_err(|e| DuDuClawError::Gateway(format!("MCP namespace resolution failed: {e}")))?;
+
+    drop(initial_call);
 
     // RFC-22 P1-10: Distinguish API key owner (`client_id`, used for namespace
     // isolation) from the actual calling agent (`caller_agent`, taken from
@@ -198,6 +215,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
     let mut legacy_initialized = false;
     let mut modern_seen = false;
     let mut tool_subscriptions: Vec<Value> = Vec::new();
+    let watch_tools = tools_list_watcher_enabled(member_transport);
     let mut watch = tokio::time::interval(TOOLS_LIST_WATCH_INTERVAL);
     watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // First tick completes immediately; burn it so the watcher does not fire
@@ -218,9 +236,9 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                     }
                 }
             }
-            _ = watch.tick() => {
+            _ = watch.tick(), if watch_tools => {
                 if last_advertised.is_some()
-                    && let Ok(p) = authenticate_stdio(home_dir, &auth_cache)
+                    && let Ok(p) = authenticate_stdio(home_dir, &auth_cache).await
                 {
                     let current: Vec<String> =
                         crate::mcp_auth::with_authenticated_call(p.clone(),
@@ -301,6 +319,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
         }
         let capabilities = || {
             let mut caps = stdio_capabilities();
+            caps["tools"]["listChanged"] = json!(watch_tools);
             if workflow_available {
                 caps["experimental"] = serde_json::json!({"duduclaw_workflow":{"version":1}});
             }
@@ -309,7 +328,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 
         // A process started during grace must not retain an unverified identity
         // after the deadline. Keep this stdio-only gate ahead of all dispatch.
-        if caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
+        if !member_transport && caller_identity_verdict(home_dir) == duduclaw_core::IdentityVerdict::Rejected {
             let err = jsonrpc_error(&id, -32003,
                 "MCP caller identity rejected: strict tokens required or identity policy/key unavailable");
             let err = if modern { crate::mcp_protocol::modernize_response(err) } else { err };
@@ -332,7 +351,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // Acknowledge first (spec MUST), then deliver tagged
                 // `list_changed` until the client cancels. No response is
                 // written now: the request stays open.
-                let wants = crate::mcp_protocol::wants_tools_list_changed(&params);
+                let wants = watch_tools && crate::mcp_protocol::wants_tools_list_changed(&params);
                 if wants
                     && !tool_subscriptions.contains(&id)
                     && tool_subscriptions.len() >= crate::mcp_protocol::MAX_SUBSCRIPTIONS
@@ -351,7 +370,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // A subscriber the watcher cannot authenticate would never be
                 // compared against, so refuse instead of acknowledging.
                 let baseline = if wants {
-                    match authenticate_stdio(home_dir, &auth_cache) {
+                    match authenticate_stdio(home_dir, &auth_cache).await {
                         Ok(p) => Some(
                             crate::mcp_auth::with_authenticated_call(
                                 p.clone(),
@@ -404,7 +423,7 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // Gap (a): re-authenticate per call instead of reusing the
                 // boot-time `principal` — a revoked/rescoped key must stop
                 // (or start) seeing tools without a restart.
-                match authenticate_stdio(home_dir, &auth_cache) {
+                match authenticate_stdio(home_dir, &auth_cache).await {
                     Ok(p) => {
                         let resp = crate::mcp_auth::with_authenticated_call(
                             p.clone(),
@@ -447,8 +466,8 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
                 // `auth_cache` above) instead of reusing the boot-time
                 // `principal` for the whole life of this long-running
                 // subprocess.
-                match authenticate_stdio(home_dir, &auth_cache) {
-                    Ok(p) => match resolve_ns(p.principal()) {
+                match authenticate_stdio(home_dir, &auth_cache).await {
+                    Ok(p) => match resolve_ns(&p) {
                         Ok(ns) => {
                             crate::mcp_auth::with_authenticated_call(
                                 p.clone(),
@@ -487,14 +506,30 @@ pub async fn run_mcp_server(home_dir: &Path) -> Result<()> {
 /// `mcp_auth_failed` security-audit record on a blocking thread and does not
 /// wait for it (`mcp_auth_audit::record_stdio_failure`); the startup refusal
 /// above waits for it, bounded, because the process exits.
-fn authenticate_stdio(
+async fn authenticate_stdio(
     home_dir: &Path,
-    cache: &crate::mcp_auth::KeyRegistryCache,
+    cache: &std::sync::Arc<crate::mcp_auth::KeyRegistryCache>,
 ) -> std::result::Result<crate::mcp_auth::AuthenticatedCall, crate::mcp_auth::AuthError> {
-    crate::mcp_auth::authenticate_from_env_cached_call_refusal(home_dir, cache).map_err(|refusal| {
+    stdio_auth_call(home_dir, cache).await.map_err(|refusal| {
         crate::mcp_auth_audit::record_stdio_failure(home_dir, &refusal);
         refusal.error
     })
+}
+
+/// Only the synchronous registry uses a blocking worker. Member gateway I/O
+/// is async and bounded to five seconds; authority is request-scoped.
+async fn stdio_auth_call(
+    home: &Path, cache: &std::sync::Arc<crate::mcp_auth::KeyRegistryCache>,
+) -> std::result::Result<crate::mcp_auth::AuthenticatedCall, crate::mcp_auth::Refusal> {
+    if let Ok(raw) = std::env::var("DUDUCLAW_MCP_API_KEY")
+        && duduclaw_auth::member_keys::is_member_key(&raw) {
+        return super::person_key_client::authenticate(home, &raw).await
+            .map_err(crate::mcp_auth::Refusal::from);
+    }
+    let home = home.to_path_buf();
+    let cache = cache.clone();
+    tokio::task::spawn_blocking(move || crate::mcp_auth::authenticate_from_env_cached_call_refusal(&home, &cache))
+        .await.map_err(|_| crate::mcp_auth::Refusal::from(crate::mcp_auth::AuthError::StoreUnavailable))?
 }
 
 /// The boot-time authentication failure message. A missing key is the first
@@ -544,6 +579,14 @@ pub(super) fn tools_list_change_notifications(
 mod startup_auth_error_tests {
     use super::startup_auth_error;
     use crate::mcp_auth::AuthError;
+
+    #[test]
+    fn member_transport_disables_background_authentication_and_subscription_baseline() {
+        // The same switch guards the tick branch and subscription acceptance:
+        // false skips both authenticate_stdio calls, even after tools/list.
+        assert!(!super::tools_list_watcher_enabled(true));
+        assert!(super::tools_list_watcher_enabled(false));
+    }
 
     #[test]
     fn missing_key_names_the_init_command() {

@@ -96,12 +96,73 @@ pub async fn route_text_reply(
     replied_message_id: &str,
     text: &str,
 ) -> Option<Result<String, String>> {
+    parse_decision_verb(text)?;
+    // An old message index is not a delivery receipt. This also protects
+    // callers without verified transport metadata (for example Teams).
+    if let Some((namespace, id)) = crate::decision_message_store::lookup_decision_by_message(
+        home_dir, channel, chat_id, replied_message_id,
+    ) {
+        if source_from_namespace(&namespace) == Some(DecisionSource::Approval) {
+            let home = home_dir.to_path_buf();
+            let broker = match tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&home)).await {
+                Ok(Ok(broker)) => broker,
+                _ => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
+            };
+            match broker.get(&crate::approval::ApprovalId::from(id)).await {
+                Ok(Some(row)) if crate::approval::chat_admin::press::owns(home_dir, &row).await => return None,
+                Err(_) => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
+                _ => {}
+            }
+        }
+    }
     match resolve_action(home_dir, channel, chat_id, replied_message_id, text)? {
         Ok(action) => Some(
             crate::decision_notify::dispatch(home_dir, channel, channel_user_id, &action).await,
         ),
         Err(msg) => Some(Err(msg)),
     }
+}
+
+/// Verified adapters use receipt coordinates before consulting the legacy
+/// index. The approval ID comes exclusively from the replied-to receipt.
+pub(crate) async fn route_verified_text_reply(
+    ctx: &crate::channel_reply::ReplyContext,
+    context: &crate::approval::DecisionContext,
+    origin: &crate::approval::chat_admin::press::PressOrigin,
+    scope: crate::decision_notify::DecisionAccessScope<'_>,
+    text: &str,
+) -> Option<Result<String, String>> {
+    use crate::approval::{ApprovalBroker, ApprovalId, chat_admin::press};
+    let act = parse_decision_verb(text)?;
+    let message_id = origin.message_id.as_deref()?;
+    let home = ctx.home_dir.clone();
+    let broker = match tokio::task::spawn_blocking(move || ApprovalBroker::open(&home)).await {
+        Ok(Ok(broker)) => broker,
+        _ => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
+    };
+    let receipt = match broker.lookup_chat_admin_receipt(&context.channel,
+        &origin.account, &origin.dm, message_id).await {
+        Ok(receipt) => receipt,
+        Err(_) => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
+    };
+    if let Some(receipt) = receipt {
+        let row = match broker.get(&ApprovalId::from(receipt.approval_id.clone())).await {
+            Ok(Some(row)) => row,
+            _ => return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into())),
+        };
+        let action = DecisionAction { source: DecisionSource::Approval, act, id: receipt.approval_id };
+        if press::owns(&ctx.home_dir, &row).await {
+            return Some(press::handle(ctx, context, &action, &row, origin, scope).await.into_reply());
+        }
+        if !act.valid_for(DecisionSource::Approval) {
+            return Some(Err(crate::channel_decision_route::DECISION_REFUSED.into()));
+        }
+        // Feature-off cards retain the existing dashboard-only refusal.
+        return Some(crate::decision_notify::dispatch(&ctx.home_dir, &context.channel,
+            &context.principal_id, &action).await);
+    }
+    route_text_reply(&ctx.home_dir, &context.channel, &context.principal_id,
+        &origin.dm, message_id, text).await
 }
 
 #[cfg(test)]

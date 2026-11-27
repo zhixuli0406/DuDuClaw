@@ -178,12 +178,23 @@ impl MethodHandler {
         let home_cfg = gi::read_home_config(&home);
         let people = self.people().await;
         if let Some(db) = people.user_db() {
-            if let Ok(records) = crate::person_credentials::all_metadata(&home) {
-                for record in records {
-                    if let Ok(user) = db.get_user(&record.owner_id) {
-                        let _ = crate::person_credentials::sync_user_status(&home, &record.owner_id, user.is_some_and(|u| u.status == duduclaw_auth::UserStatus::Active));
-                    }
+            let sync = (|| -> Result<(), String> {
+                let mut owners: Vec<String> = crate::person_credentials::all_metadata(&home)?
+                    .into_iter().map(|record| record.owner_id).collect();
+                owners.extend(crate::person_credentials::write_store::all_metadata(&home)?
+                    .into_iter().filter(|record| record.owner_kind == "user")
+                    .map(|record| record.owner_id));
+                owners.sort();
+                owners.dedup();
+                for owner in owners {
+                    let user = db.get_user(&owner)?;
+                    crate::person_credentials::sync_user_status(&home, &owner,
+                        user.is_some_and(|u| u.status == duduclaw_auth::UserStatus::Active))?;
                 }
+                Ok(())
+            })();
+            if let Err(error) = sync {
+                return WsFrame::error_response("", &error);
             }
         }
         let agents: Vec<Value> = {
