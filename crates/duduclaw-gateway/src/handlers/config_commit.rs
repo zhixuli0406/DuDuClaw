@@ -692,7 +692,7 @@ pub fn strip_drive_write_preserving(text: &str) -> Result<(String, bool), String
     };
     let implicit = google.as_table().is_some_and(|table| table.is_implicit());
     let Some(table) = google.as_table_like_mut() else {
-        return Ok((text.to_owned(), false));
+        return Err("設定中的 google 區段格式不正確，沒有匯入或還原。".into());
     };
     if table.remove("drive_write").is_none() {
         return Ok((text.to_owned(), false));
@@ -1325,10 +1325,49 @@ name = "oa1"
     #[test]
     fn strip_drive_write_without_section_is_byte_identical() {
         for original in ["", "# header\n", "# header\n[google]\nclient_id = 'keep' # comment\n\n",
-            "# header\n[integrations]\ngoogle_workspace = true", "google = 'unrelated'\n"] {
+            "# header\n[integrations]\ngoogle_workspace = true"] {
             assert_eq!(strip_drive_write_preserving(original).unwrap(), (original.to_owned(), false));
         }
         assert!(strip_drive_write_preserving("[broken").is_err());
+    }
+
+    #[test]
+    fn strip_drive_write_refuses_non_table_google() {
+        for original in [
+            "[[google]]\ndrive_write = { create = true }\n",
+            "google = [{ drive_write = { create = true } }]\n",
+            "google = 'unrelated'\n",
+            "google = []\n",
+        ] {
+            let error = strip_drive_write_preserving(original).unwrap_err();
+            assert!(error.contains("google 區段格式不正確"), "{original}: {error}");
+        }
+    }
+
+    #[test]
+    fn drive_write_text_edit_refuses_changed_non_table_google() {
+        for after in [
+            "[[google]]\ndrive_write = { create = true }\n",
+            "google = [{ drive_write = { create = true } }]\n",
+            "google = 'invalid'\n",
+            "google = []\n",
+        ] {
+            for before in ["", "[google]\nclient_id = 'keep'\n", "google = false\n"] {
+                assert!(refuse_drive_write_text_edit(before, after).is_err(), "{before} -> {after}");
+            }
+            assert!(refuse_drive_write_text_edit(after, after).is_ok());
+            assert!(refuse_drive_write_text_edit(after, "").is_ok());
+        }
+    }
+
+    #[test]
+    fn drive_write_text_edit_keeps_table_rules() {
+        let consent = "[google.drive_write]\ncreate = true\n";
+        assert!(refuse_drive_write_text_edit("", consent).is_err());
+        assert!(refuse_drive_write_text_edit(consent, consent).is_ok());
+        assert!(refuse_drive_write_text_edit(consent, "[google]\nclient_id = 'keep'\n").is_ok());
+        assert!(refuse_drive_write_text_edit("", "google = { client_id = 'keep' }\n").is_ok());
+        assert!(refuse_drive_write_text_edit("", "").is_ok());
     }
 
     #[test]

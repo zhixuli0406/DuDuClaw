@@ -441,6 +441,34 @@ mod tests {
     }
 
     #[test]
+    fn import_refuses_array_table_google_before_unpack() {
+        let _operator = crate::ai_session_guard::test_session(&[]);
+        for force in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let current = "[google]\nclient_id = 'keep'\n";
+            fs::write(home.join("config.toml"), current).unwrap();
+            if force {
+                write(&home.join("agents/existing.txt"), "keep");
+            }
+            let archive = root.path().join("input.tar.gz");
+            ordered_archive(&archive, &[
+                ("payload.txt", b"must not land"),
+                ("config.toml", b"[[google]]\ndrive_write = { create = true }\n"),
+            ]);
+            let error = import_archive(&archive, &home, force, true).unwrap_err();
+            assert!(error.to_string().contains("google 區段格式不正確"), "{error}");
+            assert_eq!(fs::read_to_string(home.join("config.toml")).unwrap(), current);
+            assert!(!home.join("payload.txt").exists());
+            assert!(!home.join("agents.pre-import").exists());
+            if force {
+                assert_eq!(fs::read_to_string(home.join("agents/existing.txt")).unwrap(), "keep");
+            }
+        }
+    }
+
+    #[test]
     fn import_strips_signed_drive_write_and_loads_all_off() {
         use duduclaw_gateway::google_workspace::drive_write_policy::{self, DriveWritePolicy};
         let _operator = crate::ai_session_guard::test_session(&[]);

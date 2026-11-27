@@ -1297,6 +1297,31 @@ mod tests {
     }
 
     #[test]
+    fn drive_write_restore_refuses_array_table_google_before_staging() {
+        for nested in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("duduclaw");
+            std::fs::create_dir(&home).unwrap();
+            let current = "[google]\nclient_id = 'keep'\n";
+            std::fs::write(home.join("config.toml"), current).unwrap();
+            std::fs::write(home.join("customer-data.txt"), b"keep").unwrap();
+            let config_path = if nested { "duduclaw/config.toml" } else { "config.toml" };
+            let data_path = if nested { "duduclaw/customer-data.txt" } else { "customer-data.txt" };
+            let archive = write_archive(tmp.path(), "drive.tar.gz", &build_tar_gz(&[
+                (config_path, b"[[google]]\ndrive_write = { create = true }\n"),
+                (data_path, b"must not land"),
+            ]));
+            let error = stage_restore_with_protection(&home, &archive, RestoreProtection::Off).unwrap_err();
+            assert!(error.contains("google 區段格式不正確"), "{error}");
+            assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), current);
+            assert_eq!(std::fs::read(home.join("customer-data.txt")).unwrap(), b"keep");
+            assert!(!staging_dir(&home).exists());
+            assert!(!marker_path(&home).exists());
+            assert_no_request_residue(&home);
+        }
+    }
+
+    #[test]
     fn drive_write_restore_strips_consent_preserves_format_and_allows_swap() {
         for nested in [false, true] {
             for current in ["", "[google.drive_write]\ncreate = true\n"] {
