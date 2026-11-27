@@ -563,6 +563,34 @@ impl ApprovalStore {
         Ok(())
     }
 
+    /// Bound decisions have their own gates; never relax the unbound writer.
+    /// Called before and inside resolve_bound's transaction. No store re-locks.
+    pub(super) fn validate_bound_chat_decision(
+        &self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry,
+    ) -> Result<(), String> {
+        let home = self.db_path.as_deref().and_then(Path::parent)
+            .ok_or("chat-admin bound decisions require durable identity")?;
+        if crate::google_identity::chat_send::is_member_card(rec) {
+            return Err("Only the requesting member may confirm".into());
+        }
+        // chat_tier also excludes live mail-requester-eligible egress cards.
+        if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_none() || rec.request_kind != RequestKind::Approval {
+            return Err("chat-admin bound decisions require a bound approval".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        // Identical to the dashboard digest: activation facts include live
+        // pricing. A bare decision_digest would omit those displayed facts.
+        if entry.digest != decision_digest_at(home, rec) {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
     async fn decide_if_pending_inner(
         &self,
         id: &ApprovalId,

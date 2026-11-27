@@ -2,6 +2,7 @@
 //! never approval-payload identity. Dashboard callers retain their RPC gates.
 //! `expected_digest` is inherited from EXPECTED_DECISION_DIGEST for dashboard
 //! calls; chat always scopes its receipt digest, including denials.
+mod bound;
 pub(crate) mod files_org;
 mod identity;
 mod knowledge;
@@ -188,14 +189,13 @@ async fn decide_locked(
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
         Decider::ChatAdmin(proof) => {
-            // Workflow/bound decisions remain the P7 extension point.
-            match rec.action_kind.as_str() {
-                super::WORKFLOW_ACTIVATION_KIND => return Err(DecisionRefusal::NotSupportedInChat),
-                _ if rec.binding.is_some() || rec.request_kind != super::RequestKind::Approval => return Err(DecisionRefusal::NotSupportedInChat),
-                _ => (),
+            if rec.request_kind != super::RequestKind::Approval {
+                return Err(DecisionRefusal::NotSupportedInChat);
             }
             let entry = identity::authorize(env, &rec, approve, proof).await?;
-            if !handles(&rec) { return Err(DecisionRefusal::NotSupportedInChat); }
+            if rec.binding.is_none() && !handles(&rec) {
+                return Err(DecisionRefusal::NotSupportedInChat);
+            }
             DecisionActor::ChatAdmin(entry)
         }
     };
@@ -215,6 +215,10 @@ async fn decide_locked(
     // Knowledge retains its original status/expiry/authorization ordering and
     // sidecar cleanup. Other kinds originally checked expiry before status.
     let value_result: Result<Value, DecisionRefusal> = async { Ok(match rec.action_kind.as_str() {
+        _ if rec.binding.is_some() && matches!(&actor, DecisionActor::ChatAdmin(_)) => {
+            chat_preflight(env, &rec, approve, by).await?;
+            bound::decide(env, &rec, approve, by, &actor).await?
+        }
         crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE => {
             check_state(env, &rec, true).await?;
             check_digest(&rec)?;
@@ -283,7 +287,7 @@ async fn decide_locked(
                 // The immutable ledger, not that later status, records what
                 // this card actually decided (including hash-mismatch denial).
                 if let Some((approved, step_required)) = recorded_chat_decision(env, id, entry).await? {
-                    if !is_general(&rec) {
+                    if rec.binding.is_none() && !is_general(&rec) {
                         crate::approval_notify::spawn_dashboard_collapse(env.home.clone(), rec.clone(), approved, display_name.clone());
                     }
                     let mut recorded = entry.clone();

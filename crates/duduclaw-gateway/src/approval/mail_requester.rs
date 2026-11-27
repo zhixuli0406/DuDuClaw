@@ -192,6 +192,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_admin_cannot_decide_mail_requester_eligible_egress() {
+        use crate::approval::chat_admin::{ChatChannel, LedgerEntry, ledger::Step, receipts::{self, Receipt}};
+        let f = Fixture::new();
+        let admin = f.db.create_user("admin@example.com", "Admin", "test-password", UserRole::Admin).unwrap();
+        let (id, _) = f.request("mail_send").await;
+        let rec = f.broker.get(&id).await.unwrap().unwrap();
+        assert!(eligible(f.home.path(), &rec));
+        let entry = LedgerEntry {
+            user_id: admin.id.parse().unwrap(), channel: ChatChannel::Telegram,
+            step: Step::Web, step_required: true, card_id: uuid::Uuid::new_v4().to_string(),
+            digest: crate::approval::decision_digest_at(f.home.path(), &rec),
+        };
+        receipts::insert(&f.broker.store, &Receipt {
+            card_id: entry.card_id.clone(), approval_id: id.to_string(), purpose: "rm143".into(),
+            user_id: admin.id, channel: "telegram".into(), account: "bot".into(),
+            principal: "12345".into(), dm: "12345".into(), message_id: Some(id.to_string()),
+            digest: entry.digest.clone(), tier: "T2".into(), status: "live".into(),
+            valid_until: rec.deadline_rfc3339().unwrap(), sent_at: chrono::Utc::now().to_rfc3339(),
+        }).await.unwrap();
+        for approve in [true, false] {
+            let error = f.broker.decide_bound_chat_admin(&id, &entry, approve).await.unwrap_err();
+            assert!(error.contains("T3"), "{error}");
+        }
+        let unchanged = f.broker.get(&id).await.unwrap().unwrap();
+        assert_eq!(unchanged.status, super::super::ApprovalStatus::Pending);
+        assert_eq!(unchanged.decided_by, None);
+        assert_eq!(receipts::list_live(&f.broker.store, &id).await.unwrap().len(), 1);
+        let conn = f.broker.store.conn.lock().await;
+        let count: i64 = conn.query_row("SELECT count(*) FROM chat_admin_decisions WHERE approval_id=?1",
+            [id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
     async fn mail_requester_group_and_legacy_bindings_are_admin_only_without_content() {
         let f = Fixture::new();
         let admin = f.db.create_user("admin@example.com", "Admin", "test-password", UserRole::Admin).unwrap();

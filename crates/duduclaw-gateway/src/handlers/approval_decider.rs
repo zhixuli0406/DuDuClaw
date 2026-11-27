@@ -15,10 +15,15 @@ pub(crate) use crate::approval::{activation_facts, is_activation_record};
 
 /// For an activation: the dashboard user who submitted it decides it too.
 pub(crate) fn submitter_is_decider(rec: &ApprovalRecord, decider: &UserContext) -> bool {
+    submitter_is_decider_id(rec, &decider.user_id)
+}
+
+/// Compare the authenticated account id without fabricating dashboard claims.
+pub(crate) fn submitter_is_decider_id(rec: &ApprovalRecord, user_id: &str) -> bool {
     is_activation_record(rec)
         && rec.binding.as_ref().is_some_and(|b| {
             b.decision_context.channel == "dashboard"
-                && b.decision_context.principal_id == decider.user_id
+                && b.decision_context.principal_id == user_id
         })
 }
 
@@ -80,28 +85,35 @@ impl MethodHandler {
         decider: &UserContext,
         approve: bool,
     ) {
-        if !is_activation_record(rec) {
-            return;
-        }
-        let self_approved = submitter_is_decider(rec, decider);
-        crate::security_autopilot::audit_and_emit(
-            &self.home_dir,
-            &duduclaw_security::audit::AuditEvent::new(
-                "workflow_activation_decided",
-                rec.agent_id.as_str(),
-                if self_approved && approve {
-                    duduclaw_security::audit::Severity::Warning
-                } else {
-                    duduclaw_security::audit::Severity::Info
-                },
-                json!({
-                    "approval_id": rec.id.as_str(),
-                    "decided_by": decider.user_id,
-                    "decision": if approve { "approved" } else { "denied" },
-                    "submitted_by": rec.binding.as_ref().map(|b| &b.decision_context.principal_id),
-                    "submitter_is_decider": self_approved,
-                }),
-            ),
-        );
+        audit_activation_decision(&self.home_dir, rec, &decider.user_id, approve);
     }
+}
+
+/// Shared audit for dashboard and verified chat-admin activation decisions.
+pub(crate) fn audit_activation_decision(
+    home: &std::path::Path, rec: &ApprovalRecord, user_id: &str, approve: bool,
+) {
+    if !is_activation_record(rec) {
+        return;
+    }
+    let self_approved = submitter_is_decider_id(rec, user_id);
+    crate::security_autopilot::audit_and_emit(
+        home,
+        &duduclaw_security::audit::AuditEvent::new(
+            "workflow_activation_decided",
+            rec.agent_id.as_str(),
+            if self_approved && approve {
+                duduclaw_security::audit::Severity::Warning
+            } else {
+                duduclaw_security::audit::Severity::Info
+            },
+            json!({
+                "approval_id": rec.id.as_str(),
+                "decided_by": user_id,
+                "decision": if approve { "approved" } else { "denied" },
+                "submitted_by": rec.binding.as_ref().map(|b| &b.decision_context.principal_id),
+                "submitter_is_decider": self_approved,
+            }),
+        ),
+    );
 }

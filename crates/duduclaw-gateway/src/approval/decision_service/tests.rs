@@ -335,31 +335,145 @@ async fn personal_employee_card_refused_even_for_its_admin_owner() {
     assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
 }
 
-#[tokio::test]
-async fn bound_egress_temporarily_unsupported() {
-    let f = Fixture::new();
-    let id = f.simple("other_outgoing").await;
-    // Seed a fully shaped binding as in approval/tests/bound_cases. No bound
-    // resolver should be reached in this package.
-    let binding = crate::approval::ExecutionBinding {
-        schema_version:1, run_id:uuid::Uuid::new_v4().to_string(), run_origin_kind:"workflow".into(),
-        actor_principal:"support".into(), conversation_audience:Default::default(),
-        decision_context:crate::approval::DecisionContext { channel:"telegram".into(),
-            account_id:"telegram".into(), conversation_id:"123456789".into(), principal_id:"123456789".into() },
-        task_id:None, task_revision:None, task_snapshot_hash:None,
-        payload_hash:"fixture".into(), policy_revision:"fixture".into(), cwd:None,
-        environment_hash:"fixture".into(), file_hashes:Default::default(),
-        expires_at:(Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
-        resume_handler:"fixture".into(), resume_version:1,
-    };
-    {
-        let conn = f.env.broker.store.conn.lock().await;
-        conn.execute("UPDATE approvals SET binding_json=?1 WHERE id=?2",
-            rusqlite::params![serde_json::to_string(&binding).unwrap(), id.as_str()]).unwrap();
+impl Fixture {
+    async fn bound(&self, payload: Value, submitter: &str) -> ApprovalId {
+        let binding = crate::approval::ExecutionBinding {
+            schema_version:1, run_id:uuid::Uuid::new_v4().to_string(), run_origin_kind:"ingress".into(),
+            actor_principal:"support".into(), conversation_audience:Default::default(),
+            decision_context:crate::approval::DecisionContext { channel:"dashboard".into(),
+                account_id:"dashboard".into(), conversation_id:"approval".into(), principal_id:submitter.into() },
+            task_id:None, task_revision:None, task_snapshot_hash:None,
+            payload_hash:crate::approval::payload_hash(&payload),
+            policy_revision:crate::approval::policy_revision(&self.env.home, "support").unwrap(), cwd:None,
+            environment_hash:"fixture".into(), file_hashes:Default::default(),
+            expires_at:(Utc::now() + chrono::Duration::minutes(30)).to_rfc3339(),
+            resume_handler:"live_only_v1".into(), resume_version:1,
+        };
+        self.env.broker.request_bound(crate::approval::RequestKind::Approval, "support", "review",
+            payload, binding).await.unwrap()
     }
+}
+
+#[tokio::test]
+async fn bound_egress_uses_verified_admin_and_receipt() {
+    let f = Fixture::new();
+    let id = f.bound(json!({"egress_guard":{}}), "other-submitter").await;
     let proof = f.proof(&id).await;
-    assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await, Err(DecisionRefusal::NotSupportedInChat)));
+    let outcome = decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await.unwrap();
+    assert_eq!(outcome.value, json!({"id":id.as_str(), "decided":"approved",
+        "execution_status":"awaiting_execution", "submitter_is_decider":false}));
+    assert_eq!(outcome.decided_by, format!("chat-admin:{}:telegram:tap", f.user));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Approved);
+    f.assert_ledger(&id, true).await;
+    assert!(receipts::list_live(&f.env.broker.store, &id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bound_activation_service_reports_submitter_and_web_step() {
+    let f = Fixture::new();
+    f.config(true, "telegram", &[crate::approval::WORKFLOW_ACTIVATION_KIND]);
+    for submitter in [&f.user, &f.ack] {
+        let id = f.bound(json!({"kind":crate::approval::WORKFLOW_ACTIVATION_KIND}), submitter).await;
+        let mut proof = f.proof(&id).await;
+        assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof.clone())).await,
+            Err(DecisionRefusal::StepUpRequired)));
+        proof.step = Step::Web;
+        let outcome = decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await.unwrap();
+        assert_eq!(outcome.value, json!({"id":id.as_str(), "decided":"approved",
+            "execution_status":"awaiting_execution", "submitter_is_decider":submitter == &f.user}));
+        assert_eq!(outcome.decided_by, format!("chat-admin:{}:telegram:web", f.user));
+        f.assert_ledger(&id, true).await;
+        let audits: Vec<Value> = std::fs::read_to_string(f.env.home.join("security_audit.jsonl")).unwrap()
+            .lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["event_type"] == "workflow_activation_decided"
+                && event["details"]["approval_id"] == id.as_str()).collect();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["details"]["decided_by"], json!(f.user));
+        assert_eq!(audits[0]["details"]["submitter_is_decider"], json!(submitter == &f.user));
+    }
+}
+
+#[tokio::test]
+async fn bound_autopilot_uses_receipt_digest_even_without_outer_scope() {
+    let f = Fixture::new();
+    for drift in [false, true] {
+        let id = f.bound(json!({"frozen_action":"fixture"}), &f.ack).await;
+        // Production currently files unbound autopilot cards. A future bound
+        // record must still receive the exact receipt scope from decide().
+        f.env.broker.store.conn.lock().await.execute(
+            "UPDATE approvals SET action_kind=?1 WHERE id=?2",
+            rusqlite::params![crate::autopilot_approval::ACTION_KIND, id.as_str()],
+        ).unwrap();
+        let proof = f.proof(&id).await;
+        if drift {
+            f.env.broker.store.conn.lock().await.execute(
+                "UPDATE approvals SET summary='changed' WHERE id=?1", [id.as_str()],
+            ).unwrap();
+        }
+        let result = decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await;
+        if drift {
+            assert!(matches!(result, Err(DecisionRefusal::DigestMismatch)));
+            assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+            f.assert_ledger(&id, false).await;
+        } else {
+            assert_eq!(result.unwrap().status, ApprovalStatus::Approved);
+            f.assert_ledger(&id, true).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn bound_chat_still_requires_live_identity_and_receipt() {
+    let f = Fixture::new();
+    let id = f.bound(json!({"egress_guard":{}}), &f.ack).await;
+    let mut proof = f.proof(&id).await;
+    proof.card_id = uuid::Uuid::new_v4().to_string();
+    assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await,
+        Err(DecisionRefusal::Forbidden(_))));
     assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    // Revocation must be checked even though the bound context is a different
+    // identity and the caller presents an otherwise valid receipt.
+    let proof = f.proof(&id).await;
+    f.db().update_user(&f.user, None, Some(UserRole::Manager), None).unwrap();
+    assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await,
+        Err(DecisionRefusal::Forbidden(_))));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+}
+
+#[tokio::test]
+async fn bound_chat_self_approval_refused_but_denial_allowed() {
+    let f = Fixture::new();
+    let path = f.env.home.join("config.toml");
+    let mut config = std::fs::read_to_string(&path).unwrap();
+    config.push_str("\n[approval]\nforbid_self_approval=true\n");
+    std::fs::write(path, config).unwrap();
+    let principal = duduclaw_core::HumanPrincipal::user(&f.user).unwrap().to_string();
+    let id = crate::on_behalf_of::ON_BEHALF_OF.scope(Some(principal),
+        f.bound(json!({"egress_guard":{}}), &f.user)).await;
+    let by = Decider::ChatAdmin(f.proof(&id).await);
+    assert!(matches!(decide(&f.env, &id, true, "", &by).await, Err(DecisionRefusal::Forbidden(_))));
+    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+    assert_eq!(decide(&f.env, &id, false, "", &by).await.unwrap().status, ApprovalStatus::Denied);
+    f.assert_ledger(&id, true).await;
+}
+
+#[tokio::test]
+async fn bound_chat_t3_and_questions_stay_unsupported() {
+    let f = Fixture::new();
+    for question in [false, true] {
+        let payload = if question { json!({"egress_guard":{}}) } else { json!({}) };
+        let id = f.bound(payload, &f.ack).await;
+        if question {
+            f.env.broker.store.conn.lock().await.execute(
+                "UPDATE approvals SET request_kind='question' WHERE id=?1", [id.as_str()],
+            ).unwrap();
+        }
+        let proof = f.proof(&id).await;
+        assert!(matches!(decide(&f.env, &id, true, "", &Decider::ChatAdmin(proof)).await,
+            Err(DecisionRefusal::NotSupportedInChat)));
+        assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+        f.assert_ledger(&id, false).await;
+    }
 }
 
 #[tokio::test]
