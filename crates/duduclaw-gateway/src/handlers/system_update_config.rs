@@ -56,6 +56,10 @@ impl MethodHandler {
                 );
             }
         };
+        if let Err(error) = super::chat_admin_settings_rpc::refuse_generic_change(&table, &params) {
+            return WsFrame::error_response("", &error);
+        }
+        let chat_admin_before = table.clone();
         let mut changes: Vec<String> = Vec::new();
         if let Some(value) = params.get("skill_ttl_days") {
             let Some(days) = value.as_i64().filter(|days| (1..=30).contains(days)) else {
@@ -1133,6 +1137,9 @@ impl MethodHandler {
             );
         }
 
+        if let Err(error) = super::chat_admin_settings_rpc::refuse_subtable_change(&chat_admin_before, &table) {
+            return WsFrame::error_response("", &error);
+        }
         // Atomic write (temp + rename) under the cross-process config lock,
         // refused when another writer changed the file since it was read.
         let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();

@@ -473,6 +473,7 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
         || method.split('.').take(2).eq(["me", "chat_link"])
+        || method.split('.').take(2).eq(["approvals", "chat_admin"])
         || method.split('.').take(2).eq(["me", "odoo"])
         || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));
     if excluded { return None; }
@@ -482,6 +483,12 @@ pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
 #[cfg(test)]
 mod member_key_tests {
     use super::*;
+    #[test]
+    fn chat_admin_settings_are_never_in_member_key_contract() {
+        for method in ["approvals.chat_admin.get", "approvals.chat_admin.set", "approvals.chat_admin.future"] {
+            assert_eq!(member_key_method(method), None, "{method}");
+        }
+    }
     #[test]
     fn chat_link_methods_are_never_in_member_key_contract() {
         for method in ["me.chat_link.start", "me.chat_link.status", "me.chat_link.confirm",

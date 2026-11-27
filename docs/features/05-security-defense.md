@@ -672,6 +672,40 @@ The card shows every full recipient address, the subject, a body summary and whe
 
 The audience check accepts authenticated dashboard WebChat, but the current non-Admin WebChat confirmation UI/decision entry point is not yet wired; those users still need an Admin to complete the approval.
 
+## Admin approval in chat apps (v1.86)
+
+Dashboard-only approvals stay in the dashboard unless a customer Admin turns on **Approve in chat apps** under Security settings. With it on, an Admin who has proven their own chat account can decide some of these requests from a card in a private Telegram or Google Chat conversation with the bot or Chat app. The feature is off by default.
+
+| Tier | Requests | In chat |
+|---|---|---|
+| T1 | Knowledge review (`knowledge_quarantine`), add a document to a shared collection (`knowledge_add_source`) | Approve or deny with one tap |
+| T2 | Enable skills, activate a workflow, change an employee's profile files, change the org chart, run an automation action, CLI outgoing operations, and any card held by the outgoing data guard | Deny with one tap; approving needs a second confirmation unless an Admin switched it off for that category |
+| T3 | Personal delegation, the operator command-line kinds, and anything not listed | Dashboard only; no chat card is sent |
+
+The requester-confirms-own-mail path above is unchanged, and a Personal employee's cards always go to the dashboard.
+
+**Who can decide.** Only a user who is an Active Admin at the moment of the press. Managers, solo mode and the `system` identity never decide through this path. The chat account must be proven by the Admin personally: the dashboard (My Connections) shows a one-time code `DUDU-XXXX-XXXX` valid for 10 minutes, the Admin pastes it in a private chat with the bot or app, then confirms "this is me" on the dashboard in the same login session. If the dashboard shows an account that is not theirs, "not me" voids the code and writes `channel_link_rejected`. A code pasted in a group is voided. Codes are consumed by the gateway and never reach an AI employee; wrong codes are throttled per sender and globally. A binding that an Admin filled in for someone else keeps working for notifications and login codes but is labelled "not self-confirmed" and cannot approve. **Cancel chat approval eligibility** clears only the proof; notifications and login codes keep working.
+
+**How a press is checked.**
+
+- Cards go only to the Admin's proven private conversation, one card per Admin, never to a group or an employee's control channel. Google Chat cards are sent only by an app that receives JWT-verified HTTP clicks; Pub/Sub never decides.
+- Every delivered card has a receipt. A press counts only when it matches that receipt (receiving bot, conversation, message, full approval id, the person who pressed) and happens in a private chat. Typed commands such as `確認 <id>` and replies to other messages never decide these requests, so a look-alike card written by an AI employee has no effect.
+- On every press the gateway re-reads the user (still an Active Admin), the proof, the settings and whether the bot or app is still configured. If the content changed after the card was sent, the press is refused and a fresh card is sent. Pressing twice executes once; the dashboard and chat share one per-approval lock.
+- **Second confirmation.** Every T2 category requires it by default (owner decision). An Admin can switch it off per category; that needs an explicit risk acknowledgement and is audited. The default method is a one-time link to the dashboard (10 minutes, single use, only its hash is stored): the Admin signs in and enters their password and authenticator code. Rejecting on that page needs no password. An Admin without an authenticator app approves these categories in the dashboard. Optionally an Admin can enable a Telegram private-chat code: reply to the bot's prompt with the 6-digit code within 3 minutes; recovery codes and reused codes are refused, five wrong attempts void the request, and the bot deletes the message containing the code. Google Chat does not offer this method.
+- A chat decision is recorded as `chat-admin:<user>:<channel>:<tap|web|totp>` together with a ledger row written in the same transaction. Downstream grants (workflow revisions, single-use action grants) accept a chat decision only when the matching ledger row exists. The operator command-line, Personal delegation and disconnect-forget consumers still accept dashboard decisions only.
+- Audit events: `channel_identity_proven`, `channel_link_rejected`, `channel_identity_proof_revoked`, `approval_chat_admin_card_sent`, `approval_chat_admin_decided`, `approval_chat_admin_refused` (at most 5 per sender per minute) and `approval_chat_admin_settings_changed` (an intent record before the settings are written, then a committed record).
+- Turning the feature off rewrites in-flight cards to "Chat approval is off, please use the dashboard"; later presses are refused. Other Admins' cards are rewritten to the result once someone decides, and to "expired" when the request expires.
+- Migration to another host never imports receipts, the decision ledger, proofs or confirmation tickets; Admins prove their chat accounts again on the new host.
+
+**Limitations.**
+
+- Only Telegram and Google Chat are offered in this version. LINE, Slack and Discord entries in the settings are ignored with a warning.
+- If any AI employee's `agent.toml` cannot be read, chat approval refuses every press, because the gateway cannot confirm the card came from a bot that is still configured. Symptom: the card answers "Your approval permission could not be confirmed. Please use the dashboard." and the audit log shows `approval_chat_admin_refused`. Remedy: fix or remove the employee with the broken settings on the AI employees page; the dashboard keeps working meanwhile.
+- The confirmation link needs an external https address for the dashboard. Without one, second-confirmation categories are approved in the dashboard.
+- Google Chat cards, buttons, message updates and links have not been tested against a real Workspace yet, and Telegram has not been tested against the real Bot API.
+- A card is valid for 168 hours by default (1 to 720), never longer than the request itself; most requests expire within 1 hour to 3 days.
+- An AI employee with unrestricted Bash can edit local databases directly; see [What these guards do not cover](#what-these-guards-do-not-cover). This path does not make that gap wider.
+
 ## Connection deletion approvals and receipts
 
 Disconnecting a connection creates a seven-day batch of memory-forgetting plans, with one dashboard-only, Admin-only approval card for the batch. The card shows counts for each AI employee; it does not expose memory content. Disconnecting remains successful even if planning fails. `[memory] forget_source` off, an unreadable configuration or an invalid setting prevents new plans and applies.

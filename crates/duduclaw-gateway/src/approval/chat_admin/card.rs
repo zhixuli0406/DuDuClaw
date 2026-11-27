@@ -38,15 +38,19 @@ fn add(lines: &mut Vec<String>, label: &str, value: Option<&str>, max: usize) {
 }
 
 pub(crate) fn kind_label(rec: &ApprovalRecord, lang: Lang) -> &'static str {
-    match kind_key(rec) {
-        Some("knowledge_quarantine") => words(lang, "知識審核", "Knowledge review", "知識の確認"),
-        Some("knowledge_add_source") => words(lang, "加入知識庫", "Add to knowledge base", "ナレッジへの追加"),
-        Some("expert_skills_enable") => words(lang, "啟用技能", "Enable skills", "スキルの有効化"),
-        Some("workflow_activation") => words(lang, "啟用工作流", "Activate workflow", "ワークフローの有効化"),
-        Some("agent_file_change") => words(lang, "修改員工設定", "Change employee settings", "従業員設定の変更"),
-        Some("org_change") => words(lang, "調整組織", "Change organization", "組織の変更"),
-        Some("autopilot_action") => words(lang, "自動化操作", "Automation action", "自動操作"),
-        Some("cli_egress" | "egress_guard") => words(lang, "對外操作", "Outbound operation", "外部への操作"),
+    kind_label_for_key(kind_key(rec).unwrap_or(""), lang)
+}
+
+pub(crate) fn kind_label_for_key(key: &str, lang: Lang) -> &'static str {
+    match key {
+        "knowledge_quarantine" => words(lang, "知識審核", "Knowledge review", "知識の確認"),
+        "knowledge_add_source" => words(lang, "加入知識庫", "Add to knowledge base", "ナレッジへの追加"),
+        "expert_skills_enable" => words(lang, "啟用技能", "Enable skills", "スキルの有効化"),
+        "workflow_activation" => words(lang, "啟用工作流", "Activate workflow", "ワークフローの有効化"),
+        "agent_file_change" => words(lang, "修改員工設定", "Change employee settings", "従業員設定の変更"),
+        "org_change" => words(lang, "調整組織", "Change organization", "組織の変更"),
+        "autopilot_action" => words(lang, "自動化操作", "Automation action", "自動操作"),
+        "cli_egress" | "egress_guard" => words(lang, "對外操作", "Outbound operation", "外部への操作"),
         _ => words(lang, "待核准事項", "Approval request", "承認依頼"),
     }
 }

@@ -1887,7 +1887,8 @@ fn telegram_totp_event(msg: &TgMessage, agent: Option<&str>) -> crate::approval:
         account: crate::chat_link_intercept::account_label("telegram", agent),
         dm: msg.chat.id.to_string(),
         principal: msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default(),
-        private: telegram_handshake_private(msg),
+        envelope_private: telegram_handshake_private(msg),
+        authorized: false,
         reply_to: msg.reply_to_message.as_ref().and_then(|m| m.message_id).map(|m| m.to_string()),
         prompt_hint: msg.reply_to_message.as_ref().is_some_and(|m| dm_totp::is_prompt(telegram_handshake_text(m))),
         text: telegram_handshake_text(msg).to_owned(),
@@ -1920,12 +1921,12 @@ async fn telegram_totp_intercept(msg: &TgMessage, client: &reqwest::Client, api:
     ctx: &ReplyContext, agent: Option<&str>, verified_account: &str) -> bool {
     use crate::approval::chat_admin::step_up::dm_totp::{self, ReplySink};
     let mut event = telegram_totp_event(msg, agent);
-    if event.reply_to.is_none() && (!event.private || !dm_totp::code_shaped(&event.text)) { return false; }
+    if event.reply_to.is_none() && (!event.envelope_private || !dm_totp::code_shaped(&event.text)) { return false; }
     let sink = TelegramTotpSink { msg, client, api, home: &ctx.home_dir };
-    if event.private {
+    if event.envelope_private {
         let context = crate::approval::DecisionContext { channel:"telegram".into(),
             account_id:verified_account.into(), principal_id:event.principal.clone(), conversation_id:event.dm.clone() };
-        event.private = crate::decision_notify::check_trusted_decision_access(ctx, &context,
+        event.authorized = crate::decision_notify::check_trusted_decision_access(ctx, &context,
             crate::decision_notify::DecisionAccessScope { channel_id:None, guild_id:None, session_id:None }, "").await.is_ok();
     }
     let home = ctx.home_dir.clone();
@@ -1935,7 +1936,7 @@ async fn telegram_totp_intercept(msg: &TgMessage, client: &reqwest::Client, api:
         Ok::<_, String>((broker, users))
     }).await;
     let Ok(Ok((broker, users))) = opened else {
-        if !event.private || !(dm_totp::code_shaped(&event.text) || event.prompt_hint) { return false; }
+        if !event.envelope_private || !(dm_totp::code_shaped(&event.text) || event.prompt_hint) { return false; }
         // Storage failure must not send a possible code to any conversation.
         sink.delete_code().await;
         sink.reply("目前無法確認，請到儀表板處理。").await;
