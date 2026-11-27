@@ -326,11 +326,14 @@ describe('department grant state', () => {
     },
   );
 
-  it('updates RPC me data and clears stale grants on older responses and logout', () => {
+  it('keeps grants when setUser omits me, but clears them for explicit empty me and logout', () => {
     const store = useAuthStore.getState();
     store.setUser(ME_OK.user as never, [], { dept_grants: grants, main_agent_access: true });
     expect(useAuthStore.getState().mainAgentAccess).toBe(true);
     store.setUser(ME_OK.user as never, []);
+    expect([...useAuthStore.getState().deptGroups].sort()).toEqual(['schedules', 'skills']);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(true);
+    store.setUser(ME_OK.user as never, [], {});
     expect([...useAuthStore.getState().deptGroups]).toEqual([]);
     expect(useAuthStore.getState().deptGrants).toEqual([]);
     expect(useAuthStore.getState().mainAgentAccess).toBe(false);

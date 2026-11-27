@@ -681,6 +681,8 @@ export interface GoalCreateResult {
 }
 
 export interface SkillInfo {
+  can_manage?: boolean;
+  can_restore?: boolean;
   name: string;
   agent_id?: string | null;
   content: string;
@@ -707,6 +709,8 @@ export interface SkillInfo {
 
 /** B8: one employee holding a company-wide skill. */
 export interface SkillHolder {
+  can_manage?: boolean;
+  can_restore?: boolean;
   agent_id: string;
   display_name?: string;
   enabled: boolean;
@@ -5815,6 +5819,23 @@ export interface CostRecentRow {
   created_at: string;
 }
 
+export interface DepartmentCostTotals {
+  total_requests: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_millicents: number;
+  total_cache_savings_millicents: number;
+  avg_cache_efficiency: number;
+}
+
+export interface DepartmentCostSummary {
+  available: boolean;
+  department: string;
+  days: number;
+  agents: (DepartmentCostTotals & { agent_id: string; display_name: string })[];
+  totals: DepartmentCostTotals;
+}
+
 export interface CostRecentResult {
   available: boolean;
   records: CostRecentRow[];
@@ -8667,6 +8688,10 @@ export const api = {
   // Cache-efficiency telemetry (CostTelemetry). `available:false` on every
   // response when telemetry isn't initialized.
   cost: {
+    departmentSummary: (department: string, days: 7 | 30 | 90 = 30) =>
+      client.call('cost.department_summary', { department, days }) as Promise<DepartmentCostSummary>,
+    departmentRecent: (department: string, limit = 50) =>
+      client.call('cost.department_recent', { department, limit }) as Promise<CostRecentResult & { department: string }>,
     summary: (hours = 24) =>
       client.call('cost.summary', { hours }) as Promise<CostSummary>,
     agents: (hours = 24) =>

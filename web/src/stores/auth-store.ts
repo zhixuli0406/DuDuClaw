@@ -595,7 +595,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   setUser: (user: AuthUser, bindings: AgentBinding[], me?: MeGrantFields) => {
-    set({ user, bindings, ...grantState(me) });
+    set({ user, bindings, ...(me === undefined ? {} : grantState(me)) });
   },
 }));
 
