@@ -415,7 +415,7 @@ pub struct OwnerRoleLookupError;
 /// Owner bindings, and verify the current requester or persisted job initiator.
 /// Return `Ok(None)` for unknown identity/provenance, `Err` for read failures.
 /// Role strings are matched exactly against the closed list and config.
-pub trait OwnerRoleView {
+pub trait OwnerRoleView: Send + Sync {
     fn avatar_owner_role(&self, agent_id: &str) -> Result<Option<String>, OwnerRoleLookupError>;
     fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError>;
 }

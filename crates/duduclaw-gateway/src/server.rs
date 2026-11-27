@@ -3558,6 +3558,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(_license_runtime.clone()),
         ),
     )));
+    app = app.merge(crate::admin_ai::route::router(Arc::new(crate::admin_ai::route::RouteState::new(home_dir.clone()))));
     // RouteState synchronously restores durable sink fences (or records a
     // fail-closed store error) before the listener below can serve any request.
     app = app.merge(crate::egress_guard::router(Arc::new(
