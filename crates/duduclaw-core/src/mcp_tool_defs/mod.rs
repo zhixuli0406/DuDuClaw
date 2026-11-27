@@ -32,9 +32,6 @@
 //!    `test_catalog_scopes_match_tool_requires_scope`) fail otherwise.
 //! 4. If the tool is gated by a per-agent capability, add it to the matching
 //!    list in `duduclaw_cli::mcp::tools_list` so *discoverable ⇔ callable* holds.
-//! 5. If it runs code/programs/skill scripts or drives a desktop terminal,
-//!    add it to `crate::types::COMMAND_CAPABLE_MCP_TOOLS` with its reason.
-//!    Main-person-list admission must never classify a new executor as read-only.
 
 use serde_json::Value;
 

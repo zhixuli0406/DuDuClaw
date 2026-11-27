@@ -23,35 +23,26 @@ JSON-RPC 2.0, and member login does not use Ed25519 challenge signing.
 Enterprise Admin dashboard sessions can read `agents.main_access.get` and save
 `agents.main_access.set` (`user_ids`, plus `acknowledged: true` when adding people).
 Both responses contain `users`, `risk_notice` and `effective`. An empty list has
-`effective: true`. A non-empty list has `effective: false` and `ineffective_reason`
-when any main-role or configured default employee can run shell commands, or its
-configuration cannot be determined. Saving still succeeds; the warning does not
-discard the list.
+`effective: true`. A non-empty list takes effect only in protected mode with
+isolated employee execution. Otherwise, it has `effective: false` and an
+`ineffective_reason` explaining that only Admins can use the main AI employee.
+Saving still succeeds and keeps the list for when protected execution is enabled.
+Removing shell tools or changing the employee's runtime does not activate the list.
 
-The safeguard accepts isolated employee execution (`isolation_required()`), or
-a proven command-free Claude CLI turn. Both built-in tools and MCP count:
-any third-party MCP server makes the proof fail; every command-capable DuDuClaw
-tool must be unavailable under the MCP server's actual allowed/denied selectors.
-A `mcp__duduclaw__*` allowlist includes command tools. The shared inventory
-`COMMAND_CAPABLE_MCP_TOOLS` in `duduclaw-core/src/types.rs` documents each tool;
-it includes `execute_program`, `office_script`, desktop input/session tools,
-workspace writes and `llamafile_start`. Screenshots and workspace reads cannot
-issue commands. Fixed-purpose data/OS queries are not general command interfaces.
+In protected mode, active listed Enterprise members can talk to the main AI
+employee and assign it work. A protected-mode flag alone is insufficient: the
+host must also have the employee isolation architecture installed. Each final
+execution checks the person's current access and the protected execution state.
+Without protected execution, the list grants no access; only Admins can use the
+main AI employee through these conversation and assignment entry points.
 
-A protected-mode flag alone does not establish isolation. Non-Claude, local
-inference and API execution are refused for listed non-Admin main turns unless
-isolated. Both Claude spawn paths recheck the final tool arguments and the
-strict frozen MCP file; every runtime fallback attempt rechecks its actual
-provider. Mapped human channel turns use the host-owned principal for this gate.
-Unreadable or ambiguous inputs fail closed, with `MAIN_TURN_REFUSAL`.
-
-Only authenticated dashboard JWT sessions can obtain the list-based WebChat
-conversation/assignment grant. Member API keys and other credentials cannot
-inherit it from their account, even when that account appears on the list.
-`users.me.main_agent_access` and list effectiveness use the in-memory roster
-and strict read-only configuration checks; they never regenerate resolved
-employee configuration. Live Admin turns retain their existing access.
-Management and scheduling retain their separate Admin-only gate.
+For WebChat, list access requires an authenticated dashboard session. Member API
+keys never grant access to the main AI employee, even if their account is listed
+or is an Admin. Other credentials cannot inherit the dashboard session grant.
+`users.me.main_agent_access` reports this availability: non-Admins must be active,
+listed Enterprise members using a dashboard session while protected execution
+is enabled. Live Admin turns retain their existing access. Management and
+scheduling remain Admin-only.
 
 [openapi.yaml](openapi.yaml) is a partial historical discovery reference,
 with selected sections maintained separately. Its `/rpc/<method>` paths are

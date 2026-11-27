@@ -14,7 +14,7 @@ pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理
 mod main_tools;
 pub use main_tools::listed_access_effective;
 pub(crate) use main_tools::main_default_targets;
-pub(crate) use main_tools::{loaded_access_effective, snapshot_access_effective};
+pub(crate) use main_tools::loaded_access_effective;
 
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,22 @@ tokio::task_local! {
 /// management and scheduling retain the separate Admin-only gate.
 /// Missing accounts deny; identity-store read failures are errors (callers deny).
 pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
+    main_access_allowed_with_isolation(home, user_id, use_,
+        duduclaw_core::execution_gate::isolation_required())
+}
+
+fn main_access_allowed_with_isolation(
+    home: &Path, user_id: &str, use_: MainUse, isolated: bool,
+) -> Result<bool, String> {
+    Ok(match admitted_main_role(home, user_id, use_)? {
+        Some(UserRole::Admin) => true,
+        Some(_) => isolated,
+        None => false,
+    })
+}
+
+/// Membership alone is used only to select refusal text, never to grant a turn.
+pub(crate) fn main_access_listed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     admitted_main_role(home, user_id, use_).map(|role| role.is_some())
 }
 
@@ -56,13 +72,20 @@ fn admitted_main_role(home: &Path, user_id: &str, use_: MainUse) -> Result<Optio
 }
 
 /// Opt-in admission for a concrete target. Only a live Admin bypasses the
-/// shell safeguard; listing a person never bypasses edition/account checks.
+/// isolation requirement; listing a person never bypasses edition/account checks.
 pub async fn main_turn_allowed(
     home: &Path, user_id: &str, agent: &str, use_: MainUse,
 ) -> Result<bool, String> {
+    main_turn_allowed_with_isolation(home, user_id, agent, use_,
+        duduclaw_core::execution_gate::isolation_required()).await
+}
+
+async fn main_turn_allowed_with_isolation(
+    home: &Path, user_id: &str, agent: &str, use_: MainUse, isolated: bool,
+) -> Result<bool, String> {
     match admitted_main_role(home, user_id, use_)? {
         Some(UserRole::Admin) => Ok(true),
-        Some(_) => listed_access_effective(home, agent).await,
+        Some(_) => main_tools::listed_access_effective_with_isolation(home, agent, isolated).await,
         None => Ok(false),
     }
 }
@@ -80,19 +103,25 @@ pub async fn requires_main_restriction_for_target(
     }
 }
 
-/// Visibility covers every main/default target: showing a single entry must
-/// not promise access to a main employee whose turns would be refused.
+/// Visibility follows the same account, edition and isolation gates as turns.
 pub(crate) async fn main_entry_available(home: &Path, user_id: &str, agents: &[LoadedAgent]) -> Result<bool, String> {
+    main_entry_available_with_isolation(home, user_id, agents,
+        main_tools::snapshot_access_effective(home, agents).await?).await
+}
+
+async fn main_entry_available_with_isolation(
+    home: &Path, user_id: &str, agents: &[LoadedAgent], isolated: bool,
+) -> Result<bool, String> {
     match admitted_main_role(home, user_id, MainUse::Converse)? {
         Some(UserRole::Admin) => return Ok(true),
         None => return Ok(false),
         Some(_) => {},
     }
-    snapshot_access_effective(home, agents).await
+    main_tools::snapshot_access_effective_with_isolation(home, agents, isolated).await
 }
 
 /// Opt-in list-aware admission. Unlike requires_main_restriction, this allows
-/// active listed users on Enterprise for the explicitly declared use only.
+/// active listed users on Enterprise under isolation for the declared use only.
 pub fn requires_main_restriction_for(
     home: &Path, principal: Option<&str>, use_: MainUse,
 ) -> Result<bool, String> {
@@ -134,7 +163,7 @@ pub async fn check_loaded_main_target(
 
 /// Conversation/assignment sibling; legacy management callers stay unchanged.
 /// Validate the actual loaded role, name and directory, even after routing.
-/// Call without holding the live registry lock: the tool proof loads agents.
+/// Call without holding the live registry lock.
 pub async fn check_loaded_main_target_for(
     home: &Path, principal: Option<&str>, agent: &LoadedAgent, use_: MainUse,
 ) -> Result<(), String> {
@@ -155,25 +184,33 @@ pub async fn check_loaded_main_target_for(
         .ok_or_else(|| REFUSAL.to_owned())?;
     let restricted = Box::pin(requires_main_restriction_for_target(home, principal, target, use_)).await;
     if matches!(restricted, Ok(false)) {
-        // A shell-free file must not bless a stale loaded config with a shell.
+        // The execution check must still require isolation.
         if loaded_access_effective(agent).unwrap_or(false) {
             return Ok(());
         }
     }
     let listed = match super::super::PrincipalState::from_wire(principal) {
         super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
-            main_access_allowed(home, &id, use_).unwrap_or(false),
+            main_access_listed(home, &id, use_).unwrap_or(false),
         _ => false,
     };
     Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
 }
 
-/// Last gate for turns admitted under the main-person rule. `None` means an opaque runtime
-/// (non-Claude, API or local tool loop), never an assumed shell-free command.
+/// Last gate for turns admitted under the main-person rule. Every runtime
+/// requires isolation for a listed non-Admin, regardless of its command tools.
 /// Ordinary channel conversations retain their pre-list policy. Channel
 /// identities come from on_behalf_of, not the WebChat-only task local.
 pub(crate) async fn check_final_main_spawn(
     home: &Path, dir: Option<&Path>, command: Option<&tokio::process::Command>,
+) -> Result<(), String> {
+    check_final_main_spawn_with_isolation(home, dir, command,
+        duduclaw_core::execution_gate::isolation_required()).await
+}
+
+// Private injection boundary; production callers always read the trusted gate.
+async fn check_final_main_spawn_with_isolation(
+    home: &Path, dir: Option<&Path>, _command: Option<&tokio::process::Command>, isolated: bool,
 ) -> Result<(), String> {
     let web_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
         .filter(|id| id.as_str() != "system" && !crate::webchat::is_widget_visitor(id));
@@ -209,13 +246,12 @@ pub(crate) async fn check_final_main_spawn(
     if role.is_none() || origin == duduclaw_auth::acl::ContextOrigin::MemberKey
         || (web_user.is_some() && origin != duduclaw_auth::acl::ContextOrigin::DashboardSession)
     { return Err(MAIN_TURN_REFUSAL.into()); }
-    if duduclaw_core::execution_gate::isolation_required() { return Ok(()); }
-    if command.is_some_and(|cmd| main_tools::final_command_shell_free(cmd, &config)) { return Ok(()); }
+    if isolated { return Ok(()); }
     Err(MAIN_TURN_REFUSAL.into())
 }
 
 /// Called at each actual provider attempt, including fallback. Claude's own
-/// spawn checks the final command; all other runtime surfaces are opaque.
+/// spawn performs the same final identity and isolation check.
 pub(crate) async fn check_main_runtime_attempt(
     provider: RuntimeType, context: &crate::runtime::RuntimeContext,
 ) -> Result<(), String> {

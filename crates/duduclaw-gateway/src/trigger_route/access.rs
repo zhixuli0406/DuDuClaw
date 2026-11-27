@@ -149,7 +149,7 @@ impl SenderAccess {
 
     /// Assignment admission is precomputed separately, before the registry lock.
     pub(crate) async fn for_assign(self, home: &Path) -> Self {
-        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        use crate::on_behalf_of::access::{main_access_listed, main_default_targets, main_turn_allowed, MainUse};
         let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
         let scope = sender.webchat_scope.as_mut().expect("assignment scope was set");
         scope.main_assign.clear();
@@ -157,7 +157,7 @@ impl SenderAccess {
         if !scope.available || sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
             if !crate::webchat::is_widget_visitor(user_id)
-                && main_access_allowed(home, user_id, MainUse::Assign).unwrap_or(false)
+                && main_access_listed(home, user_id, MainUse::Assign).unwrap_or(false)
             {
                 scope.main_assign_listed = true;
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
