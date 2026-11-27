@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::sync::Mutex;
 use super::super::odoo_identity_client::tests::with_decision;
 

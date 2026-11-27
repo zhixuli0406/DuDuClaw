@@ -4,6 +4,7 @@ use super::odoo_actor::OdooActor;
 use super::odoo_access::{ToolPolicy, error_text, follows, identity_suffix};
 use super::odoo_identity_client::{self, OdooIdentity};
 use duduclaw_odoo::OdooConnector;
+use serde_json::json;
 use std::sync::Arc;
 
 const TEXT_LIMIT: usize = 10_000;
