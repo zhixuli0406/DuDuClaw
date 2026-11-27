@@ -17,16 +17,32 @@ enum OwnAccount {
     Partial,
 }
 
-fn classify_account(odoo: Option<&AgentOdooConfig>) -> OwnAccount {
-    let Some(odoo) = odoo else { return OwnAccount::Absent; };
+fn classify_account(odoo: Option<&AgentOdooConfig>, raw_odoo: Option<&toml::Value>) -> OwnAccount {
+    let Some(raw_odoo) = raw_odoo else { return OwnAccount::Absent; };
+    let Some(table) = raw_odoo.as_table() else { return OwnAccount::Partial; };
+    const POLICY_KEYS: &[&str] = &[
+        "profile", "allowed_models", "allowed_actions", "company_ids",
+        "unblock_models", "permission_override", "act_as_requester",
+    ];
+    let policy_only = table.keys().all(|key| POLICY_KEYS.contains(&key.as_str()));
+    // Unknown or legacy account keys must never grant the company account.
+    if table.keys().any(|key| !POLICY_KEYS.contains(&key.as_str())
+        && !matches!(key.as_str(), "username" | "api_key_enc" | "password_enc" | "url" | "db")) {
+        return OwnAccount::Partial;
+    }
+    let Some(odoo) = odoo else {
+        return if policy_only { OwnAccount::Absent } else { OwnAccount::Partial };
+    };
     let populated = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.trim().is_empty());
     if populated(&odoo.username) && (populated(&odoo.api_key_enc) || populated(&odoo.password_enc)) {
         OwnAccount::Complete
     } else if [&odoo.username, &odoo.api_key_enc, &odoo.password_enc, &odoo.url, &odoo.db]
         .iter().any(|value| value.is_some()) {
         OwnAccount::Partial
-    } else {
+    } else if policy_only {
         OwnAccount::Absent
+    } else {
+        OwnAccount::Partial
     }
 }
 
@@ -66,8 +82,13 @@ pub(crate) fn employees(home: &Path) -> Result<Vec<Employee>, String> {
         if !metadata.is_file() { return Err("AI 員工設定必須是一般檔案。".into()); }
         let raw = std::fs::read_to_string(path).map_err(|_| "無法讀取 AI 員工設定。")?;
         let table: toml::Table = raw.parse().map_err(|_| "AI 員工設定格式有誤。")?;
-        let odoo = AgentOdooConfig::parse_agent_toml(&raw)?;
-        let own_account = classify_account(odoo.as_ref());
+        let raw_odoo = table.get("odoo");
+        let odoo = if raw_odoo.is_some_and(|value| !value.is_table()) {
+            None
+        } else {
+            AgentOdooConfig::parse_agent_toml(&raw)?
+        };
+        let own_account = classify_account(odoo.as_ref(), raw_odoo);
         let has_own_account = own_account == OwnAccount::Complete;
         let agent = table.get("agent").and_then(toml::Value::as_table);
         let display_name = agent.and_then(|a| a.get("display_name").or_else(|| a.get("name")))
@@ -154,6 +175,29 @@ mod tests {
     fn read(home: &Path) -> String { std::fs::read_to_string(home.join("config.toml")).unwrap() }
     const COMPANY: &str = "# keep comment\n[odoo]\nurl='https://erp.example.test'\ndb='company'\n";
 
+    #[test]
+    fn classifies_raw_odoo_account_keys() {
+        for (raw, expected) in [
+            ("", OwnAccount::Absent),
+            ("[odoo]\n", OwnAccount::Absent),
+            ("[odoo]\nlogin='alice'\napi_key='secret'\n", OwnAccount::Partial),
+            ("[odoo]\nprofile='default'\nallowed_models=[]\nallowed_actions=[]\ncompany_ids=[]\nunblock_models=[]\npermission_override='inherit'\nact_as_requester=false\n", OwnAccount::Absent),
+            ("odoo='x'\n", OwnAccount::Partial),
+            ("[odoo]\nusername='alice'\napi_key_enc='encrypted'\n", OwnAccount::Complete),
+            ("[odoo]\nusername='alice'\napi_key_enc='encrypted'\nlogin='legacy'\n", OwnAccount::Partial),
+        ] {
+            let table: toml::Table = raw.parse().unwrap();
+            let odoo = AgentOdooConfig::from_agent_toml(raw);
+            assert_eq!(classify_account(odoo.as_ref(), table.get("odoo")), expected, "{raw}");
+        }
+        for key in ["login", "api_key", "password", "user", "key", "server", "unknown"] {
+            let raw = format!("[odoo]\n{key}='value'\n");
+            let table: toml::Table = raw.parse().unwrap();
+            let odoo = AgentOdooConfig::parse_agent_toml(&raw).unwrap();
+            assert_eq!(classify_account(odoo.as_ref(), table.get("odoo")), OwnAccount::Partial, "{key}");
+        }
+    }
+
     #[tokio::test]
     async fn backfills_all_regular_employees_once_without_changing_mode() {
         let home = tempfile::tempdir().unwrap();
@@ -195,7 +239,7 @@ mod tests {
         write(h, "config.toml", COMPANY);
         for (id, raw) in [
             ("absent", "[agent]\nname='Absent'\n"),
-            ("policy", "[odoo]\nallowed_models=['res.partner']\nallowed_actions=['read']\nprofile='default'\ncompany_ids=[1]\npermission_override='read_only'\nact_as_requester=true\n"),
+            ("policy", "[odoo]\nallowed_models=['res.partner']\nallowed_actions=['read']\nprofile='default'\ncompany_ids=[1]\nunblock_models=[]\npermission_override='read_only'\nact_as_requester=true\n"),
             ("complete", "[odoo]\nusername='own'\napi_key_enc='encrypted'\n"),
             ("password", "[odoo]\nusername='own'\npassword_enc='encrypted'\n"),
             ("username", "[odoo]\nusername='own'\n"),
@@ -204,6 +248,8 @@ mod tests {
             ("empty", "[odoo]\nusername=''\napi_key_enc='  '\n"),
             ("empty-url", "[odoo]\nurl=''\n"),
             ("key", "[odoo]\napi_key_enc='encrypted'\n"),
+            ("legacy", "[odoo]\nlogin='alice'\napi_key='secret'\n"),
+            ("non-table", "odoo='x'\n"),
         ] {
             write(h, &format!("agents/{id}/agent.toml"), raw);
         }
@@ -216,7 +262,7 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap()).collect();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["details"]["partial_agents"],
-            json!(["db", "empty", "empty-url", "key", "url", "username"]));
+            json!(["db", "empty", "empty-url", "key", "legacy", "non-table", "url", "username"]));
         assert_eq!(events[0]["details"]["count"], 2);
     }
 
