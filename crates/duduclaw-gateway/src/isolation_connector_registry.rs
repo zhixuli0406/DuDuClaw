@@ -1,6 +1,6 @@
-//! Boot registry for account-bound provider adapters. A registered adapter must
-//! implement both live product selection and execution, except explicit Drive
-//! write refusals which cover inventory without permitting selection or calls.
+//! Boot registry for account-bound provider adapters supporting selection and execution.
+//! Intentionally refused Connector routes (Drive writes) count as covered without
+//! any adapter and never select a provider.
 use std::{collections::BTreeMap, future::Future, pin::Pin, sync::Arc};
 use duduclaw_mcp_boundary::{tool_policy::{AuthorizedToolCall, POLICIES, Route}, RequestContext, VerificationError};
 use serde_json::Value;
@@ -15,16 +15,15 @@ struct Adapter {
 #[derive(Default)]
 pub struct ConnectorProviderRegistry { adapters: BTreeMap<&'static str, Adapter> }
 impl ConnectorProviderRegistry {
-    /// Registration is explicit and immutable after boot. Overlap, unknown
-    /// tools and a policy/executor disagreement refuse the registration, except
-    /// the explicit Drive write refusal inventory handled by this registry.
+    /// Registration is explicit and immutable after boot. Overlap, unknown tools
+    /// and a policy/executor disagreement refuse registration. Intentionally refused
+    /// Connector routes (Drive writes) need no adapter and never select a provider.
     pub fn register(&mut self, tools: &[&'static str], policy: Arc<dyn LiveConnectorSelectionPolicy>,
         executor: Arc<dyn BoundConnectorExecutor>) -> Result<(), VerificationError> {
         let mut seen = std::collections::BTreeSet::new();
         if tools.is_empty() || tools.iter().any(|tool| !seen.insert(*tool)
             || self.adapters.contains_key(tool) || provider_for_tool(tool).is_none()
-            || (!duduclaw_core::google_identity::is_drive_write_tool(tool)
-                && (!policy.supports(tool) || !executor.supports(tool)))) {
+            || !policy.supports(tool) || !executor.supports(tool)) {
             return Err(VerificationError::Invalid);
         }
         for tool in tools { self.adapters.insert(tool, Adapter { policy: policy.clone(), executor: executor.clone() }); }
@@ -41,17 +40,13 @@ impl ConnectorProviderRegistry {
     }
     /// Full parity is an install/startup condition, never an optimistic label.
     pub fn require_complete(&self) -> Result<(), VerificationError> {
-        if POLICIES.iter().filter(|p| p.route == Route::Connector)
-            .any(|p| !self.covered(p.name)) { return Err(VerificationError::Unavailable); }
+        if !self.missing_tools().is_empty() { return Err(VerificationError::Unavailable); }
         Ok(())
     }
     pub fn missing_tools(&self) -> Vec<&'static str> {
-        POLICIES.iter().filter(|p| p.route == Route::Connector && !self.covered(p.name))
+        POLICIES.iter().filter(|p| p.route == Route::Connector
+            && !crate::isolation_connectors::intentionally_refused_connector(p.name) && !self.ready(p.name))
             .map(|p| p.name).collect()
-    }
-    fn covered(&self, tool: &str) -> bool {
-        self.adapters.contains_key(tool)
-            && (duduclaw_core::google_identity::is_drive_write_tool(tool) || self.ready(tool))
     }
     fn ready(&self, tool: &str) -> bool {
         !duduclaw_core::google_identity::is_drive_write_tool(tool)
@@ -123,7 +118,8 @@ mod tests {
     fn whole_provider_registration_is_atomic_and_policy_inventory_is_complete() {
         let mut registry = ConnectorProviderRegistry::default();
         assert!(registry.register_provider("database", Arc::new(AdapterStub), Arc::new(AdapterStub)).is_err());
-        assert_eq!(registry.missing_tools().len(), POLICIES.iter().filter(|p| p.route == Route::Connector).count());
+        assert_eq!(registry.missing_tools().len(), POLICIES.iter().filter(|p| p.route == Route::Connector
+            && !crate::isolation_connectors::intentionally_refused_connector(p.name)).count());
         assert!(!registry.ready("db_sources"), "partial registration must not leak into readiness");
         assert!(registry.register_provider("unrecognized", Arc::new(AdapterStub), Arc::new(AdapterStub)).is_err());
         struct Complete;
@@ -146,12 +142,15 @@ mod tests {
             registry.register_provider(provider, Arc::new(Complete), Arc::new(Complete)).unwrap();
         }
         for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
-            assert!(registry.covered(tool), "{tool}: explicit refusal covers inventory");
             assert!(!LiveConnectorSelectionPolicy::supports(&registry, tool), "{tool}");
             assert!(!BoundConnectorExecutor::supports(&registry, tool), "{tool}");
         }
         assert!(registry.missing_tools().is_empty());
         assert!(registry.require_complete().is_ok());
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert!(!registry.missing_tools().contains(tool));
+            assert!(!registry.ready(tool), "intentional coverage must not enable execution");
+        }
         assert!(registry.register_provider("google", Arc::new(Complete), Arc::new(Complete)).is_err());
     }
 

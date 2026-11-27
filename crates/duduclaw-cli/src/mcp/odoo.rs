@@ -170,6 +170,10 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if let Err(error) = config_result { return mcp_error(&error); }
+    if let Err(error) = policy.data_preconnect(tool, params, odoo.agent_override(caller_agent).await) {
+        return super::egress_gate::pre_dispatch_error(&format!(
+            "{error} This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。"));
+    }
     }
     // The gateway decision selects the mode. A bound isolation connector has
     // no personal decision and therefore retains the legacy Engine gates.

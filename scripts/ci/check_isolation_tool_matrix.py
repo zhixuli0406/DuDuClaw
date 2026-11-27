@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 MATRIX = Path("docs/architecture/native-linux-isolation-tools.md")
 POLICY = Path("crates/duduclaw-mcp-boundary/src/tool_policy.rs")
 DISPOSITION = Path("crates/duduclaw-cli/src/mcp_isolation_disposition.rs")
+DRIVE_TOOLS = Path("crates/duduclaw-core/src/google_identity/tools.rs")
 FORK = Path("crates/duduclaw-mcp-boundary/src/fork_policy.rs")
 ROW = re.compile(r"^\|\s*`([a-z][a-z0-9_]*)`\s*\|\s*(.*?)\s*\|$")
 EXECUTABLE = re.compile(
@@ -17,7 +18,7 @@ EXECUTABLE = re.compile(
 )
 
 
-def check(matrix, policy, disposition, fork):
+def check(matrix, policy, disposition, fork, drive_tools=""):
     errors = []
     rows = {}
     for number, line in enumerate(matrix.splitlines(), 1):
@@ -33,24 +34,27 @@ def check(matrix, policy, disposition, fork):
         errors.append("policy inventory is empty or cannot be parsed")
     if set(rows) != names:
         errors.append(f"inventory mismatch: missing={sorted(names - rows.keys())}, extra={sorted(rows.keys() - names)}")
-    host = set()
-    for arm in re.finditer(r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*HostAuthority', disposition):
-        host.update(re.findall(r'"([a-z0-9_]+)"', arm[1]))
-    proposal = set()
-    for arm in re.finditer(r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*ProposalRequired', disposition):
-        proposal.update(re.findall(r'"([a-z0-9_]+)"', arm[1]))
-    admin_settings = set()
-    for arm in re.finditer(r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*AdminSettingsUnavailable', disposition):
-        admin_settings.update(re.findall(r'"([a-z0-9_]+)"', arm[1]))
+    refusals = {}
+    for arm in re.finditer(
+        r'((?:"[a-z0-9_]+"\s*\|?\s*)+)\s*=>\s*'
+        r'(HostAuthority|ProposalRequired|AdminSettingsUnavailable|PersonalKeyRequired)\b', disposition
+    ):
+        for name in re.findall(r'"([a-z0-9_]+)"', arm[1]):
+            refusals[name] = arm[2]
+    if "is_drive_write_tool(name)" in disposition:
+        drive = re.search(r'DRIVE_WRITE_TOOLS[^=]*=\s*&?\[(.*?)\];', drive_tools, re.S)
+        if drive is None:
+            errors.append("Drive refusal inventory is empty or cannot be parsed")
+        else:
+            for name in re.findall(r'"([a-z0-9_]+)"', drive[1]):
+                refusals[name] = "DriveWriteUnavailable"
     deferred = re.search(r'DEFERRED_TOOLS[^=]*=\s*\[(.*?)\];', fork, re.S)
-    if not host or deferred is None:
+    if "HostAuthority" not in refusals.values() or deferred is None:
         errors.append("refusal policy is empty or cannot be parsed")
         return errors
     deferred = set(re.findall(r'"([a-z0-9_]+)"', deferred[1]))
     for name, description in rows.items():
-        expected = ("HostAuthority" if name in host else "ProposalRequired" if name in proposal
-                    else "AdminSettingsUnavailable" if name in admin_settings
-                    else "ForkNextRelease" if name in deferred else None)
+        expected = refusals.get(name, "ForkNextRelease" if name in deferred else None)
         actual = re.findall(r"Refused:\s*([A-Za-z]+)", description)
         if actual != ([expected] if expected else []):
             errors.append(f"{name}: refusal contradicts code: expected={expected}, actual={actual}")
@@ -60,7 +64,7 @@ def check(matrix, policy, disposition, fork):
 
 
 def check_repository(root=ROOT):
-    return check(*(root.joinpath(path).read_text() for path in (MATRIX, POLICY, DISPOSITION, FORK)))
+    return check(*(root.joinpath(path).read_text() for path in (MATRIX, POLICY, DISPOSITION, FORK, DRIVE_TOOLS)))
 
 
 if __name__ == "__main__":

@@ -612,7 +612,8 @@ impl DetailOutcomes {
 }
 impl ConnectorProviderFactory for GatewayConnectorFactory {
     fn inventory(&self) -> Result<(), VerificationError> {
-        let connector_tools = || POLICIES.iter().filter(|policy| policy.route == ToolRoute::Connector).map(|policy| policy.name);
+        let connector_tools = || POLICIES.iter().filter(|policy| policy.route == ToolRoute::Connector
+            && !crate::isolation_connectors::intentionally_refused_connector(policy.name)).map(|policy| policy.name);
         if connector_tools().any(|tool| !provider_for_tool(tool).is_some_and(|provider| FACTORY_PROVIDERS.contains(&provider)))
             || FACTORY_PROVIDERS.iter().any(|provider| !connector_tools().any(|tool| provider_for_tool(tool) == Some(*provider))) {
             return Err(VerificationError::Unavailable);
