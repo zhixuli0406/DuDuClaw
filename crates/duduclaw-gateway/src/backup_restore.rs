@@ -936,15 +936,26 @@ fn perform_pending_restore_swap_locked(
         &read_config(&restore_root.join("config.toml"))?,
     ).map_err(RestoreSwapError::Io)?;
 
+    let restored_config_path = restore_root.join("config.toml");
+    let restored_config = read_config(&restored_config_path)?;
+    // Older staging paths may have left consent behind, even unchanged from current.
+    let (_, removed_drive_write) =
+        crate::handlers::config_commit::strip_drive_write_preserving(&restored_config)
+            .map_err(|_| RestoreSwapError::Io(
+                "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
+            ))?;
+    if removed_drive_write {
+        return Err(RestoreSwapError::Io(
+            "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
+        ));
+    }
     crate::handlers::config_commit::refuse_drive_write_text_edit(
-        &read_config(&current_config)?, &read_config(&restore_root.join("config.toml"))?,
+        &read_config(&current_config)?, &restored_config,
     ).map_err(|_| RestoreSwapError::Io(
         "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
     ))?;
 
     let kept_mfa = crate::mfa::restore_policy(home_dir);
-    let restored_config_path = restore_root.join("config.toml");
-    let restored_config = read_config(&restored_config_path)?;
     if crate::mfa::restore_policy_differs(home_dir, &restored_config) {
         let updated = crate::mfa::preserve_restore_policy(&restored_config, kept_mfa)
             .map_err(RestoreSwapError::Io)?;
@@ -1318,6 +1329,79 @@ mod tests {
             assert!(!staging_dir(&home).exists());
             assert!(!marker_path(&home).exists());
             assert_no_request_residue(&home);
+        }
+    }
+
+    #[test]
+    fn drive_write_swap_refuses_unsanitized_staging_without_moving_data() {
+        for config in [
+            "[[google]]\ndrive_write = { create = true }\n",
+            "google = [{ drive_write = { create = true } }]\n",
+            "[google.drive_write]\ncreate = true\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            // Identical configs bypass the old text-edit guard for non-table google.
+            std::fs::write(home.join("config.toml"), config).unwrap();
+            std::fs::write(home.join("old.txt"), b"old").unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("config.toml"), config).unwrap();
+            std::fs::write(staging.join("new.txt"), b"new").unwrap();
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "old-drive.tar.gz".into(),
+            }).unwrap();
+            let marker = std::fs::read(marker_path(home)).unwrap();
+
+            let error = perform_pending_restore_swap_with_protection(
+                home, "unsanitized-drive", RestoreProtection::Off,
+            ).unwrap_err();
+
+            assert_eq!(error, RestoreSwapError::Io(
+                "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
+            ));
+            assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), config);
+            assert_eq!(std::fs::read(home.join("old.txt")).unwrap(), b"old");
+            assert!(!home.join("new.txt").exists());
+            assert_eq!(std::fs::read_to_string(staging.join("config.toml")).unwrap(), config);
+            assert_eq!(std::fs::read(staging.join("new.txt")).unwrap(), b"new");
+            assert_eq!(std::fs::read(marker_path(home)).unwrap(), marker);
+            assert!(!home.join("restore-backup-unsanitized-drive").exists());
+            assert!(!home.join(crate::channel_ingress::RESTORE_MARKER).exists());
+        }
+    }
+
+    #[test]
+    fn drive_write_swap_allows_already_sanitized_staging() {
+        for config in [
+            "[general]\nlog_level = 'debug'\n",
+            "[google]\nclient_id = 'keep'\n",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path();
+            let current = "# current config\n";
+            std::fs::write(home.join("config.toml"), current).unwrap();
+            std::fs::write(home.join("old.txt"), b"old").unwrap();
+            let staging = staging_dir(home);
+            std::fs::create_dir_all(&staging).unwrap();
+            std::fs::write(staging.join("config.toml"), config).unwrap();
+            std::fs::write(staging.join("new.txt"), b"new").unwrap();
+            write_marker(home, &RestoreMarker {
+                staged_at: Utc::now(), source_filename: "clean-drive.tar.gz".into(),
+            }).unwrap();
+
+            let report = perform_pending_restore_swap_with_protection(
+                home, "sanitized-drive", RestoreProtection::Off,
+            ).unwrap().unwrap();
+
+            let restored = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            assert!(restored.contains(config));
+            assert_eq!(std::fs::read(home.join("new.txt")).unwrap(), b"new");
+            assert_eq!(std::fs::read_to_string(report.preserved_dir.join("config.toml")).unwrap(), current);
+            assert_eq!(std::fs::read(report.preserved_dir.join("old.txt")).unwrap(), b"old");
+            assert!(!home.join("old.txt").exists());
+            assert!(!staging.exists());
+            assert!(read_marker(home).is_none());
         }
     }
 
