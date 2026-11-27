@@ -1653,6 +1653,7 @@ pub mod authority {
         key("permissions.can_modify_own_skills", &["form.can_modify_own_skills"], Change),
         // Which channels the employee may answer on.
         key("permissions.allowed_channels", &[], Change),
+        key("evolution.skill_budget_unlimited", &["form.skill_budget_unlimited"], Change),
         key("guardrails.enabled", &["v.guardrails_enabled"], Change),
         key("guardrails.block_secrets", &["v.guardrails_block_secrets"], Change),
         // v1.76: opens the employee to `@` calls from unmapped channel senders.
@@ -1714,6 +1715,7 @@ pub mod authority {
             "container.sandbox_enabled"
             | "container.network_access"
             | "permissions.can_modify_own_soul"
+            | "evolution.skill_budget_unlimited"
             | "guardrails.enabled"
             | "channels.public_trigger"
             | "prompt.cli_bare_mode"
@@ -1884,5 +1886,37 @@ pub mod authority {
     pub fn admin_only_form_paths() -> Vec<&'static str> {
         AUTHORITY.iter().filter(|k| k.kind == Change)
             .flat_map(|k| k.form_paths.iter().copied()).collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn skill_budget_unlimited_changes_require_admin_in_both_directions() {
+            let absent = toml::Table::new();
+            let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
+            let on: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+            for before in [&absent, &off] {
+                assert_eq!(authority_diff(before, &on), vec![ProtectedChange {
+                    key: "evolution.skill_budget_unlimited".into(),
+                    before: json!(false), after: json!(true),
+                }]);
+                assert_eq!(authority_diff(&on, before), vec![ProtectedChange {
+                    key: "evolution.skill_budget_unlimited".into(),
+                    before: json!(true), after: json!(false),
+                }]);
+            }
+            assert!(admin_only_form_paths().contains(&"form.skill_budget_unlimited"));
+        }
+
+        #[test]
+        fn skill_budget_unlimited_explicit_default_is_not_an_authority_change() {
+            assert!(!crate::types::EvolutionConfig::default().skill_budget_unlimited);
+            let absent = toml::Table::new();
+            let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
+            assert!(authority_diff(&absent, &off).is_empty());
+            assert!(authority_diff(&off, &absent).is_empty());
+        }
     }
 }

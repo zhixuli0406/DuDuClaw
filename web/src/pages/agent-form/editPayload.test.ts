@@ -352,6 +352,20 @@ describe('admin-only paths and the team vendor rule', () => {
     expect([...KV_REFUSED_SECTIONS].sort()).toEqual([...authorityFields.kv_refused_sections].sort());
   });
 
+  it('drops unlimited skill content from non-admin saves but keeps the token budget', () => {
+    const s = state({ form: { skill_budget_unlimited: true, skill_token_budget: 1200 } });
+    const consumed = new Set(['form.skill_budget_unlimited', 'form.skill_token_budget']);
+    const serverPaths = authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths);
+    for (const serverList of [undefined, serverPaths]) {
+      expect(isAdminOnlyPath('form.skill_budget_unlimited', serverList)).toBe(true);
+      expect(isAdminOnlyPath('form.skill_budget_unlimited_extra', serverList)).toBe(false);
+      const dirty = new Set([...consumed].filter((p) => !isAdminOnlyPath(p, serverList)));
+      expect(buildUpdatePayload(s, dirty, CTX).payload).toEqual({ skill_token_budget: 1200 });
+    }
+    expect(buildUpdatePayload(s, consumed, CTX).payload)
+      .toEqual({ skill_budget_unlimited: true, skill_token_budget: 1200 });
+  });
+
   it('treats the permission switches, guardrails and protected sections as admin-only', () => {
     for (const p of ['form.can_create_agents', 'form.can_send_cross_agent', 'form.can_schedule_tasks',
       'form.can_modify_own_skills', 'v.guardrails_enabled', 'v.guardrails_block_secrets',

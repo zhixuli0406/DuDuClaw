@@ -10,6 +10,7 @@ import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore } from '@/stores/auth-store';
+import authorityFields from './__fixtures__/authority-fields.json';
 
 // v1.68 W1 — partial writes, typed key/value editor, new controls, admin gating.
 
@@ -413,6 +414,35 @@ describe('typed key/value editor', () => {
 });
 
 describe('admin-only fields', () => {
+  it.each([false, true])('locks unlimited skill content for an owner (server paths: %s)', async (serverPaths) => {
+    const user = userEvent.setup();
+    setRole('employee');
+    mockWsClient.call.mockResolvedValue({
+      ...FULL,
+      ...(serverPaths ? {
+        admin_only_fields: authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths),
+      } : {}),
+    });
+    renderAt('/agents/my-bot/edit?tab=skills');
+    const unlimited = await screen.findByRole('switch', { name: en['agents.adv.skillBudgetUnlimited'] });
+    expect(unlimited).toHaveAttribute('data-disabled');
+    expect(screen.getByText(en['agents.v168.adminOnly.hint'])).toBeInTheDocument();
+    expect(screen.getByRole('spinbutton', { name: en['agents.adv.skillTokenBudget'] })).not.toBeDisabled();
+    await user.click(unlimited);
+    expect(unlimited).not.toBeChecked();
+    expect(updateAgent).not.toHaveBeenCalled();
+  });
+
+  it('lets an admin enable unlimited skill content and save it', async () => {
+    const user = userEvent.setup();
+    renderAt('/agents/my-bot/edit?tab=skills');
+    const unlimited = await screen.findByRole('switch', { name: en['agents.adv.skillBudgetUnlimited'] });
+    expect(unlimited).not.toHaveAttribute('data-disabled');
+    expect(screen.queryByText(en['agents.v168.adminOnly.hint'])).not.toBeInTheDocument();
+    await user.click(unlimited);
+    await waitFor(() => expect(updateAgent).toHaveBeenCalledWith('my-bot', { skill_budget_unlimited: true }), { timeout: 3000 });
+  });
+
   it('disables org, capability and sandbox controls for a non-admin and never sends them', async () => {
     const user = userEvent.setup();
     setRole('manager');

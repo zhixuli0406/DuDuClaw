@@ -309,6 +309,53 @@ async fn raw_editor_rejects_invalid_toml_and_escaping_agent_ids() {
 // ── agents.update / agents.inspect ───────────────────────────────────────────
 
 #[tokio::test]
+async fn skill_budget_unlimited_requires_admin_for_flat_and_advanced_updates() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    let owner = owner_of_a1();
+    let initial = std::fs::read_to_string(&path).unwrap();
+    let mut table: toml::Table = initial.parse().unwrap();
+    table.get_mut("evolution").and_then(toml::Value::as_table_mut).unwrap()
+        .remove("skill_budget_unlimited");
+    std::fs::write(&path, toml::to_string_pretty(&table).unwrap()).unwrap();
+
+    // Explicit false over the loader default is allowed, as are other evolution keys.
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "skill_budget_unlimited": false, "skill_token_budget": 1200,
+    }), &owner).await);
+    let stored: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(stored["evolution"]["skill_token_budget"].as_integer(), Some(1200));
+
+    for advanced in [false, true] {
+        for value in [true, false] {
+            let params = if advanced {
+                json!({ "agent_id": "a1", "advanced_kv": [{
+                    "section": "evolution", "key": "skill_budget_unlimited",
+                    "type": "boolean", "value": value,
+                }] })
+            } else {
+                json!({ "agent_id": "a1", "skill_budget_unlimited": value })
+            };
+            let before = std::fs::read(&path).unwrap();
+            let e = err(&handler.handle("agents.update", params.clone(), &owner).await);
+            assert!(e.contains("evolution.skill_budget_unlimited"), "{e}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            let refused = audit_rows(home.path(), "agent_authority_refused");
+            let row = refused.last().unwrap();
+            assert_eq!(row["details"]["keys"], json!(["evolution.skill_budget_unlimited"]));
+            assert_eq!(row["details"]["user_id"], "owner-7");
+
+            ok(&handler.handle("agents.update", params, &admin()).await);
+            let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(value));
+        }
+    }
+    let inspect = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &owner).await);
+    assert!(inspect["admin_only_fields"].as_array().unwrap()
+        .contains(&json!("form.skill_budget_unlimited")));
+}
+
+#[tokio::test]
 async fn non_admin_owner_cannot_change_authority_keys_but_can_edit_the_rest() {
     let (home, handler) = handler_with_agent().await;
     let owner = owner_of_a1();

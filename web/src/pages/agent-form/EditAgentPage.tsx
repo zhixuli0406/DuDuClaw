@@ -1380,7 +1380,8 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
               <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
-              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} disabled={locked('form.skill_budget_unlimited')} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              {adminHint}
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} disabled={form.skill_budget_unlimited ?? false} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
