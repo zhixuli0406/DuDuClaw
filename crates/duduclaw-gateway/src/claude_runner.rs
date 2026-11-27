@@ -92,6 +92,12 @@ fn build_system_prompt(
         parts.push(section.content);
     }
 
+    audit.push(crate::prompt_audit::PromptSection::new(
+        "delegation_guidance",
+        crate::prompt_identity::DELEGATION_GUIDANCE,
+    ));
+    parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
     // Sort skills by name for deterministic ordering (cache-friendly).
     // Apply the employee's budget (with a 10 KB floor) or explicit unlimited
     // setting, and report any omitted skills in the truncation footer.
@@ -6529,6 +6535,7 @@ mod instructions_slot_tests {
             .await
             .unwrap();
         let p = super::build_system_prompt(&agent, None, None).unwrap();
+        assert_eq!(p.matches(crate::prompt_identity::DELEGATION_GUIDANCE).count(), 1);
         let pinned_system = super::build_system_prompt(&agent, None, Some("en")).unwrap();
         for message in ["First dispatch", "Next cron turn"] {
             let user = crate::prompt_identity::with_reply_language_reminder(message.into(), Some("en"));

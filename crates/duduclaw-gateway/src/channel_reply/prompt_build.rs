@@ -191,6 +191,12 @@ pub(super) fn build_system_prompt(
             parts.push(section.content);
         }
 
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "delegation_guidance",
+            crate::prompt_identity::DELEGATION_GUIDANCE,
+        ));
+        parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
+
         // WP1.3 hardening (2026-07-28): the 📎DELIVER protocol used to live
         // only in the office SKILL.md files, so a model that skipped skill
         // content wrote its .docx to ~/Desktop and never emitted the marker —
