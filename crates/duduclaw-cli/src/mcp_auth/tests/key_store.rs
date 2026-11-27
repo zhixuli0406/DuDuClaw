@@ -283,3 +283,36 @@ fn unauthenticated_opt_in_does_not_apply_while_store_keys_exist() {
     assert_eq!(result.unwrap_err(), AuthError::MissingKey);
     assert_eq!(corrupt_result.unwrap_err(), AuthError::MissingKey, "an unreadable store counts as keys configured");
 }
+
+#[test]
+fn hand_edited_stored_keys_drop_person_only_scopes_but_keep_odoo() {
+    let home = TempDir::new().unwrap();
+    let (raw, id) = issue(home.path(), "person-scope-tamper", &["memory:read"]);
+    sql(home.path(), "UPDATE mcp_api_keys SET scopes = ?2 WHERE id = ?1", &id,
+        Some(r#"["memory:read","tasks:read","agents:status","odoo:read","odoo:write"]"#.into()));
+    for (external, binding) in [(true, None), (false, None), (true, Some("employee")), (false, Some("employee"))] {
+        sql(home.path(), "UPDATE mcp_api_keys SET agent_binding = ?2 WHERE id = ?1", &id, binding.map(str::to_owned));
+        sql(home.path(), "UPDATE mcp_api_keys SET is_external = ?2 WHERE id = ?1", &id,
+            Some(if external { "1" } else { "0" }.into()));
+        let principal = authenticate_with_key(&raw, home.path()).unwrap();
+        assert_eq!(principal.is_external, external);
+        assert_eq!(principal.scopes,
+            [Scope::MemoryRead, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
+    }
+}
+
+#[test]
+fn legacy_and_gateway_internal_authentication_drop_person_only_scopes() {
+    for client in ["legacy", "gateway-internal"] {
+        let raw = fresh_key("prod");
+        let home = make_config_dir_with_key(&raw, client,
+            &["admin", "tasks:read", "agents:status", "odoo:read", "odoo:write"],
+            false, &fresh_today_rfc3339());
+        if client == "gateway-internal" {
+            McpKeyStore::open(home.path()).unwrap().record_internal_key(&raw, Utc::now()).unwrap();
+        }
+        let principal = authenticate_with_key(&raw, home.path()).unwrap();
+        assert_eq!(principal.scopes,
+            [Scope::Admin, Scope::OdooRead, Scope::OdooWrite].into_iter().collect::<HashSet<Scope>>());
+    }
+}

@@ -537,6 +537,12 @@ pub(crate) async fn handle_tools_list_for_transport(
     default_agent: &str,
     remote_bearer: bool,
 ) -> Value {
+    if crate::mcp_auth::is_person_principal(principal) {
+        let tools: Vec<Value> = tools()
+            .filter(|tool| !crate::mcp_auth::person_tool_refused(tool.name, principal))
+            .map(build_tool_schema).collect();
+        return jsonrpc_response(id, serde_json::json!({"tools":tools}));
+    }
     let access = remote_bearer.then(|| remote_access(home_dir, principal, default_agent));
     let tools: Vec<&'static ToolDef> = match &access {
         Some(RemoteAccess::Unbound(_)) => Vec::new(),
@@ -673,7 +679,22 @@ pub(crate) async fn visible_tools_in_lane(
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
-    visible_tools_in_lane_for_transport(principal, home_dir, default_agent, employee_process, lane, false).await
+    let agent = acting_agent_id(&principal.client_id, default_agent);
+    let human = super::host_on_behalf_of(home_dir, agent);
+    visible_tools_for_principal(principal, home_dir, default_agent, employee_process, lane, human.as_deref()).await
+}
+
+/// Host principal injected separately from tool arguments and process env.
+/// Both tools/list and the listChanged snapshot use this same filter pipeline.
+pub(crate) async fn visible_tools_for_principal(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    human: Option<&str>,
+) -> Vec<&'static ToolDef> {
+    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human, false).await
 }
 
 async fn visible_tools_in_lane_for_transport(
@@ -684,6 +705,23 @@ async fn visible_tools_in_lane_for_transport(
     lane: &duduclaw_core::ProcessLane,
     remote_bearer: bool,
 ) -> Vec<&'static ToolDef> {
+    let agent = acting_agent_id(&principal.client_id, default_agent);
+    let human = super::host_on_behalf_of(home_dir, agent);
+    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human.as_deref(), remote_bearer).await
+}
+
+async fn visible_tools_for_principal_and_transport(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    human: Option<&str>,
+    remote_bearer: bool,
+) -> Vec<&'static ToolDef> {
+    if crate::mcp_auth::is_person_principal(principal) {
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+    }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
     // not act for the process's agent. Discovery filter only.
@@ -725,6 +763,8 @@ async fn visible_tools_in_lane_for_transport(
     // clients are filtered separately by `external_tool_allowed` and carry no
     // per-agent capability config.
     let effective_agent = acting_agent_id(&principal.client_id, default_agent);
+    let main_restricted = (!principal.is_external || dedicated_google)
+        && super::main_principal_gate::restricted(home_dir, effective_agent, human);
     let admin_ai = super::admin_ai_client::available_for(home_dir, principal, effective_agent, remote_bearer).await;
     let is_member =
         !principal.is_external && duduclaw_gateway::ephemeral::is_ephemeral_id(effective_agent);
@@ -804,16 +844,10 @@ async fn visible_tools_in_lane_for_transport(
     let allow_responsibilities = gated_caller
         && !member_invalid
         && duduclaw_gateway::responsibility::ResponsibilityConfig::from_home(home_dir).enabled;
-    // RM-120: generic `odoo_create` / `odoo_write` need an explicit grant and
-    // the separate per-table opt-in in the employee's own Odoo settings, and
-    // the table must clear the never-writable list, the 功能模組 switch and
-    // the block list. The Odoo handler acts for `default_agent`, so the same
-    // agent and the same predicate (`generic_write_model_gate` over
-    // `allowed_models`) decide the listing.
-    let allow_odoo_create =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_create");
-    let allow_odoo_write =
-        !member_invalid && super::generic_write_listed(home_dir, default_agent, "odoo_write");
+    // RM-141: one policy adapter for listing and dispatch, with read-only
+    // identity metadata. A malformed artifact hides every Odoo tool.
+    let odoo_policy = (!member_invalid).then(||
+        super::odoo_access::ToolPolicy::load(home_dir, default_agent).ok()).flatten();
 
     // RFC-26: `[fork] enabled` is opt-in per agent and `mcp_fork`'s handlers
     // refuse every fork tool without it. Read through the same shared typed
@@ -954,6 +988,9 @@ async fn visible_tools_in_lane_for_transport(
     .is_some();
 
     tools()
+        .filter(|t| super::main_principal_gate::refusal(main_restricted, t.name).is_none())
+        .filter(|t| super::drive_write_refusal(home_dir, effective_agent, t.name, principal, lane).is_none())
+        .filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal))
         .filter(|t| !super::admin_ai_client::TOOLS.contains(&t.name) || admin_ai.permits(t.name))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
@@ -1002,8 +1039,8 @@ async fn visible_tools_in_lane_for_transport(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
-        .filter(|t| t.name != "odoo_create" || allow_odoo_create)
-        .filter(|t| t.name != "odoo_write" || allow_odoo_write)
+        .filter(|t| !t.name.starts_with("odoo_")
+            || odoo_policy.as_ref().is_some_and(|policy| policy.listed_for_context(t.name)))
         // O7: PORTICO scoped tools without an active grant.
         .filter(|t| {
             (principal.is_external && !GOOGLE_WORKSPACE_TOOLS.contains(&t.name))

@@ -189,3 +189,30 @@ pub(crate) fn telegram_decision_principal(
         _ => String::new(),
     }
 }
+
+/// Strict commands never inherit authority from an RM-143 card's UUID.
+pub(crate) async fn refuse_chat_admin_row(
+    home: &std::path::Path, context: &crate::approval::DecisionContext,
+    row: &crate::approval::ApprovalRecord,
+) -> Option<String> {
+    use crate::approval::{chat_admin::press, decision_service::identity};
+    if !press::owns(home, row).await { return None; }
+    identity::audit_refusal_reason(home, &row.id, &context.channel, &context.account_id,
+        &context.principal_id, "strict_text").await;
+    Some(press::words(press::language(home).await, "這類審批請按卡片上的按鈕",
+        "Please use the buttons on the approval card.", "この依頼は承認カードのボタンを押してください。"))
+}
+
+pub(crate) async fn refuse_chat_admin_text(
+    home: &std::path::Path, context: &crate::approval::DecisionContext, id: &str,
+) -> Option<String> {
+    let owned_home = home.to_path_buf();
+    let broker = match tokio::task::spawn_blocking(move || crate::approval::ApprovalBroker::open(&owned_home)).await {
+        Ok(Ok(broker)) => broker,
+        _ => return Some(DECISION_REFUSED.into()),
+    };
+    match broker.get(&crate::approval::ApprovalId::from(id.to_owned())).await {
+        Ok(Some(row)) => refuse_chat_admin_row(home, context, &row).await,
+        _ => Some(DECISION_REFUSED.into()),
+    }
+}

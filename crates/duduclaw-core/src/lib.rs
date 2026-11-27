@@ -49,6 +49,7 @@ pub mod llm_contract;
 pub mod macos_bundle;
 pub mod match_utils;
 pub mod net_addr;
+pub mod mcp_person_tools;
 pub mod mcp_scopes;
 pub mod org;
 pub mod org_change;

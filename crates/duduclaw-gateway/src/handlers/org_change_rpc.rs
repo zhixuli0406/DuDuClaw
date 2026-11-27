@@ -25,12 +25,14 @@
 //! refused (and a waiting proposal is denied).
 
 use super::*;
+use crate::dept_grants::reach;
 use crate::org_change_approval::{self as oc, journal, Proposal};
-use duduclaw_core::org_change;
+use duduclaw_core::org_change::{self, OrgChangeError};
 use duduclaw_core::org_store::{self, OrgEntry};
 
 use crate::approval::decision_service::{Decider, files_org::{
     coded, coded_with, change_error, authority_error, mirror_failed, validate,
+    confirm_reach, reach_refusal_code,
     lock_failed, mirror_of, audit, commit_org_entry, sync_mirror, record_mirror_drift,
 }};
 pub(crate) use crate::approval::decision_service::files_org::lock_org;
@@ -171,13 +173,18 @@ impl MethodHandler {
             proposer_email: fresh.email.clone(),
             reason,
         };
+        let reach_preview = reach::proposal_preview(&self.home_dir, &before.department, &after.department);
+        let mut payload = proposal.to_payload();
+        payload.as_object_mut().expect("proposal object")
+            .extend(reach_preview.as_object().expect("reach object").clone());
+        let summary = oc::summary(&proposal, reach_preview["sentence"].as_str());
         // `[approval] forbid_self_approval` judges `on_behalf_of`: stamp the
         // trusted dashboard principal of the proposer (never a request value).
         let principal = duduclaw_core::HumanPrincipal::user(&fresh.user_id).map(|p| p.to_string());
         let filed = crate::on_behalf_of::ON_BEHALF_OF
             .scope(
                 principal,
-                broker.request(&agent_id, oc::ACTION_KIND, &oc::summary(&proposal), proposal.to_payload(), oc::TTL_SECS),
+                broker.request(&agent_id, oc::ACTION_KIND, &summary, payload, oc::TTL_SECS),
             )
             .await;
         drop(org_lock);
@@ -214,6 +221,9 @@ impl MethodHandler {
                 "after": oc::entry_json(&after),
                 "base": proposal.base,
                 "expires_at": expires_at,
+                "reach": reach_preview["reach"],
+                "reach_digest": reach_preview["reach_digest"],
+                "sentence": reach_preview["sentence"],
             }),
         )
     }
@@ -292,6 +302,17 @@ impl MethodHandler {
             }
             return coded("no_change", NO_CHANGE);
         }
+        let reach_preview = match confirm_reach(&self.home_dir, &before, &after, params["reach_digest"].as_str()) {
+            Ok(preview) => preview,
+            Err(frame) => {
+                audit(&self.home_dir, "org_change_rejected", &agent_id,
+                    duduclaw_security::audit::Severity::Info,
+                    json!({"agent_id": agent_id, "rejected_by": ctx.user_id,
+                        "source": "org.apply_change", "before": oc::entry_json(&before),
+                        "after": oc::entry_json(&after), "why": reach_refusal_code(&frame)}));
+                return frame;
+            }
+        };
         let commit = match commit_org_entry(&self.home_dir, &self.registry, &org_lock, &agent_id, &after, "org.apply_change", &Decider::Dashboard(ctx.clone())).await {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
@@ -343,6 +364,9 @@ impl MethodHandler {
             "base": new_base,
             "registry_reloaded": commit.registry_reloaded,
             "withdrawn_pending": withdrawn,
+            "reach": reach_preview["reach"],
+            "reach_digest": reach_preview["reach_digest"],
+            "sentence": reach_preview["sentence"],
         });
         if let Some(e) = commit.mirror_error {
             let mut extra = result;
@@ -437,6 +461,9 @@ impl MethodHandler {
                     "reason": p.reason,
                     "created_at": rec.created_at,
                     "expires_at": oc::expires_at(rec),
+                    "reach": rec.payload.get("reach"),
+                    "reach_digest": rec.payload.get("reach_digest"),
+                    "sentence": rec.payload.get("sentence"),
                 }),
             ));
         }
@@ -447,17 +474,22 @@ impl MethodHandler {
 
     /// Compatibility entry point; all decisions share the service lock.
     pub(crate) async fn decide_org_change(
-        &self, broker: &crate::approval::ApprovalBroker,
-        approval_id: &crate::approval::ApprovalId, approve: bool,
-        decision_reason: &str, ctx: &UserContext,
+        &self,
+        broker: &crate::approval::ApprovalBroker,
+        approval_id: &crate::approval::ApprovalId,
+        approve: bool,
+        decision_reason: &str,
+        ctx: &UserContext,
+        reach_digest: Option<&str>,
     ) -> WsFrame {
         let env = crate::approval::decision_service::DecisionEnv {
             home: self.home_dir.clone(), registry: Some(self.registry.clone()),
             broker: broker.clone(), users: self.user_db.read().await.clone(),
         };
-        match Box::pin(crate::approval::decision_service::decide(
+        match Box::pin(crate::approval::decision_service::decide_with_reach(
             &env, approval_id, approve, decision_reason,
             &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+            reach_digest,
         )).await {
             Ok(outcome) => WsFrame::ok_response("", outcome.value),
             Err(error) => error.dashboard_frame(),

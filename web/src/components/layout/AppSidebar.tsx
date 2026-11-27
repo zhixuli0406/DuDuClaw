@@ -23,7 +23,7 @@ import { api } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
 import { sortPrimaryStaff } from '@/lib/primary-agent';
 import { useSystemStore } from '@/stores/system-store';
-import { useAuthStore } from '@/stores/auth-store';
+import { useAuthStore, useDeptGroups } from '@/stores/auth-store';
 import { selectInboxCount, useApprovalsStore } from '@/stores/approvals-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useCommandPaletteStore } from '@/stores/command-palette-store';
@@ -254,7 +254,7 @@ function StaffZone({
       await api.users.setPrimaryAgent(agent);
       const me = await api.users.me();
       if (subject && useAuthStore.getState().user?.id === subject) {
-        useAuthStore.getState().setUser(me.user, me.bindings);
+        useAuthStore.getState().setUser(me.user, me.bindings, me);
       }
     } catch (error) { toast.error(formatError(error)); }
     finally { setSettingPrimary(false); }
@@ -577,7 +577,9 @@ export function AppSidebar() {
   // D6: the org chart's progressive-disclosure gate reuses the roster that's
   // already being fetched for the LIVE staff zone — no second RPC.
   const protectedMode = useProtectedMode();
+  const deptGroups = useDeptGroups();
   const ctx = {
+    deptGroups,
     hasOperatorAccess,
     forksExist,
     isDesktop: isTauri(),

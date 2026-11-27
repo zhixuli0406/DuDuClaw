@@ -27,7 +27,8 @@
 //! 1. Add the `ToolDef` to the matching family file (create a new one and
 //!    register it in [`TOOL_GROUPS`] if no family fits).
 //! 2. Add the enforced scope arm in `mcp_auth::tool_requires_scope`.
-//! 3. Add the catalog row in `crate::tool_catalog` — the drift tests
+//! 3. Add the catalog row in `crate::tool_catalog` (person-only tools use
+//!    `crate::mcp_person_tools` instead and never enter employee pickers) — the drift tests
 //!    (`tool_catalog_covers_all_advertised_tools`,
 //!    `test_catalog_scopes_match_tool_requires_scope`) fail otherwise.
 //! 4. If the tool is gated by a per-agent capability, add it to the matching
@@ -124,6 +125,9 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("drive_create_file", "folder", "boolean"),
+    ("docs_format", "operations", "array"),
+    ("my_tasks_list", "limit", "integer"),
     ("admin_settings_read", "agent_ids", "array"),
     ("admin_settings_read", "sections", "array"),
     ("admin_settings_propose", "items", "array"),
@@ -279,14 +283,12 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
         );
     }
+    let mut input_schema = serde_json::json!({"type":"object","properties":properties,"required":required});
+    google::drive_write_schema(tool.name, &mut input_schema);
     let mut schema = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required
-        },
+        "inputSchema": input_schema,
         "annotations": annotations::tool_annotations(tool.name)
     });
     if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {

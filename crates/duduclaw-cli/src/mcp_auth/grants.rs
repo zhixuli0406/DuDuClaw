@@ -45,6 +45,7 @@ pub(crate) fn dedicated_google_tool_allowed(
     tool: &str,
 ) -> bool {
     use duduclaw_core::google_identity::{NativeGoogleScope, native_google_scope};
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
     let required = match native_google_scope(tool) {
         Some(NativeGoogleScope::Read) => Scope::GoogleRead,
         Some(NativeGoogleScope::Write) => Scope::GoogleWrite,

@@ -12,6 +12,7 @@ use super::*;
 /// it only needs to be a plausible fixture value.
 pub(super) fn admin_ctx() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "admin-test".to_string(),

@@ -7,6 +7,11 @@ use duduclaw_security::audit::{AuditEvent, Severity};
 
 fn forbidden() -> DecisionRefusal { DecisionRefusal::Forbidden("請到儀表板處理".into()) }
 
+fn requires_step_up(approve: bool, tier: chat_admin::Tier, key: Option<&str>, exempt: &[String]) -> bool {
+    approve && tier == chat_admin::Tier::T2
+        && key.is_none_or(|key| !exempt.iter().any(|kind| kind == key))
+}
+
 pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, proof: &ChatAdminProof) -> Result<LedgerEntry, DecisionRefusal> {
     let agents = match &env.registry {
         Some(registry) => Some(registry.read().await.list().iter().map(|a| a.config.agent.name.clone()).collect::<Vec<_>>()),
@@ -26,6 +31,13 @@ pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: 
         }
         let cfg = chat_admin::config::effective(&home, users.as_deref()).ok_or(DecisionRefusal::FeatureOff)?;
         if !cfg.channels.contains(&proof.channel) { return Err(DecisionRefusal::FeatureOff); }
+        if approve && proof.step == Step::Web && !cfg.step_up_methods.contains(&chat_admin::StepMethod::Web) {
+            return Err(DecisionRefusal::StepUpRequired);
+        }
+        if proof.step == Step::Totp && (!cfg.step_up_methods.contains(&chat_admin::StepMethod::DmTotp)
+            || proof.channel != chat_admin::ChatChannel::Telegram) {
+            return Err(DecisionRefusal::StepUpRequired);
+        }
         let user_id = uuid::Uuid::parse_str(&proof.user_id).map_err(|_| forbidden())?;
         // Ledger UUID serialization must not silently alter the identity key.
         if user_id.to_string() != proof.user_id { return Err(forbidden()); }
@@ -59,8 +71,8 @@ pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: 
         let accounts = crate::chat_link_intercept::configured_accounts(&home, proof.channel.as_str(), &agents)
             .map_err(|_| forbidden())?;
         if !accounts.iter().any(|account| account.account == proof.account) { return Err(forbidden()); }
-        let step_required = approve && chat_admin::kind_key(&rec)
-            .is_some_and(|key| cfg.step_up_kinds.iter().any(|kind| kind == key));
+        let step_required = requires_step_up(approve, chat_admin::tier(&rec),
+            chat_admin::kind_key(&rec), &cfg.step_up_exempt_kinds);
         if step_required && proof.step == Step::Tap { return Err(DecisionRefusal::StepUpRequired); }
         Ok(LedgerEntry { user_id, channel: proof.channel, step: proof.step, step_required,
             card_id: proof.card_id, digest: proof.digest })
@@ -84,7 +96,7 @@ pub(super) async fn knowledge_user(env: &DecisionEnv, by: &Decider) -> Result<du
     }).await.map_err(|e| DecisionRefusal::Internal(e.to_string()))?
 }
 
-pub(super) async fn display_name(env: &DecisionEnv, user: &str) -> Option<String> {
+pub(crate) async fn display_name(env: &DecisionEnv, user: &str) -> Option<String> {
     let (db, user) = (env.users.clone()?, user.to_owned());
     tokio::task::spawn_blocking(move || db.get_user(&user).ok().flatten()
         .map(|u| u.display_name.trim().to_owned()).filter(|name| !name.is_empty()))
@@ -125,10 +137,20 @@ fn admit_refusal(channel: &str, account: &str, principal: &str) -> bool {
 }
 
 pub(super) async fn audit_refusal(env: &DecisionEnv, id: &ApprovalId, proof: &ChatAdminProof, error: &DecisionRefusal) {
-    if !admit_refusal(proof.channel.as_str(), &proof.account, &proof.principal) { return; }
-    let details = json!({"reason":error.code(), "approval_id":id.as_str(),
-        "channel":proof.channel.as_str(), "principal":duduclaw_auth::otp::mask_target(&proof.principal)});
-    let home = env.home.clone();
+    audit_refusal_reason(&env.home, id, proof.channel.as_str(), &proof.account,
+        &proof.principal, error.code()).await;
+}
+
+/// Shared rate limit for service and pre-service transport refusals. Identity
+/// here is for masked auditing only; it is never an authorization proof.
+pub(crate) async fn audit_refusal_reason(
+    home: &std::path::Path, id: &ApprovalId, channel: &str, account: &str,
+    principal: &str, reason: &'static str,
+) {
+    if !admit_refusal(channel, account, principal) { return; }
+    let details = json!({"reason":reason, "approval_id":id.as_str(),
+        "channel":channel, "principal":duduclaw_auth::otp::mask_target(principal)});
+    let home = home.to_path_buf();
     let result = tokio::task::spawn_blocking(move || duduclaw_security::audit::try_append_audit_event(
         &home, &AuditEvent::new("approval_chat_admin_refused", "chat_admin", Severity::Warning, details),
     )).await;
@@ -138,6 +160,20 @@ pub(super) async fn audit_refusal(env: &DecisionEnv, id: &ApprovalId, proof: &Ch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn step_up_defaults_to_all_t2_and_unknown_t2_keys_fail_closed() {
+        for key in chat_admin::STEP_UP_KIND_KEYS {
+            assert!(requires_step_up(true, chat_admin::Tier::T2, Some(key), &[]));
+            assert!(!requires_step_up(false, chat_admin::Tier::T2, Some(key), &[]));
+            let exempt = vec![(*key).to_owned()];
+            assert!(!requires_step_up(true, chat_admin::Tier::T2, Some(key), &exempt));
+            assert!(requires_step_up(true, chat_admin::Tier::T2, Some("different"), &exempt));
+            assert!(requires_step_up(true, chat_admin::Tier::T2, None, &exempt));
+        }
+        assert!(!requires_step_up(true, chat_admin::Tier::T1, None, &[]));
+        assert!(!requires_step_up(true, chat_admin::Tier::T1, Some("knowledge_quarantine"), &[]));
+    }
 
     #[test]
     fn refusal_audit_is_limited_to_five_per_sender_per_minute() {

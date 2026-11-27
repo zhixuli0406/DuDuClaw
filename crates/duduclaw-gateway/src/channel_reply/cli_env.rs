@@ -63,6 +63,11 @@ pub(super) async fn spawn_claude_cli_with_env(
 ) -> Result<String, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    // Preserve legacy callers; only a scoped foreground snapshot supplies
+    // effort here when the ambient/no-account path has no explicit override.
+    let effort = effort.or_else(|| crate::runtime_dispatch::chat_turn_config(work_dir)
+        .and_then(|_| crate::runtime_dispatch::chat_effort(work_dir)));
+
     // The CLI runs with full tools and `--dangerously-skip-permissions`, so
     // without an employee directory it would have no instructions, MCP
     // config, file-guard hook or cwd. An employee turn is refused outright;
@@ -251,7 +256,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         // from --mcp-config, orthogonal to setting sources). Default ON; env
         // kill-switch DUDUCLAW_MINIMAL_CONTEXT / per-agent [runtime]
         // minimal_context = false opts out.
-        if duduclaw_core::agent_toml::resolve_minimal_context(work_dir) {
+        if resolve_minimal_context(work_dir) {
             if hook_args.is_empty() { cmd.args(["--setting-sources", "project,local"]); }
             if explore_lane.is_none() {
                 let tools =
@@ -1213,3 +1218,23 @@ pub(super) async fn spawn_claude_cli_with_env(
 #[cfg(all(test, unix))]
 #[path = "cli_env_thinking_tests.rs"]
 mod thinking_tests;
+
+fn resolve_minimal_context(work_dir: Option<&Path>) -> bool {
+    let env = std::env::var(duduclaw_core::agent_toml::ENV_MINIMAL_CONTEXT).ok();
+    minimal_context_with_override(work_dir, env.as_deref())
+}
+
+pub(super) fn minimal_context_with_override(work_dir: Option<&Path>, env: Option<&str>) -> bool {
+    if let Some(turn) = crate::runtime_dispatch::chat_turn_config(work_dir) {
+        if let Some(value) = env {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" | "off" => return false,
+                "1" | "true" | "yes" | "on" => return true,
+                _ => {}
+            }
+        }
+        return turn.sections.runtime.minimal_context.unwrap_or(true);
+    }
+    // Background/no-snapshot callers keep the legacy env + disk semantics.
+    duduclaw_core::agent_toml::resolve_minimal_context(work_dir)
+}

@@ -349,7 +349,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         .and_then(|t| t.as_str())
         .unwrap_or_default()
         .to_string();
-    let text = strip_feishu_mentions(&raw_text);
+    let mut text = strip_feishu_mentions(&raw_text);
 
     let chat_id = message
         .get("chat_id")
@@ -384,10 +384,30 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
         return;
     }
 
+    let mut drop_files = false;
+    if matches!(msg_type, "file" | "image") && !msg_id.is_empty() {
+        let session = format!("feishu:{chat_id}");
+        match crate::channel_reply::attachment_gate::check(
+            &state.ctx, &session, &session,
+            crate::ccr_runtime::reply_principal_for_sender(sender), &text, None, None,
+        ).await {
+            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
+                drop_files = true;
+                text = command;
+            }
+            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                send_message(state, chat_id, &reply).await;
+                return;
+            }
+        }
+    }
+
     // WP1.3: download a file/image resource via the message resource API
     // (Bearer tenant token) into the resolved agent's dir.
     let mut attachment_lines: Vec<String> = Vec::new();
-    if matches!(msg_type, "file" | "image") && !msg_id.is_empty() {
+    if !drop_files && matches!(msg_type, "file" | "image") && !msg_id.is_empty() {
         let (key_field, res_type, default_name) = if msg_type == "image" {
             ("image_key", "image", "image.png")
         } else {

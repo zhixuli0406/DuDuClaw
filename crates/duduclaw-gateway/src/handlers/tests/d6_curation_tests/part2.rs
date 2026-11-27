@@ -69,6 +69,7 @@ pub(super) async fn experts_rpcs_deny_non_admin() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let ctx = UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),
@@ -129,6 +130,7 @@ pub(super) async fn gallery_list_denies_non_admin() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let ctx = UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),
@@ -169,6 +171,7 @@ pub(super) async fn mail_rpcs_deny_a_plain_employee() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let ctx = UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "u1".to_string(),

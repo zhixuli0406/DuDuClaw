@@ -73,6 +73,7 @@ async fn post(
     if !duduclaw_core::is_valid_agent_id(agent)
         || !request.credential_ref().is_well_formed()
         || duduclaw_core::google_identity::native_google_scope(request.tool()).is_none()
+        || duduclaw_core::google_identity::is_drive_write_tool(request.tool())
         || !request.arguments().is_object()
     {
         return Err(ERROR.into());

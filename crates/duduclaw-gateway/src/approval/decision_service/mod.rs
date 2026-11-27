@@ -4,11 +4,11 @@
 //! calls; chat always scopes its receipt digest, including denials.
 mod bound;
 pub(crate) mod files_org;
-mod identity;
+pub(crate) mod identity;
 mod knowledge;
 mod locks;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::{path::PathBuf, sync::Arc};
 use duduclaw_agent::registry::AgentRegistry;
@@ -126,7 +126,7 @@ impl DecisionRefusal {
         }
     }
 
-    fn code(&self) -> &'static str {
+    pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found", Self::Expired(_) => "expired",
             Self::AlreadyDecided { .. } => "already_decided", Self::Forbidden(_) => "forbidden",
@@ -161,8 +161,30 @@ pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
     }
 }
 
+/// Read-only identity preflight for the press flow before retiring/resending a
+/// card. Reuse the exact service authority; decide rechecks under its lock.
+/// Step-up is not issued here: the receipt digest must be checked first.
+pub(crate) async fn validate_chat_identity(
+    env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, proof: &ChatAdminProof,
+) -> Result<(), DecisionRefusal> {
+    match identity::authorize(env, rec, approve, proof).await {
+        Ok(_) | Err(DecisionRefusal::StepUpRequired) => Ok(()),
+        Err(error) => {
+            identity::audit_refusal(env, &rec.id, proof, &error).await;
+            Err(error)
+        }
+    }
+}
+
 pub(crate) async fn decide(
     env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
+) -> Result<DecisionOutcome, DecisionRefusal> {
+    decide_with_reach(env, id, approve, reason, by, None).await
+}
+
+pub(crate) async fn decide_with_reach(
+    env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
+    reach_digest: Option<&str>,
 ) -> Result<DecisionOutcome, DecisionRefusal> {
     let expected = match by {
         Decider::Dashboard(_) => super::EXPECTED_DECISION_DIGEST.try_with(Clone::clone).ok().flatten(),
@@ -172,7 +194,7 @@ pub(crate) async fn decide(
     let _guard = lock.lock().await;
     let result = super::EXPECTED_DECISION_DIGEST.scope(expected,
         super::EXPECTED_DECISION_HOME.scope(env.home.clone(),
-            Box::pin(decide_locked(env, id, approve, reason, by))),
+            Box::pin(decide_locked(env, id, approve, reason, by, reach_digest))),
     ).await;
     if let (Decider::ChatAdmin(proof), Err(error)) = (by, &result) {
         identity::audit_refusal(env, id, proof, error).await;
@@ -182,6 +204,7 @@ pub(crate) async fn decide(
 
 async fn decide_locked(
     env: &DecisionEnv, id: &ApprovalId, approve: bool, reason: &str, by: &Decider,
+    reach_digest: Option<&str>,
 ) -> Result<DecisionOutcome, DecisionRefusal> {
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
@@ -198,6 +221,11 @@ async fn decide_locked(
         let Decider::Dashboard(ctx) = by else { return Err(DecisionRefusal::NotSupportedInChat); };
         super::operator_cli_gate::require_admin_decider(&env.home, ctx)
             .map_err(|_| DecisionRefusal::Forbidden("資料庫授權只能由管理員在儀表板決定。".into()))?;
+    }
+    if crate::google_identity::member_card::is_member_card(&rec)
+        && (matches!(by, Decider::ChatAdmin(_))
+            || !crate::google_identity::member_card::may_decide(&env.home, &rec, by.user_id())) {
+        return Err(DecisionRefusal::Forbidden("Only the requesting member may confirm".into()));
     }
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
@@ -270,7 +298,7 @@ async fn decide_locked(
             }
             // The kind owns state/expiry ordering: an applied journal must
             // be recovered before treating its original base as stale.
-            files_org::org_change(env, id, approve, reason, by, &actor).await?
+            files_org::org_change(env, id, approve, reason, by, &actor, reach_digest).await?
         }
         _ if handles(&rec) => {
             check_state(env, &rec, false).await?;
@@ -382,6 +410,12 @@ async fn chat_preflight(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, 
 }
 
 async fn general(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, by: &Decider, actor: &DecisionActor) -> Result<Value, DecisionRefusal> {
+    if rec.payload["drive_write_admin_confirmation"] == true {
+        let principal = duduclaw_core::HumanPrincipal::user(by.user_id()).map(|p| p.to_string());
+        if crate::on_behalf_of::self_approval::refuses(&env.home, rec.on_behalf_of.as_deref(), principal.as_deref(), approve) {
+            return Err(DecisionRefusal::Forbidden(crate::on_behalf_of::self_approval::REFUSAL.into()));
+        }
+    }
     let decision = match by {
         Decider::Dashboard(ctx) if rec.payload.get("egress_guard").is_some() || rec.action_kind == "db_source_grant" =>
             env.broker.decide_egress_dashboard(&rec.id, ctx, approve).await,

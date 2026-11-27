@@ -1,7 +1,7 @@
 //! Isolation changes execution location, not employee permissions.
 //! Operator-only tools retain their existing gates; admin settings are also explicitly refused here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, AdminSettingsUnavailable }
+pub enum Refusal { HostAuthority, ForkNextRelease, ProposalRequired, AdminSettingsUnavailable, DriveWriteUnavailable, PersonalKeyRequired }
 impl Refusal {
     pub fn message(self) -> &'static str {
         self.message_for_language(None)
@@ -12,6 +12,8 @@ impl Refusal {
             Self::ForkNextRelease => duduclaw_mcp_boundary::fork_policy::message(language),
             Self::ProposalRequired => PROPOSAL_REQUIRED,
             Self::AdminSettingsUnavailable => "受保護模式下無法使用管理員設定工具。",
+            Self::DriveWriteUnavailable => "受保護模式尚不支援雲端硬碟寫入。",
+            Self::PersonalKeyRequired => "This tool is only available to a personal key",
         }
     }
 }
@@ -26,6 +28,8 @@ pub const PROPOSAL_REQUIRED: &str = "受保護模式下 AI 員工不能自行建
 /// Gateway-owned computer containers retain their original session handlers.
 pub fn intentional_refusal(name: &str) -> Option<Refusal> {
     use Refusal::*;
+    if duduclaw_core::google_identity::is_drive_write_tool(name) { return Some(DriveWriteUnavailable); }
+    if duduclaw_core::mcp_person_tools::is_person_tool(name) { return Some(PersonalKeyRequired); }
     if duduclaw_mcp_boundary::fork_policy::deferred(name) { return Some(ForkNextRelease); }
     Some(match name {
         "os_notify" | "os_watch_status" | "os_open" | "os_frontmost" | "os_spotlight_search" |

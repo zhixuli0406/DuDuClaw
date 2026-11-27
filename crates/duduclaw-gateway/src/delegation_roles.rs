@@ -193,3 +193,15 @@ pub(crate) fn audit_allow(home: &Path, sender: &str, target: &str, source: Deleg
 
 #[cfg(test)]
 mod tests;
+
+/// Ordinary task hand-overs opt into the main list; other boundaries are unchanged.
+pub async fn assignment_boundaries(
+    home: &Path, sender: &str, target: &str, principal: Option<&str>,
+) -> Result<DelegationBoundaries, String> {
+    Box::pin(crate::on_behalf_of::access::check_main_target_for(
+        home, principal, target, crate::on_behalf_of::access::MainUse::Assign,
+    )).await?;
+    let mut boundaries = sync_boundaries(home, sender, target, principal);
+    boundaries.main_target_allowed = crate::machine_employee::check_target(home, target, principal).is_ok();
+    Ok(boundaries)
+}

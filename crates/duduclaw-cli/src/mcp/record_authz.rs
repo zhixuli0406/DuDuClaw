@@ -275,9 +275,15 @@ pub(crate) async fn check_record_change_allowed(
         return Ok(());
     }
     // The predicate audits the refusal and returns the shared AI explanation.
-    check_delegation_allowed(home_dir, caller, target, tool)
-        .await
-        .map_err(|explanation| {
+    let delegated = if tool == "tasks_update" {
+        super::delegation::check_assignment_delegation_allowed(home_dir, caller, target, tool).await
+    } else {
+        check_delegation_allowed(home_dir, caller, target, tool).await
+    };
+    delegated.map_err(|explanation| {
+            if explanation == duduclaw_gateway::on_behalf_of::access::MAIN_TURN_REFUSAL {
+                return explanation;
+            }
             let target_short = duduclaw_core::truncate_chars(target, 64);
             format!(
                 "{tool} 遭拒：這筆{label}屬於「{target_short}」。{explanation}未做任何變更。",

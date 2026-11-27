@@ -1,3 +1,14 @@
+const UNSUPPORTED_DRIVE_WRITES: &[&str] = &[
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "drive_move_file",
+    "drive_trash_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
+];
 use super::*;
 use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
 use serde_json::json;
@@ -57,9 +68,24 @@ fn policy_covers_exactly_the_declared_catalog() {
         }
     }
     assert_eq!(names.len(), POLICIES.len());
+    for name in UNSUPPORTED_DRIVE_WRITES { assert!(names.contains(name)); }
     for entry in POLICIES {
         assert!(names.contains(entry.name));
         assert!(!entry.required.is_empty());
+    }
+}
+
+#[test]
+fn protected_drive_writes_have_exact_connector_policies() {
+    // The CLI disposition and gateway executor enforce intentional refusal;
+    // this dependency-neutral registry still classifies every ToolDef.
+    for name in UNSUPPORTED_DRIVE_WRITES {
+        let entry = policy(name).expect("Drive write policy");
+        assert_eq!(entry.route, Route::Connector, "{name}");
+        assert_eq!(entry.required, &[ResourceKind::Employee, ResourceKind::Connector], "{name}");
+        let ctx = context(name, vec![employee()]);
+        assert!(!eligible(&ctx, name), "{name}");
+        assert!(authorize(&ctx, name, &json!({}), &Fixed(vec![employee()])).is_err(), "{name}");
     }
 }
 

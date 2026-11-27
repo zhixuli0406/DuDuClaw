@@ -22,6 +22,7 @@ pub(crate) async fn execute(
     arguments: &Value,
     selection: Option<&duduclaw_core::google_identity::GoogleSelectionStamp>,
 ) -> Result<Value, String> {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Err("雲端硬碟寫入只能由主程式執行。".into()); }
     let scope = native_google_scope(tool).ok_or("Google 工具不存在。")?;
     if !duduclaw_core::is_valid_agent_id(agent)
         || !reference.is_well_formed()
@@ -40,6 +41,7 @@ pub(crate) async fn execute(
 
 pub(crate) async fn prepare_owner(home: &Path, agent: &str, reference: &CredentialRef,
     tool: &str, arguments: &Value) -> Result<Value, String> {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return Err("雲端硬碟寫入只能由主程式執行。".into()); }
     let body = serde_json::to_vec(&json!({"tool":tool, "arguments":arguments,
         "credential_ref":reference, "owner_prepare":true})).map_err(|_| "Google 請求無法編碼。")?;
     post_body(home, agent, body, NativeGoogleScope::Read, true).await
@@ -217,7 +219,12 @@ pub(crate) mod test_transport {
         );
         Guard(home)
     }
-    pub(super) fn invoke(home: &Path, body: &Value) -> Result<Value, String> {
+    pub(crate) fn installed(home: &Path) -> bool {
+        home.canonicalize()
+            .map(|home| handlers().lock().unwrap().contains_key(&home))
+            .unwrap_or(false)
+    }
+    pub(crate) fn invoke(home: &Path, body: &Value) -> Result<Value, String> {
         let home = home
             .canonicalize()
             .map_err(|_| "isolated execute home unavailable")?;

@@ -15,6 +15,11 @@ pub(crate) async fn handle_tools_call(
 ) -> Value {
     let caller_client_id = principal.client_id.as_str();
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(message) = drive_write_refusal(home_dir,
+        acting_agent_id(caller_client_id, default_agent), tool_name, principal,
+        &crate::mcp_isolation::process_lane()) {
+        return jsonrpc_error(id, -32003, &message);
+    }
     let arguments = params
         .get("arguments")
         .cloned()
@@ -1064,6 +1069,9 @@ impl GatewayHandler<'_> {
                 "content": [{"type": "text", "text": "Google Workspace 整合尚未啟用。請操作者在 dashboard 的 整合 → Google 頁面完成連線或儲存憑證（會自動啟用），或手動在 config.toml 加上 [integrations] google_workspace = true。"}],
                 "isError": true
             })
+        }
+        name if duduclaw_core::google_identity::is_drive_write_tool(name) => {
+            crate::mcp::google_owner_client::execute(home_dir, name, &arguments).await
         }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.owner_execution(home_dir) => {
             google_caller.execute_owner(home_dir, name, &arguments).await

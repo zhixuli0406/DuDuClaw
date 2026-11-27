@@ -294,6 +294,7 @@ pub use crate::runtime::ConversationTurn;
 // re-exports below.
 
 mod access_gate;
+pub(crate) mod attachment_gate;
 pub(crate) mod assembly;
 mod breaker_wait;
 mod ccr_delivery;
@@ -343,6 +344,8 @@ mod reply_origin;
 pub(crate) use reply_origin::testing::NoImplicitCloud;
 use reply_origin::{ReplyAttempt,ReplyFailure,ReplyOrigin,direct_api_allowed};
 #[cfg(test)]
-mod origin_tests;
+pub(crate) mod origin_tests;
+#[cfg(test)]
+pub(crate) mod entry_gate_test_helpers;
 
 pub(crate) mod group_buffer;

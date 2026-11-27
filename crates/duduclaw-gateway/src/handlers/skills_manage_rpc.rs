@@ -3,7 +3,8 @@
 //! restore removed skills.
 //!
 //! Permissions follow the employee profile files: Viewer of that employee (or
-//! an admin) may read, the employee's Owner (or an admin) may change. Every
+//! an admin) may read, the employee's Owner (or an admin) may change.
+//! Department Skills grants are an alternative for these operations. Every
 //! call re-reads the caller from `users.db`. A request naming several
 //! employees is refused as a whole when any one of them is out of reach.
 //!
@@ -16,6 +17,7 @@
 use super::*;
 
 use crate::agent_files::flow::require_live_agent_access;
+use crate::dept_grants::{department_grant_allows, record_grant_use, DeptGrantView, GrantAction, GrantGroup};
 use duduclaw_agent::{skill_archive, skill_state};
 use duduclaw_security::audit::{AuditEvent, Severity};
 
@@ -86,13 +88,39 @@ fn frame(r: Result<Value, String>) -> WsFrame {
 }
 
 impl MethodHandler {
-    /// Owner (or admin) of every employee in `agents`, read live.
-    fn require_owner_of_all(&self, ctx: &UserContext, agents: &[String]) -> Result<UserContext, String> {
+    /// Check every employee before writing; retain exactly the grant-only targets.
+    fn require_owner_of_all(
+        &self, ctx: &UserContext, agents: &[String], view: &DeptGrantView, action: GrantAction,
+    ) -> Result<(UserContext, Vec<String>), String> {
         let mut fresh: Option<UserContext> = None;
+        let mut granted = Vec::new();
         for a in agents {
-            fresh = Some(require_live_agent_access(&self.home_dir, ctx, a, AccessLevel::Owner)?);
+            let live = match require_live_agent_access(&self.home_dir, ctx, a, AccessLevel::Owner) {
+                Ok(live) => live,
+                Err(e) => {
+                    if !department_grant_allows(view, a, GrantGroup::Skills, action) {
+                        return Err(e);
+                    }
+                    // Same live identity source as require_live_agent_access;
+                    // failures remain closed even when the view has a grant.
+                    let live = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
+                        .map_err(|_| "permission denied".to_string())?;
+                    granted.push(a.clone());
+                    live
+                }
+            };
+            fresh = Some(live);
         }
-        fresh.ok_or_else(|| "no employee named".to_string())
+        Ok((fresh.ok_or_else(|| "no employee named".to_string())?, granted))
+    }
+
+    async fn audit_skill_grants(
+        &self, ctx: &UserContext, changed: &[String], granted: &[String],
+        action: GrantAction, method: &str,
+    ) {
+        for agent in changed.iter().filter(|agent| granted.contains(agent)) {
+            record_grant_use(self, ctx, agent, GrantGroup::Skills, action, method).await;
+        }
     }
 
     /// Rescan the registry so prompts pick up the change, and tell open
@@ -142,7 +170,8 @@ impl MethodHandler {
         let targets = parse_targets(params)?;
         let agents = agents_of(&targets);
         if expected_hash.is_some() && agents.len() != 1 { return Err(crate::admin_ai::proposal::STALE.into()); }
-        let fresh = self.require_owner_of_all(ctx, &agents)?;
+        let view = DeptGrantView::load(self, ctx).await;
+        let (fresh, granted) = self.require_owner_of_all(ctx, &agents, &view, GrantAction::Toggle)?;
         let mut state_hash = None;
         let mut results: Vec<Value> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
@@ -182,6 +211,7 @@ impl MethodHandler {
             }
         }
         if !changed.is_empty() {
+            self.audit_skill_grants(&fresh, &changed, &granted, GrantAction::Toggle, "skills.set_enabled").await;
             self.after_skill_change(if enabled { "enabled" } else { "disabled" }, &changed).await?;
         }
         let mut result = json!({ "results": results, "enabled": enabled });
@@ -197,7 +227,8 @@ impl MethodHandler {
     async fn skills_remove(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
         let targets = parse_targets(params)?;
         let agents = agents_of(&targets);
-        let fresh = self.require_owner_of_all(ctx, &agents)?;
+        let view = DeptGrantView::load(self, ctx).await;
+        let (fresh, granted) = self.require_owner_of_all(ctx, &agents, &view, GrantAction::Remove)?;
         let dirs = self.agent_skill_dirs(&agents).await?;
         let mut results: Vec<Value> = Vec::new();
         let mut changed: Vec<String> = Vec::new();
@@ -228,6 +259,7 @@ impl MethodHandler {
             }
         }
         if !changed.is_empty() {
+            self.audit_skill_grants(&fresh, &changed, &granted, GrantAction::Remove, "skills.remove").await;
             self.after_skill_change("removed", &changed).await?;
         }
         Ok(json!({ "results": results }))
@@ -249,24 +281,38 @@ impl MethodHandler {
 
     /// `skills.archived {agent_id}` — removed skills of one employee.
     pub(crate) async fn handle_skills_archived(&self, params: Value, ctx: &UserContext) -> WsFrame {
-        frame(self.skills_archived(&params, ctx))
+        frame(self.skills_archived(&params, ctx).await)
     }
 
-    fn skills_archived(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
+    async fn skills_archived(&self, params: &Value, ctx: &UserContext) -> Result<Value, String> {
         let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
         if !is_valid_agent_id(agent_id) {
             return Err("`agent_id` is required".into());
         }
-        let fresh = require_live_agent_access(&self.home_dir, ctx, agent_id, AccessLevel::Viewer)?;
+        let view = DeptGrantView::load(self, ctx).await;
+        let fresh = match require_live_agent_access(&self.home_dir, ctx, agent_id, AccessLevel::Viewer) {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                if !department_grant_allows(&view, agent_id, GrantGroup::Skills, GrantAction::Read) {
+                    return Err(e);
+                }
+                crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
+                    .map_err(|_| "permission denied".to_string())?
+            }
+        };
+        let (can_manage, can_restore) = super::skills_list_rpc::skill_management_flags(&fresh, &view, agent_id);
         let items = skill_archive::list(&self.home_dir, agent_id)?;
         Ok(json!({
             "agent_id": agent_id,
-            "can_restore": fresh.has_agent_access(agent_id, AccessLevel::Owner),
+            "can_manage": can_manage,
+            "can_restore": can_restore,
             "archived": items.iter().map(|m| json!({
                 "archive_id": m.archive_id,
                 "skill_name": m.skill_name,
                 "archived_at": m.archived_at,
                 "archived_by": m.archived_by,
+                "can_manage": can_manage,
+                "can_restore": can_restore,
             })).collect::<Vec<_>>(),
         }))
     }
@@ -283,7 +329,8 @@ impl MethodHandler {
             return Err("`agent_id` and `archive_id` are required".into());
         }
         let agents = vec![agent_id.to_string()];
-        let fresh = self.require_owner_of_all(ctx, &agents)?;
+        let view = DeptGrantView::load(self, ctx).await;
+        let (fresh, granted) = self.require_owner_of_all(ctx, &agents, &view, GrantAction::Restore)?;
         let dir = self.agent_skill_dirs(&agents).await?.remove(agent_id).ok_or("Agent not found")?;
         let m = skill_archive::restore(&self.home_dir, agent_id, &dir, archive_id)?;
         audit(
@@ -292,6 +339,7 @@ impl MethodHandler {
             agent_id,
             json!({ "agent_id": agent_id, "skill": m.skill_name, "archive_id": archive_id, "user_id": fresh.user_id }),
         );
+        self.audit_skill_grants(&fresh, &agents, &granted, GrantAction::Restore, "skills.restore").await;
         self.after_skill_change("restored", &agents).await?;
         Ok(json!({ "agent_id": agent_id, "skill_name": m.skill_name, "restored": true }))
     }

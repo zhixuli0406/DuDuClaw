@@ -795,6 +795,28 @@ pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Tab
     Ok(())
 }
 
+/// Drive write consent is issued only by the dedicated Admin dialog.
+/// Removing the complete section is the only permitted raw edit.
+pub(crate) fn refuse_drive_write_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    let new = super::config_commit::toml_at(after, "google.drive_write");
+    if new.is_some() && new != super::config_commit::toml_at(before, "google.drive_write") {
+        return Err("請到 Google 整合設定頁調整雲端硬碟寫入權限。".into());
+    }
+    Ok(())
+}
+
+/// Generic settings RPCs must not silently accept a misplaced consent edit.
+pub(crate) fn refuse_drive_write_params(params: &Value) -> Result<(), String> {
+    let forbidden = params.as_object().is_some_and(|object| object.keys().any(|key| {
+        let parts: Vec<_> = key.split('.').collect();
+        matches!(parts.as_slice(), ["google", "drive_write", ..] | ["drive_write", ..])
+    })) || params.get("google").and_then(Value::as_object).is_some_and(|object| {
+        object.keys().any(|key| key.split('.').next() == Some("drive_write"))
+    });
+    if forbidden { return Err("請到 Google 整合設定頁調整雲端硬碟寫入權限。".into()); }
+    Ok(())
+}
+
 /// RM-027 round 3: a raw `agent.toml` save that changes the org pair must
 /// not carry along a field the admin left alone while that field differs
 /// from the authority (the mirror drifted — possibly tampered by the
@@ -997,6 +1019,8 @@ impl MethodHandler {
         }
         if matches!(kind, RawFile::Config) {
             refuse_disclosure_ack_edit(&before, &after)?;
+            crate::google_signin::config::refuse_google_signin_widening(&before, &after)?;
+            refuse_drive_write_edit(&before, &after)?;
         }
         // B11 L3: the raw editor follows the same one-bot / one-app rule as
         // the dashboard bind, under the same lock.

@@ -471,7 +471,7 @@ pub(crate) async fn handle_agent_update(
         if let Some(agent) = after.get_mut("agent").and_then(toml::Value::as_table_mut) {
             agent.insert("reports_to".into(), toml::Value::String(v.into()));
         }
-        if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before, &after) {
+        if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before, &after, None) {
             return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true});
         }
         // Validate reports_to references an existing agent and won't create a cycle

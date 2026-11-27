@@ -136,6 +136,8 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod odoo_member_rpc;
+mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -160,7 +162,11 @@ mod widgets_custom;
 mod departments_rpc;
 mod org_change_rpc;
 mod users_rpc;
+mod dept_grants_rpc;
+mod main_access_rpc;
 mod user_invites_rpc;
+mod google_signin_rpc;
+mod google_signin_me_rpc;
 pub(crate) mod company_rpc;
 mod members_rpc;
 mod onboarding_rpc;
@@ -175,6 +181,7 @@ mod mcp_oauth;
 mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
+mod google_drive_write_rpc;
 mod google_identity_rpc;
 // v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
 mod google_tenant_settings_rpc;
@@ -244,7 +251,7 @@ mod dispatch_knowledge;
 mod dispatch_system;
 mod dispatch_org;
 mod dispatch_ops;
-pub(crate) mod config_commit;
+pub mod config_commit;
 mod config_schema;
 mod system_update_config_v168;
 mod tick_sources_rpc;
@@ -336,6 +343,9 @@ pub struct MethodHandler {
     /// Test seam: the agent cap `effective_agent_cap` returns (RM-149 tests).
     #[cfg(test)]
     agent_cap_fixture: RwLock<Option<usize>>,
+    /// Isolated cost ledger for RPC tests; production keeps the singleton.
+    #[cfg(test)]
+    cost_telemetry_fixture: std::sync::OnceLock<crate::cost_telemetry::CostTelemetry>,
     /// Active interactive CLI-login sessions ("Dashboard 一鍵登入"), keyed by
     /// session id. Each drives a CLI's native login command in a PTY.
     cli_auth_sessions: RwLock<std::collections::HashMap<String, (String, Arc<crate::cli_auth::AuthSession>)>>,
@@ -711,6 +721,15 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_my_memory_rpc(method, params, ctx)).await;
         }
 
+        // Google sign-in administration must never reach extension handlers.
+        // The role floor also covers unknown operations in reserved namespaces.
+        if let Some(role) = gates::google_signin_minimum_role(method) {
+            if acl::require_role(ctx, role).is_err() {
+                return google_signin_rpc::signin_error("signin_admin_required");
+            }
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
+        }
+
         // Invitations are gateway-owned authentication methods. An extension
         // must never replace their Admin checks or inspect a returned link.
         // Reserved namespace fallbacks are Admin-only and stay in core dispatch,
@@ -745,6 +764,11 @@ impl MethodHandler {
         // this branch is embedded in the shared dispatcher future.
         if method.split('.').next() == Some("mcp_keys") {
             return boxed_frame(|| self.route_mcp_keys_rpc(method, params, ctx)).await;
+        }
+
+        // Personal Odoo secrets never pass through extension dispatch.
+        if odoo_member_rpc::owns(method) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route

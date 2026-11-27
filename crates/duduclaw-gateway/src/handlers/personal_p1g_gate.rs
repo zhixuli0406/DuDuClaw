@@ -156,6 +156,14 @@ pub(crate) fn metadata_allowlisted(method: &str) -> bool {
         "agents.status" | "presets.status" | "agents.avatar" | "agents.pause" | "agents.resume"
             | "autonomy.pause" | "autonomy.resume" | "autonomy.status" | "agents.list"
             | "users.list" | "users.me" | "approvals.list" | "approvals.get"
+            // Department authority is metadata, not employee content. mine
+            // checks owner-only access itself, including its drift metadata.
+            // Do not strip department/group strings that happen to equal an agent id.
+            | "users.dept_grants.list" | "users.dept_grants.set"
+            | "users.dept_grants.options" | "users.dept_grants.mine"
+            | "users.dept_grants.reach_preview"
+            // Admin-only person-list metadata, never employee content.
+            | "agents.main_access.get" | "agents.main_access.set"
     ) || LIFECYCLE_ALLOWLIST.iter().any(|(listed, _)| *listed == method)
 }
 

@@ -397,11 +397,14 @@ impl ApprovalBroker {
             };
             if !crate::admin_ai::may_decide(&home, &rec, &user) { return Err(crate::admin_ai::REFUSAL.into()); }
         }
-        if crate::google_identity::chat_send::is_member_card(&rec) {
+        if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
-            if !crate::google_identity::chat_send::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
+            if !crate::google_identity::member_card::eligible(&home, &rec) { return Err("Chat confirmation changed".into()); }
+            if matches!(authority, BoundAuthority::ChatAdmin(_)) {
+                return Err("Only the requesting member may confirm".into());
+            }
             if let BoundAuthority::Dashboard(ctx) = authority {
-                if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+                if !crate::google_identity::member_card::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
             } else if rec.binding.as_ref().is_none_or(|b| b.conversation_audience != super::ConversationAudience::Private) {
                 return Err("Confirm privately in My Connections".into());
             }
@@ -551,9 +554,9 @@ impl ApprovalBroker {
             let home = self.home_dir().ok_or(crate::admin_ai::REFUSAL)?;
             if !crate::admin_ai::may_decide(&home, &rec, &ctx.user_id) { return Err(crate::admin_ai::REFUSAL.into()); }
         }
-        if crate::google_identity::chat_send::is_member_card(&rec) {
+        if crate::google_identity::member_card::is_member_card(&rec) {
             let home = self.home_dir().ok_or("Chat confirmation home unavailable")?;
-            if !crate::google_identity::chat_send::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
+            if !crate::google_identity::member_card::may_decide(&home, &rec, &ctx.user_id) { return Err("Only the requesting member may confirm".into()); }
             let context = rec.binding.as_ref().ok_or("binding missing")?.decision_context.clone();
             return self.resolve_bound(id, &context, RequestKind::Approval,
                 if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied }, None, BoundAuthority::Dashboard(ctx)).await;

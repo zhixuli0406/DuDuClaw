@@ -103,6 +103,12 @@ impl Wire {
         mut hook: Option<Box<dyn FnOnce() + Send>>,
     ) -> Self {
         let home = home.canonicalize().unwrap();
+        // Successful fixture responses declare the actual grant explicitly.
+        let actual_scope = std::fs::read(home.join("mcp-oauth-tokens.json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|rows| rows.as_array()?.iter().find(|row| row["provider_id"] == "google")?["scopes"]
+                .as_array()?.iter().map(|v| v.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>())
+            .unwrap_or_default().join(" ");
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
@@ -201,7 +207,7 @@ impl Wire {
                     // limit incidentally rejecting this response.
                     let body = serde_json::to_vec(&serde_json::json!({
                         "access_token":"owned-access", "refresh_token":"owned-refresh",
-                        "token_type":"Bearer", "expires_in":3600,
+                        "token_type":"Bearer", "expires_in":3600, "scope":actual_scope,
                         "ignored_padding":"A".repeat(4 * 1024 * 1024 + 4096)
                     }))
                     .unwrap();
@@ -224,7 +230,7 @@ impl Wire {
                     let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n100\r\n{}");
                     continue;
                 }
-                let mut payload=body.clone().unwrap_or_else(||serde_json::json!({"access_token":"owned-access","refresh_token":"owned-refresh","token_type":"Bearer","expires_in":3600}));
+                let mut payload=body.clone().unwrap_or_else(||serde_json::json!({"access_token":"owned-access","refresh_token":"owned-refresh","token_type":"Bearer","expires_in":3600,"scope":actual_scope}));
                 if scenario == "invalid_grant" {
                     payload = serde_json::json!({"error":"invalid_grant","error_description":"secret-provider-description"});
                 }

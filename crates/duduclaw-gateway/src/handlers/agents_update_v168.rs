@@ -619,7 +619,7 @@ skill_security_scan = true
         table_at_mut(&mut after, &["agent"]).unwrap().insert("department".into(), toml::Value::String("ops".into()));
         let diff = authority_diff(&before, &after);
         let keys: Vec<&str> = diff.iter().map(|d| d.key.as_str()).collect();
-        assert_eq!(keys, vec!["agent.department", "capabilities"]);
+        assert_eq!(keys, vec!["agent.department", "capabilities.git_credentials"]);
         // Permission flags: absent reads as allowed, so an explicit `true`
         // is no change but an explicit `false` is.
         let mut perm = before.clone();

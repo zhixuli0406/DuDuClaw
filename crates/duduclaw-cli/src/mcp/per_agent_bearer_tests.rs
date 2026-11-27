@@ -43,7 +43,7 @@ fn home() -> tempfile::TempDir {
         std::fs::create_dir_all(dir.join("state")).unwrap();
         std::fs::write(
             dir.join("agent.toml"),
-            format!("[agent]\nname = \"{agent} display\"\nstatus = \"active\"\n"),
+            format!("[agent]\nname = \"{agent} display\"\nstatus = \"active\"\n[model]\npreferred = \"claude-sonnet-4-6\"\n"),
         )
         .unwrap();
     }

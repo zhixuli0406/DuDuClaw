@@ -32,7 +32,7 @@ use std::path::Path;
 
 #[path = "google_identity/tools.rs"]
 mod tools;
-pub use tools::{NATIVE_GOOGLE_TOOLS, NativeGoogleScope, native_google_scope};
+pub use tools::{DRIVE_WRITE_TOOLS, is_drive_write_tool, NATIVE_GOOGLE_TOOLS, NativeGoogleScope, native_google_scope};
 #[path = "google_identity/credentials.rs"]
 mod credentials;
 pub use credentials::{CredentialKind, CredentialRef};

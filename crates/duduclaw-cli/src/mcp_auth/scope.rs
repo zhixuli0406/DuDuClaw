@@ -126,6 +126,10 @@ pub enum Scope {
     /// dashboard; not externally grantable (same reason as
     /// [`Scope::KnowledgeRead`]).
     KnowledgeWrite,
+    /// Personal-key task visibility, never the server employee's task board.
+    TasksRead,
+    /// Personal-key employee visibility, never the server employee's identity.
+    AgentsStatus,
     Admin,
 }
 
@@ -160,6 +164,8 @@ impl std::fmt::Display for Scope {
             Scope::DiscoveryExecute => "discovery:execute",
             Scope::KnowledgeRead => "knowledge:read",
             Scope::KnowledgeWrite => "knowledge:write",
+            Scope::TasksRead => "tasks:read",
+            Scope::AgentsStatus => "agents:status",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -202,6 +208,8 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "discovery:execute" => Scope::DiscoveryExecute,
         "knowledge:read" => Scope::KnowledgeRead,
         "knowledge:write" => Scope::KnowledgeWrite,
+        "tasks:read" => Scope::TasksRead,
+        "agents:status" => Scope::AgentsStatus,
         "admin" => Scope::Admin,
         _ => return None,
     })
@@ -252,6 +260,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => Some(Scope::KnowledgeRead),
         // Proposing a source: always approval-gated by the gateway route.
         "knowledge_add_source" => Some(Scope::KnowledgeWrite),
+        "my_tasks_list" => Some(Scope::TasksRead),
+        "my_agents_status" => Some(Scope::AgentsStatus),
         // ── Memory: read family ──────────────────────────────────────────
         "memory_search"
         | "memory_read"

@@ -24,7 +24,8 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
     MemberContractMethod {
         name: "users.me", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read the signed-in account and direct bindings",
-        key_fields: &["user", "bindings", "email_setup"],
+        // Department grants are always empty for member-key authentication.
+        key_fields: &["user", "bindings", "email_setup", "dept_grants"],
     },
     MemberContractMethod {
         name: "about.get", since: "1.85.0", kind: MemberContractKind::Read,
@@ -337,6 +338,14 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
         key_fields: &[],
     },
     MemberContractMethod {
+        name: "me.google.write_confirmations", since: "1.86.0", kind: MemberContractKind::Read,
+        summary_en: "Read only your pending Google Drive write confirmations", key_fields: &["requests"],
+    },
+    MemberContractMethod {
+        name: "me.google.write_confirm", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Confirm or cancel your single Google Drive write", key_fields: &["decided"],
+    },
+    MemberContractMethod {
         name: "me.google.chat_confirmations", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read only your pending Google Chat confirmations", key_fields: &["requests"],
     },
@@ -347,7 +356,17 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
     MemberContractMethod {
         name: "me.google.status", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read personal Google connection and consent status (Enterprise)",
-        key_fields: &["connection", "login_email", "client_configured", "chat_read", "chat_send", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
+        key_fields: &["connection", "drive_write", "enabled_by_admin", "login_email", "client_configured", "chat_read", "chat_send", "integration_enabled", "requests", "delegated", "requires_login", "recent_usage"],
+    },
+    MemberContractMethod {
+        name: "me.google.write_connect_start", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Start separate personal Google Drive write authorization (browser session only)",
+        key_fields: &[],
+    },
+    MemberContractMethod {
+        name: "me.google.write_disconnect", since: "1.86.0", kind: MemberContractKind::Write,
+        summary_en: "Remove the local Google Drive write connection (browser session only)",
+        key_fields: &["disconnected", "provider_note"],
     },
     MemberContractMethod {
         name: "me.google.connect_start", since: "1.85.0", kind: MemberContractKind::Write,
@@ -425,15 +444,36 @@ pub(crate) fn member_key_agent_update_params(params: &serde_json::Value) -> Resu
     visit(params, "")
 }
 
+/// Reads that can expose the holder's conversation content or derived memory.
+pub(crate) const MEMBER_KEY_CONVERSATION_METHODS: &[&str] = &[
+    "chat.sessions.list", "chat.sessions.history", "chat.sessions.restore",
+    "knowledge.citations.for_session", "memory.search", "memory.browse",
+    "memory.key_facts", "memory.history", "me.memory.list",
+];
+
+/// HTTP reads of conversation content. Knowledge originals are collection documents;
+/// uploads, voice transforms, users.me and task creation do not read stored conversations.
+pub(crate) const MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS: &[&str] = &[
+    "http.chat.attachment",
+];
+
 /// Contract membership is necessary, never sufficient: existing ACL and
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {
     let excluded = matches!(method, "users.change_password" | "users.change_email"
-        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm")
+        | "me.google.write_connect_start" | "me.google.write_disconnect"
+        | "me.google.disconnect" | "me.google.consents.set" | "me.google.chat_confirm"
+        | "google.signin.get" | "google.signin.set"
+        | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+        | "users.google_signin.attest" | "users.google_signin.unlink"
+        | "users.signin_onboarding.retry_avatar"
+        | "me.google.write_confirmations" | "me.google.write_confirm")
         || matches!(method.split('.').next(), Some("mfa" | "sessions" | "config" | "member_keys"))
+        || method.split('.').take(2).eq(["me", "google_signin"])
         || method.split('.').take(2).eq(["me", "status_tokens"])
         || method.split('.').take(2).eq(["me", "member_keys"])
         || method.split('.').take(2).eq(["me", "chat_link"])
+        || method.split('.').take(2).eq(["me", "odoo"])
         || method.strip_prefix("me.google.").is_some_and(|op| op.starts_with("connect_"));
     if excluded { return None; }
     MEMBER_CONTRACT_METHODS.iter().find(|entry| entry.name == method).map(|entry| entry.kind)
@@ -455,8 +495,11 @@ mod member_key_tests {
     fn keys_use_contract_intersected_with_credential_exclusions() {
         for method in ["users.change_password", "users.change_email", "me.status_tokens.list",
             "me.member_keys.create", "me.google.connect_start", "me.google.disconnect",
+            "me.google.write_connect_start", "me.google.write_disconnect",
             "me.google.consents.set", "sessions.list", "mfa.status", "config.get",
-            "system.update_config", "agents.delete", "unknown.method"] {
+            "system.update_config", "agents.delete", "unknown.method",
+            "me.odoo.status", "me.odoo.connect", "me.odoo.test", "me.odoo.disconnect",
+            "me.odoo.future", "me.member_keys.narrow", "member_keys.admin_narrow"] {
             assert_eq!(member_key_method(method), None, "{method}");
         }
         assert_eq!(member_key_method("tasks.create"), Some(MemberContractKind::Write));

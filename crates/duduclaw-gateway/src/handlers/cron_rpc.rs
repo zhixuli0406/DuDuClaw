@@ -59,7 +59,13 @@ impl MethodHandler {
         };
         match store.list_all().await {
             Ok(rows) => {
-                let tasks: Vec<Value> = rows.iter().map(Self::cron_row_to_json).collect();
+                let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
+                let tasks: Vec<Value> = rows.iter().map(|row| {
+                    let mut value = Self::cron_row_to_json(row);
+                    value["creator_access_lost"] = json!(display.display_creator_access_lost(
+                        row.created_by_user_id.as_deref(), &row.agent_id));
+                    value
+                }).collect();
                 WsFrame::ok_response("", json!({ "tasks": tasks }))
             }
             Err(e) => WsFrame::error_response("", &format!("list cron tasks: {e}")),

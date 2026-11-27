@@ -140,6 +140,33 @@ pub(super) async fn persist_failure_notice(
     }
 }
 
+/// Render both entry and late alignment refusals from the same fixed text.
+/// The late gate can still refuse if settings change after entry preflight.
+pub(super) async fn entry_refusal_text(
+    ctx: &ReplyContext, sid: &str, agent: &str, turn: &str,
+    error: &crate::entry_gate::EntryRefusal,
+) -> String {
+    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
+    let base = error.user_text(sid, language.as_deref(), turn);
+    let fallback_note = if error.code() == "model_provider_mismatch"
+        && !crate::channel_reply::assembly::public_session(sid)
+        && crate::runtime_config::agent_runtime_fallback(
+        &ctx.home_dir.join("agents").join(agent)).is_some() {
+        let language = language.as_deref().unwrap_or("zh-TW");
+        let sentence = if language == "en" || language == "en_US" || language.starts_with("en-") {
+            "A fallback runtime is configured, but it was not used because the model setting itself is incorrect."
+        } else if matches!(language, "ja" | "ja-JP" | "ja_JP") {
+            "予備の実行エンジンは設定されていますが、モデル設定自体が誤っているため切り替えませんでした。"
+        } else if matches!(language, "zh-CN" | "zh_CN") {
+            "已设置备用引擎，但模型设置本身有误，因此没有切换。"
+        } else {
+            "已設定備援引擎，但模型設定本身有誤，因此沒有切換。"
+        };
+        format!("\n{sentence}")
+    } else { String::new() };
+    format!("{base}{fallback_note}")
+}
+
 /// Alignment refusals carry a fixed, specific code on the live transport and
 /// in the stored notice. Only a post-persist error can add that notice.
 pub(super) async fn model_alignment_gate(
@@ -148,32 +175,19 @@ pub(super) async fn model_alignment_gate(
 ) -> Result<(), String> {
     // v1.84.0: a bare Claude alias on a prefixed non-Claude engine runs with
     // that engine's default (the runtime layer substitutes it the same way).
-    let runnable = crate::runtime_config::runnable_model(agent, model, provider);
-    let result = crate::runtime_config::ensure_model_provider(&runnable, provider);
+    let result = crate::entry_gate::check_model(agent, model, provider);
     if result.is_err() {
         if generation.is_some() {
             persist_failure_notice(ctx, sid, agent, turn, TurnFailureReason::ModelProviderMismatch, generation).await;
         }
     }
     match result {
-        Ok(()) => Ok(()),
+        Ok(_) => Ok(()),
         Err(error) => {
-            tracing::warn!(agent, %error, "model/provider alignment refused");
-            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
-            let reason = TurnFailureReason::ModelProviderMismatch;
-            Err(format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn)))
+            tracing::warn!(agent, ?error, "model/provider alignment refused");
+            Err(entry_refusal_text(ctx, sid, agent, turn, &error).await)
         }
     }
-}
-
-/// The turn's refusal when the employee's provider/model pair could not be
-/// read strictly (`runtime_config::load_runtime_settings_strict`). Fixed
-/// sentence + specific code only; the path and parser text are already in the
-/// gateway log. Runs before any session row exists, so nothing is persisted.
-pub(super) async fn agent_config_refusal(ctx: &ReplyContext, agent: &str, turn: &str) -> String {
-    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
-    let reason = TurnFailureReason::AgentConfigUnreadable;
-    format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn))
 }
 
 pub(super) async fn active_provider_gate(

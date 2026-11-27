@@ -82,6 +82,11 @@ impl MethodHandler {
 
         // Build the [odoo] section
         let mut odoo = toml::map::Map::new();
+        // This dedicated switch is changed only through its audited RPC (or
+        // explicit config editing), never reset by the connection form.
+        if let Some(value) = table.get("odoo").and_then(|v| v.get("member_credentials")) {
+            odoo.insert("member_credentials".into(), toml::Value::Boolean(value.as_bool() == Some(true)));
+        }
         odoo.insert(
             "allow_private_network".into(),
             toml::Value::Boolean(allow_private),

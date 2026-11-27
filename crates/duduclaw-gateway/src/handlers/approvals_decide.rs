@@ -239,12 +239,20 @@ impl MethodHandler {
             if let Err(error) = crate::approval::check_expected_digest(rec) {
                 return WsFrame::error_response("", &error);
             }
+            let session = "dashboard:approval";
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, session).await {
+                return WsFrame::error_response("", &text);
+            }
             if let Err(e) = Box::pin(broker.decide_bound_dashboard(&approval_id, &decider, approve))
                 .await
             {
                 return WsFrame::error_response("", &e);
             }
             self.audit_activation_decision(rec, &decider, approve);
+            let decider_name = self.user_display_name(&ctx.user_id).await;
+            crate::approval_notify::spawn_dashboard_collapse(
+                self.home_dir.clone(), rec.clone(), approve, decider_name,
+            );
             return WsFrame::ok_response(
                 "",
                 json!({
@@ -260,9 +268,10 @@ impl MethodHandler {
                 home: self.home_dir.clone(), registry: Some(self.registry.clone()),
                 broker: broker.clone(), users: self.user_db.read().await.clone(),
             };
-            return match Box::pin(crate::approval::decision_service::decide(
+            return match Box::pin(crate::approval::decision_service::decide_with_reach(
                 &env, &approval_id, approve, &reason,
                 &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+                params["reach_digest"].as_str(),
             )).await {
                 Ok(outcome) => WsFrame::ok_response("", outcome.value),
                 Err(error) => error.dashboard_frame(),
@@ -314,6 +323,11 @@ impl MethodHandler {
             .await
             {
                 return WsFrame::error_response("", &error);
+            }
+        }
+        if let Some(rec) = &record {
+            if let Err(text) = crate::entry_gate::check_approval_start(&self.home_dir, rec, approve, "dashboard:approval").await {
+                return WsFrame::error_response("", &text);
             }
         }
         let decided_by = format!("dashboard:{}", ctx.user_id);
