@@ -32,7 +32,7 @@ impl Settings {
 pub(super) struct Decision {
     pub identity: IdentityKind,
     pub permission: EffectiveMode,
-    pub personal: Option<(String, UnsealedOdooCredential)>,
+    pub personal: Option<(String, UnsealedOdooCredential, String, String, String)>,
 }
 
 impl Decision {
@@ -45,13 +45,16 @@ impl Decision {
         }
     }
     pub fn user_id(&self) -> Option<&str> {
-        self.personal.as_ref().map(|(user, _)| user.as_str())
+        self.personal.as_ref().map(|(user, ..)| user.as_str())
     }
     pub fn response(self, have_rev: Option<i64>) -> Value {
         let mut value = json!({"ok":true,"identity":self.identity_name(),"permission":match self.permission {
             EffectiveMode::Follow => "follow", EffectiveMode::Engine => "engine", EffectiveMode::ReadOnly => "read_only",
         }});
-        if let Some((user, credential)) = self.personal {
+        if let Some((user, credential, url, db, server_fp)) = self.personal {
+            value["url"] = json!(url);
+            value["db"] = json!(db);
+            value["server_fp"] = json!(server_fp);
             value["user_id"] = json!(user);
             value["odoo_uid"] = json!(credential.odoo_uid);
             value["login"] = json!(credential.login);
@@ -76,7 +79,7 @@ fn personal(home: &Path, db: &UserDb, user: &str, settings: &Settings,
         .map_err(|_| Refusal::unavailable())? else { return Ok(None); };
     db.odoo_credential_touch(user).map_err(|_| Refusal::unavailable())?;
     Ok(Some(Decision { identity: IdentityKind::Personal, permission,
-        personal: Some((user.to_owned(), credential)) }))
+        personal: Some((user.to_owned(), credential, server.url.clone(), server.db.clone(), server.fp.clone())) }))
 }
 
 /// Reverse avatar lookup with the live active-member and owner/operator gates.

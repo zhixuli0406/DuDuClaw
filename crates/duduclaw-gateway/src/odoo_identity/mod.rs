@@ -13,7 +13,7 @@
 //! no employee engine table for a person key. MCP must still enforce Odoo
 //! account ACLs, always-refuse rules and F1–F5, as well as the key's scopes.
 //!
-//! 200: {ok:true,identity,permission,user_id?,odoo_uid?,login?,rev?,secret?}.
+//! 200: {ok:true,identity,permission,user_id?,odoo_uid?,login?,rev?,url?,db?,server_fp?,secret?}.
 //! Only personal responses carry metadata, and secret appears only when the
 //! caller's have_rev differs. Refusals: {ok:false,code,message}; 400 malformed
 //! body/tool, 401 authentication, 403 policy/not-connected/scope, 429 rate,

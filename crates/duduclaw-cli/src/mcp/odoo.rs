@@ -661,6 +661,10 @@ async fn handle_odoo_tool_with_connector(
         _ => Err(format!("Unknown Odoo tool: {tool}")),
     };
 
+    let raw_result = match &result { Ok(text) | Err(text) => text.as_str() };
+    identity_client::audit_result(home_dir, caller_agent, tool, params, result.is_ok(),
+        raw_result, follow || actor.employee().is_none());
+
     let result = result.map(|text| {
         let verb = match tool {
             "odoo_crm_create_lead" | "odoo_sale_create_quotation" => Some("create"),
@@ -672,38 +676,6 @@ async fn handle_odoo_tool_with_connector(
             super::odoo_access::identity_suffix(decision.as_ref(), verb)))
     });
 
-    // RFC-21 §2 acceptance: per-call audit attribution. tool_calls.jsonl
-    // now carries the originating agent + profile + outcome so Odoo
-    // activity can be traced to the agent that triggered it (and not the
-    // shared admin user inside Odoo's own audit log).
-    let params_summary = format!(
-        "profile={}; tool={}; ok={}",
-        _audit_profile,
-        tool,
-        result.is_ok(),
-    );
-    // B3b: `odoo_*` deliberately stays out of the central `is_state_changing`
-    // dispatch gate (see the comment on that list — it audits itself here to
-    // avoid double-logging), so it needs its own `result_text` capture. Odoo
-    // reads (partner search, schema fields, ...) return real business data
-    // in `Ok(text)` — exactly the kind of evidence B3's grounding pre-check
-    // needs, and it was silently excluded before this change. Error text is
-    // captured too (masked/capped inside the helper); `check_grounded`
-    // already excludes `is_error` evidence, so this never lets a failed
-    // Odoo call masquerade as grounding.
-    let result_text = match &result {
-        Ok(text) => text.clone(),
-        Err(e) if follow => super::odoo_access::error_text(e, decision.as_ref()),
-        Err(e) => e.clone(),
-    };
-    identity_client::audit_call(
-        home_dir,
-        caller_agent,
-        tool,
-        &params_summary,
-        result.is_ok(),
-        Some(&result_text),
-    );
 
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
@@ -964,48 +936,51 @@ async fn connect_odoo_pool_inner(
 /// cannot select a person or authorize reuse without another gateway response.
 async fn select_odoo_identity(home: &Path, pool: &OdooState, agent: &str, tool: &str,
     cache: &mut IdentityCache) -> std::result::Result<OdooIdentity, String> {
-    let have_rev = cache.entries.iter().rev().find(|(a, _, _, _)| a == agent).map(|(_, _, rev, _)| *rev);
+    let have_rev = cache.entries.iter().rev().find(|(a, ..)| a == agent).map(|(_, _, rev, _, _)| *rev);
     let result = identity_client::request_identity(home, agent, tool, have_rev).await;
     let mut identity = match result {
         Ok(identity) => identity,
         Err(error) => {
-            let old: Vec<_> = cache.entries.iter().filter(|(a, _, _, _)| a == agent)
-                .map(|(a, user, rev, _)| (a.clone(), format!("person:{user}:{rev}"))).collect();
-            cache.entries.retain(|(a, _, _, _)| a != agent);
+            let old: Vec<_> = cache.entries.iter().filter(|(a, ..)| a == agent)
+                .map(|(a, user, rev, fp, _)| (a.clone(), format!("person:{user}:{rev}:{fp}"))).collect();
+            cache.entries.retain(|(a, ..)| a != agent);
             for key in old { pool.drop_slot(&key).await; }
             identity_client::audit_call(home, agent, tool, "identity refused", false, None);
             return Err(error.message);
         }
     };
     if identity.kind == IdentityKind::Personal {
-        // Two different people may have the same revision number. An omitted
-        // secret can only be filled from the exact (agent, person, rev) entry.
+        // Revision alone is not a credential binding: include person and server.
         if identity.secret.is_none() {
-            identity.secret = cache.entries.iter().find(|(a, u, r, _)|
-                a == agent && Some(u) == identity.user_id.as_ref() && Some(*r) == identity.rev)
-                .map(|(_, _, _, secret)| secret.clone());
+            identity.secret = cache.entries.iter().find(|(a, u, r, fp, _)|
+                a == agent && Some(u) == identity.user_id.as_ref() && Some(*r) == identity.rev
+                    && Some(fp) == identity.server_fp.as_ref())
+                .map(|(_, _, _, _, secret)| secret.clone());
             if identity.secret.is_none() {
                 let delivered = identity_client::request_identity(home, agent, tool, None).await.map_err(|e| e.message)?;
-                if delivered.kind != IdentityKind::Personal || delivered.user_id != identity.user_id {
+                if delivered.kind != IdentityKind::Personal || delivered.user_id != identity.user_id
+                    || delivered.server_fp != identity.server_fp || delivered.rev != identity.rev {
                     return Err("Odoo 身分在確認期間已變更，這次操作尚未執行。".into());
                 }
                 identity = delivered;
             }
         }
-        if identity.kind == IdentityKind::Personal {
-            let user = identity.user_id.as_deref().ok_or("Missing Odoo user")?;
-            let rev = identity.rev.ok_or("Missing Odoo revision")?;
-            let secret = identity.secret.clone().ok_or("Missing Odoo credential")?;
-            let old: Vec<_> = cache.entries.iter().filter(|(a, u, r, _)| a == agent && u == user && *r != rev)
-                .map(|(a, u, r, _)| (a.clone(), format!("person:{u}:{r}"))).collect();
-            cache.entries.retain(|(a, u, _, _)| !(a == agent && u == user));
-            for key in old { pool.drop_slot(&key).await; }
-            cache.entries.push((agent.to_owned(), user.to_owned(), rev, secret));
-            if cache.entries.len() > 32 {
-                let (a, u, r, _) = cache.entries.remove(0);
-                pool.drop_slot(&(a, format!("person:{u}:{r}"))).await;
-            }
+        let user = identity.user_id.as_deref().ok_or("Missing Odoo user")?;
+        let rev = identity.rev.ok_or("Missing Odoo revision")?;
+        let (_, _, fp) = identity.personal_endpoint()?;
+        let secret = identity.secret.clone().ok_or("Missing Odoo credential")?;
+        let old: Vec<_> = cache.entries.iter().filter(|(a, u, r, f, _)|
+            a == agent && u == user && (*r != rev || f != fp))
+            .map(|(a, u, r, f, _)| (a.clone(), format!("person:{u}:{r}:{f}"))).collect();
+        cache.entries.retain(|(a, u, ..)| !(a == agent && u == user));
+        for key in old { pool.drop_slot(&key).await; }
+        cache.entries.push((agent.to_owned(), user.to_owned(), rev, fp.to_owned(), secret));
+        if cache.entries.len() > 32 {
+            let (a, u, r, f, _) = cache.entries.remove(0);
+            pool.drop_slot(&(a, format!("person:{u}:{r}:{f}"))).await;
         }
+        identity_client::record(&identity);
+        return Ok(identity); // Never select a personal endpoint from local config.
     }
     identity_client::record(&identity);
     // Re-read the effective artifact on every decision. Missing/malformed

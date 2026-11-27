@@ -359,13 +359,13 @@ pub fn fixed_refusal(op: &OdooOp<'_>) -> Option<FixedRefusal> {
     {
         return Some(FixedRefusal::F1);
     }
-    if modifies && matches!(op.model, "ir.model" | "ir.model.fields" | "ir.model.access" | "ir.rule") {
+    if modifies && (op.model == "ir.model" || descendant(op.model, "ir.model") || op.model == "ir.rule") {
         return Some(FixedRefusal::F2);
     }
     if modifies && (op.model == "res.users.apikeys" || descendant(op.model, "res.users.apikeys")) {
         return Some(FixedRefusal::F3);
     }
-    if (modifies && matches!(op.model, "mail.mail" | "mail.compose.message" | "mail.followers" | "mail.template"))
+    if (modifies && (op.model == "mail" || descendant(op.model, "mail")))
         || (op.tool == ToolKind::Generic
             && matches!(op.method, "message_post" | "message_notify" | "message_subscribe" | "send_mail" | "action_send_mail"))
     {

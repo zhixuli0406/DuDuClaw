@@ -160,14 +160,103 @@ fn open_file(_: &Path, _: &str, _: &str) -> AttachmentResult<OpenedAttachment> {
     Err("Safe attachment file access is unavailable on this platform".into())
 }
 
+// Structural screening only; this is not an antivirus scan or a full decoder.
+fn png_valid(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") { return false; }
+    let mut offset = 8usize;
+    let mut first = true;
+    let mut saw_data = false;
+    while let Some(header) = bytes.get(offset..).and_then(|b| b.get(..8)) {
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        let Some(end) = offset.checked_add(12).and_then(|n| n.checked_add(length)) else { return false };
+        let Some(chunk) = bytes.get(offset..end) else { return false };
+        let kind = &header[4..8];
+        if !kind.iter().all(u8::is_ascii_alphabetic) { return false; }
+        if first && (kind != b"IHDR" || length != 13) { return false; }
+        if !first && kind == b"IHDR" { return false; }
+        first = false;
+        // PNG uses the standard reflected CRC-32 over type and data.
+        let mut crc = !0u32;
+        for byte in &chunk[4..chunk.len() - 4] {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 { crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1))); }
+        }
+        if !crc != u32::from_be_bytes(chunk[chunk.len() - 4..].try_into().unwrap()) { return false; }
+        if kind == b"IDAT" { saw_data = true; }
+        if kind == b"IEND" { return length == 0 && saw_data && end == bytes.len(); }
+        offset = end;
+    }
+    false
+}
+
+fn jpeg_valid(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"\xff\xd8") || !bytes.ends_with(b"\xff\xd9") { return false; }
+    let mut offset = 2usize;
+    let mut scan = false;
+    let mut saw_scan = false;
+    while offset < bytes.len() {
+        if bytes[offset] != 0xff {
+            if !scan { return false; }
+            offset += 1;
+            continue;
+        }
+        while bytes.get(offset) == Some(&0xff) { offset += 1; }
+        let Some(&marker) = bytes.get(offset) else { return false };
+        offset += 1;
+        match marker {
+            0x00 | 0xd0..=0xd7 if scan => continue,
+            0xd9 => return saw_scan && offset == bytes.len(),
+            0x00 | 0xd0..=0xd8 => return false,
+            0x01 => continue,
+            _ => (),
+        }
+        let Some(length) = bytes.get(offset..).and_then(|b| b.get(..2)) else { return false };
+        let length = u16::from_be_bytes(length.try_into().unwrap()) as usize;
+        if length < 2 { return false; }
+        let Some(end) = offset.checked_add(length).filter(|n| *n <= bytes.len()) else { return false };
+        offset = end;
+        scan = marker == 0xda;
+        saw_scan |= scan;
+    }
+    false
+}
+
+fn pdf_valid(bytes: &[u8]) -> bool {
+    if !bytes.starts_with(b"%PDF-") { return false; }
+    for token in [b"/JavaScript".as_slice(), b"/JS", b"/Launch", b"/EmbeddedFile",
+        b"/OpenAction", b"/AA", b"/RichMedia", b"/XFA"] {
+        if bytes.windows(token.len()).any(|w| w == token) { return false; }
+    }
+    let tail = &bytes[bytes.len().saturating_sub(1024)..];
+    tail.windows(5).rposition(|w| w == b"%%EOF")
+        .is_some_and(|end| tail[end + 5..].iter().all(u8::is_ascii_whitespace))
+}
+
+fn display_name_matches(name: &str, mime: &str) -> bool {
+    let extension = Path::new(name).extension().and_then(|s| s.to_str()).unwrap_or("").to_ascii_lowercase();
+    match mime {
+        "application/pdf" => extension == "pdf",
+        "image/png" => extension == "png",
+        "image/jpeg" => matches!(extension.as_str(), "jpg" | "jpeg"),
+        "image/webp" => extension == "webp",
+        "text/plain" => extension == "txt",
+        "text/csv" => extension == "csv",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => extension == "xlsx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => extension == "docx",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation" => extension == "pptx",
+        _ => false,
+    }
+}
+
 fn mimetype(file: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
     let extension = Path::new(file).extension().and_then(|s| s.to_str())
         .unwrap_or("").to_ascii_lowercase();
     let kind = match extension.as_str() {
-        "pdf" if bytes.starts_with(b"%PDF-") => "application/pdf",
-        "png" if bytes.starts_with(b"\x89PNG\r\n\x1a\n") => "image/png",
-        "jpg" | "jpeg" if bytes.starts_with(b"\xff\xd8\xff") => "image/jpeg",
+        "pdf" if pdf_valid(bytes) => "application/pdf",
+        "png" if png_valid(bytes) => "image/png",
+        "jpg" | "jpeg" if jpeg_valid(bytes) => "image/jpeg",
         "webp" if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP")
+            && bytes.get(4..8).is_some_and(|size| u32::from_le_bytes(size.try_into().unwrap()) as u64 + 8 == bytes.len() as u64)
             && matches!(bytes.get(12..16), Some(b"VP8 " | b"VP8L" | b"VP8X")) => "image/webp",
         "txt" | "csv" if !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok() => {
             if extension == "txt" { "text/plain" } else { "text/csv" }
@@ -194,6 +283,26 @@ fn ooxml_type(extension: &str, bytes: &[u8]) -> AttachmentResult<&'static str> {
         let lower = name.to_ascii_lowercase();
         lower.ends_with("vbaproject.bin") || lower.split('/').any(|component| component == "activex")
     }) { return Err(invalid.into()); }
+    // Bound both each relationship part and total expanded relationship bytes.
+    // Reject entities/DTDs and non-UTF-8 rather than guessing XML encodings.
+    let mode = regex::Regex::new(r"(?i)\bTargetMode\b").map_err(|_| invalid)?;
+    let internal = regex::Regex::new(r#"(?i)^\s*=\s*(?:"Internal"|'Internal')"#).map_err(|_| invalid)?;
+    let mut remaining = 4 * 1024 * 1024usize;
+    for index in 0..archive.len() {
+        let entry = archive.by_index(index).map_err(|_| invalid)?;
+        if !entry.name().to_ascii_lowercase().ends_with(".rels") { continue; }
+        let mut xml = Vec::new();
+        entry.take(256 * 1024 + 1).read_to_end(&mut xml).map_err(|_| invalid)?;
+        if xml.len() > 256 * 1024 || xml.len() > remaining || xml.contains(&0) || xml.contains(&b'&') {
+            return Err(invalid.into());
+        }
+        remaining -= xml.len();
+        let xml = std::str::from_utf8(&xml).map_err(|_| invalid)?;
+        if xml.contains("<!DOCTYPE") || xml.contains("<!ENTITY")
+            || mode.find_iter(xml).any(|m| !internal.is_match(&xml[m.end()..])) {
+            return Err("OOXML 附件不能包含外部關聯或無法確認的關聯設定。".into());
+        }
+    }
     {
         let entry = archive.by_name(part).map_err(|_| invalid)?;
         if !entry.is_file() || entry.size() == 0 { return Err(invalid.into()); }
@@ -219,6 +328,9 @@ fn read_file(home: &Path, agent: &str, call: &Attachment, max_mb: u8)
     (&mut opened.file).take(limit + 1).read_to_end(&mut bytes).map_err(|_| FILE_REFUSED)?;
     if bytes.len() as u64 > limit { return Err("附件超過 attachment_max_mb 大小限制。".into()); }
     let mime = mimetype(&call.file, &bytes)?;
+    if !display_name_matches(&call.name, mime) {
+        return Err("附件顯示名稱的副檔名必須符合已驗證的檔案格式。".into());
+    }
     Ok((bytes, mime))
 }
 

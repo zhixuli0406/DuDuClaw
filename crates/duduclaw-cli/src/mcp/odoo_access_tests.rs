@@ -6,7 +6,7 @@ use serde_json::json;
 
 fn identity(permission: IdentityPermission) -> OdooIdentity {
     OdooIdentity { kind: IdentityKind::Personal, permission, user_id: Some("alice".into()),
-        odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None }
+        url: None, db: None, server_fp: None, odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None }
 }
 
 fn policy() -> ToolPolicy {
@@ -23,7 +23,7 @@ fn policy() -> ToolPolicy {
 fn all_modes_enforce_fixed_and_admin_refusals() {
     for permission in [IdentityPermission::Follow, IdentityPermission::Engine, IdentityPermission::ReadOnly] {
         let mut p = policy();
-        for model in ["ir.attachment", "ir.model.fields", "ir.model", "ir.model.access", "ir.rule", "res.users.apikeys"] {
+        for model in ["ir.attachment", "ir.model.fields", "ir.model", "ir.model.access", "ir.model.data", "ir.model.constraint", "mail.template", "mail.message", "ir.rule", "res.users.apikeys"] {
             let error = p.check_call("odoo_write", &json!({"model":model}), Some(&identity(permission))).unwrap_err();
             assert!(error.starts_with("DuDuClaw 不讓 AI 做這件事："), "{error}");
         }
@@ -188,7 +188,7 @@ fn person_policy_never_uses_employee_tables_or_engine() {
         }
     }
     let follow = identity(IdentityPermission::Follow);
-    for model in ["ir.model", "ir.model.fields", "ir.model.access", "ir.rule"] {
+    for model in ["ir.model", "ir.model.fields", "ir.model.access", "ir.model.data", "ir.model.constraint", "mail.template", "mail.message", "ir.rule"] {
         assert!(p.check_call("odoo_write", &json!({"model":model}), Some(&follow)).unwrap_err()
             .starts_with("DuDuClaw 不讓 AI 做這件事："));
     }

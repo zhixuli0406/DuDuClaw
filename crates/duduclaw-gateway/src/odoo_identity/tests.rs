@@ -151,9 +151,14 @@ async fn five_rows_and_personal_precedence_and_revision_handoff() {
     assert_eq!(value["user_id"], f.a);
     assert_eq!(value["secret"], SECRET_A);
     assert_eq!(value["permission"], "engine");
+    let server = server::company_server(f.home.path()).unwrap().unwrap();
+    assert_eq!(value["url"], server.url);
+    assert_eq!(value["db"], server.db);
+    assert_eq!(value["server_fp"], server.fp);
     let rev = value["rev"].as_i64().unwrap();
     let (_, cached) = f.employee("alice", json!({"tool":"odoo_read","have_rev":rev})).await;
     assert_eq!(cached["rev"], rev);
+    for field in ["url", "db", "server_fp"] { assert_eq!(cached[field], value[field]); }
     assert_eq!(cached["odoo_uid"], 42);
     assert!(cached.get("secret").is_none());
     assert!(f.state.users.odoo_credential_status(&f.a).unwrap().unwrap().last_used_at.is_some());
@@ -174,7 +179,7 @@ async fn five_rows_and_personal_precedence_and_revision_handoff() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value["identity"], identity);
         assert_eq!(value["permission"], "engine");
-        for key in ["secret", "user_id", "login", "rev"] { assert!(value.get(key).is_none()); }
+        for key in ["secret", "user_id", "login", "rev", "url", "db", "server_fp"] { assert!(value.get(key).is_none()); }
     }
     let (status, value) = f.employee("company-extra", read()).await;
     refused(status, &value, "odoo_not_connected");

@@ -2026,7 +2026,7 @@ impl McpDispatcher {
         // RM-103 S3: a role member's intrinsic skips this gate's inherited
         // approval lists / action-rule `ask`; an egress-guard ask still runs.
         if (employee_policy_applies && !intrinsic_exempt)
-            || tool_name == "odoo_message_send"
+            || crate::mcp::approval::odoo_requires_approval(tool_name, &params_owned)
             || params_owned.get("egress_guard").is_some()
         {
             // Keyed by the ACTING agent: with the internal key the client_id
@@ -2436,6 +2436,8 @@ mod tests {
         use crate::mcp_auth::{AuthenticatedCall, PrincipalKind, with_authenticated_call};
         let tmp = tempfile::tempdir().unwrap();
         let dispatcher = make_dispatcher(&tmp).await;
+        std::fs::write(tmp.path().join("config.toml"),
+            "[odoo]\nurl='https://erp.example.com'\ndb='test'\n[odoo_access]\npermission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}\nalways_refuse=[]\n").unwrap();
         for scopes in ["", "tasks:read", "agents:status", "tasks:read,agents:status",
             "odoo:read", "odoo:read,odoo:write", "odoo:write"] {
             let principal = Principal {

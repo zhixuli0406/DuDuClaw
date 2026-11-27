@@ -870,6 +870,11 @@ pub(super) async fn handle_actor(
             Err(error) => Err(error),
         },
     }}).await;
+    if follow || actor.employee().is_none() || super::odoo_identity_client::sensitive_model(model) {
+        let raw = match &result { Ok(text) | Err(text) => text.as_str() };
+        super::odoo_identity_client::audit_result(home_dir, caller_agent, tool, params,
+            result.is_ok(), raw, true);
+    }
     let result = result.map(|text| format!("{text}\n{}", super::odoo_access::identity_suffix(decision.as_ref(), verb)));
     let fields: Vec<&str> = args.values.keys().map(String::as_str).collect();
     let summary = format!(
@@ -884,6 +889,7 @@ pub(super) async fn handle_actor(
         Ok(text) => text.clone(),
         Err(error) => format!("error class={}; length={}", error_class(error), error.len()),
     };
+    if !follow && actor.employee().is_some() && !super::odoo_identity_client::sensitive_model(model) {
     super::odoo_identity_client::audit_call(
         home_dir,
         caller_agent,
@@ -892,6 +898,7 @@ pub(super) async fn handle_actor(
         result.is_ok(),
         Some(result_text.as_str()),
     );
+    }
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
         Err(error) => serde_json::json!({

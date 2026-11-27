@@ -111,7 +111,7 @@ impl Stub {
     }
     fn writes(&self) -> Vec<Value> {
         self.requests.lock().unwrap().iter().filter(|v|
-            matches!(v["params"]["args"][4].as_str(), Some("activity_schedule" | "message_post")))
+            matches!(v["params"]["args"][4].as_str(), Some("activity_schedule" | "message_post" | "action_send_customer_email")))
             .map(|v| v["params"]["args"].clone()).collect()
     }
 }
@@ -214,14 +214,17 @@ async fn follow_message_admin_refusal_prevents_every_write() {
 async fn dispatch_approval_gate_denies_or_sends_once_despite_allow_rule() {
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus};
     use super::super::approval::gate_tool_approval_dispatch;
+    for (tool, args) in [
+        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"})),
+        ("odoo_execute", json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"})),
+    ] {
     for approved in [false, true] {
         let stub = Stub::start(true).await;
         let home = home(&stub, "personal", true, &[]);
         let path = home.path().join("agents/bot/agent.toml");
         let raw = std::fs::read_to_string(&path).unwrap();
-        std::fs::write(path, format!("{raw}\n[capabilities]\naction_rules=[{{tool='odoo_message_send',verdict='allow'}}]\n")).unwrap();
-        let args = json!({"model":"crm.lead","res_id":9,"body":"test"});
-        let payload = json!({"name":"odoo_message_send","arguments":args});
+        std::fs::write(path, format!("{raw}\n[capabilities]\naction_rules=[{{tool='{tool}',verdict='allow'}}]\n")).unwrap();
+        let payload = json!({"name":tool,"arguments":args});
         let broker = ApprovalBroker::open(home.path()).unwrap();
         let observer = broker.clone();
         let seen = Arc::new(Mutex::new(None));
@@ -240,17 +243,18 @@ async fn dispatch_approval_gate_denies_or_sends_once_despite_allow_rule() {
             panic!("fixed approval did not produce a card");
         });
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5),
-            gate_tool_approval_dispatch(home.path(), "bot", "odoo_message_send", payload)).await.unwrap();
+            gate_tool_approval_dispatch(home.path(), "bot", tool, payload)).await.unwrap();
         answer.await.unwrap();
         assert_eq!(outcome.is_ok(), approved);
         assert!(stub.writes().is_empty());
         if outcome.is_ok() {
-            let result = call(home.path(), "personal", true, "odoo_message_send", &args).await;
+            let result = call(home.path(), "personal", true, tool, &args).await;
             assert_ne!(result["isError"], true, "{result}");
             let id = seen.lock().unwrap().clone().unwrap();
             assert_eq!(broker.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Invalidated);
         }
         assert_eq!(stub.writes().len(), usize::from(approved));
+    }
     }
 }
 
@@ -435,5 +439,66 @@ async fn attachment_listing_and_dispatch_share_identity_and_policy_gates() {
         assert_eq!(outcome.0, allowed, "follow={follow}, token={token}, refuse={refuse}, readonly={readonly}, verified={verified}");
         assert_eq!(outcome.1["isError"] != true, allowed, "{}", outcome.1);
         assert_eq!(attachment_requests(&stub).len(), usize::from(allowed));
+    }
+}
+
+#[tokio::test]
+async fn arbitrary_execute_approval_binds_model_method_args_and_is_single_use() {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStore};
+    use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY, verify_and_consume};
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", true, &[]);
+    let args = json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"});
+    let payload = json!({"name":"odoo_execute","arguments":args});
+    assert!(super::super::approval::static_gate_flags(&home.path().join("agents/bot"), "odoo_execute", &payload).0);
+    let broker = ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()));
+    let grant = ActionGrant::build("bot", "odoo_execute", &payload);
+    let mut bound = payload.clone(); bound[ACTION_GRANT_KEY] = grant.to_json();
+    let id = broker.request("bot", "mcp_call", "Odoo customer email", bound, 60).await.unwrap();
+    assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
+    assert!(stub.writes().is_empty());
+    broker.decide(&id, true, "dashboard:admin").await.unwrap();
+    for (key, value) in [("model", "sale.order"), ("method", "other_method"), ("ids", "[10]")] {
+        let mut changed = payload.clone(); changed["arguments"][key] = json!(value);
+        let different = ActionGrant::build("bot", "odoo_execute", &changed);
+        assert!(verify_and_consume(&broker, &id, &different).await.is_err());
+    }
+    assert!(stub.writes().is_empty());
+    verify_and_consume(&broker, &id, &grant).await.unwrap();
+    let result = call(home.path(), "personal", true, "odoo_execute", &args).await;
+    assert_ne!(result["isError"], true, "{result}");
+    assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
+    assert_eq!(stub.writes().len(), 1);
+}
+
+#[test]
+fn all_odoo_buttons_and_unknown_execute_methods_require_approval() {
+    use super::super::approval::odoo_requires_approval;
+    for method in ["action_send_customer_email", "button_custom", "toggle_custom", "unknown", "create", "write", "unlink"] {
+        assert!(odoo_requires_approval("odoo_execute", &json!({"arguments":{"method":method}})));
+    }
+    assert!(odoo_requires_approval("odoo_execute", &json!({"arguments":{}})));
+    assert!(odoo_requires_approval("odoo_sale_confirm", &json!({"arguments":{}})));
+    for method in ["read", "search_read", "fields_get", "read_group"] {
+        assert!(!odoo_requires_approval("odoo_execute", &json!({"arguments":{"method":method}})));
+    }
+}
+
+#[tokio::test]
+async fn generic_writes_to_mail_and_model_families_never_reach_odoo() {
+    for follow in [false, true] {
+        let stub = Stub::start(true).await;
+        let home = home(&stub, "personal", follow, &[]);
+        for model in ["mail.template", "mail.message", "ir.model.data", "ir.model.constraint"] {
+            for (tool, args) in [
+                ("odoo_write", json!({"model":model,"ids":[1],"values":{"name":"x"}})),
+                ("odoo_create", json!({"model":model,"values":{"name":"x"}})),
+                ("odoo_execute", json!({"model":model,"method":"action_send_customer_email","ids":"[1]"})),
+            ] {
+                let result = call(home.path(), "personal", follow, tool, &args).await;
+                assert_eq!(result["isError"], true, "{follow} {tool} {model}: {result}");
+            }
+        }
+        assert!(stub.requests.lock().unwrap().is_empty());
     }
 }

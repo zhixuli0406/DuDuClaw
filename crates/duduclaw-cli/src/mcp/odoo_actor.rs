@@ -39,7 +39,7 @@ impl<'a> OdooActor<'a> {
             Self::Person { user_id, .. } => {
                 let identity = decision.ok_or("Missing personal identity")?;
                 if identity.user_id.as_deref() != Some(user_id) { return Err("Personal identity changed".into()); }
-                Ok(format!("person:{user_id}:{}", identity.rev.ok_or("Missing personal revision")?))
+                identity.personal_profile()
             }
         }
     }

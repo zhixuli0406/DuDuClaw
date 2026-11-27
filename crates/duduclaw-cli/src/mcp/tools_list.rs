@@ -673,7 +673,13 @@ pub(crate) async fn visible_tools_in_lane(
     lane: &duduclaw_core::ProcessLane,
 ) -> Vec<&'static ToolDef> {
     if crate::mcp_auth::is_person_principal(principal) {
-        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        let policy = super::odoo_access::ToolPolicy::load_person(home_dir).ok();
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)
+            && person_tool(t.name).is_some_and(|definition| match definition.executes_in {
+                PersonToolHost::McpWithPersonalOdoo => policy.as_ref().is_some_and(|p| p.person_listed(t.name, None)),
+                _ => true,
+            })).collect();
     }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does

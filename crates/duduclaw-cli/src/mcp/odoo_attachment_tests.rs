@@ -54,6 +54,8 @@ fn only_own_regular_files_and_bounded_size() {
     std::fs::write(home.path().join("agents/bot/attachments/large.pdf"), &oversized).unwrap();
     assert!(read_file(home.path(), "bot", &attachment("large.pdf"), 1).unwrap_err().contains("attachment_max_mb"));
     oversized.pop();
+    let end = oversized.len();
+    oversized[end - 5..].copy_from_slice(b"%%EOF");
     std::fs::write(home.path().join("agents/bot/attachments/large.pdf"), oversized).unwrap();
     assert!(read_file(home.path(), "bot", &attachment("large.pdf"), 1).is_ok());
     for limit in [0, 26] { assert!(read_file(home.path(), "bot", &attachment("x.pdf"), limit).is_err()); }
@@ -86,12 +88,12 @@ fn no_symlink_component_or_root_and_open_handle_survives_path_replacement() {
 
 #[test]
 fn extension_and_magic_must_agree_and_text_must_be_utf8_without_nul() {
-    let png = b"\x89PNG\r\n\x1a\nexample";
+    let png = valid_png();
     for (file, bytes, mime) in [
         ("x.pdf", PDF, "application/pdf"), ("x.PNG", png.as_slice(), "image/png"),
-        ("x.jpg", b"\xff\xd8\xffexample".as_slice(), "image/jpeg"),
-        ("x.jpeg", b"\xff\xd8\xffexample".as_slice(), "image/jpeg"),
-        ("x.webp", b"RIFF\x14\0\0\0WEBPVP8 example".as_slice(), "image/webp"),
+        ("x.jpg", b"\xff\xd8\xff\xda\x00\x02data\xff\xd9".as_slice(), "image/jpeg"),
+        ("x.jpeg", b"\xff\xd8\xff\xda\x00\x02data\xff\xd9".as_slice(), "image/jpeg"),
+        ("x.webp", b"RIFF\x0f\0\0\0WEBPVP8 example".as_slice(), "image/webp"),
         ("x.txt", "中文🙂".as_bytes(), "text/plain"), ("x.csv", b"a,b\n1,2".as_slice(), "text/csv"),
     ] { assert_eq!(mimetype(file, bytes).unwrap(), mime); }
     for (file, bytes) in [("x.pdf", png.as_slice()), ("x.png", PDF),
@@ -124,5 +126,95 @@ fn office_requires_real_zip_content_types_and_matching_part() {
         assert!(mimetype(&file, &office_zip(&["[Content_Types].xml", "unrelated.xml"])).is_err());
         assert!(mimetype(&file, &office_zip(&["[Content_Types].xml", part, "xl/vbaProject.bin"])).is_err());
         assert!(mimetype(&file, b"PK\x03\x04not a zip").is_err());
+    }
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(data);
+    let mut crc = !0u32;
+    for byte in &chunk[4..] {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 { crc = (crc >> 1) ^ (0xedb88320 & (0u32.wrapping_sub(crc & 1))); }
+    }
+    chunk.extend_from_slice(&(!crc).to_be_bytes());
+    chunk
+}
+fn valid_png() -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend(png_chunk(b"IHDR", &[0,0,0,1,0,0,0,1,8,2,0,0,0]));
+    bytes.extend(png_chunk(b"IDAT", &[0x78,0x9c,0x63,0,2,0,0,4,0,1]));
+    bytes.extend(png_chunk(b"IEND", &[]));
+    bytes
+}
+
+#[test]
+fn display_extension_must_match_validated_format() {
+    let home = fixture();
+    for name in ["invoice.html", "invoice.pdf.exe", "invoice", "invoice.pdf ", "invoice.png"] {
+        let mut call = attachment("x.pdf"); call.name = name.into();
+        assert!(read_file(home.path(), "bot", &call, 1).is_err(), "{name}");
+    }
+    let mut call = attachment("x.pdf"); call.name = "發票.PDF".into();
+    assert!(read_file(home.path(), "bot", &call, 1).is_ok());
+    assert!(display_name_matches("photo.jpeg", "image/jpeg"));
+    assert!(!display_name_matches("photo.png", "image/jpeg"));
+}
+
+#[test]
+fn png_requires_chunk_walk_crc_and_iend_at_eof() {
+    let png = valid_png();
+    assert!(mimetype("x.png", &png).is_ok());
+    let mut trailing = png.clone(); trailing.extend_from_slice(b"<script/>");
+    let mut crc = png.clone(); crc[29] ^= 1;
+    let mut length = png.clone(); length[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut iend = png.clone(); let last = iend.len() - 1; iend[last] ^= 1;
+    for bad in [trailing, crc, length, iend, png[..png.len()-12].to_vec()] {
+        assert!(mimetype("x.png", &bad).is_err());
+    }
+}
+
+#[test]
+fn jpeg_and_webp_refuse_truncation_and_appended_content() {
+    let jpeg = b"\xff\xd8\xff\xda\x00\x02data\xff\xd9";
+    assert!(mimetype("x.jpg", jpeg).is_ok());
+    for bad in [jpeg[..jpeg.len()-2].to_vec(), [jpeg.as_slice(), b"payload"].concat(),
+        [jpeg.as_slice(), b"payload\xff\xd9"].concat()] {
+        assert!(mimetype("x.jpg", &bad).is_err());
+    }
+    let webp = b"RIFF\x0f\0\0\0WEBPVP8 example";
+    assert!(mimetype("x.webp", webp).is_ok());
+    for bad in [webp[..webp.len()-1].to_vec(), [webp.as_slice(), b"payload"].concat()] {
+        assert!(mimetype("x.webp", &bad).is_err());
+    }
+}
+
+#[test]
+fn pdf_requires_eof_and_refuses_active_content() {
+    assert!(mimetype("x.pdf", &[PDF, b" \r\n\t"].concat()).is_ok());
+    for bad in [b"%PDF-1.7 no eof".to_vec(), [PDF, b"payload"].concat(),
+        [PDF, &vec![b' '; 1024]].concat(), b"prefix%PDF-1.7\n%%EOF".to_vec()] {
+        assert!(mimetype("x.pdf", &bad).is_err());
+    }
+    for token in ["/JavaScript", "/JS", "/Launch", "/EmbeddedFile", "/OpenAction", "/AA", "/RichMedia", "/XFA"] {
+        assert!(mimetype("x.pdf", format!("%PDF-1.7\n{token}\n%%EOF").as_bytes()).is_err(), "{token}");
+    }
+}
+
+#[test]
+fn office_refuses_external_relationships_in_any_part() {
+    use std::io::Write;
+    for mode in [r#"TargetMode="External""#, "TargetMode = 'External'", r#"TargetMode="Ext&#101;rnal""#] {
+        for rel in ["_rels/.rels", "word/_rels/document.xml.rels"] {
+            let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            for part in ["[Content_Types].xml", "word/document.xml", rel] {
+                writer.start_file(part, zip::write::SimpleFileOptions::default()).unwrap();
+                let xml = if part == rel { format!("<Relationships><Relationship {mode} Target='https://example.com'/></Relationships>") }
+                    else { "<test/>".into() };
+                writer.write_all(xml.as_bytes()).unwrap();
+            }
+            assert!(mimetype("x.docx", &writer.finish().unwrap().into_inner()).is_err(), "{rel}: {mode}");
+        }
     }
 }

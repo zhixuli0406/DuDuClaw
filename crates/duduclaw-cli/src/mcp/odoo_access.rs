@@ -51,7 +51,7 @@ pub(super) fn personal_facts(home: &Path, agent: &str) -> PossibleIdentities {
 
 /// Fixed methods must also be supplied during listing. Existing dedicated
 /// business tools use Execute (ordinary grants), not generic-write opt-ins.
-fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Option<&'a str>, Option<&'a str>)> {
+pub(super) fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Option<&'a str>, Option<&'a str>)> {
     let model = params.and_then(|p| p.get("model")).and_then(Value::as_str);
     Some(match tool {
         "odoo_connect" | "odoo_status" => (ToolClass::Read, None, Some("read")),
@@ -116,6 +116,25 @@ impl ToolPolicy {
             access, global, identities: PossibleIdentities::default() })
     }
 
+    /// The gateway uses this same effective_mode (including the acknowledgement)
+    /// for person keys. Availability never supplies a runtime identity.
+    pub fn person_listed(&self, tool: &str, params: Option<&Value>) -> bool {
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        if !person_tool(tool).is_some_and(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
+            return false;
+        }
+        let Some((class, model, method)) = operation(tool, params) else { return false };
+        if class != ToolClass::Read && effective_mode(policy::IdentityKind::Personal,
+            &self.access, PermissionOverride::Inherit) != EffectiveMode::Follow { return false; }
+        let candidates: Vec<String> = model.map(|m| vec![m.to_owned()]).unwrap_or_else(||
+            (0..=self.access.always_refuse.len()).map(|n| format!("policy_model_{n}")).collect());
+        let Some(method) = method else { return false };
+        candidates.iter().any(|model| self.common_tool(tool, model, method).is_ok()
+            && (method != "search_read" || self.common(model, "fields_get").is_ok()))
+            && self.auxiliary(tool).iter().all(|(m, v)|
+                self.common(m, v).is_ok() && self.common(m, "fields_get").is_ok())
+    }
+
     fn check_person_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
         use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
         if !person_tool(tool).is_some_and(|t| t.executes_in == PersonToolHost::McpWithPersonalOdoo) {
@@ -135,6 +154,7 @@ impl ToolPolicy {
             self.common(model, method)?;
             self.common(model, "fields_get")?;
         }
+        if !self.person_listed(tool, Some(params)) { return Err(DENIED.into()); }
         Ok(())
     }
 
