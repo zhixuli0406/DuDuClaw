@@ -8267,6 +8267,12 @@ export const api = {
       >,
   },
   system: {
+    companyTimezone: () =>
+      client.call('system.company_timezone', {}) as Promise<{
+        timezone: string | null;
+        status: 'set' | 'unset' | 'invalid';
+        source: 'detected_at_upgrade' | null;
+      }>,
     status: () =>
       client.call('system.status') as Promise<SystemStatus>,
     /** Login/boot autostart registration state (admin). */
