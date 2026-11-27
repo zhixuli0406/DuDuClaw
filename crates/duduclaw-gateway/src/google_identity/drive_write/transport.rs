@@ -474,6 +474,12 @@ impl WriteTransport {
         // Validate the final logical request, including every query VALUE and
         // duplicate key, before adding credentials or applying the test base.
         call.validate_target(request.method(), request.url())?;
+        #[cfg(feature = "live-test-mocks")]
+        {
+            let actual = crate::google_workspace::effective_url(request.url().as_str());
+            let actual = Url::parse(actual.as_ref()).map_err(|_| NotSentReason::InvalidEndpoint)?;
+            *request.url_mut() = actual;
+        }
         #[cfg(test)]
         if let Some(base) = &self.test_api_base {
             let mut actual = base.clone();
