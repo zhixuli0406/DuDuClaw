@@ -219,11 +219,11 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "create_reminder",
-        description: "Create a one-shot reminder that messages a channel at a time (relative 5m/2h/1d or ISO 8601). 'direct' sends a static message at zero LLM cost; 'agent_callback' wakes the agent to answer.",
+        description: "Create a one-shot reminder (relative 5m/2h/1d or ISO 8601 with offset). 'direct' sends a static message at zero LLM cost; 'agent_callback' wakes the agent to answer.",
         params: &[
             ParamDef {
                 name: "time",
-                description: "When to trigger: relative (5m, 2h, 1d, 1h30m) or absolute ISO 8601 (2026-04-07T15:00:00+08:00)",
+                description: "Relative (5m, 2h, 1d, 1h30m) or absolute ISO 8601 with an offset (2026-04-07T15:00:00+08:00). Confirmation shows company time zone local time.",
                 required: true,
             },
             ParamDef {
