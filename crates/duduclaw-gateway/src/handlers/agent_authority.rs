@@ -573,3 +573,27 @@ mod idle_tests {
         assert!(!idle_authority_diff(&table(Some(60)), &table(None), 0).is_empty());
     }
 }
+
+#[cfg(test)]
+mod az1_tests {
+    use super::*;
+
+    #[test]
+    fn az1_capabilities_allow_revocation_but_refuse_grants() {
+        let table = |s: &str| s.parse::<toml::Table>().unwrap();
+        for (before, after) in [
+            ("db_sources=['fixture_db','old']", "db_sources=['fixture_db']"),
+            ("git_credentials=true", "git_credentials=false"),
+            ("allowed_tools=['Read','Bash']", "allowed_tools=['Read']"),
+            ("denied_tools=['Bash']", "denied_tools=['Bash','Write']"),
+        ] {
+            let b = table(&format!("[capabilities]\n{before}"));
+            let a = table(&format!("[capabilities]\n{after}"));
+            assert!(authority_diff(&b, &a).is_empty(), "{before} -> {after}");
+            assert!(!authority_diff(&a, &b).is_empty(), "reverse widens");
+        }
+        let b = table("[capabilities]\nallowed_tools=['Read']");
+        assert!(!authority_diff(&b, &table("[capabilities]\nallowed_tools=[]")).is_empty());
+        assert!(!authority_diff(&table(""), &table("[capabilities]\nunknown_grant=true")).is_empty());
+    }
+}
