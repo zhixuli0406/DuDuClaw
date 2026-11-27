@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, fireEvent, waitFor } from '@testing-library/react';
+import { screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { mockWsClient } from '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { BillingPage } from './BillingPage';
@@ -43,7 +43,8 @@ it('renders granted department employees, totals and recent usage with millicent
       : method === 'cost.department_recent' ? { available: true, records: [{ agent_id: 'agnes', model: 'test-model', created_at: '2026-11-27T00:00:00Z', cost_millicents: 1000 }] } : {}));
   renderWithProviders(<BillingPage />);
   expect(screen.getByText('Department usage')).toBeInTheDocument();
-  await screen.findByText('Agnes');
+  const department = within(screen.getByRole('region', { name: 'Department usage' }));
+  expect(within(await department.findByRole('table')).getByText('Agnes')).toBeInTheDocument();
   expect(screen.getByText('Total')).toBeInTheDocument();
   expect(screen.getAllByText('$1.23')).toHaveLength(2);
   expect(screen.getByText('test-model')).toBeInTheDocument();

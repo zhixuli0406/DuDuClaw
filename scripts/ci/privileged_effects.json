@@ -3939,6 +3939,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/on_behalf_of/main_target_tests.rs::frozen_command",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only constructor of a never-spawned Claude command whose argv is inspected by the main-agent final-spawn check tests; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/on_behalf_of/native_tests.rs::mcp_call",
       "apis": {
         "command_constructor": 1,

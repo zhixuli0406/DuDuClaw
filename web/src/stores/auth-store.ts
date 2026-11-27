@@ -48,7 +48,7 @@ interface AuthMe extends MeGrantFields {
 const EMPTY_DEPT_GROUPS: ReadonlySet<GrantGroup> = new Set();
 
 function grantState(me: MeGrantFields = {}) {
-  const deptGrants: DepartmentGrant[] = (me.dept_grants ?? []).map((grant) => ({
+  const deptGrants: DepartmentGrant[] = (Array.isArray(me.dept_grants) ? me.dept_grants : []).map((grant) => ({
     department: grant.department,
     groups: grant.groups.filter(isGrantGroup),
   }));
@@ -588,7 +588,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       && get().user?.id === user.id && get().isAuthenticated;
     try {
       const me = await client.call('users.me') as AuthMe;
-      if (stillCurrent()) set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      if (!stillCurrent()) return;
+      if (!me || !me.user || typeof me.user !== 'object' || Array.isArray(me.user)
+        || me.user.id !== user.id || !Array.isArray(me.bindings)) {
+        set(grantState());
+        return;
+      }
+      set({ user: me.user, bindings: me.bindings, ...grantState(me) });
     } catch {
       if (stillCurrent()) set(grantState());
     }
