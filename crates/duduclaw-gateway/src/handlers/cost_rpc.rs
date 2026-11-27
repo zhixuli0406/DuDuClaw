@@ -189,14 +189,18 @@ impl MethodHandler {
             totals.total_output_tokens += summary.total_output_tokens;
             totals.total_cost_millicents += summary.total_cost_millicents;
             totals.total_cache_savings_millicents += summary.total_cache_savings_millicents;
-            // The department RPC contract sums every numeric row field,
-            // including this field; it is not a request-weighted global mean.
-            totals.avg_cache_efficiency += summary.avg_cache_efficiency;
+            // Weight each agent's average by its request count, then normalize below.
+            totals.avg_cache_efficiency += summary.avg_cache_efficiency * summary.total_requests as f64;
             let mut row = department_cost_numbers(&summary);
             row["agent_id"] = json!(id);
             row["display_name"] = json!(display_name);
             rows.push(row);
         }
+        totals.avg_cache_efficiency = if totals.total_requests == 0 {
+            0.0
+        } else {
+            totals.avg_cache_efficiency / totals.total_requests as f64
+        };
         WsFrame::ok_response("", json!({"available": true, "department": department,
             "days": days, "agents": rows, "totals": department_cost_numbers(&totals)}))
     }

@@ -585,6 +585,10 @@ async fn cost_department_scoped_matrix() {
 async fn department_cost_excludes_other_departments() {
     let f = fixture().await;
     seed_matrix_cost(&f).await;
+    // Unequal request counts and efficiencies distinguish a weighted mean.
+    f.h.cost_telemetry_fixture.get().unwrap().record_priced(
+        "a2", crate::cost_telemetry::RequestType::Chat, "matrix-model",
+        &crate::cost_telemetry::TokenUsage::default(), 0, false, None).await.unwrap();
     let payload = scoped_payload("cost.department_summary", Box::pin(f.h.handle(
         "cost.department_summary", json!({"department": "sales"}), &f.mgr_a)).await);
     assert_eq!(payload["available"], true);
@@ -598,8 +602,13 @@ async fn department_cost_excludes_other_departments() {
         let sum: u64 = rows.iter().map(|r| r[field].as_u64().unwrap()).sum();
         assert_eq!(payload["totals"][field].as_u64(), Some(sum), "{field}");
     }
-    let efficiency: f64 = rows.iter().map(|r| r["avg_cache_efficiency"].as_f64().unwrap()).sum();
-    assert_eq!(payload["totals"]["avg_cache_efficiency"].as_f64(), Some(efficiency));
+    let requests: u64 = rows.iter().map(|r| r["total_requests"].as_u64().unwrap()).sum();
+    assert_eq!(requests, 3);
+    let efficiency: f64 = rows.iter().map(|r|
+        r["avg_cache_efficiency"].as_f64().unwrap() * r["total_requests"].as_u64().unwrap() as f64
+    ).sum::<f64>() / requests as f64;
+    let actual = payload["totals"]["avg_cache_efficiency"].as_f64().unwrap();
+    assert!((actual - efficiency).abs() < 1e-12);
     assert_eq!(payload["totals"]["total_cost_millicents"], 30);
     let recent = scoped_payload("cost.department_recent", Box::pin(f.h.handle(
         "cost.department_recent", json!({"department": "sales", "limit": 1}), &f.mgr_a)).await);
@@ -689,6 +698,7 @@ async fn department_cost_empty_scope_never_falls_back_to_global() {
         assert!(payload[key].as_array().unwrap().is_empty());
         if key == "agents" {
             assert_eq!(payload["totals"]["total_requests"], 0);
+            assert_eq!(payload["totals"]["avg_cache_efficiency"].as_f64(), Some(0.0));
             assert_eq!(payload["totals"]["total_cost_millicents"], 0);
         }
     }
