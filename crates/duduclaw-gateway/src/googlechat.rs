@@ -696,15 +696,14 @@ pub(crate) struct CardPress {
     pub space: String,
     /// The HUMAN presser, exactly `users/<digits>`.
     pub user: String,
-    /// The `decision_action::encode(..)` the button carried (a goal action).
+    /// The `decision_action::encode(..)` the button carried (Goal or Approval).
     pub action: String,
 }
 
 /// Read a decision press from a `CARD_CLICKED` event, or `None` for
 /// anything else: a non-human or malformed presser, a malformed or
 /// inconsistent space, another function, a missing, repeated or
-/// disagreeing decision parameter, or a parameter that is not a goal
-/// decision (the only card Google Chat is sent).
+/// disagreeing decision parameter, or a source other than Goal or Approval.
 pub(crate) fn parse_card_press(event: &serde_json::Value) -> Option<CardPress> {
     use crate::channel_format::{GOOGLECHAT_DECISION_FUNCTION, GOOGLECHAT_DECISION_PARAM};
     use serde_json::Value;
@@ -756,7 +755,8 @@ pub(crate) fn parse_card_press(event: &serde_json::Value) -> Option<CardPress> {
         return None;
     }
     let decoded = crate::decision_action::parse(action)?;
-    if decoded.source != crate::decision_action::DecisionSource::Goal {
+    if !matches!(decoded.source, crate::decision_action::DecisionSource::Goal
+        | crate::decision_action::DecisionSource::Approval) {
         return None;
     }
     Some(CardPress { space: space.to_string(), user: user.to_string(), action: action.to_string() })
@@ -774,6 +774,64 @@ async fn card_clicked(
         info!("Google Chat: CARD_CLICKED without a usable decision ignored");
         return ack();
     };
+    let Some(outcome) = route_card_press(state, event, &press).await else { return ack(); };
+    (StatusCode::OK, axum::Json(card_press_response(&press, &outcome))).into_response()
+}
+
+fn card_press_response(
+    _press: &CardPress,
+    outcome: &crate::approval::chat_admin::press::PressOutcome,
+) -> serde_json::Value {
+    if let Some(text) = &outcome.card_text {
+        // Non-add-on HTTP apps return a Message, not a Workspace add-on action.
+        // UPDATE_MESSAGE is only valid for CARD_CLICKED on the app's BOT message:
+        // https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#ResponseType
+        // The receipt binds that exact message to the receiving app. An empty
+        // cardsV2 removes its buttons; never copy event text/cards into the reply.
+        serde_json::json!({"actionResponse":{"type":"UPDATE_MESSAGE"}, "text":text, "cardsV2":[]})
+    } else {
+        let reply = if outcome.refused_reason == Some("legacy_refused") {
+            format!("⚠️ {}", outcome.reply)
+        } else { outcome.reply.clone() };
+        serde_json::json!({"text":reply})
+    }
+}
+
+fn card_press_origin(
+    state: &GoogleChatState,
+    event: &serde_json::Value,
+    press: &CardPress,
+    is_dm: bool,
+) -> crate::approval::chat_admin::press::PressOrigin {
+    // Non-add-on CARD_CLICKED carries the clicked message at event.message.
+    // Keep its resource name verbatim: no aliases or callback-supplied IDs.
+    let message_id = event.pointer("/message/name").and_then(serde_json::Value::as_str)
+        .filter(|name| crate::googlechat_inbox::parse_message_resource_name(name)
+            .is_some_and(|(space, _)| format!("spaces/{space}") == press.space))
+        .map(str::to_owned);
+    crate::approval::chat_admin::press::PressOrigin {
+        message_id, private: is_dm,
+        account: crate::chat_link_intercept::account_label("googlechat", state.agent.as_deref()),
+        dm: press.space.clone(),
+    }
+}
+
+async fn route_card_press(
+    state: &Arc<GoogleChatState>,
+    event: &serde_json::Value,
+    press: &CardPress,
+) -> Option<crate::approval::chat_admin::press::PressOutcome> {
+    // Research §9: Chat user ID == OIDC sub, ID stability after rename/recreate,
+    // and user.email presence are not documented and need live testing. This
+    // adapter uses only the verified HUMAN user.name and receipt/handshake proof;
+    // it neither infers a sub nor uses email/displayName as identity.
+    if crate::decision_action::parse(&press.action)
+        .is_some_and(|action| action.source == crate::decision_action::DecisionSource::Approval)
+        && event.pointer("/message/sender/type").and_then(serde_json::Value::as_str) != Some("BOT")
+    {
+        return Some(crate::approval::chat_admin::press::PressOutcome::refused(
+            crate::channel_decision_route::DECISION_REFUSED.into(), "message_not_bot", false));
+    }
     // RM-192 B3: the trusted classifier decides whether this is the
     // presser's 1:1 DM with the app (unknown or failed = shared). Only then
     // is the press attested as coming from that DM's human member; the goal
@@ -796,7 +854,8 @@ async fn card_clicked(
         conversation_id: press.space.clone(),
         principal_id: press.user.clone(),
     };
-    let result = crate::ccr_runtime::ATTESTED_ONE_TO_ONE
+    let origin = card_press_origin(state, event, press, is_dm);
+    crate::ccr_runtime::ATTESTED_ONE_TO_ONE
         .scope(
             attestation,
             crate::decision_notify::route_verified_bound_press(
@@ -808,21 +867,10 @@ async fn card_clicked(
                     guild_id: None,
                     session_id: None,
                 },
-                &crate::approval::chat_admin::press::PressOrigin {
-                    message_id: event["message"]["name"].as_str().map(str::to_owned),
-                    private: is_dm,
-                    account: crate::chat_link_intercept::account_label("googlechat", state.agent.as_deref()),
-                    dm: press.space.clone(),
-                },
+                &origin,
             ),
         )
-        .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply);
-    let text = match result {
-        None => return ack(),
-        Some(Ok(msg)) => msg,
-        Some(Err(msg)) => format!("⚠️ {msg}"),
-    };
-    (StatusCode::OK, axum::Json(serde_json::json!({ "text": text }))).into_response()
+        .await
 }
 
 /// Cache only successful admission, under the same lock as submit so a
@@ -2706,7 +2754,9 @@ mod card_click_tests {
         // Undecodable, or a decision Google Chat is never sent.
         assert_eq!(parse_card_press(&click("not-a-decision")), None);
         let approve = encode(DecisionSource::Approval, DecisionAct::Approve, "a1");
-        assert_eq!(parse_card_press(&click(&approve)), None);
+        assert!(parse_card_press(&click(&approve)).is_some());
+        let install = encode(DecisionSource::Install, DecisionAct::Approve, "a1");
+        assert_eq!(parse_card_press(&click(&install)), None);
     }
 
     #[test]
@@ -3307,3 +3357,7 @@ mod handshake_tests {
             HandshakeStatus::Rejected);
     }
 }
+
+#[cfg(test)]
+#[path = "googlechat_chat_admin_tests.rs"]
+mod chat_admin_tests;

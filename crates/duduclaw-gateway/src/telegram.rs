@@ -1918,20 +1918,20 @@ async fn handle_callback_query(
     agent_name: Option<&str>,
 ) {
     let data = cb.data.as_deref().unwrap_or("");
-    let sender = cb
-        .from
-        .as_ref()
-        .and_then(|u| u.first_name.as_deref())
-        .unwrap_or("someone");
+    let origin = callback_press_origin(cb, agent_name);
     let Some(msg) = &cb.message else {
-        // No source message (e.g. too old) — just clear the spinner.
-        answer_callback_query(client, api_base, &cb.id, "").await;
+        // Inline-mode / inaccessible callbacks cannot prove a delivered card.
+        // Never substitute inline_message_id or any callback parameter.
+        let reply = if crate::decision_action::parse(data).is_some() {
+            crate::channel_decision_route::DECISION_REFUSED
+        } else { "" };
+        answer_callback_query(client, api_base, &cb.id, reply).await;
         return;
     };
     let chat_id = msg.chat.id;
     let thread_id = msg.message_thread_id;
 
-    info!("🔘 Telegram [{sender}] pressed a callback button");
+    info!("Telegram: callback button pressed");
 
     // Decision buttons — every "a human must decide this" card, whichever
     // store backs it. `None` ⇒ not a decision button, fall through to this
@@ -1966,25 +1966,11 @@ async fn handle_callback_query(
                 guild_id: None,
                 session_id: None,
             },
-            &crate::approval::chat_admin::press::PressOrigin {
-                message_id: msg.message_id.map(|id| id.to_string()),
-                private: msg.chat.chat_type.as_deref() == Some("private")
-                    && cb.from.as_ref().is_some_and(|from| from.id == msg.chat.id),
-                account: crate::chat_link_intercept::account_label("telegram", agent_name),
-                dm: chat_id.to_string(),
-            },
+            &origin,
         )
-        .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
+        .await
         {
-            // The persistent card (this same message) is retired in place by
-            // the decide path itself — a detached best-effort edit that
-            // clears the buttons and rewrites the card to a one-line result,
-            // independent of this toast. See `decision_card::collapse_all`.
-            let text = match result {
-                Ok(msg) => msg,
-                Err(msg) => format!("⚠️ {msg}"),
-            };
-            answer_callback_query(client, api_base, &cb.id, &text).await;
+            reply_to_decision_press(cb, client, api_base, &result).await;
             return;
         }
     }
@@ -2119,6 +2105,50 @@ fn toggle_voice_state(
     }
 }
 
+fn callback_press_origin(
+    cb: &TgCallbackQuery,
+    agent: Option<&str>,
+) -> crate::approval::chat_admin::press::PressOrigin {
+    let message = cb.message.as_ref();
+    crate::approval::chat_admin::press::PressOrigin {
+        message_id: message.and_then(|msg| msg.message_id).map(|id| id.to_string()),
+        private: message.is_some_and(|msg| msg.chat.chat_type.as_deref() == Some("private")
+            && cb.from.as_ref().is_some_and(|from| from.id == msg.chat.id)),
+        account: crate::chat_link_intercept::account_label("telegram", agent),
+        dm: message.map(|msg| msg.chat.id.to_string()).unwrap_or_default(),
+    }
+}
+
+async fn reply_to_decision_press(
+    cb: &TgCallbackQuery,
+    client: &reqwest::Client,
+    api_base: &str,
+    outcome: &crate::approval::chat_admin::press::PressOutcome,
+) {
+    // Legacy decisions still collapse their cards in decision_card::collapse_all.
+    // Their from_result outcome has no card_text; preserve that edit path/toast.
+    let reply = if outcome.refused_reason == Some("legacy_refused") {
+        format!("⚠️ {}", outcome.reply)
+    } else { outcome.reply.clone() };
+    answer_callback_query(client, api_base, &cb.id, &reply).await;
+    if let (Some(text), Some(message)) = (&outcome.card_text, &cb.message) {
+        if let Some(message_id) = message.message_id {
+            // Use the receiving bot's API base, never resolve a different bot.
+            // card.rs already sanitizes the text; send it without parse_mode.
+            let response = client.post(format!("{api_base}/editMessageText"))
+                .json(&json!({"chat_id":message.chat.id, "message_id":message_id,
+                    "text":text, "reply_markup":{"inline_keyboard":[]}}))
+                .send().await;
+            let ok = match response {
+                Ok(response) if response.status().is_success() => response.json::<serde_json::Value>()
+                    .await.is_ok_and(|body| body["ok"] == true),
+                _ => false,
+            };
+            if !ok { warn!("Telegram: approval card replacement failed"); }
+        }
+    }
+}
+
 /// Acknowledge a callback query (clears the client-side loading spinner).
 /// An empty `text` acknowledges silently; otherwise a toast is shown.
 async fn answer_callback_query(
@@ -2127,9 +2157,9 @@ async fn answer_callback_query(
     callback_id: &str,
     text: &str,
 ) {
-    let mut body = json!({ "callback_query_id": callback_id });
+    let mut body = json!({ "callback_query_id": callback_id, "show_alert": false });
     if !text.is_empty() {
-        body["text"] = json!(text);
+        body["text"] = json!(duduclaw_core::truncate_chars(text, 200));
     }
     match client
         .post(format!("{api_base}/answerCallbackQuery"))
@@ -2141,13 +2171,11 @@ async fn answer_callback_query(
             if let Ok(data) = resp.json::<TgResponse<bool>>().await
                 && !data.ok
             {
-                warn!(
-                    "Telegram answerCallbackQuery failed: {}",
-                    data.description.unwrap_or_default()
-                );
+                warn!("Telegram answerCallbackQuery failed");
             }
         }
-        Err(e) => warn!("Telegram answerCallbackQuery error: {e}"),
+        // Request errors may include the bot token in the URL.
+        Err(_) => warn!("Telegram answerCallbackQuery request failed"),
     }
 }
 
@@ -4846,3 +4874,7 @@ mod handshake_tests {
         assert_eq!(telegram_handshake_route(&message(caption), false), CodeRoute::Match);
     }
 }
+
+#[cfg(test)]
+#[path = "telegram_chat_admin_tests.rs"]
+mod chat_admin_tests;
