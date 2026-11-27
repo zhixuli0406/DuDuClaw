@@ -110,6 +110,9 @@ allowed_tools = ["Read"]
     fn sql(&self, sql: &str) {
         rusqlite::Connection::open(self.home.path().join("users.db")).unwrap().execute_batch(sql).unwrap();
     }
+    fn approvals_sql(&self, sql: &str) {
+        rusqlite::Connection::open(self.home.path().join("approvals.db")).unwrap().execute_batch(sql).unwrap();
+    }
     async fn request(&self, agent: &str, value: Value) -> (u16, Value) {
         request(self.state.clone(), agent, value).await
     }

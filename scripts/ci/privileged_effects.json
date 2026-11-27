@@ -4,6 +4,30 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-gateway/src/admin_ai/execute_tests.rs::audit_uses_gateway_turn",
+      "apis": { "command_constructor": 1, "terminal_output": 1 },
+      "effects": ["process_spawn"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only child process verifies gateway audit provenance against hostile environment values."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/admin_ai/execute_tests.rs::preset_raw_cas_refuses_cross_process_replace_with_stale_resolved_text",
+      "apis": { "command_constructor": 1, "terminal_output": 1 },
+      "effects": ["process_spawn"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only child process replaces a raw preset artifact to exercise the compare-and-swap refusal."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/delegation_roles/tests.rs::concurrent_message_consumers_get_only_one_allow",
+      "apis": { "terminal_spawn": 2 },
+      "effects": ["side_effect"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped threads race two consumers of the same delegation initiator."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/runtime_dispatch.rs::testing::isolated_claude_test",
       "apis": {
         "command_constructor": 1,
