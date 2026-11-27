@@ -157,7 +157,11 @@ async fn home_write_finish_rechecks_admin_policy_client_route_and_connection() {
                 match changed {
                     "policy" => { config["google"].as_table_mut().unwrap().remove("drive_write"); }
                     "route" => config["integrations"]["google_credential_path"] = toml::Value::String("none".into()),
-                    "domain" => { config["google"].as_table_mut().unwrap().insert("allowed_domains".into(), toml::Value::Array(vec![toml::Value::String("other.test".into())])); }
+                    "domain" => {
+                        let identity = config["integrations"].as_table_mut().unwrap().entry("google_identity")
+                            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+                        identity.as_table_mut().unwrap().insert("allowed_domains".into(), toml::Value::Array(vec![toml::Value::String("other.test".into())]));
+                    }
                     _ => unreachable!(),
                 }
                 std::fs::write(f.home().join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
