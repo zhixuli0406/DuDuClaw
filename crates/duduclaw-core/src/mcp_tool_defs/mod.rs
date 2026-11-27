@@ -148,6 +148,10 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("odoo_search", "limit", "integer"),
     ("odoo_report", "record_id", "integer"),
     ("odoo_partner_search", "limit", "integer"),
+    ("odoo_activity_create", "res_id", "integer"),
+    ("odoo_activity_create", "user_id", "integer"),
+    ("odoo_note_post", "res_id", "integer"),
+    ("odoo_message_send", "res_id", "integer"),
     ("odoo_create", "values", "object"),
     ("odoo_write", "ids", "array"),
     ("odoo_write", "values", "object"),
@@ -219,6 +223,19 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
+    let writeback = matches!(tool.name, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send");
+    if writeback {
+        for name in ["res_id", "user_id"] {
+            if let Some(prop) = properties.get_mut(name) { prop["minimum"] = serde_json::json!(1); }
+        }
+        for name in ["body", "summary", "note"] {
+            if let Some(prop) = properties.get_mut(name) { prop["maxLength"] = serde_json::json!(10_000); }
+        }
+        if let Some(prop) = properties.get_mut("date_deadline") {
+            prop["pattern"] = serde_json::json!("^[0-9]{4}-[0-9]{2}-[0-9]{2}$");
+            prop["format"] = serde_json::json!("date");
+        }
+    }
     if tool.name == "sheets_update" {
         properties.get_mut("values").unwrap()["items"] = serde_json::json!({
             "type":"array", "items":{"type":["string","number","boolean","null"]}
@@ -276,7 +293,7 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
         );
     }
-    serde_json::json!({
+    let mut schema = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
         "inputSchema": {
@@ -285,12 +302,36 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             "required": required
         },
         "annotations": annotations::tool_annotations(tool.name)
-    })
+    });
+    if writeback { schema["inputSchema"]["additionalProperties"] = serde_json::json!(false); }
+    schema
 }
 
 #[cfg(test)]
 mod registration_tests {
     use super::{build_tool_schema, tools, EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS};
+
+    #[test]
+    fn mcp_odoo_writeback_schemas_and_effects() {
+        for (name, effect) in [("odoo_activity_create", crate::ToolEffect::Modify),
+            ("odoo_note_post", crate::ToolEffect::Modify), ("odoo_message_send", crate::ToolEffect::Send)] {
+            let tool = tools().find(|t| t.name == name).unwrap();
+            let schema = build_tool_schema(tool);
+            let input = &schema["inputSchema"];
+            assert_eq!(input["additionalProperties"], false);
+            assert_eq!(input["properties"]["res_id"]["type"], "integer");
+            assert_eq!(input["properties"]["res_id"]["minimum"], 1);
+            let text = if name == "odoo_activity_create" { "summary" } else { "body" };
+            assert_eq!(input["properties"][text]["maxLength"], 10_000);
+            assert_eq!(input["required"], serde_json::json!(["model", "res_id", text]));
+            assert_eq!(crate::effect_of(name), effect);
+            assert_eq!(crate::tool_effect::reads_private(name), Some(false));
+        }
+        let tool = tools().find(|t| t.name == "odoo_activity_create").unwrap();
+        let schema = build_tool_schema(tool);
+        assert_eq!(schema["inputSchema"]["properties"]["user_id"]["type"], "integer");
+        assert_eq!(schema["inputSchema"]["properties"]["date_deadline"]["format"], "date");
+    }
 
     #[test]
     fn odoo_schemas_declare_numeric_and_boolean_parameters() {

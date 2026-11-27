@@ -74,7 +74,11 @@ pub(crate) fn static_gate_flags(
         tool_name,
         payload.get("arguments").unwrap_or(&Value::Null),
     );
-    let always = payload.get("egress_guard").is_some()
+    // RM-141: notifying Odoo followers always needs a human, even when an
+    // action rule allows the tool. Send classification binds/consumes its
+    // exact arguments through ActionGrant below.
+    let always = tool_name == "odoo_message_send"
+        || payload.get("egress_guard").is_some()
         || install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
         || crate::mcp_dispatch::action_rule_verdict_for_call(

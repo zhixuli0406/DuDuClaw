@@ -2026,6 +2026,7 @@ impl McpDispatcher {
         // RM-103 S3: a role member's intrinsic skips this gate's inherited
         // approval lists / action-rule `ask`; an egress-guard ask still runs.
         if (employee_policy_applies && !intrinsic_exempt)
+            || tool_name == "odoo_message_send"
             || params_owned.get("egress_guard").is_some()
         {
             // Keyed by the ACTING agent: with the internal key the client_id
@@ -5434,6 +5435,9 @@ effect = "forbid"
         "notion_search",
         "notion_status",
         "odoo_connect",
+        "odoo_activity_create",
+        "odoo_note_post",
+        "odoo_message_send",
         "odoo_create",
         "odoo_crm_create_lead",
         "odoo_crm_leads",
@@ -5575,7 +5579,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            273,
+            276,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

@@ -58,6 +58,9 @@ fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Op
         "odoo_schema_fields" | "odoo_schema_overview" => (ToolClass::Read, model.filter(|s| !s.is_empty()), Some("fields_get")),
         "odoo_create" => (ToolClass::GenericCreate, model.map(str::trim), Some("create")),
         "odoo_write" => (ToolClass::GenericWrite, model.map(str::trim), Some("write")),
+        "odoo_activity_create" => (ToolClass::Activity, model, Some("activity_schedule")),
+        "odoo_note_post" => (ToolClass::Note, model, Some("message_post")),
+        "odoo_message_send" => (ToolClass::Message, model, Some("message_post")),
         "odoo_execute" => (ToolClass::Execute, model, params.and_then(|p| p.get("method")).and_then(Value::as_str)),
         "odoo_crm_leads" => (ToolClass::Read, Some("crm.lead"), Some("search_read")),
         "odoo_crm_create_lead" => (ToolClass::Execute, Some("crm.lead"), Some("create")),
@@ -148,7 +151,28 @@ impl ToolPolicy {
     }
 
     pub(super) fn common(&self, model: &str, method: &str) -> Result<(), String> {
-        let op = OdooOp { tool: ToolKind::Generic, model, method, verb: method_verb(method) };
+        self.common_operation(ToolKind::Generic, method_verb(method), model, method)
+    }
+
+    fn common_tool(&self, tool: &str, model: &str, method: &str) -> Result<(), String> {
+        let (kind, verb) = match tool {
+            "odoo_activity_create" => (ToolKind::Activity, Verb::Activity),
+            "odoo_note_post" => (ToolKind::Note, Verb::Note),
+            "odoo_message_send" => (ToolKind::Message, Verb::Message),
+            _ => (ToolKind::Generic, method_verb(method)),
+        };
+        self.common_operation(kind, verb, model, method)?;
+        // The dedicated tools read the target before writing. This read is
+        // intrinsic to the dedicated grant, but still obeys fixed/company gates.
+        if matches!(kind, ToolKind::Activity | ToolKind::Note | ToolKind::Message) {
+            self.common(model, "search_read")?;
+            self.common(model, "fields_get")?;
+        }
+        Ok(())
+    }
+
+    fn common_operation(&self, tool: ToolKind, verb: Verb, model: &str, method: &str) -> Result<(), String> {
+        let op = OdooOp { tool, model, method, verb };
         if let Some(refusal) = fixed_refusal(&op) { return Err(fixed_refusal_message(refusal)); }
         if self.access.always_refuses(&op) {
             return Err(list_refusal_message(&format!("{}：{model}", match op.verb {
@@ -165,7 +189,8 @@ impl ToolPolicy {
         if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
             return super::odoo_generic_write::generic_write_model_gate(Some(&self.agent), &self.global, unblock, verb, model).is_ok();
         }
-        if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview") {
+        if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview"
+            | "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
             let kind = if method_verb(method) == Verb::Read { duduclaw_odoo::AccessKind::Read } else { duduclaw_odoo::AccessKind::Mutate };
             if duduclaw_odoo::check_blocklist(model, kind, unblock).is_err() { return false; }
         }
@@ -204,7 +229,7 @@ impl ToolPolicy {
         }
         if let Some(method) = method { methods = vec![method.to_owned()]; }
         let allowed = candidates.iter().any(|model| methods.iter().any(|method| {
-            self.common(model, method).is_ok()
+            self.common_tool(tool, model, method).is_ok()
                 && (method != "search_read" || self.common(model, "fields_get").is_ok())
                 && self.pure(tool, class, Some(model), Some(method), false)
                 && (self.prospective_follow() || self.engine_model(tool, model, method))
@@ -226,7 +251,7 @@ impl ToolPolicy {
     pub fn precheck(&self, tool: &str, params: &Value) -> Result<(), String> {
         let (_, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
         if let (Some(model), Some(method)) = (model, method) {
-            self.common(model, method)?;
+            self.common_tool(tool, model, method)?;
             if method == "search_read" { self.common(model, "fields_get")?; }
         }
         for (model, method) in self.auxiliary(tool) { self.common(model, method)?; }
@@ -236,7 +261,7 @@ impl ToolPolicy {
     pub fn check_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
         let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
         if let (Some(model), Some(method)) = (model, method) {
-            self.common(model, method)?;
+            self.common_tool(tool, model, method)?;
             if method == "search_read" { self.common(model, "fields_get")?; }
         }
         let permission = decision.map_or(IdentityPermission::Engine, |d| d.permission);
@@ -247,6 +272,9 @@ impl ToolPolicy {
             return Err(DENIED.into());
         }
         if permission == IdentityPermission::Engine {
+            if tool == "odoo_activity_create" && params.get("user_id").is_some() {
+                return Err("引擎模式不接受 user_id；活動只能指派給連線帳號本人。".into());
+            }
             if let (Some(model), Some(method)) = (model, method) {
                 if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
                     let unblock = self.agent.unblock_models.as_ref().unwrap_or(&self.global.unblock_models);

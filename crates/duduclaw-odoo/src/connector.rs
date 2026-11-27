@@ -478,6 +478,20 @@ impl OdooConnector {
         Ok(result)
     }
 
+    /// Keyword calls reserved for the dedicated activity/note/message tools.
+    /// Generic execute callers must continue to supply empty kwargs.
+    pub async fn call_kw(
+        &self, model: &str, method: &str, args: Vec<Value>, kwargs: Value,
+    ) -> Result<Value, String> {
+        if !matches!(method, "activity_schedule" | "message_post") {
+            return Err("Odoo call_kw only supports activity_schedule and message_post".into());
+        }
+        if !kwargs.is_object() {
+            return Err("Odoo call_kw kwargs must be an object".into());
+        }
+        self.raw_execute_kw(model, method, args, kwargs).await
+    }
+
     /// Execute an ORM method.
     pub async fn execute_kw(
         &self,
@@ -925,6 +939,24 @@ pub(crate) fn mocked_connector(responses: Vec<Result<Value, String>>) -> OdooCon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn call_kw_is_closed_and_preserves_dedicated_kwargs() {
+        let conn = mocked_connector(vec![Ok(json!(42)), Ok(json!([7]))]);
+        for method in ["write", "create", "unlink", "message_notify", "send_mail", "_message_post", "activity_schedule_extra"] {
+            assert!(conn.call_kw("crm.lead", method, vec![], json!({})).await.is_err());
+        }
+        assert!(conn.call_kw("crm.lead", "message_post", vec![], json!([])).await.is_err());
+        assert!(conn.mocked_requests().is_empty());
+        let note = json!({"body":"&lt;b&gt;中文&lt;/b&gt;", "message_type":"comment",
+            "subtype_xmlid":"mail.mt_note", "partner_ids":[]});
+        assert_eq!(conn.call_kw("crm.lead", "message_post", vec![json!([9])], note.clone()).await.unwrap(), json!(42));
+        let activity = json!({"act_type_xmlid":"mail.mail_activity_data_todo", "summary":"Review", "user_id":7});
+        conn.call_kw("crm.lead", "activity_schedule", vec![json!([9])], activity.clone()).await.unwrap();
+        let requests = conn.mocked_requests();
+        assert_eq!(requests[0], ("crm.lead".into(), "message_post".into(), vec![json!([9])], note));
+        assert_eq!(requests[1].3, activity);
+    }
 
     #[tokio::test]
     async fn retained_authority_stops_version_and_rpc_after_revocation() {

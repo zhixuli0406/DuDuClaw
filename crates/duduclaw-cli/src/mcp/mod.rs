@@ -221,6 +221,8 @@ mod odoo_access;
 mod odoo_access_tests;
 pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
+mod odoo_writeback;
+pub(crate) use odoo_writeback::odoo_writeback_precheck;
 mod on_behalf_of;
 mod os_tools;
 mod personal_target;

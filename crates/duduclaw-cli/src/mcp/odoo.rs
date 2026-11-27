@@ -111,6 +111,10 @@ async fn handle_odoo_tool_with_connector(
         return result;
     }
 
+    if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
+        return super::odoo_writeback::handle(tool, params, home_dir, odoo, caller_agent, bound).await;
+    }
+
     // RM-120: generic create / write carry their own explicit-grant gate
     // chain (`odoo_generic_write.rs`); the permissive per-agent filter below
     // never authorizes them. Protected mode (owner decision C) runs the same
@@ -698,6 +702,15 @@ async fn handle_odoo_tool_with_connector(
 /// need no model permission).
 pub(crate) fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, String)> {
     match tool {
+        "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" => {
+            let model = params.get("model").and_then(Value::as_str)?;
+            let verb = match tool {
+                "odoo_activity_create" => "activity",
+                "odoo_note_post" => "note",
+                _ => "message",
+            };
+            Some((verb, model.to_owned()))
+        }
         "odoo_crm_leads" => Some(("search", "crm.lead".into())),
         "odoo_crm_create_lead" => Some(("create", "crm.lead".into())),
         "odoo_crm_update_stage" => Some(("write", "crm.lead".into())),

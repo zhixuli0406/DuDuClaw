@@ -316,7 +316,7 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     // v1.80 merge: +google_chat_spaces/google_chat_messages, Google connector route.
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
     // 141K-P5: +two person tools, intentionally refused for all employees.
-    assert_eq!(tools.len(), 273, "review every new tool's isolation disposition");
+    assert_eq!(tools.len(), 276, "review every new tool's isolation disposition");
     for tool in tools {
         let route = boundary_route(tool.name).expect("exact route");
         if intentional_refusal(tool.name).is_some() { continue; }
@@ -354,7 +354,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 273);
+    assert_eq!(manifest.len(), 276);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
             ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));
