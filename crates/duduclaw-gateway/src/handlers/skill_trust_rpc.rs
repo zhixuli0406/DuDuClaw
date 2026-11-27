@@ -6,7 +6,7 @@ use duduclaw_core::publishers::{Publisher, TrustStore, TRUST_STORE_FILE, OFFICIA
     validate_publisher_id, validate_pubkey};
 use duduclaw_security::audit::{append_audit_event, AuditEvent, Severity};
 use crate::approval::{ApprovalBroker, ApprovalRecord};
-use crate::skill_trust::{minisign_key_id, PinnedKey, TrustConfig};
+use crate::skill_trust::{conflicting_pin_ids, minisign_key_id, PinnedKey, TrustConfig};
 use super::config_commit;
 
 const READ_ERROR: &str = "無法讀取自家技能來源，請稍後再試。";
@@ -14,6 +14,8 @@ const WRITE_ERROR: &str = "無法儲存自家技能來源，請重新整理後�
 const ADMIN: &str = "只有管理員可以管理自家技能來源。";
 const BROWSER: &str = "請使用瀏覽器登入帳號後管理自家技能來源。";
 const REAUTH: &str = "請重新輸入目前密碼或新的二次驗證碼。";
+const KEY_CONFLICT: &str = "同一發行者的金鑰代號對應到不同公鑰，請先請管理員排除衝突。";
+const PIN_INCOMPLETE: &str = "來源已儲存，但尚未啟用，請重新整理後再試。";
 const POLICY_PREFIX: &str = "policy:skill_trust:";
 
 fn frame(result: Result<Value, String>) -> WsFrame {
@@ -47,7 +49,7 @@ fn set_entries(table: &mut toml::Table, entries: &[PinnedKey]) -> Result<(), Str
     section.insert("auto_approve".into(), toml::Value::try_from(entries).map_err(|_| WRITE_ERROR)?);
     Ok(())
 }
-fn live_browser_admin(db: &UserDb, ctx: &UserContext, session: &str) -> Result<UserContext, String> {
+pub(super) fn live_browser_admin(db: &UserDb, ctx: &UserContext, session: &str) -> Result<UserContext, String> {
     let live = db.live_user_context(&ctx.user_id).map_err(|_| REAUTH)?
         .filter(|live| live.is_admin() && live.credential_epoch == ctx.credential_epoch && !live.must_change_password)
         .ok_or(REAUTH)?;
@@ -119,7 +121,7 @@ impl MethodHandler {
 
 /// Same format and sidecar lock as the operator publisher CLI. Validate the
 /// complete resulting store before atomically publishing it.
-fn add_trusted_key(home: &Path, publisher: &str, key: &str) -> Result<bool, String> {
+fn add_trusted_key(home: &Path, publisher: &str, key: &str, guard: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
     let path = home.join(TRUST_STORE_FILE);
     duduclaw_core::with_file_lock(&path, || {
         match std::fs::symlink_metadata(&path) {
@@ -137,6 +139,9 @@ fn add_trusted_key(home: &Path, publisher: &str, key: &str) -> Result<bool, Stri
         let mut temporary = tempfile::NamedTempFile::new_in(home)?;
         temporary.write_all(text.as_bytes())?;
         temporary.as_file().sync_all()?;
+        // Recheck the live session and role under the trust-store lock, at the
+        // final publication boundary (the config commit has already finished).
+        guard().map_err(std::io::Error::other)?;
         temporary.persist(&path).map_err(|e| e.error)?;
         #[cfg(unix)]
         std::fs::File::open(home)?.sync_all()?;
@@ -144,22 +149,28 @@ fn add_trusted_key(home: &Path, publisher: &str, key: &str) -> Result<bool, Stri
     }).map_err(|_| WRITE_ERROR.into())
 }
 
-fn pin(home: &Path, params: &Value, actor: &str, guard: impl Fn() -> Result<(), String>) -> Result<Value, String> {
+pub(super) fn pin(home: &Path, params: &Value, actor: &str, guard: impl Fn() -> Result<(), String>) -> Result<Value, String> {
     let publisher = publisher_param(params)?;
     let key = params.get("public_key").and_then(Value::as_str).ok_or("請填寫公鑰。")?;
     validate_pubkey(key).map_err(|_| "公鑰格式不正確，請確認後再試。")?;
     let key_id = minisign_key_id(key).map_err(|_| "公鑰格式不正確，請確認後再試。")?;
     let (mut table, hash, mut entries) = config(home)?;
+    if entries.iter().any(|entry| entry.publisher == publisher && entry.key_id == key_id && entry.key != key) {
+        return Err(KEY_CONFLICT.into());
+    }
     let entry = entries.iter().find(|entry| entry.publisher == publisher && entry.key == key).cloned()
         .unwrap_or_else(|| PinnedKey { publisher: publisher.into(), key: key.into(), key_id,
             added_by: actor.into(), added_at: Utc::now().to_rfc3339() });
     if !entries.iter().any(|existing| existing.publisher == publisher && existing.key == key) { entries.push(entry.clone()); }
     set_entries(&mut table, &entries)?;
     guard()?;
-    let trust_store_changed = add_trusted_key(home, publisher, key)?;
-    config_commit::commit_skill_trust_table(home, &hash, &table, guard).map_err(|_| {
-        if trust_store_changed { "公鑰已加入信任清單，但尚未設為自動放行，請重新整理後再試。" }
-        else { WRITE_ERROR }
+    // A pin without its exact key in the trust store is inert. Commit this
+    // first so a failed config CAS cannot broaden global publisher trust.
+    config_commit::commit_skill_trust_table(home, &hash, &table, &guard).map_err(|_| WRITE_ERROR)?;
+    let trust_store_changed = add_trusted_key(home, publisher, key, &guard).map_err(|_| {
+        append_audit_event(home, &AuditEvent::new("skill_trust_pin_incomplete", actor, Severity::Warning,
+            json!({"publisher": publisher, "key_id": entry.key_id})));
+        PIN_INCOMPLETE
     })?;
     append_audit_event(home, &AuditEvent::new("skill_trust_pinned", actor, Severity::Info,
         json!({"publisher": publisher, "key_id": entry.key_id, "trust_store_changed": trust_store_changed})));
@@ -196,8 +207,10 @@ fn get_sources(home: &Path, records: Vec<ApprovalRecord>) -> Result<Value, Strin
             "key_id": minisign_key_id(key).map_err(|_| READ_ERROR)?}))).collect::<Result<Vec<_>, String>>()?;
         publishers.push(json!({"publisher": publisher, "built_in": publisher == "duduclaw", "keys": keys}));
     }
+    let conflicts = conflicting_pin_ids(&entries);
     let entries: Vec<Value> = entries.iter().map(|entry| json!({"publisher": entry.publisher,
         "key_id": entry.key_id, "added_by": entry.added_by, "added_at": entry.added_at,
+        "conflicting": conflicts.contains(&(entry.publisher.clone(), entry.key_id.clone())),
         "in_trust_store": store.keys(&entry.publisher).iter().any(|key| *key == entry.key.as_str())})).collect();
     let days = config_commit::toml_at(&table, "approval.skill_ttl_days").and_then(toml::Value::as_integer)
         .filter(|days| (1..=30).contains(days)).unwrap_or(crate::skill_ttl::DEFAULT_SKILL_APPROVAL_TTL_SECS / 86_400);
@@ -225,6 +238,9 @@ fn unpin(home: &Path, params: &Value, ctx: &UserContext, records: &[ApprovalReco
         _ => return Err("請選擇是否一併停用已放行的技能。".into()),
     };
     let (mut table, hash, mut entries) = config(home)?;
+    if conflicting_pin_ids(&entries).contains(&(publisher.to_owned(), key_id.to_owned())) {
+        return Err(KEY_CONFLICT.into());
+    }
     let before = entries.len();
     entries.retain(|entry| entry.publisher != publisher || entry.key_id != key_id);
     let removed = before - entries.len();

@@ -70,10 +70,26 @@ impl PinnedKey {
             && minisign_key_id(&self.key).is_ok_and(|id| id == self.key_id)
     }
 }
+/// A minisign key id is not a fingerprint. Check all entries, including invalid
+/// ones, before selecting usable pins so a collision cannot be filtered away.
+pub(crate) fn conflicting_pin_ids(entries: &[PinnedKey]) -> BTreeSet<(String, String)> {
+    let mut keys = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for entry in entries {
+        let identity = (entry.publisher.as_str(), entry.key_id.as_str());
+        if keys.insert(identity, entry.key.as_str()).is_some_and(|key| key != entry.key.as_str()) {
+            conflicts.insert((entry.publisher.clone(), entry.key_id.clone()));
+        }
+    }
+    conflicts
+}
 fn read_config(root: &Directory) -> Result<TrustConfig, String> {
     let raw = root.read("config.toml", 2 * 1024 * 1024).map_err(|_| CONFIG)?;
     let text = std::str::from_utf8(&raw).map_err(|_| CONFIG)?;
-    toml::from_str::<Config>(text).map(|c| c.skill_trust).map_err(|_| CONFIG.into())
+    let mut trust = toml::from_str::<Config>(text).map_err(|_| CONFIG)?.skill_trust;
+    let conflicts = conflicting_pin_ids(&trust.auto_approve);
+    trust.auto_approve.retain(|entry| !conflicts.contains(&(entry.publisher.clone(), entry.key_id.clone())));
+    Ok(trust)
 }
 
 #[derive(Deserialize)]

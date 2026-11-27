@@ -179,6 +179,76 @@ async fn wrong_key_same_publisher_goes_manual() {
     f.manual(SIGNATURE).await;
 }
 #[tokio::test]
+async fn conflicting_pinned_key_ids_ignore_both_keys_and_go_manual() {
+    let original = base64::engine::general_purpose::STANDARD.decode(KEY_A).unwrap();
+    let mut other = base64::engine::general_purpose::STANDARD.decode(KEY_B).unwrap();
+    other[2..10].copy_from_slice(&original[2..10]);
+    let collision = base64::engine::general_purpose::STANDARD.encode(other);
+    validate_pubkey(&collision).unwrap();
+    assert_ne!(collision, KEY_A);
+    let id = minisign_key_id(KEY_A).unwrap();
+    assert_eq!(minisign_key_id(&collision).unwrap(), id);
+    for reverse in [false, true] {
+        let f = Fixture::standard().await;
+        let mut config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id)).unwrap();
+        let mut second = config.skill_trust.auto_approve[0].clone();
+        second.key = collision.clone();
+        assert!(second.usable());
+        config.skill_trust.auto_approve.push(second);
+        if reverse { config.skill_trust.auto_approve.reverse(); }
+        let mut table = toml::Table::new();
+        let mut trust = toml::Table::new();
+        trust.insert("auto_approve".into(), toml::Value::try_from(&config.skill_trust.auto_approve).unwrap());
+        table.insert("skill_trust".into(), toml::Value::Table(trust));
+        std::fs::write(f.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+        // Both keys are globally trusted; the ambiguous pin identity must
+        // still exclude even the real signer, regardless of entry order.
+        std::fs::write(f.path().join("trusted_publishers.toml"),
+            format!("[publishers.fixture]\nkeys=['{KEY_A}', '{collision}']\n")).unwrap();
+        assert!(read_config(&Directory::open(f.path()).unwrap()).unwrap().auto_approve.is_empty());
+        assert_eq!(evaluate(f.path(), &f.record().await).await.unwrap_err(), KEY);
+        f.manual(KEY).await;
+    }
+}
+#[test]
+fn config_reader_checks_conflicts_before_usability_and_preserves_other_identities() {
+    let home = tempfile::tempdir().unwrap();
+    let id = minisign_key_id(KEY_A).unwrap();
+    let config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id)).unwrap();
+    let first = config.skill_trust.auto_approve[0].clone();
+    let mut invalid = first.clone();
+    invalid.key = "invalid".into();
+    assert!(!invalid.usable());
+    let mut other_publisher = first.clone();
+    other_publisher.publisher = "another".into();
+    let mut other_id = first.clone();
+    other_id.key = KEY_B.into();
+    other_id.key_id = minisign_key_id(KEY_B).unwrap();
+    let mut trust = toml::Table::new();
+    trust.insert("auto_approve".into(), toml::Value::try_from(
+        vec![first.clone(), invalid, first, other_publisher.clone(), other_publisher, other_id]).unwrap());
+    let mut table = toml::Table::new();
+    table.insert("skill_trust".into(), toml::Value::Table(trust));
+    std::fs::write(home.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let read = read_config(&Directory::open(home.path()).unwrap()).unwrap();
+    assert_eq!(read.auto_approve.len(), 3);
+    assert!(read.auto_approve.iter().all(PinnedKey::usable));
+    assert_eq!(read.auto_approve.iter().filter(|pin| pin.publisher == "another").count(), 2);
+    assert_eq!(read.auto_approve[2].key, KEY_B);
+}
+#[tokio::test]
+async fn identical_duplicate_pins_still_allow_the_exact_signing_key() {
+    let f = Fixture::standard().await;
+    let text = std::fs::read_to_string(f.path().join("config.toml")).unwrap();
+    let mut table: toml::Table = text.parse().unwrap();
+    let entries = table.get_mut("skill_trust").unwrap().get_mut("auto_approve").unwrap().as_array_mut().unwrap();
+    entries.push(entries[0].clone());
+    std::fs::write(f.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let result = evaluate(f.path(), &f.record().await).await.unwrap();
+    assert_eq!(result.publisher, "fixture");
+    assert_eq!(result.key_id, minisign_key_id(KEY_A).unwrap());
+}
+#[tokio::test]
 async fn tampered_script_after_quarantine_goes_manual() {
     let f = Fixture::standard().await;
     std::fs::write(f.quarantine().join("run.sh"), "echo changed\n").unwrap();

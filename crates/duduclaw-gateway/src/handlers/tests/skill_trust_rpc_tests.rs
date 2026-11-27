@@ -2,6 +2,7 @@ use super::*;
 use duduclaw_core::publishers::{TrustStore, OFFICIAL_PUBLISHER_KEY, TRUST_STORE_FILE};
 use crate::approval::{ApprovalBroker, ApprovalId};
 use crate::skill_trust::minisign_key_id;
+use super::super::skill_trust_rpc::{live_browser_admin, pin};
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -42,8 +43,30 @@ fn key_id() -> String { minisign_key_id(OFFICIAL_PUBLISHER_KEY).unwrap() }
 fn policy() -> String { format!("policy:skill_trust:in-house:{}", key_id()) }
 fn config(f: &Fixture) -> String { std::fs::read_to_string(f.home.path().join("config.toml")).unwrap() }
 fn audit(f: &Fixture, event: &str) -> Vec<Value> {
-    std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap().lines()
+    let text = match std::fs::read_to_string(f.home.path().join("security_audit.jsonl")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => panic!("cannot read audit: {error}"),
+    };
+    text.lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap()).filter(|row| row["event_type"] == event).collect()
+}
+fn consume_pin_proof(f: &Fixture, db: &UserDb, session: &str) {
+    let now = Utc::now().timestamp();
+    let proof = db.skill_trust_pin_reauthenticate(&f.admin.user_id, session, f.admin.credential_epoch,
+        "test-password", "", &crate::mfa::Cipher(f.home.path()), now).unwrap();
+    db.skill_trust_pin_consume(&f.admin.user_id, session, f.admin.credential_epoch, &proof, now).unwrap();
+}
+fn colliding_key() -> String {
+    use base64::Engine;
+    let mut bytes = base64::engine::general_purpose::STANDARD.decode(OFFICIAL_PUBLISHER_KEY).unwrap();
+    // Preserve the algorithm and eight-byte id; change the public key itself.
+    bytes[10] ^= 1;
+    let key = base64::engine::general_purpose::STANDARD.encode(bytes);
+    duduclaw_core::publishers::validate_pubkey(&key).unwrap();
+    assert_ne!(key, OFFICIAL_PUBLISHER_KEY);
+    assert_eq!(minisign_key_id(&key).unwrap(), key_id());
+    key
 }
 async fn approve(f: &Fixture, slug: &str, entries: Value, decided_by: &str) -> ApprovalId {
     let broker = ApprovalBroker::open(f.home.path()).unwrap();
@@ -130,6 +153,123 @@ async fn pin_refuses_builtin_and_invalid_key_and_is_idempotent() {
     assert_eq!(table["skill_trust"]["auto_approve"].as_array().unwrap().len(), 1);
     assert_eq!(TrustStore::load(f.home.path()).unwrap().keys("in-house").len(), 1);
     assert_eq!(audit(&f, "skill_trust_pinned")[1]["details"]["trust_store_changed"], false);
+}
+
+#[tokio::test]
+async fn pin_config_cas_failure_never_changes_trust_store() {
+    for existing_store in [false, true] {
+        let f = fixture().await;
+        let trust_path = f.home.path().join(TRUST_STORE_FILE);
+        if existing_store {
+            std::fs::write(&trust_path, format!("[publishers.other]\nkeys=['{OFFICIAL_PUBLISHER_KEY}']\n")).unwrap();
+        }
+        let trust_before = std::fs::read(&trust_path).ok();
+        let db = f.handler.user_db.read().await.clone().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        consume_pin_proof(&f, &db, &session);
+        let concurrent = format!("{}# concurrent change\n", config(&f));
+        let calls = std::cell::Cell::new(0);
+        let error = pin(f.home.path(), &args(), &f.admin.user_id, || {
+            calls.set(calls.get() + 1);
+            assert_eq!(calls.get(), 1, "CAS must fail before the commit guard or trust-store write");
+            std::fs::write(f.home.path().join("config.toml"), &concurrent).unwrap();
+            live_browser_admin(&db, &f.admin, &session).map(|_| ())
+        }).unwrap_err();
+        assert_eq!(error, "無法儲存自家技能來源，請重新整理後再試。");
+        assert_eq!(calls.get(), 1);
+        assert_eq!(config(&f), concurrent);
+        assert_eq!(std::fs::read(&trust_path).ok(), trust_before);
+        assert!(audit(&f, "skill_trust_pinned").is_empty());
+        assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn pin_rechecks_admin_and_session_under_trust_store_lock_after_config_commit() {
+    for revoke_session in [false, true] {
+        let f = fixture().await;
+        let db = f.handler.user_db.read().await.clone().unwrap();
+        let session = uuid::Uuid::new_v4().to_string();
+        db.remember_create(&f.admin.user_id, f.admin.credential_epoch, &session, "test", None, 1,
+            Utc::now().timestamp(), false, |_, _, _| Ok(())).unwrap();
+        consume_pin_proof(&f, &db, &session);
+        let calls = std::cell::Cell::new(0);
+        let error = pin(f.home.path(), &args(), &f.admin.user_id, || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                let table: toml::Table = config(&f).parse().unwrap();
+                assert_eq!(table["skill_trust"]["auto_approve"].as_array().unwrap().len(), 1);
+                assert!(!f.home.path().join(TRUST_STORE_FILE).exists());
+                let lock = std::fs::OpenOptions::new().read(true).write(true)
+                    .open(f.home.path().join(format!("{TRUST_STORE_FILE}.lock"))).unwrap();
+                assert_eq!(fs2::FileExt::try_lock_exclusive(&lock).unwrap_err().raw_os_error(),
+                    fs2::lock_contended_error().raw_os_error());
+                if revoke_session {
+                    db.remember_revoke(&f.admin.user_id, Some(&session)).unwrap();
+                } else {
+                    db.update_user(&f.admin.user_id, None, Some(UserRole::Employee), None).unwrap();
+                }
+            }
+            live_browser_admin(&db, &f.admin, &session).map(|_| ())
+        }).unwrap_err();
+        assert_eq!(calls.get(), 3);
+        assert_eq!(error, "來源已儲存，但尚未啟用，請重新整理後再試。");
+        assert!(!f.home.path().join(TRUST_STORE_FILE).exists());
+        assert!(TrustStore::load(f.home.path()).unwrap().keys("in-house").is_empty());
+        assert!(audit(&f, "skill_trust_pinned").is_empty());
+        let rows = audit(&f, "skill_trust_pin_incomplete");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["agent_id"], f.admin.user_id);
+        assert_eq!(rows[0]["details"]["publisher"], "in-house");
+        assert_eq!(rows[0]["details"]["key_id"], key_id());
+        // Inspect through the real get RPC with a separate, still-live Admin.
+        db.update_user(&f.member.user_id, None, Some(UserRole::Admin), None).unwrap();
+        let observer = db.live_user_context(&f.member.user_id).unwrap().unwrap();
+        let got = payload(f.handler.handle("skill_trust.get", json!({}), &observer).await);
+        assert_eq!(got["auto_approve"].as_array().unwrap().len(), 1);
+        assert_eq!(got["auto_approve"][0]["in_trust_store"], false);
+        assert_eq!(got["auto_approve"][0]["conflicting"], false);
+    }
+}
+
+#[tokio::test]
+async fn conflicting_key_id_refuses_pin_and_unpin_and_is_visible_in_get() {
+    let f = fixture().await;
+    payload(browser(&f, &f.admin, "skill_trust.pin", args()).await);
+    let before = config(&f);
+    let trust_before = std::fs::read(f.home.path().join(TRUST_STORE_FILE)).unwrap();
+    let mut collision = args();
+    collision["public_key"] = json!(colliding_key());
+    refused(browser(&f, &f.admin, "skill_trust.pin", collision.clone()).await);
+    assert_eq!(config(&f), before);
+    assert_eq!(audit(&f, "skill_trust_pinned").len(), 1);
+    // A hand-edited legacy config may already contain both keys.
+    let mut table: toml::Table = before.parse().unwrap();
+    let entries = table.get_mut("skill_trust").unwrap().get_mut("auto_approve").unwrap().as_array_mut().unwrap();
+    let mut second = entries[0].clone();
+    second.as_table_mut().unwrap().insert("key".into(), toml::Value::String(colliding_key()));
+    entries.push(second);
+    let conflicted = toml::to_string(&table).unwrap();
+    std::fs::write(f.home.path().join("config.toml"), &conflicted).unwrap();
+    let got = payload(f.handler.handle("skill_trust.get", json!({}), &f.admin).await);
+    let entries = got["auto_approve"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    assert!(entries.iter().all(|entry| entry["conflicting"] == true));
+    assert_eq!(entries[0]["in_trust_store"], true);
+    assert_eq!(entries[1]["in_trust_store"], false);
+    // Even re-pinning either existing key must refuse the ambiguous identity.
+    for params in [args(), collision] {
+        refused(browser(&f, &f.admin, "skill_trust.pin", params).await);
+    }
+    for disable in [true, false] {
+        refused(f.handler.handle("skill_trust.unpin",
+            json!({"publisher":"in-house", "key_id":key_id(), "disable_skills":disable}), &f.admin).await);
+    }
+    assert_eq!(config(&f), conflicted);
+    assert_eq!(std::fs::read(f.home.path().join(TRUST_STORE_FILE)).unwrap(), trust_before);
+    assert_eq!(audit(&f, "skill_trust_pinned").len(), 1);
+    assert!(audit(&f, "skill_trust_unpinned").is_empty());
+    assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
 }
 
 #[tokio::test]
@@ -238,6 +378,7 @@ async fn get_lists_trust_state_and_twenty_newest_auto_approvals() {
     approve(&f, "manual", json!([]), "dashboard:admin").await;
     let got = payload(f.handler.handle("skill_trust.get", json!({}), &f.admin).await);
     assert_eq!(got["auto_approve"][0]["in_trust_store"], true);
+    assert_eq!(got["auto_approve"][0]["conflicting"], false);
     assert_eq!(got["auto_approve"][0]["added_by"], f.admin.user_id);
     assert_eq!(got["skill_ttl_days"], 9);
     let publisher = got["publishers"].as_array().unwrap().iter().find(|p| p["publisher"] == "in-house").unwrap();
@@ -271,7 +412,10 @@ async fn skill_trust_read_errors_never_become_empty_success() {
     std::fs::write(f.home.path().join(TRUST_STORE_FILE), "[broken").unwrap();
     refused(f.handler.handle("skill_trust.get", json!({}), &f.admin).await);
     refused(browser(&f, &f.admin, "skill_trust.pin", args()).await);
-    assert_eq!(config(&f), original);
+    let table: toml::Table = config(&f).parse().unwrap();
+    assert_eq!(table["skill_trust"]["auto_approve"].as_array().unwrap().len(), 1);
+    assert_eq!(audit(&f, "skill_trust_pin_incomplete").len(), 1);
+    assert!(audit(&f, "skill_trust_pinned").is_empty());
     assert_eq!(std::fs::read_to_string(f.home.path().join(TRUST_STORE_FILE)).unwrap(), "[broken");
 }
 
