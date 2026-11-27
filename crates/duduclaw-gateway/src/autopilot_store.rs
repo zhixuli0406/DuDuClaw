@@ -989,7 +989,7 @@ impl AutopilotStore {
             if count_fire {
                 conn.execute(
                     "UPDATE autopilot_rules SET trigger_count = trigger_count + 1, last_triggered_at = ?1
-                     WHERE id = (SELECT rule_id FROM autopilot_approval_dispatch WHERE dispatch_id = ?2)",
+                     WHERE id = (SELECT rule_id FROM autopilot_approval_dispatch WHERE dispatch_id = ?2 AND run_id IS NULL)",
                     params![now, dispatch_id],
                 )
                 .map_err(|e| format!("settle dispatch trigger count: {e}"))?;

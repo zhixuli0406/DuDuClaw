@@ -6,7 +6,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::autopilot_approval::{event_ref, rule_revision_hash, run_dedupe_key};
 use crate::autopilot_store::{
     AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, RunNext,
-    run_ts, step_idempotency_key, RUN_PENDING, RUN_RUNNING,
+    run_ts, step_idempotency_key, RUN_PENDING, RUN_RUNNING, RUN_AWAITING_APPROVAL,
     STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED,
 };
 use crate::autopilot_window::{rule_window_decision, WindowDecision};
@@ -100,6 +100,7 @@ impl AutopilotEngine {
         if !duduclaw_core::gateway_instance::held(&self.home_dir) {
             return Ok(());
         }
+        self.reconcile_approval_runs_once(now).await?;
         self.announce_run_notices_once(now).await?;
         for run in self.store.list_unsupported_runs(50).await? {
             if self.store.settle_unclaimed_run(&run.run_id, &[&run.state], "unsupported_state", None, now).await? {
@@ -125,6 +126,62 @@ impl AutopilotEngine {
         Ok(())
     }
 
+    /// Durable bridge from the approval ledger to the run state machine.
+    /// A crash after dispatch settlement is repaired by the next lock-holder tick.
+    pub(super) async fn reconcile_approval_runs_once(&self, now: DateTime<Utc>) -> Result<(), String> {
+        use crate::autopilot_approval as gate;
+        use crate::autopilot_store::{DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_REQUESTING, DISPATCH_SETTLED};
+        if !duduclaw_core::gateway_instance::held(&self.home_dir) { return Ok(()); }
+        for run in self.store.list_awaiting_approval_runs().await? {
+            let steps = self.store.list_run_steps(&run.run_id).await?;
+            let step = steps.iter().find(|step| step.step_index == run.step_index);
+            let dispatch = match step.and_then(|step| step.dispatch_id.as_deref()) {
+                Some(id) => self.store.get_dispatch(id).await?,
+                None => None,
+            };
+            let valid = dispatch.as_ref().filter(|row| {
+                row.run_id.as_deref() == Some(run.run_id.as_str()) && row.step_index == Some(run.step_index)
+                    && row.rule_id == run.rule_id && row.rule_hash == run.rule_hash
+                    && step.is_some_and(|step| step.state == STEP_RUNNING)
+            });
+            let (outcome, detail) = match valid {
+                Some(row) if row.state == DISPATCH_SETTLED => {
+                    let detail = row.detail.as_deref();
+                    let outcome = match row.outcome.as_deref() {
+                        Some(gate::RESULT_SUCCESS) => "completed",
+                        Some(gate::RESULT_DENIED) => "denied",
+                        Some(gate::RESULT_EXPIRED) => "expired",
+                        Some(gate::RESULT_STALE) => "stale_rule_changed",
+                        Some(gate::RESULT_BREAKER_OPEN) => "blocked_breaker_open",
+                        Some(gate::RESULT_SKIPPED) if detail == Some("scope_denied") => "scope_denied",
+                        Some(gate::RESULT_SKIPPED) => "autonomy_paused",
+                        Some(gate::RESULT_FAILURE) => "step_failed",
+                        Some(gate::RESULT_UNCERTAIN) => "execution_uncertain",
+                        _ => "approval_error",
+                    };
+                    (outcome, detail)
+                }
+                Some(row) if matches!(row.state.as_str(), DISPATCH_REQUESTING | DISPATCH_AWAITING | DISPATCH_EXECUTING) => continue,
+                _ => ("approval_error", Some("核准紀錄不存在或與流程步驟不符")),
+            };
+            // Stable ID makes re-driving a crash between this audit and the
+            // run CAS harmless; neither write increments trigger_count.
+            self.store.append_step_history(&AutopilotHistoryRow {
+                id: format!("run:{}:step:{}", run.run_id, run.step_index),
+                rule_id: run.rule_id.clone(), rule_name: run.rule_name.clone(), triggered_at: run_ts(now),
+                result: if outcome == "completed" { "step_done" } else { "step_failed" }.into(),
+                details: detail.map(str::to_owned),
+            }).await?;
+            if outcome == "completed" {
+                let row = valid.expect("success requires a bound dispatch");
+                self.store.resume_after_approval(&run.run_id, run.step_index, &row.dispatch_id, now).await?;
+            } else {
+                self.store.settle_unclaimed_run(&run.run_id, &[RUN_AWAITING_APPROVAL], outcome, detail, now).await?;
+            }
+        }
+        self.announce_run_notices_once(now).await
+    }
+
     async fn recover_run(&self, id: &str, now: DateTime<Utc>) -> Result<(), String> {
         if !self.store.reclaim_expired_run(id, lease_owner(), now).await? {
             return Ok(());
@@ -135,7 +192,13 @@ impl AutopilotEngine {
             if step.state == STEP_RUNNING
                 && matches!(step.step_type.as_str(), "notify" | "proactive_notify")
             {
-                return self.settle_run(&run, "execution_uncertain", None, now).await;
+                let gated = self.store.get_rule(&run.rule_id).await?
+                    .and_then(|rule| steps_action(&rule).ok())
+                    .and_then(|steps| usize::try_from(run.step_index).ok().and_then(|i| steps.get(i).cloned()))
+                    .is_some_and(|step| crate::approval::rule_requires_approval(&step));
+                if !gated {
+                    return self.settle_run(&run, "execution_uncertain", None, now).await;
+                }
             }
         }
         // Pending steps advance normally. Running queue actions are reconciled
@@ -255,11 +318,7 @@ impl AutopilotEngine {
                     }
                 }
             }
-            // 141A-P6: render/freeze this step and enter the approval ledger.
-            // Until that package lands, no approval-gated step may execute.
-            if crate::approval::rule_requires_approval(action) {
-                return self.settle_run(&run, "approval_step_unavailable", None, now).await;
-            }
+            let gated = crate::approval::rule_requires_approval(action);
             let queue_action = matches!(step.step_type.as_str(), "delegate" | "run_skill");
             let message_id = queue_id(id, run.step_index);
             let wait_deadline = if step.step_type == "wait" {
@@ -290,6 +349,44 @@ impl AutopilotEngine {
             {
                 let hook = self.after_claim_hook.lock().unwrap_or_else(|p| p.into_inner()).take();
                 if let Some(hook) = hook { hook(); }
+            }
+            if gated {
+                if !matches!(step.state.as_str(), STEP_PENDING | STEP_RUNNING) {
+                    return self.settle_run(&run, "invalid_state", Some("unexpected gated step state"), now).await;
+                }
+                match self.checked_run_step(&run, &fields, now, None, step.state == STEP_RUNNING).await? {
+                    Ok(true) => {}
+                    Ok(false) => return Ok(()),
+                    Err((outcome, detail)) => return self.settle_run(&run, &outcome, Some(&detail), now).await,
+                }
+                match prepared {
+                    Ok(None) => {
+                        if !self.finish_run_step(&run, STEP_SKIPPED, None, None, Self::next_run_step(&run), now).await? {
+                            return Ok(());
+                        }
+                        if !self.store.claim_run(id, lease_owner(), now).await? { return Ok(()); }
+                        continue;
+                    }
+                    Err(detail) => {
+                        self.finish_run_step(&run, STEP_FAILED, Some(&detail), None,
+                            RunNext::Settle { outcome: "step_failed".into(), detail: Some(detail.clone()) }, now).await?;
+                    }
+                    Ok(Some(frozen)) => {
+                        let failure = if self.approval_broker.is_none() {
+                            Some((crate::autopilot_approval::RESULT_BLOCKED,
+                                "需要核准，但核准服務沒有接上；動作沒有執行".to_string()))
+                        } else {
+                            self.gate_step_on_approval(&rule, &run, frozen, &fields, lease_owner(), now).await
+                                .err().map(|detail| (crate::autopilot_approval::RESULT_APPROVAL_ERROR, detail))
+                        };
+                        if let Some((outcome, detail)) = failure {
+                            self.approval_notice(&run.rule_id, &run.rule_name, outcome, &detail).await;
+                            self.finish_run_step(&run, STEP_FAILED, Some(&detail), None,
+                                RunNext::Settle { outcome: outcome.into(), detail: Some(detail.clone()) }, now).await?;
+                        }
+                    }
+                }
+                return Ok(());
             }
             let mut reconciled = None;
             if step.state == STEP_RUNNING && wait_deadline.is_none() {

@@ -1229,3 +1229,34 @@ async fn outside_window_skips_before_other_gates_without_counting() {
     assert!(engine.circuit.lock().await.is_empty());
     assert!(h.store.list_runs_for_rule("windowed", 100).await.unwrap().is_empty());
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn approved_single_action_scope_denied_under_fence() {
+    let h = Harness::new();
+    h.insert_rule("r1", reproduced_action()).await;
+    let at = chrono::Utc::now();
+    // Public writes require a steps envelope for departments. Inject the
+    // legacy-shaped row directly to exercise the no-run execution seam.
+    rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+        "UPDATE autopilot_rules SET owner_department='sales' WHERE id='r1'", []).unwrap();
+    let rule = h.store.get_rule("r1").await.unwrap().unwrap();
+    let frozen = gate::FrozenDispatch {
+        dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+        rule_hash: gate::rule_revision_hash(&rule), event: "task_created".into(), event_ref: "direct fixture".into(),
+        source_agent: None,
+        action: gate::FrozenAction::Delegate { target_agent: "plain".into(), prompt: "never".into(), lane: None },
+    };
+    let ledger = frozen.ledger_row(&at.to_rfc3339(), "scope-fixture");
+    assert!(h.store.insert_dispatch(&ledger).await.unwrap());
+    let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
+    let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+        frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+    assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    assert_eq!(h.engine(true).resume_approvals_once().await, 1);
+    let row = h.only_dispatch().await;
+    assert_eq!(row.state, DISPATCH_SETTLED);
+    assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+    assert_eq!(row.detail.as_deref(), Some("scope_denied"));
+    assert!(h.queued().await.is_empty());
+}

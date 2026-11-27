@@ -45,6 +45,12 @@
 //!    and is never run again. A `requesting` row is re-linked to its card or
 //!    settled `approval_error`.
 //!
+//! v1.86 multi-step runs use the same lifecycle for each gated step, with
+//! [`step_dispatch_dedupe_key`] and a permanent unique (run, step) binding.
+//! The executor checks that binding under the rule fence before consuming
+//! the card. A durable sweep reconciles settled dispatches back into their
+//! waiting runs; step dispatches never count another rule fire.
+//!
 //! ## Announcements (durable outbox)
 //!
 //! Settling a ledger row, writing its one history row and recording what
@@ -482,6 +488,14 @@ pub fn dedupe_key(rule_id: &str, rule_hash: &str, event_name: &str, fields: &ser
         "rule_hash": rule_hash,
         "event": event_name,
         "fields_sha256": digest_value(&Value::Object(fields.clone())),
+    }))
+}
+
+/// One approval dispatch per run step, independent of the ingress dedupe window.
+pub fn step_dispatch_dedupe_key(rule_id: &str, rule_hash: &str, run_id: &str, step_index: i64) -> String {
+    digest_value(&json!({
+        "v": 2, "rule_id": rule_id, "rule_hash": rule_hash,
+        "run_id": run_id, "step_index": step_index,
     }))
 }
 

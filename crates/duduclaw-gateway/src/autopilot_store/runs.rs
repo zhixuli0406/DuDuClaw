@@ -152,6 +152,24 @@ const STEP_COLUMNS: &str = "run_id, step_index, step_type, state, idempotency_ke
     dispatch_id, queue_message_id, started_at, finished_at, detail";
 
 impl AutopilotStore {
+    pub async fn list_awaiting_approval_runs(&self) -> Result<Vec<AutopilotRunRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM autopilot_runs
+            WHERE state='awaiting_approval' ORDER BY created_at, run_id"))
+            .map_err(|e| format!("prepare approval runs: {e}"))?;
+        let rows = stmt.query_map([], row_to_run)
+            .map_err(|e| format!("query approval runs: {e}"))?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| format!("read approval runs: {e}"))?;
+        Ok(rows)
+    }
+
+    pub async fn get_step_dispatch(&self, run_id: &str, step_index: i64) -> Result<Option<super::AutopilotDispatchRow>, String> {
+        let conn = self.conn.lock().await;
+        conn.query_row(&format!("SELECT {} FROM autopilot_approval_dispatch WHERE run_id=?1 AND step_index=?2",
+            super::DISPATCH_COLUMNS), params![run_id, step_index], super::row_to_dispatch)
+            .optional().map_err(|e| format!("read step dispatch: {e}"))
+    }
+
     /// Atomically enforce capacity and dedupe, then insert the run and all steps.
     /// Creation/audit timestamps use `now`; supplied optional timestamps are normalized.
     pub async fn insert_run(
@@ -416,6 +434,12 @@ impl AutopilotStore {
             if !is_known_run_state(&state) && outcome != "unsupported_state" {
                 return Err("unknown run states must be settled as unsupported_state".into());
             }
+            if state == RUN_AWAITING_APPROVAL {
+                conn.execute("UPDATE autopilot_run_steps SET state='failed', finished_at=?1, detail=?2
+                    WHERE run_id=?3 AND state='running'
+                    AND step_index=(SELECT step_index FROM autopilot_runs WHERE run_id=?3)",
+                    params![run_ts(now), detail, run_id]).map_err(|e| format!("fail approval step: {e}"))?;
+            }
             let n = conn.execute("UPDATE autopilot_runs SET state='settled', outcome=?1, detail=?2,
                 notice_pending=1,
                 notice_push_state=CASE WHEN ?1 IN ('missed_late','execution_uncertain') THEN 'pending' ELSE NULL END,
@@ -542,6 +566,16 @@ fn mark_step_running(
 }
 
 impl super::RuleFence<'_> {
+    /// Read the exact run/step binding without recursively locking the store.
+    pub fn approval_run(&self, run_id: &str, step_index: i64, dispatch_id: &str) -> Result<Option<AutopilotRunRow>, String> {
+        self.conn.query_row(&format!("SELECT {RUN_COLUMNS} FROM autopilot_runs
+            WHERE run_id=?1 AND state='awaiting_approval' AND step_index=?2
+            AND EXISTS (SELECT 1 FROM autopilot_run_steps WHERE run_id=?1
+                AND step_index=?2 AND state='running' AND dispatch_id=?3)"),
+            params![run_id, step_index, dispatch_id], row_to_run)
+            .optional().map_err(|e| format!("read fenced approval run: {e}"))
+    }
+
     /// Record the point of no return on this fence's already locked connection.
     pub fn mark_step_running(&self, run_id: &str, step_index: i64, lease_owner: &str, now: DateTime<Utc>) -> Result<bool, String> {
         mark_step_running(&self.conn, run_id, step_index, lease_owner, now)

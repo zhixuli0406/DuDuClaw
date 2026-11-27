@@ -1,4 +1,4 @@
-//! 141A-P5: isolated stores, injected UTC clock, no real sleeps or channel sends.
+//! 141A-P5/P6: isolated stores, injected UTC clock, no real sleeps or channel sends.
 use super::*;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use crate::autopilot_store::{
@@ -332,7 +332,7 @@ async fn missing_skill_param_fails_step() {
 }
 
 #[tokio::test]
-async fn require_approval_step_unavailable() {
+async fn gated_step_without_approval_service_is_blocked() {
     let h = Harness::new();
     h.acquire();
     let engine = h.engine();
@@ -340,7 +340,11 @@ async fn require_approval_step_unavailable() {
         "type":"delegate","target_agent":"plain","prompt":"never","require_approval":true
     }]})).await;
     engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
-    h.assert_outcome("approval_step_unavailable", 0).await;
+    let run = h.assert_outcome("blocked_no_approval_service", 0).await;
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    let (activity, _) = h.tasks.list_activity(None, None, 100, 0).await.unwrap();
+    assert!(activity.iter().any(|row| row.event_type == gate::ACTIVITY_BLOCKED));
 }
 
 #[tokio::test]
@@ -676,4 +680,377 @@ async fn run_notice_no_target_stops_retrying() {
     assert!(row.notice_push_next_at.is_none());
     assert_eq!(row.notice_push_attempts, 1);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+// Per-step approval fixtures use the broker's clock for card decisions; run
+// deadlines remain injectable. No real channels or employee execution are used.
+use crate::approval::{ApprovalBroker, ApprovalId, ApprovalRecord};
+use crate::autopilot_approval::{self as gate, FrozenAction, FrozenDispatch};
+use crate::autopilot_store::{
+    AutopilotDispatchRow, RunNext, RUN_AWAITING_APPROVAL,
+    DISPATCH_REQUESTING, DISPATCH_AWAITING, DISPATCH_EXECUTING, DISPATCH_SETTLED,
+};
+
+fn gated_flow(skill: bool, tail: bool) -> Value {
+    let second = if skill {
+        json!({"type":"run_skill", "target_agent":"other", "skill_name":"test",
+            "params":{"order":"{{task.title}}"}, "require_approval":true})
+    } else {
+        json!({"type":"delegate", "target_agent":"other", "prompt":"B {{task.title}}", "require_approval":true})
+    };
+    let mut steps = vec![json!({"type":"delegate", "target_agent":"plain", "prompt":"A"}), second];
+    if tail { steps.push(json!({"type":"delegate", "target_agent":"plain", "prompt":"C"})); }
+    json!({"type":"steps", "steps":steps})
+}
+
+impl Harness {
+    fn broker(&self) -> ApprovalBroker { ApprovalBroker::open(&self.home).unwrap() }
+
+    fn approval_engine(&self) -> AutopilotEngine {
+        let engine = self.engine().with_approval_broker(Arc::new(self.broker()));
+        *engine.notice_pusher.lock().unwrap() = Some(Arc::new(|_, _| gate::NoticePush::NoTarget));
+        engine
+    }
+
+    async fn cards(&self) -> Vec<ApprovalRecord> {
+        self.broker().list_by_kind(gate::ACTION_KIND).await.unwrap()
+    }
+
+    async fn pending_approval(&self, engine: &AutopilotEngine, skill: bool, tail: bool) -> (AutopilotRunRow, ApprovalId) {
+        let rule = self.rule(gated_flow(skill, tail)).await;
+        engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+        let run = self.run().await;
+        assert_eq!(run.state, RUN_AWAITING_APPROVAL);
+        assert_eq!(run.step_index, 1);
+        assert_eq!(self.queued().await.len(), 1);
+        let cards = self.cards().await;
+        assert_eq!(cards.len(), 1);
+        (run, cards[0].id.clone())
+    }
+
+    async fn step_dispatch(&self, run: &AutopilotRunRow) -> AutopilotDispatchRow {
+        self.store.get_step_dispatch(&run.run_id, run.step_index).await.unwrap().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn gated_step_waits_for_dashboard_approval() {
+    for skill in [false, true] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let (run, id) = h.pending_approval(&engine, skill, false).await;
+        let card = h.broker().get(&id).await.unwrap().unwrap();
+        assert!(card.summary.contains("第 2 步"));
+        assert!(card.payload[gate::PAYLOAD_KEY]["action"]["prompt"].as_str().unwrap().contains("凍結標題"));
+        let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+        assert_eq!(steps[0].state, STEP_DONE);
+        assert_eq!(steps[1].state, STEP_RUNNING);
+        assert_eq!(steps[1].dispatch_id.as_deref(), Some(h.step_dispatch(&run).await.dispatch_id.as_str()));
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        assert_eq!(h.cards().await.len(), 1);
+        assert_eq!(h.queued().await.len(), 1);
+        h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 1);
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 0);
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        h.assert_outcome("completed", 2).await;
+        let queued = h.mq.get_by_id(&runs::queue_id(&run.run_id, 1)).await.unwrap().unwrap();
+        assert_eq!(queued.target, "other");
+        assert!(queued.payload.contains("凍結標題"));
+        assert!(h.store.list_run_steps(&run.run_id).await.unwrap().iter().all(|s| s.state == STEP_DONE));
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+        let history = h.store.list_history(Some("r"), 100).await.unwrap();
+        assert_eq!(history.iter().filter(|r| r.id == format!("run:{}:step:1", run.run_id) && r.result == "step_done").count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn gated_step_denied_or_expired_settles_run() {
+    for expire in [false, true] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let (run, id) = h.pending_approval(&engine, false, true).await;
+        if expire {
+            rusqlite::Connection::open(h.home.join("approvals.db")).unwrap().execute(
+                "UPDATE approvals SET created_at='2000-01-01T00:00:00+00:00' WHERE id=?1", [id.as_str()]).unwrap();
+            engine.resume_approvals_once().await;
+        } else {
+            h.broker().decide(&id, false, "dashboard:admin").await.unwrap();
+        }
+        engine.resume_approvals_once().await;
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        let outcome = if expire { "expired" } else { "denied" };
+        h.assert_outcome(outcome, 1).await;
+        assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(outcome));
+        assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[1].state, STEP_FAILED);
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn gated_step_edited_rule_is_stale_after_approval() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.approval_engine();
+    let (run, id) = h.pending_approval(&engine, false, false).await;
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    let mut action = gated_flow(false, false);
+    action["steps"][1]["prompt"] = json!("changed");
+    h.store.update_rule("r", &json!({"action":action})).await.unwrap();
+    engine.resume_approvals_once().await;
+    h.assert_outcome("stale_rule_changed", 1).await;
+    assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(gate::RESULT_STALE));
+}
+
+#[tokio::test]
+async fn cancelled_run_retires_approved_step_without_execution() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.approval_engine();
+    let (run, id) = h.pending_approval(&engine, false, false).await;
+    assert!(h.store.settle_unclaimed_run(&run.run_id, &[RUN_AWAITING_APPROVAL], "cancelled", None, Utc::now()).await.unwrap());
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    engine.resume_approvals_once().await;
+    engine.resume_runs_once(Utc::now()).await.unwrap();
+    h.assert_outcome("cancelled", 1).await;
+    assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(gate::RESULT_STALE));
+    assert!(h.broker().get(&id).await.unwrap().unwrap().invalidated_reason.unwrap().starts_with(gate::RETIRED_PREFIX));
+}
+
+#[tokio::test]
+async fn settled_step_reconciles_after_crash_exactly_once() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.approval_engine();
+    let (run, id) = h.pending_approval(&engine, false, true).await;
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    engine.crash_after_settle.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(engine.resume_approvals_once().await, 1);
+    assert_eq!(h.run().await.state, RUN_AWAITING_APPROVAL);
+    assert_eq!(h.step_dispatch(&run).await.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+    assert_eq!(h.queued().await.len(), 2);
+    let restarted = h.approval_engine();
+    restarted.resume_runs_once(Utc::now()).await.unwrap();
+    restarted.resume_runs_once(Utc::now()).await.unwrap();
+    assert_eq!(restarted.resume_approvals_once().await, 0);
+    h.assert_outcome("completed", 3).await;
+    assert_eq!(h.queued().await.iter().filter(|q| q.target == "other").count(), 1);
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+}
+
+#[tokio::test]
+async fn duplicate_step_filing_reuses_one_card() {
+    // Exercise both insert_dispatch's recent dedupe and its permanent UNIQUE
+    // constraint after the dedupe window has passed.
+    for old in [false, true] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let (run, _) = h.pending_approval(&engine, false, false).await;
+        let original = h.step_dispatch(&run).await;
+        let at = Utc::now();
+        {
+            let conn = rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap();
+            conn.execute("UPDATE autopilot_runs SET state='running', lease_owner='filing-test', lease_until=?1 WHERE run_id=?2",
+                rusqlite::params![run_ts(at + ChronoDuration::seconds(60)), run.run_id]).unwrap();
+            if old {
+                conn.execute("UPDATE autopilot_approval_dispatch SET created_at='2000-01-01T00:00:00+00:00' WHERE dispatch_id=?1",
+                    [&original.dispatch_id]).unwrap();
+            }
+        }
+        let rule = h.store.get_rule("r").await.unwrap().unwrap();
+        let frozen: FrozenDispatch = serde_json::from_str(&original.frozen_json).unwrap();
+        engine.gate_step_on_approval(&rule, &run, frozen.action, &fields(), "filing-test", at).await.unwrap();
+        assert_eq!(h.cards().await.len(), 1);
+        assert_eq!(h.run().await.state, RUN_AWAITING_APPROVAL);
+        assert_eq!(h.step_dispatch(&run).await.dispatch_id, original.dispatch_id);
+        assert_eq!(h.queued().await.len(), 1);
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn department_gated_run_never_files_approval() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.approval_engine();
+    h.rule(gated_flow(false, false)).await;
+    let rule = h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: run_ts(Utc::now()),
+    }).await.unwrap().unwrap();
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+    assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+    engine.start_run(&rule, "task_created", &fields(), Utc::now()).await.unwrap();
+    h.assert_outcome("scope_denied", 0).await;
+    assert!(h.cards().await.is_empty());
+}
+
+#[tokio::test]
+async fn approved_run_step_scope_denied_under_fence() {
+    let h = Harness::new();
+    let engine = h.approval_engine();
+    h.rule(gated_flow(false, false)).await;
+    let rule = h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: run_ts(Utc::now()),
+    }).await.unwrap().unwrap();
+    // Construct a bound ledger directly: admission must not be the check that
+    // prevents execution in this test.
+    let at = Utc::now();
+    engine.start_run(&rule, "task_created", &fields(), at).await.unwrap();
+    let run = h.run().await;
+    h.acquire();
+    assert!(h.store.claim_run(&run.run_id, "fixture", at).await.unwrap());
+    assert!(h.store.mark_step_running(&run.run_id, 0, "fixture", at).await.unwrap());
+    let frozen = FrozenDispatch {
+        dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+        rule_hash: run.rule_hash.clone(), event: run.event_name.clone(), event_ref: run.event_ref.clone(),
+        source_agent: None, action: FrozenAction::Delegate { target_agent: "plain".into(), prompt: "never".into(), lane: None },
+    };
+    let mut ledger = frozen.ledger_row(&at.to_rfc3339(), &gate::step_dispatch_dedupe_key(&rule.id, &run.rule_hash, &run.run_id, 0));
+    ledger.run_id = Some(run.run_id.clone());
+    ledger.step_index = Some(0);
+    assert!(h.store.insert_dispatch(&ledger).await.unwrap());
+    let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
+    let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+        frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+    assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
+    assert!(h.store.complete_step(&run.run_id, "fixture", 0, STEP_RUNNING, None, None,
+        RunNext::AwaitApproval { dispatch_id: ledger.dispatch_id.clone() }, at).await.unwrap());
+    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+    engine.resume_approvals_once().await;
+    h.assert_outcome("scope_denied", 0).await;
+    let settled = h.step_dispatch(&run).await;
+    assert_eq!(settled.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+    assert_eq!(settled.detail.as_deref(), Some("scope_denied"));
+}
+
+#[tokio::test]
+async fn step_ledger_recovery_preserves_requesting_and_executing_protocol() {
+    for state in [DISPATCH_REQUESTING, DISPATCH_EXECUTING] {
+        for consumed in [false, true] {
+            if state == DISPATCH_REQUESTING && consumed { continue; }
+            let h = Harness::new();
+            h.acquire();
+            let engine = h.approval_engine();
+            let (run, id) = h.pending_approval(&engine, false, false).await;
+            let row = h.step_dispatch(&run).await;
+            if state == DISPATCH_REQUESTING {
+                rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+                    "UPDATE autopilot_approval_dispatch SET state='requesting', approval_id=NULL WHERE dispatch_id=?1",
+                    [&row.dispatch_id]).unwrap();
+            } else {
+                h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+                assert!(h.store.transition_dispatch(&row.dispatch_id, DISPATCH_AWAITING, DISPATCH_EXECUTING).await.unwrap());
+                if consumed {
+                    let rec = h.broker().get(&id).await.unwrap().unwrap();
+                    assert!(h.broker().consume_autopilot_approval(&rec, &format!("{}{}", gate::CONSUMED_PREFIX, row.dispatch_id)).await.unwrap());
+                }
+            }
+            let restarted = h.approval_engine();
+            restarted.recover_approval_dispatches().await;
+            if consumed {
+                h.assert_outcome("execution_uncertain", 1).await;
+                assert_eq!(h.step_dispatch(&run).await.state, DISPATCH_SETTLED);
+            } else {
+                assert_eq!(h.step_dispatch(&run).await.state, DISPATCH_AWAITING);
+                if state == DISPATCH_REQUESTING {
+                    h.broker().decide(&id, true, "dashboard:admin").await.unwrap();
+                }
+                restarted.resume_approvals_once().await;
+                h.assert_outcome("completed", 2).await;
+            }
+            assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn approval_run_reconciliation_maps_outcomes_and_missing_dispatch() {
+    for (outcome, detail, expected) in [
+        (Some(gate::RESULT_DENIED), "denied", "denied"),
+        (Some(gate::RESULT_EXPIRED), "expired", "expired"),
+        (Some(gate::RESULT_STALE), "edited", "stale_rule_changed"),
+        (Some(gate::RESULT_BREAKER_OPEN), "breaker", "blocked_breaker_open"),
+        (Some(gate::RESULT_SKIPPED), "pause", "autonomy_paused"),
+        (Some(gate::RESULT_SKIPPED), "scope_denied", "scope_denied"),
+        (Some(gate::RESULT_FAILURE), "failed", "step_failed"),
+        (Some(gate::RESULT_APPROVAL_ERROR), "filing failed", "approval_error"),
+        (Some(gate::RESULT_UNCERTAIN), "uncertain", "execution_uncertain"),
+        (Some("unknown"), "unknown", "approval_error"),
+        (None, "missing", "approval_error"),
+    ] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let (run, _) = h.pending_approval(&engine, false, true).await;
+        let row = h.step_dispatch(&run).await;
+        if let Some(outcome) = outcome {
+            // Even a caller mistakenly asking to count the dispatch cannot
+            // increment a run's fire counter a second time.
+            assert!(h.store.settle_dispatch(&row.dispatch_id, DISPATCH_AWAITING, outcome, detail, false, true).await.unwrap());
+        } else {
+            rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+                "DELETE FROM autopilot_approval_dispatch WHERE dispatch_id=?1", [&row.dispatch_id]).unwrap();
+        }
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        engine.resume_runs_once(Utc::now()).await.unwrap();
+        h.assert_outcome(expected, 1).await;
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn gated_step_payload_refusal_fails_without_filing() {
+    for prompt in [
+        "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        "x".repeat(gate::MAX_FROZEN_PAYLOAD_BYTES + 1),
+    ] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.approval_engine();
+        let rule = h.rule(json!({"type":"steps", "steps":[{
+            "type":"delegate", "target_agent":"plain", "prompt":prompt, "require_approval":true
+        }]})).await;
+        engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+        let run = h.assert_outcome("approval_error", 0).await;
+        assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
+        assert!(h.cards().await.is_empty());
+        assert!(h.store.get_step_dispatch(&run.run_id, 0).await.unwrap().is_none());
+        assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    }
+}
+
+#[tokio::test]
+async fn gated_skill_render_failure_fails_step_without_filing() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.approval_engine();
+    let rule = h.rule(json!({"type":"steps", "steps":[{
+        "type":"run_skill", "target_agent":"plain", "skill_name":"test",
+        "params":{"order":"{{task.deadline_at}}"}, "require_approval":true
+    }]})).await;
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), Utc::now()).await;
+    let run = h.assert_outcome("step_failed", 0).await;
+    assert_eq!(run.detail.as_deref(), Some("param_missing:order"));
+    assert_eq!(h.store.list_run_steps(&run.run_id).await.unwrap()[0].state, STEP_FAILED);
+    assert!(h.cards().await.is_empty());
+}
+
+#[test]
+fn step_dispatch_dedupe_is_v2_and_separates_runs_and_steps() {
+    use sha2::{Digest, Sha256};
+    let key = gate::step_dispatch_dedupe_key("r", "hash", "run", 1);
+    let body = crate::approval::action_grant::canonical_json(&json!({
+        "v":2, "rule_id":"r", "rule_hash":"hash", "run_id":"run", "step_index":1,
+    }));
+    assert_eq!(key, hex::encode(Sha256::digest(body.as_bytes())));
+    assert_ne!(key, gate::step_dispatch_dedupe_key("r", "hash", "run", 2));
+    assert_ne!(key, gate::step_dispatch_dedupe_key("r", "hash", "another", 1));
+    assert_ne!(key, gate::step_dispatch_dedupe_key("r", "edited", "run", 1));
+    assert_ne!(key, gate::step_dispatch_dedupe_key("another", "hash", "run", 1));
 }
