@@ -1013,7 +1013,7 @@ mod live_assignee_tests {
                 };
                 match frame {
                     WsFrame::Response { ok: false, error: Some(error), .. } => {
-                        assert!(error["message"].as_str().unwrap().contains(
+                        assert!(error.as_str().unwrap().contains(
                             if malformed { "agent_config_unreadable" } else { "model_provider_mismatch" }
                         ), "{error}");
                     }

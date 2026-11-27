@@ -864,7 +864,8 @@ async fn handle_message(state: &Arc<TeamsState>, activity: &serde_json::Value) {
             crate::ccr_runtime::reply_principal_for_sender(&sender_id), &text, None, None,
         ).await {
             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
-            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
             crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
                 drop(typing_guard);
                 deliver_reply(&state.creds, &target, &reply, None).await;

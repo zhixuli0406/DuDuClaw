@@ -1791,6 +1791,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Some(silence_tx),
         Some(proactive_notice),
         Some(Arc::new(|home, dir, agent| Box::pin(async move {
+            crate::entry_gate::check_task_assignee(&home, &agent)
+                .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
             crate::budget::gate_before_spawn(&home, Some(&dir), &agent, "heartbeat_proactive")
                 .await.map_err(|e| e.to_string())
         }))),

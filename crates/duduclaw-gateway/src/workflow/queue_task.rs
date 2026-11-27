@@ -40,6 +40,10 @@ pub fn spawn(queue: Arc<MessageQueue>, home: PathBuf, message: QueueMessage) {
                 .acquire_owned()
                 .await
                 .map_err(|_| "workflow dispatch slots closed".to_string())?;
+            // Workflow steps are deterministic, but still act for this employee.
+            // A malformed target must fail the queue handoff, never be completed.
+            crate::entry_gate::check_task_assignee(&home, &message.target)
+                .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
             let store = Arc::new(WorkflowStore::open(&home)?);
             let broker = Arc::new(crate::approval::ApprovalBroker::open(&home)?);
             let service = WorkflowService::new(

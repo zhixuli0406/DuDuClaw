@@ -26,6 +26,10 @@ fn ok(frame: WsFrame) { assert!(matches!(frame, WsFrame::Response {ok:true,..}),
 #[tokio::test]
 async fn survival_evidence_authorized_dashboard_decisions_persist_and_continue_clears_old_approval() {
     let home=tempfile::tempdir().unwrap(); let store=TaskStore::open(home.path()).unwrap();
+    let agent_dir = home.path().join("agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     store.insert_task(&goal("g", "needs_human")).await.unwrap();
     let h=handler(home.path()).await;
     ok(h.handle_tasks_goal_decide(json!({"task_id":"g","action":"done"}), &UserContext::admin_fallback()).await);
@@ -115,6 +119,10 @@ async fn survival_evidence_difficulty_requires_complete_dispatch_snapshots_and_p
 #[tokio::test]
 async fn survival_evidence_human_approval_binds_actual_iteration_and_clears_on_continue() {
     let home=tempfile::tempdir().unwrap(); let store=TaskStore::open(home.path()).unwrap();
+    let agent_dir = home.path().join("agents/alice");
+    std::fs::create_dir_all(&agent_dir).unwrap();
+    std::fs::write(agent_dir.join("agent.toml"),
+        "[agent]\nname='alice'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
     let mut task=goal("bound","needs_human"); task.revision_round=99;
     store.insert_task(&task).await.unwrap();
     store.insert_task(&goal("other","pending")).await.unwrap();

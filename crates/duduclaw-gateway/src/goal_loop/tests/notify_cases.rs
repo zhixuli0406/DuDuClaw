@@ -3,6 +3,82 @@
 use super::*;
 
 #[tokio::test]
+async fn observer_autoclose_rechecks_assignee_after_refusal_token_is_lost() {
+    // An unregistered id models a persisted token after restart or expiry,
+    // without mutating the process registry used by parallel tests.
+    let stale = "ENTRY_REFUSED:model_provider_mismatch:00000000000000000000000000000000: employee configuration refused";
+    assert_eq!(crate::entry_gate::background_refusal_code(stale), None);
+    for (model, feedback, expected_status) in [
+        ("preferred='gpt-5.4'", stale, "needs_human"),
+        ("preferred=42", stale, "needs_human"),
+        ("preferred='claude-sonnet-4-6'", stale, "cancelled"),
+        ("preferred='claude-sonnet-4-6'", "ordinary non-entry pause", "cancelled"),
+    ] {
+        let home = home_with_agent("worker", &format!(
+            "[capabilities]\nautonomy_level='observer'\n[runtime]\nprovider='claude'\n[model]\n{model}\n"
+        ));
+        assert_eq!(AutonomyLevel::for_agent(home.path(), "worker"), AutonomyLevel::Observer);
+        assert_eq!(crate::entry_gate::check_task_assignee(home.path(), "worker").is_ok(),
+            expected_status == "cancelled");
+        let (store, queue) = open_stores(home.path()).await;
+        let mut task = goal_task("observer-parked", "worker");
+        task.status = "needs_human".into();
+        task.pause_reason = Some("blocked_needs_decision".into());
+        task.judge_feedback = Some(feedback.into());
+        store.insert_task(&task).await.unwrap();
+
+        let d = driver(store.clone(), queue, small_cfg()).with_home_dir(home.path().to_path_buf());
+        d.reconcile_needs_human().await;
+        let actual = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(actual.status, expected_status, "{model}: {feedback}");
+        if expected_status == "needs_human" {
+            assert_eq!(actual.judge_feedback.as_deref(), Some(stale));
+            // Repair the effective artifact, then simulate a fresh gateway life.
+            write_agent_toml(home.path(), "worker",
+                "[capabilities]\nautonomy_level='observer'\n[runtime]\nprovider='claude'\n[model]\npreferred='claude-sonnet-4-6'\n");
+            let queue = Arc::new(MessageQueue::open(home.path()).unwrap());
+            let restarted = driver(store.clone(), queue, small_cfg())
+                .with_home_dir(home.path().to_path_buf());
+            restarted.reconcile_needs_human().await;
+            assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status, "cancelled");
+        }
+    }
+}
+
+#[tokio::test]
+async fn persisted_queue_refusal_rechecks_current_assignee() {
+    let stale = "ENTRY_REFUSED:model_provider_mismatch:00000000000000000000000000000000: employee configuration refused";
+    assert_eq!(crate::entry_gate::background_refusal_code(stale), None);
+    for (model, error, should_park) in [
+        ("gpt-5.4", stale, true),
+        ("claude-sonnet-4-6", stale, false),
+        ("claude-sonnet-4-6", "ordinary provider failure", false),
+    ] {
+        let home = home_with_agent("worker", &format!(
+            "[runtime]\nprovider='claude'\n[model]\npreferred='{model}'\n"
+        ));
+        let (store, queue) = open_stores(home.path()).await;
+        let task = goal_task("queue-refusal", "worker");
+        store.insert_task(&task).await.unwrap();
+        let message_id = crate::goal_loop::enqueue::enqueue_goal_work(
+            &queue, &store, &task, 1, "").await.unwrap();
+        queue.fail(&message_id, error).await.unwrap();
+        let d = driver(store.clone(), queue, small_cfg()).with_home_dir(home.path().to_path_buf());
+        let mut entry = inflight_entry(1, Utc::now());
+        entry.awaiting_pickup = true;
+        entry.message_id = Some(message_id);
+        let mut inflight = HashMap::from([(task.id.clone(), entry)]);
+        let persisted = d.dispatch_failure_for(&inflight, &task.id).await.unwrap();
+        assert_eq!(persisted, error);
+        assert_eq!(d.on_dispatch_failed(&mut inflight, &task.id, &persisted).await.unwrap(), should_park);
+        assert!(inflight.is_empty());
+        assert_eq!(store.get_task(&task.id).await.unwrap().unwrap().status,
+            if should_park { "needs_human" } else { "todo" });
+        assert_eq!(d.dispatch_failures.lock().await.contains_key(&task.id), !should_park);
+    }
+}
+
+#[tokio::test]
 async fn goal_dispatch_freezes_while_a_human_holds_the_conversation() {
     let dir = tempfile::tempdir().unwrap();
     let (store, queue) = open_stores(dir.path()).await;

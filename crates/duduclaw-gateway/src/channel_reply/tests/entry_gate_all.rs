@@ -1,8 +1,8 @@
 //! W8: one entry table crossed with every effective configuration state.
 //!
-//! Not gated yet (later packages): background/dispatch (cron, reminder,
-//! heartbeat, goal-loop tick, claude_runner, runtime_dispatch), and the channel
-//! trigger-word block in channel_reply/inner.rs. MCP tasks_create/tasks_update
+//! Background rows exercise the shared runner with the producers' RequestType;
+//! goal tick additionally reconciles its actual refusal through a failed queue row.
+//! MCP tasks_create/tasks_update
 //! live in the CLI crate and retain their own tests in mcp/tasks.rs.
 //!
 //! Contract exceptions deliberately not disguised as shared-code rows:
@@ -36,7 +36,10 @@ impl Config {
             match self {
                 Self::Mismatch => document["runtime"]["provider"] = toml::Value::String("grok".into()),
                 Self::UnknownEngine => document["runtime"]["provider"] = toml::Value::String("typo".into()),
-                Self::MissingModel => { document["model"].as_table_mut().unwrap().remove("preferred"); }
+                Self::MissingModel => {
+                    document["runtime"]["provider"] = toml::Value::String("openai_compat".into());
+                    document["model"].as_table_mut().unwrap().remove("preferred");
+                }
                 Self::Healthy => {}
                 Self::Malformed => unreachable!(),
             }
@@ -174,9 +177,23 @@ macro_rules! row {
 enum Entry {
     Channel, Arrival, Turn(bool), Pending, AgUi, Command(&'static str), Attachment,
     Goal, Admission, ChatGoal, Schedule, Rpc(&'static str), Retry, Kickoff, Bound,
+    TriggerPending, TriggerMention, TriggerReply, AssignArm(bool),
+    Background(crate::cost_telemetry::RequestType), GoalTick,
 }
 const ROWS: &[Row] = &[
+    row!("dispatch", false, Entry::Background(crate::cost_telemetry::RequestType::Dispatch)),
+    row!("cron", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("heartbeat (Cron request)", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("reminder (Cron request)", false, Entry::Background(crate::cost_telemetry::RequestType::Cron)),
+    row!("goal tick refused run", false, Entry::GoalTick),
     row!("channel pipeline", true, Entry::Channel),
+    row!("channel trigger pending pipeline", false, Entry::TriggerPending),
+    row!("channel trigger bare mention pipeline", false, Entry::TriggerMention),
+    // Public conversations bypass messaging-app trigger routing. Exercise the
+    // exact pending-execution seam with their original session separately.
+    row!("trigger assignment reply session", true, Entry::TriggerReply),
+    row!("trigger assignment arm", true, Entry::AssignArm(false)),
+    row!("trigger assignment admission arm", true, Entry::AssignArm(true)),
     row!("WebChat arrival", true, Entry::Arrival),
     row!("WebChat turn", true, Entry::Turn(false)),
     row!("WebChat turn with attachment", true, Entry::Turn(true)),
@@ -203,24 +220,104 @@ fn request() -> GoalCreateRequest {
         description: "整理報表".into(), ..Default::default() }
 }
 async fn command(f: &Fixture, case: Case, text: &str) -> String {
+    command_in_session(f, case.session, text).await
+}
+async fn command_in_session(f: &Fixture, session: &str, text: &str) -> String {
     let cmd = crate::chat_commands::parse_command(text, None).expect("ChatCommand");
     crate::chat_commands::handle_gated_command(&cmd, &f.ctx,
-        &crate::chat_commands::CommandOrigin { channel: "telegram", gate_session: case.session,
-            command_session: case.session, sender: "42", text, shared: false },
+        &crate::chat_commands::CommandOrigin { channel: "telegram", gate_session: session,
+            command_session: session, sender: "42", text, shared: false },
         if matches!(cmd, crate::chat_commands::ChatCommand::Assign(_)) { "main" } else { "worker" },
     ).await
 }
 async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
     match entry {
+        Entry::Background(_) | Entry::GoalTick => {
+            let request_type = match entry {
+                Entry::Background(kind) => kind,
+                _ => crate::cost_telemetry::RequestType::Dispatch,
+            };
+            let result = crate::claude_runner::call_claude_for_agent_with_type(
+                f.home(), &f.ctx.registry, "worker", "work", request_type).await;
+            if case.healthy() {
+                // The fixture runtime intentionally returns an auth failure.
+                assert!(f.calls.load(Ordering::SeqCst) > 0, "{result:?}");
+                return EntryResult::result(Ok(()));
+            }
+            let error = result.unwrap_err();
+            assert_eq!(crate::entry_gate::background_refusal_code(&error), f.expected_code);
+            let mut outcome = EntryResult::result(Err(error.clone()));
+            if matches!(entry, Entry::GoalTick) {
+                crate::goal_loop::assert_entry_refusal_tick(f.home(), f.store.clone(), &error).await;
+                outcome.seed_tasks = 1;
+            }
+            outcome
+        }
         Entry::Channel => {
             let spy = crate::channel_reply::reply_origin::testing::NoImplicitCloud::at(f.home());
             let text = build_reply_for_agent("整理報表", &f.ctx, "worker", case.session, "42", None).await;
             assert_eq!(spy.counts(), [0, 0]);
             if case.healthy() {
                 assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-                assert!(text.contains("Actual Worker"), "{text}");
+                if case.public() {
+                    assert_eq!(text, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+                } else {
+                    assert!(text.contains("Actual Worker"), "{text}");
+                }
                 EntryResult::result(Ok(()))
             } else { EntryResult::result(Err(text)) }
+        }
+        Entry::TriggerPending | Entry::TriggerMention | Entry::TriggerReply | Entry::AssignArm(_) => {
+            use crate::trigger_route::{assign, pending};
+            let session = format!("{}:trigger:{}", case.session, uuid::Uuid::new_v4());
+            let key = pending::PendingKey::new("telegram", &session, "42");
+            let caller = assign::AssignCaller {
+                home: f.home(), channel: "telegram", conversation: &session, sender: "42",
+                event: Some("entry-trigger"), seq: pending::next_seq(), fallback: Some("main"),
+                access: crate::trigger_route::access::for_channel_sender(f.home(), "telegram", "42"),
+            };
+            let spy = crate::channel_reply::reply_origin::testing::NoImplicitCloud::at(f.home());
+            let reply = match entry {
+                Entry::TriggerPending => {
+                    // Represents an assignment armed while the target was healthy.
+                    pending::arm_kind(&key, "worker", pending::PendingKind::Assign, "prior", caller.seq);
+                    crate::channel_reply::inner::build_reply_with_session_inner(
+                        "整理報表", &f.ctx, None, &session, "42", None,
+                    ).await
+                }
+                Entry::TriggerMention => crate::channel_reply::inner::build_reply_with_session_inner(
+                    "@worker", &f.ctx, None, &session, "42", None,
+                ).await,
+                Entry::TriggerReply => crate::channel_reply::inner::run_trigger_assignment(
+                    &f.ctx, "worker", "整理報表", &caller,
+                ).await,
+                Entry::AssignArm(admission) => {
+                    if admission {
+                        let registry = f.ctx.registry.read().await;
+                        assign::arm_on_admission(&registry, "/交辦 @worker", &caller);
+                        assert_eq!(pending::peek_kind(&key, pending::next_seq()).is_some(), case.healthy());
+                    }
+                    command_in_session(f, &session, "/交辦 @worker").await
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(spy.counts(), [0, 0]);
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+            let arms = matches!(entry, Entry::TriggerMention | Entry::AssignArm(_));
+            let waiting = pending::peek_kind(&key, pending::next_seq());
+            assert_eq!(waiting.is_some(), case.healthy() && arms, "{reply}");
+            if let Some((id, kind)) = waiting {
+                assert_eq!(id, "worker");
+                assert_eq!(kind, if matches!(entry, Entry::TriggerMention) {
+                    pending::PendingKind::Chat
+                } else { pending::PendingKind::Assign });
+                pending::cancel(&key, "test-cleanup", pending::next_seq());
+            }
+            if case.healthy() {
+                assert!(!reply.is_empty());
+                assert_eq!(f.counts().await.0, usize::from(!arms), "{reply}");
+                EntryResult::result(Ok(()))
+            } else { EntryResult::result(Err(reply)) }
         }
         Entry::Arrival => EntryResult::result(web::arrival(&f.chat, &f.admin.user_id, case.session, "整理報表", true).await),
         Entry::Turn(attach) => {
@@ -475,6 +572,15 @@ async fn broken_employees_keep_exempt_commands_available() {
     for &config in CONFIGS.iter().filter(|&&c| c != Config::Healthy) {
         for &text in EXEMPT {
             for webchat in [false, true] {
+                // /takeover is not a ChatCommand. Like v1.85, run falls
+                // through to terminal delivery via subscriptions, which this
+                // direct-run helper does not install (even when healthy).
+                // Keep its real channel handler covered below; this WebChat
+                // matrix covers commands that answer directly on the sink.
+                if webchat && text == "/takeover" {
+                    assert!(crate::chat_commands::parse_command(text, None).is_none());
+                    continue;
+                }
                 let f = Fixture::new(config).await;
                 let case = Case { config, session: "telegram:42" };
                 let before = crate::model_call_probe::calls();
@@ -545,4 +651,80 @@ async fn a2a_send_preserves_its_protocol_refusal_and_creates_no_work() {
         f.no_models(before);
         assert_no_saved_attachments(f.home());
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_commands_refuse_non_admins_and_public_visitors_without_mutation() {
+    use crate::channel_reply::entry_gate_test_helpers::misaligned_worker;
+    for session in ["telegram:42:7", "telegram-evil:42", "widget-visitor:test", "odoolivechat:test"] {
+        let (_home, ctx, _runtime, calls) = misaligned_worker("").await;
+        let channel = session.split(':').next().unwrap();
+        // Exact identities and channel names are required. Public visitors
+        // remain unprivileged even if their channel setting lists their id.
+        let admins = if session == "telegram:42:7" { r#"["142","telegram:42"]"# } else { r#"["42"]"# };
+        ctx.channel_settings.set("telegram", "global", crate::channel_settings::keys::ADMIN_USERS, admins).await.unwrap();
+        if crate::channel_reply::assembly::public_session(session) {
+            ctx.channel_settings.set(channel, "global", crate::channel_settings::keys::ADMIN_USERS, r#"["42"]"#).await.unwrap();
+        }
+        let failsafe = ctx.failsafe.as_ref().unwrap();
+        let before = crate::model_call_probe::calls();
+        for text in ["!STOP", "!STOP ALL", "!RESUME"] {
+            if text == "!RESUME" {
+                failsafe.force_halt(session, "existing halt").await;
+            }
+            let state_before = failsafe.get_state(session).await
+                .map(|s| (s.level, s.since, s.reason, s.auto_recover_at));
+            let reply = crate::channel_reply::inner::build_reply_with_session_inner(text, &ctx, Some("worker"), session, "42", None).await;
+            assert_eq!(reply, "只有管理員可以使用這個指令。", "{session}: {text}");
+            let state_after = failsafe.get_state(session).await
+                .map(|s| (s.level, s.since, s.reason, s.auto_recover_at));
+            assert_eq!(state_after, state_before, "{session}: {text}");
+            assert!(failsafe.get_state("__global__").await.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(crate::model_call_probe::calls(), before);
+            assert!(ctx.session_manager.session_agent(session).await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_admins_can_control_broken_employees_but_stop_all_stays_scoped() {
+    use crate::channel_reply::entry_gate_test_helpers::misaligned_worker;
+    use duduclaw_security::failsafe::FailsafeLevel;
+    for malformed in [false, true] {
+        for admin in ["42", "telegram:42:7"] {
+            let (home, ctx, _runtime, calls) = misaligned_worker("").await;
+            if malformed {
+                std::fs::write(home.path().join("agents/worker/agent.toml"), "[model").unwrap();
+            }
+            let session = "telegram:42:7";
+            ctx.channel_settings.set("telegram", "global", crate::channel_settings::keys::ADMIN_USERS,
+                &serde_json::to_string(&[admin]).unwrap()).await.unwrap();
+            let failsafe = ctx.failsafe.as_ref().unwrap();
+            let before = crate::model_call_probe::calls();
+            for stop in ["!STOP", "!STOP ALL"] {
+                let reply = crate::channel_reply::inner::build_reply_with_session_inner(stop, &ctx, Some("worker"), session, "42", None).await;
+                assert!(reply.contains("stopped"), "{reply}");
+                assert_eq!(failsafe.get_level(session).await, FailsafeLevel::L4Halted);
+                let states = failsafe.active_states().await;
+                assert_eq!(states.len(), 1);
+                assert_eq!(states[0].0, session, "global halt must not be set");
+                let reply = crate::channel_reply::inner::build_reply_with_session_inner("!RESUME", &ctx, Some("worker"), session, "42", None).await;
+                assert!(reply.contains("resumed"), "{reply}");
+                assert!(failsafe.active_states().await.is_empty());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(crate::model_call_probe::calls(), before);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_status_remains_available_without_admin_on_a_broken_employee() {
+    let (_home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::misaligned_worker("").await;
+    let session = "telegram:42:7";
+    let before = crate::model_call_probe::calls();
+    let reply = crate::channel_reply::inner::build_reply_with_session_inner("!STATUS", &ctx, Some("worker"), session, "42", None).await;
+    assert_eq!(reply, duduclaw_security::failsafe::format_status(session, None));
+    assert_refused_before_any_side_effect(&ctx, session, &calls, before).await;
 }

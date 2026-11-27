@@ -819,6 +819,7 @@ async fn process_line_events(
                         &base_text, Some(agent_id), None,
                     ).await {
                         crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                        crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
                         crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(text) => {
                             drop_files = true;
                             base_text = text;

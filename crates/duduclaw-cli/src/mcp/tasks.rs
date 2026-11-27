@@ -693,6 +693,13 @@ pub(crate) async fn handle_tasks_create(
     if let Err(message) = validate_created_task_assignee(home_dir, &row.assigned_to, implicit_operator_task) {
         return tool_error(message);
     }
+    if !implicit_operator_assignee(home_dir, &row.assigned_to, implicit_operator_task)
+        && let Err(refusal) = duduclaw_gateway::entry_gate::check_task_assignee(home_dir, &row.assigned_to) {
+        return tool_error(&format!(
+            "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+            refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+        ));
+    }
     if let Err(e) = store.insert_task(&row).await {
         return tool_error(&format!("insert task: {e}"));
     }
@@ -1744,6 +1751,36 @@ mod live_assignee_tests {
         assert_unavailable(response);
         let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
         assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_create_rechecks_effective_settings_immediately_before_insert() {
+        for explicit in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            employee(home.path(), "live", "active");
+            let mut params = serde_json::json!({"title": "work"});
+            if explicit { params["assigned_to"] = serde_json::json!("live"); }
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let call = TASK_CREATE_BEFORE_COMMIT.scope(
+                barrier.clone(), handle_tasks_create(&params, home.path(), RecordActor::Operator("live")),
+            );
+            let break_settings = async {
+                barrier.wait().await;
+                // Keep the employee active so the roster-only check passes.
+                std::fs::write(home.path().join("agents/live/agent.toml"),
+                    "[agent]\nname='live'\nstatus='active'\n[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='grok'\n").unwrap();
+                barrier.wait().await;
+            };
+            let (response, ()) = tokio::time::timeout(
+                std::time::Duration::from_secs(10), async { tokio::join!(call, break_settings) },
+            ).await.expect("handler must reach the commit barrier");
+            assert_eq!(response["isError"], true, "{response}");
+            let text = response["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("Task creation refused: "), "{text}");
+            assert!(text.contains("model_provider_mismatch"), "{text}");
+            let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+            assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
+        }
     }
 
     #[tokio::test]

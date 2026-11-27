@@ -1001,7 +1001,8 @@ async fn handle_message(
             &text, routed_agent.as_deref(), None,
         ).await {
             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
-            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => {
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => {
                 attachments.clear();
             }
             crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {

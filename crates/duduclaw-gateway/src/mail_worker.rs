@@ -452,12 +452,15 @@ where
         "[Agent Mail] 你的信箱收到一封新信，請閱讀後決定要不要處理。\n\n{}",
         mail::render_mail_as_data(&item)
     );
-    if duduclaw_core::autonomy_gate::check(
-        home_dir, &item.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
-    ).is_err() {
-        return false;
-    }
-    let outcome = invoke(item.agent_id.clone(), prompt).await;
+    let outcome = match crate::entry_gate::check_task_assignee(home_dir, &item.agent_id) {
+        Err(refusal) => Err(crate::entry_gate::background_refusal(&refusal)),
+        Ok(()) => {
+            if duduclaw_core::autonomy_gate::check(
+                home_dir, &item.agent_id, duduclaw_core::autonomy_gate::AutonomyPath::Background,
+            ).is_err() { return false; }
+            invoke(item.agent_id.clone(), prompt).await
+        }
+    };
     match outcome {
         Ok(_) => {
             mail::mark_triggered(home_dir, mail_id, &item.agent_id, "auto_trigger");

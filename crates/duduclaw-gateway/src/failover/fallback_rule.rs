@@ -181,6 +181,9 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
         .or_else(|| error.strip_prefix("no accounts available: ")).unwrap_or(error);
 
     // ── Refusals (checked first; fail closed) ──────────────────────────
+    if crate::entry_gate::background_refusal_code(error).is_some() {
+        return Refused(FallbackRefusal::Policy);
+    }
     if crate::budget::budget_refusal_message(error).is_some() {
         return Refused(FallbackRefusal::Budget);
     }

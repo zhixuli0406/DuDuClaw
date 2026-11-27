@@ -752,7 +752,8 @@ async fn handle_event(
             ctx, &session, &session, user, text, agent_name, None,
         ).await {
             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
-            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
             crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
                 send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
                 return;
@@ -2091,7 +2092,7 @@ mod quoted_context_tests {
         // Windows CRLF checkout: rustc normalizes literals, but include_str! does not.
         let source = include_str!("slack.rs").replace("\r\n", "\n");
         let source = source.split("\n#[cfg(test)]").next().unwrap();
-        assert!(source.contains(r#"let base_text = match slack_quoted_context(event, bot_user_id) {
+        assert!(source.contains(r#"let base_text = match slack_quoted_context(event, bot_user_id).filter(|_| !drop_files) {
         Some(quote_block) if text.is_empty() => quote_block,
         Some(quote_block) => format!("{quote_block}\n{text}"),
         None => text.to_string(),

@@ -451,3 +451,6 @@ const NOTIFY_PUSH_MAX_RETRIES: u32 = 3;
 /// RFC-27: concurrency-gate class label for goal dispatch. Scopes the in-flight
 /// lease budget so a future second consumer cannot starve the goal budget.
 const CONCURRENCY_CLASS_GOAL: &str = "goal";
+
+#[cfg(test)]
+pub(crate) use dispatch::assert_entry_refusal_tick;

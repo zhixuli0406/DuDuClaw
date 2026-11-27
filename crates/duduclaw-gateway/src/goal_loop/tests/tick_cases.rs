@@ -559,3 +559,71 @@ async fn repeated_max_turns_results_never_become_infrastructure_failures() {
         assert_eq!(store.get_task("work-result").await.unwrap().unwrap().pause_reason.as_deref(), Some("max_turns"));
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn entry_refusal_remains_needs_human_for_observer_without_retry() {
+    let home = home_with_agent("worker", "[model]\npreferred='claude-sonnet-4-6'\n[capabilities]\nautonomy_level='observer'\n");
+    let (store, _) = open_stores(home.path()).await;
+    let error = crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::Config(
+        crate::runtime_config::RuntimeSettingsError::UnknownProvider));
+    let before = crate::model_call_probe::calls();
+    crate::goal_loop::assert_entry_refusal_tick(home.path(), store, &error).await;
+    assert_eq!(crate::model_call_probe::calls(), before);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn incompatible_team_assignee_is_parked_once_before_any_model_call() {
+    let home = home_with_agent("worker", "[runtime]\nprovider='claude'\n[model]\npreferred='gpt-5.4'\n");
+    write_enabled_team(home.path());
+    let (store, queue) = open_stores(home.path()).await;
+    let resolved = crate::team_composer::resolve_team(home.path(), "worker").result.unwrap();
+    let mut spec = crate::team_composer::FrozenTeamSpec::from_resolved(&resolved);
+    spec.gate = duduclaw_core::types::TeamGateMode::AlwaysTeam;
+    let mut task = goal_task("incompatible-team", "worker");
+    task.team_spec_json = Some(serde_json::to_string(&spec).unwrap());
+    store.insert_task(&task).await.unwrap();
+    // The old gate accepts the parseable profile; only the strict gate catches it.
+    assert!(duduclaw_core::autonomy_gate::check(home.path(), "worker",
+        duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop).is_ok());
+    let d = driver(store.clone(), queue.clone(), small_cfg()).with_home_dir(home.path().to_path_buf());
+    let before = crate::model_call_probe::calls();
+    for _ in 0..2 {
+        d.tick_once().await.unwrap();
+        tokio::task::yield_now().await;
+        let parked = store.get_task(&task.id).await.unwrap().unwrap();
+        assert_eq!(parked.status, "needs_human");
+        assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
+        assert_eq!(parked.judge_feedback.as_deref().and_then(crate::entry_gate::background_refusal_code),
+            Some("model_provider_mismatch"));
+        let events = store.list_activity_for_task(&task.id, 100).await.unwrap();
+        assert_eq!(events.iter().filter(|event| event.event_type == "goal_loop.entry_refused"
+            && event.summary == "blocked_needs_decision: model_provider_mismatch").count(), 1);
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert!(d.inflight.lock().await.is_empty());
+        assert!(d.dispatch_failures.lock().await.is_empty());
+        assert_eq!(crate::model_call_probe::calls() - before, 0);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detached_team_handoff_rechecks_the_assignee() {
+    let home = home_with_agent("worker", "[runtime]\nprovider='claude'\n[model]\npreferred='claude-sonnet-4-6'\n");
+    write_enabled_team(home.path());
+    let (store, queue) = open_stores(home.path()).await;
+    let resolved = crate::team_composer::resolve_team(home.path(), "worker").result.unwrap();
+    let mut spec = crate::team_composer::FrozenTeamSpec::from_resolved(&resolved);
+    spec.gate = duduclaw_core::types::TeamGateMode::AlwaysTeam;
+    let mut task = goal_task("changed-team", "worker");
+    task.team_spec_json = Some(serde_json::to_string(&spec).unwrap());
+    store.insert_task(&task).await.unwrap();
+    crate::entry_gate::check_task_assignee(home.path(), "worker").unwrap();
+    std::fs::write(home.path().join("agents/worker/agent.toml"),
+        "[agent]\nname='worker'\nstatus='active'\n[runtime]\nprovider='claude'\n[model]\npreferred='gpt-5.4'\n").unwrap();
+    let d = driver(store, queue, small_cfg()).with_home_dir(home.path().to_path_buf());
+    let before = crate::model_call_probe::calls();
+    let error = d.try_team_dispatch(&task, 1, "").await.unwrap_err();
+    let enqueue::TeamDispatchError::ConfigRefused(error) = error else { panic!("expected configuration refusal"); };
+    assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"));
+    tokio::task::yield_now().await;
+    assert_eq!(crate::model_call_probe::calls() - before, 0);
+}
