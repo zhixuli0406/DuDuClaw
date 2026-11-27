@@ -2346,6 +2346,37 @@ async fn d1_representationally_equal_but_differently_bound_arguments_never_open_
     }
 }
 
+async fn drive_transport_refusals(home: bool) {
+    use crate::google_workspace::native_confirmation::{drive_refusal_cases, TEST_DRIVE_REQUEST};
+    use std::sync::atomic::Ordering;
+    let f = d1_fixture(home);
+    let wire = d1_wire(|_, _| D1Reply::json(serde_json::json!({"files":[]}))).await;
+    let _fixture = crate::google_workspace::native_call::testing::install(f.home.path(), &wire.endpoint);
+    let args = serde_json::json!({"query":"q"});
+    let value = d1_pending(&f, "drive_search", &args).execute_native(args.clone()).await.unwrap();
+    assert_ne!(value["isError"], true);
+    assert_eq!(wire.hits.swap(0, Ordering::SeqCst), 1);
+    wire.requests.lock().unwrap().clear();
+    for (method, url) in drive_refusal_cases() {
+        let pending = d1_pending(&f, "drive_search", &args);
+        let result = TEST_DRIVE_REQUEST.scope((method.clone(), url.clone()),
+            pending.execute_native(args.clone())).await;
+        assert!(result.is_err(), "home={home}: {method} {url}");
+        assert_eq!(wire.hits.load(Ordering::SeqCst), 0);
+        assert!(wire.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn personal_drive_refusals_never_reach_wire() {
+    drive_transport_refusals(false).await;
+}
+
+#[tokio::test]
+async fn home_oauth_drive_refusals_never_reach_wire() {
+    drive_transport_refusals(true).await;
+}
+
 #[tokio::test]
 async fn d1_same_scope_equal_digest_foreign_template_step_never_reaches_wire() {
     use crate::google_workspace::native_call::NativeCallTemplate;

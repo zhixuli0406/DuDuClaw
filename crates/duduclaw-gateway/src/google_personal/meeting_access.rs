@@ -77,6 +77,15 @@ impl MeetingAccess {
     }
 
     pub(crate) async fn get(&self, home: &Path, db: &UserDb, url: reqwest::Url) -> Result<reqwest::Response, String> {
+        let method = reqwest::Method::GET;
+        #[cfg(test)]
+        let (method, url) = crate::google_workspace::native_confirmation::TEST_DRIVE_REQUEST
+            .try_with(Clone::clone)
+            .map(|(method, url)| url.parse().map(|url| (method, url)))
+            .unwrap_or(Ok((method, url))).map_err(|_: url::ParseError| UNAVAILABLE)?;
+        if !crate::google_workspace::native_confirmation::drive_method_allowed(&method, &url) {
+            return Err(UNAVAILABLE.into());
+        }
         self.validate(home, db)?;
         if !allowed_endpoint(&url) { return Err(UNAVAILABLE.into()); }
         #[cfg(test)]
@@ -89,7 +98,7 @@ impl MeetingAccess {
             .read_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(30 * 60))
             .build().map_err(|_| UNAVAILABLE)?;
-        let request = client.get(url).bearer_auth(self.token.as_str())
+        let request = client.request(method, url).bearer_auth(self.token.as_str())
             .build().map_err(|_| UNAVAILABLE)?;
         self.validate(home, db)?;
         let response = client.execute(request).await.map_err(|_| UNAVAILABLE)?;
@@ -105,6 +114,9 @@ fn valid_id(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 fn allowed_endpoint(url: &reqwest::Url) -> bool {
+    if !crate::google_workspace::native_confirmation::drive_method_allowed(&reqwest::Method::GET, url) {
+        return false;
+    }
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some()
         || url.port().is_some_and(|p| p != 443) || url.fragment().is_some()
     { return false; }
@@ -243,6 +255,34 @@ mod tests {
         flow::finish(&f.home, &f.db, &f.alice.id, "meeting-login", state).await.unwrap();
         let material = resolve(&f.home, &f.db, &f.alice.id).await.unwrap();
         (f, material)
+    }
+
+    #[tokio::test]
+    async fn meeting_drive_refusals_never_reach_wire() {
+        use crate::google_workspace::native_confirmation::{drive_refusal_cases, TEST_DRIVE_REQUEST};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let (f, material) = connected_fixture().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(serde_json::json!({})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let _endpoint = install_test_endpoint(&f.home, &base);
+        let read: reqwest::Url = "https://www.googleapis.com/drive/v3/files".parse().unwrap();
+        material.get(&f.home, &f.db, read.clone()).await.unwrap();
+        assert_eq!(count.swap(0, Ordering::SeqCst), 1);
+        for (method, url) in drive_refusal_cases() {
+            let result = TEST_DRIVE_REQUEST.scope((method.clone(), url.clone()),
+                material.get(&f.home, &f.db, read.clone())).await;
+            assert!(matches!(result, Err(ref message) if message == UNAVAILABLE), "{method} {url}");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]
