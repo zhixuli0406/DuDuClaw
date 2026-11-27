@@ -66,7 +66,13 @@ impl ApprovalBroker {
         // Push it to the humans who can decide it, on the channel they are
         // actually on. Best-effort and time-boxed — a channel outage must never
         // stop the approval from being filed.
-        self.push_new_request(&rec).await;
+        // Scheduling hint only. The gateway verifies the quarantined artifact
+        // before either approving this SAME row or pushing its manual card.
+        if !(action_kind == crate::expert_skills::SKILLS_ACTION_KIND
+            && rec.payload.get("auto_approval_candidate").and_then(Value::as_bool) == Some(true))
+        {
+            self.push_new_request(&rec).await;
+        }
         Ok(id)
     }
 
@@ -162,6 +168,8 @@ impl ApprovalBroker {
     /// landed. Silent no-op for in-memory stores and for kinds that own their
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
     pub(crate) async fn push_new_request(&self, rec: &ApprovalRecord) {
+        #[cfg(test)]
+        if crate::skill_trust::tests::capture_card(self.home_dir().as_deref(), rec) { return; }
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;
@@ -310,6 +318,21 @@ impl ApprovalBroker {
         decided_by: &str,
     ) -> Result<(), String> {
         self.decide_unbound(id, approve, decided_by, false).await
+    }
+
+    /// Gateway-only policy decision; no additional approval row or grant.
+    pub(crate) async fn decide_by_skill_trust_policy(
+        &self, id: &ApprovalId, decided_by: &str,
+    ) -> Result<(), String> {
+        let rec = self.store.get(id).await?.ok_or("找不到技能核准單")?;
+        if rec.status != ApprovalStatus::Pending
+            || rec.action_kind != crate::expert_skills::SKILLS_ACTION_KIND
+            || !decided_by.starts_with("policy:skill_trust:")
+        {
+            return Err("這張核准單不能依自家技能來源設定核准".into());
+        }
+        // Keep the existing binding, expiry, lease and pending CAS checks.
+        self.decide_unbound(id, true, decided_by, false).await
     }
 
     /// Egress approvals require live Admin authority even without a binding.
