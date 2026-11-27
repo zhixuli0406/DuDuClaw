@@ -134,10 +134,12 @@ impl SenderAccess {
         scope.main_converse_listed = false;
         if sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
+            scope.main_converse_listed = !crate::webchat::is_widget_visitor(user_id)
+                && crate::on_behalf_of::access::main_list_refusal(home, Some(&format!("user:{user_id}")))
+                    == crate::on_behalf_of::access::MAIN_TURN_REFUSAL;
             if !crate::webchat::is_widget_visitor(user_id)
                 && main_access_listed(home, user_id, MainUse::Converse).unwrap_or(false)
             {
-                scope.main_converse_listed = true;
                 if !scope.available { return sender; }
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
                     for target in targets {
@@ -162,10 +164,12 @@ impl SenderAccess {
         scope.main_assign_listed = false;
         if sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
+            scope.main_assign_listed = !crate::webchat::is_widget_visitor(user_id)
+                && crate::on_behalf_of::access::main_list_refusal(home, Some(&format!("user:{user_id}")))
+                    == crate::on_behalf_of::access::MAIN_TURN_REFUSAL;
             if !crate::webchat::is_widget_visitor(user_id)
                 && main_access_listed(home, user_id, MainUse::Assign).unwrap_or(false)
             {
-                scope.main_assign_listed = true;
                 if !scope.available { return sender; }
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
                     for target in targets {

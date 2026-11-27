@@ -476,10 +476,11 @@ impl MethodHandler {
         // bound only to agent A from mutating agent B's tasks.
         // F5-D: the live identity and the task's audience apply as for
         // `tasks.goal_decide` — an update can decide a needs_human task.
-        let live = match live_reader_context(&self.home_dir, ctx) {
+        let mut live = match live_reader_context(&self.home_dir, ctx) {
             Ok(l) => l,
             Err(()) => return WsFrame::error_response("", PERMISSION_DENIED),
         };
+        live.origin = ctx.origin;
         let ctx = &live;
         if !task_privacy::a2a_owner_allows(&self.home_dir, ctx, task_id) {
             return WsFrame::error_response("", PERMISSION_DENIED);
@@ -1146,7 +1147,8 @@ mod main_assignment_tests {
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
         db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
-        crate::isolation_io_test_support::with_isolation(async {
+        {
+            let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
             assert!(handler.main_assignment_admitted(&ctx, "main").await);
             assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
             for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
@@ -1168,7 +1170,46 @@ mod main_assignment_tests {
             assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
                 WsFrame::Response { ok: true, .. }));
             db.set_main_agent_users(&admin.id, &[], true).unwrap();
-            assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
-        }).await;
+            assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
+        }
+        db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+        assert!(!handler.main_assignment_admitted(&ctx, "main").await);
+        assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
+    }
+
+    #[tokio::test]
+    async fn listed_member_key_cannot_create_main_work() {
+        let home = tempfile::tempdir().unwrap();
+        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+            "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+        std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
+        let employee = db.create_user("emp@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
+        db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
+        handler.registry.write().await.scan().await.unwrap();
+        let store = Arc::new(TaskStore::open(home.path()).unwrap());
+        handler.set_task_store(store.clone()).await;
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
+        // Neither refreshing account authority nor a conflicting origin may
+        // promote a member key to dashboard list admission.
+        for user_id in [&employee.id, &admin.id] {
+            for (origin, member_key_id) in [
+                (duduclaw_auth::acl::ContextOrigin::MemberKey, Some("member-key".to_string())),
+                (duduclaw_auth::acl::ContextOrigin::MemberKey, None),
+                (duduclaw_auth::acl::ContextOrigin::DashboardSession, Some("member-key".to_string())),
+            ] {
+                let mut ctx = db.live_user_context(user_id).unwrap().unwrap();
+                ctx.origin = origin;
+                ctx.member_key_id = member_key_id;
+                assert!(!handler.main_assignment_admitted(&ctx, "main").await);
+                assert_eq!(error(handler.handle_tasks_create(json!({
+                    "title":"work", "assigned_to":"main"
+                }), &ctx).await), "主代理僅管理員可以使用。");
+            }
+        }
+        assert!(store.list_tasks(None, None, None).await.unwrap().is_empty());
     }
 }

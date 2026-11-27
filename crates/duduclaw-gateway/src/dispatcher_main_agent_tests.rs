@@ -367,7 +367,8 @@ async fn dispatch_execution_accepts_listed_shell_free_main_and_rechecks_revocati
     assert!(matches!(unprotected, Err(DispatchError::Other(reason))
         if reason == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
     assert_eq!(crate::model_call_probe::calls(), before);
-    crate::isolation_io_test_support::with_isolation(async {
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(f.home.path());
     let allowed = crate::on_behalf_of::scope_first(Some(f.employee.clone()),
         dispatch_to_agent_outcome(f.home.path(), &f.registry, "main", "work", &delegation, None)).await;
     assert!(allowed.is_ok(), "{allowed:?}");
@@ -377,6 +378,6 @@ async fn dispatch_execution_accepts_listed_shell_free_main_and_rechecks_revocati
         dispatch_to_agent_outcome(f.home.path(), &f.registry, "main", "work", &delegation, None)).await;
     assert!(denied.is_err());
     assert_eq!(crate::model_call_probe::calls(), before + 1);
-    }).await;
+    }
     crate::model_call_probe::set_dry_run(false);
 }

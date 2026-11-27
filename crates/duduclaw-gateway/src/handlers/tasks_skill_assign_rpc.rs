@@ -191,11 +191,12 @@ impl MethodHandler {
             }
             if requested.len() > 5 { return WsFrame::error_response("", "at most five skills may be assigned together"); }
         }
-        let fresh =
+        let mut fresh =
             match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
                 Ok(f) => f,
                 Err(_) => return WsFrame::error_response("", "permission denied"),
             };
+        fresh.origin = ctx.origin;
         let (mut holdings, usage_error) = self.skill_holdings(&fresh, skill_name).await;
         if let Some(e) = usage_error {
             warn!(skill = skill_name, error = %e, "skill_assign: usage unavailable, runner falls back to the first holder");
