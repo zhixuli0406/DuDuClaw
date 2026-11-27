@@ -1,5 +1,15 @@
 # Security Defense
 
+## Department grants and main employee access (Enterprise, v1.86.0)
+
+Department authority comes from an Admin's explicit grant to an active Manager and the official org chart department, which must agree with the employee's own settings. A member's department label or an employee's self-edited settings cannot expand it. The main AI employee and other people's personal employees are excluded. Missing or unreadable authority grants no access.
+
+Grants work only in signed-in dashboard sessions, never through personal API keys or chat apps. They start empty. Adding or widening access requires reading a risk note and ticking **I understand**; every grant and revocation is audited, as are writes authorized through a grant. Stopping an account or changing it away from Manager revokes department grants automatically. Existing routines and saved rules are not automatically disabled.
+
+The separate main AI employee access list also starts empty and requires risk acknowledgement when adding people. It permits conversation and ordinary work only in protected mode with isolated employee execution. Otherwise, only Admins can use these entry points; the settings response explains that the saved list is inactive. Personal API keys can never use the main employee. Scheduling, employee creation and settings changes remain Admin-only. Listed people may ask about remembered content, including Admin conversations.
+
+When working for a listed non-Admin person, the main employee's administrator tools are hidden and refused with “This action requires the administrator to perform it personally.” It can still delegate to other employees under its normal delegation rules; `[delegation] human_principal = "enforce"` is recommended to check the person's access on hand-over. See [Department managers](79-department-managers.md) for scope, rollout and known limitations.
+
 
 ## Per-run caller identity
 

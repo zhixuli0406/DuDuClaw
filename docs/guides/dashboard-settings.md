@@ -1,5 +1,19 @@
 # Dashboard settings map (v1.80.0)
 
+## Department and main employee access settings (Enterprise, v1.86.0)
+
+| Location | Controls and current availability |
+|---|---|
+| Manage → Members → department grants | Admin chooses an active Manager, department and schedules, automation rules, skills or usage. Outbound-data review is also an option, to be documented separately. The gateway supports saving grants; the Members-page editor still needs dashboard integration. |
+| Main AI employee → Who may use | Admin maintains the initially empty list for conversation and ordinary work. The gateway supports saving the list and explains when it is inactive; the dashboard control still needs integration. It grants access only in protected mode with isolated employee execution. Otherwise only Admins can use these entry points. |
+| Routines | A Manager with schedules access can filter by department and manage eligible routines, reminders and scheduled assignments. Creation is limited to prompt-only routines. Employees needing an Admin org sync are counted in a notice. Department automation editing and member read-only rule screens still need integration. |
+| Skills | Granted Managers can switch skills on or off, remove, restore and choose **Request installation** for an employee. Installation still requires Admin approval. |
+| Budget / billing → Department usage | Granted Managers can choose a department and 7, 30 or 90 days, then read per-employee usage, totals and recent records. They cannot change budgets through this grant. |
+
+Adding or widening a grant, or adding people to the main list, requires reading the risk note and ticking **I understand**. Changes are audited. Department grants apply only to signed-in dashboard sessions, not personal API keys or chat apps. They end automatically when the person stops being an active Manager. The main list warns that listed people may ask about memories, including Admin conversations; personal API keys can never use the main employee. Scheduling the main employee, creating employees and changing their settings stay Admin-only.
+
+See [Department managers](../features/79-department-managers.md) for exact permissions, rule execution limits, revocation and existing work. Company-wide analytics and billing summaries remain visible to all Managers.
+
 ## Skill archive recovery
 
 Automatic skill staleness and archiving have been removed. `[skill_curator]`

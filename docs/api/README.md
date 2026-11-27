@@ -20,29 +20,24 @@ JSON-RPC 2.0, and member login does not use Ed25519 challenge signing.
 
 ## Main AI employee access list (1.86.0)
 
-Enterprise Admin dashboard sessions can read `agents.main_access.get` and save
-`agents.main_access.set` (`user_ids`, plus `acknowledged: true` when adding people).
-Both responses contain `users`, `risk_notice` and `effective`. An empty list has
-`effective: true`. A non-empty list takes effect only in protected mode with
-isolated employee execution. Otherwise, it has `effective: false` and an
-`ineffective_reason` explaining that only Admins can use the main AI employee.
-Saving still succeeds and keeps the list for when protected execution is enabled.
-Removing shell tools or changing the employee's runtime does not activate the list.
+Enterprise Admin dashboard sessions use `agents.main_access.get` and
+`agents.main_access.set` to read and replace the initially empty list. Saving
+accepts `user_ids`; adding people also requires `acknowledged: true`. Responses
+include `users`, `risk_notice` and `effective`. For a non-empty list,
+`effective` is true only in protected mode with isolated employee execution;
+otherwise `ineffective_reason` explains that only Admins can use the main
+employee. An empty list reports `effective: true` without granting anyone access.
+Saving an inactive list preserves it for later; removing command tools does
+not activate it.
 
-In protected mode, active listed Enterprise members can talk to the main AI
-employee and assign it work. A protected-mode flag alone is insufficient: the
-host must also have the employee isolation architecture installed. Each final
-execution checks the person's current access and the protected execution state.
-Without protected execution, the list grants no access; only Admins can use the
-main AI employee through these conversation and assignment entry points.
-
-For WebChat, list access requires an authenticated dashboard session. Member API
-keys never grant access to the main AI employee, even if their account is listed
-or is an Admin. Other credentials cannot inherit the dashboard session grant.
-`users.me.main_agent_access` reports this availability: non-Admins must be active,
-listed Enterprise members using a dashboard session while protected execution
-is enabled. Live Admin turns retain their existing access. Management and
-scheduling remain Admin-only.
+Active listed Enterprise members may converse and assign ordinary work only
+under protected execution, with access checked again before execution.
+Personal API keys can never use the main AI employee, including keys held by
+Admins. `users.me.main_agent_access` reports dashboard-session availability.
+Scheduling and employee management stay Admin-only. Work for a listed
+non-Admin person cannot use administrator tools. See
+[Department managers](../features/79-department-managers.md) for memory exposure,
+delegation and dashboard integration limits.
 
 [openapi.yaml](openapi.yaml) is a partial historical discovery reference,
 with selected sections maintained separately. Its `/rpc/<method>` paths are

@@ -1,5 +1,11 @@
 # Org chart editing (reporting lines and departments)
 
+## Department manager reach (Enterprise, v1.86.0)
+
+Moving an AI employee between departments can change which Managers may manage its schedules, automation rules, skills and usage. The change summary states who gains or loses which controls, for example: “After approval, the Sales Manager can manage this employee's schedules and skills; the Manufacturing Manager will lose that access.” Approval checks the effect again. If it changed since the Admin reviewed it, the Admin must review and confirm again before applying the move. Org sync also reports the effect.
+
+Only the official org chart department, when it agrees with the employee's own settings, gives department grants their scope. Mismatches need an Admin org sync; the main employee and other people's personal employees are excluded. See [Department managers](79-department-managers.md).
+
 Who an AI employee reports to (`reports_to`) and which department it belongs to decide who may delegate to whom. The authoritative record is `<home>/org.toml`, which no employee can write. Each employee's `agent.toml` holds a display copy. Since v1.81.0 both can be changed on the dashboard org chart page: select an employee and use **Adjust position** in the side panel, or drag the employee onto a new manager, which opens the same panel with that manager pre-selected. Nothing is sent until you confirm there. The panel uses the gateway API described below.
 
 ## Who may change what
