@@ -187,7 +187,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search" | "wiki_stats"
         | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get" | "xlsx_read"
         | "calendar_list_events" | "discovery_catalog" | "discovery_list" | "discovery_tree"
-        | "discovery_artifact" | "meeting_transcribe_status" => Read,
+        | "discovery_artifact" | "meeting_transcribe_status" | "admin_settings_read" => Read,
 
         // ── draft ───────────────────────────────────────────────────────
         "gmail_create_draft" | "canvas_push" | "plan_start" | "skill_from_recording"
@@ -232,7 +232,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "working_state_set" | "discovery_cancel" => Modify,
 
         // ── admin ───────────────────────────────────────────────────────
-        "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
+        "admin_settings_propose" | "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
         | "codrive_run" | "create_agent" | "evolution_toggle" | "execute_program"
         | "llamafile_start" | "llamafile_stop" | "model_download" | "model_load"
         | "model_unload" | "odoo_execute" | "os_apply_update" | "os_doctor_repair"

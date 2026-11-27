@@ -211,6 +211,11 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     // actual ToolDefs, not a source-text count or a duplicated name fixture.
     for tool in crate::mcp::tools() {
         assert!(seen.insert(tool.name), "duplicate ToolDef: {}", tool.name);
+        if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
+            assert_eq!(boundary_route(tool.name), None, "admin AI is unavailable in protected mode");
+            assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some());
+            continue;
+        }
         assert!(boundary_route(tool.name).is_some(), "missing route: {}", tool.name);
         assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some(),
             "missing effect: {}", tool.name);

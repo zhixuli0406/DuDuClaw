@@ -173,6 +173,7 @@ pub(crate) struct TeamMemberSection {
 
 // ── Submodules (P10a: mcp.rs was split by tool family) ──────
 mod action_guard;
+pub(crate) mod admin_ai_client;
 mod agent_admin;
 mod agent_update;
 mod agents;

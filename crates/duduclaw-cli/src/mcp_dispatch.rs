@@ -991,6 +991,19 @@ impl McpDispatcher {
                 return Some((jsonrpc_error(id, -32003, &msg), "explore_lane", msg, None));
             }
 
+            // RM-194: exactly the tools/list predicate; gateway rechecks the live turn.
+            if crate::mcp::admin_ai_client::TOOLS.contains(&tool_name)
+                && !crate::mcp::admin_ai_client::available_for(
+                    &self.home_dir, principal,
+                    crate::mcp::acting_agent_id(&principal.client_id, &self.default_agent),
+                    self.is_remote_bearer(),
+                ).await.permits(tool_name)
+            {
+                let message = "目前無法使用管理員設定工具，請在有效的管理員分身對話中重試。".to_owned();
+                return Some((jsonrpc_response(id, crate::mcp::tool_error(&message)),
+                    "admin_ai_unavailable", message, None));
+            }
+
             // ── 1. Scope check ───────────────────────────────────────────────────
             // `tools/list` for a bound HTTP key filters by the same
             // `scope_gate_refusal` (discoverable ⇔ callable).

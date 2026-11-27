@@ -71,6 +71,8 @@ pub(crate) const GITHUB_WORKSPACE_TOOLS: &[&str] = &[
 /// dispatch gate (`mcp_dispatch.rs`, error class `process_agent_tool`), both
 /// through [`process_agent_tool_refused`], so discoverable ⇔ callable.
 pub(crate) const PROCESS_AGENT_TOOLS: &[&str] = &[
+    "admin_settings_read",
+    "admin_settings_propose",
     "code_map",
     "meeting_upload_link",
     "meeting_transcribe",
@@ -242,7 +244,8 @@ pub(crate) fn remote_process_agent_tool_refused(
     kind: Option<&crate::mcp_auth::PrincipalKind>,
     default_agent: &str,
 ) -> bool {
-    remote_non_gateway_internal(principal, kind, default_agent) && acts_for_process_agent(name)
+    super::admin_ai_client::TOOLS.contains(&name)
+        || (remote_non_gateway_internal(principal, kind, default_agent) && acts_for_process_agent(name))
 }
 
 /// What the HTTP MCP server makes of an authenticated principal (v1.82,
@@ -266,7 +269,8 @@ pub(crate) enum RemoteAccess {
 impl RemoteAccess {
     /// Whether this caller is refused the process-agent union for `name`.
     pub(crate) fn refuses_process_agent_tool(&self, name: &str) -> bool {
-        matches!(self, Self::Bound(_) | Self::Unbound(_)) && acts_for_process_agent(name)
+        super::admin_ai_client::TOOLS.contains(&name)
+            || (matches!(self, Self::Bound(_) | Self::Unbound(_)) && acts_for_process_agent(name))
     }
 }
 
@@ -540,7 +544,7 @@ pub(crate) async fn handle_tools_list_for_transport(
             let bound_access = RemoteAccess::Bound(agent.clone());
             let listed = with_remote_binding(
                 RemoteBinding::Bound(agent.clone()),
-                visible_tools(principal, home_dir, agent),
+                visible_tools(principal, home_dir, agent, true),
             )
             .await;
             // `visible_tools` exempts an AI-employee client from the scope
@@ -552,7 +556,7 @@ pub(crate) async fn handle_tools_list_for_transport(
                 .filter(|t| remote_bound_key_can_call(&bound_access, t.name, principal))
                 .collect()
         }
-        _ => visible_tools(principal, home_dir, default_agent).await,
+        _ => visible_tools(principal, home_dir, default_agent, remote_bearer).await,
     };
     let native_rest = google_native_rest_available(home_dir, principal);
     let tools: Vec<Value> = tools.into_iter().map(|t| backend_tool_schema(t, native_rest)).collect();
@@ -588,7 +592,7 @@ pub(crate) async fn visible_tool_snapshot(
     principal: &crate::mcp_auth::Principal, home: &Path, default_agent: &str,
 ) -> Vec<String> {
     let native_rest = google_native_rest_available(home, principal);
-    visible_tools(principal, home, default_agent).await.into_iter().map(|tool| {
+    visible_tools(principal, home, default_agent, false).await.into_iter().map(|tool| {
         if tool.name == "gmail_create_draft" {
             tool_schema_snapshot(&backend_tool_schema(tool, native_rest)).unwrap()
         } else { tool.name.to_owned() }
@@ -617,7 +621,7 @@ pub(crate) async fn visible_tool_names(
     home_dir: &Path,
     default_agent: &str,
 ) -> Vec<&'static str> {
-    visible_tools(principal, home_dir, default_agent)
+    visible_tools(principal, home_dir, default_agent, false)
         .await
         .into_iter()
         .map(|t| t.name)
@@ -629,12 +633,15 @@ async fn visible_tools(
     principal: &crate::mcp_auth::Principal,
     home_dir: &Path,
     default_agent: &str,
+    remote_bearer: bool,
 ) -> Vec<&'static ToolDef> {
-    visible_tools_with(
+    visible_tools_in_lane_for_transport(
         principal,
         home_dir,
         default_agent,
         employee_process_from_env(),
+        &crate::mcp_isolation::process_lane(),
+        remote_bearer,
     )
     .await
 }
@@ -665,6 +672,17 @@ pub(crate) async fn visible_tools_in_lane(
     default_agent: &str,
     employee_process: bool,
     lane: &duduclaw_core::ProcessLane,
+) -> Vec<&'static ToolDef> {
+    visible_tools_in_lane_for_transport(principal, home_dir, default_agent, employee_process, lane, false).await
+}
+
+async fn visible_tools_in_lane_for_transport(
+    principal: &crate::mcp_auth::Principal,
+    home_dir: &Path,
+    default_agent: &str,
+    employee_process: bool,
+    lane: &duduclaw_core::ProcessLane,
+    remote_bearer: bool,
 ) -> Vec<&'static ToolDef> {
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
@@ -707,6 +725,7 @@ pub(crate) async fn visible_tools_in_lane(
     // clients are filtered separately by `external_tool_allowed` and carry no
     // per-agent capability config.
     let effective_agent = acting_agent_id(&principal.client_id, default_agent);
+    let admin_ai = super::admin_ai_client::available_for(home_dir, principal, effective_agent, remote_bearer).await;
     let is_member =
         !principal.is_external && duduclaw_gateway::ephemeral::is_ephemeral_id(effective_agent);
     let member_caps = is_member
@@ -935,6 +954,7 @@ pub(crate) async fn visible_tools_in_lane(
     .is_some();
 
     tools()
+        .filter(|t| !super::admin_ai_client::TOOLS.contains(&t.name) || admin_ai.permits(t.name))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))
         // SR2 1a: refused on every transport where the isolation architecture
         // applies, so it is not listed there either (discoverable ⇔ callable).
