@@ -606,3 +606,55 @@ mod google_chat_audit_tests {
         }
     }
 }
+
+/// Shared discovery/admission gate. Identity comes only from the authenticated
+/// employee, never tool arguments; the gateway rechecks policy at execution.
+pub(crate) fn drive_write_refusal(
+    home: &Path,
+    agent: &str,
+    tool: &str,
+    principal: &crate::mcp_auth::Principal,
+    lane: &duduclaw_core::ProcessLane,
+) -> Option<String> {
+    use duduclaw_gateway::google_workspace::drive_write_policy as policy;
+    let action = policy::action_for_tool(tool)?;
+    if principal.is_external || crate::mcp_isolation::current().is_some() {
+        return Some("此連線不支援雲端硬碟寫入。".into());
+    }
+    if let Some(message) = lane_refusal(lane, tool) { return Some(message); }
+    if !policy::tool_available(home, tool) {
+        let current = policy::load(home);
+        if (tool == "drive_move_file" && current.move_
+            || tool == "drive_trash_file" && current.trash) && current.folders.is_empty() {
+            return Some("需要先限定資料夾。".into());
+        }
+        let verb = match action {
+            policy::DriveWriteAction::Create => "建立檔案",
+            policy::DriveWriteAction::Modify => "修改檔案",
+            policy::DriveWriteAction::Move => "搬移檔案",
+            policy::DriveWriteAction::Trash => "將檔案移到垃圾桶",
+        };
+        return Some(format!("管理員還沒開放 AI 在雲端硬碟{verb}。"));
+    }
+    if !duduclaw_core::is_valid_agent_id(agent)
+        || !duduclaw_gateway::google_workspace::native_rest_available(home, Some(agent)) {
+        return Some("此 Google 連線不支援雲端硬碟寫入。".into());
+    }
+    let dir = caller_agent_dir(home, agent);
+    let caps = std::fs::read_to_string(dir.join("agent.toml")).ok()
+        .and_then(|raw| toml::from_str::<crate::mcp_dispatch::PolicyOnlyConfig>(&raw).ok());
+    let Some(config) = caps else {
+        return Some("無法確認這位 AI 員工的工具權限。".into());
+    };
+    if duduclaw_core::tool_catalog::tool_list_verdict(
+        tool, &config.capabilities.denied_tools, &config.capabilities.allowed_tools,
+    ) != duduclaw_core::tool_catalog::ToolListVerdict::Allowed {
+        return Some("這位 AI 員工的 denied_tools／allowed_tools 不允許此工具。".into());
+    }
+    if crate::mcp_dispatch::action_rule_verdict(
+        &duduclaw_core::agent_toml::load_action_rules(&dir), tool,
+    ) == Some(duduclaw_core::ActionVerdict::Block) {
+        return Some("這位 AI 員工的 action_rules 不允許此動作。".into());
+    }
+    None
+}
