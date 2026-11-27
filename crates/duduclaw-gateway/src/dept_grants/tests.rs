@@ -76,6 +76,66 @@ async fn grants_exclude_other_departments_and_main_agents() {
 }
 
 #[tokio::test]
+async fn registry_missing_target_denied() {
+    let f = fixture().await;
+    // Create a valid target after the registry scan, with matching authority/mirror.
+    crate::trigger_route::tests::write_agent(&f.home.join("agents"), "a3", "a3", "", "specialist", "");
+    let path = f.home.join("agents/a3/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, raw.replace("[agent]", "[agent]\ndepartment = 'sales'")).unwrap();
+    let org_path = f.home.join("org.toml");
+    let org = std::fs::read_to_string(&org_path).unwrap();
+    std::fs::write(org_path, format!("{org}\n[agents.a3]\ndepartment = 'sales'\nreports_to = ''\n")).unwrap();
+    assert_eq!(duduclaw_agent::skill_loader::authoritative_department(&f.home, "a3"), Some("sales".into()));
+    let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+    assert!(allows_create(&view, "a1"));
+    assert!(!allows_create(&view, "a3"));
+}
+
+#[tokio::test]
+async fn role_changed_to_main_after_scan_denied() {
+    let f = fixture().await;
+    let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+    assert!(allows_create(&view, "a2"));
+    let path = f.home.join("agents/a2/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, raw.replace("role = \"specialist\"", "role = \"main\"")).unwrap();
+    assert!(!allows_create(&view, "a2"));
+    assert!(!allows_create(&DeptGrantView::load(&f.h, &f.mgr_a).await, "a2"));
+}
+
+#[tokio::test]
+async fn unreadable_agent_toml_denied() {
+    let f = fixture().await;
+    let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+    assert!(allows_create(&view, "a1"));
+    std::fs::write(f.home.join("agents/a1/agent.toml"), "invalid TOML !").unwrap();
+    assert!(!allows_create(&view, "a1"));
+}
+
+#[tokio::test]
+async fn config_name_alias_not_accepted() {
+    let f = fixture().await;
+    let path = f.home.join("agents/a1/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let aliased = raw.replace("name = \"a1\"", "name = \"alias\"");
+    std::fs::write(&path, &aliased).unwrap();
+    f.h.registry().write().await.scan().await.unwrap();
+    // Give the alias valid on-disk authority without adding its directory to
+    // the registry, so rejection cannot depend on a missing file or mirror.
+    std::fs::create_dir(f.home.join("agents/alias")).unwrap();
+    std::fs::write(f.home.join("agents/alias/agent.toml"), aliased).unwrap();
+    let org_path = f.home.join("org.toml");
+    let org = std::fs::read_to_string(&org_path).unwrap();
+    std::fs::write(org_path, format!("{org}\n[agents.alias]\ndepartment = 'sales'\nreports_to = ''\n")).unwrap();
+    assert_eq!(duduclaw_agent::skill_loader::authoritative_department(&f.home, "alias"), Some("sales".into()));
+    let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+    assert_eq!(view.loaded_agents.get("a1").map(String::as_str), Some("alias"));
+    assert!(allows_create(&view, "a1"));
+    assert!(!allows_create(&view, "alias"));
+}
+
+#[tokio::test]
 async fn actions_outside_constant_table_are_denied() {
     let f = fixture().await;
     let view = DeptGrantView::load(&f.h, &f.mgr_a).await;

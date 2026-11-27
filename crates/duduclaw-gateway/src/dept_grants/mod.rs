@@ -1,6 +1,6 @@
 //! Request-local department authority. No existing binding or routing gate is widened here.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use duduclaw_auth::acl::ContextOrigin;
@@ -40,6 +40,7 @@ pub(crate) struct DeptGrantView {
     ctx: Option<UserContext>,
     default_id: String,
     main_agents: BTreeSet<String>,
+    loaded_agents: BTreeMap<String, String>,
 }
 
 impl DeptGrantView {
@@ -81,6 +82,7 @@ impl DeptGrantView {
             Err(_) => return Self::denied("gateway default unavailable"),
         };
         let mut main_agents = BTreeSet::new();
+        let mut loaded_agents = BTreeMap::new();
         {
             let registry = h.registry().read().await;
             for agent in registry.list() {
@@ -95,9 +97,12 @@ impl DeptGrantView {
                     main_agents.insert(agent.config.agent.name.clone());
                     main_agents.insert(dir_id.to_owned());
                 }
+                if let Some(dir_id) = dir_id {
+                    loaded_agents.insert(dir_id.to_owned(), agent.config.agent.name.clone());
+                }
             }
         }
-        Self { grants, home, ctx: Some(ctx.clone()), default_id, main_agents }
+        Self { grants, home, ctx: Some(ctx.clone()), default_id, main_agents, loaded_agents }
     }
 
     // Only fixed, non-sensitive reasons reach logs; never include database errors.
@@ -128,6 +133,19 @@ pub(crate) fn department_grant_allows(
     }
     let Some(ctx) = v.ctx.as_ref() else { return false; };
     if ctx.owner_only_denied(agent) { return false; }
+    // Only successfully loaded directory ids qualify; config names are not aliases.
+    if !v.loaded_agents.contains_key(agent) { return false; }
+    // The registry may be stale. Deserialize the fresh role with the same
+    // AgentRole serde implementation used by the registry's AgentConfig.
+    let path = v.home.join("agents").join(agent).join("agent.toml");
+    let Ok(raw) = std::fs::read_to_string(path) else { return false; };
+    let Ok(config) = toml::from_str::<toml::Value>(&raw) else { return false; };
+    let role: Option<AgentRole> = config.get("agent").and_then(|info| info.get("role"))
+        .and_then(|role| role.clone().try_into().ok());
+    match role {
+        Some(AgentRole::Main) | None => return false,
+        Some(_) => {},
+    }
     // A present user principal never parses as Background. load admits only
     // live Managers in non-Personal editions, not the machine Admin shortcut.
     let principal = format!("user:{}", ctx.user_id);
