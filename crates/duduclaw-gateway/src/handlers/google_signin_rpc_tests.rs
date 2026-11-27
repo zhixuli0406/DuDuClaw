@@ -1,5 +1,6 @@
 use super::*;
 use duduclaw_auth::signin_members::{SigninApproval, SigninOutcome, SigninPolicy, VerifiedGoogleIdentity};
+use sha2::{Digest, Sha256};
 
 const METHODS: &[&str] = &[
     "google.signin.get", "google.signin.set", "users.signin_requests.list",
@@ -7,6 +8,7 @@ const METHODS: &[&str] = &[
     "users.google_signin.unlink", "users.signin_onboarding.retry_avatar",
 ];
 const BASE: &str = "[dashboard]\npublic_url='https://company.test/app'\n[member_api_keys]\nenabled=true\nrate_per_minute=100\n";
+const CSRF: [u8; 32] = [7; 32];
 struct Fixture {
     home: tempfile::TempDir, db: Arc<UserDb>, handler: MethodHandler,
     admin: UserContext, employee: UserContext, manager: UserContext, session: String,
@@ -18,6 +20,10 @@ async fn fixture() -> Fixture {
     let admin = db.create_user("admin@company.test", "Admin", "password123", UserRole::Admin).unwrap();
     let employee = db.create_user("employee@company.test", "Employee", "password123", UserRole::Employee).unwrap();
     let manager = db.create_user("manager@company.test", "Manager", "password123", UserRole::Manager).unwrap();
+    // Fixture for an already completed password + TOTP step-up. Auth tests
+    // exercise proof issuance; these tests exercise its RPC consumption.
+    let raw = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+    raw.execute("INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'test-only-unusable-secret',0)", [&admin.id]).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"google-signin-rpc-tests-32-byte-secret"))).await;
     handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
@@ -28,6 +34,14 @@ async fn fixture() -> Fixture {
 }
 impl Fixture {
     fn raw(&self) -> rusqlite::Connection { rusqlite::Connection::open(self.home.path().join("users.db")).unwrap() }
+    fn proof(&self, at: i64, session: &str, epoch: u64) {
+        let hash = format!("{:x}", Sha256::digest(session.as_bytes()));
+        self.raw().execute("INSERT INTO migration_dashboard_proofs(user_id,session_hash,epoch,verified_at,csrf)
+            VALUES(?1,?2,?3,?4,?5) ON CONFLICT(user_id,session_hash) DO UPDATE SET
+            epoch=excluded.epoch,verified_at=excluded.verified_at,csrf=excluded.csrf",
+            params![self.admin.user_id, hash, epoch, at, CSRF.as_slice()]).unwrap();
+    }
+    fn fresh_proof(&self) { self.proof(Utc::now().timestamp(), &self.session, self.admin.credential_epoch); }
     async fn call(&self, ctx: &UserContext, method: &str, params: Value) -> WsFrame {
         crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), self.session.clone())),
             self.handler.handle(method, params, ctx)).await
@@ -48,7 +62,7 @@ impl Fixture {
 fn settings() -> Value {
     json!({"enabled": true, "allowed_hd": ["company.test"], "approval": "admin", "daily_new_accounts": 20,
         "avatar_template": "", "avatar_template_revision": 0, "approval_grants_mfa_enrollment": false,
-        "acknowledge_risk": true})
+        "acknowledge_risk": true, "step_up_csrf": CSRF})
 }
 fn payload(frame: WsFrame) -> Value {
     match frame { WsFrame::Response { ok: true, payload: Some(value), .. } => value,
@@ -86,10 +100,25 @@ async fn role_table_dashboard_only_and_member_keys_refused() {
 }
 
 #[tokio::test]
-async fn set_and_attest_succeed_without_step_up_and_require_live_admin() {
+async fn set_and_attest_require_fresh_session_bound_step_up() {
     let f = fixture().await;
-    let attest = json!({"user_ids": [f.employee.user_id]});
+    let attest = json!({"user_ids": [f.employee.user_id], "step_up_csrf": CSRF});
     for (method, input) in [("google.signin.set", settings()), ("users.google_signin.attest", attest)] {
+        assert_eq!(code(f.admin(method, input.clone()).await), "signin_step_up_required");
+        f.proof(Utc::now().timestamp() - 301, &f.session, f.admin.credential_epoch);
+        assert_eq!(code(f.admin(method, input.clone()).await), "signin_step_up_required");
+        f.proof(Utc::now().timestamp(), &f.session, f.admin.credential_epoch + 1);
+        assert_eq!(code(f.admin(method, input.clone()).await), "signin_step_up_required");
+        f.fresh_proof();
+        let mut missing = input.clone();
+        missing.as_object_mut().unwrap().remove("step_up_csrf");
+        assert_eq!(code(f.admin(method, missing).await), "signin_step_up_required");
+        let mut wrong = input.clone(); wrong["step_up_csrf"] = json!(vec![8u8; 32]);
+        assert_eq!(code(f.admin(method, wrong).await), "signin_step_up_required");
+        let other_session = uuid::Uuid::new_v4().to_string();
+        let result = crate::google_personal::DASHBOARD_SESSION.scope(Some((f.admin.user_id.clone(), other_session)),
+            f.handler.handle(method, input.clone(), &f.admin)).await;
+        assert_eq!(code(result), "signin_step_up_required");
         payload(f.admin(method, input.clone()).await);
         let mut stale = f.admin.clone();
         stale.credential_epoch += 1;
@@ -97,14 +126,28 @@ async fn set_and_attest_succeed_without_step_up_and_require_live_admin() {
         let mut forged = f.employee.clone();
         forged.role = UserRole::Admin;
         assert_eq!(code(f.call(&forged, method, input).await), "signin_admin_required");
+        f.raw().execute("DELETE FROM migration_dashboard_proofs", []).unwrap();
     }
-    let proofs: i64 = f.raw().query_row("SELECT COUNT(*) FROM migration_dashboard_proofs", [], |r| r.get(0)).unwrap();
-    assert_eq!(proofs, 0);
+}
+
+#[tokio::test]
+async fn disable_needs_no_step_up() {
+    let f = fixture().await;
+    f.fresh_proof();
+    payload(f.admin("google.signin.set", settings()).await);
+    f.raw().execute("DELETE FROM migration_dashboard_proofs", []).unwrap();
+    let mut input = settings();
+    input["enabled"] = json!(false);
+    input.as_object_mut().unwrap().remove("step_up_csrf");
+    let result = payload(f.admin("google.signin.set", input).await);
+    assert_eq!(result["settings"]["enabled"], false);
+    assert!(!config::read_strict(f.home.path()).enabled);
 }
 
 #[tokio::test]
 async fn risk_ack_required_written_and_settings_audited() {
     let f = fixture().await;
+    f.fresh_proof();
     for change in ["enabled", "direct", "preauth"] {
         std::fs::write(f.home.path().join("config.toml"), BASE).unwrap();
         let mut input = settings();
@@ -141,6 +184,7 @@ async fn risk_ack_required_written_and_settings_audited() {
 #[tokio::test]
 async fn settings_checks_reuse_redirect_and_personal_edition_refuses_writes() {
     let f = fixture().await;
+    f.fresh_proof();
     payload(f.admin("google.signin.set", settings()).await);
     let get = payload(f.admin("google.signin.get", json!({})).await);
     assert_eq!(get["redirect_uri"], routes::redirect_uri(&routes::public_base(f.home.path()).unwrap().0));
@@ -178,6 +222,7 @@ async fn requests_list_approve_reject_and_preauthorize_policy() {
     let rejected = f.provision("456", SigninApproval::Admin);
     payload(f.admin("users.signin_requests.reject", json!({"id": rejected})).await);
     assert_eq!(f.db.signin_request_by_id(&rejected).unwrap().unwrap().status, duduclaw_auth::google_signin::SigninRequestStatus::Rejected);
+    f.fresh_proof();
     let mut input = settings(); input["approval_grants_mfa_enrollment"] = json!(true);
     payload(f.admin("google.signin.set", input).await);
     let allowed = f.provision("789", SigninApproval::Admin);
@@ -188,15 +233,16 @@ async fn requests_list_approve_reject_and_preauthorize_policy() {
 #[tokio::test]
 async fn attest_writes_rows_all_or_nothing_and_allows_self() {
     let f = fixture().await;
+    f.fresh_proof();
     let linked = f.provision("123", SigninApproval::Direct);
     for ids in [vec![f.employee.user_id.clone(), "missing".into()], vec![f.employee.user_id.clone(); 2],
         vec![f.employee.user_id.clone(); 101], vec![f.employee.user_id.clone(), linked]] {
-        assert_eq!(code(f.admin("users.google_signin.attest", json!({"user_ids": ids})).await), "signin_attest_invalid_target");
+        assert_eq!(code(f.admin("users.google_signin.attest", json!({"user_ids": ids, "step_up_csrf": CSRF})).await), "signin_attest_invalid_target");
         let count: i64 = f.raw().query_row("SELECT COUNT(*) FROM google_signin_attestations", [], |r| r.get(0)).unwrap();
         assert_eq!(count, 0);
         assert!(f.db.query_audit_log(None, Some("google_signin.attested"), 100).unwrap().is_empty());
     }
-    let result = payload(f.admin("users.google_signin.attest", json!({"user_ids": [f.employee.user_id, f.admin.user_id]})).await);
+    let result = payload(f.admin("users.google_signin.attest", json!({"user_ids": [f.employee.user_id, f.admin.user_id], "step_up_csrf": CSRF})).await);
     assert_eq!(result["attested"], 2);
     let (email, actor, seq): (String, String, i64) = f.raw().query_row(
         "SELECT email_at_attestation,attested_by,credential_seq FROM google_signin_attestations WHERE user_id=?1",

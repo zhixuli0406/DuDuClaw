@@ -23,6 +23,7 @@ pub(super) fn signin_error(code: &str) -> WsFrame {
         "signin_rate_limited" => "嘗試次數過多，請稍後再試。",
         "signin_admin_required" => "請以管理員帳號重新登入後再操作。",
         "signin_dashboard_required" => "請登入儀表板後再操作，不能使用 API 金鑰。",
+        "signin_step_up_required" => "請先以密碼與驗證器驗證碼確認身分，並在五分鐘內完成操作。",
         "signin_request_not_found" => "找不到這筆登入申請，請重新整理清單。",
         "signin_request_not_pending" => "這筆登入申請已經處理，請重新整理清單。",
         "signin_request_expired" => "這筆登入申請已過期，請同仁重新申請。",
@@ -58,6 +59,7 @@ struct SetRequest {
     approval_grants_mfa_enrollment: bool,
     #[serde(default)]
     acknowledge_risk: bool,
+    step_up_csrf: Option<[u8; 32]>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,7 +76,7 @@ struct RequestId { id: String }
 struct UserId { user_id: String }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AttestRequest { user_ids: Vec<String> }
+struct AttestRequest { user_ids: Vec<String>, step_up_csrf: Option<[u8; 32]> }
 
 fn parse<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, WsFrame> {
     serde_json::from_value(params).map_err(|_| signin_error("signin_invalid_params"))
@@ -108,6 +110,12 @@ fn settings_get(home: &Path) -> Value {
             "mfa_policy": mfa, "personal_edition": false, "personal_connection_domains_cover": covers}})
 }
 
+fn step_up(db: &UserDb, ctx: &UserContext, session: &str, csrf: Option<[u8; 32]>) -> Result<(), WsFrame> {
+    let csrf = csrf.ok_or_else(|| signin_error("signin_step_up_required"))?;
+    super::google_tenant_settings_rpc::check_step_up(db, &ctx.user_id, session, ctx.credential_epoch, &csrf)
+        .map_err(|_| signin_error("signin_step_up_required"))
+}
+
 impl MethodHandler {
     pub(crate) async fn handle_google_signin_rpc(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
         if ctx.role != UserRole::Admin || ctx.must_change_password {
@@ -116,9 +124,9 @@ impl MethodHandler {
         if ctx.member_key_id.is_some() || ctx.user_id.is_empty() || ctx.user_id == "system" {
             return signin_error("signin_dashboard_required");
         }
-        if crate::google_personal::session_for(&ctx.user_id).is_err() {
-            return signin_error("signin_dashboard_required");
-        }
+        let session = match crate::google_personal::session_for(&ctx.user_id) {
+            Ok(session) => session, Err(_) => return signin_error("signin_dashboard_required"),
+        };
         let personal = self.resolve_edition_profile().await.is_personal();
         if personal { return signin_error("signin_personal_edition"); }
         let Some(db) = self.user_db.read().await.clone() else { return signin_error("signin_storage_unavailable"); };
@@ -134,6 +142,7 @@ impl MethodHandler {
                 }
                 "google.signin.set" => {
                     let input: SetRequest = parse(params)?;
+                    if input.enabled { step_up(&db, &ctx, &session, input.step_up_csrf)?; }
                     let approval = match input.approval.as_str() {
                         "admin" => Approval::Admin, "direct" => Approval::Direct,
                         _ => return Err(signin_error("signin_invalid_params")),
@@ -180,6 +189,7 @@ impl MethodHandler {
                 }
                 "users.google_signin.attest" => {
                     let input: AttestRequest = parse(params)?;
+                    step_up(&db, &ctx, &session, input.step_up_csrf)?;
                     let count = db.attest_google_signin_users(&ctx.user_id, ctx.credential_epoch, &input.user_ids, now.timestamp()).map_err(signin_error)?;
                     Ok(json!({"attested": count}))
                 }
