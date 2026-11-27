@@ -1786,7 +1786,7 @@ pub(crate) mod testing {
     pub(super) fn owned_registry(home: &Path) -> Option<Arc<RuntimeRegistry>> {
         OWNED_REGISTRIES
             .get()
-            .and_then(|map| map.lock().unwrap().get(home).cloned())
+            .and_then(|map| map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(home).cloned())
     }
 
     pub(crate) struct RegistryGuard {
@@ -1797,11 +1797,19 @@ pub(crate) mod testing {
         pub(crate) async fn install(home: &Path, registry: RuntimeRegistry) -> Self {
             assert!(home.is_dir());
             let registry = Arc::new(registry);
-            let mut map = OWNED_REGISTRIES
-                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
-            assert!(map.insert(home.to_owned(), registry.clone()).is_none());
+            let installed = {
+                let mut map = OWNED_REGISTRIES
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(home.to_owned()) {
+                    entry.insert(registry.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            assert!(installed, "a RegistryGuard for this home is already installed: {}", home.display());
             Self {
                 home: home.to_owned(),
                 registry,
@@ -1810,12 +1818,12 @@ pub(crate) mod testing {
     }
     impl Drop for RegistryGuard {
         fn drop(&mut self) {
-            let mut map = OWNED_REGISTRIES.get().unwrap().lock().unwrap();
-            assert!(
-                map.get(&self.home)
-                    .is_some_and(|actual| Arc::ptr_eq(actual, &self.registry))
-            );
-            map.remove(&self.home);
+            if let Some(map) = OWNED_REGISTRIES.get() {
+                let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if map.get(&self.home).is_some_and(|actual| Arc::ptr_eq(actual, &self.registry)) {
+                    map.remove(&self.home);
+                }
+            }
         }
     }
 

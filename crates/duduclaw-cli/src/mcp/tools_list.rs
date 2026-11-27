@@ -681,7 +681,7 @@ pub(crate) async fn visible_tools_in_lane(
 ) -> Vec<&'static ToolDef> {
     let agent = acting_agent_id(&principal.client_id, default_agent);
     let human = super::host_on_behalf_of(home_dir, agent);
-    visible_tools_for_principal(principal, home_dir, default_agent, employee_process, lane, human.as_deref()).await
+    Box::pin(visible_tools_for_principal(principal, home_dir, default_agent, employee_process, lane, human.as_deref())).await
 }
 
 /// Host principal injected separately from tool arguments and process env.
@@ -694,7 +694,7 @@ pub(crate) async fn visible_tools_for_principal(
     lane: &duduclaw_core::ProcessLane,
     human: Option<&str>,
 ) -> Vec<&'static ToolDef> {
-    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human, false).await
+    Box::pin(visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human, false)).await
 }
 
 async fn visible_tools_in_lane_for_transport(
@@ -707,7 +707,7 @@ async fn visible_tools_in_lane_for_transport(
 ) -> Vec<&'static ToolDef> {
     let agent = acting_agent_id(&principal.client_id, default_agent);
     let human = super::host_on_behalf_of(home_dir, agent);
-    visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human.as_deref(), remote_bearer).await
+    Box::pin(visible_tools_for_principal_and_transport(principal, home_dir, default_agent, employee_process, lane, human.as_deref(), remote_bearer)).await
 }
 
 async fn visible_tools_for_principal_and_transport(

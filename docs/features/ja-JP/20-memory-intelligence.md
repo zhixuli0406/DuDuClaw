@@ -391,7 +391,7 @@ get_by_ids(namespace, ids)
 [knowledge_guard]
 enabled = true          # 同一オリジンのバースト検知器のマスタースイッチ。デフォルト true
 window_secs = 3600      # スライディングウィンドウ長（秒）。デフォルト 3600（1 時間）
-max_per_subject = 5     # 1 つのオリジンがウィンドウ内で同一 subject に書き込める事実の上限。超えると隔離。デフォルト 5
+max_per_subject = 5     # 1 つのオリジンがウィンドウ内で同一 subject に書き込む事実の件数。この件数に達すると確認のため隔離。デフォルト 5
 ```
 
 置き換え時の信頼度チェックはデフォルトで有効です：
