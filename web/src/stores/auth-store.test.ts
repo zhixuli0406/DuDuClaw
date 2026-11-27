@@ -261,6 +261,40 @@ describe('refresh (#1 — only 401/403 logs out)', () => {
 
 
 describe('department grant state', () => {
+  it.each([
+    null,
+    { agents: [], tasks: [], events: [] },
+    { user: null, bindings: [] },
+    { user: 'u1', bindings: [] },
+    { user: { ...ME_OK.user, id: 'another-user' }, bindings: [] },
+    { user: ME_OK.user },
+    { user: ME_OK.user, bindings: {} },
+  ])('preserves identity and bindings but clears authority for malformed users.me: %j', async (response) => {
+    const bindings = [{ user_id: 'u1', agent_name: 'agnes', access_level: 'owner' as const, bound_at: '' }];
+    useAuthStore.setState({ isAuthenticated: true, jwt: 'jwt-1' });
+    useAuthStore.getState().setUser(ME_OK.user as never, bindings, {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true,
+    });
+    mockWsClient.call.mockResolvedValueOnce(response);
+    await useAuthStore.getState().refreshMe();
+    expect(useAuthStore.getState().user).toBe(ME_OK.user);
+    expect(useAuthStore.getState().bindings).toBe(bindings);
+    expect(useAuthStore.getState().deptGrants).toEqual([]);
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  it.each([null, {}, 'sales'])('treats non-array department grants as empty: %j', async (dept_grants) => {
+    useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
+    useAuthStore.getState().setUser(ME_OK.user as never, [], {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }],
+    });
+    mockWsClient.call.mockResolvedValueOnce({ ...ME_OK, dept_grants });
+    await useAuthStore.getState().refreshMe();
+    expect(useAuthStore.getState().deptGrants).toEqual([]);
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+  });
+
   it('loads grants from the authenticated users.me RPC', async () => {
     useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
     mockWsClient.call.mockResolvedValueOnce({
