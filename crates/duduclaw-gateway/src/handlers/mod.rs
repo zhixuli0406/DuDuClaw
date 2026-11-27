@@ -135,6 +135,7 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod odoo_member_rpc;
 mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
@@ -732,6 +733,11 @@ impl MethodHandler {
         // this branch is embedded in the shared dispatcher future.
         if method.split('.').next() == Some("mcp_keys") {
             return boxed_frame(|| self.route_mcp_keys_rpc(method, params, ctx)).await;
+        }
+
+        // Personal Odoo secrets never pass through extension dispatch.
+        if odoo_member_rpc::owns(method) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route
