@@ -7,31 +7,19 @@
 //! predicate all of those choke points share, so the answer cannot drift per
 //! call site.
 //!
-//! ## The rule (design doc §2.1, evaluated in this order, short-circuiting)
+//! ## Decision order
 //!
-//! 1. `sender == target` → **DENY** (self-delegation is an echo loop; denied
-//!    under every policy, including [`DelegationPolicy::Open`]).
-//! 2. `sender` is a **system sender** ([`SYSTEM_SENDERS`]) → ALLOW.
-//! 3. `sender` is an ancestor of `target` on the `reports_to` chain, at any
-//!    depth (≤ [`MAX_ANCESTOR_HOPS`] hops, cycle-safe) → ALLOW. This is what
-//!    makes skip-level assignment (grandparent → grandchild) work.
-//! 4. `target` is an ancestor of `sender` → ALLOW (escalation / reporting up,
-//!    not limited to the direct manager).
-//! 5. Policy is [`DelegationPolicy::Department`] and both agents carry the
-//!    **same non-empty** department → ALLOW (peer collaboration).
-//! 6. Otherwise → **DENY**, fail-closed (project convention #4).
+//! Empty ids, self-delegation and injected boundary refusals always deny first.
+//! Existing system senders then retain their operator-authorized access.
+//! For AI senders: unrestricted role → explicit pair → delegation mode.
+//! [`evaluate_delegation`] requires both an avatar owner and a verified turn
+//! requester (or background-job initiator) in `unrestricted_roles`. This pass
+//! overrides explicit `none`; neither kind of pair overrides `none`.
+//! Unknown policy values and unreadable config fail closed without overrides.
 //!
-//! [`DelegationPolicy::Hierarchy`] skips rule 5; [`DelegationPolicy::Open`]
-//! skips rules 3–5 and allows everything except rule 1 (the escape hatch that
-//! restores pre-WP21 behaviour for the back-door paths).
-//!
-//! [`DelegationPolicy::Disabled`] (`policy = "none"`, RM-137, v1.82) denies
-//! every agent sender right after rule 2: no ancestor rule, no department rule
-//! and **no `[delegation] allow` pair** applies. System senders (dashboard,
-//! cron, heartbeat, goal-loop-driver, …) still pass — a person or a schedule
-//! the operator configured is not an AI employee handing work on. An
-//! unrecognised policy value, and a `config.toml` that exists but cannot be
-//! read or parsed, resolve to `Disabled` as well (fail closed).
+//! Legacy `can_delegate*` wrappers keep their signatures and decisions. They
+//! have no role evidence or new overrides; callers must migrate to the new
+//! entry point to use them and supply the live boundary checks.
 //!
 //! Team-as-Agent role hand-offs never reach this predicate: the team composer
 //! scaffolds and runs its role members itself (`team_composer` →
@@ -200,6 +188,8 @@ pub enum DelegationPolicy {
     /// `policy = "none"` (RM-137, v1.82): no AI employee may delegate to,
     /// message, spawn, create or assign work to another AI employee. Explicit
     /// `[delegation] allow` pairs do not apply. System senders still pass.
+    /// An explicitly configured unrestricted role can pass through
+    /// [`evaluate_delegation`] after every always-deny check.
     /// Also what an unrecognised value or an unreadable config resolves to.
     Disabled,
 }
@@ -365,6 +355,124 @@ impl DelegationRules {
     }
 }
 
+/// New opt-in rules, kept separate so existing `DelegationRules` literals
+/// and legacy callers remain source-compatible. Resolve through
+/// [`DelegationConfig::resolve_overrides`]; defaults grant no extra access.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DelegationOverrides {
+    pub allow_one_way: Vec<(String, String)>,
+    pub unrestricted_roles: Vec<String>,
+}
+
+/// Matches the existing dashboard's pair-entry limit. Legacy `allow` parsing
+/// is unchanged; the new directional list accepts only its first 200 entries.
+pub const MAX_ONE_WAY_PAIRS: usize = 200;
+
+/// Coupled to `duduclaw_auth::models::UserRole`. Auth depends on core, so core
+/// must keep a local closed list rather than introduce a dependency cycle.
+pub const DELEGATION_ROLE_NAMES: [&str; 3] = ["admin", "manager", "employee"];
+
+/// Same validation and trimming as `allow`, with ordered deduplication.
+/// Entries beyond the first 200 are ignored with one limit warning.
+pub fn resolve_allow_one_way(entries: &[Vec<String>]) -> (Vec<(String, String)>, Vec<String>) {
+    let mut pairs = Vec::new();
+    let mut warnings = Vec::new();
+    for entry in entries.iter().take(MAX_ONE_WAY_PAIRS) {
+        match normalize_allow_entry(entry) {
+            Ok(_) => {
+                let pair = (entry[0].trim().to_string(), entry[1].trim().to_string());
+                if !pairs.contains(&pair) {
+                    pairs.push(pair);
+                }
+            }
+            Err(reason) => warnings.push(format!(
+                "config.toml [delegation] allow_one_way 項目已忽略:{reason}(原始值:{entry:?})。"
+            )),
+        }
+    }
+    if entries.len() > MAX_ONE_WAY_PAIRS {
+        warnings.push(format!(
+            "config.toml [delegation] allow_one_way 超過 {MAX_ONE_WAY_PAIRS} 項,超出部分已忽略。"
+        ));
+    }
+    (pairs, warnings)
+}
+
+/// A verified account's current role, with explicit background-job provenance.
+/// Bare background/system status is not evidence of a qualifying initiator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegationRequesterRole {
+    Account(String),
+    BackgroundStartedBy(String),
+}
+
+/// Lookup failure grants no unrestricted pass (pairs/mode still apply).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnerRoleLookupError;
+
+/// Trusted host-side identity snapshot for this decision. Never read users.db
+/// in core. Implementations must resolve `users.avatar_agent_id`, not generic
+/// Owner bindings, and verify the current requester or persisted job initiator.
+/// Return `Ok(None)` for unknown identity/provenance, `Err` for read failures.
+/// Role strings are matched exactly against the closed list and config.
+pub trait OwnerRoleView {
+    fn avatar_owner_role(&self, agent_id: &str) -> Result<Option<String>, OwnerRoleLookupError>;
+    fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError>;
+}
+
+/// Host-computed always-deny facts for the actual sender/target/turn. Unknown
+/// or failed checks must be false. Defaults deny; no role or pair bypasses them.
+/// These booleans attest checks, not user-configurable permission overrides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DelegationBoundaries {
+    pub personal_target_allowed: bool,
+    pub main_target_allowed: bool,
+    pub can_send_cross_agent: bool,
+}
+
+/// Inputs that legacy callers cannot supply. The host must compute boundaries
+/// before evaluation, including for system senders; do not infer them from role.
+pub struct DelegationContext<'a> {
+    pub overrides: &'a DelegationOverrides,
+    pub owner_roles: Option<&'a dyn OwnerRoleView>,
+    pub boundaries: DelegationBoundaries,
+    pub extra_system_senders: &'a [&'a str],
+}
+
+/// The first rule that allowed the decision, for audit/effective-settings UIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationAllowSource {
+    SystemSender,
+    UnrestrictedRole,
+    OneWayPair,
+    TwoWayPair,
+    Mode,
+}
+
+impl DelegationAllowSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SystemSender => "system_sender",
+            Self::UnrestrictedRole => "unrestricted_role",
+            Self::OneWayPair => "one_way_pair",
+            Self::TwoWayPair => "two_way_pair",
+            Self::Mode => "mode",
+        }
+    }
+}
+
+fn unrestricted_sender(view: &dyn OwnerRoleView, overrides: &DelegationOverrides, sender: &str) -> bool {
+    let configured = |role: &str| DELEGATION_ROLE_NAMES.contains(&role)
+        && overrides.unrestricted_roles.iter().any(|r| r == role);
+    let Ok(Some(owner_role)) = view.avatar_owner_role(sender) else { return false };
+    if !configured(&owner_role) { return false; }
+    let Ok(Some(requester)) = view.requester_role() else { return false };
+    let role = match requester {
+        DelegationRequesterRole::Account(role) | DelegationRequesterRole::BackgroundStartedBy(role) => role,
+    };
+    configured(&role)
+}
+
 // ── Org lookups (dependency injection) ───────────────────────────────────────
 
 /// Read-only view of the org tree, implemented by each caller over whatever
@@ -512,6 +620,14 @@ pub fn is_ancestor(org: &impl OrgView, ancestor: &str, descendant: &str) -> bool
 /// (`delegation_denied` events) plus zh-TW rendering for humans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
+    /// Only the reverse one-way pair exists, and no mode rule allowed this call.
+    ReversePairOnly,
+    /// The host refused another person's personal employee (or could not check).
+    PersonalTargetNotPermitted,
+    /// The host refused the main-agent boundary (or could not check).
+    MainTargetNotPermitted,
+    /// The sender's own cross-agent permission is false or could not be checked.
+    CrossAgentSendDisabled,
     /// Rule 1 — an agent may not delegate to itself.
     SelfDelegation,
     /// Defensive: an empty sender or target id; nothing can be proven about a
@@ -540,6 +656,10 @@ impl DenyReason {
     /// Stable machine code for audit logs.
     pub fn as_str(&self) -> &'static str {
         match self {
+            DenyReason::ReversePairOnly => "reverse_pair_only",
+            DenyReason::PersonalTargetNotPermitted => "personal_target_not_permitted",
+            DenyReason::MainTargetNotPermitted => "main_target_not_permitted",
+            DenyReason::CrossAgentSendDisabled => "cross_agent_send_disabled",
             DenyReason::DelegationDisabled => "delegation_disabled",
             DenyReason::SelfDelegation => "self_delegation",
             DenyReason::InvalidAgentId => "invalid_agent_id",
@@ -579,6 +699,18 @@ impl DelegationDenied {
         let s = short_id(&self.sender);
         let t = short_id(&self.target);
         match self.reason {
+            DenyReason::ReversePairOnly => format!(
+                "委派遭拒:配對只允許「{t}」委派給「{s}」,不允許反向,目前委派模式也未放行。"
+            ),
+            DenyReason::PersonalTargetNotPermitted => format!(
+                "委派遭拒:「{s}」不能把工作交給「{t}」,個人員工的擁有者邊界未通過驗證。"
+            ),
+            DenyReason::MainTargetNotPermitted => format!(
+                "委派遭拒:「{s}」不能把工作交給「{t}」,主代理使用權限未通過驗證。"
+            ),
+            DenyReason::CrossAgentSendDisabled => format!(
+                "委派遭拒:「{s}」的跨員工傳送權限未開啟或無法確認。"
+            ),
             DenyReason::DelegationDisabled => format!(
                 "委派遭拒:「{s}」不能把工作交給「{t}」— 委派政策是 {},AI 員工之間不能互相委派、\
                  傳訊、建立或指派工作(跨部門協作配對在這個政策下不生效)。設定值無法辨識或 config.toml \
@@ -667,7 +799,7 @@ pub fn can_delegate_ext(
     target: &str,
     extra_system_senders: &[&str],
 ) -> Result<(), DelegationDenied> {
-    can_delegate_ext_impl(policy, None, org, sender, target, extra_system_senders)
+    can_delegate_ext_impl(policy, None, org, sender, target, extra_system_senders, None).map(|_| ())
 }
 
 /// [`can_delegate`], plus the explicit cross-department/cross-hierarchy
@@ -703,6 +835,33 @@ pub fn can_delegate_rules_ext(
         sender,
         target,
         extra_system_senders,
+        None,
+    ).map(|_| ())
+}
+
+/// Evaluate always-deny → unrestricted role → pair → mode, returning the
+/// winning rule. Empty ids and self-delegation are checked before every grant;
+/// personal/main boundaries and `can_send_cross_agent` come from the trusted
+/// caller and also run before system senders, roles, pairs or `open`.
+///
+/// D-Q2: a qualifying avatar AND qualifying requester/job initiator may pass
+/// explicit `none`. Pairs never pass `none`. A reverse-only pair is explanatory,
+/// not a veto of an otherwise allowed mode. Two-way wins if both pair kinds
+/// match. Unknown/error role lookups grant no pass, then pairs/mode are tried.
+/// Target ownership is never consulted to grant sender authority.
+///
+/// Load rules and overrides from the same `DelegationConfigRead` snapshot.
+/// Legacy wrappers omit the new overrides and leave boundary checks to callers.
+pub fn evaluate_delegation(
+    rules: &DelegationRules,
+    org: &impl OrgView,
+    sender: &str,
+    target: &str,
+    context: &DelegationContext<'_>,
+) -> Result<DelegationAllowSource, DelegationDenied> {
+    can_delegate_ext_impl(
+        rules.policy, Some(rules), org, sender, target,
+        context.extra_system_senders, Some(context),
     )
 }
 
@@ -717,7 +876,8 @@ fn can_delegate_ext_impl(
     sender: &str,
     target: &str,
     extra_system_senders: &[&str],
-) -> Result<(), DelegationDenied> {
+    context: Option<&DelegationContext<'_>>,
+) -> Result<DelegationAllowSource, DelegationDenied> {
     let s = sender.trim();
     let t = target.trim();
 
@@ -740,9 +900,29 @@ fn can_delegate_ext_impl(
         return deny(DenyReason::SelfDelegation);
     }
 
-    // ② System / human-interface senders.
+    // Always-deny facts are resolved outside core and never inferred from roles.
+    if let Some(context) = context {
+        if !context.boundaries.personal_target_allowed {
+            return deny(DenyReason::PersonalTargetNotPermitted);
+        }
+        if !context.boundaries.main_target_allowed {
+            return deny(DenyReason::MainTargetNotPermitted);
+        }
+        if !context.boundaries.can_send_cross_agent {
+            return deny(DenyReason::CrossAgentSendDisabled);
+        }
+    }
+
     if is_system_sender(s) || extra_system_senders.iter().any(|extra| extra.trim() == s) {
-        return Ok(());
+        return Ok(DelegationAllowSource::SystemSender);
+    }
+
+    if let Some(context) = context {
+        if !context.overrides.unrestricted_roles.is_empty()
+            && context.owner_roles.is_some_and(|view| unrestricted_sender(view, context.overrides, s))
+        {
+            return Ok(DelegationAllowSource::UnrestrictedRole);
+        }
     }
 
     // RM-137: `none` (and every value that resolves to it) stops every agent
@@ -752,21 +932,36 @@ fn can_delegate_ext_impl(
         return deny(DenyReason::DelegationDisabled);
     }
 
+    // Explicit pairs precede mode rules, but never override `none`.
+    if rules.is_some_and(|rules| rules.allows_pair(s, t)) {
+        return Ok(DelegationAllowSource::TwoWayPair);
+    }
+    let mut reverse_pair = false;
+    if let Some(context) = context {
+        if context.overrides.allow_one_way.iter().take(MAX_ONE_WAY_PAIRS)
+            .any(|(from, to)| from == s && to == t)
+        {
+            return Ok(DelegationAllowSource::OneWayPair);
+        }
+        reverse_pair = context.overrides.allow_one_way.iter().take(MAX_ONE_WAY_PAIRS)
+            .any(|(from, to)| from == t && to == s);
+    }
+
     // Open skips rules ③–⑤b entirely (escape hatch = pre-WP21 behaviour).
     if policy == DelegationPolicy::Open {
-        return Ok(());
+        return Ok(DelegationAllowSource::Mode);
     }
 
     // ③ sender is an ancestor of target (skip-level command).
     let down = walk_up(org, t, s);
     if down == Walk::Found {
-        return Ok(());
+        return Ok(DelegationAllowSource::Mode);
     }
 
     // ④ target is an ancestor of sender (escalation / reporting up).
     let up = walk_up(org, s, t);
     if up == Walk::Found {
-        return Ok(());
+        return Ok(DelegationAllowSource::Mode);
     }
 
     // ⑤ same non-empty department (Department policy only).
@@ -779,15 +974,11 @@ fn can_delegate_ext_impl(
         && !target_dept.is_empty()
         && sender_dept == target_dept
     {
-        return Ok(());
+        return Ok(DelegationAllowSource::Mode);
     }
 
-    // ⑤b explicit whitelist pair (design doc §2.1 rule 5b) — both Department
-    // and Hierarchy respect it; Open already returned above.
-    if let Some(rules) = rules {
-        if rules.allows_pair(s, t) {
-            return Ok(());
-        }
+    if reverse_pair {
+        return deny(DenyReason::ReversePairOnly);
     }
 
     // ⑥ Fail closed, with the most informative reason available.
@@ -830,6 +1021,10 @@ pub struct DelegationConfig {
     /// `allow = [["a", "b"], ...]` — unordered whitelist pairs (design doc
     /// §2.2). Defaults to empty when the key is absent.
     pub allow: Vec<Vec<String>>,
+    /// Ordered pairs: only `from` may delegate to `to`, at most 200 entries.
+    pub allow_one_way: Vec<Vec<String>>,
+    /// Exact lowercase account roles; unknown values are dropped with a warning.
+    pub unrestricted_roles: Vec<String>,
     /// Require a valid DuDuClaw-issued identity token (default true).
     /// Authorization reads this through `require_identity_token_from_home`,
     /// whose errors must reject the caller. Soft mode also requires a valid, bounded grace deadline.
@@ -841,6 +1036,8 @@ impl Default for DelegationConfig {
         Self {
             policy: DelegationPolicy::default().as_str().to_string(),
             allow: Vec::new(),
+            allow_one_way: Vec::new(),
+            unrestricted_roles: Vec::new(),
             require_identity_token: true,
         }
     }
@@ -881,8 +1078,8 @@ pub fn delegation_config_from_table(table: &toml::Table) -> DelegationConfig {
         Some(other) => other.to_string(),
     };
 
-    let allow = section
-        .get("allow")
+    let parse_pairs = |key: &str| section
+        .get(key)
         .and_then(|v| v.as_array())
         .map(|entries| {
             entries
@@ -913,7 +1110,17 @@ pub fn delegation_config_from_table(table: &toml::Table) -> DelegationConfig {
 
     DelegationConfig {
         policy,
-        allow,
+        allow: parse_pairs("allow"),
+        allow_one_way: match section.get("allow_one_way") {
+            Some(value) if !value.is_array() => vec![Vec::new()],
+            _ => parse_pairs("allow_one_way"),
+        },
+        unrestricted_roles: match section.get("unrestricted_roles") {
+            None => Vec::new(),
+            Some(toml::Value::Array(roles)) => roles.iter()
+                .map(|role| role.as_str().unwrap_or_default().to_string()).collect(),
+            Some(_) => vec![String::new()],
+        },
         require_identity_token,
     }
 }
@@ -955,6 +1162,31 @@ impl DelegationConfig {
     /// Resolved policy, dropping the warning.
     pub fn policy(&self) -> DelegationPolicy {
         self.resolve().0
+    }
+
+    /// Resolve the opt-in additions independently of the legacy rule shape.
+    /// Unknown roles produce one aggregate warning and never widen access.
+    /// An invalid policy discards all overrides (explicit `none` is different).
+    pub fn resolve_overrides(&self) -> (DelegationOverrides, Vec<String>) {
+        let (allow_one_way, mut warnings) = resolve_allow_one_way(&self.allow_one_way);
+        let mut unrestricted_roles = Vec::new();
+        let mut unknown = false;
+        for role in &self.unrestricted_roles {
+            if DELEGATION_ROLE_NAMES.contains(&role.as_str()) {
+                if !unrestricted_roles.contains(role) {
+                    unrestricted_roles.push(role.clone());
+                }
+            } else {
+                unknown = true;
+            }
+        }
+        if unknown {
+            warnings.push("config.toml [delegation] unrestricted_roles 含無法辨識的角色,已忽略;僅接受 admin / manager / employee。".into());
+        }
+        if self.resolve().1.is_some() {
+            return (DelegationOverrides::default(), warnings);
+        }
+        (DelegationOverrides { allow_one_way, unrestricted_roles }, warnings)
     }
 
     /// Resolved [`DelegationRules`] (policy + whitelist) plus every warning
@@ -1005,6 +1237,9 @@ fn read_config_table(home_dir: &Path) -> Result<toml::Table, (&'static str, Stri
 /// enforce plus what the dashboard needs to explain them (RM-137).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DelegationConfigRead {
+    /// New opt-in rules from the same config snapshot as `rules`.
+    pub overrides: DelegationOverrides,
+    pub override_warnings: Vec<String>,
     /// What every gate enforces.
     pub rules: DelegationRules,
     /// The `policy` value as written, when the key is present (non-string
@@ -1040,7 +1275,10 @@ impl DelegationConfigRead {
         };
         let (policy, policy_warning) = cfg.resolve();
         let (allow_pairs, allow_warnings) = resolve_allow_pairs(&cfg.allow);
+        let (overrides, override_warnings) = cfg.resolve_overrides();
         Self {
+            overrides,
+            override_warnings,
             rules: DelegationRules {
                 policy,
                 allow_pairs,
@@ -1055,6 +1293,8 @@ impl DelegationConfigRead {
 
     fn unreadable(kind: &'static str, reason: String) -> Self {
         Self {
+            overrides: DelegationOverrides::default(),
+            override_warnings: Vec::new(),
             rules: DelegationRules {
                 policy: DelegationPolicy::Disabled,
                 allow_pairs: Vec::new(),
@@ -1075,7 +1315,7 @@ impl DelegationConfigRead {
         if let Some(e) = self.config_error.as_deref().or(self.policy_warning.as_deref()) {
             warn_policy_once(e);
         }
-        for w in &self.allow_warnings {
+        for w in self.allow_warnings.iter().chain(&self.override_warnings) {
             tracing::warn!("{w}");
         }
     }
@@ -2013,5 +2253,469 @@ allow = [["sales-lead", "warehouse-lead"], ["a"], ["x", "x"]]
         let (rules, warnings) = cfg.resolve_rules();
         assert_eq!(rules.allow_pairs, vec![("a".to_string(), "b".to_string())]);
         assert_eq!(warnings.len(), 2, "{warnings:?}"); // the two non-array entries
+    }
+
+    const CHECKED_BOUNDARIES: DelegationBoundaries = DelegationBoundaries {
+        personal_target_allowed: true,
+        main_target_allowed: true,
+        can_send_cross_agent: true,
+    };
+
+    struct TestOwnerRoles {
+        avatar: &'static str,
+        owner: Result<Option<String>, OwnerRoleLookupError>,
+        requester: Result<Option<DelegationRequesterRole>, OwnerRoleLookupError>,
+    }
+
+    impl OwnerRoleView for TestOwnerRoles {
+        fn avatar_owner_role(&self, agent_id: &str) -> Result<Option<String>, OwnerRoleLookupError> {
+            if agent_id == self.avatar { self.owner.clone() } else { Ok(None) }
+        }
+        fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError> {
+            self.requester.clone()
+        }
+    }
+
+    fn qualifying_roles() -> TestOwnerRoles {
+        TestOwnerRoles {
+            avatar: "sales_rep",
+            owner: Ok(Some("admin".into())),
+            requester: Ok(Some(DelegationRequesterRole::Account("admin".into()))),
+        }
+    }
+
+    fn evaluate_test(
+        rules: &DelegationRules,
+        overrides: &DelegationOverrides,
+        roles: Option<&dyn OwnerRoleView>,
+        sender: &str,
+        target: &str,
+        boundaries: DelegationBoundaries,
+    ) -> Result<DelegationAllowSource, DelegationDenied> {
+        evaluate_delegation(rules, &org(), sender, target, &DelegationContext {
+            overrides, owner_roles: roles, boundaries, extra_system_senders: &[],
+        })
+    }
+
+    #[test]
+    fn delegation_roles_pairs_modes_and_always_deny_matrix() {
+        // 4 policies × 4 sender kinds (including attributed background) ×
+        // 5 relations × 7 boundary cases = 560 decisions, with exact reasons.
+        let mut decisions = 0;
+        for policy in DelegationPolicy::ALL {
+            for kind in 0..4 {
+                let mut roles = qualifying_roles();
+                match kind {
+                    1 => roles.requester = Ok(Some(DelegationRequesterRole::Account("employee".into()))),
+                    2 => roles.owner = Ok(None), // Ordinary AI, even with an admin requester.
+                    3 => roles.requester = Ok(Some(DelegationRequesterRole::BackgroundStartedBy("admin".into()))),
+                    _ => {}
+                }
+                for relation in 0..5 {
+                    let target = if relation == 0 { "sales_rep2" } else { "mkt_rep" };
+                    let rules = rules_with(policy, if relation == 2 { &[("sales_rep", "mkt_rep")] } else { &[] });
+                    let overrides = DelegationOverrides {
+                        unrestricted_roles: vec!["admin".into()],
+                        allow_one_way: match relation {
+                            3 => vec![("sales_rep".into(), target.into())],
+                            4 => vec![(target.into(), "sales_rep".into())],
+                            _ => Vec::new(),
+                        },
+                    };
+                    let expected = if kind == 0 || kind == 3 {
+                        Ok(DelegationAllowSource::UnrestrictedRole)
+                    } else if policy == DelegationPolicy::Disabled {
+                        Err(DenyReason::DelegationDisabled)
+                    } else if relation == 2 {
+                        Ok(DelegationAllowSource::TwoWayPair)
+                    } else if relation == 3 {
+                        Ok(DelegationAllowSource::OneWayPair)
+                    } else if policy == DelegationPolicy::Open
+                        || (policy == DelegationPolicy::Department && relation == 0) {
+                        Ok(DelegationAllowSource::Mode)
+                    } else if relation == 4 {
+                        Err(DenyReason::ReversePairOnly)
+                    } else if policy == DelegationPolicy::Hierarchy {
+                        Err(DenyReason::NoHierarchyRelation)
+                    } else {
+                        Err(DenyReason::DifferentDepartment)
+                    };
+                    for boundary in 0..7 {
+                        let mut checked = CHECKED_BOUNDARIES;
+                        let (sender, target, result) = match boundary {
+                            1 => ("sales_rep", "sales_rep", Err(DenyReason::SelfDelegation)),
+                            2 => (" ", target, Err(DenyReason::InvalidAgentId)),
+                            3 => ("sales_rep", " ", Err(DenyReason::InvalidAgentId)),
+                            4 => {
+                                checked.personal_target_allowed = false;
+                                ("sales_rep", target, Err(DenyReason::PersonalTargetNotPermitted))
+                            }
+                            5 => {
+                                checked.main_target_allowed = false;
+                                ("sales_rep", target, Err(DenyReason::MainTargetNotPermitted))
+                            }
+                            6 => {
+                                checked.can_send_cross_agent = false;
+                                ("sales_rep", target, Err(DenyReason::CrossAgentSendDisabled))
+                            }
+                            _ => ("sales_rep", target, expected),
+                        };
+                        assert_eq!(
+                            evaluate_test(&rules, &overrides, Some(&roles), sender, target, checked)
+                                .map_err(|d| d.reason),
+                            result, "{policy:?}, sender kind {kind}, relation {relation}, boundary {boundary}",
+                        );
+                        decisions += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(decisions, 560);
+    }
+
+    #[test]
+    fn delegation_role_lookup_failures_and_unknowns_fall_back_to_pairs_and_mode() {
+        let overrides = DelegationOverrides {
+            unrestricted_roles: vec!["admin".into(), "invented".into()],
+            allow_one_way: vec![("sales_rep".into(), "mkt_rep".into())],
+        };
+        for failure in 0..9 {
+            let mut roles = qualifying_roles();
+            match failure {
+                0 => roles.owner = Err(OwnerRoleLookupError),
+                1 => roles.requester = Err(OwnerRoleLookupError),
+                2 => roles.owner = Ok(None),
+                3 => roles.requester = Ok(None),
+                4 => roles.owner = Ok(Some("invented".into())),
+                5 => roles.requester = Ok(Some(DelegationRequesterRole::Account("invented".into()))),
+                6 => roles.requester = Ok(Some(DelegationRequesterRole::BackgroundStartedBy("employee".into()))),
+                7 => roles.owner = Ok(Some("Admin".into())),
+                _ => roles.requester = Ok(Some(DelegationRequesterRole::Account(" admin ".into()))),
+            }
+            for policy in DelegationPolicy::ALL {
+                let rules = rules_with(policy, &[]);
+                let result = evaluate_test(&rules, &overrides, Some(&roles), "sales_rep", "mkt_rep", CHECKED_BOUNDARIES);
+                if policy == DelegationPolicy::Disabled {
+                    assert_eq!(result.unwrap_err().reason, DenyReason::DelegationDisabled);
+                } else {
+                    assert_eq!(result.unwrap(), DelegationAllowSource::OneWayPair);
+                    let no_pair = DelegationOverrides { allow_one_way: Vec::new(), ..overrides.clone() };
+                    let result = evaluate_test(&rules, &no_pair, Some(&roles), "sales_rep", "sales_rep2", CHECKED_BOUNDARIES);
+                    assert_eq!(result.is_ok(), policy != DelegationPolicy::Hierarchy);
+                }
+            }
+        }
+        let rules = rules_with(DelegationPolicy::Disabled, &[]);
+        assert_eq!(evaluate_test(&rules, &overrides, None, "sales_rep", "mkt_rep", CHECKED_BOUNDARIES)
+            .unwrap_err().reason, DenyReason::DelegationDisabled);
+    }
+
+    #[test]
+    fn delegation_unrestricted_target_never_confers_reverse_authority() {
+        let roles = qualifying_roles();
+        let overrides = DelegationOverrides {
+            unrestricted_roles: vec!["admin".into()], ..DelegationOverrides::default()
+        };
+        for policy in DelegationPolicy::ALL {
+            let rules = rules_with(policy, &[]);
+            assert_eq!(evaluate_test(&rules, &overrides, Some(&roles), "sales_rep", "mkt_rep", CHECKED_BOUNDARIES)
+                .unwrap(), DelegationAllowSource::UnrestrictedRole);
+            let reverse = evaluate_test(&rules, &overrides, Some(&roles), "mkt_rep", "sales_rep", CHECKED_BOUNDARIES);
+            assert_eq!(reverse.map(|_| ()), can_delegate_rules(&rules, &org(), "mkt_rep", "sales_rep"));
+        }
+        // Avatar owner and requester may be different qualifying role kinds.
+        let roles = TestOwnerRoles {
+            requester: Ok(Some(DelegationRequesterRole::Account("manager".into()))),
+            ..qualifying_roles()
+        };
+        let overrides = DelegationOverrides {
+            unrestricted_roles: vec!["admin".into(), "manager".into()], ..overrides
+        };
+        assert_eq!(evaluate_test(&rules_with(DelegationPolicy::Disabled, &[]), &overrides, Some(&roles),
+            "sales_rep", "mkt_rep", CHECKED_BOUNDARIES).unwrap(), DelegationAllowSource::UnrestrictedRole);
+    }
+
+    #[test]
+    fn delegation_boundaries_precede_system_and_role_lookups() {
+        struct MustNotLookup;
+        impl OwnerRoleView for MustNotLookup {
+            fn avatar_owner_role(&self, _: &str) -> Result<Option<String>, OwnerRoleLookupError> {
+                panic!("always-deny must precede lookups")
+            }
+            fn requester_role(&self) -> Result<Option<DelegationRequesterRole>, OwnerRoleLookupError> {
+                panic!("always-deny must precede lookups")
+            }
+        }
+        let overrides = DelegationOverrides { unrestricted_roles: vec!["admin".into()], ..Default::default() };
+        for sender in ["sales_rep", "cron", "trusted"] {
+            let rules = rules_with(DelegationPolicy::Open, &[(sender, "mkt_rep")]);
+            for (checked, expected) in [
+                (DelegationBoundaries::default(), DenyReason::PersonalTargetNotPermitted),
+                (DelegationBoundaries { main_target_allowed: false, ..CHECKED_BOUNDARIES }, DenyReason::MainTargetNotPermitted),
+                (DelegationBoundaries { can_send_cross_agent: false, ..CHECKED_BOUNDARIES }, DenyReason::CrossAgentSendDisabled),
+            ] {
+                let result = evaluate_delegation(&rules, &org(), sender, "mkt_rep", &DelegationContext {
+                    overrides: &overrides, owner_roles: Some(&MustNotLookup), boundaries: checked,
+                    extra_system_senders: &["trusted"],
+                });
+                assert_eq!(result.unwrap_err().reason, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn delegation_pair_sources_precede_mode_and_preserve_exact_direction() {
+        let roles = qualifying_roles();
+        let overrides = DelegationOverrides {
+            allow_one_way: vec![("sales_rep".into(), "mkt_rep".into())],
+            unrestricted_roles: Vec::new(),
+        };
+        for policy in [DelegationPolicy::Department, DelegationPolicy::Hierarchy, DelegationPolicy::Open] {
+            let rules = rules_with(policy, &[("sales_rep", "mkt_rep")]);
+            assert_eq!(evaluate_test(&rules, &overrides, Some(&roles), "sales_rep", "mkt_rep", CHECKED_BOUNDARIES)
+                .unwrap(), DelegationAllowSource::TwoWayPair);
+            assert_eq!(evaluate_test(&rules, &overrides, Some(&roles), "mkt_rep", "sales_rep", CHECKED_BOUNDARIES)
+                .unwrap(), DelegationAllowSource::TwoWayPair);
+        }
+        let rules = rules_with(DelegationPolicy::Hierarchy, &[]);
+        for sender in ["sales_rep_extra", "Sales_rep", "x-sales_rep"] {
+            assert!(evaluate_test(&rules, &overrides, Some(&roles), sender, "mkt_rep", CHECKED_BOUNDARIES).is_err());
+        }
+        let reversed = evaluate_test(&rules, &overrides, None, "mkt_rep", "sales_rep", CHECKED_BOUNDARIES).unwrap_err();
+        assert_eq!(reversed.reason.as_str(), "reverse_pair_only");
+        assert!(reversed.message_zh().contains("只允許「sales_rep」委派給「mkt_rep」"));
+        // A reverse pair does not veto an independent same-department/hierarchy grant.
+        let overrides = DelegationOverrides {
+            allow_one_way: vec![("sales_rep2".into(), "sales_rep".into()), ("ceo".into(), "sales_rep".into())],
+            ..overrides
+        };
+        assert_eq!(evaluate_test(&rules_with(DelegationPolicy::Department, &[]), &overrides, None,
+            "sales_rep", "sales_rep2", CHECKED_BOUNDARIES).unwrap(), DelegationAllowSource::Mode);
+        assert_eq!(evaluate_test(&rules, &overrides, None, "sales_rep", "ceo", CHECKED_BOUNDARIES)
+            .unwrap(), DelegationAllowSource::Mode);
+    }
+
+    #[test]
+    fn delegation_one_way_normalization_limits_and_unicode() {
+        let entries = vec![
+            vec![" 甲 ".into(), " 乙 ".into()], vec!["乙".into(), "甲".into()],
+            vec!["甲".into(), "乙".into()], vec!["甲".into()],
+            vec!["甲".into(), "乙".into(), "丙".into()], vec![" ".into(), "乙".into()],
+            vec!["甲 ".into(), " 甲".into()],
+        ];
+        let (pairs, warnings) = resolve_allow_one_way(&entries);
+        assert_eq!(pairs, vec![("甲".into(), "乙".into()), ("乙".into(), "甲".into())]);
+        assert_eq!(warnings.len(), 4);
+        let entries: Vec<_> = (0..201).map(|i| vec![format!("a{i}"), "b".into()]).collect();
+        let (pairs, warnings) = resolve_allow_one_way(&entries);
+        assert_eq!(pairs.len(), 200);
+        assert_eq!(warnings.len(), 1);
+        assert!(!pairs.iter().any(|(from, _)| from == "a200"));
+        assert!(resolve_allow_one_way(&entries[..200]).1.is_empty());
+        let overrides = DelegationOverrides { allow_one_way: pairs, ..Default::default() };
+        assert_eq!(evaluate_test(&rules_with(DelegationPolicy::Hierarchy, &[]), &overrides, None,
+            "a199", "b", CHECKED_BOUNDARIES).unwrap(), DelegationAllowSource::OneWayPair);
+        assert!(evaluate_test(&rules_with(DelegationPolicy::Hierarchy, &[]), &overrides, None,
+            "a200", "b", CHECKED_BOUNDARIES).is_err());
+    }
+
+    #[test]
+    fn delegation_role_closed_list_tracks_auth_user_role() {
+        // Auth depends on core: compare its source declaration without building
+        // auth or creating a circular dev-dependency. New roles require review.
+        let source = include_str!("../../duduclaw-auth/src/models.rs");
+        let body = source.split("pub enum UserRole {").nth(1).unwrap().split('}').next().unwrap();
+        let roles: Vec<_> = body.lines().map(str::trim).filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches(',').to_ascii_lowercase()).collect();
+        assert_eq!(roles, DELEGATION_ROLE_NAMES);
+        assert!(source.contains("#[serde(rename_all = \"lowercase\")]"));
+    }
+
+    #[test]
+    fn delegation_new_config_keys_validate_independently_and_fail_closed() {
+        let table: toml::Table = toml::from_str(r#"
+[delegation]
+policy = "none"
+allow = [["b", "a"]]
+allow_one_way = [[" a ", " b "], ["b", "a"], ["a", "b"], ["a"], ["a", 2], ["a", "a"]]
+unrestricted_roles = ["admin", "manager", "employee", "admin", "Admin", " admin ", "root", 4]
+"#).unwrap();
+        let read = delegation_config_read_from_table(&table);
+        assert_eq!(read.rules.allow_pairs, vec![("a".into(), "b".into())]);
+        assert_eq!(read.overrides.allow_one_way, vec![("a".into(), "b".into()), ("b".into(), "a".into())]);
+        assert_eq!(read.overrides.unrestricted_roles, DELEGATION_ROLE_NAMES);
+        assert_eq!(read.override_warnings.len(), 4); // 3 invalid pairs + 1 role warning.
+        for value in ["false", "42", "'not-a-list'"] {
+            let table = toml::from_str(&format!(
+                "[delegation]\npolicy = 'hierarchy'\nallow = [['a', 'b']]\nallow_one_way = {value}\nunrestricted_roles = {value}"
+            )).unwrap();
+            let read = delegation_config_read_from_table(&table);
+            assert_eq!(read.rules.policy, DelegationPolicy::Hierarchy);
+            assert_eq!(read.rules.allow_pairs.len(), 1);
+            assert_eq!(read.overrides, DelegationOverrides::default());
+            assert_eq!(read.override_warnings.len(), 2);
+        }
+        for policy in ["'typo'", "false", "42"] {
+            let table = toml::from_str(&format!(
+                "[delegation]\npolicy = {policy}\nallow_one_way = [['a', 'b']]\nunrestricted_roles = ['admin']"
+            )).unwrap();
+            let read = delegation_config_read_from_table(&table);
+            assert_eq!(read.rules.policy, DelegationPolicy::Disabled);
+            assert_eq!(read.overrides, DelegationOverrides::default());
+            assert!(read.policy_warning.is_some());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+        assert_eq!(read_delegation_config(dir.path()).overrides, read.overrides);
+        std::fs::write(dir.path().join("config.toml"), "[delegation\nunrestricted_roles=['admin']").unwrap();
+        let read = read_delegation_config(dir.path());
+        assert!(read.config_error.is_some());
+        assert_eq!(read.overrides, DelegationOverrides::default());
+        std::fs::remove_file(dir.path().join("config.toml")).unwrap();
+        std::fs::create_dir(dir.path().join("config.toml")).unwrap();
+        assert_eq!(read_delegation_config(dir.path()).overrides, DelegationOverrides::default());
+    }
+
+    #[test]
+    fn delegation_absent_and_empty_keys_match_frozen_legacy_matrix_byte_for_byte() {
+        let mut org = org();
+        org.insert("cycle_a", "cycle_b", "");
+        org.insert("cycle_b", "cycle_a", "");
+        let ids = ["ceo", "sales_lead", "sales_rep", "sales_rep2", "mkt_lead", "mkt_rep",
+            "loner", "unknown", "", "  ", " sales_rep ", "cron", "a2a-client", "cycle_a", "嘟嘟"];
+        let roles = qualifying_roles();
+        let mut decisions = 0;
+        for policy in DelegationPolicy::ALL {
+            for pairs in ["[]", "[['sales_rep','mkt_rep']]"] {
+                for extras in [Vec::new(), vec![ACP_CLIENT_SENDER]] {
+                    for new_keys in ["", "allow_one_way = []\nunrestricted_roles = []\n"] {
+                        let table = toml::from_str(&format!(
+                            "[delegation]\npolicy = '{}'\nallow = {pairs}\n{new_keys}", policy.as_str()
+                        )).unwrap();
+                        let read = delegation_config_read_from_table(&table);
+                        for sender in ids {
+                            for target in ids {
+                                let before = legacy_decision(policy, Some(&read.rules), &org, sender, target, &extras);
+                                let after = evaluate_delegation(&read.rules, &org, sender, target, &DelegationContext {
+                                    overrides: &read.overrides, owner_roles: Some(&roles),
+                                    boundaries: CHECKED_BOUNDARIES, extra_system_senders: &extras,
+                                }).map(|_| ());
+                                let legacy_wrapper = can_delegate_rules_ext(&read.rules, &org, sender, target, &extras);
+                                assert_eq!(before, after, "{policy:?}: {sender:?} -> {target:?}");
+                                assert_eq!(before, legacy_wrapper);
+                                assert_eq!(format!("{before:?}").as_bytes(), format!("{after:?}").as_bytes());
+                                if let (Err(before), Err(after)) = (before, after) {
+                                    assert_eq!(before.message_zh().as_bytes(), after.message_zh().as_bytes());
+                                }
+                                decisions += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(decisions, 7200);
+    }
+
+    // Frozen pre-RM-183 oracle: preserve all legacy decisions and denial messages.
+    fn legacy_decision(
+        policy: DelegationPolicy,
+        rules: Option<&DelegationRules>,
+        org: &impl OrgView,
+        sender: &str,
+        target: &str,
+        extra_system_senders: &[&str],
+    ) -> Result<(), DelegationDenied> {
+        let s = sender.trim();
+        let t = target.trim();
+    
+        let deny = |reason: DenyReason| {
+            Err(DelegationDenied {
+                sender: s.to_string(),
+                target: t.to_string(),
+                policy,
+                reason,
+            })
+        };
+    
+        // Defensive (fail-closed): a nameless party proves nothing.
+        if s.is_empty() || t.is_empty() {
+            return deny(DenyReason::InvalidAgentId);
+        }
+    
+        // ① Self-delegation — denied under every policy, Open included.
+        if s == t {
+            return deny(DenyReason::SelfDelegation);
+        }
+    
+        // ② System / human-interface senders.
+        if is_system_sender(s) || extra_system_senders.iter().any(|extra| extra.trim() == s) {
+            return Ok(());
+        }
+    
+        // RM-137: `none` (and every value that resolves to it) stops every agent
+        // sender here — before the ancestor rules and before the whitelist, so an
+        // explicit `[delegation] allow` pair does not pass either.
+        if policy == DelegationPolicy::Disabled {
+            return deny(DenyReason::DelegationDisabled);
+        }
+    
+        // Open skips rules ③–⑤b entirely (escape hatch = pre-WP21 behaviour).
+        if policy == DelegationPolicy::Open {
+            return Ok(());
+        }
+    
+        // ③ sender is an ancestor of target (skip-level command).
+        let down = walk_up(org, t, s);
+        if down == Walk::Found {
+            return Ok(());
+        }
+    
+        // ④ target is an ancestor of sender (escalation / reporting up).
+        let up = walk_up(org, s, t);
+        if up == Walk::Found {
+            return Ok(());
+        }
+    
+        // ⑤ same non-empty department (Department policy only).
+        let sender_dept = org.department(s).unwrap_or_default();
+        let target_dept = org.department(t).unwrap_or_default();
+        let sender_dept = sender_dept.trim();
+        let target_dept = target_dept.trim();
+        if policy == DelegationPolicy::Department
+            && !sender_dept.is_empty()
+            && !target_dept.is_empty()
+            && sender_dept == target_dept
+        {
+            return Ok(());
+        }
+    
+        // ⑤b explicit whitelist pair (design doc §2.1 rule 5b) — both Department
+        // and Hierarchy respect it; Open already returned above.
+        if let Some(rules) = rules {
+            if rules.allows_pair(s, t) {
+                return Ok(());
+            }
+        }
+    
+        // ⑥ Fail closed, with the most informative reason available.
+        if down == Walk::Truncated || up == Walk::Truncated {
+            return deny(DenyReason::ChainTooDeep);
+        }
+        match policy {
+            DelegationPolicy::Hierarchy => deny(DenyReason::NoHierarchyRelation),
+            DelegationPolicy::Department => {
+                if sender_dept.is_empty() || target_dept.is_empty() {
+                    deny(DenyReason::MissingDepartment)
+                } else {
+                    deny(DenyReason::DifferentDepartment)
+                }
+            }
+            // Unreachable: Open returned Ok and Disabled denied above. Kept
+            // exhaustive rather than wildcarded so a future policy variant must
+            // state its denial reason.
+            DelegationPolicy::Open => deny(DenyReason::NoHierarchyRelation),
+            DelegationPolicy::Disabled => deny(DenyReason::DelegationDisabled),
+        }
     }
 }
