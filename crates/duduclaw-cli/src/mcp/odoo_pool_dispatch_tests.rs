@@ -16,7 +16,7 @@ fn policy_home(odoo_options: &str) -> tempfile::TempDir {
 }
 
 /// A regression must not turn a local refusal into an identity or Odoo request.
-async fn local_refusal(home: &Path, pool: &OdooState, tool: &str, params: &Value) -> Value {
+pub(super) async fn local_refusal(home: &Path, pool: &OdooState, tool: &str, params: &Value) -> Value {
     use super::odoo_identity_client::tests::{gateway, AUTH};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -586,7 +586,8 @@ async fn real_config_gates_run_before_auto_connect_or_secret_resolution() {
         ("odoo_search", serde_json::json!({"model":"project.project"}), "allowed_models = ['crm.lead']", "features_project = true", "allowed_models gate"),
         ("odoo_search", serde_json::json!({"model":"res.partner"}), "", "", "block list gate"),
         ("odoo_execute", serde_json::json!({"model":"ir.model","method":"write"}), "unblock_models = ['ir.model']", "", "system read-only"),
-        ("odoo_execute", serde_json::json!({"model":"crm.lead","method":"unlink"}), "", "", "method safety gate"),
+        // The default always_refuse list now rejects unlink before the legacy method gate.
+        ("odoo_execute", serde_json::json!({"model":"crm.lead","method":"unlink"}), "", "", "一律不允許"),
         ("odoo_inventory_check", serde_json::json!({"product_id":1}), "allowed_models = ['stock.quant']", "", "allowed_models gate"),
         ("odoo_crm_leads", serde_json::json!({}), "", "", "not connected"),
     ] {
