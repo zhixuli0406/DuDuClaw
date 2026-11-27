@@ -215,6 +215,15 @@ fn request(params: Value) -> Result<SetRequest, String> {
 
 fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
     sweep: impl FnOnce()) -> Result<Value, String> {
+    set_with_commit(home, db, ctx, req, sweep, |path, hash, render| {
+        config_commit::commit_rendered_locked(path, hash, render)
+    })
+}
+
+fn set_with_commit(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
+    sweep: impl FnOnce(),
+    commit: impl FnOnce(&Path, &str, &mut dyn FnMut(&str) -> Result<String, String>) -> Result<(), String>,
+) -> Result<Value, String> {
     require_live(db, ctx)?;
     let (text, mut table, before) = read(home)?;
     let hash = config_commit::content_hash(&text);
@@ -258,7 +267,7 @@ fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
     duduclaw_security::audit::try_append_audit_event(home, &event)
         .map_err(|_| "稽核紀錄寫入失敗，設定未儲存，請聯絡管理員。")?;
     let mut saved_hash = String::new();
-    let published = config_commit::commit_rendered_locked(&home.join("config.toml"), &hash, |current| {
+    let published = commit(&home.join("config.toml"), &hash, &mut |current| {
         require_live(db, ctx)?;
         // Check again under the commit lock. Never bless a missing file as empty.
         if !home.join("config.toml").is_file() { return Err(UNREADABLE.into()); }
@@ -269,21 +278,31 @@ fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
         saved_hash = config_commit::content_hash(&rendered);
         Ok(rendered)
     });
+    let durability_unconfirmed = published.is_err();
     if let Err(error) = published {
-        event.details["phase"] = json!("aborted");
-        let _ = duduclaw_security::audit::try_append_audit_event(home, &event);
-        return Err(error);
+        // Rename may have succeeded before a later durability check failed.
+        // Reconcile the effective settings, not the proposed bytes or hash.
+        if !read(home).is_ok_and(|(_, _, actual)| actual == after) {
+            event.details["phase"] = json!("aborted");
+            let _ = duduclaw_security::audit::try_append_audit_event(home, &event);
+            return Err(error);
+        }
     }
-    // Schedule immediately after durable publication, even if auditing fails.
+    // Schedule after confirmed publication, even if durability or auditing fails.
     if !after.enabled { sweep(); }
     duduclaw_security::audit::log_config_changed(home, &ctx.email, "admin",
         &["approval.chat_admin".into()]);
     crate::security_autopilot::emit_config_changed();
-    event.details["phase"] = json!("committed");
-    duduclaw_security::audit::try_append_audit_event(home, &event)
-        .map_err(|_| "設定已儲存，但稽核紀錄寫入失敗，請重新整理並聯絡管理員。")?;
+    event.details["phase"] = json!(if durability_unconfirmed { "committed_unconfirmed" } else { "committed" });
+    let audit_result = duduclaw_security::audit::try_append_audit_event(home, &event);
+    if !durability_unconfirmed {
+        audit_result.map_err(|_| "設定已儲存，但稽核紀錄寫入失敗，請重新整理並聯絡管理員。")?;
+    }
     crate::security_autopilot::emit_security_autopilot_event(&event.severity, &event.event_type,
         Some(&event.agent_id), crate::security_autopilot::SOURCE_AUDIT);
+    if durability_unconfirmed {
+        return Err("設定已儲存，但無法確認資料已持久寫入，請重新整理確認設定。".into());
+    }
     Ok(json!({"success": true, "hash": saved_hash}))
 }
 

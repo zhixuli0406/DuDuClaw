@@ -197,6 +197,70 @@ fn disabling_sweeps_after_durable_write_removes_ack_and_preserves_siblings() {
 }
 
 #[test]
+fn commit_error_after_rename_is_unconfirmed_and_sweeps() {
+    let (home, db, ctx) = fixture();
+    let mut value = params(home.path(), true);
+    value["acknowledge_risk"] = json!(true);
+    write(home.path(), &db, &ctx, value).unwrap();
+    let swept = std::cell::Cell::new(false);
+    let error = set_with_commit(home.path(), &db, &ctx,
+        request(params(home.path(), false)).unwrap(), || {
+            assert!(!read(home.path()).unwrap().2.enabled);
+            swept.set(true);
+        }, |path, hash, render| {
+            let current = std::fs::read_to_string(path).unwrap();
+            assert_eq!(config_commit::content_hash(&current), hash);
+            let rendered = render(&current)?;
+            let temporary = home.path().join("config.toml.test-tmp");
+            std::fs::write(&temporary, rendered).unwrap();
+            std::fs::rename(&temporary, path).unwrap();
+            Err("injected directory fsync failure".into())
+        }).unwrap_err();
+    assert!(swept.get());
+    assert!(error.contains("設定已儲存"));
+    assert!(error.contains("持久寫入"));
+    assert!(error.contains("重新整理"));
+    let rows = audits(home.path());
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2]["details"]["phase"], "intent");
+    assert_eq!(rows[3]["details"]["phase"], "committed_unconfirmed");
+    assert_eq!(rows[2]["details"]["change_id"], rows[3]["details"]["change_id"]);
+    let mut committed = rows[3]["details"].clone();
+    committed["phase"] = json!("intent");
+    assert_eq!(committed, rows[2]["details"]);
+    let all_rows: Vec<Value> = std::fs::read_to_string(home.path().join("security_audit.jsonl"))
+        .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(all_rows.iter().filter(|row| row["event_type"] == "config_changed").count(), 2);
+}
+
+#[test]
+fn commit_error_before_rename_aborts_without_sweep() {
+    let (home, db, ctx) = fixture();
+    let mut value = params(home.path(), true);
+    value["acknowledge_risk"] = json!(true);
+    write(home.path(), &db, &ctx, value).unwrap();
+    let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let error = set_with_commit(home.path(), &db, &ctx,
+        request(params(home.path(), false)).unwrap(), || panic!("must not sweep"),
+        |path, hash, render| {
+            let current = std::fs::read_to_string(path).unwrap();
+            assert_eq!(config_commit::content_hash(&current), hash);
+            let _ = render(&current)?;
+            Err("injected failure before rename".into())
+        }).unwrap_err();
+    assert_eq!(error, "injected failure before rename");
+    assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
+    let rows = audits(home.path());
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2]["details"]["phase"], "intent");
+    assert_eq!(rows[3]["details"]["phase"], "aborted");
+    assert_eq!(rows[2]["details"]["change_id"], rows[3]["details"]["change_id"]);
+    let all_rows: Vec<Value> = std::fs::read_to_string(home.path().join("security_audit.jsonl"))
+        .unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(all_rows.iter().filter(|row| row["event_type"] == "config_changed").count(), 1);
+}
+
+#[test]
 fn intent_failure_refuses_enable_and_exemption_without_config_write_or_sweep() {
     let (home, db, ctx) = fixture();
     let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
