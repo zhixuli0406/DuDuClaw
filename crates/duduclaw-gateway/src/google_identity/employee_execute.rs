@@ -212,7 +212,11 @@ mod tests {
                     Request::Prepare { tool: (*tool).into(), arguments, turn_id, run_id: None, call_id }
                 };
                 let result = serve(&state, "bot", request).await;
-                let code = if case == "disabled" { "disabled" } else { "changed" };
+                let code = match case {
+                    "disabled" => "disabled",
+                    "malformed" => "changed",
+                    _ => "identity_changed",
+                };
                 assert_eq!(result.unwrap_err().code, code, "{tool}: {case}");
                 let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
                 let rows: Vec<Value> = raw.lines().map(|line| serde_json::from_str(line).unwrap()).collect();

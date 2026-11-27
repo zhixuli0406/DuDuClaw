@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// Only the typed tick paths may carry an in-process configuration refusal.
+/// Durable queue text must always be revalidated against current authority.
+#[derive(Clone, Copy)]
+pub(super) enum DispatchFailure<'a> {
+    Persisted(&'a str),
+    Entry(&'a crate::entry_gate::EntryRefusal),
+    TeamConfig(&'a str),
+}
+
 impl GoalLoopDriver {
     /// RFC-27: release the edition concurrency lease a terminal task held.
     /// No-op when the gate did not apply (unguarded / `None`). Best-effort — the
@@ -44,8 +53,26 @@ impl GoalLoopDriver {
         task_id: &str,
         error: &str,
     ) -> Result<bool, String> {
-        if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(error).or_else(|| {
-            crate::work_outcome::is_work_result(error).then_some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 0, partial: String::new() })
+        self.handle_dispatch_failure(inflight, task_id, DispatchFailure::Persisted(error)).await
+    }
+
+    pub(super) async fn handle_dispatch_failure(
+        &self,
+        inflight: &mut HashMap<String, InFlight>,
+        task_id: &str,
+        failure: DispatchFailure<'_>,
+    ) -> Result<bool, String> {
+        let entry_error;
+        let error = match failure {
+            DispatchFailure::Persisted(error) | DispatchFailure::TeamConfig(error) => error,
+            DispatchFailure::Entry(refusal) => {
+                entry_error = crate::entry_gate::background_refusal(refusal);
+                &entry_error
+            }
+        };
+        let persisted = matches!(failure, DispatchFailure::Persisted(_));
+        if let Some(outcome) = crate::work_outcome::WorkOutcome::decode(error).filter(|_| persisted).or_else(|| {
+            (persisted && crate::work_outcome::is_work_result(error)).then_some(crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 0, partial: String::new() })
         }) {
             let pause = match outcome {
                 crate::work_outcome::WorkOutcome::MaxTurns { .. } => crate::pause_reason::PauseReason::MaxTurns,
@@ -75,16 +102,23 @@ impl GoalLoopDriver {
         // stopped, paused or moved on). Nothing failed to run — free the slot
         // without counting a dispatch failure. Only fixed-id durable rounds
         // can carry this text.
-        if error.starts_with(crate::responsibility::FENCE_ERROR_PREFIX) {
+        if persisted && error.starts_with(crate::responsibility::FENCE_ERROR_PREFIX) {
             debug!(task = %task_id, "goal loop: durable round fenced by the dispatcher — slot released");
             return Ok(false);
         }
-        // Queue errors survive restarts and token expiry. Recheck the durable
-        // assignee instead of authenticating a persisted refusal token.
+        // Only persisted failures need a fresh assignee check. A typed refusal
+        // computed by this tick also covers a frozen role, even if the durable
+        // assignee itself is healthy. Never authenticate queue text by prefix.
         if let Some(task) = self.store.get_task(task_id).await? {
-            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
-                let code = refusal.code();
-                let error = crate::entry_gate::background_refusal(&refusal);
+            let refusal = match failure {
+                DispatchFailure::Persisted(_) => {
+                    crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to)
+                        .err().map(|refusal| crate::entry_gate::background_refusal(&refusal))
+                }
+                DispatchFailure::Entry(_) | DispatchFailure::TeamConfig(_) => Some(error.to_owned()),
+            };
+            if let Some(error) = refusal {
+                let code = crate::entry_gate::background_refusal_code(&error).unwrap_or("team_config_refused");
                 self.dispatch_failures.lock().await.remove(task_id);
                 self.escalate(inflight, &task, &error,
                     crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;

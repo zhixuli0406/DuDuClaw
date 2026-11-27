@@ -402,7 +402,14 @@ async fn odoo_member_switch_audit_failure_leaves_config_unchanged() {
     let path = f.home.path().join("config.toml");
     let original = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=false");
     std::fs::write(&path, &original).unwrap();
-    std::fs::create_dir(f.home.path().join("security_audit.jsonl")).unwrap();
+    let audit = f.home.path().join("security_audit.jsonl");
+    // set_user_db may already have emitted an edition-watcher audit record.
+    match std::fs::remove_file(&audit) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => panic!("remove fixture audit: {error}"),
+    }
+    std::fs::create_dir(&audit).unwrap();
     refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true,"acknowledge_risk":true})).await);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     assert_eq!(s.calls.load(Ordering::SeqCst), 0);

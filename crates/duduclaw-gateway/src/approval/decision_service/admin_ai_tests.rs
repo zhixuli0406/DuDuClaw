@@ -3,7 +3,7 @@ use super::*;
 use crate::approval::{action_grant::{self, ActionGrant}, ConversationAudience, DecisionContext, ExecutionBinding};
 
 impl Fixture {
-    async fn admin_ai(&self) -> ApprovalId {
+    pub(super) async fn admin_ai(&self) -> ApprovalId {
         self.db().bind_agent(&self.user, "support", duduclaw_auth::AccessLevel::Operator).unwrap();
         rusqlite::Connection::open(self.env.home.join("users.db")).unwrap().execute(
             "UPDATE users SET avatar_agent_id='support', must_change_password=0 WHERE id=?1", [&self.user]).unwrap();

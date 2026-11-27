@@ -681,8 +681,8 @@ the original four fields, using the same identity check and organization gate
 as `agent_update`. The `open` delegation policy permits cross-team changes;
 human operators remain unrestricted. Callers rejected by either check are
 refused before reading the target configuration. Only an administrator may
-change `skill_budget_unlimited`, because it removes the cap on injected skill
-content.
+change `skill_budget_unlimited` through this tool, because it removes the cap on injected skill
+content. The employee's Owner can turn it off in the dashboard.
 
 ### `execute_program` — where the script runs
 

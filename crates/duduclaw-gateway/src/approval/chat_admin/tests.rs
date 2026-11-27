@@ -14,6 +14,8 @@ use duduclaw_auth::{UserContext, UserRole};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const DASHBOARD_SESSION_ID: &str = "14300000-0000-4000-8000-000000000022";
+
 const KINDS: &[&str] = &[
     "knowledge_quarantine", "knowledge_add_source", "expert_skills_enable",
     "workflow_activation", "agent_file_change", "org_change", "autopilot_action",
@@ -37,8 +39,19 @@ async fn handler(env: &DecisionEnv) -> MethodHandler {
 async fn dashboard(env: &DecisionEnv, user: &str, id: &ApprovalId, approve: bool) -> WsFrame {
     let rec = env.broker.get(id).await.unwrap().unwrap();
     let ctx = env.users.as_ref().unwrap().live_user_context(user).unwrap().unwrap();
-    handler(env).await.handle_approvals_decide(json!({"id":id.as_str(), "approve":approve,
-        "expected_digest":approval::decision_digest_at(&env.home, &rec)}), &ctx).await
+    let h = handler(env).await;
+    // Exercise the same live account/epoch check as the dashboard handler.
+    let live = crate::review_evidence::audience::fresh_dashboard_context(&env.home, &ctx).unwrap();
+    assert!(live.is_admin());
+    let frame = crate::google_personal::DASHBOARD_SESSION.scope(
+        Some((user.to_owned(), DASHBOARD_SESSION_ID.into())),
+        h.handle_approvals_decide(json!({"id":id.as_str(), "approve":approve,
+            "expected_digest":approval::decision_digest_at(&env.home, &rec)}), &ctx)).await;
+    if rec.action_kind != crate::isolation_background::PERSONAL_DELEGATION_KIND {
+        assert!(matches!(&frame, WsFrame::Response { ok:true, .. }),
+            "dashboard kind={} approve={approve}: {frame:?}", rec.action_kind);
+    }
+    frame
 }
 
 async fn request(f: &Fixture, kind: &str) -> ApprovalId {
@@ -52,9 +65,56 @@ async fn request(f: &Fixture, kind: &str) -> ApprovalId {
         }
         "agent_file_change" => f.file_change().await,
         "org_change" => f.org_change(&f.ack).await,
-        "workflow_activation" => f.bound(json!({"kind":approval::WORKFLOW_ACTIVATION_KIND}), &f.ack).await,
+        "workflow_activation" => ApprovalId::from(workflow_card(f).await.acceptance_id),
         _ => f.simple(kind).await,
     }
+}
+
+// The grant fixture supplies immutable revision material, but deliberately omits
+// the dashboard draft. Seed that read-side material before delivering any card;
+// draft creation/fixture execution are outside this decision-entry-point test.
+async fn workflow_card(f: &Fixture) -> approval::AcceptedRevisionGrant {
+    let (_, store, accepted, _) = approval::workflow_grants::tests::fixture_at(&f.env.home, false).await;
+    store.initialize_evidence().await.unwrap();
+    // Model an archived source task: current Admins retain draft oversight.
+    crate::task_store::TaskStore::open(&f.env.home).unwrap();
+    let mut draft = crate::workflow_drafts::WorkflowDraft {
+        schema_version:1, draft_id:"p22-draft".into(), revision:1,
+        owner:accepted.spec.actor.clone(), source_task:"p22-archived-task".into(),
+        skill_id:"p22-skill".into(), source_snapshot_id:"p22-snapshot".into(),
+        source_evidence_hash:"p22-evidence".into(),
+        definition:accepted.revision.definition.clone(), revision_hash:accepted.spec.revision_hash.clone(),
+        source_data:vec![], fixtures:vec![], creator_grant:accepted.spec.creator_grant.clone(),
+        effect_templates:accepted.spec.templates.clone(), audience:accepted.spec.audience.clone(),
+        budget:accepted.spec.budget.clone(), input_max_age_seconds:accepted.spec.input_max_age_seconds,
+        timezone:"Asia/Taipei".into(), routine:None, stop_conditions:vec![],
+        created_at:chrono::Utc::now().to_rfc3339(), disabled:true,
+        review_status:"draft".into(), draft_hash:String::new(),
+    };
+    draft.draft_hash = draft.compute_hash();
+    store.with_transaction(|tx| {
+        tx.execute("INSERT INTO workflow_drafts VALUES(?1,?2,?3,?4,1,?5)",
+            rusqlite::params![draft.draft_id, draft.revision, draft.owner, draft.draft_hash,
+                serde_json::to_string(&draft).unwrap()]).map_err(|e| e.to_string())?;
+        Ok(())
+    }).await.unwrap();
+    let request = crate::workflow::ActivationRequest {
+        activation_id:accepted.activation_id.clone(), draft_id:draft.draft_id,
+        draft_hash:draft.draft_hash, revision:accepted.revision.clone(), spec:accepted.spec.clone(),
+        fixture_results:vec![], fixture_assertions:vec![], cron:None,
+    };
+    let payload = crate::workflow::activation::activation_payload(&request);
+    let id = ApprovalId::from(accepted.acceptance_id.clone());
+    let mut binding = f.env.broker.get(&id).await.unwrap().unwrap().binding.unwrap();
+    binding.payload_hash = approval::payload_hash(&payload);
+    binding.validate(&payload).unwrap();
+    // Complete the seed atomically, before receipts/digests exist. Runtime
+    // replace_text intentionally invalidates bound cards and is not a seed API.
+    f.env.broker.store.conn.lock().await.execute(
+        "UPDATE approvals SET payload=?1,binding_json=?2 WHERE id=?3",
+        rusqlite::params![serde_json::to_string(&payload).unwrap(),
+            serde_json::to_string(&binding).unwrap(), id.as_str()]).unwrap();
+    accepted
 }
 
 async fn effect(f: &Fixture, id: &ApprovalId, kind: &str) -> Value {
@@ -79,7 +139,7 @@ fn methods(f: &Fixture, channel: &str, exempt: &[&str], enabled_methods: &[&str]
     f.config(true, channel, exempt);
     let path = f.env.home.join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap()
-        .replace("[approval.chat_admin]", "googlechat_project_number='1'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
+        .replace("[approval.chat_admin]", "googlechat_project_number='123456789012'\ngooglechat_service_account_json_enc='invalid-encrypted-fixture'\n[approval.chat_admin]");
     std::fs::write(path, format!("{raw}step_up_methods={}\n", serde_json::to_string(enabled_methods).unwrap())).unwrap();
     if channel == "googlechat" {
         f.db().bind_channel_identity(&f.user, "googlechat", "users/123", true).unwrap();
@@ -141,7 +201,9 @@ async fn t1_t2_decision_entry_point_matrix() {
                     for entry in ["dashboard", "tap", "web", "totp"] {
                         let f = Fixture::files_org().await;
                         let key = if *kind == "other_outgoing" { "egress_guard" } else { kind };
-                        methods(&f, channel, if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &[key] } else { &[] }, enabled_methods);
+                        let keys = [key];
+                        let selected: &[&str] = if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &keys } else { &[] };
+                        methods(&f, channel, selected, enabled_methods);
                         let id = request(&f, kind).await;
                         let rec = f.env.broker.get(&id).await.unwrap().unwrap();
                         let before = effect(&f, &id, kind).await;
@@ -266,7 +328,7 @@ async fn t3_kinds_refused_in_chat() {
 }
 
 async fn link_call(handler: &MethodHandler, ctx: &UserContext, method: &str, params: Value) -> WsFrame {
-    crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), "p22-dashboard-session".into())),
+    crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), DASHBOARD_SESSION_ID.into())),
         handler.handle_chat_link_rpc(method, params, ctx)).await
 }
 
@@ -274,10 +336,10 @@ async fn settings(f: &Fixture, enabled: bool, exempt: &[&str], acknowledge: bool
     let h = handler(&f.env).await;
     let ctx = f.db().live_user_context(&f.user).unwrap().unwrap();
     let view = crate::google_personal::DASHBOARD_SESSION.scope(
-        Some((f.user.clone(), "p22-dashboard-session".into())),
+        Some((f.user.clone(), DASHBOARD_SESSION_ID.into())),
         h.handle_chat_admin_settings_rpc("approvals.chat_admin.get", json!({}), &ctx)).await;
     let view = payload(view);
-    crate::google_personal::DASHBOARD_SESSION.scope(Some((f.user.clone(), "p22-dashboard-session".into())),
+    crate::google_personal::DASHBOARD_SESSION.scope(Some((f.user.clone(), DASHBOARD_SESSION_ID.into())),
         h.handle_chat_admin_settings_rpc("approvals.chat_admin.set", json!({
             "expected_hash":view["hash"], "enabled":enabled, "channels":["telegram"],
             "step_up_methods":["web","dm_totp"], "card_valid_hours":168,
@@ -317,7 +379,9 @@ async fn linked_card(kind: &str, exempt: bool) -> PressFixture {
     let f = Fixture::files_org().await;
     f.config(false, "telegram", &[]);
     handshake(&f, true).await;
-    payload(settings(&f, true, if exempt { &[kind] } else { &[] }, true).await);
+    let kinds = [kind];
+    let selected: &[&str] = if exempt { &kinds } else { &[] };
+    payload(settings(&f, true, selected, true).await);
     let id = request(&f, kind).await;
     let rec = f.env.broker.get(&id).await.unwrap().unwrap();
     let receipt = {
@@ -384,7 +448,7 @@ async fn handshake_settings_delivery_press_rewrite_dashboard_sync() {
     let before_raw_edit = std::fs::read_to_string(f.env.home.join("config.toml")).unwrap();
     let ctx = f.db().live_user_context(&f.user).unwrap().unwrap();
     assert!(matches!(handler(&f.env).await.handle_system_update_config(
-        json!({"approval":{"chat_admin":{"enabled":true}}}), &ctx).await, WsFrame::Response { ok:false, .. }));
+        json!({"approval":{"chat_admin":{"enabled":false}}}), &ctx).await, WsFrame::Response { ok:false, .. }));
     assert_eq!(std::fs::read_to_string(f.env.home.join("config.toml")).unwrap(), before_raw_edit);
     let cfg = load(&f.env.home);
     assert_eq!(cfg.enabled_ack.unwrap().by.to_string(), f.user);
@@ -527,7 +591,7 @@ async fn workflow_web_password_totp_flow_grants_revision() {
     f.config(false, "telegram", &[]);
     handshake(&f, true).await;
     payload(settings(&f, true, &[], true).await);
-    let (_, _workflow, accepted, _) = approval::workflow_grants::tests::fixture_at(&f.env.home, false).await;
+    let accepted = workflow_card(&f).await;
     let id = ApprovalId::from(accepted.acceptance_id.clone());
     let rec = f.env.broker.get(&id).await.unwrap().unwrap();
     let receipt = {

@@ -199,6 +199,7 @@ fn frozen_table_order_and_coverage_per_file_kind() {
         "org fields must be reported ahead of [capabilities]"
     );
 
+    // [delegation], [acp], and [admin_ai] are protected sections.
     let config: Vec<FrozenVerdict> = frozen_for(ProtectedTomlKind::HomeConfigToml)
         .map(|f| f.verdict)
         .collect();
@@ -206,8 +207,9 @@ fn frozen_table_order_and_coverage_per_file_kind() {
         config,
         vec![
             FrozenVerdict::ProtectedSection,
+            FrozenVerdict::ProtectedSection,
             FrozenVerdict::ProtectedSection
         ],
-        "both config.toml sections share one verdict so they report together"
+        "all three config.toml sections, including [admin_ai], share one verdict so they report together"
     );
 }

@@ -62,9 +62,17 @@ pub(crate) async fn check_human_principal(
     if matches!(path_kind, "send_to_agent" | "spawn_agent" | "tasks_create" | "tasks_update"
         | "tasks_create_schedule" | "create_task" | "run_cron_task" | "update_cron_task") {
         let wire = principal_wire(principal.clone());
-        duduclaw_gateway::on_behalf_of::access::check_main_target(
-            home_dir, wire.as_deref(), target,
-        ).await?;
+        if matches!(path_kind, "tasks_create" | "tasks_update" | "create_task") {
+            Box::pin(duduclaw_gateway::on_behalf_of::access::check_main_target_for(
+                home_dir, wire.as_deref(), target,
+                duduclaw_gateway::on_behalf_of::access::MainUse::Assign,
+            )).await?;
+        } else {
+            // Employee-to-employee messaging and scheduling retain the Admin-only boundary.
+            duduclaw_gateway::on_behalf_of::access::check_main_target(
+                home_dir, wire.as_deref(), target,
+            ).await?;
+        }
     }
     if mode == duduclaw_core::HumanPrincipalMode::Record {
         return Ok(());

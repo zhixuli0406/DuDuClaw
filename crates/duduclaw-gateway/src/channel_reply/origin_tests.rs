@@ -322,6 +322,8 @@ async fn broken_employee_can_stop_resume_and_query_failsafe_before_config_gate()
     use duduclaw_security::failsafe::FailsafeLevel;
     let model_calls_before = crate::model_call_probe::calls();
     let (home, ctx, _registry, calls) = misaligned_worker("").await;
+    ctx.channel_settings.set("discord", "global", crate::channel_settings::keys::ADMIN_USERS,
+        r#"["owned-user"]"#).await.unwrap();
     let path = home.path().join("agents/worker/agent.toml");
     // Cover both a readable mismatch and a file that cannot be parsed.
     for broken in [false, true] {
@@ -340,6 +342,11 @@ async fn broken_employee_can_stop_resume_and_query_failsafe_before_config_gate()
             assert!(!reply.contains("model_provider_mismatch"), "{reply}");
             assert!(!reply.contains("agent_config_unreadable"), "{reply}");
             assert_eq!(failsafe.get_level(sid).await, expected, "{text}");
+            for denied in ["!STOP", "!STOP ALL", "!RESUME"] {
+                let reply = build_reply_for_agent(denied, &ctx, "worker", sid, "non-admin", None).await;
+                assert!(reply.contains("只有管理員"), "{denied}: {reply}");
+                assert_eq!(failsafe.get_level(sid).await, expected, "{denied}: no state change");
+            }
             // Inline STOP ALL must retain the old scope-only restriction.
             assert_eq!(failsafe.get_level("__global__").await, FailsafeLevel::L0Normal);
             assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -417,32 +424,47 @@ async fn missing_openai_compat_model_is_refused_with_a_specific_code_and_no_mode
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn system_prompt_read_failure_uses_entry_refusal_for_public_and_operator_audiences() {
-    let model_calls_before = crate::model_call_probe::calls();
+async fn turn_snapshot_survives_broken_source_for_public_and_operator_audiences() {
     let (home, ctx, _registry, calls) = owned_channel(RuntimeType::Codex).await;
     let raw = home.path().join("agents/worker/agent.toml");
     let resolved = duduclaw_core::preset::agent_resolved_path(home.path(), "worker");
     std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
     std::fs::copy(&raw, &resolved).unwrap();
-    // Entry preflight reads the valid effective artifact. ProfileSections
-    // still reads the source in W1, so this fails at system-prompt assembly.
+    // Entry preflight reads the valid effective artifact. Prompt assembly must
+    // reuse that turn snapshot instead of reopening the broken raw source.
     std::fs::write(&raw, "[broken-source").unwrap();
-    for sid in ["odoolivechat:owned:44", "widget-visitor:profile", "webchat:operator-profile"] {
-        let reply = build_reply_for_agent("hello", &ctx, "worker", sid, "owned-user", None).await;
-        if super::assembly::public_session(sid) {
-            assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+    let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
+    for (index, (sid, principal, public)) in [
+        ("odoolivechat:owned:44", None, true),
+        ("widget-visitor:profile", None, true),
+        ("webchat:operator-profile", None, false),
+        ("webchat:widget-profile", Some("widget-visitor:profile-account"), true),
+    ].into_iter().enumerate() {
+        let calls_before = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let turn = build_reply_for_agent("hello", &ctx, "worker", sid, "owned-user", None);
+        let reply = match principal {
+            Some(principal) => crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL
+                .scope(principal.into(), turn).await,
+            None => turn.await,
+        };
+        // The fixture registers only the gated Codex runtime, which counts its
+        // call before returning an auth error (not a successful model reply).
+        assert_eq!(calls_before, index);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), calls_before + 1, "{sid}: {reply}");
+        assert!(!reply.contains("agent_config_unreadable"), "{sid}: {reply}");
+        assert!(!reply.contains("無法讀取這位員工的設定"), "{sid}: {reply}");
+        if public {
+            assert!(reply.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{sid}: {reply}");
+            for operator_text in ["Actual Worker", "Codex", "401", "invalid bearer token", "/login", "Claude"] {
+                assert!(!reply.contains(operator_text), "{sid}: {reply}");
+            }
         } else {
-            assert!(reply.contains("agent_config_unreadable"), "{reply}");
-            assert!(reply.contains("無法讀取這位員工的設定"), "{reply}");
+            assert!(reply.contains("Actual Worker"), "{reply}");
+            assert!(reply.contains("Codex"), "{reply}");
         }
     }
-    let reply = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(
-        "widget-visitor:profile-account".into(),
-        build_reply_for_agent("hello", &ctx, "worker", "webchat:widget-profile", "owned-user", None),
-    ).await;
-    assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert_eq!(crate::model_call_probe::calls(), model_calls_before);
+    assert_eq!(spy.counts(), [0, 0]);
+    assert_eq!(std::fs::read_to_string(&raw).unwrap(), "[broken-source");
 }
 
 /// Shared owned-home fixture for the chat and dispatch entry-point regressions.
@@ -458,7 +480,9 @@ pub(crate) async fn owned_claude_fallback(fallback: &str) -> (
     let path = home.path().join("agents/worker/agent.toml");
     let text = std::fs::read_to_string(&path).unwrap()
         .replace("preferred='gpt-5.4'", "preferred='claude-does-not-exist'")
-        .replace("provider='claude'", &format!("provider='claude'\nfallback='{fallback}'"));
+        .replace("provider='claude'", &if fallback.is_empty() {
+            "provider='claude'".to_string()
+        } else { format!("provider='claude'\nfallback='{fallback}'") });
     std::fs::write(&path, format!("{text}\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n")).unwrap();
     ctx.registry.write().await.scan().await.unwrap();
     let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
