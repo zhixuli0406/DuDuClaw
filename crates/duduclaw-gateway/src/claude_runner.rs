@@ -6734,3 +6734,36 @@ mod turn_budget_tests {
         }
     }
 }
+
+#[cfg(all(test, unix))]
+mod runtime_fallback_tests {
+    use super::*;
+    use duduclaw_core::types::RuntimeType;
+    #[test]
+    fn claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes() {
+        crate::runtime_dispatch::testing::isolated_claude_test(
+            concat!(module_path!(), "::claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes"), |cli_home| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                std::fs::write(cli_home.join("stream.jsonl"),
+                    "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"404 model not found\"}\n").unwrap();
+                for mode in ["claude", "hybrid"] {
+                    for fallback in ["codex", ""] {
+                        let (home, ctx, _registry, calls) = crate::channel_reply::origin_tests::owned_claude_fallback(fallback).await;
+                        std::fs::write(home.path().join("config.toml"), format!("[general]\ninference_mode='{mode}'\n")).unwrap(); *INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None)).write().await = None;
+                        let result = call_claude_for_agent_impl(home.path(), &ctx.registry, "worker", "dispatch task",
+                            crate::cost_telemetry::RequestType::Dispatch, None, DispatchOverrides::default()).await;
+                        let calls = calls.lock().unwrap();
+                        assert_eq!(calls.len(), usize::from(!fallback.is_empty()), "{result:?}");
+                        if !fallback.is_empty() {
+                            assert_eq!(result.unwrap(), "CODEX_FALLBACK_OK");
+                            assert_eq!(calls[0].model, RuntimeType::Codex.spec().fallback_models[0].0);
+                            assert!(calls[0].conversation_history.is_empty());
+                        } else {
+                            assert!(result.is_err());
+                        }
+                    }
+                }
+            });
+        });
+    }
+}

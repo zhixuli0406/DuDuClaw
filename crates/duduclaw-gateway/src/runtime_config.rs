@@ -1978,6 +1978,17 @@ mod tests {
     // ── W3/G1: [model] fallbacks chain ──────────────────────────────────
 
     #[test]
+    fn runtime_fallback_models_prepend_singular_model() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[model]\nfallback=' grok-4 '\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4"]);
+        write_agent_toml(dir.path(), "[model]\nfallback='grok-4'\nfallbacks=['grok-4.7', 'claude-haiku-4-5']\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4", "grok-4.7", "claude-haiku-4-5"]);
+        write_agent_toml(dir.path(), "[model]\nfallback='  '\nfallbacks=['grok-4.7']\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4.7"]);
+    }
+
+    #[test]
     fn model_fallbacks_empty_when_absent() {
         let dir = TempDir::new().unwrap();
         assert!(agent_model_fallbacks(dir.path()).is_empty());

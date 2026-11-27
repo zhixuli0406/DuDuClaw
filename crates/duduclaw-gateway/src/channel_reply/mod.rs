@@ -320,6 +320,6 @@ mod reply_origin;
 pub(crate) use reply_origin::testing::NoImplicitCloud;
 use reply_origin::{ReplyAttempt,ReplyFailure,ReplyOrigin,direct_api_allowed};
 #[cfg(test)]
-mod origin_tests;
+pub(crate) mod origin_tests;
 
 pub(crate) mod group_buffer;

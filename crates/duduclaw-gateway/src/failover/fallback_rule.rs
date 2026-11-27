@@ -418,6 +418,15 @@ mod tests {
             ("API error (404 Not Found): The model `opus` does not exist", Refused(FallbackRefusal::RequestRejected)),
             ("API error (400 Bad Request): invalid model 'opus'", Refused(FallbackRefusal::RequestRejected)),
             ("API error (422 Unprocessable Entity): unknown model grok-x", Refused(FallbackRefusal::RequestRejected)),
+            // Claude wrapper/prefix classification must ignore provider-written bodies.
+            ("claude CLI stream error [error]: 404 model not found", Eligible(FallbackTrigger::ProcessError)),
+            ("claude CLI exit 1: invalid_api_key", Eligible(FallbackTrigger::ProcessError)),
+            ("claude CLI assistant error: content policy violation", Eligible(FallbackTrigger::ProcessError)),
+            ("Empty response from claude CLI", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: claude CLI stream error [error]: 404 not found", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: claude CLI exit 1", Eligible(FallbackTrigger::ProcessError)),
+            ("no accounts available: claude CLI assistant error: 400 bad request", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: Empty response from claude CLI", Eligible(FallbackTrigger::ProcessError)),
             // ── Eligible ──
             (engine_local.as_str(), Eligible(FallbackTrigger::EngineLocalConfig)),
             ("Empty response from Codex CLI (exit 0); stderr tail: ", Eligible(FallbackTrigger::ProcessError)),

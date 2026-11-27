@@ -1686,6 +1686,58 @@ pub(crate) mod testing {
         }
     }
 
+    pub(crate) type RecordedFallback = Arc<std::sync::Mutex<Vec<RuntimeContext>>>;
+
+    pub(crate) struct RecordingCodex(pub RecordedFallback);
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for RecordingCodex {
+        fn name(&self) -> &str { "codex" }
+        async fn is_available(&self) -> bool { true }
+        async fn execute(&self, _: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            self.0.lock().unwrap().push(context.clone());
+            Ok(RuntimeResponse { content: "CODEX_FALLBACK_OK".into(), runtime_name: "codex".into(),
+                model_used: context.model.clone(), ..Default::default() })
+        }
+    }
+
+    /// Run exactly one test in an isolated process; never discover a host CLI.
+    #[cfg(unix)]
+    pub(crate) fn isolated_claude_test(full_name: &str, child_test: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "DUDU_TEST_RUNTIME_FALLBACK_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = Path::new(&home); assert_eq!(duduclaw_core::which_claude().as_deref(), home.join("bin/claude").to_str()); child_test(home);
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::test_exec::write_executable(&bin.join("claude"),
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+             printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
+             /bin/cat \"$HOME/stream.jsonl\"\nexit 1\n", 0o755);
+        let name = full_name.split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", home.path()).env("DUDUCLAW_HOME", home.path()).env(CHILD_HOME, home.path())
+            .args(["--exact", name, "--nocapture"])
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(45) {
+                let _ = duduclaw_core::platform::kill_process_group(child.id());
+                let _ = child.wait();
+                panic!("isolated runtime fallback test exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+
     // ── RM-181: a test-owned builder for the PRODUCTION cache ──────────
     //
     // Unlike `RegistryGuard` (which bypasses the cache), this replaces only

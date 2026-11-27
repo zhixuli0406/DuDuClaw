@@ -936,6 +936,53 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_dispatch_honours_singular_fallback_model_and_source() {
+        use crate::runtime_dispatch::{AgentPrompt, SpawnPurpose, run_agent_prompt_detailed};
+        #[derive(Clone)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let log = Log(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        for (single, chain, expected, source) in [
+            ("grok-4", "", "grok-4", "agent_fallback_model"),
+            ("grok-4", "'grok-4.7'", "grok-4", "agent_fallback_model"),
+            ("claude-haiku-4-5", "'grok-4.7'", "grok-4.7", "agent_fallbacks"),
+            ("unknown-house-model", "", RuntimeType::Grok.spec().fallback_models[0].0, "catalog_default"),
+        ] {
+            log.0.lock().unwrap().clear();
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("agents/worker");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!(
+                "[runtime]\nprovider='codex'\nfallback='grok'\n[model]\npreferred='gpt-5.4'\nfallback='{single}'\nfallbacks=[{chain}]\n")).unwrap();
+            let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+            map.insert(RuntimeType::Codex, Box::new(StubRuntime { content: "" }));
+            map.insert(RuntimeType::Grok, Box::new(EchoModelRuntime));
+            let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+                home.path(), RuntimeRegistry::with_runtimes(map)).await;
+            let result = run_agent_prompt_detailed(AgentPrompt {
+                agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+                system_prompt: "system", model: "gpt-5.4", max_tokens: 128, provider_override: None,
+                conversation_history: &[], request_type: crate::cost_telemetry::RequestType::Chat,
+                runtime_settings: None, effort: None, allow_cross_family_failover: true,
+                purpose: SpawnPurpose::EmployeeTurn,
+            }).await.unwrap();
+            assert_eq!(result.model_used, expected);
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(&format!("model_source=\"{source}\"")), "{logs}");
+        }
+    }
+
     fn codex_context() -> RuntimeContext {
         RuntimeContext {
             model: "gpt-5.4".to_string(),
