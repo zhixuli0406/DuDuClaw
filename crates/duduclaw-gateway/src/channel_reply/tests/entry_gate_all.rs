@@ -259,7 +259,11 @@ async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
             assert_eq!(spy.counts(), [0, 0]);
             if case.healthy() {
                 assert_eq!(f.calls.load(Ordering::SeqCst), 1);
-                assert!(text.contains("Actual Worker"), "{text}");
+                if case.public() {
+                    assert_eq!(text, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+                } else {
+                    assert!(text.contains("Actual Worker"), "{text}");
+                }
                 EntryResult::result(Ok(()))
             } else { EntryResult::result(Err(text)) }
         }
@@ -568,6 +572,15 @@ async fn broken_employees_keep_exempt_commands_available() {
     for &config in CONFIGS.iter().filter(|&&c| c != Config::Healthy) {
         for &text in EXEMPT {
             for webchat in [false, true] {
+                // /takeover is not a ChatCommand. Like v1.85, run falls
+                // through to terminal delivery via subscriptions, which this
+                // direct-run helper does not install (even when healthy).
+                // Keep its real channel handler covered below; this WebChat
+                // matrix covers commands that answer directly on the sink.
+                if webchat && text == "/takeover" {
+                    assert!(crate::chat_commands::parse_command(text, None).is_none());
+                    continue;
+                }
                 let f = Fixture::new(config).await;
                 let case = Case { config, session: "telegram:42" };
                 let before = crate::model_call_probe::calls();
