@@ -144,7 +144,7 @@ async fn owner_browser_history_list_restore_keep_full_access() {
 #[tokio::test]
 async fn member_key_cannot_use_adjacent_full_conversation_routes() {
     let f = fixture(AccessLevel::Owner, true).await;
-    for method in ["runs.list", "runs.get", "runs.steps", "search.query", "data_exports.create", "users.team_history.get", "users.team_history.restore"] {
+    for method in ["runs.list", "runs.get", "runs.steps", "tasks.artifacts", "files.list", "files.download", "search.query", "data_exports.create", "users.team_history.get", "users.team_history.restore"] {
         assert!(super::super::member_contract::member_key_method(method).is_none(), "{method}");
         denied(f.handler.handle(method, json!({"agent_id":"sales", "session_id":EXTERNAL}), &f.key).await);
     }

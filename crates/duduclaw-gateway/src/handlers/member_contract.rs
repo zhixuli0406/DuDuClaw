@@ -432,6 +432,12 @@ pub(crate) const MEMBER_KEY_CONVERSATION_METHODS: &[&str] = &[
     "memory.key_facts", "memory.history", "me.memory.list",
 ];
 
+/// HTTP reads of conversation content. Knowledge originals are collection documents;
+/// uploads, voice transforms, users.me and task creation do not read stored conversations.
+pub(crate) const MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS: &[&str] = &[
+    "http.chat.attachment",
+];
+
 /// Contract membership is necessary, never sufficient: existing ACL and
 /// private-data gates still apply. Credential/step-up namespaces stay closed.
 pub(crate) fn member_key_method(method: &str) -> Option<MemberContractKind> {

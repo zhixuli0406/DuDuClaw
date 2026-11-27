@@ -67,12 +67,6 @@ impl MethodHandler {
                     let (include, scopes) = scope_params(&params)?;
                     let include = include.unwrap_or(false);
                     let scopes = scopes.unwrap_or_default();
-                    if include && !config.allow_conversation_content {
-                        return Err(coded("member_key_conversation_not_allowed", "管理員尚未開放包含我的對話內容。"));
-                    }
-                    if scopes.iter().any(|scope| !config.allow_mcp_scopes.contains(scope)) {
-                        return Err(coded("member_key_scope_not_allowed", "管理員尚未開放選取的外部 AI 工具使用範圍。"));
-                    }
                     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                     let days = params.get("expires_in_days").and_then(Value::as_u64)
                         .filter(|days| (1..=365).contains(days)).ok_or_else(|| error(MemberKeyError::InvalidExpiry))?;
@@ -85,6 +79,16 @@ impl MethodHandler {
                     let code = params.get("code").and_then(Value::as_str).unwrap_or("");
                     let proof = db.member_key_reauthenticate(&user, &session, epoch, password, code,
                         &crate::mfa::Cipher(&home), Utc::now().timestamp()).map_err(error)?;
+                    // Reauthentication can be slow. Validate the creation policy after it,
+                    // immediately before the authenticated insert; parse/read errors disable it.
+                    let config = crate::member_keys::config(&home);
+                    if !config.enabled { return Err(coded("member_keys_disabled", "本人金鑰已關閉。")); }
+                    if include && !config.allow_conversation_content {
+                        return Err(coded("member_key_conversation_not_allowed", "管理員尚未開放包含我的對話內容。"));
+                    }
+                    if scopes.iter().any(|scope| !config.allow_mcp_scopes.contains(scope)) {
+                        return Err(coded("member_key_scope_not_allowed", "管理員尚未開放選取的外部 AI 工具使用範圍。"));
+                    }
                     let created = db.member_key_create_authenticated(&user, name, days, epoch, &session, &proof, include, &scopes).map_err(error)?;
                     Ok(json!({"key": created.info, "secret": created.secret}))
                 }

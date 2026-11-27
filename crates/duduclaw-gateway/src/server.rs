@@ -4708,7 +4708,7 @@ async fn handle_me(
     };
 
     if duduclaw_auth::member_keys::is_member_key(token) {
-        let ctx = match member_http_caller(&state, &headers, None) { Ok(ctx) => ctx, Err(response) => return response };
+        let ctx = match member_http_caller(&state, &headers, None).await { Ok(ctx) => ctx, Err(response) => return response };
         return match state.handler.handle("users.me", serde_json::json!({}), &ctx).await {
             WsFrame::Response { ok: true, payload: Some(payload), .. } => Json(payload).into_response(),
             WsFrame::Response { error: Some(error), .. } if error.get("code").and_then(serde_json::Value::as_str) == Some("member_key_rate_limited") =>
@@ -15494,7 +15494,7 @@ async fn handle_chat_attachment(
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ChatAttachmentQuery>,
 ) -> axum::response::Response {
-    let ctx = match member_http_caller(&state, &headers, Some(("http.chat.attachment", false))) { Ok(c) => c, Err(r) => return r };
+    let ctx = match member_http_caller(&state, &headers, Some(("http.chat.attachment", false))).await { Ok(c) => c, Err(r) => return r };
     let max = if q.preview { crate::chat_attachments::limits::MAX_PREVIEW } else { crate::chat_attachments::limits::MAX_DOWNLOAD };
     let (bytes, name, admission) = match state.handler.history_attachment_bytes(&ctx, &q.id, max).await {
         Ok(f) => f,
@@ -15519,6 +15519,9 @@ async fn handle_chat_attachment(
 
 #[cfg(test)]
 mod chat_attachments_http_tests;
+
+#[cfg(test)]
+mod member_key_content_http_tests;
 
 mod files_snapshot;
 
@@ -15615,15 +15618,30 @@ fn member_http_error(error: String) -> axum::response::Response {
 }
 
 /// Explicit member HTTP surfaces only; task RPC is charged by dispatch.
-fn member_http_caller(state: &AppState, headers: &axum::http::HeaderMap,
+async fn member_http_caller(state: &AppState, headers: &axum::http::HeaderMap,
     operation: Option<(&str, bool)>) -> Result<UserContext, axum::response::Response> {
     if let Some(raw) = extract_bearer_token(headers)
         && duduclaw_auth::member_keys::is_member_key(raw) {
-        let ctx = crate::member_keys::authenticate(&state.home_dir, &state.user_db, raw).map_err(member_http_error)?;
-        if let Some((method, write)) = operation {
-            crate::member_keys::record_call(&state.home_dir, &state.user_db, &ctx, method, write).map_err(member_http_error)?;
-        }
-        return Ok(ctx);
+        let home = state.home_dir.clone();
+        let db = state.user_db.clone();
+        let raw = raw.to_owned();
+        let operation = operation.map(|(method, write)| (method.to_owned(), write));
+        return tokio::task::spawn_blocking(move || {
+            let ctx = crate::member_keys::authenticate(&home, &db, &raw).map_err(member_http_error)?;
+            if let Some((method, write)) = operation {
+                crate::member_keys::record_call(&home, &db, &ctx, &method, write).map_err(member_http_error)?;
+                if crate::handlers::member_contract::MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS.contains(&method.as_str()) {
+                    let live = crate::member_keys::refresh_authority(&home, &db, &ctx).map_err(member_http_error)?;
+                    if !live.include_conversations {
+                        return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({
+                            "error": "member key conversation scope required", "code": "member_key_conversation_scope"
+                        }))).into_response());
+                    }
+                    return Ok(live.context);
+                }
+            }
+            Ok(ctx)
+        }).await.map_err(|_| member_http_error("member key authority unavailable".into()))?;
     }
     knowledge_caller(state, headers)
 }
@@ -15673,7 +15691,7 @@ async fn handle_knowledge_upload(
     headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> axum::response::Response {
-    match member_http_caller(&state, &headers, Some(("http.knowledge.upload", true))) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.upload", true))).await {
         Ok(ctx) => {
             crate::knowledge::upload::handle_upload(
                 &state.home_dir,
@@ -15711,7 +15729,7 @@ async fn handle_task_rpc_with_files(
     // Authenticate and take a slot from the headers alone, before a byte of
     // the (up to ~67 MB) body is read: an unauthenticated or surplus request
     // is refused without the gateway buffering its upload.
-    let ctx = match member_http_caller(&state, &headers, None) {
+    let ctx = match member_http_caller(&state, &headers, None).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -15782,7 +15800,7 @@ async fn handle_knowledge_original(
     headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    match member_http_caller(&state, &headers, Some(("http.knowledge.original", false))) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.original", false))).await {
         Ok(ctx) => {
             crate::knowledge::upload::handle_original(
                 &state.home_dir,
@@ -16171,7 +16189,7 @@ async fn handle_stt(
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
-    if let Err(resp) = member_http_caller(&state, &headers, Some(("http.voice.stt", true))) {
+    if let Err(resp) = member_http_caller(&state, &headers, Some(("http.voice.stt", true))).await {
         return resp;
     }
 
@@ -16332,7 +16350,7 @@ async fn handle_tts(
 ) -> axum::response::Response {
     use crate::tts::{TtsProvider, TtsRouter};
 
-    let caller = match member_http_caller(&state, &headers, Some(("http.voice.tts", true))) {
+    let caller = match member_http_caller(&state, &headers, Some(("http.voice.tts", true))).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
