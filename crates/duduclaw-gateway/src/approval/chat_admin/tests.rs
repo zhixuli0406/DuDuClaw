@@ -141,7 +141,9 @@ async fn t1_t2_decision_entry_point_matrix() {
                     for entry in ["dashboard", "tap", "web", "totp"] {
                         let f = Fixture::files_org().await;
                         let key = if *kind == "other_outgoing" { "egress_guard" } else { kind };
-                        methods(&f, channel, if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &[key] } else { &[] }, enabled_methods);
+                        let keys = [key];
+                        let selected: &[&str] = if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &keys } else { &[] };
+                        methods(&f, channel, selected, enabled_methods);
                         let id = request(&f, kind).await;
                         let rec = f.env.broker.get(&id).await.unwrap().unwrap();
                         let before = effect(&f, &id, kind).await;
@@ -317,7 +319,9 @@ async fn linked_card(kind: &str, exempt: bool) -> PressFixture {
     let f = Fixture::files_org().await;
     f.config(false, "telegram", &[]);
     handshake(&f, true).await;
-    payload(settings(&f, true, if exempt { &[kind] } else { &[] }, true).await);
+    let kinds = [kind];
+    let selected: &[&str] = if exempt { &kinds } else { &[] };
+    payload(settings(&f, true, selected, true).await);
     let id = request(&f, kind).await;
     let rec = f.env.broker.get(&id).await.unwrap().unwrap();
     let receipt = {

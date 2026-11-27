@@ -122,7 +122,12 @@ async fn set_and_attest_require_fresh_session_bound_step_up() {
         payload(f.admin(method, input.clone()).await);
         let mut stale = f.admin.clone();
         stale.credential_epoch += 1;
-        assert_eq!(code(f.call(&stale, method, input.clone()).await), "signin_admin_required");
+        match f.call(&stale, method, input.clone()).await {
+            WsFrame::Response { ok: false, error: Some(error), .. } => {
+                assert_eq!(error, json!("登入憑證已失效，請重新登入。"));
+            }
+            other => panic!("expected stale-epoch refusal: {other:?}"),
+        }
         let mut forged = f.employee.clone();
         forged.role = UserRole::Admin;
         assert_eq!(code(f.call(&forged, method, input).await), "signin_admin_required");

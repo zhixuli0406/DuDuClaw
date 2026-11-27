@@ -828,3 +828,55 @@ async fn background_memory_store_with_dispatch_provenance() {
         [id], |row| row.get(0)).unwrap();
     assert_eq!(dispatch_origin, 1, "background memory must retain its gateway-issued dispatch source");
 }
+
+#[tokio::test]
+async fn isolated_odoo_message_still_requires_single_use_approval() {
+    use duduclaw_gateway::approval::ApprovalBroker;
+    use crate::mcp::approval::{gate_tool_approval_dispatch, static_gate_flags};
+    for approved in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/main");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[capabilities]\naction_rules=[{tool='odoo_message_send',verdict='allow'}]\n").unwrap();
+        let payload = json!({"name":"odoo_message_send",
+            "arguments":{"model":"crm.lead","res_id":9,"body":"approved content"}});
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let observer = broker.clone();
+        let answer = tokio::spawn(async move {
+            for _ in 0..200 {
+                let pending = observer.list_pending(Some("main")).await.unwrap();
+                if let Some(card) = pending.first() {
+                    assert_eq!(card.payload["action_grant"]["single_use"], true);
+                    assert_eq!(card.payload["arguments"]["body"], "approved content");
+                    observer.decide(&card.id, approved, "dashboard:admin").await.unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("protected message did not request approval");
+        });
+        let mut isolated = call();
+        Arc::get_mut(&mut isolated).unwrap().home = home.path().to_path_buf();
+        Arc::get_mut(&mut isolated).unwrap().context = live_context(context().record().clone());
+        ISOLATED_CALL.scope(isolated, async {
+            assert!(crate::mcp_isolation_disposition::intentional_refusal("odoo_message_send").is_none());
+            assert!(static_gate_flags(&agent_dir, "odoo_message_send", &payload).0);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+                gate_tool_approval_dispatch(home.path(), "main", "odoo_message_send", payload)).await.unwrap();
+            assert_eq!(result.is_ok(), approved);
+        }).await;
+        answer.await.unwrap();
+    }
+}
+
+#[test]
+fn protected_person_only_refusal_does_not_hide_employee_odoo_tools() {
+    use crate::mcp_isolation_disposition::{intentional_refusal, Refusal};
+    for tool in ["my_agents_status", "my_tasks_list"] {
+        assert_eq!(intentional_refusal(tool), Some(Refusal::PersonalKeyRequired));
+    }
+    for tool in crate::mcp_isolation_connector_odoo::ODOO_EXECUTOR_TOOLS {
+        assert_eq!(intentional_refusal(tool), None, "{tool}");
+    }
+}

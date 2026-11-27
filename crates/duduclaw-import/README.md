@@ -105,7 +105,9 @@ marker table is never authorized for reading. `scripts/capture_tasks_schema.py`
 regenerates both files. A fourth catalog, v1.82, is `tasks-v181.sql` plus the additive
 `tasks.source_origin_proof` column (`TASKS_V182` in `catalog.rs`; no separate file): the
 opaque id of the gateway-held proof of an AI-created goal's source conversation, mapped as
-v1.80; the reader never selects it. The gateway test compares that v1.82 catalog with a fresh `TaskStore`.
+v1.80; the reader never selects it. The v1.86 catalog adds `idx_tasks_employee_created` (`tasks-employee-created-v186.sql`)
+without changing the v1.80 reader or older catalogs. The gateway test compares this newest
+catalog with a fresh `TaskStore`.
 `sessions.db` v1.82 is either pinned v1.81 shape (fresh / upgraded) plus the gateway-owned
 `schedule_origin_proofs` table (`session-origin-proofs-v182.sql`, the same text as
 `recipient_guard::origin::SCHEMA`; `SESSION_V182` / `SESSION_V182_UPGRADED` in `catalog.rs`).
