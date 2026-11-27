@@ -210,7 +210,7 @@ async fn reproduced_scenario_waits_for_approval_then_dispatches_the_frozen_promp
     assert!(frozen["event_ref"].as_str().unwrap().starts_with("task_created:task=task-季報:"));
     assert_eq!(frozen["action"]["type"], "delegate");
     assert_eq!(frozen["action"]["target_agent"], "plain");
-    assert_eq!(frozen["action"]["prompt"], "請處理新任務：季報（）");
+    assert_eq!(frozen["action"]["prompt"], format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
     // H1: the summary names the action but carries no content excerpt (the
     // dashboard view renders the complete frozen action from the payload),
     // and states the latest execution time.
@@ -230,7 +230,7 @@ async fn reproduced_scenario_waits_for_approval_then_dispatches_the_frozen_promp
     let queued = h.queued().await;
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].target, "plain");
-    assert_eq!(queued[0].payload, "請處理新任務：季報（）");
+    assert_eq!(queued[0].payload, format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
     assert_eq!(queued[0].sender, "autopilot");
 
     // Single use: the card is consumed and the ledger settled.
@@ -460,7 +460,7 @@ async fn an_approval_granted_while_the_gateway_was_down_runs_after_restart() {
     assert_eq!(second.resume_approvals_once().await, 1);
     let queued = h.queued().await;
     assert_eq!(queued.len(), 1);
-    assert_eq!(queued[0].payload, "請處理新任務：季報（）");
+    assert_eq!(queued[0].payload, format!("{EVENT_DATA_BANNER}\n\n請處理新任務：季報（）"));
 }
 
 /// Move a decided card's `decided_at` by `offset` from now.
@@ -532,7 +532,9 @@ async fn the_card_carries_the_complete_prompt_with_its_long_suffix() {
     let card = h.broker().get(&id).await.unwrap().unwrap();
     let prompt = card.payload[gate::PAYLOAD_KEY]["action"]["prompt"].as_str().unwrap();
     assert!(prompt.chars().count() > 3000);
-    assert!(prompt.starts_with(&prefix) && prompt.ends_with(suffix), "the whole prompt is frozen");
+    let original = format!("{prefix}季報{suffix}");
+    assert_eq!(prompt, format!("{EVENT_DATA_BANNER}\n\n{original}"), "the whole prompt is frozen");
+    assert!(serde_json::to_vec(&card.payload).unwrap().len() <= gate::MAX_FROZEN_PAYLOAD_BYTES);
     assert!(!card.summary.contains(suffix), "no excerpt in the summary");
     // The view renders exactly this payload; its digest is what an approval must name.
     assert_eq!(card.payload[gate::DIGEST_KEY], json!(h.only_dispatch().await.frozen_digest));
