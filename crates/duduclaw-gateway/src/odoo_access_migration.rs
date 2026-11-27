@@ -1,7 +1,7 @@
 //! One-time company-account backfill. Config, marker and notice publish together.
 use std::path::Path;
 
-use duduclaw_odoo::{AgentOdooConfig, access_policy::OdooAccessConfig};
+use duduclaw_odoo::{AgentOdooConfig, OdooConfig, access_policy::OdooAccessConfig};
 use duduclaw_security::audit::{AuditEvent, Severity, try_append_audit_event};
 use serde::Serialize;
 use serde_json::json;
@@ -10,11 +10,33 @@ use crate::handlers::config_commit;
 
 const MARKER: &str = "1.86.0";
 
+#[derive(Debug, PartialEq, Eq)]
+enum OwnAccount {
+    Absent,
+    Complete,
+    Partial,
+}
+
+fn classify_account(odoo: Option<&AgentOdooConfig>) -> OwnAccount {
+    let Some(odoo) = odoo else { return OwnAccount::Absent; };
+    let populated = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.trim().is_empty());
+    if populated(&odoo.username) && (populated(&odoo.api_key_enc) || populated(&odoo.password_enc)) {
+        OwnAccount::Complete
+    } else if [&odoo.username, &odoo.api_key_enc, &odoo.password_enc, &odoo.url, &odoo.db]
+        .iter().any(|value| value.is_some()) {
+        OwnAccount::Partial
+    } else {
+        OwnAccount::Absent
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub(crate) struct Employee {
     pub id: String,
     pub display_name: Option<String>,
     pub has_own_account: bool,
+    #[serde(skip)]
+    own_account: OwnAccount,
 }
 
 /// Only immediate regular employee directories, never the ephemeral namespace.
@@ -45,14 +67,12 @@ pub(crate) fn employees(home: &Path) -> Result<Vec<Employee>, String> {
         let raw = std::fs::read_to_string(path).map_err(|_| "無法讀取 AI 員工設定。")?;
         let table: toml::Table = raw.parse().map_err(|_| "AI 員工設定格式有誤。")?;
         let odoo = AgentOdooConfig::parse_agent_toml(&raw)?;
-        let populated = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.trim().is_empty());
-        let has_own_account = odoo.as_ref().is_some_and(|o| {
-            populated(&o.username) && (populated(&o.api_key_enc) || populated(&o.password_enc))
-        });
+        let own_account = classify_account(odoo.as_ref());
+        let has_own_account = own_account == OwnAccount::Complete;
         let agent = table.get("agent").and_then(toml::Value::as_table);
         let display_name = agent.and_then(|a| a.get("display_name").or_else(|| a.get("name")))
             .and_then(toml::Value::as_str).map(str::to_owned);
-        rows.push(Employee { id, display_name, has_own_account });
+        rows.push(Employee { id, display_name, has_own_account, own_account });
     }
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows.dedup_by(|a, b| a.id == b.id);
@@ -68,13 +88,39 @@ pub(crate) async fn run(home: &Path) -> Result<bool, String> {
         let mut table: toml::Table = raw.parse().map_err(|_| "config.toml is invalid")?;
         let access = OdooAccessConfig::from_table(&table)?;
         if !access.company_key_agents_migrated.is_empty() { return Ok(false); }
-        let configured = table.get("odoo").and_then(toml::Value::as_table)
-            .is_some_and(|o| ["url", "db"].iter().all(|key| {
-                o.get(*key).and_then(toml::Value::as_str).is_some_and(|s| !s.trim().is_empty())
-            }));
-        if !configured { return Ok(false); }
-        let ids: Vec<_> = employees(&home)?.into_iter().filter(|e| !e.has_own_account)
-            .map(|e| toml::Value::String(e.id)).collect();
+        let document = toml::Value::Table(table.clone());
+        match crate::odoo_identity::server::company_server_from_document(&document) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!("Skipping Odoo company-account backfill: company server is not configured");
+                return Ok(false);
+            }
+            Err(_) => {
+                tracing::warn!("Skipping Odoo company-account backfill: invalid company server configuration");
+                return Ok(false);
+            }
+        }
+        let typed: Result<OdooConfig, _> = document.get("odoo").expect("validated company section")
+            .clone().try_into();
+        if typed.is_err() {
+            tracing::warn!("Skipping Odoo company-account backfill: invalid typed Odoo configuration");
+            return Ok(false);
+        }
+        let mut ids = Vec::new();
+        let mut partial_agents = Vec::new();
+        for employee in employees(&home)? {
+            match employee.own_account {
+                OwnAccount::Absent => ids.push(toml::Value::String(employee.id)),
+                OwnAccount::Complete => {}
+                OwnAccount::Partial => partial_agents.push(employee.id),
+            }
+        }
+        // Aborting all backfill would disconnect every AI after upgrade. Excluding
+        // only ambiguous accounts is the narrow fail-closed choice; admins must
+        // explicitly assign these employees before they use the company account.
+        if !partial_agents.is_empty() {
+            tracing::warn!(?partial_agents, "Excluded incomplete own Odoo accounts from company-account backfill");
+        }
         let count = ids.len();
         let section = config_commit::table_at_mut(&mut table, &["odoo_access"])?;
         section.insert("company_key_agents".into(), toml::Value::Array(ids));
@@ -89,7 +135,7 @@ pub(crate) async fn run(home: &Path) -> Result<bool, String> {
             &path, config_commit::content_hash(&raw), &table, move || {
                 try_append_audit_event(&home, &AuditEvent::new(
                     "odoo_company_key_agents_backfilled", "", Severity::Info,
-                    json!({"count":count,"marker":MARKER,"phase":"before_commit"}),
+                    json!({"count":count,"marker":MARKER,"phase":"before_commit","partial_agents":partial_agents}),
                 )).map_err(|_| "Odoo migration audit failed".to_owned())
             },
         ))?;
@@ -140,6 +186,68 @@ mod tests {
         write(h, "config.toml", &toml::to_string(&table).unwrap());
         assert!(!run(h).await.unwrap());
         assert!(OdooAccessConfig::parse_config_toml(&read(h)).unwrap().company_key_agents.is_empty());
+    }
+
+    #[tokio::test]
+    async fn excludes_partial_accounts_and_audits_their_ids() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        write(h, "config.toml", COMPANY);
+        for (id, raw) in [
+            ("absent", "[agent]\nname='Absent'\n"),
+            ("policy", "[odoo]\nallowed_models=['res.partner']\nallowed_actions=['read']\nprofile='default'\ncompany_ids=[1]\npermission_override='read_only'\nact_as_requester=true\n"),
+            ("complete", "[odoo]\nusername='own'\napi_key_enc='encrypted'\n"),
+            ("password", "[odoo]\nusername='own'\npassword_enc='encrypted'\n"),
+            ("username", "[odoo]\nusername='own'\n"),
+            ("url", "[odoo]\nurl='https://erp.example.test'\n"),
+            ("db", "[odoo]\ndb='other'\n"),
+            ("empty", "[odoo]\nusername=''\napi_key_enc='  '\n"),
+            ("empty-url", "[odoo]\nurl=''\n"),
+            ("key", "[odoo]\napi_key_enc='encrypted'\n"),
+        ] {
+            write(h, &format!("agents/{id}/agent.toml"), raw);
+        }
+        assert!(run(h).await.unwrap());
+        let config = OdooAccessConfig::parse_config_toml(&read(h)).unwrap();
+        assert_eq!(config.company_key_agents, vec!["absent", "policy"]);
+        assert_eq!(config.company_key_agents_migrated, MARKER);
+        let audit = std::fs::read_to_string(h.join("security_audit.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = audit.lines()
+            .map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["details"]["partial_agents"],
+            json!(["db", "empty", "empty-url", "key", "url", "username"]));
+        assert_eq!(events[0]["details"]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn invalid_company_is_untouched_and_later_valid_start_backfills() {
+        for raw in [
+            "[odoo]\nurl='ftp://x'\ndb='company'\n",
+            "[odoo]\nurl='https://erp.example.test/?query=1'\ndb='company'\n",
+            "[odoo]\nurl='https://erp.example.test/#fragment'\ndb='company'\n",
+            "[odoo]\nurl='https://erp.example.test'\ndb='invalid db'\n",
+            "[odoo]\nurl='https://erp.example.test'\ndb='company'\npoll_enabled='yes'\n",
+            "[odoo]\nurl='https://erp.example.test'\ndb='company'\nusername=5\n",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let h = home.path();
+            write(h, "config.toml", raw);
+            write(h, "agents/absent/agent.toml", "[agent]\nname='Absent'\n");
+            assert!(!run(h).await.unwrap(), "{raw}");
+            assert_eq!(read(h), raw);
+            let config = OdooAccessConfig::parse_config_toml(&read(h)).unwrap();
+            assert!(config.company_key_agents.is_empty());
+            assert!(config.company_key_agents_migrated.is_empty());
+            assert!(!config.upgrade_notice_pending);
+            assert!(!h.join("security_audit.jsonl").exists());
+            write(h, "config.toml", COMPANY);
+            assert!(run(h).await.unwrap());
+            let config = OdooAccessConfig::parse_config_toml(&read(h)).unwrap();
+            assert_eq!(config.company_key_agents, vec!["absent"]);
+            assert_eq!(config.company_key_agents_migrated, MARKER);
+            assert!(h.join("security_audit.jsonl").is_file());
+        }
     }
 
     #[tokio::test]
