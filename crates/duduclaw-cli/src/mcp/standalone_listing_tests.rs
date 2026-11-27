@@ -24,7 +24,10 @@ async fn names(
     agent: &str,
     employee: bool,
 ) -> BTreeSet<&'static str> {
-    visible_tools_with(p, home, agent, employee)
+    // This scope-listing fixture is background work, with no human principal.
+    super::tools_list::visible_tools_for_principal(
+        p, home, agent, employee, &crate::mcp_isolation::process_lane(), None,
+    )
         .await
         .into_iter()
         .map(|t| t.name)

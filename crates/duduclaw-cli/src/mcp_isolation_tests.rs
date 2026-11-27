@@ -211,11 +211,6 @@ fn isolated_every_tool_def_has_exact_boundary_route_and_effect() {
     // actual ToolDefs, not a source-text count or a duplicated name fixture.
     for tool in crate::mcp::tools() {
         assert!(seen.insert(tool.name), "duplicate ToolDef: {}", tool.name);
-        if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
-            assert_eq!(boundary_route(tool.name), None, "admin AI is unavailable in protected mode");
-            assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some());
-            continue;
-        }
         assert!(boundary_route(tool.name).is_some(), "missing route: {}", tool.name);
         assert!(duduclaw_core::tool_effect::effect_of_builtin(tool.name).is_some(),
             "missing effect: {}", tool.name);
@@ -322,7 +317,9 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     // v1.81 main merge: +odoo_create/odoo_write (RM-120), Odoo connector route.
     // 141K-P5: +two person tools, intentionally refused for all employees.
     // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
-    assert_eq!(tools.len(), 284, "review every new tool's isolation disposition");
+    // RM-194: both admin settings tools are refused and hidden in protected mode.
+    // RM-141: includes four Odoo write-back tools with connector routes.
+    assert_eq!(tools.len(), 288, "review every new tool's isolation disposition");
     for tool in tools {
         if intentional_refusal(tool.name).is_some() { continue; }
         let route = boundary_route(tool.name).expect("exact route");
@@ -369,7 +366,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 284);
+    assert_eq!(manifest.len(), 288);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
             ServiceState::IntentionalRefusal(crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired));
@@ -380,6 +377,43 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     assert!(matches!(manifest.iter().find(|(name, _)| *name == "os_power").unwrap().1,
         ServiceState::IntentionalRefusal(_)));
     assert!(dispatcher.require_complete_services().is_err());
+}
+
+#[tokio::test]
+async fn isolated_admin_settings_are_refused_and_not_listed_even_with_admin_grants() {
+    use crate::mcp_isolation_disposition::{Refusal, intentional_refusal};
+    use duduclaw_core::tool_effect::{ToolEffect, effect_of_builtin};
+    let home = tempfile::tempdir().unwrap();
+    let manifest = adapter(home.path()).service_manifest();
+    let mut admin = principal();
+    admin.scopes = [crate::mcp_auth::Scope::Admin].into_iter().collect();
+    for binding in [EmployeeBinding::Personal(Text::new("owner".into()).unwrap()),
+        EmployeeBinding::Shared(Text::new("tenant".into()).unwrap())] {
+        for (name, effect) in [("admin_settings_read", ToolEffect::Read),
+            ("admin_settings_propose", ToolEffect::Admin)] {
+            assert_eq!(boundary_route(name), Some(BoundaryRoute::Resource));
+            assert_eq!(effect_of_builtin(name), Some(effect));
+            assert_eq!(intentional_refusal(name), Some(Refusal::AdminSettingsUnavailable));
+            assert_eq!(manifest.iter().find(|(tool, _)| *tool == name).unwrap().1,
+                ServiceState::IntentionalRefusal(Refusal::AdminSettingsUnavailable));
+            let mut record = context().record().clone();
+            record.lane = Lane::Standard;
+            record.employee_binding = binding.clone();
+            record.tools = List::new(vec![Text::new(name.into()).unwrap()]).unwrap();
+            record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee }]).unwrap();
+            let call = Arc::new(IsolatedCall { forks: None, home: home.path().into(), context: live_context(record),
+                agent: "main".into(), roots: Arc::new(ResourceRoots::default()), parser: None,
+                services: Some(Arc::new(RecordProbe)), execution: None, worker: None,
+                record_resolver: Some(Arc::new(RecordProbe)) });
+            ISOLATED_CALL.scope(call, async {
+                // The shared tools/list predicate must refuse even an installed service.
+                assert!(!tool_allowed(name, &admin), "{name}");
+                let result = dispatch_resource_tool(home.path(), name, &json!({})).await.unwrap();
+                assert_eq!(result["isError"], true, "{name}: {result}");
+                assert_eq!(result["content"][0]["text"], Refusal::AdminSettingsUnavailable.message());
+            }).await;
+        }
+    }
 }
 
 #[tokio::test]
@@ -793,4 +827,56 @@ async fn background_memory_store_with_dispatch_provenance() {
          AND source_kind='dispatch_run' AND source_session='cron:main' AND source_message='run:parity-run'",
         [id], |row| row.get(0)).unwrap();
     assert_eq!(dispatch_origin, 1, "background memory must retain its gateway-issued dispatch source");
+}
+
+#[tokio::test]
+async fn isolated_odoo_message_still_requires_single_use_approval() {
+    use duduclaw_gateway::approval::ApprovalBroker;
+    use crate::mcp::approval::{gate_tool_approval_dispatch, static_gate_flags};
+    for approved in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let agent_dir = home.path().join("agents/main");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("agent.toml"),
+            "[capabilities]\naction_rules=[{tool='odoo_message_send',verdict='allow'}]\n").unwrap();
+        let payload = json!({"name":"odoo_message_send",
+            "arguments":{"model":"crm.lead","res_id":9,"body":"approved content"}});
+        let broker = ApprovalBroker::open(home.path()).unwrap();
+        let observer = broker.clone();
+        let answer = tokio::spawn(async move {
+            for _ in 0..200 {
+                let pending = observer.list_pending(Some("main")).await.unwrap();
+                if let Some(card) = pending.first() {
+                    assert_eq!(card.payload["action_grant"]["single_use"], true);
+                    assert_eq!(card.payload["arguments"]["body"], "approved content");
+                    observer.decide(&card.id, approved, "dashboard:admin").await.unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("protected message did not request approval");
+        });
+        let mut isolated = call();
+        Arc::get_mut(&mut isolated).unwrap().home = home.path().to_path_buf();
+        Arc::get_mut(&mut isolated).unwrap().context = live_context(context().record().clone());
+        ISOLATED_CALL.scope(isolated, async {
+            assert!(crate::mcp_isolation_disposition::intentional_refusal("odoo_message_send").is_none());
+            assert!(static_gate_flags(&agent_dir, "odoo_message_send", &payload).0);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5),
+                gate_tool_approval_dispatch(home.path(), "main", "odoo_message_send", payload)).await.unwrap();
+            assert_eq!(result.is_ok(), approved);
+        }).await;
+        answer.await.unwrap();
+    }
+}
+
+#[test]
+fn protected_person_only_refusal_does_not_hide_employee_odoo_tools() {
+    use crate::mcp_isolation_disposition::{intentional_refusal, Refusal};
+    for tool in ["my_agents_status", "my_tasks_list"] {
+        assert_eq!(intentional_refusal(tool), Some(Refusal::PersonalKeyRequired));
+    }
+    for tool in crate::mcp_isolation_connector_odoo::ODOO_EXECUTOR_TOOLS {
+        assert_eq!(intentional_refusal(tool), None, "{tool}");
+    }
 }

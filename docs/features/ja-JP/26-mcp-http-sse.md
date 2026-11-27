@@ -1,5 +1,7 @@
 # MCP HTTP/SSE Transport
 
+以下の URL クエリの例は、この方式に対応する MCP API キーのみが対象です。個人キーは SSE を含む毎回の HTTP リクエストに `Authorization: Bearer` が必要です。標準の `EventSource` はこのヘッダーを設定できないため、ヘッダー対応クライアントを使用してください。
+
 > MCPツールボックスへの二つ目の玄関——単発呼び出しはBearer認証のREST、長時間接続のストリームはServer-Sent Eventsで、リモートクライアントがstdio transportと同じツールに到達できます。
 
 ---
@@ -228,3 +230,11 @@ SSEはクライアントが結果を*購読*することを可能にし、同期
 ## まとめ
 
 stdioは専用回線：一プロセス、一発信者、ネットワークなし。HTTP/SSE transportは交換台とラジオ放送です——`POST /mcp/v1/call`は単発のダイヤルと応答、`GET /mcp/v1/stream`は聴取、`POST /mcp/v1/stream/call`はリクエストを発射し結果が空中から返ってくるのを聴く。同じツールボックス、Bearer認証、60 req/minでスロットル、デフォルトでfail-closed——今やローカルCLIだけでなく、あらゆる外部HTTPクライアントが到達できます。
+
+## 個人キーを MCP 認証に使う（v1.86.0）
+
+`ddc_member_` 個人キーには稼働中のゲートウェイと個人キー機能の有効化が必要です。スタンドアロン MCP キーとは別の認証です。MCP HTTP では `Authorization: Bearer <member-key>`、stdio ではサーバー環境変数 `DUDUCLAW_MCP_API_KEY` を使います。個人キーを URL クエリに含めてはいけません。HTTP／SSE クライアントは認証ヘッダーを送れるものを使ってください。
+
+有効なスコープはキーの `mcp_scopes` と管理者の現在の `[member_api_keys] allow_mcp_scopes`（既定 `[]`）の共通部分です。選べるのは `tasks:read`、`agents:status`、`odoo:read`、`odoo:write` のみです。ツールは所有者本人として実行し、現在の権限を確認します。Odoo は本人が接続したアカウントのみを使い、会社・AI 社員のアカウントには切り替えません。対象ツールは [MCP ツール](../../guides/ja-JP/mcp-tools.md) を参照してください。
+
+このリリースの OAuth 同意画面は個人キーを拒否します。ヘッダーか stdio の環境変数を直接設定してください。OAuth 同意画面での交換には対応していません。

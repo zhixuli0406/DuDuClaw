@@ -8,6 +8,8 @@ use crate::message_queue::{MessageStatus, QueueMessage};
 
 fn queue_msg(id: &str, task_id: &str) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.into(),
         sender: "goal-loop-driver".into(),
         target: OWNER.into(),

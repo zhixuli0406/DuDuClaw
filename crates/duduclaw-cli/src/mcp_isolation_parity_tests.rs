@@ -102,12 +102,16 @@ fn documented_refusals() -> BTreeSet<String> {
     // refusal must change the reviewed product matrix before it can pass parity.
     let matrix = include_str!("../../../docs/architecture/native-linux-isolation-tools.md");
     let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && (line.contains("Refused: HostAuthority")
-            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")))
+            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")
+            || line.contains("Refused: AdminSettingsUnavailable")))
         .filter_map(|line| line.split('`').nth(1)).map(str::to_owned).collect();
     assert!(names.contains("os_power"), "matrix must enumerate the host-authority exception");
     let proposal: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ProposalRequired"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(proposal, BTreeSet::from(["create_agent"]), "protected employee creation is proposal-only");
+    let admin_settings: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: AdminSettingsUnavailable"))
+        .filter_map(|line| line.split('`').nth(1)).collect();
+    assert_eq!(admin_settings, BTreeSet::from(["admin_settings_read", "admin_settings_propose"]));
     let deferred: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ForkNextRelease"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(deferred, BTreeSet::from(["fork_run", "merge_or_select", "terminate_branch"]));
@@ -676,6 +680,10 @@ fn every_connector_checks_executor_for_its_effective_route() {
         .filter(|p| p.route == Route::Connector).collect();
     assert!(connectors.len() > 28, "must cover providers beyond Google/Notion/GitHub");
     for policy in connectors {
+        if duduclaw_gateway::isolation_connectors::intentionally_refused_connector(policy.name) {
+            assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_none(), "{}", policy.name);
+            continue;
+        }
         assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_some(), "{}", policy.name);
         dispatcher.services = Some(Arc::new(WithoutOne { omitted: policy.name, inner: complete.clone() }));
         let state = dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1;

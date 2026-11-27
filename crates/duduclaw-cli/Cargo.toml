@@ -70,6 +70,7 @@ dirs = "6"
 base64 = { workspace = true }
 scraper = "0.22"
 sha2 = "0.10"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 hex = "0.4"
 # WP2.2 R3: registry code-lane signature verification on install
 minisign-verify = "0.2"

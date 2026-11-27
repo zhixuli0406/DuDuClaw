@@ -1,5 +1,19 @@
 # 儀表板設定對照（v1.80.0）
 
+## 部門與主要 AI 員工權限設定（企業版，v1.86.0）
+
+| 位置 | 操作與目前狀態 |
+|---|---|
+| 管理 → 成員 → 部門主管授權 | 管理員選擇使用中的主管、部門，以及排程、自動化規則、技能或用量。另有對外傳送審核選項，將另行說明。閘道已支援儲存授權，成員頁編輯介面仍待整合。 |
+| 主要 AI 員工 → 誰可以使用 | 管理員維護預設為空的對話與一般工作開放名單。閘道已支援儲存並說明未生效原因，儀表板控制項仍待整合。只在受保護模式且員工工作已隔離執行時生效；其他情況下，這些入口仍只限管理員。 |
+| 例行工作 | 有排程授權的主管可依部門篩選，管理符合條件的例行工作、提醒與排程交辦。只可建立純提示例行工作。需要管理員同步組織資料的員工會計入提醒。部門自動化編輯與成員唯讀規則畫面仍待整合。 |
+| 技能 | 有授權的主管可啟用、停用、移除、還原技能，並替員工「提出安裝申請」。安裝仍須管理員核准。 |
+| 預算／帳務 → 部門用量 | 有授權的主管可選擇部門與七天、三十天或九十天，查看逐員工用量、合計與近期紀錄。這項授權不能修改預算。 |
+
+新增或擴大授權、將成員加入主要 AI 員工名單前，都須閱讀風險說明並勾選「我了解」。變更有稽核紀錄。部門授權只適用於儀表板登入，本人 API 金鑰與聊天軟體不適用；對方不再是使用中的主管時自動撤銷。主要 AI 員工名單會提醒，被加入的人可能問到包含管理員對話的記憶；本人 API 金鑰一律不能使用主要 AI 員工。替主要 AI 員工排程、建立員工與修改員工設定仍只限管理員。
+
+完整權限、規則執行限制、撤銷與既有工作的處理方式，請見[部門主管](../../features/zh-TW/79-department-managers.md)。全公司分析與帳務彙總仍對所有主管可見。
+
 ## 技能封存還原
 
 技能不再因閒置而被標成過時或自動封存。`[skill_curator]` 設定仍可讀取，但所有值都無作用，每個程序會警告一次。Gateway 啟動時會將有紀錄的封存技能搬回原位並恢復使用，不覆蓋既有技能；衝突檔留在 `skills-archive`，由管理員處理。Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，並拒絕符號連結路徑；其他平台保留封存檔，供管理員手動還原。
@@ -595,7 +609,7 @@ RPC `agent_files.list / get / diff / history / save / rollback / withdraw / pend
 - **存檔：** 在檔案鎖內比對編輯器讀到的雜湊（`base_hash`），期間被別人改過就當作衝突拒絕。新內容從員工的下一則對話開始生效，通道的下一則回覆會附一行提示。
 - **版本：** 存在員工資料夾外的 `<home>/agent_file_history/<員工>/<檔案>/`（只有擁有者能讀），每檔預設保留 20 份（`[agent_files] history_keep`，5–100）。第一次修改也會留下修改前的內容。還原版本會跑同樣的檢查。刪除員工時版本整份移到 `agent_file_history/_trash/`，之後同一個代號的新員工從零開始。
 - **核可基準：** 存 SOUL.md、IDENTITY.md、USER.md 或 INSTRUCTIONS.md 會更新核可指紋（INSTRUCTIONS.md 現在也有，heartbeat 以 `_instructions_integrity_drift` 回報）。在系統外被改過的檔案會標示出來，可以還原到上次核可版本，或檢查後接受目前內容（照原樣再存一次：整份重新檢查，至少要寫理由確認或送審，確認後不改寫檔案，只把目前內容記成一個版本並設為核可基準；沒有被改過的檔案照原樣存一次仍然是「沒有變動」）。員工改名會同步 SOUL.md／IDENTITY.md 裡的名字，原本核可的 SOUL 維持核可，原本已在系統外被改過的 SOUL 仍然標示。名字必須是純文字（1–64 字，不能換行、不能有看不見的字元或 `< > [ ] { }`、反引號），改名後的內容若被固定規則標出問題就不同步（列在 `identity_files_skipped`）。
-- **送審：** 種類 `agent_file_change`，只能由目前仍是管理員的人在儀表板決定，期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
+- **送審：** 種類 `agent_file_change`，由目前仍是管理員的人在儀表板決定（開啟[在聊天軟體核准](#安全--在聊天軟體核准v186)後，完成本人連結的管理員也能按聊天卡片決定，預設要再確認一次），期限 3 天（逾期視為拒絕）。通道只收通知、沒有按鈕。提出的內容存在 `<home>/agent_file_pending/`，申請結束就刪除。核准時先套用；申請期間檔案被改過，申請會被拒絕，需要申請者重新送出。
 - **稽核：** `agent_file_changed`、`agent_file_change_refused`、`agent_file_review_failed`、`agent_file_change_requested`（只記雜湊，不記內容）。
 
 ### 建立之後修改員工的人格設定（v1.82.0）
@@ -743,6 +757,22 @@ AI 員工在同一回合成功讀過私人資料後，之後的外送呼叫會�
 **讓寄信交辦人在對話中確認** 透過限 Admin 的鎖定寫入流程 `system.update_config` 保存 `config.toml [security] mail_requester_approval`。只接受布林值，預設 `true`；檔案或鍵不存在時使用預設。設定無法讀取、格式錯誤、值無效或設為 `false` 時，恢復僅儀表板 Admin 核准。
 
 開啟時，只有 gateway 證實為發起本回合、已驗證的公司帳號，且目前仍有該 AI 員工 Operator 操作權限的人，僅可在一對一對話或已登入的儀表板 WebChat 確認等待核准的 `mail_send`。卡片顯示完整收件人、主旨、內文摘要及私人資料讀取狀態。群組其他人、外部或未驗證使用者、自動回合都不能決定；儀表板 Admin 仍可決定。其他外送工具維持原規則，參數綁定、單次使用、執行前重驗與逾期拒絕均保留。詳見[完整規則](../../features/zh-TW/05-security-defense.md#寄信由交辦人在原對話確認)。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
+
+## 安全 → 在聊天軟體核准（v1.86）
+
+預設關閉，只限管理員。這一段只能透過專用的設定呼叫寫入；設定檔進階編輯與一般設定寫入都會拒絕任何對 `[approval.chat_admin]` 的修改，所以不經風險畫面無法開啟。開啟只需要確認風險（「我了解」），不用輸入密碼。完整規則見[安全防護](../../features/zh-TW/05-security-defense.md#在聊天軟體核准v186)。
+
+| 設定 | `config.toml [approval.chat_admin]` | 說明 |
+|---|---|---|
+| 在聊天軟體核准 | `enabled`（預設 `false`）與 `enabled_ack = { by, at }` | `enabled_ack` 由設定呼叫寫入，記錄確認風險的管理員；缺少或該使用者已不是有效管理員時，功能視為關閉 |
+| 通道 | `channels`（預設 `["telegram", "googlechat"]`） | 本版只開放 Telegram 與 Google Chat；其他值會被忽略並警告 |
+| 需要再確認的類別 | `step_up_exempt_kinds`（預設空白＝所有 T2 類別都要） | 每一項是要免除的 T2 類別；免除時要逐類確認風險並留下稽核，恢復也會稽核 |
+| 再確認方式 | `step_up_methods`（預設 `["web"]`；可加 `"dm_totp"`） | web＝回儀表板的一次性連結，輸入密碼與驗證器 App 的驗證碼；`dm_totp`＝在 Telegram 私訊輸入 6 位數驗證碼（Google Chat 不提供；含驗證碼的訊息會被刪除） |
+| 卡片有效時數 | `card_valid_hours`（預設 `168`，1～720） | 不會超過審批本身的期限 |
+
+讀取或解析失敗、未知的鍵或值，功能一律視為關閉；畫面會把所有 T2 類別顯示為需要再確認，並在修好設定檔前拒絕儲存。每次修改都寫入設定變更紀錄與稽核 `approval_chat_admin_settings_changed`。這一段也會列出尚未完成本人連結的管理員，以及確認連結能不能用（需要對外的 https 網址）。
+
+**我的連線 → 聊天帳號（管理員）。** 產生代碼後，在 10 分鐘內到列出的機器人或 Chat app 私訊貼上，再回到這裡按「是我」。管理員代填的綁定在成員頁會標示「尚未本人確認」。「取消聊天核准資格」只清除本人證明。
 
 ## 完成說法檢查（只能在設定檔進階編輯修改）
 
@@ -1005,3 +1035,32 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 | `approval_grants_mfa_enrollment` | `false`。允許管理員核准時明確授權首次 MFA 註冊，72 小時內限用一次。單獨開啟此鍵不會核發授權。 |
 
 開始登入、回呼及完成登入時都會重讀設定。設定檔無法讀取或解析時關閉登入。`enabled` 缺漏或型別錯誤、確認紀錄缺漏或欄位空白、`allowed_hd` 為空或無效時也關閉；任何一個網域格式錯誤會使整份清單無效。只有完整的 `"direct"` 值會直接建立帳號，其他核准模式值皆要求管理員核准。上限未設定時採 20，無效值轉為 0 並阻擋新增申請或帳號。無效範本會阻擋分身建立，不會自動改用空白分身。MFA 預先授權僅在值為布林 `true` 時開啟。原始設定編輯器只能關閉登入、移除風險確認紀錄或刪除整段，無法啟用或擴大此功能。
+
+## 本人金鑰與 Odoo 權限設定（v1.86.0）
+
+以下新增項目目前透過設定／RPC 操作，儀表板控制項會隨儀表板更新提供。
+
+| 區段／鍵 | 預設與用途 |
+| --- | --- |
+| `[member_api_keys] allow_conversation_content` | `false`；允許建立 `include_conversations=true` 的金鑰，只管建立時授權，不會移除既有權限。升級前的金鑰保留對話權限並標示已遷移。 |
+| `[member_api_keys] allow_mcp_scopes` | `[]`；只接受 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`。每次使用時與金鑰範圍取交集。 |
+| `[odoo] member_credentials` | `false`；是否允許同仁連接本人 Odoo 帳號。透過 `odoo.member_credentials.set_enabled` 啟用時須帶 `acknowledge_risk=true`。 |
+| `[odoo_access] permission_mode` | 預設 `"engine"`，也可設為 `"follow_odoo_account"`；後者只對本人身分生效且須有有效確認紀錄，員工／公司帳號仍用引擎模式。 |
+| `[odoo_access] permission_mode_ack` | 預設無。管理員 RPC 記錄 `{by, at}`，包含操作人與 RFC 3339 時間。缺少或無效時退回引擎模式。 |
+| `[odoo_access] company_key_agents` | `[]`；允許使用公司帳號的 AI 員工 ID。 |
+| `[odoo_access] company_key_agents_migrated` | 遷移前為空，由系統維護的完成標記。 |
+| `[odoo_access] upgrade_notice_pending` | 預設 `false`，升級補入清單時設為 `true`；權限 RPC 的 `dismiss_upgrade_notice=true` 可清除。 |
+| `[odoo_access] always_refuse` | 預設清單如下，所有模式均適用。移除規則須確認風險，F1～F5 固定拒絕仍保留。 |
+| `[odoo_access] attachment_max_mb` | `10` MiB，範圍 1～25；原始檔與重新編碼後的附件都須符合。 |
+| 員工 `[odoo] permission_override` | 預設 `"inherit"`，也可選 `"engine"`、`"read_only"`，只能收窄。未知值視為唯讀。 |
+| 員工 `[odoo] act_as_requester` | `false`；允許使用經驗證請求者的本人 Odoo 身分，分身不能借用別人的帳號。 |
+
+`always_refuse` 預設清單：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
+
+管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
+
+已有公司 Odoo URL／資料庫的安裝在升級時會一次將所有沒有自己 Odoo 帳號的既有正式 AI 補入 `company_key_agents`，記錄完成標記與升級提示，不更改權限模式。自身 Odoo 帳號設定不完整的 AI 不會加入，必須由管理員明確指派。 新 AI 不會自動加入，升級後請檢查清單。
+
+同仁透過瀏覽器限定的 `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` 管理連線。先讀 status 查看伺服器／資料庫；位址變更後，須在同一瀏覽器工作階段重新讀取再驗證。Connect 與 test 共用每位同仁每分鐘五次限制，包含失敗與格式錯誤。改密碼、登出所有裝置或停權後須重新輸入金鑰。管理員可用 `odoo.member_credentials.list`、`.revoke {user_id}` 列出／撤銷，但不能代填別人的秘密。
+
+降回 v1.85.x 前，請移除 `[member_api_keys]` 的 `allow_conversation_content`、`allow_mcp_scopes`。舊版會將未知鍵視為整段無效，停用所有本人金鑰。v1.85 忽略 `[odoo_access]` 並退回全域 Odoo 帳號，新版公司帳號清單與拒絕政策不會保護降版後的安裝。

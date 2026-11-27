@@ -46,7 +46,13 @@ pub(super) async fn webchat_command_gate(
 #[path = "run_command_gate_tests.rs"]
 mod command_gate_tests;
 
-pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
+pub(super) async fn run(input: TurnInput, sink: TurnSink, ticket: &Ticket) {
+    let origin = input.credential.as_ref().map(crate::webchat::ChatCredential::origin)
+        .unwrap_or(duduclaw_auth::acl::ContextOrigin::Other);
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(origin, run_with_origin(input, sink, ticket)).await;
+}
+
+async fn run_with_origin(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     let TurnInput {
         state,
         requested_agent: _,

@@ -244,18 +244,21 @@ impl MethodHandler {
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
+        let principal = format!("user:{}", reader.live().user_id);
         let result = match limit {
             Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
-                |id, assignee| !reader.hides(assignee)
-                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+                &principal, |assignee| !reader.hides(assignee)
             ).await,
-            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
+            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await
+                .map(|rows| (rows, false)),
         };
         match result {
-            Ok(rows) => {
-                let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
-                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
-                ).collect();
+            Ok((rows, more_may_exist)) => {
+                let rows = if limit.is_none() {
+                    rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
+                        && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
+                    ).collect()
+                } else { rows };
                 // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
                 // `/goal` entry point's stamped source conversation
                 // (`source_channel`/`source_chat_id`, P5 write-back). No
@@ -274,7 +277,11 @@ impl MethodHandler {
                 }
                 self.set_goal_cost_fields(&store, &reader, &rows, &mut tasks)
                     .await;
-                WsFrame::ok_response("", json!({ "tasks": tasks }))
+                let mut response = json!({ "tasks": tasks });
+                if limit.is_some() && more_may_exist {
+                    response["more_may_exist"] = json!(true);
+                }
+                WsFrame::ok_response("", response)
             }
             Err(e) => WsFrame::error_response("", &format!("list tasks: {e}")),
         }
@@ -437,6 +444,7 @@ impl MethodHandler {
         self.broadcast_event("activity.new", activity_row_to_json(&activity))
             .await;
         self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::gateway(),
             task: task_json.clone(),
         })
         .await;
@@ -584,6 +592,7 @@ impl MethodHandler {
                 self.broadcast_event("task.updated", task_json.clone())
                     .await;
                 self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskUpdated {
+                    origin: crate::autopilot_engine::EventOrigin::gateway(),
                     task: task_json.clone(),
                 })
                 .await;
@@ -596,6 +605,7 @@ impl MethodHandler {
                     if prev != new_status {
                         self.emit_autopilot_event(
                             crate::autopilot_engine::AutopilotEvent::TaskStatusChanged {
+                                origin: crate::autopilot_engine::EventOrigin::gateway(),
                                 task_id: task_id.to_string(),
                                 from: prev.to_string(),
                                 to: new_status.to_string(),
@@ -1048,7 +1058,7 @@ mod live_assignee_tests {
                 if id == "same" && malformed {
                     match frame {
                         WsFrame::Response { ok: false, error: Some(error), .. } => {
-                            assert!(error["message"].as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+                            assert!(error.as_str().unwrap().contains("agent_config_unreadable"), "{error}");
                         }
                         other => panic!("expected refusal: {other:?}"),
                     }
@@ -1111,7 +1121,7 @@ mod main_assignment_tests {
 
     fn error(frame: WsFrame) -> String {
         match frame {
-            WsFrame::Response { ok: false, error: Some(error), .. } => error["message"].as_str().unwrap().into(),
+            WsFrame::Response { ok: false, error: Some(error), .. } => error.as_str().unwrap().into(),
             other => panic!("expected refusal: {other:?}"),
         }
     }
@@ -1125,7 +1135,8 @@ mod main_assignment_tests {
         let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", duduclaw_auth::UserRole::Admin).unwrap();
         let employee = db.create_user("emp@test.local", "Employee", "TeamPass-12345", duduclaw_auth::UserRole::Employee).unwrap();
-        let ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        let mut ctx = db.live_user_context(&employee.id).unwrap().unwrap();
+        ctx.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         crate::team_edition::record(home.path(), duduclaw_core::EditionProfile::Enterprise);
         handler.registry.write().await.scan().await.unwrap();
@@ -1134,26 +1145,30 @@ mod main_assignment_tests {
         let params = json!({"title":"work", "assigned_to":"main"});
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), "主代理僅管理員可以使用。");
         db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
-        assert!(handler.main_assignment_admitted(&ctx, "main").await);
-        assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
-        for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
-            let mut scheduled = params.clone();
-            scheduled["schedule"] = json!(schedule);
-            assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
-            assert_eq!(error(handler.handle_tasks_goal_create(json!({
-                "agent_id":"main", "description":"work", "schedule":schedule
-            }), &ctx).await), "主代理僅管理員可以使用。");
-        }
-        let rows = store.list_tasks(None, None, None).await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
-        crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
-            "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
-        handler.registry.write().await.scan().await.unwrap();
         assert_eq!(error(handler.handle_tasks_create(params.clone(), &ctx).await), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
-        assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
-            WsFrame::Response { ok: true, .. }));
-        db.set_main_agent_users(&admin.id, &[], true).unwrap();
-        assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
+        crate::isolation_io_test_support::with_isolation(async {
+            assert!(handler.main_assignment_admitted(&ctx, "main").await);
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+            for schedule in ["0 9 * * *", "2099-01-01T09:00:00Z"] {
+                let mut scheduled = params.clone();
+                scheduled["schedule"] = json!(schedule);
+                assert_eq!(error(handler.handle_tasks_create(scheduled, &ctx).await), "主代理僅管理員可以使用。");
+                assert_eq!(error(handler.handle_tasks_goal_create(json!({
+                    "agent_id":"main", "description":"work", "schedule":schedule
+                }), &ctx).await), "主代理僅管理員可以使用。");
+            }
+            let rows = store.list_tasks(None, None, None).await.unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].on_behalf_of, Some(format!("user:{}", employee.id)));
+            crate::trigger_route::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+                "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+            handler.registry.write().await.scan().await.unwrap();
+            // Tool names do not replace the protected-mode requirement.
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &ctx).await, WsFrame::Response { ok: true, .. }));
+            assert!(matches!(handler.handle_tasks_create(params.clone(), &db.live_user_context(&admin.id).unwrap().unwrap()).await,
+                WsFrame::Response { ok: true, .. }));
+            db.set_main_agent_users(&admin.id, &[], true).unwrap();
+            assert_eq!(error(handler.handle_tasks_create(params, &ctx).await), "主代理僅管理員可以使用。");
+        }).await;
     }
 }

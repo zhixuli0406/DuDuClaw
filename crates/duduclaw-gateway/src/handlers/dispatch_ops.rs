@@ -53,21 +53,25 @@ impl MethodHandler {
         }
 
         match method {
-            "autopilot.create" => {
+            "autopilot.affecting_me" => {
+                boxed_frame(|| self.handle_autopilot_affecting_me(params, ctx)).await
+            }
+            method if method.split('.').next() == Some("skill_trust") => {
                 require_admin!();
-                boxed_frame(|| self.handle_autopilot_create(params, ctx)).await
+                boxed_frame(|| self.handle_skill_trust_rpc(method, params, ctx, conn)).await
+            }
+            "autopilot.create" => {
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
             "autopilot.update" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_update(params, ctx)).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
             "autopilot.template_fields" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_template_fields(params)).await
             }
             "autopilot.remove" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_remove(params)).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
             "autopilot.runs.list" => {
                 require_admin!();
@@ -78,8 +82,7 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_autopilot_runs_cancel(params, ctx)).await
             }
             "autopilot.history" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_history(params)).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
 
             // ── Resident sensing observability (WP4, admin only) ──

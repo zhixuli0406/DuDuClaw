@@ -1,5 +1,15 @@
 # Security Defense
 
+## Department grants and main employee access (Enterprise, v1.86.0)
+
+Department authority comes from an Admin's explicit grant to an active Manager and the official org chart department, which must agree with the employee's own settings. A member's department label or an employee's self-edited settings cannot expand it. The main AI employee and all personal employees are excluded from department grants; owners retain their existing personal-employee access. Missing or unreadable authority grants no access.
+
+Grants work only in signed-in dashboard sessions, never through personal API keys or chat apps. They start empty. Adding or widening access requires reading a risk note and ticking **I understand**; every grant and revocation is audited, as are writes authorized through a grant. Stopping an account or changing it away from Manager revokes department grants automatically. Existing routines and saved rules are not automatically disabled.
+
+The separate main AI employee access list also starts empty and requires risk acknowledgement when adding people. It permits conversation and ordinary work only in protected mode with isolated employee execution. Otherwise, only Admins can use these entry points; the settings response explains that the saved list is inactive. Personal API keys can never use the main employee. Scheduling, employee creation and settings changes remain Admin-only. Listed people may ask about remembered content, including Admin conversations.
+
+When working for a listed non-Admin person, the main employee's administrator tools are hidden and refused with “This action requires the administrator to perform it personally.” It can still delegate to other employees under its normal delegation rules; `[delegation] human_principal = "enforce"` is recommended to check the person's access on hand-over. See [Department managers](79-department-managers.md) for scope, rollout and known limitations.
+
 
 ## Per-run caller identity
 
@@ -66,6 +76,49 @@ Ownership comes from `users.db`, plus, for a removed Personal employee whose dat
 ## Released in v1.80.x
 
 Non-admin members (Employee and Manager) see only employees explicitly marked selectable by `agents.callable` in the sidebar, conversation filters, command palette, WebChat `@` suggestions and other employee pickers. The main AI employee stays hidden unless that response explicitly makes it selectable. The full roster is shown only after `agents.callable` confirms `unrestricted: true` from the live Admin identity, including the local Personal principal. Initial loading and failed permission reads show no employees for any account. Grants refresh every 60 seconds while the page is visible, when it becomes visible again, and when selection menus open. Refreshing preserves the same identity’s confirmed grants; a failed refresh clears them. File and settings pickers additionally require direct access; team calling rights do not grant file or configuration access. New conversations continue to use the server assignment resolver. This dashboard filtering does not change RPC authorization.
+
+## A misconfigured employee is refused at every entry (v1.86)
+
+Every way of handing an employee work now runs the same check first: find the employee, read its effective settings once (the preset-resolved profile when there is one, otherwise `agent.toml`), and check that they can run. When the check fails, the work is refused before anything happens: no model call, no saved attachment, no task or schedule row, no message accepted into the queue, no approval recorded.
+
+**What counts as misconfigured.** The reason code shown to people who may see it:
+
+- `model_provider_mismatch`: the model does not belong to the engine.
+- `agent_config_unreadable`: the settings file is missing, unreadable or malformed, a `[runtime]`/`[model]` field has the wrong type, the engine name is unknown, or an engine that needs a model (OpenAI-compatible) has none.
+- `runtime_unavailable`: the engine (or a team role's engine) is removed or not active.
+- `runtime_policy_refused`: the product policy does not allow the engine or the substituted model.
+- `agent_not_found`: no such employee.
+
+An employee without `[model] preferred` keeps working as in v1.85: it uses the engine's default model, and Kiro uses the model chosen in its own CLI settings.
+
+**Entries covered.**
+
+- Chat: ordinary messages on every channel and in WebChat; WebChat checks at arrival and again after waiting in the queue; AG-UI runs.
+- Chat commands on all eleven channels and in WebChat. The check runs after the channel's access check, so a blocked sender still gets silence, and a `/交辦` command checks the employee it assigns to.
+- Attachments: checked before any file is downloaded or saved (Telegram, LINE, Discord, Slack, WhatsApp, Feishu, Google Chat, Teams, WebChat). A sender the channel blocks gets no files downloaded and no refusal text.
+- Trigger words: `@employee` assignment, and a bare `@employee` that would wait for the next message, are checked against that employee.
+- Task creation: the dashboard (tasks, goals, skill assignment, schedules), MCP `tasks_create` (goals, board tasks, cron and reminders), A2A `SendMessage`, and chat `/交辦` and `/goal`. Reassigning a task to a misconfigured employee is refused the same way (dashboard `tasks.update`/`tasks.assign`, MCP `tasks_update`, and MCP `tasks_claim` by an employee); un-assigning a task or moving it away from a misconfigured employee is not affected.
+- Decisions: "approve", "start", "retry" and "continue" check the employee the task is actually assigned to (never the card's label); "decline", "cancel", "abort" and "done" never read settings. A decision sent with a file still reaches the decision handler; the file is dropped.
+- Background work: dispatch, the goal loop (including Team-as-Agent rounds), cron, reminders, heartbeats, the mail worker, automation rules, the workflow queue, scheduled assignments and the task sandbox.
+
+Authorization comes first. A caller who may not hand work to an employee gets the existing refusal and learns nothing about that employee's settings; a deleted, archived or unknown employee keeps the existing "employee unavailable" error.
+
+**What people see.** Chat users get the same notice as the v1.84 chat refusal, with the reason code and a turn reference. Website visitors (Odoo live chat, website widget sessions and widget accounts) only ever get 「抱歉，目前暫時無法回覆，請稍後再試一次。」. The dashboard shows the operator notice. An AI calling MCP gets "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work." (or "Task reassignment refused: …"). A2A callers get `EMPLOYEE_CONFIGURATION_REFUSED`. No message contains a file path or parser output; those go to the gateway log.
+
+**Commands that still work when settings are broken.** `!STOP`, `!STOP ALL`, `!RESUME`, `!STATUS`, `/takeover`, `/status`, `/help`, `/new`, `/pair` and `/model` skip the settings check, so you can stop, resume, take over, start over, pair and repair the model. Skipping the settings check never skips the access and admin checks: `!STOP`, `!STOP ALL`, `!RESUME` and `/model <name>` still need an administrator, also when they arrive through a channel without its own command handling. A command with a file attached runs without the file.
+
+Two more flows stay outside the check because they repair access or routing and never run the employee:
+
+- Telegram `/start <token>`: links a Telegram account to its dashboard account (shared bot only). It restores access, like `/pair`.
+- Discord native `/config`, `/session` and `/agent`: channel settings, session management and choosing which employee answers. Choosing another employee is one way to route around a broken one.
+
+**One read per turn.** A chat turn and a background run use the settings read at the start for the whole run: engine, model, fallback engine and model, local model, reasoning effort and minimal context. Editing `agent.toml` mid-turn affects the next message only and can never switch a running turn to another engine. Before v1.86, a file that became unreadable between two reads could make the rest of the turn run with Claude defaults.
+
+**Background work no longer falls back to Claude.** Before v1.86, scheduled and dispatched work took the engine from a lenient read: a mistyped `[runtime] provider` or an unreadable file ran the work with Claude, and an engine/model mismatch on the Claude engine was started anyway. That work is now refused. The refusal is a configuration error, so it does not rotate accounts, switch to the fallback engine or count as an engine failure. A goal is parked as needing a decision (`goal_loop.entry_refused` in its activity, with the reason code) and is not retried; Observer mode does not close it while the settings are still broken. Cron and reminders record a failed run. A scheduled assignment whose employee is broken when it fires is paused as `agent_unavailable`.
+
+**Behaviour changes.** Assigning or reassigning work to a misconfigured employee is refused at once instead of failing later. A scheduled assignment for a broken employee pauses. Team-as-Agent role members keep their frozen model and are no longer re-routed to another model tier. On Discord with automatic threads, a message with files downloads them after the thread is created (the new thread can be bound to a different employee); a thread for a files-only message starts with a temporary name and is renamed to the usual name after the download.
+
+**Known limits.** An MCP server started before the gateway has ever run reads the raw `agent.toml`, because the preset-resolved profile is written by the gateway; an employee whose model comes only from its preset can then be refused task creation through MCP until the gateway has started once. The employee's tool restrictions and account pool are still read from `agent.toml` at spawn time, outside the one-read rule.
 
 ## `code_map` stays inside the employee's own directory (v1.81)
 
@@ -672,6 +725,40 @@ The card shows every full recipient address, the subject, a body summary and whe
 
 The audience check accepts authenticated dashboard WebChat, but the current non-Admin WebChat confirmation UI/decision entry point is not yet wired; those users still need an Admin to complete the approval.
 
+## Admin approval in chat apps (v1.86)
+
+Dashboard-only approvals stay in the dashboard unless a customer Admin turns on **Approve in chat apps** under Security settings. With it on, an Admin who has proven their own chat account can decide some of these requests from a card in a private Telegram or Google Chat conversation with the bot or Chat app. The feature is off by default.
+
+| Tier | Requests | In chat |
+|---|---|---|
+| T1 | Knowledge review (`knowledge_quarantine`), add a document to a shared collection (`knowledge_add_source`) | Approve or deny with one tap |
+| T2 | Enable skills, activate a workflow, change an employee's profile files, change the org chart, run an automation action, CLI outgoing operations, and any card held by the outgoing data guard | Deny with one tap; approving needs a second confirmation unless an Admin switched it off for that category |
+| T3 | Personal delegation, the operator command-line kinds, and anything not listed | Dashboard only; no chat card is sent |
+
+The requester-confirms-own-mail path above is unchanged, and a Personal employee's cards always go to the dashboard.
+
+**Who can decide.** Only a user who is an Active Admin at the moment of the press. Managers, solo mode and the `system` identity never decide through this path. The chat account must be proven by the Admin personally: the dashboard (My Connections) shows a one-time code `DUDU-XXXX-XXXX` valid for 10 minutes, the Admin pastes it in a private chat with the bot or app, then confirms "this is me" on the dashboard in the same login session. If the dashboard shows an account that is not theirs, "not me" voids the code and writes `channel_link_rejected`. A code pasted in a group is voided. Codes are consumed by the gateway and never reach an AI employee; wrong codes are throttled per sender and globally. A binding that an Admin filled in for someone else keeps working for notifications and login codes but is labelled "not self-confirmed" and cannot approve. **Cancel chat approval eligibility** clears only the proof; notifications and login codes keep working.
+
+**How a press is checked.**
+
+- Cards go only to the Admin's proven private conversation, one card per Admin, never to a group or an employee's control channel. Google Chat cards are sent only by an app that receives JWT-verified HTTP clicks; Pub/Sub never decides.
+- Every delivered card has a receipt. A press counts only when it matches that receipt (receiving bot, conversation, message, full approval id, the person who pressed) and happens in a private chat. Typed commands such as `確認 <id>` and replies to other messages never decide these requests, so a look-alike card written by an AI employee has no effect.
+- On every press the gateway re-reads the user (still an Active Admin), the proof, the settings and whether the bot or app is still configured. If the content changed after the card was sent, the press is refused and a fresh card is sent. Pressing twice executes once; the dashboard and chat share one per-approval lock.
+- **Second confirmation.** Every T2 category requires it by default (owner decision). An Admin can switch it off per category; that needs an explicit risk acknowledgement and is audited. The default method is a one-time link to the dashboard (10 minutes, single use, only its hash is stored): the Admin signs in and enters their password and authenticator code. Rejecting on that page needs no password. An Admin without an authenticator app approves these categories in the dashboard. Optionally an Admin can enable a Telegram private-chat code: reply to the bot's prompt with the 6-digit code within 3 minutes; recovery codes and reused codes are refused, five wrong attempts void the request, and the bot deletes the message containing the code. Google Chat does not offer this method.
+- A chat decision is recorded as `chat-admin:<user>:<channel>:<tap|web|totp>` together with a ledger row written in the same transaction. Downstream grants (workflow revisions, single-use action grants) accept a chat decision only when the matching ledger row exists. The operator command-line, Personal delegation and disconnect-forget consumers still accept dashboard decisions only.
+- Audit events: `channel_identity_proven`, `channel_link_rejected`, `channel_identity_proof_revoked`, `approval_chat_admin_card_sent`, `approval_chat_admin_decided`, `approval_chat_admin_refused` (at most 5 per sender per minute) and `approval_chat_admin_settings_changed` (an intent record before the settings are written, then a committed record).
+- Turning the feature off rewrites in-flight cards to "Chat approval is off, please use the dashboard"; later presses are refused. Other Admins' cards are rewritten to the result once someone decides, and to "expired" when the request expires.
+- Migration to another host never imports receipts, the decision ledger, proofs or confirmation tickets; Admins prove their chat accounts again on the new host.
+
+**Limitations.**
+
+- Only Telegram and Google Chat are offered in this version. LINE, Slack and Discord entries in the settings are ignored with a warning.
+- If any AI employee's `agent.toml` cannot be read, chat approval refuses every press, because the gateway cannot confirm the card came from a bot that is still configured. Symptom: the card answers "Your approval permission could not be confirmed. Please use the dashboard." and the audit log shows `approval_chat_admin_refused`. Remedy: fix or remove the employee with the broken settings on the AI employees page; the dashboard keeps working meanwhile.
+- The confirmation link needs an external https address for the dashboard. Without one, second-confirmation categories are approved in the dashboard.
+- Google Chat cards, buttons, message updates and links have not been tested against a real Workspace yet, and Telegram has not been tested against the real Bot API.
+- A card is valid for 168 hours by default (1 to 720), never longer than the request itself; most requests expire within 1 hour to 3 days.
+- An AI employee with unrestricted Bash can edit local databases directly; see [What these guards do not cover](#what-these-guards-do-not-cover). This path does not make that gap wider.
+
 ## Connection deletion approvals and receipts
 
 Disconnecting a connection creates a seven-day batch of memory-forgetting plans, with one dashboard-only, Admin-only approval card for the batch. The card shows counts for each AI employee; it does not expose memory content. Disconnecting remains successful even if planning fails. `[memory] forget_source` off, an unreadable configuration or an invalid setting prevents new plans and applies.
@@ -872,7 +959,7 @@ Drive/Meet consent is incremental: `https://www.googleapis.com/auth/drive.file` 
 
 The gateway validates file IDs and requires Drive `isAppAuthorized=true` even for older broad grants. That Google flag can reflect a previous app authorization; it does not prove a current Picker click. Imports additionally require the user/employee/file confirmation receipt described below. Requests use fixed official Google API endpoints and refuse redirects. It bounds metadata responses, streams media through the existing upload chunks, and enforces the same byte, staging and duration limits. Connection ownership, granted scopes and local authorization are rechecked during transfer and before job admission. Disconnect or detected revocation stops further access. Local provenance links the upload to the selecting user, Google account, Drive file ID and file version; audits hash identifiers and omit tokens, file content and sensitive names.
 
-The gateway records local consent separately for basic services, meeting recordings and employee Drive tools, and binds it to the sealed credential and its authority record. A capability needs both the provider scope and the matching local purpose consent. Extra `drive.readonly` or `drive` scopes returned during meeting consent cannot enable employee Drive tools. Incremental consent preserves earlier local purposes and must retain every previously held provider scope; publication also checks the original credential revision. Missing scopes or a concurrent credential change leave the old credential unchanged. Records without local purpose consent require reconnection. Reconnecting basic services resets local purposes to basic services, so recording access and employee Drive tools must then be enabled separately again.
+The gateway records local consent separately for basic services, meeting recordings and employee Drive tools, and binds it to the sealed credential and its authority record. A capability needs both the provider scope and the matching local purpose consent. Extra `drive.readonly` returned during meeting consent cannot enable employee Drive tools. An ordinary credential containing full `drive` scope is refused and requires reconnection. Additional-service consent uses `include_granted_scopes=false` and explicitly requests the already-consented ordinary services together with the added service, so Google may show their permissions again. It preserves earlier local purposes and must retain every previously held provider scope; publication also checks the original credential revision. Missing scopes or a concurrent credential change leave the old credential unchanged. Records without local purpose consent require reconnection. Reconnecting basic services resets local purposes to basic services, so recording access and employee Drive tools must then be enabled separately again.
 
 Every import requires a server-issued confirmation receipt. It proves that a dashboard user authenticated by JWT explicitly registered and confirmed this exact Drive file ID for this exact receiving employee within the last five minutes. Employee/MCP tokens cannot register it. The receipt is single use and bound to that user, employee and file ID; a new confirmation for the same user and employee replaces the previous receipt. The dashboard registers the file only when the user confirms the import. Missing, expired, reused or mismatched receipts are rejected. An admitted import attempt consumes the receipt even if later checks fail, so retry with a new confirmation. The server additionally checks Drive metadata for `isAppAuthorized=true` under that user's Google connection. Neither the receipt nor this Google flag proves a click in Google Picker: a dashboard caller can explicitly confirm a previously app-authorized file by its known ID.
 
@@ -939,6 +1026,22 @@ Creation, revocation and write calls are audited; repeated use is aggregated.
 [member API authentication reference](../api/member-contract.md#personal-member-api-keys-1850)
 for transport examples and the precise method restrictions.
 
+## Administrator AI: proof of the person in the conversation
+
+The administrator AI settings tools are offered only when the gateway verifies an active Admin who has changed the initial password, the Admin’s uniquely assigned avatar, and an attended turn from that person. The gateway checks the signed conversation context and re-resolves the requester’s identity; tool parameters cannot assert who the person is. Writes additionally require a private conversation or signed-in WebChat. Scheduled, delegated, background and protected-mode turns are refused. Each proposed write still requires the proposing Admin’s dashboard confirmation.
+
+## Administrator-controlled Drive writes
+
+The nine cloud-drive write tools run only inside the main gateway process. Their write credential is stored separately from ordinary Google credentials. Every token hand-out point refuses a token carrying full Drive access, including refresh and remote MCP paths; an ordinary connection found with that scope needs reconnection. The official Drive remote MCP never receives that token. This protects product routes; a service-account key readable by the CLI can still mint tokens after Google grants the scope. Prefer a gateway-sealed delegation key.
+
+Create, modify, move and trash default off independently. Enabling or widening access requires the administrator's recorded risk acknowledgement, without additional re-authentication. Required member confirmation is bound to the exact operation, account, credential and policy, expires after five minutes, and can only be decided by that member. Tool allowlists, Admin tokens and standing workflow approvals cannot skip it. Administrators may disable confirmation per action or require additional administrator approval. Unattended work refuses actions that need confirmation. Imported or restored configuration strips these write settings; the destination administrator must explicitly enable access again.
+
+Permanent Drive deletion and sharing/permission endpoints are refused on every DuDuClaw Google request path. The write transport accepts only the enumerated operations; trash uses an update to mark the file as trashed, never permanent deletion. Existing transports cannot use the new write path by changing a method or endpoint. These controls do not govern arbitrary third-party programs or unrestricted shells.
+
+Folder checks are best effort because Google has no folder allowlist. Checks run before and after the write and again after approval; concurrent changes remain possible. Detected violations notify administrators, and incomplete checks are recorded without claiming success. With an empty list, create and modify can reach any writable location, while move and trash are refused. Listed folders cannot be renamed, moved or trashed; cross-drive moves are refused. See [write tools and folder rules](../guides/google-mcp.md#cloud-drive-write-tools).
+
+Every write attempt, including refusals and uncertain outcomes, is logged with the action, account, requester, file/location metadata, approval decision and outcome. Logs omit file content and tokens; they may include file names and a content digest. Administrators can query `audit.unified_log` with `tool_name_filter="google_drive_write"`. Dashboard write controls and related navigation arrive with the settings-page package in this release; they are not available yet. Real Google consent isolation/revocation, delegation, API behavior, private-message delivery, Windows and native protected Linux acceptance remain unverified here.
+
 ## Company Google sign-in
 
 The server supports Google sign-in alongside passwords and channel one-time codes. It is off by default and unavailable in the personal edition. Availability requires an administrator's risk acknowledgement, allowed company domains, a configured company Google OAuth client ID and secret, and a valid `[dashboard] public_url` (HTTPS, or HTTP on localhost/loopback). Dashboard pages for this feature are not available yet.
@@ -956,3 +1059,21 @@ New colleagues receive an AI avatar automatically, using a blank avatar or a non
 Admin or self-service unlinking invalidates all of that member's sessions. Self-service unlinking requires a local password and a password re-check. For offboarding, suspend the DuDuClaw account or unlink Google sign-in. Disabling the Google Workspace account alone does not terminate existing DuDuClaw sessions. Google-only accounts without a local password cannot sign in after downgrading to v1.85.0 or older.
 
 See [settings](../guides/dashboard-settings.md#company-google-sign-in) and [OAuth setup](../guides/google-setup.md#company-google-sign-in).
+
+## Personal keys and Odoo account boundaries (v1.86.0)
+
+A member key sees only its holder's own web conversations. Owner access to an AI employee never opens other members' conversations or external-channel conversations. New keys default to `include_conversations=false`; without it they cannot read conversation methods, resume or subscribe to existing WebChat conversations, or download conversation attachments or conversation-derived files. `activity.list` exposes conversation text only for the holder's own conversations with this option enabled. Memory reads are restricted to the holder's assigned avatar or their own personal employee under active isolation; ownership of a shared employee is insufficient.
+
+`[member_api_keys] allow_conversation_content` (default `false`) governs creation only. Turning it off does not strip existing grants. Keys created before the upgrade retain conversation access and carry `conversations_migrated=true`, within the same own-web-conversation boundary. Browser-only `me.member_keys.narrow` and Admin `member_keys.admin_narrow` can remove conversation access or MCP scopes, never add them. Creation still requires the existing password/MFA re-verification.
+
+Odoo identity selection uses this order: the avatar owner's personal credential; a verified requester's personal credential when `act_as_requester` is enabled; the AI employee's own account; the company account only when the AI is in `company_key_agents`; otherwise not connected. An avatar cannot borrow a different requester's credential. A personal API key uses only its holder's personal credential, with no employee/company fallback.
+
+Personal Odoo credentials are sealed with the gateway's machine encryption key and an owner-bound envelope. Only the gateway unseals them. Use requires an active member, matching account credential epoch and the verified server fingerprint (URL and database). After a server change, read the new address/database through `me.odoo.status` in the same browser session before testing again. Password changes, sign-out-everywhere or suspension invalidate use; when the account is available again, re-enter the key. Offboarding deletes the saved credential, and an administrator can revoke it without seeing its secret. The gateway supplies the authorized MCP process with the identity decision, verified endpoint, account metadata and credential revision, plus the selected secret when its cached revision differs; it never supplies the machine sealing key. This is an application boundary, not OS isolation from unrestricted processes running as the gateway user.
+
+| Rule | Always refused |
+| --- | --- |
+| F1 | Updating or deleting `ir.attachment`; creating it through a generic tool. Use `odoo_attachment_add` to create an attachment from a file. |
+| F2 | Mutations of `ir.model`, every `ir.model.*` descendant, and `ir.rule`. |
+| F3 | Mutations of `res.users.apikeys` and its dot descendants. |
+| F4 | Mutations of `mail` and every `mail.*` descendant; generic calls to `message_post`, `message_notify`, `message_subscribe`, `send_mail`, or `action_send_mail`. Use the dedicated note/message tools. |
+| F5 | Methods starting with `_`, plus `init` and `uninstall_hook`. |

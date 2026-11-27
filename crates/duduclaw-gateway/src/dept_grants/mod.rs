@@ -13,6 +13,7 @@ pub(crate) use duduclaw_auth::dept_grants::GrantGroup;
 
 pub(crate) mod methods;
 pub(crate) mod reach;
+pub(crate) mod rules;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantAction {
@@ -87,6 +88,63 @@ impl DeptGrantView {
         view
     }
 
+    /// Broker/push readers have no MethodHandler. Require the actual session
+    /// provenance and re-read identity, epoch, grants and disk targets each time.
+    pub(crate) fn load_session_home(home: &std::path::Path, ctx: &UserContext) -> Self {
+        if ctx.origin != ContextOrigin::DashboardSession || ctx.member_key_id.is_some()
+            || ctx.user_id == "system" {
+            return Self::empty();
+        }
+        Self::load_home_account(home, &ctx.user_id, Some(ctx)).unwrap_or_default()
+    }
+
+    /// Notification eligibility only. This never manufactures a dashboard session.
+    pub(crate) fn notification_allows(home: &std::path::Path, user: &str, agent: &str) -> bool {
+        Self::load_home_account(home, user, None).is_some_and(|view|
+            department_grant_allows(&view, agent, GrantGroup::EgressReview, GrantAction::Read))
+    }
+
+    fn load_home_account(home: &std::path::Path, user: &str, session: Option<&UserContext>) -> Option<Self> {
+        if !crate::team_edition::team_grants_enabled(home) { return None; }
+        let db = crate::decision_notify::open_user_db_read_only(home).ok()??;
+        let account = db.get_user(user).ok()??;
+        if account.status != UserStatus::Active || account.role != UserRole::Manager
+            || account.must_change_password { return None; }
+        if session.is_some_and(|ctx|
+            !duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, account.credential_epoch)) {
+            return None;
+        }
+        let grants = db.dept_grants_for_user(user).ok()?;
+        let mut ctx = db.live_user_context(user).ok()??;
+        if let Some(session) = session { ctx.origin = session.origin; }
+        let raw = std::fs::read_to_string(home.join("config.toml")).ok()?;
+        let default_id = crate::webchat::access::parse_gateway_default(&raw).ok()?;
+        let mut view = Self { home: home.to_path_buf(), grants, ctx: Some(ctx), default_id,
+            ..Self::default() };
+        for entry in std::fs::read_dir(home.join("agents")).ok()? {
+            let entry = entry.ok()?;
+            if !entry.file_type().ok()?.is_dir() { continue; }
+            let id = entry.file_name().into_string().ok()?;
+            if duduclaw_core::is_internal_agent_dir(&id)
+                || !duduclaw_core::is_valid_agent_id(&id) { continue; }
+            let raw = match std::fs::read_to_string(entry.path().join("agent.toml")) {
+                Ok(raw) => raw,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return None,
+            };
+            let config: toml::Value = toml::from_str(&raw).ok()?;
+            let info = config.get("agent")?;
+            let name = info.get("name")?.as_str()?;
+            let role: AgentRole = info.get("role")?.clone().try_into().ok()?;
+            if role == AgentRole::Main || name == view.default_id || id == view.default_id {
+                view.main_agents.insert(id.clone());
+                view.main_agents.insert(name.to_owned());
+            }
+            view.loaded_agents.insert(id, name.to_owned());
+        }
+        Some(view)
+    }
+
     async fn load_targets(h: &MethodHandler) -> Option<Self> {
         let home = h.home_dir().to_path_buf();
         let default_id = crate::webchat::access::gateway_default_id(&home).await.ok()?;
@@ -155,6 +213,10 @@ fn grant_target_department(v: &DeptGrantView, agent: &str) -> Result<Option<Stri
     if !duduclaw_core::is_valid_agent_id(agent) || agent == v.default_id
         || v.main_agents.contains(agent) || !v.loaded_agents.contains_key(agent)
     { return Ok(None); }
+    // Personal employees never inherit department grants, including for their
+    // owner. Explicit Owner bindings remain the authority for owner operations.
+    let owners = crate::personal_visibility::personal_owners(&v.home).map_err(|_| ())?;
+    if owners.contains_key(agent) { return Ok(None); }
     // Registry roles can be stale; only exact loaded directory ids qualify.
     let raw = std::fs::read_to_string(v.home.join("agents").join(agent).join("agent.toml"))
         .map_err(|_| ())?;

@@ -465,7 +465,7 @@ async fn denied_tools_still_wins_with_no_human_confirmation() {
         "denied_tools=['drive_create_file']").unwrap();
     let http = Arc::new(Http::default());
     let result = invoke(&f, &state, http.clone(), "drive_create_file", create_args(), RequesterIdentity::DashboardUser { user_id:f.user.clone() }).await;
-    assert_eq!(result.as_ref().unwrap_err().code, "changed"); assert_eq!(http.writes(), 0);
+    assert_eq!(result.as_ref().unwrap_err().code, "identity_changed"); assert_eq!(http.writes(), 0);
     assert!(http.methods.lock().unwrap().is_empty()); assert_audit(&f, &result, "refused");
 }
 
@@ -565,4 +565,52 @@ async fn displayed_folder_path_change_after_confirmation_never_writes() {
         RequesterIdentity::DashboardUser { user_id:f.user.clone() }).await;
     assert_eq!(result.unwrap_err().code, "changed");
     assert_eq!(http.writes(), 0);
+}
+
+#[tokio::test]
+async fn readiness_missing_write_credential_returns_authenticated_request_link() {
+    use crate::google_authorization_requests::{self as requests, turn as request_turn};
+    let f=Fixture::new();
+    policy(&f,ApprovalMode::Member);
+    let who=RequesterIdentity::DashboardUser {user_id:f.user.clone()};
+    let turn=uuid::Uuid::new_v4().to_string();
+    let sessions=Arc::new(crate::session::SessionManager::new(&f.home.path().join("sessions.db")).unwrap());
+    let notice=Arc::new(Mutex::new(request_turn::Notice::default()));
+    crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(who.clone(),
+        request_turn::NOTICE.scope(notice,async {
+            let _guard=request_turn::register(f.home.path(),"bot",&turn,"Create a file",
+                "webchat:write-test",sessions,None).unwrap();
+            let route=credential::resolve_route(f.home.path(),"bot").unwrap();
+            let refusal=readiness_check(f.home.path(),&route,"bot","drive_create_file",&who,Some(&turn)).unwrap_err();
+            assert_eq!(refusal.code,"drive_write_needs_member_consent");
+            let ticket=refusal.message_zh.strip_prefix(
+                "請本人開啟這個連結，連結雲端硬碟寫入：/me/google/authorize#ticket=").unwrap();
+            let row=requests::store::Store::open(f.home.path()).unwrap().preview(ticket,&f.user).unwrap();
+            assert_eq!(row.purpose,"drive_write");
+            assert_eq!(row.tool,"drive_create_file");
+            assert_eq!(row.google_sub.as_deref(),Some("google-sub-1"));
+            let outsider=RequesterIdentity::DashboardUser {user_id:"outsider".into()};
+            let refusal=readiness_check(f.home.path(),&route,"bot","drive_create_file",&outsider,Some(&turn)).unwrap_err();
+            assert!(!refusal.message_zh.contains("#ticket="));
+        })).await;
+}
+
+#[test]
+fn drive_write_request_completion_refuses_different_stored_google_sub() {
+    use crate::google_authorization_requests::{self as requests, store::Store};
+    let f=Fixture::new();
+    policy(&f,ApprovalMode::Member);
+    let who=RequesterIdentity::DashboardUser {user_id:f.user.clone()};
+    let notice=requests::issue_for_turn(f.home.path(),&f.db,"bot","drive_create_file",
+        "Create a file","webchat:test",&who,None,None).unwrap().unwrap();
+    let ticket=notice.split_once("#ticket=").unwrap().1;
+    let store=Store::open(f.home.path()).unwrap();
+    let row=store.claim_ticket(ticket,&f.user,&uuid::Uuid::new_v4().to_string()).unwrap();
+    let ordinary=std::fs::read(vault::path(f.home.path())).unwrap();
+    let mut wrong=f.metadata("user");
+    wrong.google_sub="different-sub".into();
+    f.connect(wrong,false);
+    assert!(requests::routes::complete(f.home.path(),&f.db,row,None).is_err());
+    assert!(store.ready_rows().unwrap().is_empty());
+    assert_eq!(std::fs::read(vault::path(f.home.path())).unwrap(),ordinary);
 }

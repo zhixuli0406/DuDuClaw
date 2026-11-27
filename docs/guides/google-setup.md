@@ -115,3 +115,23 @@ https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/g
 ```
 
 Tool behavior and the security model: [Google Workspace reference](google-workspace.md). Enterprise account-holder consent: [personal connections](google-personal-connections.md). Google Chat channel credentials are separate: [Chat setup](channels-googlechat-teams.md).
+
+## Prepare cloud-drive write access
+
+Create, modify, move and trash are separate administrator choices, all off by default. Enabling an action or widening access requires an explicit risk acknowledgement, logged with the administrator and time, without additional re-authentication. Each action defaults to the member's confirmation; administrators may turn it off per action or add administrator approval. An empty folder list allows create and modify anywhere the account can write, and disables move and trash. The dashboard controls arrive with the settings page in this release; the write-settings and personal write-connection blocks are not built yet.
+
+For domain-wide delegation, the Workspace super administrator must add all three scopes to the service account's authorized scope list in **Google Admin console → Security → Access and data control → API controls → Manage Domain Wide Delegation**. Keep the existing scopes required by other services:
+
+```text
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/spreadsheets
+```
+
+These scopes cover writing; the ordinary `drive.readonly` scope does not. Colleagues using delegation do not each need a personal write consent. Actual token issuance after the Google Admin change still needs Workspace acceptance.
+
+For a shared company account connected by OAuth, an administrator must complete a one-time additional Google write consent for that company account. It is stored separately from the ordinary connection. People whose employees use their own Google connection instead need their own second write consent; see [personal connections](google-personal-connections.md).
+
+For a shared company service account, protect the key file carefully. Once full Drive scope is authorized, a key readable by the CLI could be used to mint write tokens independently of DuDuClaw's write switches. Prefer the gateway-sealed delegation key. Product checks do not isolate a process with unrestricted access to the key.
+
+Apps Script company connections and protected mode do not support Drive write: these tools are hidden and calls are refused. Existing Docs/Sheets write tools retain their own rules; see the [write-tool reference](google-mcp.md#cloud-drive-write-tools).

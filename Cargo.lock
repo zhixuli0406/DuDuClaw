@@ -1798,6 +1798,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
+ "image",
  "json5",
  "libc",
  "minisign-verify",
@@ -2364,6 +2365,7 @@ dependencies = [
 name = "duduclaw-odoo"
 version = "1.85.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "duduclaw-core",
  "duduclaw-security",

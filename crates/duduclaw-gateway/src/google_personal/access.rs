@@ -214,6 +214,14 @@ pub async fn resolve(
     effective: &EffectiveIdentity,
     tool: &str,
 ) -> Result<Resolved, Refusal> {
+    resolve_with_authority(home, agent, requester, people, effective, tool, None).await
+}
+
+pub(crate) async fn resolve_with_authority(
+    home: &Path, agent: &str, requester: &RequesterIdentity, people: &dyn People,
+    effective: &EffectiveIdentity, tool: &str,
+    mut authority: Option<&mut Option<duduclaw_core::authority_coordinator::SharedLease>>,
+) -> Result<Resolved, Refusal> {
     if !crate::team_edition::team_grants_enabled(home) {
         return Err(Refusal::hard(
             "not_available",
@@ -264,7 +272,15 @@ pub async fn resolve(
     let selected =
         super::authority::PersonalSelection::capture(home, agent, requester, people, tool)?;
     let lock = refresh_lock(home, &user.id)?;
+    // Another refresher may hold this mutex while waiting for grant -> authority.
+    // Never wait for that mutex with the route's shared authority lease held.
+    if let Some(lease) = authority.as_deref_mut() { drop(lease.take()); }
     let _guard = lock.lock().await;
+    if let Some(lease) = authority.as_deref_mut() {
+        *lease = Some(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+            .shared().await.map_err(|_| pinned_changed())?);
+        selected.validate(home, agent, requester, people, tool)?;
+    }
     check_person(home, db, agent, &user)?;
     vault::sync_user_status(home, &user.id, true).map_err(store_error)?;
     selected.validate(home, agent, requester, people, tool)?;
@@ -300,7 +316,24 @@ pub async fn resolve(
         .expires_at
         .is_none_or(|expiry| expiry <= chrono::Utc::now().timestamp() + 120)
     {
+        let before = super::authority::PersonalAuthority::new(selected.clone(), record.metadata.revision);
+        if let Some(lease) = authority.as_deref_mut() { drop(lease.take()); }
+        #[cfg(test)]
+        pinned_test::observe(home, "token_refresh_waiting_for_grant");
         let _grant_lease = super::grants::acquire(home).await.map_err(store_error)?;
+        if let Some(lease) = authority.as_deref_mut() {
+            *lease = Some(duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+                .shared().await.map_err(|_| pinned_changed())?);
+            // The selection pins config/client files, ACL/owner generations,
+            // requester/consent gates and grant identity; authority also pins
+            // the exact token revision. A changed snapshot never falls back.
+            before.validate(home, agent, requester, people, tool)?;
+            check_person(home, db, agent, &user)?;
+            check_record(home, &record, tool).map_err(audience)?;
+            let live_key = crate::google_identity::protection_gate_async(home).await?;
+            if live_key.key_id() != key.key_id() { return Err(pinned_changed()); }
+            before.validate(home, agent, requester, people, tool)?;
+        }
         let Some(refresh_token) = secret.refresh_token.as_deref() else {
             return Err(audience(Refusal::soft(
                 "needs_reconnect",
@@ -328,6 +361,9 @@ pub async fn resolve(
                     return Err(refresh_route_changed());
                 }
                 let current_scopes = tokens.granted_scopes.as_deref();
+                if authority.is_some() {
+                    before.validate(home, agent, requester, people, tool)?;
+                }
                 if !vault::finish_refresh_with_scopes(
                     home,
                     &key,

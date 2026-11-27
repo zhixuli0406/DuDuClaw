@@ -1,4 +1,5 @@
 use super::*;
+use super::odoo_actor::OdooActor;
 use super::odoo_identity_client::{self as identity_client, IdentityKind, OdooIdentity, IdentityCache};
 
 pub(super) fn blocked_odoo_method(method: &str) -> bool {
@@ -46,7 +47,7 @@ pub(crate) async fn handle_odoo_tool(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, None)).await)
+    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None, None)).await)
 }
 
 /// Isolation supplies the already selected connector; no account resolution or
@@ -54,18 +55,33 @@ pub(crate) async fn handle_odoo_tool(
 pub(crate) async fn handle_bound_odoo_tool(
     tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
+    attachment: Option<super::ValidatedAttachment>,
 ) -> Value {
-    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, caller_agent, Some(connector)).await)
+    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector), attachment).await)
+}
+
+/// Person tools enter here before employee dispatch, isolation or approvals.
+pub(super) async fn handle_odoo_actor(
+    tool: &str, params: &Value, home: &Path, odoo: &OdooState, actor: OdooActor<'_>,
+) -> Value {
+    if actor.employee().is_none() && !duduclaw_core::mcp_person_tools::person_tool(tool)
+        .is_some_and(|t| t.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::McpWithPersonalOdoo) {
+        return mcp_error("本人金鑰不提供這項 Odoo 工具。");
+    }
+    handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None, None).await
 }
 
 async fn handle_odoo_tool_with_connector(
-    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
+    tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, actor: OdooActor<'_>,
     bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
+    attachment: Option<super::ValidatedAttachment>,
 ) -> Value {
     use duduclaw_odoo::connector::OdooConnector;
     use duduclaw_odoo::models::{accounting, crm, inventory, sale};
 
-    let policy = match super::odoo_access::ToolPolicy::load(home_dir, caller_agent) {
+    let audit_name = actor.audit_name();
+    let caller_agent = audit_name.as_ref();
+    let policy = match actor.policy(home_dir) {
         Ok(policy) => policy,
         Err(error) => return mcp_error(&error),
     };
@@ -87,6 +103,12 @@ async fn handle_odoo_tool_with_connector(
         return handle_odoo_connect(home_dir, odoo, caller_agent).await;
     }
 
+    if tool == "odoo_status" && actor.employee().is_none() {
+        return match actor.connect(home_dir, odoo, tool, params).await {
+            Ok((conn, _)) => tool_text(&format!("Odoo connected; uid={}", conn.status().uid.unwrap_or_default())),
+            Err(error) => mcp_error(&error),
+        };
+    }
     if tool == "odoo_status" {
         let mut cache = odoo.identity_cache.lock().await;
         let identity = match select_odoo_identity(home_dir, odoo, caller_agent, tool, &mut cache).await {
@@ -111,16 +133,20 @@ async fn handle_odoo_tool_with_connector(
         return result;
     }
 
+    if tool == "odoo_attachment_add" {
+        return super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound, attachment).await;
+    }
+
+    if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {
+        return super::odoo_writeback::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
+    }
+
     // RM-120: generic create / write carry their own explicit-grant gate
     // chain (`odoo_generic_write.rs`); the permissive per-agent filter below
     // never authorizes them. Protected mode (owner decision C) runs the same
     // chain on the employee's own isolation connector: no pool lookup.
     if matches!(tool, "odoo_create" | "odoo_write") {
-        return match bound {
-            Some(connector) => super::odoo_generic_write::handle_bound_odoo_generic_write(
-                tool, params, home_dir, odoo, caller_agent, connector).await,
-            None => super::odoo_generic_write::handle_odoo_generic_write(tool, params, home_dir, odoo, caller_agent).await,
-        };
+        return super::odoo_generic_write::handle_actor(tool, params, home_dir, odoo, actor, bound).await;
     }
 
     if !matches!(tool,
@@ -131,6 +157,7 @@ async fn handle_odoo_tool_with_connector(
         return super::egress_gate::pre_dispatch_error("This Odoo capability is not available. This is a policy decision; retrying the same call will not succeed. 這項 Odoo 功能不提供；這是政策限制，重試相同呼叫不會成功。");
     }
 
+    if let Some(caller_agent) = actor.employee() {
     // Local-only preparation. Preserve a registered override when no agent file exists.
     let config_result = odoo.load_global_for_gate(home_dir).await;
     let agent_path = caller_agent_dir(home_dir, caller_agent).join("agent.toml");
@@ -145,10 +172,15 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if let Err(error) = config_result { return mcp_error(&error); }
+    if let Err(error) = policy.data_preconnect(tool, params, odoo.agent_override(caller_agent).await) {
+        return super::egress_gate::pre_dispatch_error(&format!(
+            "{error} This is a policy decision; retrying the same call will not succeed. 這是政策限制，重試相同呼叫不會成功。"));
+    }
+    }
     // The gateway decision selects the mode. A bound isolation connector has
     // no personal decision and therefore retains the legacy Engine gates.
     let (conn_arc, decision) = if let Some(connector) = bound { (connector, None) } else {
-        match connect_odoo_pool_checked(home_dir, odoo, caller_agent, tool, params).await {
+        match actor.connect(home_dir, odoo, tool, params).await {
             Ok((conn, identity)) => (conn, Some(identity)),
             Err(error) => return mcp_error(&error),
         }
@@ -166,18 +198,15 @@ async fn handle_odoo_tool_with_connector(
             return super::egress_gate::pre_dispatch_error(&format!("Odoo permission denied: {reason}"));
         }
     }
-    let unblock_models = odoo.unblock_models(caller_agent).await;
+    let unblock_models = if let Some(agent) = actor.employee() { odoo.unblock_models(agent).await } else { vec![] };
     if conn_arc.verify_io().is_err() { return mcp_error("Odoo authority revoked"); }
     let conn: &OdooConnector = conn_arc.as_ref();
     // ── per-call audit attribution (RFC-21 §2 acceptance) ────────────────
     // Surface caller_agent + profile + tool + params summary to
     // tool_calls.jsonl so the audit trail attributes Odoo activity to a
     // specific agent rather than to the global admin user.
-    let _audit_profile = match &decision {
-        Some(identity) => match odoo.key_for_identity(caller_agent, identity).await {
-            Ok(key) => key.1, Err(error) => return mcp_error(&error),
-        },
-        None => odoo.pool_key(caller_agent).await.1,
+    let _audit_profile = match actor.profile(odoo, decision.as_ref()).await {
+        Ok(profile) => profile, Err(error) => return mcp_error(&error),
     };
     // A: effective block-list opt-out for this agent (per-agent override, else
     // global). Empty ⇒ the built-in security block list is fully in force.
@@ -397,11 +426,10 @@ async fn handle_odoo_tool_with_connector(
                 Err(error) => return mcp_error(&error),
             };
             // This tool also reads product totals; preserve both model gates.
-            if let Err(module) = odoo.feature_gate("product.product").await {
+            if let Err(module) = policy.global.feature_allows_model("product.product") {
                 return mcp_error(&format!("Odoo feature_gate: module '{module}' is switched off"));
             }
-            let cfg = odoo.agent_override(caller_agent).await;
-            if engine && let Err(reason) = crate::odoo_pool::check_action_permission(cfg.as_ref(), "search", "product.product") {
+            if engine && let Err(reason) = crate::odoo_pool::check_action_permission(Some(&policy.agent), "search", "product.product") {
                 return mcp_error(&format!("Odoo permission denied: {reason}"));
             }
             if follow {
@@ -639,6 +667,10 @@ async fn handle_odoo_tool_with_connector(
         _ => Err(format!("Unknown Odoo tool: {tool}")),
     };
 
+    let raw_result = match &result { Ok(text) | Err(text) => text.as_str() };
+    identity_client::audit_result(home_dir, caller_agent, tool, params, result.is_ok(),
+        raw_result, follow || actor.employee().is_none());
+
     let result = result.map(|text| {
         let verb = match tool {
             "odoo_crm_create_lead" | "odoo_sale_create_quotation" => Some("create"),
@@ -650,38 +682,6 @@ async fn handle_odoo_tool_with_connector(
             super::odoo_access::identity_suffix(decision.as_ref(), verb)))
     });
 
-    // RFC-21 §2 acceptance: per-call audit attribution. tool_calls.jsonl
-    // now carries the originating agent + profile + outcome so Odoo
-    // activity can be traced to the agent that triggered it (and not the
-    // shared admin user inside Odoo's own audit log).
-    let params_summary = format!(
-        "profile={}; tool={}; ok={}",
-        _audit_profile,
-        tool,
-        result.is_ok(),
-    );
-    // B3b: `odoo_*` deliberately stays out of the central `is_state_changing`
-    // dispatch gate (see the comment on that list — it audits itself here to
-    // avoid double-logging), so it needs its own `result_text` capture. Odoo
-    // reads (partner search, schema fields, ...) return real business data
-    // in `Ok(text)` — exactly the kind of evidence B3's grounding pre-check
-    // needs, and it was silently excluded before this change. Error text is
-    // captured too (masked/capped inside the helper); `check_grounded`
-    // already excludes `is_error` evidence, so this never lets a failed
-    // Odoo call masquerade as grounding.
-    let result_text = match &result {
-        Ok(text) => text.clone(),
-        Err(e) if follow => super::odoo_access::error_text(e, decision.as_ref()),
-        Err(e) => e.clone(),
-    };
-    identity_client::audit_call(
-        home_dir,
-        caller_agent,
-        tool,
-        &params_summary,
-        result.is_ok(),
-        Some(&result_text),
-    );
 
     match result {
         Ok(text) => serde_json::json!({ "content": [{"type": "text", "text": text}] }),
@@ -698,6 +698,16 @@ async fn handle_odoo_tool_with_connector(
 /// need no model permission).
 pub(crate) fn classify_odoo_call(tool: &str, params: &Value) -> Option<(&'static str, String)> {
     match tool {
+        "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add" => {
+            let model = params.get("model").and_then(Value::as_str)?;
+            let verb = match tool {
+                "odoo_activity_create" => "activity",
+                "odoo_note_post" => "note",
+                "odoo_attachment_add" => "attach",
+                _ => "message",
+            };
+            Some((verb, model.to_owned()))
+        }
         "odoo_crm_leads" => Some(("search", "crm.lead".into())),
         "odoo_crm_create_lead" => Some(("create", "crm.lead".into())),
         "odoo_crm_update_stage" => Some(("write", "crm.lead".into())),
@@ -932,48 +942,51 @@ async fn connect_odoo_pool_inner(
 /// cannot select a person or authorize reuse without another gateway response.
 async fn select_odoo_identity(home: &Path, pool: &OdooState, agent: &str, tool: &str,
     cache: &mut IdentityCache) -> std::result::Result<OdooIdentity, String> {
-    let have_rev = cache.entries.iter().rev().find(|(a, _, _, _)| a == agent).map(|(_, _, rev, _)| *rev);
+    let have_rev = cache.entries.iter().rev().find(|(a, ..)| a == agent).map(|(_, _, rev, _, _)| *rev);
     let result = identity_client::request_identity(home, agent, tool, have_rev).await;
     let mut identity = match result {
         Ok(identity) => identity,
         Err(error) => {
-            let old: Vec<_> = cache.entries.iter().filter(|(a, _, _, _)| a == agent)
-                .map(|(a, user, rev, _)| (a.clone(), format!("person:{user}:{rev}"))).collect();
-            cache.entries.retain(|(a, _, _, _)| a != agent);
+            let old: Vec<_> = cache.entries.iter().filter(|(a, ..)| a == agent)
+                .map(|(a, user, rev, fp, _)| (a.clone(), format!("person:{user}:{rev}:{fp}"))).collect();
+            cache.entries.retain(|(a, ..)| a != agent);
             for key in old { pool.drop_slot(&key).await; }
             identity_client::audit_call(home, agent, tool, "identity refused", false, None);
             return Err(error.message);
         }
     };
     if identity.kind == IdentityKind::Personal {
-        // Two different people may have the same revision number. An omitted
-        // secret can only be filled from the exact (agent, person, rev) entry.
+        // Revision alone is not a credential binding: include person and server.
         if identity.secret.is_none() {
-            identity.secret = cache.entries.iter().find(|(a, u, r, _)|
-                a == agent && Some(u) == identity.user_id.as_ref() && Some(*r) == identity.rev)
-                .map(|(_, _, _, secret)| secret.clone());
+            identity.secret = cache.entries.iter().find(|(a, u, r, fp, _)|
+                a == agent && Some(u) == identity.user_id.as_ref() && Some(*r) == identity.rev
+                    && Some(fp) == identity.server_fp.as_ref())
+                .map(|(_, _, _, _, secret)| secret.clone());
             if identity.secret.is_none() {
                 let delivered = identity_client::request_identity(home, agent, tool, None).await.map_err(|e| e.message)?;
-                if delivered.kind != IdentityKind::Personal || delivered.user_id != identity.user_id {
+                if delivered.kind != IdentityKind::Personal || delivered.user_id != identity.user_id
+                    || delivered.server_fp != identity.server_fp || delivered.rev != identity.rev {
                     return Err("Odoo 身分在確認期間已變更，這次操作尚未執行。".into());
                 }
                 identity = delivered;
             }
         }
-        if identity.kind == IdentityKind::Personal {
-            let user = identity.user_id.as_deref().ok_or("Missing Odoo user")?;
-            let rev = identity.rev.ok_or("Missing Odoo revision")?;
-            let secret = identity.secret.clone().ok_or("Missing Odoo credential")?;
-            let old: Vec<_> = cache.entries.iter().filter(|(a, u, r, _)| a == agent && u == user && *r != rev)
-                .map(|(a, u, r, _)| (a.clone(), format!("person:{u}:{r}"))).collect();
-            cache.entries.retain(|(a, u, _, _)| !(a == agent && u == user));
-            for key in old { pool.drop_slot(&key).await; }
-            cache.entries.push((agent.to_owned(), user.to_owned(), rev, secret));
-            if cache.entries.len() > 32 {
-                let (a, u, r, _) = cache.entries.remove(0);
-                pool.drop_slot(&(a, format!("person:{u}:{r}"))).await;
-            }
+        let user = identity.user_id.as_deref().ok_or("Missing Odoo user")?;
+        let rev = identity.rev.ok_or("Missing Odoo revision")?;
+        let (_, _, fp) = identity.personal_endpoint()?;
+        let secret = identity.secret.clone().ok_or("Missing Odoo credential")?;
+        let old: Vec<_> = cache.entries.iter().filter(|(a, u, r, f, _)|
+            a == agent && u == user && (*r != rev || f != fp))
+            .map(|(a, u, r, f, _)| (a.clone(), format!("person:{u}:{r}:{f}"))).collect();
+        cache.entries.retain(|(a, u, ..)| !(a == agent && u == user));
+        for key in old { pool.drop_slot(&key).await; }
+        cache.entries.push((agent.to_owned(), user.to_owned(), rev, fp.to_owned(), secret));
+        if cache.entries.len() > 32 {
+            let (a, u, r, f, _) = cache.entries.remove(0);
+            pool.drop_slot(&(a, format!("person:{u}:{r}:{f}"))).await;
         }
+        identity_client::record(&identity);
+        return Ok(identity); // Never select a personal endpoint from local config.
     }
     identity_client::record(&identity);
     // Re-read the effective artifact on every decision. Missing/malformed

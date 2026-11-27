@@ -226,9 +226,6 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
     }
     let decision = validate_import_policy(&mut snapshot, home, personal)?;
     apply_import_snapshot(&mut snapshot, home, force, &decision, |_| Ok(()))?;
-    if decision.removed_drive_write {
-        println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
-    }
     Ok(())
 }
 
@@ -331,6 +328,9 @@ fn apply_import_snapshot_with_limits(
     // or identity data; per-entry checks still guard subsequent changes.
     if decision.publish_before_unpack {
         publish_import_config(home, &decision.prepared_config)?;
+        if decision.removed_drive_write {
+            println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
+        }
     }
     if has_agents {
         let backup = home.join("agents.pre-import");
@@ -467,6 +467,7 @@ mod tests {
             assert!(table.get("google").and_then(|v| v.get("drive_write")).is_none());
             assert!(published.starts_with("# preserve this header\n"));
             assert!(published.contains("google_workspace = true # keep this comment"));
+            assert!(published.ends_with('\n'));
             assert_eq!(drive_write_policy::load(&home), DriveWritePolicy::all_off());
             assert_eq!(fs::read_to_string(home.join("payload.txt")).unwrap(), "ok");
         }
@@ -502,6 +503,7 @@ mod tests {
             assert!(table.get("google").and_then(|v| v.get("drive_write")).is_none());
             assert!(published.starts_with("# preserve this header\n"));
             assert!(published.contains("google_workspace = true # keep this comment"));
+            assert!(published.ends_with('\n'));
             assert_eq!(drive_write_policy::load(&home), DriveWritePolicy::all_off());
             assert_eq!(fs::read_to_string(home.join("payload.txt")).unwrap(), "ok");
         }
@@ -1708,7 +1710,9 @@ fn validate_import_policy_with_limits(
                 if let Some(google) = sanitized.get_mut("google").and_then(toml::Value::as_table_mut) {
                     removed_drive_write |= google.remove("drive_write").is_some();
                 }
-                let text = render_preserving(&text, &sanitized).map_err(DuDuClawError::Config)?;
+                let text = if removed_drive_write {
+                    render_preserving(&text, &sanitized).map_err(DuDuClawError::Config)?
+                } else { text };
                 refuse_drive_write_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
                 duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
                     .map_err(DuDuClawError::Config)?;

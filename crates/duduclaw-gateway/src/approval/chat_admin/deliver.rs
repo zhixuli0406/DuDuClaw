@@ -10,7 +10,7 @@ use super::{card, config, receipts, chat_tier, Tier};
 
 pub(super) mod transport;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Default, Debug)]
 pub(crate) struct DeliveryResult {

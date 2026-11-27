@@ -49,6 +49,7 @@ pub mod remembered_sessions;
 
 pub mod status_tokens;
 pub mod member_keys;
+pub mod skill_trust;
 
 /// RM-134 (v1.82): hashed store for dashboard-issued MCP API keys.
 pub mod mcp_keys;

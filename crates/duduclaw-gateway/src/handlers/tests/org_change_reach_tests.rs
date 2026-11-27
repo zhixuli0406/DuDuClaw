@@ -131,8 +131,10 @@ async fn reach_preview_is_admin_only_and_uses_the_org_base_department() {
 #[tokio::test]
 async fn org_reach_read_error_marks_proposal_and_refuses_decision_and_apply() {
     let f = fixture().await;
+    // A request-time migrating opener in another subsystem must not heal the fault.
     rusqlite::Connection::open(f.home.join("users.db")).unwrap()
-        .execute("DROP TABLE department_manager_grants", []).unwrap();
+        .execute_batch("DROP TABLE department_manager_grants;
+            CREATE VIEW department_manager_grants AS SELECT 1 AS unreadable;").unwrap();
     let p = propose(&f).await;
     assert_eq!(p["sentence"], "授權影響無法計算");
     assert!(p["reach_digest"].is_null());

@@ -9,7 +9,10 @@ pub(crate) struct Event {
     pub account: String,
     pub dm: String,
     pub principal: String,
-    pub private: bool,
+    // Envelope fact: authorization failure must never disable suppression.
+    pub envelope_private: bool,
+    // Only grants access to verification/decision, never to message forwarding.
+    pub authorized: bool,
     pub reply_to: Option<String>,
     pub prompt_hint: bool,
     pub text: String,
@@ -59,15 +62,16 @@ pub(crate) async fn intercept(env: &DecisionEnv, event: Event, lang: Lang, sink:
 async fn intercept_with_verify<F>(env: &DecisionEnv, event: Event, lang: Lang, sink: &impl ReplySink, verify: F) -> bool
 where F: FnOnce(&duduclaw_auth::UserDb, &std::path::Path, &str, &str, i64) -> Result<(), String> + Send + 'static,
 {
-    if event.reply_to.is_none() && (!event.private || !code_shaped(&event.text)) { return false; }
-    let could_carry_code = event.private && (code_shaped(&event.text) || event.prompt_hint);
+    if event.reply_to.is_none() && (!event.envelope_private || !code_shaped(&event.text)) { return false; }
+    let could_carry_code = event.envelope_private && (code_shaped(&event.text) || event.prompt_hint);
+    let authorized = event.authorized;
     let mut prompt_bound = false;
     let result = process(env, event, lang, verify, &mut prompt_bound).await;
     let (text, receipt) = match result {
         Ok(Some(result)) => result,
         Ok(None) => return false,
         Err(_) if !prompt_bound && !could_carry_code => return false,
-        Err(error) if matches!(error.code, "expired" | "used") => (expired(lang), None),
+        Err(error) if authorized && matches!(error.code, "expired" | "used") => (expired(lang), None),
         Err(_) => (dashboard(lang), None),
     };
     // Attempt deletion before slower cosmetic edits/replies, even on refusal.
@@ -84,19 +88,20 @@ async fn process<F>(env: &DecisionEnv, event: Event, lang: Lang, verify: F, prom
 where F: FnOnce(&duduclaw_auth::UserDb, &std::path::Path, &str, &str, i64) -> Result<(), String> + Send + 'static,
 {
     if event.reply_to.is_none() {
-        if !event.private || !code_shaped(&event.text) { return Ok(None); }
+        if !event.envelope_private || !code_shaped(&event.text) { return Ok(None); }
         let (home, account, dm, principal) = (env.home.clone(), event.account, event.dm, event.principal);
         let live = tokio::task::spawn_blocking(move || {
             Store::open(&home)?.has_live_totp(&account, &dm, &principal)
         }).await.map_err(Error::unavailable)??;
         // A successful lookup without a live flow leaves a bare code as ordinary text.
-        // No verification or authorization is attempted on this path.
+        // No verification is attempted on this path.
+        if live && !event.authorized { return Ok(Some((dashboard(lang), None))); }
         return Ok(live.then(|| (words(lang,
             "請回覆驗證提示訊息，再輸入驗證碼。",
             "Please reply to the verification prompt with your code.",
             "確認コードの案内メッセージに返信して、コードを入力してください。"), None)));
     }
-    let hint = event.private && event.prompt_hint;
+    let hint = event.envelope_private && event.prompt_hint;
     let (home, account, dm, prompt) = (env.home.clone(), event.account.clone(), event.dm.clone(), event.reply_to.clone());
     let ticket = tokio::task::spawn_blocking(move || {
         match prompt {
@@ -105,12 +110,12 @@ where F: FnOnce(&duduclaw_auth::UserDb, &std::path::Path, &str, &str, i64) -> Re
         }
     }).await.map_err(Error::unavailable)??;
     let Some(bound) = ticket else {
-        return Ok(hint.then(|| (expired(lang), None)));
+        return Ok(hint.then(|| (if event.authorized { expired(lang) } else { dashboard(lang) }, None)));
     };
     // Once a prompt is bound, later errors still consume even malformed input.
     *prompt_bound = true;
     // An invalid sender is still consumed, but cannot burn the owner's attempts.
-    if !event.private || event.principal != bound.principal || event.account != bound.account
+    if !event.envelope_private || !event.authorized || event.principal != bound.principal || event.account != bound.account
         || event.dm != bound.dm || bound.channel != "telegram" {
         return Ok(Some((dashboard(lang), None)));
     }
@@ -137,6 +142,12 @@ where F: FnOnce(&duduclaw_auth::UserDb, &std::path::Path, &str, &str, i64) -> Re
     let (home, db, current) = (env.home.clone(), env.users.clone(), row.clone());
     let verified = tokio::task::spawn_blocking(move || -> Result<Option<i64>, Error> {
         let db = db.as_deref().ok_or_else(Error::forbidden)?;
+        // A live setting can disable an already-issued prompt. Refuse before
+        // verifying the factor or changing ticket status/attempts.
+        if !config::effective(&home, Some(db))
+            .is_some_and(|cfg| cfg.step_up_methods.contains(&config::StepMethod::DmTotp)) {
+            return Err(Error::forbidden());
+        }
         if !has_totp(db, &bound.ticket.user_id)? { return Err(Error::forbidden()); }
         if crate::approval::decision_digest_at(&home, &current) != bound.ticket.digest { return Err(Error::digest()); }
         let mut store = Store::open(&home)?;
@@ -180,4 +191,4 @@ fn matches_receipt(bound: &TotpTicket, receipt: &Receipt) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -51,7 +51,9 @@ async fn rpc(h: &MethodHandler, method: &str, params: Value, ctx: &UserContext) 
 async fn non_admin_get_and_set_are_refused() {
     let (dir, h) = fixture().await;
     let mut member = admin(); member.role = UserRole::Employee;
-    for method in ["google.drive_write.get", "google.drive_write.set"] {
+    for method in ["google.drive_write.get", "google.drive_write.set",
+        "google.drive_write.consent_home_start", "google.drive_write.consent_home_disconnect",
+        "google.drive_write.consent_home_finish", "google.drive_write.consent_home_paste"] {
         refused(rpc(&h, method, input(), &member).await);
     }
     assert_eq!(std::fs::read_to_string(dir.path().join("config.toml")).unwrap(), ORIGINAL);
@@ -179,7 +181,11 @@ async fn all_off_is_signed_and_hand_edit_invalidates_effective_switches() {
 #[tokio::test]
 async fn raw_editor_and_shared_commit_only_allow_whole_section_removal() {
     let (dir, h) = fixture().await;
-    ok(rpc(&h, "google.drive_write.set", input(), &admin()).await);
+    let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+    let user = db.create_user("admin@example.test", "Admin", "fixture-password", UserRole::Admin).unwrap();
+    let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+    let refusal = "請到 Google 整合設定頁調整雲端硬碟寫入權限。";
+    ok(rpc(&h, "google.drive_write.set", input(), &ctx).await);
     let path = dir.path().join("config.toml");
     let raw = std::fs::read_to_string(&path).unwrap();
     let before = raw.parse::<toml::Table>().unwrap();
@@ -188,16 +194,20 @@ async fn raw_editor_and_shared_commit_only_allow_whole_section_removal() {
         let mut changed = before.clone();
         if key == "trash" { changed["google"]["drive_write"]["trash"] = toml::Value::Boolean(true); }
         else { changed["google"]["drive_write"]["ack"]["by_email"] = toml::Value::String("forged@test.invalid".into()); }
-        assert!(guard(&before, &changed).is_err());
+        assert_eq!(guard(&before, &changed).unwrap_err(), refusal);
         assert!(super::super::config_commit::commit_table_locked(&path,
-            super::super::config_commit::content_hash(&raw), &changed).await.is_err());
-        refused(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&changed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &admin()).await);
+            super::super::config_commit::content_hash(&raw), &changed).await.unwrap_err().contains(refusal));
+        let response = rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&changed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &ctx).await;
+        match response {
+            WsFrame::Response { ok:false, error:Some(error), .. } => assert_eq!(error.as_str(), Some(refusal)),
+            other => panic!("expected Drive write refusal: {other:?}"),
+        }
         assert_eq!(std::fs::read_to_string(&path).unwrap(), raw);
     }
     let mut removed = before.clone(); removed["google"].as_table_mut().unwrap().remove("drive_write");
     assert!(guard(&before, &removed).is_ok());
-    assert!(guard(&removed, &before).is_err());
-    ok(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&removed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &admin()).await);
+    assert_eq!(guard(&removed, &before).unwrap_err(), refusal);
+    ok(rpc(&h, "config.raw.set", json!({"file":"config","content":toml::to_string(&removed).unwrap(),"base_hash":super::super::config_commit::content_hash(&raw)}), &ctx).await);
     assert_eq!(policy::load(dir.path()), policy::DriveWritePolicy::all_off());
 }
 
@@ -292,4 +302,27 @@ async fn http_error_folder_metadata_is_unavailable_and_stored_unverified() {
     let response = axum::http::Response::builder().status(200)
         .body(metadata.to_string()).unwrap();
     assert_eq!(folder_response_value(reqwest::Response::from(response)).await, Some(metadata));
+}
+
+#[tokio::test]
+async fn home_write_status_is_safe_and_unreadable_store_fails_closed() {
+    let (dir, h) = fixture().await;
+    let status = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    assert_eq!(status["home_write"]["connected"], false);
+    assert_eq!(status["home_write"]["status"], "disconnected");
+    assert!(status["home_write"]["account_email"].is_null());
+    std::fs::write(crate::person_credentials::write_store::path(dir.path()), "broken").unwrap();
+    let status = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    assert_eq!(status["home_write"]["connected"], false);
+    assert_eq!(status["home_write"]["status"], "unreadable");
+}
+
+#[tokio::test]
+async fn home_write_rpcs_require_authenticated_dashboard_session() {
+    let (_dir, h) = fixture().await;
+    for method in ["google.drive_write.consent_home_start", "google.drive_write.consent_home_disconnect",
+        "google.drive_write.consent_home_finish", "google.drive_write.consent_home_paste"] {
+        refused(rpc(&h, method, json!({"acknowledge_google_data":true,"acknowledge_write":true,
+            "redirect_origin":"http://127.0.0.1:18889","user_id":"admin-test"}), &admin()).await);
+    }
 }

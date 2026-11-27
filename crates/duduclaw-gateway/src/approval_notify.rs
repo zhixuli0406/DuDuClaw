@@ -136,7 +136,7 @@ pub(crate) fn approval_body_with(
     assigner: Option<&str>,
 ) -> String {
     // Private mail details have a separate, audience-gated renderer.
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         return dashboard_only_notice_body(home, rec, reminder);
     }
     let head = if reminder {
@@ -234,8 +234,7 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
 /// Record-level restrictions also cover outbound guards on arbitrary kinds.
 pub(crate) fn is_dashboard_only_record(home: Option<&Path>, rec: &ApprovalRecord) -> bool {
     is_dashboard_only_kind(&rec.action_kind)
-        || rec.action_kind == crate::approval::cli_egress::KIND
-        || (rec.payload.get("egress_guard").is_some()
+        || (crate::approval::is_outbound_data_card(rec)
             && !home.is_some_and(|home| crate::approval::mail_requester::eligible(home, rec)))
 }
 
@@ -280,9 +279,9 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
 pub(crate) fn dashboard_only_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
-    if rec.action_kind == crate::approval::cli_egress::KIND || rec.payload.get("egress_guard").is_some() {
-        let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
-        return format!("{head}\n請管理員開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
+    if crate::approval::is_outbound_data_card(rec) {
+        let head = if reminder { "有一則對外操作審核快到期了。" } else { crate::approval::outbound::NOTICE_SUMMARY };
+        return format!("{head}\n請管理員或被授權的部門主管開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
             deadline_phrase(home, rec), rec.id.as_str());
     }
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
@@ -381,26 +380,78 @@ pub(crate) fn activation_notice_body(home: &Path, rec: &ApprovalRecord, reminder
     )
 }
 
-/// Destinations for a dashboard-only notice: the agent's own control
-/// channel, else the approvers' linked chats — never the originating
-/// conversation, which is excluded explicitly rather than by relying on the
-/// reply-channel task-local being absent.
+/// Keep every outbound reviewer's identity and role until the delivery check.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NoticeTarget {
+    destination: (String, String),
+    expected_user_id: Option<String>,
+    department_manager: bool,
+}
+
+impl NoticeTarget {
+    fn unscoped(destination: (String, String)) -> Self {
+        Self { destination, expected_user_id: None, department_manager: false }
+    }
+
+    fn allows_send(&self, home: &Path, rec: &ApprovalRecord) -> bool {
+        let Some(user_id) = self.expected_user_id.as_deref() else {
+            return !crate::approval::is_outbound_data_card(rec);
+        };
+        let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return false; };
+        let Ok(Some(user)) = db.get_user(user_id) else { return false; };
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { return false; }
+        let allowed = if self.department_manager {
+            user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, user_id, &rec.agent_id)
+        } else {
+            user.role == duduclaw_auth::UserRole::Admin
+        };
+        if !allowed { return false; }
+        db.verified_dm_destinations_for_user(user_id).is_ok_and(|destinations|
+            destinations.iter().any(|dest|
+                dest.channel == self.destination.0 && dest.channel_user_id == self.destination.1))
+    }
+}
+
+fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<NoticeTarget> {
+    let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return vec![]; };
+    let Ok(users) = db.list_users() else { return vec![]; };
+    let mut targets = std::collections::BTreeSet::new();
+    for user in users {
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { continue; }
+        let allowed = user.role == duduclaw_auth::UserRole::Admin
+            || (user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, &user.id, &rec.agent_id));
+        if allowed && let Ok(destinations) = db.verified_dm_destinations_for_user(&user.id) {
+            targets.extend(destinations.into_iter().map(|dest| NoticeTarget {
+                destination: (dest.channel, dest.channel_user_id),
+                expected_user_id: Some(user.id.clone()),
+                department_manager: user.role == duduclaw_auth::UserRole::Manager,
+            }));
+        }
+    }
+    targets.into_iter().collect()
+}
+
 fn dashboard_only_targets(
     home_dir: &Path,
     rec: &ApprovalRecord,
     reminder: bool,
-) -> Vec<(String, String)> {
+) -> Vec<NoticeTarget> {
     let origin = origin_target();
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let owners = if kb { crate::knowledge::add_source_chat::owner_targets(home_dir, rec) } else { vec![] };
-    let base = if kb {
+    let base = if crate::approval::is_outbound_data_card(rec) {
+        // Recompute even for reminders; a previous destination is not authority.
+        outbound_targets(home_dir, rec)
+    } else if kb {
         let mut targets: Vec<_> = crate::knowledge::add_source_chat::decider_targets(home_dir, rec)
             .into_iter().map(|(_, ch, id)| (ch, id)).collect();
         if let Some(target) = crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id) { targets.push(target); }
         targets.extend(approver_links(home_dir));
         let mut seen = std::collections::HashSet::new();
         targets.retain(|t| seen.insert(t.clone()));
-        targets
+        targets.into_iter().map(NoticeTarget::unscoped).collect()
     } else { match (
         reminder,
         rec.notify_channel.as_deref(),
@@ -414,7 +465,7 @@ fn dashboard_only_targets(
             crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id),
             approver_links(home_dir),
         ),
-    }
+    }.into_iter().map(NoticeTarget::unscoped).collect()
     };
     // R-L1: the origin recorded on the card at filing (captured before the
     // distillation was spawned) is the reliable one; the task-local is a
@@ -427,8 +478,8 @@ fn dashboard_only_targets(
         _ => None,
     };
     base.into_iter()
-        .filter(|t| (origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
-            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, t, &owners)))
+        .filter(|t| (origin.as_ref() != Some(&t.destination) && recorded.as_ref() != Some(&t.destination))
+            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, &t.destination, &owners)))
         .collect()
 }
 
@@ -438,7 +489,7 @@ pub(crate) fn dashboard_only_targets_for_test(
     home_dir: &Path,
     rec: &ApprovalRecord,
 ) -> Vec<(String, String)> {
-    dashboard_only_targets(home_dir, rec, false)
+    dashboard_only_targets(home_dir, rec, false).into_iter().map(|t| t.destination).collect()
 }
 
 /// Push the plain dashboard-only notice: no buttons, no card record (so no
@@ -449,6 +500,15 @@ async fn push_dashboard_only(
     reminder: bool,
 ) -> Option<(String, String)> {
     let targets = dashboard_only_targets(home_dir, rec, reminder);
+    push_dashboard_only_targets(home_dir, rec, reminder, targets).await
+}
+
+async fn push_dashboard_only_targets(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+    reminder: bool,
+    targets: Vec<NoticeTarget>,
+) -> Option<(String, String)> {
     if targets.is_empty() {
         return None;
     }
@@ -468,7 +528,7 @@ async fn push_dashboard_only(
         return None;
     }
     let mut text = if rec.action_kind == crate::autopilot_approval::ACTION_KIND
-        && rec.payload.get("egress_guard").is_none()
+        && !crate::approval::is_outbound_data_card(rec)
     {
         crate::autopilot_approval::pending_notice_body(
             home_dir,
@@ -494,11 +554,14 @@ async fn push_dashboard_only(
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let mut delivered = None;
     let mut notified_users = std::collections::HashSet::new();
-    for (channel, chat_id) in targets {
+    let mut delivered_destinations = std::collections::HashSet::new();
+    for target in targets {
+        if delivered_destinations.contains(&target.destination) { continue; }
+        let (channel, chat_id) = target.destination.clone();
         // Re-read owner and destinations at delivery time. Never reuse a
         // queued content preview after an ACL or identity change.
         let uid = if kb {
-            crate::decision_notify::open_user_db(home_dir).ok().flatten().and_then(|db| {
+            crate::decision_notify::open_user_db_read_only(home_dir).ok().flatten().and_then(|db| {
                 db.list_users().ok()?.into_iter().find_map(|u| {
                     db.verified_dm_destinations_for_user(&u.id).ok()?.iter()
                         .any(|d| d.channel == channel && d.channel_user_id == chat_id).then_some(u.id)
@@ -510,13 +573,20 @@ async fn push_dashboard_only(
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return delivered; }
         let is_owner = kb && crate::knowledge::add_source_chat::owner_targets(home_dir, rec)
             .contains(&(channel.clone(), chat_id.clone()));
+        // Recheck the expected user, role/grant and exact verified DM after
+        // token resolution, immediately before each first send or reminder.
+        if !target.allows_send(home_dir, rec) {
+            tracing::debug!("approval notice skipped: recipient authority or verified DM unavailable");
+            continue;
+        }
         let sent = if is_owner {
             crate::knowledge::add_source_chat::push_owner_card(home_dir, &http, rec, &channel, &token, &chat_id).await
         } else {
             crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
         };
         if sent {
-            if !kb { return Some((channel, chat_id)); }
+            delivered_destinations.insert((channel.clone(), chat_id.clone()));
+            if !kb && !crate::approval::is_outbound_data_card(rec) { return Some((channel, chat_id)); }
             if let Some(uid) = uid { notified_users.insert(uid); }
             if delivered.is_none() { delivered = Some((channel, chat_id)); }
         }
@@ -579,12 +649,17 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         return None;
     }
     if let Some(result) = crate::approval::chat_admin::deliver::try_push(home_dir, rec, reminder).await {
+        if crate::approval::is_outbound_data_card(rec) {
+            // Admin chat receipts do not suppress department reviewers' dashboard notices.
+            let notice = push_dashboard_only(home_dir, rec, reminder).await;
+            return result.first.or(notice);
+        }
         return chat_delivery_or_notice(result, || push_dashboard_only(home_dir, rec, reminder)).await;
     }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         // A config/identity change between checks must never enter the legacy
         // fallback chain with private mail content.
         if !crate::approval::mail_requester::eligible(home_dir, rec) { return None; }
@@ -858,7 +933,7 @@ fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card
 /// decision alike) so the collapsed card always reads the same regardless of
 /// where the decision was made.
 fn approval_collapse_summary(rec: &ApprovalRecord) -> String {
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         return "郵件或對外操作審核".into();
     }
     format!(
@@ -1612,6 +1687,152 @@ mod tests {
         assert!(reminder.contains("快到期") && reminder.contains("不會啟用"));
     }
 
+    async fn outbound_notice_fixture() -> (
+        crate::dept_grants::tests::Fixture,
+        crate::test_channel_provider::TestChannelProvider,
+        ApprovalRecord,
+    ) {
+        let f = crate::dept_grants::tests::fixture().await;
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let config = std::fs::read_to_string(f.home.join("config.toml")).unwrap();
+        std::fs::write(f.home.join("config.toml"), format!(
+            "{config}\n[channels]\ntelegram_bot_token='{}'\n", provider.token,
+        )).unwrap();
+        let _ = crate::dept_grants::DeptGrantView::load(&f.h, &f.mgr_a).await;
+        for (ctx, chat) in [(&f.admin, "11111"), (&f.mgr_a, "22222")] {
+            f.db.bind_channel_identity(&ctx.user_id, "telegram", chat, true).unwrap();
+        }
+        let mut record = rec("mcp_call");
+        record.agent_id = "a1".into();
+        record.summary = "secret customer https://private.example.invalid".into();
+        record.payload = json!({"egress_guard":{}, "arguments":{"text":"secret content"}});
+        record.notify_channel = Some("telegram".into());
+        record.notify_chat_id = Some("22222".into());
+        // Neither an employee's verified DM nor the agent's notify target
+        // may enter the outbound reviewer list, including on reminders.
+        f.db.bind_channel_identity(&f.emp.user_id, "telegram", "33333", true).unwrap();
+        let agent_path = f.home.join("agents/a1/agent.toml");
+        let config = std::fs::read_to_string(&agent_path).unwrap();
+        std::fs::write(agent_path, format!(
+            "{config}\n[proactive]\nnotify_channel='telegram'\nnotify_chat_id='33333'\n",
+        )).unwrap();
+        (f, provider, record)
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_manager_before_first_send_and_reminder() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        for reminder in [false, true] {
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
+                &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
+            let targets = dashboard_only_targets(&f.home, &record, reminder);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].expected_user_id.as_deref(), Some(f.admin.user_id.as_str()));
+            assert!(!targets[0].department_manager);
+            assert_eq!(targets[1].expected_user_id.as_deref(), Some(f.mgr_a.user_id.as_str()));
+            assert!(targets[1].department_manager);
+            let before = provider.requests().len();
+            // Legitimate control proves the transport/token path is reachable.
+            assert!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await.is_some());
+            assert_eq!(provider.requests().len(), before + 2);
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                Some(("telegram".into(), "11111".into())));
+            let requests = provider.requests();
+            assert_eq!(requests.len(), before + 3);
+            assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some("11111"));
+            for request in requests {
+                assert!(!request.body.to_string().contains("secret"));
+                assert!(!request.body.to_string().contains("private.example.invalid"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_dm_verification_and_owner() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        for reminder in [false, true] {
+            for (user, chat, other_user, other_chat) in [
+                (&f.admin.user_id, "11111", &f.mgr_a.user_id, "22222"),
+                (&f.mgr_a.user_id, "22222", &f.admin.user_id, "11111"),
+            ] {
+                for rebind in [false, true] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    f.db.bind_channel_identity(user, "telegram", chat, false).unwrap();
+                    if rebind {
+                        // The new owner is also an eligible reviewer. The old
+                        // queued target still belongs to the expected user.
+                        f.db.bind_channel_identity(other_user, "telegram", chat, true).unwrap();
+                    }
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, rebind={rebind}, chat={chat}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    f.db.unbind_channel_identity("telegram", chat).unwrap();
+                    f.db.bind_channel_identity(user, "telegram", chat, true).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_account_eligibility() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+        for reminder in [false, true] {
+            for (user, role, other_chat) in [
+                (&f.admin.user_id, "admin", "22222"),
+                (&f.mgr_a.user_id, "manager", "11111"),
+            ] {
+                for change in [
+                    "UPDATE users SET role='employee' WHERE id=?1",
+                    "UPDATE users SET status='suspended' WHERE id=?1",
+                    "UPDATE users SET must_change_password=1 WHERE id=?1",
+                    "UPDATE users SET id='removed-reviewer' WHERE id=?1",
+                ] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    // Leave the verified binding intact to isolate the live
+                    // account check from identity revocation side effects.
+                    assert_eq!(conn.execute(change, [user]).unwrap(), 1);
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, user={user}, change={change}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    conn.execute("UPDATE users SET id=?1, role=?2, status='active', must_change_password=0
+                        WHERE id=?1 OR id='removed-reviewer'", rusqlite::params![user, role]).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_skips_queued_targets_when_identity_reads_fail() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let targets = dashboard_only_targets(&f.home, &record, false);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+        let empty_home = tempfile::tempdir().unwrap();
+        assert!(targets.iter().all(|t| !t.allows_send(empty_home.path(), &record)));
+        assert!(!empty_home.path().join("users.db").exists());
+        assert!(!NoticeTarget::unscoped(("telegram".into(), "11111".into()))
+            .allows_send(&f.home, &record));
+        // Even a failed secondary DM lookup must discard the entire result.
+        rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+            .execute_batch("DROP TABLE verified_googlechat_dms").unwrap();
+        for reminder in [false, true] {
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await, None);
+        }
+        assert!(provider.requests().is_empty());
+    }
+
     #[tokio::test]
     async fn dashboard_only_notice_never_targets_the_originating_conversation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1641,7 +1862,7 @@ mod tests {
                 dashboard_only_targets(&home, &r, false)
             })
             .await;
-        assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
+        assert_eq!(got, vec![NoticeTarget::unscoped(("telegram".to_string(), "555".to_string()))]);
     }
 }
 

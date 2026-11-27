@@ -370,6 +370,7 @@ impl UserDb {
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
+        crate::skill_trust::migrate(&conn)?;
         crate::chat_link::migrate(&conn)?;
         crate::odoo_credentials::migrate(&conn)?;
 

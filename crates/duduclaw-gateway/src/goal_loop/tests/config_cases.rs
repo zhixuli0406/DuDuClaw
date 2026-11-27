@@ -315,6 +315,10 @@ async fn removed_frozen_runtime_is_refused_before_solo_and_durable_dispatch() {
         spec.verifier.runtime = "agy".into();
         spec.gate = duduclaw_core::types::TeamGateMode::AlwaysSolo;
         let (store, queue) = open_stores(dir.path()).await;
+        let path = dir.path().join("agents/alice/agent.toml");
+        let config = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{config}\n[capabilities]\nautonomy_level='observer'\n")).unwrap();
+        crate::entry_gate::check_task_assignee(dir.path(), "alice").unwrap();
         let mut task = goal_task("frozen", "alice");
         task.team_spec_json = Some(serde_json::to_string(&spec).unwrap());
         store.insert_task(&task).await.unwrap();
@@ -334,6 +338,12 @@ async fn removed_frozen_runtime_is_refused_before_solo_and_durable_dispatch() {
         assert_eq!(parked.status, "needs_human");
         assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
         assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert!(d.inflight.lock().await.is_empty());
+        assert!(d.dispatch_failures.lock().await.is_empty());
+        d.tick_once().await.unwrap();
+        assert_eq!(store.get_task("frozen").await.unwrap().unwrap().status, "needs_human");
+        assert!(queue.pending_messages(10).await.unwrap().is_empty());
+        assert!(d.dispatch_failures.lock().await.is_empty());
     }
 }
 

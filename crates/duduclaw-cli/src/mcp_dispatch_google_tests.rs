@@ -692,9 +692,12 @@ fn drive_write_fixture(create: bool, move_: bool, backend: &str, capabilities: &
     let home = fixture(capabilities);
     let mut config: toml::Value = std::fs::read_to_string(home.path().join("config.toml"))
         .unwrap().parse().unwrap();
-    config["integrations"]["google_credential_path"] = toml::Value::String(backend.into());
+    let integrations = config.as_table_mut().expect("fixture config must be a table")
+        .entry("integrations").or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut().expect("fixture integrations must be a table");
+    integrations.insert("google_credential_path".into(), toml::Value::String(backend.into()));
     if backend == "apps_script" {
-        config["integrations"]["google_apps_script"] = toml::Value::Table(Default::default());
+        integrations.insert("google_apps_script".into(), toml::Value::Table(Default::default()));
     }
     let mut settings = policy::DriveWritePolicy::all_off();
     settings.create = create;
@@ -746,7 +749,7 @@ async fn drive_write_listing_admission_and_snapshot_follow_policy() {
                     assert_eq!(result["error"]["message"], refusal.unwrap(), "{result}");
                 }
                 if move_ && *tool == "drive_move_file" && lane == ProcessLane::Normal {
-                    assert_eq!(crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane).as_deref(), Some("需要先限定資料夾。"));
+                    assert_eq!(crate::mcp::drive_write_refusal(home.path(), "employee-a", tool, &principal, &lane).as_deref(), Some("這項操作需要先限定可使用的資料夾，請管理員設定。"));
                 }
             }
         }

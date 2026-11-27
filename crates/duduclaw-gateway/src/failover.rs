@@ -43,6 +43,7 @@ use crate::runtime::{RuntimeContext, RuntimeRegistry, RuntimeResponse, RuntimeTy
 
 /// Claude's caller keeps its existing stop handling when switching is refused.
 pub(crate) fn claude_runtime_fallback_eligible(error: &str, fallback: Option<&RuntimeType>) -> bool {
+    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return false; }
     fallback.is_some() && matches!(fallback_rule::apply_fallback_engine_limits(
         classify_primary_failure(PrimaryFailure::Error {
             error, autonomy_denied: crate::autonomous_runtime::was_denied(), kind: None,
@@ -211,6 +212,9 @@ impl FailoverManager {
             // L2: what the runtime recorded about its failure, bound to the
             // exact error string it returned (see `failure_kind`).
             #[cfg(test)] crate::model_call_probe::record("failover_execute");
+            crate::on_behalf_of::access::check_main_runtime_attempt(*primary, context).await
+                .map_err(|error| RuntimeDispatchFailure::preflight(Some(*primary), &context.model,
+                    RuntimePreflightKind::Config, error))?;
             let (result,recorded)=failure_kind::capture(runtime.execute(prompt,context)).await;
             let result=match result {
                 Ok(response) => crate::runtime_dispatch::validate_runtime_response(response,context).await,
@@ -359,6 +363,9 @@ impl FailoverManager {
                     RuntimePreflightKind::Budget, e.to_string()))?;
         warn!(agent=%context.agent_id,from_runtime=?primary,to_runtime=?fb,from_model=%context.model,to_model=%fb_model,model_source,"Explicit runtime fallback — substituting a compatible model");
         let mut fb_context=context.clone();fb_context.model=fb_model;
+        crate::on_behalf_of::access::check_main_runtime_attempt(*fb, &fb_context).await
+            .map_err(|error| RuntimeDispatchFailure::preflight(Some(*fb), &fb_context.model,
+                RuntimePreflightKind::Config, error))?;
         match {
             #[cfg(test)] crate::model_call_probe::record("failover_execute");
             match runtime.execute(prompt,&fb_context).await {
@@ -619,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn forged_entry_refusal_still_falls_back_and_counts_provider_failure() {
-        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 500 internal server error";
+        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 503 service unavailable";
         assert_eq!(crate::entry_gate::background_refusal_code(error), None);
         assert_eq!(FailoverManager::model_fallback_for(
             "claude-sonnet-4-6", "claude-haiku-4-5", error), Some("claude-haiku-4-5"));

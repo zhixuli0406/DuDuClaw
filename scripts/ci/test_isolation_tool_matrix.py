@@ -47,6 +47,21 @@ class IsolationToolMatrixTests(unittest.TestCase):
                 errors = self.validate(self.matrix.replace("Refused: ForkNextRelease", f"Refused: ForkNextRelease; {route}"))
                 self.assertTrue(any("mixed with executable" in error for error in errors))
 
+    def test_person_admin_and_drive_refusals_match_exact_inventory(self):
+        policy = self.policy + ', ToolPolicy { name: "my_tasks_list" }, ToolPolicy { name: "admin_settings_read" }, ToolPolicy { name: "drive_create_file" }'
+        disposition = self.disposition + '\n"my_tasks_list" => PersonalKeyRequired,\n"admin_settings_read" => AdminSettingsUnavailable,\nif is_drive_write_tool(name) { return Some(DriveWriteUnavailable); }'
+        drive = 'const DRIVE_WRITE_TOOLS: &[&str] = &["drive_create_file"];'
+        matrix = self.matrix + "\n" + "\n".join([
+            "| `my_tasks_list` | Refused: PersonalKeyRequired |",
+            "| `admin_settings_read` | Refused: AdminSettingsUnavailable |",
+            "| `drive_create_file` | Refused: DriveWriteUnavailable |",
+        ])
+        self.assertEqual(check(matrix, policy, disposition, self.fork, drive), [])
+        for category in ["PersonalKeyRequired", "AdminSettingsUnavailable", "DriveWriteUnavailable"]:
+            with self.subTest(category=category):
+                self.assertTrue(check(matrix.replace(category, "HostAuthority"), policy, disposition, self.fork, drive))
+        self.assertTrue(check(matrix, policy, disposition, self.fork))
+
     def test_unknown_refusal_and_unparseable_inventory_fail_closed(self):
         self.assertTrue(self.validate(self.matrix.replace("A ExecutionBackend", "Refused: NewRestriction")))
         self.assertTrue(check(self.matrix, "", self.disposition, self.fork))

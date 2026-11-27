@@ -23,28 +23,31 @@ fn hooks() -> &'static Mutex<BTreeMap<PathBuf, Pushes>> {
     HOOKS.get_or_init(Default::default)
 }
 pub(crate) fn capture_card(home: Option<&Path>, rec: &ApprovalRecord) -> Option<bool> {
-    let home = home?;
+    let home = std::fs::canonicalize(home?).ok()?;
     let mut hooks = hooks().lock().unwrap();
-    let pushes = hooks.get_mut(home)?;
+    let pushes = hooks.get_mut(&home)?;
     pushes.cards.push(rec.clone());
     let success = pushes.card_failures == 0;
     pushes.card_failures = pushes.card_failures.saturating_sub(1);
     Some(success)
 }
 pub(super) fn capture_notice(home: &Path) -> Option<delivery::NoticeState> {
+    let home = std::fs::canonicalize(home).ok()?;
     let mut hooks = hooks().lock().unwrap();
-    let pushes = hooks.get_mut(home)?;
+    let pushes = hooks.get_mut(&home)?;
     pushes.notices += 1;
     let result = if pushes.notice_failures == 0 { delivery::NoticeState::Sent } else { delivery::NoticeState::Pending };
     pushes.notice_failures = pushes.notice_failures.saturating_sub(1);
     Some(result)
 }
 pub(super) fn fail_outbox_write(home: &Path, state: &State) -> bool {
-    !state.outbox.is_empty() && hooks().lock().unwrap().get(home).is_some_and(|p|
+    let Ok(home) = std::fs::canonicalize(home) else { return false; };
+    !state.outbox.is_empty() && hooks().lock().unwrap().get(&home).is_some_and(|p|
         p.fail_outbox_write || (p.fail_audit_ack && state.outbox.iter().any(|entry| entry.audit_done)))
 }
 pub(super) async fn before_cas(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord) {
-    let human = hooks().lock().unwrap().get(home).is_some_and(|p| p.human_before_cas);
+    let Ok(home) = std::fs::canonicalize(home) else { return; };
+    let human = hooks().lock().unwrap().get(&home).is_some_and(|p| p.human_before_cas);
     if human { broker.decide(&rec.id, true, "admin").await.unwrap(); }
 }
 
@@ -63,14 +66,15 @@ fn rendered_skill(version: &str) -> String {
     format!("---\n{yaml}---\n\n# Helper\nHelp with daily notes.\n")
 }
 
-struct Fixture { home: tempfile::TempDir, broker: ApprovalBroker, id: ApprovalId }
+struct Fixture { _home: tempfile::TempDir, canonical_home: PathBuf, broker: ApprovalBroker, id: ApprovalId }
 impl Drop for Fixture {
-    fn drop(&mut self) { hooks().lock().unwrap().remove(self.home.path()); }
+    fn drop(&mut self) { hooks().lock().unwrap().remove(self.path()); }
 }
 impl Fixture {
     async fn new(manifest: &str, signature: &str, script: &str, held: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let h = home.path();
+        let canonical_home = std::fs::canonicalize(home.path()).unwrap();
+        let h = canonical_home.as_path();
         hooks().lock().unwrap().insert(h.to_owned(), Pushes::default());
         if held { duduclaw_core::gateway_instance::acquire(h).unwrap(); }
         let root = h.join("experts/imported/provenance");
@@ -99,10 +103,10 @@ impl Fixture {
         let id = expert_skills::request_enable_with(h, "imported", vec![skill],
             expert_skills::EnableRequestOptions { auto_approval_candidate: true }).await.unwrap();
         let broker = ApprovalBroker::open(h).unwrap();
-        Self { home, broker, id: id.into() }
+        Self { _home: home, canonical_home, broker, id: id.into() }
     }
     async fn standard() -> Self { Self::new(V120_MANIFEST, V120_SIGNATURE, V120_SCRIPT_B64, true).await }
-    fn path(&self) -> &Path { self.home.path() }
+    fn path(&self) -> &Path { &self.canonical_home }
     fn quarantine(&self) -> PathBuf { expert_skills::quarantined_skill_dir(self.path(), "imported", "alice", "helper") }
     fn pushes(&self) -> Pushes { hooks().lock().unwrap().get(self.path()).unwrap().clone() }
     async fn record(&self) -> ApprovalRecord { self.broker.get(&self.id).await.unwrap().unwrap() }
@@ -173,10 +177,121 @@ async fn auto_approval_uses_same_record_and_cas() {
     assert_eq!(f.pushes().notices, 1);
     assert!(load_state(f.path()).unwrap().evaluated.is_empty(), "terminal ids are pruned");
 }
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_home_still_auto_approves() {
+    let f = Fixture::standard().await;
+    let links = tempfile::tempdir().unwrap();
+    let home = links.path().join("home");
+    std::os::unix::fs::symlink(f.path(), &home).unwrap();
+    let broker = ApprovalBroker::open(&home).unwrap();
+    assert_ne!(home, broker.home_dir().unwrap());
+    run_once(&home, &broker).await;
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+    assert!(home.join("agents/alice/SKILLS/helper/run.sh").is_file());
+    assert_eq!(f.pushes().notices, 1);
+    assert!(f.pushes().cards.is_empty());
+    assert!(load_state(&home).unwrap().outbox.is_empty());
+}
 #[tokio::test]
 async fn wrong_key_same_publisher_goes_manual() {
     let f = Fixture::new(OTHER_KEY_MANIFEST, OTHER_KEY_SIGNATURE, OTHER_KEY_SCRIPT_B64, true).await;
     f.manual(SIGNATURE).await;
+}
+#[tokio::test]
+async fn conflicting_pinned_key_ids_ignore_both_keys_and_go_manual() {
+    let original = base64::engine::general_purpose::STANDARD.decode(KEY_A).unwrap();
+    let mut other = base64::engine::general_purpose::STANDARD.decode(KEY_B).unwrap();
+    other[2..10].copy_from_slice(&original[2..10]);
+    let collision = base64::engine::general_purpose::STANDARD.encode(other);
+    validate_pubkey(&collision).unwrap();
+    assert_ne!(collision, KEY_A);
+    let id = minisign_key_id(KEY_A).unwrap();
+    assert_eq!(minisign_key_id(&collision).unwrap(), id);
+    for (reverse, forged_id) in [(false, false), (true, false), (false, true), (true, true)] {
+        let f = Fixture::standard().await;
+        let mut config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id)).unwrap();
+        let mut second = config.skill_trust.auto_approve[0].clone();
+        second.key = collision.clone();
+        assert!(second.usable());
+        if forged_id { second.key_id = minisign_key_id(KEY_B).unwrap(); }
+        config.skill_trust.auto_approve.push(second);
+        if reverse { config.skill_trust.auto_approve.reverse(); }
+        let mut table = toml::Table::new();
+        let mut trust = toml::Table::new();
+        trust.insert("auto_approve".into(), toml::Value::try_from(&config.skill_trust.auto_approve).unwrap());
+        table.insert("skill_trust".into(), toml::Value::Table(trust));
+        std::fs::write(f.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+        // Both keys are globally trusted; the ambiguous canonical identity
+        // must exclude the signer even with a forged id or reversed order.
+        std::fs::write(f.path().join("trusted_publishers.toml"),
+            format!("[publishers.fixture]\nkeys=['{KEY_A}', '{collision}']\n")).unwrap();
+        assert!(read_config(&Directory::open(f.path()).unwrap()).unwrap().auto_approve.is_empty());
+        assert_eq!(evaluate(f.path(), &f.record().await).await.unwrap_err(), KEY);
+        f.manual(KEY).await;
+    }
+}
+#[test]
+fn mismatched_and_unparseable_keys_poison_claimed_and_canonical_identities() {
+    let id_a = minisign_key_id(KEY_A).unwrap();
+    let id_b = minisign_key_id(KEY_B).unwrap();
+    let config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id_a)).unwrap();
+    let first = config.skill_trust.auto_approve[0].clone();
+    let mut forged = first.clone();
+    forged.key_id = id_b.clone();
+    let mut claimed = first.clone();
+    claimed.key = KEY_B.into();
+    claimed.key_id = id_b.clone();
+    let mut other_publisher = first.clone();
+    other_publisher.publisher = "another".into();
+    let expected = BTreeSet::from([("fixture".to_owned(), id_a.clone()), ("fixture".to_owned(), id_b)]);
+    assert_eq!(conflicting_pin_ids(&[forged.clone()]), expected);
+    for reverse in [false, true] {
+        let mut entries = vec![first.clone(), forged.clone(), claimed.clone(), other_publisher.clone()];
+        if reverse { entries.reverse(); }
+        assert_eq!(conflicting_pin_ids(&entries), expected);
+    }
+    let mut invalid = first;
+    invalid.key = "invalid".into();
+    assert_eq!(conflicting_pin_ids(&[invalid]), BTreeSet::from([("fixture".to_owned(), id_a)]));
+}
+#[test]
+fn config_reader_checks_conflicts_before_usability_and_preserves_other_identities() {
+    let home = tempfile::tempdir().unwrap();
+    let id = minisign_key_id(KEY_A).unwrap();
+    let config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id)).unwrap();
+    let first = config.skill_trust.auto_approve[0].clone();
+    let mut invalid = first.clone();
+    invalid.key = "invalid".into();
+    assert!(!invalid.usable());
+    let mut other_publisher = first.clone();
+    other_publisher.publisher = "another".into();
+    let mut other_id = first.clone();
+    other_id.key = KEY_B.into();
+    other_id.key_id = minisign_key_id(KEY_B).unwrap();
+    let mut trust = toml::Table::new();
+    trust.insert("auto_approve".into(), toml::Value::try_from(
+        vec![first.clone(), invalid, first, other_publisher.clone(), other_publisher, other_id]).unwrap());
+    let mut table = toml::Table::new();
+    table.insert("skill_trust".into(), toml::Value::Table(trust));
+    std::fs::write(home.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let read = read_config(&Directory::open(home.path()).unwrap()).unwrap();
+    assert_eq!(read.auto_approve.len(), 3);
+    assert!(read.auto_approve.iter().all(PinnedKey::usable));
+    assert_eq!(read.auto_approve.iter().filter(|pin| pin.publisher == "another").count(), 2);
+    assert_eq!(read.auto_approve[2].key, KEY_B);
+}
+#[tokio::test]
+async fn identical_duplicate_pins_still_allow_the_exact_signing_key() {
+    let f = Fixture::standard().await;
+    let text = std::fs::read_to_string(f.path().join("config.toml")).unwrap();
+    let mut table: toml::Table = text.parse().unwrap();
+    let entries = table.get_mut("skill_trust").unwrap().get_mut("auto_approve").unwrap().as_array_mut().unwrap();
+    entries.push(entries[0].clone());
+    std::fs::write(f.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let result = evaluate(f.path(), &f.record().await).await.unwrap();
+    assert_eq!(result.publisher, "fixture");
+    assert_eq!(result.key_id, minisign_key_id(KEY_A).unwrap());
 }
 #[tokio::test]
 async fn tampered_script_after_quarantine_goes_manual() {
@@ -448,11 +563,10 @@ async fn broker_policy_honors_reviewed_digest() {
 #[cfg(unix)]
 #[tokio::test]
 async fn special_file_in_quarantine_goes_manual() {
-    use std::os::unix::net::UnixListener;
     let f = Fixture::standard().await;
     let script = f.quarantine().join("run.sh");
     std::fs::remove_file(&script).unwrap();
-    let _socket = UnixListener::bind(script).unwrap();
+    nix::unistd::mkfifo(&script, nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR).unwrap();
     f.manual(FILES).await;
 }
 #[tokio::test]

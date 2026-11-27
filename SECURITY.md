@@ -271,6 +271,15 @@ See [docs/features/05-security-defense.md](docs/features/05-security-defense.md#
 
 An AI employee with Bash can get past the checks of `duduclaw ops users mfa-setup-code` (they are a speed bump, not containment); see "Known limitation" under [Two-factor login](docs/features/05-security-defense.md#two-factor-login).
 
+### Admin approval in chat apps: trust premises (v1.86)
+
+Turning on **Approve in chat apps** lets an Active Admin decide some dashboard-only approvals from a chat card. It rests on these premises, which the operator should accept knowingly:
+
+- The Admin's chat account is as safe as the phone and the chat service account behind it. Keep two-step verification on for Telegram and Google accounts, and remove the chat proof (My Connections) when a phone is lost. Second confirmation is required by default for every higher-risk category; switching it off is a recorded decision.
+- Telegram and Google deliver the button press. The gateway accepts a press only when it matches a receipt for a card the gateway itself sent to that Admin's proven private chat; Google Chat presses are accepted only from JWT-verified HTTP events.
+- The private-chat code option leaves the code in Telegram until the bot deletes the message; Google Chat does not offer it because a Chat app cannot delete a user's message.
+- An AI employee with unrestricted Bash running as the same OS user can edit local databases, including `approvals.db`; this pre-existing limit applies to dashboard decisions as well. See [Admin approval in chat apps](docs/features/05-security-defense.md#admin-approval-in-chat-apps-v186).
+
 ## Binary Distribution Security
 
 DuDuClaw binaries are:
@@ -376,3 +385,13 @@ admin lists use keyset pagination (default 25, maximum 100 rows per page).
 
 See [member authentication](docs/api/member-contract.md#personal-member-api-keys-rm-213-part-b-1850)
 for the supported routes, configuration and method exclusions.
+
+## Members' personal Odoo credentials
+
+Odoo identity selection uses this order: the avatar owner's personal credential; a verified requester's personal credential when `act_as_requester` is enabled; the AI employee's own account; the company account only when the AI is in `company_key_agents`; otherwise not connected. An avatar cannot borrow a different requester's credential. A personal API key uses only its holder's personal credential, with no employee/company fallback.
+
+Personal Odoo credentials are sealed with the gateway's machine encryption key and an owner-bound envelope. Only the gateway unseals them. Use requires an active member, matching account credential epoch and the verified server fingerprint (URL and database). After a server change, read the new address/database through `me.odoo.status` in the same browser session before testing again. Password changes, sign-out-everywhere or suspension invalidate use; when the account is available again, re-enter the key. Offboarding deletes the saved credential, and an administrator can revoke it without seeing its secret. The gateway supplies the authorized MCP process with the identity decision, verified endpoint, account metadata and credential revision, plus the selected secret when its cached revision differs; it never supplies the machine sealing key. This is an application boundary, not OS isolation from unrestricted processes running as the gateway user.
+
+The saved credential is encrypted at rest in the member credential store; status and administrator lists return metadata only. Connection setup and testing require a live browser session and are limited to five attempts per member per minute. Enabling personal credentials is off by default and requires an administrator's risk acknowledgement. Admin revocation and member disconnect delete the saved credential. Account offboarding deletes it automatically; suspension prevents use, and credential-epoch changes prevent stale credentials from being unsealed or tested. The member must reconnect by re-entering the key. Server fingerprint changes require seeing and re-verifying the new destination before the key is sent there. Missing encryption keys, malformed policy and failed required identity audits refuse access.
+
+Personal MCP credentials are never accepted in URL queries or OAuth consent. Effective MCP scopes are checked against both the key and the live administrator allowlist. Fixed Odoo refusals cover attachment replacement/deletion, schema and ACL changes (`ir.model` and all `ir.model.*`, `ir.rule`), API-key changes, the `mail.*` family and generic messaging calls, and internal hooks. Mutating execute/button methods and follower messages always need bound, single-use approval. Personal API keys cannot use execute, follower-message or attachment-upload tools.

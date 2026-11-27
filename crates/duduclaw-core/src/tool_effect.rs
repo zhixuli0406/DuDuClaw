@@ -197,7 +197,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         // ── send ────────────────────────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "mail_send" | "send_to_agent"
         | "spawn_agent" | "team_handoff" | "create_reminder" | "responsibility_ask"
-        | "calendar_create_event" | "calendar_update_event" | "gmail_send_draft" | "google_chat_send" | "os_notify" => Send,
+        | "odoo_message_send" | "calendar_create_event" | "calendar_update_event" | "gmail_send_draft" | "google_chat_send" | "os_notify" => Send,
 
         // ── publish ─────────────────────────────────────────────────────
         // `knowledge_add_source` only files a proposal; a person decides in
@@ -222,7 +222,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_update_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
-        | "odoo_create" | "odoo_write"
+        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" | "odoo_attachment_add"
         | "office_script" | "os_audio_set" | "os_backup_create" | "os_display_set" | "os_open"
         | "pause_cron_task" | "plan_update_step" | "responsibility_followup" | "run_cron_task"
         | "sheets_append" | "skill_bank_feedback" | "skill_extract"
@@ -254,6 +254,8 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 /// that return existing records count as private too. A write acknowledgement
 /// or a public model-catalog search does not introduce private data.
 pub fn reads_private(tool_name: &str) -> Option<bool> {
+    if tool_name == "admin_settings_read" { return Some(true); }
+    if tool_name == "admin_settings_propose" { return Some(false); }
     if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(true); }
     if matches!(tool_name, "gmail_send_draft" | "calendar_delete_event") { return Some(true); }
     match tool_name {
@@ -298,7 +300,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "web_fetch" | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph"
         | "wiki_lint" | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search"
         | "wiki_stats" | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get"
-        | "xlsx_read" => Some(true),
+        | "xlsx_read" | "odoo_attachment_add" => Some(true),
         "activity_post" | "agent_remove" | "agent_update" | "agent_update_soul"
         | "belief_submit" | "browser_record_start" | "browser_record_stop"
         | "google_chat_send" | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
@@ -308,11 +310,11 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
         | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_create_file" | "drive_copy_file" | "drive_update_file" | "drive_move_file" | "drive_trash_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
         | "gmail_create_draft" | "goals_create" | "gtasks_complete" | "gtasks_create"
-        | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send"
+        | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send" | "odoo_message_send"
         | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
         | "model_load" | "model_search" | "model_unload" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
-        | "odoo_create" | "odoo_write"
+        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post"
         | "os_apply_update" | "os_audio_set" | "os_backup_create" | "os_display_set"
         | "os_factory_reset" | "os_notify" | "os_open" | "os_power" | "os_update_rollback"
         | "os_wifi_connect" | "pause_cron_task" | "plan_start" | "responsibility_ask"
@@ -385,6 +387,10 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "notion_page_append",
     "notion_page_read",
     "notion_search",
+    "odoo_attachment_add",
+    "odoo_activity_create",
+    "odoo_note_post",
+    "odoo_message_send",
     "odoo_create",
     "odoo_crm_create_lead",
     "odoo_crm_leads",
@@ -423,6 +429,7 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
 /// negative entries independent of the private-read table, so completeness
 /// tests require a separate egress decision whenever a tool is added.
 pub fn egress_capable(tool_name: &str) -> Option<bool> {
+    if matches!(tool_name, "admin_settings_read" | "admin_settings_propose") { return Some(false); }
     if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(false); }
     if EGRESS_CAPABLE_READS.contains(&tool_name) {
         return Some(true);

@@ -24,13 +24,9 @@ fn assert_success(method: &str, frame: WsFrame) {
 
 fn admin_only_params(method: &str) -> Value {
     match method {
-        "autopilot.create" => json!({
-            "name": "matrix rule", "trigger_event": "task_created", "conditions": {},
-            "action": {"type": "notify", "channel": "webchat", "chat_id": "matrix", "text": "matrix"}, "agent_id": "a1",
-        }),
-        "autopilot.update" | "autopilot.remove" | "autopilot.history" => {
-            json!({"rule_id": "matrix-rule", "enabled": false, "agent_id": "a1"})
-        }
+        "autopilot.template_fields" => json!({"trigger_event": "task_created"}),
+        "autopilot.runs.list" => json!({"rule_id": "matrix-rule", "limit": 10}),
+        "autopilot.runs.cancel" => json!({"run_id": "matrix-run"}),
         "skills.install" => json!({"scope": "a1", "content": MATRIX_SKILL}),
         _ => json!({"agent_id": "a1", "days": 7, "limit": 10}),
     }
@@ -76,6 +72,16 @@ where
     S: for<'a> Fn(&'a Fixture, &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
     C: Fn(&str, WsFrame, bool),
 {
+    assert_scoped_target(method, params_for_agent, setup,
+        |label, _, frame, allowed| check(label, frame, allowed)).await;
+}
+
+async fn assert_scoped_target<P, S, C>(method: &str, params_for_agent: P, setup: S, check: C)
+where
+    P: Fn(&str) -> Value,
+    S: for<'a> Fn(&'a Fixture, &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>>,
+    C: Fn(&str, &str, WsFrame, bool),
+{
     assert!(matches!(coverage_for(method), Some((_, Coverage::Scoped(_)))),
         "{method}: matrix helper requires a Scoped row");
     for case in ["allowed", "other_department", "main", "no_grants", "employee", "member_key", "other_origin", "moved_department"] {
@@ -104,7 +110,7 @@ where
         }
         let frame = Box::pin(f.h.handle(method, params_for_agent(agent), &ctx)).await;
         // Include the case in failures emitted by the supplied outcome hook.
-        check(&format!("{method} [{case}]"), frame, case == "allowed");
+        check(&format!("{method} [{case}]"), agent, frame, case == "allowed");
     }
 }
 
@@ -180,6 +186,41 @@ async fn schedules_cron_scoped_matrix() {
         }).await;
 }
 
+fn assert_heartbeat_scheduler_unavailable(label: &str, frame: WsFrame) {
+    // The fixture has no scheduler: this exact non-permission error proves
+    // admission passed, but does not claim a heartbeat was actually triggered.
+    assert!(matches!(&frame, WsFrame::Response {
+        ok: false, error: Some(Value::String(error)), ..
+    } if error == "Heartbeat scheduler not started"), "{label}: {frame:?}");
+}
+
+#[tokio::test]
+async fn schedules_heartbeat_scoped_matrix() {
+    assert_scoped("heartbeat.trigger", |agent| json!({"agent_id": agent}),
+        |_, _| Box::pin(async {}),
+        |label, frame, allowed| {
+            if allowed { assert_heartbeat_scheduler_unavailable(label, frame); }
+            else { assert_permission_denied(label, frame); }
+        }).await;
+}
+
+#[tokio::test]
+async fn schedules_heartbeat_does_not_audit_failed_trigger() {
+    let f = fixture().await;
+    assert_heartbeat_scheduler_unavailable("heartbeat.trigger",
+        Box::pin(f.h.handle("heartbeat.trigger", json!({"agent_id": "a1"}), &f.mgr_a)).await);
+    assert!(schedule_grant_audits(&f).is_empty());
+    // A live Operator binding takes precedence even while the grant exists.
+    f.db.bind_agent(&f.mgr_a.user_id, "a1", AccessLevel::Operator).unwrap();
+    for ctx in [&f.mgr_a, &f.admin] {
+        assert_heartbeat_scheduler_unavailable("heartbeat.trigger",
+            Box::pin(f.h.handle("heartbeat.trigger", json!({"agent_id": "a1"}), ctx)).await);
+    }
+    assert_permission_denied("heartbeat.trigger",
+        Box::pin(f.h.handle("heartbeat.trigger", json!({"agent_id": "b1"}), &f.mgr_a)).await);
+    assert!(schedule_grant_audits(&f).is_empty());
+}
+
 fn seed_matrix_reminder<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     Box::pin(async move {
         let row = json!({"id": "matrix-record", "agent_id": agent,
@@ -209,7 +250,7 @@ fn seed_matrix_assign_by<'a>(f: &'a Fixture, agent: &'a str, paused: bool, creat
         let row = crate::task_store::AssignScheduleRow {
             id: "matrix-record".into(), creator_user_id: creator.to_owned(),
             agent_id: agent.into(), kind: "task".into(), title: "Daily report".into(),
-            payload_json: json!({"title": "Daily report"}).to_string(),
+            payload_json: json!({"title": "Daily report", "description": "Summarize today's work."}).to_string(),
             schedule_json: json!({"kind": "daily", "hour": 9, "minute": 0}).to_string(),
             timezone: Some("UTC".into()), status: if paused { "paused" } else { "active" }.into(),
             pause_reason: paused.then(|| "by_user".into()), created_via: "dashboard".into(),
@@ -332,13 +373,12 @@ fn seed_matrix_archive<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future
 
 #[tokio::test]
 async fn skills_read_scoped_matrix() {
-    assert_scoped("skills.list", |_| json!({}), seed_matrix_skill,
-        |label, frame, allowed| {
+    assert_scoped_target("skills.list", |_| json!({}), seed_matrix_skill,
+        |label, agent, frame, allowed| {
             let payload = scoped_payload(label, frame);
             let rows = payload["agents"].as_array().unwrap();
-            assert_eq!(rows.iter().any(|r| r["agent_id"] == "a1"), allowed, "{label}: {payload}");
+            assert_eq!(rows.iter().any(|r| r["agent_id"] == agent), allowed, "{label}: {payload}");
             assert!(!rows.iter().any(|r| r["agent_id"] == "b1"), "{label}: {payload}");
-            if !allowed { assert!(rows.is_empty(), "{label}: {payload}"); }
         }).await;
     // Exercise the single-employee list refusal as well as aggregate visibility.
     assert_scoped("skills.list", |a| json!({"agent_id": a}), seed_matrix_skill,
@@ -529,6 +569,67 @@ async fn skills_install_request_audits_grant_and_routes_only_to_admin() {
         json!({"group": "skills", "action": "request_install", "method": "skills.install_request"}))]);
 }
 
+
+fn seed_matrix_budget_incidents<'a>(f: &'a Fixture, agent: &'a str) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    Box::pin(async move {
+        let rows = [
+            json!({"agent_id": agent, "event": "older"}),
+            json!({"agent_id": agent, "event": "newer"}),
+            json!({"agent_id": "b1", "event": "other-department"}),
+            json!({"agent_id": "main", "event": "main"}),
+            json!({"event": "unattributed"}),
+        ];
+        let raw = rows.iter().map(Value::to_string).collect::<Vec<_>>().join("\n");
+        std::fs::write(f.home.join("budget_events.jsonl"), raw).unwrap();
+    })
+}
+
+#[tokio::test]
+async fn cost_budget_incidents_scoped_matrix() {
+    assert_scoped("budget.incidents", |_| json!({"limit": 1}), seed_matrix_budget_incidents,
+        |label, frame, allowed| {
+            // Employees still fail the Manager floor; eligible roles receive
+            // only visible rows, including an empty list when no scope matches.
+            if label.ends_with("[employee]") {
+                assert_permission_denied(label, frame);
+                return;
+            }
+            let payload = scoped_payload(label, frame);
+            if allowed {
+                assert_eq!(payload["incidents"], json!([{"agent_id": "a1", "event": "newer"}]), "{label}");
+                assert_eq!(payload["by_agent"], json!([{"agent_id": "a1", "open_events": 2}]), "{label}");
+            } else {
+                assert_eq!(payload["incidents"], json!([]), "{label}");
+                assert_eq!(payload["by_agent"], json!([]), "{label}");
+            }
+        }).await;
+}
+
+#[tokio::test]
+async fn cost_budget_incidents_preserves_bindings_and_admin_scope() {
+    let f = fixture().await;
+    seed_matrix_budget_incidents(&f, "a1").await;
+    for ctx in [&f.mgr_a, &f.mgr_b] {
+        f.db.bind_agent(&ctx.user_id, "b1", AccessLevel::Viewer).unwrap();
+        let payload = scoped_payload("budget.incidents",
+            Box::pin(f.h.handle("budget.incidents", json!({"limit": 1}), ctx)).await);
+        assert_eq!(payload["incidents"], json!([{"agent_id": "b1", "event": "other-department"}]));
+        let mut counts = payload["by_agent"].as_array().unwrap().clone();
+        counts.sort_by_key(|row| row["agent_id"].as_str().unwrap().to_owned());
+        let expected = if ctx.user_id == f.mgr_a.user_id {
+            json!([{"agent_id": "a1", "open_events": 2}, {"agent_id": "b1", "open_events": 1}])
+        } else {
+            json!([{"agent_id": "b1", "open_events": 1}])
+        };
+        assert_eq!(Value::Array(counts), expected);
+    }
+    let all = scoped_payload("budget.incidents",
+        Box::pin(f.h.handle("budget.incidents", json!({}), &f.admin)).await);
+    // Preserve the existing Admin-all path, including unattributed incidents.
+    assert_eq!(all["incidents"].as_array().unwrap().len(), 5);
+    assert_eq!(all["by_agent"].as_array().unwrap().len(), 3);
+    assert!(schedule_grant_audits(&f).is_empty(), "reads must not emit grant-use audits");
+}
 
 async fn seed_matrix_cost(f: &Fixture) {
     use crate::cost_telemetry::{CostTelemetry, RequestType, TokenUsage};
@@ -789,3 +890,6 @@ async fn creator_access_lost_assign_schedules_keep_running_after_revocation() {
         }
     }
 }
+
+#[path = "dept_automation_tests.rs"]
+mod automation;

@@ -52,7 +52,7 @@ impl Fixture {
             hd: "company.test".into(), display_name: "新同仁".into() };
         let policy = SigninPolicy { approval, daily_cap: 100, settings_version: "v1".into(),
             ack_by: self.admin.user_id.clone(), ack_at: Utc::now().to_rfc3339() };
-        match self.db.resolve_google_signin(&identity, &policy, Utc::now().timestamp()).unwrap() {
+        match self.db.resolve_google_signin(true, &identity, &policy, Utc::now().timestamp(), &|_| Ok(None)).unwrap() {
             SigninOutcome::PendingApproval { request_id } => request_id,
             SigninOutcome::Ok { user_id, .. } => user_id,
             other => panic!("unexpected provisioning result: {other:?}"),
@@ -122,7 +122,12 @@ async fn set_and_attest_require_fresh_session_bound_step_up() {
         payload(f.admin(method, input.clone()).await);
         let mut stale = f.admin.clone();
         stale.credential_epoch += 1;
-        assert_eq!(code(f.call(&stale, method, input.clone()).await), "signin_admin_required");
+        match f.call(&stale, method, input.clone()).await {
+            WsFrame::Response { ok: false, error: Some(error), .. } => {
+                assert_eq!(error, json!("登入憑證已失效，請重新登入。"));
+            }
+            other => panic!("expected stale-epoch refusal: {other:?}"),
+        }
         let mut forged = f.employee.clone();
         forged.role = UserRole::Admin;
         assert_eq!(code(f.call(&forged, method, input).await), "signin_admin_required");

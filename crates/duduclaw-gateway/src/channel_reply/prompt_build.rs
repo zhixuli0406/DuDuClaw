@@ -183,7 +183,7 @@ pub(super) fn build_system_prompt(
     }
 
     if let Some(a) = agent {
-        let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&a.dir)?;
+        let mut profile = crate::runtime_dispatch::chat_profile(&a.dir)?;
         // The caller already inserted the authoritative name/language directive.
         profile.set_identity_directive(None);
         for section in profile.rendered(Default::default()) {

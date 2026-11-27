@@ -27,6 +27,9 @@ impl MethodHandler {
     /// Only allows safe, non-sensitive fields: `log_level`, `rotation_strategy`.
     /// Uses atomic write (temp + rename) and never touches token/key fields.
     pub(crate) async fn handle_system_update_config(&self, mut params: Value, ctx: &UserContext) -> WsFrame {
+        if params.as_object().is_some_and(|fields| fields.keys().any(|key| key.split('.').next() == Some("skill_trust"))) {
+            return WsFrame::error_response("", "請到自家技能來源設定頁變更自動放行清單。");
+        }
         if super::transcription_credentials_rpc::reject_generic_credentials(&mut params) {
             return WsFrame::error_response("", "請使用專用的會議轉錄憑證設定操作。");
         }
@@ -56,6 +59,10 @@ impl MethodHandler {
                 );
             }
         };
+        if let Err(error) = super::chat_admin_settings_rpc::refuse_generic_change(&table, &params) {
+            return WsFrame::error_response("", &error);
+        }
+        let chat_admin_before = table.clone();
         let mut changes: Vec<String> = Vec::new();
         if let Some(value) = params.get("skill_ttl_days") {
             let Some(days) = value.as_i64().filter(|days| (1..=30).contains(days)) else {
@@ -1136,6 +1143,9 @@ impl MethodHandler {
             );
         }
 
+        if let Err(error) = super::chat_admin_settings_rpc::refuse_subtable_change(&chat_admin_before, &table) {
+            return WsFrame::error_response("", &error);
+        }
         // Atomic write (temp + rename) under the cross-process config lock,
         // refused when another writer changed the file since it was read.
         let security_change = params.get("auth.mfa_enforced").or_else(||params.get("auth").and_then(|v|v.get("mfa_enforced"))).is_some();

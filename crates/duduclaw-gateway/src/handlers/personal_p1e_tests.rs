@@ -354,6 +354,7 @@ const EMPLOYEE_KEYS: &[&str] = &["agent_id", "agent", "agent_name", "from_agent"
 /// an employee, method by method, each with its reason. Required for every
 /// such arm in a namespace that also has a gated method.
 const EMPLOYEE_ARMS: &[(&str, &str)] = &[
+    ("autopilot.affecting_me", "live direct Viewer binding; explicit owner-only Personal rule filter before projection; P1g default deny on agent_id and hidden rows"),
     // The shared broadcast_event helper reads assigned_to only for task events;
     // these system-status events neither select nor expose employee content.
     ("license.activate", "Admin-only signed license installation; request contains a license key, no employee; broadcasts system status"),
@@ -452,6 +453,12 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.mfa_reset", "a person's second factor; names no employee"),
     ("users.mfa_enrollment_code", "a person's second factor; names no employee"),
     ("users.google_disconnect", "a person's Google connection; names no employee"),
+    ("users.google_signin.attest", "Admin-only dashboard session + step-up; attests people's sign-in identities, names no employee"),
+    ("users.google_signin.unlink", "Admin-only dashboard session; unlinks a person's sign-in identity, names no employee"),
+    ("users.signin_onboarding.retry_avatar", "Admin-only dashboard session; queues onboarding retry for a person, accepts no employee target"),
+    ("users.signin_requests.approve", "Admin-only dashboard session; approves a person's sign-in request, names no employee"),
+    ("users.signin_requests.list", "Admin-only dashboard session; pending sign-in request metadata, no employee content"),
+    ("users.signin_requests.reject", "Admin-only dashboard session; rejects a person's sign-in request, names no employee"),
     ("users.my_history_views", "the caller's own history views"),
     ("users.team_history.list", "team oversight skips Personal employees in SQL (P1)"),
     ("users.team_history.get", "team oversight skips Personal employees in SQL (P1)"),
@@ -564,6 +571,7 @@ const EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
 /// Namespaces that must never name an employee: the scan fails if any arm
 /// (or the handler it calls) reads an employee key.
 const NO_EMPLOYEE_NAMESPACES: &[(&str, &str)] = &[
+    ("admin_ai", "administrator AI settings"),
     ("connect", "connection handshake"),
     ("ping", "liveness"),
     ("hello-ok", "connection handshake"),

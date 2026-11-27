@@ -6,11 +6,12 @@ use serde_json::json;
 
 fn identity(permission: IdentityPermission) -> OdooIdentity {
     OdooIdentity { kind: IdentityKind::Personal, permission, user_id: Some("alice".into()),
-        odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None }
+        url: None, db: None, server_fp: None, odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None }
 }
 
 fn policy() -> ToolPolicy {
     ToolPolicy {
+        person_key: false,
         agent_id: "bot".into(), agent: duduclaw_odoo::AgentOdooConfig::default(),
         access: OdooAccessConfig::parse_config_toml("[odoo_access]\npermission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}\nalways_refuse=[]").unwrap(),
         global: duduclaw_odoo::OdooConfig::default(),
@@ -22,7 +23,7 @@ fn policy() -> ToolPolicy {
 fn all_modes_enforce_fixed_and_admin_refusals() {
     for permission in [IdentityPermission::Follow, IdentityPermission::Engine, IdentityPermission::ReadOnly] {
         let mut p = policy();
-        for model in ["ir.attachment", "ir.model.fields", "ir.model", "ir.model.access", "ir.rule", "res.users.apikeys"] {
+        for model in ["ir.attachment", "ir.model.fields", "ir.model", "ir.model.access", "ir.model.data", "ir.model.constraint", "mail.template", "mail.message", "ir.rule", "res.users.apikeys"] {
             let error = p.check_call("odoo_write", &json!({"model":model}), Some(&identity(permission))).unwrap_err();
             assert!(error.starts_with("DuDuClaw 不讓 AI 做這件事："), "{error}");
         }
@@ -42,6 +43,39 @@ fn decision_engine_never_inherits_follow_and_read_only_refuses_write() {
 }
 
 #[test]
+fn bound_preconnect_intersects_all_engine_gates_even_with_possible_follow() {
+    let mut p = policy();
+    // Exercise the explicit bound API without relying on an isolation task local.
+    let read = json!({"model":"crm.lead","method":"read"});
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_ok());
+    for (model, method) in [("crm.lead", "unlink"), ("res.partner", "read"),
+        ("ir.model", "write"), ("res.users.apikeys", "create"), ("crm.lead", "message_post")] {
+        assert!(p.data_preconnect_engine("odoo_execute", &json!({"model":model,"method":method})).is_err());
+    }
+    p.agent.allowed_models = vec!["sale.order".into()];
+    assert!(p.data_preconnect("odoo_execute", &read, None).is_ok());
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_err());
+    p.agent.allowed_models.clear();
+    p.agent.allowed_actions = vec!["write:crm.lead".into()];
+    assert!(p.data_preconnect_engine("odoo_execute", &read).is_err());
+    p.agent.allowed_actions.clear();
+    p.access.always_refuse = vec!["read:crm.lead".into()];
+    assert!(p.data_preconnect_engine("odoo_execute", &read).unwrap_err().contains("一律不允許"));
+    p.access.always_refuse.clear();
+    p.global.features_crm = false;
+    assert!(p.data_preconnect_engine("odoo_crm_leads", &json!({})).is_err());
+    p.global.features_crm = true;
+    let attach = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
+    assert!(p.data_preconnect("odoo_attachment_add", &attach, None).is_ok());
+    assert!(p.data_preconnect_engine("odoo_attachment_add", &attach).is_err());
+    p.agent.allowed_actions = vec!["attach:crm.lead".into(), "attach:res.partner".into()];
+    assert!(p.data_preconnect_engine("odoo_attachment_add", &attach).is_ok());
+    assert!(p.data_preconnect_engine("odoo_attachment_add",
+        &json!({"model":"res.partner","res_id":9,"file":"x.pdf"})).is_err());
+    assert!(p.data_preconnect_engine("odoo_unknown", &json!({})).is_err());
+}
+
+#[test]
 fn listing_and_dispatch_share_possible_identity_matrix() {
     for personal in [false, true] {
         for own in [false, true] {
@@ -52,7 +86,8 @@ fn listing_and_dispatch_share_possible_identity_matrix() {
                     p.identities.has_agent_credential = own;
                     p.access.company_key_agents = if company { vec!["bot".into()] } else { vec![] };
                     p.agent.permission_override = readonly.then(|| "read_only".into());
-                    for tool in ["odoo_search", "odoo_create", "odoo_write", "odoo_execute"] {
+                    for tool in ["odoo_search", "odoo_create", "odoo_write", "odoo_execute",
+                        "odoo_activity_create", "odoo_note_post", "odoo_message_send", "odoo_attachment_add"] {
                         let params = json!({"model":"res.partner", "method":"write"});
                         assert_eq!(p.listed(tool, Some(&params)), p.precheck(tool, &params).is_ok(),
                             "{tool}: personal={personal}, own={own}, company={company}, readonly={readonly}");
@@ -63,6 +98,34 @@ fn listing_and_dispatch_share_possible_identity_matrix() {
             }
         }
     }
+}
+
+#[test]
+fn writeback_policy_uses_semantic_verbs_and_exact_dedicated_tokens() {
+    let params = json!({"model":"crm.lead", "res_id":1, "summary":"test", "body":"test"});
+    for (tool, verb) in [("odoo_activity_create", "activity"), ("odoo_note_post", "note"), ("odoo_message_send", "message"), ("odoo_attachment_add", "attach")] {
+        let mut p = policy();
+        assert!(p.listed(tool, None));
+        assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::Follow))).is_ok());
+        p.access.permission_mode = PermissionMode::Engine;
+        p.agent.allowed_models = vec!["crm.lead".into()];
+        for token in [verb.to_string(), format!("{verb}:*"), format!("{verb}:crm.lead.extra")] {
+            p.agent.allowed_actions = vec![token];
+            assert!(!p.listed(tool, None));
+            assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::Engine))).is_err());
+        }
+        p.agent.allowed_actions = vec![format!("{verb}:crm.lead")];
+        assert!(p.listed(tool, None));
+        assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::Engine))).is_ok());
+        assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::ReadOnly))).is_err());
+        p.access.permission_mode = PermissionMode::FollowOdooAccount;
+        p.access.always_refuse = vec![format!("{verb}:*")];
+        assert!(!p.listed(tool, None));
+        assert!(p.check_call(tool, &params, Some(&identity(IdentityPermission::Follow))).unwrap_err().contains("一律不允許"));
+    }
+    let p = policy();
+    assert!(p.check_call("odoo_execute", &json!({"model":"crm.lead","method":"message_post"}),
+        Some(&identity(IdentityPermission::Follow))).unwrap_err().contains("DuDuClaw 不讓"));
 }
 
 #[test]
@@ -136,4 +199,32 @@ fn exact_and_segment_refusals_and_feature_switches_apply_in_follow() {
     p.global.features_crm = false;
     assert!(!p.listed("odoo_crm_leads", None));
     assert!(p.check_call("odoo_crm_leads", &json!({}), Some(&identity(IdentityPermission::Follow))).is_err());
+}
+
+#[test]
+fn person_policy_never_uses_employee_tables_or_engine() {
+    let mut p = policy();
+    p.person_key = true;
+    p.agent.allowed_models = vec!["employee.only".into()];
+    p.agent.allowed_actions = vec!["read:employee.only".into()];
+    p.access.always_refuse = vec!["unlink:*".into()];
+    for permission in [IdentityPermission::Follow, IdentityPermission::ReadOnly] {
+        let decision = identity(permission);
+        assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), Some(&decision)).is_ok());
+        for tool in ["odoo_create", "odoo_write", "odoo_activity_create", "odoo_note_post"] {
+            assert_eq!(p.check_call(tool, &json!({"model":"res.partner"}), Some(&decision)).is_ok(),
+                permission == IdentityPermission::Follow, "{tool}");
+        }
+        assert!(p.common("res.partner", "unlink").unwrap_err().contains("一律不允許"));
+        for tool in ["odoo_execute", "odoo_report", "odoo_connect", "odoo_message_send", "odoo_attachment_add"] {
+            assert!(p.check_call(tool, &json!({"model":"res.partner"}), Some(&decision)).is_err());
+        }
+    }
+    let follow = identity(IdentityPermission::Follow);
+    for model in ["ir.model", "ir.model.fields", "ir.model.access", "ir.model.data", "ir.model.constraint", "mail.template", "mail.message", "ir.rule"] {
+        assert!(p.check_call("odoo_write", &json!({"model":model}), Some(&follow)).unwrap_err()
+            .starts_with("DuDuClaw 不讓 AI 做這件事："));
+    }
+    assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), None).is_err());
+    assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), Some(&identity(IdentityPermission::Engine))).is_err());
 }

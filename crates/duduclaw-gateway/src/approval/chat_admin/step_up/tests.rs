@@ -1,18 +1,18 @@
 //! P15 regression tests. Gateway compilation/execution is reserved for review.
 use super::*;
 use super::{store::Store, routes::{Choice, Decision}};
-use crate::approval::{ApprovalId, ApprovalStatus, decision_service::tests::Fixture};
+use crate::approval::{ApprovalId, ApprovalStatus, decision_service::{self, tests::Fixture}};
 use crate::approval::chat_admin::receipts;
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 
-struct WebFixture {
-    service: Fixture,
-    id: ApprovalId,
-    receipt: Receipt,
-    raw: String,
-    session: String,
+pub(crate) struct WebFixture {
+    pub(crate) service: Fixture,
+    pub(crate) id: ApprovalId,
+    pub(crate) receipt: Receipt,
+    pub(crate) raw: String,
+    pub(crate) session: String,
 }
 impl WebFixture {
     async fn new() -> Self {
@@ -21,15 +21,18 @@ impl WebFixture {
         let id = service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
         let proof = service.proof(&id).await;
         let receipt = receipts::by_card_id(&service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
+        Self::from_service(service, id, receipt)
+    }
+    pub(crate) fn from_service(service: Fixture, id: ApprovalId, receipt: Receipt) -> Self {
         let raw = Store::open(&service.env.home).unwrap().issue(&receipt).unwrap();
         Self { service, id, receipt, raw, session:uuid::Uuid::new_v4().to_string() }
     }
-    fn ctx(&self) -> UserContext { self.service.db().live_user_context(&self.service.user).unwrap().unwrap() }
-    fn input(&self, approve: bool, csrf: Option<[u8;32]>) -> Decision {
+    pub(crate) fn ctx(&self) -> UserContext { self.service.db().live_user_context(&self.service.user).unwrap().unwrap() }
+    pub(crate) fn input(&self, approve: bool, csrf: Option<[u8;32]>) -> Decision {
         Decision { decision:if approve { Choice::Approve } else { Choice::Reject },
             expected_digest:self.receipt.digest.clone(), step_up_csrf:csrf }
     }
-    async fn post(&self, input: Decision) -> Result<Value, Error> {
+    pub(crate) async fn post(&self, input: Decision) -> Result<Value, Error> {
         routes::confirm(&self.service.env, &self.ctx(), &self.session, &self.raw, input).await
     }
     async fn handler(&self) -> crate::handlers::MethodHandler {
@@ -38,7 +41,7 @@ impl WebFixture {
             std::sync::Arc::new(duduclaw_auth::JwtConfig::new(b"step-up-test-secret-32-bytes!!!!!"))).await;
         handler
     }
-    async fn get(&self) -> Result<Value, Error> {
+    pub(crate) async fn get(&self) -> Result<Value, Error> {
         routes::preview(&self.handler().await, &self.service.env, &self.ctx(), &self.session, &self.raw).await
     }
     fn sql(&self, query: &str) {
@@ -50,9 +53,10 @@ impl WebFixture {
         // the REAL password+TOTP migration_step_up API to issue the proof.
         Connection::open(self.service.env.home.join("users.db")).unwrap().execute(
             "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,?2,0)",
-            params![self.service.user, "fixture:GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"]).unwrap();
+            params![self.service.user, format!("fixture:{}", serde_json::to_string(
+                &(&self.service.user, "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")).unwrap())]).unwrap();
     }
-    fn step_up(&self) -> [u8;32] {
+    pub(crate) fn step_up(&self) -> [u8;32] {
         self.factor();
         let now = Utc::now().timestamp();
         let mut mac = Hmac::<sha1::Sha1>::new_from_slice(b"12345678901234567890").unwrap();
@@ -302,4 +306,31 @@ fn web_link_requires_external_https_and_preserves_base_path() {
     }
     std::fs::write(home.path().join("config.toml"), "[dashboard]\npublic_url='https://dashboard.example.test/dudu/'\n").unwrap();
     assert_eq!(landing_base(home.path()).as_deref(), Some("https://dashboard.example.test/dudu/approvals/confirm"));
+}
+
+#[tokio::test]
+async fn disabled_web_refuses_both_decisions_without_consuming_old_ticket() {
+    for enabled in [true, false] {
+        let f = WebFixture::new().await;
+        let csrf = f.step_up();
+        f.service.config(enabled, "telegram", &[]);
+        let path = f.service.env.home.join("config.toml");
+        let cfg = std::fs::read_to_string(&path).unwrap() + "step_up_methods=['dm_totp']\n";
+        std::fs::write(path, cfg).unwrap();
+        let proof = decision_service::ChatAdminProof { user_id:f.service.user.clone(), channel:config::ChatChannel::Telegram,
+            account:f.receipt.account.clone(), principal:f.receipt.principal.clone(), dm:f.receipt.dm.clone(),
+            card_id:f.receipt.card_id.clone(), digest:f.receipt.digest.clone(), step:super::super::ledger::Step::Web };
+        for approve in [true, false] {
+            assert!(f.post(f.input(approve, Some(csrf))).await.is_err());
+            let result = decision_service::decide(&f.service.env, &f.id, approve, "",
+                &decision_service::Decider::ChatAdmin(proof.clone())).await;
+            if enabled {
+                assert!(matches!(result, Err(decision_service::DecisionRefusal::StepUpRequired)));
+            } else {
+                assert!(matches!(result, Err(decision_service::DecisionRefusal::FeatureOff)));
+            }
+            assert!(Store::open(&f.service.env.home).unwrap().preview(&f.raw, &f.service.user).is_ok());
+            f.pending().await;
+        }
+    }
 }

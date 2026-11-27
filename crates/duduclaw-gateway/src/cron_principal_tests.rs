@@ -20,6 +20,8 @@ impl AgentInvoker for PrincipalInvoker {
         if self.deny_main {
             let queue = crate::message_queue::MessageQueue::open(home).unwrap();
             let message = crate::message_queue::QueueMessage {
+                autopilot_department: None,
+                autopilot_rule_id: None,
                 id: uuid::Uuid::new_v4().to_string(), sender: agent.into(), target: "main".into(),
                 payload: "delegated from cron".into(), status: crate::message_queue::MessageStatus::Pending,
                 retry_count: 0, delegation_depth: 1, origin_agent: Some(agent.into()),

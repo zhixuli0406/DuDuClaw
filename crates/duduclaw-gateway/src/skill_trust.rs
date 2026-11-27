@@ -50,30 +50,55 @@ struct Config {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TrustConfig {
+pub(crate) struct TrustConfig {
     #[serde(default)]
-    auto_approve: Vec<PinnedKey>,
+    pub(crate) auto_approve: Vec<PinnedKey>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PinnedKey {
-    publisher: String,
-    key: String,
-    key_id: String,
-    added_by: String,
-    added_at: String,
+pub(crate) struct PinnedKey {
+    pub(crate) publisher: String,
+    pub(crate) key: String,
+    pub(crate) key_id: String,
+    pub(crate) added_by: String,
+    pub(crate) added_at: String,
 }
 impl PinnedKey {
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.publisher != "duduclaw" && validate_publisher_id(&self.publisher).is_ok()
             && !self.added_by.is_empty() && !self.added_at.is_empty()
             && minisign_key_id(&self.key).is_ok_and(|id| id == self.key_id)
     }
 }
+/// A minisign key id is not a fingerprint. Check all entries, including invalid
+/// ones, before selecting usable pins so a collision cannot be filtered away.
+pub(crate) fn conflicting_pin_ids(entries: &[PinnedKey]) -> BTreeSet<(String, String)> {
+    let mut keys = BTreeMap::new();
+    let mut conflicts = BTreeSet::new();
+    for entry in entries {
+        let claimed = (entry.publisher.clone(), entry.key_id.clone());
+        let Ok(key_id) = minisign_key_id(&entry.key) else {
+            conflicts.insert(claimed);
+            continue;
+        };
+        let identity = (entry.publisher.clone(), key_id);
+        if claimed != identity {
+            conflicts.insert(claimed);
+            conflicts.insert(identity.clone());
+        }
+        if keys.insert(identity.clone(), entry.key.as_str()).is_some_and(|key| key != entry.key.as_str()) {
+            conflicts.insert(identity);
+        }
+    }
+    conflicts
+}
 fn read_config(root: &Directory) -> Result<TrustConfig, String> {
     let raw = root.read("config.toml", 2 * 1024 * 1024).map_err(|_| CONFIG)?;
     let text = std::str::from_utf8(&raw).map_err(|_| CONFIG)?;
-    toml::from_str::<Config>(text).map(|c| c.skill_trust).map_err(|_| CONFIG.into())
+    let mut trust = toml::from_str::<Config>(text).map_err(|_| CONFIG)?.skill_trust;
+    let conflicts = conflicting_pin_ids(&trust.auto_approve);
+    trust.auto_approve.retain(|entry| !conflicts.contains(&(entry.publisher.clone(), entry.key_id.clone())));
+    Ok(trust)
 }
 
 #[derive(Deserialize)]
@@ -153,7 +178,7 @@ pub async fn evaluate(home: &Path, rec: &ApprovalRecord) -> Result<AutoApproval,
     if !candidate(rec) || rec.is_stale(chrono::Utc::now()) { return Err(APPROVAL.into()); }
     let slug = rec.payload.get("slug").and_then(serde_json::Value::as_str).ok_or(APPROVAL)?;
     if slug != rec.agent_id || !segment(slug) { return Err(APPROVAL.into()); }
-    let root = Directory::open(home).map_err(|_| EVIDENCE)?;
+    let root = Directory::open_home(home).map_err(|_| EVIDENCE)?;
     let expert = root.descend(&format!("experts/{slug}")).map_err(|_| EVIDENCE)?;
     let evidence = expert.child("provenance").map_err(|_| EVIDENCE)?;
     let provenance: Provenance = serde_json::from_slice(&evidence.read("provenance.json", 1024 * 1024)
@@ -327,7 +352,7 @@ impl From<&AutoApproval> for HighestVersion {
     }
 }
 fn load_state(home: &Path) -> Result<State, String> {
-    let root = Directory::open(home).map_err(|_| INTERNAL)?;
+    let root = Directory::open_home(home).map_err(|_| INTERNAL)?;
     let bytes = match root.read(STATE_FILE, MAX_STATE_BYTES) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
@@ -365,7 +390,7 @@ fn check_version(state: &State, approved: &AutoApproval) -> Result<(), String> {
     Ok(())
 }
 fn update_state<T>(home: &Path, change: impl FnOnce(&mut State) -> Result<T, String>) -> Result<T, String> {
-    let _root = Directory::open(home).map_err(|_| INTERNAL)?;
+    let _root = Directory::open_home(home).map_err(|_| INTERNAL)?;
     // with_file_lock uses a sidecar; reject pre-existing link/special locks.
     let lock = home.join(format!("{STATE_FILE}.lock"));
     match std::fs::symlink_metadata(&lock) {
@@ -410,9 +435,25 @@ async fn refuse(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord, reas
     }
 }
 
-/// Evaluate each candidate once. A process without the gateway lock does no IO.
+/// Evaluate each candidate once. Only the gateway lock holder touches approval state.
 pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
-    if !duduclaw_core::gateway_instance::held(home) || broker.home_dir().as_deref() != Some(home) { return; }
+    let canonical_home = match std::fs::canonicalize(home) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "skill trust home cannot be canonicalized; auto-approval skipped");
+            return;
+        }
+    };
+    if !duduclaw_core::gateway_instance::held(home) { return; }
+    let Some(broker_home) = broker.home_dir() else { return; };
+    let canonical_broker_home = match std::fs::canonicalize(broker_home) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, "skill trust broker home cannot be canonicalized; auto-approval skipped");
+            return;
+        }
+    };
+    if canonical_broker_home != canonical_home { return; }
     // Serializes overlapping ticks/callers without holding a filesystem lock
     // across awaits. The cross-process state mutation still uses with_file_lock.
     static RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());

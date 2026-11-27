@@ -484,6 +484,11 @@ where
     F: std::future::Future<Output = Result<String, String>> + Send,
 {
     use crate::cost_telemetry::RequestType as RT;
+    // Every runner invocation is execution/assignment, including calls whose
+    // telemetry type is Chat. Scope the full run so retries and failover retain it.
+    let fut = crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+        crate::on_behalf_of::access::MainUse::Assign, fut,
+    );
     let fut = crate::process_group::with_class(crate::process_group::request_class(request_type), fut);
     let connector_snapshot = std::sync::Arc::new(std::sync::Mutex::new(crate::egress_guard::ConnectorSnapshot::unknown()));
     let snapshot_after_run = connector_snapshot.clone();
@@ -1128,6 +1133,7 @@ async fn call_claude_for_agent_resolved(
     // dispatch is single-shot by design, so history is empty (same as the
     // non-Claude branch below).
     if duduclaw_llm::is_moa_model_id(&claude_model) {
+        crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(&agent_dir), None).await?;
         info!(
             agent = %agent_id,
             model = %claude_model,
@@ -1626,6 +1632,7 @@ pub(crate) fn resolve_background_model(
 
 /// Admission refusals never trigger account, model, or provider retries.
 fn is_admission_refusal(error: &str) -> bool {
+    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL { return true; }
     crate::entry_gate::background_refusal_code(error).is_some()
         || crate::work_outcome::is_work_result(error) || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error)
         || crate::budget::budget_refusal_message(error).is_some()
@@ -2759,6 +2766,7 @@ async fn try_direct_api(
     rotator: Option<&duduclaw_agent::account_rotator::AccountRotator>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(agent_dir), None).await?;
     crate::budget::gate_before_spawn(home_dir, Some(agent_dir), agent_id, "direct_api_attempt")
         .await.map_err(|e| e.legacy_message())?;
     crate::product_policy::require_model(crate::product_policy::load(home_dir)?, model)?;
@@ -2984,6 +2992,7 @@ async fn try_direct_api_chain(
     request_type: crate::cost_telemetry::RequestType,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, Some(agent_dir), None).await?;
     let policy = crate::product_policy::load(home_dir)?;
     crate::product_policy::require_model(policy, preferred_model)?;
     // Rotator is best-effort: if it can't be built we still resolve keys via env.
@@ -3396,6 +3405,8 @@ async fn call_local_inference_raw(
     agent_id: Option<&str>,
     capabilities: Option<&duduclaw_core::types::CapabilitiesConfig>,
 ) -> Result<String, String> {
+    let final_dir = agent_id.map(|id| home_dir.join("agents").join(id));
+    crate::on_behalf_of::access::check_final_main_spawn(home_dir, final_dir.as_deref(), None).await?;
     // Provider transports admit each request, including local tool-loop rounds.
     crate::autonomous_runtime::check_current().await?;
     let engine = get_inference_engine(home_dir)
@@ -4063,6 +4074,18 @@ async fn call_claude_streaming(
 ) -> Result<ClaudeResponse, String> {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
+    let final_dir = protected_input.map(|(dir, _, _, _)| dir.to_path_buf())
+        .or_else(|| mcp_observer.map(|(home, agent)| home.join("agents").join(agent)))
+        .or_else(|| cmd.as_std().get_current_dir().map(Path::to_path_buf));
+    let final_home = mcp_observer.map(|(home, _)| home.to_path_buf())
+        .or_else(|| final_dir.as_deref().and_then(duduclaw_core::preset::agent_home_dir))
+        .unwrap_or_else(duduclaw_core::platform::duduclaw_home);
+    if protected_input.is_some() {
+        crate::on_behalf_of::access::check_final_main_spawn(
+            &final_home, final_dir.as_deref(), Some(cmd),
+        ).await?;
+    }
+
     // This is the final signed config attached to this command. A protected
     // runtime does not receive this employee stdio config, so observes no names.
     let mcp_names = {
@@ -4093,6 +4116,9 @@ async fn call_claude_streaming(
         }
     } else {
         let admission = crate::autonomous_runtime::admit_current().await?;
+        crate::on_behalf_of::access::check_final_main_spawn(
+            &final_home, final_dir.as_deref(), Some(cmd),
+        ).await?;
         let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
         crate::process_group::BackendChild::spawn_class_bound(cmd, crate::process_group::execution_class(
@@ -6966,7 +6992,7 @@ mod background_entry_tests {
             let path = crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path;
             let mut document: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
             document["model"]["preferred"] = toml::Value::String("opus".into());
-            document["model"]["effort"] = toml::Value::String("high".into());
+            document["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("high".into()));
             document["model"]["fallback"] = toml::Value::String("gpt-5.4-mini".into());
             std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
             Arc::new(crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap())
@@ -6974,7 +7000,7 @@ mod background_entry_tests {
         let mut changed = snapshot.document.clone();
         changed["runtime"]["provider"] = toml::Value::String("claude".into());
         changed["model"]["preferred"] = toml::Value::String("claude-sonnet-4-6".into());
-        changed["model"]["effort"] = toml::Value::String("low".into());
+        changed["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("low".into()));
         changed["model"]["fallback"] = toml::Value::String("claude-haiku-4-5".into());
         std::fs::write(&snapshot.config_path, toml::to_string(&changed).unwrap()).unwrap();
         let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();

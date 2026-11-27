@@ -102,7 +102,8 @@ pub(crate) fn person_tool_refused(name: &str, principal: &Principal) -> bool {
         return !tool.is_some_and(|tool| parse_scopes(tool.scope).ok()
             .is_some_and(|scopes| scopes.is_subset(&principal.scopes)));
     }
-    tool.is_some()
+    // Shared Odoo schemas remain available to employees under their own gates.
+    tool.is_some_and(|tool| tool.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::Gateway)
 }
 
 pub(crate) fn is_person_principal(principal: &Principal) -> bool {
