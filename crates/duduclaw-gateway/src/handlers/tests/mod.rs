@@ -17,6 +17,7 @@ mod member_contract_tests;
 mod live_acl_tests;
 mod team_callable_rpc_tests;
 mod team_history_rpc_tests;
+mod member_key_history_tests;
 mod computer_team_rpc_tests;
 mod computer_watch_link_tests;
 mod team_rpc_tests;

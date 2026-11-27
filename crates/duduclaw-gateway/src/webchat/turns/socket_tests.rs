@@ -1571,3 +1571,6 @@ async fn member_key_chat_prefixes_cannot_fall_back_to_jwt_or_widget() {
         assert!(authenticate_with(&fixture.state.jwt_config, &fixture.state.user_db, raw).is_err());
     }
 }
+
+#[path = "member_key_resume_tests.rs"]
+mod member_key_resume_tests;
