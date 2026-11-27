@@ -7,7 +7,7 @@ fn assert_validation_error(frame: WsFrame, expected: &str) {
 }
 
 fn create_params(agent: &str) -> Value {
-    json!({"name": "Department rule", "owner_department": "sales", "trigger_event": "agent_idle",
+    json!({"name": "Department rule", "owner_department": "sales", "trigger_event": "task_created",
         "action": {"type": "delegate", "target_agent": agent, "prompt": "Prepare report"}})
 }
 
@@ -21,7 +21,7 @@ fn row(id: &str, department: Option<&str>) -> AutopilotRuleRow {
     let action = json!({"type": "delegate", "target_agent": if department == Some("mfg") { "b1" } else { "a2" },
         "prompt": "Report"});
     AutopilotRuleRow {
-        id: id.into(), name: id.into(), enabled: true, trigger_event: "agent_idle".into(),
+        id: id.into(), name: id.into(), enabled: true, trigger_event: "task_created".into(),
         conditions: "{}".into(), action: if department.is_some() {
             json!({"type": "steps", "steps": [action]}).to_string()
         } else { action.to_string() },
@@ -148,7 +148,7 @@ async fn automation_update_validates_result_and_audits_remove() {
 async fn automation_department_triggers_and_provenance_are_closed() {
     let f = fixture().await;
     seed(&f, "a2").await;
-    for trigger in ["tick", "odoo_event", "mcp_event", "os_file", "os_frontmost", "security_event", "cron_tick", "unknown"] {
+    for trigger in ["tick", "odoo_event", "mcp_event", "os_file", "os_frontmost", "security_event", "cron_tick", "unknown", "activity_new", "channel_message", "agent_idle", "run_at_risk"] {
         let mut params = create_params("a2");
         params["trigger_event"] = json!(trigger);
         let frame = Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await;
@@ -165,7 +165,7 @@ async fn automation_department_triggers_and_provenance_are_closed() {
     let mut absent = create_params("a2");
     absent.as_object_mut().unwrap().remove("owner_department");
     assert_permission_denied("missing department", Box::pin(f.h.handle("autopilot.create", absent, &f.mgr_a)).await);
-    for trigger in ["task_created", "task_updated", "task_status_changed", "activity_new", "channel_message", "agent_idle", "run_at_risk"] {
+    for trigger in ["task_created", "task_updated", "task_status_changed"] {
         let mut params = create_params("a2");
         params["trigger_event"] = json!(trigger);
         assert_success(trigger, Box::pin(f.h.handle("autopilot.create", params, &f.mgr_a)).await);
@@ -309,9 +309,9 @@ async fn department_create_and_update_share_normalized_save_validation() {
     let f = fixture().await;
     seed(&f, "a2").await;
     let mut params = create_params("a2");
-    params["trigger_event"] = json!("channel_message");
+    params["trigger_event"] = json!("task_created");
     params["action"] = json!({"type":"run_skill", "target_agent":"a2", "skill_name":"report",
-        "params":{"note":"{{text}}"}, "require_approval":true,
+        "params":{"note":"{{task.title}}"}, "require_approval":true,
         "screen":{"mode":"local", "prompt":"Check relevance"}});
     params["active_window"] = json!({"days":[1], "start":"09:00", "end":"18:00", "timezone":"UTC"});
     params["run_policy"] = json!({"outside_window":"skip"});
@@ -321,7 +321,7 @@ async fn department_create_and_update_share_normalized_save_validation() {
     let before = store.get_rule(id).await.unwrap().unwrap();
     let action: Value = serde_json::from_str(&before.action).unwrap();
     assert_eq!(action["screen"]["mode"], "local");
-    assert_eq!(action["steps"][0]["params"]["note"], "{{text}}");
+    assert_eq!(action["steps"][0]["params"]["note"], "{{task.title}}");
     assert_eq!(action["steps"][0]["require_approval"], true);
     assert!(action["steps"][0].get("screen").is_none());
     for (key, value, message) in [
