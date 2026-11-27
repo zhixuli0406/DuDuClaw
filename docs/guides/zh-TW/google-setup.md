@@ -104,3 +104,23 @@ https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/g
 ```
 
 工具行為與安全模型見 [Google Workspace 參考](google-workspace.md)。Enterprise 本人同意見[個人連線](google-personal-connections.md)。Google Chat 頻道使用另一組憑證，見 [Chat 設定](channels-googlechat-teams.md)。
+
+## 準備雲端硬碟寫入授權
+
+建立、修改、搬移與移到垃圾桶由管理員分別開放，預設全關。開啟或放寬存取前須明確確認了解風險，系統記錄管理員與時間，不要求額外重新驗證。各項預設由成員本人確認；管理員可逐項關閉確認或加上管理員核准。資料夾清單為空時，建立與修改可用於帳號能寫入的任何位置，搬移與移到垃圾桶則不能使用。儀表板控制項會隨本版設定頁交付，寫入設定與個人寫入連線區塊目前尚未建置。
+
+使用網域全權委派時，Workspace 超級管理員須在 **Google 管理控制台 → 安全性 → 存取權與資料控管 → API 控制項 → 管理網域全權委派**，將以下三個範圍加入服務帳號的授權清單，並保留其他服務原本需要的範圍：
+
+```text
+https://www.googleapis.com/auth/drive
+https://www.googleapis.com/auth/documents
+https://www.googleapis.com/auth/spreadsheets
+```
+
+這三個範圍用於寫入，一般的 `drive.readonly` 不足以提供寫入權限。使用委派的同仁不須逐一完成個人寫入同意；Google 管理控制台變更後能否實際取得權杖，仍待 Workspace 驗收。
+
+公司共用帳號使用 OAuth 時，管理員須為該公司帳號完成一次額外的 Google 寫入同意，憑證會與一般連線分開保存。AI 員工使用同仁自己的 Google 連線時，則由各人完成第二次寫入同意，詳見[個人連線](google-personal-connections.md)。
+
+公司共用帳號使用服務帳號時，請妥善保管金鑰檔。Google 一旦授予完整 Drive 範圍，CLI 可讀取的金鑰就可能被用來自行取得寫入權杖，不受 DuDuClaw 寫入開關限制。建議優先使用 gateway 封存的委派金鑰。能任意讀取金鑰的行程不受產品內檢查隔離。
+
+Apps Script 公司連線與受保護模式不支援 Drive 寫入，相關工具不會列出，呼叫也會被拒絕。既有 Docs／Sheets 寫入工具維持原本規則，詳見[寫入工具參考](google-mcp.md#雲端硬碟寫入工具)。
