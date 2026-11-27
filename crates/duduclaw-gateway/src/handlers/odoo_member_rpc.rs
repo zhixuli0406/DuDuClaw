@@ -12,7 +12,8 @@ const STORE: &str = "目前無法處理 Odoo 連線，請稍後再試。";
 const LOGIN: &str = "請使用瀏覽器重新登入後管理自己的 Odoo 連線。";
 const CONFIG: &str = "公司還沒有設定 Odoo 連線，請找管理員。";
 const DENIED: &str = "Odoo 登入名稱和金鑰對不上，請確認後再試。";
-const CHANGED: &str = "連線資料已變更，請重新整理後再試。";
+const CHANGED: &str = "連線資料已變更，請重新整理頁面，確認伺服器位址和資料庫後再試。";
+const CONFIRM_SERVER: &str = "請先重新整理連線頁面，確認 Odoo 伺服器位址和資料庫後再連線或重新驗證。";
 
 pub(super) fn owns(method: &str) -> bool {
     method.split('.').take(2).eq(["me", "odoo"])
@@ -49,7 +50,7 @@ struct ServerFields {
     #[serde(default)] db: String,
     #[serde(default)] allow_private_network: bool,
 }
-struct Server { url: String, db: String, host: String, fp: String, allow_private: bool }
+struct Server { url: String, db: String, destination: String, fp: String, allow_private: bool }
 fn company_server(home: &Path) -> Result<Option<Server>, String> {
     let text = std::fs::read_to_string(home.join("config.toml")).map_err(|_| CONFIG.to_owned())?;
     let doc: toml::Value = toml::from_str(&text).map_err(|_| CONFIG.to_owned())?;
@@ -62,9 +63,12 @@ fn company_server(home: &Path) -> Result<Option<Server>, String> {
     duduclaw_odoo::url_guard::check_url(&fields.url, fields.allow_private_network).map_err(|_| CONFIG.to_owned())?;
     let parsed = url::Url::parse(&fields.url).map_err(|_| CONFIG.to_owned())?;
     if parsed.query().is_some() || parsed.fragment().is_some() { return Err(CONFIG.into()); }
-    let host = parsed.host_str().ok_or(CONFIG)?.to_owned();
+    // check_url rejects userinfo; query/fragment are rejected above. Include
+    // the effective port and base path so same-host changes remain visible.
+    let destination = format!("{}://{}:{}{}", parsed.scheme(), parsed.host_str().ok_or(CONFIG)?,
+        parsed.port_or_known_default().ok_or(CONFIG)?, parsed.path());
     let fp = format!("{:x}", Sha256::digest(format!("{}|{}", fields.url, fields.db).as_bytes()));
-    Ok(Some(Server { url: fields.url, db: fields.db, host, fp, allow_private: fields.allow_private_network }))
+    Ok(Some(Server { url: fields.url, db: fields.db, destination, fp, allow_private: fields.allow_private_network }))
 }
 
 #[derive(Default)]
@@ -126,7 +130,8 @@ fn status(db: &UserDb, home: &Path, user: &str, session: &str) -> Result<Value, 
     if let Some(server) = &server { seen_server(home, user, session, &server.fp, true)?; }
     Ok(json!({"connected":row.is_some(), "state":row.as_ref().map(|r| &r.state),
         "login":row.as_ref().map(|r| &r.login), "odoo_name":row.as_ref().map(|r| &r.odoo_name),
-        "server":server.as_ref().map(|s| &s.host), "verified_at":row.as_ref().map(|r| &r.verified_at),
+        "server":server.as_ref().map(|s| &s.destination), "database":server.as_ref().map(|s| &s.db),
+        "verified_at":row.as_ref().map(|r| &r.verified_at),
         "last_used_at":row.as_ref().and_then(|r| r.last_used_at.as_ref())}))
 }
 
@@ -152,6 +157,7 @@ fn rpc_failure(message: String) -> Failure {
     }
 }
 async fn verify(server: &Server, login: &str, key: &str, check: impl Fn() -> Result<(), String>) -> Result<(i64, String), Failure> {
+    check().map_err(|_| Failure::Changed)?;
     let plan = duduclaw_odoo::url_guard::plan_connection(&server.url, server.allow_private).await.map_err(|_| Failure::Unreachable)?;
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none()).no_proxy();
@@ -227,7 +233,7 @@ impl MethodHandler {
                             audit(&home, "odoo_member_credential_rejected", user, user, "not_configured");
                             message
                         })?;
-                    let (login, secret, expected_rev) = if is_connect {
+                    let (login, secret, expected_rev, requires_confirmation) = if is_connect {
                         let args: Connect = serde_json::from_value(params).map_err(|_| {
                             audit(&home, "odoo_member_credential_rejected", user, user, "invalid_input");
                             "請填寫有效的 Odoo 登入名稱和金鑰。".to_owned()
@@ -236,25 +242,35 @@ impl MethodHandler {
                             audit(&home, "odoo_member_credential_rejected", user, user, "invalid_input");
                             return Err("請填寫有效的 Odoo 登入名稱和金鑰。".into());
                         }
-                        (args.login, args.api_key, None)
+                        if !seen_server(&home, user, &session, &server.fp, false)? {
+                            return Err(CONFIRM_SERVER.into());
+                        }
+                        (args.login, args.api_key, None, true)
                     } else {
                         serde_json::from_value::<Empty>(params).map_err(|_| STORE.to_owned())?;
                         let row = db.odoo_credential_status(user).map_err(|_| STORE.to_owned())?.ok_or("你還沒有連接 Odoo，請先填寫登入名稱和金鑰。")?;
                         if row.server_fp != server.fp {
                             db.odoo_credential_mark_state(user, row.rev, "needs_reverify").map_err(|_| STORE.to_owned())?;
                             if !seen_server(&home, user, &session, &server.fp, false)? {
-                                return Err("公司 Odoo 位址已變更，請先重新整理連線頁面，確認新位址後再按重新驗證。".into());
+                                return Err(CONFIRM_SERVER.into());
                             }
                         }
                         let sealer = crate::odoo_credentials::Sealer::load(&home)?;
                         let opened = db.odoo_credential_unseal_for_reverification(user, row.rev, &sealer)
                             .map_err(|_| STORE.to_owned())?.ok_or(CHANGED)?;
-                        (opened.login, opened.secret, Some(opened.rev))
+                        (opened.login, opened.secret, Some(opened.rev), row.server_fp != server.fp)
                     };
+                    // Load the existing machine key before sending a newly entered secret.
+                    let write_sealer = if is_connect {
+                        Some(crate::odoo_credentials::Sealer::for_write(&home)?)
+                    } else { None };
                     let check = || -> Result<(), String> {
                         fresh(&db, &ctx, &session, role)?;
                         let current = company_server(&home)?.ok_or(CONFIG)?;
                         if current.fp != server.fp { return Err(CHANGED.into()); }
+                        if requires_confirmation && !seen_server(&home, user, &session, &current.fp, false)? {
+                            return Err(CONFIRM_SERVER.into());
+                        }
                         if let Some(rev) = expected_rev {
                             if db.odoo_credential_status(user).map_err(|_| STORE.to_owned())?.is_none_or(|r| r.rev != rev) {
                                 return Err(CHANGED.into());
@@ -283,8 +299,8 @@ impl MethodHandler {
                         }
                         audit(&home, "odoo_member_credential_verified", user, user, "verified");
                     } else {
-                        let sealer = crate::odoo_credentials::Sealer::for_write(&home)?;
-                        db.odoo_credential_put(user, &login, uid, &name, &secret, &server.fp, &sealer).map_err(|_| STORE.to_owned())?;
+                        let sealer = write_sealer.as_ref().ok_or(STORE)?;
+                        db.odoo_credential_put(user, &login, uid, &name, &secret, &server.fp, sealer).map_err(|_| STORE.to_owned())?;
                         audit(&home, "odoo_member_credential_set", user, user, "verified");
                     }
                     status(&db, &home, user, &session)

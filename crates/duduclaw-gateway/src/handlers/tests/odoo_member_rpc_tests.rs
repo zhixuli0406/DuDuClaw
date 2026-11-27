@@ -46,6 +46,8 @@ struct Fixture {
 async fn fixture(stub: &Stub) -> Fixture {
     let home = tempfile::tempdir().unwrap();
     configure(home.path(), stub);
+    // Personal connection RPCs use the machine key initialized by gateway setup.
+    assert!(crate::config_crypto::encrypt_value("setup", home.path()).is_some());
     let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
     let member = db.create_user("m@test.invalid", "Member", "password", UserRole::Employee).unwrap();
     let admin = db.create_user("a@test.invalid", "Admin", "password", UserRole::Admin).unwrap();
@@ -81,10 +83,11 @@ async fn connect(f: &Fixture) -> WsFrame {
 async fn odoo_member_connect_status_disconnect_and_admin_management() {
     let s = stub().await;
     let f = fixture(&s).await;
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     payload(connect(&f).await);
     let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     assert_eq!(status, json!({"connected":true,"state":"ok","login":"member@example.test","odoo_name":"Member",
-        "server":"127.0.0.1","verified_at":status["verified_at"],"last_used_at":null}));
+        "server":format!("{}/", s.url),"database":"test","verified_at":status["verified_at"],"last_used_at":null}));
     let list = payload(rpc(&f, &f.admin, "odoo.member_credentials.list", json!({})).await);
     assert_eq!(list["credentials"][0]["user_id"], f.member.user_id);
     assert!(!list.to_string().contains("secret"));
@@ -93,6 +96,7 @@ async fn odoo_member_connect_status_disconnect_and_admin_management() {
     }
     payload(rpc(&f, &f.admin, "odoo.member_credentials.revoke", json!({"user_id":f.member.user_id})).await);
     assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     payload(connect(&f).await);
     payload(rpc(&f, &f.member, "me.odoo.disconnect", json!({})).await);
     assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
@@ -107,6 +111,7 @@ async fn odoo_member_rejects_mismatch_denied_false_and_secret_echo() {
         let s = stub().await;
         s.mode.store(mode, Ordering::SeqCst);
         let f = fixture(&s).await;
+        payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
         refused(connect(&f).await);
         assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
         let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
@@ -119,12 +124,18 @@ async fn odoo_member_server_change_requires_status_then_explicit_test() {
     let old = stub().await;
     let new = stub().await;
     let f = fixture(&old).await;
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     payload(connect(&f).await);
+    let old_status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     configure(f.home.path(), &new);
     refused(rpc(&f, &f.member, "me.odoo.test", json!({})).await);
     assert_eq!(new.calls.load(Ordering::SeqCst), 0);
     let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     assert_eq!(status["state"], "needs_reverify");
+    assert_eq!(old_status["server"], format!("{}/", old.url));
+    assert_eq!(status["server"], format!("{}/", new.url));
+    assert_ne!(old_status["server"], status["server"]);
+    assert_eq!(status["database"], "test");
     assert_eq!(f.db.odoo_credential_status(&f.member.user_id).unwrap().unwrap().state, "needs_reverify");
     payload(rpc(&f, &f.member, "me.odoo.test", json!({})).await);
     assert_eq!(new.calls.load(Ordering::SeqCst), 2);
@@ -140,6 +151,7 @@ async fn odoo_member_server_change_requires_status_then_explicit_test() {
 async fn odoo_member_shared_rate_limit_refuses_sixth_before_network() {
     let s = stub().await;
     let f = fixture(&s).await;
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     payload(connect(&f).await);
     for _ in 0..4 { payload(rpc(&f, &f.member, "me.odoo.test", json!({})).await); }
     let before = s.calls.load(Ordering::SeqCst);
@@ -155,6 +167,7 @@ async fn odoo_member_browser_live_identity_and_parameter_gates() {
     key_ctx.member_key_id = Some("fake-member-key".into());
     // Direct handler call also refuses even if a future dispatcher changes.
     refused(f.handler.handle_odoo_member_rpc("me.odoo.connect", json!({"login":"member@example.test","api_key":KEY}), &key_ctx).await);
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     for args in [json!({"login":" member@example.test", "api_key":KEY}),
         json!({"login":"member@example.test", "api_key":"bad\nkey"}),
         json!({"login":"member@example.test", "api_key":KEY,"user_id":f.admin.user_id}),
@@ -176,6 +189,7 @@ async fn odoo_member_config_fails_closed() {
     std::fs::write(f.home.path().join("config.toml"), "").unwrap();
     let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     assert_eq!(status["server"], Value::Null);
+    assert_eq!(status["database"], Value::Null);
     refused(connect(&f).await);
     for text in ["broken [", "[odoo]\nurl=7\ndb='test'"] {
         std::fs::write(f.home.path().join("config.toml"), text).unwrap();
@@ -195,8 +209,75 @@ async fn odoo_member_unreachable_is_audited_without_storing() {
     let url = format!("http://{}", unavailable.local_addr().unwrap());
     drop(unavailable);
     std::fs::write(f.home.path().join("config.toml"), format!("[odoo]\nurl='{url}'\ndb='test'\n")).unwrap();
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
     refused(connect(&f).await);
     assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
     let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
     assert!(audit.contains("unreachable"));
+}
+
+#[tokio::test]
+async fn odoo_member_connect_requires_status_in_the_same_browser_session() {
+    let s = stub().await;
+    let mut f = fixture(&s).await;
+    refused(connect(&f).await);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    f.session = uuid::Uuid::new_v4().to_string();
+    refused(connect(&f).await);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    payload(connect(&f).await);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn odoo_member_connect_refuses_destination_changed_after_status() {
+    let old = stub().await;
+    let new = stub().await;
+    let f = fixture(&old).await;
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    configure(f.home.path(), &new);
+    refused(connect(&f).await);
+    assert_eq!(old.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(new.calls.load(Ordering::SeqCst), 0);
+    assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    payload(connect(&f).await);
+    assert_eq!(new.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn odoo_member_status_shows_full_destination_and_database() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    for (url, database, shown) in [
+        ("https://odoo.example.test", "first", "https://odoo.example.test:443/"),
+        ("https://odoo.example.test:8443/base", "second", "https://odoo.example.test:8443/base"),
+        ("https://odoo.example.test:8443/other", "third", "https://odoo.example.test:8443/other"),
+    ] {
+        std::fs::write(f.home.path().join("config.toml"),
+            format!("[odoo]\nurl='{url}'\ndb='{database}'\n")).unwrap();
+        let status = payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+        assert_eq!(status["server"], shown);
+        assert_eq!(status["database"], database);
+    }
+    for url in ["https://user:secret@odoo.example.test", "https://odoo.example.test/?secret=hidden",
+        "https://odoo.example.test/#hidden"] {
+        std::fs::write(f.home.path().join("config.toml"),
+            format!("[odoo]\nurl='{url}'\ndb='test'\n")).unwrap();
+        refused(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    }
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn odoo_member_missing_machine_key_refuses_connect_before_network() {
+    let s = stub().await;
+    let f = fixture(&s).await;
+    payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await);
+    std::fs::remove_file(f.home.path().join(".keyfile")).unwrap();
+    refused(connect(&f).await);
+    assert_eq!(s.calls.load(Ordering::SeqCst), 0);
+    assert!(!f.home.path().join(".keyfile").exists());
 }
