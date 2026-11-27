@@ -50,21 +50,21 @@ struct Config {
 }
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TrustConfig {
+pub(crate) struct TrustConfig {
     #[serde(default)]
-    auto_approve: Vec<PinnedKey>,
+    pub(crate) auto_approve: Vec<PinnedKey>,
 }
-#[derive(Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PinnedKey {
-    publisher: String,
-    key: String,
-    key_id: String,
-    added_by: String,
-    added_at: String,
+pub(crate) struct PinnedKey {
+    pub(crate) publisher: String,
+    pub(crate) key: String,
+    pub(crate) key_id: String,
+    pub(crate) added_by: String,
+    pub(crate) added_at: String,
 }
 impl PinnedKey {
-    fn usable(&self) -> bool {
+    pub(crate) fn usable(&self) -> bool {
         self.publisher != "duduclaw" && validate_publisher_id(&self.publisher).is_ok()
             && !self.added_by.is_empty() && !self.added_at.is_empty()
             && minisign_key_id(&self.key).is_ok_and(|id| id == self.key_id)

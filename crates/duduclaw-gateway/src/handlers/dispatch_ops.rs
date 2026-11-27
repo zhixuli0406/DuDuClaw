@@ -53,6 +53,10 @@ impl MethodHandler {
         }
 
         match method {
+            method if method.split('.').next() == Some("skill_trust") => {
+                require_admin!();
+                boxed_frame(|| self.handle_skill_trust_rpc(method, params, ctx, conn)).await
+            }
             "autopilot.create" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_create(params, ctx)).await

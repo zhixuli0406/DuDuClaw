@@ -252,10 +252,10 @@ pub(crate) fn commit_text_observed_guarded(
     if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
         let home=path.parent().ok_or("config.toml has no parent")?;
         return crate::google_identity::home_source::with_source_guard(home,|g|Ok(
-            commit_rendered_inner(path,expected_hash,render,true,Some(g),None,Some(observer))
+            commit_rendered_inner(path,expected_hash,render,true,Some(g),None,Some(observer),false)
         )).map_err(|e|e.to_string())?;
     }
-    commit_rendered_inner(path,expected_hash,render,true,None,None,Some(observer))
+    commit_rendered_inner(path,expected_hash,render,true,None,None,Some(observer),false)
 }
 
 pub(crate) fn commit_text_locked_with_guard(
@@ -358,12 +358,33 @@ pub(crate) fn commit_local_config_rendered(
 fn commit_rendered_policy(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,mfa_actor:Option<&str>)->Result<(),String> {
     if path.file_name().and_then(|n|n.to_str())==Some("config.toml") {
         let home=path.parent().ok_or("config.toml has no parent")?;
-        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g),mfa_actor,None)))
+        return crate::google_identity::home_source::with_source_guard(home,|g|Ok(commit_rendered_inner(path,expected_hash,render,dashboard_policy,Some(g),mfa_actor,None,false)))
             .map_err(|e|e.to_string())?;
     }
-    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None)
+    commit_rendered_inner(path,expected_hash,render,dashboard_policy,None,mfa_actor,None,false)
 }
-fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
+/// Dedicated writer; callers must perform Admin verification before entering.
+/// All normal CAS, policy, source, authority and atomic-write fences still apply.
+pub(super) fn commit_skill_trust_table(
+    home: &Path, expected_hash: &str, table: &toml::Table,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let path = home.join("config.toml");
+    crate::google_identity::home_source::with_source_guard(home, |source| Ok(
+        commit_rendered_inner(&path, expected_hash, |current| {
+            guard()?;
+            // This exception may change exactly one section.
+            let mut old = current.parse::<toml::Table>().map_err(|e| e.to_string())?;
+            let mut new = table.clone();
+            old.remove("skill_trust");
+            new.remove("skill_trust");
+            if old != new { return Err("只能變更自家技能來源。".into()); }
+            render_preserving(current, table)
+        }, true, Some(source), None, None, true)
+    )).map_err(|e| e.to_string())?
+}
+
+fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,skill_trust_write:bool)->Result<(),String> {
     let authority_home = match path.file_name().and_then(|n| n.to_str()) {
         Some("config.toml") => path.parent(),
         Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
@@ -386,6 +407,16 @@ fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)-
             Ok(c) => c,
             Err(e) => return Ok(Err(e)),
         };
+        // Only the dedicated Admin RPC may change the auto-approval policy.
+        // Check final TOML values under the common lock, including generic
+        // whole-table, raw, observed and local-config adapters.
+        if !skill_trust_write && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            let unchanged = current.parse::<toml::Table>().and_then(|old|
+                new_content.parse::<toml::Table>().map(|new| old.get("skill_trust") == new.get("skill_trust")));
+            if !matches!(unchanged, Ok(true)) {
+                return Ok(Err("請到自家技能來源設定頁變更自動放行清單。".into()));
+            }
+        }
         if observer.is_some() && source.is_some() {
             if let Err(error)=crate::google_identity::home_source::require_unrelated_config(&current,&new_content) {
                 return Ok(Err(error.to_string()));
