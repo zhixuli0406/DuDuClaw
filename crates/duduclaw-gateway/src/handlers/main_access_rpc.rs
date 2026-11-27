@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
+use super::dept_grants_rpc::acknowledgement_required;
 
 const RISK_NOTICE: &str = "被加入的人可以和主要 AI 員工對話、交辦工作，也可能問到它記得的內容（包含管理員和它的對話）。建立員工、改其他員工設定、排程仍只限管理員。";
 const UNAVAILABLE: &str = "無法讀取主要 AI 員工開放名單，請稍後再試。";
@@ -26,6 +27,7 @@ fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
 
 fn store_message(error: &str) -> &'static str {
     match error {
+        duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED => duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED,
         "user not found" => "找不到指定的成員。",
         "main-agent access requires an active user" => "只能加入使用中的成員帳號。",
         _ => SAVE_FAILED,
@@ -58,13 +60,15 @@ impl MethodHandler {
         }
         let ids: Vec<String> = ids.into_iter().collect();
         let actor = ctx.user_id.clone();
+        let acknowledged = params.get("acknowledged").and_then(Value::as_bool) == Some(true);
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", SAVE_FAILED); };
         let result = tokio::task::spawn_blocking(move || {
-            db.set_main_agent_users(&actor, &ids).map_err(|error| store_message(&error))?;
+            db.set_main_agent_users(&actor, &ids, acknowledged).map_err(|error| store_message(&error))?;
             list_payload(&db)
         }).await;
         match result {
             Ok(Ok(payload)) => WsFrame::ok_response("", payload),
+            Ok(Err(duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED)) => acknowledgement_required(),
             Ok(Err(message)) => WsFrame::error_response("", message),
             Err(_) => WsFrame::error_response("", SAVE_FAILED),
         }

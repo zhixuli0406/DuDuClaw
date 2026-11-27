@@ -198,11 +198,16 @@ async fn schedules_reminders_scoped_matrix() {
 }
 
 fn seed_matrix_assign<'a>(f: &'a Fixture, agent: &'a str, paused: bool) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
+    seed_matrix_assign_by(f, agent, paused, &f.admin.user_id)
+}
+
+fn seed_matrix_assign_by<'a>(f: &'a Fixture, agent: &'a str, paused: bool, creator: &'a str)
+    -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     Box::pin(async move {
         let store = Arc::new(TaskStore::open(&f.home).unwrap());
         let now = chrono::Utc::now().to_rfc3339();
         let row = crate::task_store::AssignScheduleRow {
-            id: "matrix-record".into(), creator_user_id: f.admin.user_id.clone(),
+            id: "matrix-record".into(), creator_user_id: creator.to_owned(),
             agent_id: agent.into(), kind: "task".into(), title: "Daily report".into(),
             payload_json: json!({"title": "Daily report"}).to_string(),
             schedule_json: json!({"kind": "daily", "hour": 9, "minute": 0}).to_string(),
@@ -721,5 +726,66 @@ async fn department_cost_recent_default_and_upper_limit() {
         let rows = payload["records"].as_array().unwrap();
         assert_eq!(rows.len(), expected);
         assert!(rows.iter().all(|row| row["agent_id"] == "a1"));
+    }
+}
+
+#[tokio::test]
+async fn creator_access_lost_cron_is_display_only_and_fresh_after_revocation() {
+    let f = fixture().await;
+    let store = Arc::new(CronStore::open(&f.home).unwrap());
+    let legacy = CronTaskRow::new("legacy".into(), "Legacy report".into(), "a1".into(),
+        "0 9 * * *".into(), "Prepare report".into());
+    store.insert(&legacy).await.unwrap();
+    f.h.set_cron_store(store.clone()).await;
+    let created = scoped_payload("cron.add",
+        Box::pin(f.h.handle("cron.add", cron_add_params("a1"), &f.mgr_a)).await);
+    let id = created["task"]["id"].as_str().unwrap();
+    for expected in [false, true] {
+        if expected {
+            f.db.set_dept_grants("admin", "mgrA", "sales", &[], false).unwrap();
+        }
+        for ctx in [&f.admin, &f.mgr_a] {
+            let listed = scoped_payload("cron.list", Box::pin(f.h.handle("cron.list", json!({}), ctx)).await);
+            let row = listed["tasks"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap();
+            assert_eq!(row["creator_access_lost"], expected);
+            assert_eq!(row["enabled"], true);
+            if ctx.is_admin() {
+                let legacy = listed["tasks"].as_array().unwrap().iter().find(|r| r["id"] == "legacy").unwrap();
+                assert_eq!(legacy["creator_access_lost"], false);
+            }
+        }
+        assert!(store.get(id).await.unwrap().unwrap().enabled);
+    }
+    // A broken account store must not be labelled either authorized or revoked.
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute("DROP TABLE department_manager_grants", []).unwrap();
+    let listed = scoped_payload("cron.list", f.h.handle_cron_list().await);
+    let row = listed["tasks"].as_array().unwrap().iter().find(|r| r["id"] == id).unwrap();
+    assert_eq!(row.get("creator_access_lost"), Some(&Value::Null));
+    assert!(store.get(id).await.unwrap().unwrap().enabled);
+}
+
+#[tokio::test]
+async fn creator_access_lost_assign_schedules_keep_running_after_revocation() {
+    for creator in ["mgrA", ""] {
+        let f = fixture().await;
+        seed_matrix_assign_by(&f, "a1", false, creator).await;
+        for revoked in [false, true] {
+            if revoked {
+                f.db.set_dept_grants("admin", "mgrA", "sales", &[], false).unwrap();
+            }
+            let listed = scoped_payload("assign_schedules.list", Box::pin(f.h.handle(
+                "assign_schedules.list", json!({"scope": "all"}), &f.admin)).await);
+            assert_eq!(listed["schedules"][0]["creator_access_lost"], revoked && !creator.is_empty());
+            assert_eq!(listed["schedules"][0]["status"], "active");
+            if !creator.is_empty() {
+                let own = scoped_payload("assign_schedules.list", Box::pin(f.h.handle(
+                    "assign_schedules.list", json!({}), &f.mgr_a)).await);
+                assert_eq!(own["schedules"][0]["creator_access_lost"], revoked);
+                assert_eq!(own["schedules"][0]["status"], "active");
+            }
+            let row = f.h.task_store().await.unwrap().get_assign_schedule("matrix-record").await.unwrap().unwrap();
+            assert_eq!(row.status, "active");
+        }
     }
 }

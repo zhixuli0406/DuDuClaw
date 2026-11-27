@@ -8,7 +8,16 @@ use chrono::Utc;
 use rusqlite::{params, Connection, Row, TransactionBehavior};
 
 use crate::user_row::{bump_acl_generation, load_user};
-use crate::{UserDb, UserRole, UserStatus};
+use crate::{AccessLevel, User, UserDb, UserRole, UserStatus};
+
+pub const ACKNOWLEDGEMENT_REQUIRED: &str = "acknowledgement required";
+
+/// Fresh database facts for display only; never an authorization context.
+pub struct DisplayCreatorAccess {
+    pub user: User,
+    pub bindings: BTreeMap<String, AccessLevel>,
+    pub grants: Vec<(String, Vec<GrantGroup>)>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,8 +203,10 @@ impl UserDb {
     /// Replace a Manager's groups for one exact department. An unchanged set
     /// (including reordered/duplicate input) writes no audit and does not bump
     /// the ACL generation. Target validation still runs for unchanged sets.
+    /// Any added group requires acknowledgement, compared within the same
+    /// IMMEDIATE transaction as the write and audit (no re-authentication).
     pub fn set_dept_grants(&self, actor_user_id: &str, target_user_id: &str,
-        department: &str, groups: &[GrantGroup]) -> Result<(), String> {
+        department: &str, groups: &[GrantGroup], acknowledged: bool) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
         let user = load_user(&tx, target_user_id)?.ok_or("user not found")?;
@@ -214,6 +225,10 @@ impl UserDb {
                 .collect::<rusqlite::Result<_>>().map_err(store_error)?
         };
         let after: BTreeSet<String> = groups.iter().map(|group| group.as_str().to_owned()).collect();
+        // Compare under the IMMEDIATE write transaction, before any mutation.
+        if !acknowledged && !after.is_subset(&before) {
+            return Err(ACKNOWLEDGEMENT_REQUIRED.into());
+        }
         if before == after { return Ok(()); }
         tx.execute("DELETE FROM department_manager_grants WHERE user_id=?1 AND department=?2",
             params![target_user_id, department]).map_err(store_error)?;
@@ -224,11 +239,38 @@ impl UserDb {
                 params![target_user_id, department, group, actor_user_id, now]).map_err(store_error)?;
         }
         bump_acl_generation(&tx).map_err(store_error)?;
-        let detail = serde_json::json!({"department": department, "before": before, "after": after}).to_string();
+        let detail = serde_json::json!({"department": department, "before": before, "after": after, "acknowledged": acknowledged}).to_string();
         tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
             VALUES (?1, 'dept_grant_changed', ?2, ?3, NULL, ?4)",
             params![actor_user_id, target_user_id, detail, now]).map_err(store_error)?;
         tx.commit().map_err(store_error)
+    }
+
+    /// DISPLAY ONLY. Read one creator's account, direct bindings and grants in
+    /// one SQLite snapshot. A corrupt binding is unknown, not a missing grant.
+    pub fn display_creator_access(&self, user_id: &str) -> Result<Option<DisplayCreatorAccess>, String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(store_error)?;
+        let Some(user) = load_user(&tx, user_id)? else { return Ok(None); };
+        let mut bindings = BTreeMap::new();
+        if user.status == UserStatus::Active && user.role != UserRole::Admin {
+            let mut stmt = tx.prepare(
+                "SELECT agent_name, access_level FROM user_agent_bindings WHERE user_id=?1",
+            ).map_err(store_error)?;
+            let rows = stmt.query_map([user_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }).map_err(store_error)?;
+            for row in rows {
+                let (agent, level) = row.map_err(store_error)?;
+                bindings.insert(agent, level.parse::<AccessLevel>()?);
+            }
+        }
+        let grants = if user.status == UserStatus::Active && user.role == UserRole::Manager {
+            read_grants(&tx, Some(user_id))?.into_iter()
+                .map(|grant| (grant.department, grant.groups)).collect()
+        } else { Vec::new() };
+        tx.commit().map_err(store_error)?;
+        Ok(Some(DisplayCreatorAccess { user, bindings, grants }))
     }
 
     pub fn dept_grants_for_user(&self, user_id: &str) -> Result<Vec<(String, Vec<GrantGroup>)>, String> {
@@ -256,7 +298,8 @@ impl UserDb {
 
     /// Replace the complete main-agent access set. Like department grants,
     /// unchanged sets do not write an audit or bump the ACL generation.
-    pub fn set_main_agent_users(&self, actor: &str, user_ids: &[String]) -> Result<(), String> {
+    /// Any added user requires acknowledgement in the same write transaction.
+    pub fn set_main_agent_users(&self, actor: &str, user_ids: &[String], acknowledged: bool) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
         let after: BTreeSet<String> = user_ids.iter().cloned().collect();
@@ -265,6 +308,10 @@ impl UserDb {
             if user.status != UserStatus::Active { return Err("main-agent access requires an active user".into()); }
         }
         let before: BTreeSet<String> = read_main_users(&tx)?.into_iter().collect();
+        // Compare under the IMMEDIATE write transaction, before any mutation.
+        if !acknowledged && !after.is_subset(&before) {
+            return Err(ACKNOWLEDGEMENT_REQUIRED.into());
+        }
         if before == after { return Ok(()); }
         tx.execute("DELETE FROM main_agent_users", []).map_err(store_error)?;
         let now = Utc::now().to_rfc3339();
@@ -273,7 +320,7 @@ impl UserDb {
                 params![id, actor, now]).map_err(store_error)?;
         }
         bump_acl_generation(&tx).map_err(store_error)?;
-        let detail = serde_json::json!({"before": before, "after": after}).to_string();
+        let detail = serde_json::json!({"before": before, "after": after, "acknowledged": acknowledged}).to_string();
         tx.execute("INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
             VALUES (?1, 'main_access_changed', 'main_agent_users', ?2, NULL, ?3)",
             params![actor, detail, now]).map_err(store_error)?;

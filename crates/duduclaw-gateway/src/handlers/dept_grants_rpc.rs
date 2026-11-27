@@ -12,6 +12,16 @@ use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, Gr
 const UNAVAILABLE: &str = "無法讀取部門管理授權，請稍後再試。";
 const INVALID_GROUP: &str = "請選擇有效的管理功能：排程、自動化規則、技能、用量或對外傳送審核。";
 
+pub(super) fn acknowledgement_required() -> WsFrame {
+    WsFrame::Response {
+        id: String::new(), ok: false, payload: None,
+        error: Some(json!({
+            "code": "acknowledgement_required",
+            "message": "請先閱讀風險說明並勾選「我了解」後再授權。",
+        })),
+    }
+}
+
 /// Only serialize authority already admitted by the request-local view.
 pub(super) fn effective_grants(view: &DeptGrantView) -> Value {
     let mut grants: BTreeMap<String, Vec<&str>> = BTreeMap::new();
@@ -27,6 +37,7 @@ pub(super) fn effective_grants(view: &DeptGrantView) -> Value {
 
 fn store_message(error: &str) -> &'static str {
     match error {
+        duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED => duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED,
         "user not found" => "找不到指定的成員。",
         "department grants require an active Manager" => "只能授權給使用中的主管帳號。",
         "invalid department name" => "部門名稱格式不正確。",
@@ -121,6 +132,7 @@ impl MethodHandler {
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", UNAVAILABLE); };
         let home = self.home_dir().to_path_buf();
         let actor = ctx.user_id.clone();
+        let acknowledged = params.get("acknowledged").and_then(Value::as_bool) == Some(true);
         let target = user_id.to_owned();
         let department = department.to_owned();
         let groups: Vec<_> = groups.into_iter().collect();
@@ -134,11 +146,12 @@ impl MethodHandler {
                     return Err("此部門尚未確認或已不存在，請先由管理員同步部門資料後再授權。");
                 }
             }
-            db.set_dept_grants(&actor, &target, &department, &groups)
+            db.set_dept_grants(&actor, &target, &department, &groups, acknowledged)
                 .map_err(|error| store_message(&error))
         }).await;
         match result {
             Ok(Ok(())) => WsFrame::ok_response("", json!({"ok": true})),
+            Ok(Err(duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED)) => acknowledgement_required(),
             Ok(Err(message)) => WsFrame::error_response("", message),
             Err(_) => WsFrame::error_response("", "無法儲存部門管理授權，請稍後再試。"),
         }

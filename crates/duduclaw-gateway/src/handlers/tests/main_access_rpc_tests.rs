@@ -35,7 +35,7 @@ async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor()
         "role": "employee", "status": "active",
     }], "risk_notice": RISK_NOTICE});
     assert_eq!(payload(rpc(&f, SET, json!({
-        "user_ids": ["emp", "emp"], "actor": "mgrA", "user_id": "mgrA",
+        "user_ids": ["emp", "emp"], "acknowledged": true, "actor": "mgrA", "user_id": "mgrA",
     }), &f.admin).await), expected);
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await), expected);
     let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
@@ -45,7 +45,7 @@ async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor()
     ).unwrap();
     assert_eq!(actor, "admin");
     assert_eq!(target, "main_agent_users");
-    assert_eq!(serde_json::from_str::<Value>(&detail).unwrap(), json!({"before": [], "after": ["emp"]}));
+    assert_eq!(serde_json::from_str::<Value>(&detail).unwrap(), json!({"before": [], "after": ["emp"], "acknowledged": true}));
     payload(rpc(&f, SET, json!({"user_ids": ["emp"]}), &f.admin).await);
     let count: i64 = conn.query_row(
         "SELECT count(*) FROM auth_audit_log WHERE action='main_access_changed'", [], |row| row.get(0),
@@ -59,7 +59,7 @@ async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor()
 #[tokio::test]
 async fn managers_and_employees_cannot_read_or_edit_main_access() {
     let f = fixture().await;
-    f.db.set_main_agent_users("admin", &["emp".into(), "mgrA".into()]).unwrap();
+    f.db.set_main_agent_users("admin", &["emp".into(), "mgrA".into()], true).unwrap();
     for method in [GET, SET] {
         for ctx in [&f.mgr_a, &f.mgr_b, &f.emp] {
             assert_eq!(error(rpc(&f, method, json!({"user_ids": []}), ctx).await), "permission denied");
@@ -71,7 +71,7 @@ async fn managers_and_employees_cannot_read_or_edit_main_access() {
 #[tokio::test]
 async fn invalid_main_access_payloads_are_refused_without_partial_writes() {
     let f = fixture().await;
-    f.db.set_main_agent_users("admin", &["mgrA".into()]).unwrap();
+    f.db.set_main_agent_users("admin", &["mgrA".into()], true).unwrap();
     for params in [
         json!({}), Value::Null, json!({"user_ids": null}), json!({"user_ids": "emp"}),
         json!({"user_ids": {"emp": true}}), json!({"user_ids": ["emp", 1]}),
@@ -97,7 +97,7 @@ async fn invalid_main_access_payloads_are_refused_without_partial_writes() {
 #[tokio::test]
 async fn personal_edition_refuses_both_rpcs_and_ignores_stale_list_in_users_me() {
     let f = fixture().await;
-    f.db.set_main_agent_users("admin", &["emp".into()]).unwrap();
+    f.db.set_main_agent_users("admin", &["emp".into()], true).unwrap();
     f.h.set_test_edition(Some(EditionProfile::Personal)).await;
     for method in [GET, SET] {
         for ctx in [&f.admin, &f.mgr_a, &f.emp] {
@@ -113,7 +113,7 @@ async fn personal_edition_refuses_both_rpcs_and_ignores_stale_list_in_users_me()
 async fn users_me_main_access_requires_dashboard_session_and_new_rpcs_have_no_member_contract() {
     let f = fixture().await;
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], false);
-    f.db.set_main_agent_users("admin", &["emp".into()]).unwrap();
+    f.db.set_main_agent_users("admin", &["emp".into()], true).unwrap();
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], true);
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.admin).await)["main_agent_access"], true);
     for origin in [ContextOrigin::MemberKey, ContextOrigin::Other] {
@@ -140,4 +140,27 @@ async fn main_access_store_errors_are_sanitized_and_users_me_fails_closed() {
     assert_eq!(error(rpc(&f, SET, json!({"user_ids": ["emp"]}), &f.admin).await),
         "無法儲存主要 AI 員工開放名單，請稍後再試。");
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], false);
+}
+
+#[tokio::test]
+async fn widening_requires_strict_boolean_acknowledgement_but_revocation_does_not() {
+    let f = fixture().await;
+    let base = json!({"user_ids": ["emp"]});
+    for ack in [None, Some(json!(false)), Some(json!("true")), Some(json!(1)), Some(Value::Null)] {
+        let mut params = base.clone();
+        if let Some(ack) = ack { params["acknowledged"] = ack; }
+        let refused = error(rpc(&f, SET, params, &f.admin).await);
+        assert_eq!(refused, json!({
+            "code": "acknowledgement_required",
+            "message": "請先閱讀風險說明並勾選「我了解」後再授權。",
+        }));
+        assert!(f.db.main_agent_users().unwrap().is_empty());
+    }
+    let mut params = base.clone();
+    params["acknowledged"] = json!(true);
+    payload(rpc(&f, SET, params, &f.admin).await);
+    // Identical sets and revocations do not require confirmation.
+    payload(rpc(&f, SET, base, &f.admin).await);
+    payload(rpc(&f, SET, json!({"user_ids": []}), &f.admin).await);
+    assert!(f.db.main_agent_users().unwrap().is_empty());
 }

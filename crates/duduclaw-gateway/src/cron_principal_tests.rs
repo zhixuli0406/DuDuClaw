@@ -321,7 +321,7 @@ async fn department_grant_created_cron_keeps_fire_time_authority_after_revocatio
     assert_eq!(row.on_behalf_of, Some(format!("user:{}", f.mgr_a.user_id)));
     assert!(cron_principal_allowed(&f.home, &store, f.h.registry(), &row).await);
 
-    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[]).unwrap();
+    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
     assert!(crate::dept_grants::DeptGrantView::load(&f.h, &f.mgr_a).await.is_empty());
     // D14: removing management authority does not revoke stored cron work.
     // The production principal gate still checks main/host/personal targets,

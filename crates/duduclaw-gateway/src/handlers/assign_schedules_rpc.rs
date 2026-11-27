@@ -243,16 +243,15 @@ impl MethodHandler {
             Ok(r) => r,
             Err(e) => return WsFrame::error_response("", &format!("list schedules: {e}")),
         };
-        let home = self.home_dir.clone();
+        let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
         let schedules: Vec<Value> = rows
             .iter()
             .map(|r| {
+                let lost = display.display_creator_access_lost(Some(&r.creator_user_id), &r.agent_id);
                 let name = (r.creator_user_id != actor.user_id)
-                    .then(|| {
-                        crate::trigger_route::assign_create::account_name(&home, &r.creator_user_id)
-                    })
-                    .flatten();
-                let mut value = manage::row_json(r, name.as_deref());
+                    .then(|| display.display_creator_name(&r.creator_user_id)).flatten();
+                let mut value = manage::row_json(r, name);
+                value["creator_access_lost"] = json!(lost);
                 value["can_manage"] = json!(actor.is_admin || r.creator_user_id == actor.user_id
                     || ctx.has_agent_access(&r.agent_id, AccessLevel::Operator)
                     || (department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, GrantAction::Toggle)

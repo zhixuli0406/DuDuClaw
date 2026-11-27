@@ -96,6 +96,7 @@ impl MethodHandler {
                 Err(_) => return WsFrame::error_response("", "Automation data unavailable"),
             };
             let mut tasks = Vec::new();
+            let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
             for row in rows.into_iter().filter(|r| may_read(ctx, &view, r)) {
                 let bound = match store.workflow_binding(&row.id).await {
                     Ok(binding) => binding.is_some(),
@@ -119,7 +120,10 @@ impl MethodHandler {
                 let can_run = can_activate && (operator
                     || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, GrantAction::RunNow));
                 // Script bodies and notification destinations remain operator-only configuration.
-                tasks.push(member_cron_row(&row, writable, can_edit, can_resume, can_run));
+                let mut value = member_cron_row(&row, writable, can_edit, can_resume, can_run);
+                value["creator_access_lost"] = json!(display.display_creator_access_lost(
+                    row.created_by_user_id.as_deref(), &row.agent_id));
+                tasks.push(value);
             }
             return WsFrame::ok_response("", json!({ "tasks": tasks }));
         }

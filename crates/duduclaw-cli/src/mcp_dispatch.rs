@@ -4746,7 +4746,7 @@ effect = "forbid"
             duduclaw_auth::UserRole::Admin).unwrap();
         let user = db.create_user("person@example.invalid", "Person", "isolated-test-password",
             duduclaw_auth::UserRole::Employee).unwrap();
-        db.set_main_agent_users(&admin.id, &[user.id.clone()]).unwrap();
+        db.set_main_agent_users(&admin.id, &[user.id.clone()], true).unwrap();
         (home, format!("user:{}", admin.id), format!("user:{}", user.id))
     }
 

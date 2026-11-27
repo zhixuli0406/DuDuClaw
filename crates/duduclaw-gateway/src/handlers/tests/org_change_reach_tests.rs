@@ -64,7 +64,7 @@ async fn org_change_reach_digest_refuses_stale() {
     let p = propose(&f).await;
     let original_base = base(&f);
     error(rpc(&f, "approvals.decide", json!({"id": p["approval_id"], "approve": true})).await, "reach_changed");
-    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Skills]).unwrap();
+    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Skills], true).unwrap();
     let e = error(rpc(&f, "approvals.decide", json!({
         "id": p["approval_id"], "approve": true, "reach_digest": p["reach_digest"],
     })).await, "reach_changed");
@@ -80,7 +80,7 @@ async fn org_change_reach_digest_refuses_stale() {
         "reach_digest": e["current"]["reach_digest"]})).await);
 
     let f = fixture().await;
-    f.db.set_dept_grants("admin", "mgrA", "sales", &[]).unwrap();
+    f.db.set_dept_grants("admin", "mgrA", "sales", &[], true).unwrap();
     let p = propose(&f).await;
     assert_eq!(p["reach"], json!([]));
     assert!(p["sentence"].is_null());
@@ -95,7 +95,7 @@ async fn org_apply_change_reach_digest_refuses_stale() {
     let original_base = base(&f);
     error(rpc(&f, "org.apply_change", json!({"agent_id": "b1", "department": "sales",
         "expected_base": original_base})).await, "reach_changed");
-    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Cost]).unwrap();
+    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Cost], true).unwrap();
     let e = error(rpc(&f, "org.apply_change", json!({"agent_id": "b1", "department": "sales",
         "expected_base": original_base, "reach_digest": preview["reach_digest"]})).await, "reach_changed");
     assert_eq!(base(&f), original_base);
@@ -105,7 +105,7 @@ async fn org_apply_change_reach_digest_refuses_stale() {
     assert_eq!(applied["reach"], e["current"]["reach"]);
 
     let f = fixture().await;
-    f.db.set_dept_grants("admin", "mgrA", "sales", &[]).unwrap();
+    f.db.set_dept_grants("admin", "mgrA", "sales", &[], true).unwrap();
     ok(rpc(&f, "org.apply_change", json!({"agent_id": "b1", "department": "sales",
         "expected_base": base(&f)})).await);
 }
@@ -165,7 +165,7 @@ async fn org_reach_denial_succeeds_without_digest_after_grants_change() {
     let p = propose(&f).await;
     let original_base = base(&f);
     assert!(!p["reach"].as_array().unwrap().is_empty());
-    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Skills]).unwrap();
+    f.db.set_dept_grants("admin", "mgrB", "sales", &[GrantGroup::Skills], true).unwrap();
     let denied = ok(rpc(&f, "approvals.decide", json!({
         "id": p["approval_id"], "approve": false,
     })).await);

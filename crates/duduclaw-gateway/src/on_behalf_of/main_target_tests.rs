@@ -30,20 +30,20 @@ fn active_admin_and_exact_listed_employee_decisions() {
         assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(false));
         assert_eq!(main_access_allowed(f.dir.path(), "missing", use_), Ok(false));
     }
-    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
     for use_ in USES {
         assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(true));
         assert_eq!(main_access_allowed(f.dir.path(), &format!("{}-extra", f.emp), use_), Ok(false));
         assert_eq!(main_access_allowed(f.dir.path(), &format!(" {} ", f.emp), use_), Ok(false));
     }
-    f.db.set_main_agent_users(&f.admin, &[]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[], true).unwrap();
     assert_eq!(main_access_allowed(f.dir.path(), &f.emp, MainUse::Converse), Ok(false));
 }
 
 #[test]
 fn suspension_removes_list_entry_and_denies_even_admin() {
     let f = fixture(Some(EditionProfile::Enterprise));
-    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
     let conn = rusqlite::Connection::open(f.dir.path().join("users.db")).unwrap();
     conn.execute("UPDATE users SET status='suspended' WHERE id=?1", [&f.emp]).unwrap();
     assert!(!f.db.is_main_agent_user(&f.emp).unwrap());
@@ -58,7 +58,7 @@ fn suspension_removes_list_entry_and_denies_even_admin() {
 #[test]
 fn personal_downgrade_ignores_stale_rows_but_retains_admin() {
     let f = fixture(Some(EditionProfile::Enterprise));
-    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
     crate::team_edition::record(f.dir.path(), EditionProfile::Personal);
     assert!(f.db.is_main_agent_user(&f.emp).unwrap());
     for use_ in USES {
@@ -70,7 +70,7 @@ fn personal_downgrade_ignores_stale_rows_but_retains_admin() {
 #[test]
 fn unresolved_edition_ignores_list() {
     let f = fixture(None);
-    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
     for use_ in USES {
         assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(false));
         assert_eq!(main_access_allowed(f.dir.path(), &f.admin, use_), Ok(true));
@@ -99,7 +99,7 @@ fn principal_classification_and_legacy_admin_only_gate_are_preserved() {
     for use_ in USES {
         assert_eq!(requires_main_restriction_for(f.dir.path(), Some(&employee), use_), Ok(true));
     }
-    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()]).unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
     for use_ in USES {
         assert_eq!(requires_main_restriction_for(f.dir.path(), None, use_), Ok(false));
         assert_eq!(requires_main_restriction_for(f.dir.path(),
