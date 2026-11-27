@@ -332,6 +332,7 @@ async fn receive_webhook(
                             &state.ctx, &session, &session, sender, &base_text, None, None,
                         ).await {
                             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
                             crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(text) => {
                                 drop_files = true;
                                 base_text = text;

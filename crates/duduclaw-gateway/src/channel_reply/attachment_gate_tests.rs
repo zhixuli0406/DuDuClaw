@@ -57,7 +57,7 @@ async fn blocked_or_unpaired_senders_keep_the_original_access_flow() {
             r#"["42"]"#).await.unwrap();
         for text in ["附件", "/help"] {
             assert_eq!(check(&ctx, session, session, "42", text, Some("worker"), None).await,
-                AttachmentEntry::Proceed);
+                AttachmentEntry::SkipFiles);
         }
     }
     ctx.channel_settings.set("telegram", "global", crate::channel_settings::keys::BLOCKED_USERS, "[]").await.unwrap();
@@ -65,7 +65,7 @@ async fn blocked_or_unpaired_senders_keep_the_original_access_flow() {
     let code = ctx.access_control.generate_pairing_code("42").await.unwrap();
     let text = format!("/pair {code}");
     assert_eq!(check(&ctx, "telegram:42", "telegram:42", "42", &text, Some("worker"), None).await,
-        AttachmentEntry::Proceed);
+        AttachmentEntry::SkipFiles);
     // Preflight must not consume the code or approve its sender.
     assert!(ctx.access_control.runtime_approved_users().await.is_empty());
     let reply = crate::channel_reply::check_command_access_gate(&ctx, "telegram:42", "42", &text).await.unwrap();
@@ -119,7 +119,7 @@ async fn scoped_policy_and_thread_binding_match_the_reply_pipeline() {
         AttachmentEntry::Refuse(_)));
     let blocked = crate::channel_reply::UserAccessPolicy { blocked: vec!["42".into()], ..scoped };
     assert_eq!(check(&ctx, "discord:thread:42", "discord:thread:42", "42", "附件", None, Some(&blocked)).await,
-        AttachmentEntry::Proceed);
+        AttachmentEntry::SkipFiles);
     assert_no_saved_attachments(home.path());
 }
 

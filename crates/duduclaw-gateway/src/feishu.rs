@@ -392,6 +392,7 @@ async fn handle_message(event: &serde_json::Value, state: &Arc<FeishuState>) {
             crate::ccr_runtime::reply_principal_for_sender(sender), &text, None, None,
         ).await {
             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
             crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
                 drop_files = true;
                 text = command;

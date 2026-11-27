@@ -546,3 +546,79 @@ async fn a2a_send_preserves_its_protocol_refusal_and_creates_no_work() {
         assert_no_saved_attachments(f.home());
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_commands_refuse_non_admins_and_public_visitors_without_mutation() {
+    use crate::channel_reply::entry_gate_test_helpers::misaligned_worker;
+    for session in ["telegram:42:7", "telegram-evil:42", "widget-visitor:test", "odoolivechat:test"] {
+        let (_home, ctx, _runtime, calls) = misaligned_worker("").await;
+        let channel = session.split(':').next().unwrap();
+        // Exact identities and channel names are required. Public visitors
+        // remain unprivileged even if their channel setting lists their id.
+        let admins = if session == "telegram:42:7" { r#"["142","telegram:42"]"# } else { r#"["42"]"# };
+        ctx.channel_settings.set("telegram", "global", crate::channel_settings::keys::ADMIN_USERS, admins).await.unwrap();
+        if crate::channel_reply::assembly::public_session(session) {
+            ctx.channel_settings.set(channel, "global", crate::channel_settings::keys::ADMIN_USERS, r#"["42"]"#).await.unwrap();
+        }
+        let failsafe = ctx.failsafe.as_ref().unwrap();
+        let before = crate::model_call_probe::calls();
+        for text in ["!STOP", "!STOP ALL", "!RESUME"] {
+            if text == "!RESUME" {
+                failsafe.force_halt(session, "existing halt").await;
+            }
+            let state_before = failsafe.get_state(session).await
+                .map(|s| (s.level, s.since, s.reason, s.auto_recover_at));
+            let reply = crate::channel_reply::inner::build_reply_with_session_inner(text, &ctx, Some("worker"), session, "42", None).await;
+            assert_eq!(reply, "只有管理員可以使用這個指令。", "{session}: {text}");
+            let state_after = failsafe.get_state(session).await
+                .map(|s| (s.level, s.since, s.reason, s.auto_recover_at));
+            assert_eq!(state_after, state_before, "{session}: {text}");
+            assert!(failsafe.get_state("__global__").await.is_none());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(crate::model_call_probe::calls(), before);
+            assert!(ctx.session_manager.session_agent(session).await.unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_admins_can_control_broken_employees_but_stop_all_stays_scoped() {
+    use crate::channel_reply::entry_gate_test_helpers::misaligned_worker;
+    use duduclaw_security::failsafe::FailsafeLevel;
+    for malformed in [false, true] {
+        for admin in ["42", "telegram:42:7"] {
+            let (home, ctx, _runtime, calls) = misaligned_worker("").await;
+            if malformed {
+                std::fs::write(home.path().join("agents/worker/agent.toml"), "[model").unwrap();
+            }
+            let session = "telegram:42:7";
+            ctx.channel_settings.set("telegram", "global", crate::channel_settings::keys::ADMIN_USERS,
+                &serde_json::to_string(&[admin]).unwrap()).await.unwrap();
+            let failsafe = ctx.failsafe.as_ref().unwrap();
+            let before = crate::model_call_probe::calls();
+            for stop in ["!STOP", "!STOP ALL"] {
+                let reply = crate::channel_reply::inner::build_reply_with_session_inner(stop, &ctx, Some("worker"), session, "42", None).await;
+                assert!(reply.contains("stopped"), "{reply}");
+                assert_eq!(failsafe.get_level(session).await, FailsafeLevel::L4Halted);
+                let states = failsafe.active_states().await;
+                assert_eq!(states.len(), 1);
+                assert_eq!(states[0].0, session, "global halt must not be set");
+                let reply = crate::channel_reply::inner::build_reply_with_session_inner("!RESUME", &ctx, Some("worker"), session, "42", None).await;
+                assert!(reply.contains("resumed"), "{reply}");
+                assert!(failsafe.active_states().await.is_empty());
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(crate::model_call_probe::calls(), before);
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn inline_safety_status_remains_available_without_admin_on_a_broken_employee() {
+    let (_home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::misaligned_worker("").await;
+    let session = "telegram:42:7";
+    let before = crate::model_call_probe::calls();
+    let reply = crate::channel_reply::inner::build_reply_with_session_inner("!STATUS", &ctx, Some("worker"), session, "42", None).await;
+    assert_eq!(reply, duduclaw_security::failsafe::format_status(session, None));
+    assert_refused_before_any_side_effect(&ctx, session, &calls, before).await;
+}

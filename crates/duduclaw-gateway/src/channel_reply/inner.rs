@@ -521,9 +521,15 @@ async fn build_reply_with_session_inner_impl(
     // ── L0: Safety word check (highest priority, zero latency) ──
     // Runs BEFORE session creation to avoid unnecessary DB writes for !STOP etc.
     let safety_action = duduclaw_security::safety_word::check(text, &ctx.killswitch.safety_words);
-    if crate::chat_commands::parse_safety_word_with_config(text, &ctx.killswitch.safety_words)
-        .as_ref().is_some_and(crate::entry_gate::command_is_exempt)
+    if let Some(command) = crate::chat_commands::parse_safety_word_with_config(text, &ctx.killswitch.safety_words)
+        .filter(crate::entry_gate::command_is_exempt)
     {
+        let channel = session_id.split(':').next().unwrap_or("");
+        if command.requires_admin()
+            && (public_visitor || !super::is_channel_admin(ctx, channel, &[user_id, session_id]).await)
+        {
+            return "只有管理員可以使用這個指令。".to_string();
+        }
         // Safety words are handled by chat_commands.rs, but if we reach here
         // (e.g., direct call without command parsing), handle inline
         match &safety_action {
@@ -547,14 +553,13 @@ async fn build_reply_with_session_inner_impl(
                             );
                         }
                         duduclaw_security::safety_word::SafetyWordScope::Global => {
-                            // Global stop requires admin — this inline path has no
-                            // admin context, so only halt the current scope as a
-                            // safeguard. The full !STOP ALL is handled via
-                            // chat_commands::handle_command which enforces admin.
+                            // Channel admin is verified above, but this inline
+                            // path has no global admin context. Keep the halt
+                            // scoped; the command handler owns global stops.
                             warn!(
                                 session_id,
                                 user_id,
-                                "!STOP ALL via inline path — halting scope only (admin check unavailable)"
+                                "!STOP ALL via inline path — halting scope only (no global admin context)"
                             );
                             failsafe
                                 .force_halt(session_id, "safety word: STOP ALL (scope-only)")

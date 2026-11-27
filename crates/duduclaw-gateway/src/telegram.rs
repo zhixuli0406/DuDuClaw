@@ -1057,6 +1057,7 @@ async fn process_telegram_message(
     let has_files = msg.photo.as_ref().is_some_and(|p| !p.is_empty())
         || msg.document.is_some() || msg.video.is_some() || msg.sticker.is_some()
         || msg.voice.is_some() || msg.audio.is_some();
+    let mut drop_files = false;
     if has_files {
         let session = telegram_gate_session(chat_id, thread_id);
         let user = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
@@ -1108,11 +1109,15 @@ async fn process_telegram_message(
                 }
             }
         }
-        if check_employee {
+        // Denied senders must skip media even when routing selected no employee.
+        if check_employee || crate::channel_reply::check_command_access_gate(
+            &ctx, &session, &user, "",
+        ).await.is_some() {
             match crate::channel_reply::attachment_gate::check(
                 &ctx, &session, &reply_session, &user, &text, selected.as_deref(), None,
             ).await {
                 crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
                 crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
                     // The handler owns access/admin checks; no media reference
                     // or quoted text may change the parsed exempt command.
@@ -1155,7 +1160,7 @@ async fn process_telegram_message(
         }
         // Strip bot mention
         strip_bot_mention(text, &bot_username)
-    } else if let Some(voice) = &msg.voice {
+    } else if !drop_files && let Some(voice) = &msg.voice {
         info!("🎙 Telegram [{sender}]: voice message");
         match transcribe_voice(&client, &api_base, &voice.file_id, &ctx.home_dir).await {
             Ok(text) => {
@@ -1180,7 +1185,7 @@ async fn process_telegram_message(
                 return;
             }
         }
-    } else if let Some(audio) = &msg.audio {
+    } else if !drop_files && let Some(audio) = &msg.audio {
         info!("🎵 Telegram [{sender}]: audio message");
         match transcribe_voice(&client, &api_base, &audio.file_id, &ctx.home_dir).await {
             Ok(text) => text,
@@ -1216,7 +1221,7 @@ async fn process_telegram_message(
     // shared home dir when no agent resolves.
     let home_for_attach =
         crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name.as_deref()).await;
-    if let Some(photos) = &msg.photo {
+    if !drop_files && let Some(photos) = &msg.photo {
         // Telegram sends multiple sizes; take the largest (last element)
         if let Some(largest) = photos.last() {
             info!("🖼️ Telegram [{sender}]: photo attachment");
@@ -1243,7 +1248,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(doc) = &msg.document {
+    if !drop_files && let Some(doc) = &msg.document {
         info!("📎 Telegram [{sender}]: document attachment");
         let fname = doc.file_name.as_deref().unwrap_or("document");
         match download_telegram_file(&client, &api_base, &doc.file_id).await {
@@ -1265,7 +1270,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(video) = &msg.video {
+    if !drop_files && let Some(video) = &msg.video {
         info!("🎬 Telegram [{sender}]: video attachment");
         let mime = video.mime_type.as_deref().unwrap_or("video/mp4");
         let ext = crate::media::extension_from_mime(mime);
@@ -1287,7 +1292,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(sticker) = &msg.sticker {
+    if !drop_files && let Some(sticker) = &msg.sticker {
         let emoji_label = sticker.emoji.as_deref().unwrap_or("sticker");
         info!("🏷️ Telegram [{sender}]: sticker {emoji_label}");
         match download_telegram_file(&client, &api_base, &sticker.file_id).await {

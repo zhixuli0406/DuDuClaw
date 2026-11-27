@@ -1395,6 +1395,7 @@ async fn prepare_discord_attachments(
         ctx, session, session, sender, text, selected, Some(policy),
     ).await {
         crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+        crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => return Ok(combined.to_string()),
         crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => return Ok(command),
         crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => return Err(reply),
     }

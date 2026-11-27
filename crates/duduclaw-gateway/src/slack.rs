@@ -752,7 +752,8 @@ async fn handle_event(
             ctx, &session, &session, user, text, agent_name, None,
         ).await {
             crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => false,
-            crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => true,
             crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
                 send_message(http, bot_token, channel, &reply, thread_ts.as_deref().or(Some(ts))).await;
                 return;
