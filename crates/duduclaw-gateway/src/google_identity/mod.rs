@@ -32,6 +32,7 @@ pub(crate) mod delegated_scopes;
 pub(crate) mod delegate_owner;
 pub(crate) mod credential_registry;
 pub(crate) mod effect_authority;
+pub(crate) mod drive_write;
 pub mod delegation_key;
 pub mod execute;
 pub mod isolation_bridge;
