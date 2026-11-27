@@ -222,6 +222,9 @@ Owners and Editors receive notices at their verified DMs first, followed by the 
 
 The dashboard card retains the existing 2,000-character text preview and sidecar SHA-256. Approval rechecks the hash and imports under the existing per-card lock before recording the decision, so repeated approvals do not duplicate the source. Pending cards expire after three days; expired, denied and orphaned sidecars are cleaned up. Existing pending limits remain 20 per AI and 10 per proposer. `knowledge.proposals.list` and `knowledge.proposals.decide {id, approve}` remain available to authorized collection Editors.
 
+
+When **Approve in chat apps** is on (Security settings), a self-confirmed Admin can also approve or deny an add-to-knowledge-base card from a chat card in their private Telegram or Google Chat conversation. In chat only Admins decide; a collection editor who is not an Admin still decides in the dashboard. See [Admin approval in chat apps](05-security-defense.md#admin-approval-in-chat-apps-v186).
+
 ## Forgetting what employees learned from a document
 
 `knowledge.sources.delete` with `also_forget_memories: true` looks up the conversations whose replies **cited** the source and files one forget-by-source plan per employee and conversation (at most 20 per deletion; the rest are reported as skipped), covering those turns' messages. The plans are filed only after the deletion succeeded. Each plan waits for the existing Admin-only dashboard approval and is applied afterwards with `duduclaw memory forget-source apply`. This is coarse on purpose: it forgets everything those turns taught the employee, not only what came from the document. Passages that were offered but not cited are not included.

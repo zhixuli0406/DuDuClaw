@@ -38,7 +38,7 @@ Besides `org.toml`, an AI employee cannot write, hold or delete `<home>/locks/or
 ## Proposals and approvals
 
 - Only one proposal can wait for each employee at a time. A second one is refused with `pending_exists` and the waiting request's id.
-- The request is decided in the dashboard only. Messaging apps get a plain notice without buttons, and a decision sent from a channel is refused.
+- The request is decided in the dashboard. Messaging apps get a plain notice without buttons, and a decision sent from a channel is refused. Exception (v1.86): with Approve in chat apps on, a self-confirmed Admin can decide it from a gateway-sent card in a private chat, after a second confirmation by default; see [Admin approval in chat apps](05-security-defense.md#admin-approval-in-chat-apps-v186).
 - On approval the gateway checks the rules again and confirms the employee's placement is still the one the proposal was made against. Only then does it write the authority and the display copy, and it records the decision only after the write succeeded. If the placement changed while the request waited, or the change is no longer valid, the request is **denied** and nothing is written.
 - Recording the decision can fail after the change was applied. In that case the request stays waiting (`decision_unrecorded`) and no final audit row is written. The applied result is saved under `<home>/org_change_journal/` with the approval id. Approving again completes the original approval and does not apply the change a second time. A denial of an already applied request is refused (`already_applied`). Audit rows and the channel notice update are written only after the decision is recorded.
 - Rejection writes nothing. A request expires after 3 days, and expiry counts as a denial.

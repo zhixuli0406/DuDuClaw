@@ -73,7 +73,7 @@ The gateway's dashboard-only list is the authority; today it contains:
 - workflow activation
 - reconciling an operation whose result is unknown (`approvals.resolve_uncertain`, Admin)
 
-A channel reply to one of these never takes effect.
+A channel reply to one of these never takes effect. Exception (v1.86): when a customer Admin turns on Approve in chat apps, knowledge reviews and workflow activation can also be decided from a gateway-sent card in a self-confirmed Admin's private Telegram or Google Chat chat; typed replies still never decide them. See [Admin approval in chat apps](../features/05-security-defense.md#admin-approval-in-chat-apps-v186).
 
 ## Slack: the `users:read` scope
 
