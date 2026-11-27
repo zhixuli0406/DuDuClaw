@@ -974,3 +974,6 @@ async fn org_change_malformed_new_journal_identity_never_uses_legacy_fallback() 
         assert!(f.org_journal_path(&id).exists());
     }
 }
+
+#[path = "admin_ai_tests.rs"]
+mod admin_ai_tests;

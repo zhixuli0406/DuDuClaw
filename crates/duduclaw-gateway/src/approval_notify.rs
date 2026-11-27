@@ -523,7 +523,8 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
     // SR2 round 4 (N4): the owner-only Personal delegation card is never
     // pushed or reminded through the generic chain (defence in depth behind
     // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
-    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || rec.action_kind == crate::admin_ai::card::ACTION_KIND { return None; }
     if crate::google_identity::chat_send::is_member_card(rec) {
         if !crate::google_identity::chat_send::eligible(home_dir, rec) { return None; }
         let binding = rec.binding.as_ref()?;

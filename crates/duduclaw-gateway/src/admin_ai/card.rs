@@ -9,7 +9,7 @@ use super::proposal::{Prepared, Result, refused, hash_text};
 
 pub(crate) const ACTION_KIND: &str = "admin_ai_settings";
 const NOTICE: &str = "已送出確認卡，請到儀表板收件匣確認；十分鐘內有效。";
-const RESULT_MESSAGE: &str = "已送出確認卡，請在私訊或儀表板確認；十分鐘內有效";
+const RESULT_MESSAGE: &str = "已送出確認卡，請到儀表板收件匣確認；十分鐘內有效";
 
 pub(super) fn tool_result(count: usize) -> Value { json!({"message": RESULT_MESSAGE, "item_count": count}) }
 pub(crate) fn check_code_hash(id: &str, code: &str) -> String {
@@ -66,7 +66,8 @@ pub(crate) fn card_body(rec: &ApprovalRecord, code: Option<&str>) -> String {
     body
 }
 fn channel_body(rec: &ApprovalRecord, code: &str) -> String {
-    let body = card_body(rec, Some(code));
+    let _ = code; // Reserved for the immutable proposal contract; never authorize free text.
+    let body = format!("{}\n請到儀表板收件匣確認或取消。", card_body(rec, None));
     if body.chars().count() <= 1800 { body } else { NOTICE.into() }
 }
 

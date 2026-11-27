@@ -38,3 +38,12 @@ fn check_code_hash_is_salted_with_approval_id() {
     assert_ne!(check_code_hash("first", "A9b2"), check_code_hash("first", "A9b3"));
     assert_eq!(check_code_hash("first", "A9b2").len(), 64);
 }
+
+#[test]
+fn unreceipted_notice_never_advertises_text_confirmation() {
+    let rec = record();
+    let notice = channel_body(&rec, "A9b2");
+    assert!(notice.contains("儀表板收件匣"));
+    assert!(!notice.contains("A9b2"));
+    assert!(!notice.contains(rec.id.as_str()));
+}

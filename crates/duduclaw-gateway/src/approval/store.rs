@@ -578,6 +578,10 @@ impl ApprovalStore {
         if crate::google_identity::chat_send::is_member_card(rec) {
             return Err("Only the requesting member may confirm".into());
         }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND
+            && !crate::admin_ai::may_decide(home, rec, &entry.user_id.to_string()) {
+            return Err(crate::admin_ai::REFUSAL.into());
+        }
         // chat_tier also excludes live mail-requester-eligible egress cards.
         if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
             return Err("chat-admin decisions refuse T3 approvals".into());

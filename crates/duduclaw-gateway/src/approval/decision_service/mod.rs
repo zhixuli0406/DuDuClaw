@@ -186,6 +186,14 @@ async fn decide_locked(
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
         .ok_or(DecisionRefusal::NotFound)?;
+    if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+        let (home, record, decider) = (env.home.clone(), rec.clone(), by.clone());
+        let allowed = tokio::task::spawn_blocking(move || match &decider {
+            Decider::Dashboard(ctx) => crate::admin_ai::may_decide(&home, &record, &ctx.user_id),
+            Decider::ChatAdmin(proof) => crate::admin_ai::may_decide_chat(&home, &record, proof),
+        }).await.map_err(|e| DecisionRefusal::Internal(e.to_string()))?;
+        if !allowed { return Err(DecisionRefusal::Forbidden(crate::admin_ai::REFUSAL.into())); }
+    }
     let actor = match by {
         Decider::Dashboard(ctx) => DecisionActor::Dashboard { user_id: ctx.user_id.clone() },
         Decider::ChatAdmin(proof) => {
@@ -215,7 +223,8 @@ async fn decide_locked(
     // Knowledge retains its original status/expiry/authorization ordering and
     // sidecar cleanup. Other kinds originally checked expiry before status.
     let value_result: Result<Value, DecisionRefusal> = async { Ok(match rec.action_kind.as_str() {
-        _ if rec.binding.is_some() && matches!(&actor, DecisionActor::ChatAdmin(_)) => {
+        _ if rec.binding.is_some() && (matches!(&actor, DecisionActor::ChatAdmin(_))
+            || rec.action_kind == crate::admin_ai::card::ACTION_KIND) => {
             chat_preflight(env, &rec, approve, by).await?;
             bound::decide(env, &rec, approve, by, &actor).await?
         }
@@ -345,7 +354,9 @@ async fn chat_preflight(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, 
     let refuses = tokio::task::spawn_blocking(move || crate::on_behalf_of::self_approval::refuses(
         &home, on_behalf_of.as_deref(), me.as_deref(), approve,
     )).await.map_err(|e| DecisionRefusal::Internal(e.to_string()))?;
-    if refuses { return Err(DecisionRefusal::Forbidden(crate::on_behalf_of::self_approval::REFUSAL.into())); }
+    if refuses && rec.action_kind != crate::admin_ai::card::ACTION_KIND {
+        return Err(DecisionRefusal::Forbidden(crate::on_behalf_of::self_approval::REFUSAL.into()));
+    }
     // Validate the receipt BEFORE a side effect, not only when committing the
     // ledger. The transaction still consumes/revalidates it after the effect.
     let receipts = chat_admin::receipts::list_live(&env.broker.store, &rec.id).await
