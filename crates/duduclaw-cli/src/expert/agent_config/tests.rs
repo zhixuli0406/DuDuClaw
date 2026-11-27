@@ -608,3 +608,129 @@ async fn invalid_native_id_never_joins_an_employee_path() {
     assert!(crate::expert::install::cmd_install_with(home.path(), source.path().to_str().unwrap(), opts(true, None)).await.is_err());
     assert!(!home.path().join("agents").exists());
 }
+
+// The signature verifier is tested in core. These importer tests inject its
+// result, as the front door does, and verify evidence handling without granting.
+fn provenance_pack(dir: &Path) -> PathBuf {
+    use duduclaw_core::pack::signatures::{MANIFEST, SIGNATURE};
+    let root = dir.join("signed-team");
+    let manifest = "[pack]\nschema = 1\nid = \"signed-team\"\nkind = \"team\"\ntier = \"free\"\nversion = \"1.0.0\"\npublisher = \"fixture\"\n";
+    write(&root.join("pack.toml"), manifest);
+    write(&root.join("SOUL.md"), "# Helper\n\nHelp organize documents.\n");
+    write(&root.join("skills/helper/SKILL.md"), "---\nname: helper\ndescription: Help organize documents\n---\nRead the supplied files.\n");
+    write(&root.join("skills/helper/scripts/run.sh"), "#!/bin/sh\necho hello\n");
+    write(&root.join("skills/helper/references/說明.txt"), "A short guide.\n");
+    write(&root.join("skills/helper/.hidden.txt"), "Not installed.\n");
+    let pack = duduclaw_core::pack::parse_pack("signed-team", manifest).unwrap();
+    duduclaw_core::pack::signatures::write_manifest(&root, &pack, "fixture").unwrap();
+    assert!(root.join(MANIFEST).is_file());
+    write(&root.join(SIGNATURE), "untrusted comment: importer fixture\r\nsignature bytes\r\n");
+    root
+}
+
+async fn run_provenance_import(
+    home: &Path, root: &Path,
+    status: Option<duduclaw_core::publishers::SignatureState>, github: bool,
+    reimport: crate::expert::reimport::ReimportMode,
+) -> serde_json::Value {
+    let out = tempfile::tempdir().unwrap();
+    let report = out.path().join("report.json");
+    cmd_install_with(home, root.to_str().unwrap(), PipelineOpts {
+        signature_status: status.map(|state| duduclaw_core::publishers::SignatureStatus {
+            state, publisher: Some("fixture".into()),
+        }),
+        source_is_github: github, reimport, report_json: Some(report.clone()),
+        ..Default::default()
+    }).await.unwrap();
+    report_json(&report)
+}
+
+async fn provenance_approval(home: &Path, report: &serde_json::Value) -> serde_json::Value {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalId, ApprovalStatus};
+    let id = ApprovalId::from(report["meta"]["skills_approval_id"].as_str().unwrap().to_string());
+    let broker = ApprovalBroker::open(home).unwrap();
+    assert_eq!(broker.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+    broker.get(&id).await.unwrap().unwrap().payload
+}
+
+#[tokio::test]
+async fn verified_local_pack_preserves_provenance_and_files_candidate_without_grant() {
+    use duduclaw_core::pack::signatures::{MANIFEST, SIGNATURE};
+    use duduclaw_core::publishers::SignatureState;
+    use duduclaw_gateway::expert_skills::{read_skills_state, SkillsStatus};
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let root = provenance_pack(source.path());
+    let report = run_provenance_import(home.path(), &root, Some(SignatureState::Verified), false, Default::default()).await;
+    let slug = report["meta"]["slug"].as_str().unwrap();
+    let dir = home.path().join("experts").join(slug).join("provenance");
+    for name in [MANIFEST, SIGNATURE] {
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), std::fs::read(root.join(name)).unwrap());
+    }
+    let state = read_skills_state(home.path(), slug).unwrap();
+    assert_eq!(state.status, SkillsStatus::PendingApproval);
+    assert_eq!(state.skills.len(), 1);
+    let agent = &state.skills[0].agent;
+    assert_eq!(report_json(&dir.join("provenance.json")), serde_json::json!({
+        "version": 1, "publisher": "fixture", "pack": "signed-team", "pack_version": "1.0.0",
+        "skills": [{"agent": agent, "name": "helper", "source_dir": "skills/helper",
+            "files": ["SKILL.md", "references/說明.txt", "scripts/run.sh"]}],
+    }));
+    let quarantine = duduclaw_gateway::expert_skills::quarantined_skill_dir(home.path(), slug, agent, "helper");
+    assert_ne!(read(&quarantine.join("SKILL.md")), read(&root.join("skills/helper/SKILL.md")));
+    assert_eq!(read(&quarantine.join("scripts/run.sh")), read(&root.join("skills/helper/scripts/run.sh")));
+    assert!(!home.path().join("agents").join(agent).join("SKILLS/helper").exists());
+    assert_eq!(provenance_approval(home.path(), &report).await["auto_approval_candidate"], true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+        for name in [MANIFEST, SIGNATURE, "provenance.json"] {
+            assert_eq!(std::fs::metadata(dir.join(name)).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unsigned_github_invalid_and_legacy_imports_have_no_provenance_or_candidate() {
+    use duduclaw_core::publishers::SignatureState::{Verified, Unsigned, Invalid};
+    for (status, github, canonical) in [
+        (None, false, true), (Some(Unsigned), false, true), (Some(Invalid), false, true),
+        // Deliberately inject Verified to prove that transport exclusion is independent.
+        (Some(Verified), true, true), (Some(Verified), false, false),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let root = provenance_pack(source.path());
+        if !canonical { std::fs::remove_file(root.join("pack.toml")).unwrap(); }
+        let report = run_provenance_import(home.path(), &root, status, github, Default::default()).await;
+        let slug = report["meta"]["slug"].as_str().unwrap();
+        assert!(!home.path().join("experts").join(slug).join("provenance").exists());
+        assert!(provenance_approval(home.path(), &report).await.get("auto_approval_candidate").is_none());
+    }
+}
+
+#[tokio::test]
+async fn reimport_replaces_provenance_and_unsigned_reimport_removes_it() {
+    use duduclaw_core::publishers::SignatureState::Verified;
+    use crate::expert::reimport::ReimportMode;
+    let home = tempfile::tempdir().unwrap();
+    let source = tempfile::tempdir().unwrap();
+    let root = provenance_pack(source.path());
+    let first = run_provenance_import(home.path(), &root, Some(Verified), false, Default::default()).await;
+    let slug = first["meta"]["slug"].as_str().unwrap();
+    let dir = home.path().join("experts").join(slug).join("provenance");
+    write(&dir.join("stale-evidence"), "old");
+    std::fs::rename(root.join("skills/helper/scripts/run.sh"), root.join("skills/helper/scripts/new.sh")).unwrap();
+    let pack = duduclaw_core::pack::parse_pack("signed-team", &read(&root.join("pack.toml"))).unwrap();
+    duduclaw_core::pack::signatures::write_manifest(&root, &pack, "fixture").unwrap();
+    let mode = || ReimportMode::Replace { slug: slug.to_string(), accept_edits: true };
+    let next = run_provenance_import(home.path(), &root, Some(Verified), false, mode()).await;
+    assert_eq!(next["meta"]["slug"], slug);
+    assert!(!dir.join("stale-evidence").exists());
+    let map = read(&dir.join("provenance.json"));
+    assert!(!map.contains("run.sh"));
+    assert!(map.contains("scripts/new.sh"));
+    let unsigned = run_provenance_import(home.path(), &root, None, false, mode()).await;
+    assert!(!dir.exists());
+    assert!(provenance_approval(home.path(), &unsigned).await.get("auto_approval_candidate").is_none());
+}

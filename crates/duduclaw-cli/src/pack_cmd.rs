@@ -243,6 +243,7 @@ async fn install_pack_inner(home: &Path, source: &str, opts: &InstallOptions) ->
         dry_run: opts.dry_run,
         confirm_profile: opts.confirm_profile.clone(),
         signature_status: None,
+        source_is_github: source.starts_with("github:"),
         rename: opts.rename,
         trust_hooks: opts.trust_hooks,
         attach_under: opts.attach_under.clone(),

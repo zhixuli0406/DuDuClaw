@@ -175,6 +175,15 @@ pub fn approval_summary(slug: &str, skills: &[QuarantinedSkill]) -> String {
     out
 }
 
+/// Optional scheduling hints for an imported-skills approval request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EnableRequestOptions {
+    /// Hint for when to push the to-do card only; carries no authority.
+    /// The gateway must independently re-verify the signature, provenance
+    /// and actual quarantined files before considering automatic approval.
+    pub auto_approval_candidate: bool,
+}
+
 /// File one approval request for every quarantined skill of `slug` and
 /// persist the state. Returns the approval id. On any failure the state is
 /// still written as `Disabled` (fail closed) and the error returned.
@@ -183,8 +192,18 @@ pub async fn request_enable(
     slug: &str,
     skills: Vec<QuarantinedSkill>,
 ) -> Result<String, String> {
+    request_enable_with(home, slug, skills, EnableRequestOptions::default()).await
+}
+
+/// File an approval with scheduling hints, preserving the same approval gate.
+pub async fn request_enable_with(
+    home: &Path,
+    slug: &str,
+    skills: Vec<QuarantinedSkill>,
+    opts: EnableRequestOptions,
+) -> Result<String, String> {
     let summary = approval_summary(slug, &skills);
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "slug": slug,
         "action": "enable_imported_skills",
         "skills": skills.iter().map(|s| format!("{}/{}", s.agent, s.name)).collect::<Vec<_>>(),
@@ -195,6 +214,9 @@ pub async fn request_enable(
             .map(|s| serde_json::json!({ "agent": s.agent, "name": s.name, "digest": s.digest }))
             .collect::<Vec<_>>(),
     });
+    if opts.auto_approval_candidate {
+        payload["auto_approval_candidate"] = serde_json::json!(true);
+    }
     let filed = match ApprovalBroker::open(home) {
         Ok(broker) => broker
             .request(
@@ -408,6 +430,31 @@ mod tests {
         std::fs::create_dir_all(home.join("agents").join(&s.agent)).unwrap();
         std::fs::write(home.join("agents").join(&s.agent).join("agent.toml"), "").unwrap();
         s.digest = tree_digest(&q).unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_enable_default_payload_is_unchanged_and_candidate_is_only_a_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let mut s = skill("worker", "helper");
+        seed(h, "pack", &mut s);
+        let expected = serde_json::json!({
+            "slug": "pack", "action": "enable_imported_skills", "skills": ["worker/helper"],
+            "entries": [{"agent": "worker", "name": "helper", "digest": s.digest}],
+        });
+        let broker = ApprovalBroker::open(h).unwrap();
+        let id = request_enable(h, "pack", vec![s.clone()]).await.unwrap();
+        assert_eq!(broker.get(&ApprovalId::from(id)).await.unwrap().unwrap().payload, expected);
+        let id = request_enable_with(h, "pack", vec![s], EnableRequestOptions {
+            auto_approval_candidate: true,
+        }).await.unwrap();
+        let id = ApprovalId::from(id);
+        let mut payload = broker.get(&id).await.unwrap().unwrap().payload;
+        assert_eq!(payload.as_object_mut().unwrap().remove("auto_approval_candidate"), Some(serde_json::json!(true)));
+        assert_eq!(payload, expected);
+        assert_eq!(broker.poll(&id).await.unwrap(), ApprovalStatus::Pending);
+        assert_eq!(read_skills_state(h, "pack").unwrap().status, SkillsStatus::PendingApproval);
+        assert!(!h.join("agents/worker/SKILLS/helper").exists());
     }
 
     #[tokio::test]
