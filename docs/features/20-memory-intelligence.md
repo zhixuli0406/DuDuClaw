@@ -403,7 +403,7 @@ The write-side burst detector is on by default and tunable in `config.toml`. Abs
 [knowledge_guard]
 enabled = true          # master switch for the same-origin burst detector (default true)
 window_secs = 3600      # sliding window length in seconds (default 3600 = 1 hour)
-max_per_subject = 5     # facts one origin may write per subject inside the window; beyond this, quarantine (default 5)
+max_per_subject = 5     # facts from one origin about one subject inside the window; quarantine when the count reaches this number (default 5)
 ```
 
 The supersession trust guard is on by default:
