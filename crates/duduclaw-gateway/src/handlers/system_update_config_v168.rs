@@ -101,6 +101,7 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         ("general.inference_mode", "inference_mode"),
         ("general.default_language", "default_language"),
         ("general.company_timezone", "company_timezone"),
+        ("approval.skill_ttl_days", "skill_ttl_days"),
         ("rotation.strategy", "rotation_strategy"),
         ("rotation.cooldown_after_rate_limit_seconds", "cooldown_after_rate_limit_seconds"),
         ("rotation.health_check_interval_seconds", "health_check_interval_seconds"),
@@ -125,7 +126,15 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         if out.get(*flat).is_some() {
             continue;
         }
-        if let Some(v) = param_at(&out, path) {
+        // Skill TTL rejects every present non-integer, including explicit null.
+        // Other legacy aliases retain param_at's null-as-absent convention.
+        let value = if *path == "approval.skill_ttl_days" {
+            out.get("approval").and_then(|v| v.get("skill_ttl_days"))
+                .or_else(|| out.get(*path))
+        } else {
+            param_at(&out, path)
+        };
+        if let Some(v) = value {
             // `logging.format` is `plain|json` in the contract; the original
             // handler (and the reader, which treats non-json as plain) spells
             // the plain value `pretty`.

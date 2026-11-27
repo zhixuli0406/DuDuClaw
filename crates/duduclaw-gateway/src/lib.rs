@@ -551,6 +551,7 @@ pub mod session_summarizer;
 pub mod session_summarizer_task;
 pub mod session_titler_task;
 pub mod skill_approval;
+pub mod skill_ttl;
 pub mod skill_gap_digest;
 pub mod skill_lifecycle;
 pub mod slack;

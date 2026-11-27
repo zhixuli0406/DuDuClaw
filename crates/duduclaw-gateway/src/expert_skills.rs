@@ -25,7 +25,7 @@ pub const SKILLS_ACTION_KIND: &str = "expert_skills_enable";
 
 /// TTL for a skills approval request (7 days — the operator may need time
 /// to check whether the external capability exists). Expiry = deny.
-pub const SKILLS_APPROVAL_TTL_SECS: i64 = 7 * 86_400;
+pub const SKILLS_APPROVAL_TTL_SECS: i64 = crate::skill_ttl::DEFAULT_SKILL_APPROVAL_TTL_SECS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -202,7 +202,7 @@ pub async fn request_enable(
                 SKILLS_ACTION_KIND,
                 &summary,
                 payload,
-                SKILLS_APPROVAL_TTL_SECS,
+                crate::skill_ttl::skill_approval_ttl_secs(home),
             )
             .await
             .map(|id| id.to_string()),
@@ -408,6 +408,23 @@ mod tests {
         std::fs::create_dir_all(home.join("agents").join(&s.agent)).unwrap();
         std::fs::write(home.join("agents").join(&s.agent).join("agent.toml"), "").unwrap();
         s.digest = tree_digest(&q).unwrap();
+    }
+
+    #[tokio::test]
+    async fn request_enable_reads_ttl_at_creation_and_preserves_existing_requests() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        let mut s = skill("doubao-a1", "test-skill");
+        seed(h, "pack", &mut s);
+        std::fs::write(h.join("config.toml"), "[approval]\nskill_ttl_days = 1\n").unwrap();
+        let id = request_enable(h, "pack", vec![s.clone()]).await.unwrap();
+        let broker = ApprovalBroker::open(h).unwrap();
+        let id = ApprovalId::from(id);
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().ttl_seconds, 86_400);
+        std::fs::write(h.join("config.toml"), "[approval]\nskill_ttl_days = 30\n").unwrap();
+        let next = request_enable(h, "pack", vec![s]).await.unwrap();
+        assert_eq!(broker.get(&ApprovalId::from(next)).await.unwrap().unwrap().ttl_seconds, 2_592_000);
+        assert_eq!(broker.get(&id).await.unwrap().unwrap().ttl_seconds, 86_400);
     }
 
     #[tokio::test]

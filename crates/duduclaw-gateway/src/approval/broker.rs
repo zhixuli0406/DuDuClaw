@@ -151,7 +151,7 @@ impl ApprovalBroker {
         }
     }
 
-    pub(super) fn home_dir(&self) -> Option<PathBuf> {
+    pub(crate) fn home_dir(&self) -> Option<PathBuf> {
         self.store
             .db_path
             .as_ref()

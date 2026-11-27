@@ -41,7 +41,7 @@ use tracing::info;
 
 /// Default TTL for an install request: 7 days. Unlike a live tool-call
 /// approval, an install request is not time-critical.
-pub const DEFAULT_INSTALL_TTL_SECONDS: i64 = 7 * 24 * 3600;
+pub const DEFAULT_INSTALL_TTL_SECONDS: i64 = crate::skill_ttl::DEFAULT_SKILL_APPROVAL_TTL_SECS;
 
 /// Lifecycle status. Only `Approved` authorizes execution (fail-closed).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,7 +220,6 @@ pub enum DecideOutcome {
 /// SQLite-backed store. Mirrors `ApprovalStore` idioms.
 pub struct InstallRequestStore {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
     db_path: Option<PathBuf>,
 }
 
@@ -300,7 +299,9 @@ impl InstallRequestStore {
         let ttl = if ttl_seconds > 0 {
             ttl_seconds
         } else {
-            DEFAULT_INSTALL_TTL_SECONDS
+            self.db_path.as_deref().and_then(Path::parent)
+                .map(crate::skill_ttl::skill_approval_ttl_secs)
+                .unwrap_or(DEFAULT_INSTALL_TTL_SECONDS)
         };
         let dept = requester_department
             .map(|d| d.trim())
@@ -566,6 +567,25 @@ fn row_to_request(row: &rusqlite::Row) -> rusqlite::Result<InstallRequest> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn install_request_uses_configured_ttl_for_default_and_explicit_policy() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[approval]\nskill_ttl_days = 1\n").unwrap();
+        let store = InstallRequestStore::open(home.path()).unwrap();
+        for kind in ["skill", "mcp"] {
+            for ttl in [0, -1, crate::skill_ttl::skill_approval_ttl_secs(home.path())] {
+                let id = store.create(
+                    kind, "test", "description", "u-1", "u1@x", "admin", None,
+                    "Low", &json!([]), &json!({}), ttl,
+                ).await.unwrap();
+                assert_eq!(store.get(&id).await.unwrap().unwrap().ttl_seconds, 86_400);
+            }
+        }
+        // Explicit caller TTLs retain their existing semantics.
+        let id = make(&store, "admin").await;
+        assert_eq!(store.get(&id).await.unwrap().unwrap().ttl_seconds, 3600);
+    }
 
     fn store() -> InstallRequestStore {
         InstallRequestStore::open_in_memory().unwrap()
