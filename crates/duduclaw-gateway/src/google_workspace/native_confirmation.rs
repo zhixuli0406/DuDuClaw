@@ -270,6 +270,13 @@ pub(crate) fn drive_read_path_allowed(url: &reqwest::Url) -> bool {
 /// Non-Drive services retain their own transport policy.
 pub(crate) fn drive_request_url(method: &reqwest::Method, original: &str) -> Option<reqwest::Url> {
     let url = reqwest::Url::parse(original).ok()?;
+    if let Some(host) = url.host_str() {
+        let canonical = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+        // Refuse aliases outright rather than treating them as another service.
+        if host.ends_with('.') || (host != canonical.as_str()
+            && matches!(canonical.as_str(), "www.googleapis.com" | "content.googleapis.com" | "googleapis.com"))
+        { return None; }
+    }
     if drive_host(&url) {
         if original.chars().any(|ch| ch == '\\' || ch.is_control()) { return None; }
         let without_query = original.split(['?', '#']).next()?;
@@ -372,6 +379,22 @@ mod tests {
             "https://www.googleapis.com/drive/../../calendar/v3/calendars/primary/events",
             "https://www.googleapis.com/drive/v3/fi\tles/x"] {
             assert!(drive_request_url(&reqwest::Method::GET, url).is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn drive_raw_url_fence_rejects_trailing_dot_hosts() {
+        for host in ["www.googleapis.com.", "content.googleapis.com.", "googleapis.com.",
+            "WWW.GOOGLEAPIS.COM.", "gmail.googleapis.com.", "other.example."] {
+            for (method, path) in [
+                (reqwest::Method::GET, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::DELETE, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::PATCH, "/drive/v3/files/x1234567890"),
+                (reqwest::Method::POST, "/upload/drive/v3/files?uploadType=multipart"),
+            ] {
+                let url = format!("https://{host}{path}");
+                assert!(drive_request_url(&method, &url).is_none(), "{method} {url}");
+            }
         }
     }
 

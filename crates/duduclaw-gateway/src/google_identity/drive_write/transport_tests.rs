@@ -180,6 +180,49 @@ async fn trash_and_move_bodies_are_transport_owned_exact_json() {
 }
 
 #[tokio::test]
+async fn invalid_move_parents_are_refused_without_send() {
+    let eleven = (0..11).map(|index| GoogleId::new(format!("old_parent_{index:02}")).unwrap()).collect::<Vec<_>>();
+    for remove_parents in [
+        vec![],
+        eleven,
+        vec![GoogleId::new(OLD_PARENT).unwrap(), GoogleId::new(OLD_PARENT).unwrap()],
+    ] {
+        let call = WriteCall::DriveMove {
+            file_id: id(), add_parent: GoogleId::new(PARENT).unwrap(), remove_parents,
+        };
+        let (mut transport, recorded) = fake(FakeReply::Ok(200, vec![]));
+        assert!(matches!(transport.send(&call).await, WriteResult::NotSent(NotSentReason::InvalidParents)));
+        assert_eq!(transport.requests, 0);
+        assert!(recorded.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn ten_distinct_move_parents_are_allowed() {
+    let call = WriteCall::DriveMove {
+        file_id: id(), add_parent: GoogleId::new(PARENT).unwrap(),
+        remove_parents: (0..10).map(|index| GoogleId::new(format!("old_parent_{index:02}")).unwrap()).collect(),
+    };
+    let (mut transport, recorded) = fake(FakeReply::Ok(200, vec![]));
+    assert!(matches!(transport.send(&call).await, WriteResult::Ok(_)));
+    assert_eq!(recorded.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn final_url_over_8192_bytes_is_refused_without_send() {
+    // Exercise the length gate independently of route mismatch. Production IDs
+    // are constructor-bounded; this private test fixture bypasses that bound.
+    let call = WriteCall::DriveTrash { file_id: GoogleId("x".repeat(8192)) };
+    let (method, url) = call.method_and_url();
+    assert!(url.as_str().len() > 8192);
+    assert_eq!(call.validate_target(&method, &url), Err(NotSentReason::InvalidEndpoint));
+    let (mut transport, recorded) = fake(FakeReply::Ok(200, vec![]));
+    assert!(matches!(transport.send(&call).await, WriteResult::NotSent(NotSentReason::InvalidEndpoint)));
+    assert_eq!(transport.requests, 0);
+    assert!(recorded.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn tampered_targets_are_refused_before_send() {
     let call = trash();
     let (method, logical) = call.method_and_url();

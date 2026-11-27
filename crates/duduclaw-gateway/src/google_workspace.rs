@@ -888,6 +888,7 @@ async fn google_request(
     body: Option<&Value>,
 ) -> Result<Value, GoogleApiError> {
     native_confirmation::drive_request_url(&method, url)
+        .filter(|url| !url.host_str().is_some_and(|host| host.ends_with(".googleapis.com.")))
         .ok_or_else(|| GoogleApiError::Http("這個 Google 請求不被允許。".into()))?;
     let client = http_client()?;
     let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
@@ -955,6 +956,7 @@ async fn google_request_text(
     query: &[(&str, String)],
 ) -> Result<String, GoogleApiError> {
     native_confirmation::drive_request_url(&method, url)
+        .filter(|url| !url.host_str().is_some_and(|host| host.ends_with(".googleapis.com.")))
         .ok_or_else(|| GoogleApiError::Http("這個 Google 請求不被允許。".into()))?;
     let client = http_client()?;
     let retry_allowed = automatic_retry_allowed(&method) && !crate::isolation_connector_clients::active();
@@ -1639,7 +1641,9 @@ mod tests {
                 "https://www.googleapis.com/drive/v3/files", &[], None).await.unwrap();
             assert_eq!(count.swap(0, Ordering::SeqCst), 1);
             for (method, url) in native_confirmation::drive_refusal_cases() {
-                for host in ["www.googleapis.com", "content.googleapis.com", "googleapis.com"] {
+                for host in ["www.googleapis.com", "content.googleapis.com", "googleapis.com",
+                    "www.googleapis.com.", "content.googleapis.com.", "googleapis.com.",
+                    "gmail.googleapis.com."] {
                     let url = url.replace("www.googleapis.com", host);
                     for text in [false, true] {
                         let result = if text {

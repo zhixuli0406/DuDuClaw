@@ -29,6 +29,7 @@ pub(crate) enum NotSentReason {
     ContentTooLarge,
     InvalidBearer,
     InvalidEndpoint,
+    InvalidParents,
     RequestLimit,
     BoundaryUnavailable,
     ClientUnavailable,
@@ -142,6 +143,17 @@ struct Route {
 }
 
 impl WriteCall {
+    fn validate_parents(&self) -> Result<(), NotSentReason> {
+        if let Self::DriveMove { remove_parents, .. } = self {
+            if remove_parents.is_empty() || remove_parents.len() > 10
+                || remove_parents.iter().enumerate().any(|(index, parent)| remove_parents[..index].contains(parent))
+            {
+                return Err(NotSentReason::InvalidParents);
+            }
+        }
+        Ok(())
+    }
+
     fn route(&self) -> Route {
         let (method, host, parts): (Method, &str, Vec<String>) = match self {
             Self::DriveGetMetadata { file_id, .. } =>
@@ -214,6 +226,8 @@ impl WriteCall {
     }
 
     fn validate_target(&self, method: &Method, url: &Url) -> Result<(), NotSentReason> {
+        self.validate_parents()?;
+        if url.as_str().len() > 8192 { return Err(NotSentReason::InvalidEndpoint); }
         let route = self.route();
         let segments = url.path_segments().ok_or(NotSentReason::InvalidEndpoint)?.collect::<Vec<_>>();
         let query = url.query_pairs().collect::<Vec<_>>();
@@ -422,6 +436,8 @@ impl WriteTransport {
         {
             return Err(NotSentReason::InvalidBearer);
         }
+        // Bound the list before route construction joins its values.
+        call.validate_parents()?;
         let (method, url) = call.method_and_url();
         let mut request = reqwest::Request::new(method, url);
         if let Some((content_type, body)) = call.body()? {
