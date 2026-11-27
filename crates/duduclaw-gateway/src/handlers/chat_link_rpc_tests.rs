@@ -50,7 +50,7 @@ async fn begin(handler: &MethodHandler, ctx: &UserContext) -> Value {
 fn receive(db: &UserDb, started: &Value) {
     assert_eq!(chat_link::match_code(db, "telegram",
         &chat_link::parse_code(started["code"].as_str().unwrap()).unwrap(),
-        PRINCIPAL, "shared", PRINCIPAL, "<b>王小明</b>", true).unwrap(), chat_link::MatchOutcome::Matched);
+        PRINCIPAL, "telegram", PRINCIPAL, "<b>王小明</b>", true).unwrap(), chat_link::MatchOutcome::Matched);
 }
 
 #[tokio::test]
@@ -134,7 +134,7 @@ async fn rejected_match_writes_audit() {
     assert_eq!(detail["user_id"], ctx.user_id);
     assert_eq!(detail["channel"], "telegram");
     assert_eq!(detail["masked_principal"], "••••4821");
-    assert_eq!(detail["account"], "shared");
+    assert_eq!(detail["account"], "telegram");
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
     assert_eq!(audit.lines().filter(|line| line.contains("channel_link_rejected")).count(), 1);
     assert!(!audit.contains(PRINCIPAL));

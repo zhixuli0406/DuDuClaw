@@ -110,8 +110,7 @@ fn configured_secret(table: &toml::Table, key: &str) -> bool {
 
 fn target(channel: &str, agent: Option<&str>, name: &str, project: Option<&str>) -> Value {
     // Runtime labels distinguish the shared bot from an employee named "shared".
-    let label = agent.map(|id| crate::agent_channels::label(channel, id))
-        .unwrap_or_else(|| channel.to_owned());
+    let label = crate::chat_link_intercept::account_label(channel, agent);
     let identity = crate::agent_channels::identity::get(&label);
     json!({"channel": channel, "account": label, "agent_id": agent, "display_name": name,
         "bot_username": if channel == "telegram" { identity.as_deref() } else { None },
