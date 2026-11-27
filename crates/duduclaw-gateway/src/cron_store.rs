@@ -178,12 +178,6 @@ pub struct CronStore {
 }
 
 impl CronStore {
-    fn revoke_initiator(&self, id: &str) {
-        if let Some(home) = self.db_path.parent() {
-            crate::delegation_roles::initiators::revoke_before_write(home, "cron", id);
-        }
-    }
-
     /// A bound cron never falls back to its legacy prompt after disarm/rollback.
     pub async fn bind_workflow(
         &self,
@@ -580,13 +574,11 @@ impl CronStore {
             // F6h writer gate: a tombstoned label's schedule stays as paused.
             crate::isolation_label_stores::check_label_writable_at(&tx, &row.agent_id)?;
             scoped::check_transition(&tx, &current, row)?;
-            self.revoke_initiator(&row.id);
             tx.execute("UPDATE cron_tasks SET name=?2,cron=?3,task=?4,enabled=?5,on_behalf_of=?6,updated_at=?7,scoped_by_user_id=?8 WHERE id=?1",
                 params![expected.id,row.name,row.cron,row.task,row.enabled,row.on_behalf_of,Utc::now().to_rfc3339(),row.scoped_by_user_id])
                 .map_err(|e| e.to_string())?;
             if !scoped::requires_admission(row) || scoped::validate_scoped_schedule(row).is_ok() { Self::clear_scoped_schedule_skip_in_transaction(&tx, &row.id)?; }
         } else {
-            self.revoke_initiator(&expected.id);
             tx.execute("DELETE FROM cron_tasks WHERE id=?1", params![expected.id]).map_err(|e| e.to_string())?;
         }
         commit_write(tx)?;
@@ -602,9 +594,8 @@ impl CronStore {
         ).optional().map_err(|e| e.to_string())
     }
 
-    fn persist_edit(&self, conn: &Connection, before: &CronTaskRow, row: &CronTaskRow) -> Result<(), String> {
+    fn persist_edit(conn: &Connection, before: &CronTaskRow, row: &CronTaskRow) -> Result<(), String> {
         scoped::check_transition(conn, before, row)?;
-        self.revoke_initiator(&row.id);
         conn.execute(
             "UPDATE cron_tasks SET name=?2,agent_id=?3,cron=?4,task=?5,enabled=?6,
              notify_channel=?7,notify_chat_id=?8,notify_thread_id=?9,cron_timezone=?10,
@@ -626,7 +617,7 @@ impl CronStore {
         let Some(before) = Self::row_in_transaction(&tx, id)? else { return Ok(false) };
         let mut row = before.clone();
         change(&mut row);
-        self.persist_edit(&tx, &before, &row)?;
+        Self::persist_edit(&tx, &before, &row)?;
         commit_write(tx)?;
         Ok(true)
     }
@@ -748,7 +739,7 @@ impl CronStore {
             let before = Self::row_in_transaction(&tx, id)?.ok_or("Automation disappeared")?;
             let mut row = before.clone();
             row.enabled = enabled;
-            self.persist_edit(&tx, &before, &row)?;
+            Self::persist_edit(&tx, &before, &row)?;
         }
         commit_write(tx)?;
         Ok(!ids.is_empty())
@@ -757,7 +748,6 @@ impl CronStore {
     pub async fn delete(&self, id: &str) -> Result<bool, String> {
         let mut guard = self.conn.lock().await;
         let conn = begin_write(&mut guard)?;
-        self.revoke_initiator(id);
         let changed = conn
             .execute("DELETE FROM cron_tasks WHERE id = ?1", params![id])
             .map_err(|e| format!("delete cron task: {e}"))?;
@@ -768,10 +758,6 @@ impl CronStore {
     pub async fn delete_by_name(&self, name: &str) -> Result<bool, String> {
         let mut guard = self.conn.lock().await;
         let conn = begin_write(&mut guard)?;
-        let ids = conn.prepare("SELECT id FROM cron_tasks WHERE name=?1").map_err(|e| e.to_string())?
-            .query_map(params![name], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?
-            .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-        for id in &ids { self.revoke_initiator(id); }
         let changed = conn
             .execute("DELETE FROM cron_tasks WHERE name = ?1", params![name])
             .map_err(|e| format!("delete_by_name: {e}"))?;

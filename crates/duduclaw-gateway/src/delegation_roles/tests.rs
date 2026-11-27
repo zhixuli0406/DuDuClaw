@@ -36,13 +36,13 @@ fn current_avatar_owner_and_requester_are_both_required() {
     assert!(decision(&no_principal).is_err());
 }
 #[test]
-fn background_initiator_is_rechecked_after_demotion_and_disable() {
+fn message_initiator_is_rechecked_after_demotion_and_disable() {
     let (home, admin, _) = seed();
     let principal = format!("user:{admin}");
     initiators::record(home.path(), "message", "avatar", "other", "job", &Requester::attended(&admin)).unwrap();
     let recovered = initiators::lookup(home.path(), "message", "job", Some("avatar"), "other", Some(&principal)).unwrap();
     let roles = GatewayOwnerRoles::new(home.path(), recovered);
-    assert_eq!(roles.requester_role(), Ok(Some(DelegationRequesterRole::BackgroundStartedBy("admin".into()))));
+    assert_eq!(roles.requester_role(), Ok(Some(DelegationRequesterRole::Account("admin".into()))));
     assert_eq!(decision(&roles), Ok(DelegationAllowSource::UnrestrictedRole));
     let db = Connection::open(home.path().join("users.db")).unwrap();
     // Keep avatar ownership privileged; demote a distinct initiating account.
@@ -92,7 +92,7 @@ fn signed_initiator_is_bound_to_record_sender_target_and_live_account() {
     let recovered = load("job", Some("avatar"), "other", Some(&principal)).unwrap();
     assert!(decision(&GatewayOwnerRoles::new(home.path(), recovered)).is_err());
     let receipts = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
-    receipts.execute("UPDATE initiators SET body=?1 WHERE id='job'", [b"{}".as_slice()]).unwrap();
+    receipts.execute("UPDATE message_initiators SET body=?1 WHERE id='job'", [b"{}".as_slice()]).unwrap();
     assert!(load("job", Some("avatar"), "other", Some(&principal)).is_none());
 }
 
@@ -115,56 +115,6 @@ fn ordinary_sender_cannot_launder_an_admin_started_job() {
         &DelegationContext { overrides: &read.overrides, owner_roles: Some(&roles), extra_system_senders: &[],
             boundaries: DelegationBoundaries { personal_target_allowed: true, main_target_allowed: true, can_send_cross_agent: true } }).unwrap_err();
     assert_eq!(denied.reason, DenyReason::DelegationDisabled);
-}
-
-#[tokio::test]
-async fn cron_receipt_requires_current_persisted_content_and_target() {
-    let (home, admin, _) = seed();
-    let requester = Requester::attended(&admin);
-    let principal = format!("user:{admin}");
-    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
-    assert_eq!(initiators::record(home.path(), "cron", "avatar", "avatar", "missing", &requester), Err(OwnerRoleLookupError));
-    assert_eq!(initiators::record(home.path(), "unknown", "avatar", "avatar", "cron", &requester), Err(OwnerRoleLookupError));
-    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
-        "0 9 * * *".into(), "original work".into());
-    store.insert(&row).await.unwrap();
-    assert_eq!(initiators::record(home.path(), "cron", "avatar", "other", "cron", &requester), Err(OwnerRoleLookupError));
-    initiators::record(home.path(), "cron", "avatar", "avatar", "cron", &requester).unwrap();
-    let load = || initiators::lookup(home.path(), "cron", "cron", None, "avatar", Some(&principal));
-    assert_eq!(decision(&GatewayOwnerRoles::new(home.path(), load().unwrap())), Ok(DelegationAllowSource::UnrestrictedRole));
-    Connection::open(home.path().join("cron_tasks.db")).unwrap()
-        .execute("UPDATE cron_tasks SET task='edited work' WHERE id='cron'", []).unwrap();
-    assert!(load().is_none());
-    assert_eq!(decision(&GatewayOwnerRoles::new(home.path(), load().unwrap_or_else(Requester::background))).unwrap_err().reason,
-        DenyReason::DelegationDisabled);
-    initiators::record(home.path(), "cron", "avatar", "avatar", "cron", &requester).unwrap();
-    assert_eq!(decision(&GatewayOwnerRoles::new(home.path(), load().unwrap())), Ok(DelegationAllowSource::UnrestrictedRole));
-    let count: i64 = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap()
-        .query_row("SELECT COUNT(*) FROM initiators WHERE kind='cron' AND id='cron'", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 2);
-}
-
-#[tokio::test]
-async fn initiator_scope_is_bound_to_registered_target() {
-    let (home, admin, _) = seed();
-    let principal = format!("user:{admin}");
-    initiators::record(home.path(), "message", "avatar", "avatar2", "job", &Requester::attended(&admin)).unwrap();
-    let requester = initiators::lookup(home.path(), "message", "job", None, "avatar2", Some(&principal));
-    // An attended fallback must not leak into another employee registered inside this scope.
-    crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(
-        RequesterIdentity::DashboardUser { user_id: admin.clone() },
-        initiators::scope("avatar2", requester, async {
-            assert!(matches!(initiators::current("avatar2"), Some(Some(_))));
-            assert!(matches!(initiators::current("avatar"), Some(None)));
-            let target = crate::on_behalf_of::context::register(home.path(), "avatar2").unwrap();
-            let other = crate::on_behalf_of::context::register(home.path(), "avatar").unwrap();
-            let target_requester = crate::on_behalf_of::context::delegation_requester(home.path(), "avatar2", target.reference()).unwrap();
-            assert_eq!(GatewayOwnerRoles::new(home.path(), target_requester).requester_role(),
-                Ok(Some(DelegationRequesterRole::BackgroundStartedBy("admin".into()))));
-            let other_requester = crate::on_behalf_of::context::delegation_requester(home.path(), "avatar", other.reference()).unwrap();
-            assert_eq!(decision(&GatewayOwnerRoles::new(home.path(), other_requester)).unwrap_err().reason, DenyReason::DelegationDisabled);
-        }),
-    ).await;
 }
 
 #[test]
@@ -204,113 +154,148 @@ fn initiator_database_is_private_and_refuses_symlinks() {
     let moved = home.path().join("saved.db");
     std::fs::rename(&path, &moved).unwrap();
     symlink(&moved, &path).unwrap();
-    assert!(initiators::lookup(home.path(), "message", "job", None, "other", Some(&format!("user:{admin}"))).is_none());
+    assert!(initiators::lookup(home.path(), "message", "job", Some("avatar"), "other", Some(&format!("user:{admin}"))).is_none());
     assert_eq!(initiators::record(home.path(), "message", "avatar", "other", "new", &Requester::attended(&admin)), Err(OwnerRoleLookupError));
 }
 
 
-fn assert_receipt_access(home: &Path, kind: &str, id: &str, admin: &str, allowed: bool) {
-    let requester = initiators::lookup(home, kind, id, None, "avatar", Some(&format!("user:{admin}")));
-    assert_eq!(requester.is_some(), allowed);
-    assert_eq!(decision(&GatewayOwnerRoles::new(home,
-        requester.unwrap_or_else(Requester::background))).is_ok(), allowed);
-}
-
-#[tokio::test]
-async fn cron_pause_resume_requires_a_new_qualifying_initiator() {
+#[test]
+fn only_attended_pass_holders_can_mint_message_receipts() {
     let (home, admin, employee) = seed();
-    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
-    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
-        "0 9 * * *".into(), "work".into());
-    store.insert(&row).await.unwrap();
-    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
-    assert!(store.set_enabled(&row.id, false).await.unwrap());
-    assert!(store.set_enabled(&row.id, true).await.unwrap());
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
-    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&employee)).unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
-    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
-}
-
-#[tokio::test]
-async fn cron_delete_removes_all_receipt_versions() {
-    let (home, admin, _) = seed();
-    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
-    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
-        "0 9 * * *".into(), "work".into());
-    store.insert(&row).await.unwrap();
-    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
-    // Seed another target/version to prove revocation is not digest-scoped.
-    {
-        let db = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
-        db.execute("INSERT INTO initiators SELECT kind,id,'other','old',body,mac FROM initiators", []).unwrap();
+    for (id, sender, requester) in [
+        ("background", "avatar", Requester::background()),
+        ("ordinary-requester", "avatar", Requester::attended(&employee)),
+        ("ordinary-sender", "ordinary", Requester::attended(&admin)),
+    ] {
+        initiators::record(home.path(), "message", sender, "other", id, &requester).unwrap();
+        assert!(initiators::lookup(home.path(), "message", id, Some(sender), "other",
+            Some(&format!("user:{admin}"))).is_none());
     }
-    assert!(store.delete(&row.id).await.unwrap());
-    let db = crate::fs_safe::sqlite::open(home.path(), "delegation-initiators.db").unwrap();
-    let count: i64 = db.query_row("SELECT COUNT(*) FROM initiators WHERE kind='cron' AND id='cron'", [], |r| r.get(0)).unwrap();
-    assert_eq!(count, 0);
-    drop(db);
-    store.insert(&row).await.unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
-}
-
-#[tokio::test]
-async fn task_cancel_reopen_and_reassign_revoke_initiator() {
-    let (home, admin, _) = seed();
-    let store = crate::task_store::TaskStore::open(home.path()).unwrap();
-    let row = crate::task_store::TaskRow::new("task".into(), "Task".into(), "work".into(),
-        "medium".into(), "avatar".into(), "avatar".into());
-    store.insert_task(&row).await.unwrap();
-    for fields in [serde_json::json!({"status":"cancelled"}), serde_json::json!({"assigned_to":"other"})] {
-        initiators::record(home.path(), "task", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-        assert_receipt_access(home.path(), "task", &row.id, &admin, true);
-        store.update_task(&row.id, &fields).await.unwrap().unwrap();
-        assert_receipt_access(home.path(), "task", &row.id, &admin, false);
-        store.update_task(&row.id, &serde_json::json!({"status":"todo","assigned_to":"avatar"})).await.unwrap().unwrap();
-        assert_receipt_access(home.path(), "task", &row.id, &admin, false);
+    for kind in ["cron", "reminder", "task", "task_spec", "unknown"] {
+        assert_eq!(initiators::record(home.path(), kind, "avatar", "other", "job",
+            &Requester::attended(&admin)), Err(OwnerRoleLookupError));
     }
 }
 
-#[tokio::test]
-async fn reminder_cancel_revokes_initiator() {
+#[test]
+fn message_receipt_expires_after_24_hours_and_rejects_future_timestamps() {
     let (home, admin, _) = seed();
-    let row: crate::reminder_scheduler::Reminder = serde_json::from_value(serde_json::json!({
-        "id":"reminder", "agent_id":"avatar", "trigger_at":"2099-01-01T00:00:00Z",
-        "channel":"test", "chat_id":"test", "prompt":"work", "mode":"agent_callback",
-        "sender_agent":"avatar"
-    })).unwrap();
-    crate::reminder_scheduler::append_reminder(home.path(), &row).await.unwrap();
-    initiators::record(home.path(), "reminder", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-    assert_receipt_access(home.path(), "reminder", &row.id, &admin, true);
-    assert!(crate::reminder_scheduler::cancel_reminder(home.path(), &row.id, Some("avatar")).await.unwrap());
-    assert_receipt_access(home.path(), "reminder", &row.id, &admin, false);
-    // Restore identical pending material without re-recording to detect resurrection.
-    std::fs::write(home.path().join("reminders.jsonl"), format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
-    assert_receipt_access(home.path(), "reminder", &row.id, &admin, false);
+    let principal = format!("user:{admin}");
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    for (id, created_at, allowed) in [
+        ("recent", now - 23 * 3600, true),
+        ("expired", now - 24 * 3600, false),
+        ("future", now + 3600, false),
+    ] {
+        initiators::record(home.path(), "message", "avatar", "other", id, &Requester::attended(&admin)).unwrap();
+        initiators::set_created_at(home.path(), id, created_at);
+        let result = initiators::consume_if(home.path(), id, "avatar", "other", Some(&principal),
+            |requester| decision(&GatewayOwnerRoles::new(home.path(), requester)).ok());
+        assert_eq!(result.is_some(), allowed, "{id}");
+        assert!(initiators::lookup(home.path(), "message", id, Some("avatar"), "other", Some(&principal)).is_none());
+    }
+}
+
+#[test]
+fn message_receipt_is_consumed_only_by_an_unrestricted_allow() {
+    let (home, admin, _) = seed();
+    let principal = format!("user:{admin}");
+    initiators::record(home.path(), "message", "avatar", "other", "job", &Requester::attended(&admin)).unwrap();
+    for source in [None, Some(DelegationAllowSource::Mode), Some(DelegationAllowSource::OneWayPair),
+        Some(DelegationAllowSource::TwoWayPair), Some(DelegationAllowSource::SystemSender)] {
+        assert!(initiators::consume_if(home.path(), "job", "avatar", "other", Some(&principal), |_| source).is_none());
+        assert!(initiators::lookup(home.path(), "message", "job", Some("avatar"), "other", Some(&principal)).is_some());
+    }
+    for (sender, target) in [("ordinary", "other"), ("avatar", "different")] {
+        assert!(initiators::consume_if(home.path(), "job", sender, target, Some(&principal),
+            |_| Some(DelegationAllowSource::UnrestrictedRole)).is_none());
+    }
+    assert_eq!(initiators::consume_if(home.path(), "job", "avatar", "other", Some(&principal),
+        |requester| decision(&GatewayOwnerRoles::new(home.path(), requester)).ok()), Some(DelegationAllowSource::UnrestrictedRole));
+    assert!(initiators::consume_if(home.path(), "job", "avatar", "other", Some(&principal),
+        |_| Some(DelegationAllowSource::UnrestrictedRole)).is_none());
 }
 
 #[tokio::test]
-async fn receipt_revoke_failure_does_not_block_cron_pause() {
+async fn attended_created_jobs_and_queued_turns_never_inherit_the_pass() {
     let (home, admin, _) = seed();
-    let store = crate::cron_store::CronStore::open(home.path()).unwrap();
-    let row = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
-        "0 9 * * *".into(), "work".into());
-    store.insert(&row).await.unwrap();
-    initiators::record(home.path(), "cron", "avatar", "avatar", &row.id, &Requester::attended(&admin)).unwrap();
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, true);
-    let path = crate::fs_safe::sqlite::database_path(home.path(), "delegation-initiators.db");
-    std::fs::remove_file(&path).unwrap();
-    std::fs::create_dir(&path).unwrap();
-    assert!(store.set_enabled(&row.id, false).await.unwrap());
-    assert!(!store.get(&row.id).await.unwrap().unwrap().enabled);
-    assert_receipt_access(home.path(), "cron", &row.id, &admin, false);
-    let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
-    assert!(audit.lines().any(|line| {
-        let event: serde_json::Value = serde_json::from_str(line).unwrap();
-        line.contains("delegation_initiator_revoke_failed")
-            && event["details"]["kind"] == "cron" && event["details"]["id"] == "cron"
-    }));
+    let principal = format!("user:{admin}");
+    let who = RequesterIdentity::DashboardUser { user_id: admin.clone() };
+    crate::knowledge::turn_requesters::CURRENT_REQUESTER.scope(who, async {
+        assert!(decision(&GatewayOwnerRoles::new(home.path(), Requester::current(home.path(), "avatar"))).is_ok());
+        let mut cron = crate::cron_store::CronTaskRow::new("cron".into(), "Cron".into(), "avatar".into(),
+            "0 9 * * *".into(), "work".into());
+        cron.on_behalf_of = Some(principal.clone());
+        crate::cron_store::CronStore::open(home.path()).unwrap().insert(&cron).await.unwrap();
+        let reminder: crate::reminder_scheduler::Reminder = serde_json::from_value(serde_json::json!({
+            "id":"reminder", "agent_id":"avatar", "trigger_at":"2099-01-01T00:00:00Z",
+            "channel":"test", "chat_id":"test", "prompt":"work", "mode":"agent_callback",
+            "sender_agent":"avatar", "on_behalf_of":principal,
+        })).unwrap();
+        crate::reminder_scheduler::append_reminder(home.path(), &reminder).await.unwrap();
+        let mut task = crate::task_store::TaskRow::new("task".into(), "Task".into(), "work".into(),
+            "medium".into(), "avatar".into(), "avatar".into());
+        task.on_behalf_of = Some(principal.clone());
+        crate::task_store::TaskStore::open(home.path()).unwrap().insert_task(&task).await.unwrap();
+        let mut spec = crate::task_spec::TaskSpec::new("avatar", "work", vec![crate::task_spec::Step {
+            id: 0, description: "work".into(), agent: "avatar".into(), depends_on: vec![],
+            acceptance_criteria: vec![], status: crate::task_spec::StepStatus::Pending,
+            result: None, retry_count: 0,
+        }]);
+        spec.on_behalf_of = Some(principal.clone());
+        let agent_dir = home.path().join("agents/avatar");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        spec.save(&agent_dir).unwrap();
+        // Even an inherited attended task-local and stored admin principal cannot
+        // turn any dispatched run into an attended conversation.
+        for kind in ["cron", "reminder", "task", "task_spec", "heartbeat", "message"] {
+            crate::memory_provenance::DISPATCH_RUN.scope(Some((format!("{kind}:avatar"), "run-id".into())),
+                crate::on_behalf_of::scope_first(Some(principal.clone()), async {
+                    assert_background_policy(home.path());
+                    let guard = crate::on_behalf_of::context::register(home.path(), "avatar").unwrap();
+                    let requester = crate::on_behalf_of::context::delegation_requester(home.path(), "avatar", guard.reference()).unwrap();
+                    assert!(decision(&GatewayOwnerRoles::new(home.path(), requester)).is_err(), "{kind}");
+                })).await;
+        }
+        crate::runtime::GOAL_ROUND_ATTRIBUTION.scope(crate::runtime::GoalRoundAttribution {
+            episode_id: "task".into(), round: Some(1),
+        }, async { assert_background_policy(home.path()); }).await;
+    }).await;
+}
+
+fn assert_background_policy(home: &Path) {
+    let requester = Requester::current(home, "avatar");
+    let roles = GatewayOwnerRoles::new(home, requester.clone());
+    assert!(roles.requester_role().unwrap().is_none());
+    let org = duduclaw_core::MapOrgView::new().with_agent("avatar", "", "sales")
+        .with_agent("other", "", "engineering");
+    for policy in [DelegationPolicy::Disabled, DelegationPolicy::Department] {
+        let rules = DelegationRules { policy, allow_pairs: vec![] };
+        assert!(evaluate_delegation(&rules, &org, "avatar", "other", &DelegationContext {
+            overrides: &DelegationOverrides { unrestricted_roles: vec!["admin".into()], ..Default::default() },
+            owner_roles: Some(&roles), extra_system_senders: &[], boundaries: DelegationBoundaries {
+                personal_target_allowed: true, main_target_allowed: true, can_send_cross_agent: true,
+            },
+        }).is_err());
+    }
+    initiators::record(home, "message", "avatar", "other", "background-followup", &requester).unwrap();
+}
+
+#[test]
+fn concurrent_message_consumers_get_only_one_allow() {
+    let (home, admin, _) = seed();
+    let principal = format!("user:{admin}");
+    initiators::record(home.path(), "message", "avatar", "other", "job", &Requester::attended(&admin)).unwrap();
+    let barrier = std::sync::Barrier::new(2);
+    let consume = || {
+        barrier.wait();
+        initiators::consume_if(home.path(), "job", "avatar", "other", Some(&principal),
+            |requester| decision(&GatewayOwnerRoles::new(home.path(), requester)).ok()).is_some()
+    };
+    let allowed = std::thread::scope(|scope| {
+        let first = scope.spawn(&consume);
+        let second = scope.spawn(&consume);
+        usize::from(first.join().unwrap()) + usize::from(second.join().unwrap())
+    });
+    assert_eq!(allowed, 1);
 }

@@ -524,16 +524,6 @@ async fn load_reminders(home_dir: &Path) -> Vec<Reminder> {
 /// to acquire it internally.
 fn save_reminders_sync(home_dir: &Path, reminders: &[Reminder]) -> Result<(), String> {
     let path = home_dir.join("reminders.jsonl");
-    // Every writer holds the lock, including cancellation, GC and backfill.
-    // Compare persisted material before publishing to prevent edit-back revival.
-    for before in load_reminders_sync(home_dir) {
-        let after = reminders.iter().find(|row| row.id == before.id);
-        if after.is_none_or(|row| row.status != ReminderStatus::Pending
-            || crate::isolation_background::material::reminder(row)
-                != crate::isolation_background::material::reminder(&before)) {
-            crate::delegation_roles::initiators::revoke_before_write(home_dir, "reminder", &before.id);
-        }
-    }
 
     let mut content = String::new();
     for r in reminders {
@@ -1102,12 +1092,9 @@ where
     let principal = crate::on_behalf_of::from_stored(
         home_dir, reminder.on_behalf_of.as_deref(), &reminder.agent_id, "reminder",
     );
-    let requester = crate::delegation_roles::initiators::lookup(home_dir, "reminder", &reminder.id,
-        None, &reminder.agent_id, principal.as_deref());
-    authority.scope(crate::delegation_roles::initiators::scope(&reminder.agent_id, requester,
-        crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
+    authority.scope(crate::on_behalf_of::scope_first(principal, deliver_reminder_scoped(
         home_dir, http, registry, sem, reminder, invoke,
-    )))).await
+    ))).await
 }
 
 async fn deliver_reminder_scoped<F, Fut>(

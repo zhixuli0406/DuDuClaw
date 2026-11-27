@@ -296,7 +296,6 @@ impl TaskStore {
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
         verify_before_io().map_err(|e| e.to_string())?;
-        self.revoke_initiator(id);
         let n = conn
             .execute(
                 "UPDATE tasks

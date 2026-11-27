@@ -38,14 +38,17 @@ fn loopback_refusal_malformed_answer_and_wrong_employee_grant_no_pass() {
     let roles = LoopbackOwnerRoles(decode("avatar", &encoded));
     assert!(unrestricted(h.path(), "avatar", &read(), &roles));
     assert!(!unrestricted(h.path(), "avatar", &read(), &facts("employee")));
-    let mut background = facts("employee").facts().unwrap();
+    let mut background = facts("admin").facts().unwrap();
     background.background = true;
     assert!(!unrestricted(h.path(), "avatar", &read(), &LoopbackOwnerRoles(Ok(background))));
 }
 #[tokio::test]
 async fn front_door_none_listing_and_call_share_turn_eligibility() {
     let h = home();
+    let mut background = facts("admin").facts().unwrap();
+    background.background = true;
     for (roles, allowed) in [(facts("admin"), true), (facts("employee"), false),
+        (LoopbackOwnerRoles(Ok(background)), false),
         (LoopbackOwnerRoles(Err(OwnerRoleLookupError)), false)] {
         TEST_ROLES.scope((h.path().into(), "avatar".into(), roles), async {
             let policy = none_policy(h.path(), "avatar").await;

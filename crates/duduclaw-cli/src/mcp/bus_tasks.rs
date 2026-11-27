@@ -253,8 +253,6 @@ pub(crate) async fn handle_create_task(params: &Value, home_dir: &Path, caller: 
         return mcp_error(&format!("failed to save task: {e}"));
     }
 
-    super::delegation_roles::record_initiator(home_dir, "task_spec", caller, caller, &task_id).await;
-
     // Write a signal to bus_queue.jsonl so the dispatcher picks up the new task.
     let signal = serde_json::json!({
         "type": "task_created",

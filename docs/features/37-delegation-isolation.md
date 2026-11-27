@@ -120,22 +120,21 @@ The dashboard card "Advanced settings → Delegation permissions" provides the e
 
 ## Role exceptions and one-way pairs (v1.86.0)
 
-In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin, Manager or Employee. All three are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current turn, or in work that the member started through that avatar. The recipient gains no right to delegate back.
+In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin, Manager or Employee. All three are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
 
-The account's status and role are checked each time. Disabling the account or changing its role to an unchecked role ends the exception immediately. Editing, pausing, cancelling or reassigning a task or schedule clears its “started by” status; the member must set it again through their avatar in their own turn. Resuming it from the dashboard does not restore that status.
+The account's status and role are checked each time. Disabling the account or changing its role to an unchecked role ends the exception immediately. The exception applies only while the member personally asks in that conversation; schedules, reminders and other background work of that AI follow the ordinary delegation rules in every mode, including protected mode.
 
 Cross-department pairs now offer **Two-way** or **One-way A → B**. Existing pairs remain two-way. A one-way pair permits A to hand work to B; it does not grant B permission to hand work to A. Other applicable rules can still allow B → A. Use the swap button to reverse the pair.
 
 Decisions follow this order:
 
 1. Always-deny boundaries: self-delegation, another owner's personal employee, the main-agent boundary for non-admin requests, machine employees, and an employee whose **Can Send Cross-Agent Messages** switch is off. Human-principal enforcement still applies.
-2. The role exception, when the member and turn or member-started work qualify.
+2. The role exception, when the member and attended turn qualify.
 3. Cross-department pairs, in their saved direction, except under **No delegation**.
 4. The selected delegation mode.
 
 The role exception applies even under **No delegation**. The dashboard warns when roles are checked in this mode. Both kinds of cross-department pair remain inactive in this mode. The restrictions described above for this mode apply when the role exception does not qualify.
 
-**Known limitation in v1.86.0:** in protected mode, unattended background work—schedules, reminders and queued jobs—does not receive the role exception. Interactive turns do.
 
 When delegation is refused, the AI and the person receive one consistent explanation: the rule in effect, why this sender cannot hand work to this recipient, and the next step. Ask an administrator to check Delegation permissions or the employee's Delegation card; do not work around the refusal.
 
@@ -159,8 +158,8 @@ Four controls:
 
 3. **Roles exempt from delegation scope** (v1.86.0)
    - Admin / Manager / Employee; all unchecked by default
-   - Applies to the member's administrator-assigned avatar for their own requests or work they started through it; the recipient cannot delegate back by this exception
-   - Also applies under No delegation, with a warning; protected-mode unattended background work is excluded
+   - Applies to the member's administrator-assigned avatar only while they personally ask in that conversation; the recipient cannot delegate back by this exception
+   - Also applies under No delegation, with a warning; background work follows ordinary rules in every mode
 
 4. **Status indicators**
    - Current policy, pair count

@@ -153,9 +153,8 @@ tokio::task_local! {
     static TEST_ROLES: (std::path::PathBuf, String, LoopbackOwnerRoles);
 }
 
-/// Register messages before enqueue; register durable work after persistence
-/// and before its wake event. Failure never invents
-/// an initiator: dequeue/background evaluation then receives no role pass.
+/// Register a one-shot message receipt before enqueue. Failure leaves the
+/// queue gate to evaluate ordinary delegation policy.
 pub(crate) async fn record_initiator(home: &Path, kind: &str, agent: &str, target: &str, id: &str) {
     let read = duduclaw_core::delegation_policy::read_delegation_config(home);
     if read.overrides.unrestricted_roles.is_empty() { return; }
@@ -164,6 +163,6 @@ pub(crate) async fn record_initiator(home: &Path, kind: &str, agent: &str, targe
         None => Err(OwnerRoleLookupError),
     };
     if result.is_err() {
-        tracing::warn!(agent, target, "Delegation initiator could not be verified; background role pass unavailable");
+        tracing::warn!(agent, target, "Message initiator could not be verified; queue role pass unavailable");
     }
 }

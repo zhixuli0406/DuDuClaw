@@ -461,8 +461,6 @@ pub(crate) async fn handle_tasks_create(
         ).await
         {
             Ok(created) => {
-                super::delegation_roles::record_initiator(home_dir, "task", default_agent,
-                    &created.task.assigned_to, &created.task.id).await;
                 // The goal already exists. A pause here suppresses only its
                 // best-effort wake event, never reports a retryable create failure.
                 match admit_background_caller(home_dir, actor, "tasks_create").await {
@@ -671,7 +669,6 @@ pub(crate) async fn handle_tasks_create(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
-    super::delegation_roles::record_initiator(home_dir, "task", default_agent, &row.assigned_to, &row.id).await;
     if let Err(message) = validate_created_task_assignee(home_dir, &row.assigned_to, implicit_operator_task) {
         return tool_error(message);
     }
@@ -999,12 +996,6 @@ pub(crate) async fn handle_tasks_update(
                 "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
             }));
         }
-    }
-    if !updated.archived && !matches!(updated.status.as_str(), "cancelled" | "failed" | "done")
-        && (current.status != updated.status || current.archived != updated.archived
-            || duduclaw_gateway::isolation_background::material::task(&current)
-                != duduclaw_gateway::isolation_background::material::task(&updated)) {
-        super::delegation_roles::record_initiator(home_dir, "task", caller, &updated.assigned_to, &updated.id).await;
     }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
