@@ -43,7 +43,11 @@ struct Revoke { user_id: String }
 struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SetEnabled { enabled: bool }
+struct SetEnabled {
+    enabled: bool,
+    #[serde(default)]
+    acknowledge_risk: bool,
+}
 fn require_enabled(home: &Path) -> Result<(), String> {
     if member_credentials_enabled(home) { Ok(()) } else { Err(MEMBER_CREDENTIALS_OFF.into()) }
 }
@@ -204,6 +208,9 @@ impl MethodHandler {
                 "odoo.member_credentials.set_enabled" => {
                     let args: SetEnabled = serde_json::from_value(params)
                         .map_err(|_| "請選擇是否開放同仁連接 Odoo。".to_owned())?;
+                    if args.enabled && !args.acknowledge_risk {
+                        return Err("開放同仁連接 Odoo 前，請先確認你已了解風險。".into());
+                    }
                     let path = home.join("config.toml");
                     let raw = super::config_commit::read_text_or_empty(&path).map_err(|_| STORE.to_owned())?;
                     let mut table = raw.parse::<toml::Table>().map_err(|_| CONFIG.to_owned())?;
@@ -221,7 +228,7 @@ impl MethodHandler {
                             // live authorization. Failure aborts publication; a later
                             // commit failure may leave an explicitly labelled intent.
                             let event = AuditEvent::new("odoo_member_credentials_toggled", "", Severity::Info,
-                                json!({"actor_user_id":actor.user_id,"enabled":args.enabled,"phase":"before_commit"}));
+                                json!({"actor_user_id":actor.user_id,"enabled":args.enabled,"acknowledged":args.acknowledge_risk,"phase":"before_commit"}));
                             try_append_audit_event(&guard_home, &event).map_err(|_| STORE.to_owned())
                         },
                     )).map_err(|_| STORE.to_owned())?;

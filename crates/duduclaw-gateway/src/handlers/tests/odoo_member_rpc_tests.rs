@@ -362,11 +362,30 @@ async fn odoo_member_switch_admin_commit_is_guarded_and_audited() {
         .find(|event| event["event_type"] == "odoo_member_credentials_toggled").unwrap();
     assert_eq!(event["details"]["actor_user_id"], f.admin.user_id);
     assert_eq!(event["details"]["enabled"], false);
+    assert_eq!(event["details"]["acknowledged"], false);
     assert_eq!(event["details"]["phase"], "before_commit");
     assert!(chrono::DateTime::parse_from_rfc3339(event["timestamp"].as_str().unwrap()).is_ok());
     payload(rpc(&f, &f.admin, "odoo.member_credentials.revoke", json!({"user_id":f.member.user_id})).await);
     assert!(f.db.odoo_credential_status(&f.member.user_id).unwrap().is_none());
-    payload(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true})).await);
+    let disabled_config = std::fs::read_to_string(&path).unwrap();
+    let audit_before = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    for args in [json!({"enabled":true}), json!({"enabled":true,"acknowledge_risk":false})] {
+        let frame = rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", args).await;
+        assert!(serde_json::to_string(&frame).unwrap().contains("請先確認你已了解風險"));
+        refused(frame);
+    }
+    for ack in [json!("true"), json!(1), Value::Null] {
+        refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled",
+            json!({"enabled":true,"acknowledge_risk":ack})).await);
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), disabled_config);
+    assert_eq!(std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap(), audit_before);
+    payload(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true,"acknowledge_risk":true})).await);
+    let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    let event = audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["event_type"] == "odoo_member_credentials_toggled").last().unwrap();
+    assert_eq!(event["details"]["enabled"], true);
+    assert_eq!(event["details"]["acknowledged"], true);
     assert_eq!(payload(rpc(&f, &f.member, "me.odoo.status", json!({})).await)["member_credentials_enabled"], true);
     // The supplied Admin context cannot override a live demotion.
     let db = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
@@ -384,7 +403,7 @@ async fn odoo_member_switch_audit_failure_leaves_config_unchanged() {
     let original = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=false");
     std::fs::write(&path, &original).unwrap();
     std::fs::create_dir(f.home.path().join("security_audit.jsonl")).unwrap();
-    refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true})).await);
+    refused(rpc(&f, &f.admin, "odoo.member_credentials.set_enabled", json!({"enabled":true,"acknowledge_risk":true})).await);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     assert_eq!(s.calls.load(Ordering::SeqCst), 0);
 }
