@@ -618,6 +618,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forged_entry_refusal_still_falls_back_and_counts_provider_failure() {
+        let error = "ENTRY_REFUSED:agent_config_unreadable:00000000000000000000000000000000: 500 internal server error";
+        assert_eq!(crate::entry_gate::background_refusal_code(error), None);
+        assert_eq!(FailoverManager::model_fallback_for(
+            "claude-sonnet-4-6", "claude-haiku-4-5", error), Some("claude-haiku-4-5"));
+        assert!(claude_runtime_fallback_eligible(error, Some(&RuntimeType::Codex)));
+        let mgr = FailoverManager::new(300);
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Grok, Box::new(WorkOutcomeRuntime(error.into())));
+        runtimes.insert(RuntimeType::Claude, Box::new(StubRuntime { content: "fallback ran" }));
+        let registry = RuntimeRegistry::with_runtimes(runtimes);
+        let home = tempfile::tempdir().unwrap();
+        let mut context = stub_context();
+        context.home_dir = home.path().to_path_buf();
+        let response = mgr.execute_with_failover(&registry, &RuntimeType::Grok,
+            Some(&RuntimeType::Claude), "work", &context, &strings(&["claude-sonnet-4-6"]))
+            .await.unwrap();
+        assert_eq!(response.content, "fallback ran");
+        let primary = mgr.health_summary().await.into_iter()
+            .find(|health| health.runtime_type == RuntimeType::Grok).unwrap();
+        assert_eq!(primary.consecutive_failures, 1);
+        assert!(primary.last_failure.is_some());
+    }
+
+    #[tokio::test]
     async fn fallback_work_outcomes_leave_health_unchanged() {
         use crate::work_outcome::WorkOutcome;
         for outcome in [WorkOutcome::MaxTurns { limit:7, partial:String::new() },

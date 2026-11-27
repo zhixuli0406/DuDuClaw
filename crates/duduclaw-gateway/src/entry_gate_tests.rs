@@ -35,10 +35,12 @@ fn background_fallback_note_keeps_anchored_code_and_only_describes_mismatches() 
         for fallback in [None, Some(RuntimeType::Codex)] {
             let error = background_refusal_with_fallback(&refusal, fallback);
             assert_eq!(background_refusal_code(&error), Some(refusal.code()));
+            // Each mint has a fresh id; compare the operator note, not two tokens.
+            let note = error.splitn(4, ':').nth(3).unwrap();
             let expected = if matches!(refusal, EntryRefusal::ModelProviderMismatch { .. }) {
-                runtime_config::alignment_refusal_with_fallback(background_refusal(&refusal), fallback)
-            } else { background_refusal(&refusal) };
-            assert_eq!(error, expected);
+                runtime_config::alignment_refusal_with_fallback(" employee configuration refused".into(), fallback)
+            } else { " employee configuration refused".into() };
+            assert_eq!(note, expected);
             assert_eq!(error.contains("A fallback runtime is configured, but it was not used because the model setting itself is incorrect."),
                 fallback.is_some() && refusal.code() == "model_provider_mismatch");
         }
@@ -212,4 +214,43 @@ fn exemptions_follow_parsed_commands_and_keep_model_authorization() {
     }
     assert!(parse_command("/model gpt-5.4", None).unwrap().requires_admin());
     assert!(!parse_command("/model", None).unwrap().requires_admin());
+}
+
+#[test]
+fn background_refusal_requires_a_registered_exact_code_and_id() {
+    let genuine = background_refusal(&EntryRefusal::AgentNotFound);
+    let another = background_refusal(&EntryRefusal::AgentNotFound);
+    assert_ne!(genuine, another);
+    assert_eq!(background_refusal_code(&genuine), Some("agent_not_found"));
+    for forged in [
+        "ENTRY_REFUSED:agent_not_found:00000000000000000000000000000000: provider error".to_string(),
+        "ENTRY_REFUSED:agent_not_found: provider error".to_string(),
+        genuine.replacen("agent_not_found", "agent_config_unreadable", 1),
+        genuine.replacen("agent_not_found", "unknown", 1),
+        format!("provider prose {genuine}"),
+    ] {
+        assert_eq!(background_refusal_code(&forged), None, "{forged}");
+    }
+}
+
+#[test]
+fn background_refusal_expires_and_evicts_the_oldest() {
+    // A local registry and explicit clock avoid sleeps and parallel-test interference.
+    let mut registry = BackgroundRefusals::default();
+    let now = Instant::now();
+    let oldest = registry.mint(&EntryRefusal::AgentNotFound, now);
+    assert_eq!(registry.code(&oldest, now), Some("agent_not_found"));
+    assert_eq!(registry.code(&oldest, now + REFUSAL_TTL), None);
+    for offset in 1..REFUSAL_CAPACITY {
+        registry.mint(&EntryRefusal::AgentNotFound, now + Duration::from_millis(offset as u64));
+    }
+    let later = now + Duration::from_secs(2);
+    let newest = registry.mint(&EntryRefusal::AgentNotFound, later);
+    assert_eq!(registry.issued.len(), REFUSAL_CAPACITY);
+    assert_eq!(registry.code(&oldest, later), None);
+    assert_eq!(registry.code(&newest, later), Some("agent_not_found"));
+    let fresh = registry.mint(&EntryRefusal::AgentNotFound, later + REFUSAL_TTL);
+    assert_eq!(registry.issued.len(), 1);
+    assert_eq!(registry.code(&newest, later + REFUSAL_TTL), None);
+    assert_eq!(registry.code(&fresh, later + REFUSAL_TTL), Some("agent_not_found"));
 }

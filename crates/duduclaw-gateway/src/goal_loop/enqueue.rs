@@ -210,6 +210,10 @@ impl GoalLoopDriver {
             episode_id: task.id.clone(),
             round: Some(task.revision_round + 1),
         };
+        // No await between the strict assignee check and creating the detached round.
+        crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to)
+            .map_err(|refusal| TeamDispatchError::ConfigRefused(
+                crate::entry_gate::background_refusal(&refusal)))?;
         // P2-A: registered before the spawn so a stop never reports
         // "stopped" while this round may still run (the queue never sees it).
         let round_guard = crate::responsibility::team_activity::RoundGuard::register(&task.id);

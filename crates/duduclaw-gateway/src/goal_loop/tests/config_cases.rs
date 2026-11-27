@@ -200,7 +200,7 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         let agent_dir = dir.path().join("agents/alice");
         std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(agent_dir.join("agent.toml"),
-            format!("{body}\n[agent]\nname = 'alice'\nstatus = 'active'\n")).unwrap();
+            format!("{body}\n[agent]\nname = 'alice'\nstatus = 'active'\n[model]\npreferred = 'claude-sonnet-4-6'\n")).unwrap();
         let (store, queue) = open_stores(dir.path()).await;
         let mut bad = goal_task("bad", "alice");
         bad.created_at = (Utc::now() - chrono::Duration::seconds(1)).to_rfc3339();
@@ -219,22 +219,25 @@ async fn fatal_team_refusal_parks_only_that_goal_and_is_not_audited_again() {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].target, "bob");
         assert!(pending[0].payload.contains("task_id=healthy"));
-        // Malformed TOML is now refused by the autonomy/config check first.
-        // Active employees still reach the independent team and budget gates.
-        let (audit_file, event) = if body.starts_with("budget =") {
-            ("budget_events.jsonl", "budget_unavailable")
-        } else {
-            ("security_audit.jsonl", "team_refused")
+        let entry_refusals = || async {
+            store.list_activity_for_task("bad", 100).await.unwrap().into_iter()
+                .filter(|row| row.event_type == "goal_loop.entry_refused").count()
         };
-        let audit = || std::fs::read_to_string(dir.path().join(audit_file)).unwrap();
-        let first = audit();
-        assert_eq!(first.lines().filter(|line| line.contains(event)).count(), 1);
-        assert!(!first.contains(&dir.path().display().to_string()));
-        assert!(!first.contains("broken"));
+        if body.starts_with("budget =") {
+            let audit = std::fs::read_to_string(dir.path().join("budget_events.jsonl")).unwrap();
+            assert_eq!(audit.lines().filter(|line| line.contains("budget_unavailable")).count(), 1);
+        } else {
+            assert_eq!(entry_refusals().await, 1);
+        }
 
         d.tick_once().await.unwrap();
 
-        assert_eq!(audit().lines().filter(|line| line.contains(event)).count(), 1);
+        if body.starts_with("budget =") {
+            let audit = std::fs::read_to_string(dir.path().join("budget_events.jsonl")).unwrap();
+            assert_eq!(audit.lines().filter(|line| line.contains("budget_unavailable")).count(), 1);
+        } else {
+            assert_eq!(entry_refusals().await, 1);
+        }
         assert_eq!(queue.pending_messages(10).await.unwrap().len(), 1);
         assert_eq!(store.get_task("bad").await.unwrap().unwrap().status, "needs_human");
     }
@@ -270,10 +273,10 @@ async fn autonomy_paused_broken_config_waits_then_resume_parks_once() {
             assert_eq!(parked.status, "needs_human");
             assert_eq!(parked.pause_reason.as_deref(), Some("blocked_needs_decision"));
             assert!(queue.pending_messages(10).await.unwrap().is_empty());
-            let audit = std::fs::read_to_string(dir.path().join("security_audit.jsonl")).unwrap();
-            assert_eq!(audit.lines().filter(|line| line.contains("team_refused")).count(), 1);
-            assert!(!audit.contains("broken"));
-            assert!(!audit.contains(&dir.path().display().to_string()));
+            let events = store.list_activity_for_task("bad", 100).await.unwrap();
+            let refusals: Vec<_> = events.iter().filter(|row| row.event_type == "goal_loop.entry_refused").collect();
+            assert_eq!(refusals.len(), 1);
+            assert_eq!(refusals[0].summary, "blocked_needs_decision: agent_config_unreadable");
         }
     }
 }

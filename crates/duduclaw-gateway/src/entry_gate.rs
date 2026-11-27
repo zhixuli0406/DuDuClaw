@@ -1,7 +1,10 @@
 //! Shared employee entry preflight. One read and TOML parse of the effective
 //! employee artifact; all checks and the returned settings use that document.
 //! Callers must handle an exempt command without entering a model pipeline.
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use duduclaw_agent::registry::{AgentRegistry, LoadedAgent};
 use duduclaw_core::agent_toml::AgentTomlSections;
@@ -95,8 +98,51 @@ impl EntryRefusal {
 /// Anchored operator-only marker shared by background producers and failover.
 pub(crate) const ENTRY_REFUSAL_PREFIX: &str = "ENTRY_REFUSED:";
 
+const REFUSAL_CAPACITY: usize = 1024;
+const REFUSAL_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Default)]
+struct BackgroundRefusals {
+    issued: HashMap<String, (&'static str, Instant)>,
+}
+
+impl BackgroundRefusals {
+    fn mint(&mut self, refusal: &EntryRefusal, now: Instant) -> String {
+        self.issued.retain(|_, (_, issued)| now.duration_since(*issued) < REFUSAL_TTL);
+        if self.issued.len() >= REFUSAL_CAPACITY {
+            if let Some(oldest) = self.issued.iter().min_by_key(|(_, (_, issued))| *issued)
+                .map(|(id, _)| id.clone()) {
+                self.issued.remove(&oldest);
+            }
+        }
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let code = refusal.code();
+        self.issued.insert(id.clone(), (code, now));
+        format!("{ENTRY_REFUSAL_PREFIX}{code}:{id}: employee configuration refused")
+    }
+
+    /// One parser for all consumers. Provider text cannot mint an admission refusal.
+    fn code<'a>(&self, error: &'a str, now: Instant) -> Option<&'a str> {
+        let (code, rest) = error.strip_prefix(ENTRY_REFUSAL_PREFIX)?.split_once(':')?;
+        match code {
+            "agent_not_found" | "agent_config_unreadable" | "runtime_unavailable"
+            | "model_provider_mismatch" | "runtime_policy_refused" => {}
+            _ => return None,
+        }
+        let (id, _) = rest.split_once(':')?;
+        let (registered_code, issued) = self.issued.get(id)?;
+        (*registered_code == code && now.duration_since(*issued) < REFUSAL_TTL).then_some(code)
+    }
+}
+
+fn background_refusals() -> &'static Mutex<BackgroundRefusals> {
+    static REFUSALS: OnceLock<Mutex<BackgroundRefusals>> = OnceLock::new();
+    REFUSALS.get_or_init(|| Mutex::new(BackgroundRefusals::default()))
+}
+
 pub(crate) fn background_refusal(refusal: &EntryRefusal) -> String {
-    format!("{ENTRY_REFUSAL_PREFIX}{}: employee configuration refused", refusal.code())
+    background_refusals().lock().unwrap_or_else(|e| e.into_inner())
+        .mint(refusal, Instant::now())
 }
 
 pub(crate) fn background_refusal_with_fallback(
@@ -110,12 +156,8 @@ pub(crate) fn background_refusal_with_fallback(
 
 /// Never infer admission from provider prose or substring matches.
 pub(crate) fn background_refusal_code(error: &str) -> Option<&str> {
-    let (code, _) = error.strip_prefix(ENTRY_REFUSAL_PREFIX)?.split_once(':')?;
-    match code {
-        "agent_not_found" | "agent_config_unreadable" | "runtime_unavailable"
-        | "model_provider_mismatch" | "runtime_policy_refused" => Some(code),
-        _ => None,
-    }
+    background_refusals().lock().unwrap_or_else(|e| e.into_inner())
+        .code(error, Instant::now())
 }
 
 /// Owned so a caller can release the registry lock before running commands or
