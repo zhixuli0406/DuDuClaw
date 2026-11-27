@@ -45,6 +45,10 @@ pub(crate) struct DecidedBy {
 }
 
 impl DecidedBy {
+    pub(crate) fn user_id(&self) -> &str { &self.user_id }
+
+    pub(crate) fn channel(&self) -> ChatChannel { self.channel }
+
     pub(crate) fn new(user_id: Uuid, channel: ChatChannel, step: Step) -> Self {
         Self { user_id: user_id.to_string(), channel, step }
     }
@@ -161,3 +165,7 @@ pub(in crate::approval) fn insert_and_consume(
 #[cfg(test)]
 #[path = "ledger_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "consumer_test_support.rs"]
+pub(crate) mod consumer_test_support;

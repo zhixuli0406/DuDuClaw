@@ -55,6 +55,55 @@ fn prove(db: &UserDb, uid: &str) -> ChatApprovalProof {
 }
 
 #[test]
+fn clear_approval_proof_keeps_binding_and_is_owner_scoped_and_idempotent() {
+    let (db, _home, owner) = fixture();
+    let original = prove(&db, &owner);
+    let other = admin(&db, "other@example.com");
+    let h = begin(&db, &other);
+    assert_eq!(receive(&db, &h.code, "98765432", true), MatchOutcome::Matched);
+    let other_proof = confirm(&db, &other, &h.handshake_id, SESSION).unwrap();
+    let before = db.channel_identities_for_user(&owner).unwrap().pop().unwrap();
+    let generation = db.acl_generation().unwrap();
+    assert!(!db.clear_approval_proof(&other, "telegram", PRINCIPAL).unwrap());
+    assert!(!db.clear_approval_proof(&owner, "googlechat", PRINCIPAL).unwrap());
+    assert!(!db.clear_approval_proof(&owner, "telegram", "missing").unwrap());
+    assert_eq!(db.approval_proof(&owner, "telegram").unwrap(), Some(original));
+    assert_eq!(db.acl_generation().unwrap(), generation);
+    assert!(db.clear_approval_proof(&owner, "telegram", PRINCIPAL).unwrap());
+    assert_eq!(db.acl_generation().unwrap(), generation + 1);
+    let rows = db.channel_identities_for_user(&owner).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].verified);
+    assert_eq!(rows[0].user_id, before.user_id);
+    assert_eq!(rows[0].channel_user_id, before.channel_user_id);
+    assert_eq!(rows[0].created_at, before.created_at);
+    assert_eq!(db.find_verified_user_id_by_channel("telegram", PRINCIPAL).unwrap(), Some(owner.clone()));
+    let cleared: bool = db.conn().query_row(
+        "SELECT proof_method IS NULL AND proof_user_id IS NULL AND proven_at IS NULL
+            AND proof_account IS NULL AND proof_dm IS NULL AND verified_at IS NOT NULL
+         FROM channel_identities WHERE user_id=?1 AND channel='telegram' AND channel_user_id=?2",
+        params![owner, PRINCIPAL], |r| r.get(0),
+    ).unwrap();
+    assert!(cleared);
+    assert!(db.approval_proof(&owner, "telegram").unwrap().is_none());
+    assert_eq!(db.channel_identity_proof_status(&owner, "telegram", PRINCIPAL).unwrap(), Some(ChannelProofStatus::AdminPrefilled));
+    assert_eq!(db.approval_proof(&other, "telegram").unwrap(), Some(other_proof));
+    assert!(!db.clear_approval_proof(&owner, "telegram", PRINCIPAL).unwrap());
+    assert_eq!(db.acl_generation().unwrap(), generation + 1);
+}
+
+#[test]
+fn clear_approval_proof_rolls_back_when_acl_bump_fails() {
+    let (db, _home, owner) = fixture();
+    let proof = prove(&db, &owner);
+    // Use an authorizer-independent trigger to fail the shared generation write.
+    db.conn().execute_batch("CREATE TRIGGER fail_proof_acl BEFORE UPDATE ON auth_meta
+        BEGIN SELECT RAISE(ABORT, 'fixture failure'); END;").unwrap();
+    assert!(db.clear_approval_proof(&owner, "telegram", PRINCIPAL).is_err());
+    assert_eq!(db.approval_proof(&owner, "telegram").unwrap(), Some(proof));
+}
+
+#[test]
 fn proof_migration_idempotent_on_fresh_and_old_db() {
     let (db, home, uid) = fixture();
     db.bind_channel_identity(&uid, "telegram", PRINCIPAL, true).unwrap();

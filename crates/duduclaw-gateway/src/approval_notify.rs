@@ -519,6 +519,14 @@ async fn push_dashboard_only(
     delivered
 }
 
+/// A successful receipt suppresses the old notice; zero deliveries preserves it.
+async fn chat_delivery_or_notice<F, Fut>(
+    result: crate::approval::chat_admin::deliver::DeliveryResult, notice: F,
+) -> Option<(String, String)>
+where F: FnOnce() -> Fut, Fut: std::future::Future<Output = Option<(String, String)>> {
+    if result.delivered > 0 { result.first } else { notice().await }
+}
+
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
     // SR2 round 4 (N4): the owner-only Personal delegation card is never
     // pushed or reminded through the generic chain (defence in depth behind
@@ -543,6 +551,9 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         crate::notify_push::push_person_notice(home_dir, uid,
             &body).await;
         return None;
+    }
+    if let Some(result) = crate::approval::chat_admin::deliver::try_push(home_dir, rec, reminder).await {
+        return chat_delivery_or_notice(result, || push_dashboard_only(home_dir, rec, reminder)).await;
     }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
@@ -886,7 +897,11 @@ pub(crate) fn spawn_dashboard_collapse(
     approve: bool,
     decider_name: Option<String>,
 ) {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
     tokio::spawn(async move {
+        authority.scope(crate::approval::chat_admin::sync::collapse_after_decision(
+            &home_dir, &rec, approve, decider_name.clone(),
+        )).await;
         let http = reqwest::Client::new();
         let verb = settled_verb_for(&rec, approve);
         let summary = approval_collapse_summary(&rec);
@@ -1588,5 +1603,27 @@ mod tests {
             })
             .await;
         assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
+    }
+}
+
+#[cfg(test)]
+mod chat_admin_delivery_tests {
+    use super::chat_delivery_or_notice;
+    use crate::approval::chat_admin::deliver::DeliveryResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn no_recipients_falls_back_but_one_card_suppresses_plain_notice() {
+        let notices = AtomicUsize::new(0);
+        let fallback = || async {
+            notices.fetch_add(1, Ordering::SeqCst);
+            Some(("telegram".into(), "old-control-target".into()))
+        };
+        assert_eq!(chat_delivery_or_notice(DeliveryResult::default(), fallback).await,
+            Some(("telegram".into(), "old-control-target".into())));
+        let first = Some(("telegram".into(), "proven-private-dm".into()));
+        let result = DeliveryResult { delivered:1, first:first.clone() };
+        assert_eq!(chat_delivery_or_notice(result, fallback).await, first);
+        assert_eq!(notices.load(Ordering::SeqCst), 1);
     }
 }

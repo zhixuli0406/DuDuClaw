@@ -34,8 +34,19 @@ pub async fn spawn(
         )
         .await
         .unwrap_or(SysdSupport::Current);
+        let mut card_sync_at: Option<std::time::Instant> = None;
+        let mut card_sync: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             tokio::time::sleep(env.tick_interval).await;
+            if duduclaw_core::gateway_instance::held(&env.home_dir)
+                && card_sync_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60))
+                && card_sync.as_ref().is_none_or(|task| task.is_finished()) {
+                card_sync_at = Some(std::time::Instant::now());
+                let home = env.home_dir.clone();
+                card_sync = Some(tokio::spawn(async move {
+                    guarded("chat-admin card sync", crate::approval::chat_admin::sync::maintenance(&home)).await;
+                }));
+            }
             support = tick(&env, support).await;
         }
     })

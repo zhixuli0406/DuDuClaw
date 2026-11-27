@@ -742,6 +742,23 @@ impl UserDb {
         }
         tx.commit().map_err(|e| e.to_string())
     }
+    /// Chat step-up accepts only six ASCII digits. Malformed input follows the
+    /// same failure throttle and audit path; recovery codes are never consumed.
+    pub fn mfa_step_up_verify_totp_only(&self, user: &str, code: &str, cipher: &dyn MfaCipher, now: i64) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        active_user(&tx, user)?;
+        // Use an invalid TOTP for malformed input, so check_factor still counts
+        // the failure without ever entering its recovery-code branch.
+        let code = if code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()) { code } else { "" };
+        if check_factor(&tx, user, code, false, cipher, now).is_err() {
+            audit(&tx, user, "mfa.verification_failed", None)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            return Err(DENIED.into());
+        }
+        tx.commit().map_err(|e| e.to_string())
+    }
     /// Host break-glass recovery for any account.
     /// The CLI must enforce its AI-session and Bash-lane guards before calling.
     pub fn mfa_operator_reset(&self, email: &str) -> Result<()> {

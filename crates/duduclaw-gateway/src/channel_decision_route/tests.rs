@@ -379,8 +379,11 @@ async fn button_presses_check_access_first_and_keep_legacy_cards_working() {
                 &private_context("11"),
                 &encode(DecisionSource::Approval, DecisionAct::Approve, &request),
                 PRIVATE,
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: None, private: false, account: "telegram".into(), dm: "11".into(),
+                },
             )
-            .await
+            .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
         }
     };
     let bound = press(id.as_str().to_owned()).await;

@@ -3,6 +3,37 @@ use crate::workflow::*;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
+async fn chat_admin_acceptance(evidence: super::super::chat_admin::ledger::consumer_test_support::Evidence) -> Result<(), String> {
+    let (_home, broker, _store, accepted, _run) = fixture().await;
+    {
+        let conn = broker.store.conn.lock().await;
+        super::super::chat_admin::ledger::consumer_test_support::install(&conn, &accepted.acceptance_id, evidence);
+    }
+    let grant = broker.prepare_revision_grant(&accepted).await?;
+    broker.activate_revision_grant(&grant).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn decided_by_without_ledger_refused() {
+    use super::super::chat_admin::ledger::consumer_test_support::Evidence;
+    assert_eq!(chat_admin_acceptance(Evidence::Missing).await.unwrap_err(),
+        "activation must be accepted by an Admin in the dashboard");
+}
+
+#[tokio::test]
+async fn chat_admin_acceptance_requires_matching_ledger_and_step() {
+    use super::super::chat_admin::ledger::consumer_test_support::CASES;
+    for &(evidence, accepted) in CASES {
+        let result = chat_admin_acceptance(evidence).await;
+        if accepted {
+            assert!(result.is_ok(), "{evidence:?}: {result:?}");
+        } else {
+            assert_eq!(result.unwrap_err(), "activation must be accepted by an Admin in the dashboard", "{evidence:?}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn legacy_purchase_delete_workflow_grants_cannot_authorize_calls() {
     let (_home, broker, store, accepted, run) = fixture().await;

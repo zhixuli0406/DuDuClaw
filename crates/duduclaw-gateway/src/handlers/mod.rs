@@ -219,7 +219,7 @@ mod approvals_topology_rpc;
 pub(crate) mod approval_visibility;
 mod mail_rpc;
 mod approvals_decide;
-mod approval_decider;
+pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
 mod ticks_rpc;

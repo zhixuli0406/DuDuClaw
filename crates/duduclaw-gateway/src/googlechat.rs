@@ -696,15 +696,14 @@ pub(crate) struct CardPress {
     pub space: String,
     /// The HUMAN presser, exactly `users/<digits>`.
     pub user: String,
-    /// The `decision_action::encode(..)` the button carried (a goal action).
+    /// The `decision_action::encode(..)` the button carried (Goal or Approval).
     pub action: String,
 }
 
 /// Read a decision press from a `CARD_CLICKED` event, or `None` for
 /// anything else: a non-human or malformed presser, a malformed or
 /// inconsistent space, another function, a missing, repeated or
-/// disagreeing decision parameter, or a parameter that is not a goal
-/// decision (the only card Google Chat is sent).
+/// disagreeing decision parameter, or a source other than Goal or Approval.
 pub(crate) fn parse_card_press(event: &serde_json::Value) -> Option<CardPress> {
     use crate::channel_format::{GOOGLECHAT_DECISION_FUNCTION, GOOGLECHAT_DECISION_PARAM};
     use serde_json::Value;
@@ -756,7 +755,8 @@ pub(crate) fn parse_card_press(event: &serde_json::Value) -> Option<CardPress> {
         return None;
     }
     let decoded = crate::decision_action::parse(action)?;
-    if decoded.source != crate::decision_action::DecisionSource::Goal {
+    if !matches!(decoded.source, crate::decision_action::DecisionSource::Goal
+        | crate::decision_action::DecisionSource::Approval) {
         return None;
     }
     Some(CardPress { space: space.to_string(), user: user.to_string(), action: action.to_string() })
@@ -774,6 +774,69 @@ async fn card_clicked(
         info!("Google Chat: CARD_CLICKED without a usable decision ignored");
         return ack();
     };
+    let Some(outcome) = route_card_press(state, event, &press).await else { return ack(); };
+    (StatusCode::OK, axum::Json(card_press_response(&press, &outcome))).into_response()
+}
+
+fn card_press_response(
+    _press: &CardPress,
+    outcome: &crate::approval::chat_admin::press::PressOutcome,
+) -> serde_json::Value {
+    if let Some(text) = &outcome.card_text {
+        // Non-add-on HTTP apps return a Message, not a Workspace add-on action.
+        // UPDATE_MESSAGE is only valid for CARD_CLICKED on the app's BOT message:
+        // https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages#ResponseType
+        // The receipt binds that exact message to the receiving app. An empty
+        // cardsV2 removes its buttons; never copy event text/cards into the reply.
+        let cards = outcome.card_link.as_ref().map(|link| serde_json::json!([{
+            "cardId":"approval-step-up", "card":{"sections":[{"widgets":[{"buttonList":{
+                "buttons":[{"text":link.label,"onClick":{"openLink":{"url":link.url}}}]
+            }}]}]}
+        }])).unwrap_or_else(|| serde_json::json!([]));
+        serde_json::json!({"actionResponse":{"type":"UPDATE_MESSAGE"}, "text":text, "cardsV2":cards})
+    } else {
+        let reply = if outcome.refused_reason == Some("legacy_refused") {
+            format!("⚠️ {}", outcome.reply)
+        } else { outcome.reply.clone() };
+        serde_json::json!({"text":reply})
+    }
+}
+
+fn card_press_origin(
+    state: &GoogleChatState,
+    event: &serde_json::Value,
+    press: &CardPress,
+    is_dm: bool,
+) -> crate::approval::chat_admin::press::PressOrigin {
+    // Non-add-on CARD_CLICKED carries the clicked message at event.message.
+    // Keep its resource name verbatim: no aliases or callback-supplied IDs.
+    let message_id = event.pointer("/message/name").and_then(serde_json::Value::as_str)
+        .filter(|name| crate::googlechat_inbox::parse_message_resource_name(name)
+            .is_some_and(|(space, _)| format!("spaces/{space}") == press.space))
+        .map(str::to_owned);
+    crate::approval::chat_admin::press::PressOrigin {
+        message_id, private: is_dm,
+        account: crate::chat_link_intercept::account_label("googlechat", state.agent.as_deref()),
+        dm: press.space.clone(),
+    }
+}
+
+async fn route_card_press(
+    state: &Arc<GoogleChatState>,
+    event: &serde_json::Value,
+    press: &CardPress,
+) -> Option<crate::approval::chat_admin::press::PressOutcome> {
+    // Research §9: Chat user ID == OIDC sub, ID stability after rename/recreate,
+    // and user.email presence are not documented and need live testing. This
+    // adapter uses only the verified HUMAN user.name and receipt/handshake proof;
+    // it neither infers a sub nor uses email/displayName as identity.
+    if crate::decision_action::parse(&press.action)
+        .is_some_and(|action| action.source == crate::decision_action::DecisionSource::Approval)
+        && event.pointer("/message/sender/type").and_then(serde_json::Value::as_str) != Some("BOT")
+    {
+        return Some(crate::approval::chat_admin::press::PressOutcome::refused(
+            crate::channel_decision_route::DECISION_REFUSED.into(), "message_not_bot", false));
+    }
     // RM-192 B3: the trusted classifier decides whether this is the
     // presser's 1:1 DM with the app (unknown or failed = shared). Only then
     // is the press attested as coming from that DM's human member; the goal
@@ -796,7 +859,8 @@ async fn card_clicked(
         conversation_id: press.space.clone(),
         principal_id: press.user.clone(),
     };
-    let result = crate::ccr_runtime::ATTESTED_ONE_TO_ONE
+    let origin = card_press_origin(state, event, press, is_dm);
+    crate::ccr_runtime::ATTESTED_ONE_TO_ONE
         .scope(
             attestation,
             crate::decision_notify::route_verified_bound_press(
@@ -808,15 +872,10 @@ async fn card_clicked(
                     guild_id: None,
                     session_id: None,
                 },
+                &origin,
             ),
         )
-        .await;
-    let text = match result {
-        None => return ack(),
-        Some(Ok(msg)) => msg,
-        Some(Err(msg)) => format!("⚠️ {msg}"),
-    };
-    (StatusCode::OK, axum::Json(serde_json::json!({ "text": text }))).into_response()
+        .await
 }
 
 /// Cache only successful admission, under the same lock as submit so a
@@ -1704,17 +1763,91 @@ pub async fn send_text_to_space_as(
 /// Send its final payload directly; do not reinterpret previews as Markdown.
 pub(crate) async fn send_untrusted_card(
     home_dir: &Path, space: &str, body: serde_json::Value,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     if !crate::google_workspace::chat_read::valid_space(space) {
         return Err(GoogleChatSendError::InvalidTarget.user_message(home_dir));
     }
     let (creds, _) = sending_creds(home_dir, None, space).await?;
     post_message_json(&creds, space, None, body, None).await
-        .map(|_| ())
         .map_err(|status| match status {
             Some(status) => GoogleChatSendError::Http { status },
             None => GoogleChatSendError::Transport,
         }.user_message(home_dir))
+}
+
+/// A proven account is authoritative: None means the shared app, never the
+/// space roster or another employee's app. All RM-143 sends/edits use this.
+async fn proven_app_creds(home: &Path, agent: Option<&str>) -> Result<Arc<GoogleChatCreds>, String> {
+    match agent {
+        Some(id) => crate::googlechat_agents::agent_creds(home, id).await,
+        None => GoogleChatCreds::from_config(home).await.map(Arc::new),
+    }.ok_or_else(|| "proven Google Chat app unavailable".into())
+}
+
+pub(crate) async fn send_untrusted_card_as(
+    home: &Path, agent: Option<&str>, space: &str, body: serde_json::Value,
+) -> Result<String, String> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err("invalid Google Chat destination".into());
+    }
+    let creds = proven_app_creds(home, agent).await?;
+    // Knowing the name before POST also lets us neutralize an ambiguous send.
+    let id = format!("client-{}", uuid::Uuid::new_v4().simple());
+    let name = format!("{space}/messages/{id}");
+    match post_message_json(&creds, space, None, body, Some(&id)).await {
+        Ok(Some(created)) if crate::googlechat_inbox::parse_message_resource_name(&created)
+            .is_some_and(|(s, _)| format!("spaces/{s}") == space) => Ok(created),
+        Ok(_) => Ok(name),
+        Err(_) => {
+            let _ = replace_approval_card_as(home, agent, &name, "請到儀表板處理").await;
+            Err("Google Chat card send failed".into())
+        }
+    }
+}
+
+pub(crate) async fn replace_approval_card_as(
+    home: &Path, agent: Option<&str>, name: &str, text: &str,
+) -> Result<(), String> {
+    let (space, message) = crate::googlechat_inbox::parse_message_resource_name(name)
+        .ok_or_else(|| "invalid Google Chat message".to_string())?;
+    let creds = proven_app_creds(home, agent).await?;
+    let token = creds.get_token().await.map_err(|_| "Google Chat authorization failed")?;
+    let url = format!("{}/spaces/{space}/messages/{message}?updateMask=text,cardsV2", creds.api_base());
+    let response = creds.http.patch(url).bearer_auth(token)
+        .json(&serde_json::json!({"text":text, "cardsV2":[]}))
+        .send_authorized().await.map_err(|_| "Google Chat card replacement failed")?;
+    if response.status().is_success() { Ok(()) } else { Err("Google Chat card replacement failed".into()) }
+}
+
+pub(crate) async fn remind_approval_card_as(
+    home: &Path, agent: Option<&str>, space: &str, message: Option<&str>, text: &str,
+) -> Result<(), String> {
+    if !crate::google_workspace::chat_read::valid_space(space) {
+        return Err("invalid Google Chat destination".into());
+    }
+    let creds = proven_app_creds(home, agent).await?;
+    // A message name does not encode its thread. Read the message, and use
+    // only a thread in the proven DM; an unavailable thread falls back to DM.
+    let mut thread = None;
+    if let Some(name) = message.filter(|name| crate::googlechat_inbox::parse_message_resource_name(name)
+        .is_some_and(|(s, _)| format!("spaces/{s}") == space)) {
+        let token = creds.get_token().await.map_err(|_| "Google Chat authorization failed")?;
+        if let Ok(response) = creds.http.get(format!("{}/{name}", creds.api_base()))
+            .bearer_auth(token).send_authorized().await {
+            if response.status().is_success() {
+                if let Ok(body) = response.json::<serde_json::Value>().await {
+                    thread = body["thread"]["name"].as_str().filter(|name| {
+                        let parts: Vec<_> = name.split('/').collect();
+                        parts.len() == 4 && parts[0] == "spaces" && parts[2] == "threads"
+                            && format!("spaces/{}", parts[1]) == space
+                            && !parts[3].is_empty() && parts[3].bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    }).map(str::to_owned);
+                }
+            }
+        }
+    }
+    post_message_json(&creds, space, thread.as_deref(), serde_json::json!({"text":text}), None)
+        .await.map(|_| ()).map_err(|_| "Google Chat reminder failed".into())
 }
 
 /// RM-192: whether the app a send to `space` as `agent` would use (the same
@@ -1722,14 +1855,16 @@ pub(crate) async fn send_untrusted_card(
 /// HTTP transport — the only transport whose `CARD_CLICKED` events are
 /// JWT-verified (`webhook_handler`, `googlechat_agents::handle`). A Pub/Sub
 /// app gets no click it can trust, so it must not be sent buttons. Fail
-/// closed on anything unclear.
+/// closed on anything unclear. `exact_account` pins None to the shared app
+/// and Some(agent) to that employee, bypassing the space roster for RM-143.
 pub(crate) async fn sending_app_takes_http_clicks(
     home_dir: &Path,
     agent: Option<&str>,
     space: &str,
+    exact_account: bool,
 ) -> bool {
     use crate::agent_channels::gchat_spaces::{self, SpaceApp};
-    let own = match agent {
+    let own = if exact_account { agent.map(str::to_owned) } else { match agent {
         Some(id) if crate::agent_channels::store::agent_has_googlechat_section(home_dir, id) => {
             Some(id.to_string())
         }
@@ -1737,9 +1872,13 @@ pub(crate) async fn sending_app_takes_http_clicks(
             Some(SpaceApp::Agent(id)) => Some(id),
             Some(SpaceApp::Shared) | None => None,
         },
-    };
+    }};
     match own {
-        Some(id) => crate::agent_channels::store::agent_uses_http(home_dir, &id),
+        Some(id) => {
+            let home = home_dir.to_path_buf();
+            tokio::task::spawn_blocking(move || crate::agent_channels::store::agent_uses_http(&home, &id))
+                .await.unwrap_or(false)
+        },
         None => {
             shared_settings_valid(home_dir).await
                 && crate::googlechat_pubsub::shared_http_enabled(home_dir).await
@@ -1874,8 +2013,8 @@ async fn post_message_json(
 ) -> Result<Option<String>, Option<u16>> {
     let token = match creds.get_token().await {
         Ok(t) => t,
-        Err(e) => {
-            error!("Google Chat token error: {e}");
+        Err(_) => {
+            error!("Google Chat authorization failed");
             return Err(None);
         }
     };
@@ -1906,8 +2045,8 @@ async fn post_message_json(
             warn!(status = status.as_u16(), "Google Chat send failed");
             Err(Some(status.as_u16()))
         }
-        Err(e) => {
-            error!("Google Chat send error: {e}");
+        Err(_) => {
+            error!("Google Chat send transport failed");
             Err(None)
         }
     }
@@ -2651,7 +2790,9 @@ mod card_click_tests {
         // Undecodable, or a decision Google Chat is never sent.
         assert_eq!(parse_card_press(&click("not-a-decision")), None);
         let approve = encode(DecisionSource::Approval, DecisionAct::Approve, "a1");
-        assert_eq!(parse_card_press(&click(&approve)), None);
+        assert!(parse_card_press(&click(&approve)).is_some());
+        let install = encode(DecisionSource::Install, DecisionAct::Approve, "a1");
+        assert_eq!(parse_card_press(&click(&install)), None);
     }
 
     #[test]
@@ -2733,22 +2874,37 @@ mod card_click_tests {
     }
 
     #[tokio::test]
+    async fn approval_cards_pin_shared_app_even_when_space_roster_names_an_employee() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::write(home.join("config.toml"), "[channels]\ngooglechat_project_number='1'\n").unwrap();
+        std::fs::create_dir_all(home.join("agents/sales")).unwrap();
+        std::fs::write(home.join("agents/sales/agent.toml"),
+            "[agent]\nname='sales'\n[channels.googlechat]\nproject_number='1'\nconnection='pubsub'\npubsub_subscription='projects/p/subscriptions/s'\n").unwrap();
+        crate::agent_channels::gchat_spaces::record(home, "spaces/A", Some("sales"));
+        assert!(!sending_app_takes_http_clicks(home, None, "spaces/A", false).await);
+        assert!(sending_app_takes_http_clicks(home, None, "spaces/A", true).await);
+        assert!(!sending_app_takes_http_clicks(home, Some("sales"), "spaces/A", true).await);
+        assert!(!sending_app_takes_http_clicks(home, Some("missing"), "spaces/A", true).await);
+    }
+
+    #[tokio::test]
     async fn buttons_follow_the_sending_apps_transport() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         // Shared app, HTTP (no connection setting) → buttons.
         std::fs::write(home.join("config.toml"), "[channels]\ngooglechat_project_number = \"1\"\n").unwrap();
-        assert!(sending_app_takes_http_clicks(home, None, "spaces/A").await);
+        assert!(sending_app_takes_http_clicks(home, None, "spaces/A", false).await);
         // Shared app over Pub/Sub → text only.
         std::fs::write(
             home.join("config.toml"),
             "[channels]\ngooglechat_connection = \"pubsub\"\ngooglechat_pubsub_subscription = \"projects/p/subscriptions/s\"\n",
         )
         .unwrap();
-        assert!(!sending_app_takes_http_clicks(home, None, "spaces/A").await);
+        assert!(!sending_app_takes_http_clicks(home, None, "spaces/A", false).await);
         // No config at all → fail closed.
         std::fs::remove_file(home.join("config.toml")).unwrap();
-        assert!(!sending_app_takes_http_clicks(home, None, "spaces/A").await);
+        assert!(!sending_app_takes_http_clicks(home, None, "spaces/A", false).await);
         // An employee's own app decides for itself.
         let agent = home.join("agents").join("sales");
         std::fs::create_dir_all(&agent).unwrap();
@@ -2760,11 +2916,11 @@ mod card_click_tests {
             .unwrap()
         };
         write("");
-        assert!(sending_app_takes_http_clicks(home, Some("sales"), "spaces/A").await);
+        assert!(sending_app_takes_http_clicks(home, Some("sales"), "spaces/A", false).await);
         write("connection = \"pubsub\"\npubsub_subscription = \"projects/p/subscriptions/s\"\n");
-        assert!(!sending_app_takes_http_clicks(home, Some("sales"), "spaces/A").await);
+        assert!(!sending_app_takes_http_clicks(home, Some("sales"), "spaces/A", false).await);
         write("connection = 7\n");
-        assert!(!sending_app_takes_http_clicks(home, Some("sales"), "spaces/A").await);
+        assert!(!sending_app_takes_http_clicks(home, Some("sales"), "spaces/A", false).await);
     }
 }
 
@@ -3241,3 +3397,7 @@ mod handshake_tests {
             HandshakeStatus::Rejected);
     }
 }
+
+#[cfg(test)]
+#[path = "googlechat_chat_admin_tests.rs"]
+mod chat_admin_tests;

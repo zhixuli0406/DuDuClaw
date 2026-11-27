@@ -86,6 +86,17 @@ first-administrator latch and `mfa_reset_audit_outbox` tables, so a v1.82 `users
 as a source and the latch never travels through import — the new installation keeps its own). Extra tables,
 columns, indexes, views or triggers reject the whole source; other historical
 variants are deliberately rejected until exact catalogs are reviewed.
+RM-143 adds `approvals-v186.sql` (the v1.81 pin plus `chat_admin_cards`,
+`chat_admin_decisions` and their index). The reader still authorizes only approval
+ids and the authority schema version: no receipts, decision ledger, or `chat-admin:`
+authority crosses installations. Old approvals become inert `LegacyApproval` proposals.
+User channel identities likewise become re-entry proposals, never copied rows;
+no source principal or proof columns are emitted. RM-143 proof columns and
+`chat_link_*` tables remain outside the users pin, so such sources are refused in
+full. Recreated bindings must prove themselves in the target installation.
+`protected/approval_step_up.db` and its SQLite sidecars are outside the source
+inventory allowlist and are never imported.
+
 `tasks.db` additionally has a third catalog, `tasks-v181.sql`: the v1.80.x store plus the
 P1e `task_store_markers` table that every fresh v1.81 `tasks.db` creates, so a home made
 by this release is accepted as a source. Both the v1.80 and v1.81 catalogs are accepted

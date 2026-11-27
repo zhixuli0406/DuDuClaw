@@ -22,7 +22,6 @@
 //! proposal list and the worker's housekeeping).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use duduclaw_knowledge::acl::Role;
 use duduclaw_knowledge::blob::{BlobStore, url_identity};
@@ -380,7 +379,7 @@ async fn propose_inner(
     }
 }
 
-fn remove_sidecar(home: &Path, payload: &Value) {
+pub(crate) fn remove_sidecar(home: &Path, payload: &Value) {
     if let Some(path) = payload["staged"]
         .as_str()
         .and_then(|s| sidecar_path(home, s))
@@ -411,23 +410,6 @@ pub fn may_decide(home: &Path, rec: &ApprovalRecord, user: &ResolvedUser) -> KbR
     .map(|_| ())
 }
 
-fn lock_for(id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock, Weak};
-    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut m = LOCKS
-        .get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    m.retain(|_, w| w.strong_count() > 0);
-    if let Some(l) = m.get(id).and_then(Weak::upgrade) {
-        return l;
-    }
-    let l = Arc::new(tokio::sync::Mutex::new(()));
-    m.insert(id.to_string(), Arc::downgrade(&l));
-    l
-}
-
 /// The refusal when the decider is neither Admin nor an editor.
 pub const NOT_EDITOR: &str =
     "只有管理員或這個集合的編輯者（含擁有者）可以決定這筆加入知識庫的請求。";
@@ -444,22 +426,63 @@ pub async fn decide(
     approve: bool,
     user: &ResolvedUser,
 ) -> Result<Value, String> {
-    decide_inner(home, broker, id, approve, user, None).await
+    let lock = crate::approval::decision_service::decision_lock(id.as_str());
+    let _guard = lock.lock().await;
+    decide_inner(home, broker, id, approve, user, None, None).await
 }
 
 pub(crate) async fn decide_owner(
     home: &Path, broker: &ApprovalBroker, id: &ApprovalId, approve: bool,
     user: &ResolvedUser, context: &crate::approval::DecisionContext,
 ) -> Result<Value, String> {
-    decide_inner(home, broker, id, approve, user, Some(context)).await
+    let lock = crate::approval::decision_service::decision_lock(id.as_str());
+    let _guard = lock.lock().await;
+    decide_inner(home, broker, id, approve, user, Some(context), None).await
+}
+
+/// Service-only entry: the caller holds decision_lock and has authenticated
+/// ChatAdmin from live identity, configuration and the exact receipt.
+/// Legacy dashboard/owner APIs above retain their signatures and share the lock.
+pub(crate) async fn decide_as_locked(
+    env: &crate::approval::decision_service::DecisionEnv,
+    id: &ApprovalId, approve: bool,
+    by: &crate::approval::decision_service::Decider,
+    user: &ResolvedUser, actor: &crate::approval::chat_admin::DecisionActor,
+) -> Result<Value, String> {
+    if matches!(by, crate::approval::decision_service::Decider::ChatAdmin(_)) && !user.is_admin {
+        return Err(NOT_EDITOR.into());
+    }
+    decide_inner(&env.home, &env.broker, id, approve, user, None, Some(actor)).await
+}
+
+async fn record_decision(
+    broker: &ApprovalBroker, id: &ApprovalId, approve: bool, user: &ResolvedUser,
+    owner: Option<&crate::approval::DecisionContext>,
+    actor: Option<&crate::approval::chat_admin::DecisionActor>,
+) -> Result<(), String> {
+    if let Some(actor) = actor {
+        // A rejected content hash records a denial even if the original
+        // request was approve. Denials never require a step-up.
+        if !approve && let crate::approval::chat_admin::DecisionActor::ChatAdmin(entry) = actor {
+            let mut entry = entry.clone();
+            entry.step_required = false;
+            return broker.decide_as(id, false, &crate::approval::chat_admin::DecisionActor::ChatAdmin(entry)).await;
+        }
+        return broker.decide_as(id, approve, actor).await;
+    }
+    if let Some(ctx) = owner {
+        return broker.decide(id, approve, &format!("channel:{}:{}", ctx.channel, ctx.principal_id)).await;
+    }
+    broker.decide_as(id, approve, &crate::approval::chat_admin::DecisionActor::Dashboard {
+        user_id: user.user_id.clone(),
+    }).await
 }
 
 async fn decide_inner(
     home: &Path, broker: &ApprovalBroker, id: &ApprovalId, approve: bool,
     user: &ResolvedUser, owner_context: Option<&crate::approval::DecisionContext>,
+    actor: Option<&crate::approval::chat_admin::DecisionActor>,
 ) -> Result<Value, String> {
-    let lock = lock_for(id.as_str());
-    let _g = lock.lock().await;
     let rec = match broker.get(id).await {
         Ok(Some(r)) if r.action_kind == ACTION_KIND => r,
         Ok(_) => return Err("找不到這筆審核".into()),
@@ -492,21 +515,17 @@ async fn decide_inner(
         return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
     }
     crate::approval::check_expected_digest(&rec)?;
-    let decided_by = match owner_context {
-        Some(ctx) => format!("channel:{}:{}", ctx.channel, ctx.principal_id),
-        None => format!("dashboard:{}", user.user_id),
-    };
     if !approve {
-        broker.decide(id, false, &decided_by).await?;
+        record_decision(broker, id, false, user, owner_context, actor).await?;
         remove_sidecar(home, &rec.payload);
         audit(home, &rec, user, "denied");
         return Ok(json!({"id": id.to_string(), "decided": "denied"}));
     }
     let (h, r, u) = (home.to_path_buf(), rec.clone(), user.clone());
-    let owner_context = owner_context.cloned();
-    match super::blocking(move || ingest(&h, &r, &u, owner_context.as_ref())).await {
+    let ingest_context = owner_context.cloned();
+    match super::blocking(move || ingest(&h, &r, &u, ingest_context.as_ref())).await {
         Ok(v) => {
-            broker.decide(id, true, &decided_by).await?;
+            record_decision(broker, id, true, user, owner_context, actor).await?;
             remove_sidecar(home, &rec.payload);
             audit(home, &rec, user, "approved");
             super::worker::notify();
@@ -516,7 +535,7 @@ async fn decide_inner(
             code: "hash_mismatch",
             ..
         }) => {
-            broker.decide(id, false, &decided_by).await?;
+            record_decision(broker, id, false, user, owner_context, actor).await?;
             remove_sidecar(home, &rec.payload);
             audit(home, &rec, user, "hash_mismatch");
             Err(HASH_MISMATCH.into())

@@ -357,135 +357,22 @@ impl MethodHandler {
         Ok(out)
     }
 
-    /// `approvals.decide` for `agent_file_change` (dashboard only, current
-    /// admin only). Applies FIRST and records the decision only after the
-    /// write succeeded; a file changed while the request waited is denied.
+    /// Compatibility entry point; the service owns the decision lock and effects.
     pub(crate) async fn decide_agent_file_change(
-        &self,
-        broker: &crate::approval::ApprovalBroker,
-        approval_id: &crate::approval::ApprovalId,
-        approve: bool,
-        ctx: &UserContext,
+        &self, broker: &crate::approval::ApprovalBroker,
+        approval_id: &crate::approval::ApprovalId, approve: bool, ctx: &UserContext,
     ) -> WsFrame {
-        if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx).is_err() {
-            return WsFrame::error_response("", "只有管理員可以在儀表板決定設定檔修改的審核");
-        }
-        let lock = super::approvals_decide::decision_lock(approval_id.as_str());
-        let _held = lock.lock().await;
-        let rec = match broker.get(approval_id).await {
-            Ok(Some(r)) if r.action_kind == fa::ACTION_KIND => r,
-            Ok(_) => return WsFrame::error_response("", "找不到這筆審核"),
-            Err(e) => return WsFrame::error_response("", &format!("讀取審核失敗：{e}")),
+        let env = crate::approval::decision_service::DecisionEnv {
+            home: self.home_dir.clone(), registry: Some(self.registry.clone()),
+            broker: broker.clone(), users: self.user_db.read().await.clone(),
         };
-        if rec.status != crate::approval::ApprovalStatus::Pending {
-            return WsFrame::error_response("", &format!("approval {} already {}", rec.id, rec.status.as_str()));
-        }
-        if rec.is_stale(chrono::Utc::now()) {
-            let _ = broker.poll(approval_id).await;
-            fa::remove_sidecar(&self.home_dir, approval_id.as_str());
-            return WsFrame::error_response("", crate::approval_notify::dashboard_only_expired_text(fa::ACTION_KIND));
-        }
-        if let Err(error) = crate::approval::check_expected_digest(&rec) {
-            return WsFrame::error_response("", &error);
-        }
-        let decided_by = format!("dashboard:{}", ctx.user_id);
-        if !approve {
-            if let Err(e) = broker.decide(approval_id, false, &decided_by).await {
-                return WsFrame::error_response("", &format!("decide: {e}"));
-            }
-            fa::remove_sidecar(&self.home_dir, approval_id.as_str());
-            self.collapse_decided(&rec, false, ctx).await;
-            return WsFrame::ok_response("", json!({ "id": rec.id.as_str(), "decided": "denied", "side_effect": Value::Null }));
-        }
-        match self.apply_agent_file_change(&rec, &decided_by, ctx).await {
-            Ok(side_effect) => {
-                if let Err(e) = broker.decide(approval_id, true, &decided_by).await {
-                    crate::security_autopilot::audit_and_emit(
-                        &self.home_dir,
-                        &duduclaw_security::audit::AuditEvent::new(
-                            "agent_file_change_decision_unrecorded",
-                            rec.agent_id.as_str(),
-                            duduclaw_security::audit::Severity::Warning,
-                            json!({ "approval_id": rec.id.as_str(), "side_effect": side_effect, "error": duduclaw_core::truncate_chars(&e, 300) }),
-                        ),
-                    );
-                    return WsFrame::error_response(
-                        "",
-                        &format!("修改已套用，但這筆審核的決定沒有記錄成功（{}）；已寫入稽核紀錄。", duduclaw_core::truncate_chars(&e, 300)),
-                    );
-                }
-                fa::remove_sidecar(&self.home_dir, approval_id.as_str());
-                self.collapse_decided(&rec, true, ctx).await;
-                WsFrame::ok_response("", json!({ "id": rec.id.as_str(), "decided": "approved", "side_effect": side_effect }))
-            }
-            Err(ApplyRefusal::Changed) => {
-                let _ = broker.decide(approval_id, false, &decided_by).await;
-                fa::remove_sidecar(&self.home_dir, approval_id.as_str());
-                self.collapse_decided(&rec, false, ctx).await;
-                WsFrame::error_response("", "檔案在審核期間被修改，這份申請已拒絕；請申請者重新送出")
-            }
-            Err(ApplyRefusal::Other(e)) => {
-                WsFrame::error_response("", &format!("沒有套用，這筆審核仍待決定，可以再試一次：{e}"))
-            }
+        match Box::pin(crate::approval::decision_service::decide(
+            &env, approval_id, approve, "", &crate::approval::decision_service::Decider::Dashboard(ctx.clone()),
+        )).await {
+            Ok(outcome) => WsFrame::ok_response("", outcome.value),
+            Err(error) => error.dashboard_frame(),
         }
     }
-
-    async fn collapse_decided(&self, rec: &crate::approval::ApprovalRecord, approve: bool, ctx: &UserContext) {
-        let name = self.user_display_name(&ctx.user_id).await;
-        crate::approval_notify::spawn_dashboard_collapse(self.home_dir.clone(), rec.clone(), approve, name);
-    }
-
-    async fn apply_agent_file_change(
-        &self,
-        rec: &crate::approval::ApprovalRecord,
-        decided_by: &str,
-        ctx: &UserContext,
-    ) -> Result<Value, ApplyRefusal> {
-        use crate::agent_files::writer::{Commit, CommitError, CommitMeta, commit};
-        let (agent_id, key) = fa::target(rec).ok_or_else(|| ApplyRefusal::Other("not a profile file change".into()))?;
-        let content = fa::approved_content(&self.home_dir, rec).map_err(ApplyRefusal::Other)?;
-        let p = &rec.payload;
-        let s = |k: &str| p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let base_hash = s("base_hash");
-        let mut meta = CommitMeta::new(&s("requested_by"), "approval");
-        meta.verdict = crate::agent_files::verdict::Verdict::parse(&s("verdict"));
-        meta.reason_categories = p
-            .get("reason_categories")
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        meta.confirm_reason = Some(s("reason")).filter(|r| !r.is_empty());
-        meta.approval_id = Some(rec.id.as_str().to_string());
-        meta.decided_by = Some(decided_by.to_string());
-        meta.severity = duduclaw_security::audit::Severity::Warning;
-        let home = self.home_dir.clone();
-        let decider = ctx.clone();
-        let result = commit(
-            &self.registry,
-            Commit {
-                home: &self.home_dir,
-                agent_id: &agent_id,
-                key,
-                expected_hash: Some(&base_hash),
-                meta,
-                baseline: flow::baseline_for(&content, &base_hash),
-            },
-            move |_| Ok(content),
-            move || crate::approval::operator_cli_gate::require_admin_decider(&home, &decider),
-        )
-        .await;
-        match result {
-            Ok(o) => Ok(json!({ "applied": true, "version_id": o.version_id, "hash": o.hash, "registry_reloaded": o.registry_reloaded })),
-            Err(CommitError::Conflict { .. }) => Err(ApplyRefusal::Changed),
-            Err(e) => Err(ApplyRefusal::Other(e.message())),
-        }
-    }
-}
-
-enum ApplyRefusal {
-    /// The file no longer matches the request's `base_hash`.
-    Changed,
-    Other(String),
 }
 
 /// Each kept version plus `user_name`: the editor's display name, resolved
