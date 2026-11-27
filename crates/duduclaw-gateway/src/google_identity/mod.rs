@@ -91,6 +91,7 @@ impl Refusal {
 
 /// Every refusal code this module emits.
 pub const REFUSAL_CODES: &[&str] = &[
+    "drive_write_admin_scope_missing",
     "no_verified_caller",
     "external",
     "attestation_required",

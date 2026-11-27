@@ -113,6 +113,7 @@ impl ClosedMime {
 
 #[derive(Clone)]
 pub(crate) enum WriteCall {
+    DriveProbe,
     DriveGetMetadata { file_id: GoogleId, fields: MetadataFields },
     DriveCreateFolder { metadata_json: JsonBody },
     DriveCreateMultipart { metadata_json: JsonBody, content: Bytes, content_type: ClosedMime },
@@ -156,6 +157,8 @@ impl WriteCall {
 
     fn route(&self) -> Route {
         let (method, host, parts): (Method, &str, Vec<String>) = match self {
+            Self::DriveProbe =>
+                (Method::GET, "www.googleapis.com", vec!["drive".into(), "v3".into(), "files".into()]),
             Self::DriveGetMetadata { file_id, .. } =>
                 (Method::GET, "www.googleapis.com", vec!["drive".into(), "v3".into(), "files".into(), file_id.0.clone()]),
             Self::DriveCreateFolder { .. } =>
@@ -178,6 +181,10 @@ impl WriteCall {
                 (Method::POST, "sheets.googleapis.com", vec!["v4".into(), "spreadsheets".into(), format!("{}:batchUpdate", spreadsheet_id.as_str())]),
         };
         let query = match self {
+            Self::DriveProbe => vec![
+                ("pageSize", "1".into()), ("fields", "files(id)".into()),
+                ("supportsAllDrives", "true".into()), ("includeItemsFromAllDrives", "true".into()),
+            ],
             Self::DriveGetMetadata { fields, .. } => vec![
                 ("fields", fields.as_str().into()), ("supportsAllDrives", "true".into()),
             ],
@@ -203,6 +210,7 @@ impl WriteCall {
 
     pub(crate) fn allowed_query_keys(&self) -> &'static [&'static str] {
         match self {
+            Self::DriveProbe => &["pageSize", "fields", "supportsAllDrives", "includeItemsFromAllDrives"],
             Self::DriveGetMetadata { .. } => &["fields", "supportsAllDrives"],
             Self::DriveCreateFolder { .. } | Self::DriveCopy { .. }
             | Self::DriveUpdateMetadata { .. } | Self::DriveTrash { .. } => &["supportsAllDrives", "fields"],
@@ -221,6 +229,9 @@ impl WriteCall {
         url.set_path(&format!("/{}", route.segments.join("/")));
         if !route.query.is_empty() {
             url.query_pairs_mut().extend_pairs(route.query.iter().map(|(k, v)| (*k, v.as_str())));
+        }
+        if matches!(self, Self::DriveProbe) {
+            url.set_query(Some("pageSize=1&fields=files(id)&supportsAllDrives=true&includeItemsFromAllDrives=true"));
         }
         (route.method, url)
     }
@@ -249,7 +260,7 @@ impl WriteCall {
 
     fn body(&self) -> Result<Option<(String, Vec<u8>)>, NotSentReason> {
         match self {
-            Self::DriveGetMetadata { .. } | Self::DocsGet { .. } | Self::SheetsGetProperties { .. } => Ok(None),
+            Self::DriveProbe | Self::DriveGetMetadata { .. } | Self::DocsGet { .. } | Self::SheetsGetProperties { .. } => Ok(None),
             Self::DriveTrash { .. } => Ok(Some(("application/json".into(), br#"{"trashed":true}"#.to_vec()))),
             Self::DriveMove { .. } => Ok(Some(("application/json".into(), b"{}".to_vec()))),
             Self::DriveCreateFolder { metadata_json } | Self::DriveCopy { metadata_json, .. }

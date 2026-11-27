@@ -27,6 +27,12 @@ fn cases() -> Vec<Case> {
     let upload_query = vec![("uploadType", "multipart"), ("supportsAllDrives", "true"), ("fields", EXPECTED_WRITE)];
     vec![
         Case {
+            call: WriteCall::DriveProbe,
+            method: Method::GET, host: "www.googleapis.com", path: "/drive/v3/files".into(),
+            query: vec![("pageSize", "1"), ("fields", "files(id)"),
+                ("supportsAllDrives", "true"), ("includeItemsFromAllDrives", "true")],
+        },
+        Case {
             call: WriteCall::DriveGetMetadata { file_id: id(), fields: MetadataFields::Scope },
             method: Method::GET, host: "www.googleapis.com", path: format!("/drive/v3/files/{ID}"),
             query: vec![("fields", EXPECTED_SCOPE), ("supportsAllDrives", "true")],
@@ -121,7 +127,7 @@ fn fake(reply: FakeReply) -> (WriteTransport, Arc<Mutex<Vec<BuiltRequest>>>) {
 #[test]
 fn every_variant_has_exact_method_host_path_and_query() {
     let cases = cases();
-    assert_eq!(cases.len(), 13); // Twelve variants plus both DocsGet shapes.
+    assert_eq!(cases.len(), 14); // Thirteen variants plus both DocsGet shapes.
     for case in cases {
         let (method, url) = case.call.method_and_url();
         assert_eq!(method, case.method);
@@ -528,4 +534,18 @@ async fn real_http_does_not_redirect_or_retry_error_status() {
         assert!(matches!(result.unwrap(), WriteResult::Ok((actual, body)) if actual == status && body == b"{}"));
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
+}
+
+#[test]
+fn drive_probe_is_exact_get_without_body() {
+    let call = WriteCall::DriveProbe;
+    let (method, url) = call.method_and_url();
+    assert_eq!(method, Method::GET);
+    assert_eq!(url.as_str(), "https://www.googleapis.com/drive/v3/files?pageSize=1&fields=files(id)&supportsAllDrives=true&includeItemsFromAllDrives=true");
+    assert!(call.validate_target(&method, &url).is_ok());
+    let mut changed = url.clone();
+    changed.query_pairs_mut().append_pair("q", "trashed=false");
+    assert!(call.validate_target(&method, &changed).is_err());
+    let mut transport = WriteTransport::new(Zeroizing::new(TOKEN.into())).unwrap();
+    assert!(transport.prepare(&call).unwrap().0.body().is_none());
 }
