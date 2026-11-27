@@ -143,6 +143,7 @@ mod channel_util;
 mod runtime_models_rpc;
 mod system_update_config;
 mod delegation_rpc;
+mod admin_ai_rpc;
 mod task_forward_rpc;
 mod accounts_add_rpc;
 mod config_io;

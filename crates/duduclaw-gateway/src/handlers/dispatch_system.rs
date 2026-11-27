@@ -188,6 +188,14 @@ impl MethodHandler {
             // Who may hand work to whom, org-wide. Admin-gated like every
             // other config-writing RPC; the write takes effect on the next
             // delegation decision (enforcement re-reads config.toml).
+            "admin_ai.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_get(ctx)).await
+            }
+            "admin_ai.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_admin_ai_set(params, ctx)).await
+            }
             "delegation.get" => {
                 require_admin!();
                 boxed_frame(|| self.handle_delegation_get()).await

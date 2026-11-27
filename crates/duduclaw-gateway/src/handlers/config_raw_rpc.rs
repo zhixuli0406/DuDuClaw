@@ -963,7 +963,13 @@ impl MethodHandler {
         }
         // Every validation message is scrubbed of restored secrets.
         let before: toml::Table = stored.parse().unwrap_or_default();
-        let after = validate_raw_with_stored(&kind, &new_text, Some(&before)).map_err(|e| rctx.scrub(&e))?;
+        let mut after = validate_raw_with_stored(&kind, &new_text, Some(&before)).map_err(|e| rctx.scrub(&e))?;
+        let admin_ai_changed = if matches!(kind, RawFile::Config) {
+            let changed = super::admin_ai_rpc::prepare_admin_ai_change(&before, &mut after,
+                params.get("acknowledge_risk").and_then(Value::as_bool) == Some(true), &ctx.user_id)?;
+            if changed { new_text = super::config_commit::render_preserving(&new_text, &after)?; }
+            changed
+        } else { false };
         if matches!(kind, RawFile::Agent(_)) {
             if let Some(value) = super::config_commit::toml_at(&after, "runtime.timeout_secs") {
                 let max = crate::runtime_config::TimeoutPolicy::load(&self.home_dir).max_secs;
@@ -1167,6 +1173,9 @@ impl MethodHandler {
                 .map_err(|e| format!("write task failed: {e}"))??;
         }
 
+        if admin_ai_changed {
+            super::admin_ai_rpc::audit_admin_ai_toggle(&self.home_dir, &ctx.user_id, &before, &after);
+        }
         // Committed (authority first, then mirror): release the org lock.
         drop(org_lock);
         let backup_name = backup

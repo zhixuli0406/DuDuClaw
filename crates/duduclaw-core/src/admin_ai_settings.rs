@@ -405,3 +405,75 @@ pub fn validate_item(item: &Item, bounds: &Bounds) -> Result<NormalizedItem, Adm
 #[cfg(test)]
 #[path = "admin_ai_settings_tests.rs"]
 mod tests;
+
+/// Only an explicit TOML boolean true enables administrator AI settings.
+pub fn enabled_from_table(table: &toml::Table) -> bool {
+    table.get("admin_ai").and_then(toml::Value::as_table)
+        .and_then(|section| section.get("enabled")).and_then(toml::Value::as_bool) == Some(true)
+}
+
+pub fn enabled_from_home(home: &std::path::Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .is_some_and(|table| enabled_from_table(&table))
+}
+
+/// Compare actual leaves; arrays are atomic values and empty tables have no leaves.
+pub fn changed_leaves(before: &toml::Table, after: &toml::Table) -> Vec<(String, Value, Value)> {
+    fn flatten(table: &toml::Table, prefix: &str, out: &mut BTreeMap<String, Value>) {
+        for (key, value) in table {
+            let path = if prefix.is_empty() { key.clone() } else { format!("{prefix}.{key}") };
+            if let Some(child) = value.as_table() { flatten(child, &path, out); }
+            else { out.insert(path, serde_json::to_value(value).unwrap_or(Value::Null)); }
+        }
+    }
+    let (mut b, mut a) = (BTreeMap::new(), BTreeMap::new());
+    flatten(before, "", &mut b);
+    flatten(after, "", &mut a);
+    b.keys().chain(a.keys()).collect::<BTreeSet<_>>().into_iter().filter_map(|path| {
+        let before = b.get(path).cloned().unwrap_or(Value::Null);
+        let after = a.get(path).cloned().unwrap_or(Value::Null);
+        (before != after).then(|| (path.clone(), before, after))
+    }).collect()
+}
+
+pub const DIFF_REFUSED: &str = "admin_ai_diff_refused";
+
+/// Validate the final artifact, including any automatic runtime alignment.
+pub fn validate_changed_leaves(before: &toml::Table, after: &toml::Table, fields: &[AdminAiField]) -> Result<(), &'static str> {
+    let allowed: BTreeSet<_> = fields.iter().flat_map(|field| field.paths()).collect();
+    if changed_leaves(before, after).iter().any(|(path, _, _)| !allowed.contains(path.as_str())) {
+        return Err(DIFF_REFUSED);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod setting_tests {
+    use super::*;
+
+    #[test]
+    fn admin_ai_enabled_is_strict_and_defaults_off() {
+        for text in ["", "admin_ai=true", "[admin_ai]", "[admin_ai]\nenabled=false", "[admin_ai]\nenabled='true'", "[admin_ai]\nenabled=1"] {
+            assert!(!enabled_from_table(&text.parse().unwrap()), "{text}");
+        }
+        assert!(enabled_from_table(&"[admin_ai]\nenabled=true".parse().unwrap()));
+        let home = tempfile::tempdir().unwrap();
+        assert!(!enabled_from_home(home.path()));
+        std::fs::write(home.path().join("config.toml"), "[broken").unwrap();
+        assert!(!enabled_from_home(home.path()));
+    }
+
+    #[test]
+    fn admin_ai_diff_checks_requested_leaves_and_engine_alignment() {
+        let before: toml::Table = "[model]\npreferred='sonnet'\n[runtime]\nprovider='claude'".parse().unwrap();
+        let after: toml::Table = "[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='codex'".parse().unwrap();
+        assert_eq!(validate_changed_leaves(&before, &after, &[AdminAiField::Model]), Err(DIFF_REFUSED));
+        let after: toml::Table = "[model]\npreferred='opus'\n[runtime]\nprovider='claude'".parse().unwrap();
+        assert!(validate_changed_leaves(&before, &after, &[AdminAiField::Model]).is_ok());
+        assert!(validate_changed_leaves(&before, &after, &[AdminAiField::Icon]).is_err());
+        let before = "[agent]\ndisplay_name='A'\ntrigger='@A'".parse().unwrap();
+        let after = "[agent]\ndisplay_name='B'\ntrigger='@B'\n[budget]".parse().unwrap();
+        assert!(validate_changed_leaves(&before, &after, &[AdminAiField::DisplayName]).is_ok());
+    }
+}
