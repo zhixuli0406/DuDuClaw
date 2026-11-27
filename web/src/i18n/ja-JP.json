@@ -11746,5 +11746,21 @@
   "myConnections.chatSend.egress": "全文を確認してください。確認すると、個人情報を含む可能性がある内容が上記スペースへ送信されます。Google にアプリ名も表示されます。",
   "myConnections.chatSend.expires": "確認期限：{time}",
   "myConnections.chatSend.confirm": "確認して送信",
-  "myConnections.chatSend.cancel": "キャンセル"
+  "myConnections.chatSend.cancel": "キャンセル",
+  "settings.delegation.roles.title": "委任範囲の制限を受けない役割",
+  "settings.delegation.roles.help": "選択した役割のメンバー本人が依頼したとき、その人の AI 分身は任意の AI スタッフへ一方向に仕事を依頼し、タスクやスケジュールを作成できます。本人が開始したバックグラウンド処理にも適用されます。「委任を許可しない」場合も有効です。各メンバーの AI分身は、管理者がメンバー管理でそのメンバーに割り当てた AI です。変更は監査ログに記録されます。保護モードでのバックグラウンド処理には適用されません。",
+  "settings.delegation.roles.admin": "管理者",
+  "settings.delegation.roles.manager": "マネージャー",
+  "settings.delegation.roles.employee": "一般メンバー",
+  "settings.delegation.roles.noneWarning": "選択した役割の AI 分身は、本人からの依頼や本人が開始したバックグラウンド処理では、引き続き任意の AI スタッフへ委任できます。",
+  "settings.delegation.saveImpact": "委任設定を保存すると、保留中の関連する承認カードが無効になり、有効なワークフローは次回の実行まで一時停止します。",
+  "settings.delegation.pair.twoWay": "双方向",
+  "settings.delegation.pair.oneWay": "一方向 A→B",
+  "settings.delegation.pair.swap": "依頼方向を入れ替える",
+  "agentDetail.delegation.unrestricted": "委任範囲の制限なし（{role}の AI 分身。本人の依頼または本人が開始したバックグラウンド処理に限る）",
+  "agentDetail.delegation.outgoing": "依頼先：{peer}",
+  "agentDetail.delegation.incoming": "依頼元：{peer}",
+  "agentDetail.delegation.oneWayInactive": "現在のモードでは無効",
+  "agentDetail.delegation.unrestrictedUnknown": "分身の所有者の役割を確認できないため、役割による例外は適用されません。",
+  "settings.delegation.pair.direction": "ペアの方向"
 }
