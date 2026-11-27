@@ -13,3 +13,8 @@ pub(crate) mod avatar;
 
 #[cfg(test)]
 mod avatar_tests;
+
+pub(crate) mod onboarding;
+
+#[cfg(test)]
+mod onboarding_tests;

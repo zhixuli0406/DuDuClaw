@@ -2911,6 +2911,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     }
 
 
+    // Google provisioning maintenance belongs exclusively to the lock holder.
+    if crate::google_signin::onboarding::should_run(&home_dir) {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if crate::google_signin::onboarding::should_run(&bg_state.home_dir) {
+                    crate::google_signin::onboarding::run_once(
+                        &bg_state.handler, chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
+
     // M1/M60: open the shared audit index once and refresh it on a background
     // interval, so audit/reliability requests reuse one connection instead of
     // opening + full-syncing per request.

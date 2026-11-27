@@ -730,6 +730,11 @@ impl MethodHandler {
         self.resolve_edition_profile().await;
     }
 
+    /// Clone the shared database before moving synchronous work off the async runtime.
+    pub(crate) async fn signin_onboarding_db(&self) -> Option<Arc<UserDb>> {
+        self.user_db.read().await.clone()
+    }
+
     /// Inject the reply context for hot-starting channels. Called once after
     /// ReplyContext is constructed in server.rs.
     pub async fn set_reply_ctx(&self, ctx: Arc<crate::channel_reply::ReplyContext>) {
