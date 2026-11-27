@@ -71,6 +71,12 @@ impl Harness {
     async fn insert_rule(&self, id: &str, action: Value) {
         self.store
             .insert_rule(&AutopilotRuleRow {
+                active_window: None,
+                run_policy: None,
+                owner_department: None,
+                created_by_user_id: None,
+                updated_by_user_id: None,
+                updated_at: None,
                 id: id.into(),
                 name: format!("rule {id}"),
                 enabled: true,
@@ -1088,6 +1094,12 @@ async fn a_forged_security_event_row_is_ignored() {
     let h = Harness::new();
     h.store
         .insert_rule(&AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "sec".into(),
             name: "on security".into(),
             enabled: true,

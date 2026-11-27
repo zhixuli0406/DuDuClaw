@@ -4405,6 +4405,12 @@ mod tests {
             action["screen"] = s;
         }
         AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "rule-screen".into(),
             name: "screened".into(),
             enabled: true,

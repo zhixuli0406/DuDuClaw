@@ -180,6 +180,12 @@ pub(crate) fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
         // P4-1: induced-rule provenance ({induced, induced_at, fingerprint, source});
         // null for hand-authored rules. Lets the dashboard badge PBD-induced rules.
         "metadata": r.metadata.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "active_window": r.active_window.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "run_policy": r.run_policy.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "owner_department": r.owner_department,
+        "created_by_user_id": r.created_by_user_id,
+        "updated_by_user_id": r.updated_by_user_id,
+        "updated_at": r.updated_at,
     })
 }
 

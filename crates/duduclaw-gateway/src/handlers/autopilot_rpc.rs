@@ -87,6 +87,12 @@ impl MethodHandler {
         };
 
         let row = AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: uuid::Uuid::new_v4().to_string(),
             name,
             enabled: true,

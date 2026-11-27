@@ -71,6 +71,12 @@ async fn autopilot_list_respects_enabled_only() {
     let store = duduclaw_gateway::autopilot_store::AutopilotStore::open(tmp.path()).unwrap();
     let now = chrono::Utc::now().to_rfc3339();
     let mut enabled = duduclaw_gateway::autopilot_store::AutopilotRuleRow {
+        active_window: None,
+        run_policy: None,
+        owner_department: None,
+        created_by_user_id: None,
+        updated_by_user_id: None,
+        updated_at: None,
         id: "r1".into(),
         name: "r1".into(),
         enabled: true,

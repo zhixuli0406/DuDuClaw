@@ -412,6 +412,12 @@ mod tests {
 
     fn rule(action: serde_json::Value, conditions: serde_json::Value) -> AutopilotRuleRow {
         AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r-1".into(),
             name: "測試規則".into(),
             enabled: true,
@@ -613,6 +619,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AutopilotStore::open(dir.path()).unwrap();
         let row = AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r-42".into(),
             name: "迴圈規則".into(),
             enabled: true,
@@ -664,6 +676,12 @@ mod tests {
 
         let store = AutopilotStore::open(dir.path()).unwrap();
         let row = AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r-ok".into(),
             name: "迴圈規則".into(),
             enabled: true,
@@ -716,6 +734,12 @@ mod tests {
 
         let store = AutopilotStore::open(dir.path()).unwrap();
         let row = AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r-bad".into(),
             name: "迴圈規則".into(),
             enabled: true,
@@ -750,6 +774,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = AutopilotStore::open(dir.path()).unwrap();
         let row = AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r-7".into(),
             name: "已暫停規則".into(),
             enabled: false,
