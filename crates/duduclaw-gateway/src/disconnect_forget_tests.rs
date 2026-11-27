@@ -1,6 +1,28 @@
 use super::*;
 use crate::memory_provenance::test_msg;
 
+#[tokio::test]
+async fn t3_consumers_refuse_chat_admin() {
+    use crate::approval::chat_admin::ledger::consumer_test_support::{self, Evidence};
+    for evidence in [Evidence::Missing, Evidence::Matching] {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[memory]\nforget_source=true\n").unwrap();
+        seeded(home.path(), "alice", "private google must survive").await;
+        super::engine(home.path()).unwrap().record_connector_disconnect("google:home").await.unwrap();
+        let (id, approval) = create_batch(home.path(), "google:home", "Google").await.unwrap();
+        let conn = Connection::open(home.path().join("approvals.db")).unwrap();
+        consumer_test_support::install(&conn, &approval, evidence);
+        drop(conn);
+        enqueue_approved(home.path(), &id).await.unwrap();
+        let refused = batch(home.path(), &id).unwrap();
+        assert_eq!(refused.status, "refused", "{evidence:?}");
+        assert!(refused.approved_by.is_none());
+        assert_eq!(connection(home.path()).unwrap().query_row("SELECT COUNT(*) FROM memories", [],
+            |row| row.get::<_, u64>(0)).unwrap(), 1);
+        assert!(receipts(home.path(), None).unwrap()["receipts"].as_array().unwrap().is_empty());
+    }
+}
+
 async fn seeded(home: &Path, agent: &str, content: &str) -> String {
     seeded_at(home, agent, content, Utc::now()).await
 }

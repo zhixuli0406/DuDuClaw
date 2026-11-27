@@ -78,8 +78,13 @@ impl ApprovalBroker {
         if kind != "approval" || status != "approved" {
             return Err("activation not accepted by human".into());
         }
-        // U3: only an Admin decision in the dashboard accepts an activation.
-        if !decided_by.as_deref().is_some_and(|d| d.starts_with("dashboard:")) {
+        // Read chat authority in the same transaction as the acceptance row.
+        // A decider string alone never grants chat-admin authority.
+        if !decided_by.as_deref().is_some_and(|d| d.starts_with("dashboard:"))
+            && !super::super::store::record_in_connection(tx, &ApprovalId::from(accepted_id.to_owned()))
+                .ok().flatten()
+                .is_some_and(|rec| super::super::chat_admin::ledger::accepts(tx, &rec))
+        {
             return Err("activation must be accepted by an Admin in the dashboard".into());
         }
         let payload: Value =

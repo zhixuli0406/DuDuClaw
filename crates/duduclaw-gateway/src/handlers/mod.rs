@@ -97,6 +97,7 @@ mod accounts_basic;
 mod memory_rpc;
 mod memory_history_rpc;
 pub(crate) mod my_memory_rpc;
+mod chat_link_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -216,7 +217,7 @@ mod approvals_topology_rpc;
 pub(crate) mod approval_visibility;
 mod mail_rpc;
 mod approvals_decide;
-mod approval_decider;
+pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
 mod ticks_rpc;
@@ -683,6 +684,18 @@ impl MethodHandler {
                 return WsFrame::error_response("", &e);
             }
             return boxed_frame(|| self.handle_company(method, params, ctx)).await;
+        }
+
+        // RM-143 is available in both editions. Reserve the entire namespace
+        // before extensions; no unknown member may bypass the JWT session gate.
+        if method.split('.').take(2).eq(["me", "chat_link"]) {
+            let Some(role) = chat_link_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此聊天連結操作。");
+            };
+            if ctx.role != role {
+                return WsFrame::error_response("", "只有管理員可以連結聊天帳號。");
+            }
+            return boxed_frame(|| self.handle_chat_link_rpc(method, params, ctx)).await;
         }
 
         // RM-039 "my memory" is gateway-owned self-service: an extension must

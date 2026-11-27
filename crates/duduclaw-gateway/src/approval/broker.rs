@@ -320,7 +320,38 @@ impl ApprovalBroker {
         self.decide_unbound(id, approve, &format!("dashboard:{}", ctx.user_id), true).await
     }
 
+    /// Persist a decision from caller-verified identity. The future decision
+    /// service MUST verify a live Active Admin and matching chat proof before
+    /// using ChatAdmin, including for egress_guard records. This method does
+    /// not establish identity from the approval payload or tool arguments.
+    /// Dashboard follows ordinary decide; egress still uses the existing
+    /// decide_egress_dashboard entry point with its live role check.
+    pub(crate) async fn decide_as(
+        &self,
+        id: &ApprovalId,
+        approve: bool,
+        by: &chat_admin::DecisionActor,
+    ) -> Result<(), String> {
+        match by {
+            chat_admin::DecisionActor::Dashboard { user_id } => {
+                self.decide_unbound(id, approve, &format!("dashboard:{user_id}"), false).await
+            }
+            chat_admin::DecisionActor::ChatAdmin(entry) => {
+                self.decide_unbound_inner(
+                    id, approve, &entry.decided_by().to_string(), true, Some(entry),
+                ).await
+            }
+        }
+    }
+
     async fn decide_unbound(&self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool) -> Result<(), String> {
+        self.decide_unbound_inner(id, approve, decided_by, egress_admin, None).await
+    }
+
+    async fn decide_unbound_inner(
+        &self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool,
+        ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<(), String> {
         let rec = self
             .store
             .get(id)
@@ -354,10 +385,11 @@ impl ApprovalBroker {
         } else {
             ApprovalStatus::Denied
         };
-        let n = self
-            .store
-            .decide_if_pending(id, new_status, decided_by, &Utc::now().to_rfc3339())
-            .await?;
+        let decided_at = Utc::now().to_rfc3339();
+        let n = match ledger {
+            Some(entry) => self.store.decide_if_pending_with_ledger(id, approve, entry, &decided_at).await?,
+            None => self.store.decide_if_pending(id, new_status, decided_by, &decided_at).await?,
+        };
         if n == 0 {
             // Lost the race to another decider between get() and update.
             return Err(format!("approval {id} was decided concurrently"));
@@ -517,6 +549,30 @@ impl ApprovalBroker {
         }
         info!(approval_id = %id, decision = status.as_str(), decided_by, "approval decided (leased)");
         Ok(())
+    }
+
+    /// Actor-aware equivalent of decide_as while an org-change decision
+    /// lease owns the row. Preserve the lease/TTL contract and atomically
+    /// consume the receipt with the ledger and decision; never release the
+    /// lease just to use an ordinary unleased write.
+    pub(crate) async fn decide_as_with_lease(
+        &self, id: &ApprovalId, lease: &DecisionLease, approve: bool,
+        actor: &chat_admin::DecisionActor,
+    ) -> Result<(), String> {
+        match actor {
+            chat_admin::DecisionActor::Dashboard { user_id } =>
+                self.decide_with_lease(id, lease, approve, &format!("dashboard:{user_id}")).await,
+            chat_admin::DecisionActor::ChatAdmin(entry) => {
+                let n = self.store.decide_leased_with_ledger(
+                    id, &lease.token, approve, entry, &Utc::now().to_rfc3339(),
+                ).await?;
+                if n == 0 {
+                    return Err(format!("approval {id}: the decision lease lapsed or the row is no longer pending"));
+                }
+                info!(approval_id = %id, decided_by = %entry.decided_by(), "approval decided (leased chat-admin)");
+                Ok(())
+            }
+        }
     }
 
     /// Test-only seam: stamp the delivered notification destination without
