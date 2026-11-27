@@ -341,6 +341,7 @@ pub mod deep_link;
 pub mod delegation;
 /// WP21 C1 — delegation gate on the bus-consumption path (`dispatcher.rs`).
 pub mod delegation_gate;
+pub mod delegation_roles;
 pub mod delegation_router;
 pub mod direct_api;
 pub mod discord;

@@ -100,6 +100,7 @@ impl TaskStore {
                 }
             } else {
                 duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
+                self.revoke_initiator(id);
                 tx.execute(
                     "UPDATE tasks
                         SET status = 'done', result_summary = ?2,
@@ -162,6 +163,7 @@ impl TaskStore {
                 None
             })
             .flatten();
+        self.revoke_initiator(id);
         let n = conn
             .execute(
                 "UPDATE tasks
@@ -527,6 +529,7 @@ impl TaskStore {
         // H11: the pause is over on every branch — clear the class so a task
         // sent back around the loop (or closed out) never renders a stale
         // 「卡住沒進展」chip from the pause a human just resolved.
+        if matches!(decision, "done" | "abort") { self.revoke_initiator(id); }
         let n = match decision {
             "retry" => tx
                 .execute(
@@ -765,6 +768,7 @@ impl TaskStore {
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
         let now = Utc::now().to_rfc3339();
+        self.revoke_initiator(id);
         let n = conn
             .execute(
                 "UPDATE tasks

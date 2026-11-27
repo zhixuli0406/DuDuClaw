@@ -1191,8 +1191,7 @@ impl McpDispatcher {
                     gate_agent,
                     || crate::mcp::caller_token_verified(&self.home_dir, gate_agent),
                 )
-                && duduclaw_core::delegation_policy_from_home(&self.home_dir)
-                    == duduclaw_core::DelegationPolicy::Disabled
+                && crate::mcp::delegation_roles::none_policy(&self.home_dir, gate_agent).await.blocks(tool_name)
             {
                 // Audited by the shared denial path below (error class
                 // `delegation_disabled`), after background admission.

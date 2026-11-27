@@ -119,6 +119,7 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
+        self.revoke_initiator(id);
         let result = conn.execute("UPDATE tasks SET status=?3,result_summary=?4,completed_at=?5,updated_at=?5,lease_expires_at=NULL
             WHERE id=?1 AND kind='discovery' AND status='in_progress' AND claimed_by=?2",
             params![id, worker, if success {"done"} else {"failed"}, summary, Utc::now().to_rfc3339()])
@@ -130,6 +131,7 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
+        self.revoke_initiator(id);
         let result = conn.execute("UPDATE tasks SET status='failed',blocked_reason='discovery interrupted; create a new run to retry',lease_expires_at=NULL,updated_at=?3
             WHERE id=?1 AND kind='discovery' AND status='in_progress' AND lease_expires_at=?2",
             params![id, scanned_expiry, Utc::now().to_rfc3339()]).map(|n| n == 1).map_err(|e| e.to_string())?;
@@ -140,6 +142,7 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
+        self.revoke_initiator(id);
         let result = conn.execute("UPDATE tasks SET status='cancelled',blocked_reason=?2,updated_at=?3,completed_at=?3
             WHERE id=?1 AND kind='discovery' AND status IN ('pending_approval','queued','in_progress')",
             params![id, reason, Utc::now().to_rfc3339()]).map(|n| n == 1).map_err(|e| e.to_string())?;
@@ -152,6 +155,7 @@ impl TaskStore {
         let mut connection = self.conn.lock().await;
         let conn = begin_live_write(&mut connection)?;
         verify_live_io()?;
+        self.revoke_initiator(id);
         let result = conn.execute("UPDATE tasks SET status='cancelled',blocked_reason=?2,updated_at=?3,completed_at=?3
             WHERE id=?1 AND kind='discovery' AND status='pending_approval'",
             params![id, reason, Utc::now().to_rfc3339()]).map(|n| n == 1).map_err(|e| e.to_string())?;
