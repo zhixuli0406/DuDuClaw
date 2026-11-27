@@ -2888,7 +2888,7 @@ async fn resolve_shared_route(
 /// before) for an unverified or missing identity, an inactive account, no or a
 /// stale primary (no longer bound at Owner/Operator), an employee that is gone
 /// or not active (archived, deleted, paused), one WebChat would not give this
-/// account (a main-role or gateway-default employee for a non-admin), or any
+/// account (main without an effective conversation-list grant), or any
 /// lookup failure — never a refusal.
 async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<String> {
     crate::shared_app_route::member_agent_route(ctx, "telegram", user_id).await

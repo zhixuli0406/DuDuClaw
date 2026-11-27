@@ -31,6 +31,17 @@ pub(super) async fn listed_access_effective_with_isolation(
     let agent = matches.next().ok_or_else(|| MAIN_TURN_REFUSAL.to_owned())?;
     // A name/directory collision must not prove safety for a different target.
     if matches.next().is_some() { return Err(MAIN_TURN_REFUSAL.into()); }
+    loaded_shell_free(agent)
+}
+
+/// Synchronous half of the proof, also used against the executing registry
+/// snapshot so a stale precomputed admission never blesses loaded shell tools.
+pub(crate) fn loaded_access_effective(agent: &LoadedAgent) -> Result<bool, String> {
+    if duduclaw_core::execution_gate::isolation_required() { return Ok(true); }
+    loaded_shell_free(agent)
+}
+
+fn loaded_shell_free(agent: &LoadedAgent) -> Result<bool, String> {
     let settings = crate::runtime_config::load_runtime_settings_strict(&agent.dir)
         .map_err(|_| MAIN_TURN_REFUSAL.to_owned())?;
     if settings.provider != RuntimeType::Claude

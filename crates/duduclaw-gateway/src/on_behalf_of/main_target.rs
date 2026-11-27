@@ -14,6 +14,7 @@ pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理
 mod main_tools;
 pub use main_tools::listed_access_effective;
 pub(crate) use main_tools::main_default_targets;
+pub(crate) use main_tools::loaded_access_effective;
 
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,9 +23,8 @@ pub enum MainUse {
     Assign,
 }
 
-/// RM-142 P13: the list is editable and exposed through users.me, but no
-/// conversation or assignment admission path consults it yet. Later packages
-/// switch those callers; management and scheduling retain the Admin-only gate.
+/// RM-142: opt-in admission for conversation and assignment callers;
+/// management and scheduling retain the separate Admin-only gate.
 /// Missing accounts deny; identity-store read failures are errors (callers deny).
 pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     admitted_main_role(home, user_id, use_).map(|role| role.is_some())
@@ -128,6 +128,38 @@ pub async fn check_loaded_main_target(
 ) -> Result<(), String> {
     if !requires_main_restriction(home, principal)? { return Ok(()); }
     check_loaded_restricted_target(home, agent).await
+}
+
+/// Conversation/assignment sibling; legacy management callers stay unchanged.
+/// Validate the actual loaded role, name and directory, even after routing.
+/// Call without holding the live registry lock: the tool proof loads agents.
+pub async fn check_loaded_main_target_for(
+    home: &Path, principal: Option<&str>, agent: &LoadedAgent, use_: MainUse,
+) -> Result<(), String> {
+    // Preserve Admin/background/unmapped behavior and reject unknown identities.
+    if !requires_main_restriction(home, principal)? { return Ok(()); }
+    let default = crate::webchat::access::gateway_default_id(home).await
+        .map_err(|_| REFUSAL.to_owned())?;
+    if agent.config.agent.role != AgentRole::Main && agent.config.agent.name != default
+        && agent.dir.file_name().and_then(|name| name.to_str()) != Some(default.as_str())
+    {
+        return Ok(());
+    }
+    let target = agent.dir.file_name().and_then(|name| name.to_str())
+        .ok_or_else(|| REFUSAL.to_owned())?;
+    let restricted = Box::pin(requires_main_restriction_for_target(home, principal, target, use_)).await;
+    if matches!(restricted, Ok(false)) {
+        // A shell-free file must not bless a stale loaded config with a shell.
+        if loaded_access_effective(agent).unwrap_or(false) {
+            return Ok(());
+        }
+    }
+    let listed = match super::super::PrincipalState::from_wire(principal) {
+        super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
+            main_access_allowed(home, &id, use_).unwrap_or(false),
+        _ => false,
+    };
+    Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
 }
 
 async fn check_loaded_restricted_target(home: &Path, agent: &LoadedAgent) -> Result<(), String> {

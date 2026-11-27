@@ -191,7 +191,7 @@ pub(crate) fn assign_right_under(
     else {
         return AssignRight::Denied;
     };
-    if !access.webchat_allows(loaded) {
+    if !access.webchat_allows_work(loaded) {
         return AssignRight::Denied;
     }
     if crate::machine_employee::requires_admin(loaded)

@@ -52,8 +52,9 @@ impl WebChatState {
         if is_widget_visitor(user) { return Ok(None); }
         let snapshot = self.acl_snapshot(user).await.map_err(|_| "unavailable")?;
         if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(None); }
-        let default = gateway_default_id(&self.ctx.home_dir).await.map_err(|_| "unavailable")?;
-        let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
+        let sender = SenderAccess::from_effective(snapshot.access.clone())
+            .for_webchat_converse(&self.ctx.home_dir).await;
+        if !sender.webchat_scope.as_ref().is_some_and(|s| s.available) { return Err("unavailable"); }
         let db = self.user_db.clone();
         let uid = user.to_owned();
         let primary = tokio::task::spawn_blocking(move || db.member_avatar_or_primary(&uid))
@@ -115,6 +116,13 @@ impl WebChatState {
         if matches.next().is_some() { return Err(not_found()); }
         if !(admin && stops_work) {
             self.authorize_target(user, &row.agent_id, false).await?;
+            // Resuming scheduled work does not inherit Converse admission.
+            let sender = SenderAccess::from_effective(snapshot.access)
+                .for_webchat(gateway_default_id(&self.ctx.home_dir).await);
+            let reg = self.ctx.registry.read().await;
+            if !reg.get(&row.agent_id).is_some_and(|a| sender.webchat_allows_work(a)) {
+                return Err(agent_unavailable());
+            }
         }
         // Bind subsequent command execution to the checked row, never resolve
         // the short display number against a second potentially changed list.
@@ -140,8 +148,8 @@ impl WebChatState {
         self.authorize_target_inner(user, agent, true).await
     }
 
-    /// Repeated before admission and after FIFO waiting. No default/public grant
-    /// can turn a main agent into a callable dashboard target.
+    /// Repeated before admission and after FIFO waiting. Only an effective
+    /// person-list grant can open main conversations to a non-Admin.
     pub(crate) async fn authorize_target(&self, user: &str, agent: &str, public: bool) -> Result<(), ChatMessage> {
         self.authorize_target_inner(user, agent, public).await
     }
@@ -202,8 +210,8 @@ impl WebChatState {
             }
         }
         if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }
-        let default = gateway_default_id(&self.ctx.home_dir).await.map_err(|_| denied("config_unavailable"))?;
-        let sender = SenderAccess::from_effective(snapshot.access.clone()).for_webchat(Ok(default));
+        let sender = SenderAccess::from_effective(snapshot.access.clone())
+            .for_webchat_converse(&self.ctx.home_dir).await;
         let reg = self.ctx.registry.read().await;
         let loaded = reg.get(agent).ok_or_else(|| denied("unknown_agent"))?;
         if !target_allowed(&sender, loaded, public) {
@@ -243,9 +251,8 @@ pub(crate) fn assignment_text_allowed(
 /// Whether `agent` may be what a dashboard account talks to by default: the
 /// filter WebChat applies to a non-admin account's candidates (and so to its
 /// AI avatar or legacy primary) — live, the account may hand it work (Operator or above, or
-/// Admin), and the WebChat target rules allow it (no main-role or gateway
-/// default employee for non-admins; `sender` should carry
-/// [`SenderAccess::for_webchat`] so those rules apply). The Telegram shared
+/// Admin), or the effective main conversation list admits them. `sender` should
+/// use [`SenderAccess::for_webchat_converse`] so those rules apply. The Telegram shared
 /// bot's primary-employee route (RM-172) uses the same check, so an employee
 /// the account may no longer use is skipped there exactly as in WebChat.
 ///
@@ -273,7 +280,7 @@ pub(crate) fn primary_candidate_under(
         crate::trigger_route::Sender::Unmapped => false,
     };
     agent.config.agent.status.is_operational()
-        && may_assign
+        && (may_assign || sender.main_converse_allowed(agent))
         && !sender.personal_denied_under(name, restriction)
         && sender.webchat_allows(agent)
         && sender.may_call_under(agent, None, restriction)
@@ -284,11 +291,11 @@ fn target_allowed(sender: &SenderAccess, loaded: &duduclaw_agent::registry::Load
     sender.webchat_allows(loaded)
         && loaded.config.agent.status.is_operational()
         && sender.may_call(loaded, None)
-        && matches!(&sender.sender,
+        && (sender.main_converse_allowed(loaded) || matches!(&sender.sender,
             crate::trigger_route::Sender::Account { access, .. }
                 if !access.level(&loaded.config.agent.name).is_some_and(|(level, _)|
                     !level.at_least(duduclaw_auth::AccessLevel::Operator))
-                    && (public || access.may_assign(&loaded.config.agent.name)))
+                    && (public || access.may_assign(&loaded.config.agent.name))))
 }
 
 pub(super) async fn user_session_info(

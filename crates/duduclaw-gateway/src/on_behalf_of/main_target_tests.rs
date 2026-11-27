@@ -123,6 +123,27 @@ fn write_main(f: &Fixture, extra: &str) {
 }
 
 #[tokio::test]
+async fn converse_loaded_gate_uses_role_default_name_and_directory_without_changing_legacy() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let mut loaded = AgentRegistry::load_agent(&f.dir.path().join("agents/main")).await.unwrap();
+    let wire = format!("user:{}", f.emp);
+    assert!(check_loaded_main_target_for(f.dir.path(), Some(&wire), &loaded, MainUse::Converse).await.is_ok());
+    assert!(check_loaded_main_target(f.dir.path(), Some(&wire), &loaded).await.is_err());
+    // The configured default also counts when it is a specialist.
+    loaded.config.agent.role = AgentRole::Specialist;
+    assert!(check_loaded_main_target_for(f.dir.path(), Some(&wire), &loaded, MainUse::Converse).await.is_ok());
+    loaded.config.agent.name = "renamed-main".into();
+    f.db.set_main_agent_users(&f.admin, &[], true).unwrap();
+    assert!(check_loaded_main_target_for(f.dir.path(), Some(&wire), &loaded, MainUse::Converse).await.is_err());
+    // Ordinary non-main targets preserve their existing gate behavior.
+    loaded.dir = f.dir.path().join("agents/ordinary");
+    assert!(check_loaded_main_target_for(f.dir.path(), Some(&wire), &loaded, MainUse::Converse).await.is_ok());
+}
+
+#[tokio::test]
 async fn listed_shell_turns_are_restricted_but_admin_is_unaffected() {
     let f = fixture(Some(EditionProfile::Enterprise));
     write_main(&f, "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
