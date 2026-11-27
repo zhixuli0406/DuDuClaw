@@ -1,8 +1,8 @@
 //! W8: one entry table crossed with every effective configuration state.
 //!
 //! Not gated yet (later packages): background/dispatch (cron, reminder,
-//! heartbeat, goal-loop tick, claude_runner, runtime_dispatch), and the channel
-//! trigger-word block in channel_reply/inner.rs. MCP tasks_create/tasks_update
+//! heartbeat, goal-loop tick, claude_runner, runtime_dispatch without a chat
+//! snapshot). MCP tasks_create/tasks_update
 //! live in the CLI crate and retain their own tests in mcp/tasks.rs.
 //!
 //! Contract exceptions deliberately not disguised as shared-code rows:
@@ -174,9 +174,17 @@ macro_rules! row {
 enum Entry {
     Channel, Arrival, Turn(bool), Pending, AgUi, Command(&'static str), Attachment,
     Goal, Admission, ChatGoal, Schedule, Rpc(&'static str), Retry, Kickoff, Bound,
+    TriggerPending, TriggerMention, TriggerReply, AssignArm(bool),
 }
 const ROWS: &[Row] = &[
     row!("channel pipeline", true, Entry::Channel),
+    row!("channel trigger pending pipeline", false, Entry::TriggerPending),
+    row!("channel trigger bare mention pipeline", false, Entry::TriggerMention),
+    // Public conversations bypass messaging-app trigger routing. Exercise the
+    // exact pending-execution seam with their original session separately.
+    row!("trigger assignment reply session", true, Entry::TriggerReply),
+    row!("trigger assignment arm", true, Entry::AssignArm(false)),
+    row!("trigger assignment admission arm", true, Entry::AssignArm(true)),
     row!("WebChat arrival", true, Entry::Arrival),
     row!("WebChat turn", true, Entry::Turn(false)),
     row!("WebChat turn with attachment", true, Entry::Turn(true)),
@@ -203,10 +211,13 @@ fn request() -> GoalCreateRequest {
         description: "整理報表".into(), ..Default::default() }
 }
 async fn command(f: &Fixture, case: Case, text: &str) -> String {
+    command_in_session(f, case.session, text).await
+}
+async fn command_in_session(f: &Fixture, session: &str, text: &str) -> String {
     let cmd = crate::chat_commands::parse_command(text, None).expect("ChatCommand");
     crate::chat_commands::handle_gated_command(&cmd, &f.ctx,
-        &crate::chat_commands::CommandOrigin { channel: "telegram", gate_session: case.session,
-            command_session: case.session, sender: "42", text, shared: false },
+        &crate::chat_commands::CommandOrigin { channel: "telegram", gate_session: session,
+            command_session: session, sender: "42", text, shared: false },
         if matches!(cmd, crate::chat_commands::ChatCommand::Assign(_)) { "main" } else { "worker" },
     ).await
 }
@@ -221,6 +232,58 @@ async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
                 assert!(text.contains("Actual Worker"), "{text}");
                 EntryResult::result(Ok(()))
             } else { EntryResult::result(Err(text)) }
+        }
+        Entry::TriggerPending | Entry::TriggerMention | Entry::TriggerReply | Entry::AssignArm(_) => {
+            use crate::trigger_route::{assign, pending};
+            let session = format!("{}:trigger:{}", case.session, uuid::Uuid::new_v4());
+            let key = pending::PendingKey::new("telegram", &session, "42");
+            let caller = assign::AssignCaller {
+                home: f.home(), channel: "telegram", conversation: &session, sender: "42",
+                event: Some("entry-trigger"), seq: pending::next_seq(), fallback: Some("main"),
+                access: crate::trigger_route::access::for_channel_sender(f.home(), "telegram", "42"),
+            };
+            let spy = crate::channel_reply::reply_origin::testing::NoImplicitCloud::at(f.home());
+            let reply = match entry {
+                Entry::TriggerPending => {
+                    // Represents an assignment armed while the target was healthy.
+                    pending::arm_kind(&key, "worker", pending::PendingKind::Assign, "prior", caller.seq);
+                    crate::channel_reply::inner::build_reply_with_session_inner(
+                        "整理報表", &f.ctx, None, &session, "42", None,
+                    ).await
+                }
+                Entry::TriggerMention => crate::channel_reply::inner::build_reply_with_session_inner(
+                    "@worker", &f.ctx, None, &session, "42", None,
+                ).await,
+                Entry::TriggerReply => crate::channel_reply::inner::run_trigger_assignment(
+                    &f.ctx, "worker", "整理報表", &caller,
+                ).await,
+                Entry::AssignArm(admission) => {
+                    if admission {
+                        let registry = f.ctx.registry.read().await;
+                        assign::arm_on_admission(&registry, "/交辦 @worker", &caller);
+                        assert_eq!(pending::peek_kind(&key, pending::next_seq()).is_some(), case.healthy());
+                    }
+                    command_in_session(f, &session, "/交辦 @worker").await
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(spy.counts(), [0, 0]);
+            assert_eq!(f.calls.load(Ordering::SeqCst), 0);
+            let arms = matches!(entry, Entry::TriggerMention | Entry::AssignArm(_));
+            let waiting = pending::peek_kind(&key, pending::next_seq());
+            assert_eq!(waiting.is_some(), case.healthy() && arms, "{reply}");
+            if let Some((id, kind)) = waiting {
+                assert_eq!(id, "worker");
+                assert_eq!(kind, if matches!(entry, Entry::TriggerMention) {
+                    pending::PendingKind::Chat
+                } else { pending::PendingKind::Assign });
+                pending::cancel(&key, "test-cleanup", pending::next_seq());
+            }
+            if case.healthy() {
+                assert!(!reply.is_empty());
+                assert_eq!(f.counts().await.0, usize::from(!arms), "{reply}");
+                EntryResult::result(Ok(()))
+            } else { EntryResult::result(Err(reply)) }
         }
         Entry::Arrival => EntryResult::result(web::arrival(&f.chat, &f.admin.user_id, case.session, "整理報表", true).await),
         Entry::Turn(attach) => {

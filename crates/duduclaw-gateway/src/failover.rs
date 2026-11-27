@@ -320,7 +320,7 @@ impl FailoverManager {
         // only when that candidate actually passed the family checks.
         if model_source == "agent_fallbacks" {
             if let Some(dir) = context.agent_dir.as_deref() {
-                let single = crate::runtime_config::agent_fallback_model(dir);
+                let single = crate::runtime_dispatch::chat_fallback_model(dir);
                 if let Some(single) = single {
                     let candidate = vec![single];
                     if resolve_fallback_model(fb, "", &candidate)
