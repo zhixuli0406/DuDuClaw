@@ -102,6 +102,10 @@ impl MethodHandler {
         }
 
         match method {
+            "google.drive_write.get" | "google.drive_write.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_drive_write_rpc(method, params, ctx)).await
+            }
             "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
             | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove"
             | "mfa.recovery_regenerate" | "mfa.disable" => {
@@ -116,7 +120,8 @@ impl MethodHandler {
             method if super::odoo_member_rpc::owns(method) => {
                 boxed_frame(|| self.handle_odoo_member_rpc(method, params, ctx)).await
             }
-            "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            "me.google.write_confirmations" | "me.google.write_confirm"
+            | "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
             | "me.google.write_connect_start"
             | "me.google.write_disconnect"
             | "me.google.connect_start"
@@ -415,6 +420,9 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────

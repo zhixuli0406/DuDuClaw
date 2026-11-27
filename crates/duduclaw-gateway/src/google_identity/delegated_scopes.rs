@@ -1,6 +1,16 @@
 //! Closed service scope groups. Unknown operations never receive a broad token.
 use std::path::Path;
 
+pub(in crate::google_identity) const DRIVE_WRITE_SCOPES: &[&str] = &[
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/documents",
+    "https://www.googleapis.com/auth/spreadsheets",
+];
+
+pub(in crate::google_identity) fn for_drive_write() -> &'static [&'static str] {
+    DRIVE_WRITE_SCOPES
+}
+
 pub(crate) const SERVICES: &[(&str, &[&str])] = &[
     ("gmail", &["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.compose"]),
     ("calendar", &["https://www.googleapis.com/auth/calendar.events", "https://www.googleapis.com/auth/calendar.calendarlist.readonly"]),
@@ -23,6 +33,9 @@ pub(crate) fn for_service(home: &Path, service: &str) -> Result<&'static [&'stat
 }
 
 pub(crate) fn for_tool(home: &Path, tool: &str) -> Result<&'static [&'static str], super::Refusal> {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) {
+        return Err(super::Refusal::hard("scope_missing", "這項操作不能取得 Google 權杖。"));
+    }
     if tool == "google_chat_send" {
         return if crate::google_workspace::chat_send_enabled(home) { Ok(crate::google_workspace::CHAT_SEND_SCOPES) }
             else { Err(super::Refusal::hard("scope_missing", crate::google_workspace::chat_send::GUIDANCE)) };
@@ -59,6 +72,35 @@ pub(crate) fn for_endpoint(home: &Path, endpoint: &str) -> Result<&'static [&'st
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordinary_scope_tables_never_grant_drive_write() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"), "[google]\nchat_read=true\nchat_send=true").unwrap();
+        for tool in duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS {
+            if let Ok(scopes) = for_tool(home.path(), tool) {
+                assert!(!scopes.contains(&DRIVE_WRITE_SCOPES[0]), "{tool}");
+            }
+        }
+        for endpoint in [
+            "https://gmailmcp.googleapis.com/mcp/v1", "https://calendarmcp.googleapis.com/mcp/v1",
+            "https://docsmcp.googleapis.com/mcp/v1", "https://sheetsmcp.googleapis.com/mcp/v1",
+            "https://drivemcp.googleapis.com/mcp/v1", "https://slidesmcp.googleapis.com/mcp/v1",
+            "https://chatmcp.googleapis.com/mcp/v1", "unknown",
+        ] {
+            if let Ok(scopes) = for_endpoint(home.path(), endpoint) {
+                assert!(!scopes.contains(&DRIVE_WRITE_SCOPES[0]), "{endpoint}");
+            }
+        }
+        assert_eq!(duduclaw_core::google_identity::DRIVE_WRITE_TOOLS.len(), 9);
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert_eq!(for_tool(home.path(), tool).unwrap_err().code, "scope_missing");
+        }
+        assert_eq!(for_drive_write(), &[
+            "https://www.googleapis.com/auth/drive", "https://www.googleapis.com/auth/documents",
+            "https://www.googleapis.com/auth/spreadsheets",
+        ]);
+    }
+
     #[test]
     fn chat_send_scope_is_independent_and_fail_closed() {
         let home = tempfile::tempdir().unwrap();

@@ -118,12 +118,20 @@ async fn token_endpoint(
         )
             .into_response();
     }
+    if local == "p8-missing-scope" {
+        return axum::Json(json!({"access_token":"fixture-secret", "expires_in":3600,
+            "scope":"https://www.googleapis.com/auth/drive.readonly"})).into_response();
+    }
+    if local == "p8-explicit-scope" {
+        return axum::Json(json!({"access_token":"fixture-secret", "expires_in":3600,
+            "scope": c["scope"]})).into_response();
+    }
     if local == "write-scope" {
         return axum::Json(json!({"access_token":"isolated-delegate-secret", "expires_in":3600,
             "token_type":"Bearer", "scope":format!("{} {}", c["scope"].as_str().unwrap_or(""), crate::google_personal::oauth::DRIVE_WRITE_SCOPE)})).into_response();
     }
     axum::Json(
-        json!({"access_token":if headers.get("x-duduclaw-w3-owned-issuer").is_some(){closed_fixture_token(&sub)}else{format!("tok:{sub}")}, "expires_in": 3600, "token_type": "Bearer"}),
+        json!({"access_token":if headers.get("x-duduclaw-w3-owned-issuer").is_some() || local.starts_with("p8-"){closed_fixture_token(&sub)}else{format!("tok:{sub}")}, "expires_in": 3600, "token_type": "Bearer"}),
     )
     .into_response()
 }
@@ -210,6 +218,10 @@ async fn service_endpoint(
         .lock()
         .unwrap()
         .push((account.clone(), uri.to_string()));
+    if account == "p8-probe-denied@c.test" {
+        return (axum::http::StatusCode::FORBIDDEN,
+            axum::Json(json!({"error":{"message":"fixture-provider-detail"}}))).into_response();
+    }
     for code in [429u16, 503] {
         if uri
             .path()
@@ -1158,3 +1170,6 @@ async fn delegated_token_actual_write_scope_refuses_even_on_cache_hit_and_home_f
     assert!(!audit.contains("isolated-delegate-secret"));
     assert!(audit.contains("write_scope_isolated"));
 }
+
+#[path = "drive_write_check_tests.rs"]
+mod drive_write_check_tests;

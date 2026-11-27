@@ -177,7 +177,7 @@ impl ApprovalVisibility {
                 && self.admin_ai_reader.as_deref() == Some(fresh.user_id.as_str())
                 && record.payload["admin_user_id"].as_str() == Some(fresh.user_id.as_str());
         }
-        if crate::google_identity::chat_send::is_member_card(record) { return false; }
+        if crate::google_identity::member_card::is_member_card(record) { return false; }
         if !fresh.has_role(UserRole::Manager) || fresh.requires_password_change() { return false; }
         if !fresh.is_admin() && self.employee_requires_admin != Some(false) { return false; }
         let allowed = match dashboard_only_reader(record) {

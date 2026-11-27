@@ -809,9 +809,6 @@ impl McpDispatcher {
         }
         let params = &clean_params;
         let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-        if duduclaw_core::google_identity::is_drive_write_tool(tool_name) {
-            return jsonrpc_error(id, -32003, "雲端硬碟寫入只能由主程式執行。");
-        }
         if let Err(message) = duduclaw_gateway::google_workspace::validate_native_tool_inputs(
             tool_name, params.get("arguments").unwrap_or(&Value::Null),
         ) {
@@ -833,6 +830,12 @@ impl McpDispatcher {
         // whitelist, namespace isolation and the per-key rate limiter stay on
         // `principal.client_id`.
         let gate_agent: &str = acting_gate_agent(principal, &self.default_agent);
+        if let Some(message) = crate::mcp::drive_write_refusal(
+            &self.home_dir, gate_agent, tool_name, principal,
+            &crate::mcp_isolation::process_lane(),
+        ) {
+            return jsonrpc_error(id, -32003, &message);
+        }
         // RM-134 fourth review (Medium 2): a principal acting as its bound
         // employee over HTTP exercises only per-employee scopes — `admin`
         // never stands in for another scope on it (scope gates below,

@@ -27,7 +27,7 @@
 //! and writes nothing, so the dashboard can validate a form before committing
 //! it — the same shape `odoo.test` already has.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use duduclaw_db::{
     ALLOW_ALL_TABLES, DbError, Driver, LoadedDbSources, clamp_max_rows, clamp_timeout_ms,
@@ -162,7 +162,7 @@ async fn upsert(home_dir: &Path, params: Value) -> WsFrame {
     };
 
     let config_path = home_dir.join("config.toml");
-    let mut doc = match read_config_doc(&config_path).await {
+    let (mut doc, expected_hash) = match read_config_doc(&config_path).await {
         Ok(d) => d,
         Err(msg) => return WsFrame::error_response("", &msg),
     };
@@ -194,7 +194,7 @@ async fn upsert(home_dir: &Path, params: Value) -> WsFrame {
     if let Err(msg) = crate::disconnect_forget::connections::mark_connecting(home_dir, &format!("db:{name}")) {
         return WsFrame::error_response("", &msg);
     }
-    if let Err(msg) = commit(&config_path, &doc).await {
+    if let Err(msg) = commit(&config_path, expected_hash, &doc).await {
         return WsFrame::error_response("", &msg);
     }
 
@@ -214,7 +214,7 @@ async fn remove(
         Err(msg) => return WsFrame::error_response("", &msg),
     };
     let config_path = home_dir.join("config.toml");
-    let mut doc = match read_config_doc(&config_path).await {
+    let (mut doc, expected_hash) = match read_config_doc(&config_path).await {
         Ok(d) => d,
         Err(msg) => return WsFrame::error_response("", &msg),
     };
@@ -226,7 +226,7 @@ async fn remove(
     if !removed {
         return WsFrame::error_response("", &format!("資料來源「{name}」不存在"));
     }
-    if let Err(msg) = commit(&config_path, &doc).await {
+    if let Err(msg) = commit(&config_path, expected_hash, &doc).await {
         return WsFrame::error_response("", &msg);
     }
     // WP-A: the grants go with the source. Leaving them behind was defensible
@@ -547,14 +547,15 @@ fn tables_json(tables: &[duduclaw_db::TableInfo]) -> Vec<Value> {
 /// than an empty document, so a rewrite can never silently discard an operator's
 /// existing config because of an unrelated typo (the `read_config_table_strict`
 /// rule in `handlers.rs`).
-async fn read_config_doc(path: &Path) -> Result<toml_edit::DocumentMut, String> {
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => content
-            .parse::<toml_edit::DocumentMut>()
-            .map_err(|e| format!("設定檔解析失敗，拒絕覆寫：{e}")),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(toml_edit::DocumentMut::new()),
-        Err(e) => Err(format!("設定檔讀取失敗：{e}")),
-    }
+async fn read_config_doc(path: &Path) -> Result<(toml_edit::DocumentMut, String), String> {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("設定檔讀取失敗：{e}")),
+    };
+    let doc = content.parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("設定檔解析失敗，拒絕覆寫：{e}"))?;
+    Ok((doc, crate::handlers::config_commit::content_hash(&content)))
 }
 
 fn existing_block(doc: &toml_edit::DocumentMut, name: &str) -> Option<toml::Table> {
@@ -614,16 +615,11 @@ fn write_block(
     Ok(())
 }
 
-async fn commit(path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), String> {
-    let tmp: PathBuf = path.with_extension("toml.tmp");
-    tokio::fs::write(&tmp, doc.to_string())
-        .await
-        .map_err(|e| format!("寫入設定檔失敗：{e}"))?;
-    if let Err(e) = tokio::fs::rename(&tmp, path).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(format!("套用設定檔失敗：{e}"));
-    }
-    Ok(())
+async fn commit(path: &Path, expected_hash: String, doc: &toml_edit::DocumentMut) -> Result<(), String> {
+    let table = doc.to_string().parse::<toml::Table>()
+        .map_err(|e| format!("設定檔解析失敗，拒絕覆寫：{e}"))?;
+    // Bind the final write to the pre-probe snapshot, including Drive consent.
+    crate::handlers::config_commit::commit_table_locked(path, expected_hash, &table).await
 }
 
 // ── Small helpers ───────────────────────────────────────────────────────────
@@ -696,6 +692,25 @@ mod tests {
 
     fn config_text(dir: &Path) -> String {
         std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn db_source_commit_refuses_drive_write_edits_and_stale_consent() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let original = "# keep\n[google.drive_write]\ncreate = false\n";
+        std::fs::write(&path, original).unwrap();
+        let (mut doc, hash) = read_config_doc(&path).await.unwrap();
+        doc["google"]["drive_write"]["create"] = toml_edit::value(true);
+        let error = commit(&path, hash, &doc).await.unwrap_err();
+        assert!(error.contains("Google 整合設定頁"), "{error}");
+        assert_eq!(config_text(home.path()), original);
+
+        let (doc, hash) = read_config_doc(&path).await.unwrap();
+        std::fs::write(&path, "# admin removed consent\n").unwrap();
+        let error = commit(&path, hash, &doc).await.unwrap_err();
+        assert!(error.contains("changed on disk"), "{error}");
+        assert_eq!(config_text(home.path()), "# admin removed consent\n");
     }
 
     #[tokio::test]

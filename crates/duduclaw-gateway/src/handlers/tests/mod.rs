@@ -125,3 +125,4 @@ mod odoo_member_rpc_tests;
 mod dept_grant_matrix_tests;
 mod dept_grants_rpc_tests;
 mod main_access_rpc_tests;
+mod google_drive_write_rpc_tests;

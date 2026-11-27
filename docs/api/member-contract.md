@@ -194,10 +194,14 @@ cannot use `users.set_primary_agent` to replace it.
 | `me.status_tokens.list` | Read | List personal external-status credentials | `enabled`, `max_active`, `endpoint_path`, `tokens` | 1.85.0 |
 | `me.status_tokens.create` | Write | Create a personal status-only credential when enabled | — | 1.85.0 |
 | `me.status_tokens.revoke` | Write | Revoke a personal status-only credential | — | 1.85.0 |
+| `me.google.write_confirmations` | Read | Read only your pending Google Drive write confirmations (display projection only) | `requests` | 1.86.0 |
+| `me.google.write_confirm` | Write | Confirm or cancel your single Google Drive write (`id`, `approve`: boolean) | `decided` | 1.86.0 |
 | `me.google.chat_confirmations` | Read | Read only your pending Google Chat confirmations | `requests` | 1.85.0 |
 | `me.google.chat_confirm` | Write | Confirm or cancel your single Google Chat send | `decided` | 1.85.0 |
 | `me.google.status` | Read | Read personal Google connection and consent status (Enterprise) | `connection`, `login_email`, `client_configured`, `chat_read`, `chat_send`, `integration_enabled`, `requests`, `delegated`, `requires_login`, `recent_usage` | 1.85.0 |
 | `me.google.connect_start` | Write | Start personal Google authorization (Enterprise) | — | 1.85.0 |
+| `me.google.write_connect_start` | Write | Start separate personal Google Drive write authorization (browser session only) | — | 1.86.0 |
+| `me.google.write_disconnect` | Write | Remove the local Google Drive write connection (browser session only) | — | 1.86.0 |
 | `me.google.connect_finish` | Write | Finish personal Google authorization (Enterprise) | — | 1.85.0 |
 | `me.google.connect_paste` | Write | Finish Google authorization using a pasted callback (Enterprise) | — | 1.85.0 |
 | `me.google.disconnect` | Write | Disconnect the personal Google account (Enterprise) | — | 1.85.0 |
@@ -350,7 +354,9 @@ the next real request observes current scopes.
 Key RPC access is the intersection of `MEMBER_CONTRACT_METHODS`, the member's
 **current** role/bindings, and all existing handler gates. Credential management,
 `users.change_password`, `users.change_email`, `mfa.*`, `sessions.*`, `config.*`,
-`me.google.connect_*`, `me.google.disconnect`, `me.google.consents.set`, `me.google.chat_confirm` and
+`me.google.connect_*`, `me.google.disconnect`, `me.google.write_connect_start`,
+`me.google.write_disconnect`, `me.google.consents.set`, `me.google.chat_confirm`,
+`me.google.write_confirmations`, `me.google.write_confirm` and
 step-up operations are excluded. Unknown methods are denied. The compatibility
 table includes browser-only methods; its presence alone is not a key grant.
 
@@ -382,6 +388,12 @@ or plaintext. Creation and revocation are also audited.
 
 The tests added for part B have not been executed in the implementation session;
 compilation, target tests and independent security review remain release gates.
+
+Drive write confirmations are browser-session operations. `me.google.write_confirmations` returns
+`{ "requests": [...] }` with escaped display fields and an expiry, never raw arguments or grants.
+`me.google.write_confirm` accepts `{ "id": "...", "approve": true }` (or `false` to cancel)
+and returns `{ "decided": true }`. Only the authenticated requesting member may decide;
+managerial roles and chat-admin authority cannot substitute for that member.
 
 ### Internal person-key MCP bridge (v1.86, 141K-P6a)
 

@@ -989,7 +989,7 @@ async fn visible_tools_for_principal_and_transport(
 
     tools()
         .filter(|t| super::main_principal_gate::refusal(main_restricted, t.name).is_none())
-        .filter(|t| !duduclaw_core::google_identity::is_drive_write_tool(t.name))
+        .filter(|t| super::drive_write_refusal(home_dir, effective_agent, t.name, principal, lane).is_none())
         .filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal))
         .filter(|t| !super::admin_ai_client::TOOLS.contains(&t.name) || admin_ai.permits(t.name))
         .filter(|t| crate::mcp_isolation::tool_allowed(t.name, principal))

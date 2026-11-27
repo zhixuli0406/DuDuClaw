@@ -17,6 +17,10 @@ pub(crate) fn has_scopes(scopes: &[String]) -> bool {
 }
 
 pub(crate) fn check_metadata(home: &Path, db: &UserDb, user: &str, metadata: &Metadata) -> Result<(), String> {
+    check_metadata_for(home, db, user, metadata, false)
+}
+
+fn check_metadata_for(home: &Path, db: &UserDb, user: &str, metadata: &Metadata, drive_read: bool) -> Result<(), String> {
     crate::google_identity::write_scope_guard::check_personal(home, metadata, &metadata.granted_scopes)
         .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
     flow::active_user(db, user)?;
@@ -33,6 +37,9 @@ pub(crate) fn check_metadata(home: &Path, db: &UserDb, user: &str, metadata: &Me
     crate::google_data_consent::require_current(metadata.google_data_consent.as_ref())?;
     if !access::domain_allowed(home, metadata)? {
         return Err("這個 Google 帳號不在管理員允許的網域內。".into());
+    }
+    if drive_read {
+        return access::check_metadata(home, metadata, "drive_read").map_err(|r| r.message_zh);
     }
     if !metadata.local_purposes.iter().any(|p| p == "meeting_recordings")
         || !has_scopes(&metadata.granted_scopes) {
@@ -51,6 +58,7 @@ fn client_fingerprint(client: &crate::mcp_oauth::McpOAuthClientConfig) -> String
 }
 
 pub(crate) struct MeetingAccess {
+    drive_read: bool,
     authority: CredentialAuthority,
     token_revision: u64,
     client_fingerprint: String,
@@ -64,7 +72,7 @@ impl MeetingAccess {
     pub(crate) fn validate(&self, home: &Path, db: &UserDb) -> Result<(), String> {
         let current = vault::authority_state(home, self.owner_id())?;
         let metadata = current.metadata.as_ref().ok_or(CHANGED)?;
-        check_metadata(home, db, self.owner_id(), metadata)?;
+        check_metadata_for(home, db, self.owner_id(), metadata, self.drive_read)?;
         let client = crate::mcp_oauth::get_client_config(home, "google").ok_or(CHANGED)?;
         if current.authority().as_ref() != Some(&self.authority)
             || metadata.revision != self.token_revision
@@ -77,7 +85,19 @@ impl MeetingAccess {
     }
 
     pub(crate) async fn get(&self, home: &Path, db: &UserDb, url: reqwest::Url) -> Result<reqwest::Response, String> {
+        let method = reqwest::Method::GET;
+        #[cfg(test)]
+        let (method, url) = crate::google_workspace::native_confirmation::TEST_DRIVE_REQUEST
+            .try_with(Clone::clone)
+            .map(|(method, url)| url.parse().map(|url| (method, url)))
+            .unwrap_or(Ok((method, url))).map_err(|_: url::ParseError| UNAVAILABLE)?;
+        if !crate::google_workspace::native_confirmation::drive_method_allowed(&method, &url) {
+            return Err(UNAVAILABLE.into());
+        }
         self.validate(home, db)?;
+        if self.drive_read && !crate::google_workspace::native_confirmation::drive_read_path_allowed(&url) {
+            return Err(UNAVAILABLE.into());
+        }
         if !allowed_endpoint(&url) { return Err(UNAVAILABLE.into()); }
         #[cfg(test)]
         let url = test_endpoint(home, &url)?;
@@ -87,9 +107,9 @@ impl MeetingAccess {
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(20))
             .read_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(30 * 60))
+            .timeout(Duration::from_secs(if self.drive_read { 15 } else { 30 * 60 }))
             .build().map_err(|_| UNAVAILABLE)?;
-        let request = client.get(url).bearer_auth(self.token.as_str())
+        let request = client.request(method, url).bearer_auth(self.token.as_str())
             .build().map_err(|_| UNAVAILABLE)?;
         self.validate(home, db)?;
         let response = client.execute(request).await.map_err(|_| UNAVAILABLE)?;
@@ -105,6 +125,9 @@ fn valid_id(id: &str) -> bool {
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
 }
 fn allowed_endpoint(url: &reqwest::Url) -> bool {
+    if !crate::google_workspace::native_confirmation::drive_method_allowed(&reqwest::Method::GET, url) {
+        return false;
+    }
     if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some()
         || url.port().is_some_and(|p| p != 443) || url.fragment().is_some()
     { return false; }
@@ -120,6 +143,16 @@ fn allowed_endpoint(url: &reqwest::Url) -> bool {
 }
 
 pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<MeetingAccess, String> {
+    resolve_for(home, db, user, false).await
+}
+
+/// Dashboard caller's ordinary personal Drive read grant. The bearer stays
+/// inside the existing personal owner and never passes through /google-token.
+pub(crate) async fn resolve_drive_read(home: &Path, db: &UserDb, user: &str) -> Result<MeetingAccess, String> {
+    resolve_for(home, db, user, true).await
+}
+
+async fn resolve_for(home: &Path, db: &UserDb, user: &str, drive_read: bool) -> Result<MeetingAccess, String> {
     // Re-read after the cross-process lease. This also serializes refreshes
     // with the existing personal OAuth owner and provider revocations.
     flow::active_user(db, user)?;
@@ -127,7 +160,7 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     let state = vault::authority_state(home, user)?;
     let authority = state.authority().ok_or(CHANGED)?;
     let metadata = state.metadata.as_ref().ok_or(CHANGED)?;
-    check_metadata(home, db, user, metadata)?;
+    check_metadata_for(home, db, user, metadata, drive_read)?;
     let client = crate::mcp_oauth::get_client_config(home, "google").ok_or(CHANGED)?;
     if client.client_id != metadata.oauth_client_id { return Err(CHANGED.into()); }
     let fingerprint = client_fingerprint(&client);
@@ -138,6 +171,7 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     { return Err(CHANGED.into()); }
     let mut secret = vault::unseal(&key, &record)?;
     let mut material = MeetingAccess {
+        drive_read,
         authority,
         token_revision: record.metadata.revision,
         client_fingerprint: fingerprint,
@@ -148,7 +182,11 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     material.validate(home, db)?;
     if secret.expires_at.is_none_or(|expiry| expiry <= chrono::Utc::now().timestamp().saturating_add(120)) {
         let refresh = secret.refresh_token.as_deref().ok_or(CHANGED)?;
-        let result = oauth::refresh_meeting(&client.client_id, &client.client_secret, refresh).await;
+        let result = if drive_read {
+            oauth::refresh(&client.client_id, &client.client_secret, refresh).await
+        } else {
+            oauth::refresh_meeting(&client.client_id, &client.client_secret, refresh).await
+        };
         material.validate(home, db)?;
         let mut tokens = match result {
             Ok(tokens) => tokens,
@@ -163,8 +201,10 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
         if tokens.secret.refresh_token.is_none() {
             tokens.secret.refresh_token = secret.refresh_token.take();
         }
-        crate::google_identity::write_scope_guard::check_personal_refresh(home, &record.metadata, tokens.granted_scopes.as_deref())
-            .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
+        tokens.granted_scopes = Some(crate::google_identity::write_scope_guard::check_personal_refresh(
+            home, &record.metadata, tokens.granted_scopes.as_deref(), &tokens.secret.access_token,
+        ).await.map_err(|r| format!("{}: {}", r.code, r.message_zh))?);
+        material.validate(home, db)?;
         if !vault::finish_refresh_with_scopes(home, &key, &record.metadata, &tokens.secret, tokens.granted_scopes.as_deref())? {
             return Err(CHANGED.into());
         }
@@ -243,6 +283,34 @@ mod tests {
         flow::finish(&f.home, &f.db, &f.alice.id, "meeting-login", state).await.unwrap();
         let material = resolve(&f.home, &f.db, &f.alice.id).await.unwrap();
         (f, material)
+    }
+
+    #[tokio::test]
+    async fn meeting_drive_refusals_never_reach_wire() {
+        use crate::google_workspace::native_confirmation::{drive_refusal_cases, TEST_DRIVE_REQUEST};
+        use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+        let (f, material) = connected_fixture().await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            seen.fetch_add(1, Ordering::SeqCst);
+            async { axum::Json(serde_json::json!({})) }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        let _endpoint = install_test_endpoint(&f.home, &base);
+        let read: reqwest::Url = "https://www.googleapis.com/drive/v3/files".parse().unwrap();
+        material.get(&f.home, &f.db, read.clone()).await.unwrap();
+        assert_eq!(count.swap(0, Ordering::SeqCst), 1);
+        for (method, url) in drive_refusal_cases() {
+            let result = TEST_DRIVE_REQUEST.scope((method.clone(), url.clone()),
+                material.get(&f.home, &f.db, read.clone())).await;
+            assert!(matches!(result, Err(ref message) if message == UNAVAILABLE), "{method} {url}");
+            assert_eq!(count.load(Ordering::SeqCst), 0);
+        }
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

@@ -705,3 +705,29 @@ mod open_file {
         assert!(matches!(ConnectorCatalog::open(home.path()), Err(CatalogError::Unavailable)));
     }
 }
+
+#[test]
+fn isolated_drive_writes_refused_before_product_selection() {
+    struct UnexpectedSelection;
+    impl LiveConnectorSelectionPolicy for UnexpectedSelection {
+        fn supports(&self, _: &str) -> bool { panic!("Drive write reached product selection") }
+        fn candidates(&self, _: &RequestContext, _: &str, _: &str)
+            -> Result<Vec<ProductConnectorAccount>, VerificationError> {
+            panic!("Drive write reached account selection")
+        }
+    }
+    let (bindings, catalog, ctx) = fixture();
+    for name in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        let mut record = ctx.record().clone();
+        record.tools = List::new(vec![text(name)]).unwrap();
+        let mut resources = record.resources.as_slice().to_vec();
+        resources.push(ResourceGrant::Employee { id: record.employee });
+        record.resources = List::new(resources).unwrap();
+        let context = RequestContext::with_live_verifier(record, Arc::new(FixtureAuthority));
+        assert!(duduclaw_mcp_boundary::tool_policy::eligible(&context, name), "{name}");
+        assert_eq!(provider_for_tool(name), None, "{name}");
+        assert!(matches!(SelectedConnector::select_with_policy(&context, name, &json!({}),
+            bindings.clone(), catalog.clone(), Some(Arc::new(UnexpectedSelection))),
+            Err(VerificationError::Invalid)), "{name}");
+    }
+}

@@ -1323,8 +1323,10 @@ async fn rejected_write_consent_and_local_disconnect_never_revoke_google() {
     enabled.create = true;
     let section = policy::render_section(&enabled,
         &policy::sign(&enabled, "admin", "admin@c.test", chrono::Utc::now()));
-    let config = format!("[integrations]\ngoogle_workspace=true\n[google.drive_write]\n{}",
-        toml::to_string(&section).unwrap());
+    let config = toml::to_string(&json!({
+        "integrations": {"google_workspace": true},
+        "google": {"drive_write": section},
+    })).unwrap();
     std::fs::write(f.home.join("config.toml"), &config).unwrap();
     let start = flow::start_drive_write(&f.home, &f.db, &f.alice.id, "login-a",
         "http://127.0.0.1:18889", &[], true, true).await.unwrap();

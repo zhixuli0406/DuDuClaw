@@ -27,6 +27,15 @@ pub(super) struct NativeStep<'a> {
     if_match: Option<String>,
 }
 impl NativeStep<'_> {
+    #[cfg(test)]
+    pub(super) fn with_test_drive_request(mut self) -> Self {
+        if let Ok((method, url)) = native_confirmation::TEST_DRIVE_REQUEST.try_with(Clone::clone) {
+            self.method = method;
+            self.url = url;
+        }
+        self
+    }
+
     pub(super) fn template(&self) -> &NativeCallTemplate {
         self.template
     }

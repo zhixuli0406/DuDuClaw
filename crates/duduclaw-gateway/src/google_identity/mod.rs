@@ -27,11 +27,13 @@
 
 pub mod check;
 pub(crate) mod chat_send;
+pub(crate) mod member_card;
 pub(crate) mod personal_check;
 pub(crate) mod delegated_scopes;
 pub(crate) mod delegate_owner;
 pub(crate) mod credential_registry;
 pub(crate) mod effect_authority;
+pub(crate) mod drive_write;
 pub mod delegation_key;
 pub mod execute;
 pub mod isolation_bridge;
@@ -90,6 +92,14 @@ impl Refusal {
 
 /// Every refusal code this module emits.
 pub const REFUSAL_CODES: &[&str] = &[
+    "drive_write_unsupported_identity",
+    "drive_write_needs_member_consent",
+    "drive_write_needs_home_consent",
+    "changed",
+    "public_visitor",
+    "requester_not_account_holder",
+    "approval_unavailable_unattended",
+    "drive_write_admin_scope_missing",
     "no_verified_caller",
     "external",
     "attestation_required",

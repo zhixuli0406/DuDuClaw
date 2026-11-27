@@ -51,12 +51,13 @@ impl Binding {
 
 pub(super) async fn serve(state: &ExecuteState, agent: &str, request: Request) -> Result<Value, Refusal> {
     let execute = matches!(&request, Request::Execute { .. });
-    let chat = match &request {
-        Request::Prepare { tool, .. } | Request::Execute { tool, .. } => tool == super::chat_send::TOOL,
+    let (chat, drive) = match &request {
+        Request::Prepare { tool, .. } | Request::Execute { tool, .. } =>
+            (tool == super::chat_send::TOOL, gi::is_drive_write_tool(tool)),
     };
     let progress = AtomicUsize::new(0);
     let mut binding = None;
-    let result = match tokio::time::timeout(Duration::from_secs(if chat { 420 } else { 120 }),
+    let result = match tokio::time::timeout(Duration::from_secs(if drive { 660 } else if chat { 420 } else { 120 }),
         serve_inner(state, agent, request, &progress, &mut binding)).await {
         Ok(result) => result,
         Err(_) => Err(Refusal::hard(if !chat && progress.load(Ordering::SeqCst) == 0 { "not_sent" } else { "result_unconfirmed" },
@@ -77,10 +78,6 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         Request::Execute { tool, arguments, turn_id, run_id, call_id, approval_binding_digest } =>
             (tool, arguments, turn_id, run_id, call_id, Some(approval_binding_digest)),
     };
-    // Package 131-P9a will route these tools to the gateway executor.
-    if duduclaw_core::google_identity::is_drive_write_tool(&tool) {
-        return Err(Refusal::hard("drive_write_unavailable", "雲端硬碟寫入只能由主程式執行。"));
-    }
     if gi::native_google_scope(&tool).is_none() || !args.is_object() || !valid_id(&call) {
         return Err(changed());
     }
@@ -90,6 +87,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, request: Request,
         return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
     }
     let who = requester(agent, turn.as_deref(), run.as_deref())?;
+    if gi::is_drive_write_tool(&tool) {
+        return super::drive_write::serve::serve(state, agent, &tool, &args, who, turn, run, call, approved, progress).await;
+    }
     if tool == super::chat_send::TOOL {
         return super::chat_send::serve(state, agent, &args, who, turn, call, approved).await;
     }
@@ -135,7 +135,7 @@ fn audit(home: &std::path::Path, binding: &Binding, steps: usize, success: bool,
     let outcome = if steps == 0 { "not_sent" } else if success { "confirmed" } else { "may_have_sent" };
     duduclaw_security::audit::append_tool_call_with_extras(home, &binding.agent, "google_execute", &binding.tool,
         success, &[("call_id", json!(binding.call_id)), ("run_id", json!(binding.run_id)),
-        ("turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
+        ("google_turn_id", json!(binding.turn_id)), ("owner_id", json!(binding.snapshot.owner_id)),
         ("authority_epoch", json!(binding.snapshot.epoch)), ("args_digest", json!(binding.args_digest)),
         ("step_count", json!(steps)), ("outcome", json!(outcome)), ("reason", json!(reason))]);
 }
@@ -188,6 +188,27 @@ pub(super) async fn verify_policy_approval(home: &std::path::Path, agent: &str, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn d12_audit_preserves_google_turn_id() {
+        let home = tempfile::tempdir().unwrap();
+        let binding = Binding {
+            agent: "bot".into(), tool: "gmail_read".into(), args_digest: "digest".into(),
+            turn_id: Some("registered-d12-turn".into()), run_id: None, call_id: "call".into(),
+            approval_nonce: "nonce".into(),
+            snapshot: OwnerSnapshot {
+                owner_id: "holder".into(), email: "holder@c.test".into(), employee_nonce: "nonce".into(),
+                employee_id: "employee".into(), incarnation: 1, owner_generation: 1,
+                attestation_revision: "revision".into(), epoch: "epoch".into(), policy_digest: "policy".into(),
+                user_epoch: "user-epoch".into(), credential_epoch: 1, policy_epoch: "policy-epoch".into(),
+            },
+        };
+        audit(home.path(), &binding, 1, true, None);
+        let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["tool_name"], "google_execute");
+        assert_eq!(row["google_turn_id"], "registered-d12-turn");
+    }
+
     #[test]
     fn no_wire_subject_or_forged_run() {
         for field in ["subject", "email", "owner_id", "credential_ref"] {
