@@ -1058,7 +1058,7 @@ mod live_assignee_tests {
                 if id == "same" && malformed {
                     match frame {
                         WsFrame::Response { ok: false, error: Some(error), .. } => {
-                            assert!(error["message"].as_str().unwrap().contains("agent_config_unreadable"), "{error}");
+                            assert!(error.as_str().unwrap().contains("agent_config_unreadable"), "{error}");
                         }
                         other => panic!("expected refusal: {other:?}"),
                     }

@@ -27,9 +27,7 @@ impl Rig {
         rusqlite::Connection::open(dir.path().join("users.db")).unwrap()
             .execute("UPDATE users SET id = 'owner' WHERE id = ?1", [&owner.id]).unwrap();
         let agent_dir = dir.path().join("agents/alice");
-        std::fs::create_dir_all(&agent_dir).unwrap();
-        std::fs::write(agent_dir.join("agent.toml"),
-            "[agent]\nname = \"alice\"\nstatus = \"active\"\n").unwrap();
+        write_alias_agent(&agent_dir, "alice", "specialist");
 
         std::fs::write(
             dir.path().join("config.toml"),
@@ -39,6 +37,8 @@ impl Rig {
         let store = Arc::new(TaskStore::open(dir.path()).unwrap());
         let queue = Arc::new(MessageQueue::open(dir.path()).unwrap());
         let registry = Arc::new(RwLock::new(AgentRegistry::new(dir.path().join("agents"))));
+        registry.write().await.scan().await.unwrap();
+        assert!(registry.read().await.get("alice").is_some(), "fixture alice must be registered");
         Self {
             dir,
             store,
@@ -125,9 +125,11 @@ async fn stop_before_enqueue(point: &str) {
     let driver = rig.driver();
     let d = Arc::clone(&driver);
     let tick = tokio::spawn(async move { d.tick_once().await });
-    gate.arrived.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+        .await.expect(&format!("{point}: arrived hook timed out"));
     rig.stop(&t.id).await;
-    gate.release.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+        .await.expect(&format!("{point}: release hook timed out"));
     tick.await.unwrap().unwrap();
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
@@ -202,11 +204,13 @@ async fn stop_after_fence_waits_for_the_running_turn() {
     let rig = Arc::new(rig);
     let r2 = Arc::clone(&rig);
     let poll = tokio::spawn(async move { r2.poll().await });
-    gate.arrived.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+        .await.expect("after_fence: arrived hook timed out");
     let st = rig.stop(&t.id).await;
     assert_eq!(st.state, "cancel_pending");
     assert_eq!(st.detail.running_turns, 1);
-    gate.release.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+        .await.expect("after_fence: release hook timed out");
     poll.await.unwrap();
     model_call_probe::set_dry_run(false);
     assert_eq!(
@@ -589,12 +593,14 @@ async fn the_start_mark_comes_before_the_runtime_and_gates_it() {
     let rig = Arc::new(rig);
     let r2 = Arc::clone(&rig);
     let poll = tokio::spawn(async move { r2.poll().await });
-    gate.arrived.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+        .await.expect("after_fence: arrived hook timed out");
     assert!(
         !rig.store.any_round_started(&t.id).await.unwrap(),
         "not yet marked"
     );
-    gate.release.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+        .await.expect("after_fence: release hook timed out");
     poll.await.unwrap();
     model_call_probe::set_dry_run(false);
     assert_eq!(model_call_probe::calls(), before + 1, "the round ran");
@@ -611,14 +617,16 @@ async fn the_start_mark_comes_before_the_runtime_and_gates_it() {
     let rig2 = Arc::new(rig2);
     let r3 = Arc::clone(&rig2);
     let poll = tokio::spawn(async move { r3.poll().await });
-    gate.arrived.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+        .await.expect("after_fence: arrived hook timed out");
     let conn = rusqlite::Connection::open(rig2.dir.path().join("tasks.db")).unwrap();
     conn.execute(
         "DELETE FROM task_dispatch_intents WHERE intent_id = ?1",
         rusqlite::params![id2],
     )
     .unwrap();
-    gate.release.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+        .await.expect("after_fence: release hook timed out");
     poll.await.unwrap();
     model_call_probe::set_dry_run(false);
     assert_eq!(
@@ -708,8 +716,8 @@ async fn autonomy_pause_waits_for_running_unclaimed_round() {
 async fn autonomy_pause_backlog_does_not_starve_other_agents() {
     let rig = Rig::new().await;
     let dir = rig.dir.path().join("agents/bob");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+    write_alias_agent(&dir, "bob", "specialist");
+    rig.registry.write().await.scan().await.unwrap();
     // Cross a complete page, not merely the 10-message dispatch batch.
     for i in 0..112 {
         let mut message = plain_goal_message(&format!("paused-{i:03}"), "alice-task");
@@ -746,9 +754,11 @@ async fn autonomy_pause_at_sqlite_handoff_defers_without_start_charge() {
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     let pause = async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("autonomy_dispatch_handoff: arrived hook timed out");
         duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some("alice"), "late pause", "op").unwrap();
-        gate.release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+            .await.expect("autonomy_dispatch_handoff: release hook timed out");
     };
     tokio::join!(rig.poll(), pause);
     assert_eq!(model_call_probe::calls(), before);
@@ -771,9 +781,8 @@ async fn autonomy_pause_at_taskspec_handoff_preserves_retry_budget() {
     let rig = Rig::new().await;
     let agent = "taskspec-late-pause";
     let agent_dir = rig.dir.path().join("agents").join(agent);
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("agent.toml"),
-        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n")).unwrap();
+    write_alias_agent(&agent_dir, agent, "specialist");
+    rig.registry.write().await.scan().await.unwrap();
     let mut spec = TaskSpec::new(agent, "finish one step", vec![Step {
         id: 0, description: "work".into(), agent: agent.into(), depends_on: vec![],
         acceptance_criteria: vec![], status: StepStatus::Pending, result: None, retry_count: 2,
@@ -782,9 +791,11 @@ async fn autonomy_pause_at_taskspec_handoff_preserves_retry_budget() {
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     let pause = async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("autonomy_dispatch_handoff: arrived hook timed out");
         duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some(agent), "late pause", "op").unwrap();
-        gate.release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+            .await.expect("autonomy_dispatch_handoff: release hook timed out");
     };
     let (result, ()) = tokio::join!(dispatch_taskspec(rig.dir.path(), &rig.registry, &mut spec, &agent_dir), pause);
     result.unwrap();
@@ -807,9 +818,8 @@ async fn autonomy_pause_at_jsonl_handoff_restores_original_messages() {
     let rig = Rig::new().await;
     let agent = "jsonl-late-pause";
     let agent_dir = rig.dir.path().join("agents").join(agent);
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    std::fs::write(agent_dir.join("agent.toml"),
-        format!("[agent]\nname = \"{agent}\"\nstatus = \"active\"\n")).unwrap();
+    write_alias_agent(&agent_dir, agent, "specialist");
+    rig.registry.write().await.scan().await.unwrap();
     let path = rig.dir.path().join("bus_queue.jsonl");
     let originals: Vec<serde_json::Value> = (0..2).map(|i| serde_json::json!({
         "type":"agent_message", "message_id":format!("late-jsonl-{i}"),
@@ -821,9 +831,11 @@ async fn autonomy_pause_at_jsonl_handoff_restores_original_messages() {
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     let pause = async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("autonomy_dispatch_handoff: arrived hook timed out");
         duduclaw_core::autonomy_gate::set_pause(rig.dir.path(), Some(agent), "late pause", "op").unwrap();
-        gate.release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+            .await.expect("autonomy_dispatch_handoff: release hook timed out");
     };
     let (result, ()) = tokio::join!(poll_and_dispatch(rig.dir.path(), &rig.registry, None, None), pause);
     result.unwrap();
@@ -876,8 +888,8 @@ async fn autonomy_pause_proactive_delivery_preserves_queue_then_resumes() {
 async fn queued_delegation_from_paused_sender_stays_pending() {
     let rig = Rig::new().await;
     let dir = rig.dir.path().join("agents/bob");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("agent.toml"), "[agent]\nname = \"bob\"\nstatus = \"active\"\n").unwrap();
+    write_alias_agent(&dir, "bob", "specialist");
+    rig.registry.write().await.scan().await.unwrap();
     let mut message = plain_goal_message("sender-paused", "unused");
     message.sender = "alice".into();
     message.sender_agent = Some("alice".into());
@@ -968,11 +980,13 @@ async fn default_alias_cannot_retarget_after_admission_identity_is_selected() {
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     let retarget = async {
-        hook.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.arrived.wait())
+            .await.expect("autonomy_dispatch_handoff: arrived hook timed out");
         write_alias_agent(&home.join("agents/alice"), "alice", "specialist");
         write_alias_agent(&home.join("agents/bob"), "bob", "main");
         rig.registry.write().await.scan().await.unwrap();
-        hook.release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.release.wait())
+            .await.expect("autonomy_dispatch_handoff: release hook timed out");
     };
     let (result, ()) = tokio::join!(
         dispatch_to_agent_outcome(home, &rig.registry, "default", "work", &delegation, Some(&message_id)),
@@ -988,8 +1002,8 @@ async fn default_alias_cannot_retarget_after_admission_identity_is_selected() {
 async fn paused_task_creator_cannot_hide_behind_goal_loop_sender() {
     let rig = Rig::new().await;
     let bob = rig.dir.path().join("agents/bob");
-    std::fs::create_dir_all(&bob).unwrap();
-    std::fs::write(bob.join("agent.toml"), "[agent]\nstatus = \"active\"\n").unwrap();
+    write_alias_agent(&bob, "bob", "specialist");
+    rig.registry.write().await.scan().await.unwrap();
     let mut task = TaskRow::new("origin-goal".into(), "work".into(), "work".into(),
         "medium".into(), "alice".into(), "bob".into());
     task.goal_mode = true;
@@ -1091,7 +1105,8 @@ async fn downstream_sqlite_running_stop_is_terminal_and_callback_is_untouched() 
     model_call_probe::set_dry_run(true);
     let dispatch = rig.poll();
     let stop = async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("downstream_runtime: arrived hook timed out");
         assert_eq!(crate::downstream_runs::count(rig.dir.path(), "s", "t", "user:owner"), 1);
         let result = crate::downstream_runs::stop(rig.dir.path(), "s", "t", "user:owner",
             std::time::Duration::from_secs(2), "test").await;
@@ -1122,10 +1137,12 @@ async fn downstream_register_before_fence_closes_cancel_race() {
     model_call_probe::set_dry_run(true);
     let before = model_call_probe::calls();
     tokio::join!(rig.poll(), async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("downstream_registered: arrived hook timed out");
         assert_eq!(crate::downstream_runs::count(rig.dir.path(), "s", "t", "user:owner"), 1);
         broker.withdraw_turn_for_principal("s", "t", Some("user:owner")).await.unwrap();
-        gate.release.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.release.wait())
+            .await.expect("downstream_registered: release hook timed out");
     });
     assert_eq!(model_call_probe::calls(), before);
     model_call_probe::set_dry_run(false);
@@ -1146,7 +1163,8 @@ async fn downstream_bus_stop_writes_no_response_or_retry_and_preserves_callback(
     let gate = test_hooks::install("downstream_runtime", &key);
     model_call_probe::set_dry_run(true);
     tokio::join!(async { poll_and_dispatch(rig.dir.path(), &rig.registry, None, None).await.unwrap(); }, async {
-        gate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.arrived.wait())
+            .await.expect("downstream_runtime: arrived hook timed out");
         let result = crate::downstream_runs::stop(rig.dir.path(), "s", "t", "user:owner",
             std::time::Duration::from_secs(2), "test").await;
         assert_eq!(result.stopped, 1);
@@ -1282,7 +1300,8 @@ async fn downstream_real_two_hop_inherits_scopes_and_stops_both_rails() {
     model_call_probe::delegate_on_run(&b, &c, "bob");
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
     tokio::join!(rig.poll(), async {
-        bgate.arrived.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), bgate.arrived.wait())
+            .await.expect("downstream_runtime: arrived hook timed out");
         // C was created inside B's real dispatch scopes, without supplying
         // a new scope or a pair from the test.
         let bus = std::fs::read_to_string(home.join("bus_queue.jsonl")).unwrap();
@@ -1293,7 +1312,8 @@ async fn downstream_real_two_hop_inherits_scopes_and_stops_both_rails() {
         assert_eq!(child.turn_id.as_deref(), Some("origin-turn"));
         assert_eq!(child.on_behalf_of.as_deref(), Some("user:owner"));
         tokio::join!(async { poll_and_dispatch(home, &rig.registry, None, None).await.unwrap(); }, async {
-            cgate.arrived.wait().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), cgate.arrived.wait())
+                .await.expect("downstream_runtime: arrived hook timed out");
             assert_eq!(crate::downstream_runs::count(home, "origin-session", "origin-turn", "user:owner"), 2);
             let result = crate::downstream_runs::stop(home, "origin-session", "origin-turn", "user:owner",
                 std::time::Duration::from_secs(2), "test").await;
@@ -1482,6 +1502,7 @@ async fn queued_department_work_is_checked_again_before_dispatch() {
             "unreadable" => { std::fs::write(rig.dir.path().join("org.toml"), "[broken").unwrap(); }
             _ => {}
         }
+        rig.registry.write().await.scan().await.unwrap();
         let conn = rusqlite::Connection::open(rig.dir.path().join("autopilot.db")).unwrap();
         match case {
             "disabled" => { conn.execute("UPDATE autopilot_rules SET enabled=0", []).unwrap(); }

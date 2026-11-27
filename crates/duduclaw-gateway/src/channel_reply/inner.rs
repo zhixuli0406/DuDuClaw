@@ -858,8 +858,8 @@ async fn build_reply_with_session_inner_impl(
         None => crate::prompt_identity::read_default_language(&ctx.home_dir).await,
     };
 
-    // Build progressive system prompt
-    let system_prompt = {
+    // Profile assembly must use the same admitted document as runtime routing.
+    let system_prompt = crate::runtime_dispatch::with_chat_turn_config(resolved_turn.clone(), async {
         let cache = ctx.skill_cache.lock().await;
         let compressed: Vec<_> = cache.all().into_iter().cloned().collect();
         // turn_id keys this turn's citations (drain unit); session_id is the
@@ -896,7 +896,7 @@ async fn build_reply_with_session_inner_impl(
                 default_language.as_deref(),
             )
         }
-    };
+    }).await;
     let system_prompt = match system_prompt {
         Ok(prompt) => prompt,
         Err(error) => {
@@ -5117,42 +5117,50 @@ mod turn_snapshot_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn mid_turn_rewrites_never_change_the_gated_runtime_or_model() {
-        for replacement in [
-            "[runtime",
-            "[runtime]\nprovider='grok'\n[model]\npreferred='opus'\n",
-            "[runtime]\nprovider='gemini'\n[model]\npreferred='opus'\n",
-            "[model]\npreferred='opus'\n",
-        ] {
-            let (home, ctx, original_runtime, _) = super::super::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
-            drop(original_runtime);
-            let calls: RecordedFallback = Default::default();
-            let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
-            runtimes.insert(RuntimeType::Codex, Box::new(RecordingCodex(calls.clone())));
-            let _runtime = RegistryGuard::install(home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
-            let spy = super::super::reply_origin::testing::NoImplicitCloud::at(home.path());
-            let mutated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let observed = mutated.clone();
-            let hook = Box::new(move |snapshot: &crate::entry_gate::ResolvedTurnConfig| {
-                assert_eq!(snapshot.runtime_settings.provider, RuntimeType::Codex);
-                assert_eq!(snapshot.model, "gpt-5.4");
-                std::fs::write(&snapshot.config_path, replacement).unwrap();
-                observed.store(true, std::sync::atomic::Ordering::SeqCst);
-            });
-            let reply = AFTER_ENTRY_SNAPSHOT.scope(hook,
-                build_reply_for_agent("hello", &ctx, "worker", "discord:snapshot", "owned-user", None),
-            ).await;
-            assert!(mutated.load(std::sync::atomic::Ordering::SeqCst));
-            assert_eq!(spy.counts(), [0, 0]);
-            let calls = calls.lock().unwrap();
-            if replacement == "[runtime" {
-                // The independent live budget gate still refuses malformed
-                // configuration; it must never reroute to a default provider.
-                assert!(calls.is_empty(), "{reply}");
-                assert!(reply.contains("目前無法確認預算"), "{reply}");
-            } else {
-                assert_eq!(calls.len(), 1, "{reply}");
-                assert_eq!(calls[0].model, "gpt-5.4");
-                assert!(reply.contains("CODEX_FALLBACK_OK"), "{reply}");
+        for minimal in [false, true] {
+            for replacement in [
+                "[runtime",
+                "[runtime]\nprovider='grok'\n[model]\npreferred='opus'\n",
+                "[runtime]\nprovider='gemini'\n[model]\npreferred='opus'\n",
+                "[model]\npreferred='opus'\n",
+            ] {
+                let (home, ctx, original_runtime, _) = super::super::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+                drop(original_runtime);
+                if minimal {
+                    let path = home.path().join("agents/worker/agent.toml");
+                    let raw = std::fs::read_to_string(&path).unwrap();
+                    std::fs::write(path, format!("{raw}\n[prompt]\nmode='minimal'\n")).unwrap();
+                    ctx.registry.write().await.scan().await.unwrap();
+                }
+                let calls: RecordedFallback = Default::default();
+                let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
+                runtimes.insert(RuntimeType::Codex, Box::new(RecordingCodex(calls.clone())));
+                let _runtime = RegistryGuard::install(home.path(), crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
+                let spy = super::super::reply_origin::testing::NoImplicitCloud::at(home.path());
+                let mutated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = mutated.clone();
+                let hook = Box::new(move |snapshot: &crate::entry_gate::ResolvedTurnConfig| {
+                    assert_eq!(snapshot.runtime_settings.provider, RuntimeType::Codex);
+                    assert_eq!(snapshot.model, "gpt-5.4");
+                    std::fs::write(&snapshot.config_path, replacement).unwrap();
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                });
+                let reply = AFTER_ENTRY_SNAPSHOT.scope(hook,
+                    build_reply_for_agent("hello", &ctx, "worker", "discord:snapshot", "owned-user", None),
+                ).await;
+                assert!(mutated.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(spy.counts(), [0, 0]);
+                let calls = calls.lock().unwrap();
+                if replacement == "[runtime" {
+                    // The independent live budget gate still refuses malformed
+                    // configuration; it must never reroute to a default provider.
+                    assert!(calls.is_empty(), "{reply}");
+                    assert!(reply.contains("目前無法確認預算"), "{reply}");
+                } else {
+                    assert_eq!(calls.len(), 1, "{reply}");
+                    assert_eq!(calls[0].model, "gpt-5.4");
+                    assert!(reply.contains("CODEX_FALLBACK_OK"), "{reply}");
+                }
             }
         }
     }
@@ -5191,7 +5199,7 @@ mod turn_snapshot_tests {
                 crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").unwrap()
             };
             snapshot.document["model"].as_table_mut().unwrap().remove("effort");
-            if let Some(value) = value { snapshot.document["model"]["effort"] = value; }
+            if let Some(value) = value { snapshot.document["model"].as_table_mut().unwrap().insert("effort".into(), value); }
             crate::runtime_dispatch::with_chat_turn_config(std::sync::Arc::new(snapshot), async {
                 assert_eq!(crate::runtime_dispatch::chat_effort(Some(&dir)), None);
             }).await;
