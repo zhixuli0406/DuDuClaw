@@ -1047,8 +1047,8 @@ async fn agent_update_refuses_self_authority_changes() {
     assert_eq!(config.prompt.reply_language, None);
     assert_eq!(config.memory.language, None);
     let rows = audit_rows(h, "agent_authority_refused");
-    // `reports_to` to a non-subtree parent may be refused by the placement
-    // gate first; the other four always reach the self-authority guard.
+    // Invalid source ids may fail source validation first; protected changes
+    // with a valid value reach the shared authority guard and are audited.
     assert!(rows.len() >= 4, "{rows:?}");
     assert_eq!(rows[0]["reason"], "authority_widening");
 
@@ -1082,9 +1082,8 @@ async fn agent_update_refuses_self_authority_changes() {
 
 /// RM-205 / security review: `[runtime] utility_provider` decides which
 /// outside service receives the employee's conversation text for background
-/// work. Through MCP `agent_update` an employee cannot set it on itself (the
-/// whole `runtime` parameter is a self-authority key), and no caller can set
-/// it at all: `agent_update` has no `[runtime]` write path.
+/// work. AI callers explicitly refuse runtime parameters on any target;
+/// `agent_update` has no `[runtime]` write path for any caller.
 #[tokio::test]
 async fn agent_update_never_writes_runtime_utility_provider() {
     let home = Home::new();
@@ -1094,7 +1093,7 @@ async fn agent_update_never_writes_runtime_utility_provider() {
     let params = serde_json::json!({ "agent_id": "sales-rep", "runtime": { "utility_provider": "openai_compat" } });
     let out = handle_agent_update(&params, h, A("sales-rep")).await;
     assert!(is_error(&out), "self: {out}");
-    assert!(text(&out).contains("runtime"), "{out}");
+    assert!(text(&out).contains("管理介面"), "{out}");
     assert_eq!(fs::read_to_string(&path).unwrap(), before, "self: file unchanged");
     let rows = audit_rows(h, "agent_authority_refused");
     assert!(rows.iter().any(|r| r["keys"].as_array().is_some_and(|k| k.iter().any(|k| k == "runtime"))), "{rows:?}");

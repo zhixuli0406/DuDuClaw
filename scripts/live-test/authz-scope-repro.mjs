@@ -11,12 +11,13 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 
 const file = fileURLToPath(import.meta.url), scriptDir = dirname(file);
-const names = ['K1', 'K2', 'K3', 'M1', 'M2', 'M3', 'U1', 'U2', 'U3', 'U4'];
+const names = ['K1', 'K2', 'K3', 'M1', 'M2', 'M3', 'U1', 'U2', 'U3', 'U4', 'U5', 'M4'];
 const observations = ['key_received_other_members_content', 'unbound_key_received_other_members_content',
   'dashboard_owner_received_other_members_content', 'manager_saw_other_department_incidents',
   'heartbeat_trigger_accepted_without_binding', 'employee_control_accepted_either_call',
   'superior_raised_subordinate_budget', 'unrelated_ai_raised_budget_under_open',
-  'subordinate_raised_superior_budget', 'superior_granted_subordinate_database_source'];
+  'subordinate_raised_superior_budget', 'superior_granted_subordinate_database_source',
+  'superior_narrowed_subordinate_budget', 'heartbeat_trigger_accepted_with_binding'];
 const children = new Set(), sockets = new Set(), secrets = new Set(), rows = new Map();
 const summary = Object.fromEntries(observations.map(k => [k, null]));
 const delay = ms => new Promise(r => setTimeout(r, ms));
@@ -44,7 +45,7 @@ function args(argv) {
     const arg = argv[i];
     if (arg === '--bin') { ensure(argv[i + 1] && !argv[i + 1].startsWith('--'), '--bin requires a path'); o.bin = realpathSync(resolve(argv[++i])); }
     else if (arg === '--scenario') {
-      const n = argv[++i]?.toUpperCase(); ensure(names.includes(n), '--scenario requires K1..K3, M1..M3 or U1..U4'); o.selected.add(n);
+      const n = argv[++i]?.toUpperCase(); ensure(names.includes(n), '--scenario requires K1..K3, M1..M4 or U1..U5'); o.selected.add(n);
     } else if (arg === '--keep') o.keep = true;
     else if (arg === '--verbose') o.verbose = true;
     else throw new Error('Usage: node authz-scope-repro.mjs --bin <path> [--scenario K1] [--keep] [--verbose]');
@@ -474,6 +475,16 @@ async function seedIncident() {
 }
 async function mScenario(n, row) {
   const m = await managerFixture(), user = n === 'M3' ? m.employee : m.manager;
+  if (n === 'M4') {
+    row.call = { method: 'heartbeat.trigger', params: { agent_id: 'a' } };
+    const r = await user.client.raw(row.call.method, row.call.params);
+    row.http_status = r.http_status; row.rpc_error = r.rpc_error;
+    const accepted = r.ok && r.payload?.success === true;
+    Object.assign(row.observed, { accepted, response: r.payload, actor_has_binding_to_a: true });
+    summary.heartbeat_trigger_accepted_with_binding = accepted;
+    row.notes = 'M is Manager in X with an Owner binding to A; records actual heartbeat acceptance.';
+    return;
+  }
   if (n === 'M2') {
     row.call = { method: 'heartbeat.trigger', params: { agent_id: 'b' } };
     const h = await heartbeat(user);
@@ -538,7 +549,13 @@ async function uScenario(n, row) {
   const policy = n === 'U2' ? 'open' : 'hierarchy', actor = n === 'U2' ? 'p' : n === 'U3' ? 't' : 's';
   const target = n === 'U2' ? 'q' : n === 'U3' ? 's' : 't';
   await ctx.admin.call('delegation.set', { policy, allow: [] });
-  const before = agentState(target), params = { agent_id: target, ...(n === 'U4' ? { db_sources_add: 'fixture_db' } : { budget_cents: before.budget + 1000 }) };
+  const before = agentState(target);
+  if (n === 'U5' && (!Number.isSafeInteger(before.budget) || before.budget <= 1)) {
+    row.status = 'skipped'; row.observed.before = before;
+    row.notes = 'No positive cap below the current budget is available (0 means unlimited).'; return;
+  }
+  const params = { agent_id: target, ...(n === 'U4' ? { db_sources_add: 'fixture_db' }
+    : { budget_cents: n === 'U5' ? before.budget - 1 : before.budget + 1000 }) };
   row.call = { method: 'tools/call', params: { name: 'agent_update', arguments: params } };
   Object.assign(row.observed, { policy, target, before });
   const client = await mcpClient(actor);
@@ -552,13 +569,17 @@ async function uScenario(n, row) {
     row.rpc_error = r.error || null;
     Object.assign(row.observed, { tool_result: r.result ?? null, after, budget_increased: after.budget > before.budget,
       db_source_added: !before.db_sources.includes('fixture_db') && after.db_sources.includes('fixture_db') });
-    summary[observations[names.indexOf(n)]] = n === 'U4' ? row.observed.db_source_added : row.observed.budget_increased;
+    if (n === 'U5') {
+      Object.assign(row.observed, { budget_decreased: after.budget > 0 && after.budget < before.budget,
+        update_succeeded: !r.error && Boolean(r.result) && r.result.isError !== true && after.budget === params.budget_cents });
+      summary.superior_narrowed_subordinate_budget = row.observed.update_succeeded;
+    } else summary[observations[names.indexOf(n)]] = n === 'U4' ? row.observed.db_source_added : row.observed.budget_increased;
     row.notes = 'Real employee registration and identity token; --bin overrides registered executable. Effective agent.toml read before and after; MCP stdio has no HTTP status.';
   } finally { await client.close(); }
 }
 async function run(n) {
   const row = { scenario: n, status: 'ran', actor: { K1: 'U1 member key', K2: 'U3 member key', K3: 'U1 dashboard JWT',
-    M1: 'M Manager', M2: 'M Manager', M3: 'EmployeeControl', U1: 'S', U2: 'P', U3: 'T', U4: 'S' }[n],
+    M1: 'M Manager', M2: 'M Manager', M3: 'EmployeeControl', U1: 'S', U2: 'P', U3: 'T', U4: 'S', U5: 'S', M4: 'M Manager' }[n],
     call: n[0] === 'K' ? ['chat.sessions.list', 'chat.sessions.history'] : n[0] === 'M' ? ['budget.incidents', 'heartbeat.trigger'] : 'agent_update',
     http_status: null, rpc_error: null, observed: {}, notes: '' };
   try {
@@ -584,7 +605,7 @@ async function main() {
   try {
     await setup();
     // Trigger B before adding spend, so the CLI observation is not budget-blocked.
-    for (const n of ['K1', 'K2', 'K3', 'M2', 'M1', 'M3', 'U1', 'U2', 'U3', 'U4'])
+    for (const n of ['K1', 'K2', 'K3', 'M2', 'M1', 'M3', 'U1', 'U2', 'U3', 'U4', 'U5', 'M4'])
       if (options.selected.has(n)) { ensure(!interrupted, 'interrupted'); await run(n); }
   } catch (e) { failure = e.message; }
   finally { try { await cleanup(); } catch (e) { cleanupError = e.message; } }

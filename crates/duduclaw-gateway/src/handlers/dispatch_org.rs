@@ -886,7 +886,7 @@ impl MethodHandler {
             // ── Budget incidents (WP14-T14.6) ───────────────
             "budget.incidents" => {
                 require_manager!();
-                boxed_frame(|| self.handle_budget_incidents(params)).await
+                boxed_frame(|| self.handle_budget_incidents(params, ctx)).await
             }
 
             // ── Autopilot (admin only) ──────────────────────

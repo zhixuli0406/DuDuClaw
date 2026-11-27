@@ -167,7 +167,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "agent_update",
-        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, container, and database-source-grant fields. Uses atomic write for safety.",
+        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, container, and database-source fields. AI callers may only narrow budget and database authority; protected changes require an administrator in the admin console. Tell the requesting person when administrator action is needed. Uses atomic write for safety.",
         params: &[
             ParamDef {
                 name: "agent_id",
@@ -231,7 +231,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "budget_cents",
-                description: "Monthly budget limit in cents",
+                description: "Monthly budget limit in cents. AI callers may only lower an existing cap (0 means unlimited), or cap an unlimited budget.",
                 required: false,
             },
             ParamDef {
@@ -256,7 +256,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
             ParamDef {
                 name: "db_sources_add",
-                description: "GRANT these `[db_sources.<id>]` ids on top of what the agent holds (comma-separated). Idempotent; unknown ids are rejected with the configured ids listed.",
+                description: "Add configured DB source ids (comma-separated). A new grant requires an administrator in the admin console; AI callers can only resend sources already held or narrow the final list.",
                 required: false,
             },
             ParamDef {
