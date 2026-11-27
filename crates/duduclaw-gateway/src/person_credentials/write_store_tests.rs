@@ -46,6 +46,43 @@ fn connect_personal(home: &Path, key: &ProtectedKey) {
     crate::person_credentials::connect(home, key, metadata, &secret(), epoch).unwrap();
 }
 
+fn ordinary_metadata(metadata: &Metadata) -> crate::person_credentials::Metadata {
+    let mut value = serde_json::to_value(metadata).unwrap();
+    value.as_object_mut().unwrap().remove("purpose");
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn ordinary_unseal_rejects_transplanted_write_vault_secret() {
+    let (home, key) = fixture();
+    let record = connected(home.path(), &key, "user", "user-a");
+    assert!(unseal(&key, &record).is_ok());
+    let transplanted = crate::person_credentials::Record {
+        metadata: ordinary_metadata(&record.metadata),
+        secret: record.secret.clone(),
+    };
+    assert_eq!(
+        crate::person_credentials::unseal(&key, &transplanted).err().as_deref(),
+        Some("你的連線憑證無法辨識，請重新連結。"),
+    );
+}
+
+#[test]
+fn write_unseal_rejects_transplanted_ordinary_vault_secret() {
+    let (home, key) = fixture();
+    let mut record = connected(home.path(), &key, "user", "user-a");
+    let metadata = ordinary_metadata(&record.metadata);
+    let epoch = crate::person_credentials::begin_connection(home.path(), "user-a").unwrap();
+    crate::person_credentials::connect(home.path(), &key, metadata, &secret(), epoch).unwrap();
+    let ordinary = crate::person_credentials::get(home.path(), "user-a").unwrap().unwrap();
+    assert!(crate::person_credentials::unseal(&key, &ordinary).is_ok());
+    record.secret = ordinary.secret.clone();
+    assert_eq!(
+        unseal(&key, &record).err().as_deref(),
+        Some("你的寫入連線憑證無法辨識，請重新連結。"),
+    );
+}
+
 #[test]
 fn seal_round_trip_and_clear_identity_tampering_is_rejected() {
     let (home, key) = fixture();

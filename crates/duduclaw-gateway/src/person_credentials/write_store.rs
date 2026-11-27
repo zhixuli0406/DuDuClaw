@@ -55,12 +55,14 @@ impl From<&Metadata> for Binding {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Envelope {
+    #[serde(rename = "write_binding")]
     binding: Binding,
     secret: Secret,
 }
 
 #[derive(Serialize)]
 struct EnvelopeRef<'a> {
+    #[serde(rename = "write_binding")]
     binding: Binding,
     secret: &'a Secret,
 }
