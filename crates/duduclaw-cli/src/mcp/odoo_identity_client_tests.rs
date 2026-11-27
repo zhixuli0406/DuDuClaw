@@ -292,6 +292,10 @@ async fn person_key_has_only_bearer_body_and_cannot_accept_company() {
 async fn malformed_decision_never_dials_even_with_a_company_slot() {
     let odoo = odoo_stub().await;
     let home = home(&odoo.url);
+    // Reach decision validation rather than the local no-possible-identity gate.
+    let path = home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(path, format!("{raw}\n[odoo_access]\ncompany_key_agents=['bot']\n")).unwrap();
     let pool = pool();
     let gateway = gateway(home.path(), 200, json!({"ok":true,"identity":"company","permission":"engine"})).await;
     AUTH.scope((), async {
@@ -299,14 +303,22 @@ async fn malformed_decision_never_dials_even_with_a_company_slot() {
         let count = odoo.calls.lock().unwrap().len();
         for kind in ["agent", "company"] {
             *gateway.answer.lock().unwrap() = (200, json!({"ok":true,"identity":kind,"permission":"engine","secret":"never-log-this"}));
+            let decisions = gateway.requests.lock().unwrap().len();
             let result = crate::mcp::odoo::handle_odoo_tool("odoo_search", &json!({"model":"crm.lead"}), home.path(), &pool, "bot").await;
             assert_eq!(result["isError"], true);
+            assert_eq!(gateway.requests.lock().unwrap().len(), decisions + 1,
+                "the malformed decision must be requested and rejected");
             assert!(!result.to_string().contains("never-log-this"));
             assert_eq!(odoo.calls.lock().unwrap().len(), count);
         }
     }).await;
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("never-log-this"));
+    assert_eq!(audit.lines().count(), 2);
+    for row in audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()) {
+        assert_eq!(row["params_summary"], "identity refused");
+        assert_eq!(row["success"], false);
+    }
 }
 
 #[tokio::test]
@@ -543,13 +555,20 @@ async fn personal_endpoint_snapshot_survives_config_change_before_connect() {
     }, &decision).await.unwrap();
     assert_eq!(employee.status().url, decided.url);
     assert_eq!(person.status().url, decided.url);
+    assert_eq!(employee.status().uid, Some(11));
+    assert_eq!(person.status().uid, Some(11));
+    assert!(!Arc::ptr_eq(&employee, &person), "employee and person-key slots stay separate");
     assert!(changed.calls.lock().unwrap().is_empty());
-    assert_eq!(decided.calls.lock().unwrap().iter().filter(|r| r["params"]["method"] == "authenticate").count(), 2);
+    // On Unix the separate person-key slot reuses the same credential-bound
+    // on-disk connection metadata; off Unix that cache is disabled.
+    assert_eq!(decided.calls.lock().unwrap().iter().filter(|r| r["params"]["method"] == "authenticate").count(), if cfg!(unix) { 1 } else { 2 });
     // Same user/revision at a newly verified server cannot reuse the old slot.
     *gateway.answer.lock().unwrap() = (200, snapshot(personal("alice", 11, 1), &changed.url, "test"));
     let (new, _) = AUTH.scope((), crate::mcp::odoo::connect_odoo_pool(home.path(), &pool, "bot", "odoo_search")).await.unwrap();
     assert!(!Arc::ptr_eq(&employee, &new));
     assert_eq!(new.status().url, changed.url);
+    assert_eq!(new.status().uid, Some(11));
+    assert_eq!(changed.calls.lock().unwrap().iter().filter(|r| r["params"]["method"] == "authenticate").count(), 1);
     assert_eq!(pool.identity_cache.lock().await.entries.len(), 1);
     let slots = pool.slots().await;
     assert!(!slots.contains(&("bot".into(), profile(&decided.url, "alice", 1), true)));
@@ -572,6 +591,7 @@ async fn follow_sensitive_read_never_persists_values() {
     assert_ne!(person["isError"], true, "{person}");
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("smtp-secret-must-not-persist") && !audit.contains("smtp.password"));
+    assert_audit_chain(&audit, 1);
     for row in audit.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()) {
         assert!(row.get("result_text").is_none());
         assert_eq!(row["odoo_result"]["model"], "ir.config_parameter");
@@ -592,6 +612,7 @@ fn sensitive_models_are_metadata_only_even_without_follow() {
     for model in ["crm.lead", "secretary.notes", "keynote.slide", "tokenizer.result"] { assert!(!sensitive_model(model)); }
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("secret-never-log") && !audit.contains("result_text"));
+    assert_audit_chain(&audit, 10);
     for row in audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()) {
         assert_metadata_fields_only(&row);
     }
@@ -648,6 +669,18 @@ async fn person_listing_and_dispatch_share_local_policy_and_follow_ack() {
     assert!(odoo.calls.lock().unwrap().is_empty());
 }
 
+fn assert_audit_chain(audit: &str, expected_rows: usize) {
+    assert_eq!(audit.lines().count(), expected_rows);
+    let mut previous = duduclaw_security::audit_chain::genesis_hash();
+    for line in audit.lines() {
+        let row: Value = serde_json::from_str(line).unwrap();
+        // This is a hash of the previous persisted metadata record, never
+        // a digest of the Odoo response (including low-entropy secrets).
+        assert_eq!(row["_prev_hash"].as_str(), Some(previous.as_str()));
+        previous = format!("{:x}", Sha256::digest(line.as_bytes()));
+    }
+}
+
 fn assert_metadata_fields_only(row: &Value) {
     let metadata = row["odoo_result"].as_object().unwrap();
     assert_eq!(metadata.len(), 5);
@@ -655,7 +688,9 @@ fn assert_metadata_fields_only(row: &Value) {
         assert!(metadata.contains_key(key), "missing {key}: {metadata:?}");
     }
     assert!(row.get("result_text").is_none());
-    for key in row.as_object().unwrap().keys().chain(metadata.keys()) {
+    // Only the verified top-level audit-chain field is exempt. Metadata and
+    // every other top-level field still cannot carry a response digest.
+    for key in row.as_object().unwrap().keys().filter(|key| key.as_str() != "_prev_hash").chain(metadata.keys()) {
         let key = key.to_ascii_lowercase();
         assert!(!key.contains("hash") && !key.contains("digest") && !key.contains("sha256"));
     }
@@ -672,6 +707,7 @@ fn follow_audit_keeps_counts_and_lengths_without_content_or_digest_even_on_error
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("low-entropy-pin-1234"));
     assert!(!audit.contains(&format!("{:x}", Sha256::digest(raw.as_bytes()))));
+    assert_audit_chain(&audit, 2);
     for row in audit.lines().map(|line| serde_json::from_str::<Value>(line).unwrap()) {
         assert_metadata_fields_only(&row);
         assert_eq!(row["odoo_result"]["model"], "crm.lead");
