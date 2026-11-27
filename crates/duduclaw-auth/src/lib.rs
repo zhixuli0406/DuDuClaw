@@ -6,6 +6,7 @@ pub mod admin_approval_rule;
 pub mod admin_eligibility;
 pub mod credential_changes;
 pub mod db;
+pub mod dept_grants;
 pub mod jwt;
 pub mod google_delegate_attestation;
 pub mod google_identity;
