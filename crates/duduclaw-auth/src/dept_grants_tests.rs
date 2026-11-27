@@ -20,6 +20,20 @@ fn audits(db: &UserDb, action: &str) -> Vec<(String, String, serde_json::Value)>
 }
 
 #[test]
+fn dept_grants_use_audit_preserves_acl_generation_and_grants() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Schedules]).unwrap();
+    let before = generation(&db);
+    let grants = db.dept_grants_for_user(&manager).unwrap();
+    db.record_dept_grant_use(&manager, "a1", GrantGroup::Schedules, "run_now", "cron.run_now").unwrap();
+    assert_eq!(generation(&db), before);
+    assert_eq!(db.dept_grants_for_user(&manager).unwrap(), grants);
+    assert_eq!(audits(&db, "dept_grant_used"), vec![(manager, "a1".into(),
+        serde_json::json!({"group":"schedules", "action":"run_now", "method":"cron.run_now"}))]);
+}
+
+#[test]
 fn dept_grants_set_read_audit_noop_and_revoke() {
     let (db, _path) = test_db();
     let admin = user(&db, "admin", UserRole::Admin);

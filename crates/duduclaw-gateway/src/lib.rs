@@ -365,6 +365,7 @@ pub mod foresight;
 pub mod growth;
 pub mod guardrail;
 pub mod handlers;
+pub(crate) mod dept_grants;
 pub mod process_group;
 // G5 (2026-09 feature audit) — one `config.toml [identity]` → provider
 // builder shared by the dashboard RPC, the channel `<sender>` block, and the

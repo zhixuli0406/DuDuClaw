@@ -135,6 +135,20 @@ impl UserDb {
             .map(|grant| (grant.department, grant.groups)).collect())
     }
 
+    /// Record a successful grant-backed mutation, without changing authority.
+    pub fn record_dept_grant_use(&self, actor: &str, agent: &str, group: GrantGroup,
+        action: &str, method: &str) -> Result<(), String> {
+        let detail = serde_json::json!({
+            "group": group.as_str(), "action": action, "method": method,
+        }).to_string();
+        self.conn().execute(
+            "INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
+             VALUES (?1, 'dept_grant_used', ?2, ?3, NULL, ?4)",
+            params![actor, agent, detail, Utc::now().to_rfc3339()],
+        ).map_err(store_error)?;
+        Ok(())
+    }
+
     pub fn list_dept_grants(&self) -> Result<Vec<DeptGrant>, String> {
         read_grants(&self.conn(), None)
     }
