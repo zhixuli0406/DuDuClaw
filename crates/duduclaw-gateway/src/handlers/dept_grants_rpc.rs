@@ -47,6 +47,37 @@ fn non_main_role(home: &Path, id: &str) -> bool {
 }
 
 impl MethodHandler {
+    /// Admin-only preview. Use the same locked effective entry and canonical
+    /// target as org.apply_change, even when a display mirror has drifted.
+    pub(crate) async fn handle_dept_grants_reach_preview(&self, params: Value) -> WsFrame {
+        let Some(agent_id) = params["agent_id"].as_str().filter(|id| duduclaw_core::is_valid_agent_id(id)) else {
+            return WsFrame::error_response("", "請指定有效的 AI 員工。");
+        };
+        let Some(department) = params["department"].as_str() else {
+            return WsFrame::error_response("", "請選擇部門。");
+        };
+        if !duduclaw_core::org_change::agent_exists(&self.home_dir, agent_id) {
+            return WsFrame::error_response("", "找不到指定的 AI 員工。");
+        }
+        let guard = match super::org_change_rpc::lock_org(&self.home_dir).await {
+            Ok(guard) => guard,
+            Err(_) => return WsFrame::error_response("", "暫時無法讀取組織資料，請稍後再試。"),
+        };
+        let store = match guard.load() {
+            Ok(store) => store,
+            Err(_) => return WsFrame::error_response("", "暫時無法讀取組織資料，請稍後再試。"),
+        };
+        let before = duduclaw_core::org_change::effective_in(&store, &self.home_dir, agent_id).unwrap_or_default();
+        let after = duduclaw_core::org_store::OrgEntry::new(&before.reports_to, department);
+        if !after.department.is_empty() && !duduclaw_core::department::is_valid_department(&after.department) {
+            return WsFrame::error_response("", "部門名稱格式不正確。");
+        }
+        match crate::dept_grants::reach::for_move(&self.home_dir, &before.department, &after.department) {
+            Ok(lines) => WsFrame::ok_response("", crate::dept_grants::reach::preview(&lines)),
+            Err(_) => WsFrame::error_response("", crate::dept_grants::reach::UNAVAILABLE),
+        }
+    }
+
     // These three handlers are Admin-gated by dispatch_org.
     pub(crate) async fn handle_dept_grants_list(&self) -> WsFrame {
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", UNAVAILABLE); };

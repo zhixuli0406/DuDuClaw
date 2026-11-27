@@ -238,10 +238,8 @@ impl UserDb {
     ///   and the MAC key here is random per handle, so no presented
     ///   remembered-session token authenticates either.
     ///
-    /// `pub` only because its one caller,
-    /// `duduclaw_gateway::decision_notify::open_user_db_read_only`, is in
-    /// another crate; Rust has no narrower visibility that reaches it. Use
-    /// that wrapper, not this constructor.
+    /// Used by gateway request-time lookups and the CLI's advisory org-sync
+    /// reach preview. Never use this constructor for a mutation path.
     pub fn open_read_only(db_path: &Path) -> Result<Self, String> {
         use rusqlite::OpenFlags;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;

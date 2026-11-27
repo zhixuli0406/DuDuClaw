@@ -12,6 +12,7 @@ use crate::handlers::MethodHandler;
 pub(crate) use duduclaw_auth::dept_grants::GrantGroup;
 
 pub(crate) mod methods;
+pub(crate) mod reach;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GrantAction {

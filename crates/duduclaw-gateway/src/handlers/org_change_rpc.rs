@@ -25,6 +25,7 @@
 //! refused (and a waiting proposal is denied).
 
 use super::*;
+use crate::dept_grants::reach;
 use crate::org_change_approval::{self as oc, journal, Proposal};
 use duduclaw_core::org_change::{self, OrgChangeError};
 use duduclaw_core::org_store::{self, OrgEntry, OrgMutationGuard, OrgStore, OrgStoreError};
@@ -48,6 +49,26 @@ fn change_error(e: &OrgChangeError) -> WsFrame {
 
 fn authority_error(e: &OrgStoreError) -> WsFrame {
     coded(e.code(), &e.to_string())
+}
+
+/// Always recompute from the locked org entry; a missing/unreadable grant
+/// store cannot prove an empty impact. Empty impact preserves legacy clients.
+fn confirm_reach(home: &Path, before: &OrgEntry, after: &OrgEntry, supplied: Option<&str>)
+    -> Result<Value, WsFrame> {
+    let lines = reach::for_move(home, &before.department, &after.department)
+        .map_err(|_| coded("reach_unavailable", reach::UNAVAILABLE))?;
+    let current = reach::preview(&lines);
+    if !lines.is_empty() && supplied != current["reach_digest"].as_str() {
+        return Err(coded_with("reach_changed", reach::CHANGED, json!({"current": current})));
+    }
+    Ok(current)
+}
+
+fn reach_refusal_code(frame: &WsFrame) -> &str {
+    match frame {
+        WsFrame::Response { error: Some(error), .. } => error["code"].as_str().unwrap_or("reach_unavailable"),
+        _ => "reach_unavailable",
+    }
 }
 
 const NO_CHANGE: &str = "這個調整和目前的組織位置相同，沒有需要變更的內容。";
@@ -180,7 +201,7 @@ fn audit(home: &Path, event: &str, agent_id: &str, severity: duduclaw_security::
 
 /// `org_change_rejected`: the request ended without being applied (`why`:
 /// `rejected` by the Admin, `expired`, `stale`, `invalid`, `malformed`).
-/// Written only after the terminal state was recorded.
+/// Reach refusals leave the card pending; other rows follow the terminal decision.
 fn audit_rejected(
     home: &Path,
     rec: &crate::approval::ApprovalRecord,
@@ -346,13 +367,18 @@ impl MethodHandler {
             proposer_email: fresh.email.clone(),
             reason,
         };
+        let reach_preview = reach::proposal_preview(&self.home_dir, &before.department, &after.department);
+        let mut payload = proposal.to_payload();
+        payload.as_object_mut().expect("proposal object")
+            .extend(reach_preview.as_object().expect("reach object").clone());
+        let summary = oc::summary(&proposal, reach_preview["sentence"].as_str());
         // `[approval] forbid_self_approval` judges `on_behalf_of`: stamp the
         // trusted dashboard principal of the proposer (never a request value).
         let principal = duduclaw_core::HumanPrincipal::user(&fresh.user_id).map(|p| p.to_string());
         let filed = crate::on_behalf_of::ON_BEHALF_OF
             .scope(
                 principal,
-                broker.request(&agent_id, oc::ACTION_KIND, &oc::summary(&proposal), proposal.to_payload(), oc::TTL_SECS),
+                broker.request(&agent_id, oc::ACTION_KIND, &summary, payload, oc::TTL_SECS),
             )
             .await;
         drop(org_lock);
@@ -389,6 +415,9 @@ impl MethodHandler {
                 "after": oc::entry_json(&after),
                 "base": proposal.base,
                 "expires_at": expires_at,
+                "reach": reach_preview["reach"],
+                "reach_digest": reach_preview["reach_digest"],
+                "sentence": reach_preview["sentence"],
             }),
         )
     }
@@ -467,6 +496,17 @@ impl MethodHandler {
             }
             return coded("no_change", NO_CHANGE);
         }
+        let reach_preview = match confirm_reach(&self.home_dir, &before, &after, params["reach_digest"].as_str()) {
+            Ok(preview) => preview,
+            Err(frame) => {
+                audit(&self.home_dir, "org_change_rejected", &agent_id,
+                    duduclaw_security::audit::Severity::Info,
+                    json!({"agent_id": agent_id, "rejected_by": ctx.user_id,
+                        "source": "org.apply_change", "before": oc::entry_json(&before),
+                        "after": oc::entry_json(&after), "why": reach_refusal_code(&frame)}));
+                return frame;
+            }
+        };
         let commit = match self.commit_org_entry(&org_lock, &agent_id, &after, "org.apply_change", ctx).await {
             Ok(c) => c,
             Err(e) => return WsFrame::error_response("", &e),
@@ -518,6 +558,9 @@ impl MethodHandler {
             "base": new_base,
             "registry_reloaded": commit.registry_reloaded,
             "withdrawn_pending": withdrawn,
+            "reach": reach_preview["reach"],
+            "reach_digest": reach_preview["reach_digest"],
+            "sentence": reach_preview["sentence"],
         });
         if let Some(e) = commit.mirror_error {
             let mut extra = result;
@@ -612,6 +655,9 @@ impl MethodHandler {
                     "reason": p.reason,
                     "created_at": rec.created_at,
                     "expires_at": oc::expires_at(rec),
+                    "reach": rec.payload.get("reach"),
+                    "reach_digest": rec.payload.get("reach_digest"),
+                    "sentence": rec.payload.get("sentence"),
                 }),
             ));
         }
@@ -637,6 +683,7 @@ impl MethodHandler {
         approve: bool,
         decision_reason: &str,
         ctx: &UserContext,
+        reach_digest: Option<&str>,
     ) -> WsFrame {
         if crate::approval::operator_cli_gate::require_admin_decider(&self.home_dir, ctx).is_err() {
             return WsFrame::error_response("", "只有管理員可以在儀表板決定組織調整的審核");
@@ -730,7 +777,7 @@ impl MethodHandler {
         // past that the applied journal's recovery records the outcome.
         let keeper =
             broker.keep_decision_lease(approval_id, &lease, oc::DECISION_LEASE_SECS, oc::COMMITTED_LEASE_MAX);
-        let frame = self.apply_leased(broker, &lease, &keeper, approval_id, ctx, decision_reason).await;
+        let frame = self.apply_leased(broker, &lease, &keeper, approval_id, ctx, decision_reason, reach_digest).await;
         drop(keeper);
         // A lease the decision did not consume is given back (no-op otherwise).
         broker.release_decision_lease(approval_id, &lease).await;
@@ -747,6 +794,7 @@ impl MethodHandler {
         approval_id: &crate::approval::ApprovalId,
         ctx: &UserContext,
         decision_reason: &str,
+        reach_digest: Option<&str>,
     ) -> WsFrame {
         let org_lock = match lock_org(&self.home_dir).await {
             Ok(g) => g,
@@ -812,6 +860,11 @@ impl MethodHandler {
             return self
                 .deny_org_card(broker, &rec, ctx, Some(&proposal), "invalid", decision_reason, &message, Some(lease))
                 .await;
+        }
+        let before = org_change::effective_in(&store, &self.home_dir, &proposal.agent_id).unwrap_or_default();
+        if let Err(frame) = confirm_reach(&self.home_dir, &before, &proposal.after, reach_digest) {
+            audit_rejected(&self.home_dir, &rec, ctx, Some(&proposal), reach_refusal_code(&frame), decision_reason);
+            return frame;
         }
         // No prepared journal entry ⇒ no apply: a crash after the commit must
         // always leave a trace a retry can complete from.

@@ -10,7 +10,8 @@ use rusqlite::{params, Connection, Row, TransactionBehavior};
 use crate::user_row::{bump_acl_generation, load_user};
 use crate::{UserDb, UserRole, UserStatus};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GrantGroup {
     Schedules,
     Automation,
@@ -44,6 +45,106 @@ pub struct DeptGrant {
     pub groups: Vec<GrantGroup>,
     pub granted_by: String,
     pub granted_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachChange {
+    Gains,
+    Loses,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReachLine {
+    pub user_id: String,
+    pub display_name: String,
+    /// The grant's department, never the manager's profile department.
+    pub department: String,
+    pub groups: Vec<GrantGroup>,
+    pub change: ReachChange,
+}
+
+/// Net group changes for one employee's move. Read grants and live users in
+/// one SQLite snapshot, including on a read-only connection. No profile,
+/// prefix, case folding or mirror is an authority source here.
+pub fn reach_change(db: &UserDb, from_dept: Option<&str>, to_dept: Option<&str>)
+    -> Result<Vec<ReachLine>, String> {
+    let from = from_dept.filter(|d| !d.is_empty());
+    let to = to_dept.filter(|d| !d.is_empty());
+    if from == to { return Ok(Vec::new()); }
+    let mut conn = db.conn();
+    let tx = conn.transaction().map_err(store_error)?;
+    let mut groups: BTreeMap<String, (BTreeSet<GrantGroup>, BTreeSet<GrantGroup>)> = BTreeMap::new();
+    for grant in read_grants(&tx, None)? {
+        if Some(grant.department.as_str()) == from {
+            groups.entry(grant.user_id).or_default().0.extend(grant.groups);
+        } else if Some(grant.department.as_str()) == to {
+            groups.entry(grant.user_id).or_default().1.extend(grant.groups);
+        }
+    }
+    let mut lines = Vec::new();
+    for (user_id, (before, after)) in groups {
+        let Some(user) = load_user(&tx, &user_id)? else { continue; };
+        if user.role != UserRole::Manager || user.status != UserStatus::Active { continue; }
+        for (change, department, net) in [
+            (ReachChange::Gains, to, after.difference(&before).copied().collect::<Vec<_>>()),
+            (ReachChange::Loses, from, before.difference(&after).copied().collect::<Vec<_>>()),
+        ] {
+            if !net.is_empty() {
+                lines.push(ReachLine {
+                    user_id: user_id.clone(), display_name: user.display_name.clone(),
+                    department: department.expect("nonempty difference has a department").to_owned(),
+                    groups: net, change,
+                });
+            }
+        }
+    }
+    lines.sort_by(|a, b| (&a.user_id, &a.department, &a.groups, a.change)
+        .cmp(&(&b.user_id, &b.department, &b.groups, b.change)));
+    Ok(lines)
+}
+
+/// Canonical JSON tuples, sorted independently of caller order. Display names
+/// are deliberately excluded: a rename does not change authority.
+pub fn reach_digest(lines: &[ReachLine]) -> String {
+    let mut canonical: Vec<_> = lines.iter().map(|line| {
+        let mut groups: Vec<_> = line.groups.iter().map(|g| g.as_str()).collect();
+        groups.sort_unstable();
+        groups.dedup();
+        (&line.user_id, &line.department, groups, line.change)
+    }).collect();
+    canonical.sort();
+    let bytes = serde_json::to_vec(&canonical).expect("reach tuples are JSON serializable");
+    // ring is already an auth dependency; no additional hash dependency.
+    ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref().iter()
+        .map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Org-change cards currently use zh-TW only.
+pub fn reach_sentence_zh(lines: &[ReachLine]) -> Option<String> {
+    if lines.is_empty() { return None; }
+    let clauses: Vec<_> = lines.iter().map(|line| {
+        let mut groups = line.groups.clone();
+        groups.sort();
+        groups.dedup();
+        let labels: Vec<_> = groups.iter().map(|group| match group {
+            GrantGroup::Schedules => "排程",
+            GrantGroup::Automation => "自動化規則",
+            GrantGroup::Skills => "技能",
+            GrantGroup::Cost => "用量",
+            GrantGroup::EgressReview => "對外傳送審核",
+        }).collect();
+        let label = match labels.split_last() {
+            Some((last, [])) => (*last).to_owned(),
+            Some((last, rest)) => format!("{}與{last}", rest.join("、")),
+            None => String::new(),
+        };
+        let name = if line.display_name.trim().is_empty() { "部門主管" } else { &line.display_name };
+        let verb = match line.change { ReachChange::Gains => "將可管理", ReachChange::Loses => "將不再能管理" };
+        format!("{}（{}）{verb}這位 AI 員工的{label}",
+            name.replace(['\r', '\n'], " "), line.department.replace(['\r', '\n'], " "))
+    }).collect();
+    Some(format!("核准後，{}。", clauses.join("；")))
 }
 
 fn store_error(error: rusqlite::Error) -> String {

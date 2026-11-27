@@ -273,7 +273,7 @@ impl MethodHandler {
             // RM-027: an org chart change applies first (re-validated, base
             // re-checked) and records the decision only after the write.
             if rec.action_kind == crate::org_change_approval::ACTION_KIND {
-                return Box::pin(self.decide_org_change(&broker, &approval_id, approve, &reason, ctx)).await;
+                return Box::pin(self.decide_org_change(&broker, &approval_id, approve, &reason, ctx, params["reach_digest"].as_str())).await;
             }
         }
         if let Some(rec) = &record {

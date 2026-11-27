@@ -378,6 +378,7 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.me", "(a) the caller's own account"),
     ("users.dept_grants.list", "(a) Admin-only department authority metadata; no employee content"),
     ("users.dept_grants.set", "(a) Admin-only audited department grants; names a person and department, not employee content"),
+    ("users.dept_grants.reach_preview", "(a) Admin-only department reach metadata; no employee content"),
     ("users.dept_grants.options", "(a) Admin-only department names and aggregate employee counts; no employee content"),
     ("users.dept_grants.mine", "(a) own effective authority; employee metadata filtered by department_grant_allows, drift labels also check owner-only and machine gates"),
     // Everything below is covered by the P1g default deny (a named
@@ -599,7 +600,8 @@ const P1F_CEILING: usize = 0;
 /// entries, method by method). Growing it is an owner decision.
 /// P1h (N6): 13 — `topology.list` left the allowlist.
 /// RM-142 P4: four explicitly requested department-grant metadata methods.
-const METADATA_CEILING: usize = 17;
+/// RM-142 P12: one Admin-only reach preview joins the four department metadata RPCs.
+const METADATA_CEILING: usize = 18;
 
 struct Arm {
     methods: Vec<String>,

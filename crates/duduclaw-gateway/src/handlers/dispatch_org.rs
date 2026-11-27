@@ -212,6 +212,10 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_dept_grants_options()).await
             }
             "users.dept_grants.mine" => boxed_frame(|| self.handle_dept_grants_mine(params, ctx)).await,
+            "users.dept_grants.reach_preview" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_reach_preview(params)).await
+            }
             "users.invite" | "users.invite_status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_user_invites(method, params, ctx)).await
