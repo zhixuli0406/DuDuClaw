@@ -200,6 +200,44 @@ async fn task_status_filter_and_argument_types_are_enforced() {
 }
 
 #[tokio::test]
+async fn member_tasks_list_limit_validates_and_returns_newest_rows() {
+    let f = fixture(&["tasks:read"]).await;
+    let live = authenticate(&f.state, f.secret.clone()).await
+        .unwrap_or_else(|e| panic!("authenticate: {}", e.message));
+    let store = TaskStore::open(f.home.path()).unwrap();
+    let conn = rusqlite::Connection::open(f.home.path().join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET created_at='2000-01-01T00:00:00Z', pinned=1", []).unwrap();
+    for index in 1..=4 {
+        let id = format!("rpc-{index}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "normal".into(), "sales".into(), "system".into());
+        row.created_at = format!("2026-01-0{index}T00:00:00Z");
+        row.updated_at = format!("2026-02-0{}T00:00:00Z", 5 - index);
+        store.insert_task(&row).await.unwrap();
+    }
+    for limit in [1, 2, 1000] {
+        let frame = f.state.handler.handle("tasks.list", json!({"agent_id":"sales", "limit":limit}), &live.context).await;
+        let WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else {
+            panic!("member tasks.list refused a valid limit");
+        };
+        let rows = payload["tasks"].as_array().unwrap();
+        assert_eq!(rows.len(), (limit as usize).min(5));
+        assert_eq!(rows[0]["id"], "rpc-4");
+        if limit >= 2 { assert_eq!(rows[1]["id"], "rpc-3"); }
+    }
+    let frame = f.state.handler.handle("tasks.list", json!({"agent_id":"sales"}), &live.context).await;
+    let WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else {
+        panic!("member tasks.list refused the unlimited default");
+    };
+    assert_eq!(payload["tasks"].as_array().unwrap().len(), 5);
+    assert_eq!(payload["tasks"][0]["id"], "visible-task");
+    for limit in [json!(0), json!(1001), json!(u64::MAX), json!(-1), json!(1.5),
+        json!("1"), json!(true), json!(null), json!([]), json!({})] {
+        let frame = f.state.handler.handle("tasks.list", json!({"agent_id":"sales", "limit":limit}), &live.context).await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{limit}");
+    }
+}
+
+#[tokio::test]
 async fn task_limit_default_and_upper_boundary_are_accepted() {
     let f = fixture(&["tasks:read"]).await;
     assert_eq!(default_limit(), 50);
@@ -250,18 +288,44 @@ async fn task_row_ceiling_bounds_collection_and_stops_further_rpcs() {
     for index in 1..=6 {
         let id = format!("bounded-{index}");
         let mut row = TaskRow::new(id.clone(), id, "".into(), "normal".into(), "cap-000".into(), "system".into());
-        // tasks.list orders by updated_at; the bridge sorts collected rows by
-        // created_at. The sixth fetched row must not enter that sort.
+        // Bounded tasks.list must use created_at, regardless of update order.
         row.updated_at = format!("2026-01-0{index}T00:00:00Z");
         row.created_at = format!("2026-01-0{}T00:00:00Z", 7 - index);
         store.insert_task(&row).await.unwrap();
     }
+    let conn = rusqlite::Connection::open(f.home.path().join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET title=X'FF' WHERE id='bounded-6'", []).unwrap();
     let response = call(&f, "my_tasks_list", json!({"limit":1})).await;
     // Querying sales after reaching five rows would fail the one-call quota.
     assert_eq!(response.0, StatusCode::OK, "{}", response.1);
     let tasks = response.1["result"]["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 1);
-    assert_eq!(tasks[0]["id"], "bounded-2");
+    assert_eq!(tasks[0]["id"], "bounded-1");
+    assert_eq!(response.1["result"]["truncated"], true);
+}
+
+#[tokio::test]
+async fn task_bridge_passes_remaining_budget_to_each_employee() {
+    let f = fixture(&["tasks:read"]).await;
+    add_visible_agent(&f, "cap-000");
+    let store = TaskStore::open(f.home.path()).unwrap();
+    for (agent, count, year) in [("cap-000", 2, 2029), ("sales", 3, 2030)] {
+        for index in 1..=count {
+            let id = format!("{agent}-{index}");
+            let mut row = TaskRow::new(id.clone(), id, String::new(), "normal".into(), agent.into(), "system".into());
+            row.created_at = format!("{year}-01-0{index}T00:00:00Z");
+            store.insert_task(&row).await.unwrap();
+        }
+    }
+    let conn = rusqlite::Connection::open(f.home.path().join("tasks.db")).unwrap();
+    conn.execute("UPDATE tasks SET title=X'FF', created_at='2000-01-01T00:00:00Z' WHERE id='visible-task'", []).unwrap();
+    // cap-000 uses two of five rows. Reading more than three from sales
+    // would materialize its invalid old row and fail this request.
+    let response = call(&f, "my_tasks_list", json!({"limit":1})).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    let rows = response.1["result"]["tasks"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], "sales-3");
     assert_eq!(response.1["result"]["truncated"], true);
 }
 

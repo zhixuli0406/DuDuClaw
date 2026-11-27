@@ -108,6 +108,28 @@ impl Fixture {
 }
 
 fn read() -> Value { json!({"tool":"odoo_search"}) }
+
+#[tokio::test]
+async fn employee_audit_failure_refuses_before_releasing_personal_secret() {
+    let f = Fixture::new();
+    f.avatar(&f.a, "alice");
+    f.credential(&f.a, SECRET_A);
+    let (status, value) = f.employee("alice", read()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["secret"], SECRET_A);
+    let audit_path = f.home.path().join("tool_calls.jsonl");
+    std::fs::remove_file(&audit_path).unwrap();
+    std::fs::create_dir(&audit_path).unwrap();
+
+    let (status, value) = f.employee("alice", read()).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["ok"], false);
+    assert!(value.get("secret").is_none());
+    assert!(value.get("identity").is_none());
+    assert!(!value.to_string().contains(SECRET_A));
+    assert!(audit_path.is_dir());
+}
+
 fn refused(status: StatusCode, value: &Value, code: &str) {
     assert_eq!(status, StatusCode::FORBIDDEN, "{value}");
     assert_eq!(value["ok"], false);

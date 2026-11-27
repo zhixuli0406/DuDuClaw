@@ -2,6 +2,34 @@
 
 use super::*;
 
+#[tokio::test]
+async fn bounded_list_limits_sql_materialization_and_orders_newest_first() {
+    let (store, dir) = temp_store();
+    for index in 0..6 {
+        let id = format!("bounded-{index}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "medium".into(), "bot".into(), "system".into());
+        // The two newest rows tie; ID ascending must break the tie.
+        row.created_at = format!("2026-01-0{}T00:00:00Z", index.min(4) + 1);
+        row.updated_at = format!("2026-02-0{}T00:00:00Z", 6 - index);
+        row.pinned = index == 0;
+        store.insert_task(&row).await.unwrap();
+    }
+    let conn = rusqlite::Connection::open(dir.path().join("tasks.db")).unwrap();
+    // This old row cannot deserialize as TaskRow. A load-all-then-truncate
+    // implementation would fail even when the caller only asks for one row.
+    conn.execute("UPDATE tasks SET title = X'FF' WHERE id = 'bounded-0'", []).unwrap();
+    for (limit, expected) in [(1, vec!["bounded-4"]), (2, vec!["bounded-4", "bounded-5"])] {
+        let rows = store.list_tasks_filtered_bounded(Some("todo"), Some("bot"), Some("medium"), Some(false), limit).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), expected);
+    }
+    assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, 6).await.is_err());
+    assert!(store.list_tasks_filtered(None, Some("bot"), None, None).await.is_err());
+    for invalid in [0, 1001, usize::MAX] {
+        assert!(store.list_tasks_filtered_bounded(None, Some("bot"), None, None, invalid).await.is_err());
+    }
+    assert!(store.list_tasks_filtered_bounded(None, Some("other"), None, None, 1).await.unwrap().is_empty());
+}
+
 // ── W2-7: source_discord_guild_id column round trip ──────
 
 #[tokio::test]

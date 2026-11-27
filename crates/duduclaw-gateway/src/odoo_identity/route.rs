@@ -131,15 +131,14 @@ fn employee_request(state: &OdooIdentityRouteState, peer: SocketAddr,
         resolve::employee(&state.home, &state.users, &caller.agent_id, &requester, &settings)
     })();
     let decision = result.as_ref().ok();
-    // The existing writer holds duduclaw_core::with_file_lock across rotation
-    // and the chained append. This is the gateway-wide employee-attributed log.
-    duduclaw_security::audit::append_tool_call_with_extras(
+    // Persist the employee-attributed decision before serializing any secret.
+    duduclaw_security::audit::try_append_tool_call_with_extras(
         &state.home, &caller.agent_id, "odoo_identity", "identity decision", result.is_ok(),
         &[("tool", json!(audit_tool(body))),
           ("identity", json!(decision.map(|d| d.identity_name()))),
           ("user_id", json!(decision.and_then(|d| d.user_id()))),
           ("outcome", json!(result.as_ref().map(|_| "ok").unwrap_or_else(|e| e.code)))],
-    );
+    ).map_err(|_| Refusal::unavailable())?;
     result.map(|decision| decision.response(have_rev))
 }
 

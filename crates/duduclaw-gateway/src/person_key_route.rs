@@ -300,14 +300,13 @@ async fn execute(state: &PersonKeyRouteState, ctx: &UserContext, tool: &PersonTo
                     truncated = true;
                     break;
                 }
-                let mut params = json!({"agent_id":agent});
+                let remaining = row_ceiling - tasks.len();
+                let mut params = json!({"agent_id":agent, "limit":remaining});
                 if let Some(status) = &args.status { params["status"] = json!(status); }
-                // tasks.list has no limit; tasks.list_page is not in the member
-                // contract. Never bypass that gate to obtain a bounded page.
+                // Bound SQL materialization and enrichment within the member contract.
                 let payload = rpc(state, ctx, tool, "tasks.list", params).await?;
                 let rows = payload.get("tasks").and_then(Value::as_array).ok_or_else(Refusal::unavailable)?;
-                let remaining = row_ceiling - tasks.len();
-                truncated |= rows.len() > remaining;
+                truncated |= rows.len() >= remaining;
                 tasks.extend(rows.iter().take(remaining).cloned());
             }
             tasks.sort_by(|a, b| b["created_at"].as_str().cmp(&a["created_at"].as_str())

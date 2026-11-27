@@ -50,6 +50,33 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
     ) -> Result<Vec<TaskRow>, String> {
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, None).await
+    }
+
+    /// Bound materialization in SQL, newest-created first with a stable ID tie-break.
+    /// Unlike the board view, pinned/updated rows do not outrank newer tasks.
+    pub async fn list_tasks_filtered_bounded(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: usize,
+    ) -> Result<Vec<TaskRow>, String> {
+        if !(1..=1000).contains(&limit) {
+            return Err("limit must be an integer between 1 and 1000".into());
+        }
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, Some(limit)).await
+    }
+
+    async fn list_tasks_filtered_inner(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: Option<usize>,
+    ) -> Result<Vec<TaskRow>, String> {
         let conn = self.conn.lock().await;
         let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
@@ -83,8 +110,13 @@ impl TaskStore {
         // a caller actually archives something. Callers that need to browse
         // the archive explicitly use `list_tasks_paginated` instead.
         sql.push_str(" AND archived = 0");
-        // Pinned tasks float to the top of every list (I-3b "置頂").
-        sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        if let Some(limit) = limit {
+            binds.push(limit.to_string());
+            sql.push_str(&format!(" ORDER BY created_at DESC, id ASC LIMIT ?{}", binds.len()));
+        } else {
+            // Preserve the unlimited board view's pinned/updated ordering.
+            sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        }
 
         let mut stmt = conn
             .prepare(&sql)
