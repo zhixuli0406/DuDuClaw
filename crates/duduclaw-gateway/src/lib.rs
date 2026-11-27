@@ -271,9 +271,12 @@ pub mod channel_decision_route;
 // and the scheduled daily digest.
 pub mod autopilot_approval;
 pub mod autopilot_engine;
+pub mod autopilot_fields;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
 pub mod autopilot_store;
+pub mod autopilot_template;
+pub mod autopilot_window;
 pub mod cep_matcher;
 pub mod cron_scheduler;
 pub mod cron_store;
