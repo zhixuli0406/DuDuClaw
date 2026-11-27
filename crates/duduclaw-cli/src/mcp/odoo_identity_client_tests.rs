@@ -591,8 +591,15 @@ async fn follow_sensitive_read_never_persists_values() {
     assert_ne!(person["isError"], true, "{person}");
     let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert!(!audit.contains("smtp-secret-must-not-persist") && !audit.contains("smtp.password"));
-    assert_audit_chain(&audit, 1);
-    for row in audit.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()) {
+    // One employee call and one person-key call each emit result metadata.
+    assert_audit_chain(&audit, 2);
+    for (row, actor) in audit.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .zip(["bot", "person:alice"]) {
+        assert_eq!(row["agent_id"], actor);
+        assert_eq!(row["tool_name"], "odoo_search");
+        assert_eq!(row["params_summary"], "Odoo result metadata");
+        assert_eq!(row["success"], true);
+        assert_eq!(row["odoo_identity"]["user_id"], "alice");
         assert!(row.get("result_text").is_none());
         assert_eq!(row["odoo_result"]["model"], "ir.config_parameter");
         assert_eq!(row["odoo_result"]["record_count"], 1);
