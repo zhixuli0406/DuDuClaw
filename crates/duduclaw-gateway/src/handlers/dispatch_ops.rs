@@ -53,6 +53,9 @@ impl MethodHandler {
         }
 
         match method {
+            "autopilot.affecting_me" => {
+                boxed_frame(|| self.handle_autopilot_affecting_me(params, ctx)).await
+            }
             "autopilot.create" => {
                 boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }

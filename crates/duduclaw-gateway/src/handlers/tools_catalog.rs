@@ -83,6 +83,7 @@ impl MethodHandler {
                     { "name": "cost.department_summary", "description": "Authorized department cost rows and their totals" },
                     { "name": "cost.department_recent", "description": "Recent cost records for an authorized department" },
                     { "name": "autopilot.list", "description": "List autopilot rules (read-only, admin)" },
+                    { "name": "autopilot.affecting_me", "description": "Read rules acting on your directly bound AI employees (dashboard session only)" },
                     { "name": "autopilot.breakers", "description": "List autopilot breaker states (read-only, admin)" },
                     { "name": "wiki.pages", "description": "List wiki pages for an agent" },
                     { "name": "wiki.read", "description": "Read a wiki page" },

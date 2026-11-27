@@ -36,6 +36,7 @@ pub(crate) const METHOD_COVERAGE: &[(&str, GrantGroup, Coverage)] = &[
     ("autopilot.update", Automation, Scoped(Edit)),
     ("autopilot.remove", Automation, Scoped(Remove)),
     ("autopilot.history", Automation, Scoped(Read)),
+    ("autopilot.affecting_me", Automation, NotDelegated("member read-only view of rules acting on own bound employees")),
     ("autopilot.breakers", Automation, AdminOnly),
     ("ticks.sources", Automation, AdminOnly),
     ("ticks.recent", Automation, AdminOnly),

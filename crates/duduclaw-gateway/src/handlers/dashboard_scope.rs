@@ -3,6 +3,7 @@
 use duduclaw_auth::models::UserRole;
 
 const EMPLOYEE_METHODS: &[&str] = &[
+    "autopilot.affecting_me",
     "agents.org_chart",
     "skills.recent",
     "cron.list",
