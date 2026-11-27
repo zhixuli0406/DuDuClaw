@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Download, ReceiptText } from 'lucide-react';
@@ -11,6 +12,7 @@ import {
 
 export function ForgetReceiptsPanel() {
   const intl = useIntl();
+  useCompanyTimeZone();
   const connection = useConnectionStore((s) => s.state);
   const [receipts, setReceipts] = useState<ForgetReceipt[]>([]);
   const [jobs, setJobs] = useState<ForgetJob[]>([]);
@@ -164,7 +166,7 @@ export function ForgetReceiptsPanel() {
                     </Button>
                   </>
                 ) : job.next_attempt_at > 0 && (
-                  <p className="text-xs text-muted-foreground">{t('nextAttempt')}: {new Date(job.next_attempt_at * 1000).toLocaleString()}</p>
+                  <p className="text-xs text-muted-foreground">{t('nextAttempt')}: {formatDateTime(job.next_attempt_at * 1000, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</p>
                 )}
               </div>
             ))}

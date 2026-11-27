@@ -1,3 +1,5 @@
+import { useCompanyTimeStore } from '@/lib/company-time';
+import { toast } from '@/lib/toast';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import userEvent from '@testing-library/user-event';
 import { screen, waitFor, act, fireEvent } from '@testing-library/react';
@@ -13,6 +15,7 @@ const wsHandlers = new Map<string, (payload: unknown) => void>();
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useCompanyTimeStore.setState({ zone: null, status: 'unset', source: null });
   useAuthStore.setState({ user: null, bindings: [], deptGrants: [], deptGroups: new Set() });
   wsHandlers.clear();
   mockWsClient.call.mockResolvedValue({ tasks: [] });
@@ -206,6 +209,40 @@ describe('routine delivery status', () => {
   });
 });
 
+
+describe('routine time zones', () => {
+  it('shows the stored zone and UTC for legacy rows', async () => {
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'cron.list' ? {
+      tasks: [
+        { id: 'new', name: 'New', agent_id: 'sales', cron: '0 9 * * *', enabled: true, cron_timezone: 'Asia/Taipei' },
+        { id: 'old', name: 'Old', agent_id: 'sales', cron: '0 8 * * *', enabled: true, cron_timezone: null },
+      ],
+    } : {}));
+    renderWithProviders(<RoutinesPage />);
+    expect(await screen.findByText('0 9 * * * (Asia/Taipei)')).toBeInTheDocument();
+    expect(screen.getByText('0 8 * * * (UTC)')).toBeInTheDocument();
+  });
+
+  it.each(['set', 'unset'] as const)('explains the create zone (%s) and shows the server notice', async (status) => {
+    const success = vi.spyOn(toast, 'success');
+    try {
+      useCompanyTimeStore.setState({ zone: 'Asia/Taipei', status, source: null });
+      useConnectionStore.setState({ state: 'authenticated' });
+      mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+        method === 'cron.list' ? { tasks: [] } : method === 'cron.add' ? { zone_note: 'Server fallback notice' } : {},
+      ));
+      renderWithProviders(<RoutinesPage />);
+      fireEvent.click((await screen.findAllByText('New automation'))[0]);
+      expect(await screen.findByText(status === 'set' ? 'Runs in the company time zone (Asia/Taipei)' : 'Company time zone is not set; runs in UTC')).toBeInTheDocument();
+      fireEvent.change(screen.getByLabelText('Task Name'), { target: { value: 'Morning' } });
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+      await waitFor(() => expect(success).toHaveBeenCalledWith(expect.stringContaining('Server fallback notice')));
+    } finally {
+      success.mockRestore();
+    }
+  });
+});
 
 it('filters department schedules using granted employees and reports employees needing sync', async () => {
   useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [],

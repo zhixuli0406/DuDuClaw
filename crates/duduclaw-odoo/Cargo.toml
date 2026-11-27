@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+base64 = { workspace = true }
 duduclaw-core = { workspace = true }
 duduclaw-security = { workspace = true }
 tokio = { workspace = true }

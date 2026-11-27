@@ -2,6 +2,90 @@
 
 use super::*;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn employee_fixture() -> (tempfile::TempDir, MethodHandler, UserContext) {
+        let home = tempfile::tempdir().unwrap();
+        let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+        let user = db.create_user(
+            "employee@example.test", "Employee", "password-test", UserRole::Employee,
+        ).unwrap();
+        let ctx = db.live_user_context(&user.id).unwrap().unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        handler.set_user_db(
+            db,
+            Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!")),
+        ).await;
+        (home, handler, ctx)
+    }
+
+    async fn read_payload(handler: &MethodHandler, ctx: &UserContext, params: Value) -> Value {
+        match handler.handle("system.company_timezone", params, ctx).await {
+            WsFrame::Response { ok: true, payload: Some(payload), .. } => payload,
+            frame => panic!("expected successful timezone response, got {frame:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn company_timezone_rpc_returns_only_name_and_status() {
+        let (home, handler, ctx) = employee_fixture().await;
+        assert_eq!(ctx.role, UserRole::Employee);
+        assert_eq!(read_payload(&handler, &ctx, json!({})).await,
+            json!({"timezone": null, "status": "unset", "source": null}));
+
+        for (config, timezone, status) in [
+            ("[general]\ncompany_timezone = 'Asia/Taipei'\n", Some("Asia/Taipei"), "set"),
+            ("[general]\n", None, "unset"),
+            ("[general]\ncompany_timezone = ''\n", None, "unset"),
+            ("[general]\ncompany_timezone = 'Not/AZone'\n", None, "invalid"),
+            ("[general]\ncompany_timezone = 42\n", None, "invalid"),
+            ("invalid toml [", None, "invalid"),
+        ] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            let payload = read_payload(&handler, &ctx, json!({})).await;
+            assert_eq!(payload,
+                json!({"timezone": timezone, "status": status, "source": null}));
+            assert!(!payload.to_string().contains("Not/AZone"));
+        }
+    }
+
+    #[tokio::test]
+    async fn company_timezone_rpc_is_read_only() {
+        let (home, handler, ctx) = employee_fixture().await;
+        let path = home.path().join("config.toml");
+        let config = b"# Preserve these bytes\n[general]\ncompany_timezone = 'Asia/Taipei'\n";
+        std::fs::write(&path, config).unwrap();
+        assert_eq!(read_payload(&handler, &ctx, json!({"timezone": "Asia/Tokyo"})).await,
+            json!({"timezone": "Asia/Taipei", "status": "set", "source": null}));
+        assert_eq!(std::fs::read(&path).unwrap(), config);
+        assert!(matches!(
+            handler.handle("system.update_config", json!({"company_timezone": "Asia/Tokyo"}), &ctx).await,
+            WsFrame::Response { ok: false, .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), config);
+    }
+
+    #[tokio::test]
+    async fn company_timezone_rpc_source_requires_exact_value() {
+        let (home, handler, ctx) = employee_fixture().await;
+        for (raw_source, source) in [
+            ("'detected_at_upgrade'", Some("detected_at_upgrade")),
+            ("'detected_at_upgrade '", None),
+            ("'DETECTED_AT_UPGRADE'", None),
+            ("'private-config-value'", None),
+            ("42", None),
+        ] {
+            std::fs::write(home.path().join("config.toml"), format!(
+                "[general]\ncompany_timezone = 'Asia/Taipei'\ncompany_timezone_source = {raw_source}\n",
+            )).unwrap();
+            assert_eq!(read_payload(&handler, &ctx, json!({})).await,
+                json!({"timezone": "Asia/Taipei", "status": "set", "source": source}));
+        }
+    }
+}
+
 impl MethodHandler {
     pub(crate) async fn dispatch_system(
         &self,
@@ -52,6 +136,22 @@ impl MethodHandler {
                 Ok(payload) => WsFrame::ok_response("", payload),
                 Err(error) => WsFrame::error_response("", &error),
             },
+            "system.company_timezone" => {
+                use duduclaw_core::company_timezone::{self, CompanyZone};
+
+                let (timezone, status) = match company_timezone::read(&self.home_dir) {
+                    CompanyZone::Set(zone) => (Some(zone.name()), "set"),
+                    CompanyZone::Unset => (None, "unset"),
+                    CompanyZone::Invalid => (None, "invalid"),
+                };
+                let source = company_timezone::read_source(&self.home_dir)
+                    .filter(|source| source == "detected_at_upgrade");
+                WsFrame::ok_response("", json!({
+                    "timezone": timezone,
+                    "status": status,
+                    "source": source,
+                }))
+            }
             "finetune.datasets.delete" => {
                 require_admin!();
                 let id = params.get("dataset_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -549,6 +649,10 @@ impl MethodHandler {
             }
 
             // ── Odoo (admin only) ────────────────────────────
+            "odoo.access_get" | "odoo.access_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_odoo_access_rpc(method, params, ctx)).await
+            }
             "odoo.status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_status()).await

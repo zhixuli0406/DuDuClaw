@@ -102,12 +102,16 @@ fn documented_refusals() -> BTreeSet<String> {
     // refusal must change the reviewed product matrix before it can pass parity.
     let matrix = include_str!("../../../docs/architecture/native-linux-isolation-tools.md");
     let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && (line.contains("Refused: HostAuthority")
-            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")))
+            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")
+            || line.contains("Refused: AdminSettingsUnavailable")))
         .filter_map(|line| line.split('`').nth(1)).map(str::to_owned).collect();
     assert!(names.contains("os_power"), "matrix must enumerate the host-authority exception");
     let proposal: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ProposalRequired"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(proposal, BTreeSet::from(["create_agent"]), "protected employee creation is proposal-only");
+    let admin_settings: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: AdminSettingsUnavailable"))
+        .filter_map(|line| line.split('`').nth(1)).collect();
+    assert_eq!(admin_settings, BTreeSet::from(["admin_settings_read", "admin_settings_propose"]));
     let deferred: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ForkNextRelease"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(deferred, BTreeSet::from(["fork_run", "merge_or_select", "terminate_branch"]));

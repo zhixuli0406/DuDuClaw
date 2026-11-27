@@ -5,7 +5,7 @@ use super::*;
 /// the routine exists.
 #[test]
 fn cron_receipt_is_human_zh_tw_and_points_at_the_dashboard() {
-    let r = cron_created_receipt("每日晨報", "0 9 * * *", Some("Asia/Taipei"));
+    let r = cron_created_receipt("每日晨報", "0 9 * * *", Some("Asia/Taipei"), None);
     assert!(r.contains("每日晨報"), "{r}");
     assert!(r.contains("每天 09:00"), "{r}");
     assert!(r.contains("Asia/Taipei"), "{r}");
@@ -128,7 +128,7 @@ fn humanize_cron_rejects_the_shapes_it_would_describe_wrongly() {
     assert_eq!(humanize_cron_zh("15 * * * 5"), None);
 
     // The receipt then carries the raw expression, which the user can audit.
-    let r = cron_created_receipt("每週報", "0 * * * 2", None);
+    let r = cron_created_receipt("每週報", "0 * * * 2", None, None);
     assert!(r.contains("排程 0 * * * 2"), "{r}");
 }
 
@@ -230,7 +230,7 @@ fn unhandled_cron_shapes_fall_back_to_the_raw_expression() {
     assert_eq!(humanize_cron_zh("0 9 * 3 *"), None); // month
     assert_eq!(humanize_cron_zh("garbage"), None);
 
-    let r = cron_created_receipt("季報", "*/5 * * * *", None);
+    let r = cron_created_receipt("季報", "*/5 * * * *", None, None);
     assert!(r.contains("排程 */5 * * * *"), "{r}");
     assert!(r.contains("例行工作"), "{r}");
 }
@@ -632,4 +632,14 @@ async fn paused_create_task_writes_no_spec_or_signal() {
     assert_eq!(result["isError"], true, "{result}");
     assert!(!home.join("bus_queue.jsonl").exists());
     assert!(!home.join("agents/sales-rep/tasks").exists());
+}
+
+#[test]
+fn receipt_mentions_utc_fallback() {
+    use duduclaw_core::company_timezone::{zone_note_zh, ZoneSource};
+    for source in [ZoneSource::UtcUnset, ZoneSource::UtcInvalid, ZoneSource::UtcMemberDst] {
+        let note = zone_note_zh(&source).unwrap();
+        let receipt = cron_created_receipt("每日晨報", "0 9 * * *", Some("UTC"), Some(note));
+        assert!(receipt.contains(&format!("每天 09:00（UTC） 執行。{note}")), "{receipt}");
+    }
 }

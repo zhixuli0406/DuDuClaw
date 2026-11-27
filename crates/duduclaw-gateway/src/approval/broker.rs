@@ -355,20 +355,19 @@ impl ApprovalBroker {
         self.decide_unbound(id, true, decided_by, false).await
     }
 
-    /// Egress approvals require live Admin authority even without a binding.
+    /// Outbound authority is re-read inside the decision path, never supplied as a boolean.
     pub async fn decide_egress_dashboard(
         &self, id: &ApprovalId, ctx: &duduclaw_auth::UserContext, approve: bool,
     ) -> Result<(), String> {
-        self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
-        self.decide_unbound(id, approve, &format!("dashboard:{}", ctx.user_id), true).await
+        self.decide_unbound_inner(id, approve, &format!("dashboard:{}", ctx.user_id), false, None, Some(ctx)).await
     }
 
     /// Persist a decision from caller-verified identity. The future decision
     /// service MUST verify a live Active Admin and matching chat proof before
     /// using ChatAdmin, including for egress_guard records. This method does
     /// not establish identity from the approval payload or tool arguments.
-    /// Dashboard follows ordinary decide; egress still uses the existing
-    /// decide_egress_dashboard entry point with its live role check.
+    /// Dashboard outbound decisions use decide_egress_dashboard, which
+    /// re-loads the signed-in user's current department review authority.
     pub(crate) async fn decide_as(
         &self,
         id: &ApprovalId,
@@ -381,30 +380,37 @@ impl ApprovalBroker {
             }
             chat_admin::DecisionActor::ChatAdmin(entry) => {
                 self.decide_unbound_inner(
-                    id, approve, &entry.decided_by().to_string(), true, Some(entry),
+                    id, approve, &entry.decided_by().to_string(), true, Some(entry), None,
                 ).await
             }
         }
     }
 
     async fn decide_unbound(&self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool) -> Result<(), String> {
-        self.decide_unbound_inner(id, approve, decided_by, egress_admin, None).await
+        self.decide_unbound_inner(id, approve, decided_by, egress_admin, None, None).await
     }
 
     async fn decide_unbound_inner(
         &self, id: &ApprovalId, approve: bool, decided_by: &str, egress_admin: bool,
         ledger: Option<&chat_admin::LedgerEntry>,
+        dashboard: Option<&duduclaw_auth::UserContext>,
     ) -> Result<(), String> {
         let rec = self
             .store
             .get(id)
             .await?
             .ok_or_else(|| format!("approval {id} not found"))?;
-        if rec.action_kind == "db_source_grant" && (!egress_admin || ledger.is_some()) {
-            return Err("database grants require an authenticated dashboard Admin".into());
+        if rec.action_kind == "db_source_grant" {
+            let ctx = dashboard.ok_or("database grants require an authenticated dashboard Admin")?;
+            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
         }
-        if rec.payload.get("egress_guard").is_some() && !egress_admin {
-            return Err("outgoing data approval requires an authenticated Admin".into());
+        if !super::is_outbound_data_card(&rec) && let Some(ctx) = dashboard {
+            // Preserve the old Admin gate for callers using this entry for
+            // non-outbound cards (notably database source grants).
+            self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+        }
+        if super::is_outbound_data_card(&rec) && dashboard.is_none() && (!egress_admin || ledger.is_none()) {
+            return Err(super::outbound::REFUSAL.into());
         }
         if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
             return Err("bound requests require authenticated decision context".into());
@@ -432,6 +438,14 @@ impl ApprovalBroker {
             ApprovalStatus::Denied
         };
         let decided_at = Utc::now().to_rfc3339();
+        // Re-load immediately before the store CAS. A prior list/preflight is
+        // never authority, and generic dashboard decided_by strings grant nothing.
+        let reviewer = if super::is_outbound_data_card(&rec) {
+            match dashboard {
+                Some(ctx) => Some(self.require_outbound_reviewer(ctx, &rec)?),
+                None => None,
+            }
+        } else { None };
         let n = match ledger {
             Some(entry) => self.store.decide_if_pending_with_ledger(id, approve, entry, &decided_at).await?,
             None => self.store.decide_if_pending(id, new_status, decided_by, &decided_at).await?,
@@ -439,6 +453,13 @@ impl ApprovalBroker {
         if n == 0 {
             // Lost the race to another decider between get() and update.
             return Err(format!("approval {id} was decided concurrently"));
+        }
+        if super::is_outbound_data_card(&rec) && let Some(home) = self.home_dir() {
+            if let Some(ctx) = reviewer {
+                super::outbound::audit(&home, &rec, &ctx.user_id, ctx.is_admin(), Some(approve));
+            } else if let Some(entry) = ledger {
+                super::outbound::audit(&home, &rec, &entry.user_id.to_string(), true, Some(approve));
+            }
         }
         info!(approval_id = %id, decision = new_status.as_str(), decided_by, "approval decided");
         Ok(())

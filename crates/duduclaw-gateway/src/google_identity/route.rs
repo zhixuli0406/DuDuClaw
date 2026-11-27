@@ -192,7 +192,7 @@ pub(crate) async fn serve(
         return outcome;
     }
     if crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS.contains(&tool) {
-        let outcome = Err(Refusal::hard("write_tool_gateway_only", "雲端硬碟寫入必須由主程式執行，不能取得 Google 權杖。"));
+        let outcome = Err(Refusal::hard("write_tool_gateway_only", "此連線不支援雲端硬碟寫入，請管理員檢查 Google 連線設定。"));
         audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
         return outcome.map(|_| Value::Null);
     }

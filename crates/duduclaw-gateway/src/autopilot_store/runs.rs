@@ -99,6 +99,8 @@ pub struct AutopilotRunRow {
     pub lease_owner: Option<String>,
     pub lease_until: Option<String>,
     pub owner_department: Option<String>,
+    #[serde(default)]
+    pub gateway_origin: bool,
     pub outcome: Option<String>,
     pub detail: Option<String>,
     pub notice_pending: bool,
@@ -107,6 +109,13 @@ pub struct AutopilotRunRow {
     pub notice_push_next_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl AutopilotRunRow {
+    pub(crate) fn event_origin(&self) -> crate::autopilot_engine::EventOrigin {
+        if self.gateway_origin { crate::autopilot_engine::EventOrigin::gateway() }
+        else { crate::autopilot_engine::EventOrigin::external() }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,7 +161,7 @@ pub fn step_idempotency_key(run_id: &str, step_index: i64) -> String {
 const RUN_COLUMNS: &str = "run_id, rule_id, rule_name, rule_hash, event_name, event_ref,
     dedupe_key, fields_json, state, step_index, step_count, next_at, lease_owner,
     lease_until, owner_department, outcome, detail, created_at, updated_at,
-    notice_pending, notice_push_state, notice_push_attempts, notice_push_next_at";
+    notice_pending, notice_push_state, notice_push_attempts, notice_push_next_at, gateway_origin";
 const STEP_COLUMNS: &str = "run_id, step_index, step_type, state, idempotency_key,
     dispatch_id, queue_message_id, started_at, finished_at, detail";
 
@@ -264,14 +273,14 @@ impl AutopilotStore {
             // A conflict rolls the transaction back before returning Duplicate.
             let n = conn.execute(
                 &format!("INSERT INTO autopilot_runs ({RUN_COLUMNS})
-                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)
+                    VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)
                     ON CONFLICT(dedupe_key) DO NOTHING"),
                 params![run.run_id, run.rule_id, run.rule_name, run.rule_hash, run.event_name,
                     run.event_ref, run.dedupe_key, run.fields_json, run.state, run.step_index,
                     run.step_count, normalize_ts(run.next_at.as_deref())?, run.lease_owner,
                     normalize_ts(run.lease_until.as_deref())?, run.owner_department,
                     run.outcome, run.detail, now, now, run.notice_pending, run.notice_push_state,
-                    run.notice_push_attempts, normalize_ts(run.notice_push_next_at.as_deref())?],
+                    run.notice_push_attempts, normalize_ts(run.notice_push_next_at.as_deref())?, run.gateway_origin],
             ).map_err(|e| format!("insert run: {e}"))?;
             if n == 0 {
                 duplicate = true;
@@ -516,6 +525,16 @@ impl AutopilotStore {
         Ok(rows)
     }
 
+    /// Atomically retire both owed channels without publishing event-derived data.
+    pub async fn deny_run_notice(&self, run_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute("UPDATE autopilot_runs SET notice_pending=0,
+            notice_push_state='scope_denied', notice_push_next_at=NULL
+            WHERE run_id=?1 AND state='settled'", params![run_id])
+            .map_err(|_| "settle scope-denied run notice".to_string())?;
+        Ok(())
+    }
+
     pub async fn clear_run_notice_pending(&self, run_id: &str) -> Result<(), String> {
         let conn = self.conn.lock().await;
         conn.execute("UPDATE autopilot_runs SET notice_pending=0 WHERE run_id=?1 AND state='settled'",
@@ -548,6 +567,7 @@ impl AutopilotStore {
         use crate::autopilot_approval::{NoticePush, MAX_NOTICE_PUSH_ATTEMPTS, notice_push_backoff};
         let (state, next_at) = match result {
             NoticePush::Sent | NoticePush::Queued => ("sent", None),
+            NoticePush::ScopeDenied => ("scope_denied", None),
             NoticePush::NoTarget => ("no_target", None),
             NoticePush::Failed if attempt >= MAX_NOTICE_PUSH_ATTEMPTS => ("gave_up", None),
             NoticePush::Failed => ("pending", Some(run_ts(now + notice_push_backoff(attempt)))),
@@ -591,7 +611,7 @@ fn row_to_run(r: &rusqlite::Row<'_>) -> rusqlite::Result<AutopilotRunRow> {
         lease_owner: r.get(12)?, lease_until: r.get(13)?, owner_department: r.get(14)?,
         outcome: r.get(15)?, detail: r.get(16)?, created_at: r.get(17)?, updated_at: r.get(18)?,
         notice_pending: r.get::<_, i64>(19)? != 0, notice_push_state: r.get(20)?,
-        notice_push_attempts: r.get(21)?, notice_push_next_at: r.get(22)?,
+        notice_push_attempts: r.get(21)?, notice_push_next_at: r.get(22)?, gateway_origin: r.get(23)?,
     })
 }
 

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api } from '@/lib/api';
@@ -16,6 +17,7 @@ import { HeartPulse, Play } from 'lucide-react';
 
 export function HeartbeatTab() {
   const intl = useIntl();
+  useCompanyTimeZone();
   // P05: an empty `heartbeats` array is rendered as "no scheduled work", which
   // is exactly what a failed fetch produced too. `loadError` splits the two,
   // and `rowErrors` marks the single row whose toggle/trigger did not land.
@@ -130,7 +132,7 @@ export function HeartbeatTab() {
                   <span>{describe(hb.cron, hb.interval_seconds)}</span>
                   <span>{intl.formatMessage({ id: 'settings.heartbeat.runs' })}: {hb.total_runs}</span>
                   {hb.last_run && (
-                    <span>{intl.formatMessage({ id: 'settings.heartbeat.last' })}: {new Date(hb.last_run).toLocaleTimeString()}</span>
+                    <span>{intl.formatMessage({ id: 'settings.heartbeat.last' })}: {formatDateTime(hb.last_run, { locale: intl.locale, hour: 'numeric', minute: 'numeric', second: 'numeric' })}</span>
                   )}
                 </span>
                 {/* A toggle or trigger that failed leaves its reason on the row

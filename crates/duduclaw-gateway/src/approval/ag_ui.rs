@@ -57,7 +57,7 @@ impl ApprovalBroker {
                         || !matches!(current.action_kind.as_str(), "mcp_call" | "mcp_install")
                         || crate::approval_notify::is_dashboard_only_record(None, &current)
                         || current.payload.get("scope_epoch").is_some()
-                        || current.payload.get("egress_guard").is_some() {
+                        || super::is_outbound_data_card(&current) {
                         return Err("approval cannot be decided by AG-UI".into());
                     }
                     let n = tx.execute(

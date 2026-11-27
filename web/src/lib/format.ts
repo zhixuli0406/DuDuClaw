@@ -1,3 +1,5 @@
+import { formatDateTime } from './company-time';
+
 /**
  * Machine-value formatters (dashboard-redesign §8, paperclip P8). One place
  * that turns raw ids / money / tokens / timestamps into the compact, aligned,
@@ -5,7 +7,7 @@
  * (instead of ad-hoc `.toFixed(2)` sprinkled across pages) makes machine values
  * read as one system.
  *
- * These are pure and locale-neutral on purpose: `timeAgo` returns compact
+ * These are locale-neutral on purpose: `timeAgo` returns compact
  * unit tokens (`now` / `5m` / `2h` / `3d`) that need no translation, so they
  * can be used inside `<Mono>` without threading `intl` through every call site.
  */
@@ -83,11 +85,9 @@ export function timeAgo(input: string | number | Date | null | undefined, nowMs?
   const weeks = Math.round(days / 7);
   if (weeks < 52) return `${weeks}w`;
   // Older than ~1 year: show the calendar date instead of an unhelpful "60w".
-  const d = new Date(then);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  return formatDateTime(then, {
+    locale: 'sv-SE', year: 'numeric', month: '2-digit', day: '2-digit',
+  });
 }
 
 /**

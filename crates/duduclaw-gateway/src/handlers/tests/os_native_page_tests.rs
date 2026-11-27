@@ -559,3 +559,28 @@ async fn os_events_subscribe_denies_non_admin() {
         .await;
     assert!(!frame_ok(&frame2), "manager must be denied, got {frame2:?}");
 }
+
+#[tokio::test]
+async fn unified_log_tool_name_filter_is_exact_optional_and_strictly_typed() {
+    let home=tempfile::tempdir().unwrap();
+    let rows=["google_drive_write","drive_read","google_drive_write_extra"].map(|name|
+        json!({"timestamp":"2026-11-27T00:00:00Z","tool_name":name,"agent_id":"bot"}).to_string());
+    std::fs::write(home.path().join("tool_calls.jsonl"),rows.join("\n")).unwrap();
+    std::fs::write(home.path().join("channel_failures.jsonl"),
+        json!({"timestamp":"2026-11-27T00:00:00Z","event":"send_failed"}).to_string()).unwrap();
+    let handler=MethodHandler::new(home.path().to_path_buf()).await;
+    for (params,count) in [(json!({}),4), (json!({"tool_name_filter":"google_drive_write"}),1),
+        (json!({"tool_name_filter":"google_drive"}),0)] {
+        let WsFrame::Response {ok:true,payload:Some(payload),..}=handler.handle_audit_unified_log(params.clone()).await
+            else { panic!("expected successful audit response"); };
+        assert_eq!(payload["events"].as_array().unwrap().len(),count);
+        assert_eq!(payload["total"],json!(count));
+        if params.get("tool_name_filter").is_some() {
+            assert!(payload["events"].as_array().unwrap().iter().all(|r| r["source"]=="tool_call"));
+        }
+    }
+    for filter in [json!(null),json!(true),json!(1),json!([]),json!({}),json!("x".repeat(65))] {
+        assert!(matches!(handler.handle_audit_unified_log(json!({"tool_name_filter":filter})).await,
+            WsFrame::Response {ok:false,..}));
+    }
+}

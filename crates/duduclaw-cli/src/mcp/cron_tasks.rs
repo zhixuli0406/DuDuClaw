@@ -1,4 +1,6 @@
 use super::*;
+use duduclaw_core::company_timezone;
+use chrono::Utc;
 
 /// The cron rail behind `tasks_create` with a cron `schedule`: write a
 /// recurring task. Writes directly to the shared
@@ -110,42 +112,30 @@ pub(crate) async fn handle_schedule_task_for_actor(
     let origin = stored_origin(context.as_ref(), &target);
     let delivery = target.delivery();
     let NotifyTarget { channel: notify_channel, chat: notify_chat_id, thread: notify_thread_id, .. } = target;
-    // v1.8.25: auto-detect the host's IANA timezone when the caller doesn't
-    // specify one explicitly. Historically the cron rail fell through to UTC
-    // if `cron_timezone` was absent — which surprised every Taipei-based
-    // user whose "0 8 * * *" fired at 16:00 local time. Auto-detecting
-    // matches what a human would expect "8am every day" to mean when
-    // running the scheduler on their own laptop / server.
-    //
-    // Explicit opt-out: pass `cron_timezone = "UTC"` to force UTC
-    // evaluation. Explicit any-other-IANA-name still wins (below).
-    //
-    // Member (human-origin) schedules never auto-detect: they default to UTC.
-    // The store admits an explicit zone for them only when its UTC offset
-    // never changes (e.g. Asia/Taipei); DST zones are refused there.
-    let cron_timezone = params
+    // Persist the company default at creation so later settings changes never
+    // move this schedule. Human-origin rows keep the fixed-offset admission
+    // rule; a DST company zone falls back to UTC with an explicit receipt note.
+    // Explicit zones still go through the existing validation and store gates.
+    let explicit_timezone = params
         .get("cron_timezone")
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            // Human-origin rows default to UTC, never the host zone.
-            if principal.is_some() { return Some("UTC".into()); }
-            let detected = detect_local_timezone();
-            if let Some(ref tz) = detected {
-                tracing::info!(detected_tz = %tz, "cron schedule: auto-detected local timezone (no cron_timezone param supplied)");
-            } else {
-                tracing::warn!("cron schedule: could not detect local timezone — falling back to UTC");
-            }
-            detected
-        });
+        .map(str::to_owned);
+    let (cron_timezone, zone_note) = match explicit_timezone {
+        Some(zone) => (Some(zone), None),
+        None => {
+            let choice = company_timezone::default_for_new_schedule(
+                &company_timezone::read(home_dir), principal.is_some(), Utc::now(),
+            );
+            (Some(choice.zone), company_timezone::zone_note_zh(&choice.source))
+        }
+    };
 
     // Validate cron_timezone against the IANA database at call time so a
     // typo is reported to the scheduler caller instead of silently falling
-    // back to UTC at firing time. Auto-detected values always parse (they
-    // come from the host's TZ database), but explicit user input might
-    // have a typo.
+    // back to UTC at firing time. Company defaults already parse, but
+    // explicit user input might have a typo.
     if let Some(ref tz_name) = cron_timezone {
         if duduclaw_core::parse_timezone(tz_name).is_none() {
             return serde_json::json!({
@@ -198,7 +188,7 @@ pub(crate) async fn handle_schedule_task_for_actor(
             // `cron.changed` event raised by the MCP dispatch tail.
             let receipt = format!(
                 "{}{}",
-                cron_created_receipt(name, cron, row.cron_timezone.as_deref()),
+                cron_created_receipt(name, cron, row.cron_timezone.as_deref(), zone_note),
                 if delivery == Delivery::Channel {
                     format!("執行結果會傳送到 {} 的{}對話。", row.notify_channel.as_deref()
                         .map(duduclaw_gateway::decision_notify::channel_display_name).unwrap_or("聊天通道"),
@@ -292,7 +282,9 @@ pub(crate) fn humanize_cron_zh(cron: &str) -> Option<String> {
 
 /// The exact zh-TW sentence a channel user should see after a routine is
 /// created — names the routine, when it runs, and where to find it.
-pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str>) -> String {
+pub(crate) fn cron_created_receipt(
+    name: &str, cron: &str, timezone: Option<&str>, zone_note: Option<&str>,
+) -> String {
     let when = match humanize_cron_zh(cron) {
         Some(h) => match timezone {
             Some(tz) => format!("{h}（{tz}）"),
@@ -300,7 +292,8 @@ pub(crate) fn cron_created_receipt(name: &str, cron: &str, timezone: Option<&str
         },
         None => format!("排程 {cron}"),
     };
-    format!("已建立例行工作：「{name}」，{when} 執行。可在 dashboard 的「例行工作」頁查看或修改。")
+    let note = zone_note.unwrap_or("");
+    format!("已建立例行工作：「{name}」，{when} 執行。{note}可在 dashboard 的「例行工作」頁查看或修改。")
 }
 
 /// Where a scheduled result will go (RM-124) — decides the receipt wording.

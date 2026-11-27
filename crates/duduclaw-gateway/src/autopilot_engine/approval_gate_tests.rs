@@ -171,6 +171,7 @@ fn reproduced_action() -> Value {
 
 fn task_created(title: &str) -> AutopilotEvent {
     AutopilotEvent::TaskCreated {
+        origin: crate::autopilot_engine::EventOrigin::external(),
         task: json!({ "id": format!("task-{title}"), "title": title, "priority": "high" }),
     }
 }
@@ -181,6 +182,63 @@ async fn file_one(h: &Harness, engine: &AutopilotEngine) -> ApprovalId {
     let cards = h.cards().await;
     assert_eq!(cards.len(), 1, "exactly one approval per fire");
     cards[0].id.clone()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn department_containment_blocks_approval_resume_before_perform_action() {
+    // Seed a legacy pending approval directly, bypassing the new trigger guard.
+    // The hash includes department ownership, so a stale-revision rejection
+    // cannot mask a missing containment check in the resumer.
+    for department in [Some("sales"), None] {
+        let h = Harness::new();
+        h.insert_rule("r1", reproduced_action()).await;
+        // Inject the legacy shape: typed writes now require a steps envelope.
+        rusqlite::Connection::open(h.home.join("autopilot.db")).unwrap().execute(
+            "UPDATE autopilot_rules SET owner_department=?1 WHERE id='r1'", [department],
+        ).unwrap();
+        let rule = h.store.get_rule("r1").await.unwrap().unwrap();
+        let engine = h.engine(true);
+        let at = chrono::Utc::now();
+        let frozen = gate::FrozenDispatch {
+            dispatch_id: uuid::Uuid::new_v4().to_string(), rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+            rule_hash: gate::rule_revision_hash(&rule), event: "task_created".into(), event_ref: "legacy fixture".into(),
+            source_agent: None,
+            action: gate::FrozenAction::Delegate { target_agent: "plain".into(), prompt: "report".into(), lane: None },
+        };
+        let ledger = frozen.ledger_row(&at.to_rfc3339(), "department-fixture");
+        assert!(h.store.insert_dispatch(&ledger).await.unwrap());
+        let latest = gate::latest_execution_at(at, crate::approval::DEFAULT_TTL_SECONDS);
+        let id = h.broker().request(gate::REQUESTER, gate::ACTION_KIND, &frozen.summary(&latest),
+            frozen.approval_payload(&latest), crate::approval::DEFAULT_TTL_SECONDS).await.unwrap();
+        assert!(h.store.mark_dispatch_awaiting(&ledger.dispatch_id, id.as_str()).await.unwrap());
+        let cards = h.cards().await;
+        assert_eq!(cards.len(), 1);
+        let id = &cards[0].id;
+        let pending = h.only_dispatch().await;
+        assert_eq!(pending.rule_hash, gate::rule_revision_hash(&rule));
+        h.broker().decide(id, true, "dashboard:admin").await.unwrap();
+        assert_eq!(engine.resume_approvals_once().await, 1);
+
+        let row = h.only_dispatch().await;
+        assert_eq!(row.state, DISPATCH_SETTLED);
+        if department.is_some() {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 0);
+            assert!(h.queued().await.is_empty());
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
+            let history = h.store.list_history(Some("r1"), 10).await.unwrap();
+            let skipped: Vec<_> = history.iter().filter(|r| r.result == "skipped").collect();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(skipped[0].details.as_deref(), Some("部門範圍不符，已略過"));
+            let card = h.broker().get(id).await.unwrap().unwrap();
+            assert_eq!(card.status, ApprovalStatus::Invalidated);
+            assert!(card.invalidated_reason.unwrap().starts_with(gate::RETIRED_PREFIX));
+        } else {
+            assert_eq!(engine.performed_actions.load(Ordering::SeqCst), 1);
+            assert_eq!(h.queued().await.len(), 1);
+            assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SUCCESS));
+        }
+        assert_eq!(engine.resume_approvals_once().await, 0);
+    }
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1259,6 +1317,6 @@ async fn approved_single_action_scope_denied_under_fence() {
     let row = h.only_dispatch().await;
     assert_eq!(row.state, DISPATCH_SETTLED);
     assert_eq!(row.outcome.as_deref(), Some(gate::RESULT_SKIPPED));
-    assert_eq!(row.detail.as_deref(), Some("scope_denied"));
+    assert_eq!(row.detail.as_deref(), Some(DEPARTMENT_CONTAINMENT_SKIP));
     assert!(h.queued().await.is_empty());
 }

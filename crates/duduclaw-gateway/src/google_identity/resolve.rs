@@ -152,7 +152,7 @@ pub(in crate::google_identity) async fn mint_delegate_for_drive_write(
     let key = super::protection_gate_async(home).await?;
     let home = home.to_path_buf();
     let sa_key = tokio::task::spawn_blocking(move || delegation_key::load(&home, &key))
-        .await.map_err(|_| Refusal::hard("credential_protection", "讀取服務帳號金鑰中斷，請稍後再試。"))??;
+        .await.map_err(|_| Refusal::hard("credential_protection", "無法使用公司 Google 連線，這次沒有執行，請管理員檢查連線後再試。"))??;
     validate_drive_write_mint(sa::mint_for_subject(
         &sa_key, email, super::delegated_scopes::for_drive_write(), mode,
     ).await, email)
@@ -160,7 +160,7 @@ pub(in crate::google_identity) async fn mint_delegate_for_drive_write(
 
 pub(in crate::google_identity) fn drive_write_admin_scope_missing() -> Refusal {
     Refusal::hard("drive_write_admin_scope_missing",
-        "公司管理員還沒在 Google 管理控制台開放雲端硬碟寫入範圍。")
+        "公司管理員尚未允許雲端硬碟寫入，這次沒有執行，請公司管理員在 Google 管理控制台開放寫入權限。")
 }
 
 pub(in crate::google_identity) fn validate_drive_write_mint(

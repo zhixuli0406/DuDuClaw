@@ -720,7 +720,13 @@ async fn visible_tools_for_principal_and_transport(
     remote_bearer: bool,
 ) -> Vec<&'static ToolDef> {
     if crate::mcp_auth::is_person_principal(principal) {
-        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)).collect();
+        use duduclaw_core::mcp_person_tools::{person_tool, PersonToolHost};
+        let policy = super::odoo_access::ToolPolicy::load_person(home_dir).ok();
+        return tools().filter(|t| !crate::mcp_auth::person_tool_refused(t.name, principal)
+            && person_tool(t.name).is_some_and(|definition| match definition.executes_in {
+                PersonToolHost::McpWithPersonalOdoo => policy.as_ref().is_some_and(|p| p.person_listed(t.name, None)),
+                _ => true,
+            })).collect();
     }
     // Scoped non-employee callers (standalone `duduclaw mcp init` clients,
     // external keys): list only what the scope gate lets through and what does
@@ -1039,6 +1045,8 @@ async fn visible_tools_for_principal_and_transport(
         .filter(|t| allow_knowledge || !super::KNOWLEDGE_TOOLS.contains(&t.name))
         .filter(|t| t.name != "credential_declare" || (gated_caller && !member_invalid))
         .filter(|t| allow_responsibilities || !super::RESPONSIBILITY_TOOLS.contains(&t.name))
+        .filter(|t| t.name != "odoo_attachment_add"
+            || super::odoo_attachment::verified_employee(home_dir, effective_agent))
         .filter(|t| !t.name.starts_with("odoo_")
             || odoo_policy.as_ref().is_some_and(|policy| policy.listed_for_context(t.name)))
         // O7: PORTICO scoped tools without an active grant.

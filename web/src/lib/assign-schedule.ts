@@ -1,3 +1,4 @@
+import { getCompanyTimeZone } from '@/lib/company-time';
 import type { IntlShape } from 'react-intl';
 import type { AssignScheduleInput, AssignScheduleSpec } from '@/lib/api';
 import { formatError } from '@/lib/toast';
@@ -63,6 +64,14 @@ const pad = (n: number) => String(n).padStart(2, '0');
 
 /** "Every Monday, Wednesday at 09:00" in the viewer's language. */
 export function describeSchedule(intl: IntlShape, s: AssignScheduleSpec, timeZone?: string | null): string {
+  const description = describeScheduleText(intl, s, timeZone);
+  // An omitted argument is also used for previews without a persisted row.
+  if (timeZone === undefined || timeZone === getCompanyTimeZone()) return description;
+  const zone = timeZone ?? intl.formatMessage({ id: 'assignSchedule.hostZone' });
+  return `${description} ${intl.formatMessage({ id: 'companyTime.zoneSuffix' }, { zone })}`;
+}
+
+function describeScheduleText(intl: IntlShape, s: AssignScheduleSpec, timeZone?: string | null): string {
   const t = (id: string, values?: Record<string, string | number>) =>
     intl.formatMessage({ id: `assignSchedule.describe.${id}` }, values);
   switch (s.kind) {

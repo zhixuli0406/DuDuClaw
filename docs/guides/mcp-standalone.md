@@ -188,3 +188,11 @@ does not:
 The registry metadata is `distribution/registries/mcp/server.json`; the
 publish steps (owner only, after each release) are in
 [`distribution/registries/README.md`](../../distribution/registries/README.md).
+
+## Personal member keys for MCP (v1.86.0)
+
+A personal `ddc_member_` key requires a running gateway and an enabled member-key feature. It is separate from a standalone MCP key. Send it as `Authorization: Bearer <member-key>` on the MCP HTTP transport, or set `DUDUCLAW_MCP_API_KEY` in the stdio server's environment. Never put a personal key in a URL query; use an HTTP/SSE client that can send the authorization header.
+
+Effective scopes are the key's `mcp_scopes` intersected with the current administrator setting `[member_api_keys] allow_mcp_scopes` (default `[]`). Only `tasks:read`, `agents:status`, `odoo:read`, and `odoo:write` are available. Tools act as the key holder, with live permission checks, rather than borrowing an AI employee's identity. Odoo requires the holder's own connected Odoo account; company and employee accounts are never substituted. See [MCP tools](mcp-tools.md) for the exact person-tool subset.
+
+OAuth consent refuses personal member keys in this release. Configure the header or stdio environment directly; a personal key cannot be exchanged through the OAuth consent page.

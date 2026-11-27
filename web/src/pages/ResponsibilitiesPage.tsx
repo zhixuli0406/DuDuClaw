@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -482,13 +483,14 @@ function CreateDialog({
 }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const companyTime = useCompanyTimeZone();
   const [preset, setPreset] = useState<PresetId>('daily_briefing');
   const [form, setForm] = useState<PresetForm>({
     ownerAgentId: agents?.[0] ?? '',
     objective: '',
     acceptance: '',
     time: '08:00',
-    timezone: localTimezone(),
+    timezone: companyTime.status === 'set' ? companyTime.zone ?? localTimezone() : localTimezone(),
     readOnly: true,
     runCapCents: 50,
     periodCapCents: 50,

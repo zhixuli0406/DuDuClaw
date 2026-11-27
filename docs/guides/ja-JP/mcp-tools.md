@@ -203,7 +203,7 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 |---|---|---|
 | 外部クライアント許可リスト | `principal.is_external` | 従来の許可リスト 7 ツールと、明示的に付与した scope のツールのみ。続けて次の行の scope 規則が適用されます |
 | 社員でない呼び出し元の scope | `principal.scopes`。`admin` を持たず AI 社員でもないキー（gateway 内部キーでも、社員ごとのキーでも、gateway が社員用に起動したプロセスでもない）に適用 | キーが最低 scope を持つツールだけを掲載。プロセス自身のエージェントとして動くツール（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` と三つの統合状態の参照など）は掲載せず、すべての外部キーにも掲載しません。呼び出しはディスパッチゲートが同じ規則で拒否します（`process_agent_tool`）。[mcp-standalone.md](mcp-standalone.md) を参照 |
-| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 29 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
+| Google Workspace | `config.toml [integrations] google_workspace` | オフ時は `google_status` を含む全 38 ツールが非表示。ダッシュボードの設定・テストは可能。[接続手順](google-setup.md)。 |
 | Google の身元（v1.76.0） | `agent.toml [google] identity`、なければ `config.toml [integrations.google_identity] default_identity` | `none` なら同じ 29 ツールを非表示にし、呼び出しも拒否。それ以外の値では一覧に残り、使えない呼び出しは理由を返します。`google_status` は最初に社員が誰として動いているかを示します |
 | GitHub | `config.toml [integrations] github` | `github_*` 5 ツールを非表示 |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 拒否分を非表示。許可リストが非空なら他を全て非表示。項目は完全一致、または末尾の `*` で照合：`*`、`mcp__duduclaw__*`（DuDuClaw の全ツール）、`mcp__duduclaw__odoo_*`／`memory_*`（先頭からの前方一致）。`mcp__<他のサーバー>__…` は DuDuClaw のツールに一致しない。それ以外の位置の `*` は通常の文字。3 つの承認リストと `scoped_tools` も同じ規則 |
@@ -293,6 +293,12 @@ AI 社員のものになっているレコードを変更・起動するツー�
 ヒントは MCP クライアント向け（呼び出し前に確認するかどうかなど）で、権限を与えるものではありません。DuDuClaw のゲートは毎回そのまま動きます。Claude Code と Codex はモデルに名前・説明・入力スキーマだけを渡すため、上の説明バイト予算には含めません。
 
 ## 説明から移した長い詳細
+
+### `tasks_create` のスケジュール
+
+cron `schedule` で `cron_timezone` を省略すると会社タイムゾーンを使います。未設定または無効の場合は UTC を使い、確認に明記します。会社タイムゾーンに夏時間がある場合、メンバー作成のルーティンは UTC で保存し、その旨を通知します。単発の `schedule` 時刻には UTC オフセットが必要です。例：`2026-11-28T09:00:00+08:00`。
+
+
 
 ### `tasks_create`／`tasks_update` — ゴール費用上限
 
@@ -461,6 +467,8 @@ root が必要な `os_*` ツール（電源、更新の状態、sysd が再検�
 
 上限は **400 モデル、各 500 フィールド**です。メタデータとフィールド探索の上限は **5 分**、`fields_get` は最大 4 件同時実行です。アカウント権限の確認には別途 30 秒の全体上限を設けます。組み込みモデル、インストール済み業務モジュール（CRM、販売、購買、在庫、会計、プロジェクト、人事、製造、ヘルプデスク、Web）のモデル、残りの名前順で優先します。時間切れは打ち切りと表示し、接続・バージョン・モジュールが同じなら次回は取得済みフィールドを再利用して続行します。モジュール／モデル一覧は各 5,000 件までです。不完全な差分を削除の証拠にはしません。
 
+以下の既存の汎用書き込み・構造照会に関する社員権限と機密モデル制限は Engine モードに適用します。Follow は本人の Odoo 権限を使い、会社の機能スイッチと共通の拒否は維持します。
+
 ### `odoo_create` / `odoo_write`：汎用の作成と更新（v1.81.0）
 
 - `odoo_create {model, values}` はレコードを 1 件作成して ID を返し、`odoo_write {model, ids, values}` は 1〜100 件のレコードを更新して（重複 ID は 1 件として扱います）`ok` を返します。どちらも **`odoo:write`** が必要で、効果クラスは `modify` です。`action_rules`、承認リスト、探索レーンは `odoo_crm_create_lead` と同じように適用されます。
@@ -556,8 +564,94 @@ MIME 全体は gateway のメモリに保持し、承認には必要なプレビ
 
 `google_chat_send {space, text, thread?}` は、依頼した認証済みメンバー自身の Google アカウントで既存スペースにテキストを送信します。`google:write` が必要で、管理者が `[google] chat_send = true` を有効にするまでは使用できません。共有アカウント、他のメンバー、Apps Script、Chat アプリの `chat.bot` トークンへの切り替えは行いません。
 
-個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意の最小スコープは `https://www.googleapis.com/auth/chat.messages.create` です。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
+個人 OAuth では、先にアカウントを接続し、「自分の接続 → Google Chat の送信」で独立した `chat_send` 用途を許可します。追加同意では、同意済みの通常サービスと `https://www.googleapis.com/auth/chat.messages.create` を明示的に要求します。以前の Google 認可の自動統合は要求しません。Google の `sub` が以前と同じで、実際にスコープが付与されている必要があります。ドメイン全体の委任でも送信用スコープを別に要求し、Workspace 管理者の許可が必要です。他の Google ツールの要求には追加しません。
 
 毎回本人の確認が必要です。確認は５分間有効で１回限りです。カードにはアカウント、スペースのリソース名、スレッド、送信する全文と個人情報の送信に関する注意が表示されます。短文は認証済みの個別チャットで確認でき、グループからの依頼や長文は本人だけが開ける「自分の接続」ページで確認します。管理者の承認、`allow` ルール、Admin MCP scope、宛先許可リストでは代替できません。組織の外部送信承認も別途適用されます。本文、宛先、アカウント、認証情報、ポリシーが変わると再確認が必要です。
 
 Gateway は操作ごとに固定の request ID を保存します。結果が不明な場合は `result_unconfirmed` を返し、自動再送しません。新たに送信を依頼する前に Google Chat を確認してください。添付ファイルやスペースの作成には対応していません。指定スレッドは同じスペース内のものに限ります。Google では本人が送信者として表示され、アプリ名も付きます。[Google Chat API](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。
+
+## 管理者 AI の設定
+
+`admin_settings_read` は管理者 AI 機能で公開される日常設定を読み取ります。`admin_settings_propose` は確認カードを作成するだけで、変更を直接適用しません。利用資格のある管理者本人が、自分専用の AI アバターを通じて参加している会話でのみ利用できます。変更提案はプライベートチャットまたはサインイン済み WebChat に限られます。グループでの読み取りではスケジュールのプロンプト本文とスキル説明を省略します。機能を有効にするには、管理者がリスク説明を読み確認する必要があります。1 件の提案でも、提案者本人が 10 分以内にダッシュボード受信箱で確認します。
+
+通常のプロフィール、モデル、実行上限、定期起動、プロンプトのみのスケジュール、導入済みスキルの有効／無効を変更できます。権限、チャネルと認証情報、隔離、実行エンジン、予算引き上げ、組織と委任権限、外部ツール接続、人格と業務契約、従業員削除、外部スキルの導入は引き続きダッシュボード限定です。
+
+AI 呼び出し元が `agent_update` を使う場合、予算は引き下げのみ可能です。予算引き上げやその他の保護対象のセキュリティ設定変更は拒否されます。データベースソースの追加は、管理者だけがダッシュボードで判断できる承認カードを作成します。削除は権限縮小として引き続き可能です。これらの制限は `open` を含むすべての委任ポリシーで適用されます。
+
+## クラウドドライブへの書き込みツール
+
+この九つのネイティブツールには `google:write` が必要です。管理者は作成、変更、移動、ゴミ箱への移動を個別に許可します。四項目とも既定はオフです。有効化や制限の緩和にはリスクへの明示的な同意が必要で、管理者と時刻を記録します。この設定変更に追加の再ログインは不要です。ダッシュボードの操作機能は本リリースの設定ページとともに提供予定です。Google 連携と個人の書き込み接続のブロックは、現時点では未提供です。
+
+各操作は既定でメンバー本人の確認を必要とします。管理者は操作ごとに確認を無効にするか、本人の確認に加えて管理者の承認を要求できます。本人確認は五分間有効で、そのメンバーだけが判断できます。ツール許可リスト、Admin トークン、ワークフローの継続承認では代用できません。確認が必要な操作は無人実行やバックグラウンド処理では拒否されます。個人接続と所有者への委任では依頼者がアカウント本人である必要があります。会社共用接続と固定の委任では、検証済みの依頼メンバーが確認します。
+
+| ツール | パラメーターと結果 | 操作スイッチ | 効果クラス |
+|---|---|---|---|
+| `drive_create_file` | `name` は必須、`parent_folder_id` は任意。`text`（最大 100,000 文字）、`attachment`（この会話の添付ファイル名）、`folder=true` のいずれか一つを指定。任意の `convert_to` は `document`／`spreadsheet`、`mime_type` は `text/plain`／`text/csv`／`text/markdown`。ファイルまたはフォルダを作成します。 | 作成 | Publish |
+| `drive_copy_file` | `file_id`、`parent_folder_id` は必須、`name` は任意。読み取り可能なファイルを宛先フォルダへコピーします。 | 作成 | Publish |
+| `drive_update_file` | `file_id` は必須。`name`、`description`、`text` の少なくとも一つを指定。名前、説明、テキスト内容を変更します。内容は最大 100,000 文字で、Google 形式以外のテキストファイルに限ります。 | 変更 | Modify |
+| `drive_move_file` | `file_id`、`destination_folder_id` は必須。同じドライブ内で移動し、元の親フォルダは Google から取得します。 | 移動 | Publish |
+| `drive_trash_file` | `file_id` は必須。ゴミ箱へ移動するだけです。 | ゴミ箱へ移動 | Delete |
+| `docs_insert_text` | `document_id`、`text`（1～20,000 文字）は必須。`at="start"`、`at="end"`、`after_text`（文書内で一意の位置指定テキスト、1～1,000 文字）から一つを指定。`tab_id` は任意。 | 変更 | Modify |
+| `docs_format` | `document_id`、`operations`（1～50 件）は必須。段落・文字のスタイル、表のセル背景、ヘッダー、文書タブの追加に対応。詳細は下記参照。 | 変更 | Modify |
+| `sheets_add_sheet` | `spreadsheet_id`、`title` は必須。`copy_from_sheet`（既存シート名）は任意。同じスプレッドシートに空のシートを追加するか、既存シートを複製します。 | 変更 | Modify |
+| `sheets_add_note` | `spreadsheet_id`、`range`（A1、最大 1,000 セル）、`note`（最大 5,000 文字、空文字で消去）は必須。セルのメモを設定し、スレッド形式のコメントは作成しません。 | 変更 | Modify |
+
+ID の代わりに、対応する Google ファイル・フォルダ URL も使えます。作成時に `parent_folder_id` を省略するとマイドライブのルートを使用し、フォルダリストが空の場合だけ許可されます。アップロードはこの会話の現在の依頼に添付されたファイルに限り、最大 5 MB（5 MiB）です。任意のローカルパスや社員の作業フォルダは指定できません。Google ドキュメントやスプレッドシートへの変換は任意です。完全削除、ゴミ箱を空にする操作、共有や権限の変更には対応しません。
+
+`docs_format` の各操作は `type` と、その種類に対応するフィールドだけを受け付けます。
+
+- `paragraph_style`：一意の `text`、`named_style`（`NORMAL_TEXT`、`TITLE`、`SUBTITLE`、`HEADING_1`～`HEADING_6`）。`alignment`（`START`、`CENTER`、`END`、`JUSTIFIED`）は任意。
+- `text_style`：一意の `text` と、`bold`、`italic`、`underline`、`font_size_pt`（6～96）の少なくとも一つ。
+- `table_cell_style`：ゼロ始まりの `table_index`（0～99）、`row`（0～499）、`column`（0～49）、`background_hex`（`#RRGGBB`）。
+- `header`：`text`（最大 1,000 文字）。
+- `add_tab`：`title`（1～100 文字）。
+
+### フォルダの規則と制限
+
+管理者はフォルダまたは共有ドライブ全体をリストに登録できます。登録済み共有ドライブ内のファイルは許可範囲内です。それ以外は、すべての親経路が十二階層以内に登録済みフォルダへ到達する必要があります。親を読めない場合、対象や祖先がゴミ箱内の場合、確認上限を超える場合、Google の権限が足りない場合は拒否します。再確認を含め、一回の呼び出しでメタデータを取得できるのは十六回までです。
+
+作成とコピーは宛先フォルダを確認します。コピー元は読み取り可能で、ゴミ箱内でない必要があります。変更、移動、ゴミ箱への移動は対象の場所を確認します。登録済みフォルダ自体の名前変更、移動、ゴミ箱への移動はできません。移動元と宛先の両方が範囲内である必要があり、マイドライブと共有ドライブの間や、異なる共有ドライブ間の移動はできません。ショートカットは許可フォルダや宛先に指定できません。変更はショートカットを拒否します。移動とゴミ箱への移動はショートカット自体を操作し、リンク先をたどらず自身の親で確認します。
+
+リストが空の場合、作成と変更はそのアカウントが書き込めるすべての場所で可能ですが、移動とゴミ箱への移動は使えません。書き込み前後と承認後にフォルダを確認します。Google 自体にフォルダ許可リストはなく、確認中にも他者が場所を変えられるため、この確認はベストエフォートです。書き込み後の範囲違反は管理者に通知し、未完了の確認も記録します。拒否や結果不明も含むすべての試行を記録しますが、内容やトークンは残しません。結果不明の操作は自動再試行せず、Google で確認してから改めて依頼してください。
+
+既存の `docs_append`、`docs_create`、`docs_replace_text`、`sheets_append`、`sheets_create`、`sheets_update` は従来の認可を維持し、この四つのスイッチやフォルダ規則の対象外です。新しい Docs／Sheets の四ツールは「変更」に分類します。Google 公式 Drive リモート MCP に完全な Drive 権限を持つトークンを渡すことはありません。この九つの書き込みツールはメイン gateway プロセス内だけで実行します。
+
+アカウントの準備は[接続設定](google-setup.md)と[個人の書き込み同意](google-personal-connections.md)を参照してください。Google OAuth の分離・取消、委任スコープ、文書タブ、変換、共有ドライブのロール、個人メッセージでの確認配信は実アカウントでの受け入れ確認が必要です。本書はこれらの検証済みを意味しません。
+
+## 本人用ツールと Odoo 権限（v1.86.0）
+
+個人キーは次のツールのみを提供し、キーのスコープと管理者の現在の `allow_mcp_scopes` の共通部分を適用します。
+
+| スコープ | ツール |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`：参照可能なタスク。既定 50 件、範囲 1–200。上限や省略は `truncated` で示します。 |
+| `agents:status` | `my_agents_status {}`：参照可能な社員の ID、名前、状態、`can_call`。 |
+| `odoo:read` | `odoo_search`、`odoo_crm_leads`、`odoo_sale_orders`、`odoo_inventory_products`、`odoo_inventory_check`、`odoo_invoice_list`、`odoo_payment_status`、`odoo_partner_search`、`odoo_schema_overview`、`odoo_schema_fields`、`odoo_status`。 |
+| `odoo:write` | `odoo_create`、`odoo_write`、`odoo_activity_create`、`odoo_note_post`。確認済みの `follow_odoo_account` が必要です。 |
+
+所有者本人の現在の権限で実行します。Odoo は本人の接続済みアカウントのみを使い、社員・会社の認証情報を借用しません。`odoo_execute`、`odoo_report`、`odoo_connect`、`odoo_message_send`、`odoo_attachment_add` と CRM／販売の専用変更ツールは対象外です。2 つの `my_*` ツールは個人キー専用で、社員用ツールではありません。
+
+### Odoo の専用書き込みツール 4 種
+
+すべて `odoo:write` と既存の読み取り可能な対象レコードが必要です。テキストはプレーンテキストとして HTML エスケープし、メンションや任意の宛先リストは受け付けません。
+
+| ツール／引数 | 動作 |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | 活動を作成。各テキストは最大 10,000 文字、期限は `YYYY-MM-DD`、既定の種類は `mail.mail_activity_data_todo`。Engine は接続アカウントに割り当て、`user_id` は Follow のみ受け付けます。 |
+| `odoo_note_post {model, res_id, body}` | 内部メモを追加。本文は最大 10,000 文字。 |
+| `odoo_message_send {model, res_id, body}` | レコードのフォロワーに通知。本文は最大 10,000 文字。内容に結び付いた人の承認が毎回必要で、社員の認証主体が必要です。 |
+| `odoo_attachment_add {model, res_id, file, name?}` | 呼び出し元社員自身の添付フォルダーから非公開添付を作成。インライン／base64、絶対パス、親への移動、シンボリックリンク、共有フォルダーは不可。内容と形式が一致する PDF、PNG、JPEG、WebP、UTF-8 TXT／CSV、OOXML XLSX／DOCX／PPTX のみ。元ファイルと再エンコード後の両方に `attachment_max_mb`（既定 10 MiB、範囲 1–25）を適用します。社員の認証主体が必要です。 |
+
+Engine は `allowed_models` の正確な対象と `allowed_actions` の `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` を必要とし、空リストでは許可しません。Follow は社員のモデル／操作権限と Engine の機密モデルブロックリストに代えて本人の Odoo 権限を使用します。会社の機能スイッチ、`always_refuse`、固定拒否、入力確認、承認、Odoo ACL は残ります。会社／AI 自身のアカウントは Engine のままです。社員の `permission_override=engine` は Engine を維持し、`read_only` は書き込みを除きます。有効な管理者確認がないグローバル Follow は Engine に戻ります。
+
+`always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。モデル完全一致、`*`、`ir.*` のようなドット区切りの子モデル、正確なメソッド名の `method:<name>` を使用します。専用操作は対象モデルと `activity:`、`note:`、`message:`、`attach:` で照合します。
+
+| ルール | 常に拒否する操作 |
+| --- | --- |
+| F1 | `ir.attachment` の更新・削除、汎用ツールによる作成。ファイルからの作成には `odoo_attachment_add` を使います。 |
+| F2 | `ir.model`、すべての `ir.model.*` 子モデル、`ir.rule` の変更。 |
+| F3 | `res.users.apikeys` とドット区切りの子モデルの変更。 |
+| F4 | `mail` とすべての `mail.*` 子モデルの変更。汎用ツールでの `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。メモ・メッセージには専用ツールを使います。 |
+| F5 | `_` で始まるメソッド、および `init`、`uninstall_hook`。 |
+
+変更を行う `odoo_execute` とすべての `action_*`、`button_*`、`toggle_*` は、全モードで人の承認が必要です。`odoo_message_send` も常に承認が必要です。Allow ルールで承認や拒否を回避できません。承認はツールと正確な引数に結び付き、一度だけ使えます。ほかの書き込みも既存の承認・データ送信チェックを受けます。管理者は監査付き `odoo.access_get/set` で管理し、Follow・会社アカウント一覧・拒否リストの権限拡大には `acknowledge_risk` が必要です。

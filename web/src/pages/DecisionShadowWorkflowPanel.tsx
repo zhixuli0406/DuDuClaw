@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useState } from 'react';
 import { Badge, Button, Card, CardContent, Input } from '@/components/mds';
 import { decisionApi, type DecisionShadowAssessment, type DecisionShadowErrorSums,
@@ -166,8 +167,9 @@ function validReview(value: DecisionShadowReview, screen: DecisionShadowScreen, 
 
 function dateTime(value: string | number, locale: string): string {
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return !Number.isNaN(date.getTime()) ? new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short',
-    timeZone: 'UTC' }).format(date) : String(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const time = formatDateTime(date, { locale, zone: 'UTC', dateStyle: 'medium', timeStyle: 'short' });
+  return time;
 }
 
 function SourceInput({ artifact, source, retention, setArtifact, setSource, setRetention,
@@ -208,6 +210,7 @@ function Sums({ values, locale, t }: { values: DecisionShadowErrorSums | null; l
 export function DecisionShadowWorkflowPanel({ scope, blocked, onBusyChange, locale, t }: {
   scope: Scope; blocked: boolean; onBusyChange: (busy: boolean) => void; locale: string; t: Translate;
 }) {
+  useCompanyTimeZone();
   const [policyId, setPolicyId] = useState('');
   const [lineage, setLineage] = useState('');
   const [queue, setQueue] = useState('');

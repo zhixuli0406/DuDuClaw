@@ -56,7 +56,7 @@ const MAX_RAW_BYTES: usize = 1024 * 1024;
 const SECRET_CONTAINERS: &[&str] = &["headers", "otlp_headers", "env"];
 
 /// Tables hidden from the editor because their keys are secrets.
-const HIDDEN_SECTIONS: &[&str] = &["mcp_keys"];
+const HIDDEN_SECTIONS: &[&str] = &["mcp_keys", "skill_trust"];
 
 /// `config.toml` sections read once at boot (a raw edit needs a restart).
 const CONFIG_BOOT_SECTIONS: &[&str] = &[
@@ -444,6 +444,9 @@ pub(crate) fn restore_raw_toml_ctx(submitted: &str, stored: &str, ctx: &mut Rest
     };
     for s in HIDDEN_SECTIONS {
         if doc.get(s).is_some() {
+            if *s == "skill_trust" {
+                return Err("請到自家技能來源設定頁變更自動放行清單。".into());
+            }
             return Err(format!("[{s}] is managed on its own page and cannot be edited here"));
         }
     }
@@ -649,6 +652,8 @@ fn validate_raw_with_stored(file: &RawFile, text: &str, stored: Option<&toml::Ta
     })?;
     match file {
         RawFile::Config => {
+            super::chat_admin_settings_rpc::refuse_subtable_change(
+                stored.unwrap_or(&toml::Table::new()), &table)?;
             super::config_schema::check_config_types_with_stored(text, &table, stored)?;
             validate_config_table(&table)?;
             duduclaw_inference::transcription::config::TranscriptionConfig::from_toml(text)?;
@@ -1725,6 +1730,21 @@ OPENAI_API_KEY = "sk-env-secret"
         assert!(err.contains("line 2"), "{err}");
         let err = validate_raw(&RawFile::Config, "a = 1\nb = \n").unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn raw_editor_cannot_enable_chat_admin() {
+        let empty = toml::Table::new();
+        let off: toml::Table = "[approval.chat_admin]\nenabled=false".parse().unwrap();
+        let on = "[approval.chat_admin]\nenabled=true";
+        for before in [&empty, &off] {
+            assert!(validate_raw_with_stored(&RawFile::Config, on, Some(before)).is_err());
+        }
+        assert!(validate_raw_with_stored(&RawFile::Config, "", Some(&off)).is_err());
+        assert!(validate_raw_with_stored(&RawFile::Config,
+            "[approval.chat_admin]\nenabled=false\ncard_valid_hours=1", Some(&off)).is_err());
+        assert!(validate_raw_with_stored(&RawFile::Config,
+            "[approval]\nskill_ttl_days=8\n[approval.chat_admin]\nenabled=false", Some(&off)).is_ok());
     }
 
     #[test]

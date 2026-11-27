@@ -127,6 +127,8 @@ async fn token(
     let (account, scope) = match who {
         code if code.strip_prefix("write-for-").is_some() => (code.strip_prefix("write-for-").unwrap(), format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "write-alice" => ("alice", format!("openid email https://www.googleapis.com/auth/gmail.readonly {}", oauth::DRIVE_WRITE_SCOPE)),
+        "write-no-refresh-alice" | "write-no-scopes-alice" =>
+            ("alice", format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "write-bob" => ("bob", format!("openid email {}", oauth::DRIVE_WRITE_SCOPE)),
         "chat-send-alice" => ("alice", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
         "chat-send-bob" => ("bob", "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/chat.messages.create".into()),
@@ -139,12 +141,10 @@ async fn token(
         "drive-bob" => ("bob", format!("openid email {}", oauth::DRIVE_TOOLS_SCOPE)),
         _ => (who, "openid email https://www.googleapis.com/auth/gmail.readonly".into()),
     };
-    (
-        StatusCode::OK,
-        Json(
-            json!({"access_token":format!("access-{account}"),"refresh_token":format!("refresh-{account}"),"token_type":"Bearer","expires_in":3600,"scope":scope}),
-        ),
-    )
+    let mut response = json!({"access_token":format!("access-{account}"),"refresh_token":format!("refresh-{account}"),"token_type":"Bearer","expires_in":3600,"scope":scope});
+    if who == "write-no-refresh-alice" { response.as_object_mut().unwrap().remove("refresh_token"); }
+    if who == "write-no-scopes-alice" { response.as_object_mut().unwrap().remove("scope"); }
+    (StatusCode::OK, Json(response))
 }
 
 // Test-only adjacent Home fixture. The Personal endpoint keeps its exact
@@ -172,11 +172,11 @@ async fn bound_home_token(
     (
         StatusCode::OK,
         Json(
-            json!({"access_token":"owned-home-access","refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")}),
+            json!({"access_token":if code == "home-alice" { "access-alice" } else { "owned-home-access" },"refresh_token":"owned-home-refresh","token_type":"Bearer","expires_in":3600,"scope":crate::google_workspace::REQUIRED_SCOPES.join(" ")}),
         ),
     )
 }
-async fn bound_home_before_personal_capture(
+pub(super) async fn bound_home_before_personal_capture(
     f: &Fixture,
 ) -> (
     String,

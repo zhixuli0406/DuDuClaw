@@ -4,6 +4,9 @@
 use super::*;
 use duduclaw_mcp_boundary::io_authority::verify_before_io;
 
+/// Maximum extra metadata candidates inspected while filling a bounded list.
+pub(crate) const TASK_LIST_SCAN_ALLOWANCE: usize = 500;
+
 /// Fields of an occurrence task nobody may change through `update_task`.
 pub(crate) const OCCURRENCE_FROZEN_FIELDS: [&str; 11] = [
     "assigned_to",
@@ -50,12 +53,16 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
     ) -> Result<Vec<TaskRow>, String> {
-        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, None, |_, _| true).await
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, None, "", |_| true)
+            .await.map(|(rows, _)| rows)
     }
 
     /// Stream metadata through the visibility gate before cutting the page.
     /// Only selected rows are materialized, newest-created first with a stable ID tie-break.
     /// Unlike the board view, pinned/updated rows do not outrank newer tasks.
+    /// The predicate must only inspect in-memory assignee visibility. A2A
+    /// ownership is checked in SQL; the boolean reports an exhausted scan cap.
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_tasks_filtered_bounded<F>(
         &self,
         status: Option<&str>,
@@ -63,13 +70,14 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
         limit: usize,
+        principal: &str,
         visible: F,
-    ) -> Result<Vec<TaskRow>, String>
-    where F: FnMut(&str, &str) -> bool + Send {
+    ) -> Result<(Vec<TaskRow>, bool), String>
+    where F: FnMut(&str) -> bool + Send {
         if !(1..=1000).contains(&limit) {
             return Err("limit must be an integer between 1 and 1000".into());
         }
-        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, Some(limit), visible).await
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, Some(limit), principal, visible).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -80,13 +88,28 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
         limit: Option<usize>,
+        principal: &str,
         mut visible: F,
-    ) -> Result<Vec<TaskRow>, String>
-    where F: FnMut(&str, &str) -> bool + Send {
+    ) -> Result<(Vec<TaskRow>, bool), String>
+    where F: FnMut(&str) -> bool + Send {
         let conn = self.conn.lock().await;
-        let columns = if limit.is_some() { "id, assigned_to, created_at" } else { TASK_COLUMNS };
-        let mut sql = format!("SELECT {columns} FROM tasks WHERE 1=1");
+        // Metadata, owner checks and selected full rows share one read snapshot.
+        let snapshot = conn.unchecked_transaction()
+            .map_err(|e| format!("list snapshot: {e}"))?;
+        let conn = &snapshot;
         let mut binds: Vec<String> = Vec::new();
+        let columns = if limit.is_some() {
+            let registry_exists: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_access_principals')",
+                [], |r| r.get(0),
+            ).map_err(|e| format!("list task access schema: {e}"))?;
+            if !registry_exists || principal.is_empty() {
+                return Err("task list access unavailable".into());
+            }
+            binds.push(principal.to_owned());
+            "id, assigned_to, created_at"
+        } else { TASK_COLUMNS };
+        let mut sql = format!("SELECT {columns} FROM tasks WHERE 1=1");
         if let Some(s) = status {
             binds.push(s.to_string());
             sql.push_str(&format!(" AND status = ?{}", binds.len()));
@@ -117,8 +140,15 @@ impl TaskStore {
         // a caller actually archives something. Callers that need to browse
         // the archive explicitly use `list_tasks_paginated` instead.
         sql.push_str(" AND archived = 0");
-        if limit.is_some() {
-            sql.push_str(" ORDER BY created_at DESC, id ASC");
+        if let Some(limit) = limit {
+            sql.push_str(&format!(" ORDER BY created_at DESC, id ASC LIMIT {}", limit + TASK_LIST_SCAN_ALLOWANCE));
+            // Materialize the bounded metadata window before owner lookups,
+            // including hidden owners in the budget. No full task is loaded.
+            sql = format!("WITH candidates AS MATERIALIZED ({sql})
+                SELECT id, assigned_to, NOT EXISTS (
+                    SELECT 1 FROM task_access_principals p WHERE p.task_id = candidates.id
+                    AND (typeof(p.principal) != 'text' OR p.principal = '' OR p.principal != ?1)
+                ) FROM candidates ORDER BY created_at DESC, id ASC");
         } else {
             // Preserve the unlimited board view's pinned/updated ordering.
             sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
@@ -133,31 +163,36 @@ impl TaskStore {
             .collect();
         if let Some(limit) = limit {
             let mut ids = Vec::with_capacity(limit);
+            let scan_cap = limit + TASK_LIST_SCAN_ALLOWANCE;
+            let mut scanned = 0;
             {
                 let mut candidates = stmt.query(params_ref.as_slice())
                     .map_err(|e| format!("query list metadata: {e}"))?;
                 // Test the bound before advancing SQLite: do not read one extra row.
-                while ids.len() < limit {
+                while ids.len() < limit && scanned < scan_cap {
                     let Some(row) = candidates.next()
                         .map_err(|e| format!("read list metadata: {e}"))? else { break; };
                     let id: String = row.get(0).map_err(|e| format!("read task id: {e}"))?;
                     let assignee: String = row.get(1).map_err(|e| format!("read task assignee: {e}"))?;
-                    if visible(&id, &assignee) {
+                    let owner_allows: bool = row.get(2).map_err(|e| format!("read task owner visibility: {e}"))?;
+                    scanned += 1;
+                    if visible(&assignee) && owner_allows {
                         ids.push(id);
                     }
                 }
             }
             let mut selected = conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))
                 .map_err(|e| format!("prepare selected tasks: {e}"))?;
-            return ids.iter().map(|id| selected.query_row(params![id], row_to_task)
-                .map_err(|e| format!("read selected task: {e}"))).collect();
+            let rows = ids.iter().map(|id| selected.query_row(params![id], row_to_task)
+                .map_err(|e| format!("read selected task: {e}"))).collect::<Result<Vec<_>, _>>()?;
+            return Ok((rows, scanned == scan_cap));
         }
         let rows = stmt
             .query_map(params_ref.as_slice(), row_to_task)
             .map_err(|e| format!("query list: {e}"))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect list: {e}"))?;
-        Ok(rows)
+        Ok((rows, false))
     }
 
     /// I-3b: paginated task listing with a total count, for board views that

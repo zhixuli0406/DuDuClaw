@@ -46,39 +46,7 @@ impl MethodHandler {
             Ok(s) => s,
             Err(f) => return f,
         };
-        let definition = (|| -> Result<AutopilotRuleRow, String> {
-            let name = params.get("name").and_then(Value::as_str)
-                .filter(|s| !s.is_empty()).ok_or("name is required")?.to_string();
-            let trigger_event = match params.get("trigger_event") {
-                None => "task_created",
-                Some(v) => v.as_str().ok_or("trigger_event must be a string")?,
-            }.to_string();
-            validate_autopilot_trigger_event_for_create(&trigger_event)?;
-            let conditions = params.get("conditions").cloned().unwrap_or(json!({}));
-            validate_autopilot_conditions(&conditions)?;
-            let mut row = AutopilotRuleRow {
-                id: uuid::Uuid::new_v4().to_string(),
-                name,
-                enabled: true,
-                trigger_event,
-                conditions: conditions.to_string(),
-                action: params.get("action").cloned().unwrap_or(json!({})).to_string(),
-                sequence: optional_rule_object(&params, "sequence")?,
-                active_window: optional_rule_object(&params, "active_window")?,
-                run_policy: optional_rule_object(&params, "run_policy")?,
-                owner_department: None,
-                created_by_user_id: Some(ctx.user_id.clone()),
-                updated_by_user_id: None,
-                updated_at: None,
-                created_at: Utc::now().to_rfc3339(),
-                last_triggered_at: None,
-                trigger_count: 0,
-                metadata: None,
-            };
-            wrap_rule_action_if_needed(&mut row)?;
-            validate_autopilot_rule_for_save(&self.home_dir, &row)?;
-            Ok(row)
-        })();
+        let definition = autopilot_create_definition(&self.home_dir, &params, ctx, None);
         let row = match definition {
             Ok(row) => row,
             Err(e) => return WsFrame::error_response("", &e),
@@ -106,53 +74,13 @@ impl MethodHandler {
             Ok(None) => return WsFrame::error_response("", &format!("Rule not found: {rule_id}")),
             Err(e) => return WsFrame::error_response("", &format!("update rule: {e}")),
         };
-        let definition = (|| -> Result<AutopilotRuleRow, String> {
-            let mut row = stored.clone();
-            if let Some(v) = params.get("name") {
-                row.name = v.as_str().filter(|s| !s.is_empty()).ok_or("name is required")?.to_string();
-            }
-            if let Some(v) = params.get("enabled") {
-                row.enabled = v.as_bool().ok_or("enabled must be a boolean")?;
-            }
-            let changes_definition = [
-                "trigger_event", "conditions", "action", "sequence", "active_window", "run_policy",
-            ].iter().any(|key| params.get(*key).is_some());
-            // Keep stored definitions intact for toggles and renames, even if
-            // current settings or validators would reject them on a new save.
-            if !changes_definition {
-                return Ok(row);
-            }
-            if let Some(v) = params.get("trigger_event") {
-                row.trigger_event = v.as_str().ok_or("trigger_event must be a string")?.to_string();
-            }
-            if let Some(v) = params.get("conditions") {
-                row.conditions = v.to_string();
-            }
-            if let Some(v) = params.get("action") {
-                row.action = v.to_string();
-            }
-            if params.get("sequence").is_some() {
-                row.sequence = optional_rule_object(&params, "sequence")?;
-            }
-            if params.get("active_window").is_some() {
-                row.active_window = optional_rule_object(&params, "active_window")?;
-            }
-            if params.get("run_policy").is_some() {
-                row.run_policy = optional_rule_object(&params, "run_policy")?;
-            }
-            validate_autopilot_trigger_event_for_update(&row.trigger_event, &stored.trigger_event)?;
-            let conditions: Value = serde_json::from_str(&row.conditions).map_err(|_| "invalid conditions JSON")?;
-            validate_autopilot_conditions(&conditions)?;
-            wrap_rule_action_if_needed(&mut row)?;
-            validate_autopilot_rule_for_save(&self.home_dir, &row)?;
-            Ok(row)
-        })();
+        let definition = autopilot_update_definition(&self.home_dir, &params, &stored);
         let row = match definition {
             Ok(row) => row,
             Err(e) => return WsFrame::error_response("", &e),
         };
         let now = Utc::now().to_rfc3339();
-        match store.replace_rule_definition(rule_id, &row, Some(&ctx.user_id), &now).await {
+        match store.replace_company_rule_definition(rule_id, &row, Some(&ctx.user_id), &now).await {
             Ok(Some(row)) => WsFrame::ok_response("", json!({ "rule": autopilot_rule_to_json(&row) })),
             Ok(None) => WsFrame::error_response("", &format!("Rule not found: {rule_id}")),
             Err(e) => WsFrame::error_response("", &format!("update rule: {e}")),
@@ -333,6 +261,88 @@ impl MethodHandler {
             Err(e) => WsFrame::error_response("", &format!("autopilot history: {e}")),
         }
     }
+}
+
+/// Shared normalization and validation for company and department creates.
+pub(super) fn autopilot_create_definition(
+    home: &Path, params: &Value, ctx: &UserContext, owner_department: Option<String>,
+) -> Result<AutopilotRuleRow, String> {
+    let name = params.get("name").and_then(Value::as_str)
+        .filter(|s| !s.is_empty()).ok_or("name is required")?.to_string();
+    let trigger_event = match params.get("trigger_event") {
+        None => "task_created",
+        Some(v) => v.as_str().ok_or("trigger_event must be a string")?,
+    }.to_string();
+    validate_autopilot_trigger_event_for_create(&trigger_event)?;
+    let conditions = params.get("conditions").cloned().unwrap_or(json!({}));
+    validate_autopilot_conditions(&conditions)?;
+    let mut row = AutopilotRuleRow {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        enabled: true,
+        trigger_event,
+        conditions: conditions.to_string(),
+        action: params.get("action").cloned().unwrap_or(json!({})).to_string(),
+        sequence: optional_rule_object(params, "sequence")?,
+        active_window: optional_rule_object(params, "active_window")?,
+        run_policy: optional_rule_object(params, "run_policy")?,
+        owner_department,
+        created_by_user_id: Some(ctx.user_id.clone()),
+        updated_by_user_id: None,
+        updated_at: None,
+        created_at: Utc::now().to_rfc3339(),
+        last_triggered_at: None,
+        trigger_count: 0,
+        metadata: None,
+    };
+    wrap_rule_action_if_needed(&mut row)?;
+    validate_autopilot_rule_for_save(home, &row)?;
+    Ok(row)
+}
+
+/// Department updates validate the entire resulting row, including toggles.
+pub(super) fn autopilot_update_definition(
+    home: &Path, params: &Value, stored: &AutopilotRuleRow,
+) -> Result<AutopilotRuleRow, String> {
+    let mut row = stored.clone();
+    if let Some(v) = params.get("name") {
+        row.name = v.as_str().filter(|s| !s.is_empty()).ok_or("name is required")?.to_string();
+    }
+    if let Some(v) = params.get("enabled") {
+        row.enabled = v.as_bool().ok_or("enabled must be a boolean")?;
+    }
+    let changes_definition = [
+        "trigger_event", "conditions", "action", "sequence", "active_window", "run_policy",
+    ].iter().any(|key| params.get(*key).is_some());
+    // Preserve legacy company definitions for toggles and renames, even if
+    // current validators reject them. Department writes always revalidate.
+    if !changes_definition && row.owner_department.is_none() {
+        return Ok(row);
+    }
+    if let Some(v) = params.get("trigger_event") {
+        row.trigger_event = v.as_str().ok_or("trigger_event must be a string")?.to_string();
+    }
+    if let Some(v) = params.get("conditions") {
+        row.conditions = v.to_string();
+    }
+    if let Some(v) = params.get("action") {
+        row.action = v.to_string();
+    }
+    if params.get("sequence").is_some() {
+        row.sequence = optional_rule_object(params, "sequence")?;
+    }
+    if params.get("active_window").is_some() {
+        row.active_window = optional_rule_object(params, "active_window")?;
+    }
+    if params.get("run_policy").is_some() {
+        row.run_policy = optional_rule_object(params, "run_policy")?;
+    }
+    validate_autopilot_trigger_event_for_update(&row.trigger_event, &stored.trigger_event)?;
+    let conditions: Value = serde_json::from_str(&row.conditions).map_err(|_| "invalid conditions JSON")?;
+    validate_autopilot_conditions(&conditions)?;
+    wrap_rule_action_if_needed(&mut row)?;
+    validate_autopilot_rule_for_save(home, &row)?;
+    Ok(row)
 }
 
 fn autopilot_run_cancel_refused(state: &str) -> WsFrame {
@@ -655,6 +665,7 @@ mod tests {
     async fn insert_status_run(store: &AutopilotStore, id: &str, state: &str, now: chrono::DateTime<Utc>) {
         use crate::autopilot_store::{AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, run_ts};
         let run = AutopilotRunRow {
+            gateway_origin: false,
             run_id: id.into(), rule_id: "status-rule".into(), rule_name: "Status".into(),
             rule_hash: "private-hash".into(), event_name: "task_created".into(),
             event_ref: "private-event".into(), dedupe_key: format!("dedupe-{id}"),
@@ -903,7 +914,7 @@ json_fields = { secret = "/secret" }
 
 
     #[tokio::test]
-    async fn update_preserves_stored_department_and_wraps_replacement_action() {
+    async fn legacy_update_refuses_stored_department_and_shared_builder_wraps_action() {
         let (f, store, root) = automation_fixture().await;
         let mut params = notify_rule();
         params["action"] = wrap_in_steps_envelope(params["action"].clone());
@@ -913,8 +924,13 @@ json_fields = { secret = "/secret" }
             active_window: None, run_policy: None, owner_department: Some(Some("sales".into())),
             updated_by_user_id: None, updated_at: "before".into(),
         }).await.unwrap();
-        response_payload(f.handler.handle_autopilot_update(json!({"rule_id":id, "action":notify_rule()["action"]}), &root).await);
+        let before = store.get_rule(id).await.unwrap().unwrap();
+        let patch = json!({"rule_id":id, "action":notify_rule()["action"]});
+        let normalized = autopilot_update_definition(&f.home, &patch, &before).unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&normalized.action).unwrap()["type"], "steps");
+        assert!(response_error(f.handler.handle_autopilot_update(patch, &root).await).contains("permission denied"));
         let stored = store.get_rule(id).await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&stored).unwrap(), serde_json::to_value(&before).unwrap());
         assert_eq!(stored.owner_department.as_deref(), Some("sales"));
         assert_eq!(serde_json::from_str::<Value>(&stored.action).unwrap()["type"], "steps");
         let mut invalid = stored.clone();

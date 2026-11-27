@@ -305,6 +305,7 @@ async fn execute(state: &PersonKeyRouteState, ctx: &UserContext, tool: &PersonTo
                 if let Some(status) = &args.status { params["status"] = json!(status); }
                 // Bound SQL materialization and enrichment within the member contract.
                 let payload = rpc(state, ctx, tool, "tasks.list", params).await?;
+                truncated |= payload.get("more_may_exist").and_then(Value::as_bool).unwrap_or(false);
                 let rows = payload.get("tasks").and_then(Value::as_array).ok_or_else(Refusal::unavailable)?;
                 truncated |= rows.len() >= remaining;
                 tasks.extend(rows.iter().take(remaining).cloned());

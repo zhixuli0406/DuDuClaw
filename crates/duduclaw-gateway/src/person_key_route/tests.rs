@@ -305,6 +305,24 @@ async fn task_row_ceiling_bounds_collection_and_stops_further_rpcs() {
 }
 
 #[tokio::test]
+async fn task_bridge_propagates_scan_cap_even_when_no_visible_rows_were_collected() {
+    let f = fixture(&["tasks:read"]).await;
+    let store = TaskStore::open(f.home.path()).unwrap();
+    for index in 0..2000 {
+        let id = format!("hidden-a2a-{index:04}");
+        let mut row = TaskRow::new(id.clone(), id, String::new(), "normal".into(), "sales".into(), "system".into());
+        row.a2a_owner = Some(format!("user:{}", f.admin));
+        row.created_at = "2099-01-01T00:00:00Z".into();
+        store.insert_task(&row).await.unwrap();
+    }
+    let response = call(&f, "my_tasks_list", json!({"limit":1})).await;
+    assert_eq!(response.0, StatusCode::OK, "{}", response.1);
+    assert_eq!(response.1["result"]["tasks"], json!([]));
+    assert_eq!(response.1["result"]["truncated"], true);
+    assert!(!response.1.to_string().contains("hidden-a2a-"));
+}
+
+#[tokio::test]
 async fn task_bridge_passes_remaining_budget_to_each_employee() {
     let f = fixture(&["tasks:read"]).await;
     add_visible_agent(&f, "cap-000");

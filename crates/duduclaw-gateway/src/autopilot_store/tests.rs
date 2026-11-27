@@ -261,3 +261,23 @@ async fn replace_definition_rolls_back_when_stored_extensions_require_envelope()
     let stored = store.get_rule("r").await.unwrap().unwrap();
     assert_eq!(serde_json::to_value(stored).unwrap(), serde_json::to_value(original).unwrap());
 }
+
+#[tokio::test]
+async fn company_definition_replace_rechecks_persisted_department_before_writing() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    let mut original = rule();
+    original.action = json!({"type":"steps", "steps":[{"type":"delegate", "target_agent":"plain", "prompt":"report"}]}).to_string();
+    store.insert_rule(&original).await.unwrap();
+    let mut stale_definition = original.clone();
+    stale_definition.name = "must not write".into();
+    store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: "reassigned".into(),
+    }).await.unwrap();
+    let before = store.get_rule("r").await.unwrap().unwrap();
+    assert_eq!(store.replace_company_rule_definition("r", &stale_definition, Some("admin"), "later")
+        .await.unwrap_err(), "permission denied");
+    let after = store.get_rule("r").await.unwrap().unwrap();
+    assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+}

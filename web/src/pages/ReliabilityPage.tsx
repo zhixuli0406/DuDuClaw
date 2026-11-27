@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -73,6 +74,7 @@ function EvolutionEventsSection({
   agentId: string;
   windowDays: WindowDays;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [events, setEvents] = useState<EvolutionEvent[] | null>(null);
   const [total, setTotal] = useState(0);
@@ -146,7 +148,7 @@ function EvolutionEventsSection({
                         {ev.skill_id ? <span className="font-mono text-xs">{ev.skill_id}</span> : ev.trigger_signal || '—'}
                       </TableCell>
                       <TableCell className="text-right font-mono text-xs text-muted-foreground">
-                        {new Date(ev.timestamp).toLocaleString('zh-TW', {
+                        {formatDateTime(ev.timestamp, { locale: 'zh-TW',
                           month: 'short',
                           day: 'numeric',
                           hour: '2-digit',
@@ -265,6 +267,7 @@ function SkeletonGauge() {
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export function ReliabilityPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const navigate = useNavigate();
   const connectionState = useConnectionStore((s) => s.state);
@@ -409,7 +412,7 @@ export function ReliabilityPage() {
             {intl.formatMessage({ id: 'reliability.generatedAt' })}
             {': '}
             <span className="font-mono text-xs text-muted-foreground">
-              {new Date(summary.generated_at).toLocaleString('zh-TW', {
+              {formatDateTime(summary.generated_at, { locale: 'zh-TW',
                 month: 'short',
                 day: 'numeric',
                 hour: '2-digit',

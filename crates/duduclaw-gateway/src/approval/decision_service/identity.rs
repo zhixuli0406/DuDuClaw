@@ -31,7 +31,7 @@ pub(super) async fn authorize(env: &DecisionEnv, rec: &ApprovalRecord, approve: 
         }
         let cfg = chat_admin::config::effective(&home, users.as_deref()).ok_or(DecisionRefusal::FeatureOff)?;
         if !cfg.channels.contains(&proof.channel) { return Err(DecisionRefusal::FeatureOff); }
-        if approve && proof.step == Step::Web && !cfg.step_up_methods.contains(&chat_admin::StepMethod::Web) {
+        if proof.step == Step::Web && !cfg.step_up_methods.contains(&chat_admin::StepMethod::Web) {
             return Err(DecisionRefusal::StepUpRequired);
         }
         if proof.step == Step::Totp && (!cfg.step_up_methods.contains(&chat_admin::StepMethod::DmTotp)

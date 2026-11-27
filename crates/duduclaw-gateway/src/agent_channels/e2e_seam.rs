@@ -212,6 +212,8 @@ async fn capture_delegation(home: &Path, agent: &str) -> String {
     assert!(missing.is_none(), "the real WebChat route must carry a complete pair");
     let id = uuid::Uuid::new_v4().to_string();
     MessageQueue::open(home).unwrap().enqueue(&QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.clone(),
         sender: agent.into(),
         target: "downstream-fixture".into(),

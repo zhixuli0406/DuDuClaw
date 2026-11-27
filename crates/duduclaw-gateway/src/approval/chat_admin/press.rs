@@ -282,4 +282,4 @@ async fn already_decided(env: &DecisionEnv, by: Option<&str>, status: ApprovalSt
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
