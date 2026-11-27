@@ -177,6 +177,8 @@ impl GoalLoopDriver {
             if level == AutonomyLevel::Observer
                 // Persisted feedback outlives refusal tokens; check the durable assignee now.
                 && crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to).is_ok()
+                // A healthy assignee does not repair an unavailable frozen role.
+                && enqueue::check_frozen_team_runtime(&task).is_ok()
                 && crate::pause_reason::PauseReason::from_stored(task.pause_reason.as_deref())
                     .observer_may_autoclose()
             {

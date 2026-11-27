@@ -58,6 +58,12 @@ impl ProfileSections {
             Some(text) => toml::from_str(&text).map_err(invalid_data)?,
             None => toml::Table::new(),
         };
+        Self::load_with_config(agent_dir, &config)
+    }
+
+    /// Reuse an admitted configuration while reading the separate profile files.
+    /// A turn snapshot must not reopen agent.toml during prompt assembly.
+    pub fn load_with_config(agent_dir: &Path, config: &toml::Table) -> io::Result<Self> {
         let agent = config.get("agent").and_then(toml::Value::as_table);
         let display_name = agent
             .and_then(|a| a.get("display_name"))
