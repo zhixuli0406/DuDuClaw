@@ -365,6 +365,7 @@ async fn enable_locked(
                 }),
             );
             notices.push(notify::opened_text(
+                &env.home_dir,
                 req.email,
                 &window.expires_at,
                 window.ssh_key_fingerprint.as_deref().unwrap_or_default(),

@@ -110,12 +110,12 @@ impl DecisionVerb {
 }
 
 /// Render the one-line settlement result: "{emoji} {verb}（由 {decider} 於
-/// HH:mm）". `decider` is the resolved human display name; when unresolvable
+/// HH:mm ZONE）". `decider` is the resolved human display name; when unresolvable
 /// (no mapped dashboard identity — the solo-operator press path) the clause
 /// is omitted rather than showing a raw internal channel id (project
 /// convention: never leak internal identifiers into user-facing text).
-pub fn result_line(verb: DecisionVerb, decider: Option<&str>) -> String {
-    let time = chrono::Local::now().format("%H:%M");
+pub fn result_line(home: &Path, now: chrono::DateTime<chrono::Utc>, verb: DecisionVerb, decider: Option<&str>) -> String {
+    let time = duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), now, "%H:%M");
     match decider.map(str::trim).filter(|s| !s.is_empty()) {
         Some(name) => format!("{} {}（由 {name} 於 {time}）", verb.emoji(), verb.label()),
         None => format!("{} {}（於 {time}）", verb.emoji(), verb.label()),
@@ -130,9 +130,9 @@ pub fn result_line(verb: DecisionVerb, decider: Option<&str>) -> String {
 ///
 /// `summary_line` must already be a single line (CJK-safe truncated by the
 /// caller); this function does not re-truncate it.
-pub fn collapse_body(summary_line: &str, verb: DecisionVerb, decider: Option<&str>) -> String {
+pub fn collapse_body(home: &Path, now: chrono::DateTime<chrono::Utc>, summary_line: &str, verb: DecisionVerb, decider: Option<&str>) -> String {
     let summary_line = summary_line.trim();
-    let result = result_line(verb, decider);
+    let result = result_line(home, now, verb, decider);
     if summary_line.is_empty() {
         result
     } else {
@@ -310,7 +310,7 @@ pub(crate) async fn collapse_all<F, Fut>(
     Fut: std::future::Future<Output = Option<String>>,
 {
     let cards = decision_message_store::list_card_messages(home_dir, namespace, decision_id);
-    let body = collapse_body(summary_line, verb, decider);
+    let body = collapse_body(home_dir, chrono::Utc::now(), summary_line, verb, decider);
     let mut edited = 0usize;
 
     for card in cards {
@@ -355,13 +355,24 @@ pub(crate) async fn collapse_all<F, Fut>(
     let Some(token) = token_for(channel.to_string()).await else {
         return;
     };
-    let line = result_line(verb, decider);
+    let line = result_line(home_dir, chrono::Utc::now(), verb, decider);
     let _ =
         crate::channel_sender::send_plain_text(home_dir, http, channel, &token, chat_id, &line).await;
 }
 
 #[cfg(test)]
 mod tests {
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-11-27T01:30:00Z").unwrap().with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn result_line_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(super::result_line(home.path(), fixed_now(), super::DecisionVerb::Approved, None).contains("01:30 UTC"));
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert!(super::result_line(home.path(), fixed_now(), super::DecisionVerb::Approved, None).contains("09:30 CST"));
+    }
     use super::*;
 
     #[test]
@@ -398,33 +409,35 @@ mod tests {
         // D6: the collapsed card must read "👤 <名字> 已接手" — result_line's
         // shared "由 X" clause is how every other verb attributes a decider,
         // so takeover reuses it rather than inventing a second format.
-        let line = result_line(DecisionVerb::TakenOver, Some("王小明"));
+        let line = result_line(tempfile::tempdir().unwrap().path(), fixed_now(), DecisionVerb::TakenOver, Some("王小明"));
         assert!(line.starts_with("👤 已接手（由 王小明 於 "));
     }
 
     #[test]
     fn result_line_with_decider_includes_name_and_time() {
-        let line = result_line(DecisionVerb::Approved, Some("王小明"));
+        let line = result_line(tempfile::tempdir().unwrap().path(), fixed_now(), DecisionVerb::Approved, Some("王小明"));
         assert!(line.starts_with("✅ 已同意（由 王小明 於 "));
         assert!(line.ends_with('）'));
     }
 
     #[test]
     fn result_line_without_decider_omits_the_by_clause() {
-        let line = result_line(DecisionVerb::Retried, None);
+        let line = result_line(tempfile::tempdir().unwrap().path(), fixed_now(), DecisionVerb::Retried, None);
         assert!(line.starts_with("🔁 已重試（於 "));
         assert!(!line.contains("由"));
     }
 
     #[test]
     fn result_line_treats_blank_decider_as_absent() {
-        let line = result_line(DecisionVerb::Abandoned, Some("   "));
+        let line = result_line(tempfile::tempdir().unwrap().path(), fixed_now(), DecisionVerb::Abandoned, Some("   "));
         assert!(!line.contains("由"));
     }
 
     #[test]
     fn collapse_body_joins_summary_and_result() {
         let body = collapse_body(
+            tempfile::tempdir().unwrap().path(),
+            fixed_now(),
             "🎯 目標任務：整理客戶月報",
             DecisionVerb::MarkedDone,
             Some("Alice"),
@@ -437,8 +450,8 @@ mod tests {
 
     #[test]
     fn collapse_body_with_empty_summary_is_just_the_result_line() {
-        let body = collapse_body("   ", DecisionVerb::Denied, None);
-        assert_eq!(body, result_line(DecisionVerb::Denied, None));
+        let body = collapse_body(tempfile::tempdir().unwrap().path(), fixed_now(), "   ", DecisionVerb::Denied, None);
+        assert_eq!(body, result_line(tempfile::tempdir().unwrap().path(), fixed_now(), DecisionVerb::Denied, None));
     }
 
     #[test]

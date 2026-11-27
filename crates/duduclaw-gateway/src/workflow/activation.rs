@@ -342,7 +342,7 @@ impl super::WorkflowService {
         // F5-A: a content-free notice to Admins' verified chats; the card
         // itself is decided in the dashboard only.
         if let Ok(Some(card)) = self.broker.get(&id).await {
-            let text = crate::approval_notify::activation_notice_body(&card, false);
+            let text = crate::approval_notify::activation_notice_body(&self.home, &card, false);
             super::workflow_notify::send(
                 &self.home,
                 &record.request.spec.actor,

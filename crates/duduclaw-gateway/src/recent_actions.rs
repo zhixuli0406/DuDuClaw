@@ -161,21 +161,18 @@ fn read_recent_rows(home_dir: &Path, agent_id: &str, max: usize) -> Vec<ActionRo
     rows
 }
 
-/// Local-time display for a row timestamp ("MM-DD HH:MM"); falls back to a
+/// Company-zone display with a zone label ("MM-DD HH:MM"); falls back to a
 /// raw prefix when the timestamp doesn't parse.
-fn display_time(ts: &str) -> String {
+fn display_time(company: &duduclaw_core::company_timezone::CompanyZone, ts: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(ts) {
-        Ok(dt) => dt
-            .with_timezone(&chrono::Local)
-            .format("%m-%d %H:%M")
-            .to_string(),
+        Ok(dt) => duduclaw_core::company_timezone::format_local(company, dt.with_timezone(&chrono::Utc), "%m-%d %H:%M"),
         Err(_) => truncate_bytes(ts, 16).to_string(),
     }
 }
 
 /// Render rows as feed lines, collapsing consecutive identical
 /// (tool, summary, success) repeats into one line with a repeat count.
-fn render_lines(rows: &[ActionRow]) -> Vec<String> {
+fn render_lines(company: &duduclaw_core::company_timezone::CompanyZone, rows: &[ActionRow]) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rows.len() {
@@ -197,13 +194,13 @@ fn render_lines(rows: &[ActionRow]) -> Vec<String> {
         let mut line = if summary.is_empty() {
             format!(
                 "- [{}] {} {mark}",
-                display_time(&row.timestamp),
+                display_time(company, &row.timestamp),
                 row.tool_name
             )
         } else {
             format!(
                 "- [{}] {} {mark} {summary}",
-                display_time(&row.timestamp),
+                display_time(company, &row.timestamp),
                 row.tool_name
             )
         };
@@ -227,7 +224,8 @@ pub fn build_recent_actions_section(home_dir: &Path, agent_id: &str) -> Option<S
     if rows.is_empty() {
         return None;
     }
-    let mut lines = render_lines(&rows);
+    let company = duduclaw_core::company_timezone::read(home_dir);
+    let mut lines = render_lines(&company, &rows);
 
     // Trim oldest-first until the byte budget holds.
     let mut total: usize = lines.iter().map(|l| l.len() + 1).sum();
@@ -247,6 +245,16 @@ pub fn build_recent_actions_section(home_dir: &Path, agent_id: &str) -> Option<S
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn display_time_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let ts = "2026-11-27T01:30:00Z";
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 01:30 UTC");
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 09:30 CST");
+        assert_eq!(display_time(&duduclaw_core::company_timezone::read(home.path()), "bad timestamp"), "bad timestamp");
+    }
     use super::*;
     use std::io::Write as _;
 

@@ -277,7 +277,7 @@ fn the_channel_notice_names_the_workspace_request_not_a_knowledge_review() {
         on_behalf_of: None,
     };
     for reminder in [false, true] {
-        let body = crate::approval_notify::dashboard_only_notice_body(&rec, reminder);
+        let body = crate::approval_notify::dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &rec, reminder);
         assert!(!body.contains("知識"), "{body}");
         assert!(
             body.contains("電腦操作工作區") && body.contains("ws-0123456789abcdef0123456789abcdef")
