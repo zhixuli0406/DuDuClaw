@@ -101,6 +101,65 @@ The old evidence did not retain the close code or distinguish transport errors
 from JSON errors; the transport diagnosis follows the shutdown path and the
 existing socket contract, and the rerun must capture those details.
 
+## Runtime fallback reproduction
+
+`runtime-fallback-repro.mjs` observes runtime fallback using any supplied release
+or development executable, with no special build features or npm dependencies.
+Requires Node 20+ and macOS `sandbox-exec`/`lsof` for enforced loopback-only
+network access. Run outside the implementation sandbox:
+
+```bash
+node scripts/live-test/runtime-fallback-repro.mjs --bin /path/to/v1.85.0/duduclaw
+node scripts/live-test/runtime-fallback-repro.mjs --bin /path/to/new/duduclaw --scenario C-fallback-model --keep --verbose
+```
+
+Each scenario gets fresh `HOME`/`DUDUCLAW_HOME`, fake vendor CLIs, no inherited
+credentials, and a random loopback port. The script sends one ordinary WebChat
+turn; C first calls the real `agents.update` RPC with `fallback` set to
+`grok-4.7-build-fast`. Claude missing-model output is a synthetic stream with
+system/init, assistant text and an error result (no captured vendor transcript).
+`A-chat-exec-error` instead emits stderr and exits non-zero without a stream.
+A-dispatch is explicitly skipped:
+the existing acceptance harness does not drive dispatch, and `tasks.create`
+alone only inserts a task-board row; scheduler/judge execution is unverified.
+
+Stdout is JSON Lines: one observation per scenario followed by a summary of
+observed fallback attempts, with no version-specific verdict. RUN counts exclude
+Claude utility calls and calls before the chat turn. Probe counts include startup:
+help/version flags, auth/login/status commands, and other non-run commands
+(including Codex sandbox preflight) are probes. RUN forms are Claude `-p`/`--print`,
+Codex `exec`, and Grok `-p`/`--single`. Retained `invocations.jsonl` contains every
+shim invocation, its kind, arguments, model environment, inherited/effective homes,
+working directory and timestamp. Scrubbed subprocesses may omit `DUDUCLAW_HOME`;
+the shim validates HOME and restores only its baked-in isolated home. Successful
+fake version probes register Codex/Grok; no real or fake login files are needed.
+`fallback_model_arg` is the last observed fallback RUN model (null if absent).
+`primary_models_tried` and `fallback_models_tried` list model arguments in
+invocation order, including repeated attempts. Models come from `--model`/`-m`
+or Codex `-c model=...`; missing values appear in `model_extraction_errors`,
+never as invented model names or null array entries.
+Primary CLI fixtures fail for every requested model, including the singular
+model fallback. Claude scenarios use `claude-does-not-exist-9` as preferred;
+Codex scenarios use `gpt-5.3-codex`. Both keep `claude-haiku-4-5` as the initial
+singular model fallback, matching the `agents.create` scaffold.
+`agent_toml_model_section` preserves the actual model section, including singular
+or plural fallback keys; C also records `agent_toml_model_section_before` before
+`agents.update`. C also reports `agents_update_fallback_requested`,
+`model_fallback_written`, `model_fallbacks_written` (null if absent), and
+`grok_run_models_received` as plain observations. `diagnostics` contains every
+runtime-unavailable diagnostic JSON; parse failures remain visible separately.
+`explicit_fallback_logged`/`explicit_fallback_lines` retain fallback log evidence.
+`fallback_attempted` requires a fallback RUN; `fallback_step_recorded` instead
+checks for an `explicit_fallback` diagnostic step (successful fallback can have
+no failure diagnostic). A missing fixture agent error includes the last matching
+gateway parse/load log lines. Control requires a Grok RUN after the failing Codex
+RUN; otherwise it reports `harness_invalid` with diagnostics and exits 2. A/C
+have no fallback expectation. Other harness errors/timeouts also exit 2;
+exit 0 means turns completed and any selected control was valid. Gateways are always stopped;
+temporary homes/logs are removed unless `--keep` is supplied. `--verbose` prints
+log paths to stderr, and repeatable `--scenario <name>` selects scenarios.
+These commands have not been live-run during implementation.
+
 ## Why `prod-shaped` exists
 
 v1.68.1 fixed a regression present since v1.67.0: an employee whose

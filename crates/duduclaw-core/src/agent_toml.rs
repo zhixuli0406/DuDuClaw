@@ -90,6 +90,8 @@ pub struct ModelSectionView {
     #[serde(deserialize_with = "crate::lenient::opt")]
     pub preferred: Option<String>,
     #[serde(deserialize_with = "crate::lenient::opt")]
+    pub fallback: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
     pub utility: Option<String>,
     #[serde(deserialize_with = "crate::lenient::string_vec")]
     pub fallbacks: Vec<String>,
@@ -982,6 +984,7 @@ model = \"gpt-5.5\"
         let view = parse(&text).model;
         assert_eq!(view.preferred.as_deref(), Some(full_cfg.model.preferred.as_str()));
         assert_eq!(view.utility.as_deref(), Some(full_cfg.model.utility.as_str()));
+        assert_eq!(view.fallback.as_deref(), Some(full_cfg.model.fallback.as_str()));
         assert_eq!(view.fallbacks, full_cfg.model.fallbacks);
         assert_eq!(view.standard, full_cfg.model.standard);
         assert_eq!(view.delegation_routing, full_cfg.model.delegation_routing);

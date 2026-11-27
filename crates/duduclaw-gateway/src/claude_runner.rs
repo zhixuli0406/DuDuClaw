@@ -1009,6 +1009,11 @@ async fn call_claude_for_agent_impl(
     // Parse agent.toml once for the routing decision and the choke-point (L7 followup).
     crate::runtime_config::ensure_active_agent_provider(&agent_dir)?;
     let delegation_settings = crate::runtime_config::load_runtime_settings(&agent_dir);
+    if delegation_settings.provider == duduclaw_core::types::RuntimeType::Claude {
+        crate::runtime_config::ensure_model_provider(&claude_model, delegation_settings.provider)
+            .map_err(|error| crate::runtime_config::alignment_refusal_with_fallback(error, delegation_settings.fallback))?;
+    }
+
 
     // OTel (WP-B): stamp the ACTUAL runtime on the `invoke_agent` span, now
     // that `[runtime] provider` is known. Recorded here rather than in the
@@ -1197,6 +1202,23 @@ async fn call_claude_for_agent_impl(
         None => std::borrow::Cow::Borrowed(system_prompt.as_str()),
     };
 
+    let runtime_fallback = |error: String| {
+        let settings = &delegation_settings;
+        let model = &claude_model;
+        let system = &system_prompt_inlined;
+        let dir = &agent_dir;
+        async move {
+            Box::pin(crate::runtime_dispatch::run_claude_runtime_fallback(crate::runtime_dispatch::AgentPrompt {
+                agent_dir: Some(dir), home_dir, agent_id, prompt, system_prompt: system, model,
+                max_tokens: 8192, provider_override: None, conversation_history: &[], request_type,
+                runtime_settings: Some(settings), effort: dispatch_effort,
+                allow_cross_family_failover: overrides.allow_cross_family_failover,
+                purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+            }, &error)).await.map(|result| result.map(|response| response.content)
+                .map_err(|failure| failure.legacy_message()))
+        }
+    };
+
     // P0 fix: global mode gate BEFORE per-agent routing
     let inference_mode = get_inference_mode(home_dir).await;
     match inference_mode.as_str() {
@@ -1246,8 +1268,14 @@ async fn call_claude_for_agent_impl(
                 spawn_identity,
             )
             .await;
+            if let Err(error) = &primary_result {
+                if let Some(result) = runtime_fallback(error.clone()).await { return result; }
+            }
             return match primary_result {
-                Ok(text) => Ok(text),
+                Ok(text) => {
+                    crate::runtime_dispatch::record_claude_runtime_success(home_dir).await;
+                    Ok(text)
+                }
                 Err(e) if is_admission_refusal(&e) => Err(e),
                 Err(ref e)
                     if FailoverManager::model_fallback_for(&claude_model, &fallback_model, e)
@@ -1390,9 +1418,13 @@ async fn call_claude_for_agent_impl(
         )
         .await
         {
-            Ok(text) => return Ok(text),
+            Ok(text) => {
+                crate::runtime_dispatch::record_claude_runtime_success(home_dir).await;
+                return Ok(text);
+            }
             Err(e) => {
                 if is_admission_refusal(&e) { return Err(e); }
+                if let Some(result) = runtime_fallback(e.clone()).await { return result; }
                 let is_rate = is_rate_limit_error(&e);
                 let is_fallback_trigger = is_llm_fallback_error(&e);
                 let can_model_fallback =
@@ -1459,7 +1491,7 @@ async fn call_claude_for_agent_impl(
     // G1: when the agent configures `[model] fallbacks`, run the cross-provider
     // fallback chain (preferred → fallbacks). Absent/empty ⇒ fall through to the
     // byte-identical single-shot path below.
-    let model_fallbacks = crate::runtime_config::agent_model_fallbacks(&agent_dir);
+    let model_fallbacks = crate::runtime_config::agent_direct_api_model_fallbacks(&agent_dir);
     if !model_fallbacks.is_empty() {
         info!(
             agent = %agent_name,
@@ -6732,5 +6764,38 @@ mod turn_budget_tests {
             let text = std::fs::read_to_string(guards.prompt.as_ref().unwrap()).unwrap();
             assert!(text.contains("Step budget for this turn: 88"));
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runtime_fallback_tests {
+    use super::*;
+    use duduclaw_core::types::RuntimeType;
+    #[test]
+    fn claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes() {
+        crate::runtime_dispatch::testing::isolated_claude_test(
+            concat!(module_path!(), "::claude_dispatch_runtime_fallback_after_rotation_in_claude_and_hybrid_modes"), |cli_home| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                std::fs::write(cli_home.join("stream.jsonl"),
+                    "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":true,\"result\":\"404 model not found\"}\n").unwrap();
+                for mode in ["claude", "hybrid"] {
+                    for fallback in ["codex", ""] {
+                        let (home, ctx, _registry, calls) = crate::channel_reply::origin_tests::owned_claude_fallback(fallback).await;
+                        std::fs::write(home.path().join("config.toml"), format!("[general]\ninference_mode='{mode}'\n")).unwrap(); *INFERENCE_MODE_CACHE.get_or_init(|| tokio::sync::RwLock::new(None)).write().await = None;
+                        let result = call_claude_for_agent_impl(home.path(), &ctx.registry, "worker", "dispatch task",
+                            crate::cost_telemetry::RequestType::Dispatch, None, DispatchOverrides::default()).await;
+                        let calls = calls.lock().unwrap();
+                        assert_eq!(calls.len(), usize::from(!fallback.is_empty()), "{result:?}");
+                        if !fallback.is_empty() {
+                            assert_eq!(result.unwrap(), "CODEX_FALLBACK_OK");
+                            assert_eq!(calls[0].model, RuntimeType::Codex.spec().fallback_models[0].0);
+                            assert!(calls[0].conversation_history.is_empty());
+                        } else {
+                            assert!(result.is_err());
+                        }
+                    }
+                }
+            });
+        });
     }
 }

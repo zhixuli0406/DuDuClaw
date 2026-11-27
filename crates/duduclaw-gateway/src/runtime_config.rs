@@ -1021,26 +1021,35 @@ pub fn agent_runtime_provider(agent_dir: &Path) -> RuntimeType {
     load_runtime_settings(agent_dir).provider
 }
 
-/// Cross-provider direct-API fallback chain from `agent.toml [model] fallbacks`
-/// (W3/G1). A list of qualified model ids (`"openai/gpt-5.4"`,
-/// `"compat:deepseek/deepseek-v3.2"`, ...) tried in order after the preferred
-/// model on the Direct-API path.
-///
-/// Blanks are dropped and each entry is trimmed. A missing/malformed file, a
-/// missing `[model]` table, a missing key, or a non-array value all resolve to
-/// an empty vec — which the Direct-API path treats as "no chain" and keeps its
-/// existing single-shot behavior byte-identically (fail-safe).
+/// Runtime-switch model candidates: the explicit single fallback takes priority.
+/// The runtime resolver still rejects unknown or incompatible model families.
 pub fn agent_model_fallbacks(agent_dir: &Path) -> Vec<String> {
-    // Trim-and-drop-blanks stays here rather than in the schema: the stored
-    // value is what the operator wrote, and the dashboard edit form must be
-    // able to echo it back verbatim.
-    read_sections(agent_dir)
-        .model
-        .fallbacks
-        .into_iter()
+    let model = read_sections(agent_dir).model;
+    model.fallback.into_iter().chain(model.fallbacks)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// The single configured fallback, retained separately for source attribution.
+pub(crate) fn agent_fallback_model(agent_dir: &Path) -> Option<String> {
+    read_sections(agent_dir).model.fallback
+        .map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+/// Direct API retains its existing plural-only cross-provider chain.
+pub fn agent_direct_api_model_fallbacks(agent_dir: &Path) -> Vec<String> {
+    read_sections(agent_dir).model.fallbacks.into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Diagnostic wording for a pre-call alignment refusal; never authorizes a retry.
+pub(crate) fn alignment_refusal_with_fallback(error: String, fallback: Option<RuntimeType>) -> String {
+    if fallback.is_some() {
+        format!("{error} A fallback runtime is configured, but it was not used because the model setting itself is incorrect.")
+    } else { error }
 }
 
 /// Resolve the agent's runtime fallback provider (`[runtime] fallback`).
@@ -1986,6 +1995,17 @@ mod tests {
     }
 
     // ── W3/G1: [model] fallbacks chain ──────────────────────────────────
+
+    #[test]
+    fn runtime_fallback_models_prepend_singular_model() {
+        let dir = TempDir::new().unwrap();
+        write_agent_toml(dir.path(), "[model]\nfallback=' grok-4 '\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4"]);
+        write_agent_toml(dir.path(), "[model]\nfallback='grok-4'\nfallbacks=['grok-4.7', 'claude-haiku-4-5']\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4", "grok-4.7", "claude-haiku-4-5"]);
+        write_agent_toml(dir.path(), "[model]\nfallback='  '\nfallbacks=['grok-4.7']\n");
+        assert_eq!(agent_model_fallbacks(dir.path()), vec!["grok-4.7"]);
+    }
 
     #[test]
     fn model_fallbacks_empty_when_absent() {

@@ -278,6 +278,55 @@ pub struct AgentPrompt<'a> {
 pub async fn run_agent_prompt_detailed(
     req: AgentPrompt<'_>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    run_agent_prompt_scoped(req, None).await
+}
+
+tokio::task_local! {
+    /// Applies only to the new Claude continuation; older primary paths keep
+    /// their existing environment behavior.
+    pub(crate) static CLAUDE_FALLBACK_SPAWN: ();
+}
+
+pub(crate) fn in_claude_runtime_fallback() -> bool {
+    CLAUDE_FALLBACK_SPAWN.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn apply_claude_fallback_spawn_env(
+    cmd: &mut tokio::process::Command, caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) {
+    if in_claude_runtime_fallback() {
+        // Use the common environment list without changing the runtime's
+        // namespace policy: Codex/Grok native sandboxes may need namespaces.
+        cmd.env_clear();
+        cmd.envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs_for(caps));
+        let granted = duduclaw_core::spawn_env::git_credentials_granted_names(caps);
+        if !granted.is_empty() {
+            tracing::info!(names = ?granted, "runtime fallback: forwarding granted git credential references");
+        }
+    }
+}
+
+/// Keep Claude primary successes in the same health ledger as its failures.
+pub(crate) async fn record_claude_runtime_success(home: &Path) {
+    failover(home).record_success(&RuntimeType::Claude).await;
+}
+
+/// Continue a failed Claude call through the same dispatch context and spawn
+/// gates, without executing the primary again. None preserves caller stop logic.
+pub(crate) async fn run_claude_runtime_fallback(
+    req: AgentPrompt<'_>, error: &str,
+) -> Option<Result<RuntimeResponse, RuntimeDispatchFailure>> {
+    let fallback = req.runtime_settings.map(|s| s.fallback)
+        .unwrap_or_else(|| req.agent_dir.and_then(crate::runtime_config::agent_runtime_fallback));
+    if !crate::failover::claude_runtime_fallback_eligible(error, fallback.as_ref()) {
+        return None;
+    }
+    Some(CLAUDE_FALLBACK_SPAWN.scope((), run_agent_prompt_scoped(req, Some(error))).await)
+}
+
+async fn run_agent_prompt_scoped(
+    req: AgentPrompt<'_>, primary_error: Option<&str>,
+) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -298,7 +347,7 @@ pub async fn run_agent_prompt_detailed(
             crate::on_behalf_of::context::scope(
                 req.home_dir,
                 req.agent_id,
-                crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req)),
+                crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req, primary_error)),
             ),
         ),
     )).await
@@ -312,7 +361,7 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
 }
 
 async fn run_agent_prompt_inner(
-    req: AgentPrompt<'_>,
+    req: AgentPrompt<'_>, primary_error: Option<&str>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     // Every runtime (Codex, Grok, OpenAI-compatible, generic CLIs, Claude via
     // failover) would otherwise start an employee's work with no employee
@@ -370,7 +419,9 @@ async fn run_agent_prompt_inner(
     // being refused; every other mismatch keeps the refusal below.
     let runnable_model = crate::runtime_config::runnable_model(req.agent_id, req.model, provider);
     let model: &str = &runnable_model;
-    crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Config,error))?;
+    crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|
+        RuntimeDispatchFailure::preflight(Some(provider), model, RuntimePreflightKind::Config,
+            crate::runtime_config::alignment_refusal_with_fallback(error, settings.fallback)))?;
     crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
     // F5: only a catalog default DuDuClaw substituted is attributed to its
     // runtime's vendor; every other model keeps the v1.83.0 selector rule
@@ -435,11 +486,11 @@ async fn run_agent_prompt_inner(
         allow_cross_family_failover: req.allow_cross_family_failover && !in_utility_call(),
     };
 
-    // WP-A1: the agent's cross-provider model chain. Cross-runtime failover uses
+    // The singular fallback precedes the cross-provider chain. Runtime failover uses
     // it to pick a model the *fallback* runtime actually serves instead of
     // forwarding the primary's model id verbatim (a codex agent's `gpt-5.4`
     // used to be handed to the Claude runtime). Empty for agent-less utility
-    // calls and for agents that configure no chain — the failover resolver then
+    // calls and for agents that configure no candidates — the resolver then
     // falls through to `context.model` / the runtime catalog default.
     let model_fallbacks = req
         .agent_dir
@@ -455,14 +506,15 @@ async fn run_agent_prompt_inner(
     let resp = crate::cost_telemetry::USAGE_ESTIMATED
         .scope(
             usage_estimated.clone(),
-            RUNTIME_USAGE_REQUEST_TYPE.scope(req.request_type, failover(req.home_dir).execute_with_failover_detailed(
-                &reg,
-                &provider,
-                fallback.as_ref(),
-                req.prompt,
-                &ctx,
-                &model_fallbacks,
-            )),
+            RUNTIME_USAGE_REQUEST_TYPE.scope(req.request_type, async {
+                if let Some(error) = primary_error {
+                    failover(req.home_dir).after_claude_failure(&reg, fallback.as_ref(), req.prompt,
+                        &ctx, &model_fallbacks, error).await
+                } else {
+                    failover(req.home_dir).execute_with_failover_detailed(&reg, &provider,
+                        fallback.as_ref(), req.prompt, &ctx, &model_fallbacks).await
+                }
+            }),
         )
         .await?;
     let usage_estimated = usage_estimated.load(std::sync::atomic::Ordering::Relaxed);
@@ -1686,6 +1738,58 @@ pub(crate) mod testing {
         }
     }
 
+    pub(crate) type RecordedFallback = Arc<std::sync::Mutex<Vec<RuntimeContext>>>;
+
+    pub(crate) struct RecordingCodex(pub RecordedFallback);
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for RecordingCodex {
+        fn name(&self) -> &str { "codex" }
+        async fn is_available(&self) -> bool { true }
+        async fn execute(&self, _: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            self.0.lock().unwrap().push(context.clone());
+            Ok(RuntimeResponse { content: "CODEX_FALLBACK_OK".into(), runtime_name: "codex".into(),
+                model_used: context.model.clone(), ..Default::default() })
+        }
+    }
+
+    /// Run exactly one test in an isolated process; never discover a host CLI.
+    #[cfg(unix)]
+    pub(crate) fn isolated_claude_test(full_name: &str, child_test: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "DUDU_TEST_RUNTIME_FALLBACK_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = Path::new(&home); assert_eq!(duduclaw_core::which_claude().as_deref(), home.join("bin/claude").to_str()); child_test(home);
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::test_exec::write_executable(&bin.join("claude"),
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+             printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
+             /bin/cat \"$HOME/stream.jsonl\"\nexit 1\n", 0o755);
+        let name = full_name.split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", home.path()).env("DUDUCLAW_HOME", home.path()).env(CHILD_HOME, home.path())
+            .args(["--exact", name, "--nocapture"])
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(45) {
+                let _ = duduclaw_core::platform::kill_process_group(child.id());
+                let _ = child.wait();
+                panic!("isolated runtime fallback test exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
+    }
+
     // ── RM-181: a test-owned builder for the PRODUCTION cache ──────────
     //
     // Unlike `RegistryGuard` (which bypasses the cache), this replaces only
@@ -2195,5 +2299,70 @@ mod budget_preflight_tests {
         assert!(failure.to_string().contains("402.00"));
         assert!(failure.steps.is_empty());
         assert_eq!(crate::budget::budget_refusal_message(&failure.legacy_message()), Some(refusal.to_string().as_str()));
+    }
+}
+
+#[cfg(test)]
+mod claude_fallback_stop_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_fallback_spawn_env_is_scoped_and_preserves_explicit_vendor_credentials() {
+        testing::isolated_claude_test(
+            concat!(module_path!(), "::claude_fallback_spawn_env_is_scoped_and_preserves_explicit_vendor_credentials"), |_| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let mut original = tokio::process::Command::new("/usr/bin/env");
+                apply_claude_fallback_spawn_env(&mut original, None);
+                let original = original.output().await.unwrap();
+                assert!(String::from_utf8(original.stdout).unwrap().contains("DUDU_TEST_RUNTIME_FALLBACK_HOME="));
+                CLAUDE_FALLBACK_SPAWN.scope((), async {
+                    let mut command = tokio::process::Command::new("/usr/bin/env");
+                    apply_claude_fallback_spawn_env(&mut command, None);
+                    // Vendors add only their own credentials after the base allowlist.
+                    command.env("OPENAI_API_KEY", "fixture-vendor-key");
+                    let result = command.output().await.unwrap();
+                    assert!(result.status.success());
+                    let env = String::from_utf8(result.stdout).unwrap();
+                    assert!(!env.contains("DUDU_TEST_RUNTIME_FALLBACK_HOME="));
+                    assert!(env.lines().any(|line| line == "OPENAI_API_KEY=fixture-vendor-key"));
+                    assert!(env.lines().any(|line| line.starts_with("HOME=")));
+                }).await;
+                assert!(!in_claude_runtime_fallback());
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn claude_runtime_continuation_refuses_budget_spawn_policy_and_work_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\nfallback='codex'\n").unwrap();
+        let calls: testing::RecordedFallback = Default::default();
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Codex, Box::new(testing::RecordingCodex(calls.clone())));
+        let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(runtimes)).await;
+        let stops = [
+            format!("{}budget exhausted", crate::budget::BUDGET_REFUSAL_PREFIX),
+            duduclaw_agent::mcp_spawn_gate::spawn_gate_error("invalid employee MCP config"),
+            "Product profile does not allow runtime 'codex'".into(),
+            "AUTONOMY_PAUSED: owner paused".into(),
+            crate::work_outcome::WorkOutcome::MaxTurns { limit: 1, partial: String::new() }.encode(),
+            crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 1, partial: String::new() }.encode(),
+            crate::work_outcome::WorkOutcome::TimeoutNoProgress { seconds: 1, tool: None, partial: String::new() }.encode(),
+        ];
+        for error in stops {
+            for wrapped in [error.clone(), format!("All accounts exhausted. Last error: {error}")] {
+                let result = run_claude_runtime_fallback(AgentPrompt {
+                    agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+                    system_prompt: "", model: "claude-sonnet-4-6", max_tokens: 128, provider_override: None,
+                    conversation_history: &[], request_type: RequestType::Chat, runtime_settings: None,
+                    effort: None, allow_cross_family_failover: true, purpose: SpawnPurpose::EmployeeTurn,
+                }, &wrapped).await;
+                assert!(result.is_none(), "{wrapped}");
+                assert!(calls.lock().unwrap().is_empty());
+            }
+        }
     }
 }

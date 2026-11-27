@@ -143,7 +143,7 @@ async fn shared_pipeline_old_known_mismatch_is_call_zero_and_public_visitor_neve
     let path = home.path().join("agents/worker/agent.toml");
     let before = std::fs::read_to_string(&path)
         .unwrap()
-        .replace("provider='codex'", "provider='claude'");
+        .replace("provider='codex'", "provider='claude'\nfallback='codex'");
     std::fs::write(&path, &before).unwrap();
     let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
     let reply = build_reply_for_agent(
@@ -156,6 +156,7 @@ async fn shared_pipeline_old_known_mismatch_is_call_zero_and_public_visitor_neve
     )
     .await;
     assert!(reply.contains("model_provider_mismatch"), "{reply}");
+    assert!(reply.contains("已設定備援引擎，但模型設定本身有誤，因此沒有切換。"), "{reply}");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(spy.counts(), [0, 0]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -436,4 +437,101 @@ async fn system_prompt_read_failure_uses_entry_refusal_for_public_and_operator_a
     assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(crate::model_call_probe::calls(), model_calls_before);
+}
+
+/// Shared owned-home fixture for the chat and dispatch entry-point regressions.
+pub(crate) async fn owned_claude_fallback(fallback: &str) -> (
+    tempfile::TempDir, ReplyContext, crate::runtime_dispatch::testing::RegistryGuard,
+    crate::runtime_dispatch::testing::RecordedFallback,
+) {
+    let (home, ctx, original, _) = owned_channel(RuntimeType::Claude).await;
+    drop(original);
+    // No real API account or inference service may be reached by this fixture.
+    std::fs::write(home.path().join("config.toml"),
+        "[general]\ninference_mode='claude'\n[goal_intent]\nenabled=false\nmode='off'\n").unwrap();
+    let path = home.path().join("agents/worker/agent.toml");
+    let text = std::fs::read_to_string(&path).unwrap()
+        .replace("preferred='gpt-5.4'", "preferred='claude-does-not-exist'")
+        .replace("provider='claude'", &format!("provider='claude'\nfallback='{fallback}'"));
+    std::fs::write(&path, format!("{text}\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n")).unwrap();
+    ctx.registry.write().await.scan().await.unwrap();
+    let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
+    let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();
+    runtimes.insert(RuntimeType::Codex, Box::new(crate::runtime_dispatch::testing::RecordingCodex(calls.clone())));
+    let guard = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(),
+        crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
+    (home, ctx, guard, calls)
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_chat_runtime_fallback_preserves_history_and_empty_fallback_stops() {
+    crate::runtime_dispatch::testing::isolated_claude_test(
+        concat!(module_path!(), "::claude_chat_runtime_fallback_preserves_history_and_empty_fallback_stops"), |cli_home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for stream in [r#"{"type":"result","subtype":"success","is_error":true,"result":"404 model not found"}"#, ""] {
+                std::fs::write(cli_home.join("stream.jsonl"), format!("{stream}\n")).unwrap();
+                for fallback in ["codex", ""] {
+                    let (home, ctx, _registry, calls) = owned_claude_fallback(fallback).await;
+                    let sid = "discord:claude-fallback";
+                    ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
+                    ctx.session_manager.append_message(sid, "user", "EARLIER_USER", 0).await.unwrap();
+                    ctx.session_manager.append_message(sid, "assistant", "EARLIER_ASSISTANT", 0).await.unwrap();
+                    let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
+                    let reply = build_reply_for_agent("NEXT_USER", &ctx, "worker", sid, "owned-user", None).await;
+                    let recorded = calls.lock().unwrap();
+                    assert_eq!(recorded.len(), usize::from(!fallback.is_empty()), "{reply}");
+                    if !fallback.is_empty() {
+                        assert!(reply.contains("CODEX_FALLBACK_OK"), "{reply}");
+                        assert_eq!(recorded[0].model, RuntimeType::Codex.spec().fallback_models[0].0);
+                        let history: Vec<_> = recorded[0].conversation_history.iter()
+                            .map(|turn| (turn.role.as_str(), turn.content.as_str())).collect();
+                        assert_eq!(history, vec![("user", "EARLIER_USER"), ("assistant", "EARLIER_ASSISTANT")]);
+                        let argv = std::fs::read_to_string(cli_home.join("claude-argv")).unwrap();
+                        assert!(argv.contains("EARLIER_USER") && argv.contains("EARLIER_ASSISTANT"));
+                        assert_eq!(spy.counts()[1], 0, "explicit fallback must precede Direct API");
+                        let audit = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
+                        assert!(audit.lines().any(|row| {
+                            let row: serde_json::Value = serde_json::from_str(row).unwrap();
+                            row["event"] == "runtime_fallback_substitution" && row["actual"] == "codex"
+                        }));
+                    }
+                }
+            }
+        });
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_chat_spawn_gate_and_budget_do_not_switch_runtime() {
+    crate::runtime_dispatch::testing::isolated_claude_test(
+        concat!(module_path!(), "::claude_chat_spawn_gate_and_budget_do_not_switch_runtime"), |cli_home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            std::fs::write(cli_home.join("stream.jsonl"), "").unwrap();
+            for stop in ["spawn_gate", "budget"] {
+                let (home, ctx, _registry, calls) = owned_claude_fallback("codex").await;
+                let dir = home.path().join("agents/worker");
+                if stop == "spawn_gate" {
+                    std::fs::write(dir.join(".mcp.json"), "{broken").unwrap();
+                } else {
+                    // The singleton is confined to this isolated test process.
+                    let _ = crate::cost_telemetry::init_telemetry(home.path());
+                    crate::cost_telemetry::get_telemetry().unwrap().record("worker",
+                        crate::cost_telemetry::RequestType::Chat, "claude-sonnet-5",
+                        &crate::cost_telemetry::TokenUsage {
+                            input_tokens: 1000, output_tokens: 50_000_000,
+                            cache_read_tokens: 0, cache_creation_tokens: 0,
+                        }).await;
+                    assert!(crate::budget::gate_before_spawn(home.path(), Some(&dir), "worker", "test")
+                        .await.is_err(), "fixture must exceed the budget");
+                }
+                let reply = build_reply_for_agent("NEXT_USER", &ctx, "worker",
+                    "discord:claude-stopped", "owned-user", None).await;
+                assert!(calls.lock().unwrap().is_empty(), "{stop}: {reply}");
+                assert!(!reply.contains("CODEX_FALLBACK_OK"));
+                assert!(!cli_home.join("claude-argv").exists(), "stop must precede Claude spawn too");
+            }
+        });
+    });
 }
