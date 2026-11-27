@@ -284,6 +284,8 @@ async fn a_stopped_tree_member_cannot_be_claimed_or_completed() {
 
 fn heartbeat_message(id: &str, task_id: &str) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.into(),
         sender: "heartbeat-scheduler".into(),
         target: OWNER.into(),

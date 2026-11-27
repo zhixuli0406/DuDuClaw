@@ -156,7 +156,7 @@ pub(crate) fn handles(rec: &ApprovalRecord) -> bool {
         super::WORKFLOW_ACTIVATION_KIND | "discovery"
         | crate::custom_skills::ACTION_KIND_SKILL_CREATE
         | crate::memory_forget_approval::ACTION_KIND_MEMORY_FORGET_SOURCE => false,
-        _ => rec.payload.get("egress_guard").is_some()
+        _ => super::is_outbound_data_card(rec)
             && chat_admin::tier(rec) != chat_admin::Tier::T3,
     }
 }
@@ -209,6 +209,12 @@ async fn decide_locked(
     let rec = env.broker.get(id).await
         .map_err(|e| DecisionRefusal::Internal(format!("讀取審核失敗：{e}")))?
         .ok_or(DecisionRefusal::NotFound)?;
+    if super::is_outbound_data_card(&rec) {
+        if let Decider::Dashboard(ctx) = by {
+            env.broker.require_outbound_reviewer(ctx, &rec)
+                .map_err(DecisionRefusal::Forbidden)?;
+        }
+    }
     if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
         let (home, record, decider) = (env.home.clone(), rec.clone(), by.clone());
         let allowed = tokio::task::spawn_blocking(move || match &decider {
@@ -417,7 +423,7 @@ async fn general(env: &DecisionEnv, rec: &ApprovalRecord, approve: bool, by: &De
         }
     }
     let decision = match by {
-        Decider::Dashboard(ctx) if rec.payload.get("egress_guard").is_some() || rec.action_kind == "db_source_grant" =>
+        Decider::Dashboard(ctx) if super::is_outbound_data_card(rec) || rec.action_kind == "db_source_grant" =>
             env.broker.decide_egress_dashboard(&rec.id, ctx, approve).await,
         _ => env.broker.decide_as(&rec.id, approve, actor).await,
     };

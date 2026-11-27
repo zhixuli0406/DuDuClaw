@@ -45,6 +45,7 @@ pub enum Sender {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderAccess {
     pub sender: Sender,
+    pub(crate) credential_origin: duduclaw_auth::acl::ContextOrigin,
     /// Set only by WebChat; other channels retain their existing policy.
     pub webchat_scope: Option<WebChatScope>,
 }
@@ -64,6 +65,7 @@ impl SenderAccess {
     pub fn unmapped() -> Self {
         Self {
             sender: Sender::Unmapped,
+            credential_origin: duduclaw_auth::acl::ContextOrigin::Other,
             webchat_scope: None,
         }
     }
@@ -81,7 +83,7 @@ impl SenderAccess {
                 access,
             }
         };
-        Self { sender, webchat_scope: None }
+        Self { sender, credential_origin: duduclaw_auth::acl::ContextOrigin::Other, webchat_scope: None }
     }
 
     /// An account that may call only what everyone may (unknown, inactive
@@ -92,8 +94,16 @@ impl SenderAccess {
                 user_id: user_id.to_string(),
                 access: Arc::new(empty_access(user_id, 0)),
             },
+            credential_origin: duduclaw_auth::acl::ContextOrigin::Other,
             webchat_scope: None,
         }
+    }
+
+    /// Only authentication entry points may set this, never ACL lookup alone.
+    pub(crate) fn with_credential_origin(mut self, origin: duduclaw_auth::acl::ContextOrigin) -> Self {
+        self.credential_origin = origin;
+        self.webchat_scope = None;
+        self
     }
 
     pub(crate) fn for_webchat(mut self, default_agent: Result<String, String>) -> Self {
@@ -118,7 +128,7 @@ impl SenderAccess {
         let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
         let scope = sender.webchat_scope.as_mut().expect("WebChat scope was set");
         scope.main_converse.clear();
-        if !scope.available { return sender; }
+        if !scope.available || sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
             if !crate::webchat::is_widget_visitor(user_id)
                 && main_access_allowed(home, user_id, MainUse::Converse).unwrap_or(false)
@@ -139,15 +149,15 @@ impl SenderAccess {
 
     /// Assignment admission is precomputed separately, before the registry lock.
     pub(crate) async fn for_assign(self, home: &Path) -> Self {
-        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        use crate::on_behalf_of::access::{main_access_listed, main_default_targets, main_turn_allowed, MainUse};
         let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
         let scope = sender.webchat_scope.as_mut().expect("assignment scope was set");
         scope.main_assign.clear();
         scope.main_assign_listed = false;
-        if !scope.available { return sender; }
+        if !scope.available || sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
             if !crate::webchat::is_widget_visitor(user_id)
-                && main_access_allowed(home, user_id, MainUse::Assign).unwrap_or(false)
+                && main_access_listed(home, user_id, MainUse::Assign).unwrap_or(false)
             {
                 scope.main_assign_listed = true;
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
@@ -165,7 +175,8 @@ impl SenderAccess {
     }
 
     pub(crate) fn main_assign_allowed(&self, agent: &LoadedAgent) -> bool {
-        matches!(self.sender, Sender::Account { .. })
+        self.credential_origin == duduclaw_auth::acl::ContextOrigin::DashboardSession
+            && matches!(self.sender, Sender::Account { .. })
             && self.webchat_scope.as_ref().is_some_and(|scope| {
                 scope.available && is_main_target(scope, agent)
                     && agent.dir.file_name().and_then(|id| id.to_str())
@@ -182,7 +193,8 @@ impl SenderAccess {
     }
 
     pub(crate) fn main_converse_allowed(&self, agent: &LoadedAgent) -> bool {
-        matches!(self.sender, Sender::Account { .. })
+        self.credential_origin == duduclaw_auth::acl::ContextOrigin::DashboardSession
+            && matches!(self.sender, Sender::Account { .. })
             && self.webchat_scope.as_ref().is_some_and(|scope| {
                 scope.available && is_main_target(scope, agent)
                     && agent.dir.file_name().and_then(|id| id.to_str())
@@ -193,13 +205,15 @@ impl SenderAccess {
 
     /// Management keeps the legacy Admin-only main gate.
     pub(crate) fn webchat_allows_work(&self, agent: &LoadedAgent) -> bool {
-        matches!(self.sender, Sender::Admin { .. })
+        (matches!(self.sender, Sender::Admin { .. })
+            && self.credential_origin != duduclaw_auth::acl::ContextOrigin::MemberKey)
             || self.webchat_scope.as_ref().is_none_or(|scope|
                 scope.available && !is_main_target(scope, agent))
     }
 
     pub(crate) fn webchat_allows(&self, agent: &LoadedAgent) -> bool {
-        if matches!(self.sender, Sender::Admin { .. }) {
+        if matches!(self.sender, Sender::Admin { .. })
+            && self.credential_origin != duduclaw_auth::acl::ContextOrigin::MemberKey {
             return true;
         }
         self.webchat_allows_work(agent) || self.main_converse_allowed(agent)

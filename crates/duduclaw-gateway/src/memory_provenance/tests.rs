@@ -269,6 +269,8 @@ async fn upstream_unknown_marker_rides_the_queue_and_reaches_the_spawn_env() {
     let tmp = tempfile::tempdir().unwrap();
     let queue = crate::message_queue::MessageQueue::open(tmp.path()).unwrap();
     let msg = crate::message_queue::QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: "m-1".into(),
         sender: "agnes".into(),
         target: "bob".into(),

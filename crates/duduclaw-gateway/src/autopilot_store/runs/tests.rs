@@ -11,7 +11,7 @@ fn run(id: &str, rule_id: &str, count: i64) -> (AutopilotRunRow, Vec<AutopilotRu
         run_id: id.into(), rule_id: rule_id.into(), rule_name: "Rule".into(), rule_hash: "hash".into(),
         event_name: "task_created".into(), event_ref: "event".into(), dedupe_key: format!("dedupe:{id}"),
         fields_json: "{}".into(), state: RUN_PENDING.into(), step_index: 0, step_count: count,
-        next_at: None, lease_owner: None, lease_until: None, owner_department: None,
+        next_at: None, lease_owner: None, lease_until: None, owner_department: None, gateway_origin: false,
         outcome: None, detail: None, created_at: run_ts(now()), updated_at: run_ts(now()),
         notice_pending: false, notice_push_state: None, notice_push_attempts: 0, notice_push_next_at: None,
     };

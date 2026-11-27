@@ -34,6 +34,17 @@ struct DispatchFailureDelivery {
     reason: crate::channel_reply::TurnFailureReason,
 }
 
+const AUTOPILOT_SCOPE_DENIED: &str = "部門範圍不符，已略過";
+
+async fn refuse_department_message(
+    home: &Path, queue: &crate::message_queue::MessageQueue,
+    message: &crate::message_queue::QueueMessage,
+) -> Result<bool, String> {
+    if crate::autopilot_scope::queued_work_allowed(home, message).await { return Ok(false); }
+    queue.fail(&message.id, AUTOPILOT_SCOPE_DENIED).await?;
+    Ok(true)
+}
+
 /// Message envelope stored in `bus_queue.jsonl`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BusMessage {
@@ -474,6 +485,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
     );
 
     for msg in messages {
+        // Check tags before sender-specific routing or readiness can bypass them.
+        if refuse_department_message(home_dir, queue, &msg).await? { continue; }
         // R-M1: workflow messages belong to the gateway holding this home's
         // instance lock; a second gateway leaves them untouched (not acked).
         if crate::workflow::queue_task::is_workflow_message(&msg)
@@ -809,6 +822,8 @@ pub(crate) async fn poll_and_dispatch_sqlite(
         if fence_cancelled_turn(home_dir, queue, &msg).await? {
             continue;
         }
+        // Last check before the runtime future is polled (and can spawn).
+        if refuse_department_message(home_dir, queue, &msg).await? { continue; }
         let dispatch_fut = cancellable_dispatch(downstream.as_ref(), dispatch_fut);
         let class = if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
             duduclaw_core::execution_gate::ExecutionClass::Heartbeat

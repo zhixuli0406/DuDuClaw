@@ -230,6 +230,8 @@ mod approvals_decide;
 pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
+mod autopilot_department_rpc;
+mod autopilot_affecting_rpc;
 mod ticks_rpc;
 mod os_rpc;
 mod redaction_status_rpc;

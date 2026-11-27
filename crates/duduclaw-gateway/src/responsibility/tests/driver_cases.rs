@@ -298,6 +298,8 @@ async fn enqueued_but_unmarked_intent_is_repaired_not_resent() {
         panic!("intent refused");
     };
     let msg = crate::message_queue::QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: intent.intent_id.clone(),
         sender: "goal-loop-driver".into(),
         target: OWNER.into(),

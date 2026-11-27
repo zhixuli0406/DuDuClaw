@@ -409,10 +409,10 @@ impl ApprovalBroker {
                 return Err("Confirm privately in My Connections".into());
             }
         }
-        if rec.payload.get("egress_guard").is_some() {
+        if super::is_outbound_data_card(&rec) {
             match authority {
                 BoundAuthority::Dashboard(ctx) => {
-                    self.require_current_dashboard_role(ctx, duduclaw_auth::UserRole::Admin)?;
+                    self.require_outbound_reviewer(ctx, &rec)?;
                 }
                 // The service, not channel metadata, verified the live Admin.
                 BoundAuthority::ChatAdmin(_) => (),
@@ -444,7 +444,7 @@ impl ApprovalBroker {
                 return Err("policy changed; request a new approval".into());
             }
         }
-        if rec.payload["name"] == "mail_send" && rec.payload.get("egress_guard").is_some()
+        if rec.payload["name"] == "mail_send" && super::is_outbound_data_card(&rec)
             && binding.run_origin_kind == "ingress" && binding.resume_handler == "live_only_v1" {
             let home = self.home_dir().ok_or("mail policy home unavailable")?;
             if super::mail_requester::environment_hash(&home, &rec.agent_id, &binding.run_id)? != binding.environment_hash {
@@ -453,6 +453,7 @@ impl ApprovalBroker {
         }
         binding.validate_host_files()?;
         self.validate_task_snapshot(binding).await?;
+        let mut outbound_reviewer = None;
         {
             let mut conn = self.store.conn.lock().await;
             self.attach_tasks(&conn, binding)?;
@@ -462,6 +463,11 @@ impl ApprovalBroker {
             let current = super::store::record_in_connection(&tx, id)?.ok_or("request missing")?;
             if current.status != ApprovalStatus::Pending || current.is_stale(Utc::now()) {
                 return Err("request expired or decided concurrently".into());
+            }
+            if super::is_outbound_data_card(&current) {
+                if let BoundAuthority::Dashboard(ctx) = authority {
+                    outbound_reviewer = Some(self.require_outbound_reviewer(ctx, &current)?);
+                }
             }
             check_expected_digest(&current)?;
             if current.action_kind == crate::admin_ai::card::ACTION_KIND {
@@ -488,7 +494,7 @@ impl ApprovalBroker {
             let decided_by = match authority {
                 BoundAuthority::Dashboard(ctx) => format!("dashboard:{}", ctx.user_id),
                 BoundAuthority::ChatAdmin(entry) => entry.decided_by().to_string(),
-                BoundAuthority::Channel if rec.payload.get("egress_guard").is_some() =>
+                BoundAuthority::Channel if super::is_outbound_data_card(&rec) =>
                     format!("requester:{}:{}", context.channel, context.principal_id),
                 BoundAuthority::Channel => format!("{}:{}", context.channel, context.principal_id),
             };
@@ -525,6 +531,13 @@ impl ApprovalBroker {
                 Self::write_workflow_resume(&tx, binding, id)?;
             }
             commit_live_write(tx)?;
+        }
+        if super::is_outbound_data_card(&rec) && let Some(home) = self.home_dir() {
+            if let Some(ctx) = outbound_reviewer {
+                super::outbound::audit(&home, &rec, &ctx.user_id, ctx.is_admin(), Some(status == ApprovalStatus::Approved));
+            } else if let BoundAuthority::ChatAdmin(entry) = authority {
+                super::outbound::audit(&home, &rec, &entry.user_id.to_string(), true, Some(status == ApprovalStatus::Approved));
+            }
         }
         self.store.emit_lifecycle("approval.decided", &rec, status).await;
         Ok(())
@@ -565,12 +578,13 @@ impl ApprovalBroker {
             rec.action_kind == WORKFLOW_ACTIVATION_KIND || is_activation_payload(&rec.payload);
         self.require_current_dashboard_role(
             ctx,
-            if activation || rec.payload.get("egress_guard").is_some() {
+            if activation {
                 duduclaw_auth::UserRole::Admin
             } else {
                 duduclaw_auth::UserRole::Manager
             },
         )?;
+        if super::is_outbound_data_card(&rec) { self.require_outbound_reviewer(ctx, &rec)?; }
         let context = rec
             .binding
             .as_ref()

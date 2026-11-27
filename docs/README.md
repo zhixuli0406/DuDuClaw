@@ -101,6 +101,7 @@ Detailed introductions to DuDuClaw's standout features, with metaphors and flow 
 | [features/77-protected-mode.md](features/77-protected-mode.md) | Native Linux protected mode (planned for a later release): Personal and Shared employees, connectors, retire/restore/adopt/purge rules, recording gate, what still needs a real host. Not available in v1.82.0, where the protected service runs as in v1.80; [繁體中文](features/zh-TW/77-protected-mode.md) / [日本語](features/ja-JP/77-protected-mode.md) |
 | [features/78-action-claim-check.md](features/78-action-claim-check.md) | Action claim check: mail / calendar / sheets / docs / tasks completion claims in chat replies checked against the same conversation's tool records, the two notice texts, who sees them, `[action_claims] mode` (default `notice`) and known limits; [繁體中文](features/zh-TW/78-action-claim-check.md) / [日本語](features/ja-JP/78-action-claim-check.md) |
 | [features/79-admin-ai-settings.md](features/79-admin-ai-settings.md) | Administrator AI settings — bulk everyday settings with proposer-only dashboard confirmation |
+| [features/79-department-managers.md](features/79-department-managers.md) | Enterprise department grants for schedules, automation rules, skills and usage; main AI employee access list, protected-mode requirement and current limits; [繁體中文](features/zh-TW/79-department-managers.md) / [日本語](features/ja-JP/79-department-managers.md) |
 | [features/erp-support-matrix.md](features/erp-support-matrix.md) | ERP / CRM support matrix — sales-facing coverage table |
 
 ---

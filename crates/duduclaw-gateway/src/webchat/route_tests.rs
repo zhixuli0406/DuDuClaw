@@ -620,6 +620,7 @@ async fn listed_main_fixture(shell: bool) -> Fixture {
 
 #[tokio::test]
 async fn listed_shell_free_main_conversation_needs_no_binding() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
     let f = listed_main_fixture(false).await;
     assert!(f.state.agent_access_allowed(&f.emp, "dudu").await);
     assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_ok());
@@ -650,10 +651,12 @@ async fn listed_shell_free_main_conversation_needs_no_binding() {
         )
     }).await.expect("listed shell-free conversation must reach the model seam");
     assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{reply}");
+    }).await;
 }
 
 #[tokio::test]
 async fn main_conversation_refusals_distinguish_ineffective_list() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
     for kind in ["shell", "unlisted", "personal", "corrupt"] {
         let f = listed_main_fixture(kind == "shell").await;
         match kind {
@@ -681,10 +684,12 @@ async fn main_conversation_refusals_distinguish_ineffective_list() {
         } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT }, "{kind}");
         assert!(model.entered.try_recv().is_err());
     }
+    }).await;
 }
 
 #[tokio::test]
 async fn precomputed_main_admission_cannot_survive_shell_reload_or_open_assignment() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
     let f = listed_main_fixture(false).await;
     f.state.user_db.bind_agent(&f.emp, "dudu", AccessLevel::Owner).unwrap();
     let sender = f.state.sender_access(&f.emp).await;
@@ -700,6 +705,7 @@ async fn precomputed_main_admission_cannot_survive_shell_reload_or_open_assignme
     f.state.ctx.registry.write().await.scan().await.unwrap();
     assert!(!sender.webchat_allows(f.state.ctx.registry.read().await.get("dudu").unwrap()));
     assert!(policy.with_current(|| ()).is_err());
+    }).await;
 }
 
 #[tokio::test]

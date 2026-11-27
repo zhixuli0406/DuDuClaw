@@ -442,6 +442,9 @@ pub(super) async fn spawn_claude_cli_with_env(
     cmd.kill_on_drop(true);
     // Own process group: an aborted or timed-out turn kills the CLI AND the
     // processes it started (MCP servers, tool subprocesses), not just the CLI.
+    if protected {
+        crate::on_behalf_of::access::check_final_main_spawn(home_dir, work_dir, Some(&cmd)).await?;
+    }
     #[cfg(all(test, unix))]
     if let Ok(capture) = thinking_tests::COMMAND_CAPTURE.try_with(Arc::clone) {
         *capture.lock().unwrap() = Some(cmd);
@@ -462,6 +465,7 @@ pub(super) async fn spawn_claude_cli_with_env(
         { return Err(crate::claude_runner::protected_claude_options_refusal()); }
     } else {
         let admission = crate::autonomous_runtime::admit_current().await?;
+        crate::on_behalf_of::access::check_final_main_spawn(home_dir, work_dir, Some(&cmd)).await?;
         let child = duduclaw_core::execution_gate::with_runtime(
         duduclaw_core::execution_gate::RuntimeKind::Claude,
         crate::process_group::BackendChild::spawn_class_bound(&mut cmd, crate::process_group::execution_class(
