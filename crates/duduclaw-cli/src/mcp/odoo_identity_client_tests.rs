@@ -71,7 +71,18 @@ pub(crate) async fn gateway(home: &Path, status: u16, answer: Value) -> Gateway 
     Gateway { answer, requests, task }
 }
 
+pub(crate) async fn with_decision<F: std::future::Future>(home: &Path, answer: Value, future: F) -> F::Output {
+    let _gateway = gateway(home, 200, answer).await;
+    AUTH.scope((), future).await
+}
+
 pub(crate) async fn with_company<F: std::future::Future>(home: &Path, future: F) -> F::Output {
+    let path = home.join("config.toml");
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        if raw.parse::<toml::Table>().is_ok_and(|table| !table.contains_key("odoo_access")) {
+            std::fs::write(&path, format!("{raw}\n[odoo_access]\ncompany_key_agents=['agnes','bot']\n")).unwrap();
+        }
+    }
     let _gateway = gateway(home, 200, json!({"ok":true,"identity":"company","permission":"engine"})).await;
     AUTH.scope((), future).await
 }
