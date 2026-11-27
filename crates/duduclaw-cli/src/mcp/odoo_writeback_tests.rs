@@ -434,7 +434,9 @@ async fn attachment_listing_and_dispatch_share_identity_and_policy_gates() {
             std::fs::write(config, format!("{raw}\npermission_override='read_only'\n")).unwrap();
         }
         let args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
-        let principal = test_principal(false);
+        let mut principal = test_principal(false);
+        // Listing resolves the principal's client_id, not the fallback agent.
+        principal.client_id = "bot".into();
         let outcome = super::super::with_token_verified_caller(if verified { "bot" } else { "other" }, async {
             let tools = visible_tools_in_lane(&principal, home.path(), "bot", true, &duduclaw_core::ProcessLane::Normal).await;
             let listed = tools.iter().any(|tool| tool.name == "odoo_attachment_add");
@@ -444,6 +446,9 @@ async fn attachment_listing_and_dispatch_share_identity_and_policy_gates() {
         assert_eq!(outcome.0, allowed, "follow={follow}, token={token}, refuse={refuse}, readonly={readonly}, verified={verified}");
         assert_eq!(outcome.1["isError"] != true, allowed, "{}", outcome.1);
         assert_eq!(attachment_requests(&stub).len(), usize::from(allowed));
+        if !allowed {
+            assert!(stub.requests.lock().unwrap().is_empty(), "refused attachment contacted Odoo");
+        }
     }
 }
 

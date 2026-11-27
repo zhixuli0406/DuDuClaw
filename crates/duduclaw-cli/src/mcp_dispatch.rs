@@ -778,7 +778,7 @@ impl McpDispatcher {
     ) -> Value {
         let agent = acting_gate_agent(principal, &self.default_agent);
         let human = crate::mcp::host_on_behalf_of(&self.home_dir, agent);
-        self.dispatch_admitted_for_principal(principal, ns_ctx, params, id, remote, human.as_deref()).await
+        Box::pin(self.dispatch_admitted_for_principal(principal, ns_ctx, params, id, remote, human.as_deref())).await
     }
 
     // The production caller above supplies only the host principal. Keeping it
@@ -4893,23 +4893,23 @@ effect = "forbid"
             assert!(turn);
             assert_eq!(refusal(turn, "memory_search"), None);
             for tool in ["create_agent", "agent_create", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
-                let result = dispatcher.dispatch_admitted_for_principal(
+                let result = Box::pin(dispatcher.dispatch_admitted_for_principal(
                     &principal, &make_ns_ctx(false),
                     &make_params(tool, serde_json::json!({
                         "on_behalf_of": "user:forged-admin",
                         "soul_md": argument_marker,
                     })),
                     &serde_json::json!(14216), None, Some(&human),
-                ).await;
+                )).await;
                 assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
                 assert_eq!(result["error"]["message"], REFUSAL, "{tool}: {result}");
             }
         }
-        let read = dispatcher.dispatch_admitted_for_principal(
+        let read = Box::pin(dispatcher.dispatch_admitted_for_principal(
             &principal, &make_ns_ctx(false),
             &make_params("memory_search", serde_json::json!({"query":"missing"})),
             &serde_json::json!(14217), None, Some(&human),
-        ).await;
+        )).await;
         assert_ne!(read["error"]["message"], REFUSAL, "read is permitted by this gate: {read}");
         let rows = read_tool_call_rows(&home);
         for tool in ["create_agent", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {

@@ -536,7 +536,7 @@ async fn nested_commands_on_ungranted_or_never_writable_related_models_are_refus
         (serde_json::json!({"message_follower_ids": [[0, 0, {"res_model": "crm.lead", "res_id": 1, "partner_id": 3}]]}), "mail.followers", "DuDuClaw 不讓 AI 做這件事："),
         (serde_json::json!({"message_follower_ids": [[4, 3]]}), "mail.followers", "DuDuClaw 不讓 AI 做這件事："),
         // Post a message.
-        (serde_json::json!({"message_ids": [[0, 0, {"body": "hello"}]]}), "mail.message", "This capability is not available"),
+        (serde_json::json!({"message_ids": [[0, 0, {"body": "hello"}]]}), "mail.message", "訊息與通知必須透過專用功能處理"),
         // Create a user with groups, or link users.
         (serde_json::json!({"user_ids": [[0, 0, {"name": "u", "groups_id": [[4, 1]]}]]}), "res.users", "一律不允許"),
         (serde_json::json!({"user_ids": [[4, 2]]}), "res.users", "一律不允許"),
@@ -685,8 +685,15 @@ async fn odoo_write_system_readonly_model_says_capability_unavailable() {
     }
     // The same rule now covers odoo_execute writes on a read-only system model.
     let home = home_with(NEVER_RESOLVE, Some("profile = 'p'"));
-    let text = text_of(&call("odoo_execute", serde_json::json!({"model":"ir.model","method":"write","ids":"[1]"}), home.path(), &pool()).await);
-    assert!(text.contains("DuDuClaw 不讓 AI 做這件事：") && !text.to_lowercase().contains("admin"), "{text}");
+    // Execute preserves the local metadata-fence diagnostic and must refuse
+    // before even requesting an identity, as well as before any Odoo I/O.
+    let result = super::odoo_pool_dispatch_tests::local_refusal(home.path(), &pool(), "odoo_execute",
+        &serde_json::json!({"model":"ir.model","method":"write","ids":"[1]"})).await;
+    let text = text_of(&result);
+    assert_eq!(result["isError"], true, "{text}");
+    assert!(text.contains("system read-only") && text.contains("This capability is not available"), "{text}");
+    assert!(text.contains("writing or deleting is always refused, even when unblocked"), "{text}");
+    assert!(!text.to_lowercase().contains("admin"), "{text}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -701,14 +708,17 @@ async fn never_writable_models_are_refused_whatever_the_settings() {
         let agent = format!(
             "allowed_models = ['{model}']\nallowed_actions = ['create', 'write', 'generic_create:{model}', 'generic_write:{model}']\nunblock_models = ['{model}']"
         );
-        let home = home_with(NEVER_RESOLVE, Some(&agent));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let global = NEVER_RESOLVE.replace("http://localhost:1", &format!("http://{}", listener.local_addr().unwrap()));
+        let home = home_with(&global, Some(&agent));
         let pool = pool();
         for tool in ["odoo_create", "odoo_write"] {
             let result = call(tool, serde_json::json!({"model":model,"ids":[1],"values":{"name":"x"}}), home.path(), &pool).await;
             let text = text_of(&result);
             assert!(result["isError"].as_bool().unwrap(), "{model} {tool}: {text}");
             let expected = match model {
-                "res.users.apikeys" | "mail.mail" | "mail.followers" | "mail.template" | "mail.compose.message" | "ir.rule" => "DuDuClaw 不讓 AI 做這件事：",
+                "res.users.apikeys" | "mail.mail" | "mail.followers" | "mail.message" | "mail.template" | "mail.compose.message" | "mail.channel" | "ir.rule" => "DuDuClaw 不讓 AI 做這件事：",
                 "res.users" | "res.groups" | "ir.actions.server" | "ir.ui.view" | "ir.config_parameter" => "一律不允許",
                 _ => "This capability is not available",
             };
@@ -716,6 +726,8 @@ async fn never_writable_models_are_refused_whatever_the_settings() {
             assert!(!text.to_lowercase().contains("admin"), "{model} {tool}: {text}");
         }
         assert!(pool.slots().await.is_empty(), "{model}");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+            "never-writable model contacted Odoo: {model}");
     }
     for model in ["crm.lead", "res.partner", "sale.order", "mail.activity", "res.users_like"] {
         assert!(!never_generically_writable(model), "{model}");

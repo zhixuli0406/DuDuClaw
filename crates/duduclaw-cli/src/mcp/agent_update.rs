@@ -1009,6 +1009,58 @@ pub(crate) async fn handle_agent_update(
 }
 
 #[cfg(test)]
+mod skill_budget_authority_tests {
+    use super::*;
+
+    #[test]
+    fn ai_skill_budget_unlimited_enabling_is_refused_and_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = toml::Table::new();
+        let after: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+        for caller in ["rep", "lead"] {
+            assert_eq!(check_ai_authority(
+                tmp.path(), RecordActor::Agent(caller), "rep", &before, &after, None,
+            ), Err(AI_AUTHORITY_REFUSED.into()));
+        }
+        let log = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap();
+        let rows: Vec<Value> = log.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["tool_name"] == "agent_authority_refused").collect();
+        assert_eq!(rows.len(), 2);
+        for (row, caller) in rows.iter().zip(["rep", "lead"]) {
+            assert_eq!(row["caller"], caller);
+            assert_eq!(row["target"], "rep");
+            assert_eq!(row["field"], "evolution.skill_budget_unlimited");
+            assert_eq!(row["keys"], serde_json::json!(["evolution.skill_budget_unlimited"]));
+            assert_eq!(row["source"], "mcp.agent_update");
+            assert_eq!(row["reason"], "authority_widening");
+            assert_eq!(row["attempted_value_class"], "protected_value_change");
+        }
+    }
+
+    #[test]
+    fn ai_skill_budget_unlimited_disabling_is_allowed_without_refusal_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+        let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
+        let absent = toml::Table::new();
+        // Seed a refusal so successful narrowing must leave the audit unchanged.
+        assert!(check_ai_authority(
+            tmp.path(), RecordActor::Agent("rep"), "rep", &absent, &before, None,
+        ).is_err());
+        let audit_path = tmp.path().join("tool_calls.jsonl");
+        let audit_before = std::fs::read(&audit_path).unwrap();
+        for caller in ["rep", "lead"] {
+            for after in [&off, &absent] {
+                assert_eq!(check_ai_authority(
+                    tmp.path(), RecordActor::Agent(caller), "rep", &before, after, None,
+                ), Ok(()));
+                assert_eq!(std::fs::read(&audit_path).unwrap(), audit_before);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod db_source_grant_binding_tests {
     use super::*;
 
