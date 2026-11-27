@@ -496,6 +496,29 @@ pub struct RestoreMarker {
 pub struct RestoreStageReport {
     pub extraction: RestoreExtractReport,
     pub mfa_notice: bool,
+    pub drive_write_notice: bool,
+}
+
+pub(crate) const DRIVE_WRITE_RESTORE_NOTICE: &str =
+    "雲端硬碟寫入設定沒有隨備份還原，請到 Google 整合設定頁重新確認。";
+
+impl RestoreStageReport {
+    pub(crate) fn notice(&self) -> Option<String> {
+        let mut notices = Vec::new();
+        if self.mfa_notice { notices.push(crate::mfa::RESTORE_POLICY_NOTICE); }
+        if self.drive_write_notice { notices.push(DRIVE_WRITE_RESTORE_NOTICE); }
+        if notices.is_empty() { None } else { Some(notices.join("\n")) }
+    }
+}
+
+fn strip_restore_drive_write(text: &str) -> Result<(String, bool), String> {
+    let mut table: toml::Table = text.parse()
+        .map_err(|e| format!("無法解析還原設定：{e}"))?;
+    let removed = table.get_mut("google").and_then(toml::Value::as_table_mut)
+        .and_then(|google| google.remove("drive_write")).is_some();
+    if !removed { return Ok((text.to_owned(), false)); }
+    let rendered = crate::handlers::config_commit::render_preserving(text, &table)?;
+    Ok((rendered, true))
 }
 
 /// Serialize staging and boot swaps on a stable inode under the live locks/.
@@ -626,10 +649,19 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
             Err(e) => Err(format!("無法讀取還原設定：{e}")),
         }
     };
-    let restored_config = read_config(&root.join("config.toml"))?;
+    let restored_path = root.join("config.toml");
+    let (restored_config, drive_write_notice) =
+        strip_restore_drive_write(&read_config(&restored_path)?)?;
+    if drive_write_notice {
+        std::fs::write(&restored_path, &restored_config)
+            .map_err(|e| format!("無法更新還原設定：{e}"))?;
+    }
     let current_config = home.join("config.toml");
     crate::product_policy::validate_write(
         home, &current_config, &read_config(&current_config)?, &restored_config,
+    )?;
+    crate::handlers::config_commit::refuse_drive_write_text_edit(
+        &read_config(&current_config)?, &restored_config,
     )?;
     let mfa_notice = crate::mfa::restore_policy_differs(home, &restored_config);
     if mfa_notice {
@@ -646,7 +678,7 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
     };
     publish_restore_with_sync(home, &extracted, &marker, &mut sync_restore_path)
         .map_err(|e| format!("發布還原資料或標記失敗（已發布的暫存資料會保留）：{e}"))?;
-    Ok(RestoreStageReport { extraction, mfa_notice })
+    Ok(RestoreStageReport { extraction, mfa_notice, drive_write_notice })
 }
 
 // Sync children before their parent; never follow links or accept special files.
@@ -909,6 +941,12 @@ fn perform_pending_restore_swap_locked(
         &read_config(&current_config)?,
         &read_config(&restore_root.join("config.toml"))?,
     ).map_err(RestoreSwapError::Io)?;
+
+    crate::handlers::config_commit::refuse_drive_write_text_edit(
+        &read_config(&current_config)?, &read_config(&restore_root.join("config.toml"))?,
+    ).map_err(|_| RestoreSwapError::Io(
+        "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
+    ))?;
 
     let kept_mfa = crate::mfa::restore_policy(home_dir);
     let restored_config_path = restore_root.join("config.toml");
@@ -1262,6 +1300,55 @@ mod tests {
             assert!(!name.to_string_lossy().starts_with(".restore-request-"), "{name:?}");
             assert!(!name.to_string_lossy().starts_with(".restore-marker-"), "{name:?}");
         }
+    }
+
+    #[test]
+    fn drive_write_restore_strips_consent_preserves_format_and_allows_swap() {
+        for nested in [false, true] {
+            for current in ["", "[google.drive_write]\ncreate = true\n"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let home = tmp.path().join("home");
+                std::fs::create_dir(&home).unwrap();
+                std::fs::write(home.join("config.toml"), current).unwrap();
+                let backup = "# backup header\n[google]\nclient_id = 'keep' # untouched\n\n[google.drive_write]\ncreate = false\nmodify = true\n[google.drive_write.approval]\ncreate = 'none'\n[[google.drive_write.folders]]\nid = 'Folder_0123456789'\n\n[general]\nlog_level = 'debug' # keep spelling\n";
+                let config_path = if nested { "duduclaw/config.toml" } else { "config.toml" };
+                let data_path = if nested { "duduclaw/customer-data.txt" } else { "customer-data.txt" };
+                let archive = write_archive(tmp.path(), "drive.tar.gz", &build_tar_gz(&[
+                    (config_path, backup.as_bytes()), (data_path, b"restored"),
+                ]));
+                let mut report = stage_restore_with_protection(&home, &archive, RestoreProtection::Off).unwrap();
+                assert!(report.drive_write_notice);
+                assert!(report.notice().unwrap().contains(DRIVE_WRITE_RESTORE_NOTICE));
+                report.mfa_notice = true;
+                let notice = report.notice().unwrap();
+                assert!(notice.contains(crate::mfa::RESTORE_POLICY_NOTICE));
+                assert!(notice.contains(DRIVE_WRITE_RESTORE_NOTICE));
+                let root = resolve_restore_root(&staging_dir(&home), &home);
+                let staged = std::fs::read_to_string(root.join("config.toml")).unwrap();
+                assert!(staged.starts_with("# backup header\n"));
+                assert!(staged.contains("client_id = 'keep' # untouched"));
+                assert!(staged.contains("log_level = 'debug' # keep spelling"));
+                let parsed: toml::Table = staged.parse().unwrap();
+                assert!(crate::handlers::config_commit::toml_at(&parsed, "google.drive_write").is_none());
+                assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), current);
+                perform_pending_restore_swap(&home, "drive-test").unwrap().unwrap();
+                let restored: toml::Table = std::fs::read_to_string(home.join("config.toml"))
+                    .unwrap().parse().unwrap();
+                assert!(crate::handlers::config_commit::toml_at(&restored, "google.drive_write").is_none());
+                assert_eq!(std::fs::read(home.join("customer-data.txt")).unwrap(), b"restored");
+                let policy = crate::google_workspace::drive_write_policy::load(&home);
+                assert!(!policy.create && !policy.modify && !policy.move_ && !policy.trash);
+            }
+        }
+    }
+
+    #[test]
+    fn drive_write_restore_without_section_is_unchanged() {
+        let original = "# keep\n[google]\nclient_id = 'keep' # spelling\n";
+        let (rendered, notice) = strip_restore_drive_write(original).unwrap();
+        assert_eq!(rendered, original);
+        assert!(!notice);
+        assert!(strip_restore_drive_write("[invalid").is_err());
     }
 
     #[test]

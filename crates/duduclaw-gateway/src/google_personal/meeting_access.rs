@@ -17,6 +17,10 @@ pub(crate) fn has_scopes(scopes: &[String]) -> bool {
 }
 
 pub(crate) fn check_metadata(home: &Path, db: &UserDb, user: &str, metadata: &Metadata) -> Result<(), String> {
+    check_metadata_for(home, db, user, metadata, false)
+}
+
+fn check_metadata_for(home: &Path, db: &UserDb, user: &str, metadata: &Metadata, drive_read: bool) -> Result<(), String> {
     crate::google_identity::write_scope_guard::check_personal(home, metadata, &metadata.granted_scopes)
         .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
     flow::active_user(db, user)?;
@@ -33,6 +37,9 @@ pub(crate) fn check_metadata(home: &Path, db: &UserDb, user: &str, metadata: &Me
     crate::google_data_consent::require_current(metadata.google_data_consent.as_ref())?;
     if !access::domain_allowed(home, metadata)? {
         return Err("這個 Google 帳號不在管理員允許的網域內。".into());
+    }
+    if drive_read {
+        return access::check_metadata(home, metadata, "drive_read").map_err(|r| r.message_zh);
     }
     if !metadata.local_purposes.iter().any(|p| p == "meeting_recordings")
         || !has_scopes(&metadata.granted_scopes) {
@@ -51,6 +58,7 @@ fn client_fingerprint(client: &crate::mcp_oauth::McpOAuthClientConfig) -> String
 }
 
 pub(crate) struct MeetingAccess {
+    drive_read: bool,
     authority: CredentialAuthority,
     token_revision: u64,
     client_fingerprint: String,
@@ -64,7 +72,7 @@ impl MeetingAccess {
     pub(crate) fn validate(&self, home: &Path, db: &UserDb) -> Result<(), String> {
         let current = vault::authority_state(home, self.owner_id())?;
         let metadata = current.metadata.as_ref().ok_or(CHANGED)?;
-        check_metadata(home, db, self.owner_id(), metadata)?;
+        check_metadata_for(home, db, self.owner_id(), metadata, self.drive_read)?;
         let client = crate::mcp_oauth::get_client_config(home, "google").ok_or(CHANGED)?;
         if current.authority().as_ref() != Some(&self.authority)
             || metadata.revision != self.token_revision
@@ -87,6 +95,9 @@ impl MeetingAccess {
             return Err(UNAVAILABLE.into());
         }
         self.validate(home, db)?;
+        if self.drive_read && !crate::google_workspace::native_confirmation::drive_read_path_allowed(&url) {
+            return Err(UNAVAILABLE.into());
+        }
         if !allowed_endpoint(&url) { return Err(UNAVAILABLE.into()); }
         #[cfg(test)]
         let url = test_endpoint(home, &url)?;
@@ -96,7 +107,7 @@ impl MeetingAccess {
             .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(20))
             .read_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(30 * 60))
+            .timeout(Duration::from_secs(if self.drive_read { 15 } else { 30 * 60 }))
             .build().map_err(|_| UNAVAILABLE)?;
         let request = client.request(method, url).bearer_auth(self.token.as_str())
             .build().map_err(|_| UNAVAILABLE)?;
@@ -132,6 +143,16 @@ fn allowed_endpoint(url: &reqwest::Url) -> bool {
 }
 
 pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<MeetingAccess, String> {
+    resolve_for(home, db, user, false).await
+}
+
+/// Dashboard caller's ordinary personal Drive read grant. The bearer stays
+/// inside the existing personal owner and never passes through /google-token.
+pub(crate) async fn resolve_drive_read(home: &Path, db: &UserDb, user: &str) -> Result<MeetingAccess, String> {
+    resolve_for(home, db, user, true).await
+}
+
+async fn resolve_for(home: &Path, db: &UserDb, user: &str, drive_read: bool) -> Result<MeetingAccess, String> {
     // Re-read after the cross-process lease. This also serializes refreshes
     // with the existing personal OAuth owner and provider revocations.
     flow::active_user(db, user)?;
@@ -139,7 +160,7 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     let state = vault::authority_state(home, user)?;
     let authority = state.authority().ok_or(CHANGED)?;
     let metadata = state.metadata.as_ref().ok_or(CHANGED)?;
-    check_metadata(home, db, user, metadata)?;
+    check_metadata_for(home, db, user, metadata, drive_read)?;
     let client = crate::mcp_oauth::get_client_config(home, "google").ok_or(CHANGED)?;
     if client.client_id != metadata.oauth_client_id { return Err(CHANGED.into()); }
     let fingerprint = client_fingerprint(&client);
@@ -150,6 +171,7 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     { return Err(CHANGED.into()); }
     let mut secret = vault::unseal(&key, &record)?;
     let mut material = MeetingAccess {
+        drive_read,
         authority,
         token_revision: record.metadata.revision,
         client_fingerprint: fingerprint,
@@ -160,7 +182,11 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
     material.validate(home, db)?;
     if secret.expires_at.is_none_or(|expiry| expiry <= chrono::Utc::now().timestamp().saturating_add(120)) {
         let refresh = secret.refresh_token.as_deref().ok_or(CHANGED)?;
-        let result = oauth::refresh_meeting(&client.client_id, &client.client_secret, refresh).await;
+        let result = if drive_read {
+            oauth::refresh(&client.client_id, &client.client_secret, refresh).await
+        } else {
+            oauth::refresh_meeting(&client.client_id, &client.client_secret, refresh).await
+        };
         material.validate(home, db)?;
         let mut tokens = match result {
             Ok(tokens) => tokens,

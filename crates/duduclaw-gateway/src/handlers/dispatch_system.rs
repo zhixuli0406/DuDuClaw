@@ -172,6 +172,9 @@ impl MethodHandler {
             }
             "system.update_config" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_system_update_config(params, ctx)).await
             }
             // ── v1.68: raw config editor (admin; masked read, validated +

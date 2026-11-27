@@ -174,6 +174,7 @@ mod mcp_oauth;
 mod mcp_ecosystem_rpc;
 pub use mcp_ecosystem_rpc::{finish_remote_sign_in, install_remote_entry_for_callback};
 mod google_rpc;
+mod google_drive_write_rpc;
 mod google_identity_rpc;
 // v1.81 F5 UI-RPC: protected-mode Google tenant-source settings (Admin + step-up).
 mod google_tenant_settings_rpc;
