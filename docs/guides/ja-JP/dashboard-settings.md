@@ -473,6 +473,7 @@ WebChat は再接続後も元の会話とサーバー側セッションを保持
 | 頭脳とエンジン → ユーティリティモデル | `[model] utility`：Codex と OpenAI 互換 API は空白なら主モデルに従う。Claude の既定は `claude-haiku-4-5`。Grok、汎用 CLI はグローバルのバックグラウンド設定 |
 | 頭脳とエンジン → 1人の社員に4つの役割 | `[team] enabled`、`[team.roles.<役割>]` |
 | 自動化 → 夜間の整理 | `[night_engine] enabled` |
+| 自動化 → タスクの提案 → 会話中にタスクの作成を提案する | `[goal_intent] enabled`：既定はオン。オフにすると、この社員のタスク提案だけが止まります。スイッチは全体設定を含めてこの社員の提案が現在有効かを表示し、保存時は社員個別の値を書き込みます。`agent.toml` の社員個別の値が `config.toml` の全体設定より優先されます。個別の値がなければ全体設定に従い、どちらも未設定ならオンになります。 |
 | 連携 → 専用チャンネル（v1.76.0） | `[channels.telegram] bot_token_enc`、`[channels.googlechat] project_number`／`service_account_json_enc`。`agents.channels.*` で設定（管理者が設定、担当者は状態を確認可。[専用チャンネル](per-employee-channels.md)） |
 | チャネルと連携 → 外部の連絡先から @ で呼び出し（v1.76） | `[channels] public_trigger`（管理者のみ。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照） |
 | 自動化 → 記憶 → 決定の継続、決定の保持日数 | `[memory] decision_continuity`、`decision_ttl_days`（1〜3650） |
