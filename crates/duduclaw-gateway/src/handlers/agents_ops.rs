@@ -208,7 +208,7 @@ impl MethodHandler {
         caller: Option<&UserContext>,
         session: Option<&UserContext>,
         lock_wait: Option<std::time::Duration>,
-        expected_text_hash: Option<String>,
+        expected_snapshot: Option<crate::agent_files::writer::AdminAiSnapshot>,
         mutate: F,
     ) -> Result<bool, String>
     where
@@ -242,7 +242,7 @@ impl MethodHandler {
         #[cfg(test)]
         main_commit_test_seam::reached(&self.home_dir);
         crate::channel_reply::update_agent_toml_edit_expected(
-            &self.registry, agent_id, edit, lock_wait, expected_text_hash.as_deref(), mutate,
+            &self.registry, agent_id, edit, lock_wait, expected_snapshot.as_ref(), mutate,
         ).await
     }
 

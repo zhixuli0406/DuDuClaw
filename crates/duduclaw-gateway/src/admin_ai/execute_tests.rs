@@ -519,3 +519,146 @@ async fn effective_resolved_text_cas_refuses_post_reverify_drift() {
     assert_eq!(std::fs::read_to_string(resolved).unwrap(), changed);
     assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
 }
+
+impl Fixture {
+    async fn bind_identity_test_preset(&self, id: &str) {
+        let dir = self.home.path().join("agents").join(id);
+        // The raw and effective text hashes must be distinct even when their
+        // parsed identity is the same; materialization drops this comment.
+        std::fs::write(dir.join("agent.toml"), format!("{}\n# raw-only comment\n", self.profile(id))).unwrap();
+        let preset_dir = self.home.path().join("presets/identity-test");
+        std::fs::create_dir_all(&preset_dir).unwrap();
+        std::fs::write(preset_dir.join("preset.toml"),
+            "[preset]\nversion='1.0.0'\n[agent]\ndisplay_name='Ignored'\ntrigger='@ignored'\nstatus='terminated'\n").unwrap();
+        duduclaw_core::preset::bind(self.home.path(), id, &dir, "identity-test", "tester", "regression").unwrap();
+        let mut registry = duduclaw_agent::registry::AgentRegistry::new(self.home.path().join("agents"));
+        registry.scan().await.unwrap();
+        assert!(registry.get(id).is_some());
+        let effective = route::effective_text(&dir).unwrap();
+        let table: toml::Value = effective.parse().unwrap();
+        let raw: toml::Value = self.profile(id).parse().unwrap();
+        assert_eq!(table["agent"], raw["agent"], "presets cannot override identity");
+        assert_ne!(hash_text(&effective), hash_text(&self.profile(id)));
+    }
+}
+
+#[tokio::test]
+async fn preset_non_target_raw_trigger_changes_namespace_and_refuses_writes() {
+    for after_reverify in [false, true] {
+        for (name, value) in [("trigger", "@claimed"), ("display_name", "claimed")] {
+            let f = Fixture::new().await;
+            f.bind_identity_test_preset("later").await;
+            let before = f.profile("worker");
+            let rec = f.card(vec![field("worker", name, json!(value)), schedule("never-run")]).await;
+            assert!(rec.payload["target_hashes"].get("agent:later").is_none());
+            let other_dir = f.home.path().join("agents/later");
+            let effective = route::effective_text(&other_dir).unwrap();
+            let mut raw: toml::Table = f.profile("later").parse().unwrap();
+            raw.get_mut("agent").unwrap().as_table_mut().unwrap()
+                .insert("trigger".into(), toml::Value::String("@CLAIMED".into()));
+            let raw = toml::to_string(&raw).unwrap();
+            let change = async {
+                std::fs::write(other_dir.join("agent.toml"), &raw).unwrap();
+                assert_eq!(route::effective_text(&other_dir).unwrap(), effective);
+                assert_ne!(rec.payload["target_hashes"]["triggers"],
+                    json!(hash_triggers(&trigger_namespace(f.home.path()).unwrap())));
+            };
+            let result = if after_reverify {
+                f.decide(&rec, true).await;
+                let result = f.run_after_reverify(&rec, change).await;
+                assert_stale_write_stopped(&result, 0, 0);
+                result
+            } else {
+                change.await;
+                f.decide(&rec, true).await;
+                f.run(&rec).await.unwrap()
+            };
+            assert_eq!(result["outcome"], "voided");
+            assert_eq!(result["reason"], "stale");
+            assert_eq!(f.profile("worker"), before);
+            assert_eq!(f.profile("later"), raw);
+            assert_eq!(route::effective_text(&other_dir).unwrap(), effective);
+            assert!(f.events("agent_settings_changed").is_empty());
+            assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn raw_replace_child() {
+    let Some(source) = std::env::var_os("DUDUCLAW_ADMIN_AI_RAW_REPLACE_SOURCE") else { return; };
+    let target = std::env::var_os("DUDUCLAW_ADMIN_AI_RAW_REPLACE_TARGET").unwrap();
+    std::fs::rename(source, target).unwrap();
+}
+
+#[tokio::test]
+async fn preset_raw_cas_refuses_cross_process_replace_with_stale_resolved_text() {
+    for after_reverify in [false, true] {
+        let f = Fixture::new().await;
+        f.bind_identity_test_preset("worker").await;
+        let rec = f.card(vec![field("worker", "icon", json!("🦊")), schedule("never-run")]).await;
+        let dir = f.home.path().join("agents/worker");
+        let effective = route::effective_text(&dir).unwrap();
+        let before = f.profile("worker");
+        assert_eq!(rec.payload["target_hashes"]["agent:worker"], hash_text(&effective));
+        assert_eq!(rec.payload["target_hashes"]["agent_raw:worker"], hash_text(&before));
+        let changed = format!("{before}\n# cross-process raw replacement\n");
+        let change = async {
+            // A separate process atomically replaces the raw commit base,
+            // without a registry rescan or an authority epoch change.
+            let source = dir.join("replacement.toml");
+            std::fs::write(&source, &changed).unwrap();
+            let test = format!("{}::raw_replace_child", module_path!().split_once("::").unwrap().1);
+            let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env("DUDUCLAW_ADMIN_AI_RAW_REPLACE_SOURCE", &source)
+                .env("DUDUCLAW_ADMIN_AI_RAW_REPLACE_TARGET", dir.join("agent.toml"))
+                .output().await.unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            assert_eq!(f.profile("worker"), changed);
+            assert_eq!(route::effective_text(&dir).unwrap(), effective);
+        };
+        let result = if after_reverify {
+            f.decide(&rec, true).await;
+            let result = f.run_after_reverify(&rec, change).await;
+            assert_stale_write_stopped(&result, 0, 0);
+            result
+        } else {
+            change.await;
+            f.decide(&rec, true).await;
+            f.run(&rec).await.unwrap()
+        };
+        assert_eq!(result["outcome"], "voided");
+        assert_eq!(result["reason"], "stale");
+        assert_eq!(f.profile("worker"), changed);
+        assert_eq!(route::effective_text(&dir).unwrap(), effective);
+        assert!(f.events("agent_settings_changed").is_empty());
+        assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_raw_agent_hash_fails_closed() {
+    let f = Fixture::new().await;
+    let mut prepared = f.prepared(vec![field("worker", "icon", json!("🦊"))]).await;
+    prepared.target_hashes.remove("agent_raw:worker");
+    let rec = f.card_prepared(prepared).await;
+    f.decide(&rec, true).await;
+    let before = f.profile("worker");
+    assert_eq!(f.run(&rec).await.unwrap()["reason"], "stale");
+    assert_eq!(f.profile("worker"), before);
+}
+
+#[tokio::test]
+async fn preset_agent_write_accepts_distinct_matching_raw_and_effective_hashes() {
+    let f = Fixture::new().await;
+    f.bind_identity_test_preset("worker").await;
+    let rec = f.card(vec![field("worker", "icon", json!("🦊"))]).await;
+    assert_ne!(rec.payload["target_hashes"]["agent:worker"], rec.payload["target_hashes"]["agent_raw:worker"]);
+    f.decide(&rec, true).await;
+    assert_eq!(f.run(&rec).await.unwrap()["outcome"], "complete");
+    let table: toml::Value = f.profile("worker").parse().unwrap();
+    assert_eq!(table["agent"]["icon"].as_str(), Some("🦊"));
+}

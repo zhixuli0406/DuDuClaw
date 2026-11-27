@@ -4,7 +4,6 @@ use duduclaw_agent::{registry::AgentRegistry, skill_state};
 use duduclaw_core::{admin_ai_settings::{AdminAiField, AdminAiRefusal, Bounds, Item, Proposal, Schedule},
     authority_coordinator::AuthorityCoordinator};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use crate::{approval::{payload_hash, ConversationAudience}, on_behalf_of::admin_turn::{admin_turn, AdminTurn, AdminTurnLevel}};
 use super::route;
 
@@ -24,7 +23,7 @@ pub(super) fn refused(code: &'static str) -> AdminAiRefusal {
     }.into() }
 }
 fn failure<T>(_: T) -> AdminAiRefusal { refused("admin_ai_settings_unavailable") }
-pub(crate) fn hash_text(text: &str) -> String { hex::encode(Sha256::digest(text.as_bytes())) }
+pub(crate) fn hash_text(text: &str) -> String { crate::agent_files::hash_of(text) }
 
 // Shared by proposal, execution and the checks inside the committing locks.
 pub(crate) const STALE: &str = "admin_ai_state_changed";
@@ -37,6 +36,12 @@ pub(crate) fn hash_skills(state: &skill_state::DisabledSkills) -> Result<String>
 }
 fn canonical_trigger(trigger: &str) -> String { trigger.trim().to_lowercase() }
 pub(crate) fn trigger_namespace(home: &Path) -> Result<BTreeMap<String, String>> {
+    let _authority = AuthorityCoordinator::new(home).read().map_err(failure)?;
+    trigger_namespace_locked(home)
+}
+
+// The caller holds a shared or exclusive authority lease.
+fn trigger_namespace_locked(home: &Path) -> Result<BTreeMap<String, String>> {
     let mut triggers = BTreeMap::new();
     for entry in std::fs::read_dir(home.join("agents")).map_err(failure)? {
         let entry = entry.map_err(failure)?;
@@ -50,7 +55,11 @@ pub(crate) fn trigger_namespace(home: &Path) -> Result<BTreeMap<String, String>>
             Err(e) => return Err(failure(e)),
             Ok(_) => {},
         }
-        let table = route::effective(&dir).map_err(refused)?;
+        // preset::sanitize_preset_table removes the entire [agent] table before
+        // resolve_for_agent merges it: name/display_name/trigger/status are raw
+        // identity, never preset overrides. A resolved artifact can lag a commit.
+        let table: toml::Value = std::fs::read_to_string(dir.join("agent.toml"))
+            .map_err(failure)?.parse().map_err(failure)?;
         if string_leaf(&table, AdminAiField::Status)? == "terminated" { continue; }
         let id = table.get("agent").and_then(|a| a.get("name")).and_then(toml::Value::as_str)
             .ok_or_else(|| refused(STALE))?;
@@ -66,7 +75,7 @@ pub(crate) fn hash_triggers(triggers: &BTreeMap<String, String>) -> String {
 pub(crate) fn check_live_trigger(home: &Path, id: &str, table: &toml::Table) -> Result<()> {
     let trigger = table.get("agent").and_then(|a| a.get("trigger")).and_then(toml::Value::as_str)
         .ok_or_else(|| refused(STALE))?;
-    check_trigger(id, trigger, &trigger_namespace(home)?, &mut BTreeMap::new())
+    check_trigger(id, trigger, &trigger_namespace_locked(home)?, &mut BTreeMap::new())
 }
 
 pub(super) struct Prepared {
@@ -180,6 +189,8 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
         let table: toml::Value = text.parse().map_err(failure)?;
         if !route::target_allowed(home, &user, id, &agent.dir, &table) { return Err(refused("admin_ai_target_unavailable")); }
         all_hashes.insert(format!("agent:{id}"), hash_text(&text));
+        let raw = std::fs::read_to_string(agent.dir.join("agent.toml")).map_err(failure)?;
+        all_hashes.insert(format!("agent_raw:{id}"), hash_text(&raw));
         tables.insert(id.clone(), table);
     }
     let models = crate::runtime_models::merged_models(&crate::runtime_models::load_cache(home).await.unwrap_or_default());
@@ -285,6 +296,7 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
         if before == after { continue; }
         changed_agents.insert(id.clone());
         target_hashes.insert(format!("agent:{id}"), all_hashes[&format!("agent:{id}")].clone());
+        target_hashes.insert(format!("agent_raw:{id}"), all_hashes[&format!("agent_raw:{id}")].clone());
         let extra = match &item {
             Item::Skill { .. } => Some(format!("skills:{id}")),
             _ => item.schedule_id().map(|id| format!("schedule:{id}")),
@@ -339,6 +351,8 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
         let (kind, id) = key.split_once(':').ok_or_else(|| refused("admin_ai_state_changed"))?;
         let actual = match kind {
             "agent" => continue,
+            "agent_raw" => hash_text(&std::fs::read_to_string(home.join("agents").join(id).join("agent.toml"))
+                .map_err(failure)?),
             "schedule" => {
                 let row = store.get(id).await.map_err(failure)?.ok_or_else(|| refused("admin_ai_state_changed"))?;
                 if !route::prompt_only(&row) || store.workflow_binding(id).await.map_err(failure)?.is_some() {

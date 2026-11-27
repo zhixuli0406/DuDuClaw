@@ -182,6 +182,7 @@ async fn reverify(home: &Path, rec: &ApprovalRecord) -> Result<UserContext, Void
         let item: Item = serde_json::from_value(entry["item"].clone()).map_err(|_| "stale")?;
         if item.agent_id().is_some_and(|id| id != target) { return Err("stale".into()); }
         required.insert(format!("agent:{target}"));
+        required.insert(format!("agent_raw:{target}"));
         if matches!(item, Item::Skill { .. }) { required.insert(format!("skills:{target}")); }
         if matches!(item, Item::AgentField { field: AdminAiField::Trigger | AdminAiField::DisplayName, .. }) {
             required.insert("triggers".into());
@@ -205,6 +206,8 @@ async fn reverify(home: &Path, rec: &ApprovalRecord) -> Result<UserContext, Void
                 if !route::target_allowed(home, &ctx, id, &dir, &table) { return Err("stale".into()); }
                 hash_text(&text)
             }
+            "agent_raw" => hash_text(&std::fs::read_to_string(home.join("agents").join(id).join("agent.toml"))
+                .map_err(|_| "stale")?),
             "skills" => {
                 let state = duduclaw_agent::skill_state::read_disabled(home, id);
                 if state.error().is_some() { return Err("stale".into()); }
@@ -370,7 +373,11 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
             if !updated_agents.insert(agent_id.clone()) { Err("同一員工的設定順序不一致，已停止。") }
             else { frame_result(handler.agents_update_inner(params, Some(&ctx), Some(&ctx),
                 UpdateOrigin::AdminAi { approval_id: rec.id.to_string(),
-                    expected_text_hash: write_hashes.get(&format!("agent:{agent_id}")).cloned() }).await) }
+                    expected_snapshot: write_hashes.get(&format!("agent:{agent_id}"))
+                        .zip(write_hashes.get(&format!("agent_raw:{agent_id}")))
+                        .map(|(effective_hash, raw_hash)| crate::agent_files::writer::AdminAiSnapshot {
+                            effective_hash: effective_hash.clone(), raw_hash: raw_hash.clone(),
+                        }) }).await) }
         } else { execute_item(handler, &ctx, item, &mut write_hashes).await };
         match result {
             Ok(()) => {

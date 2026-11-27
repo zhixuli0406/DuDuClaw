@@ -207,6 +207,8 @@ async fn propose_never_executes_without_decision() {
             .matches_stored(&rec.payload["action_grant"]));
         let hashes = &rec.payload["target_hashes"];
         assert!(hashes["agent:worker"].is_string());
+        assert_eq!(hashes["agent_raw:worker"], proposal::hash_text(
+            &std::fs::read_to_string(f.home.path().join("agents/worker/agent.toml")).unwrap()));
         assert!(hashes["schedule:existing"].is_string());
         assert!(hashes["skills:worker"].is_string());
         assert!(rec.payload.get("check_code").is_none());

@@ -7,7 +7,7 @@ use super::*;
 pub(crate) enum UpdateOrigin {
     Dashboard,
     OsSettings,
-    AdminAi { approval_id: String, expected_text_hash: Option<String> },
+    AdminAi { approval_id: String, expected_snapshot: Option<crate::agent_files::writer::AdminAiSnapshot> },
 }
 
 impl UpdateOrigin {
@@ -116,8 +116,8 @@ impl MethodHandler {
         origin: UpdateOrigin,
     ) -> WsFrame {
         let update_source = origin.source();
-        let expected_text_hash = match &origin {
-            UpdateOrigin::AdminAi { expected_text_hash: Some(hash), .. } => Some(hash.clone()),
+        let expected_snapshot = match &origin {
+            UpdateOrigin::AdminAi { expected_snapshot: Some(hash), .. } => Some(hash.clone()),
             UpdateOrigin::AdminAi { .. } => return WsFrame::error_response("", crate::admin_ai::proposal::STALE),
             _ => None,
         };
@@ -552,7 +552,7 @@ impl MethodHandler {
             None
         };
 
-        let result = self.update_agent_toml_as_within(&agent_id, update_source, caller, session, lock_wait, expected_text_hash, move |table| {
+        let result = self.update_agent_toml_as_within(&agent_id, update_source, caller, session, lock_wait, expected_snapshot, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
             // an already-broken file can still be repaired through here).
@@ -1776,13 +1776,19 @@ mod admin_ai_update_tests {
         for params in [json!({"agent_id":"ai-a", "icon":"B", "runtime":{"provider":"codex"}}),
             json!({"agent_id":"ai-a", "preferred":"gpt-5.4"})] {
             let frame = h.agents_update_inner(params, Some(&admin), Some(&admin),
-                UpdateOrigin::AdminAi {approval_id:"approved-1".into(), expected_text_hash:Some(crate::admin_ai::proposal::hash_text(&before))}).await;
+                UpdateOrigin::AdminAi {approval_id:"approved-1".into(), expected_snapshot:Some(crate::agent_files::writer::AdminAiSnapshot {
+                    effective_hash: crate::admin_ai::proposal::hash_text(&before),
+                    raw_hash: crate::admin_ai::proposal::hash_text(&before),
+                })}).await;
             assert!(matches!(&frame, WsFrame::Response {ok:false,..}), "{frame:?}");
             assert!(serde_json::to_string(&frame).unwrap().contains("admin_ai_diff_refused"), "{frame:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         }
         let frame = h.agents_update_inner(json!({"agent_id":"ai-a", "icon":"🦊"}), Some(&admin), Some(&admin),
-            UpdateOrigin::AdminAi {approval_id:"approved-2".into(), expected_text_hash:Some(crate::admin_ai::proposal::hash_text(&before))}).await;
+            UpdateOrigin::AdminAi {approval_id:"approved-2".into(), expected_snapshot:Some(crate::agent_files::writer::AdminAiSnapshot {
+                    effective_hash: crate::admin_ai::proposal::hash_text(&before),
+                    raw_hash: crate::admin_ai::proposal::hash_text(&before),
+                })}).await;
         assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
         let rows = events(home.path());
         let row = rows.iter().find(|e| e["event_type"] == "agent_settings_changed").unwrap();
