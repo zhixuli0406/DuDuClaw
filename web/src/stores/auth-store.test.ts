@@ -269,6 +269,9 @@ describe('department grant state', () => {
     { user: { ...ME_OK.user, id: 'another-user' }, bindings: [] },
     { user: ME_OK.user },
     { user: ME_OK.user, bindings: {} },
+    { user: { id: 'u1', role: 'admin' }, bindings: [] },
+    { ...ME_OK, bindings: [{ user_id: 'u1', agent_name: 'agnes', access_level: 'owner' }] },
+    { ...ME_OK, bindings: [{ user_id: 'u1', agent_name: 'agnes', access_level: 'admin', bound_at: '' }] },
   ])('preserves identity and bindings but clears authority for malformed users.me: %j', async (response) => {
     const bindings = [{ user_id: 'u1', agent_name: 'agnes', access_level: 'owner' as const, bound_at: '' }];
     useAuthStore.setState({ isAuthenticated: true, jwt: 'jwt-1' });
@@ -287,12 +290,37 @@ describe('department grant state', () => {
   it.each([null, {}, 'sales'])('treats non-array department grants as empty: %j', async (dept_grants) => {
     useAuthStore.setState({ isAuthenticated: true, user: ME_OK.user as never, jwt: 'jwt-1' });
     useAuthStore.getState().setUser(ME_OK.user as never, [], {
-      dept_grants: [{ department: 'sales', groups: ['schedules'] }],
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true,
     });
-    mockWsClient.call.mockResolvedValueOnce({ ...ME_OK, dept_grants });
+    mockWsClient.call.mockResolvedValueOnce({ ...ME_OK, dept_grants, main_agent_access: true });
     await useAuthStore.getState().refreshMe();
     expect(useAuthStore.getState().deptGrants).toEqual([]);
     expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  it.each([
+    { department: 42, groups: ['skills'] },
+    { department: '', groups: ['skills'] },
+    { department: 'support', groups: null },
+    { department: 'support', groups: 'skills' },
+    { department: 'support', groups: ['skills', 42] },
+  ])('drops all grant state without throwing for a malformed department grant: %j', (grant) => {
+    const store = useAuthStore.getState();
+    store.setUser(ME_OK.user as never, [], {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }], main_agent_access: true,
+    });
+    expect(() => store.setUser(ME_OK.user as never, [], {
+      dept_grants: [{ department: 'sales', groups: ['schedules'] }, grant], main_agent_access: true,
+    } as never)).not.toThrow();
+    expect(useAuthStore.getState().deptGrants).toEqual([]);
+    expect([...useAuthStore.getState().deptGroups]).toEqual([]);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
+  });
+
+  it.each([false, 'true', 1, null, undefined])('requires literal true for main-agent access: %j', (main_agent_access) => {
+    useAuthStore.getState().setUser(ME_OK.user as never, [], { main_agent_access } as never);
+    expect(useAuthStore.getState().mainAgentAccess).toBe(false);
   });
 
   it('loads grants from the authenticated users.me RPC', async () => {
