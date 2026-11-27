@@ -938,3 +938,7 @@ Creation, revocation and write calls are audited; repeated use is aggregated.
 **Do not put this key in browser front-end code; call from your server.** See the
 [member API authentication reference](../api/member-contract.md#personal-member-api-keys-1850)
 for transport examples and the precise method restrictions.
+
+## Administrator AI: proof of the person in the conversation
+
+The administrator AI settings tools are offered only when the gateway verifies an active Admin who has changed the initial password, the Admin’s uniquely assigned avatar, and an attended turn from that person. The gateway checks the signed conversation context and re-resolves the requester’s identity; tool parameters cannot assert who the person is. Writes additionally require a private conversation or signed-in WebChat. Scheduled, delegated, background and protected-mode turns are refused. Each proposed write still requires the proposing Admin’s dashboard confirmation.

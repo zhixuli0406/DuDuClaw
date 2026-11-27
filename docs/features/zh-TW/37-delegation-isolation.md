@@ -506,3 +506,5 @@ Codex 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.du
 3. **能力權限** — 儀表板「AI 員工 → 進階設定」或用 MCP `agent_update` 工具（需管理員驗證）
 
 這些管道都是人類決策的體現，不會被員工自助繞過。
+
+管理員 AI 設定在提出者確認後，透過儀表板管理路徑執行，不經過 AI 對 AI 的委派，因此委派政策不授予也不限制這條寫入路徑。`agent_update` 的獨立限制仍適用於所有委派政策。詳見[管理員 AI 設定](79-admin-ai-settings.md)。
