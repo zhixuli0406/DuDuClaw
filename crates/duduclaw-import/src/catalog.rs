@@ -56,6 +56,7 @@ pub(crate) const MEMORY_V180: &str = include_str!("memory-v180.sql");
 pub(crate) const APPROVALS_V1793: &str = include_str!("approvals-v1793.sql");
 pub(crate) const APPROVALS_V180: &str = include_str!("approvals-v180.sql");
 pub(crate) const APPROVALS_V181: &str = include_str!("approvals-v181.sql");
+pub(crate) const APPROVALS_V186: &str = include_str!("approvals-v186.sql");
 const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
@@ -126,8 +127,10 @@ static CRON: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Cat
 static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793), Catalog::new(SchemaVersion::V180, MEMORY_V180)];
 // Approvals v1.81 = v1.80.x plus the SR5 `approvals.employee_incarnation`
 // column; the reader never authorizes it, so it maps as V180.
-static APPROVALS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
-    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" }];
+// v1.86 adds installation-local receipts and decisions, never authorized for reading.
+static APPROVALS: [Catalog; 4] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" },
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V186, label: "v1.86" }];
 // Recovery state is fingerprinted for schema inventory, never imported or replayed.
 const GOOGLECHAT_INBOX_V182: &str = include_str!("googlechat-inbox-v182.sql");
 const GOOGLECHAT_INBOX_V183_V1: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"));

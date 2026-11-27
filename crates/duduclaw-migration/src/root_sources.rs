@@ -231,6 +231,15 @@ mod actual_stores_tests {
         }
     }
     #[test]
+    fn rm143_step_up_database_and_sidecars_are_never_import_sources() {
+        for prefix in ["", "agents/sales/"] {
+            for suffix in ["", "-wal", "-shm", "-journal"] {
+                let path = format!("{prefix}protected/approval_step_up.db{suffix}");
+                assert!(classify(Path::new(&path)).is_none(), "{path}");
+            }
+        }
+    }
+    #[test]
     fn migration_source_session_content_and_channel_settings_have_distinct_ids() {
         let tmp=tempfile::tempdir().unwrap();let agent=tmp.path().join("agents/sales");std::fs::create_dir_all(&agent).unwrap();
         std::fs::write(agent.join("agent.toml"),"").unwrap();std::fs::write(tmp.path().join("sessions.db"),"").unwrap();
