@@ -36,6 +36,13 @@ pub(crate) enum Baseline {
     AcceptCurrent,
 }
 
+/// Both texts approved by an admin-AI card: preview and raw commit base.
+#[derive(Debug, Clone)]
+pub(crate) struct AdminAiSnapshot {
+    pub effective_hash: String,
+    pub raw_hash: String,
+}
+
 /// Who and why, for the version index and the audit row.
 #[derive(Debug, Clone)]
 pub(crate) struct CommitMeta {
@@ -48,6 +55,7 @@ pub(crate) struct CommitMeta {
     pub approval_id: Option<String>,
     pub decided_by: Option<String>,
     pub severity: Severity,
+    pub admin_ai_snapshot: Option<AdminAiSnapshot>,
 }
 
 impl CommitMeta {
@@ -62,6 +70,7 @@ impl CommitMeta {
             approval_id: None,
             decided_by: None,
             severity: Severity::Info,
+            admin_ai_snapshot: None,
         }
     }
 }
@@ -202,10 +211,27 @@ fn commit_locked_inner(
             Err(e) => return Ok(Locked::Err(CommitError::Failed(format!("cannot read {}: {e}", c.key.file_name())))),
         };
         let before_hash = super::hash_of(&current);
-        if let Some(expected) = c.expected_hash
-            && expected != before_hash
-        {
-            return Ok(Locked::Err(CommitError::Conflict { current_hash: before_hash }));
+        if c.key == FileKey::AgentToml && c.meta.source == "admin_ai" {
+            let Some(snapshot) = &c.meta.admin_ai_snapshot else {
+                return Ok(Locked::Err(CommitError::Refused(crate::admin_ai::proposal::STALE.into())));
+            };
+            // Compare the bytes actually used by render, not a second raw-file
+            // read: preset materialization can still describe the old base.
+            if snapshot.raw_hash != before_hash {
+                return Ok(Locked::Err(CommitError::Refused(crate::admin_ai::proposal::STALE.into())));
+            }
+            let effective_hash = match crate::admin_ai::route::effective_text(&c.home.join("agents").join(c.agent_id)) {
+                Ok(text) => super::hash_of(&text),
+                Err(_) => return Ok(Locked::Err(CommitError::Refused(crate::admin_ai::proposal::STALE.into()))),
+            };
+            if snapshot.effective_hash != effective_hash {
+                return Ok(Locked::Err(CommitError::Refused(crate::admin_ai::proposal::STALE.into())));
+            }
+        }
+        if let Some(expected) = c.expected_hash {
+            if expected != before_hash {
+                return Ok(Locked::Err(CommitError::Conflict { current_hash: before_hash }));
+            }
         }
         let new = match render(&current) {
             Ok(n) => n,

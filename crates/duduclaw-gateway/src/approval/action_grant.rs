@@ -245,9 +245,9 @@ pub async fn verify_and_consume(
     if !grant.matches_stored(stored) {
         return Err(GrantRefusal::Mismatch);
     }
-    if crate::google_identity::chat_send::is_member_card(&rec) {
+    if crate::google_identity::member_card::is_member_card(&rec) {
         let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
-        if !crate::google_identity::chat_send::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
+        if !crate::google_identity::member_card::decided_by_member(&home, &rec) { return Err(GrantRefusal::Mismatch); }
     }
     // Bound mail decisions retain the execution snapshot through the actual
     // single-use claim, including current requester authority after approval.
@@ -275,6 +275,30 @@ pub async fn verify_and_consume(
     }
     // Live-I/O authority is re-verified around the IMMEDIATE transaction.
     let tx = super::begin_live_write(&mut conn).map_err(GrantRefusal::Store)?;
+    if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        if !crate::admin_ai::decided_by_admin(&home, &rec, &tx) { return Err(GrantRefusal::Mismatch); }
+    }
+    if rec.payload["drive_write_admin_confirmation"] == true {
+        let home = broker.home_dir().ok_or(GrantRefusal::Mismatch)?;
+        let by = rec.decided_by.as_deref().ok_or(GrantRefusal::Mismatch)?;
+        let chat = by.parse::<super::chat_admin::ledger::DecidedBy>().ok();
+        let uid = if let Some(uid) = by.strip_prefix("dashboard:") { uid }
+            else if let Some(chat) = &chat {
+                if !super::chat_admin::ledger::accepts(&tx, &rec) { return Err(GrantRefusal::Mismatch); }
+                chat.user_id()
+            } else { return Err(GrantRefusal::Mismatch); };
+        let db = crate::decision_notify::open_user_db_read_only(&home)
+            .map_err(GrantRefusal::Store)?.ok_or(GrantRefusal::Mismatch)?;
+        let user = db.get_user(uid).map_err(GrantRefusal::Store)?.ok_or(GrantRefusal::Mismatch)?;
+        let principal = duduclaw_core::HumanPrincipal::user(uid).ok_or(GrantRefusal::Mismatch)?.to_string();
+        if rec.action_kind != "mcp_call" || rec.payload.get("egress_guard").is_none()
+            || user.status != duduclaw_auth::UserStatus::Active || user.role != duduclaw_auth::UserRole::Admin
+            || crate::on_behalf_of::self_approval::refuses(&home, rec.on_behalf_of.as_deref(), Some(&principal), true)
+            || !ActionGrant::build(&rec.agent_id, &grant.tool, &rec.payload).matches_stored(stored) {
+            return Err(GrantRefusal::Mismatch);
+        }
+    }
     if let Some(binding) = mail_binding {
         ApprovalBroker::check_task(&tx, binding).map_err(GrantRefusal::Store)?;
         let home = broker.home_dir().ok_or_else(|| GrantRefusal::Store("missing policy home".into()))?;

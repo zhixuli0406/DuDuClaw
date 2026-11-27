@@ -2,6 +2,7 @@
 use super::*;
 use crate::approval::decision_service::tests::Fixture;
 use duduclaw_auth::mfa::MfaCipher;
+use hmac::{Hmac, Mac};
 use rusqlite::Connection;
 use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
 
@@ -19,8 +20,9 @@ pub(crate) fn code(secret: &str, step: i64) -> String {
         acc = (acc << 5) | u32::from(v); bits += 5;
         if bits >= 8 { bits -= 8; key.push((acc >> bits) as u8); }
     }
-    let tag = ring::hmac::sign(&ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE, &key), &(step as u64).to_be_bytes());
-    let bytes = tag.as_ref();
+    let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).unwrap();
+    mac.update(&(step as u64).to_be_bytes());
+    let bytes = mac.finalize().into_bytes();
     let offset = (bytes[19] & 15) as usize;
     let n = u32::from_be_bytes(bytes[offset..offset+4].try_into().unwrap()) & 0x7fff_ffff;
     format!("{:06}", n % 1_000_000)

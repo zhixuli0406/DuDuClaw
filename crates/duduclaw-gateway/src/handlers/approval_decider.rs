@@ -45,8 +45,12 @@ impl MethodHandler {
         let fresh = crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx)
             .map_err(|_| "permission denied".to_string())?;
         let binding = rec.binding.as_ref().ok_or("permission denied")?;
-        if crate::google_identity::chat_send::is_member_card(rec) {
-            return if crate::google_identity::chat_send::may_decide(&self.home_dir, rec, &fresh.user_id) { Ok(fresh) }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+            return if crate::admin_ai::may_decide(&self.home_dir, rec, &fresh.user_id) { Ok(fresh) }
+                else { Err(crate::admin_ai::REFUSAL.into()) };
+        }
+        if crate::google_identity::member_card::is_member_card(rec) {
+            return if crate::google_identity::member_card::may_decide(&self.home_dir, rec, &fresh.user_id) { Ok(fresh) }
                 else { Err("Only the requesting member may confirm".into()) };
         }
         // Egress cards disclose full private arguments only to Admins.

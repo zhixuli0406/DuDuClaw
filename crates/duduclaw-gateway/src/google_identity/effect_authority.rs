@@ -132,7 +132,7 @@ impl GoogleCallContext {
         final_arguments_digest: String,
         credential_ref: CredentialRef,
     ) -> Result<Self, Refusal> {
-        if gi::native_google_scope(native_tool).is_none()
+        if gi::native_google_scope(native_tool).is_none() || duduclaw_core::google_identity::is_drive_write_tool(native_tool)
             || !gi::google_digest_well_formed(&final_arguments_digest)
             || !credential_ref.is_well_formed()
             || !duduclaw_core::is_valid_agent_id(agent)

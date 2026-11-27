@@ -17,7 +17,7 @@ impl HttpFixture {
             "INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'fixture',0)", [&service.user]).unwrap();
         let id = service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
         let proof = service.proof(&id).await;
-        let receipt = receipts::by_card_id(&service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
+        let receipt = receipts::by_card_id(service.env.broker.store_for_tests(), &proof.card_id).await.unwrap().unwrap();
         let row = service.env.broker.get(&id).await.unwrap().unwrap();
         let outcome = step_up::begin(&service.env, &row, &receipt, crate::trigger_route::texts::Lang::ZhTw).await;
         let raw = outcome.card_link.unwrap().url.split_once("#ticket=").unwrap().1.to_owned();
@@ -31,7 +31,7 @@ impl HttpFixture {
         let (tx, _) = broadcast::channel(4);
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState { auth:AuthManager::new(Some("fixture-legacy-system-token".into())),
-            handler, tx, event_tx, prepared_events:Default::default(), user_db, jwt_config,
+            handler: Arc::new(handler), tx, event_tx, prepared_events:Default::default(), user_db, jwt_config,
             otp_delivery:Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(), reqwest::Client::new())),
             home_dir:home });
         Self { service, state, token, raw }
@@ -54,7 +54,7 @@ async fn member_key_system_mcp_and_sessionless_contexts_refused() {
     let user = f.state.user_db.get_user(&f.service.user).unwrap().unwrap();
     let member = f.state.user_db.create_user("member@test.invalid", "Member", "fixture-password-only",
         duduclaw_auth::UserRole::Employee).unwrap();
-    let key = f.state.user_db.member_key_create(&member.id, "test", 1, member.credential_epoch).unwrap();
+    let key = f.state.user_db.member_key_create(&member.id, "test", 1, member.credential_epoch, false, &[]).unwrap();
     let sessionless = f.state.jwt_config.issue_access_token_in_session(&user, &[], None).unwrap();
     let mut system = user.clone();
     system.id = "system".into();

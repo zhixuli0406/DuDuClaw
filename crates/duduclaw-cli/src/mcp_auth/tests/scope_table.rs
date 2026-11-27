@@ -44,6 +44,8 @@ fn scope_enum_matches_canonical_list() {
         Scope::DiscoveryExecute,
         Scope::KnowledgeRead,
         Scope::KnowledgeWrite,
+        Scope::TasksRead,
+        Scope::AgentsStatus,
         Scope::Admin,
     ];
 
@@ -772,5 +774,29 @@ fn cached_auth_fails_closed_when_reload_hits_io_error() {
 fn session_administration_requires_admin_scope() {
     for method in ["sessions.policy", "sessions.policy_update", "users.revoke_sessions"] {
         assert_eq!(tool_requires_scope(method), Some(Scope::Admin));
+    }
+}
+
+#[test]
+fn drive_write_tools_require_explicit_write_scope() {
+    for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        assert_eq!(tool_requires_scope(tool), Some(Scope::GoogleWrite), "{tool}");
+    }
+}
+
+#[test]
+fn person_tool_scopes_match_the_person_key_contract() {
+    for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+        assert_eq!(tool_requires_scope(tool.name).unwrap().to_string(), tool.scope);
+        assert!(duduclaw_core::mcp_scopes::PERSON_KEY_MCP_SCOPE_STRINGS.contains(&tool.scope));
+    }
+}
+
+#[test]
+fn existing_principal_kinds_cannot_use_person_tools() {
+    for kind in [PrincipalKind::GatewayInternal, PrincipalKind::Other,
+        PrincipalKind::Stored { agent_binding: None, key_created_at: Utc::now() },
+        PrincipalKind::Stored { agent_binding: Some("employee".into()), key_created_at: Utc::now() }] {
+        assert!(!kind.is_person_key());
     }
 }

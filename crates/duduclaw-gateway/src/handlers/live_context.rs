@@ -40,6 +40,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use duduclaw_auth::{UserContext, UserDb};
+use duduclaw_auth::acl::ContextOrigin;
 
 use super::MethodHandler;
 use crate::protocol::WsFrame;
@@ -116,13 +117,18 @@ fn log_socket_close(reason: &str) {
 /// then everything.
 const LIVE_CONTEXT_CACHE_CAP: usize = 4096;
 
-/// `user_id → (acl_generation, context)`.
+/// `user_id → (acl_generation, context)`. Provenance belongs to the caller,
+/// not this shared cache: every return overwrites origin from the input.
 #[derive(Default)]
 pub(crate) struct LiveContextCache {
     entries: Mutex<HashMap<String, (u64, UserContext, std::time::Instant)>>,
 }
 
 impl LiveContextCache {
+    pub(super) fn invalidate_user(&self, user_id: &str) {
+        self.lock().remove(user_id);
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, (u64, UserContext, std::time::Instant)>> {
         // A panicked holder leaves plain data behind; keep serving.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
@@ -161,19 +167,22 @@ pub(crate) fn resolve_live_context(
     jwt_ctx: &UserContext,
 ) -> Result<UserContext, String> {
     if let Some(id) = jwt_ctx.member_key_id.as_deref() {
-        let live = db.member_key_context(id, &jwt_ctx.user_id)?;
+        let mut live = db.member_key_context(id, &jwt_ctx.user_id)?;
+        live.origin = ContextOrigin::MemberKey;
         if live.credential_epoch != jwt_ctx.credential_epoch { return Err("member key invalid".into()); }
         return Ok(live);
     }
     let generation = db.acl_generation();
     if let Ok(g) = generation {
-        if let Some(hit) = cache.get(&jwt_ctx.user_id, g) {
+        if let Some(mut hit) = cache.get(&jwt_ctx.user_id, g) {
+            hit.origin = jwt_ctx.origin;
             if !duduclaw_auth::mfa::credential_epoch_matches(jwt_ctx.credential_epoch, hit.credential_epoch) { return Err("登入憑證已失效，請重新登入。".into()); }
             return Ok(hit);
         }
     }
     match db.live_user_context(&jwt_ctx.user_id) {
-        Ok(Some(live)) => {
+        Ok(Some(mut live)) => {
+            live.origin = jwt_ctx.origin;
             // Cache only under a generation read before the snapshot and
             // equal to it: a write in between makes the entry unreachable
             // instead of stale.
@@ -207,7 +216,9 @@ pub(crate) fn resolve_socket_context(db: &UserDb, cache: &LiveContextCache,
         if let Some((_, live, at)) = entries.get(&ctx.user_id) {
             if at.elapsed() < std::time::Duration::from_secs(super::push_filter::PUSH_CACHE_SECS) {
                 return if duduclaw_auth::mfa::credential_epoch_matches(ctx.credential_epoch, live.credential_epoch) {
-                    Ok(live.clone())
+                    let mut live = live.clone();
+                    live.origin = ctx.origin;
+                    Ok(live)
                 } else { Err("登入憑證已失效，請重新登入。".into()) };
             }
         }
@@ -314,9 +325,53 @@ mod tests {
 
     fn ctx(id: &str, generation: u64) -> UserContext {
         let mut c = UserContext::admin_fallback();
+        c.origin = ContextOrigin::Other;
         c.user_id = id.to_string();
         c.acl_generation = generation;
         c
+    }
+
+    #[test]
+    fn context_origin_follows_caller_on_live_and_socket_cache_hits() {
+        let home = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db.create_user("origin@example.test", "Origin", "password-test", duduclaw_auth::UserRole::Manager).unwrap();
+        let mut dashboard = db.live_user_context(&user.id).unwrap().unwrap();
+        dashboard.origin = ContextOrigin::DashboardSession;
+        let mut other = dashboard.clone();
+        other.origin = ContextOrigin::Other;
+        let cache = LiveContextCache::default();
+        assert_eq!(resolve_live_context(&db, &cache, &dashboard).unwrap().origin, ContextOrigin::DashboardSession);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(resolve_live_context(&db, &cache, &dashboard).unwrap().origin, ContextOrigin::DashboardSession);
+        assert_eq!(resolve_live_context(&db, &cache, &other).unwrap().origin, ContextOrigin::Other);
+        assert_eq!(resolve_socket_context(&db, &cache, &other, false).unwrap().origin, ContextOrigin::Other);
+        assert_eq!(resolve_socket_context(&db, &cache, &dashboard, false).unwrap().origin, ContextOrigin::DashboardSession);
+        // Force a fresh socket read, then exercise its cached return with a
+        // different provenance for the same user and ACL generation.
+        let socket_cache = LiveContextCache::default();
+        assert_eq!(resolve_socket_context(&db, &socket_cache, &dashboard, true).unwrap().origin, ContextOrigin::DashboardSession);
+        assert_eq!(resolve_socket_context(&db, &socket_cache, &other, false).unwrap().origin, ContextOrigin::Other);
+        assert_eq!(resolve_socket_context(&db, &socket_cache, &other, true).unwrap().origin, ContextOrigin::Other);
+    }
+
+    #[test]
+    fn context_origin_member_key_overrides_dashboard_and_bypasses_cache() {
+        let home = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db.create_user("key-origin@example.test", "Origin", "password-test", duduclaw_auth::UserRole::Manager).unwrap();
+        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch, false, &[]).unwrap();
+        let mut ctx = db.live_user_context(&user.id).unwrap().unwrap();
+        ctx.origin = ContextOrigin::DashboardSession;
+        let cache = LiveContextCache::default();
+        resolve_live_context(&db, &cache, &ctx).unwrap();
+        ctx.member_key_id = Some(key.info.id);
+        assert_eq!(resolve_live_context(&db, &cache, &ctx).unwrap().origin, ContextOrigin::MemberKey);
+        assert_eq!(resolve_socket_context(&db, &cache, &ctx, false).unwrap().origin, ContextOrigin::MemberKey);
+        assert_eq!(resolve_socket_context(&db, &cache, &ctx, true).unwrap().origin, ContextOrigin::MemberKey);
+        // Member-key refresh cannot poison the user's dashboard cache entry.
+        ctx.member_key_id = None;
+        assert_eq!(resolve_live_context(&db, &cache, &ctx).unwrap().origin, ContextOrigin::DashboardSession);
     }
 
     #[test]

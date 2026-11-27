@@ -662,9 +662,13 @@ mod tests {
         drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
         let actual=Connection::open(home.path().join("autopilot.db")).unwrap();
         let expected=Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest known catalog (v1.82: v1.79.3 plus the
-        // approval-gate ledger); autopilot-v1793.sql pins the older release.
-        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v182.sql")).unwrap();
+        // Fresh stores use v1.86: v1.82 plus rule extensions and durable runs.
+        // v1793 and v182 remain pinned for older imports.
+        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v186.sql")).unwrap();
+        assert!(include_str!("../../duduclaw-import/src/autopilot-v186.sql")
+            .replace("\r\n", "\n").contains(crate::autopilot_store::RUNS_SCHEMA_SQL));
+        assert!(include_str!("../../duduclaw-import/src/autopilot-v186.sql")
+            .replace("\r\n", "\n").contains(crate::autopilot_store::DISPATCH_SCHEMA_SQL));
         assert_eq!(schema(&actual),schema(&expected));
 
         drop(crate::workflow::WorkflowStore::open(home.path()).unwrap());
@@ -672,6 +676,35 @@ mod tests {
         let expected=Connection::open_in_memory().unwrap();
         expected.execute_batch(include_str!("../../duduclaw-import/src/workflow-v1793.sql")).unwrap();
         assert_eq!(schema(&actual),schema(&expected));
+    }
+
+    #[test]
+    fn migration_import_schema_catalog_matches_upgraded_autopilot_stores() {
+        fn schema(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+            conn.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap()
+                .map(Result::unwrap).collect()
+        }
+        let expected = Connection::open_in_memory().unwrap();
+        expected.execute_batch(include_str!("../../duduclaw-import/src/autopilot-v186.sql")).unwrap();
+        let fresh_home = tempfile::tempdir().unwrap();
+        drop(crate::autopilot_store::AutopilotStore::open(fresh_home.path()).unwrap());
+        let fresh = Connection::open(fresh_home.path().join("autopilot.db")).unwrap();
+        assert_eq!(schema(&fresh), schema(&expected));
+        for catalog in [include_str!("../../duduclaw-import/src/autopilot-v182.sql"),
+            include_str!("../../duduclaw-import/src/autopilot-v1793.sql")] {
+            let home = tempfile::tempdir().unwrap();
+            let path = home.path().join("autopilot.db");
+            Connection::open(&path).unwrap().execute_batch(catalog).unwrap();
+            drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
+            let actual = Connection::open(&path).unwrap();
+            assert_eq!(schema(&actual), schema(&expected));
+            assert_eq!(schema(&actual), schema(&fresh));
+            drop(actual);
+            // Reopening repeats the ALTERs safely and preserves exact schema text.
+            drop(crate::autopilot_store::AutopilotStore::open(home.path()).unwrap());
+            assert_eq!(schema(&Connection::open(&path).unwrap()), schema(&expected));
+        }
     }
 
     /// RM-173: a v1.80.x or v1.79.3 sessions.db opened by this release gets the

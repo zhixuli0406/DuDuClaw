@@ -7,13 +7,19 @@ pub(super) async fn decide(
     env: &DecisionEnv, rec: &ApprovalRecord, approve: bool,
     by: &Decider, actor: &DecisionActor,
 ) -> Result<Value, DecisionRefusal> {
-    let DecisionActor::ChatAdmin(entry) = actor else {
-        return Err(DecisionRefusal::NotSupportedInChat);
-    };
+    if crate::google_identity::member_card::is_member_card(rec) {
+        return Err(DecisionRefusal::Forbidden("Only the requesting member may confirm".into()));
+    }
     check_state(env, rec, false).await?;
     check_digest(rec)?;
-    env.broker.decide_bound_chat_admin(&rec.id, entry, approve).await
-        .map_err(DecisionRefusal::from_kind_error)?;
+    match (by, actor) {
+        (Decider::ChatAdmin(_), DecisionActor::ChatAdmin(entry)) =>
+            env.broker.decide_bound_chat_admin(&rec.id, entry, approve).await,
+        (Decider::Dashboard(ctx), DecisionActor::Dashboard { .. })
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND =>
+            env.broker.decide_bound_dashboard(&rec.id, ctx, approve).await,
+        _ => return Err(DecisionRefusal::NotSupportedInChat),
+    }.map_err(DecisionRefusal::from_kind_error)?;
     crate::handlers::approval_decider::audit_activation_decision(
         &env.home, rec, by.user_id(), approve,
     );

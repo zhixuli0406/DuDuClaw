@@ -11,7 +11,19 @@ pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
         google TEXT NOT NULL DEFAULT 'pending',
         example TEXT NOT NULL DEFAULT 'pending',
         capabilities TEXT NOT NULL DEFAULT 'pending'
-    );").map_err(|_| "onboarding_unavailable".to_owned())
+    );").map_err(|_| "onboarding_unavailable".to_owned())?;
+    for (column, kind) in [
+        ("source", "TEXT"), ("avatar", "TEXT"), ("google_chat", "TEXT"),
+        ("odoo", "TEXT"), ("mfa", "TEXT"), ("avatar_agent_name", "TEXT"),
+        ("avatar_attempts", "INTEGER NOT NULL DEFAULT 0"), ("avatar_next_at", "INTEGER"),
+        ("avatar_error", "TEXT"),
+    ] {
+        if !crate::user_row::has_column(conn, "user_onboarding", column)? {
+            conn.execute_batch(&format!("ALTER TABLE user_onboarding ADD COLUMN {column} {kind};"))
+                .map_err(|_| "onboarding_unavailable".to_owned())?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,7 +43,13 @@ impl StepStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct Steps { pub channel: StepStatus, pub google: StepStatus, pub example: StepStatus, pub capabilities: StepStatus }
 #[derive(Debug, Clone, Serialize)]
-pub struct Progress { pub enabled: bool, pub dismissed: bool, pub password_done: bool, pub steps: Steps }
+pub struct Progress {
+    pub enabled: bool, pub dismissed: bool, pub password_done: bool, pub steps: Steps,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signin: Option<SigninSteps>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct SigninSteps { pub avatar: Option<String>, pub avatar_error: Option<String> }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProgressUpdate { pub step: Option<String>, pub status: Option<StepStatus>, pub dismissed: Option<bool> }
@@ -43,15 +61,17 @@ fn live_user(conn: &Connection, id: &str, epoch: u64) -> Result<crate::User, Str
 }
 
 fn read(conn: &Connection, id: &str, password_done: bool) -> Result<Progress, String> {
-    let row = conn.query_row("SELECT dismissed,channel,google,example,capabilities FROM user_onboarding WHERE user_id=?1", [id], |r| {
+    let row = conn.query_row("SELECT dismissed,channel,google,example,capabilities,source,avatar,avatar_error FROM user_onboarding WHERE user_id=?1", [id], |r| {
         Ok(Progress { enabled: true, dismissed: r.get(0)?, password_done, steps: Steps {
             channel: StepStatus::parse(r.get(1)?)?, google: StepStatus::parse(r.get(2)?)?,
             example: StepStatus::parse(r.get(3)?)?, capabilities: StepStatus::parse(r.get(4)?)?,
-        }})
+        }, signin: if r.get::<_, Option<String>>(5)?.as_deref() == Some("google_signin") {
+            Some(SigninSteps { avatar: r.get(6)?, avatar_error: r.get(7)? })
+        } else { None } })
     }).optional().map_err(|_| "onboarding_unavailable".to_owned())?;
     Ok(row.unwrap_or(Progress { enabled: false, dismissed: false, password_done, steps: Steps {
         channel: StepStatus::Pending, google: StepStatus::Pending, example: StepStatus::Pending, capabilities: StepStatus::Pending,
-    }}))
+    }, signin: None }))
 }
 
 impl UserDb {
@@ -73,6 +93,11 @@ impl UserDb {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| "onboarding_unavailable".to_owned())?;
         live_user(&tx, id, epoch)?;
+        let source: Option<String> = tx.query_row("SELECT source FROM user_onboarding WHERE user_id=?1", [id], |r| r.get(0))
+            .optional().map_err(|_| "onboarding_unavailable".to_owned())?.flatten();
+        if source.as_deref() == Some("google_signin") && step == Some("google") {
+            return Err("invalid_onboarding_update".into());
+        }
         // The column is chosen by the exact allowlist above, never user SQL.
         let changed = if let Some(step) = step {
             tx.execute(&format!("UPDATE user_onboarding SET {step}=?2 WHERE user_id=?1"), params![id, update.status.unwrap().as_str()])
@@ -102,6 +127,40 @@ impl UserDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_rows_have_no_signin_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let user = db.create_user("legacy@test.invalid", "Legacy", "password123", crate::UserRole::Employee).unwrap();
+        for insert in [false, true] {
+            if insert { db.conn().execute("INSERT INTO user_onboarding(user_id) VALUES(?1)", [&user.id]).unwrap(); }
+            let progress = db.onboarding_progress(&user.id, user.credential_epoch).unwrap();
+            assert!(progress.signin.is_none());
+            assert!(serde_json::to_value(progress).unwrap().get("signin").is_none());
+        }
+    }
+
+    #[test]
+    fn signin_steps_cannot_be_forged() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = UserDb::new(&dir.path().join("users.db")).unwrap();
+        let user = db.create_user("signin@test.invalid", "Signin", "password123", crate::UserRole::Employee).unwrap();
+        db.conn().execute("INSERT INTO user_onboarding(user_id,source,avatar,avatar_error) VALUES(?1,'google_signin','waiting_admin','template_missing')", [&user.id]).unwrap();
+        let before = serde_json::to_value(db.onboarding_progress(&user.id, user.credential_epoch).unwrap()).unwrap();
+        assert_eq!(before["signin"]["avatar"], "waiting_admin");
+        assert_eq!(before["signin"]["avatar_error"], "template_missing");
+        for step in ["mfa", "avatar", "google", "google_chat", "odoo", "unknown"] {
+            for status in [StepStatus::Done, StepStatus::Skipped, StepStatus::Pending] {
+                let update = ProgressUpdate { step: Some(step.into()), status: Some(status), dismissed: None };
+                assert_eq!(db.update_onboarding(&user.id, user.credential_epoch, &update).unwrap_err(), "invalid_onboarding_update");
+                assert_eq!(serde_json::to_value(db.onboarding_progress(&user.id, user.credential_epoch).unwrap()).unwrap(), before);
+                let row: (Option<String>, Option<String>, Option<String>) = db.conn().query_row(
+                    "SELECT mfa,google_chat,odoo FROM user_onboarding WHERE user_id=?1", [&user.id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(row, (None, None, None));
+            }
+        }
+    }
+
     #[test]
     fn onboarding_is_per_user_persistent_and_rejects_forged_completion() {
         let dir = tempfile::tempdir().unwrap();

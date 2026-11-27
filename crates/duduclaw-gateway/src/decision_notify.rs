@@ -1395,12 +1395,13 @@ async fn apply_bound_request(
         if answer.is_some() {
             return Err("這筆舊請求不是可回答的問題".into());
         }
-        return crate::approval_notify::apply_decision(
+        return crate::approval_notify::apply_decision_in_session(
             home,
             &context.channel,
             &context.principal_id,
             id,
             approve.unwrap_or(false),
+            Some(&context.conversation_id),
         )
         .await;
     }
@@ -1423,6 +1424,9 @@ async fn apply_bound_request(
     if auth != PressAuth::Allow && !crate::approval::mail_requester::eligible(home, &rec) {
         return Err(refusal_text(auth, "核准"));
     }
+    crate::entry_gate::check_approval_start(
+        home, &rec, approve == Some(true), &context.conversation_id,
+    ).await?;
     broker
         .decide_bound(&request, context, approve.ok_or("請使用確認或取消指令")?)
         .await?;
@@ -1573,7 +1577,7 @@ pub(crate) async fn route_verified_bound_press(
         // A delivered RM-143 card stays receipt-bound after disabling or
         // retirement; it must never fall back to legacy decision authority.
         if press::owns(&ctx.home_dir, &row).await
-            || crate::approval::chat_admin::receipts::has_for_approval(&broker.store, &row.id).await.unwrap_or(true) {
+            || broker.has_chat_admin_receipt(&row.id).await.unwrap_or(true) {
             return Some(press::handle(ctx, context, &action, &row, origin, scope).await);
         }
         if (row.binding.is_some() || row.action_kind == crate::knowledge::add_source_approval::ACTION_KIND) && !access_ok {
@@ -2213,3 +2217,7 @@ pub fn channel_display_name(channel: &str) -> &str {
         "dingtalk" => "釘釘", _ => "聊天通道",
     }
 }
+
+#[cfg(test)]
+#[path = "decision_entry_gate_tests.rs"]
+mod entry_gate_tests;

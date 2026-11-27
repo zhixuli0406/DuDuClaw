@@ -180,6 +180,12 @@ pub(crate) fn autopilot_rule_to_json(r: &AutopilotRuleRow) -> Value {
         // P4-1: induced-rule provenance ({induced, induced_at, fingerprint, source});
         // null for hand-authored rules. Lets the dashboard badge PBD-induced rules.
         "metadata": r.metadata.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "active_window": r.active_window.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "run_policy": r.run_policy.as_ref().and_then(|s| serde_json::from_str::<Value>(s).ok()),
+        "owner_department": r.owner_department,
+        "created_by_user_id": r.created_by_user_id,
+        "updated_by_user_id": r.updated_by_user_id,
+        "updated_at": r.updated_at,
     })
 }
 
@@ -337,10 +343,12 @@ fn validate_condition_node(node: &Value, path: &str, depth: usize) -> Result<(),
 
 /// Validate an autopilot action JSON object at rule-write time.
 ///
-/// Requires `type` ∈ {delegate, notify, run_skill} and the fields the
-/// engine will eventually need. Catches misconfiguration immediately
-/// rather than silently during the first fire.
+/// Legacy actions remain valid; v1.86 features require a steps envelope.
 pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
+    validate_autopilot_action_inner(action, false)
+}
+
+fn validate_autopilot_action_inner(action: &Value, is_step: bool) -> Result<(), String> {
     let obj = action
         .as_object()
         .ok_or_else(|| "action must be a JSON object".to_string())?;
@@ -348,6 +356,18 @@ pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "action.type is required".to_string())?;
+    if is_step && obj.contains_key("screen") {
+        return Err("screen is only allowed on the steps envelope".into());
+    }
+    if let Some(params) = obj.get("params") {
+        if !is_step || t != "run_skill" {
+            return Err("params require a run_skill step".into());
+        }
+        let params = params.as_object().ok_or("params must be an object")?;
+        if params.len() > 10 {
+            return Err("params may contain at most 10 entries".into());
+        }
+    }
     let require_str = |key: &str| -> Result<(), String> {
         obj.get(key)
             .and_then(|v| v.as_str())
@@ -356,6 +376,55 @@ pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
             .ok_or_else(|| format!("action.{key} is required for type '{t}'"))
     };
     match t {
+        "steps" => {
+            if is_step {
+                return Err("nested steps are not allowed".into());
+            }
+            if obj.contains_key("require_approval") {
+                return Err("require_approval is only allowed per step".into());
+            }
+            if obj.keys().any(|k| !matches!(k.as_str(), "type" | "steps" | "screen")) {
+                return Err("unknown steps envelope key".into());
+            }
+            let steps = obj.get("steps").and_then(Value::as_array)
+                .ok_or("steps must be an array")?;
+            if !(1..=5).contains(&steps.len()) {
+                return Err("steps must contain 1 to 5 actions".into());
+            }
+            let mut wait_minutes = 0;
+            let mut previous_wait = false;
+            let mut has_action = false;
+            for step in steps {
+                validate_autopilot_action_inner(step, true)?;
+                let is_wait = step.get("type").and_then(Value::as_str) == Some("wait");
+                if is_wait {
+                    if previous_wait {
+                        return Err("consecutive waits are not allowed".into());
+                    }
+                    wait_minutes += step["minutes"].as_u64().ok_or("invalid wait minutes")?;
+                    if wait_minutes > 1440 {
+                        return Err("total wait must not exceed 1440 minutes".into());
+                    }
+                } else {
+                    has_action = true;
+                }
+                previous_wait = is_wait;
+            }
+            if !has_action {
+                return Err("steps must contain a non-wait action".into());
+            }
+            if previous_wait {
+                return Err("last step must not be a wait".into());
+            }
+        }
+        "wait" if is_step => {
+            if obj.keys().any(|k| !matches!(k.as_str(), "type" | "minutes")) {
+                return Err("unknown wait key".into());
+            }
+            obj.get("minutes").and_then(Value::as_u64)
+                .filter(|n| (1..=1440).contains(n))
+                .ok_or("wait minutes must be an integer from 1 to 1440")?;
+        }
         "delegate" => {
             require_str("target_agent")?;
             require_str("prompt")?;
@@ -399,6 +468,82 @@ pub(crate) fn validate_autopilot_action(action: &Value) -> Result<(), String> {
         if !screen.is_null() {
             crate::autopilot_screen::validate_screen_spec(screen)?;
         }
+    }
+    Ok(())
+}
+
+/// Preserve trigger-time screening and per-step approval when upgrading a rule.
+pub(crate) fn wrap_in_steps_envelope(mut action: Value) -> Value {
+    if action.get("type").and_then(Value::as_str) == Some("steps") {
+        return action;
+    }
+    let screen = action.as_object_mut().and_then(|obj| obj.remove("screen"));
+    let mut envelope = json!({"type": "steps", "steps": [action]});
+    if let Some(screen) = screen {
+        envelope["screen"] = screen;
+    }
+    envelope
+}
+
+/// Save validation and the field picker use the same authoritative context.
+/// Runtime further narrows tick fields to the actual triggering source.
+pub(crate) fn with_autopilot_field_context<T>(
+    home: &Path,
+    trigger_event: &str,
+    sequence: Option<&str>,
+    use_context: impl FnOnce(&str, &crate::autopilot_fields::FieldContext<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let spec = sequence.map(|s| {
+        let value: Value = serde_json::from_str(s).map_err(|_| "invalid sequence JSON")?;
+        crate::cep_matcher::validate_sequence_spec(&value)?;
+        serde_json::from_value::<crate::cep_matcher::SequenceSpec>(value)
+            .map_err(|_| "invalid sequence".to_string())
+    }).transpose()?;
+    let trigger = if spec.is_some() { "cep_trigger" } else { trigger_event };
+    let then_event = spec.as_ref().map(|s| s.then.event.as_str());
+    let effective_event = if trigger == "cep_trigger" { then_event.unwrap_or("") } else { trigger };
+    let mut tick_fields = Vec::new();
+    if effective_event == "tick" {
+        let config = crate::tick_config::TickConfig::from_home(home);
+        for source in config.active_sources() {
+            tick_fields.extend(source.json_fields.keys().cloned());
+        }
+        tick_fields.sort();
+        tick_fields.dedup();
+    }
+    let ctx = crate::autopilot_fields::FieldContext { cep_then_event: then_event, tick_fields: &tick_fields };
+    use_context(trigger, &ctx)
+}
+
+/// Validate the merged definition that will actually be persisted.
+pub(crate) fn validate_autopilot_rule_for_save(home: &Path, rule: &AutopilotRuleRow) -> Result<(), String> {
+    let action: Value = serde_json::from_str(&rule.action).map_err(|_| "invalid action JSON")?;
+    validate_autopilot_action(&action)?;
+    if (rule.active_window.is_some() || rule.run_policy.is_some() || rule.owner_department.is_some())
+        && action.get("type").and_then(Value::as_str) != Some("steps") {
+        return Err("rule extensions require a steps envelope".into());
+    }
+    with_autopilot_field_context(home, &rule.trigger_event, rule.sequence.as_deref(), |trigger, ctx| {
+        if let Some(steps) = action.get("steps").and_then(Value::as_array) {
+            for step in steps {
+                if step.get("type").and_then(Value::as_str) == Some("run_skill") {
+                    if let Some(params) = step.get("params") {
+                        crate::autopilot_template::parse_params(params, trigger, ctx)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    if let Some(window) = &rule.active_window {
+        let window: Value = serde_json::from_str(window).map_err(|_| "invalid active_window JSON")?;
+        let company_zone = crate::autopilot_window::read_company_timezone(home)
+            .map_err(|_| "company timezone setting is unreadable")?;
+        crate::autopilot_window::validate_window_for_save(&window, company_zone.as_ref().map(|tz| tz.name()))?;
+    }
+    if let Some(policy) = &rule.run_policy {
+        let policy: Value = serde_json::from_str(policy).map_err(|_| "invalid run_policy JSON")?;
+        crate::autopilot_window::parse_run_policy(&policy)?;
     }
     Ok(())
 }

@@ -30,28 +30,48 @@ impl MethodHandler {
         }
         let result: Result<Value, String> = async {
             match method {
-                "me.google.chat_confirmations" => {
+                "me.google.chat_confirmations" | "me.google.write_confirmations" => {
+                    let marker = if method == "me.google.write_confirmations" { "drive_write_member_confirmation" } else { "chat_member_confirmation" };
                     let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
                     let rows = broker.list_by_kind("bound_action").await?;
                     Ok(json!({"requests":rows.into_iter().filter(|r|
-                        r.status == crate::approval::ApprovalStatus::Pending
-                        && crate::google_identity::chat_send::may_decide(&self.home_dir, r, &ctx.user_id))
-                        .map(|r| crate::google_identity::chat_send::confirmation_display(&r)).collect::<Vec<_>>()}))
+                        r.status == crate::approval::ApprovalStatus::Pending && r.payload[marker] == true
+                        && crate::google_identity::member_card::may_decide(&self.home_dir, r, &ctx.user_id))
+                        .map(|r| crate::google_identity::member_card::confirmation_display(&r)).collect::<Vec<_>>()}))
                 }
-                "me.google.chat_confirm" => {
+                "me.google.chat_confirm" | "me.google.write_confirm" => {
+                    let marker = if method == "me.google.write_confirm" { "drive_write_member_confirmation" } else { "chat_member_confirmation" };
                     let _session = google_personal::session_for(&ctx.user_id)?;
                     let id = params["id"].as_str().ok_or("Missing confirmation")?;
                     let approve = params["approve"].as_bool().ok_or("Missing decision")?;
                     let broker = crate::approval::ApprovalBroker::open(&self.home_dir)?;
                     let id = crate::approval::ApprovalId::from(id.to_owned());
                     let rec = broker.get(&id).await?.ok_or("Confirmation missing")?;
-                    if !crate::google_identity::chat_send::may_decide(&self.home_dir, &rec, &ctx.user_id) {
+                    if rec.payload[marker] != true || !crate::google_identity::member_card::may_decide(&self.home_dir, &rec, &ctx.user_id) {
                         return Err("僅限提出要求的本人確認，或這則確認已失效。".into());
                     }
                     broker.decide_bound_dashboard(&id, ctx, approve).await?;
                     Ok(json!({"decided":true}))
                 }
                 "me.google.status" => self.personal_google_status(&db, ctx).await,
+                "me.google.write_connect_start" => {
+                    let session = google_personal::session_for(&ctx.user_id)?;
+                    let origin = params.get("redirect_origin").and_then(Value::as_str)
+                        .ok_or("請提供目前控制台的網址。")?;
+                    let allowed = crate::server::allowed_origins_snapshot();
+                    flow::start_drive_write(&self.home_dir, &db, &ctx.user_id, &session, origin,
+                        &allowed, params.get("acknowledge_google_data").and_then(Value::as_bool) == Some(true),
+                        params.get("acknowledge_write").and_then(Value::as_bool) == Some(true)).await
+                }
+                "me.google.write_disconnect" => {
+                    let _session = google_personal::session_for(&ctx.user_id)?;
+                    if params.get("confirm").and_then(Value::as_bool) != Some(true) {
+                        return Err("請確認要移除雲端硬碟寫入連線。".into());
+                    }
+                    flow::write_disconnect(&self.home_dir, &db, &ctx.user_id)?;
+                    Ok(json!({"disconnected": true,
+                        "provider_note": "只移除了這裡的寫入連線。若要完整移除授權，請到 Google 帳戶的第三方存取頁操作。"}))
+                }
                 "me.google.connect_start" => {
                     if params
                         .get("acknowledge_google_data")
@@ -190,7 +210,9 @@ impl MethodHandler {
         db: &duduclaw_auth::UserDb,
         ctx: &UserContext,
     ) -> Result<Value, String> {
-        crate::person_credentials::sync_user_status(&self.home_dir, &ctx.user_id, true)?;
+        // Sync also reads the write vault; defer its error until that vault's
+        // snapshot can distinguish an unreadable write connection.
+        let sync_result = crate::person_credentials::sync_user_status(&self.home_dir, &ctx.user_id, true);
         let own = crate::person_credentials::get(&self.home_dir, &ctx.user_id)?.map(|r| {
             let mut metadata = r.metadata;
             if crate::google_data_consent::require_current(metadata.google_data_consent.as_ref())
@@ -200,6 +222,23 @@ impl MethodHandler {
             }
             metadata
         });
+        let drive_write = match crate::person_credentials::write_store::snapshot(&self.home_dir, "user", &ctx.user_id) {
+            Ok(write) => {
+                sync_result?;
+                json!({
+                    "connected": write.as_ref().is_some_and(|m| m.status == crate::person_credentials::Status::Connected),
+                    "status": write.as_ref().map(|m| m.status),
+                    "account_email": write.as_ref().map(|m| &m.account_email),
+                    "granted_scopes": write.as_ref().map(|m| m.granted_scopes.clone()).unwrap_or_default(),
+                })
+            }
+            Err(_) => json!({
+                "connected": false,
+                "status": "unreadable",
+                "account_email": null,
+                "granted_scopes": [],
+            }),
+        };
         let consents = db.google_consents(&ctx.user_id)?;
         let registry = self.registry.read().await;
         let mut requests = Vec::new();
@@ -234,6 +273,8 @@ impl MethodHandler {
         let notices = crate::events_store::EventBusStore::open(&self.home_dir)?.person_notices(&ctx.user_id).await?;
         Ok(
             json!({"authorization_requests":crate::google_authorization_requests::store::Store::open(&self.home_dir)?.statuses(&ctx.user_id)?,"notices":notices,"connection":own,"login_email":ctx.email,"client_configured":crate::mcp_oauth::get_client_config(&self.home_dir,"google").is_some(),
+            "drive_write":drive_write,
+            "enabled_by_admin":crate::google_workspace::drive_write_policy::load(&self.home_dir).any_enabled(),
             "chat_read":crate::google_workspace::chat_read_enabled(&self.home_dir),
             "chat_send":crate::google_workspace::chat_send_enabled(&self.home_dir),
             "integration_enabled":crate::google_workspace::integration_enabled(&self.home_dir),"requests":requests,"delegated":delegated,

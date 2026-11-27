@@ -982,7 +982,7 @@ async fn handle_message(
     let text = inbound_text(&message);
     // Attachment-only messages carry no text — parse attachments before the
     // empty-text bail so a bare file upload still reaches the agent.
-    let attachments = parse_gchat_attachments(&message);
+    let mut attachments = parse_gchat_attachments(&message);
     if text.is_empty() && attachments.is_empty() {
         return;
     }
@@ -1048,6 +1048,31 @@ async fn handle_message(
         .and_then(serde_json::Value::as_str).unwrap_or("").trim();
     let link_count = crate::google_workspace::chat_read::rich_links(&message, raw_text).len();
     info!(sender = %sender, message_length = text.len(), link_count, "Google Chat inbound message");
+
+    if !attachments.is_empty() {
+        let reply_session = match &routed_agent {
+            Some(agent) if own_turn || called_turn => conversation.session_for(Some(agent)),
+            _ => session_id.clone(),
+        };
+        match crate::channel_reply::attachment_gate::check(
+            &state.ctx, conversation.gate_session(), &reply_session,
+            crate::ccr_runtime::reply_principal_for_sender(&sender_id),
+            &text, routed_agent.as_deref(), None,
+        ).await {
+            crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+            crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles
+            | crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(_) => {
+                attachments.clear();
+            }
+            crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                let reply = crate::markdown_render::to_googlechat_text(&reply);
+                if post_message(&state.creds, &space, thread.as_deref(), &reply).await.is_err() {
+                    warn!("Google Chat attachment refusal delivery failed");
+                }
+                return;
+            }
+        }
+    }
 
     // ── Inbound attachments (WP1.3 parity with the other 8 channels) ──
     // Uploaded-to-Chat files are fetched through the media API with the
@@ -1212,15 +1237,21 @@ async fn handle_message(
                 Some(reply) => reply,
                 None => {
                     let agent_id = employee_id.clone();
-                    crate::chat_commands::handle_command_for_sender(
-                        &cmd,
-                        &state.ctx,
-                        "googlechat",
-                        &reply_session,
-                        &agent_id,
-                        origin.sender,
-                    )
-                    .await
+                    if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                        &cmd, &state.ctx, &origin, &agent_id,
+                    ).await {
+                        refusal
+                    } else {
+                        crate::chat_commands::handle_command_for_sender(
+                            &cmd,
+                            &state.ctx,
+                            "googlechat",
+                            &reply_session,
+                            &agent_id,
+                            origin.sender,
+                        )
+                        .await
+                    }
                 }
             };
             // An empty reply (blocked sender) removes the placeholder: silence.
@@ -3249,6 +3280,10 @@ mod kbadd_transport_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "googlechat_attachment_gate_tests.rs"]
+mod attachment_gate_tests;
 
 #[cfg(test)]
 mod handshake_tests {

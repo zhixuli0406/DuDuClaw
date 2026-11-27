@@ -124,6 +124,7 @@ pub(crate) async fn spawn_agent_with_ctx_and_upstream(
     };
 
     let task_id = uuid::Uuid::new_v4().to_string();
+    super::delegation_roles::record_initiator(home_dir, "message", caller, agent_id, &task_id).await;
 
     // Write a structured task entry to bus_queue.jsonl with spawn metadata
     let queue_path = home_dir.join("bus_queue.jsonl");

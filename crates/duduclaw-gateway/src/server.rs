@@ -74,7 +74,7 @@ static LOGIN_RATE_LIMITER: std::sync::LazyLock<Mutex<HashMap<(IpAddr, String), (
 const LOOPBACK_THROTTLE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
 /// The address the login limiter keys on for a peer `ip`.
-fn login_throttle_ip(ip: IpAddr) -> IpAddr {
+pub(crate) fn login_throttle_ip(ip: IpAddr) -> IpAddr {
     if ip.is_loopback() {
         LOOPBACK_THROTTLE_IP
     } else {
@@ -102,7 +102,7 @@ pub(crate) fn check_login_rate_limit(ip: IpAddr, email: &str) -> bool {
 
 /// Clear the failed-attempt counter for `(ip, email)` after a successful login
 /// so a legitimate user is never penalised for earlier typos (M2).
-fn reset_login_rate_limit(ip: IpAddr, email: &str) {
+pub(crate) fn reset_login_rate_limit(ip: IpAddr, email: &str) {
     let ip = login_throttle_ip(ip);
     let mut map = LOGIN_RATE_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
     map.remove(&(ip, email.to_string()));
@@ -178,23 +178,27 @@ pub struct GatewayConfig {
 }
 
 /// Internal shared state for the Axum application.
-struct AppState {
-    auth: AuthManager,
-    handler: MethodHandler,
-    tx: broadcast::Sender<String>,
+pub(crate) struct AppState {
+    pub(crate) auth: AuthManager,
+    pub(crate) handler: Arc<MethodHandler>,
+    pub(crate) tx: broadcast::Sender<String>,
     /// Broadcast channel for real-time events (channel status, etc.) pushed to clients.
-    event_tx: broadcast::Sender<String>,
-    prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
+    pub(crate) event_tx: broadcast::Sender<String>,
+    pub(crate) prepared_events: tokio::sync::OnceCell<broadcast::Sender<Arc<crate::handlers::PreparedPush>>>,
     /// User database for multi-user authentication.
-    user_db: Arc<UserDb>,
+    pub(crate) user_db: Arc<UserDb>,
     /// JWT configuration for token issuance and verification.
-    jwt_config: Arc<JwtConfig>,
+    pub(crate) jwt_config: Arc<JwtConfig>,
     /// Channel-DM delivery for passwordless login OTP codes (WP12). Injected so
     /// the pre-auth OTP handler never needs raw channel config / secret manager.
-    otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
+    pub(crate) otp_delivery: Arc<dyn crate::otp_delivery::OtpDeliverer>,
     /// DuDuClaw home directory (`~/.duduclaw`). Used by the voice endpoints to
     /// read `[voice]` STT/TTS config from `config.toml`.
-    home_dir: std::path::PathBuf,
+    pub(crate) home_dir: std::path::PathBuf,
+}
+
+impl AsRef<MethodHandler> for AppState {
+    fn as_ref(&self) -> &MethodHandler { &self.handler }
 }
 
 /// Identity policy and initial key creation are mandatory startup gates.
@@ -1328,6 +1332,23 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         }
     }
     crate::skill_lifecycle::curator::restore_on_startup(&home_dir).await;
+    // Imported skill policy decisions belong only to the live lock holder.
+    {
+        let home = home_dir.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if !duduclaw_core::gateway_instance::held(&home) || !home.join("approvals.db").exists() {
+                    continue;
+                }
+                if let Ok(broker) = crate::approval::ApprovalBroker::open(&home) {
+                    crate::skill_trust::run_once(&home, &broker).await;
+                }
+            }
+        });
+    }
 
     // RM-136 (M5): deliver `users.mfa_reset` audit rows a previous process
     // committed but did not deliver (held rows included). Only the gateway
@@ -1791,6 +1812,8 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         Some(silence_tx),
         Some(proactive_notice),
         Some(Arc::new(|home, dir, agent| Box::pin(async move {
+            crate::entry_gate::check_task_assignee(&home, &agent)
+                .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
             crate::budget::gate_before_spawn(&home, Some(&dir), &agent, "heartbeat_proactive")
                 .await.map_err(|e| e.to_string())
         }))),
@@ -2896,7 +2919,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     });
     let state = Arc::new(AppState {
         auth: AuthManager::new(config.auth_token),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
             prepared_events: Default::default(),
@@ -2910,6 +2933,22 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         tokio::spawn(async move { schema_state.handler.run_odoo_schema_background().await; });
     }
 
+
+    // Google provisioning maintenance belongs exclusively to the lock holder.
+    if crate::google_signin::onboarding::should_run(&home_dir) {
+        let bg_state = state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if crate::google_signin::onboarding::should_run(&bg_state.home_dir) {
+                    crate::google_signin::onboarding::run_once(
+                        &bg_state.handler, chrono::Utc::now().timestamp()).await;
+                }
+            }
+        });
+    }
 
     // M1/M60: open the shared audit index once and refresh it on a background
     // interval, so audit/reliability requests reuse one connection instead of
@@ -2990,6 +3029,9 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     let meeting_auth_state = state.clone();
     let extension_auth_state = state.clone();
     let knowledge_users = state.user_db.clone();
+    let person_key_state = Arc::new(crate::person_key_route::PersonKeyRouteState::new(
+        home_dir.clone(), state.user_db.clone(), state.handler.clone(),
+    ));
     let webchat_state = Arc::new(crate::webchat::WebChatState::new(
         webchat_ctx,
         state.jwt_config.clone(),
@@ -3003,6 +3045,10 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
     // ── REST API endpoints for authentication ────────────────
     let auth_router = Router::new()
         .route("/api/login", post(handle_login))
+        .route("/api/login/methods", get(crate::google_signin::routes::methods))
+        .route("/api/login/google/start", post(crate::google_signin::routes::start).layer(DefaultBodyLimit::max(4096)))
+        .route("/api/login/google/callback", get(crate::google_signin::routes::callback))
+        .route("/api/login/google/complete", post(crate::google_signin::routes::complete).layer(DefaultBodyLimit::max(4096)))
         .route("/api/invite/check", post(server_invites::check_invite))
         .route("/api/invite/redeem", post(server_invites::post_invite))
         .route("/api/otp/request", post(handle_otp_request))
@@ -3486,7 +3532,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         .route("/a2a", post(a2a_http::rpc))
         .route("/.well-known/agent-card.json", get(a2a_http::card))
         .route("/.well-known/agent.json", get(a2a_http::card))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(auth_router)
         .merge(webchat_router)
         .merge(ag_ui_router);
@@ -3560,6 +3606,7 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
             Some(_license_runtime.clone()),
         ),
     )));
+    app = app.merge(crate::admin_ai::route::router(Arc::new(crate::admin_ai::route::RouteState::with_executor(home_dir.clone(), state.clone()))));
     // RouteState synchronously restores durable sink fences (or records a
     // fail-closed store error) before the listener below can serve any request.
     app = app.merge(crate::egress_guard::router(Arc::new(
@@ -3574,6 +3621,13 @@ pub async fn start_gateway(config: GatewayConfig) -> duduclaw_core::error::Resul
         crate::knowledge::route::KnowledgeRouteState::new(
             home_dir.clone(),
             Some(knowledge_users.clone()),
+        ),
+    )));
+    // Personal MCP keys execute through the same live dashboard handler.
+    app = app.merge(crate::person_key_route::router(person_key_state));
+    app = app.merge(crate::odoo_identity::route::router(Arc::new(
+        crate::odoo_identity::route::OdooIdentityRouteState::new(
+            home_dir.clone(), knowledge_users.clone(),
         ),
     )));
     // ── Per-employee Google identity (internal, B2a) ──────────────
@@ -4710,7 +4764,7 @@ async fn handle_me(
     };
 
     if duduclaw_auth::member_keys::is_member_key(token) {
-        let ctx = match member_http_caller(&state, &headers, None) { Ok(ctx) => ctx, Err(response) => return response };
+        let ctx = match member_http_caller(&state, &headers, None).await { Ok(ctx) => ctx, Err(response) => return response };
         return match state.handler.handle("users.me", serde_json::json!({}), &ctx).await {
             WsFrame::Response { ok: true, payload: Some(payload), .. } => Json(payload).into_response(),
             WsFrame::Response { error: Some(error), .. } if error.get("code").and_then(serde_json::Value::as_str) == Some("member_key_rate_limited") =>
@@ -5712,6 +5766,9 @@ fn authorize_file_access(
         return Err(unauthorized());
     }
     if authenticated.member_key_id.is_some() && ctx.is_admin() { return Err(unauthorized()); }
+    ctx.origin = if authenticated.member_key_id.is_some() {
+        duduclaw_auth::acl::ContextOrigin::MemberKey
+    } else { authenticated.origin };
     ctx.member_key_id = authenticated.member_key_id;
     require_password_changed(&ctx)?;
 
@@ -10068,7 +10125,7 @@ mod decision_shadow_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -10899,7 +10956,7 @@ mod decision_sla_shadow_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -11349,7 +11406,7 @@ mod decision_model_candidate_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -12224,7 +12281,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -12363,7 +12420,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13027,7 +13084,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13213,7 +13270,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -13376,7 +13433,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -15241,7 +15298,7 @@ mod causal_curation_api_tests {
         let (event_tx, _) = broadcast::channel(4);
         let state = Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -15496,7 +15553,7 @@ async fn handle_chat_attachment(
     headers: axum::http::HeaderMap,
     axum::extract::Query(q): axum::extract::Query<ChatAttachmentQuery>,
 ) -> axum::response::Response {
-    let ctx = match member_http_caller(&state, &headers, Some(("http.chat.attachment", false))) { Ok(c) => c, Err(r) => return r };
+    let ctx = match member_http_caller(&state, &headers, Some(("http.chat.attachment", false))).await { Ok(c) => c, Err(r) => return r };
     let max = if q.preview { crate::chat_attachments::limits::MAX_PREVIEW } else { crate::chat_attachments::limits::MAX_DOWNLOAD };
     let (bytes, name, admission) = match state.handler.history_attachment_bytes(&ctx, &q.id, max).await {
         Ok(f) => f,
@@ -15521,6 +15578,9 @@ async fn handle_chat_attachment(
 
 #[cfg(test)]
 mod chat_attachments_http_tests;
+
+#[cfg(test)]
+mod member_key_content_http_tests;
 
 mod files_snapshot;
 
@@ -15617,15 +15677,30 @@ fn member_http_error(error: String) -> axum::response::Response {
 }
 
 /// Explicit member HTTP surfaces only; task RPC is charged by dispatch.
-fn member_http_caller(state: &AppState, headers: &axum::http::HeaderMap,
+async fn member_http_caller(state: &AppState, headers: &axum::http::HeaderMap,
     operation: Option<(&str, bool)>) -> Result<UserContext, axum::response::Response> {
     if let Some(raw) = extract_bearer_token(headers)
         && duduclaw_auth::member_keys::is_member_key(raw) {
-        let ctx = crate::member_keys::authenticate(&state.home_dir, &state.user_db, raw).map_err(member_http_error)?;
-        if let Some((method, write)) = operation {
-            crate::member_keys::record_call(&state.home_dir, &state.user_db, &ctx, method, write).map_err(member_http_error)?;
-        }
-        return Ok(ctx);
+        let home = state.home_dir.clone();
+        let db = state.user_db.clone();
+        let raw = raw.to_owned();
+        let operation = operation.map(|(method, write)| (method.to_owned(), write));
+        return tokio::task::spawn_blocking(move || {
+            let ctx = crate::member_keys::authenticate(&home, &db, &raw).map_err(member_http_error)?;
+            if let Some((method, write)) = operation {
+                crate::member_keys::record_call(&home, &db, &ctx, &method, write).map_err(member_http_error)?;
+                if crate::handlers::member_contract::MEMBER_KEY_CONVERSATION_HTTP_OPERATIONS.contains(&method.as_str()) {
+                    let live = crate::member_keys::refresh_authority(&home, &db, &ctx).map_err(member_http_error)?;
+                    if !live.include_conversations {
+                        return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({
+                            "error": "member key conversation scope required", "code": "member_key_conversation_scope"
+                        }))).into_response());
+                    }
+                    return Ok(live.context);
+                }
+            }
+            Ok(ctx)
+        }).await.map_err(|_| member_http_error("member key authority unavailable".into()))?;
     }
     knowledge_caller(state, headers)
 }
@@ -15675,7 +15750,7 @@ async fn handle_knowledge_upload(
     headers: axum::http::HeaderMap,
     multipart: Multipart,
 ) -> axum::response::Response {
-    match member_http_caller(&state, &headers, Some(("http.knowledge.upload", true))) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.upload", true))).await {
         Ok(ctx) => {
             crate::knowledge::upload::handle_upload(
                 &state.home_dir,
@@ -15713,7 +15788,7 @@ async fn handle_task_rpc_with_files(
     // Authenticate and take a slot from the headers alone, before a byte of
     // the (up to ~67 MB) body is read: an unauthenticated or surplus request
     // is refused without the gateway buffering its upload.
-    let ctx = match member_http_caller(&state, &headers, None) {
+    let ctx = match member_http_caller(&state, &headers, None).await {
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
@@ -15784,7 +15859,7 @@ async fn handle_knowledge_original(
     headers: axum::http::HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> axum::response::Response {
-    match member_http_caller(&state, &headers, Some(("http.knowledge.original", false))) {
+    match member_http_caller(&state, &headers, Some(("http.knowledge.original", false))).await {
         Ok(ctx) => {
             crate::knowledge::upload::handle_original(
                 &state.home_dir,
@@ -16173,7 +16248,7 @@ async fn handle_stt(
     headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> axum::response::Response {
-    if let Err(resp) = member_http_caller(&state, &headers, Some(("http.voice.stt", true))) {
+    if let Err(resp) = member_http_caller(&state, &headers, Some(("http.voice.stt", true))).await {
         return resp;
     }
 
@@ -16334,7 +16409,7 @@ async fn handle_tts(
 ) -> axum::response::Response {
     use crate::tts::{TtsProvider, TtsRouter};
 
-    let caller = match member_http_caller(&state, &headers, Some(("http.voice.tts", true))) {
+    let caller = match member_http_caller(&state, &headers, Some(("http.voice.tts", true))).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
@@ -16727,6 +16802,7 @@ fn pre_auth_handshake_allowed(
 /// rows never claim a person did this.
 fn pre_auth_context() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "lockscreen".to_string(),
@@ -16838,7 +16914,8 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>, peer: Socket
                                 }
                             } else if let Some(jwt_str) = jwt_param {
                                 match authenticate_jwt(&state, jwt_str) {
-                                    Ok(ctx) => {
+                                    Ok(mut ctx) => {
+                                        ctx.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
                                         // Session provenance comes only from this
                                         // verified JWT, never connect parameters.
                                         access_expires = Some(0);
@@ -18050,6 +18127,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -18100,6 +18178,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -18154,6 +18233,7 @@ mod personal_google_callback_tests {
                 google_data_consent: crate::google_data_consent::Evidence::issue("alice").unwrap(),
                 meeting_recordings: false,
                 drive_tools: false,
+                drive_write: false,
                 chat_read: false,
         chat_send: false,
                 expected_connection: None,
@@ -18350,7 +18430,7 @@ mod owner_verify_tests {
         let (event_tx, _) = broadcast::channel(4);
         Arc::new(AppState {
             auth: AuthManager::new(None),
-            handler: MethodHandler::new(home.clone()).await,
+            handler: Arc::new(MethodHandler::new(home.clone()).await),
             tx,
             event_tx,
             prepared_events: Default::default(),
@@ -19317,7 +19397,7 @@ mod live_events_socket_tests {
             let (tx, _) = broadcast::channel(4);
             let (event_tx, _) = broadcast::channel(4);
             let state = Arc::new(AppState {
-                auth: AuthManager::new(None), handler, tx, event_tx,
+                auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx,
                 prepared_events: Default::default(), user_db: db, jwt_config: jwt,
                 otp_delivery: Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.path().to_path_buf(), reqwest::Client::new())),
                 home_dir: home.path().to_path_buf(),
@@ -19459,7 +19539,7 @@ mod live_events_socket_tests {
             let base = MfaSocket::new().await;
             std::fs::write(base._home.path().join("config.toml"), "[member_api_keys]\nenabled=true\n").unwrap();
             let user = base.state.user_db.create_user("member@socket.test", "Member", "password-test", duduclaw_auth::UserRole::Employee).unwrap();
-            let key = base.state.user_db.member_key_create(&user.id, "x", 1, user.credential_epoch).unwrap();
+            let key = base.state.user_db.member_key_create(&user.id, "x", 1, user.credential_epoch, false, &[]).unwrap();
             let ctx = crate::member_keys::authenticate(base._home.path(), &base.state.user_db, &key.secret).unwrap();
             let mut socket = MfaSocket::connect_credential(base._home.clone(), base.state.clone(), user.clone(), json!({"member_key":key.secret}), ctx.clone()).await;
             assert_eq!(socket.rpc("users.me", json!({})).await["ok"], true);
@@ -19838,7 +19918,7 @@ mod live_events_socket_tests {
         let (event_tx, _) = broadcast::channel(1024);
         handler.set_event_tx(event_tx.clone()).await;
         let state = Arc::new(AppState {
-            auth: AuthManager::new(None), handler, tx, event_tx: event_tx.clone(),
+            auth: AuthManager::new(None), handler: Arc::new(handler), tx, event_tx: event_tx.clone(),
             prepared_events: Default::default(),
             user_db: Arc::new(UserDb::new(&home.path().join("users.db")).unwrap()),
             jwt_config: Arc::new(JwtConfig::new(b"live-events-test-secret-32-bytes!!")),
@@ -19894,7 +19974,7 @@ mod live_events_socket_tests {
 }
 
 #[path = "server_mfa.rs"]
-mod server_mfa;
+pub(crate) mod server_mfa;
 
 #[cfg(test)]
 mod tts_limit_tests {

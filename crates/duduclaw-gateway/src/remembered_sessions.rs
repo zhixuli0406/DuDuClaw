@@ -255,7 +255,7 @@ mod tests {
         handler.set_user_db(db.clone(),jwt.clone()).await;
         handler.set_edition_override(Some(duduclaw_core::EditionProfile::Personal)).await;
         let (tx,_)=broadcast::channel(4);let (event_tx,_)=broadcast::channel(4);
-        let state=Arc::new(AppState{auth:AuthManager::new(None),handler,tx,event_tx,prepared_events:Default::default(),user_db:db,jwt_config:jwt,
+        let state=Arc::new(AppState{auth:AuthManager::new(None),handler:Arc::new(handler),tx,event_tx,prepared_events:Default::default(),user_db:db,jwt_config:jwt,
             otp_delivery:Arc::new(crate::otp_delivery::ConfigOtpDeliverer::new(home.clone(),reqwest::Client::new())),home_dir:home});
         (dir,state,user)
     }

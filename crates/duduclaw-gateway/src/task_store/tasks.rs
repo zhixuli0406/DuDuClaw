@@ -50,8 +50,42 @@ impl TaskStore {
         priority: Option<&str>,
         goal_mode: Option<bool>,
     ) -> Result<Vec<TaskRow>, String> {
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, None, |_, _| true).await
+    }
+
+    /// Stream metadata through the visibility gate before cutting the page.
+    /// Only selected rows are materialized, newest-created first with a stable ID tie-break.
+    /// Unlike the board view, pinned/updated rows do not outrank newer tasks.
+    pub async fn list_tasks_filtered_bounded<F>(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: usize,
+        visible: F,
+    ) -> Result<Vec<TaskRow>, String>
+    where F: FnMut(&str, &str) -> bool + Send {
+        if !(1..=1000).contains(&limit) {
+            return Err("limit must be an integer between 1 and 1000".into());
+        }
+        self.list_tasks_filtered_inner(status, agent_id, priority, goal_mode, Some(limit), visible).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn list_tasks_filtered_inner<F>(
+        &self,
+        status: Option<&str>,
+        agent_id: Option<&str>,
+        priority: Option<&str>,
+        goal_mode: Option<bool>,
+        limit: Option<usize>,
+        mut visible: F,
+    ) -> Result<Vec<TaskRow>, String>
+    where F: FnMut(&str, &str) -> bool + Send {
         let conn = self.conn.lock().await;
-        let mut sql = format!("SELECT {TASK_COLUMNS} FROM tasks WHERE 1=1");
+        let columns = if limit.is_some() { "id, assigned_to, created_at" } else { TASK_COLUMNS };
+        let mut sql = format!("SELECT {columns} FROM tasks WHERE 1=1");
         let mut binds: Vec<String> = Vec::new();
         if let Some(s) = status {
             binds.push(s.to_string());
@@ -83,8 +117,12 @@ impl TaskStore {
         // a caller actually archives something. Callers that need to browse
         // the archive explicitly use `list_tasks_paginated` instead.
         sql.push_str(" AND archived = 0");
-        // Pinned tasks float to the top of every list (I-3b "置頂").
-        sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        if limit.is_some() {
+            sql.push_str(" ORDER BY created_at DESC, id ASC");
+        } else {
+            // Preserve the unlimited board view's pinned/updated ordering.
+            sql.push_str(" ORDER BY pinned DESC, updated_at DESC");
+        }
 
         let mut stmt = conn
             .prepare(&sql)
@@ -93,6 +131,27 @@ impl TaskStore {
             .iter()
             .map(|s| s as &dyn rusqlite::types::ToSql)
             .collect();
+        if let Some(limit) = limit {
+            let mut ids = Vec::with_capacity(limit);
+            {
+                let mut candidates = stmt.query(params_ref.as_slice())
+                    .map_err(|e| format!("query list metadata: {e}"))?;
+                // Test the bound before advancing SQLite: do not read one extra row.
+                while ids.len() < limit {
+                    let Some(row) = candidates.next()
+                        .map_err(|e| format!("read list metadata: {e}"))? else { break; };
+                    let id: String = row.get(0).map_err(|e| format!("read task id: {e}"))?;
+                    let assignee: String = row.get(1).map_err(|e| format!("read task assignee: {e}"))?;
+                    if visible(&id, &assignee) {
+                        ids.push(id);
+                    }
+                }
+            }
+            let mut selected = conn.prepare(&format!("SELECT {TASK_COLUMNS} FROM tasks WHERE id = ?1"))
+                .map_err(|e| format!("prepare selected tasks: {e}"))?;
+            return ids.iter().map(|id| selected.query_row(params![id], row_to_task)
+                .map_err(|e| format!("read selected task: {e}"))).collect();
+        }
         let rows = stmt
             .query_map(params_ref.as_slice(), row_to_task)
             .map_err(|e| format!("query list: {e}"))?

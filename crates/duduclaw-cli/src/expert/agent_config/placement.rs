@@ -150,10 +150,22 @@ fn write_skill_files(home: &Path, files: &BTreeMap<String, Vec<u8>>, dest: &Path
 
 pub(super) async fn file_quarantine(
     ctx: &InstallCtx,
+    root: &Path,
     slug: &str,
     skills: Vec<QuarantinedSkill>,
+    provenance: &[super::provenance::SkillProvenance],
     report: &mut Report,
 ) {
+    // Clear old evidence even when this import is unsigned or has no quarantine.
+    let candidate = if ctx.dry_run { false } else {
+        match super::provenance::replace(ctx, root, slug, &skills, provenance) {
+            Ok(candidate) => candidate,
+            Err(e) => {
+                report.warning("skill-provenance", slug, format!("來源證據保存失敗，維持人工核准：{e}"));
+                false
+            }
+        }
+    };
     if skills.is_empty() {
         return;
     }
@@ -162,7 +174,10 @@ pub(super) async fn file_quarantine(
     if ctx.dry_run {
         return;
     }
-    match expert_skills::request_enable(&ctx.home, slug, skills).await {
+    match expert_skills::request_enable_with(
+        &ctx.home, slug, skills,
+        expert_skills::EnableRequestOptions { auto_approval_candidate: candidate },
+    ).await {
         Ok(id) => {
             report.meta("skills_approval_id", &id);
             report.warning(

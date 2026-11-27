@@ -15,6 +15,23 @@ impl NativeGoogleScope {
     }
 }
 
+pub const DRIVE_WRITE_TOOLS: &[&str] = &[
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
+    "drive_move_file",
+    "drive_trash_file",
+];
+
+/// Exact membership in the gateway-only Drive write vocabulary.
+pub fn is_drive_write_tool(tool: &str) -> bool {
+    DRIVE_WRITE_TOOLS.contains(&tool)
+}
+
 pub const NATIVE_GOOGLE_TOOLS: &[&str] = &[
     "google_status",
     "gmail_search",
@@ -45,9 +62,19 @@ pub const NATIVE_GOOGLE_TOOLS: &[&str] = &[
     "sheets_update",
     "calendar_update_event",
     "slides_read",
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "drive_move_file",
+    "drive_trash_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
 ];
 
 pub fn native_google_scope(tool: &str) -> Option<NativeGoogleScope> {
+    if is_drive_write_tool(tool) { return Some(NativeGoogleScope::Write); }
     match tool {
         "google_status"
         | "gmail_search"
@@ -93,12 +120,27 @@ mod tests {
             assert!(unique.insert(tool));
             assert!(native_google_scope(tool).is_some(), "{tool}");
         }
-        assert_eq!(unique.len(), 29);
+        assert_eq!(unique.len(), 38);
         assert_eq!(
             native_google_scope("gtasks_complete"),
             Some(NativeGoogleScope::Write)
         );
         assert!(native_google_scope("google_admin_delete").is_none());
         assert!(native_google_scope("gmail_search ").is_none());
+    }
+}
+
+#[cfg(test)]
+mod drive_write_tests {
+    use super::*;
+    #[test]
+    fn drive_write_vocabulary_is_exact_and_write_scoped() {
+        assert_eq!(DRIVE_WRITE_TOOLS.len(), 9);
+        for tool in DRIVE_WRITE_TOOLS {
+            assert!(NATIVE_GOOGLE_TOOLS.contains(tool));
+            assert_eq!(native_google_scope(tool), Some(NativeGoogleScope::Write));
+            assert!(!is_drive_write_tool(&format!("{tool} ")));
+            assert!(!is_drive_write_tool(&format!("x{tool}")));
+        }
     }
 }

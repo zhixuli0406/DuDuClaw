@@ -1083,6 +1083,92 @@ async fn process_telegram_message(
         return;
     }
 
+    // Voice/audio also download bytes before transcription. Gate every media
+    // kind here, before either transcription or attachment persistence.
+    let has_files = msg.photo.as_ref().is_some_and(|p| !p.is_empty())
+        || msg.document.is_some() || msg.video.is_some() || msg.sticker.is_some()
+        || msg.voice.is_some() || msg.audio.is_some();
+    let mut drop_files = false;
+    if has_files {
+        let session = telegram_gate_session(chat_id, thread_id);
+        let user = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+        let raw = strip_bot_mention(msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or(""), &bot_username);
+        // Telegram accepts /command@BotName; use the same token normalization
+        // as handle_command before asking the shared exemption parser.
+        let text = if raw.trim_start().starts_with('/') {
+            let mut words = raw.trim().splitn(2, char::is_whitespace);
+            let token = words.next().unwrap_or("");
+            let command = token.split('@').next().unwrap_or(token);
+            let args = words.next().unwrap_or("").trim();
+            if args.is_empty() { command.to_string() } else { format!("{command} {args}") }
+        } else { raw };
+        let mut selected = agent_name.clone();
+        let mut reply_session = own_bot_session(&session, agent_name.as_deref());
+        let mut check_employee = true;
+        if agent_name.is_none() {
+            let private_chat = msg.chat.chat_type.as_deref() == Some("private")
+                && is_private_chat_with(chat_id, &user);
+            let route = resolve_shared_route(&ctx, &user, private_chat).await;
+            reply_session = shared_route_session(&session, &route);
+            selected = match route {
+                SharedRoute::Bound(id) | SharedRoute::Primary(id) => Some(id),
+                SharedRoute::Unbound => None,
+                SharedRoute::Guide(_) => { check_employee = false; None }
+            };
+            if check_employee {
+                let routing = telegram_routing_text(&msg, &bot_username)
+                    .unwrap_or_else(|| format!("{text}\n\n[附件]"));
+                match telegram_trigger_decision(&ctx, &session, &user, &routing,
+                    selected.as_deref(), "attachment-preflight", false).await {
+                    crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger } => {
+                        if via_trigger {
+                            reply_session = crate::trigger_route::called_session(&session, &id);
+                        }
+                        selected = Some(id);
+                    }
+                    crate::trigger_route::turn::TurnDecision::Assign { id } => selected = Some(id),
+                    crate::trigger_route::turn::TurnDecision::Reply { .. } => check_employee = false,
+                    crate::trigger_route::turn::TurnDecision::Default => {
+                        if selected.is_none() {
+                            let registry = ctx.registry.read().await;
+                            selected = crate::channel_reply::resolve_fallback_agent(
+                                &ctx, &*registry, &session, &user,
+                            ).await.map(|agent| agent.config.agent.name.clone());
+                            check_employee = selected.is_some();
+                        }
+                    }
+                }
+            }
+        }
+        // Denied senders must skip media even when routing selected no employee.
+        if check_employee || crate::channel_reply::check_command_access_gate(
+            &ctx, &session, &user, "",
+        ).await.is_some() {
+            match crate::channel_reply::attachment_gate::check(
+                &ctx, &session, &reply_session, &user, &text, selected.as_deref(), None,
+            ).await {
+                crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
+                crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
+                    if crate::channel_decision_route::is_strict_decision(&command) {
+                        telegram_decision_fastlane(&msg, &client, &api_base, &ctx,
+                            &verified_account_id, &bot_username).await;
+                        return;
+                    }
+                    // The handler owns access/admin checks; no media reference
+                    // or quoted text may change the parsed exempt command.
+                    handle_command(&command, &client, &api_base, chat_id, thread_id,
+                        &ctx, &scope_id, agent_name.as_deref(), msg.from.as_ref().map(|u| u.id), msg_id).await;
+                    return;
+                }
+                crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                    send_reply(&ctx.home_dir, &client, &api_base, chat_id, &reply, thread_id, msg_id, None).await;
+                    return;
+                }
+            }
+        }
+    }
+
     // Extract text — from text field or transcribed from voice/audio
     // Also collect attachment references for photo/document/video/sticker
     let mut attachment_lines: Vec<String> = Vec::new();
@@ -1110,7 +1196,7 @@ async fn process_telegram_message(
         }
         // Strip bot mention
         strip_bot_mention(text, &bot_username)
-    } else if let Some(voice) = &msg.voice {
+    } else if !drop_files && let Some(voice) = &msg.voice {
         info!("🎙 Telegram [{sender}]: voice message");
         match transcribe_voice(&client, &api_base, &voice.file_id, &ctx.home_dir).await {
             Ok(text) => {
@@ -1135,7 +1221,7 @@ async fn process_telegram_message(
                 return;
             }
         }
-    } else if let Some(audio) = &msg.audio {
+    } else if !drop_files && let Some(audio) = &msg.audio {
         info!("🎵 Telegram [{sender}]: audio message");
         match transcribe_voice(&client, &api_base, &audio.file_id, &ctx.home_dir).await {
             Ok(text) => text,
@@ -1171,7 +1257,7 @@ async fn process_telegram_message(
     // shared home dir when no agent resolves.
     let home_for_attach =
         crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name.as_deref()).await;
-    if let Some(photos) = &msg.photo {
+    if !drop_files && let Some(photos) = &msg.photo {
         // Telegram sends multiple sizes; take the largest (last element)
         if let Some(largest) = photos.last() {
             info!("🖼️ Telegram [{sender}]: photo attachment");
@@ -1198,7 +1284,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(doc) = &msg.document {
+    if !drop_files && let Some(doc) = &msg.document {
         info!("📎 Telegram [{sender}]: document attachment");
         let fname = doc.file_name.as_deref().unwrap_or("document");
         match download_telegram_file(&client, &api_base, &doc.file_id).await {
@@ -1220,7 +1306,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(video) = &msg.video {
+    if !drop_files && let Some(video) = &msg.video {
         info!("🎬 Telegram [{sender}]: video attachment");
         let mime = video.mime_type.as_deref().unwrap_or("video/mp4");
         let ext = crate::media::extension_from_mime(mime);
@@ -1242,7 +1328,7 @@ async fn process_telegram_message(
         }
     }
 
-    if let Some(sticker) = &msg.sticker {
+    if !drop_files && let Some(sticker) = &msg.sticker {
         let emoji_label = sticker.emoji.as_deref().unwrap_or("sticker");
         info!("🏷️ Telegram [{sender}]: sticker {emoji_label}");
         match download_telegram_file(&client, &api_base, &sticker.file_id).await {
@@ -1921,7 +2007,7 @@ async fn telegram_decision_fastlane(
     account: &str,
     bot_username: &str,
 ) -> bool {
-    let Some(raw) = msg.text.as_deref() else {
+    let Some(raw) = msg.text.as_deref().or(msg.caption.as_deref()) else {
         return false;
     };
     let text = crate::channel_decision_route::strip_leading_mention(raw, bot_username);
@@ -2512,6 +2598,26 @@ async fn handle_command(
             send_reply(&ctx.home_dir, client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
+            let session = match thread_id {
+                Some(tid) => format!("telegram:{chat_id}:{tid}"),
+                None => format!("telegram:{chat_id}"),
+            };
+            let sender = from_user_id.map(|id| id.to_string()).unwrap_or_default();
+            let agent = match agent_name {
+                Some(agent) => agent.to_string(),
+                None => ctx.registry.read().await.main_agent()
+                    .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+            };
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "telegram", gate_session: &session, command_session: &session,
+                sender: &sender, text, shared: !is_private_chat_with(chat_id, &sender),
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &crate::chat_commands::ChatCommand::Voice, ctx, &origin, &agent,
+            ).await {
+                send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                return;
+            }
             let msg = toggle_voice(ctx, chat_id).await;
             send_reply(&ctx.home_dir, client, api_base, chat_id, msg, thread_id, None, None).await;
         }
@@ -2657,6 +2763,19 @@ async fn handle_command(
                 } else {
                     own_bot_session(&session_id, agent_name)
                 };
+                let origin = crate::chat_commands::CommandOrigin {
+                    channel: "telegram", gate_session: &session_id,
+                    command_session: &command_session, sender: own_sender,
+                    text: &normalized, shared: !is_private_chat_with(chat_id, own_sender),
+                };
+                if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                    &parsed, ctx, &origin, &agent_id,
+                ).await {
+                    if !refusal.is_empty() {
+                        send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                    }
+                    return;
+                }
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,
@@ -2901,7 +3020,7 @@ async fn resolve_shared_route(
 /// before) for an unverified or missing identity, an inactive account, no or a
 /// stale primary (no longer bound at Owner/Operator), an employee that is gone
 /// or not active (archived, deleted, paused), one WebChat would not give this
-/// account (a main-role or gateway-default employee for a non-admin), or any
+/// account (main without an effective conversation-list grant), or any
 /// lookup failure — never a refusal.
 async fn primary_agent_route(ctx: &Arc<ReplyContext>, user_id: &str) -> Option<String> {
     crate::shared_app_route::member_agent_route(ctx, "telegram", user_id).await
@@ -4881,6 +5000,10 @@ mod routing_text_tests {
         assert_eq!(telegram_routing_text(&msg, "dudu_bot").unwrap().trim(), "嗨");
     }
 }
+
+#[cfg(test)]
+#[path = "telegram_attachment_gate_tests.rs"]
+mod attachment_gate_tests;
 
 #[cfg(test)]
 mod handshake_tests {

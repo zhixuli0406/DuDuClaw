@@ -28,12 +28,14 @@ pub trait MfaCipher {
 pub enum FirstFactor {
     Password,
     ChannelOtp,
+    GoogleOidc,
 }
 impl FirstFactor {
     fn name(self) -> &'static str {
         match self {
             Self::Password => "password",
             Self::ChannelOtp => "channel_otp",
+            Self::GoogleOidc => "google_oidc",
         }
     }
 }
@@ -379,7 +381,8 @@ fn check_factor(
     if verified { Ok(()) } else { Err(DENIED.into()) }
 }
 fn challenge_user(tx: &Connection, token: &str, purpose: &str, now: i64) -> Result<String> {
-    tx.query_row("SELECT user_id FROM mfa_challenges WHERE token_hash=?1 AND purpose=?2 AND consumed=0 AND attempts<5 AND expires_at>?3",
+    tx.query_row("SELECT user_id FROM mfa_challenges WHERE token_hash=?1 AND purpose=?2 AND consumed=0 AND attempts<5 AND expires_at>?3
+        AND first_factor IN ('password','channel_otp','google_oidc')",
         params![token_hash(token),purpose,now], |r| r.get(0)).map_err(|_| DENIED.into())
 }
 
@@ -846,7 +849,7 @@ fn issue_mfa_result<T>(
     issue(&user, &bindings, codes)
 }
 
-fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
+pub(crate) fn bump_epoch(tx: &Connection, user: &str) -> Result<()> {
     tx.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [user]).map_err(|e|e.to_string())?;
     crate::user_row::bump_acl_generation(tx).map_err(|e|e.to_string())
 }
@@ -941,3 +944,9 @@ mod tests;
 
 #[cfg(test)]
 mod issuance_tests;
+
+#[cfg(test)]
+mod signin_approval_tests;
+
+#[cfg(test)]
+mod reauth_tests;

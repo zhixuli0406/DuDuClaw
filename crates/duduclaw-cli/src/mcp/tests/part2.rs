@@ -196,7 +196,7 @@ async fn gated_writers_keep_store_and_mirror_in_sync() {
     let out = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-intern", "reports_to": "sales-rep2" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(out["isError"], true, "{out}");
@@ -248,7 +248,7 @@ async fn cli_agent_update_bounded_lock_wait() {
         handle_agent_update(
             &serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" }),
             home,
-            "sales-lead",
+            "dashboard",
         ),
     )
     .await
@@ -276,7 +276,7 @@ async fn cli_agent_update_bounded_lock_wait() {
     let out = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(out["isError"], true, "{out}");

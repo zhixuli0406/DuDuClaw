@@ -2,7 +2,8 @@
 //! anything (design §7.3). Every step mints fresh (the cache is bypassed and
 //! never written), reads only GET endpoints, and reports one line per check.
 //! Explicit mailbox diagnostics use Drive metadata and service APIs.
-//! `delegate:owner` exits through OAuth tokeninfo only, without data reads.
+//! `delegate:owner` uses tokeninfo for ordinary scopes and one metadata-only
+//! Drive probe when Drive write is enabled.
 
 use std::path::Path;
 
@@ -202,6 +203,91 @@ fn protected_subject_gate(home: &Path, agent: &str, people: &dyn People) -> Resu
         super::tenant_source::current_incarnation(home, agent))
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(super) static WRITE_TEST_API_BASE: url::Url;
+}
+
+/// The write token is consumed here and is never exposed by the diagnostic.
+pub(in crate::google_identity) async fn drive_write_step(
+    home: &Path, agent: &str, people: &dyn People,
+    configured: &gi::EffectiveIdentity, effective: &gi::EffectiveIdentity,
+) -> Step {
+    use super::drive_write::transport::{WriteCall, WriteResult, WriteTransport};
+    use crate::person_credentials::{write_store, Status};
+    let report = |ok, detail| step("drive_write", "雲端硬碟寫入", ok, detail);
+    const FAILED: &str = "無法確認雲端硬碟寫入連線，請管理員檢查後再試。";
+    if !gw::drive_write_policy::load(home).any_enabled() {
+        // Disabled optional diagnostics do not fail otherwise healthy identities.
+        return report(true, "管理員尚未開放");
+    }
+    let unchanged = || gi::effective_for(home, Some(agent)) == *configured
+        && super::delegate_owner::effective_for(home, Some(agent)) == *effective
+        && gw::drive_write_policy::load(home).any_enabled();
+    if !unchanged() { return report(false, FAILED); }
+    if let Effective::Personal { selector } = &effective.effective {
+        let Some(db) = people.user_db() else { return report(false, FAILED); };
+        let Ok(user) = crate::google_personal::access::select_user(db, agent, selector) else {
+            return report(false, FAILED);
+        };
+        if user.status != duduclaw_auth::UserStatus::Active { return report(false, "需要重新連結"); }
+        let snapshot = write_store::snapshot(home, "user", &user.id);
+        if !unchanged() { return report(false, FAILED); }
+        return match snapshot {
+            Ok(Some(snapshot)) => match snapshot.status {
+                Status::Connected => report(true, "已連結"),
+                _ => report(false, "需要重新連結"),
+            },
+            Ok(None) => report(false, "尚未連結"),
+            Err(_) => report(false, FAILED),
+        };
+    }
+    let identity = match &effective.effective {
+        Effective::Delegate { email } => Some(DiagnosticIdentity {
+            home, agent, email, expected: effective, configured, people,
+        }),
+        Effective::Home => None,
+        _ => return report(false, FAILED),
+    };
+    let verify = || -> Result<(), super::Refusal> {
+        if !unchanged() { return Err(super::Refusal::hard("identity_changed", FAILED)); }
+        if let Some(identity) = &identity { identity.verify()?; }
+        Ok(())
+    };
+    if verify().is_err() { return report(false, FAILED); }
+    let minted = if let Some(identity) = &identity {
+        super::resolve::mint_delegate_for_drive_write(home, identity.email, CacheMode::Bypass).await
+    } else {
+        match gw::selected_path(home).as_deref() {
+            Ok("oauth" | "apps_script") => return report(false, "這種公司帳號連線方式不支援雲端硬碟寫入"),
+            Ok("service_account") => super::home_source::home_sa_token_for_drive_write(home).await,
+            _ => return report(false, FAILED),
+        }
+    };
+    if verify().is_err() { return report(false, FAILED); }
+    let token = match minted {
+        Ok(token) => token,
+        Err(refusal) if refusal.code == "drive_write_admin_scope_missing" => {
+            return step("drive_write", "雲端硬碟寫入", false, refusal.message_zh);
+        }
+        Err(_) => return report(false, FAILED),
+    };
+    let Ok(mut transport) = WriteTransport::new(zeroize::Zeroizing::new(token.access_token)) else {
+        return report(false, FAILED);
+    };
+    #[cfg(test)]
+    if let Ok(base) = WRITE_TEST_API_BASE.try_with(Clone::clone) {
+        if transport.set_test_api_base(base).is_err() { return report(false, FAILED); }
+    }
+    if verify().is_err() { return report(false, FAILED); }
+    let result = transport.send(&WriteCall::DriveProbe).await;
+    if verify().is_err() { return report(false, FAILED); }
+    match result {
+        WriteResult::Ok((status, _)) if (200..300).contains(&status) => report(true, "可以使用"),
+        _ => report(false, FAILED),
+    }
+}
+
 /// Run the checks for `agent`. Stops at the first check later ones depend on.
 pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<String>, Vec<Step>) {
     let configured = gi::effective_for(home, Some(agent));
@@ -211,7 +297,7 @@ pub async fn run(home: &Path, agent: &str, people: &dyn People) -> (Option<Strin
 
 pub(crate) async fn run_selected(home: &Path, agent: &str, people: &dyn People,
     configured: &gi::EffectiveIdentity, eff: &gi::EffectiveIdentity) -> (Option<String>, Vec<Step>) {
-    let mut out = Vec::new();
+    let mut out = vec![drive_write_step(home, agent, people, configured, eff).await];
     let email = match &eff.effective {
         Effective::Delegate { email } => email.clone(),
         Effective::Home => {
@@ -257,7 +343,7 @@ pub(crate) async fn run_selected(home: &Path, agent: &str, people: &dyn People,
 
     let identity = DiagnosticIdentity { home, agent, email: &email, expected: eff, configured, people };
     if configured.effective == Effective::DelegateOwner {
-        // No Workspace data endpoint is reachable from this branch.
+        // Ordinary scopes use tokeninfo only; the write probe ran separately.
         let client_id = match super::delegation_key::info(home) {
             Ok(Some(info)) => info.client_id,
             _ => None,

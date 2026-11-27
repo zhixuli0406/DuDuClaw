@@ -1,0 +1,372 @@
+//! RM-141 MCP policy adapter. Local availability never selects a runtime mode.
+use std::path::Path;
+use serde_json::Value;
+use duduclaw_odoo::{AgentOdooConfig, OdooConfig};
+use duduclaw_odoo::access_policy::{self as policy, *};
+use super::odoo_identity_client::{IdentityKind as DecisionKind, IdentityPermission, OdooIdentity};
+
+const UNREADABLE: &str = "Odoo 權限設定讀不到或格式有誤，請管理員檢查設定後再試。";
+const DENIED: &str = "這位 AI 員工目前沒有這項 Odoo 操作權限。";
+
+#[derive(Clone)]
+pub(super) struct ToolPolicy {
+    pub agent_id: String,
+    pub agent: AgentOdooConfig,
+    pub access: OdooAccessConfig,
+    pub global: OdooConfig,
+    pub identities: PossibleIdentities,
+}
+
+/// Metadata only, one read-only connection; never select credential ciphertext.
+/// A damaged/missing database cannot create a possible personal identity.
+pub(super) fn personal_facts(home: &Path, agent: &str) -> PossibleIdentities {
+    fn read(home: &Path, agent: &str) -> rusqlite::Result<PossibleIdentities> {
+        let db = rusqlite::Connection::open_with_flags(home.join("users.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        db.query_row("SELECT
+            (SELECT count(*) FROM users u WHERE u.status='active' AND u.avatar_agent_id=?1
+                AND EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.user_id=u.id
+                    AND b.agent_name=?1 AND b.access_level IN ('owner','operator'))),
+            EXISTS(SELECT 1 FROM users u JOIN member_odoo_credentials c ON c.user_id=u.id
+                WHERE u.status='active' AND u.avatar_agent_id=?1 AND c.state='ok'
+                AND c.credential_epoch>=0 AND c.credential_epoch=u.credential_epoch
+                AND EXISTS(SELECT 1 FROM user_agent_bindings b WHERE b.user_id=u.id
+                    AND b.agent_name=?1 AND b.access_level IN ('owner','operator'))),
+            EXISTS(SELECT 1 FROM users u JOIN member_odoo_credentials c ON c.user_id=u.id
+                WHERE u.status='active' AND c.state='ok'
+                AND c.credential_epoch>=0 AND c.credential_epoch=u.credential_epoch)", [agent], |row| {
+            let owners: i64 = row.get(0)?;
+            Ok(PossibleIdentities {
+                avatar_has_owner: owners == 1,
+                owner_has_personal_credential: owners == 1 && row.get::<_, bool>(1)?,
+                // An avatar cannot borrow a different requester's identity.
+                requester_has_personal_credential: owners == 0 && row.get::<_, bool>(2)?,
+                ..Default::default()
+            })
+        })
+    }
+    read(home, agent).unwrap_or_default()
+}
+
+/// Fixed methods must also be supplied during listing. Existing dedicated
+/// business tools use Execute (ordinary grants), not generic-write opt-ins.
+fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(ToolClass, Option<&'a str>, Option<&'a str>)> {
+    let model = params.and_then(|p| p.get("model")).and_then(Value::as_str);
+    Some(match tool {
+        "odoo_connect" | "odoo_status" => (ToolClass::Read, None, Some("read")),
+        "odoo_search" => (ToolClass::Read, model, Some("search_read")),
+        "odoo_schema_fields" | "odoo_schema_overview" => (ToolClass::Read, model.filter(|s| !s.is_empty()), Some("fields_get")),
+        "odoo_create" => (ToolClass::GenericCreate, model.map(str::trim), Some("create")),
+        "odoo_write" => (ToolClass::GenericWrite, model.map(str::trim), Some("write")),
+        "odoo_execute" => (ToolClass::Execute, model, params.and_then(|p| p.get("method")).and_then(Value::as_str)),
+        "odoo_crm_leads" => (ToolClass::Read, Some("crm.lead"), Some("search_read")),
+        "odoo_crm_create_lead" => (ToolClass::Execute, Some("crm.lead"), Some("create")),
+        "odoo_crm_update_stage" => (ToolClass::Execute, Some("crm.lead"), Some("write")),
+        "odoo_sale_orders" => (ToolClass::Read, Some("sale.order"), Some("search_read")),
+        "odoo_sale_create_quotation" => (ToolClass::Execute, Some("sale.order"), Some("create")),
+        "odoo_sale_confirm" => (ToolClass::Execute, Some("sale.order"), Some("action_confirm")),
+        "odoo_inventory_products" => (ToolClass::Read, Some("product.product"), Some("search_read")),
+        "odoo_inventory_check" => (ToolClass::Read, Some("stock.quant"), Some("search_read")),
+        "odoo_invoice_list" | "odoo_payment_status" => (ToolClass::Read, Some("account.move"), Some("search_read")),
+        "odoo_partner_search" => (ToolClass::Read, Some("res.partner"), Some("search_read")),
+        "odoo_report" => (ToolClass::Execute, Some("ir.actions.report"), Some("render_qweb_pdf")),
+        _ => return None,
+    })
+}
+
+impl ToolPolicy {
+    pub fn load(home: &Path, agent_id: &str) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| UNREADABLE)?;
+        let access = OdooAccessConfig::parse_config_toml(&raw)?;
+        let table: toml::Table = raw.parse().map_err(|_| UNREADABLE)?;
+        let global = table.get("odoo").cloned().ok_or(UNREADABLE)?
+            .try_into::<OdooConfig>().map_err(|_| UNREADABLE)?;
+        let agent = super::odoo_generic_write::load_generic_write_override(home, agent_id)?.unwrap_or_default();
+        let mut identities = personal_facts(home, agent_id);
+        // The global member-credential switch is not an identity grant.
+        if table.get("odoo").and_then(|v| v.get("member_credentials")).and_then(toml::Value::as_bool) != Some(true) {
+            identities.owner_has_personal_credential = false;
+            identities.requester_has_personal_credential = false;
+        }
+        let populated = |value: &Option<String>| value.as_ref().is_some_and(|s| !s.trim().is_empty());
+        identities.has_agent_credential = populated(&agent.username)
+            && (populated(&agent.api_key_enc) || populated(&agent.password_enc));
+        let chain = duduclaw_core::autonomy_gate::effective_identities(home, agent_id,
+            duduclaw_core::autonomy_gate::AutonomyPath::Dispatcher).map_err(|_| DENIED)?;
+        let parent = chain.last().ok_or(DENIED)?.clone();
+        Ok(Self { agent_id: parent, agent, access, global, identities })
+    }
+
+    /// Preserve the old dedicated tools' search/execute grant vocabulary while
+    /// the pure policy sees the actual RPC method (search_read/action_confirm).
+    fn predicate_agent(&self, tool: &str) -> AgentOdooConfig {
+        let mut agent = self.agent.clone();
+        let alias = match tool {
+            "odoo_search" | "odoo_crm_leads" | "odoo_sale_orders" | "odoo_inventory_products"
+            | "odoo_inventory_check" | "odoo_invoice_list" | "odoo_payment_status" => Some(("search", "read")),
+            "odoo_sale_confirm" => Some(("execute", "action")),
+            _ => None,
+        };
+        if let Some((from, to)) = alias {
+            agent.allowed_actions = agent.allowed_actions.iter().filter_map(|token| {
+                let (verb, suffix) = token.split_once(':').map_or((token.as_str(), None), |(v,m)| (v,Some(m)));
+                if verb == to { return None; }
+                Some(if verb == from { suffix.map_or_else(|| to.to_owned(), |m| format!("{to}:{m}")) } else { token.clone() })
+            }).collect();
+            // Empty means unrestricted in the legacy engine, so preserve a
+            // nonempty deny set when removing its only inapplicable token.
+            if !self.agent.allowed_actions.is_empty() && agent.allowed_actions.is_empty() {
+                agent.allowed_actions.push("no_permission".into());
+            }
+        }
+        agent
+    }
+
+    fn pure(&self, tool: &str, class: ToolClass, model: Option<&str>, method: Option<&str>, engine: bool) -> bool {
+        let agent = self.predicate_agent(tool);
+        let mut access = self.access.clone();
+        let mut identities = self.identities;
+        if engine {
+            // This is an intersection with a gateway Engine decision, never a
+            // locally selected effective mode or an invented runtime account.
+            access.permission_mode = PermissionMode::Engine;
+            access.company_key_agents = vec![self.agent_id.clone()];
+            identities = PossibleIdentities::default();
+        }
+        policy::odoo_tool_listable(&ListableInput { tool: class, model, method,
+            agent_id: &self.agent_id, agent: &agent, access: &access, identities })
+    }
+
+    fn prospective_follow(&self) -> bool {
+        let personal = (self.identities.avatar_has_owner && self.identities.owner_has_personal_credential)
+            || (self.agent.act_as_requester && self.identities.requester_has_personal_credential);
+        let disconnected = !personal && !self.identities.has_agent_credential
+            && !self.access.company_key_agents.iter().any(|id| id == &self.agent_id);
+        (personal || (disconnected && (self.identities.avatar_has_owner || self.agent.act_as_requester)))
+            && effective_mode(policy::IdentityKind::Personal, &self.access, PermissionOverride::Inherit) == EffectiveMode::Follow
+            && self.agent.permission_override_mode() != PermissionOverride::Engine
+    }
+
+    pub(super) fn common(&self, model: &str, method: &str) -> Result<(), String> {
+        let op = OdooOp { tool: ToolKind::Generic, model, method, verb: method_verb(method) };
+        if let Some(refusal) = fixed_refusal(&op) { return Err(fixed_refusal_message(refusal)); }
+        if self.access.always_refuses(&op) {
+            return Err(list_refusal_message(&format!("{}：{model}", match op.verb {
+                Verb::Read => "讀取資料", Verb::Create => "新增資料", Verb::Write => "修改資料",
+                Verb::Unlink => "刪除資料", _ => "執行操作",
+            })));
+        }
+        self.global.feature_allows_model(model).map_err(|module| format!(
+            "公司目前沒有開啟這項 Odoo 功能（{module}）；Odoo feature_gate: module is switched off。"))
+    }
+
+    fn engine_model(&self, tool: &str, model: &str, method: &str) -> bool {
+        let unblock = self.agent.unblock_models.as_ref().unwrap_or(&self.global.unblock_models);
+        if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
+            return super::odoo_generic_write::generic_write_model_gate(Some(&self.agent), &self.global, unblock, verb, model).is_ok();
+        }
+        if matches!(tool, "odoo_search" | "odoo_execute" | "odoo_schema_fields" | "odoo_schema_overview") {
+            let kind = if method_verb(method) == Verb::Read { duduclaw_odoo::AccessKind::Read } else { duduclaw_odoo::AccessKind::Mutate };
+            if duduclaw_odoo::check_blocklist(model, kind, unblock).is_err() { return false; }
+        }
+        tool != "odoo_execute" || !super::odoo::blocked_odoo_method(method)
+    }
+
+    /// Isolation currently supplies a bound connector without a permission
+    /// decision. Its listing must intersect the same conservative Engine
+    /// policy as bound dispatch, rather than advertise Follow-only writes.
+    pub fn listed_for_context(&self, tool: &str) -> bool {
+        if crate::mcp_isolation::current().is_some() {
+            let mut engine = self.clone();
+            engine.access.permission_mode = PermissionMode::Engine;
+            engine.listed(tool, None)
+        } else {
+            self.listed(tool, None)
+        }
+    }
+
+    pub fn listed(&self, tool: &str, params: Option<&Value>) -> bool {
+        let Some((class, model, method)) = operation(tool, params) else { return false };
+        // Quantify over actual candidates so feature/block gates and the pure
+        // predicate cannot authorize two different models independently.
+        let mut candidates = self.agent.allowed_models.clone();
+        candidates.extend(self.agent.allowed_actions.iter().filter_map(|s| s.split_once(':').map(|(_,m)| m.to_owned())));
+        for n in 0..=self.access.always_refuse.len() {
+            candidates.push(format!("policy_model_{n}"));
+        }
+        if let Some(model) = model { candidates = vec![model.to_owned()]; }
+        let mut methods: Vec<String> = ["read", "search", "search_read", "search_count", "fields_get", "name_get",
+            "name_search", "default_get", "read_group", "create", "copy", "write", "update", "unlink"]
+            .into_iter().map(str::to_owned).collect();
+        for n in 0..=self.access.always_refuse.len() {
+            methods.push(format!("policy_execute_{n}"));
+            methods.push(format!("action_policy_{n}"));
+        }
+        if let Some(method) = method { methods = vec![method.to_owned()]; }
+        let allowed = candidates.iter().any(|model| methods.iter().any(|method| {
+            self.common(model, method).is_ok()
+                && (method != "search_read" || self.common(model, "fields_get").is_ok())
+                && self.pure(tool, class, Some(model), Some(method), false)
+                && (self.prospective_follow() || self.engine_model(tool, model, method))
+        }));
+        allowed && self.auxiliary(tool).iter().all(|(model, method)| {
+            self.common(model, method).is_ok() && self.common(model, "fields_get").is_ok()
+                && self.pure("odoo_search", ToolClass::Read, Some(model), Some(method), false)
+        })
+    }
+
+    fn auxiliary(&self, tool: &str) -> Vec<(&'static str, &'static str)> {
+        match tool {
+            "odoo_inventory_check" => vec![("product.product", "search_read")],
+            "odoo_crm_update_stage" => vec![("crm.stage", "search_read")],
+            _ => vec![],
+        }
+    }
+
+    pub fn precheck(&self, tool: &str, params: &Value) -> Result<(), String> {
+        let (_, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
+        if let (Some(model), Some(method)) = (model, method) {
+            self.common(model, method)?;
+            if method == "search_read" { self.common(model, "fields_get")?; }
+        }
+        for (model, method) in self.auxiliary(tool) { self.common(model, method)?; }
+        if self.listed(tool, Some(params)) { Ok(()) } else { Err(DENIED.into()) }
+    }
+
+    pub fn check_call(&self, tool: &str, params: &Value, decision: Option<&OdooIdentity>) -> Result<(), String> {
+        let (class, model, method) = operation(tool, Some(params)).ok_or(DENIED)?;
+        if let (Some(model), Some(method)) = (model, method) {
+            self.common(model, method)?;
+            if method == "search_read" { self.common(model, "fields_get")?; }
+        }
+        let permission = decision.map_or(IdentityPermission::Engine, |d| d.permission);
+        if permission == IdentityPermission::ReadOnly && class != ToolClass::Read {
+            return Err("目前是唯讀模式，只能查詢 Odoo 資料，不能新增、修改或執行操作。".into());
+        }
+        if permission == IdentityPermission::Follow && decision.is_none_or(|d| d.kind != DecisionKind::Personal) {
+            return Err(DENIED.into());
+        }
+        if permission == IdentityPermission::Engine {
+            if let (Some(model), Some(method)) = (model, method) {
+                if let Some(verb) = super::odoo_generic_write::generic_write_verb(tool) {
+                    let unblock = self.agent.unblock_models.as_ref().unwrap_or(&self.global.unblock_models);
+                    super::odoo_generic_write::generic_write_model_gate(Some(&self.agent), &self.global, unblock, verb, model)
+                        .map_err(|denial| denial.message(tool, model))?;
+                } else if let Some((verb, old_model)) = super::odoo::classify_odoo_call(tool, params) {
+                    crate::odoo_pool::check_action_permission(Some(&self.agent), verb, &old_model)?;
+                }
+                if !self.engine_model(tool, model, method) { return Err(DENIED.into()); }
+            }
+            if !self.pure(tool, class, model, method, true) { return Err(DENIED.into()); }
+            if let (Some(model), Some(method)) = (model, method) {
+                if !self.engine_model(tool, model, method) { return Err(DENIED.into()); }
+            }
+        }
+        self.precheck(tool, params)?;
+        if permission == IdentityPermission::ReadOnly {
+            let mut access = self.access.clone();
+            access.company_key_agents.clear();
+            let mut facts = PossibleIdentities::default();
+            match decision.map(|d| d.kind) {
+                Some(DecisionKind::Personal) => {
+                    facts.avatar_has_owner = true;
+                    facts.owner_has_personal_credential = true;
+                }
+                Some(DecisionKind::Agent) => facts.has_agent_credential = true,
+                _ => access.company_key_agents.push(self.agent_id.clone()),
+            }
+            let mut agent = self.predicate_agent(tool);
+            agent.permission_override = Some("read_only".into());
+            if !odoo_tool_listable(&ListableInput { tool: class, model, method,
+                agent_id: &self.agent_id, agent: &agent, access: &access, identities: facts }) {
+                return Err(DENIED.into());
+            }
+            // ReadOnly narrows the selected identity's inherited read policy.
+            // A possible personal account cannot relax a selected company or
+            // agent account's sensitive-table gates.
+            let inherited_follow = decision.is_some_and(|d| d.kind == DecisionKind::Personal)
+                && effective_mode(policy::IdentityKind::Personal, &self.access, PermissionOverride::Inherit) == EffectiveMode::Follow;
+            if !inherited_follow {
+                if let (Some(model), Some(method)) = (model, method) {
+                    if !self.engine_model(tool, model, method) { return Err(DENIED.into()); }
+                }
+            }
+        }
+        for (model, method) in self.auxiliary(tool) {
+            self.common(model, method)?;
+            self.common(model, "fields_get")?;
+            if permission == IdentityPermission::Engine
+                && !self.pure("odoo_search", ToolClass::Read, Some(model), Some(method), true) { return Err(DENIED.into()); }
+        }
+        Ok(())
+    }
+
+    pub fn schema_visible(&self, model: &str, decision: Option<&OdooIdentity>) -> bool {
+        self.check_call("odoo_schema_fields", &serde_json::json!({"model":model}), decision).is_ok()
+    }
+
+}
+
+pub(super) fn follows(decision: Option<&OdooIdentity>) -> bool {
+    decision.is_some_and(|d| d.kind == DecisionKind::Personal && d.permission == IdentityPermission::Follow)
+}
+
+pub(super) fn identity_suffix(decision: Option<&OdooIdentity>, verb: &str) -> String {
+    let action = match verb { "create" => "建立", "write" => "修改", _ => "執行" };
+    let text = match decision.map(|d| d.kind) {
+        Some(DecisionKind::Personal) => format!("以你的 Odoo 帳號 {} {action}", decision.and_then(|d| d.login.as_deref()).unwrap_or("本人")),
+        Some(DecisionKind::Company) => format!("以公司帳號{action}"),
+        _ => format!("以 AI 員工帳號{action}"),
+    };
+    duduclaw_security::audit::mask_sensitive_text(&text)
+}
+
+pub(super) fn error_text(error: &str, decision: Option<&OdooIdentity>) -> String {
+    if follows(decision) {
+        let classified = error.strip_prefix("Odoo field compatibility: fields_get failed for '")
+            .and_then(|rest| rest.split_once("': ").map(|(_, error)| error)).unwrap_or(error);
+        if let Some(summary) = classified.strip_prefix(duduclaw_odoo::rpc::PERSONAL_ACCESS_ERROR_PREFIX) {
+            let summary = decision.and_then(|d| d.secret.as_deref()).filter(|s| !s.is_empty())
+                .map_or_else(|| summary.to_owned(), |secret| summary.replace(secret.as_str(), "[REDACTED]"));
+            let summary = duduclaw_core::truncate_chars(&summary, 200);
+            let login = decision.and_then(|d| d.login.as_deref()).unwrap_or("本人");
+            return duduclaw_security::audit::mask_sensitive_text(&format!(
+                "你的 Odoo 帳號（{login}）沒有權限做這件事：{summary}。這是 Odoo 帳號本身的權限，要調整請找公司的 Odoo 管理員。"));
+        }
+    }
+    format!("Odoo error: {error}")
+}
+
+pub(super) fn sanitize_for_session(mut result: Value, session: Option<&str>) -> Value {
+    use duduclaw_gateway::session_origin::{origin_for_current_turn, OriginKind};
+    let public = session.is_some_and(|s| {
+        duduclaw_gateway::odoo_livechat::is_public_visitor_session(s)
+            || matches!(origin_for_current_turn(s).kind(), OriginKind::PublicVisitor | OriginKind::WebchatVisitor | OriginKind::Channel)
+            || s.split_once(':').is_some_and(|(prefix, tail)| prefix == "widget-visitor" && !tail.is_empty())
+    });
+    if public && result["isError"] == true {
+        return super::mcp_error(duduclaw_gateway::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+    }
+    if public {
+        // Audit retains attribution, but external conversations receive only
+        // the business result, never a personal login or operator instruction.
+        if let Some(items) = result.get_mut("content").and_then(Value::as_array_mut) {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if let Some((body, suffix)) = text.rsplit_once('\n') {
+                        if ["以你的 Odoo 帳號 ", "以公司帳號", "以 AI 員工帳號"].iter().any(|prefix| suffix.starts_with(prefix)) {
+                            item["text"] = Value::String(body.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
+}
+
+pub(super) fn sanitize_result(result: Value) -> Value {
+    let session = crate::mcp_isolation_identity::var(duduclaw_core::ENV_TRUST_SESSION_ID).ok()
+        .or_else(|| crate::mcp_isolation_identity::var(duduclaw_core::ENV_DISPATCH_SESSION).ok());
+    sanitize_for_session(result, session.as_deref())
+}

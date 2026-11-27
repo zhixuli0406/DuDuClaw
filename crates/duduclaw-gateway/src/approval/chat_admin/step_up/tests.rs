@@ -4,6 +4,7 @@ use super::{store::Store, routes::{Choice, Decision}};
 use crate::approval::{ApprovalId, ApprovalStatus, decision_service::{self, tests::Fixture}};
 use crate::approval::chat_admin::receipts;
 use chrono::Utc;
+use hmac::{Hmac, Mac};
 use rusqlite::{Connection, params};
 
 pub(crate) struct WebFixture {
@@ -57,9 +58,9 @@ impl WebFixture {
     pub(crate) fn step_up(&self) -> [u8;32] {
         self.factor();
         let now = Utc::now().timestamp();
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE, b"12345678901234567890");
-        let tag = ring::hmac::sign(&key, &(now as u64 / 30).to_be_bytes());
-        let bytes = tag.as_ref();
+        let mut mac = Hmac::<sha1::Sha1>::new_from_slice(b"12345678901234567890").unwrap();
+        mac.update(&(now as u64 / 30).to_be_bytes());
+        let bytes = mac.finalize().into_bytes();
         let offset = (bytes[19] & 15) as usize;
         let n = u32::from_be_bytes(bytes[offset..offset+4].try_into().unwrap()) & 0x7fff_ffff;
         let code = format!("{:06}", n % 1_000_000);

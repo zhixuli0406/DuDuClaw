@@ -6,6 +6,7 @@
 
 use super::*;
 use std::sync::Arc;
+use super::odoo_identity_client::tests::with_company;
 
 #[test]
 fn odoo_status_and_connect_neutralize_remote_version_and_modules() {
@@ -322,13 +323,15 @@ fn classify_returns_none_for_unknown_tool() {
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_status_reports_not_connected_for_fresh_agent() {
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool(
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[odoo]\nurl='http://localhost:1'\ndb='test'\n").unwrap();
+    let result = with_company(home.path(), handle_odoo_tool(
         "odoo_status",
         &serde_json::json!({}),
-        std::path::Path::new("/tmp"),
+        home.path(),
         &pool,
         "agnes",
-    )
+    ))
     .await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Odoo not connected"), "got: {text}");
@@ -549,7 +552,7 @@ async fn fresh_pool_reads_project_switch_from_disk_without_network() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("config.toml"), "[odoo]\nfeatures_project = true\nurl = 'http://localhost:1'\ndb = 'test'\n").unwrap();
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes")).await;
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(!text.contains("switched off"), "{text}");
     assert!(text.contains("not connected"), "{text}");
@@ -619,15 +622,15 @@ async fn data_tool_auto_connects_and_explicit_connect_reuses_identity_across_pro
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = '{url}'\ndb = 'test'\nusername = 'tester'\napi_key_enc = 'literal-test-key'\nfeatures_project = true\n")).unwrap();
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     assert!(pool.is_connected("agnes").await);
     assert_eq!(authentications.load(Ordering::SeqCst), 1);
-    let result = handle_odoo_tool("odoo_connect", &serde_json::json!({}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_connect", &serde_json::json!({}), home.path(), &pool, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     assert_eq!(authentications.load(Ordering::SeqCst), 1);
     let next_process: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     // Cross-process reuse comes from the on-disk connection cache, which is
     // descriptor-pinned and Unix-only; off Unix it is deliberately disabled

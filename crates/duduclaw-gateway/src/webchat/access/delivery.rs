@@ -37,7 +37,8 @@ impl WebChatState {
                 self.authorize_no_target(user).await.map_err(|_| "account unavailable".to_owned())?;
             }
             let snapshot = self.acl_snapshot(user).await?;
-            (Some(SenderAccess::from_effective(snapshot.access)), Some(snapshot.edition))
+            (Some(SenderAccess::from_effective(snapshot.access)
+                .for_webchat_converse(&self.ctx.home_dir).await), Some(snapshot.edition))
         };
         Ok(TargetPolicy {
             home: self.ctx.home_dir.clone(), registry: self.ctx.registry.clone(),

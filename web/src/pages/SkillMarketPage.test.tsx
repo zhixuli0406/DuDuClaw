@@ -12,7 +12,7 @@ import { SkillMarketPage } from './SkillMarketPage';
 const wsHandlers = new Map<string, (payload: unknown) => void>();
 
 beforeEach(() => {
-  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [] });
+  useAuthStore.setState({ user: { id: 'admin', role: 'admin' } as never, bindings: [], deptGrants: [], deptGroups: new Set() });
   vi.clearAllMocks();
   wsHandlers.clear();
   // Every RPC resolves to an empty envelope so the page renders empty states.
@@ -257,13 +257,13 @@ it('clears a revoked installation scope and does not submit an approval request'
   const request = vi.spyOn(api.skills, 'installRequest').mockResolvedValue({ stage: 'awaiting_admin' } as never);
   renderWithProviders(<SkillMarketPage />);
   await user.click(screen.getByText('security'));
-  await user.click(await screen.findByRole('button', { name: 'Install' }));
+  await user.click(await screen.findByRole('button', { name: 'Request installation' }));
   const dialog = await screen.findByRole('dialog');
   await user.click(within(dialog).getByRole('combobox'));
   await user.click(await screen.findByRole('option', { name: 'Agent: Agnes' }));
   await waitFor(() => expect(within(dialog).getByRole('combobox')).toHaveTextContent('Agent: Agnes'));
   await user.click(within(dialog).getByRole('button', { name: 'Run Security Scan' }));
-  const submit = within(dialog).getByRole('button', { name: 'Submit for approval' });
+  const submit = within(dialog).getByRole('button', { name: 'Request installation' });
   await waitFor(() => expect(submit).toBeEnabled());
   vi.mocked(api.agents.callable).mockResolvedValue({ agents: [], unrestricted: false, default_agent: null });
   act(() => {
@@ -275,7 +275,34 @@ it('clears a revoked installation scope and does not submit an approval request'
   await waitFor(() => expect({
     scope: within(dialog).getByRole('combobox').textContent,
     allowed: canSelectAgent('agnes'),
-    disabled: screen.getByRole<HTMLButtonElement>('button', { name: 'Submit for approval' }).disabled,
+    disabled: screen.getByRole<HTMLButtonElement>('button', { name: 'Request installation' }).disabled,
   }).toEqual({ scope: 'Install Scope', allowed: false, disabled: true }));
   expect(within(dialog).getByRole('combobox')).not.toHaveTextContent('Agnes');
+});
+
+
+it('submits a manager installation request for a department employee and never installs directly', async () => {
+  vi.restoreAllMocks();
+  const user = userEvent.setup();
+  useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never, bindings: [],
+    deptGrants: [{ department: 'Sales', groups: ['skills'] }] });
+  setConfirmedCallableAgents(false);
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+    method === 'users.dept_grants.mine' ? { grants: [], agents: [{ id: 'agnes', display_name: 'Agnes', groups: ['skills'] }], needs_sync: [] }
+    : method === 'skills.search' ? { skills: [{ name: 'Test skill', url: 'https://example.com/skill', tags: [] }], total_indexed: 1 }
+    : method === 'skills.vet' ? { passed: true, content: 'safe', vet_result: { score: 100, findings: [] } }
+    : method === 'skills.install_request' ? { stage: 'awaiting_admin' } : {}));
+  renderWithProviders(<SkillMarketPage />);
+  await user.click(screen.getByText('security'));
+  await user.click(await screen.findByRole('button', { name: 'Request installation' }));
+  const dialog = await screen.findByRole('dialog');
+  await user.click(within(dialog).getByRole('combobox'));
+  expect(screen.queryByRole('option', { name: 'Company-wide' })).not.toBeInTheDocument();
+  await user.click(await screen.findByRole('option', { name: 'Agent: Agnes' }));
+  await user.click(within(dialog).getByRole('button', { name: 'Run Security Scan' }));
+  const submit = within(dialog).getByRole('button', { name: 'Request installation' });
+  await waitFor(() => expect(submit).toBeEnabled());
+  await user.click(submit);
+  await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('skills.install_request', { url: 'https://example.com/skill', scope: 'agnes', content: 'safe' }));
+  expect(mockWsClient.call.mock.calls.some(c => c[0] === 'skills.install')).toBe(false);
 });

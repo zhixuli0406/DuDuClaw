@@ -427,11 +427,20 @@ async fn push_plain_notice_inner(
     receipt
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    pub(crate) static TEST_EXACT_CONFIRMATIONS: std::sync::Arc<std::sync::Mutex<Vec<(crate::approval::DecisionContext, String)>>>;
+}
+
 /// Exact host-attested account/chat/thread, with explicit full-UUID commands.
 /// No token cascade or alternative destination may receive private mail details.
 pub(crate) async fn push_exact_confirmation(
     target: &crate::approval::TrustedReplyTarget, body: &str,
 ) -> Option<(String, String)> {
+    #[cfg(test)]
+    if TEST_EXACT_CONFIRMATIONS.try_with(|sent| sent.lock().unwrap().push((target.context.clone(), body.into()))).is_ok() {
+        return Some((target.context.channel.clone(), target.context.conversation_id.clone()));
+    }
     target.sender(reqwest::Client::new()).send_text(body).await.ok()?;
     Some((target.context.channel.clone(), target.context.conversation_id.clone()))
 }

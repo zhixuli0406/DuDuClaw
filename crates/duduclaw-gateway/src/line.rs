@@ -820,8 +820,33 @@ async fn process_line_events(
                 // degrades gracefully rather than dropping the message.
                 let mut voice_text = String::new();
 
+                let mut drop_files = false;
+                if msg.msg_type != "text" && msg.id.is_some() {
+                    let session = format!("line:{}", ingress::line_conversation(&event));
+                    let reply_session = if route.as_ref().is_some_and(|r| r.labelled()) {
+                        crate::trigger_route::called_session(&session, agent_id)
+                    } else { session.clone() };
+                    match crate::channel_reply::attachment_gate::check(
+                        &state.ctx, &session, &reply_session,
+                        crate::ccr_runtime::reply_principal_for_sender(sender),
+                        &base_text, Some(agent_id), None,
+                    ).await {
+                        crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                        crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => drop_files = true,
+                        crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(text) => {
+                            drop_files = true;
+                            base_text = text;
+                        }
+                        crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                            let _ = send_reply_rich(&state.http, token, reply_token,
+                                vec![serde_json::json!({ "type": "text", "text": reply })]).await;
+                            continue;
+                        }
+                    }
+                }
+
                 // Handle non-text message types: download content and save to disk
-                if msg.msg_type != "text" {
+                if !drop_files && msg.msg_type != "text" {
                     if let Some(msg_id) = &msg.id {
                         let type_label = &msg.msg_type;
                         info!("📩 LINE [{sender}]: {type_label} message");
@@ -959,6 +984,23 @@ async fn process_line_events(
                                 .await;
                             }
                             continue; // blocked users are silently ignored
+                        }
+                        let origin = crate::chat_commands::CommandOrigin {
+                            channel: "line", gate_session: &session_id, command_session: &session_id,
+                            sender, text: &input_text,
+                            shared: source.as_ref().is_some_and(|s| s.group_id.is_some() || s.room_id.is_some()),
+                        };
+                        let command_agent = if matches!(&cmd, crate::chat_commands::ChatCommand::Assign(_)) {
+                            route.as_ref().map(|r| r.fallback.as_str()).unwrap_or(agent_id)
+                        } else { agent_id };
+                        if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                            &cmd, &state.ctx, &origin, command_agent,
+                        ).await {
+                            if !refusal.is_empty() {
+                                let messages = vec![serde_json::json!({ "type": "text", "text": refusal })];
+                                let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                            }
+                            continue;
                         }
                         // `/交辦`: the sender's own rights; the assignable
                         // list comes back as quick-reply buttons.
@@ -1788,3 +1830,7 @@ mod ccr_principal_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/line.rs"]
 mod f4_decision_route_tests;
+
+#[cfg(test)]
+#[path = "line/attachment_gate_tests.rs"]
+mod attachment_gate_tests;

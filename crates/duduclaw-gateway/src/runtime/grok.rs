@@ -838,6 +838,7 @@ impl GrokRuntime {
         third_party_env: Option<&(String, String)>,
     ) -> tokio::process::Command {
         let mut cmd = tokio::process::Command::new(&self.grok_path);
+        crate::runtime_dispatch::apply_claude_fallback_spawn_env(&mut cmd, context.capabilities.as_ref());
         cmd.args(args);
         // This token belongs to the Claude host session and must not reach Grok.
         cmd.env_remove("CLAUDE_CODE_MESSAGING_TOKEN");
@@ -965,7 +966,16 @@ impl GrokRuntime {
         }
         let _run_identity = crate::run_identity::issue(&context.home_dir, &context.agent_id, "grok",
             deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs())?;
-        let mut env: std::collections::HashMap<String, String> = home_env.iter().cloned().collect();
+        let clear_env = crate::runtime_dispatch::in_claude_runtime_fallback();
+        let mut env: std::collections::HashMap<String, String> = if clear_env {
+            let granted = duduclaw_core::spawn_env::git_credentials_granted_names(context.capabilities.as_ref());
+            if !granted.is_empty() {
+                info!(names = ?granted, "runtime fallback PTY: forwarding granted git credential references");
+            }
+            duduclaw_core::spawn_env::agent_cli_spawn_env_pairs_for(context.capabilities.as_ref())
+                .into_iter().map(|(key, value)| (key.to_owned(), value)).collect()
+        } else { Default::default() };
+        env.extend(home_env.iter().cloned());
         _run_identity.apply_pty(&mut env);
         if let Some((k, v)) = third_party_env {
             env.insert(k.clone(), v.clone());
@@ -1013,14 +1023,9 @@ impl GrokRuntime {
             env,
             work_root.map(std::path::Path::to_path_buf),
             remaining,
-            // WP-8B (credentials doctrine P3) added the `clear_env` param to
-            // `invoke_oneshot`; this call site is outside that WP's reviewed
-            // scope (multi-runtime Grok path, not the Claude spawn paths),
-            // so it deliberately keeps `false` — byte-identical prior
-            // behavior (full ambient-env inheritance). Same leak class as
-            // the Claude spawn paths this WP fixed; flagged as a follow-up
-            // candidate, not silently left unmentioned.
-            false,
+            // Claude continuation uses the common allowlist; existing Grok
+            // primaries retain their previous ambient-environment behavior.
+            clear_env,
             Some(_run_identity.spawn_binding()),
         ))
         .await

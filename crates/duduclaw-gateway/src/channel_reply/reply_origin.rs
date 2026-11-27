@@ -478,8 +478,8 @@ pub(super) async fn record_reply_recovery(origin: ReplyOrigin, home: &Path, agen
         .await;
     }
 }
-/// Fail-closed spies at the actual legacy/direct call boundaries. They never
-/// return mock answers or silently permit a real subprocess/provider call.
+/// Fail-closed spies at the actual legacy/direct call boundaries. The explicit
+/// CLI mode permits an isolated fake CLI but still refuses Direct API access.
 #[cfg(test)]
 pub(super) mod testing {
     use super::*;
@@ -491,6 +491,7 @@ pub(super) mod testing {
     struct Counts {
         claude: AtomicUsize,
         direct: AtomicUsize,
+        allow_claude: bool,
     }
     fn entries() -> &'static Mutex<std::collections::HashMap<std::path::PathBuf, Arc<Counts>>> {
         static MAP: OnceLock<Mutex<std::collections::HashMap<std::path::PathBuf, Arc<Counts>>>> =
@@ -503,8 +504,14 @@ pub(super) mod testing {
     }
     impl NoImplicitCloud {
         pub(crate) fn at(home: &Path) -> Self {
+            Self::register(home, false)
+        }
+        pub(crate) fn allowing_claude_at(home: &Path) -> Self {
+            Self::register(home, true)
+        }
+        fn register(home: &Path, allow_claude: bool) -> Self {
             let home = home.to_owned();
-            let counts = Arc::new(Counts::default());
+            let counts = Arc::new(Counts { allow_claude, ..Default::default() });
             assert!(
                 entries()
                     .lock()
@@ -531,12 +538,23 @@ pub(super) mod testing {
             map.remove(&self.home);
         }
     }
+    pub(crate) fn before_direct_api_credentials(home: &Path) {
+        let counts = entries().lock().unwrap().get(home).cloned();
+        // Strict spies still stop before credential access. The fake-CLI mode
+        // allows checking for a key, but never the actual Direct API call.
+        if counts.is_some_and(|counts| !counts.allow_claude) {
+            boundary(home, true);
+        }
+    }
     pub(crate) fn boundary(home: &Path, direct: bool) {
-        if let Some(counts) = entries().lock().unwrap().get(home).cloned() {
+        // Release the map lock before a refusal panics so Drop can unregister.
+        let counts = entries().lock().unwrap().get(home).cloned();
+        if let Some(counts) = counts {
             if direct {
                 counts.direct.fetch_add(1, Ordering::SeqCst);
             } else {
                 counts.claude.fetch_add(1, Ordering::SeqCst);
+                if counts.allow_claude { return; }
             }
             panic!("owned test refused a real implicit cloud call before credential access");
         }
