@@ -443,6 +443,7 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         migrate_isolation_personal_agents(&conn)?;
+        migrate_department_grants(&conn)?;
         crate::avatar_seats::migrate_grants(&conn, self.home.as_deref())?;
         crate::isolation::initialize_tenant(&conn)?;
         // Last: its triggers read users and every MFA table (F6 S1/S16).
@@ -2500,4 +2501,49 @@ pub fn restore_shared_bindings_in_transaction(
     bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
     bump_policy_epoch(tx)?;
     Ok(members.len())
+}
+
+/// Grant cleanup runs in the user's UPDATE/DELETE transaction, including raw
+/// SQL writers. Existing user writers own the ACL generation bump. Triggers
+/// cannot identify the authenticated actor, so audit attribution is system.
+fn migrate_department_grants(conn: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| format!("failed to migrate department grants: {e}"))?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS department_manager_grants (
+            user_id TEXT NOT NULL, department TEXT NOT NULL,
+            grp TEXT NOT NULL CHECK (grp IN ('schedules','automation','skills','cost','egress_review')),
+            granted_by TEXT NOT NULL, granted_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, department, grp));
+         CREATE TABLE IF NOT EXISTS main_agent_users (
+            user_id TEXT PRIMARY KEY, granted_by TEXT NOT NULL, granted_at TEXT NOT NULL);
+         CREATE TRIGGER IF NOT EXISTS department_grants_user_update
+         AFTER UPDATE OF role, status ON users
+         WHEN NEW.role != 'manager' OR NEW.status != 'active'
+         BEGIN
+            INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
+            SELECT 'system', 'dept_grant_revoked', OLD.id,
+                json_object('reason', 'role_or_status_changed', 'actor_unknown', json('true'),
+                    'old_role', OLD.role, 'new_role', NEW.role,
+                    'old_status', OLD.status, 'new_status', NEW.status),
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE EXISTS(SELECT 1 FROM department_manager_grants WHERE user_id=OLD.id)
+               OR (NEW.status != 'active' AND EXISTS(SELECT 1 FROM main_agent_users WHERE user_id=OLD.id));
+            DELETE FROM department_manager_grants WHERE user_id=OLD.id;
+            DELETE FROM main_agent_users WHERE user_id=OLD.id AND NEW.status != 'active';
+         END;
+         CREATE TRIGGER IF NOT EXISTS department_grants_user_delete
+         AFTER DELETE ON users
+         BEGIN
+            INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
+            SELECT 'system', 'dept_grant_revoked', OLD.id,
+                json_object('reason', 'user_deleted', 'actor_unknown', json('true')),
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE EXISTS(SELECT 1 FROM department_manager_grants WHERE user_id=OLD.id)
+               OR EXISTS(SELECT 1 FROM main_agent_users WHERE user_id=OLD.id);
+            DELETE FROM department_manager_grants WHERE user_id=OLD.id;
+            DELETE FROM main_agent_users WHERE user_id=OLD.id;
+         END;",
+    ).map_err(|e| format!("failed to migrate department grants: {e}"))?;
+    tx.commit().map_err(|e| format!("failed to migrate department grants: {e}"))
 }

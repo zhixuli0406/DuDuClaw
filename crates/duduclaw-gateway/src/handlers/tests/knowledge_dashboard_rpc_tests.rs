@@ -34,6 +34,7 @@ fn admin() -> UserContext {
 
 fn user(id: &str, agents: &[(&str, AccessLevel)]) -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: id.into(),

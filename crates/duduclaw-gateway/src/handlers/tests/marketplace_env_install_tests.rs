@@ -194,6 +194,7 @@ async fn mcp_update_probe_is_admin_only() {
     let home = tempfile::tempdir().unwrap();
     let h = handler_with_agent(home.path()).await;
     let employee = UserContext {
+            origin: duduclaw_auth::acl::ContextOrigin::Other,
             member_key_id: None, credential_epoch:0, user_id:"employee".into(), email:"employee@example.invalid".into(),
         role:UserRole::Employee, agent_access:Default::default(), must_change_password:false,
         team_access:Default::default(), acl_generation:0 };

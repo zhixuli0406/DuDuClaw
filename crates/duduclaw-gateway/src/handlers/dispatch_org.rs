@@ -204,6 +204,19 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list(ctx)).await
             }
+            "users.dept_grants.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_list()).await
+            }
+            "users.dept_grants.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_set(params, ctx)).await
+            }
+            "users.dept_grants.options" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_options()).await
+            }
+            "users.dept_grants.mine" => boxed_frame(|| self.handle_dept_grants_mine(params, ctx)).await,
             "users.invite" | "users.invite_status" => {
                 require_admin!();
                 boxed_frame(|| self.handle_user_invites(method, params, ctx)).await

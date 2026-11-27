@@ -24,7 +24,8 @@ pub const MEMBER_CONTRACT_METHODS: &[MemberContractMethod] = &[
     MemberContractMethod {
         name: "users.me", since: "1.85.0", kind: MemberContractKind::Read,
         summary_en: "Read the signed-in account and direct bindings",
-        key_fields: &["user", "bindings", "email_setup"],
+        // Department grants are always empty for member-key authentication.
+        key_fields: &["user", "bindings", "email_setup", "dept_grants"],
     },
     MemberContractMethod {
         name: "about.get", since: "1.85.0", kind: MemberContractKind::Read,

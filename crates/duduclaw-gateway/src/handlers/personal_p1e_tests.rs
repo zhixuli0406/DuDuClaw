@@ -376,6 +376,10 @@ const EMPLOYEE_ARMS: &[(&str, &str)] = &[
     ("users.list", "(a) people and their binding metadata (label, owner); no employee data"),
     ("users.repair_primary_agents", "Admin only; request names no employee (digest only); protected-mode candidates exclude all Personal employees via the ownership authority; reply contains Shared candidate rows, digest and excluded member count only; hidden-row filter remains active"),
     ("users.me", "(a) the caller's own account"),
+    ("users.dept_grants.list", "(a) Admin-only department authority metadata; no employee content"),
+    ("users.dept_grants.set", "(a) Admin-only audited department grants; names a person and department, not employee content"),
+    ("users.dept_grants.options", "(a) Admin-only department names and aggregate employee counts; no employee content"),
+    ("users.dept_grants.mine", "(a) own effective authority; employee metadata filtered by department_grant_allows, drift labels also check owner-only and machine gates"),
     // Everything below is covered by the P1g default deny (a named
     // Personal employee is refused unless an audited step-up of this
     // request admitted it) and the hidden-row filter, plus the reason.
@@ -593,7 +597,8 @@ const P1F_CEILING: usize = 0;
 /// Ratchet (P1g): the explicit metadata / management allowlist ("(a)"
 /// entries, method by method). Growing it is an owner decision.
 /// P1h (N6): 13 — `topology.list` left the allowlist.
-const METADATA_CEILING: usize = 13;
+/// RM-142 P4: four explicitly requested department-grant metadata methods.
+const METADATA_CEILING: usize = 17;
 
 struct Arm {
     methods: Vec<String>,

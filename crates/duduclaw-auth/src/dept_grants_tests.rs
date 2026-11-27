@@ -1,0 +1,233 @@
+use super::*;
+use crate::test_support::test_db;
+use crate::user_row::read_acl_generation;
+
+fn user(db: &UserDb, name: &str, role: UserRole) -> String {
+    db.create_user(&format!("{name}@example.test"), name, "password-test", role).unwrap().id
+}
+
+fn generation(db: &UserDb) -> u64 { read_acl_generation(&db.conn()).unwrap() }
+
+fn audits(db: &UserDb, action: &str) -> Vec<(String, String, serde_json::Value)> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare("SELECT user_id, target, detail FROM auth_audit_log WHERE action=?1 ORDER BY id").unwrap();
+    stmt.query_map([action], |row| {
+        Ok((row.get(0)?, row.get(1)?, row.get::<_, String>(2)?))
+    }).unwrap().map(|row| {
+        let (actor, target, detail) = row.unwrap();
+        (actor, target, serde_json::from_str(&detail).unwrap())
+    }).collect()
+}
+
+#[test]
+fn dept_grants_use_audit_preserves_acl_generation_and_grants() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Schedules]).unwrap();
+    let before = generation(&db);
+    let grants = db.dept_grants_for_user(&manager).unwrap();
+    db.record_dept_grant_use(&manager, "a1", GrantGroup::Schedules, "run_now", "cron.run_now").unwrap();
+    assert_eq!(generation(&db), before);
+    assert_eq!(db.dept_grants_for_user(&manager).unwrap(), grants);
+    assert_eq!(audits(&db, "dept_grant_used"), vec![(manager, "a1".into(),
+        serde_json::json!({"group":"schedules", "action":"run_now", "method":"cron.run_now"}))]);
+}
+
+#[test]
+fn dept_grants_set_read_audit_noop_and_revoke() {
+    let (db, _path) = test_db();
+    let admin = user(&db, "admin", UserRole::Admin);
+    let manager = user(&db, "manager", UserRole::Manager);
+    let before = generation(&db);
+    db.set_dept_grants(&admin, &manager, "業務部", &[GrantGroup::Skills, GrantGroup::Schedules]).unwrap();
+    assert_eq!(generation(&db), before + 1);
+    assert_eq!(db.dept_grants_for_user(&manager).unwrap(),
+        vec![("業務部".into(), vec![GrantGroup::Schedules, GrantGroup::Skills])]);
+    let grants = db.list_dept_grants().unwrap();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].user_id, manager);
+    assert_eq!(grants[0].granted_by, admin);
+    assert!(!grants[0].granted_at.is_empty());
+    let audit = audits(&db, "dept_grant_changed");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].0, admin);
+    assert_eq!(audit[0].1, manager);
+    assert_eq!(audit[0].2, serde_json::json!({"department":"業務部", "before":[], "after":["schedules","skills"]}));
+    db.set_dept_grants(&admin, &manager, "業務部", &[GrantGroup::Schedules, GrantGroup::Skills, GrantGroup::Skills]).unwrap();
+    assert_eq!(generation(&db), before + 1);
+    assert_eq!(audits(&db, "dept_grant_changed").len(), 1);
+    db.set_dept_grants(&admin, &manager, "業務部", &[]).unwrap();
+    assert!(db.dept_grants_for_user(&manager).unwrap().is_empty());
+    assert_eq!(generation(&db), before + 2);
+    let audit = audits(&db, "dept_grant_changed");
+    assert_eq!(audit[1].2["before"], serde_json::json!(["schedules", "skills"]));
+    assert_eq!(audit[1].2["after"], serde_json::json!([]));
+}
+
+#[test]
+fn dept_grants_refuse_invalid_targets_and_names_without_writes() {
+    let (db, _path) = test_db();
+    let admin = user(&db, "admin", UserRole::Admin);
+    let employee = user(&db, "employee", UserRole::Employee);
+    let suspended = user(&db, "suspended", UserRole::Manager);
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_user_status(&suspended, UserStatus::Suspended).unwrap();
+    let before = generation(&db);
+    for target in [&admin, &employee, &suspended, "missing"] {
+        assert!(db.set_dept_grants(&admin, target, "sales", &GrantGroup::ALL).is_err());
+    }
+    for department in ["", "../sales", "sales/team", " sales", "sales\n"] {
+        assert!(db.set_dept_grants(&admin, &manager, department, &GrantGroup::ALL).is_err());
+    }
+    assert_eq!(generation(&db), before);
+    assert!(db.list_dept_grants().unwrap().is_empty());
+    assert!(audits(&db, "dept_grant_changed").is_empty());
+}
+
+#[test]
+fn dept_grants_unknown_group_mapping_and_check_constraint() {
+    assert_eq!(GrantGroup::parse("bogus"), None);
+    assert_eq!(GrantGroup::parse("Schedules"), None);
+    for group in GrantGroup::ALL { assert_eq!(GrantGroup::parse(group.as_str()), Some(group)); }
+    let (db, _path) = test_db();
+    let conn = db.conn();
+    // Exercise the exact reader mapper without weakening the table's CHECK.
+    let unknown = conn.query_row("SELECT 'u', 'sales', 'bogus', 'admin', 'now'", [], grant_from_row).unwrap();
+    assert!(unknown.is_none());
+    let known = conn.query_row("SELECT 'u', 'sales', 'cost', 'admin', 'now'", [], grant_from_row).unwrap().unwrap();
+    assert_eq!(known.groups, vec![GrantGroup::Cost]);
+    assert!(conn.execute("INSERT INTO department_manager_grants VALUES ('u','sales','bogus','admin','now')", []).is_err());
+}
+
+#[test]
+fn dept_grants_department_names_are_exact_and_not_user_profile_authority() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.conn().execute("UPDATE users SET department='sales' WHERE id=?1", [&manager]).unwrap();
+    assert!(db.dept_grants_for_user(&manager).unwrap().is_empty());
+    db.set_dept_grants("admin", &manager, "Sales", &[GrantGroup::Cost]).unwrap();
+    db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Skills]).unwrap();
+    db.set_dept_grants("admin", &manager, "sales", &[]).unwrap();
+    assert_eq!(db.dept_grants_for_user(&manager).unwrap(), vec![("Sales".into(), vec![GrantGroup::Cost])]);
+}
+
+#[test]
+fn dept_grants_role_change_revokes_only_department_grants() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &GrantGroup::ALL).unwrap();
+    db.set_main_agent_users("admin", &[manager.clone()]).unwrap();
+    let before = generation(&db);
+    db.update_user(&manager, None, Some(UserRole::Employee), None).unwrap();
+    assert_eq!(generation(&db), before + 1);
+    assert!(db.list_dept_grants().unwrap().is_empty());
+    assert!(db.is_main_agent_user(&manager).unwrap());
+    let audit = audits(&db, "dept_grant_revoked");
+    assert_eq!(audit.len(), 1);
+    assert_eq!(audit[0].0, "system");
+    assert_eq!(audit[0].1, manager);
+    assert_eq!(audit[0].2["actor_unknown"], true);
+    assert_eq!(audit[0].2["new_role"], "employee");
+}
+
+#[test]
+fn dept_grants_raw_role_update_and_rollback_are_covered() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &GrantGroup::ALL).unwrap();
+    {
+        let mut conn = db.conn();
+        let tx = conn.transaction().unwrap();
+        tx.execute("UPDATE users SET role='admin' WHERE id=?1", [&manager]).unwrap();
+        let count: i64 = tx.query_row("SELECT count(*) FROM department_manager_grants", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        tx.rollback().unwrap();
+    }
+    assert_eq!(db.list_dept_grants().unwrap().len(), 1);
+    assert!(audits(&db, "dept_grant_revoked").is_empty());
+    db.conn().execute("UPDATE users SET role='admin' WHERE id=?1", [&manager]).unwrap();
+    assert!(db.list_dept_grants().unwrap().is_empty());
+    assert_eq!(audits(&db, "dept_grant_revoked").len(), 1);
+}
+
+#[test]
+fn dept_grants_deactivation_and_delete_clean_both_tables() {
+    for action in ["suspended", "offboarded", "delete"] {
+        let (db, _path) = test_db();
+        let manager = user(&db, "manager", UserRole::Manager);
+        db.set_dept_grants("admin", &manager, "sales", &GrantGroup::ALL).unwrap();
+        db.set_main_agent_users("admin", &[manager.clone()]).unwrap();
+        match action {
+            "suspended" => db.set_user_status(&manager, UserStatus::Suspended).unwrap(),
+            "offboarded" => { db.offboard_user(&manager, None, Some("admin")).unwrap(); },
+            _ => {
+                db.conn().execute("DELETE FROM users WHERE id=?1", [&manager]).unwrap();
+            }
+        };
+        assert!(db.list_dept_grants().unwrap().is_empty());
+        assert!(db.main_agent_users().unwrap().is_empty());
+        assert!(!db.is_main_agent_user(&manager).unwrap());
+        assert_eq!(audits(&db, "dept_grant_revoked").len(), 1);
+    }
+}
+
+#[test]
+fn dept_grants_main_users_replace_validate_and_audit() {
+    let (db, _path) = test_db();
+    let admin = user(&db, "admin", UserRole::Admin);
+    let employee = user(&db, "employee", UserRole::Employee);
+    let inactive = user(&db, "inactive", UserRole::Employee);
+    db.set_user_status(&inactive, UserStatus::Suspended).unwrap();
+    let before = generation(&db);
+    db.set_main_agent_users(&admin, &[admin.clone(), employee.clone(), employee.clone()]).unwrap();
+    assert_eq!(generation(&db), before + 1);
+    assert_eq!(db.main_agent_users().unwrap().len(), 2);
+    assert!(db.is_main_agent_user(&admin).unwrap());
+    db.set_main_agent_users(&admin, &[employee.clone(), admin.clone()]).unwrap();
+    assert_eq!(generation(&db), before + 1);
+    for invalid in [&inactive, "missing"] {
+        assert!(db.set_main_agent_users(&admin, &[employee.clone(), invalid.to_string()]).is_err());
+        assert_eq!(db.main_agent_users().unwrap().len(), 2);
+        assert_eq!(generation(&db), before + 1);
+    }
+    db.set_main_agent_users(&admin, &[employee.clone()]).unwrap();
+    assert_eq!(db.main_agent_users().unwrap(), vec![employee.clone()]);
+    assert!(!db.is_main_agent_user(&admin).unwrap());
+    let audit = audits(&db, "main_access_changed");
+    assert_eq!(audit.len(), 2);
+    assert_eq!(audit[0].2["before"], serde_json::json!([]));
+    assert_eq!(audit[1].2["after"], serde_json::json!([employee]));
+    db.set_main_agent_users(&admin, &[]).unwrap();
+    assert!(db.main_agent_users().unwrap().is_empty());
+}
+
+#[test]
+fn dept_grants_audit_failure_rolls_back_grants_and_generation() {
+    let (db, _path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Cost]).unwrap();
+    let before = generation(&db);
+    db.conn().execute_batch("CREATE TRIGGER reject_grant_audit BEFORE INSERT ON auth_audit_log
+        BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;").unwrap();
+    assert!(db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Skills]).is_err());
+    assert!(db.set_main_agent_users("admin", &[manager.clone()]).is_err());
+    assert!(db.update_user(&manager, None, Some(UserRole::Employee), None).is_err());
+    assert_eq!(generation(&db), before);
+    assert_eq!(db.dept_grants_for_user(&manager).unwrap(), vec![("sales".into(), vec![GrantGroup::Cost])]);
+    assert!(db.main_agent_users().unwrap().is_empty());
+    assert_eq!(db.get_user(&manager).unwrap().unwrap().role, UserRole::Manager);
+}
+
+#[test]
+fn dept_grants_migration_is_idempotent_and_read_errors_fail_closed() {
+    let (db, path) = test_db();
+    let manager = user(&db, "manager", UserRole::Manager);
+    db.set_dept_grants("admin", &manager, "sales", &[GrantGroup::Cost]).unwrap();
+    let reopened = UserDb::new(path.path()).unwrap();
+    assert_eq!(reopened.list_dept_grants().unwrap().len(), 1);
+    db.conn().execute_batch("DROP TABLE department_manager_grants; DROP TABLE main_agent_users;").unwrap();
+    assert!(db.dept_grants_for_user(&manager).is_err());
+    assert!(db.list_dept_grants().is_err());
+    assert!(db.main_agent_users().is_err());
+    assert!(db.is_main_agent_user(&manager).is_err());
+}

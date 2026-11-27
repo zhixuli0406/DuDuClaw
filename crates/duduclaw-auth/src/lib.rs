@@ -9,6 +9,7 @@ pub mod admin_eligibility;
 pub mod credential_changes;
 pub mod chat_link;
 pub mod db;
+pub mod dept_grants;
 pub mod jwt;
 pub mod google_delegate_attestation;
 pub mod google_identity;
