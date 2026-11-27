@@ -37,6 +37,9 @@ use crate::task_store::{ActivityRow, TaskStore};
 /// v1.82 fail-closed approval gate: filing, executing and recovering
 /// approval-gated fires (a child module so it shares the engine's state).
 mod approval_gate;
+mod runs;
+#[cfg(test)]
+mod runs_tests;
 #[cfg(test)]
 mod approval_gate_tests;
 
@@ -1251,6 +1254,9 @@ impl AutopilotEngine {
                         self.resume_approvals_once().await;
                     }
                     self.announce_pending_notices().await;
+                    if let Err(error) = self.resume_runs_once(chrono::Utc::now()).await {
+                        warn!(%error, "autopilot: run resume failed");
+                    }
                 }
                 continue;
             };
@@ -1385,11 +1391,21 @@ impl AutopilotEngine {
         event_name: &str,
         fields: &serde_json::Map<String, Value>,
     ) {
+        self.fire_matched_rule_at(rule, event_name, fields, chrono::Utc::now()).await;
+    }
+
+    async fn fire_matched_rule_at(
+        &self,
+        rule: &AutopilotRuleRow,
+        event_name: &str,
+        fields: &serde_json::Map<String, Value>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
         debug!(rule = %rule.name, event = event_name, "autopilot: rule matched");
 
         if rule.active_window.is_some() {
             use crate::autopilot_window::{rule_window_decision, WindowDecision};
-            let skipped = match rule_window_decision(&self.home_dir, rule, chrono::Utc::now()) {
+            let skipped = match rule_window_decision(&self.home_dir, rule, now) {
                 WindowDecision::Inside => None,
                 WindowDecision::Outside { detail } => Some(("outside_window", detail)),
                 WindowDecision::ZoneUnresolved { detail } => Some(("outside_window_tz_unresolved", detail)),
@@ -1400,7 +1416,7 @@ impl AutopilotEngine {
                     id: uuid::Uuid::new_v4().to_string(),
                     rule_id: rule.id.clone(),
                     rule_name: rule.name.clone(),
-                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    triggered_at: now.to_rfc3339(),
                     result: result.into(),
                     details: Some(detail),
                 }).await {
@@ -1416,7 +1432,7 @@ impl AutopilotEngine {
                 id: uuid::Uuid::new_v4().to_string(),
                 rule_id: rule.id.clone(),
                 rule_name: rule.name.clone(),
-                triggered_at: chrono::Utc::now().to_rfc3339(),
+                triggered_at: now.to_rfc3339(),
                 result: "skipped".into(),
                 details: Some(reason),
             }).await;
@@ -1474,7 +1490,7 @@ impl AutopilotEngine {
                     id: uuid::Uuid::new_v4().to_string(),
                     rule_id: rule.id.clone(),
                     rule_name: rule.name.clone(),
-                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    triggered_at: now.to_rfc3339(),
                     result: result_tag.into(),
                     details: Some(details),
                 })
@@ -1549,7 +1565,7 @@ impl AutopilotEngine {
                     id: uuid::Uuid::new_v4().to_string(),
                     rule_id: rule.id.clone(),
                     rule_name: rule.name.clone(),
-                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    triggered_at: now.to_rfc3339(),
                     result: tag.into(),
                     details: Some(format!("{detail}（{event_name}）")),
                 })
@@ -1572,6 +1588,26 @@ impl AutopilotEngine {
             crate::metrics::global_metrics().tick_wake(&rule.id).await;
         }
 
+        if let crate::autopilot_scope::ScopeDecision::Deny { reason } =
+            crate::autopilot_scope::check(&self.home_dir, rule, None, fields)
+        {
+            if let Err(error) = self.store.append_step_history(&AutopilotHistoryRow {
+                id: uuid::Uuid::new_v4().to_string(),
+                rule_id: rule.id.clone(), rule_name: rule.name.clone(),
+                triggered_at: now.to_rfc3339(), result: "scope_denied".into(),
+                details: Some(reason),
+            }).await {
+                warn!(rule_id = %rule.id, %error, "autopilot: scope history write failed");
+            }
+            return;
+        }
+        if action.get("type").and_then(Value::as_str) == Some("steps") {
+            if let Err(error) = self.start_run(rule, event_name, fields, now).await {
+                warn!(rule_id = %rule.id, %error, "autopilot: start run failed");
+            }
+            return;
+        }
+
         // ── v1.82 HITL approval gate (fail closed) ────────────
         // A rule that requires approval never runs here: it files one
         // approval freezing the rendered action (or is blocked when no
@@ -1590,7 +1626,7 @@ impl AutopilotEngine {
             id: uuid::Uuid::new_v4().to_string(),
             rule_id: rule.id.clone(),
             rule_name: rule.name.clone(),
-            triggered_at: chrono::Utc::now().to_rfc3339(),
+            triggered_at: now.to_rfc3339(),
             result: if outcome.is_ok() {
                 "success".into()
             } else {
@@ -1621,7 +1657,7 @@ impl AutopilotEngine {
                 agent_id: "autopilot".into(),
                 task_id: None,
                 summary,
-                timestamp: chrono::Utc::now().to_rfc3339(),
+                timestamp: now.to_rfc3339(),
                 metadata: Some(
                     serde_json::json!({
                         "rule_id": rule.id,
@@ -1840,10 +1876,19 @@ impl AutopilotEngine {
         &self,
         prepared: &crate::autopilot_approval::FrozenAction,
     ) -> Result<(), String> {
+        self.perform_action_with_queue_id(prepared, None, chrono::Utc::now()).await
+    }
+
+    async fn perform_action_with_queue_id(
+        &self,
+        prepared: &crate::autopilot_approval::FrozenAction,
+        queue_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
         use crate::autopilot_approval::FrozenAction;
         match prepared {
             FrozenAction::Delegate { target_agent, prompt, lane } => {
-                self.enqueue_prompt(target_agent, prompt, lane.clone()).await
+                self.enqueue_prompt_with_id(target_agent, prompt, lane.clone(), queue_id, now).await
             }
             FrozenAction::RunSkill { target_agent, skill_name, prompt, lane } => {
                 // Narrowing re-check at perform time: a skill switched off
@@ -1857,7 +1902,7 @@ impl AutopilotEngine {
                 {
                     return Err(format!("skill '{skill_name}' is switched off for {target_agent}"));
                 }
-                self.enqueue_prompt(target_agent, prompt, lane.clone()).await
+                self.enqueue_prompt_with_id(target_agent, prompt, lane.clone(), queue_id, now).await
             }
             FrozenAction::Notify { channel, chat_id, text }
             | FrozenAction::ProactiveNotify { channel, chat_id, text } => {
@@ -2509,11 +2554,13 @@ impl AutopilotEngine {
         })
     }
 
-    async fn enqueue_prompt(
+    async fn enqueue_prompt_with_id(
         &self,
         target: &str,
         prompt: &str,
         lane: Option<String>,
+        queue_id: Option<&str>,
+        now: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String> {
         duduclaw_core::autonomy_gate::check(&self.home_dir, target, duduclaw_core::autonomy_gate::AutonomyPath::Autopilot)
             .map_err(|pause| format!("autonomy paused: {pause}"))?;
@@ -2522,7 +2569,7 @@ impl AutopilotEngine {
             None => return Err("message queue not available".into()),
         };
         let msg = QueueMessage {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: queue_id.map(str::to_owned).unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
             sender: "autopilot".into(),
             target: target.to_string(),
             payload: prompt.to_string(),
@@ -2533,7 +2580,7 @@ impl AutopilotEngine {
             sender_agent: Some("autopilot".into()),
             error: None,
             response: None,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.to_rfc3339(),
             acked_at: None,
             completed_at: None,
             reply_channel: None,
@@ -2544,7 +2591,19 @@ impl AutopilotEngine {
             // An event-woken run is for nobody in particular.
             on_behalf_of: None,
         };
-        mq.enqueue(&msg).await
+        match mq.enqueue(&msg).await {
+            Ok(()) => Ok(()),
+            Err(error) if queue_id.is_some() => {
+                // Do not classify errors by their text. Only an existing exact
+                // primary key with the same recipient proves delivery to the queue.
+                match mq.get_by_id(&msg.id).await? {
+                    Some(existing) if existing.target == target => Ok(()),
+                    Some(_) => Err("autopilot queue id target mismatch".into()),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 }
 

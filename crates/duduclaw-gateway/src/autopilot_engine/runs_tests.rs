@@ -1,0 +1,510 @@
+//! 141A-P5: isolated stores, injected UTC clock, no real sleeps or channel sends.
+use super::*;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use crate::autopilot_store::{
+    AutopilotRunRow, RuleExtensionsPatch, RUN_PENDING, RUN_WAITING, RUN_SETTLED,
+    STEP_DONE, STEP_FAILED, STEP_RUNNING, run_ts,
+};
+use serde_json::json;
+
+struct Harness {
+    _dir: tempfile::TempDir,
+    home: PathBuf,
+    store: Arc<AutopilotStore>,
+    tasks: Arc<TaskStore>,
+    mq: Arc<MessageQueue>,
+}
+
+fn now() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-11-27T09:00:00Z").unwrap().with_timezone(&Utc)
+}
+
+fn fields() -> serde_json::Map<String, Value> {
+    json!({"event":"task_created", "task":{"id":"t1", "title":"凍結標題"}}).as_object().unwrap().clone()
+}
+
+fn flow() -> Value {
+    json!({"type":"steps", "steps":[
+        {"type":"delegate", "target_agent":"plain", "prompt":"A {{task.title}}"},
+        {"type":"wait", "minutes":1},
+        {"type":"delegate", "target_agent":"other", "prompt":"B {{task.title}}"}
+    ]})
+}
+
+impl Harness {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        for agent in ["plain", "other"] {
+            let path = home.join("agents").join(agent);
+            std::fs::create_dir_all(path.join("SKILLS")).unwrap();
+            std::fs::write(path.join("agent.toml"), format!("[agent]\nname = {agent:?}\nstatus = \"active\"\n")).unwrap();
+            std::fs::write(path.join("SKILLS/test.md"), "Report the supplied order.").unwrap();
+        }
+        Self {
+            store: Arc::new(AutopilotStore::open(&home).unwrap()),
+            tasks: Arc::new(TaskStore::open(&home).unwrap()),
+            mq: Arc::new(MessageQueue::open(&home).unwrap()), home, _dir: dir,
+        }
+    }
+
+    fn acquire(&self) {
+        duduclaw_core::gateway_instance::acquire(&self.home).unwrap();
+    }
+
+    fn engine(&self) -> AutopilotEngine {
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        AutopilotEngine::new(self.home.clone(), self.store.clone(), self.tasks.clone(), Some(self.mq.clone()), rx)
+    }
+
+    async fn rule(&self, action: Value) -> AutopilotRuleRow {
+        let row = AutopilotRuleRow {
+            id: "r".into(), name: "測試規則".into(), enabled: true, trigger_event: "task_created".into(),
+            conditions: "{}".into(), action: action.to_string(), created_at: run_ts(now()),
+            last_triggered_at: None, trigger_count: 0, sequence: None, metadata: None,
+            active_window: None, run_policy: None, owner_department: None,
+            created_by_user_id: None, updated_by_user_id: None, updated_at: None,
+        };
+        self.store.insert_rule(&row).await.unwrap();
+        row
+    }
+
+    async fn run(&self) -> AutopilotRunRow {
+        let rows = self.store.list_runs_for_rule("r", 100).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        rows.into_iter().next().unwrap()
+    }
+
+    async fn queued(&self) -> Vec<QueueMessage> {
+        self.mq.pending_messages(100).await.unwrap()
+    }
+
+    async fn assert_outcome(&self, outcome: &str, queued: usize) -> AutopilotRunRow {
+        let run = self.run().await;
+        assert_eq!(run.state, RUN_SETTLED);
+        assert_eq!(run.outcome.as_deref(), Some(outcome));
+        assert_eq!(self.queued().await.len(), queued);
+        let histories = self.store.list_history(Some("r"), 100).await.unwrap();
+        assert_eq!(histories.iter().filter(|h| h.id == format!("run:{}:outcome", run.run_id) && h.result == outcome).count(), 1);
+        let (activities, _) = self.tasks.list_activity(None, None, 100, 0).await.unwrap();
+        let matching: Vec<_> = activities.iter().filter(|a| a.id == format!("run:{}:outcome", run.run_id)).collect();
+        assert_eq!(matching.len(), 1);
+        let metadata: Value = serde_json::from_str(matching[0].metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["run_id"].as_str(), Some(run.run_id.as_str()));
+        run
+    }
+
+    async fn waiting(&self, engine: &AutopilotEngine) -> AutopilotRunRow {
+        let rule = self.rule(flow()).await;
+        engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+        let run = self.run().await;
+        assert_eq!(run.state, RUN_WAITING);
+        assert_eq!(run.step_index, 2);
+        assert_eq!(self.queued().await.len(), 1);
+        run
+    }
+
+    fn corrupt_run(&self, id: &str, column: &str, value: &str) {
+        // Closed set of test-only columns; values always remain bound parameters.
+        let sql = match column {
+            "state" => "UPDATE autopilot_runs SET state=?1 WHERE run_id=?2",
+            "fields_json" => "UPDATE autopilot_runs SET fields_json=?1 WHERE run_id=?2",
+            _ => panic!("unsupported test column"),
+        };
+        rusqlite::Connection::open(self.home.join("autopilot.db")).unwrap()
+            .execute(sql, rusqlite::params![value, id]).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn full_flow_delegate_wait_delegate() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let run = h.waiting(&engine).await;
+    assert_eq!(run.next_at.as_deref(), Some(run_ts(now() + ChronoDuration::minutes(1)).as_str()));
+    let a = h.queued().await;
+    assert!(a[0].id.starts_with("ap-"));
+    assert_eq!(a[0].target, "plain");
+    assert!(a[0].payload.contains("凍結標題"));
+    engine.resume_runs_once(now() + ChronoDuration::seconds(59)).await.unwrap();
+    assert_eq!(h.queued().await.len(), 1);
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    engine.resume_runs_once(now() + ChronoDuration::seconds(62)).await.unwrap();
+    h.assert_outcome("completed", 2).await;
+    let b = h.mq.get_by_id(&runs::queue_id(&run.run_id, 2)).await.unwrap().unwrap();
+    assert_eq!(b.target, "other");
+    assert!(b.payload.contains("凍結標題"));
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+    assert!(steps.iter().all(|s| s.state == STEP_DONE));
+    let history = h.store.list_history(Some("r"), 100).await.unwrap();
+    for i in 0..3 {
+        assert_eq!(history.iter().filter(|r| r.id == format!("run:{}:step:{i}", run.run_id) && r.result == "step_done").count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn restart_mid_step_no_duplicate_enqueue() {
+    for sent in [true, false] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        let run = h.waiting(&engine).await;
+        let started = now() + ChronoDuration::seconds(61);
+        assert!(h.store.claim_run(&run.run_id, "crashed-process", started).await.unwrap());
+        assert!(h.store.mark_step_running(&run.run_id, 2, "crashed-process", started).await.unwrap());
+        let id = runs::queue_id(&run.run_id, 2);
+        if sent {
+            engine.enqueue_prompt_with_id("other", "B frozen before crash", None, Some(&id), started).await.unwrap();
+        }
+        drop(engine);
+        // New engine + reopened connections, retaining only durable state.
+        let (_tx, rx) = tokio::sync::broadcast::channel(16);
+        let restarted = AutopilotEngine::new(h.home.clone(), Arc::new(AutopilotStore::open(&h.home).unwrap()),
+            Arc::new(TaskStore::open(&h.home).unwrap()), Some(Arc::new(MessageQueue::open(&h.home).unwrap())), rx);
+        restarted.resume_runs_once(started + ChronoDuration::seconds(61)).await.unwrap();
+        restarted.resume_runs_once(started + ChronoDuration::seconds(62)).await.unwrap();
+        h.assert_outcome("completed", 2).await;
+        assert!(h.mq.get_by_id(&id).await.unwrap().is_some());
+        let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+        assert_eq!(steps[2].state, STEP_DONE);
+        assert_eq!(steps[2].queue_message_id.as_deref(), Some(id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn notify_crash_settles_uncertain() {
+    // A malformed timestamp/real channel call would fail this test: recovery
+    // must never attempt preparation or delivery for these running steps.
+    for step in [
+        json!({"type":"notify","channel":"test","chat_id":"admin","text":"hello"}),
+        json!({"type":"proactive_notify","channel":"test","chat_id":"admin","text":"hello"}),
+        json!({"type":"wait","minutes":1}),
+    ] {
+        let h = Harness::new();
+        let engine = h.engine();
+        let rule = h.rule(json!({"type":"steps","steps":[step,
+            {"type":"delegate","target_agent":"plain","prompt":"never"}]})).await;
+        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        let run = h.run().await;
+        h.acquire();
+        assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+        assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
+        h.engine().resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+        h.assert_outcome("execution_uncertain", 0).await;
+        let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+        assert_eq!(steps[0].state, STEP_RUNNING);
+        assert_eq!(steps[0].started_at.as_deref(), Some(run_ts(now()).as_str()));
+        let (activities, _) = h.tasks.list_activity(None, None, 100, 0).await.unwrap();
+        assert!(activities.iter().any(|a| a.summary.contains("為避免重複沒有重送")));
+    }
+}
+
+#[tokio::test]
+async fn edit_during_wait_settles_stale() {
+    for outcome in ["stale_rule_changed", "rule_disabled", "rule_removed"] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        h.waiting(&engine).await;
+        match outcome {
+            "stale_rule_changed" => {
+                let mut changed = flow();
+                changed["steps"][2]["prompt"] = json!("changed");
+                h.store.update_rule("r", &json!({"action":changed})).await.unwrap();
+            }
+            "rule_disabled" => { h.store.update_rule("r", &json!({"enabled":false})).await.unwrap(); }
+            "rule_removed" => { h.store.remove_rule("r").await.unwrap(); }
+            _ => unreachable!(),
+        }
+        engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+        h.assert_outcome(outcome, 1).await;
+    }
+}
+
+#[tokio::test]
+async fn missed_late() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    h.waiting(&engine).await;
+    engine.resume_runs_once(now() + ChronoDuration::minutes(71)).await.unwrap();
+    h.assert_outcome("missed_late", 1).await;
+    let (activities, _) = h.tasks.list_activity(None, None, 100, 0).await.unwrap();
+    assert!(activities.iter().any(|a| a.summary.contains("系統停機超過一小時，後續步驟沒有補做")));
+}
+
+#[tokio::test]
+async fn non_lock_holder_never_advances() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    engine.resume_runs_once(now() + ChronoDuration::minutes(1)).await.unwrap();
+    assert_eq!(h.run().await.state, RUN_PENDING);
+    assert!(h.queued().await.is_empty());
+    h.acquire();
+    engine.resume_runs_once(now() + ChronoDuration::minutes(2)).await.unwrap();
+    assert_eq!(h.run().await.state, RUN_WAITING);
+    assert_eq!(h.queued().await.len(), 1);
+}
+
+#[tokio::test]
+async fn run_limit_enforced() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    // Exercise run admission directly: 21 fires in one minute would correctly
+    // trip the unrelated trigger breaker before reaching the capacity boundary.
+    for i in 0..21 {
+        let mut fields = fields();
+        fields.insert("event_id".into(), json!(i));
+        engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+    }
+    assert_eq!(h.store.list_runs_for_rule("r", 100).await.unwrap().len(), 20);
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 20);
+    let history = h.store.list_history(Some("r"), 100).await.unwrap();
+    assert_eq!(history.iter().filter(|h| h.result == "run_limit").count(), 1);
+    assert!(h.queued().await.is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_event_creates_one_run() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    for _ in 0..2 {
+        engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    }
+    assert_eq!(h.run().await.state, RUN_PENDING);
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 1);
+    assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn breaker_open_aborts_next_step() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    h.waiting(&engine).await;
+    engine.circuit.lock().await.insert("r".into(), CircuitState::Open {
+        opened_at: Instant::now(), opened_at_utc: Some(now()),
+    });
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("blocked_breaker_open", 1).await;
+}
+
+#[tokio::test]
+async fn later_step_rechecks_active_window() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    h.rule(flow()).await;
+    let rule = h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        active_window: Some(Some(json!({"days":[5],"start":"09:00","end":"09:01","timezone":"UTC"}).to_string())),
+        run_policy: None, owner_department: None, updated_by_user_id: None, updated_at: run_ts(now()),
+    }).await.unwrap().unwrap();
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    assert_eq!(h.run().await.state, RUN_WAITING);
+    engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("outside_window", 1).await;
+}
+
+#[tokio::test]
+async fn missing_skill_param_fails_step() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = h.rule(json!({"type":"steps","steps":[{
+        "type":"run_skill","target_agent":"plain","skill_name":"test",
+        "params":{"order":"{{task.deadline_at}}"}
+    }]})).await;
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    let run = h.assert_outcome("step_failed", 0).await;
+    assert_eq!(run.detail.as_deref(), Some("param_missing:order"));
+    let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+    assert_eq!(steps[0].state, STEP_FAILED);
+    assert_eq!(steps[0].detail.as_deref(), Some("param_missing:order"));
+    assert!(h.store.list_history(Some("r"), 100).await.unwrap().iter().any(|h| h.result == "step_failed" && h.id == format!("run:{}:step:0", run.run_id)));
+}
+
+#[tokio::test]
+async fn require_approval_step_unavailable() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let rule = h.rule(json!({"type":"steps","steps":[{
+        "type":"delegate","target_agent":"plain","prompt":"never","require_approval":true
+    }]})).await;
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    h.assert_outcome("approval_step_unavailable", 0).await;
+}
+
+#[tokio::test]
+async fn dept_rule_denied_until_predicate_wired() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    h.rule(flow()).await;
+    let rule = h.store.set_rule_extensions("r", &RuleExtensionsPatch {
+        owner_department: Some(Some("sales".into())), active_window: None, run_policy: None,
+        updated_by_user_id: None, updated_at: run_ts(now()),
+    }).await.unwrap().unwrap();
+    // Trigger admission denies without a fire-counter increment or a run.
+    engine.fire_matched_rule_at(&rule, "task_created", &fields(), now()).await;
+    assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 0);
+    let history = h.store.list_history(Some("r"), 100).await.unwrap();
+    assert_eq!(history[0].result, "scope_denied");
+    assert_eq!(history[0].details.as_deref(), Some("department_scope_unavailable"));
+    // Direct admission represents a persisted run awaiting the executor check.
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.assert_outcome("scope_denied", 0).await;
+    assert_eq!(run.detail.as_deref(), Some("department_scope_unavailable"));
+}
+
+#[tokio::test]
+async fn unknown_persisted_run_state_settles_unsupported() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.run().await;
+    h.corrupt_run(&run.run_id, "state", "future_state");
+    h.acquire();
+    engine.resume_runs_once(now()).await.unwrap();
+    h.assert_outcome("unsupported_state", 0).await;
+}
+
+#[tokio::test]
+async fn unreadable_frozen_fields_fail_closed() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    h.corrupt_run(&h.run().await.run_id, "fields_json", "[]");
+    h.acquire();
+    engine.resume_runs_once(now()).await.unwrap();
+    h.assert_outcome("fields_unreadable", 0).await;
+}
+
+#[tokio::test]
+async fn deterministic_queue_id_requires_same_target() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let id = runs::queue_id("test", 0);
+    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
+    engine.enqueue_prompt_with_id("plain", "one", None, Some(&id), now()).await.unwrap();
+    assert!(engine.enqueue_prompt_with_id("other", "two", None, Some(&id), now()).await.is_err());
+    assert_eq!(h.queued().await.len(), 1);
+}
+
+#[tokio::test]
+async fn recovery_queue_target_mismatch_fails_closed() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine();
+    let run = h.waiting(&engine).await;
+    let started = now() + ChronoDuration::seconds(61);
+    assert!(h.store.claim_run(&run.run_id, "crashed", started).await.unwrap());
+    assert!(h.store.mark_step_running(&run.run_id, 2, "crashed", started).await.unwrap());
+    engine.enqueue_prompt_with_id("plain", "wrong recipient", None, Some(&runs::queue_id(&run.run_id, 2)), started).await.unwrap();
+    engine.resume_runs_once(started + ChronoDuration::seconds(61)).await.unwrap();
+    h.assert_outcome("step_failed", 2).await;
+    assert!(h.queued().await.iter().all(|m| m.target == "plain"));
+}
+
+#[tokio::test]
+async fn proactive_suppression_skips_step_and_continues() {
+    let h = Harness::new();
+    h.acquire();
+    let engine = h.engine(); // No proactive gate wired: normal suppression.
+    let rule = h.rule(json!({"type":"steps","steps":[
+        {"type":"proactive_notify","channel":"test","chat_id":"admin","text":"suppressed"},
+        {"type":"delegate","target_agent":"plain","prompt":"continue"}
+    ]})).await;
+    engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+    let run = h.assert_outcome("completed", 1).await;
+    let steps = h.store.list_run_steps(&run.run_id).await.unwrap();
+    assert_eq!(steps[0].state, "skipped");
+    assert!(h.store.list_history(Some("r"), 100).await.unwrap().iter().any(|r| r.result == "step_skipped"));
+}
+
+#[tokio::test]
+async fn later_step_rechecks_global_target_and_event_autonomy() {
+    for paused in [None, Some("other"), Some("plain")] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        let rule = h.rule(flow()).await;
+        let mut fields = fields();
+        fields.insert("agent_id".into(), json!("plain"));
+        engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+        assert_eq!(h.run().await.state, RUN_WAITING);
+        duduclaw_core::autonomy_gate::set_pause(&h.home, paused, "test pause", "admin").unwrap();
+        engine.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+        h.assert_outcome("autonomy_paused", 1).await;
+    }
+}
+
+#[tokio::test]
+async fn run_skill_recovery_reconciles_or_requeues_once() {
+    for sent in [true, false] {
+        let h = Harness::new();
+        let engine = h.engine();
+        let rule = h.rule(json!({"type":"steps","steps":[{
+            "type":"run_skill","target_agent":"plain","skill_name":"test"
+        }]})).await;
+        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        let run = h.run().await;
+        h.acquire();
+        assert!(h.store.claim_run(&run.run_id, "crashed", now()).await.unwrap());
+        assert!(h.store.mark_step_running(&run.run_id, 0, "crashed", now()).await.unwrap());
+        let id = runs::queue_id(&run.run_id, 0);
+        if sent {
+            engine.enqueue_prompt_with_id("plain", "frozen skill prompt", None, Some(&id), now()).await.unwrap();
+        }
+        let restarted = h.engine();
+        restarted.resume_runs_once(now() + ChronoDuration::seconds(61)).await.unwrap();
+        restarted.resume_runs_once(now() + ChronoDuration::seconds(62)).await.unwrap();
+        h.assert_outcome("completed", 1).await;
+        assert_eq!(h.queued().await[0].id, id);
+    }
+}
+
+#[tokio::test]
+async fn oversized_fields_do_not_create_or_count_run() {
+    let h = Harness::new();
+    let engine = h.engine();
+    let rule = h.rule(flow()).await;
+    let mut fields = fields();
+    fields.insert("oversized".into(), json!("x".repeat(crate::autopilot_approval::MAX_FROZEN_PAYLOAD_BYTES)));
+    engine.start_run(&rule, "task_created", &fields, now()).await.unwrap();
+    assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+    assert_eq!(h.store.get_rule("r").await.unwrap().unwrap().trigger_count, 0);
+    let history = h.store.list_history(Some("r"), 100).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].result, "fields_too_large");
+    assert!(h.queued().await.is_empty());
+}
+
+#[tokio::test]
+async fn malformed_stored_steps_fail_closed() {
+    for action in [
+        json!({"type":"steps","steps":[]}),
+        json!({"type":"steps","steps":[{"type":"future_action"}]}),
+        json!({"type":"steps","steps":[{"type":"wait","minutes":1}]}),
+        json!({"type":"steps","require_approval":true,"steps":[
+            {"type":"delegate","target_agent":"plain","prompt":"never"}]}),
+    ] {
+        let h = Harness::new();
+        h.acquire();
+        let engine = h.engine();
+        let rule = h.rule(action).await;
+        engine.start_run(&rule, "task_created", &fields(), now()).await.unwrap();
+        assert!(h.store.list_runs_for_rule("r", 100).await.unwrap().is_empty());
+        assert_eq!(h.store.list_history(Some("r"), 100).await.unwrap()[0].result, "invalid_action");
+        assert!(h.queued().await.is_empty());
+    }
+}

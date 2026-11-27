@@ -274,6 +274,7 @@ pub mod autopilot_engine;
 pub mod autopilot_fields;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
+pub mod autopilot_scope;
 pub mod autopilot_store;
 pub mod autopilot_template;
 pub mod autopilot_window;

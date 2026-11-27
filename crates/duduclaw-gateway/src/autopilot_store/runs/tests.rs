@@ -414,3 +414,58 @@ fn run_states_are_closed_and_timestamps_have_fixed_precision() {
     assert_eq!(run_ts(now()), "2026-11-27T00:00:00.000Z");
     assert!(run_ts(now()) < run_ts(now() + Duration::milliseconds(1)));
 }
+
+#[tokio::test]
+async fn reset_running_step_requires_current_live_lease() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "r", 2).await;
+    assert!(store.claim_run("r", "old", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "old", now()).await.unwrap());
+    assert!(store.mark_step_running("r", 0, "old", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "other", now()).await.unwrap());
+    assert!(!store.reset_running_step("r", 1, "old", now()).await.unwrap());
+    let later = now() + Duration::seconds(RUN_LEASE_SECS + 1);
+    assert!(!store.reset_running_step("r", 0, "old", later).await.unwrap());
+    assert!(store.reclaim_expired_run("r", "new", later).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "old", later).await.unwrap());
+    assert!(store.reset_running_step("r", 0, "new", later).await.unwrap());
+    let steps = store.list_run_steps("r").await.unwrap();
+    assert_eq!(steps[0].state, STEP_PENDING);
+    assert!(steps[0].started_at.is_none());
+    assert!(store.mark_step_running("r", 0, "new", later).await.unwrap());
+    assert!(store.complete_step("r", "new", 0, STEP_DONE, None, None,
+        RunNext::Continue { step_index: 1 }, later).await.unwrap());
+    assert!(!store.reset_running_step("r", 0, "new", later).await.unwrap());
+}
+
+#[tokio::test]
+async fn unsupported_run_scan_excludes_known_reserved_states() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "bad", 1).await;
+    insert(&store, "reserved", 1).await;
+    insert(&store, "pending", 1).await;
+    {
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE autopilot_runs SET state='future' WHERE run_id='bad'", []).unwrap();
+        conn.execute("UPDATE autopilot_runs SET state='deferred' WHERE run_id='reserved'", []).unwrap();
+    }
+    let rows = store.list_unsupported_runs(50).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].run_id, "bad");
+    assert!(store.list_unsupported_runs(0).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn duplicate_run_at_capacity_is_not_a_limit_rejection() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    for i in 0..MAX_UNSETTLED_RUNS_PER_RULE {
+        insert(&store, &format!("r{i}"), 1).await;
+    }
+    let (mut replay, steps) = run("replay", "rule", 1);
+    replay.dedupe_key = "dedupe:r0".into();
+    assert_eq!(store.insert_run(&replay, &steps, now()).await.unwrap(), RunInsertOutcome::Duplicate);
+    assert!(store.get_run("replay").await.unwrap().is_none());
+}

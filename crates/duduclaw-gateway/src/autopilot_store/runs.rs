@@ -165,6 +165,11 @@ impl AutopilotStore {
             if steps.iter().any(|s| !matches!(s.state.as_str(), STEP_PENDING | STEP_RUNNING | STEP_DONE | STEP_FAILED | STEP_SKIPPED)) {
                 return Err("unsupported initial step state".into());
             }
+            // A replay consumes no capacity, even when the rule is already at
+            // its limit. Keep this read inside the same immediate transaction.
+            let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM autopilot_runs WHERE dedupe_key=?1)",
+                params![run.dedupe_key], |r| r.get(0)).map_err(|e| format!("check run dedupe: {e}"))?;
+            if exists { return Ok(RunInsertOutcome::Duplicate); }
             if count_unsettled(conn, Some(&run.rule_id))? >= MAX_UNSETTLED_RUNS_PER_RULE {
                 return Ok(RunInsertOutcome::RuleLimit);
             }
@@ -244,6 +249,19 @@ impl AutopilotStore {
             ORDER BY lease_until ASC, run_id ASC LIMIT ?2", now, limit)
     }
 
+    /// Unknown states are not due/expired candidates, but must not remain stranded.
+    pub async fn list_unsupported_runs(&self, limit: i64) -> Result<Vec<AutopilotRunRow>, String> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM autopilot_runs
+            WHERE state NOT IN ('pending','running','waiting','awaiting_approval','deferred','settled')
+            ORDER BY created_at, run_id LIMIT ?1"))
+            .map_err(|e| format!("prepare unsupported runs: {e}"))?;
+        let rows = stmt.query_map(params![limit.max(0)], row_to_run)
+            .map_err(|e| format!("query unsupported runs: {e}"))?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| format!("read unsupported runs: {e}"))?;
+        Ok(rows)
+    }
+
     pub async fn claim_run(&self, run_id: &str, lease_owner: &str, now: DateTime<Utc>) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let n = conn.execute("UPDATE autopilot_runs SET state='running', lease_owner=?1, lease_until=?2, updated_at=?3
@@ -271,6 +289,18 @@ impl AutopilotStore {
                 AND state='running' AND lease_owner=?4 AND lease_until>=?1)",
             params![run_ts(now), run_id, step_index, lease_owner])
             .map_err(|e| format!("mark step running: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// Retry only the current running step under a live, reclaimed lease.
+    pub async fn reset_running_step(&self, run_id: &str, step_index: i64, lease_owner: &str, now: DateTime<Utc>) -> Result<bool, String> {
+        let conn = self.conn.lock().await;
+        let n = conn.execute("UPDATE autopilot_run_steps SET state='pending', started_at=NULL
+            WHERE run_id=?1 AND step_index=?2 AND state='running'
+            AND EXISTS (SELECT 1 FROM autopilot_runs WHERE run_id=?1 AND step_index=?2
+                AND state='running' AND lease_owner=?3 AND lease_until>=?4)",
+            params![run_id, step_index, lease_owner, run_ts(now)])
+            .map_err(|e| format!("reset running step: {e}"))?;
         Ok(n == 1)
     }
 
