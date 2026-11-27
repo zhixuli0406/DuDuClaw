@@ -372,6 +372,18 @@ impl UserDb {
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
+        crate::chat_link::migrate(&conn)?;
+
+        // RM-143: old bindings retain their existing uses, without self-proof.
+        for (column, kind) in [
+            ("proof_method", "TEXT"), ("proof_user_id", "TEXT"),
+            ("proven_at", "INTEGER"), ("proof_account", "TEXT"), ("proof_dm", "TEXT"),
+        ] {
+            if !has_column(&conn, "channel_identities", column)? {
+                conn.execute(&format!("ALTER TABLE channel_identities ADD COLUMN {column} {kind}"), [])
+                    .map_err(|e| format!("failed to migrate channel identity proof: {e}"))?;
+            }
+        }
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
