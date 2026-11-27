@@ -464,6 +464,8 @@ pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<S
 /// The queue row of one goal round with the given message id.
 pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id,
         sender: "goal-loop-driver".to_string(),
         target: task.assigned_to.clone(),

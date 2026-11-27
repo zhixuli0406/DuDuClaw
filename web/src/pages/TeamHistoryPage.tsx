@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useSelectableAgents, useVisibleAgents, useAgentVisibilityUnrestricted } from '@/lib/data-scope';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl, type IntlShape } from 'react-intl';
@@ -11,6 +12,7 @@ import { cn } from '@/lib/utils';
 /** Content is rendered as plain React text. No Markdown renderer, embedded
  * media, download URL, shared chat store or resumable conversation is used. */
 export function TeamHistoryPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const [query] = useSearchParams();
   const [team, setTeam] = useState<MyTeam | null>(null);
@@ -191,7 +193,7 @@ export function TeamHistoryPage() {
 
 function formatDate(value: string, locale: string) {
   const stamp = new Date(value);
-  return Number.isNaN(stamp.getTime()) ? '' : stamp.toLocaleString(locale);
+  return Number.isNaN(stamp.getTime()) ? '' : formatDateTime(stamp, { locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 }
 
 /** Only translate the server's masked-title markers. An own conversation's

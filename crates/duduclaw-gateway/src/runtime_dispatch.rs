@@ -377,6 +377,9 @@ pub(crate) async fn run_claude_runtime_fallback(
 async fn run_agent_prompt_scoped(
     req: AgentPrompt<'_>, primary_error: Option<&str>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    // Direct dispatch callers also need the marker; Chat preserves the
+    // WebChat/shared-member scope (or the absence of one for ordinary channels).
+    let dispatch = req.request_type == RequestType::Dispatch;
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -385,7 +388,7 @@ async fn run_agent_prompt_scoped(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    crate::process_group::with_class(crate::process_group::request_class(req.request_type),
+    let run = Box::pin(crate::process_group::with_class(crate::process_group::request_class(req.request_type),
     crate::autonomous_runtime::request_scope(
         req.home_dir,
         &owner,
@@ -400,7 +403,14 @@ async fn run_agent_prompt_scoped(
                 crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req, primary_error)),
             ),
         ),
-    )).await
+    )));
+    if dispatch {
+        crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+            crate::on_behalf_of::access::MainUse::Assign, run,
+        ).await
+    } else {
+        run.await
+    }
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.

@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Brain, Info, Loader2, Trash2, TriangleAlert } from 'lucide-react';
@@ -87,6 +88,7 @@ const SELECT_CLASS =
   'h-11 min-w-0 flex-1 rounded-lg border border-input bg-transparent px-3 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 md:h-9 md:flex-none md:min-w-40 dark:bg-input/30';
 
 export function MyMemoryPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const t = useCallback(
     (key: string, values?: Record<string, string | number>) => intl.formatMessage({ id: `myMemory.${key}` }, values),
@@ -183,16 +185,26 @@ export function MyMemoryPage() {
     const d = new Date(iso);
     if (Number.isNaN(d.getTime())) return '';
     const now = new Date();
-    const sameDay = (a: Date, b: Date) => a.toDateString() === b.toDateString();
-    const yesterday = new Date(now);
-    yesterday.setDate(now.getDate() - 1);
-    const hm = d.toLocaleTimeString(intl.locale, { hour: '2-digit', minute: '2-digit', hour12: false });
-    if (sameDay(d, now)) return t('time.today', { time: hm });
-    if (sameDay(d, yesterday)) return t('time.yesterday', { time: hm });
-    const date = d.toLocaleDateString(intl.locale, {
+    const calendarOptions: Intl.DateTimeFormatOptions = {
+      calendar: 'iso8601', numberingSystem: 'latn',
+      year: 'numeric', month: 'numeric', day: 'numeric',
+    };
+    const dayKey = (value: Date, zone?: string) => formatDateTime(value, {
+      ...calendarOptions, locale: 'en-US', zone,
+    });
+    const year = (value: Date) => formatDateTime(value, {
+      locale: 'en-US', calendar: 'iso8601', numberingSystem: 'latn', year: 'numeric',
+    });
+    const month = formatDateTime(now, { locale: 'en-US', numberingSystem: 'latn', month: 'numeric' });
+    const day = formatDateTime(now, { locale: 'en-US', numberingSystem: 'latn', day: 'numeric' });
+    const yesterday = new Date(Date.UTC(Number(year(now)), Number(month) - 1, Number(day) - 1));
+    const hm = formatDateTime(d, { locale: intl.locale, hour: '2-digit', minute: '2-digit', hour12: false });
+    if (dayKey(d) === dayKey(now)) return t('time.today', { time: hm });
+    if (dayKey(d) === dayKey(yesterday, 'UTC')) return t('time.yesterday', { time: hm });
+    const date = formatDateTime(d, { locale: intl.locale,
       month: '2-digit',
       day: '2-digit',
-      ...(d.getFullYear() !== now.getFullYear() ? { year: 'numeric' as const } : {}),
+      ...(year(d) !== year(now) ? { year: 'numeric' as const } : {}),
     });
     return `${date} ${hm}`;
   };

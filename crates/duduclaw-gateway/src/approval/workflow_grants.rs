@@ -175,7 +175,7 @@ pub struct GrantRevocation {
     pub executing_operations: Vec<String>,
 }
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 mod migration;
 

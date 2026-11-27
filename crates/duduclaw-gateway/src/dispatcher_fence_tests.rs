@@ -287,6 +287,8 @@ async fn queued_message_with_intent_still_intended_runs_exactly_once() {
     };
     assert_eq!(intent.state, "intended");
     let msg = QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: intent.intent_id.clone(),
         sender: "goal-loop-driver".into(),
         target: "alice".into(),
@@ -340,6 +342,8 @@ async fn queued_message_with_intent_still_intended_runs_exactly_once() {
 
 fn plain_goal_message(id: &str, task_id: &str) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: id.into(),
         sender: "goal-loop-driver".into(),
         target: "alice".into(),
@@ -1434,4 +1438,69 @@ fn downstream_spawn_marker_survives_coalescing_without_changing_legacy_rows() {
     assert!(!merged[0].spawned);
     assert!(merged[1].spawned);
     assert_eq!(merged[1].coalesced_ids, vec!["child-2"]);
+}
+
+#[tokio::test]
+async fn queued_department_work_is_checked_again_before_dispatch() {
+    use crate::dept_grants::rules::runtime_tests::{employee, rule};
+    for case in ["same", "moved", "disabled", "removed", "changed", "missing_id", "odd_sender", "main", "default", "personal", "unreadable", "legacy"] {
+        let rig = Rig::new().await;
+        employee(rig.dir.path(), "alice", "sales");
+        rig.registry.write().await.scan().await.unwrap();
+        let store = crate::autopilot_store::AutopilotStore::open(rig.dir.path()).unwrap();
+        let row = rule(serde_json::json!({"type":"delegate", "target_agent":"alice", "prompt":"work"}));
+        store.insert_rule(&row).await.unwrap();
+        let mut msg = plain_goal_message("department-message", "unused");
+        msg.sender = "autopilot".into();
+        msg.sender_agent = Some("autopilot".into());
+        msg.origin_agent = Some("autopilot".into());
+        msg.payload = "work".into();
+        msg.on_behalf_of = Some("user:owner".into());
+        msg.autopilot_department = Some("sales".into());
+        msg.autopilot_rule_id = Some(row.id.clone());
+        if case == "missing_id" { msg.autopilot_rule_id = None; }
+        if case == "odd_sender" { msg.sender = "workflow".into(); msg.sender_agent = None; }
+        if case == "legacy" { msg.autopilot_department = None; msg.autopilot_rule_id = None; }
+        rig.queue.enqueue(&msg).await.unwrap();
+        if matches!(case, "moved" | "odd_sender" | "legacy") { employee(rig.dir.path(), "alice", "mfg"); }
+        match case {
+            "main" => {
+                let path = rig.dir.path().join("agents/alice/agent.toml");
+                let raw = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(path, raw.replace("specialist", "main")).unwrap();
+            }
+            "default" => {
+                let path = rig.dir.path().join("config.toml");
+                let raw = std::fs::read_to_string(&path).unwrap();
+                std::fs::write(path, format!("{raw}\n[general]\ndefault_agent = 'alice'\n")).unwrap();
+            }
+            "personal" => {
+                rusqlite::Connection::open(rig.dir.path().join("users.db")).unwrap().execute(
+                    "INSERT INTO isolation_personal_agents(agent_name,owner_user_id,created_at) VALUES('alice','owner','now')",
+                    []).unwrap();
+            }
+            "unreadable" => { std::fs::write(rig.dir.path().join("org.toml"), "[broken").unwrap(); }
+            _ => {}
+        }
+        let conn = rusqlite::Connection::open(rig.dir.path().join("autopilot.db")).unwrap();
+        match case {
+            "disabled" => { conn.execute("UPDATE autopilot_rules SET enabled=0", []).unwrap(); }
+            "removed" => { conn.execute("DELETE FROM autopilot_rules", []).unwrap(); }
+            "changed" => { conn.execute("UPDATE autopilot_rules SET owner_department='mfg'", []).unwrap(); }
+            _ => {}
+        }
+        model_call_probe::set_dry_run(true);
+        let before = model_call_probe::calls();
+        rig.poll().await;
+        model_call_probe::set_dry_run(false);
+        let stored = rig.queue.get_by_id(&msg.id).await.unwrap().unwrap();
+        if matches!(case, "same" | "legacy") {
+            assert_eq!(model_call_probe::calls(), before + 1, "{case}");
+            assert_eq!(stored.status, MessageStatus::Done, "{case}");
+        } else {
+            assert_eq!(model_call_probe::calls(), before, "{case}");
+            assert_eq!(stored.status, MessageStatus::Failed, "{case}");
+            assert_eq!(stored.error.as_deref(), Some(AUTOPILOT_SCOPE_DENIED), "{case}");
+        }
+    }
 }

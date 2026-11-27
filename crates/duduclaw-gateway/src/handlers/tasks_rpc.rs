@@ -244,18 +244,21 @@ impl MethodHandler {
         // Goal-scoped callers (the `/goals` page) filter server-side so the
         // whole board never crosses the wire just to keep the goal rows.
         let goal_mode = params.get("goal_mode").and_then(|v| v.as_bool());
+        let principal = format!("user:{}", reader.live().user_id);
         let result = match limit {
             Some(limit) => store.list_tasks_filtered_bounded(status, agent_id, priority, goal_mode, limit,
-                |id, assignee| !reader.hides(assignee)
-                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), id)
+                &principal, |assignee| !reader.hides(assignee)
             ).await,
-            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await,
+            None => store.list_tasks_filtered(status, agent_id, priority, goal_mode).await
+                .map(|rows| (rows, false)),
         };
         match result {
-            Ok(rows) => {
-                let rows: Vec<_> = rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
-                    && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
-                ).collect();
+            Ok((rows, more_may_exist)) => {
+                let rows = if limit.is_none() {
+                    rows.into_iter().filter(|r| !reader.hides(&r.assigned_to)
+                        && task_privacy::a2a_owner_allows(&self.home_dir, reader.live(), &r.id)
+                    ).collect()
+                } else { rows };
                 // E8 reverse handoff: "在 <通道> 中開啟" — resolve from the
                 // `/goal` entry point's stamped source conversation
                 // (`source_channel`/`source_chat_id`, P5 write-back). No
@@ -274,7 +277,11 @@ impl MethodHandler {
                 }
                 self.set_goal_cost_fields(&store, &reader, &rows, &mut tasks)
                     .await;
-                WsFrame::ok_response("", json!({ "tasks": tasks }))
+                let mut response = json!({ "tasks": tasks });
+                if limit.is_some() && more_may_exist {
+                    response["more_may_exist"] = json!(true);
+                }
+                WsFrame::ok_response("", response)
             }
             Err(e) => WsFrame::error_response("", &format!("list tasks: {e}")),
         }
@@ -437,6 +444,7 @@ impl MethodHandler {
         self.broadcast_event("activity.new", activity_row_to_json(&activity))
             .await;
         self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::gateway(),
             task: task_json.clone(),
         })
         .await;
@@ -584,6 +592,7 @@ impl MethodHandler {
                 self.broadcast_event("task.updated", task_json.clone())
                     .await;
                 self.emit_autopilot_event(crate::autopilot_engine::AutopilotEvent::TaskUpdated {
+                    origin: crate::autopilot_engine::EventOrigin::gateway(),
                     task: task_json.clone(),
                 })
                 .await;
@@ -596,6 +605,7 @@ impl MethodHandler {
                     if prev != new_status {
                         self.emit_autopilot_event(
                             crate::autopilot_engine::AutopilotEvent::TaskStatusChanged {
+                                origin: crate::autopilot_engine::EventOrigin::gateway(),
                                 task_id: task_id.to_string(),
                                 from: prev.to_string(),
                                 to: new_status.to_string(),

@@ -317,3 +317,25 @@ async fn a_one_shot_whose_time_passed_cannot_resume() {
         ManageError::TimePassed
     );
 }
+
+#[tokio::test]
+async fn legacy_null_assign_row_keeps_host_zone() {
+    let dir = tempfile::tempdir().unwrap();
+    let o = org(dir.path());
+    let store = TaskStore::open(dir.path()).unwrap();
+    let mut legacy = weekly_goal("Legacy");
+    legacy.timezone = None;
+    let schedule = legacy.spec.clone();
+    let row = create(dir.path(), &store, &who(&o.mgr, false), legacy, now()).await.unwrap();
+    std::fs::write(dir.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+    let saved = store.get_assign_schedule(&row.id).await.unwrap().unwrap();
+    assert_eq!(saved.timezone, None);
+    let zone = Zone::parse(saved.timezone.as_deref()).unwrap();
+    assert_eq!(zone, Zone::Local);
+    assert_eq!(crate::assign_schedule::spec::parse_utc(saved.next_fire_at.as_deref().unwrap()), schedule.next_after(now(), Zone::Local));
+    let later = now() + chrono::Duration::days(8);
+    let creator = who(&o.mgr, false);
+    manage(dir.path(), &store, &creator, &row.id, ManageAction::Pause, later).await.unwrap();
+    let resumed = manage(dir.path(), &store, &creator, &row.id, ManageAction::Resume, later).await.unwrap();
+    assert_eq!(crate::assign_schedule::spec::parse_utc(resumed.next_fire_at.as_deref().unwrap()), schedule.next_after(later, Zone::Local));
+}

@@ -119,21 +119,21 @@ pub(crate) fn card_body(rec: &ApprovalRecord) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use super::super::{ApprovalBroker, ApprovalId, ExecutionBinding, payload_hash, policy_revision,
         action_grant::verify_and_consume};
     use serde_json::json;
 
-    struct Fixture {
-        home: tempfile::TempDir,
-        db: duduclaw_auth::UserDb,
-        uid: String,
-        broker: ApprovalBroker,
+    pub(crate) struct Fixture {
+        pub(crate) home: tempfile::TempDir,
+        pub(crate) db: duduclaw_auth::UserDb,
+        pub(crate) uid: String,
+        pub(crate) broker: ApprovalBroker,
         context: DecisionContext,
     }
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let home = tempfile::tempdir().unwrap();
             std::fs::create_dir_all(home.path().join("agents/alice")).unwrap();
             std::fs::write(home.path().join("agents/alice/agent.toml"), "[capabilities]\n").unwrap();
@@ -147,7 +147,7 @@ mod tests {
                 conversation_id: "human".into(), principal_id: "human".into(),
             } }
         }
-        async fn request(&self, tool: &str) -> (ApprovalId, ActionGrant) {
+        pub(crate) async fn request(&self, tool: &str) -> (ApprovalId, ActionGrant) {
             let mut payload = json!({"name":tool, "arguments":{
                 "to":"recipient@example.com", "subject":"A real subject", "body":"Mail body"},
                 "egress_guard":{"sources":["memory_read"], "recipient_guard":{"reason":"outside_allowed_recipients"}}});
@@ -252,7 +252,7 @@ mod tests {
             assert!(!eligible(f.home.path(), &rec));
             assert!(crate::approval_notify::is_dashboard_only_record(Some(f.home.path()), &rec));
             for reminder in [false, true] {
-                let notice = crate::approval_notify::dashboard_only_notice_body(&rec, reminder);
+                let notice = crate::approval_notify::dashboard_only_notice_body(f.home.path(), &rec, reminder);
                 for secret in ["recipient@example.com", "A real subject", "Mail body"] { assert!(!notice.contains(secret)); }
             }
             assert!(f.broker.decide_bound(&id, &context, true).await.is_err());

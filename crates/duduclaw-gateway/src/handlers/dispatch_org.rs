@@ -102,7 +102,9 @@ impl MethodHandler {
         }
 
         match method {
-            "google.drive_write.get" | "google.drive_write.set" => {
+            "google.drive_write.get" | "google.drive_write.set"
+            | "google.drive_write.consent_home_start" | "google.drive_write.consent_home_disconnect"
+            | "google.drive_write.consent_home_finish" | "google.drive_write.consent_home_paste" => {
                 require_admin!();
                 boxed_frame(|| self.handle_google_drive_write_rpc(method, params, ctx)).await
             }
@@ -850,7 +852,11 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", "id is required");
                 }
-                boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                if method == "approvals.get" {
+                    boxed_frame(|| self.handle_approvals_get(params, ctx)).await
+                } else {
+                    boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                }
             }
             "approvals.decide" => {
                 require_manager!();
@@ -945,14 +951,13 @@ impl MethodHandler {
                 boxed_frame(|| self.handle_budget_incidents(params, ctx)).await
             }
 
-            // ── Autopilot (admin only) ──────────────────────
+            // ── Autopilot (department-scoped rules; admin-only breakers) ──────────────────────
             "autopilot.breakers" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_breakers()).await
             }
             "autopilot.list" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_list()).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
 
             _ => boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await,

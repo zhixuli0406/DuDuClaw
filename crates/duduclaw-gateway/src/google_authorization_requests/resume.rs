@@ -7,7 +7,13 @@ use super::{store::{Store,Request,REFUSED},validate};
 fn ready(home:&Path,db:&duduclaw_auth::UserDb,row:&Request,receipt:&Value) -> Result<(),String> {
     validate(home,db,row)?;
     if db.google_consent(&row.user,&row.agent)?!=Some(true) { return Err(REFUSED.into()); }
-    if row.mode=="oauth" {
+    if row.purpose=="drive_write" {
+        let metadata=super::write_metadata(home,row)?;
+        if receipt["purpose"]!="drive_write"
+            || receipt["credential_id"].as_str()!=Some(metadata.credential_id.as_str())
+            || receipt["sub"].as_str()!=Some(metadata.google_sub.as_str())
+            || receipt["email"].as_str()!=Some(metadata.account_email.as_str()) { return Err(REFUSED.into()); }
+    } else if row.mode=="oauth" {
         let record=crate::person_credentials::get(home,&row.user)?.ok_or(REFUSED)?;
         if receipt["credential_id"].as_str()!=Some(record.metadata.credential_id.as_str())
             || receipt["sub"].as_str()!=Some(record.metadata.google_sub.as_str())

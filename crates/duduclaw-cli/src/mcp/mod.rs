@@ -219,10 +219,15 @@ mod messaging;
 mod notion_github;
 mod odoo;
 mod odoo_access;
+mod odoo_actor;
 #[cfg(test)]
 mod odoo_access_tests;
 pub(crate) mod odoo_identity_client;
 mod odoo_generic_write;
+mod odoo_attachment;
+pub(crate) use odoo_attachment::odoo_attachment_precheck;
+mod odoo_writeback;
+pub(crate) use odoo_writeback::odoo_writeback_precheck;
 mod on_behalf_of;
 pub(crate) mod main_principal_gate;
 mod os_tools;

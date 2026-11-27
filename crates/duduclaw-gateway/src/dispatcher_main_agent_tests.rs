@@ -44,6 +44,8 @@ impl Fixture {
 
     fn message(&self, principal: Option<&str>, target: &str, sender: &str) -> QueueMessage {
         QueueMessage {
+            autopilot_department: None,
+            autopilot_rule_id: None,
             id: uuid::Uuid::new_v4().to_string(), sender: sender.into(), target: target.into(),
             payload: "work".into(), status: MessageStatus::Pending, retry_count: 0,
             delegation_depth: 1, origin_agent: Some(sender.into()), sender_agent: Some(sender.into()),

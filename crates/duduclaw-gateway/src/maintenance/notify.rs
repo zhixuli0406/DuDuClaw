@@ -7,7 +7,7 @@
 //! maintenance notice is neither a decision nor something to hold back (its
 //! whole value is reaching the Admin while the window is open).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -140,12 +140,10 @@ impl AdminNotifier for UserDbAdminNotifier {
 
 // ── Notice texts (zh-TW, like every other channel notice) ──
 
-fn local_time(rfc3339: &str) -> String {
+fn local_time(home: &Path, rfc3339: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
         .map(|t| {
-            t.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
+            duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), t.with_timezone(&chrono::Utc), "%Y-%m-%d %H:%M")
         })
         .unwrap_or_else(|_| rfc3339.to_string())
 }
@@ -154,6 +152,7 @@ fn local_time(rfc3339: &str) -> String {
 /// technician can check them over a channel a same-network attacker cannot
 /// rewrite (M8).
 pub fn opened_text(
+    home: &Path,
     opened_by: &str,
     expires_at: &str,
     key_fingerprint: &str,
@@ -176,7 +175,7 @@ pub fn opened_text(
          技術人員的金鑰指紋：{key_fingerprint}{label}\n\
          本機指紋：{host}\n\
          請和技術人員核對這兩個指紋。如果不是你開啟的，請立刻到儀表板關閉維修模式。",
-        expires = local_time(expires_at),
+        expires = local_time(home, expires_at),
     )
 }
 
@@ -215,11 +214,22 @@ pub fn reauth_locked_text(email: &str, minutes: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn local_time_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let ts = "2026-11-27T01:30:00Z";
+        assert_eq!(super::local_time(home.path(), ts), "2026-11-27 01:30 UTC");
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert_eq!(super::local_time(home.path(), ts), "2026-11-27 09:30 CST");
+        assert_eq!(super::local_time(home.path(), "bad timestamp"), "bad timestamp");
+    }
     use super::*;
 
     #[test]
     fn opened_text_carries_both_fingerprints_and_the_opener() {
+        let home = tempfile::tempdir().unwrap();
         let text = opened_text(
+            home.path(),
             "admin@local",
             "2026-10-16T10:00:00+00:00",
             "SHA256:key",

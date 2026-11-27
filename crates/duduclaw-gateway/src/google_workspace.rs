@@ -808,7 +808,7 @@ pub use crate::google_identity::home_source::{get_valid_google_token, get_valid_
 /// every Google REST call to a local mock named by
 /// `DUDUCLAW_LIVE_TEST_GOOGLE_API_BASE` (`https://gmail.googleapis.com/x` →
 /// `<base>/gmail.googleapis.com/x`).
-fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn effective_url(url: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(test)]
     {
         if let Some(base) = test_api_base::SCOPED.try_with(Clone::clone).ok()

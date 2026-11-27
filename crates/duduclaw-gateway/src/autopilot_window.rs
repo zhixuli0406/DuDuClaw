@@ -78,24 +78,12 @@ pub fn validate_window_for_save(window: &Value, company_tz: Option<&str>) -> Res
 }
 
 pub fn read_company_timezone(home: &Path) -> Result<Option<Tz>, String> {
-    let text = match std::fs::read_to_string(home.join("config.toml")) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(_) => return Err("cannot read config.toml".into()),
-    };
-    let config: toml::Table = text.parse().map_err(|_| "invalid config.toml")?;
-    let general = match config.get("general") {
-        None => return Ok(None),
-        Some(value) => value.as_table().ok_or("general must be a table")?,
-    };
-    let zone = match general.get("company_timezone") {
-        None => return Ok(None),
-        Some(value) => value.as_str().ok_or("company_timezone must be a string")?,
-    };
-    if zone.trim().is_empty() {
-        return Ok(None);
+    use duduclaw_core::company_timezone::{self, CompanyZone};
+    match company_timezone::read(home) {
+        CompanyZone::Set(zone) => Ok(Some(zone)),
+        CompanyZone::Unset => Ok(None),
+        CompanyZone::Invalid => Err("公司時區設定無效".into()),
     }
-    zone.parse::<Tz>().map(Some).map_err(|_| "invalid company timezone".into())
 }
 
 #[derive(Debug, PartialEq, Eq)]

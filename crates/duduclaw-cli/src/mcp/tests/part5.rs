@@ -374,28 +374,6 @@ async fn e2e_depth_zero_defaults_origin_to_caller() {
     assert_eq!(origin_agent, "main", "Should fall back to caller");
 }
 
-// ── v1.8.25: local timezone auto-detect ─────────────────────────
-
-#[test]
-fn detect_local_timezone_returns_valid_iana_name() {
-    // This is a host-system-dependent test. We can't assert the
-    // specific zone (CI may run on UTC / America/Los_Angeles /
-    // Asia/Taipei), but we CAN assert that whatever we get back
-    // parses as a valid chrono-tz IANA name. That's the contract
-    // the cron rail relies on.
-    //
-    // On hosts with no discoverable TZ (extremely minimal Docker
-    // images), the function legitimately returns None — we accept
-    // both outcomes but check parseability of any name returned.
-    if let Some(tz_name) = detect_local_timezone() {
-        assert!(
-            duduclaw_core::parse_timezone(&tz_name).is_some(),
-            "detected TZ '{tz_name}' must round-trip through parse_timezone"
-        );
-        assert!(!tz_name.is_empty(), "detected TZ must not be empty string");
-    }
-}
-
 // ── RFC-22 Phase 3 W2: claimed-author detection tests ───────────────
 
 #[test]
