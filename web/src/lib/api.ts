@@ -1,3 +1,4 @@
+import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
@@ -9928,12 +9929,16 @@ export const api = {
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
-      client.call('users.me') as Promise<{
+      client.call('users.me') as Promise<MeGrantFields & {
         user: UserInfo;
         bindings: UserAgentBinding[];
         /** Absent on gateways older than v1.73. */
         email_setup?: EmailSetup;
       }>,
+    deptGrants: {
+      mine: (group?: GrantGroup) =>
+        client.call('users.dept_grants.mine', group ? { group } : {}) as Promise<DeptGrantsMineResult>,
+    },
     /** Self-service: the logged-in user changes their OWN login email. */
     changeEmail: (email: string, currentPassword?: string) =>
       client.call('users.change_email', {

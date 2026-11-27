@@ -1,7 +1,7 @@
 import { NavLink, Navigate, Outlet, useLocation } from 'react-router';
 import { useIntl } from 'react-intl';
 import { SettingsIcon } from 'lucide-react';
-import { useAuthStore } from '@/stores/auth-store';
+import { useAuthStore, useDeptGroups } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { hasMinRole } from '@/lib/roles';
@@ -75,7 +75,7 @@ export function ManageShell() {
   const role = useAuthStore((s) => s.user?.role);
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
   // Operator kill switches that hide a rail row (today: Decision Lab).
-  const navCtx = { decisionEnabled: useDecisionEnabled() };
+  const navCtx = { decisionEnabled: useDecisionEnabled(), deptGroups: useDeptGroups() };
 
   // Fail-closed at the shell boundary: no manager+ → never render management.
   if (!hasMinRole(role, 'manager')) return <Navigate to="/" replace />;

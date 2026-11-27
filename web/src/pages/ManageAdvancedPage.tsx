@@ -1,7 +1,7 @@
 import { Link } from 'react-router';
 import { useIntl } from 'react-intl';
 import { ChevronRight, Settings } from 'lucide-react';
-import { useAuthStore } from '@/stores/auth-store';
+import { useAuthStore, useDeptGroups } from '@/stores/auth-store';
 import { useSystemStore } from '@/stores/system-store';
 import { useDecisionEnabled } from '@/hooks/useDecisionEnabled';
 import { filterVisible } from '@/lib/nav-visibility';
@@ -25,6 +25,7 @@ export function ManageAdvancedPage() {
   // index and the rail can never disagree about which surfaces exist.
   const items = filterVisible(manageAdvancedNav, role, isPersonal, {
     decisionEnabled: useDecisionEnabled(),
+    deptGroups: useDeptGroups(),
   });
 
   if (items.length === 0) {

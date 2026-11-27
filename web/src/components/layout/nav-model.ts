@@ -291,8 +291,8 @@ export const navGroups: NavGroup[] = [
       // group exists). Nothing was removed — the board keeps its route, the Home
       // task-summary cards, the mobile action, and ⌘K. The shared visibility
       // policy now hides task destinations while preserving their definitions.
-      // cron.* is admin-only, including listing and templates.
-      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'admin' },
+      // Department managers with schedules grants can also open routines.
+      { to: '/routines', icon: CalendarClock, label: 'nav.routines', desc: 'nav.routines.desc', minRole: 'admin', orGrant: 'schedules' },
       // U4 co-edited plans — shared step lists between the user and an AI employee.
       { to: '/plans', icon: ListChecks, label: 'nav.plans', desc: 'nav.plans.desc', ownScope: true },
       // Goal-loop console (2026-08-14) — assign autonomous goals and intervene
