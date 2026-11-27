@@ -183,6 +183,7 @@ impl MethodHandler {
                         })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
                         "request_kind":r.request_kind,
                         "status":r.status,
+                        "decided_by": viewer_decided_by(r.decided_by.as_deref(), may_decide && (!outbound || full_outbound)),
                         "binding": if may_decide && (!outbound || full_outbound) && r.action_kind != crate::admin_ai::card::ACTION_KIND { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide && (!outbound || full_outbound) { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
@@ -309,10 +310,38 @@ impl MethodHandler {
     }
 }
 
+// Decision attribution follows the same visibility as binding/answer data.
+// Parse chat-admin markers instead of exposing arbitrary channel principal ids.
+fn viewer_decided_by(value: Option<&str>, visible: bool) -> Value {
+    let Some(value) = value.filter(|_| visible) else { return Value::Null; };
+    if value.strip_prefix("dashboard:").is_some_and(|user| !user.is_empty())
+        || value.parse::<crate::approval::chat_admin::ledger::DecidedBy>().is_ok()
+    {
+        json!(value)
+    } else {
+        Value::Null
+    }
+}
+
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
     use crate::handlers::task_privacy_tests::{admin, fixture, ok, payload};
+
+    #[test]
+    fn decision_attribution_preserves_dashboard_and_parsed_chat_only_when_visible() {
+        let user = "14300000-0000-4000-8000-000000000022";
+        for marker in [format!("dashboard:{user}"), format!("chat-admin:{user}:telegram:tap"),
+            format!("chat-admin:{user}:googlechat:web"), format!("chat-admin:{user}:telegram:totp")] {
+            assert_eq!(viewer_decided_by(Some(&marker), true), json!(marker));
+            assert_eq!(viewer_decided_by(Some(&marker), false), Value::Null);
+        }
+        for marker in ["dashboard:", "chat-admin:bad:telegram:tap", "channel:telegram:123456789",
+            "chat-admin:14300000-0000-4000-8000-000000000022:telegram:unknown"] {
+            assert_eq!(viewer_decided_by(Some(marker), true), Value::Null);
+        }
+        assert_eq!(viewer_decided_by(None, true), Value::Null);
+    }
 
     #[tokio::test]
     async fn list_digest_matches_decide_and_mismatch_leaves_pending() {
