@@ -118,7 +118,7 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    update_agent_toml_edit_within(registry, agent_id, None, edit, None, mutate).await
+    update_agent_toml_edit_within(registry, agent_id, None, edit, None, None, mutate).await
 }
 
 /// [`update_agent_toml_edit`] whose `agent.toml` lock waits are bounded by
@@ -136,7 +136,7 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    update_agent_toml_edit_within(registry, agent_id, None, edit, Some(lock_wait), mutate).await
+    update_agent_toml_edit_within(registry, agent_id, None, edit, Some(lock_wait), None, mutate).await
 }
 
 /// [`update_agent_toml_edit`] for an employee whose directory name
@@ -156,7 +156,23 @@ where
     F: FnOnce(&mut toml::Table) -> Result<(), String>,
     G: FnOnce() -> Result<(), String>,
 {
-    update_agent_toml_edit_within(registry, agent_id, Some(dir_id), edit, None, mutate).await
+    update_agent_toml_edit_within(registry, agent_id, Some(dir_id), edit, None, None, mutate).await
+}
+
+/// Internal snapshot-bound edit; the writer compares while holding its locks.
+pub(crate) async fn update_agent_toml_edit_expected<F, G>(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    agent_id: &str,
+    edit: AgentTomlEdit<'_, G>,
+    lock_wait: Option<std::time::Duration>,
+    expected_text_hash: Option<&str>,
+    mutate: F,
+) -> Result<bool, String>
+where
+    F: FnOnce(&mut toml::Table) -> Result<(), String>,
+    G: FnOnce() -> Result<(), String>,
+{
+    update_agent_toml_edit_within(registry, agent_id, None, edit, lock_wait, expected_text_hash, mutate).await
 }
 
 async fn update_agent_toml_edit_within<F, G>(
@@ -165,6 +181,7 @@ async fn update_agent_toml_edit_within<F, G>(
     dir_id: Option<&str>,
     edit: AgentTomlEdit<'_, G>,
     lock_wait: Option<std::time::Duration>,
+    expected_text_hash: Option<&str>,
     mutate: F,
 ) -> Result<bool, String>
 where
@@ -212,13 +229,17 @@ where
         home: &home_dir,
         agent_id: path_id,
         key: crate::agent_files::FileKey::AgentToml,
-        expected_hash: None,
+        expected_hash: expected_text_hash,
         meta: crate::agent_files::writer::CommitMeta::new(edit.user_id, edit.source),
         baseline: crate::agent_files::writer::Baseline::Accept,
     };
     let outcome = crate::agent_files::writer::commit_within(registry, commit, render, edit.guard, lock_wait)
         .await
-        .map_err(|e| e.message())?;
+        .map_err(|e| match e {
+            crate::agent_files::writer::CommitError::Conflict { .. } if expected_text_hash.is_some() =>
+                crate::admin_ai::proposal::STALE.to_string(),
+            other => other.message(),
+        })?;
 
     if outcome.unchanged {
         return Ok(true);

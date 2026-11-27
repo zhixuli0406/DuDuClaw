@@ -202,10 +202,18 @@ fn commit_locked_inner(
             Err(e) => return Ok(Locked::Err(CommitError::Failed(format!("cannot read {}: {e}", c.key.file_name())))),
         };
         let before_hash = super::hash_of(&current);
-        if let Some(expected) = c.expected_hash
-            && expected != before_hash
-        {
-            return Ok(Locked::Err(CommitError::Conflict { current_hash: before_hash }));
+        if let Some(expected) = c.expected_hash {
+            // Admin-AI cards bind the raw effective text, which may be a
+            // resolved artifact. Read it under the same namespace/file locks.
+            let actual = if c.key == FileKey::AgentToml && c.meta.source == "admin_ai" {
+                match crate::admin_ai::route::effective_text(&c.home.join("agents").join(c.agent_id)) {
+                    Ok(text) => crate::admin_ai::proposal::hash_text(&text),
+                    Err(_) => return Ok(Locked::Err(CommitError::Refused(crate::admin_ai::proposal::STALE.into()))),
+                }
+            } else { before_hash.clone() };
+            if expected != actual {
+                return Ok(Locked::Err(CommitError::Conflict { current_hash: actual }));
+            }
         }
         let new = match render(&current) {
             Ok(n) => n,

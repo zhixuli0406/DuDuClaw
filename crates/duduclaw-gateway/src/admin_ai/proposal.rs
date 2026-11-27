@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::{approval::{payload_hash, ConversationAudience}, on_behalf_of::admin_turn::{admin_turn, AdminTurn, AdminTurnLevel}};
 use super::route;
 
-pub(super) type Result<T> = std::result::Result<T, AdminAiRefusal>;
+pub(crate) type Result<T> = std::result::Result<T, AdminAiRefusal>;
 pub(super) fn refused(code: &'static str) -> AdminAiRefusal {
     AdminAiRefusal { code, message: match code {
         "admin_ai_pending_limit" => "已有三張待確認卡，請先到收件匣處理。",
@@ -24,7 +24,50 @@ pub(super) fn refused(code: &'static str) -> AdminAiRefusal {
     }.into() }
 }
 fn failure<T>(_: T) -> AdminAiRefusal { refused("admin_ai_settings_unavailable") }
-pub(super) fn hash_text(text: &str) -> String { hex::encode(Sha256::digest(text.as_bytes())) }
+pub(crate) fn hash_text(text: &str) -> String { hex::encode(Sha256::digest(text.as_bytes())) }
+
+// Shared by proposal, execution and the checks inside the committing locks.
+pub(crate) const STALE: &str = "admin_ai_state_changed";
+pub(crate) fn hash_schedule(row: &crate::cron_store::CronTaskRow) -> Result<String> {
+    Ok(payload_hash(&serde_json::to_value(row).map_err(failure)?))
+}
+pub(crate) fn hash_skills(state: &skill_state::DisabledSkills) -> Result<String> {
+    if state.error().is_some() { return Err(refused(STALE)); }
+    Ok(payload_hash(&json!(state.names())))
+}
+fn canonical_trigger(trigger: &str) -> String { trigger.trim().to_lowercase() }
+pub(crate) fn trigger_namespace(home: &Path) -> Result<BTreeMap<String, String>> {
+    let mut triggers = BTreeMap::new();
+    for entry in std::fs::read_dir(home.join("agents")).map_err(failure)? {
+        let entry = entry.map_err(failure)?;
+        let dir = entry.path();
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| refused(STALE))?;
+        if duduclaw_core::is_internal_agent_dir(name) { continue; }
+        if !std::fs::metadata(&dir).map_err(failure)?.is_dir() { continue; }
+        match std::fs::symlink_metadata(dir.join("agent.toml")) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(failure(e)),
+            Ok(_) => {},
+        }
+        let table = route::effective(&dir).map_err(refused)?;
+        if string_leaf(&table, AdminAiField::Status)? == "terminated" { continue; }
+        let id = table.get("agent").and_then(|a| a.get("name")).and_then(toml::Value::as_str)
+            .ok_or_else(|| refused(STALE))?;
+        let trigger = canonical_trigger(&string_leaf(&table, AdminAiField::Trigger)?);
+        if triggers.insert(id.to_owned(), trigger).is_some() { return Err(refused(STALE)); }
+    }
+    Ok(triggers)
+}
+pub(crate) fn hash_triggers(triggers: &BTreeMap<String, String>) -> String {
+    // BTreeMap binds both ownership and canonical names in stable order.
+    payload_hash(&json!(triggers))
+}
+pub(crate) fn check_live_trigger(home: &Path, id: &str, table: &toml::Table) -> Result<()> {
+    let trigger = table.get("agent").and_then(|a| a.get("trigger")).and_then(toml::Value::as_str)
+        .ok_or_else(|| refused(STALE))?;
+    check_trigger(id, trigger, &trigger_namespace(home)?, &mut BTreeMap::new())
+}
 
 pub(super) struct Prepared {
     pub items: Vec<Value>,
@@ -76,9 +119,9 @@ fn string_leaf(table: &toml::Value, field: AdminAiField) -> Result<String> {
     Ok(leaf(table, field)?.as_str().unwrap_or("").to_owned())
 }
 fn check_trigger(id: &str, trigger: &str, existing: &BTreeMap<String, String>, proposed: &mut BTreeMap<String, String>) -> Result<()> {
-    let key = trigger.to_lowercase();
-    if existing.iter().any(|(other, value)| other != id && value.to_lowercase() == key)
-        || proposed.iter().any(|(other, value)| other != id && value.to_lowercase() == key) {
+    let key = canonical_trigger(trigger);
+    if existing.iter().any(|(other, value)| other != id && canonical_trigger(value) == key)
+        || proposed.iter().any(|(other, value)| other != id && canonical_trigger(value) == key) {
         return Err(refused("admin_ai_duplicate_trigger"));
     }
     proposed.insert(id.to_owned(), trigger.to_owned());
@@ -143,15 +186,9 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
     let policy = crate::product_policy::load(home).map_err(failure)?;
     let models: Vec<Value> = models.into_iter().filter(|row| row["provider"].as_str().is_some_and(|provider|
         policy.require_runtime(provider).is_ok() && policy.require_provider(provider).is_ok())).collect();
-    let mut existing_triggers = BTreeMap::new();
-    if normalized.iter().any(|i| matches!(i.as_item(), Item::AgentField { field: AdminAiField::Trigger | AdminAiField::DisplayName, .. })) {
-        for agent in registry.list() {
-            let table = route::effective(&agent.dir).map_err(refused)?;
-            if string_leaf(&table, AdminAiField::Status)? != "terminated" {
-                existing_triggers.insert(agent.config.agent.name.clone(), string_leaf(&table, AdminAiField::Trigger)?);
-            }
-        }
-    }
+    let changes_names = normalized.iter().any(|i| matches!(i.as_item(),
+        Item::AgentField { field: AdminAiField::Trigger | AdminAiField::DisplayName, .. }));
+    let existing_triggers = if changes_names { trigger_namespace(home)? } else { BTreeMap::new() };
     let explicit_triggers: BTreeMap<_, _> = normalized.iter().filter_map(|i| match i.as_item() {
         Item::AgentField { agent_id, field: AdminAiField::Trigger, value } => Some((agent_id.clone(), value.clone())), _ => None,
     }).collect();
@@ -213,7 +250,7 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
                     .ok_or_else(|| refused("admin_ai_skill_not_installed"))?;
                 let state = skill_state::read_disabled(home, &id);
                 if state.error().is_some() { return Err(refused("admin_ai_skills_unavailable")); }
-                all_hashes.insert(format!("skills:{id}"), payload_hash(&json!(state.names())));
+                all_hashes.insert(format!("skills:{id}"), hash_skills(&state)?);
                 (format!("skill:{id}:{}", skill.to_ascii_lowercase()), format!("技能「{skill}」"), installed["enabled"].clone(), json!(enabled))
             }
             Item::Schedule(Schedule::Create { name, cron, timezone, task, .. }) => {
@@ -240,7 +277,7 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
                     Schedule::Delete { .. } => { after = Value::Null; "刪除排程" }
                     Schedule::Create { .. } => unreachable!(),
                 };
-                all_hashes.insert(format!("schedule:{schedule_id}"), payload_hash(&serde_json::to_value(row).map_err(failure)?));
+                all_hashes.insert(format!("schedule:{schedule_id}"), hash_schedule(row)?);
                 (format!("schedule:{schedule_id}"), label.into(), before, after)
             }
         };
@@ -263,6 +300,9 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
             }
         }
         items.push(entry);
+    }
+    if items.iter().any(|v| matches!(v["item"]["field"].as_str(), Some("trigger" | "display_name"))) {
+        target_hashes.insert("triggers".into(), hash_triggers(&existing_triggers));
     }
     // All field updates invoke the same handler, which aligns even an unchanged
     // preferred model. Refuse an already mismatched model before filing any card.
@@ -292,6 +332,10 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
         }
     }
     for (key, expected) in &target_hashes {
+        if key == "triggers" {
+            if hash_triggers(&trigger_namespace(home)?) != *expected { return Err(refused(STALE)); }
+            continue;
+        }
         let (kind, id) = key.split_once(':').ok_or_else(|| refused("admin_ai_state_changed"))?;
         let actual = match kind {
             "agent" => continue,
@@ -300,12 +344,12 @@ pub(super) async fn prepare(home: &Path, turn: &AdminTurn, proposal: Proposal) -
                 if !route::prompt_only(&row) || store.workflow_binding(id).await.map_err(failure)?.is_some() {
                     return Err(refused("admin_ai_state_changed"));
                 }
-                payload_hash(&serde_json::to_value(row).map_err(failure)?)
+                hash_schedule(&row)?
             }
             "skills" => {
                 let state = skill_state::read_disabled(home, id);
                 if state.error().is_some() { return Err(refused("admin_ai_skills_unavailable")); }
-                payload_hash(&json!(state.names()))
+                hash_skills(&state)?
             }
             _ => return Err(refused("admin_ai_state_changed")),
         };

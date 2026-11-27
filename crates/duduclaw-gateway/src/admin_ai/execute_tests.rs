@@ -294,3 +294,228 @@ async fn grouped_rename_keeps_explicit_trigger_override() {
     let events = f.events("agent_settings_changed");
     assert_eq!(events.iter().filter(|v| v["details"]["approval_id"] == rec.id.as_str()).count(), 1);
 }
+
+impl Fixture {
+    async fn run_after_reverify(&self, rec: &ApprovalRecord, change: impl std::future::Future<Output = ()>) -> Value {
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let proceed = Arc::new(tokio::sync::Notify::new());
+        let run = AFTER_REVERIFY.scope((ready.clone(), proceed.clone()), self.run(rec));
+        let edit = async {
+            ready.notified().await;
+            change.await;
+            proceed.notify_one();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(run, edit)
+        }).await.expect("execution must reach and leave the re-verification barrier");
+        result.unwrap()
+    }
+
+    fn install_skills(&self) {
+        let dir = self.home.path().join("agents/worker/SKILLS");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["report", "summary"] {
+            std::fs::write(dir.join(format!("{name}.md")),
+                format!("---\nname: {name}\ndescription: Reports\n---\nSummarize reports.")).unwrap();
+        }
+    }
+}
+
+fn assert_stale_write_stopped(result: &Value, completed: usize, failed: usize) {
+    assert_eq!(result["reason"], "stale", "{result}");
+    assert_eq!(result["outcome"], if completed == 0 { "voided" } else { "partial" });
+    assert_eq!(result["completed"], completed);
+    assert_eq!(result["items"][failed]["result"], "failed");
+    assert_eq!(result["items"][failed + 1]["result"], "not_executed");
+    assert!(result["message"].as_str().unwrap().contains("設定在確認後被其他人改過"));
+}
+
+#[tokio::test]
+async fn non_target_trigger_taken_before_approval_voids_without_writes() {
+    for (name, value) in [("trigger", "@claimed"), ("display_name", "claimed")] {
+        let f = Fixture::new().await;
+        let before = f.profile("worker");
+        let rec = f.card(vec![field("worker", name, json!(value)), schedule("never-run")]).await;
+        assert!(rec.payload["target_hashes"]["triggers"].is_string());
+        assert!(rec.payload["target_hashes"].get("agent:later").is_none());
+        // Deliberately keep the authority epoch unchanged: only the namespace
+        // snapshot can detect this non-target edit before approval.
+        let mut other: toml::Table = f.profile("later").parse().unwrap();
+        other.get_mut("agent").unwrap().as_table_mut().unwrap()
+            .insert("trigger".into(), toml::Value::String("@CLAIMED".into()));
+        let other = toml::to_string(&other).unwrap();
+        std::fs::write(f.home.path().join("agents/later/agent.toml"), &other).unwrap();
+        f.decide(&rec, true).await;
+        let result = f.run(&rec).await.unwrap();
+        assert_eq!(result["outcome"], "voided");
+        assert_eq!(result["reason"], "stale");
+        assert_eq!(f.profile("worker"), before);
+        assert_eq!(f.profile("later"), other);
+        assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+        assert!(f.events("agent_settings_changed").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn missing_trigger_namespace_hash_fails_closed() {
+    let f = Fixture::new().await;
+    let mut prepared = f.prepared(vec![field("worker", "trigger", json!("@claimed"))]).await;
+    prepared.target_hashes.remove("triggers");
+    let rec = f.card_prepared(prepared).await;
+    f.decide(&rec, true).await;
+    let before = f.profile("worker");
+    assert_eq!(f.run(&rec).await.unwrap()["reason"], "stale");
+    assert_eq!(f.profile("worker"), before);
+}
+
+#[tokio::test]
+async fn trigger_taken_after_reverify_is_refused_inside_agent_writer() {
+    let f = Fixture::new().await;
+    let rec = f.card(vec![field("worker", "trigger", json!("@claimed")), schedule("never-run")]).await;
+    f.decide(&rec, true).await;
+    let before = f.profile("worker");
+    let result = f.run_after_reverify(&rec, async {
+        let ctx = f.users.live_user_context(&f.turn.user_id).unwrap().unwrap();
+        let frame = f.handler.handle_agents_update_as(
+            json!({"agent_id":"later", "trigger":"@CLAIMED"}), Some(&ctx)).await;
+        assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
+    }).await;
+    assert_stale_write_stopped(&result, 0, 0);
+    assert_eq!(f.profile("worker"), before);
+    assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn agent_text_cas_rejects_post_reverify_edit_and_stops_later_items() {
+    for partial in [false, true] {
+        let f = Fixture::new().await;
+        let mut items = vec![];
+        if partial { items.push(field("worker", "icon", json!("🦊"))); }
+        items.push(field("later", "icon", json!("🐈")));
+        items.push(schedule("never-run"));
+        let rec = f.card(items).await;
+        f.decide(&rec, true).await;
+        let worker = f.profile("worker");
+        // Even a comment-only edit must invalidate the approved raw text.
+        let changed = format!("{}\n# concurrent edit after verification\n", f.profile("later"));
+        let result = f.run_after_reverify(&rec, async {
+            std::fs::write(f.home.path().join("agents/later/agent.toml"), &changed).unwrap();
+        }).await;
+        assert_stale_write_stopped(&result, usize::from(partial), usize::from(partial));
+        assert_eq!(f.profile("later"), changed);
+        if partial {
+            let table: toml::Value = f.profile("worker").parse().unwrap();
+            assert_eq!(table["agent"]["icon"].as_str(), Some("🦊"));
+        } else { assert_eq!(f.profile("worker"), worker); }
+        assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn schedule_cas_rejects_post_reverify_edit_for_every_existing_row_operation() {
+    for op in ["update", "pause", "resume", "delete"] {
+        let f = Fixture::new().await;
+        let store = crate::cron_store::CronStore::open(f.home.path()).unwrap();
+        let mut row = crate::cron_store::CronTaskRow::new("existing".into(), "Existing".into(),
+            "worker".into(), "0 9 * * *".into(), "Summarize the report".into());
+        row.enabled = op != "resume";
+        store.insert(&row).await.unwrap();
+        let mut edit = json!({"kind":"schedule", "op":op, "schedule_id":"existing"});
+        if op == "update" {
+            edit["task"] = json!("Summarize the weekly report");
+            edit["timezone"] = json!("Asia/Taipei");
+        }
+        let rec = f.card(vec![edit, schedule("never-run")]).await;
+        f.decide(&rec, true).await;
+        let result = f.run_after_reverify(&rec, async {
+            store.update_fields(&row.id, "Concurrent name", &row.agent_id, &row.cron, &row.task, row.enabled)
+                .await.unwrap();
+        }).await;
+        assert_stale_write_stopped(&result, 0, 0);
+        let current = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(current.name, "Concurrent name");
+        assert_eq!(current.task, row.task);
+        assert_eq!(current.enabled, row.enabled);
+        assert_eq!(current.cron_timezone, row.cron_timezone);
+        assert!(store.get_by_name("never-run").await.unwrap().is_none());
+    }
+}
+
+#[tokio::test]
+async fn schedule_cas_keeps_snapshot_check_through_transaction_and_commits_timezone_together() {
+    let f = Fixture::new().await;
+    let store = crate::cron_store::CronStore::open(f.home.path()).unwrap();
+    let row = crate::cron_store::CronTaskRow::new("existing".into(), "Existing".into(),
+        "worker".into(), "0 9 * * *".into(), "Summarize the report".into());
+    store.insert(&row).await.unwrap();
+    let row = store.get(&row.id).await.unwrap().unwrap();
+    let expected = hash_schedule(&row).unwrap();
+    let mut changed = row.clone();
+    changed.task = "Summarize the weekly report".into();
+    changed.cron_timezone = Some("Asia/Taipei".into());
+    // This edit lands after the handler read its expected row.
+    store.set_enabled(&row.id, false).await.unwrap();
+    assert!(!store.edit_admin_ai(&row, Some(&changed), &expected).await.unwrap());
+    let current = store.get(&row.id).await.unwrap().unwrap();
+    assert!(!current.enabled);
+    assert_eq!(current.task, row.task);
+    assert_eq!(current.cron_timezone, row.cron_timezone);
+
+    let rec = f.card(vec![json!({"kind":"schedule", "op":"update", "schedule_id":"existing",
+        "task":"Summarize the weekly report", "timezone":"Asia/Taipei"})]).await;
+    f.decide(&rec, true).await;
+    assert_eq!(f.run(&rec).await.unwrap()["outcome"], "complete");
+    let current = store.get(&row.id).await.unwrap().unwrap();
+    assert_eq!(current.task, changed.task);
+    assert_eq!(current.cron_timezone, changed.cron_timezone);
+    assert!(!current.enabled);
+}
+
+#[tokio::test]
+async fn skill_cas_rejects_post_reverify_edit_without_overwriting_switches() {
+    let f = Fixture::new().await;
+    f.install_skills();
+    let rec = f.card(vec![json!({"kind":"skill", "agent_id":"worker", "skill":"report", "enabled":false}),
+        schedule("never-run")]).await;
+    f.decide(&rec, true).await;
+    let result = f.run_after_reverify(&rec, async {
+        duduclaw_agent::skill_state::set_disabled(f.home.path(), "worker", &["summary".into()], true).unwrap();
+    }).await;
+    assert_stale_write_stopped(&result, 0, 0);
+    let state = duduclaw_agent::skill_state::read_disabled(f.home.path(), "worker");
+    assert_eq!(state.names(), vec!["summary"]);
+    assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn consecutive_skill_edits_use_only_their_own_committed_hash() {
+    let f = Fixture::new().await;
+    f.install_skills();
+    duduclaw_agent::skill_state::set_disabled(f.home.path(), "worker", &["summary".into()], true).unwrap();
+    let rec = f.card(vec![json!({"kind":"skill", "agent_id":"worker", "skill":"report", "enabled":false}),
+        json!({"kind":"skill", "agent_id":"worker", "skill":"summary", "enabled":true})]).await;
+    f.decide(&rec, true).await;
+    let result = f.run(&rec).await.unwrap();
+    assert_eq!(result["outcome"], "complete", "{result}");
+    assert_eq!(result["completed"], 2);
+    assert_eq!(duduclaw_agent::skill_state::read_disabled(f.home.path(), "worker").names(), vec!["report"]);
+}
+
+#[tokio::test]
+async fn effective_resolved_text_cas_refuses_post_reverify_drift() {
+    let f = Fixture::new().await;
+    let before = f.profile("worker");
+    let resolved = duduclaw_core::preset::agent_resolved_path(f.home.path(), "worker");
+    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
+    std::fs::write(&resolved, &before).unwrap();
+    let rec = f.card(vec![field("worker", "icon", json!("🦊")), schedule("never-run")]).await;
+    f.decide(&rec, true).await;
+    let changed = format!("{before}\n# concurrent resolved artifact edit\n");
+    let result = f.run_after_reverify(&rec, async {
+        std::fs::write(&resolved, &changed).unwrap();
+    }).await;
+    assert_stale_write_stopped(&result, 0, 0);
+    assert_eq!(f.profile("worker"), before);
+    assert_eq!(std::fs::read_to_string(resolved).unwrap(), changed);
+    assert!(crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap().is_empty());
+}

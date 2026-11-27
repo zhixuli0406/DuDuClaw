@@ -1,17 +1,24 @@
 //! Live-only, single-use execution of the immutable administrator settings card.
-use std::{collections::BTreeSet, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use duduclaw_auth::UserContext;
 use duduclaw_core::admin_ai_settings::{AdminAiField, Item, Schedule};
 use serde_json::{json, Value};
 use crate::{approval::{action_grant::{self, ActionGrant}, ApprovalBroker, ApprovalRecord,
-    ApprovalStatus, TrustedReplyTarget, payload_hash}, handlers::{MethodHandler, agents_update::UpdateOrigin},
+    ApprovalStatus, TrustedReplyTarget}, handlers::{MethodHandler, agents_update::UpdateOrigin},
     on_behalf_of::admin_turn::AdminTurn, protocol::WsFrame};
-use super::{card::ACTION_KIND, proposal::{environment, hash_text}, route};
+use super::{card::ACTION_KIND, proposal::{environment, hash_text, hash_schedule, hash_skills, hash_triggers, trigger_namespace, STALE}, route};
 
 // AppState owns the existing handler. Keeping its Arc avoids constructing a
 // second registry/scheduler and does not require MethodHandler to be Clone.
 pub(crate) type Executor = Arc<dyn AsRef<MethodHandler> + Send + Sync>;
 static BATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const STALE_MESSAGE: &str = "設定在確認後被其他人改過，這項變更沒有儲存，請重新提出。";
+
+#[cfg(test)]
+tokio::task_local! {
+    static AFTER_REVERIFY: (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+}
 
 pub(super) fn order_items(items: &mut Vec<Value>) {
     let original = std::mem::take(items);
@@ -176,11 +183,19 @@ async fn reverify(home: &Path, rec: &ApprovalRecord) -> Result<UserContext, Void
         if item.agent_id().is_some_and(|id| id != target) { return Err("stale".into()); }
         required.insert(format!("agent:{target}"));
         if matches!(item, Item::Skill { .. }) { required.insert(format!("skills:{target}")); }
+        if matches!(item, Item::AgentField { field: AdminAiField::Trigger | AdminAiField::DisplayName, .. }) {
+            required.insert("triggers".into());
+        }
         if let Some(id) = item.schedule_id() { required.insert(format!("schedule:{id}")); }
     }
     if required != hashes.keys().cloned().collect() { return Err("stale".into()); }
     let store = crate::cron_store::CronStore::open(home).map_err(|_| "stale")?;
     for (key, expected) in hashes {
+        if key == "triggers" {
+            let actual = hash_triggers(&trigger_namespace(home).map_err(|_| "stale")?);
+            if expected.as_str() != Some(actual.as_str()) { return Err("stale".into()); }
+            continue;
+        }
         let (kind, id) = key.split_once(':').ok_or("stale")?;
         let actual = match kind {
             "agent" => {
@@ -193,7 +208,7 @@ async fn reverify(home: &Path, rec: &ApprovalRecord) -> Result<UserContext, Void
             "skills" => {
                 let state = duduclaw_agent::skill_state::read_disabled(home, id);
                 if state.error().is_some() { return Err("stale".into()); }
-                payload_hash(&json!(state.names()))
+                hash_skills(&state).map_err(|_| "stale")?
             }
             "schedule" => {
                 let row = store.get(id).await.map_err(|_| "stale")?.ok_or("stale")?;
@@ -201,7 +216,7 @@ async fn reverify(home: &Path, rec: &ApprovalRecord) -> Result<UserContext, Void
                     || items.iter().any(|v| v["item"]["schedule_id"] == id && v["target"] != row.agent_id) {
                     return Err("stale".into());
                 }
-                payload_hash(&serde_json::to_value(row).map_err(|_| "stale")?)
+                hash_schedule(&row).map_err(|_| "stale")?
             }
             _ => return Err("stale".into()),
         };
@@ -229,6 +244,7 @@ fn field_param(field: AdminAiField) -> &'static str {
 }
 fn frame_result(frame: WsFrame) -> Result<(), &'static str> {
     match frame {
+        WsFrame::Response { error: Some(error), .. } if error.as_str() == Some(STALE) => Err(STALE_MESSAGE),
         WsFrame::Response { ok: true, payload, .. } => {
             if payload.as_ref().and_then(|v| v["results"].as_array())
                 .is_some_and(|rows| rows.iter().any(|v| v["ok"] != true)) {
@@ -241,11 +257,26 @@ fn frame_result(frame: WsFrame) -> Result<(), &'static str> {
         _ => Err("設定未能完成，請到儀表板檢查；已儲存的部分不會自動還原。"),
     }
 }
-async fn execute_item(handler: &MethodHandler, ctx: &UserContext, item: Item) -> Result<(), &'static str> {
+async fn execute_item(handler: &MethodHandler, ctx: &UserContext, item: Item,
+    hashes: &mut BTreeMap<String, String>) -> Result<(), &'static str> {
     let frame = match item {
-        Item::Skill { agent_id, skill, enabled } => handler.handle_skills_set_enabled(
-            json!({"items":[{"agent_id":agent_id,"skill_name":skill}],"enabled":enabled}), ctx).await,
+        Item::Skill { agent_id, skill, enabled } => {
+            let key = format!("skills:{agent_id}");
+            let expected = hashes.get(&key).ok_or(STALE_MESSAGE)?;
+            let frame = handler.handle_admin_ai_skills_set_enabled(
+                json!({"items":[{"agent_id":agent_id,"skill_name":skill}],"enabled":enabled}), ctx, expected).await;
+            let next_hash = match &frame {
+                WsFrame::Response { ok: true, payload: Some(payload), .. } =>
+                    payload["state_hash"].as_str().map(str::to_owned),
+                _ => None,
+            };
+            frame_result(frame)?;
+            // Advance only to the state returned by our own locked commit.
+            hashes.insert(key, next_hash.ok_or(STALE_MESSAGE)?);
+            return Ok(());
+        },
         Item::Schedule(op) => {
+            let expected = item_schedule_hash(&op, hashes)?;
             let (method, params) = match op {
                 Schedule::Create { agent_id, name, cron, timezone, task } => ("cron.add",
                     json!({"agent_id":agent_id,"name":name,"cron":cron,"cron_timezone":timezone,"task":task})),
@@ -260,12 +291,21 @@ async fn execute_item(handler: &MethodHandler, ctx: &UserContext, item: Item) ->
                 Schedule::Resume { schedule_id } => ("cron.resume", json!({"id":schedule_id})),
                 Schedule::Delete { schedule_id } => ("cron.remove", json!({"id":schedule_id})),
             };
-            handler.handle_admin_ai_cron(method, params, ctx).await
+            handler.handle_admin_ai_cron(method, params, ctx, expected.as_deref()).await
         }
         Item::AgentField { .. } => return Err("設定項目無法辨識，已停止。"),
     };
     frame_result(frame)
 }
+fn item_schedule_hash(op: &Schedule, hashes: &BTreeMap<String, String>) -> Result<Option<String>, &'static str> {
+    let id = match op {
+        Schedule::Create { .. } => return Ok(None),
+        Schedule::Update { schedule_id, .. } | Schedule::Pause { schedule_id }
+        | Schedule::Resume { schedule_id } | Schedule::Delete { schedule_id } => schedule_id,
+    };
+    hashes.get(&format!("schedule:{id}")).cloned().map(Some).ok_or(STALE_MESSAGE)
+}
+
 fn item_reports(rec: &ApprovalRecord) -> Vec<Value> {
     rec.payload["items"].as_array().into_iter().flatten().map(|v| {
         let item = &v["item"];
@@ -300,6 +340,12 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
             return Some(void_audit_for(home, &rec, reason.reason, reason.employee.as_deref()));
         }
     };
+    #[cfg(test)]
+    if let Ok((ready, proceed)) = AFTER_REVERIFY.try_with(Clone::clone) {
+        ready.notify_one();
+        proceed.notified().await;
+    }
+    let mut write_hashes: BTreeMap<String, String> = serde_json::from_value(rec.payload["target_hashes"].clone()).ok()?;
     let entries = rec.payload["items"].as_array()?;
     let mut reports = item_reports(&rec);
     let mut index = 0;
@@ -323,8 +369,9 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
             }
             if !updated_agents.insert(agent_id.clone()) { Err("同一員工的設定順序不一致，已停止。") }
             else { frame_result(handler.agents_update_inner(params, Some(&ctx), Some(&ctx),
-                UpdateOrigin::AdminAi { approval_id: rec.id.to_string() }).await) }
-        } else { execute_item(handler, &ctx, item).await };
+                UpdateOrigin::AdminAi { approval_id: rec.id.to_string(),
+                    expected_text_hash: write_hashes.get(&format!("agent:{agent_id}")).cloned() }).await) }
+        } else { execute_item(handler, &ctx, item, &mut write_hashes).await };
         match result {
             Ok(()) => {
                 for report in &mut reports[index..end] { report["result"] = json!("complete"); }
@@ -344,7 +391,10 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
     }
     drop(lock); // Never hold the batch mutex during notification delivery.
     let mut result = metadata(&rec);
-    result["outcome"] = json!(if failed.is_some() { "partial" } else { "complete" });
+    let stale = failed.as_ref().is_some_and(|(_, _, error)| *error == STALE_MESSAGE);
+    let voided = stale && completed == 0;
+    result["outcome"] = json!(if voided { "voided" } else if failed.is_some() { "partial" } else { "complete" });
+    if stale { result["reason"] = json!("stale"); }
     result["items"] = json!(reports);
     result["completed"] = json!(completed);
     let remaining = reports.iter().filter(|v| v["result"] == "not_executed").count();
@@ -354,7 +404,7 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
             if count > 1 { format!("同位員工合併的 {count} 項均未完成") } else { String::new() }),
         None => format!("已完成 {completed} 項設定變更。"),
     });
-    emit(home, &rec, "admin_ai_settings_changed", result.clone());
+    emit(home, &rec, if voided { "admin_ai_settings_voided" } else { "admin_ai_settings_changed" }, result.clone());
     Some(result)
 }
 

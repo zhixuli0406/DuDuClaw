@@ -191,7 +191,7 @@ pub(super) fn target_allowed(home: &Path, ctx: &UserContext, id: &str, dir: &Pat
         Err(_) => false,
     }
 }
-pub(super) fn effective_text(dir: &Path) -> Result<String, &'static str> {
+pub(crate) fn effective_text(dir: &Path) -> Result<String, &'static str> {
     // Match the strict runtime reader: an existing resolved artifact that cannot
     // be read must not silently fall back to the employee's source profile.
     if let (Some(home), Some(id)) = (duduclaw_core::preset::agent_home_dir(dir), dir.file_name().and_then(|s| s.to_str())) {

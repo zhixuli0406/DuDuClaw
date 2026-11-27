@@ -7,7 +7,7 @@ use super::*;
 pub(crate) enum UpdateOrigin {
     Dashboard,
     OsSettings,
-    AdminAi { approval_id: String },
+    AdminAi { approval_id: String, expected_text_hash: Option<String> },
 }
 
 impl UpdateOrigin {
@@ -116,6 +116,11 @@ impl MethodHandler {
         origin: UpdateOrigin,
     ) -> WsFrame {
         let update_source = origin.source();
+        let expected_text_hash = match &origin {
+            UpdateOrigin::AdminAi { expected_text_hash: Some(hash), .. } => Some(hash.clone()),
+            UpdateOrigin::AdminAi { .. } => return WsFrame::error_response("", crate::admin_ai::proposal::STALE),
+            _ => None,
+        };
         let requested_fields = if matches!(&origin, UpdateOrigin::AdminAi { .. }) {
             if !caller.is_some_and(|ctx| ctx.has_role(UserRole::Admin)) {
                 return WsFrame::error_response("", "管理員 AI 設定需要管理員權限。");
@@ -547,7 +552,7 @@ impl MethodHandler {
             None
         };
 
-        let result = self.update_agent_toml_as_within(&agent_id, update_source, caller, session, lock_wait, move |table| {
+        let result = self.update_agent_toml_as_within(&agent_id, update_source, caller, session, lock_wait, expected_text_hash, move |table| {
             // v1.68: snapshot for the authority diff and the final typed
             // check (only enforced when the file parsed before this write, so
             // an already-broken file can still be repaired through here).
@@ -1343,6 +1348,14 @@ impl MethodHandler {
             if let Some(fields) = &requested_fields {
                 duduclaw_core::admin_ai_settings::validate_changed_leaves(&table_before, table, fields)
                     .map_err(str::to_string)?;
+                if fields.iter().any(|f| matches!(f,
+                    duduclaw_core::admin_ai_settings::AdminAiField::Trigger
+                    | duduclaw_core::admin_ai_settings::AdminAiField::DisplayName)) {
+                    // The writer holds both the authority namespace lease and
+                    // this profile's lock through the eventual commit.
+                    crate::admin_ai::proposal::check_live_trigger(&home_for_update, &audit_agent_id, table)
+                        .map_err(|_| crate::admin_ai::proposal::STALE.to_string())?;
+                }
             }
             *ordinary_for_closure.lock().map_err(|_| "settings audit lock poisoned".to_string())? =
                 ordinary_settings_diff(&table_before, table);
@@ -1355,7 +1368,7 @@ impl MethodHandler {
                 let mut details = json!({"agent_id": agent_id,
                     "user_id": caller.map(|c| c.user_id.as_str()).unwrap_or("unknown"),
                     "source": origin.source(), "changed": changed});
-                if let UpdateOrigin::AdminAi { approval_id } = &origin {
+                if let UpdateOrigin::AdminAi { approval_id, .. } = &origin {
                     details["approval_id"] = json!(approval_id);
                 }
                 crate::security_autopilot::audit_and_emit(&self.home_dir,
@@ -1763,13 +1776,13 @@ mod admin_ai_update_tests {
         for params in [json!({"agent_id":"ai-a", "icon":"B", "runtime":{"provider":"codex"}}),
             json!({"agent_id":"ai-a", "preferred":"gpt-5.4"})] {
             let frame = h.agents_update_inner(params, Some(&admin), Some(&admin),
-                UpdateOrigin::AdminAi {approval_id:"approved-1".into()}).await;
+                UpdateOrigin::AdminAi {approval_id:"approved-1".into(), expected_text_hash:Some(crate::admin_ai::proposal::hash_text(&before))}).await;
             assert!(matches!(&frame, WsFrame::Response {ok:false,..}), "{frame:?}");
             assert!(serde_json::to_string(&frame).unwrap().contains("admin_ai_diff_refused"), "{frame:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
         }
         let frame = h.agents_update_inner(json!({"agent_id":"ai-a", "icon":"🦊"}), Some(&admin), Some(&admin),
-            UpdateOrigin::AdminAi {approval_id:"approved-2".into()}).await;
+            UpdateOrigin::AdminAi {approval_id:"approved-2".into(), expected_text_hash:Some(crate::admin_ai::proposal::hash_text(&before))}).await;
         assert!(matches!(frame, WsFrame::Response {ok:true,..}), "{frame:?}");
         let rows = events(home.path());
         let row = rows.iter().find(|e| e["event_type"] == "agent_settings_changed").unwrap();
