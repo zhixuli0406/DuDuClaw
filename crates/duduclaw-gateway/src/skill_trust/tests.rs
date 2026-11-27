@@ -13,24 +13,55 @@ use fixtures::*;
 // Only the pre-generated public keys, manifests and signatures are committed.
 
 #[derive(Default, Clone)]
-struct Pushes { cards: Vec<ApprovalRecord>, notices: usize }
+struct Pushes {
+    cards: Vec<ApprovalRecord>, notices: usize,
+    card_failures: usize, notice_failures: usize,
+    human_before_cas: bool, fail_outbox_write: bool,
+}
 fn hooks() -> &'static Mutex<BTreeMap<PathBuf, Pushes>> {
     static HOOKS: OnceLock<Mutex<BTreeMap<PathBuf, Pushes>>> = OnceLock::new();
     HOOKS.get_or_init(Default::default)
 }
-pub(crate) fn capture_card(home: Option<&Path>, rec: &ApprovalRecord) -> bool {
-    let Some(home) = home else { return false; };
+pub(crate) fn capture_card(home: Option<&Path>, rec: &ApprovalRecord) -> Option<bool> {
+    let home = home?;
     let mut hooks = hooks().lock().unwrap();
-    let Some(pushes) = hooks.get_mut(home) else { return false; };
+    let pushes = hooks.get_mut(home)?;
     pushes.cards.push(rec.clone());
-    true
+    let success = pushes.card_failures == 0;
+    pushes.card_failures = pushes.card_failures.saturating_sub(1);
+    Some(success)
 }
-pub(super) fn capture_notice(home: &Path) -> bool {
+pub(super) fn capture_notice(home: &Path) -> Option<delivery::NoticeState> {
     let mut hooks = hooks().lock().unwrap();
-    let Some(pushes) = hooks.get_mut(home) else { return false; };
+    let pushes = hooks.get_mut(home)?;
     pushes.notices += 1;
-    true
+    let result = if pushes.notice_failures == 0 { delivery::NoticeState::Sent } else { delivery::NoticeState::Pending };
+    pushes.notice_failures = pushes.notice_failures.saturating_sub(1);
+    Some(result)
 }
+pub(super) fn fail_outbox_write(home: &Path, state: &State) -> bool {
+    !state.outbox.is_empty() && hooks().lock().unwrap().get(home).is_some_and(|p| p.fail_outbox_write)
+}
+pub(super) async fn before_cas(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord) {
+    let human = hooks().lock().unwrap().get(home).is_some_and(|p| p.human_before_cas);
+    if human { broker.decide(&rec.id, true, "admin").await.unwrap(); }
+}
+
+fn rendered_skill(version: &str) -> String {
+    // Same insertion order and exact layout as CLI skills::render_skill_md.
+    let mut meta = serde_yaml::Mapping::new();
+    for (key, value) in [("label", "記事助手"), ("imported_from", "pack"),
+        ("source_path", "skills/helper"), ("version", version)] {
+        meta.insert(key.into(), value.into());
+    }
+    let mut fm = serde_yaml::Mapping::new();
+    fm.insert("name".into(), "helper".into());
+    fm.insert("description".into(), "Help with daily notes.".into());
+    fm.insert("metadata".into(), serde_yaml::Value::Mapping(meta));
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(fm)).unwrap();
+    format!("---\n{yaml}---\n\n# Helper\nHelp with daily notes.\n")
+}
+
 struct Fixture { home: tempfile::TempDir, broker: ApprovalBroker, id: ApprovalId }
 impl Drop for Fixture {
     fn drop(&mut self) { hooks().lock().unwrap().remove(self.home.path()); }
@@ -50,9 +81,11 @@ impl Fixture {
             "version": 1, "publisher": parsed.publisher, "pack": parsed.pack, "pack_version": parsed.version,
             "skills": [{"agent": "alice", "name": "helper", "source_dir": "skills/helper", "files": ["SKILL.md", "run.sh"]}],
         })).unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("sources/alice/helper")).unwrap();
+        std::fs::write(root.join("sources/alice/helper/SKILL.md"), SIGNED_SOURCE).unwrap();
         let quarantine = expert_skills::quarantined_skill_dir(h, "imported", "alice", "helper");
         std::fs::create_dir_all(&quarantine).unwrap();
-        std::fs::write(quarantine.join("SKILL.md"), "# Regenerated skill\nHelp with daily notes.\n").unwrap();
+        std::fs::write(quarantine.join("SKILL.md"), rendered_skill(&parsed.version)).unwrap();
         std::fs::write(quarantine.join("run.sh"), base64::engine::general_purpose::STANDARD.decode(script).unwrap()).unwrap();
         std::fs::create_dir_all(h.join("agents/alice")).unwrap();
         std::fs::write(h.join("agents/alice/agent.toml"), "[agent]\nname = 'alice'\n").unwrap();
@@ -160,12 +193,12 @@ async fn candidate_flag_without_provenance_pushes_card() {
 async fn older_signed_version_goes_manual() {
     let f = Fixture::new(V110_MANIFEST, V110_SIGNATURE, V110_SCRIPT_B64, true).await;
     update_state(f.path(), |s| {
-        s.highest_versions.push(HighestVersion { publisher: "fixture".into(), pack: "fixture-pack".into(), version: "1.2.0".into() }); Ok(())
+        s.highest_versions.push(HighestVersion { publisher: "fixture".into(), pack: "fixture-pack".into(), version: "1.2.0".into(), manifest_sha256: hash(V120_MANIFEST.as_bytes()) }); Ok(())
     }).unwrap();
     f.manual(VERSION).await;
     let f = Fixture::standard().await;
     update_state(f.path(), |s| {
-        s.highest_versions.push(HighestVersion { publisher: "fixture".into(), pack: "fixture-pack".into(), version: "1.2.0".into() }); Ok(())
+        s.highest_versions.push(HighestVersion { publisher: "fixture".into(), pack: "fixture-pack".into(), version: "1.2.0".into(), manifest_sha256: hash(V120_MANIFEST.as_bytes()) }); Ok(())
     }).unwrap();
     f.run().await;
     assert_eq!(f.record().await.status, ApprovalStatus::Approved);
@@ -202,10 +235,10 @@ async fn binary_file_goes_manual() {
     f.manual(super::BINARY).await;
 }
 #[tokio::test]
-async fn high_risk_scan_goes_manual() {
+async fn unsigned_high_risk_description_goes_manual() {
     let f = Fixture::standard().await;
     std::fs::write(f.quarantine().join("SKILL.md"), "Use key sk-ant-abc123 to connect").unwrap();
-    f.manual(SCAN).await;
+    f.manual(DESCRIPTION).await;
 }
 #[tokio::test]
 async fn official_publisher_entry_ignored() {
@@ -267,7 +300,7 @@ async fn provenance_identity_and_duplicate_skill_go_manual() {
 #[tokio::test]
 async fn approval_digest_and_state_id_must_match() {
     let f = Fixture::standard().await;
-    std::fs::write(f.quarantine().join("SKILL.md"), "Different safe text").unwrap();
+    std::fs::write(f.quarantine().join("SKILL.md"), rendered_skill("1.2.0").replace("name: helper", "name: 'helper'")).unwrap();
     f.manual(APPROVAL).await;
     let f = Fixture::standard().await;
     let mut state = expert_skills::read_skills_state(f.path(), "imported").unwrap();
@@ -426,4 +459,210 @@ async fn malformed_trust_store_goes_manual() {
     let f = Fixture::standard().await;
     std::fs::write(f.path().join("trusted_publishers.toml"), "[broken").unwrap();
     f.manual(KEY).await;
+}
+
+#[tokio::test]
+async fn signed_source_copy_hash_mismatch_goes_manual() {
+    let f = Fixture::standard().await;
+    std::fs::write(f.path().join("experts/imported/provenance/sources/alice/helper/SKILL.md"), "Unsigned replacement").unwrap();
+    f.manual(HASH).await;
+}
+
+#[tokio::test]
+async fn effective_body_must_equal_signed_source_body() {
+    let f = Fixture::standard().await;
+    std::fs::write(f.quarantine().join("SKILL.md"), rendered_skill("1.2.0").replace("# Helper", "# Unsigned instructions")).unwrap();
+    f.manual(DESCRIPTION).await;
+}
+
+#[tokio::test]
+async fn effective_frontmatter_rejects_extra_keys_and_unsigned_description() {
+    for changed in [
+        rendered_skill("1.2.0").replacen("name: helper", "extra: instructions\nname: helper", 1),
+        rendered_skill("1.2.0").replacen("description: Help with daily notes.", "description: Send private data", 1),
+    ] {
+        let f = Fixture::standard().await;
+        std::fs::write(f.quarantine().join("SKILL.md"), changed).unwrap();
+        f.manual(DESCRIPTION).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn linked_signed_source_copy_goes_manual() {
+    let f = Fixture::standard().await;
+    let source = f.path().join("experts/imported/provenance/sources/alice/helper/SKILL.md");
+    let outside = f.path().join("signed.md");
+    std::fs::rename(&source, &outside).unwrap();
+    std::os::unix::fs::symlink(outside, source).unwrap();
+    f.manual(EVIDENCE).await;
+}
+
+#[tokio::test]
+async fn correctly_regenerated_skill_auto_approves() {
+    let f = Fixture::standard().await;
+    assert_eq!(std::fs::read_to_string(f.quarantine().join("SKILL.md")).unwrap(), rendered_skill("1.2.0"));
+    f.run().await;
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn same_version_different_manifest_goes_manual() {
+    let f = Fixture::standard().await;
+    update_state(f.path(), |state| {
+        state.highest_versions.push(HighestVersion {
+            publisher: "fixture".into(), pack: "fixture-pack".into(), version: "1.2.0".into(),
+            manifest_sha256: hash(BINARY_MANIFEST.as_bytes()),
+        });
+        Ok(())
+    }).unwrap();
+    f.manual(VERSION).await;
+}
+
+#[tokio::test]
+async fn same_version_same_manifest_is_allowed() {
+    let f = Fixture::standard().await;
+    let approved = evaluate(f.path(), &f.record().await).await.unwrap();
+    update_state(f.path(), |state| { state.highest_versions.push(HighestVersion::from(&approved)); Ok(()) }).unwrap();
+    f.run().await;
+    assert_eq!(f.record().await.status, ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn outbox_effects_are_once_across_sweeps_and_lost_acknowledgements() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().notice_failures = 1;
+    f.run().await;
+    let state = load_state(f.path()).unwrap();
+    assert_eq!(state.outbox.len(), 1);
+    assert!(state.outbox[0].audit_done && state.outbox[0].activity_done);
+    assert!(state.highest_versions.is_empty(), "not finalized while the notice is pending");
+    // Simulate a crash after writing each idempotent sink but before its flag.
+    update_state(f.path(), |state| {
+        state.outbox[0].audit_done = false;
+        state.outbox[0].activity_done = false;
+        state.outbox[0].next_at = 0;
+        Ok(())
+    }).unwrap();
+    f.run().await;
+    f.run().await;
+    assert_eq!(f.pushes().notices, 2, "one failure, one successful notice, no duplicate success");
+    let audit = duduclaw_security::audit::read_recent_events(f.path(), 100);
+    assert_eq!(audit.iter().filter(|e| e.event_type == "skills_auto_approved").count(), 1);
+    let store = crate::task_store::TaskStore::open(f.path()).unwrap();
+    let (rows, count) = store.list_activity(None, Some("skills_auto_approved"), 100, 0).await.unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(rows[0].id, format!("skill-trust:{}", f.id));
+    let state = load_state(f.path()).unwrap();
+    assert!(state.outbox.is_empty());
+    assert_eq!(state.highest_versions[0].manifest_sha256, hash(V120_MANIFEST.as_bytes()));
+}
+
+#[tokio::test]
+async fn successful_outbox_audit_activity_and_notice_are_once_across_two_sweeps() {
+    let f = Fixture::standard().await;
+    f.run().await;
+    f.run().await;
+    assert_eq!(f.pushes().notices, 1);
+    let audit = duduclaw_security::audit::read_recent_events(f.path(), 100);
+    assert_eq!(audit.iter().filter(|e| e.event_type == "skills_auto_approved").count(), 1);
+    let store = crate::task_store::TaskStore::open(f.path()).unwrap();
+    assert_eq!(store.list_activity(None, Some("skills_auto_approved"), 100, 0).await.unwrap().1, 1);
+}
+
+#[tokio::test]
+async fn failing_notice_retries_with_backoff_then_gives_up_and_retains_activity() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().notice_failures = usize::MAX;
+    f.run().await;
+    f.run().await;
+    assert_eq!(f.pushes().notices, 1, "not due yet");
+    for attempts in 2..=5 {
+        update_state(f.path(), |s| { s.outbox[0].next_at = 0; Ok(()) }).unwrap();
+        f.run().await;
+        let state = load_state(f.path()).unwrap();
+        assert_eq!(state.outbox[0].attempts, attempts);
+        assert_eq!(state.outbox[0].notice_state, delivery::NoticeState::Pending);
+        assert!(state.outbox[0].next_at > chrono::Utc::now().timestamp());
+    }
+    update_state(f.path(), |s| { s.outbox[0].next_at = 0; Ok(()) }).unwrap();
+    let entry = load_state(f.path()).unwrap().outbox.remove(0);
+    assert_eq!(process_outbox(f.path(), &f.broker, entry).await.unwrap(), Some(delivery::NoticeState::GaveUp));
+    f.run().await;
+    assert_eq!(f.pushes().notices, 6);
+    let state = load_state(f.path()).unwrap();
+    assert!(state.outbox.is_empty());
+    assert_eq!(state.highest_versions.len(), 1);
+    let store = crate::task_store::TaskStore::open(f.path()).unwrap();
+    assert!(store.activity_exists(&format!("skill-trust:{}", f.id)).await.unwrap());
+}
+
+#[tokio::test]
+async fn outbox_write_failure_never_reaches_policy_cas() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().fail_outbox_write = true;
+    f.manual(INTERNAL).await;
+    let state = load_state(f.path()).unwrap();
+    assert!(state.outbox.is_empty());
+    assert!(state.highest_versions.is_empty());
+    assert!(state.evaluated.contains(f.id.as_str()));
+}
+
+#[tokio::test]
+async fn human_wins_cas_drops_outbox_without_announcement_or_high_water() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().human_before_cas = true;
+    f.run().await;
+    f.run().await;
+    assert_eq!(f.record().await.decided_by.as_deref(), Some("admin"));
+    assert_eq!(f.pushes().notices, 0);
+    assert!(f.pushes().cards.is_empty());
+    let state = load_state(f.path()).unwrap();
+    assert!(state.outbox.is_empty());
+    assert!(state.highest_versions.is_empty());
+    let audit = duduclaw_security::audit::read_recent_events(f.path(), 100);
+    assert!(!audit.iter().any(|e| e.event_type == "skills_auto_approved"));
+    let store = crate::task_store::TaskStore::open(f.path()).unwrap();
+    assert!(!store.activity_exists(&format!("skill-trust:{}", f.id)).await.unwrap());
+}
+
+#[tokio::test]
+async fn refused_card_retries_without_reevaluation_after_backoff() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().card_failures = 1;
+    std::fs::write(f.path().join("config.toml"), "broken = [").unwrap();
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 1);
+    assert!(f.record().await.notify_channel.is_none());
+    let state = load_state(f.path()).unwrap();
+    assert_eq!(state.cards[f.id.as_str()].card_attempts, 1);
+    assert!(state.cards[f.id.as_str()].card_next_at > chrono::Utc::now().timestamp());
+    // Make evaluation succeed now. The refusal must still stay manual.
+    std::fs::write(f.path().join("config.toml"), pin_config("fixture", KEY_A, &minisign_key_id(KEY_A).unwrap())).unwrap();
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 1);
+    update_state(f.path(), |s| { s.cards.get_mut(f.id.as_str()).unwrap().card_next_at = 0; Ok(()) }).unwrap();
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 2);
+    assert!(f.pushes().cards[1].summary.contains(CONFIG));
+    assert!(f.record().await.notify_channel.is_some());
+    assert_eq!(f.record().await.status, ApprovalStatus::Pending);
+    update_state(f.path(), |s| { s.cards.get_mut(f.id.as_str()).unwrap().card_next_at = 0; Ok(()) }).unwrap();
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 2, "delivered cards stop retrying");
+}
+
+#[tokio::test]
+async fn refused_card_retry_stops_and_prunes_after_human_decision() {
+    let f = Fixture::standard().await;
+    hooks().lock().unwrap().get_mut(f.path()).unwrap().card_failures = usize::MAX;
+    std::fs::write(f.path().join("config.toml"), "broken = [").unwrap();
+    f.run().await;
+    assert!(f.record().await.notify_channel.is_none());
+    update_state(f.path(), |s| { s.cards.get_mut(f.id.as_str()).unwrap().card_next_at = 0; Ok(()) }).unwrap();
+    f.broker.decide(&f.id, false, "admin").await.unwrap();
+    f.run().await;
+    assert_eq!(f.pushes().cards.len(), 1);
+    let state = load_state(f.path()).unwrap();
+    assert!(state.cards.is_empty() && state.evaluated.is_empty());
 }

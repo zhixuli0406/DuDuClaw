@@ -169,7 +169,10 @@ impl ApprovalBroker {
     /// own notification ([`SELF_NOTIFYING_KINDS`]).
     pub(crate) async fn push_new_request(&self, rec: &ApprovalRecord) {
         #[cfg(test)]
-        if crate::skill_trust::tests::capture_card(self.home_dir().as_deref(), rec) { return; }
+        if let Some(delivered) = crate::skill_trust::tests::capture_card(self.home_dir().as_deref(), rec) {
+            if delivered { self.store.set_notify_target(&rec.id, "test", "admin").await.unwrap(); }
+            return;
+        }
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return; }
         if SELF_NOTIFYING_KINDS.contains(&rec.action_kind.as_str()) {
             return;

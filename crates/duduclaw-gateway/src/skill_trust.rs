@@ -12,6 +12,9 @@ use crate::{approval::{ApprovalBroker, ApprovalRecord, ApprovalStatus}, expert_s
 use crate::skill_lifecycle::security_scanner::{scan_skill, RiskLevel};
 
 mod files;
+mod binding;
+mod delivery;
+use delivery::{CardRetry, Outbox, process_outbox, retry_card};
 use files::{Directory, safe_relative, segment};
 
 const STATE_FILE: &str = "skill_trust_state.json";
@@ -25,6 +28,7 @@ const SIGNATURE: &str = "簽章驗證失敗，需人工確認";
 const IDENTITY: &str = "來源證據與簽章清單不符";
 const FILES: &str = "隔離檔案與來源清單不符";
 const HASH: &str = "腳本或附件內容與簽章不符";
+const DESCRIPTION: &str = "技能說明與簽章內容不符";
 const BINARY: &str = "含二進位檔，需人工確認";
 const SCAN: &str = "安全掃描判定風險過高";
 const APPROVAL: &str = "技能內容與待核准紀錄不符";
@@ -200,7 +204,12 @@ pub async fn evaluate(home: &Path, rec: &ApprovalRecord) -> Result<AutoApproval,
             total = total.checked_add(bytes.len()).ok_or(FILES)?;
             if total > 64 * 1024 * 1024 { return Err(FILES.into()); }
             let signed_hash = manifest.files.get(&format!("{}/{path}", source.source_dir)).ok_or(FILES)?;
-            if path != "SKILL.md" && *signed_hash != hash(bytes) { return Err(HASH.into()); }
+            if path == "SKILL.md" {
+                let signed_dir = evidence.descend(&format!("sources/{}/{}", entry.agent, entry.name)).map_err(|_| EVIDENCE)?;
+                let signed = signed_dir.read("SKILL.md", 512 * 1024).map_err(|_| EVIDENCE)?;
+                if *signed_hash != hash(&signed) { return Err(HASH.into()); }
+                binding::verify(bytes, &signed, &entry.name, &manifest.version)?;
+            } else if *signed_hash != hash(bytes) { return Err(HASH.into()); }
         }
         snapshots.push(actual);
     }
@@ -297,10 +306,25 @@ impl Version {
 struct State {
     highest_versions: Vec<HighestVersion>,
     evaluated: BTreeSet<String>,
+    #[serde(default)]
+    outbox: Vec<Outbox>,
+    #[serde(default)]
+    cards: BTreeMap<String, CardRetry>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct HighestVersion { publisher: String, pack: String, version: String }
+struct HighestVersion {
+    publisher: String, pack: String, version: String,
+    // Legacy high-water entries have no digest: equal versions fail closed.
+    #[serde(default)]
+    manifest_sha256: String,
+}
+impl From<&AutoApproval> for HighestVersion {
+    fn from(approved: &AutoApproval) -> Self {
+        Self { publisher: approved.publisher.clone(), pack: approved.pack.clone(),
+            version: approved.pack_version.clone(), manifest_sha256: approved.manifest_sha256.clone() }
+    }
+}
 fn load_state(home: &Path) -> Result<State, String> {
     let root = Directory::open(home).map_err(|_| INTERNAL)?;
     let bytes = match root.read(STATE_FILE, MAX_STATE_BYTES) {
@@ -311,18 +335,31 @@ fn load_state(home: &Path) -> Result<State, String> {
     let state: State = serde_json::from_slice(&bytes).map_err(|_| INTERNAL)?;
     let mut keys = BTreeSet::new();
     if state.evaluated.len() > MAX_EVALUATED || state.highest_versions.len() > 4096
+        || state.outbox.len() > MAX_EVALUATED || state.cards.len() > MAX_EVALUATED
         || state.highest_versions.iter().any(|v| Version::parse(&v.version).is_err()
             || validate_publisher_id(&v.publisher).is_err() || v.pack.is_empty()
+            || (!v.manifest_sha256.is_empty() && !digest_valid(&v.manifest_sha256))
             || !keys.insert((&v.publisher, &v.pack)))
+    { return Err(INTERNAL.into()); }
+    let mut ids = BTreeSet::new();
+    if state.outbox.iter().any(|o| !ids.insert(&o.approval_id) || o.approval_id.is_empty()
+        || !segment(&o.slug) || validate_publisher_id(&o.publisher).is_err()
+        || o.pack.is_empty() || Version::parse(&o.version).is_err() || !digest_valid(&o.manifest_sha256)
+        || o.key_id.len() != 16 || !o.key_id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_lowercase())
+        || o.skills.is_empty() || o.skills.len() > 1024 || o.skills.iter().any(|(agent, name, digest)|
+            !segment(agent) || !segment(name) || !digest_valid(digest)))
     { return Err(INTERNAL.into()); }
     Ok(state)
 }
 fn check_version(state: &State, approved: &AutoApproval) -> Result<(), String> {
     let version = Version::parse(&approved.pack_version)?;
     for old in &state.highest_versions {
-        if old.publisher == approved.publisher && old.pack == approved.pack
-            && version.compare(&Version::parse(&old.version)?) == Ordering::Less
-        { return Err(VERSION.into()); }
+        if old.publisher == approved.publisher && old.pack == approved.pack {
+            let order = version.compare(&Version::parse(&old.version)?);
+            if order == Ordering::Less || (order == Ordering::Equal && old.manifest_sha256 != approved.manifest_sha256) {
+                return Err(VERSION.into());
+            }
+        }
     }
     Ok(())
 }
@@ -338,12 +375,16 @@ fn update_state<T>(home: &Path, change: impl FnOnce(&mut State) -> Result<T, Str
     duduclaw_core::with_file_lock(&home.join(STATE_FILE), || {
         let mut state = load_state(home).map_err(std::io::Error::other)?;
         let result = change(&mut state).map_err(std::io::Error::other)?;
+        #[cfg(test)]
+        if tests::fail_outbox_write(home, &state) { return Err(std::io::Error::other(INTERNAL)); }
         let bytes = serde_json::to_vec(&state)?;
         if bytes.len() as u64 > MAX_STATE_BYTES { return Err(std::io::Error::other(INTERNAL)); }
         let mut tmp = tempfile::NamedTempFile::new_in(home)?;
         tmp.write_all(&bytes)?;
         tmp.as_file().sync_all()?;
         tmp.persist(home.join(STATE_FILE)).map_err(|e| e.error)?;
+        #[cfg(unix)]
+        _root.sync()?;
         Ok(result)
     }).map_err(|_| INTERNAL.into())
 }
@@ -352,7 +393,7 @@ fn reason_code(reason: &str) -> &'static str {
     match reason {
         EVIDENCE => "evidence_unreadable", CONFIG => "config_unreadable", KEY => "key_not_pinned",
         SIGNATURE => "signature_invalid", IDENTITY => "manifest_identity", FILES => "file_set_mismatch",
-        HASH => "file_hash_mismatch", BINARY => "binary_file", SCAN => "scan_high_risk",
+        HASH => "file_hash_mismatch", DESCRIPTION => "skill_description_mismatch", BINARY => "binary_file", SCAN => "scan_high_risk",
         APPROVAL => "approval_mismatch", VERSION => "version_rollback_or_invalid", _ => "internal_error",
     }
 }
@@ -368,40 +409,6 @@ async fn refuse(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord, reas
     }
 }
 
-async fn announce(home: &Path, rec: &ApprovalRecord, approved: &AutoApproval) {
-    let names = approved.skills.iter().map(|(agent, name, _)| format!("{agent} 的 {name}")).collect::<Vec<_>>().join("、");
-    let body = format!("已依自家技能來源設定自動啟用 {} 個技能：{}；可在技能匯入頁停用", approved.skills.len(), names);
-    let activity = crate::task_store::ActivityRow {
-        id: format!("skill-trust:{}", rec.id), event_type: "skills_auto_approved".into(),
-        agent_id: rec.agent_id.clone(), task_id: None, summary: body.clone(),
-        timestamp: chrono::Utc::now().to_rfc3339(), metadata: Some(serde_json::json!({
-            "approval_id": rec.id.as_str(), "publisher": approved.publisher, "key_id": approved.key_id,
-        }).to_string()),
-    };
-    match crate::task_store::TaskStore::open(home) {
-        Ok(store) => if let Err(error) = store.append_activity_once(&activity).await {
-            tracing::warn!(%error, "skill trust activity write failed");
-        },
-        Err(error) => tracing::warn!(%error, "skill trust activity store unavailable"),
-    }
-    #[cfg(test)]
-    if tests::capture_notice(home) { return; }
-    let targets = match crate::notify_push::admin_targets(home) {
-        Ok(targets) => targets,
-        Err(error) => { tracing::warn!(%error, "skill trust Admin targets unavailable"); return; }
-    };
-    if targets.is_empty() {
-        tracing::info!(approval_id = %rec.id, "skill trust Admin notice available in Activity Feed; no verified DM target");
-        return;
-    }
-    // Every automatic approval takes this path; no quiet/success opt-out.
-    let push = crate::notify_push::push_plain_notice(home, "skills_auto_approved", &body, targets);
-    match tokio::time::timeout(std::time::Duration::from_secs(15), push).await {
-        Ok(receipt) if receipt.outcome != crate::decision_notify::DeliverOutcome::Failed => {},
-        _ => tracing::warn!(approval_id = %rec.id, "skill trust Admin notice delivery failed"),
-    }
-}
-
 /// Evaluate each candidate once. A process without the gateway lock does no IO.
 pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
     if !duduclaw_core::gateway_instance::held(home) || broker.home_dir().as_deref() != Some(home) { return; }
@@ -410,10 +417,19 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
     static RUN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     let _running = RUN.lock().await;
     if !duduclaw_core::gateway_instance::held(home) { return; }
+    // Recover committed side effects even when there are no pending approvals.
+    if let Ok(state) = load_state(home) {
+        for entry in state.outbox {
+            if let Err(error) = process_outbox(home, broker, entry).await {
+                tracing::warn!(%error, "skill trust outbox remains pending");
+            }
+        }
+    }
     let records = match broker.list_pending(None).await { Ok(rows) => rows, Err(_) => return };
     let pending: BTreeSet<_> = records.iter().filter(|r| candidate(r)).map(|r| r.id.to_string()).collect();
     let seen = update_state(home, |state| {
         state.evaluated.retain(|id| pending.contains(id));
+        state.cards.retain(|id, _| pending.contains(id));
         Ok(state.evaluated.clone())
     });
     for rec in records.into_iter().filter(candidate) {
@@ -422,58 +438,93 @@ pub async fn run_once(home: &Path, broker: &ApprovalBroker) {
             Ok(seen) => seen,
             Err(_) => { refuse(home, broker, &rec, INTERNAL).await; continue; }
         };
-        if seen.contains(rec.id.as_str()) { continue; }
+        if seen.contains(rec.id.as_str()) {
+            // Legacy evaluated entries had no delivery state. Never re-evaluate.
+            let _ = update_state(home, |state| {
+                if !state.outbox.iter().any(|o| o.approval_id == rec.id.as_str()) {
+                    state.cards.entry(rec.id.to_string()).or_insert_with(|| CardRetry::new(INTERNAL));
+                }
+                Ok(())
+            });
+            retry_card(home, broker, &rec).await;
+            continue;
+        }
         let evaluated = evaluate(home, &rec).await;
         let reserved = update_state(home, |state| {
             if state.evaluated.contains(rec.id.as_str()) { return Ok(false); }
             if state.evaluated.len() >= MAX_EVALUATED { return Err(INTERNAL.into()); }
             if let Ok(approved) = &evaluated {
                 check_version(state, approved)?;
-                match state.highest_versions.iter_mut().find(|v| v.publisher == approved.publisher && v.pack == approved.pack) {
-                    Some(old) => old.version = approved.pack_version.clone(),
-                    None => {
-                        if state.highest_versions.len() >= 4096 { return Err(INTERNAL.into()); }
-                        state.highest_versions.push(HighestVersion { publisher: approved.publisher.clone(), pack: approved.pack.clone(), version: approved.pack_version.clone() });
+                // An unresolved outbox reserves its version/digest without
+                // changing the high-water mark. Identical replays still pass.
+                for other in &state.outbox {
+                    if other.publisher == approved.publisher && other.pack == approved.pack {
+                        let order = Version::parse(&approved.pack_version)?.compare(&Version::parse(&other.version)?);
+                        if order == Ordering::Less || (order == Ordering::Equal && other.manifest_sha256 != approved.manifest_sha256) {
+                            return Err(VERSION.into());
+                        }
                     }
                 }
+                if state.outbox.len() >= MAX_EVALUATED
+                    || (state.highest_versions.len() >= 4096 && !state.highest_versions.iter().any(|v|
+                        v.publisher == approved.publisher && v.pack == approved.pack))
+                { return Err(INTERNAL.into()); }
+                state.outbox.push(Outbox::new(&rec, approved));
+            } else if let Err(reason) = &evaluated {
+                state.cards.insert(rec.id.to_string(), CardRetry::new(reason));
             }
             state.evaluated.insert(rec.id.to_string());
             Ok(true)
         });
         match reserved {
             Ok(false) => continue,
-            Err(_) => { refuse(home, broker, &rec, INTERNAL).await; continue; }
+            Err(_) => {
+                // If the outbox cannot be persisted there is no policy CAS.
+                // Persist evaluation/card state separately when storage permits.
+                let saved = update_state(home, |state| {
+                    if state.evaluated.len() >= MAX_EVALUATED { return Err(INTERNAL.into()); }
+                    state.evaluated.insert(rec.id.to_string());
+                    state.cards.insert(rec.id.to_string(), CardRetry::new(INTERNAL));
+                    Ok(())
+                });
+                if saved.is_ok() { refuse_with_retry(home, broker, &rec, INTERNAL).await; }
+                else { refuse(home, broker, &rec, INTERNAL).await; }
+                continue;
+            }
             Ok(true) => {}
         }
         let approved = match evaluated {
             Ok(approved) => approved,
-            Err(reason) => { refuse(home, broker, &rec, &reason).await; continue; }
+            Err(reason) => { refuse_with_retry(home, broker, &rec, &reason).await; continue; }
         };
         if !duduclaw_core::gateway_instance::held(home) { return; }
-        let policy = format!("policy:skill_trust:{}:{}", approved.publisher, approved.key_id);
-        // Reuse the store's in-transaction digest guard as well as its status
-        // CAS: a privacy scrub or payload edit must not change what we verified.
+        let entry = Outbox::new(&rec, &approved);
+        #[cfg(test)]
+        tests::before_cas(home, broker, &rec).await;
+        // Reuse the store's in-transaction digest guard and status CAS.
+        let policy = entry.policy();
         let decision = crate::approval::EXPECTED_DECISION_DIGEST.scope(
             Some((rec.id.to_string(), crate::approval::decision_digest(&rec))),
             broker.decide_by_skill_trust_policy(&rec.id, &policy),
         ).await;
+        if let Err(error) = process_outbox(home, broker, entry).await {
+            tracing::warn!(%error, "skill trust outbox remains pending");
+        }
         if decision.is_err() {
-            refuse(home, broker, &rec, INTERNAL).await;
+            refuse_with_retry(home, broker, &rec, INTERNAL).await;
             continue;
         }
-        append_audit_event(home, &AuditEvent::new("skills_auto_approved", &rec.agent_id, Severity::Info,
-            serde_json::json!({"approval_id": rec.id.as_str(), "publisher": approved.publisher,
-                "key_id": approved.key_id, "pack": approved.pack, "version": approved.pack_version,
-                "manifest_sha256": approved.manifest_sha256,
-                "skills": approved.skills.iter().map(|(agent, name, digest)| serde_json::json!({
-                    "agent": agent, "skill": name, "digest": digest,
-                })).collect::<Vec<_>>() })));
-        announce(home, &rec, &approved).await;
         match expert_skills::apply_skills_decision(home, &rec.agent_id).await {
             Ok(expert_skills::SkillsApplyOutcome::Enabled { not_enabled, .. }) if not_enabled.is_empty() => {},
             _ => tracing::warn!(approval_id = %rec.id, "skill trust approval applied incompletely; promotion digest gate retained"),
         }
     }
+}
+
+async fn refuse_with_retry(home: &Path, broker: &ApprovalBroker, rec: &ApprovalRecord, reason: &str) {
+    append_audit_event(home, &AuditEvent::new("skills_auto_approval_refused", &rec.agent_id, Severity::Warning,
+        serde_json::json!({"approval_id": rec.id.as_str(), "reason_code": reason_code(reason), "reason": reason})));
+    retry_card(home, broker, rec).await;
 }
 
 #[cfg(test)]

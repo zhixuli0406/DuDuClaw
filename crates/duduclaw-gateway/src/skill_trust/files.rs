@@ -13,6 +13,17 @@ pub(super) fn segment(value: &str) -> bool {
     safe_relative(value) && !value.contains('/')
 }
 
+fn check_entry_count(count: usize) -> io::Result<()> {
+    if count >= 10_000 { return Err(denied()); }
+    Ok(())
+}
+
+#[test]
+fn entry_limit_refuses_before_allocating_entry_10001() {
+    assert!(check_entry_count(9_999).is_ok());
+    assert!(check_entry_count(10_000).is_err());
+}
+
 fn denied() -> io::Error { io::Error::other("unsafe skill evidence") }
 
 pub(super) struct Directory {
@@ -88,6 +99,11 @@ impl Directory {
         Ok(file)
     }
 
+    #[cfg(unix)]
+    pub(super) fn sync(&self) -> io::Result<()> {
+        self.handles.last().ok_or_else(denied)?.sync_all()
+    }
+
     pub(super) fn read(&self, name: &str, limit: u64) -> io::Result<Vec<u8>> {
         if !segment(name) { return Err(denied()); }
         #[cfg(unix)]
@@ -130,17 +146,21 @@ impl Directory {
                 let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
                     .to_str().map_err(|_| denied())?;
                 if name == "." || name == ".." { continue; }
-                if !segment(name) || names.len() >= 10_000 { return Err(denied()); }
+                check_entry_count(names.len())?;
+                if !segment(name) { return Err(denied()); }
                 names.push(name.to_owned());
             }
             Ok(names)
         }
         #[cfg(not(unix))] {
-            std::fs::read_dir(&self.path)?.map(|entry| {
+            let mut names = Vec::new();
+            for entry in std::fs::read_dir(&self.path)? {
+                check_entry_count(names.len())?;
                 let name = entry?.file_name().into_string().map_err(|_| denied())?;
                 if !segment(&name) { return Err(denied()); }
-                Ok(name)
-            }).collect()
+                names.push(name);
+            }
+            Ok(names)
         }
     }
 }
