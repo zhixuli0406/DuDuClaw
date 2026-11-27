@@ -441,6 +441,8 @@ impl UserDb {
         // SR4 item 1: Admin attestations of Google delegate subjects.
         self.migrate_google_authority_if_needed(&conn, crate::google_delegate_attestation::migration_needed,
             crate::google_delegate_attestation::migrate)?;
+        self.migrate_google_authority_if_needed(&conn, crate::google_signin::migration_needed,
+            crate::google_signin::migrate)?;
         // RM-135: first-Admin setup codes; its triggers read users and every
         // MFA factor table, so it runs after all of them exist.
         crate::mfa::bootstrap::migrate(&conn)?;

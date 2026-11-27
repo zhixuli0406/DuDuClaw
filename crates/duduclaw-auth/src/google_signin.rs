@@ -1,0 +1,185 @@
+//! Google sign-in storage. Callers own authorization and policy decisions.
+//! All INTEGER timestamps are Unix seconds. Transaction helpers never commit.
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use serde::Serialize;
+use crate::UserDb;
+
+pub const SIGNIN_REQUEST_TTL_SECS: i64 = 14 * 24 * 60 * 60;
+pub const SIGNIN_PENDING_MAX: u32 = 50;
+pub const SIGNIN_ATTESTATION_TTL_SECS: i64 = 14 * 24 * 60 * 60;
+pub const SIGNIN_REJECT_COOLDOWN_SECS: i64 = 7 * 24 * 60 * 60;
+
+pub fn valid_google_sub(s: &str) -> bool {
+    (1..=255).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+fn error(e: rusqlite::Error) -> String { format!("google_signin_storage: {e}") }
+
+pub(crate) fn migration_needed(conn: &Connection) -> Result<bool, String> {
+    for table in ["google_signin_links", "google_signin_requests", "google_signin_attestations"] {
+        if !crate::authority_migrations::schema_object_exists(conn, "table", table)? { return Ok(true); }
+    }
+    Ok(false)
+}
+pub(crate) fn migrate(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch("CREATE TABLE IF NOT EXISTS google_signin_links (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        google_sub TEXT NOT NULL UNIQUE CHECK(google_sub GLOB '[0-9]*' AND google_sub NOT GLOB '*[^0-9]*' AND length(google_sub) BETWEEN 1 AND 255 AND instr(google_sub,char(0))=0),
+        hd TEXT NOT NULL, email_at_link TEXT NOT NULL,
+        linked_via TEXT NOT NULL CHECK(linked_via IN ('jit_direct','jit_approved','self_link','admin_attest')),
+        linked_by TEXT NOT NULL, linked_at INTEGER NOT NULL, last_signin_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS google_signin_requests (
+        id TEXT PRIMARY KEY,
+        google_sub TEXT NOT NULL UNIQUE CHECK(google_sub GLOB '[0-9]*' AND google_sub NOT GLOB '*[^0-9]*' AND length(google_sub) BETWEEN 1 AND 255 AND instr(google_sub,char(0))=0),
+        email TEXT NOT NULL, hd TEXT NOT NULL, display_name TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','expired')),
+        requested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, decided_by TEXT, decided_at INTEGER,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        mfa_preauthorized INTEGER NOT NULL DEFAULT 0 CHECK(mfa_preauthorized IN (0,1))
+    );
+    CREATE TABLE IF NOT EXISTS google_signin_attestations (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        email_at_attestation TEXT NOT NULL, credential_seq INTEGER NOT NULL,
+        attested_by TEXT NOT NULL, attested_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+    );").map_err(error)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GoogleSigninLink {
+    pub user_id: String, pub google_sub: String, pub hd: String, pub email_at_link: String,
+    pub linked_via: String, pub linked_by: String, pub linked_at: i64, pub last_signin_at: Option<i64>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct NewGoogleSigninLink {
+    pub user_id: String, pub google_sub: String, pub hd: String, pub email_at_link: String,
+    pub linked_via: String, pub linked_by: String, pub linked_at: i64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SigninRequestStatus { Pending, Approved, Rejected, Expired }
+impl SigninRequestStatus {
+    pub fn as_str(self) -> &'static str {
+        match self { Self::Pending => "pending", Self::Approved => "approved", Self::Rejected => "rejected", Self::Expired => "expired" }
+    }
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s { "pending" => Ok(Self::Pending), "approved" => Ok(Self::Approved),
+            "rejected" => Ok(Self::Rejected), "expired" => Ok(Self::Expired), _ => Err("invalid_signin_request_status".into()) }
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SigninRequest {
+    pub id: String, pub google_sub: String, pub email: String, pub hd: String, pub display_name: String,
+    pub status: SigninRequestStatus, pub requested_at: i64, pub expires_at: i64,
+    pub decided_by: Option<String>, pub decided_at: Option<i64>, pub user_id: Option<String>, pub mfa_preauthorized: bool,
+}
+const LINK_COLUMNS: &str = "user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at,last_signin_at";
+const REQUEST_COLUMNS: &str = "id,google_sub,email,hd,display_name,status,requested_at,expires_at,decided_by,decided_at,user_id,mfa_preauthorized";
+fn link_row(r: &Row<'_>) -> rusqlite::Result<GoogleSigninLink> {
+    Ok(GoogleSigninLink { user_id: r.get(0)?, google_sub: r.get(1)?, hd: r.get(2)?, email_at_link: r.get(3)?,
+        linked_via: r.get(4)?, linked_by: r.get(5)?, linked_at: r.get(6)?, last_signin_at: r.get(7)? })
+}
+fn request_row(r: &Row<'_>) -> rusqlite::Result<SigninRequest> {
+    let status: String = r.get(5)?;
+    Ok(SigninRequest { id: r.get(0)?, google_sub: r.get(1)?, email: r.get(2)?, hd: r.get(3)?, display_name: r.get(4)?,
+        status: SigninRequestStatus::parse(&status).map_err(|_| rusqlite::Error::InvalidQuery)?, requested_at: r.get(6)?,
+        expires_at: r.get(7)?, decided_by: r.get(8)?, decided_at: r.get(9)?, user_id: r.get(10)?, mfa_preauthorized: r.get(11)? })
+}
+impl UserDb {
+    pub fn google_signin_link_by_sub(&self, sub: &str) -> Result<Option<GoogleSigninLink>, String> {
+        self.conn().query_row(&format!("SELECT {LINK_COLUMNS} FROM google_signin_links WHERE google_sub=?1"), [sub], link_row).optional().map_err(error)
+    }
+    pub fn google_signin_link_for_user(&self, user_id: &str) -> Result<Option<GoogleSigninLink>, String> {
+        self.conn().query_row(&format!("SELECT {LINK_COLUMNS} FROM google_signin_links WHERE user_id=?1"), [user_id], link_row).optional().map_err(error)
+    }
+    pub fn insert_google_signin_link_tx(tx: &Transaction<'_>, link: &NewGoogleSigninLink) -> Result<(), String> {
+        if !valid_google_sub(&link.google_sub) { return Err("invalid_google_sub".into()); }
+        tx.execute("INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7)", params![link.user_id,link.google_sub,link.hd,link.email_at_link,link.linked_via,link.linked_by,link.linked_at])
+            .map(|_| ()).map_err(error)
+    }
+    pub fn delete_google_signin_link(&self, user_id: &str) -> Result<bool, String> {
+        self.conn().execute("DELETE FROM google_signin_links WHERE user_id=?1", [user_id]).map(|n| n != 0).map_err(error)
+    }
+    pub fn touch_google_signin(&self, user_id: &str, now: i64) -> Result<(), String> {
+        self.conn().execute("UPDATE google_signin_links SET last_signin_at=?2 WHERE user_id=?1", params![user_id,now]).map(|_| ()).map_err(error)
+    }
+    /// Re-submission preserves a pending request's id and original request/expiry times.
+    /// A non-pending row is replaced for the same sub; cooldown policy belongs to P3.
+    pub fn upsert_pending_signin_request_tx(tx: &Transaction<'_>, id: &str, sub: &str, email: &str,
+        hd: &str, display_name: &str, now: i64) -> Result<(), String> {
+        if !valid_google_sub(sub) { return Err("invalid_google_sub".into()); }
+        let existing: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM google_signin_requests WHERE google_sub=?1 AND status='pending')", [sub], |r| r.get(0)).map_err(error)?;
+        let count: u32 = tx.query_row("SELECT COUNT(*) FROM google_signin_requests WHERE status='pending'", [], |r| r.get(0)).map_err(error)?;
+        if !existing && count >= SIGNIN_PENDING_MAX { return Err("signin_pending_full".into()); }
+        let expires = now.checked_add(SIGNIN_REQUEST_TTL_SECS).ok_or("signin_timestamp_overflow")?;
+        if existing {
+            tx.execute("UPDATE google_signin_requests SET email=?2,hd=?3,display_name=?4 WHERE google_sub=?1",
+                params![sub,email,hd,display_name]).map_err(error)?;
+        } else {
+            tx.execute("INSERT INTO google_signin_requests(id,google_sub,email,hd,display_name,status,requested_at,expires_at)
+                VALUES(?1,?2,?3,?4,?5,'pending',?6,?7) ON CONFLICT(google_sub) DO UPDATE SET
+                id=excluded.id,email=excluded.email,hd=excluded.hd,display_name=excluded.display_name,status='pending',
+                requested_at=excluded.requested_at,expires_at=excluded.expires_at,decided_by=NULL,decided_at=NULL,user_id=NULL,mfa_preauthorized=0",
+                params![id,sub,email,hd,display_name,now,expires]).map_err(error)?;
+        }
+        Ok(())
+    }
+    pub fn signin_request_by_id(&self, id: &str) -> Result<Option<SigninRequest>, String> {
+        self.conn().query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE id=?1"), [id], request_row).optional().map_err(error)
+    }
+    pub fn signin_request_by_sub(&self, sub: &str) -> Result<Option<SigninRequest>, String> {
+        self.conn().query_row(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE google_sub=?1"), [sub], request_row).optional().map_err(error)
+    }
+    pub fn list_pending_signin_requests(&self) -> Result<Vec<SigninRequest>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT {REQUEST_COLUMNS} FROM google_signin_requests WHERE status='pending' ORDER BY requested_at,id")).map_err(error)?;
+        let rows = stmt.query_map([], request_row).map_err(error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(error)
+    }
+    pub fn set_signin_request_status_tx(tx: &Transaction<'_>, id: &str, status: SigninRequestStatus,
+        decided_by: &str, now: i64, user_id: Option<&str>, mfa_preauthorized: bool) -> Result<(), String> {
+        let changed = tx.execute("UPDATE google_signin_requests SET status=?2,decided_by=?3,decided_at=?4,user_id=?5,mfa_preauthorized=?6 WHERE id=?1",
+            params![id,status.as_str(),decided_by,now,user_id,mfa_preauthorized]).map_err(error)?;
+        if changed != 1 { return Err("signin_request_not_found".into()); }
+        Ok(())
+    }
+    pub fn expire_signin_requests(&self, now: i64) -> Result<usize, String> {
+        self.conn().execute("UPDATE google_signin_requests SET status='expired' WHERE status='pending' AND expires_at<=?1", [now]).map_err(error)
+    }
+    pub fn count_signin_jit_since(&self, since: i64) -> Result<u32, String> {
+        self.conn().query_row("SELECT (SELECT COUNT(*) FROM google_signin_links WHERE linked_via IN ('jit_direct','jit_approved') AND linked_at>=?1)
+            + (SELECT COUNT(*) FROM google_signin_requests WHERE status='pending' AND requested_at>=?1)", [since], |r| r.get(0)).map_err(error)
+    }
+    pub fn upsert_google_signin_attestation(&self, user_id: &str, attested_by: &str, now: i64) -> Result<(), String> {
+        let expires = now.checked_add(SIGNIN_ATTESTATION_TTL_SECS).ok_or("signin_timestamp_overflow")?;
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(error)?;
+        let email: String = tx.query_row("SELECT email FROM users WHERE id=?1", [user_id], |r| r.get(0)).map_err(error)?;
+        let seq = crate::credential_changes::high_water(&tx)?;
+        tx.execute("INSERT INTO google_signin_attestations(user_id,email_at_attestation,credential_seq,attested_by,attested_at,expires_at)
+            VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(user_id) DO UPDATE SET email_at_attestation=excluded.email_at_attestation,
+            credential_seq=excluded.credential_seq,attested_by=excluded.attested_by,attested_at=excluded.attested_at,expires_at=excluded.expires_at",
+            params![user_id,email,seq,attested_by,now,expires]).map_err(error)?;
+        tx.commit().map_err(error)
+    }
+    /// Any later credential change of this user invalidates the captured high-water mark.
+    /// A token-email mismatch alone leaves an otherwise valid attestation for its owner.
+    pub fn take_valid_google_signin_attestation_tx(tx: &Transaction<'_>, user_id: &str, token_email: &str, now: i64) -> Result<bool, String> {
+        let stored: Option<(String,i64,i64)> = tx.query_row("SELECT email_at_attestation,credential_seq,expires_at FROM google_signin_attestations WHERE user_id=?1",
+            [user_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(error)?;
+        let Some((email,seq,expires)) = stored else { return Ok(false) };
+        let current: Option<String> = tx.query_row("SELECT email FROM users WHERE id=?1", [user_id], |r| r.get(0)).optional().map_err(error)?;
+        let changed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM credential_changes WHERE user_id=?1 AND seq>?2)", params![user_id,seq], |r| r.get(0)).map_err(error)?;
+        let stale = expires <= now || changed || !current.as_deref().is_some_and(|s| email.eq_ignore_ascii_case(s));
+        let valid = !stale && email.eq_ignore_ascii_case(token_email);
+        if stale || valid { tx.execute("DELETE FROM google_signin_attestations WHERE user_id=?1", [user_id]).map_err(error)?; }
+        Ok(valid)
+    }
+    pub fn delete_google_signin_attestation(&self, user_id: &str) -> Result<(), String> {
+        self.conn().execute("DELETE FROM google_signin_attestations WHERE user_id=?1", [user_id]).map(|_| ()).map_err(error)
+    }
+}
+
+#[cfg(test)]
+#[path = "google_signin_tests.rs"]
+mod tests;
