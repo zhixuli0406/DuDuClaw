@@ -142,7 +142,6 @@ impl MethodHandler {
                 }
                 "google.signin.set" => {
                     let input: SetRequest = parse(params)?;
-                    if input.enabled { step_up(&db, &ctx, &session, input.step_up_csrf)?; }
                     let approval = match input.approval.as_str() {
                         "admin" => Approval::Admin, "direct" => Approval::Direct,
                         _ => return Err(signin_error("signin_invalid_params")),
@@ -154,6 +153,19 @@ impl MethodHandler {
                     let update = SettingsUpdate { enabled: input.enabled, allowed_hd: input.allowed_hd, approval,
                         daily_new_accounts: input.daily_new_accounts, avatar_template: template,
                         approval_grants_mfa_enrollment: input.approval_grants_mfa_enrollment };
+                    let current = config::read_strict(&home);
+                    let allowed_hd = update.allowed_hd.iter().try_fold(Vec::new(), |mut domains, domain| {
+                        let domain = crate::google_signin::oidc::normalize_allowed_hd(domain)?;
+                        if !domains.contains(&domain) { domains.push(domain); }
+                        Some(domains)
+                    });
+                    let pure_disable = !update.enabled
+                        && allowed_hd.as_ref() == Some(&current.allowed_hd)
+                        && update.approval == current.approval
+                        && update.daily_new_accounts == current.daily_new_accounts
+                        && update.avatar_template == current.avatar_template
+                        && update.approval_grants_mfa_enrollment == current.approval_grants_mfa_enrollment;
+                    if !pure_disable { step_up(&db, &ctx, &session, input.step_up_csrf)?; }
                     // Refuse before touching config if the audit store is unavailable.
                     db.log_action(Some(&ctx.user_id), "google_signin.settings_change_requested", None, None, None)
                         .map_err(|_| signin_error("signin_storage_unavailable"))?;
@@ -175,8 +187,11 @@ impl MethodHandler {
                 }
                 "users.signin_requests.approve" => {
                     let input: ApproveRequest = parse(params)?;
-                    if input.mfa_preauthorize && !config::read_strict(&home).approval_grants_mfa_enrollment {
-                        return Err(signin_error("signin_preauthorize_disabled"));
+                    if input.mfa_preauthorize {
+                        let settings = config::read_strict(&home);
+                        if !settings.enabled || !settings.approval_grants_mfa_enrollment {
+                            return Err(signin_error("signin_preauthorize_disabled"));
+                        }
                     }
                     let user_id = db.approve_signin_request(&ctx.user_id, ctx.credential_epoch, &input.id, input.mfa_preauthorize, now.timestamp())
                         .map_err(signin_error)?;

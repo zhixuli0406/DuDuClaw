@@ -145,6 +145,23 @@ async fn disable_needs_no_step_up() {
 }
 
 #[tokio::test]
+async fn disable_with_other_changes_needs_step_up() {
+    let f = fixture().await;
+    f.fresh_proof();
+    payload(f.admin("google.signin.set", settings()).await);
+    f.raw().execute("DELETE FROM migration_dashboard_proofs", []).unwrap();
+    let before = std::fs::read_to_string(f.home.path().join("config.toml")).unwrap();
+    let intents = f.db.query_audit_log(Some(&f.admin.user_id), Some("google_signin.settings_change_requested"), 100).unwrap().len();
+    let mut input = settings();
+    input["enabled"] = json!(false);
+    input["approval_grants_mfa_enrollment"] = json!(true);
+    input.as_object_mut().unwrap().remove("step_up_csrf");
+    assert_eq!(code(f.admin("google.signin.set", input).await), "signin_step_up_required");
+    assert_eq!(std::fs::read_to_string(f.home.path().join("config.toml")).unwrap(), before);
+    assert_eq!(f.db.query_audit_log(Some(&f.admin.user_id), Some("google_signin.settings_change_requested"), 100).unwrap().len(), intents);
+}
+
+#[tokio::test]
 async fn risk_ack_required_written_and_settings_audited() {
     let f = fixture().await;
     f.fresh_proof();
@@ -228,6 +245,27 @@ async fn requests_list_approve_reject_and_preauthorize_policy() {
     let allowed = f.provision("789", SigninApproval::Admin);
     payload(f.admin("users.signin_requests.approve", json!({"id": allowed, "mfa_preauthorize": true})).await);
     assert!(f.db.signin_request_by_id(&allowed).unwrap().unwrap().mfa_preauthorized);
+}
+
+#[tokio::test]
+async fn preauthorize_refused_when_signin_disabled() {
+    let f = fixture().await;
+    f.fresh_proof();
+    let mut input = settings();
+    input["approval_grants_mfa_enrollment"] = json!(true);
+    payload(f.admin("google.signin.set", input.clone()).await);
+    f.raw().execute("DELETE FROM migration_dashboard_proofs", []).unwrap();
+    input["enabled"] = json!(false);
+    input.as_object_mut().unwrap().remove("step_up_csrf");
+    payload(f.admin("google.signin.set", input).await);
+    let stored = config::read_strict(f.home.path());
+    assert!(!stored.enabled);
+    assert!(stored.approval_grants_mfa_enrollment);
+    let id = f.provision("123", SigninApproval::Admin);
+    assert_eq!(code(f.admin("users.signin_requests.approve", json!({"id": id, "mfa_preauthorize": true})).await), "signin_preauthorize_disabled");
+    let request = f.db.signin_request_by_id(&id).unwrap().unwrap();
+    assert_eq!(request.status, duduclaw_auth::google_signin::SigninRequestStatus::Pending);
+    assert!(!request.mfa_preauthorized);
 }
 
 #[tokio::test]
