@@ -798,6 +798,19 @@ async fn handle_event(
             let is_admin =
                 crate::channel_reply::is_channel_admin(ctx, "slack", &[user, &session_id]).await;
             let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "slack", user);
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "slack", gate_session: &session_id, command_session: &session_id,
+                sender: user, text, shared: !is_dm,
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &cmd, ctx, &origin, &agent_id,
+            ).await {
+                if !refusal.is_empty() {
+                    send_message(http, bot_token, channel, &refusal, thread_ts.as_deref().or(Some(ts))).await;
+                }
+                remove_reaction_add_done(http, bot_token, channel, ts).await;
+                return;
+            }
             // A channel's session is shared by its members: only a verified
             // Admin/Manager may clear it (a DM resets its own as before).
             let reply = match crate::chat_commands::shared_reset_refusal(
@@ -1279,6 +1292,18 @@ async fn handle_slash_command_envelope(
                 // `slack:group:<channel>` is shared by the channel's members
                 // (only a `D…` direct-message channel is one person's).
                 let shared = !channel_id.starts_with('D');
+                let origin = crate::chat_commands::CommandOrigin {
+                    channel: "slack", gate_session: &session_id, command_session: &session_id,
+                    sender: user_id, text: &cmd_text, shared,
+                };
+                if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                    &cmd, ctx, &origin, &agent_id,
+                ).await {
+                    if !refusal.is_empty() {
+                        respond_via_response_url(http, response_url, "ephemeral", &refusal).await;
+                    }
+                    return;
+                }
                 let reply = match crate::chat_commands::shared_reset_refusal(
                     &ctx.home_dir,
                     "slack",

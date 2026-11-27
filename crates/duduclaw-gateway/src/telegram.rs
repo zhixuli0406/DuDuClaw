@@ -2320,6 +2320,26 @@ async fn handle_command(
             send_reply(&ctx.home_dir, client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
+            let session = match thread_id {
+                Some(tid) => format!("telegram:{chat_id}:{tid}"),
+                None => format!("telegram:{chat_id}"),
+            };
+            let sender = from_user_id.map(|id| id.to_string()).unwrap_or_default();
+            let agent = match agent_name {
+                Some(agent) => agent.to_string(),
+                None => ctx.registry.read().await.main_agent()
+                    .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+            };
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "telegram", gate_session: &session, command_session: &session,
+                sender: &sender, text, shared: !is_private_chat_with(chat_id, &sender),
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &crate::chat_commands::ChatCommand::Voice, ctx, &origin, &agent,
+            ).await {
+                send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                return;
+            }
             let msg = toggle_voice(ctx, chat_id).await;
             send_reply(&ctx.home_dir, client, api_base, chat_id, msg, thread_id, None, None).await;
         }
@@ -2465,6 +2485,19 @@ async fn handle_command(
                 } else {
                     own_bot_session(&session_id, agent_name)
                 };
+                let origin = crate::chat_commands::CommandOrigin {
+                    channel: "telegram", gate_session: &session_id,
+                    command_session: &command_session, sender: own_sender,
+                    text: &normalized, shared: !is_private_chat_with(chat_id, own_sender),
+                };
+                if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                    &parsed, ctx, &origin, &agent_id,
+                ).await {
+                    if !refusal.is_empty() {
+                        send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                    }
+                    return;
+                }
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,

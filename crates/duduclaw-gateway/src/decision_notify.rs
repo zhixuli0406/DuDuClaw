@@ -1421,9 +1421,9 @@ async fn apply_bound_request(
     if auth != PressAuth::Allow && !crate::approval::mail_requester::eligible(home, &rec) {
         return Err(refusal_text(auth, "核准"));
     }
-    if context.channel == "webchat" {
-        crate::entry_gate::check_approval_start(home, &rec, approve == Some(true), &context.conversation_id).await?;
-    }
+    crate::entry_gate::check_approval_start(
+        home, &rec, approve == Some(true), &context.conversation_id,
+    ).await?;
     broker
         .decide_bound(&request, context, approve.ok_or("請使用確認或取消指令")?)
         .await?;
@@ -2203,3 +2203,7 @@ pub fn channel_display_name(channel: &str) -> &str {
         "dingtalk" => "釘釘", _ => "聊天通道",
     }
 }
+
+#[cfg(test)]
+#[path = "decision_entry_gate_tests.rs"]
+mod entry_gate_tests;

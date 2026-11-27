@@ -1500,6 +1500,12 @@ pub(crate) async fn apply_needs_human(
         "決定這件事",
     )?;
 
+    if act == DecisionAct::Retry {
+        crate::entry_gate::check_task_start(
+            home_dir, task_id, &format!("{channel}:{channel_user_id}"), "retry",
+        ).await?;
+    }
+
     // W1-5: "take over" claims the task by hand rather than resolving it out
     // of needs_human — it stays `needs_human` (already outside
     // `GoalLoopDriver::tick_once`'s dispatch-candidate query, so the loop is
@@ -1870,6 +1876,10 @@ pub(crate) async fn apply_kickoff(
     }
     // Kickoff cards have no Google Chat button shape: no card target.
     authorize_goal_press(home_dir, &agent, None, channel, channel_user_id, "核准")?;
+
+    crate::entry_gate::check_approval_start(
+        home_dir, &record, approve, &format!("{channel}:{channel_user_id}"),
+    ).await?;
 
     let card_verb = crate::decision_notify::settled_verb(
         DecisionSource::Kickoff,
@@ -2341,7 +2351,7 @@ mod tests {
         std::fs::write(
             dir.join("agent.toml"),
             format!(
-                "[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"
+                "[agent]\nname = '{agent}'\nstatus = 'active'\n[model]\npreferred = 'claude-sonnet-4-6'\n[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"
             ),
         )
         .unwrap();

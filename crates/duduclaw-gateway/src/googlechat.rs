@@ -1083,15 +1083,21 @@ async fn handle_message(
                 Some(reply) => reply,
                 None => {
                     let agent_id = employee_id.clone();
-                    crate::chat_commands::handle_command_for_sender(
-                        &cmd,
-                        &state.ctx,
-                        "googlechat",
-                        &reply_session,
-                        &agent_id,
-                        origin.sender,
-                    )
-                    .await
+                    if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                        &cmd, &state.ctx, &origin, &agent_id,
+                    ).await {
+                        refusal
+                    } else {
+                        crate::chat_commands::handle_command_for_sender(
+                            &cmd,
+                            &state.ctx,
+                            "googlechat",
+                            &reply_session,
+                            &agent_id,
+                            origin.sender,
+                        )
+                        .await
+                    }
                 }
             };
             // An empty reply (blocked sender) removes the placeholder: silence.

@@ -1809,6 +1809,18 @@ async fn handle_message_create(
                 crate::channel_reply::is_channel_admin(ctx, "discord", &[user_id, &session_id])
                     .await;
             let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "discord", user_id);
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "discord", gate_session: session_id, command_session: session_id,
+                sender: user_id, text: clean_content, shared: !guild_id.is_empty(),
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &cmd, ctx, &origin, &agent_id,
+            ).await {
+                if !refusal.is_empty() {
+                    let _ = send_discord_message(http, token, channel_id, json!({ "content": refusal })).await;
+                }
+                return;
+            }
             let reply = crate::chat_commands::handle_command_with_caller(
                 &cmd,
                 ctx,

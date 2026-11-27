@@ -740,12 +740,15 @@ pub(crate) async fn apply_decision_in_session(
         return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
     }
 
-    if channel == "webchat" {
-        // Only the adapter knows the conversation. A positive decision without
-        // it cannot safely select its refusal audience.
-        if approve && session.is_none() { return Err(crate::channel_decision_route::DECISION_REFUSED.into()); }
-        crate::entry_gate::check_approval_start(home_dir, &rec, approve, session.unwrap_or("")).await?;
+    // WebChat must supply its audience; other adapters can use their verified
+    // channel identity when no conversation is available.
+    if channel == "webchat" && approve && session.is_none() {
+        return Err(crate::channel_decision_route::DECISION_REFUSED.into());
     }
+    let channel_session = format!("{channel}:{channel_user_id}");
+    crate::entry_gate::check_approval_start(
+        home_dir, &rec, approve, session.unwrap_or(&channel_session),
+    ).await?;
 
     // ── decide ──────────────────────────────────────────────
     let decided_by = format!("channel:{channel}:{channel_user_id}");

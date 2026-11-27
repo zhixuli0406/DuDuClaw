@@ -947,6 +947,23 @@ async fn process_line_events(
                             }
                             continue; // blocked users are silently ignored
                         }
+                        let origin = crate::chat_commands::CommandOrigin {
+                            channel: "line", gate_session: &session_id, command_session: &session_id,
+                            sender, text: &input_text,
+                            shared: source.as_ref().is_some_and(|s| s.group_id.is_some() || s.room_id.is_some()),
+                        };
+                        let command_agent = if matches!(&cmd, crate::chat_commands::ChatCommand::Assign(_)) {
+                            route.as_ref().map(|r| r.fallback.as_str()).unwrap_or(agent_id)
+                        } else { agent_id };
+                        if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                            &cmd, &state.ctx, &origin, command_agent,
+                        ).await {
+                            if !refusal.is_empty() {
+                                let messages = vec![serde_json::json!({ "type": "text", "text": refusal })];
+                                let _ = send_reply_rich(&state.http, &token, reply_token, messages).await;
+                            }
+                            continue;
+                        }
                         // `/交辦`: the sender's own rights; the assignable
                         // list comes back as quick-reply buttons.
                         if let crate::chat_commands::ChatCommand::Assign(assign_cmd) = &cmd {
