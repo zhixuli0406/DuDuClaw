@@ -226,7 +226,9 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
     }
     let decision = validate_import_policy(&mut snapshot, home, personal)?;
     apply_import_snapshot(&mut snapshot, home, force, &decision, |_| Ok(()))?;
-    println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
+    if decision.removed_drive_write {
+        println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
+    }
     Ok(())
 }
 
@@ -234,6 +236,7 @@ fn import_archive_locked(archive: &Path, home: &Path, force: bool, personal: boo
 struct ImportDecision {
     prepared_config: String,
     publish_before_unpack: bool,
+    removed_drive_write: bool,
 }
 
 fn publish_import_config(home: &Path, config: &str) -> Result<()> {
@@ -455,6 +458,9 @@ mod tests {
             }
             let archive = root.path().join("input.tar.gz");
             ordered_archive(&archive, &[("config.toml", config.as_bytes()), ("payload.txt", b"ok")]);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            let decision = validate_import_policy(&mut snapshot, &home, true).unwrap();
+            assert!(decision.removed_drive_write);
             import_archive(&archive, &home, force, true).unwrap();
             let published = fs::read_to_string(home.join("config.toml")).unwrap();
             let table: toml::Table = published.parse().unwrap();
@@ -463,6 +469,57 @@ mod tests {
             assert!(published.contains("google_workspace = true # keep this comment"));
             assert_eq!(drive_write_policy::load(&home), DriveWritePolicy::all_off());
             assert_eq!(fs::read_to_string(home.join("payload.txt")).unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn import_without_config_strips_retained_signed_drive_write_and_loads_all_off() {
+        use duduclaw_gateway::google_workspace::drive_write_policy::{self, DriveWritePolicy};
+        let _operator = crate::ai_session_guard::test_session(&[]);
+        for force in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let config = signed_drive_write_config();
+            fs::write(home.join("config.toml"), &config).unwrap();
+            assert!(drive_write_policy::load(&home).create);
+            if force {
+                fs::create_dir(home.join("agents")).unwrap();
+            }
+            let archive = root.path().join("input.tar.gz");
+            ordered_archive(&archive, &[("payload.txt", b"ok")]);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            let decision = validate_import_policy(&mut snapshot, &home, true).unwrap();
+            assert!(decision.removed_drive_write);
+            assert!(decision.publish_before_unpack);
+            // Verify consent is already revoked when the first payload arrives.
+            apply_import_snapshot(&mut snapshot, &home, force, &decision, |_| {
+                assert_eq!(drive_write_policy::load(&home), DriveWritePolicy::all_off());
+                Ok(())
+            }).unwrap();
+            let published = fs::read_to_string(home.join("config.toml")).unwrap();
+            let table: toml::Table = published.parse().unwrap();
+            assert!(table.get("google").and_then(|v| v.get("drive_write")).is_none());
+            assert!(published.starts_with("# preserve this header\n"));
+            assert!(published.contains("google_workspace = true # keep this comment"));
+            assert_eq!(drive_write_policy::load(&home), DriveWritePolicy::all_off());
+            assert_eq!(fs::read_to_string(home.join("payload.txt")).unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn import_without_drive_write_does_not_request_reconfirmation() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let config = "[integrations]\ngoogle_workspace = true\n";
+        fs::write(home.join("config.toml"), config).unwrap();
+        let archive = root.path().join("input.tar.gz");
+        for entries in [vec![("payload.txt", &b"ok"[..])], vec![("config.toml", config.as_bytes())]] {
+            ordered_archive(&archive, &entries);
+            let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+            let decision = validate_import_policy(&mut snapshot, &home, true).unwrap();
+            assert!(!decision.removed_drive_write);
         }
     }
 
@@ -505,7 +562,7 @@ mod tests {
             assert!(error.to_string().contains(message), "{error}");
             assert_eq!(fs::read_dir(&home).unwrap().count(), 0, "validation must not unpack anything");
             let unpack_home = tempfile::tempdir().unwrap();
-            let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+            let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false };
             let error = apply_import_snapshot_with_limits(&mut snapshot, unpack_home.path(), false, &decision, &limits, |_| Ok(())).unwrap_err();
             assert!(error.to_string().contains(message), "unpack: {error}");
             assert!(!unpack_home.path().join("second").exists());
@@ -548,7 +605,7 @@ mod tests {
         let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
         let error = validate_import_policy(&mut snapshot, &home, true).unwrap_err();
         assert!(error.to_string().contains("中繼資料"), "{error}");
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false };
         let error = apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("中繼資料"), "{error}");
         assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
@@ -741,7 +798,7 @@ mod tests {
         let home = root.path().join("home");
         fs::create_dir(&home).unwrap();
         let archive = root.path().join("input.tar.gz");
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false };
         for name in ["config.toml.", "users.db:stream", "nested/NUL.txt"] {
             if !cfg!(windows) && name != "config.toml." { continue; }
             ordered_archive(&archive, &[(name, b"")]);
@@ -1087,7 +1144,7 @@ mod tests {
         let _admission = duduclaw_core::agent_seats::SeatAdmission::acquire(&home).unwrap();
         let _writer = authority.write().unwrap();
         let bumped = fs::read(home.join(".google-authority/epoch")).unwrap();
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false };
         let mut snapshot = File::open(&archive).unwrap();
         assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
         assert_eq!(fs::read(home.join(".google-authority/epoch")).unwrap(), bumped);
@@ -1594,6 +1651,7 @@ fn validate_import_policy_with_limits(
     let mut targets = HashSet::new();
     let mut budget = ImportBudget::default();
     let mut restored_config = None;
+    let mut removed_drive_write = false;
     let canonical_home = fs::canonicalize(home).map_err(|e| io_err("import destination", e))?;
     let mut replaces_identity = false;
     let mut personal = personal;
@@ -1648,7 +1706,7 @@ fn validate_import_policy_with_limits(
                 // Consent is local to the admin settings RPC, never portable.
                 let mut sanitized = table.clone();
                 if let Some(google) = sanitized.get_mut("google").and_then(toml::Value::as_table_mut) {
-                    google.remove("drive_write");
+                    removed_drive_write |= google.remove("drive_write").is_some();
                 }
                 let text = render_preserving(&text, &sanitized).map_err(DuDuClawError::Config)?;
                 refuse_drive_write_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
@@ -1668,7 +1726,7 @@ fn validate_import_policy_with_limits(
         },
     };
     // Personal may omit the key, but may never lower the persisted policy.
-    let prepared = duduclaw_gateway::validate_mfa_import_policy(home, &retained, personal, replaces_identity)
+    let mut prepared = duduclaw_gateway::validate_mfa_import_policy(home, &retained, personal, replaces_identity)
         .map_err(DuDuClawError::Config)?;
     if replaces_identity && !personal {
         let table: toml::Table = retained.parse().map_err(|_| io_err("import policy", "invalid configuration"))?;
@@ -1680,13 +1738,21 @@ fn validate_import_policy_with_limits(
     }
     // The unchanged MFA rule guarantees that an accepted identity replacement
     // carries true in the prepared text whenever the current policy is strict.
-    let prepared_table: toml::Table = prepared.parse()
+    let mut prepared_table: toml::Table = prepared.parse()
         .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
+    // Imported identities must never inherit local consent, even when the
+    // archive omits config.toml and the current configuration is retained.
+    if prepared_table.get_mut("google").and_then(toml::Value::as_table_mut)
+        .is_some_and(|google| google.remove("drive_write").is_some()) {
+        removed_drive_write = true;
+        prepared = render_preserving(&prepared, &prepared_table).map_err(DuDuClawError::Config)?;
+    }
     let strict = prepared_table.get("auth").and_then(|auth| auth.get("mfa_enforced"))
         .and_then(|value| value.as_bool()) == Some(true);
     Ok(ImportDecision {
-        publish_before_unpack: has_imported_config || prepared != retained || (replaces_identity && strict),
+        publish_before_unpack: removed_drive_write || has_imported_config || prepared != retained || (replaces_identity && strict),
         prepared_config: prepared,
+        removed_drive_write,
     })
 }
 
