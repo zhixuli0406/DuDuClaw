@@ -733,7 +733,9 @@ impl McpDispatcher {
         }
         if crate::mcp_auth::is_person_principal(principal) {
             let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
-            let result = crate::mcp::person_tools::call(&self.home_dir, &self.odoo, principal, tool_name, &args).await;
+            // Personal Odoo calls must not embed their handler tree in this frame.
+            let result = Box::pin(crate::mcp::person_tools::call(
+                &self.home_dir, &self.odoo, principal, tool_name, &args)).await;
             return jsonrpc_response(id, result);
         }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────

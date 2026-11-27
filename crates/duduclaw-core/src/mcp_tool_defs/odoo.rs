@@ -327,7 +327,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "odoo_activity_create",
-        description: "Schedule an activity on a readable Odoo record. Text is plain text, HTML-escaped, at most 10,000 characters. Engine mode requires activity:model permission and assigns the connected account; only follow mode accepts user_id.",
+        description: "Schedule an activity on a readable Odoo record. Engine mode assigns the connected account; only follow mode accepts user_id.",
         params: &[
             ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
             ParamDef { name: "res_id", description: "Positive target record ID", required: true },
@@ -349,7 +349,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "odoo_message_send",
-        description: "Post a message that notifies followers of a readable Odoo record. Always requires single-use approval bound to the exact content. Plain text is HTML-escaped; no mentions or explicit recipients. Engine mode requires message:model permission.",
+        description: "Notify followers of a readable Odoo record with a plain-text message. Always requires single-use human approval bound to the exact content.",
         params: &[
             ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
             ParamDef { name: "res_id", description: "Positive target record ID", required: true },
@@ -358,7 +358,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "odoo_attachment_add",
-        description: "Attach an existing file from your own employee attachments folder to a readable Odoo record. Only PDF, PNG, JPEG, WebP, UTF-8 TXT/CSV and OOXML XLSX/DOCX/PPTX are accepted; extension and content must agree. Size follows attachment_max_mb (default 10 MiB, maximum 25). No symlinks, absolute paths, parent traversal, shared folders or inline/base64 content. Engine mode requires attach:model permission. Attachment is private.",
+        description: "Add a private attachment to a readable Odoo record. The file must be in the calling employee's own attachments folder; pass its relative path, not inline/base64 content.",
         params: &[
             ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
             ParamDef { name: "res_id", description: "Positive target record ID", required: true },

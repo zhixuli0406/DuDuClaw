@@ -1142,7 +1142,7 @@ impl GatewayHandler<'_> {
         "github_issue_comment" => handle_github_issue_comment(&arguments, home_dir).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
-            handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
+            Box::pin(handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent)).await
         }
         // A name removed after its deprecation window. `McpDispatcher` answers
         // these before any gate; this arm covers direct callers of this
