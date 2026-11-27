@@ -5,7 +5,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{in_immediate_tx, AutopilotHistoryRow, AutopilotStore};
+use super::{in_immediate_tx, AutopilotHistoryRow, AutopilotStore, DISPATCH_EXECUTING, DISPATCH_SETTLED};
+use crate::autopilot_approval::RESULT_SUCCESS;
 
 /// Keep byte-identical to the final statements in autopilot-v186.sql.
 pub(crate) const RUNS_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS autopilot_runs (
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS autopilot_run_steps (
     finished_at TEXT,
     detail TEXT,
     PRIMARY KEY (run_id, step_index)
-);";
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ap_dispatch_run_step ON autopilot_approval_dispatch(run_id, step_index) WHERE run_id IS NOT NULL;";
 
 pub const RUN_PENDING: &str = "pending";
 pub const RUN_RUNNING: &str = "running";
@@ -313,19 +315,24 @@ impl AutopilotStore {
         })
     }
 
-    pub async fn resume_after_approval(&self, run_id: &str, step_index: i64, now: DateTime<Utc>) -> Result<bool, String> {
+    pub async fn resume_after_approval(&self, run_id: &str, step_index: i64, dispatch_id: &str, now: DateTime<Utc>) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         in_immediate_tx(&conn, "resume approved run", |conn| {
             let count: Option<i64> = conn.query_row("SELECT step_count FROM autopilot_runs
-                WHERE run_id=?1 AND state='awaiting_approval' AND step_index=?2",
-                params![run_id, step_index], |r| r.get(0)).optional()
+                WHERE run_id=?1 AND state='awaiting_approval' AND step_index=?2
+                AND EXISTS (SELECT 1 FROM autopilot_run_steps
+                    WHERE run_id=?1 AND step_index=?2 AND state='running' AND dispatch_id=?3)
+                AND EXISTS (SELECT 1 FROM autopilot_approval_dispatch
+                    WHERE dispatch_id=?3 AND run_id=?1 AND step_index=?2
+                    AND (state=?4 OR (state=?5 AND outcome=?6)))",
+                params![run_id, step_index, dispatch_id, DISPATCH_EXECUTING, DISPATCH_SETTLED, RESULT_SUCCESS], |r| r.get(0)).optional()
                 .map_err(|e| format!("read approved run: {e}"))?;
             let Some(count) = count else { return Ok(false); };
             if step_index < 0 || step_index >= count { return Err("approved step index out of range".into()); }
             let now = run_ts(now);
             let n = conn.execute("UPDATE autopilot_run_steps SET state='done', finished_at=?1
-                WHERE run_id=?2 AND step_index=?3 AND state IN ('pending','running','done')",
-                params![now, run_id, step_index]).map_err(|e| format!("complete approved step: {e}"))?;
+                WHERE run_id=?2 AND step_index=?3 AND state='running' AND dispatch_id=?4",
+                params![now, run_id, step_index, dispatch_id]).map_err(|e| format!("complete approved step: {e}"))?;
             if n == 0 { return Ok(false); }
             let last = step_index == count - 1;
             let n = conn.execute("UPDATE autopilot_runs SET state=?1, step_index=?2, outcome=?3,
@@ -339,20 +346,40 @@ impl AutopilotStore {
         })
     }
 
-    /// Unknown persisted states can be explicitly settled as unsupported_state.
-    /// A settled run is terminal even if the caller includes it in expected_states.
-    pub async fn settle_run(
-        &self, run_id: &str, expected_states: &[&str], outcome: &str, detail: Option<&str>, now: DateTime<Utc>,
+    /// Only the owner of a live lease may settle a running run.
+    pub async fn settle_claimed_run(
+        &self, run_id: &str, lease_owner: &str, outcome: &str, detail: Option<&str>, now: DateTime<Utc>,
     ) -> Result<bool, String> {
         let conn = self.conn.lock().await;
-        in_immediate_tx(&conn, "settle run", |conn| {
+        let n = conn.execute("UPDATE autopilot_runs SET state='settled', outcome=?1, detail=?2,
+            next_at=NULL, lease_owner=NULL, lease_until=NULL, updated_at=?3
+            WHERE run_id=?4 AND state='running' AND lease_owner=?5 AND lease_until>=?3",
+            params![outcome, detail, run_ts(now), run_id, lease_owner])
+            .map_err(|e| format!("settle claimed run: {e}"))?;
+        Ok(n == 1)
+    }
+
+    /// Unknown persisted states can only be settled as unsupported_state.
+    /// Running and settled states must never be included in expected_states.
+    pub async fn settle_unclaimed_run(
+        &self, run_id: &str, expected_states: &[&str], outcome: &str, detail: Option<&str>, now: DateTime<Utc>,
+    ) -> Result<bool, String> {
+        if expected_states.iter().any(|state| matches!(*state, RUN_RUNNING | RUN_SETTLED)) {
+            return Err("unclaimed settlement cannot include running or settled states".into());
+        }
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "settle unclaimed run", |conn| {
             let state: Option<String> = conn.query_row("SELECT state FROM autopilot_runs WHERE run_id=?1",
                 params![run_id], |r| r.get(0)).optional().map_err(|e| format!("read run state: {e}"))?;
             let Some(state) = state else { return Ok(false); };
-            if state == RUN_SETTLED || !expected_states.contains(&state.as_str()) { return Ok(false); }
+            if matches!(state.as_str(), RUN_RUNNING | RUN_SETTLED) || !expected_states.contains(&state.as_str()) { return Ok(false); }
+            if !is_known_run_state(&state) && outcome != "unsupported_state" {
+                return Err("unknown run states must be settled as unsupported_state".into());
+            }
             let n = conn.execute("UPDATE autopilot_runs SET state='settled', outcome=?1, detail=?2,
-                next_at=NULL, lease_owner=NULL, lease_until=NULL, updated_at=?3 WHERE run_id=?4 AND state=?5 AND state!='settled'",
-                params![outcome, detail, run_ts(now), run_id, state]).map_err(|e| format!("settle run: {e}"))?;
+                next_at=NULL, lease_owner=NULL, lease_until=NULL, updated_at=?3
+                WHERE run_id=?4 AND state=?5 AND state NOT IN ('running','settled')",
+                params![outcome, detail, run_ts(now), run_id, state]).map_err(|e| format!("settle unclaimed run: {e}"))?;
             Ok(n == 1)
         })
     }

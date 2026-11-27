@@ -103,3 +103,4 @@ CREATE TABLE IF NOT EXISTS autopilot_run_steps (
     detail TEXT,
     PRIMARY KEY (run_id, step_index)
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ap_dispatch_run_step ON autopilot_approval_dispatch(run_id, step_index) WHERE run_id IS NOT NULL;

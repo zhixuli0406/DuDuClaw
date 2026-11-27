@@ -1,4 +1,6 @@
 use super::*;
+use crate::autopilot_store::{AutopilotDispatchRow, DISPATCH_AWAITING, DISPATCH_REQUESTING};
+use crate::autopilot_approval::{RESULT_DENIED, RESULT_EXPIRED};
 
 fn now() -> DateTime<Utc> {
     DateTime::parse_from_rfc3339("2026-11-27T00:00:00.000Z").unwrap().with_timezone(&Utc)
@@ -25,6 +27,158 @@ async fn insert(store: &AutopilotStore, id: &str, count: i64) {
     assert_eq!(store.insert_run(&row, &steps, now()).await.unwrap(), RunInsertOutcome::Inserted);
 }
 
+fn dispatch(id: &str, run_id: &str, step_index: i64) -> AutopilotDispatchRow {
+    AutopilotDispatchRow {
+        dispatch_id: id.into(), approval_id: None, rule_id: "rule".into(),
+        rule_name: "Rule".into(), rule_hash: "hash".into(), event_name: "task_created".into(),
+        event_ref: "event".into(), dedupe_key: format!("dispatch:{id}"),
+        frozen_json: "{}".into(), frozen_digest: "digest".into(), state: DISPATCH_REQUESTING.into(),
+        outcome: None, detail: None, notice_activity_pending: false, notice_push_state: None,
+        notice_push_attempts: 0, notice_push_next_at: None, notice_pushed_at: None,
+        created_at: run_ts(now()), updated_at: run_ts(now()),
+        run_id: Some(run_id.into()), step_index: Some(step_index),
+    }
+}
+
+async fn await_approval(store: &AutopilotStore) {
+    insert(store, "r", 1).await;
+    assert!(store.claim_run("r", "owner", now()).await.unwrap());
+    assert!(store.mark_step_running("r", 0, "owner", now()).await.unwrap());
+    assert!(store.complete_step("r", "owner", 0, STEP_RUNNING, None, None,
+        RunNext::AwaitApproval { dispatch_id: "d".into() }, now()).await.unwrap());
+}
+
+async fn assert_resume_rejected(store: &AutopilotStore, dispatch_id: &str) {
+    let before = store.get_run("r").await.unwrap();
+    let before_steps = store.list_run_steps("r").await.unwrap();
+    assert!(!store.resume_after_approval("r", 0, dispatch_id, now() + Duration::seconds(1)).await.unwrap());
+    assert_eq!(store.get_run("r").await.unwrap(), before);
+    assert_eq!(store.list_run_steps("r").await.unwrap(), before_steps);
+}
+
+#[tokio::test]
+async fn approval_resume_rejects_wrong_dispatch_id() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    await_approval(&store).await;
+    assert!(store.insert_dispatch(&dispatch("other", "r", 0)).await.unwrap());
+    {
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE autopilot_approval_dispatch SET state=?1 WHERE dispatch_id='other'",
+            params![DISPATCH_EXECUTING]).unwrap();
+    }
+    // Even an eligible ledger row must match the step's dispatch id.
+    assert_resume_rejected(&store, "other").await;
+    assert_resume_rejected(&store, "missing").await;
+    assert_resume_rejected(&store, "d").await;
+}
+
+#[tokio::test]
+async fn approval_resume_rejects_mismatched_dispatch_run_or_step() {
+    for (run_id, step_index) in [("other", 0), ("r", 1)] {
+        let home = tempfile::tempdir().unwrap();
+        let store = AutopilotStore::open(home.path()).unwrap();
+        await_approval(&store).await;
+        assert!(store.insert_dispatch(&dispatch("d", run_id, step_index)).await.unwrap());
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE autopilot_approval_dispatch SET state=?1 WHERE dispatch_id='d'",
+                params![DISPATCH_EXECUTING]).unwrap();
+        }
+        assert_resume_rejected(&store, "d").await;
+    }
+}
+
+#[tokio::test]
+async fn approval_resume_rejects_unapproved_denied_or_expired_dispatch() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    await_approval(&store).await;
+    assert!(store.insert_dispatch(&dispatch("d", "r", 0)).await.unwrap());
+    for (state, outcome) in [
+        (DISPATCH_REQUESTING, None), (DISPATCH_AWAITING, None),
+        (DISPATCH_SETTLED, Some(RESULT_DENIED)), (DISPATCH_SETTLED, Some(RESULT_EXPIRED)),
+        (DISPATCH_SETTLED, None), (DISPATCH_SETTLED, Some("failure")),
+    ] {
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE autopilot_approval_dispatch SET state=?1, outcome=?2 WHERE dispatch_id='d'",
+                params![state, outcome]).unwrap();
+        }
+        assert_resume_rejected(&store, "d").await;
+    }
+}
+
+#[tokio::test]
+async fn approval_resume_requires_running_step() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    await_approval(&store).await;
+    assert!(store.insert_dispatch(&dispatch("d", "r", 0)).await.unwrap());
+    {
+        let conn = store.conn.lock().await;
+        conn.execute("UPDATE autopilot_approval_dispatch SET state=?1 WHERE dispatch_id='d'",
+            params![DISPATCH_EXECUTING]).unwrap();
+    }
+    for state in [STEP_PENDING, STEP_DONE, STEP_FAILED, STEP_SKIPPED] {
+        {
+            let conn = store.conn.lock().await;
+            conn.execute("UPDATE autopilot_run_steps SET state=?1 WHERE run_id='r' AND step_index=0",
+                params![state]).unwrap();
+        }
+        assert_resume_rejected(&store, "d").await;
+    }
+}
+
+#[tokio::test]
+async fn insert_dispatch_refuses_second_dispatch_for_run_step() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    let original = dispatch("first", "r", 0);
+    assert!(store.insert_dispatch(&original).await.unwrap());
+    let error = store.insert_dispatch(&dispatch("second", "r", 0)).await.unwrap_err();
+    assert!(error.contains("UNIQUE constraint failed"), "{error}");
+    assert_eq!(store.get_dispatch("first").await.unwrap(), Some(original));
+    assert!(store.get_dispatch("second").await.unwrap().is_none());
+    // The failed insert rolled back and other steps remain insertable.
+    assert!(store.insert_dispatch(&dispatch("next", "r", 1)).await.unwrap());
+    for id in ["legacy-a", "legacy-b"] {
+        let mut row = dispatch(id, "r", 0);
+        row.run_id = None;
+        row.step_index = None;
+        assert!(store.insert_dispatch(&row).await.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn settle_claimed_run_fences_expired_and_reclaimed_owners() {
+    let home = tempfile::tempdir().unwrap();
+    let store = AutopilotStore::open(home.path()).unwrap();
+    insert(&store, "r", 1).await;
+    assert!(!store.settle_claimed_run("r", "a", "completed", None, now()).await.unwrap());
+    assert!(store.claim_run("r", "a", now()).await.unwrap());
+    let later = now() + Duration::seconds(RUN_LEASE_SECS) + Duration::milliseconds(1);
+    let expired = store.get_run("r").await.unwrap();
+    assert!(!store.settle_claimed_run("r", "a", "completed", None, later).await.unwrap());
+    assert_eq!(store.get_run("r").await.unwrap(), expired);
+    assert!(store.reclaim_expired_run("r", "b", later).await.unwrap());
+    let reclaimed = store.get_run("r").await.unwrap();
+    assert!(!store.settle_claimed_run("r", "a", "completed", None, later).await.unwrap());
+    assert_eq!(store.get_run("r").await.unwrap(), reclaimed);
+    assert!(store.settle_unclaimed_run("r", &[RUN_RUNNING], "completed", None, later).await.is_err());
+    assert!(!store.settle_unclaimed_run("r", &[RUN_PENDING], "completed", None, later).await.unwrap());
+    assert_eq!(store.get_run("r").await.unwrap(), reclaimed);
+    assert!(store.settle_claimed_run("r", "b", "completed", Some("done"), later).await.unwrap());
+    let settled = store.get_run("r").await.unwrap().unwrap();
+    assert_eq!(settled.state, RUN_SETTLED);
+    assert_eq!(settled.outcome.as_deref(), Some("completed"));
+    assert_eq!(settled.detail.as_deref(), Some("done"));
+    assert!(settled.next_at.is_none() && settled.lease_owner.is_none() && settled.lease_until.is_none());
+    assert!(!store.settle_claimed_run("r", "b", "cancelled", None, later).await.unwrap());
+    assert!(store.settle_unclaimed_run("r", &[RUN_SETTLED], "cancelled", None, later).await.is_err());
+    assert_eq!(store.get_run("r").await.unwrap(), Some(settled));
+}
+
 #[tokio::test]
 async fn insert_run_dedupes_limits_and_excludes_settled_runs() {
     let home = tempfile::tempdir().unwrap();
@@ -41,7 +195,7 @@ async fn insert_run_dedupes_limits_and_excludes_settled_runs() {
     }
     let (row, steps) = run("overflow", "rule", 1);
     assert_eq!(store.insert_run(&row, &steps, now()).await.unwrap(), RunInsertOutcome::RuleLimit);
-    assert!(store.settle_run("first", &[RUN_PENDING], "completed", None, now()).await.unwrap());
+    assert!(store.settle_unclaimed_run("first", &[RUN_PENDING], "completed", None, now()).await.unwrap());
     assert_eq!(store.count_unsettled_runs(Some("rule")).await.unwrap(), 19);
     assert_eq!(store.insert_run(&row, &steps, now()).await.unwrap(), RunInsertOutcome::Inserted);
     assert_eq!(store.count_unsettled_runs(None).await.unwrap(), 20);
@@ -71,7 +225,7 @@ async fn insert_run_enforces_global_limit() {
     let (row, steps) = run("overflow", "unused-rule", 1);
     assert_eq!(store.insert_run(&row, &steps, now()).await.unwrap(), RunInsertOutcome::GlobalLimit);
     assert!(store.list_run_steps("overflow").await.unwrap().is_empty());
-    assert!(store.settle_run("run-1", &[RUN_PENDING], "completed", None, now()).await.unwrap());
+    assert!(store.settle_unclaimed_run("run-1", &[RUN_PENDING], "completed", None, now()).await.unwrap());
     assert_eq!(store.insert_run(&row, &steps, now()).await.unwrap(), RunInsertOutcome::Inserted);
 }
 
@@ -154,7 +308,8 @@ async fn complete_step_checks_owner_waits_and_settles_terminally() {
     assert_eq!(settled.outcome.as_deref(), Some("completed"));
     assert_eq!(settled.detail.as_deref(), Some("all done"));
     assert!(settled.lease_owner.is_none() && settled.lease_until.is_none());
-    assert!(!store.settle_run("r", &[RUN_SETTLED, RUN_RUNNING], "cancelled", None, next_at).await.unwrap());
+    assert!(store.settle_unclaimed_run("r", &[RUN_SETTLED, RUN_RUNNING], "cancelled", None, next_at).await.is_err());
+    assert!(!store.settle_unclaimed_run("r", &[RUN_PENDING], "cancelled", None, next_at).await.unwrap());
     assert!(!store.claim_run("r", "owner", next_at).await.unwrap());
 }
 
@@ -192,15 +347,23 @@ async fn complete_step_continues_and_approval_resumes_once() {
             assert!(store.complete_step("r", "owner", i, STEP_DONE, None, None,
                 RunNext::Continue { step_index: 1 }, now()).await.unwrap());
         } else {
+            let dispatch_id = format!("d-{i}");
+            assert!(store.insert_dispatch(&dispatch(&dispatch_id, "r", i)).await.unwrap());
+            {
+                let conn = store.conn.lock().await;
+                conn.execute("UPDATE autopilot_approval_dispatch SET state=?1, outcome=?2 WHERE dispatch_id=?3",
+                    params![if i == 1 { DISPATCH_EXECUTING } else { DISPATCH_SETTLED },
+                        if i == 1 { None } else { Some(RESULT_SUCCESS) }, dispatch_id]).unwrap();
+            }
             assert!(store.complete_step("r", "owner", i, STEP_RUNNING, None, None,
                 RunNext::AwaitApproval { dispatch_id: format!("d-{i}") }, now()).await.unwrap());
             let awaiting = store.get_run("r").await.unwrap().unwrap();
             assert_eq!(awaiting.state, RUN_AWAITING_APPROVAL);
             assert!(awaiting.lease_owner.is_none() && awaiting.lease_until.is_none());
             assert_eq!(store.list_run_steps("r").await.unwrap()[i as usize].dispatch_id, Some(format!("d-{i}")));
-            assert!(!store.resume_after_approval("r", i - 1, now()).await.unwrap());
-            assert!(store.resume_after_approval("r", i, now()).await.unwrap());
-            assert!(!store.resume_after_approval("r", i, now()).await.unwrap());
+            assert!(!store.resume_after_approval("r", i - 1, &dispatch_id, now()).await.unwrap());
+            assert!(store.resume_after_approval("r", i, &dispatch_id, now()).await.unwrap());
+            assert!(!store.resume_after_approval("r", i, &dispatch_id, now()).await.unwrap());
         }
     }
     let completed = store.get_run("r").await.unwrap().unwrap();
@@ -218,14 +381,18 @@ async fn run_queries_order_and_settlement_handles_unknown_states() {
     store.insert_run(&row, &steps, now() + Duration::seconds(1)).await.unwrap();
     assert_eq!(store.list_runs_for_rule("rule", 1).await.unwrap()[0].run_id, "second");
     assert_eq!(store.list_due_runs(now(), 1).await.unwrap(), vec!["first"]);
-    assert!(!store.settle_run("first", &[RUN_RUNNING], "cancelled", None, now()).await.unwrap());
+    assert!(store.settle_unclaimed_run("first", &[RUN_RUNNING], "cancelled", None, now()).await.is_err());
+    assert!(!store.settle_unclaimed_run("first", &[RUN_WAITING], "cancelled", None, now()).await.unwrap());
     {
         let conn = store.conn.lock().await;
         conn.execute("UPDATE autopilot_runs SET state='unknown' WHERE run_id='first'", []).unwrap();
     }
     assert_eq!(store.count_unsettled_runs(Some("rule")).await.unwrap(), 2);
     assert!(!store.claim_run("first", "owner", now()).await.unwrap());
-    assert!(store.settle_run("first", &["unknown"], "unsupported_state", None, now()).await.unwrap());
+    let before = store.get_run("first").await.unwrap();
+    assert!(store.settle_unclaimed_run("first", &["unknown"], "completed", None, now()).await.is_err());
+    assert_eq!(store.get_run("first").await.unwrap(), before);
+    assert!(store.settle_unclaimed_run("first", &["unknown"], "unsupported_state", None, now()).await.unwrap());
     assert_eq!(store.get_run("first").await.unwrap().unwrap().outcome.as_deref(), Some("unsupported_state"));
 }
 

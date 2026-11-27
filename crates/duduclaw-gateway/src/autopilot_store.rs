@@ -68,6 +68,18 @@ pub struct AutopilotRuleRow {
     pub updated_at: Option<String>,
 }
 
+fn extensions_require_steps_envelope(row: &AutopilotRuleRow) -> Result<(), String> {
+    if row.active_window.is_some() || row.run_policy.is_some() || row.owner_department.is_some() {
+        let action = serde_json::from_str::<serde_json::Value>(&row.action).ok();
+        let action_type = action.as_ref().and_then(|v| v.as_object())
+            .and_then(|object| object.get("type")).and_then(|v| v.as_str());
+        if action_type != Some("steps") {
+            return Err("rules with an active window, run policy or owning department must use a steps action".into());
+        }
+    }
+    Ok(())
+}
+
 /// Typed extension writes only. Callers must validate contents and authority first.
 /// Outer None preserves a value; Some(None) clears it. Audit fields always change.
 #[derive(Debug, Clone)]
@@ -431,6 +443,7 @@ impl AutopilotStore {
     }
 
     pub async fn insert_rule(&self, row: &AutopilotRuleRow) -> Result<(), String> {
+        extensions_require_steps_envelope(row)?;
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO autopilot_rules
@@ -469,8 +482,8 @@ impl AutopilotStore {
         id: &str,
         fields: &serde_json::Value,
     ) -> Result<Option<AutopilotRuleRow>, String> {
-        let has_changes = {
-            let conn = self.conn.lock().await;
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "update rule", |conn| {
             let mut sets: Vec<String> = Vec::new();
             let mut binds: Vec<String> = Vec::new();
 
@@ -521,9 +534,7 @@ impl AutopilotStore {
                 }
             }
 
-            if sets.is_empty() {
-                false
-            } else {
+            if !sets.is_empty() {
                 binds.push(id.to_string());
                 let sql = format!(
                     "UPDATE autopilot_rules SET {} WHERE id = ?{}",
@@ -536,10 +547,14 @@ impl AutopilotStore {
                     .collect();
                 conn.execute(&sql, params_ref.as_slice())
                     .map_err(|e| format!("update rule: {e}"))?;
-                true
             }
-        };
-        self.get_rule(id).await
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read updated rule: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
+        })
     }
 
     /// Callers must validate extension contents and authorization before writing.
@@ -563,8 +578,12 @@ impl AutopilotStore {
                     patch.updated_by_user_id, patch.updated_at, id],
             ).map_err(|e| format!("set rule extensions: {e}"))?;
             if n == 0 { return Ok(None); }
-            conn.query_row(RULE_SELECT, params![id], row_to_rule)
-                .optional().map_err(|e| format!("read rule extensions: {e}"))
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read rule extensions: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
         })
     }
 
