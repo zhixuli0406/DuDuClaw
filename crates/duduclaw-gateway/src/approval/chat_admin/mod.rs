@@ -1,5 +1,15 @@
 pub(crate) mod config;
+pub(crate) mod ledger;
+pub(crate) mod receipts;
 pub(crate) mod tier;
+
+pub(crate) use ledger::LedgerEntry;
+
+/// Identity supplied by the authenticated decision service, never by tool arguments.
+pub(crate) enum DecisionActor {
+    Dashboard { user_id: String },
+    ChatAdmin(LedgerEntry),
+}
 
 pub(crate) use config::{
     card_valid_until, effective, load, parse, ChatAdminConfig, ChatChannel, ConfigError,

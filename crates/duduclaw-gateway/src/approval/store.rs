@@ -138,6 +138,37 @@ impl ApprovalStore {
 
              CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
              CREATE INDEX IF NOT EXISTS idx_approvals_agent  ON approvals(agent_id);
+
+             CREATE TABLE IF NOT EXISTS chat_admin_cards (
+                 card_id TEXT PRIMARY KEY,
+                 approval_id TEXT NOT NULL,
+                 purpose TEXT NOT NULL,
+                 user_id TEXT NOT NULL,
+                 channel TEXT NOT NULL,
+                 account TEXT NOT NULL,
+                 principal TEXT NOT NULL,
+                 dm TEXT NOT NULL,
+                 message_id TEXT,
+                 digest TEXT NOT NULL,
+                 tier TEXT NOT NULL,
+                 valid_until TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('live','consumed','retired','expired')),
+                 sent_at TEXT NOT NULL,
+                 UNIQUE(channel, account, dm, message_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_chat_admin_cards_approval
+                 ON chat_admin_cards(approval_id, status);
+             CREATE TABLE IF NOT EXISTS chat_admin_decisions (
+                 approval_id TEXT PRIMARY KEY,
+                 card_id TEXT NOT NULL,
+                 user_id TEXT NOT NULL,
+                 channel TEXT NOT NULL,
+                 step TEXT NOT NULL CHECK(step IN ('tap','web','totp')),
+                 step_required INTEGER NOT NULL CHECK(step_required IN (0,1)),
+                 digest TEXT NOT NULL,
+                 approve INTEGER NOT NULL CHECK(approve IN (0,1)),
+                 decided_at TEXT NOT NULL
+             );
              ",
         )
         .map_err(|e| format!("init approvals schema: {e}"))?;
@@ -491,6 +522,32 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
+        self.decide_if_pending_inner(id, status, decided_by, decided_at, None).await
+    }
+
+    /// The ledger, receipt consumption and approval status share approvals.db.
+    /// Only the caller-verified ChatAdmin decision path may supply an entry.
+    pub(super) async fn decide_if_pending_with_ledger(
+        &self,
+        id: &ApprovalId,
+        approve: bool,
+        entry: &chat_admin::LedgerEntry,
+        decided_at: &str,
+    ) -> Result<usize, String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        self.decide_if_pending_inner(
+            id, status, &entry.decided_by().to_string(), decided_at, Some(entry),
+        ).await
+    }
+
+    async fn decide_if_pending_inner(
+        &self,
+        id: &ApprovalId,
+        status: ApprovalStatus,
+        decided_by: &str,
+        decided_at: &str,
+        ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
             verify_live_io()?;
@@ -507,6 +564,26 @@ impl ApprovalStore {
                     }
                     check_expected_digest(rec)?;
                 }
+                if let Some(entry) = ledger {
+                    // Re-read classification and binding under the write lock.
+                    // Live Admin/proof checks belong to the decision service.
+                    if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+                        return Err("chat-admin decisions refuse T3 approvals".into());
+                    }
+                    if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
+                        return Err("bound requests require authenticated decision context".into());
+                    }
+                    if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+                        return Err("chat-admin decision requires step-up".into());
+                    }
+                    let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
+                        Some(home) => decision_digest_at(home, rec),
+                        None => decision_digest(rec),
+                    };
+                    if entry.digest != digest {
+                        return Err("approval digest mismatch; refetch the approval before deciding".into());
+                    }
+                }
             }
             let n = tx.execute(
                 &format!("UPDATE approvals
@@ -521,6 +598,9 @@ impl ApprovalStore {
                     no_live_lease = no_live_lease_sql("?3")),
                 params![status.as_str(), decided_by, decided_at, id.as_str()],
             ).map_err(|e| format!("decide approval: {e}"))?;
+            if n > 0 && let Some(entry) = ledger {
+                chat_admin::ledger::insert_and_consume(&tx, id, status.is_granted(), entry, decided_at)?;
+            }
             duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
             commit_live_write(tx)?;
             (n, rec)
