@@ -762,14 +762,35 @@ impl MethodHandler {
 
     /// WP14-T14.6: recent budget-breaker incidents from `budget_events.jsonl`,
     /// newest first, plus a per-agent open-count. `limit` default 50.
-    pub(crate) async fn handle_budget_incidents(&self, params: Value) -> WsFrame {
+    pub(crate) async fn handle_budget_incidents(&self, params: Value, ctx: &UserContext) -> WsFrame {
         let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
         let path = self.home_dir.join("budget_events.jsonl");
-        let raw = std::fs::read_to_string(&path).unwrap_or_default();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(_) => return WsFrame::error_response("", "Budget incidents unavailable"),
+        };
+        // Same direct-binding and Personal visibility rule as agents.list.
+        // Filter before both pagination and aggregation; hidden rows contribute
+        // neither entries nor counts, including unattributed rows.
+        let hidden = if ctx.is_admin() {
+            Default::default()
+        } else {
+            match self.personal_hidden_agents(ctx).await {
+                Ok(hidden) => hidden,
+                Err(reason) => return WsFrame::error_response("", reason),
+            }
+        };
+        let visible = ctx.visible_agents();
         let mut events: Vec<Value> = raw
             .lines()
             .filter(|l| !l.trim().is_empty())
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|event| match &visible {
+                None => true,
+                Some(ids) => event.get("agent_id").and_then(Value::as_str)
+                    .is_some_and(|id| !hidden.contains(id) && ids.iter().any(|visible_id| visible_id == id)),
+            })
             .collect();
         events.reverse(); // newest first
         let mut per_agent: std::collections::HashMap<String, u64> =
