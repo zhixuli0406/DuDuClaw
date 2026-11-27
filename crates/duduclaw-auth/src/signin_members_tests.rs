@@ -17,7 +17,7 @@ fn password_user(db: &UserDb, email: &str, role: UserRole) -> User {
 }
 fn admin(db: &UserDb) -> User { password_user(db, "admin@company.test", UserRole::Admin) }
 fn direct(db: &UserDb, id: &VerifiedGoogleIdentity) -> String {
-    match db.resolve_google_signin(id, &policy(SigninApproval::Direct, 100), NOW).unwrap() {
+    match db.resolve_google_signin(true, id, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap() {
         SigninOutcome::Ok { user_id, credential_epoch, created: true, linked_via: Some("jit_direct") } => {
             assert_eq!(credential_epoch, db.get_user(&user_id).unwrap().unwrap().credential_epoch);
             user_id
@@ -26,7 +26,7 @@ fn direct(db: &UserDb, id: &VerifiedGoogleIdentity) -> String {
     }
 }
 fn request(db: &UserDb, id: &VerifiedGoogleIdentity, at: i64) -> String {
-    match db.resolve_google_signin(id, &policy(SigninApproval::Admin, 100), at).unwrap() {
+    match db.resolve_google_signin(true, id, &policy(SigninApproval::Admin, 100), at, &|_| Ok(None)).unwrap() {
         SigninOutcome::PendingApproval { request_id } => request_id,
         other => panic!("unexpected outcome: {other:?}"),
     }
@@ -64,7 +64,7 @@ fn audit_row(db: &UserDb, action: &str) -> (String, String, Value) {
 fn existing_email_never_links() {
     let (db, _path) = test_db();
     password_user(&db, "MEMBER1@company.test", UserRole::Employee);
-    assert_eq!(db.resolve_google_signin(&identity("1"), &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::ExistingAccount);
+    assert_eq!(db.resolve_google_signin(true, &identity("1"), &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::ExistingAccount);
     assert_eq!(count(&db, "users"), 1);
     assert_eq!(count(&db, "google_signin_links"), 0);
 }
@@ -75,7 +75,7 @@ fn recycled_email_new_sub_refused() {
     let first = identity("1");
     let user_id = direct(&db, &first);
     let recycled = VerifiedGoogleIdentity { sub: "2".into(), ..first };
-    assert_eq!(db.resolve_google_signin(&recycled, &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::ExistingAccount);
+    assert_eq!(db.resolve_google_signin(true, &recycled, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::ExistingAccount);
     assert_eq!(count(&db, "users"), 1);
     assert_eq!(count(&db, "google_signin_links"), 1);
     assert_eq!(db.google_signin_link_for_user(&user_id).unwrap().unwrap().google_sub, "1");
@@ -87,7 +87,7 @@ fn suspended_never_revived() {
     let id = identity("1");
     let user_id = direct(&db, &id);
     db.set_user_status(&user_id, UserStatus::Suspended).unwrap();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW + 1).unwrap(), SigninOutcome::AccountDisabled);
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW + 1, &|_| Ok(None)).unwrap(), SigninOutcome::AccountDisabled);
     assert_eq!(db.get_user(&user_id).unwrap().unwrap().status, UserStatus::Suspended);
     assert_eq!(db.google_signin_link_for_user(&user_id).unwrap().unwrap().last_signin_at, None);
 }
@@ -97,7 +97,7 @@ fn offboarded_email_not_revived() {
     let (db, _path) = test_db();
     let user = password_user(&db, &identity("1").email, UserRole::Employee);
     db.set_user_status(&user.id, UserStatus::Offboarded).unwrap();
-    assert_eq!(db.resolve_google_signin(&identity("1"), &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::ExistingAccount);
+    assert_eq!(db.resolve_google_signin(true, &identity("1"), &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::ExistingAccount);
     assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, UserStatus::Offboarded);
     assert_eq!(count(&db, "users"), 1);
     assert_eq!(count(&db, "google_signin_links"), 0);
@@ -127,15 +127,15 @@ fn daily_cap_counts_pending() {
     let (db, _path) = test_db();
     request(&db, &identity("1"), NOW);
     let direct_policy = policy(SigninApproval::Direct, 2);
-    assert!(matches!(db.resolve_google_signin(&identity("2"), &direct_policy, NOW).unwrap(), SigninOutcome::Ok { created: true, .. }));
+    assert!(matches!(db.resolve_google_signin(true, &identity("2"), &direct_policy, NOW, &|_| Ok(None)).unwrap(), SigninOutcome::Ok { created: true, .. }));
     for mode in [SigninApproval::Admin, SigninApproval::Direct] {
-        assert_eq!(db.resolve_google_signin(&identity("3"), &policy(mode, 2), NOW).unwrap(), SigninOutcome::DailyLimit);
-        assert_eq!(db.resolve_google_signin(&identity("3"), &policy(mode, 0), NOW).unwrap(), SigninOutcome::DailyLimit);
+        assert_eq!(db.resolve_google_signin(true, &identity("3"), &policy(mode, 2), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::DailyLimit);
+        assert_eq!(db.resolve_google_signin(true, &identity("3"), &policy(mode, 0), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::DailyLimit);
     }
     assert_eq!(db.count_signin_jit_since(NOW - 86400).unwrap(), 2);
     // Direct mode must not use the pending-refresh exemption.
-    assert_eq!(db.resolve_google_signin(&identity("1"), &direct_policy, NOW).unwrap(), SigninOutcome::DailyLimit);
-    assert!(matches!(db.resolve_google_signin(&identity("3"), &policy(SigninApproval::Admin, 2), NOW + 86401).unwrap(), SigninOutcome::PendingApproval { .. }));
+    assert_eq!(db.resolve_google_signin(true, &identity("1"), &direct_policy, NOW, &|_| Ok(None)).unwrap(), SigninOutcome::DailyLimit);
+    assert!(matches!(db.resolve_google_signin(true, &identity("3"), &policy(SigninApproval::Admin, 2), NOW + 86401, &|_| Ok(None)).unwrap(), SigninOutcome::PendingApproval { .. }));
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn pending_refresh_not_capped() {
     let request_id = request(&db, &id, NOW);
     id.email = "changed@company.test".into();
     id.display_name = "更新名稱".into();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Admin, 0), NOW + 10).unwrap(),
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Admin, 0), NOW + 10, &|_| Ok(None)).unwrap(),
         SigninOutcome::PendingApproval { request_id: request_id.clone() });
     let refreshed = db.signin_request_by_id(&request_id).unwrap().unwrap();
     assert_eq!(refreshed.email, id.email);
@@ -159,8 +159,8 @@ fn pending_refresh_not_capped() {
 fn pending_full_maps_to_outcome() {
     let (db, _path) = test_db();
     for sub in 1..=SIGNIN_PENDING_MAX { request(&db, &identity(&sub.to_string()), NOW); }
-    assert_eq!(db.resolve_google_signin(&identity("999"), &policy(SigninApproval::Admin, 100), NOW).unwrap(), SigninOutcome::PendingFull);
-    assert!(matches!(db.resolve_google_signin(&identity("1"), &policy(SigninApproval::Admin, 0), NOW + 1).unwrap(), SigninOutcome::PendingApproval { .. }));
+    assert_eq!(db.resolve_google_signin(true, &identity("999"), &policy(SigninApproval::Admin, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::PendingFull);
+    assert!(matches!(db.resolve_google_signin(true, &identity("1"), &policy(SigninApproval::Admin, 0), NOW + 1, &|_| Ok(None)).unwrap(), SigninOutcome::PendingApproval { .. }));
     assert_eq!(count(&db, "google_signin_requests"), i64::from(SIGNIN_PENDING_MAX));
 }
 
@@ -179,11 +179,46 @@ fn rejected_cooldown() {
     assert_eq!(target, request_id);
     // At NOW - 2 days the rejection is six days old.
     for mode in [SigninApproval::Admin, SigninApproval::Direct] {
-        assert_eq!(db.resolve_google_signin(&id, &policy(mode, 100), NOW - 2 * 86400).unwrap(), SigninOutcome::Rejected);
+        assert_eq!(db.resolve_google_signin(true, &id, &policy(mode, 100), NOW - 2 * 86400, &|_| Ok(None)).unwrap(), SigninOutcome::Rejected);
     }
     let new_request = request(&db, &id, NOW);
     assert_ne!(request_id, new_request);
     assert_eq!(count(&db, "users"), 1);
+}
+
+#[test]
+fn attestation_without_lease_is_not_linked() {
+    let (db, _path) = test_db();
+    let id = identity("1");
+    let user = password_user(&db, &id.email, UserRole::Employee);
+    assert!(!db.signin_attestation_candidate_exists(&id.email, NOW).unwrap());
+    // Simulate an attestation created after the callback's cheap probe.
+    db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
+    assert_eq!(db.resolve_google_signin(false, &id, &policy(SigninApproval::Direct, 100), NOW,
+        &|_| panic!("personal material must not be read without the grant lease")).unwrap(),
+        SigninOutcome::ExistingAccount);
+    assert_eq!(count(&db, "google_signin_attestations"), 1);
+    assert_eq!(count(&db, "google_signin_links"), 0);
+    assert!(db.signin_attestation_candidate_exists(&id.email, NOW).unwrap());
+}
+
+#[test]
+fn signin_attestation_candidate_is_read_only_and_fails_closed() {
+    let (db, _path) = test_db();
+    let id = identity("1");
+    let user = password_user(&db, &id.email, UserRole::Employee);
+    db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
+    assert!(db.signin_attestation_candidate_exists(&id.email.to_ascii_uppercase(), NOW).unwrap());
+    assert!(!db.signin_attestation_candidate_exists("other@company.test", NOW).unwrap());
+    let expires: i64 = db.conn().query_row("SELECT expires_at FROM google_signin_attestations", [], |r| r.get(0)).unwrap();
+    assert!(!db.signin_attestation_candidate_exists(&id.email, expires).unwrap());
+    assert_eq!(count(&db, "google_signin_attestations"), 1);
+    assert!(matches!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW,
+        &|_| Ok(None)).unwrap(), SigninOutcome::Ok { .. }));
+    db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
+    assert!(!db.signin_attestation_candidate_exists(&id.email, NOW).unwrap());
+    db.conn().execute("ALTER TABLE google_signin_attestations RENAME TO missing_attestations", []).unwrap();
+    assert_eq!(db.signin_attestation_candidate_exists(&id.email, NOW), Err(STORAGE.into()));
 }
 
 #[test]
@@ -193,7 +228,7 @@ fn attestation_links_once() {
     let user = password_user(&db, &id.email.to_ascii_uppercase(), UserRole::Employee);
     db.conn().execute("UPDATE users SET credential_epoch=7 WHERE id=?1", [&user.id]).unwrap();
     db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 0), NOW).unwrap(),
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 0), NOW, &|_| Ok(None)).unwrap(),
         SigninOutcome::Ok { user_id: user.id.clone(), credential_epoch: 7, created: false, linked_via: Some("admin_attest") });
     assert_eq!(count(&db, "google_signin_attestations"), 0);
     let link = db.google_signin_link_for_user(&user.id).unwrap().unwrap();
@@ -203,8 +238,49 @@ fn attestation_links_once() {
     assert_eq!(actor, SYSTEM_ACTOR);
     assert_eq!(target, user.id);
     assert_eq!(detail, json!({"linked_via":"admin_attest", "hd":"company.test"}));
-    assert_eq!(db.resolve_google_signin(&VerifiedGoogleIdentity { sub: "2".into(), ..id }, &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::ExistingAccount);
+    assert_eq!(db.resolve_google_signin(true, &VerifiedGoogleIdentity { sub: "2".into(), ..id }, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::ExistingAccount);
     assert_eq!(count(&db, "users"), 1);
+}
+
+#[test]
+fn attestation_refused_when_personal_connection_differs() {
+    let (db, _path) = test_db();
+    let id = identity("1");
+    let user = password_user(&db, &id.email, UserRole::Employee);
+    db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
+    let lookup = |user_id: &str| {
+        assert_eq!(user_id, user.id);
+        Ok(Some("2".into()))
+    };
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &lookup).unwrap(),
+        SigninOutcome::ExistingAccount);
+    assert_eq!(count(&db, "google_signin_attestations"), 1);
+    assert!(db.google_signin_link_for_user(&user.id).unwrap().is_none());
+    assert_eq!(count(&db, "google_signin_links"), 0);
+    // The preserved attestation still works when the personal connection matches.
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW,
+        &|_| Ok(Some(id.sub.clone()))).unwrap(),
+        SigninOutcome::Ok { user_id: user.id.clone(), credential_epoch: user.credential_epoch,
+            created: false, linked_via: Some("admin_attest") });
+    assert_eq!(count(&db, "google_signin_attestations"), 0);
+    assert_eq!(db.google_signin_link_for_user(&user.id).unwrap().unwrap().google_sub, id.sub);
+}
+
+#[test]
+fn attestation_personal_lookup_error_denies() {
+    let (db, _path) = test_db();
+    let id = identity("1");
+    let user = password_user(&db, &id.email, UserRole::Employee);
+    db.upsert_google_signin_attestation(&user.id, "attesting-admin", NOW).unwrap();
+    let lookup = |user_id: &str| {
+        assert_eq!(user_id, user.id);
+        Err("signin_storage_unavailable".into())
+    };
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &lookup),
+        Err("signin_storage_unavailable".into()));
+    assert_eq!(count(&db, "google_signin_attestations"), 1);
+    assert!(db.google_signin_link_for_user(&user.id).unwrap().is_none());
+    assert_eq!(count(&db, "google_signin_links"), 0);
 }
 
 #[test]
@@ -215,7 +291,7 @@ fn attestation_void_after_email_change() {
     db.upsert_google_signin_attestation(&user.id, "admin", NOW).unwrap();
     id.email = "changed@company.test".into();
     db.conn().execute("UPDATE users SET email=?2 WHERE id=?1", params![user.id, id.email]).unwrap();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::ExistingAccount);
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::ExistingAccount);
     assert_eq!(count(&db, "google_signin_links"), 0);
     assert_eq!(count(&db, "google_signin_attestations"), 0);
 }
@@ -264,7 +340,7 @@ fn approve_creates_account_and_onboarding_row() {
     assert_eq!(target, user_id);
     assert_eq!(detail, json!({"linked_via":"jit_approved", "hd":"company.test", "request_id":request_id, "mfa_preauthorized":true}));
     assert_eq!(db.count_signin_jit_since(NOW - 86400).unwrap(), 1);
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Admin, 0), NOW + 20).unwrap(),
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Admin, 0), NOW + 20, &|_| Ok(None)).unwrap(),
         SigninOutcome::Ok { credential_epoch: db.get_user(&user_id).unwrap().unwrap().credential_epoch, user_id, created: false, linked_via: None });
     assert_eq!(db.approve_signin_request(&admin.id, admin.credential_epoch, &request_id, false, NOW + 20), Err("signin_request_not_pending"));
 }
@@ -300,7 +376,7 @@ fn jit_transaction_atomic() {
                 assert_eq!(pending.user_id, None);
                 assert!(!pending.mfa_preauthorized);
             } else {
-                assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW), Err(STORAGE.into()));
+                assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)), Err(STORAGE.into()));
             }
             assert_eq!(count(&db, "users"), 1);
             assert_eq!(count(&db, "google_signin_links"), 0);
@@ -326,7 +402,7 @@ fn invalid_identity_denied() {
         VerifiedGoogleIdentity { email: "bad\r\n@company.test".into(), ..valid.clone() },
         VerifiedGoogleIdentity { email: " member@company.test ".into(), ..valid.clone() },
     ] {
-        let code = db.resolve_google_signin(&invalid, &policy(SigninApproval::Direct, 100), NOW).unwrap_err();
+        let code = db.resolve_google_signin(true, &invalid, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap_err();
         assert!(["signin_invalid_sub", "signin_invalid_email", "signin_invalid_hd"].contains(&code.as_str()));
     }
     assert_eq!(count(&db, "users"), 0);
@@ -341,7 +417,7 @@ fn signin_existing_link_tracks_sub_and_touches_last_signin() {
     let user_id = direct(&db, &id);
     db.conn().execute("UPDATE users SET credential_epoch=9 WHERE id=?1", [&user_id]).unwrap();
     id.email = "renamed@company.test".into();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Admin, 0), NOW + 42).unwrap(),
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Admin, 0), NOW + 42, &|_| Ok(None)).unwrap(),
         SigninOutcome::Ok { user_id: user_id.clone(), credential_epoch: 9, created: false, linked_via: None });
     let link = db.google_signin_link_for_user(&user_id).unwrap().unwrap();
     assert_eq!(link.last_signin_at, Some(NOW + 42));
@@ -383,7 +459,7 @@ fn signin_attestation_and_rejection_roll_back_with_audit() {
     let request_id = request(&db, &identity("2"), NOW);
     db.conn().execute_batch("CREATE TEMP TRIGGER fail_signin_audit BEFORE INSERT ON auth_audit_log
         BEGIN SELECT RAISE(ABORT, 'sensitive test SQL failure'); END;").unwrap();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW), Err(STORAGE.into()));
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)), Err(STORAGE.into()));
     assert_eq!(count(&db, "google_signin_attestations"), 1);
     assert_eq!(count(&db, "google_signin_links"), 0);
     assert_eq!(db.reject_signin_request(&admin.id, admin.credential_epoch, &request_id, NOW), Err(STORAGE));
@@ -397,7 +473,7 @@ fn signin_attested_disabled_user_never_links() {
     let user = password_user(&db, &id.email, UserRole::Employee);
     db.set_user_status(&user.id, UserStatus::Suspended).unwrap();
     db.upsert_google_signin_attestation(&user.id, "admin", NOW).unwrap();
-    assert_eq!(db.resolve_google_signin(&id, &policy(SigninApproval::Direct, 100), NOW).unwrap(), SigninOutcome::AccountDisabled);
+    assert_eq!(db.resolve_google_signin(true, &id, &policy(SigninApproval::Direct, 100), NOW, &|_| Ok(None)).unwrap(), SigninOutcome::AccountDisabled);
     assert_eq!(count(&db, "google_signin_links"), 0);
     assert_eq!(db.get_user(&user.id).unwrap().unwrap().status, UserStatus::Suspended);
 }

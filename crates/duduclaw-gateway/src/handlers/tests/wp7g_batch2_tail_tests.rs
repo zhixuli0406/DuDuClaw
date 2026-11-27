@@ -118,6 +118,19 @@ async fn tools_catalog_lists_autopilot_read_methods() {
     }
 }
 
+#[tokio::test]
+async fn tools_catalog_lists_company_timezone_once() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let frame = handler.handle_tools_catalog(json!({}));
+    assert!(frame_ok(&frame), "{frame:?}");
+    let data = frame_data(&frame);
+    let tools = data["tools"].as_array().unwrap();
+    let entries: Vec<_> = tools.iter().filter(|t| t["name"] == "system.company_timezone").collect();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["description"], "Read the company time zone name and whether it is set (any signed-in account, read-only)");
+}
+
 // ── #3: mail.decide's optional `note` reaches the ledger ───────────
 async fn drafted_mail(home: &std::path::Path) -> (crate::approval::ApprovalBroker, String) {
     let broker = crate::approval::ApprovalBroker::open(home).unwrap();

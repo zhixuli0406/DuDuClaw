@@ -75,6 +75,15 @@ use Ty::*;
 /// `(section path, key, type)` for every typed key a reader consumes.
 pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("odoo", "member_credentials", Bool),
+    ("odoo_access", "permission_mode", OneOf(&["engine", "follow_odoo_account"])),
+    ("odoo_access", "permission_mode_ack", Table),
+    ("odoo_access.permission_mode_ack", "by", Str),
+    ("odoo_access.permission_mode_ack", "at", Str),
+    ("odoo_access", "company_key_agents", StrArray),
+    ("odoo_access", "company_key_agents_migrated", Str),
+    ("odoo_access", "upgrade_notice_pending", Bool),
+    ("odoo_access", "always_refuse", StrArray),
+    ("odoo_access", "attachment_max_mb", UInt),
     ("security", "mail_requester_approval", Bool),
     ("auth", "mfa_enforced", Bool),
     ("approval", "skill_ttl_days", UInt),
@@ -83,6 +92,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("general", "default_agent", Str),
     ("general", "default_language", Str),
     ("general", "company_timezone", Str),
+    ("general", "company_timezone_source", Str),
     ("general", "inference_mode", Str),
     ("general", "name", Str),
     ("gateway", "bind", Str),

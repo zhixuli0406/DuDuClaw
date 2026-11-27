@@ -13,7 +13,7 @@ impl MfaCipher for Cipher {
         sealed.strip_prefix("fixture:").map(str::to_owned).ok_or_else(|| "fixture cipher".into())
     }
 }
-fn code(secret: &str, step: i64) -> String {
+pub(crate) fn code(secret: &str, step: i64) -> String {
     let (mut bits, mut acc, mut key) = (0u32, 0u32, Vec::new());
     for c in secret.bytes() {
         let v = match c { b'A'..=b'Z' => c-b'A', b'2'..=b'7' => c-b'2'+26, _ => panic!("base32") };
@@ -28,13 +28,13 @@ fn code(secret: &str, step: i64) -> String {
     format!("{:06}", n % 1_000_000)
 }
 #[derive(Default)]
-struct Recording { deletes: AtomicUsize, replies: Mutex<Vec<String>> }
+pub(crate) struct Recording { pub(crate) deletes: AtomicUsize, pub(crate) replies: Mutex<Vec<String>> }
 #[async_trait::async_trait]
 impl ReplySink for Recording {
     async fn delete_code(&self) { self.deletes.fetch_add(1, Ordering::SeqCst); }
     async fn reply(&self, text: &str) { self.replies.lock().unwrap().push(text.to_owned()); }
 }
-struct DmFixture { service: Fixture, id: ApprovalId, receipt: Receipt, ticket: String, secret: String, recovery: String }
+pub(crate) struct DmFixture { pub(crate) service: Fixture, pub(crate) id: ApprovalId, pub(crate) receipt: Receipt, pub(crate) ticket: String, pub(crate) secret: String, pub(crate) recovery: String }
 impl DmFixture {
     async fn new() -> Self {
         let service = Fixture::new();
@@ -43,31 +43,41 @@ impl DmFixture {
         let mut config = std::fs::read_to_string(&path).unwrap();
         config.push_str("step_up_methods=['web','dm_totp']\n");
         std::fs::write(path, config).unwrap();
+        let id = service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
+        let proof = service.proof(&id).await;
+        service.env.broker.store.conn.lock().await.execute(
+            "UPDATE chat_admin_cards SET message_id='42' WHERE card_id=?1", [&proof.card_id]).unwrap();
+        let receipt = receipts::by_card_id(&service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
+        Self::from_service(service, id, receipt).await
+    }
+    pub(crate) async fn from_service(service: Fixture, id: ApprovalId, receipt: Receipt) -> Self {
         let now = chrono::Utc::now().timestamp() - 60;
         let db = service.db();
         let challenge = db.mfa_password_challenge(&service.user, "fixture-password-only", "fixture-session", now).unwrap();
         db.mfa_prepare_enrollment(&challenge, false, now).unwrap();
         let secret = db.mfa_begin(&service.user, Some(&challenge), &Cipher, now).unwrap();
         let recovery = db.mfa_confirm(&service.user, Some(&challenge), &code(&secret, now/30), &Cipher, now).unwrap()[0].clone();
-        let id = service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
-        let proof = service.proof(&id).await;
-        service.env.broker.store.conn.lock().await.execute(
-            "UPDATE chat_admin_cards SET message_id='42' WHERE card_id=?1", [&proof.card_id]).unwrap();
-        let receipt = receipts::by_card_id(&service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
         let store = &mut Store::open(&service.env.home).unwrap();
         let ticket = store.issue_totp(&receipt).unwrap();
         store.attach_prompt(&ticket, "43").unwrap();
         Self { service, id, receipt, ticket, secret, recovery }
     }
-    fn event(&self, text: &str) -> Event {
-        Event { account:self.receipt.account.clone(), dm:self.receipt.dm.clone(), principal:self.receipt.principal.clone(),
-            private:true, reply_to:Some("43".into()), prompt_hint:true, text:text.into() }
+    pub(crate) fn next_prompt(&mut self, id: ApprovalId, receipt: Receipt, prompt: &str) {
+        self.id = id;
+        self.receipt = receipt;
+        let mut store = Store::open(&self.service.env.home).unwrap();
+        self.ticket = store.issue_totp(&self.receipt).unwrap();
+        store.attach_prompt(&self.ticket, prompt).unwrap();
     }
-    async fn receive(&self, event: Event, sink: &Recording) -> bool {
+    pub(crate) fn event(&self, text: &str) -> Event {
+        Event { account:self.receipt.account.clone(), dm:self.receipt.dm.clone(), principal:self.receipt.principal.clone(),
+            envelope_private:true, authorized:true, reply_to:Some("43".into()), prompt_hint:true, text:text.into() }
+    }
+    pub(crate) async fn receive(&self, event: Event, sink: &Recording) -> bool {
         intercept_with_verify(&self.service.env, event, Lang::ZhTw, sink, |db, _, user, text, now|
             db.mfa_step_up_verify_totp_only(user, text, &Cipher, now)).await
     }
-    fn state(&self) -> (String, i64) {
+    pub(crate) fn state(&self) -> (String, i64) {
         Connection::open(self.service.env.home.join("protected/approval_step_up.db")).unwrap().query_row(
             "SELECT status,attempts FROM tickets WHERE id=?1", [&self.ticket], |r| Ok((r.get(0)?,r.get(1)?))).unwrap()
     }
@@ -91,7 +101,7 @@ async fn ordinary_reply_passes_through_when_ticket_store_fails() {
     for private in [false, true] {
         let sink = Recording::default();
         let mut event = f.event("thanks");
-        event.private = private;
+        event.envelope_private = private;
         event.prompt_hint = false;
         assert!(!intercept_with_verify(&f.service.env, event, Lang::En, &sink,
             |_, _, _, _, _| panic!("failed lookup must never verify")).await);
@@ -164,14 +174,12 @@ async fn dm_totp_replay_refused() {
     assert!(f.receive(f.event(&code), &sink).await);
     assert_eq!(f.service.status(&f.id).await, ApprovalStatus::Approved);
     // A second live approval and prompt cannot reuse the first approval's TOTP.
-    f.id = f.service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
-    let proof = f.service.proof(&f.id).await;
+    let id = f.service.simple(crate::expert_skills::SKILLS_ACTION_KIND).await;
+    let proof = f.service.proof(&id).await;
     f.service.env.broker.store.conn.lock().await.execute(
         "UPDATE chat_admin_cards SET message_id='50' WHERE card_id=?1", [&proof.card_id]).unwrap();
-    f.receipt = receipts::by_card_id(&f.service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
-    let mut store = Store::open(&f.service.env.home).unwrap();
-    f.ticket = store.issue_totp(&f.receipt).unwrap();
-    store.attach_prompt(&f.ticket, "51").unwrap();
+    let receipt = receipts::by_card_id(&f.service.env.broker.store, &proof.card_id).await.unwrap().unwrap();
+    f.next_prompt(id, receipt, "51");
     let mut reply = f.event(&code); reply.reply_to = Some("51".into());
     assert!(f.receive(reply, &sink).await);
     assert_eq!(f.state(), ("live".into(), 1));
@@ -208,7 +216,7 @@ async fn invalid_origins_expired_and_used_prompts_never_enter_conversation_or_de
         let mut event = f.event(&code);
         match case {
             "principal" => event.principal = "other".into(),
-            "group" => event.private = false,
+            "group" => event.envelope_private = false,
             "account" => event.account = "telegram:other".into(),
             "dm" => event.dm = "other".into(),
             "no_reply" => { event.reply_to = None; event.prompt_hint = false; },
@@ -240,7 +248,7 @@ async fn bare_codes_require_a_live_ticket_for_the_exact_private_sender() {
             event.reply_to = None;
             event.prompt_hint = false;
             match case {
-                "group" => event.private = false,
+                "group" => event.envelope_private = false,
                 "account" => event.account = "telegram:other".into(),
                 "dm" => event.dm = "other".into(),
                 "principal" => event.principal = "other".into(),
@@ -283,7 +291,7 @@ async fn unbound_prompt_hint_is_consumed_only_for_a_private_reply() {
     f.sql("DELETE FROM tickets");
     for private in [false, true] {
         let sink = Recording::default();
-        let mut event = f.event("arbitrary content"); event.private = private;
+        let mut event = f.event("arbitrary content"); event.envelope_private = private;
         assert_eq!(intercept_with_verify(&f.service.env, event, Lang::En, &sink,
             |_, _, _, _, _| panic!("expired prompt must never verify")).await, private);
         assert_eq!(sink.deletes.load(Ordering::SeqCst), usize::from(private));
@@ -326,8 +334,12 @@ async fn disabled_dm_totp_has_no_prompt_and_service_refuses_proof() {
     let proof = ChatAdminProof { user_id:f.service.user.clone(), channel:config::ChatChannel::Telegram,
         account:f.receipt.account.clone(), principal:f.receipt.principal.clone(), dm:f.receipt.dm.clone(),
         card_id:f.receipt.card_id.clone(), digest:f.receipt.digest.clone(), step:ledger::Step::Totp };
-    assert!(matches!(decision_service::decide(&f.service.env, &f.id, true, "", &Decider::ChatAdmin(proof)).await,
-        Err(crate::approval::decision_service::DecisionRefusal::StepUpRequired)));
+    for approve in [true, false] {
+        assert!(matches!(decision_service::decide(&f.service.env, &f.id, approve, "", &Decider::ChatAdmin(proof.clone())).await,
+            Err(crate::approval::decision_service::DecisionRefusal::StepUpRequired)));
+        assert_eq!(f.state(), ("live".into(), 0));
+        f.pending().await;
+    }
     assert!(f.receive(f.event(&code(&f.secret, chrono::Utc::now().timestamp()/30)), &Recording::default()).await);
     assert_eq!(f.state(), ("live".into(), 0));
     f.pending().await;
@@ -427,4 +439,48 @@ async fn malformed_prompt_reply_counts_and_never_enters_conversation() {
     assert_eq!(f.state(), ("void".into(), 5));
     assert_eq!(sink.deletes.load(Ordering::SeqCst), 5);
     f.pending().await;
+}
+
+#[tokio::test]
+async fn denied_private_codes_and_prompt_replies_stay_consumed_when_store_fails() {
+    let f = DmFixture::new().await;
+    let protected = f.service.env.home.join("protected");
+    std::fs::rename(&protected, f.service.env.home.join("protected-backup")).unwrap();
+    std::fs::write(&protected, "not a directory").unwrap();
+    assert!(Store::open(&f.service.env.home).is_err());
+    for (text, reply_to, prompt_hint) in [
+        ("123456", None, false),
+        ("123456", Some("99"), false),
+        ("0123456789abcdef0123456789abcdef", None, false),
+        ("malformed code", Some("43"), true),
+    ] {
+        let sink = Recording::default();
+        let mut event = f.event(text);
+        event.authorized = false;
+        event.reply_to = reply_to.map(str::to_owned);
+        event.prompt_hint = prompt_hint;
+        assert!(intercept_with_verify(&f.service.env, event, Lang::En, &sink,
+            |_, _, _, _, _| panic!("denied sender must never verify")).await);
+        assert_eq!(sink.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.replies.lock().unwrap().as_slice(), [dashboard(Lang::En)]);
+    }
+    f.pending().await;
+}
+
+#[tokio::test]
+async fn denied_private_prompt_reply_does_not_verify_or_count_attempts() {
+    let f = DmFixture::new().await;
+    for (text, reply_to) in [("123456", Some("43")), ("malformed code", Some("43")), ("123456", None)] {
+        let sink = Recording::default();
+        let mut event = f.event(text);
+        event.authorized = false;
+        event.reply_to = reply_to.map(str::to_owned);
+        event.prompt_hint = false;
+        assert!(intercept_with_verify(&f.service.env, event, Lang::En, &sink,
+            |_, _, _, _, _| panic!("denied sender must never verify")).await);
+        assert_eq!(sink.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(sink.replies.lock().unwrap().as_slice(), [dashboard(Lang::En)]);
+        assert_eq!(f.state(), ("live".into(), 0));
+        f.pending().await;
+    }
 }

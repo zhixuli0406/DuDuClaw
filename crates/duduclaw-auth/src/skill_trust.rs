@@ -119,7 +119,7 @@ mod tests {
         for (user, sess, epoch) in [(&member.id, &session, 0), (&admin.id, &Uuid::new_v4().to_string(), 0), (&admin.id, &session, 1)] {
             assert!(db.skill_trust_pin_consume(user, sess, epoch, &proof, now).is_err());
         }
-        assert!(db.member_key_create_authenticated(&admin.id, "x", 1, 0, &session, &proof).is_err());
+        assert!(db.member_key_create_authenticated(&admin.id, "x", 1, 0, &session, &proof, false, &[]).is_err());
         db.conn().execute("UPDATE skill_trust_pin_proofs SET purpose='me.member_keys.create'", []).unwrap();
         assert!(db.skill_trust_pin_consume(&admin.id, &session, 0, &proof, now).is_err());
         db.conn().execute("UPDATE skill_trust_pin_proofs SET purpose=?1", [PURPOSE]).unwrap();

@@ -586,7 +586,7 @@ impl MethodHandler {
                 .map(|r| {
                     json!({
                         "id": r.id,
-                        "summary": r.summary,
+                        "summary": crate::approval::outbound::list_summary(&r),
                         "created_at": r.created_at,
                         "ttl_seconds": r.ttl_seconds,
                     })

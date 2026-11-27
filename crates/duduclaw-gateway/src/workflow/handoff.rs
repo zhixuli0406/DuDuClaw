@@ -159,6 +159,8 @@ impl WorkflowService {
     ) -> Result<(), String> {
         let queue = MessageQueue::open(&self.home)?;
         let message = QueueMessage {
+            autopilot_department: None,
+            autopilot_rule_id: None,
             id: message_id.into(),
             sender: "workflow".into(),
             target: run.actor.clone(),

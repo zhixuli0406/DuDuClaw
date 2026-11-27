@@ -218,7 +218,6 @@ pub(crate) async fn handle_create_reminder(
     };
 
     let id = reminder.id.clone();
-    let trigger_display = trigger_at.to_rfc3339();
 
     let admission = match admit_background_caller(home_dir, actor, "create_reminder").await {
         Ok(guard) => guard,
@@ -228,20 +227,10 @@ pub(crate) async fn handle_create_reminder(
     match append_reminder_checked_admitted(
         home_dir, &reminder, MAX_REMINDERS_PER_AGENT, admission,
     ).await {
-        Ok(AppendResult::Ok) if webchat_origin => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Reminder created (id: {id}, trigger: {trigger_display}, channel: webchat). \
-                 提醒會在時間到時回到這個 WebChat 對話，不會即時推播；重新開啟此對話即可查看。\
-                 It will be posted back to this WebChat conversation. There is no live push; reopen this conversation to see it."
-            )}]
-        }),
-        Ok(AppendResult::Ok) => serde_json::json!({
-            "content": [{"type": "text", "text": format!(
-                "Reminder created (id: {id}, trigger: {trigger_display}, channel: {channel}). 提醒會傳送到 {} 的{}對話。",
-                duduclaw_gateway::decision_notify::channel_display_name(channel),
-                if supplied_channel.is_empty() && supplied_chat.is_empty() { "原本這個" } else { "指定" }
-            )}]
-        }),
+        Ok(AppendResult::Ok) => created_reminder_receipt(
+            home_dir, &id, trigger_at, channel, webchat_origin,
+            supplied_channel.is_empty() && supplied_chat.is_empty(),
+        ),
         Ok(AppendResult::LimitReached(count)) => serde_json::json!({
             "content": [{"type": "text", "text": format!(
                 "Error: agent '{agent_id}' has {count} pending reminders (max {MAX_REMINDERS_PER_AGENT})"
@@ -252,6 +241,60 @@ pub(crate) async fn handle_create_reminder(
             "content": [{"type": "text", "text": format!("Error: failed to save reminder: {e}")}],
             "isError": true
         }),
+    }
+}
+
+fn created_reminder_receipt(
+    home: &Path,
+    id: &str,
+    trigger_at: chrono::DateTime<chrono::Utc>,
+    channel: &str,
+    webchat_origin: bool,
+    original_conversation: bool,
+) -> Value {
+    let trigger_display = duduclaw_core::company_timezone::format_local(
+        &duduclaw_core::company_timezone::read(home), trigger_at, "%Y-%m-%d %H:%M",
+    );
+    let trigger_instant = trigger_at.to_rfc3339();
+    if webchat_origin {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Reminder created (id: {id}, trigger: {trigger_instant}, channel: webchat). 提醒時間：{trigger_display}。 \
+                 提醒會在時間到時回到這個 WebChat 對話，不會即時推播；重新開啟此對話即可查看。\
+                 It will be posted back to this WebChat conversation. There is no live push; reopen this conversation to see it."
+            )}]
+        })
+    } else {
+        serde_json::json!({
+            "content": [{"type": "text", "text": format!(
+                "Reminder created (id: {id}, trigger: {trigger_instant}, channel: {channel}). 提醒時間：{trigger_display}。提醒會傳送到 {} 的{}對話。",
+                duduclaw_gateway::decision_notify::channel_display_name(channel),
+                if original_conversation { "原本這個" } else { "指定" }
+            )}]
+        })
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn reminder_receipt_shows_company_local_time_and_preserves_instant() {
+        let home = tempfile::tempdir().unwrap();
+        let at = "2026-12-01T01:00:00Z".parse().unwrap();
+        for (config, display) in [
+            ("[general]\ncompany_timezone = 'Asia/Taipei'\n", "2026-12-01 09:00 CST"),
+            ("", "2026-12-01 01:00 UTC"),
+        ] {
+            std::fs::write(home.path().join("config.toml"), config).unwrap();
+            for webchat in [false, true] {
+                let result = created_reminder_receipt(home.path(), "reminder-id", at, "line", webchat, true);
+                let text = result["content"][0]["text"].as_str().unwrap();
+                assert!(text.contains(display), "{text}");
+                assert!(text.contains("id: reminder-id, trigger: 2026-12-01T01:00:00+00:00"), "{text}");
+            }
+        }
     }
 }
 

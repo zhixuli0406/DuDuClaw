@@ -73,7 +73,7 @@ Discord 按鈕使用平台驗證過的頻道 ID、種類與 guild。每一則 gu
 - 工作流程啟用
 - 執行結果未知的操作核對（`approvals.resolve_uncertain`，限 Admin）
 
-在通道上回覆這些請求不會生效。
+在通道上回覆這些請求不會生效。例外（v1.86）：客戶管理員開啟「在聊天軟體核准」後，知識審核與工作流程啟用也能由完成本人連結的管理員，在 Telegram 或 Google Chat 私訊按閘道送出的卡片決定；打字回覆仍然不會生效。見[在聊天軟體核准](../../features/zh-TW/05-security-defense.md#在聊天軟體核准v186)。
 
 ## Slack 需要 `users:read` 權限
 

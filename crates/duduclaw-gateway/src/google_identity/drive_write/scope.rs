@@ -165,14 +165,14 @@ impl ScopeReason {
 
     pub(crate) fn user_text(self) -> &'static str {
         match self {
-            Self::FolderOutOfScope => "這個位置不在允許的資料夾內",
-            Self::ParentNotVisible => "無法確認上層資料夾，請確認存取權限",
-            Self::Trashed => "檔案或上層資料夾已在垃圾桶中",
-            Self::ShortcutNotAllowed => "這是捷徑，請改用原始檔案",
-            Self::CapabilityDenied => "目前的 Google 帳號無法執行這個動作",
-            Self::CrossDriveMove => "不能跨雲端硬碟搬移檔案",
-            Self::ListedFolderProtected => "不能改名、搬移或刪除允許清單上的資料夾",
-            Self::FolderRequired => "請先設定允許的資料夾",
+            Self::FolderOutOfScope => "這個位置不在允許使用的資料夾內，這次沒有執行，可請管理員調整允許使用的資料夾。",
+            Self::ParentNotVisible => "無法確認上層資料夾，這次沒有執行，請帳號本人確認存取權限。",
+            Self::Trashed => "檔案或上層資料夾已在垃圾桶中，這次沒有執行，請帳號本人先還原。",
+            Self::ShortcutNotAllowed => "這是捷徑，無法執行這項操作，請改用原始檔案。",
+            Self::CapabilityDenied => "目前的 Google 帳號沒有執行這項操作的權限，可請檔案擁有者調整分享權限。",
+            Self::CrossDriveMove => "無法跨雲端硬碟搬移檔案，請選擇同一個雲端硬碟內的目的地。",
+            Self::ListedFolderProtected => "無法改名、搬移或刪除管理員指定的可用資料夾，請管理員調整可用資料夾後再試。",
+            Self::FolderRequired => "這項操作需要先限定可使用的資料夾，請管理員設定。",
         }
     }
 }

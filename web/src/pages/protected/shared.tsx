@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { createContext, useCallback, useContext, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { formatError } from '@/lib/toast';
@@ -38,6 +39,7 @@ export function PageTrail({ trail, newIn }: { trail: string; newIn?: string }) {
 
 /** Every string of this page lives under `protectedMode.*`. */
 export function useT() {
+  useCompanyTimeZone();
   const intl = useIntl();
   return useCallback(
     (key: string, values?: Record<string, string | number>) =>
@@ -136,7 +138,7 @@ export const LABEL_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 export function formatWhen(value: string, locale: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString(locale, { dateStyle: 'medium', timeStyle: 'short' });
+  return formatDateTime(date, { locale, dateStyle: 'medium', timeStyle: 'short' });
 }
 
 /** A bordered box whose table scrolls sideways on a phone. */

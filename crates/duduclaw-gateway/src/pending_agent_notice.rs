@@ -114,20 +114,21 @@ pub fn take_pending_notice_suffix(home_dir: &Path, agent_id: &str) -> Option<Str
     let path = state_path(home_dir);
     duduclaw_core::with_file_lock(&path, || {
         let mut state = load_state(home_dir);
+        let company = duduclaw_core::company_timezone::read(home_dir);
         let mut lines = Vec::new();
         let mut now_empty = false;
         if let Some(entry) = state.agents.get_mut(agent_id) {
             if let Some(ts) = entry.contract_changed_at.take() {
                 lines.push(format!(
                     "（行為規則已於 {} 更新）",
-                    format_local_mm_dd_hhmm(&ts)
+                    format_local_mm_dd_hhmm(&company, &ts)
                 ));
             }
             if entry.model_changed_at.take().is_some() {
                 lines.push("（已切換至新模型）".to_string());
             }
             if let Some(ts) = entry.profile_changed_at.take() {
-                lines.push(format!("（設定已於 {} 更新）", format_local_mm_dd_hhmm(&ts)));
+                lines.push(format!("（設定已於 {} 更新）", format_local_mm_dd_hhmm(&company, &ts)));
             }
             now_empty = entry.is_empty();
         }
@@ -144,15 +145,13 @@ pub fn take_pending_notice_suffix(home_dir: &Path, agent_id: &str) -> Option<Str
     .flatten()
 }
 
-/// Render an RFC3339 instant as a person-readable local `MM-DD HH:mm` clock.
+/// Render an RFC3339 instant as a company-zone `MM-DD HH:mm` clock with a zone label.
 /// Falls back to a vague "近期" (recently) on a malformed timestamp rather
 /// than surfacing raw ISO 8601 to the end user.
-fn format_local_mm_dd_hhmm(rfc3339: &str) -> String {
+fn format_local_mm_dd_hhmm(company: &duduclaw_core::company_timezone::CompanyZone, rfc3339: &str) -> String {
     chrono::DateTime::parse_from_rfc3339(rfc3339)
         .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%m-%d %H:%M")
-                .to_string()
+            duduclaw_core::company_timezone::format_local(company, dt.with_timezone(&chrono::Utc), "%m-%d %H:%M")
         })
         .unwrap_or_else(|_| "近期".to_string())
 }
@@ -232,14 +231,15 @@ mod tests {
 
     #[test]
     fn malformed_timestamp_degrades_to_placeholder() {
-        assert_eq!(format_local_mm_dd_hhmm("not-a-timestamp"), "近期");
+        assert_eq!(format_local_mm_dd_hhmm(&duduclaw_core::company_timezone::read(tempfile::tempdir().unwrap().path()), "not-a-timestamp"), "近期");
     }
 
     #[test]
-    fn well_formed_timestamp_renders_mm_dd_hh_mm() {
-        let rendered = format_local_mm_dd_hhmm("2026-08-11T03:04:05Z");
-        // Exactly "MM-DD HH:mm" shape (11 chars: 2+1+2+1+2+1+2).
-        assert_eq!(rendered.len(), 11);
-        assert!(rendered.contains('-') && rendered.contains(':'));
+    fn well_formed_timestamp_renders_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let ts = "2026-11-27T01:30:00Z";
+        assert_eq!(format_local_mm_dd_hhmm(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 01:30 UTC");
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert_eq!(format_local_mm_dd_hhmm(&duduclaw_core::company_timezone::read(home.path()), ts), "11-27 09:30 CST");
     }
 }

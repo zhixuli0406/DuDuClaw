@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { BellRing, ExternalLink, TriangleAlert } from 'lucide-react';
@@ -148,6 +149,7 @@ function NotifyStatsSection({ connectionState }: { readonly connectionState: str
 
 function ChannelFailuresSection({ connectionState }: { readonly connectionState: string }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const agents = useAgentsStore((s) => s.agents);
   const { jumpToAgent, jumpToConversation } = useDevPanelIdJump();
   const [events, setEvents] = useState<UnifiedAuditEvent[]>([]);
@@ -232,7 +234,7 @@ function ChannelFailuresSection({ connectionState }: { readonly connectionState:
                   <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground">
                     {(() => {
                       try {
-                        return new Date(evt.timestamp).toLocaleTimeString('zh-TW', {
+                        return formatDateTime(evt.timestamp, { locale: 'zh-TW',
                           hour12: false,
                           hour: '2-digit',
                           minute: '2-digit',

@@ -115,3 +115,11 @@ npx duduclaw mcp init --client cursor
 ## MCP Registry への掲載
 
 Registry 用メタデータは `distribution/registries/mcp/server.json` です。公開手順（オーナーが各リリース後に実行）は [`distribution/registries/README.md`](../../../distribution/registries/README.md) にあります。
+
+## 個人キーを MCP 認証に使う（v1.86.0）
+
+`ddc_member_` 個人キーには稼働中のゲートウェイと個人キー機能の有効化が必要です。スタンドアロン MCP キーとは別の認証です。MCP HTTP では `Authorization: Bearer <member-key>`、stdio ではサーバー環境変数 `DUDUCLAW_MCP_API_KEY` を使います。個人キーを URL クエリに含めてはいけません。HTTP／SSE クライアントは認証ヘッダーを送れるものを使ってください。
+
+有効なスコープはキーの `mcp_scopes` と管理者の現在の `[member_api_keys] allow_mcp_scopes`（既定 `[]`）の共通部分です。選べるのは `tasks:read`、`agents:status`、`odoo:read`、`odoo:write` のみです。ツールは所有者本人として実行し、現在の権限を確認します。Odoo は本人が接続したアカウントのみを使い、会社・AI 社員のアカウントには切り替えません。対象ツールは [MCP ツール](mcp-tools.md) を参照してください。
+
+このリリースの OAuth 同意画面は個人キーを拒否します。ヘッダーか stdio の環境変数を直接設定してください。OAuth 同意画面での交換には対応していません。

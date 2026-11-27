@@ -652,6 +652,8 @@ fn validate_raw_with_stored(file: &RawFile, text: &str, stored: Option<&toml::Ta
     })?;
     match file {
         RawFile::Config => {
+            super::chat_admin_settings_rpc::refuse_subtable_change(
+                stored.unwrap_or(&toml::Table::new()), &table)?;
             super::config_schema::check_config_types_with_stored(text, &table, stored)?;
             validate_config_table(&table)?;
             duduclaw_inference::transcription::config::TranscriptionConfig::from_toml(text)?;
@@ -1728,6 +1730,21 @@ OPENAI_API_KEY = "sk-env-secret"
         assert!(err.contains("line 2"), "{err}");
         let err = validate_raw(&RawFile::Config, "a = 1\nb = \n").unwrap_err();
         assert!(err.contains("line 2"), "{err}");
+    }
+
+    #[test]
+    fn raw_editor_cannot_enable_chat_admin() {
+        let empty = toml::Table::new();
+        let off: toml::Table = "[approval.chat_admin]\nenabled=false".parse().unwrap();
+        let on = "[approval.chat_admin]\nenabled=true";
+        for before in [&empty, &off] {
+            assert!(validate_raw_with_stored(&RawFile::Config, on, Some(before)).is_err());
+        }
+        assert!(validate_raw_with_stored(&RawFile::Config, "", Some(&off)).is_err());
+        assert!(validate_raw_with_stored(&RawFile::Config,
+            "[approval.chat_admin]\nenabled=false\ncard_valid_hours=1", Some(&off)).is_err());
+        assert!(validate_raw_with_stored(&RawFile::Config,
+            "[approval]\nskill_ttl_days=8\n[approval.chat_admin]\nenabled=false", Some(&off)).is_ok());
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod memory_rpc;
 mod memory_history_rpc;
 pub(crate) mod my_memory_rpc;
 mod chat_link_rpc;
+mod chat_admin_settings_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -138,6 +139,7 @@ mod status_tokens_rpc;
 mod member_keys_rpc;
 mod skill_trust_rpc;
 mod odoo_member_rpc;
+mod odoo_access_rpc;
 mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
@@ -228,6 +230,8 @@ mod approvals_decide;
 pub(crate) mod approval_decider;
 mod growth_rpc;
 mod autopilot_rpc;
+mod autopilot_department_rpc;
+mod autopilot_affecting_rpc;
 mod ticks_rpc;
 mod os_rpc;
 mod redaction_status_rpc;
@@ -707,6 +711,16 @@ impl MethodHandler {
                 return WsFrame::error_response("", "只有管理員可以連結聊天帳號。");
             }
             return boxed_frame(|| self.handle_chat_link_rpc(method, params, ctx)).await;
+        }
+
+        if method.split('.').take(2).eq(["approvals", "chat_admin"]) {
+            let Some(role) = chat_admin_settings_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此聊天核准操作。");
+            };
+            if ctx.role != role {
+                return WsFrame::error_response("", "只有管理員可以設定聊天核准。");
+            }
+            return boxed_frame(|| self.handle_chat_admin_settings_rpc(method, params, ctx)).await;
         }
 
         // RM-039 "my memory" is gateway-owned self-service: an extension must

@@ -1,8 +1,8 @@
 # Google's official remote MCP mount (advanced option, not the shipped path)
 
 > **Read this first**: DuDuClaw's supported path for Google Workspace is **native
-> tools** — Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks, all
-> eight services, all through the GA REST API, 19 MCP tools. See
+> tools** — Gmail / Calendar / Sheets / Drive / Docs / Slides / Forms / Tasks / Chat,
+> through the REST API, with 38 native MCP tools. See
 > [google-setup.md](google-setup.md). **You don't need to read this page
 > for normal use.**
 >
@@ -19,30 +19,26 @@
 
 From 2026-11-11, Google's Workspace MCP servers reject clients that are not marked for an AI-powered agent. In Google Auth platform → Clients, create a separate client for this advanced MCP use and select “Use this client for an AI-powered agent”. REST-only applications are unaffected. DuDuClaw's native Google tools use REST. The requirement and Console paths use research checked 2026-10-30; Console screens were not re-verified live here.
 
-## Coverage across the eight services
+## Service coverage
 
 | Service | Native tools (**the shipped path**, no enrollment needed) | Official MCP (preview, internal use only) |
 |---|---|---|
-| Gmail | ✅ 4 tools | ✅ `preset = "google:gmail"` (13 tools) |
-| Calendar | ✅ 2 | ✅ `google:calendar` (9) |
-| Sheets | ✅ 2 | ✅ `google:sheets` (7) |
-| Drive | ✅ 2 | ✅ `google:drive` (8) |
-| Docs | ✅ 2 | ✅ `google:docs` (2) |
+| Gmail | ✅ 4 | ✅ `preset = "google:gmail"` (13 tools) |
+| Calendar | ✅ 4 | ✅ `google:calendar` (9) |
+| Sheets | ✅ 6 | ✅ `google:sheets` (7) |
+| Drive | ✅ 7 | ✅ `google:drive` (8) |
+| Docs | ✅ 6 | ✅ `google:docs` (2) |
 | Slides | ✅ 1 (read-only) | ✅ `google:slides` (2) |
 | Forms | ✅ 2 | ❌ none official |
 | Tasks | ✅ 4 | ❌ none official |
 
-The official MCP's tool surface is richer than the native tools for Gmail/Drive/Sheets
-(label management, permission queries, formula writes, and more) — that's its only
-advantage; the cost is the preview enrollment and the ban on shipping. The native tool
-count is 19 total (including `google_status`).
+Native tools now include creation and editing. The remote tools retain Google's own schemas and eligibility requirements; they do not inherit the native write switches or folder checks. Use the native write tools below for controlled Drive writes.
 
 The "none official" verdict for Forms and Tasks is a verified fact, not a guess:
 `formsmcp.googleapis.com` / `tasksmcp.googleapis.com` both return 404 in practice, and
 Google's MCP documentation doesn't mention either service (not even as "coming soon").
 Separately, Google also offers Chat (`preset = "google:chat"`) and People
-(different endpoint naming, not included in a preset) — neither currently has a native
-tool equivalent.
+(different endpoint naming, not included in a preset) — People has no native equivalent here; Chat has native read and confirmed-send tools.
 
 ### Per-service tool list (historical 2026-07-30 `tools/list`, not re-verified)
 
@@ -140,7 +136,7 @@ Sources:
 [Calendar MCP reference](https://developers.google.com/workspace/calendar/api/v3/reference/mcp),
 [Developer Preview Program](https://developers.google.com/workspace/preview).
 
-The `google:chat` preset does not add Chat authorization scopes. The native Workspace scope list does not include Chat; configure separate suitable authorization before using that mount. The Google Chat channel uses `chat.bot` and is a separate connection.
+The `google:chat` preset does not add Chat authorization scopes. Native Chat read and send scopes are separate opt-ins; a mount still needs suitable authorization. The Google Chat channel uses `chat.bot` and is a separate connection.
 
 ## Chat authorization links
 
@@ -150,8 +146,48 @@ Missing personal access may produce a gateway-owned confirmation link. It requir
 
 `google_chat_send {space, text, thread?}` sends text to an existing space using the verified requesting member's own Google account. It requires `google:write` and is off until an administrator enables `[google] chat_send = true`. A home/shared account, another member, Apps Script, or a Chat app token (`chat.bot`) cannot substitute for the member.
 
-For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Incremental consent requests `https://www.googleapis.com/auth/chat.messages.create`; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
+For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Additional-service consent explicitly requests the already-consented ordinary services plus `https://www.googleapis.com/auth/chat.messages.create`, without automatic merging of prior Google grants; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
 
 Every send waits for the member's own single-use confirmation, valid for five minutes. The card shows the account, space resource name, thread and full final text, with a private-data warning. A verified private conversation can carry a short card; group requests and long messages use the member-only **My connections** page. Admin approval, an `allow` rule, Admin MCP scope and recipient allowlists cannot replace this confirmation. Any organisation-required egress approval still applies in addition. Editing the message, destination, account, credential or policy invalidates confirmation.
 
 The gateway keeps one request ID with the operation and never automatically resends an unknown outcome (`result_unconfirmed`). Check Google Chat before asking for a new send. Attachments and space creation are not supported; a specified thread must belong to the same space. Google displays the user as sender and also attributes the application by name. [Google Chat API reference](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).
+
+## Cloud-drive write tools
+
+These nine native tools require `google:write`. Administrators control create, modify, move and trash separately; all four start off. Enabling an action or widening its policy requires an explicit acknowledgement of the risks and records the administrator and time. No additional sign-in is required for that settings change. The dashboard controls arrive with the settings page in this release; the Google integration and personal write-connection blocks are not available yet.
+
+Each action defaults to confirmation by the member. An administrator can turn confirmation off per action, or require both member and administrator approval. Required member confirmation lasts five minutes and only that member can decide. Tool allowlists, Admin tokens and standing workflow approval cannot replace it. Background or unattended work is refused when confirmation is required. With personal connections or delegation to the owner, the requester must be the account holder; shared company and fixed-delegation connections use the verified requesting member.
+
+| Tool | Parameters and result | Action switch | Effect class |
+|---|---|---|---|
+| `drive_create_file` | Required `name`; optional `parent_folder_id`. Choose exactly one of `text` (up to 100,000 characters), `attachment` (this conversation's attachment filename), or `folder=true`. Optional `convert_to`: `document` or `spreadsheet`; `mime_type`: `text/plain`, `text/csv` or `text/markdown`. Creates a file or folder. | Create | Publish |
+| `drive_copy_file` | Required `file_id`, `parent_folder_id`; optional `name`. Copies a readable source file into the destination folder. | Create | Publish |
+| `drive_update_file` | Required `file_id`; at least one of `name`, `description`, `text`. Renames, changes the description or replaces text (up to 100,000 characters, non-Google-format text files only). | Modify | Modify |
+| `drive_move_file` | Required `file_id`, `destination_folder_id`. Moves within the same drive; current parents are read from Google. | Move | Publish |
+| `drive_trash_file` | Required `file_id`. Moves the item to trash only. | Trash | Delete |
+| `docs_insert_text` | Required `document_id`, `text` (1–20,000 characters). Choose `at="start"`, `at="end"` or `after_text` (a unique anchor, 1–1,000 characters). Optional `tab_id`. | Modify | Modify |
+| `docs_format` | Required `document_id`, `operations` (1–50). Supports paragraph/text styles, table-cell background, a header and adding a document tab; details below. | Modify | Modify |
+| `sheets_add_sheet` | Required `spreadsheet_id`, `title`; optional `copy_from_sheet` (an existing sheet name). Adds a blank sheet or duplicates a sheet in that spreadsheet. | Modify | Modify |
+| `sheets_add_note` | Required `spreadsheet_id`, `range` (A1, up to 1,000 cells), `note` (up to 5,000 characters; empty clears notes). Sets cell notes, not threaded comments. | Modify | Modify |
+
+IDs can also be supplied as supported Google file or folder URLs. Omitting `parent_folder_id` for creation means the My Drive root and is allowed only with an empty folder list. Uploads accept only attachments attached to the current conversation request, up to 5 MB (5 MiB); arbitrary local paths and employee workspace files are refused. Conversion to a Google document or spreadsheet is optional. Permanent deletion, emptying trash and sharing or permission changes are unavailable.
+
+For `docs_format`, each operation has a `type` and only its supported fields:
+
+- `paragraph_style`: `text` as a unique anchor, `named_style` (`NORMAL_TEXT`, `TITLE`, `SUBTITLE`, `HEADING_1`–`HEADING_6`), optional `alignment` (`START`, `CENTER`, `END`, `JUSTIFIED`).
+- `text_style`: unique `text`, and at least one of `bold`, `italic`, `underline`, `font_size_pt` (6–96).
+- `table_cell_style`: zero-based `table_index` (0–99), `row` (0–499), `column` (0–49), and `background_hex` (`#RRGGBB`).
+- `header`: `text` (up to 1,000 characters).
+- `add_tab`: `title` (1–100 characters).
+
+### Folder rules and limits
+
+An administrator can list folders or entire shared drives. A file in a listed shared drive is in scope. Otherwise every parent chain must reach a listed folder within 12 parent steps. Unreadable parents, trashed targets or ancestors, exceeded check limits, and insufficient Google permissions refuse the action. A call has a shared limit of 16 metadata lookups, including rechecks.
+
+Create and copy check the destination folder; a copied source must be readable and not trashed. Modify, move and trash check the target's location. Listed folders themselves cannot be renamed, moved or trashed. Moves require both source and destination in scope and cannot cross from My Drive to a shared drive or between shared drives. Shortcuts cannot be listed as allowed folders or used as destinations. Modify refuses shortcuts; move and trash affect the shortcut itself and check its own parents, without following the target.
+
+With an empty folder list, create and modify can act anywhere the account can write; move and trash are unavailable. Folder checks run before and after writes, with another check after approval. They are best effort: Google has no folder allowlist and concurrent changes can occur. Detected post-write violations notify administrators; incomplete checks are recorded. Every attempt, including refusals and uncertain outcomes, is logged without file contents or tokens. An uncertain result is not automatically retried; check Google before requesting another write.
+
+The existing `docs_append`, `docs_create`, `docs_replace_text`, `sheets_append`, `sheets_create` and `sheets_update` keep their existing gates and remain outside these four switches and folder rules. The four new Docs/Sheets tools above use Modify. The official Google Drive remote MCP never receives a token with full Drive access; these write tools execute only inside the main gateway process.
+
+See [connection setup](google-setup.md) and [personal write consent](google-personal-connections.md) for account requirements. Real Google OAuth isolation and revocation, delegated scopes, document tabs, conversion, shared-drive roles and private-message confirmation delivery still require real-account acceptance; this reference does not certify those checks.

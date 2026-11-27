@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -659,6 +660,7 @@ function PermCell({ allowed }: { allowed: boolean }) {
 }
 
 function AuditRow({ event }: { event: AuditEvent }) {
+  useCompanyTimeZone();
   const severityBadge: Record<string, { variant: 'secondary' | 'destructive'; className?: string }> = {
     info: { variant: 'secondary' },
     warning: { variant: 'secondary', className: 'bg-warning/15 text-warning' },
@@ -675,7 +677,7 @@ function AuditRow({ event }: { event: AuditEvent }) {
     : Shield;
 
   const badge = severityBadge[event.severity] ?? severityBadge.info;
-  const time = new Date(event.timestamp).toLocaleString();
+  const time = formatDateTime(event.timestamp, { year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 
   return (
     <div className="flex items-start gap-2 rounded-lg border border-surface-border bg-card p-2.5">

@@ -72,13 +72,13 @@ async fn raw_bearer_call_body_and_live_refusal() {
     let principal = call.principal().clone();
     crate::mcp_auth::with_authenticated_call(call, async {
         let args = json!({"user_id":"someone-else", "status":"open"});
-        let result = crate::mcp::person_tools::call(home.path(), &principal, "my_tasks_list", &args).await;
+        let result = crate::mcp::person_tools::call(home.path(), &Arc::new(crate::odoo_pool::OdooConnectorPool::default()), &principal, "my_tasks_list", &args).await;
         assert_eq!(result["structuredContent"], json!({"tasks":[{"id":"visible"}]}));
         let seen = stub.seen.lock().unwrap().clone();
         assert_eq!(seen[0].1, json!({"op":"authenticate"}));
         assert_eq!(seen[1], (format!("Bearer {RAW}"), json!({"op":"call","tool":"my_tasks_list","args":args})));
         stub.status.store(403, Ordering::SeqCst);
-        let error = crate::mcp::person_tools::call(home.path(), &principal, "my_tasks_list", &json!({})).await;
+        let error = crate::mcp::person_tools::call(home.path(), &Arc::new(crate::odoo_pool::OdooConnectorPool::default()), &principal, "my_tasks_list", &json!({})).await;
         assert_eq!(error["isError"], true);
         assert!(error.to_string().contains("scope removed"));
     }).await;

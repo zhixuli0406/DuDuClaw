@@ -49,7 +49,7 @@ mod store;
 pub(crate) mod dm_totp;
 pub(crate) mod routes;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::path::Path;
 use axum::{http::StatusCode, response::{IntoResponse, Response}, Json};

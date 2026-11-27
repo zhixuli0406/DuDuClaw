@@ -208,7 +208,8 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
             Refused(FallbackRefusal::EngineLocalConfig)
         };
     }
-    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
+    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+        || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
         return Refused(FallbackRefusal::EmployeeToolConfig);
     }
     // `duduclaw_core::product_profile` refusals raised inside a runtime are

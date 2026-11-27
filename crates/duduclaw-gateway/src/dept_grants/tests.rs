@@ -59,6 +59,51 @@ fn allows_create(view: &DeptGrantView, agent: &str) -> bool {
     department_grant_allows(view, agent, GrantGroup::Schedules, GrantAction::Create)
 }
 
+pub(crate) fn make_personal(f: &Fixture, agent: &str) -> UserContext {
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
+        "INSERT INTO isolation_personal_agents(agent_name, owner_user_id, created_at) VALUES (?1, ?2, 'now')",
+        rusqlite::params![agent, f.mgr_a.user_id],
+    ).unwrap();
+    f.db.bind_agent(&f.mgr_a.user_id, agent, duduclaw_auth::AccessLevel::Owner).unwrap();
+    crate::personal_visibility::invalidate_owner_cache(&f.home);
+    let mut owner = f.db.live_user_context(&f.mgr_a.user_id).unwrap().unwrap();
+    owner.origin = ContextOrigin::DashboardSession;
+    owner
+}
+
+#[tokio::test]
+async fn personal_owner_never_inherits_any_department_grant() {
+    let f = fixture().await;
+    let owner = make_personal(&f, "a1");
+    let restriction = crate::personal_visibility::AclRestriction::with_flag(&f.home, true);
+    assert!(owner.has_agent_access_under("a1", duduclaw_auth::AccessLevel::Owner, Some(&restriction)));
+    let view = DeptGrantView::load(&f.h, &owner).await;
+    assert_eq!(grant_target_department(&view, "a1"), Ok(None));
+    for group in GrantGroup::ALL {
+        for action in [GrantAction::Read, GrantAction::Create, GrantAction::Edit,
+            GrantAction::Toggle, GrantAction::Remove, GrantAction::Restore,
+            GrantAction::RunNow, GrantAction::RequestInstall, GrantAction::Decide] {
+            assert!(!department_grant_allows(&view, "a1", group, action));
+        }
+        assert!(department_grant_allows(&view, "a2", group, GrantAction::Read));
+    }
+}
+
+#[tokio::test]
+async fn ownership_read_error_denies_all_department_grants() {
+    let f = fixture().await;
+    let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+    assert!(allows_create(&view, "a1"));
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+    crate::personal_visibility::invalidate_owner_cache(&f.home);
+    assert_eq!(grant_target_department(&view, "a1"), Err(()));
+    for group in GrantGroup::ALL {
+        assert!(!department_grant_allows(&view, "a1", group, GrantAction::Read));
+    }
+    assert!(!DeptGrantView::notification_allows(&f.home, &f.mgr_a.user_id, "a1"));
+}
+
 #[tokio::test]
 async fn grants_exclude_other_departments_and_main_agents() {
     let f = fixture().await;

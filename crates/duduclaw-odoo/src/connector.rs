@@ -478,6 +478,42 @@ impl OdooConnector {
         Ok(result)
     }
 
+    /// Keyword calls reserved for the dedicated activity/note/message tools.
+    /// Generic execute callers must continue to supply empty kwargs.
+    pub async fn call_kw(
+        &self, model: &str, method: &str, args: Vec<Value>, kwargs: Value,
+    ) -> Result<Value, String> {
+        if !matches!(method, "activity_schedule" | "message_post") {
+            return Err("Odoo call_kw only supports activity_schedule and message_post".into());
+        }
+        if !kwargs.is_object() {
+            return Err("Odoo call_kw kwargs must be an object".into());
+        }
+        self.raw_execute_kw(model, method, args, kwargs).await
+    }
+
+    /// The dedicated attachment tool supplies validated local file bytes only.
+    /// Keep this separate from call_kw and never accept arbitrary ORM values.
+    pub async fn attachment_create(
+        &self, res_model: &str, res_id: i64, name: &str, mimetype: &str, bytes: &[u8],
+    ) -> Result<i64, String> {
+        use base64::Engine;
+        if !crate::schema::valid_model_name(res_model) || res_id <= 0 {
+            return Err("Invalid attachment target".into());
+        }
+        let values = json!({
+            "name": name,
+            "datas": base64::engine::general_purpose::STANDARD.encode(bytes),
+            "res_model": res_model,
+            "res_id": res_id,
+            "mimetype": mimetype,
+            "public": false,
+        });
+        let result = self.raw_execute_kw("ir.attachment", "create", vec![values], json!({})).await?;
+        result.as_i64().filter(|id| *id > 0)
+            .ok_or_else(|| "Odoo returned an invalid attachment ID; check the record before retrying".into())
+    }
+
     /// Execute an ORM method.
     pub async fn execute_kw(
         &self,
@@ -925,6 +961,56 @@ pub(crate) fn mocked_connector(responses: Vec<Result<Value, String>>) -> OdooCon
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn attachment_create_has_closed_private_values_and_encodes_bytes() {
+        use base64::Engine;
+        let conn = mocked_connector(vec![Ok(json!(91))]);
+        let bytes = b"%PDF-1.7\nattachment test\n%%EOF";
+        assert_eq!(conn.attachment_create("crm.lead", 9, "report.pdf", "application/pdf", bytes).await.unwrap(), 91);
+        let requests = conn.mocked_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0], ("ir.attachment".into(), "create".into(), vec![json!({
+            "name":"report.pdf", "datas":base64::engine::general_purpose::STANDARD.encode(bytes),
+            "res_model":"crm.lead", "res_id":9, "mimetype":"application/pdf", "public":false,
+        })], json!({})));
+        assert!(requests[0].2[0].get("access_token").is_none());
+        for (model, id) in [("../crm.lead", 9), ("crm.lead", 0)] {
+            assert!(conn.attachment_create(model, id, "x.pdf", "application/pdf", bytes).await.is_err());
+        }
+        assert_eq!(conn.mocked_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn attachment_create_rejects_non_id_results_and_revoked_authority() {
+        let conn = mocked_connector(vec![Ok(json!({"datas":"must not echo"})), Ok(json!(0))]);
+        for _ in 0..2 {
+            let error = conn.attachment_create("crm.lead", 9, "x.pdf", "application/pdf", b"%PDF-").await.unwrap_err();
+            assert!(!error.contains("must not echo"));
+        }
+        let mut conn = mocked_connector(vec![]);
+        conn.io_authority = std::sync::Arc::new(|| false);
+        assert!(conn.attachment_create("crm.lead", 9, "x.pdf", "application/pdf", b"%PDF-").await.is_err());
+        assert!(conn.mocked_requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn call_kw_is_closed_and_preserves_dedicated_kwargs() {
+        let conn = mocked_connector(vec![Ok(json!(42)), Ok(json!([7]))]);
+        for method in ["write", "create", "unlink", "message_notify", "send_mail", "_message_post", "activity_schedule_extra"] {
+            assert!(conn.call_kw("crm.lead", method, vec![], json!({})).await.is_err());
+        }
+        assert!(conn.call_kw("crm.lead", "message_post", vec![], json!([])).await.is_err());
+        assert!(conn.mocked_requests().is_empty());
+        let note = json!({"body":"&lt;b&gt;中文&lt;/b&gt;", "message_type":"comment",
+            "subtype_xmlid":"mail.mt_note", "partner_ids":[]});
+        assert_eq!(conn.call_kw("crm.lead", "message_post", vec![json!([9])], note.clone()).await.unwrap(), json!(42));
+        let activity = json!({"act_type_xmlid":"mail.mail_activity_data_todo", "summary":"Review", "user_id":7});
+        conn.call_kw("crm.lead", "activity_schedule", vec![json!([9])], activity.clone()).await.unwrap();
+        let requests = conn.mocked_requests();
+        assert_eq!(requests[0], ("crm.lead".into(), "message_post".into(), vec![json!([9])], note));
+        assert_eq!(requests[1].3, activity);
+    }
 
     #[tokio::test]
     async fn retained_authority_stops_version_and_rpc_after_revocation() {

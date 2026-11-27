@@ -1,5 +1,11 @@
 # Org chart editing (reporting lines and departments)
 
+## Department manager reach (Enterprise, v1.86.0)
+
+Moving an AI employee between departments can change which Managers may manage its schedules, automation rules, skills and usage. The change summary states who gains or loses which controls, for example: “After approval, the Sales Manager can manage this employee's schedules and skills; the Manufacturing Manager will lose that access.” Approval checks the effect again. If it changed since the Admin reviewed it, the Admin must review and confirm again before applying the move. Org sync also reports the effect.
+
+Only the official org chart department, when it agrees with the employee's own settings, gives department grants their scope. Mismatches need an Admin org sync; the main employee and other people's personal employees are excluded. See [Department managers](79-department-managers.md).
+
 Who an AI employee reports to (`reports_to`) and which department it belongs to decide who may delegate to whom. The authoritative record is `<home>/org.toml`, which no employee can write. Each employee's `agent.toml` holds a display copy. Since v1.81.0 both can be changed on the dashboard org chart page: select an employee and use **Adjust position** in the side panel, or drag the employee onto a new manager, which opens the same panel with that manager pre-selected. Nothing is sent until you confirm there. The panel uses the gateway API described below.
 
 ## Who may change what
@@ -38,7 +44,7 @@ Besides `org.toml`, an AI employee cannot write, hold or delete `<home>/locks/or
 ## Proposals and approvals
 
 - Only one proposal can wait for each employee at a time. A second one is refused with `pending_exists` and the waiting request's id.
-- The request is decided in the dashboard only. Messaging apps get a plain notice without buttons, and a decision sent from a channel is refused.
+- The request is decided in the dashboard. Messaging apps get a plain notice without buttons, and a decision sent from a channel is refused. Exception (v1.86): with Approve in chat apps on, a self-confirmed Admin can decide it from a gateway-sent card in a private chat, after a second confirmation by default; see [Admin approval in chat apps](05-security-defense.md#admin-approval-in-chat-apps-v186).
 - On approval the gateway checks the rules again and confirms the employee's placement is still the one the proposal was made against. Only then does it write the authority and the display copy, and it records the decision only after the write succeeded. If the placement changed while the request waited, or the change is no longer valid, the request is **denied** and nothing is written.
 - Recording the decision can fail after the change was applied. In that case the request stays waiting (`decision_unrecorded`) and no final audit row is written. The applied result is saved under `<home>/org_change_journal/` with the approval id. Approving again completes the original approval and does not apply the change a second time. A denial of an already applied request is refused (`already_applied`). Audit rows and the channel notice update are written only after the decision is recorded.
 - Rejection writes nothing. A request expires after 3 days, and expiry counts as a denial.

@@ -8,7 +8,7 @@
 Disposition summary:
 
 - **Routed**: every row below without a `Refused:` prefix. This covers the 66 connector tools, the own-skill tools, spawn tools, `create_task`, the in-run helpers, the file tools, discovery job tools and fork reads, and every employee-handler tool.
-- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`) and `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`). These three categories are the complete exception set.
+- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`), `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`) and `AdminSettingsUnavailable` (`admin_settings_read`, `admin_settings_propose`). These four categories are the complete exception set.
 - **Gated off by default**: `browser_record_start`, `browser_record_stop` and `skill_from_recording` stay hidden until the host's recording probe passes (`RECORDING_BUILD_ENABLED`, spawnd `helper_recording`; readiness names `helper_recording_unsupported`) and the employee's admin-only `[isolation] public_web` is on. `web_fetch_cached`, `web_extract` and `skill_hub_install` also need `public_web = true` (default `false`). The file tools and in-run helpers stay hidden while spawnd's readiness report lacks `work_broker` (helpers: also `helper_calls`).
 
 **CONTRACT CHANGE: capability canonical encoding v2.** `EmployeeScope { id }` is an explicit MAC-covered resource variant (tag 9), bound to the verified employee. Service/Connector calls use either exact resource grants or current live employee authority. A scope cannot be combined with task/table/wiki/mailbox/recipient/connector grants or a task-limited run. Workspace and URL-origin entries may accompany scope as explicit File/A/E inputs. Tag 10, `Confined { resource }`, carries other exact File/A/E input/output grants (for example a wiki namespace or a worker connector account); it requires EmployeeScope and forbids nesting. Neither form narrows or expands employee-scope Service/Connector authority. Older capability MACs are not reused.
@@ -221,13 +221,14 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 
 | Refusal category | Reason |
 | --- | --- |
+| AdminSettingsUnavailable | Admin settings require a non-isolated administrator conversation; protected Personal and Shared employees cannot list or call either tool, even with grants. |
 | Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
 | Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
 | ProposalRequired | Isolation architecture (planned for a later release): `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
 | ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
 
-`Refused: HostAuthority`, `Refused: ProposalRequired` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+`Refused: HostAuthority`, `Refused: ProposalRequired`, `Refused: ForkNextRelease` and `Refused: AdminSettingsUnavailable` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
 
 A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
 
@@ -295,6 +296,8 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `os_display_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `admin_settings_read` | Refused: AdminSettingsUnavailable — read effect; Service route with own Employee grant; never listed in protected mode. |
+| `admin_settings_propose` | Refused: AdminSettingsUnavailable — admin effect; Service route with own Employee grant; never listed in protected mode. |
 | `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
 | `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
 | `create_task` | Host authenticated target queue admission; fresh target run authority required; each call is authorized against the capability before the TaskSpec is written; a task/schedule run plans under its record Task grant (H8 selector, issued only while the employee owns the task, otherwise the run is refused); an interactive run uses the NewTask grant (tag 12) for new top-level plans only, assigned to the calling employee and filed for the signed human requester |

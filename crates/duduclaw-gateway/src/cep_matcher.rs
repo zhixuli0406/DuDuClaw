@@ -28,7 +28,7 @@
 //!   lightweight, dependency-free implementation (documented, not silent).
 //!   `events.db` itself is untouched and unread by this module; it already
 //!   has its own retention/pruning independent of CEP state.
-//! - Every rule with a non-null `sequence` column is evaluated against
+//! - Every company-wide rule with a non-null `sequence` column is evaluated against
 //!   **every** event that flows over the autopilot broadcast bus. Rules are
 //!   re-read from `AutopilotStore` per event (same pattern
 //!   `AutopilotEngine::process_event` already uses for ordinary rules), so a
@@ -379,7 +379,17 @@ impl CepMatcher {
 
         let mut out = Vec::new();
         let now = Instant::now();
-        for rule in rules.iter().filter(|r| r.enabled) {
+        for rule in &rules {
+            // Permanent containment: CEP has no single employee subject.
+            // Exclude even disabled department rules before parsing conditions
+            // or retaining any event fields.
+            if rule.owner_department.is_some() {
+                self.pending.lock().await.remove(&rule.id);
+                continue;
+            }
+            if !rule.enabled {
+                continue;
+            }
             let Some(seq_json) = rule.sequence.as_deref() else {
                 continue;
             };
@@ -461,7 +471,16 @@ impl CepMatcher {
         let mut out = Vec::new();
         let now = Instant::now();
         let mut map = self.pending.lock().await;
-        for rule in rules.iter().filter(|r| r.enabled) {
+        for rule in &rules {
+            // Reloaded ownership also invalidates windows on the timer path;
+            // a negate timeout must never emit a department rule's fields.
+            if rule.owner_department.is_some() {
+                map.remove(&rule.id);
+                continue;
+            }
+            if !rule.enabled {
+                continue;
+            }
             let Some(seq_json) = rule.sequence.as_deref() else {
                 continue;
             };
@@ -537,6 +556,7 @@ mod tests {
 
     fn task_created(id: &str) -> AutopilotEvent {
         AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: serde_json::json!({ "id": id, "title": "t" }),
         }
     }
@@ -833,6 +853,81 @@ mod tests {
     }
 
     // ── Disabled rules are inert ─────────────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn department_sequence_never_retains_event_fields() {
+        for department in ["sales", ""] {
+            for negate in [false, true] {
+                let mut rule = seq_rule("department", serde_json::json!({
+                    "first": { "event": "task_created", "match": {
+                        "field": "task.id", "op": "eq", "value": "confidential"
+                    }},
+                    "then": { "event": "activity_new" },
+                    "within_secs": 600,
+                    "negate": negate
+                }));
+                rule.owner_department = Some(department.into());
+                // Hand-edited sequence rows still satisfy the store's steps
+                // envelope requirement, bypassing only the RPC sequence ban.
+                rule.action = serde_json::json!({"type": "steps", "steps": []}).to_string();
+                let store = store_with(vec![rule]).await;
+                let matcher = CepMatcher::new(store);
+
+                for event in [task_created("confidential"), activity("private")] {
+                    assert!(matcher.on_event(&event).await.is_empty());
+                    assert!(matcher.pending.lock().await.is_empty(),
+                        "department rules must not allocate queues or store event fields");
+                }
+                assert!(matcher.expire_negate_windows().await.is_empty());
+                assert!(matcher.pending.lock().await.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn department_reload_clears_pending_before_event_or_expiry_processing() {
+        for expiry in [false, true] {
+            for enabled in [false, true] {
+                let mut rule = seq_rule("reassigned", serde_json::json!({
+                    "first": { "event": "task_created" },
+                    "then": { "event": "activity_new" },
+                    "within_secs": 600,
+                    "negate": expiry
+                }));
+                rule.action = serde_json::json!({"type": "steps", "steps": []}).to_string();
+                let store = store_with(vec![rule]).await;
+                let matcher = CepMatcher::new(store.clone());
+                assert!(matcher.on_event(&task_created("confidential")).await.is_empty());
+                {
+                    let mut map = matcher.pending.lock().await;
+                    let queue = map.get_mut("reassigned").unwrap();
+                    assert_eq!(queue.len(), 1);
+                    assert_eq!(queue[0].first_fields["task"]["id"], "confidential");
+                    if expiry {
+                        queue[0].deadline = Instant::now();
+                    }
+                }
+                store.set_rule_extensions("reassigned", &crate::autopilot_store::RuleExtensionsPatch {
+                    active_window: None,
+                    run_policy: None,
+                    owner_department: Some(Some("sales".into())),
+                    updated_by_user_id: None,
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                }).await.unwrap().unwrap();
+                store.update_rule("reassigned", &serde_json::json!({"enabled": enabled}))
+                    .await.unwrap().unwrap();
+
+                let out = if expiry {
+                    matcher.expire_negate_windows().await
+                } else {
+                    matcher.on_event(&activity("private")).await
+                };
+                assert!(out.is_empty(), "reassignment must prevent sequence resolution");
+                assert!(matcher.pending.lock().await.is_empty(),
+                    "reload must discard stored fields, including for disabled rules");
+            }
+        }
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn disabled_rule_never_opens_a_window() {

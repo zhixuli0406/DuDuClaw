@@ -708,7 +708,7 @@ async fn detail_handler(
         action: crate::approval_notify::zh_action_kind(&rec.action_kind).to_string(),
         // R-L2: a dashboard-only kind carries a claim and a protected value
         // in its summary; the Mini App shows only the plain notice.
-        summary: detail_summary(&rec),
+        summary: detail_summary(&state.home_dir, &rec),
         trajectory: if crate::approval_notify::is_dashboard_only_record(None, &rec) {
             None
         } else {
@@ -726,9 +726,9 @@ async fn detail_handler(
 /// The summary the Mini App shows. R-L2: a dashboard-only kind carries a
 /// claim and a protected value in its summary, so only the plain notice (the
 /// same text the channel gets) is returned for it.
-fn detail_summary(rec: &crate::approval::ApprovalRecord) -> String {
+fn detail_summary(home: &Path, rec: &crate::approval::ApprovalRecord) -> String {
     if crate::approval_notify::is_dashboard_only_record(None, rec) {
-        crate::approval_notify::dashboard_only_notice_body(rec, false)
+        crate::approval_notify::dashboard_only_notice_body(home, rec, false)
     } else {
         duduclaw_core::truncate_chars(&rec.summary, SUMMARY_MAX_CHARS)
     }
@@ -1449,17 +1449,17 @@ mod tests {
             invalidated_reason: None,
             on_behalf_of: None,
         };
-        let s = detail_summary(&rec);
+        let s = detail_summary(tempfile::tempdir().unwrap().path(), &rec);
         assert!(!s.contains("永久退款") && !s.contains("七天"), "{s}");
         assert!(s.contains("儀表板"));
         rec.action_kind = crate::approval::cli_egress::KIND.into();
         rec.payload = serde_json::json!({});
-        assert!(!detail_summary(&rec).contains("永久退款"));
+        assert!(!detail_summary(tempfile::tempdir().unwrap().path(), &rec).contains("永久退款"));
         rec.action_kind = "mcp_call".into();
         rec.payload = serde_json::json!({"egress_guard":null});
-        assert!(!detail_summary(&rec).contains("永久退款"));
+        assert!(!detail_summary(tempfile::tempdir().unwrap().path(), &rec).contains("永久退款"));
         rec.payload = serde_json::json!({});
         rec.action_kind = "mcp_install".into();
-        assert!(detail_summary(&rec).contains("永久退款"));
+        assert!(detail_summary(tempfile::tempdir().unwrap().path(), &rec).contains("永久退款"));
     }
 }

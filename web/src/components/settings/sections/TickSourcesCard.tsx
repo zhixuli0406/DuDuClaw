@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type TickRecordEntry, type TickSourceStatus, type TicksSourcesResult } from '@/lib/api';
@@ -34,6 +35,7 @@ function renderFields(entry: TickRecordEntry): string {
 
 function SourceRow({ source }: { source: TickSourceStatus }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const [open, setOpen] = useState(false);
   const [records, setRecords] = useState<TickRecordEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -91,7 +93,7 @@ function SourceRow({ source }: { source: TickSourceStatus }) {
               {source.last_tick_ts
                 ? intl.formatMessage(
                     { id: 'autopilot.monitor.lastTick' },
-                    { time: new Date(source.last_tick_ts).toLocaleString('zh-TW') },
+                    { time: formatDateTime(source.last_tick_ts, { locale: 'zh-TW', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) },
                   )
                 : intl.formatMessage({ id: 'autopilot.monitor.lastTick.never' })}
             </p>
