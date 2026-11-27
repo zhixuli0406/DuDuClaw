@@ -17,6 +17,7 @@ mod member_contract_tests;
 mod live_acl_tests;
 mod team_callable_rpc_tests;
 mod team_history_rpc_tests;
+mod member_key_history_tests;
 mod computer_team_rpc_tests;
 mod computer_watch_link_tests;
 mod team_rpc_tests;
@@ -120,6 +121,7 @@ mod status_tokens_rpc_tests;
 mod member_keys_rpc_tests;
 mod mcp_keys_rpc_tests;
 
+mod odoo_member_rpc_tests;
 mod dept_grant_matrix_tests;
 mod dept_grants_rpc_tests;
 mod main_access_rpc_tests;

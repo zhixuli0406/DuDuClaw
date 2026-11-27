@@ -113,7 +113,12 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mfa_rpc(method, params, ctx).await
             }
+            method if super::odoo_member_rpc::owns(method) => {
+                boxed_frame(|| self.handle_odoo_member_rpc(method, params, ctx)).await
+            }
             "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            | "me.google.write_connect_start"
+            | "me.google.write_disconnect"
             | "me.google.connect_start"
             | "me.google.connect_finish"
             | "me.google.connect_paste"
@@ -911,7 +916,7 @@ impl MethodHandler {
             // ── Budget incidents (WP14-T14.6) ───────────────
             "budget.incidents" => {
                 require_manager!();
-                boxed_frame(|| self.handle_budget_incidents(params)).await
+                boxed_frame(|| self.handle_budget_incidents(params, ctx)).await
             }
 
             // ── Autopilot (admin only) ──────────────────────

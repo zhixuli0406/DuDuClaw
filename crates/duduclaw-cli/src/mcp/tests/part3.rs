@@ -352,9 +352,13 @@ async fn agent_update_reports_to_enforces_subtree_rule() {
     );
     assert_eq!(read_parent("mkt-rep"), "mkt-lead");
 
-    // Legitimate: sales-lead moves its own rep under its other rep.
+    // Even a superior cannot change protected org authority through AI.
     let params = serde_json::json!({ "agent_id": "sales-rep", "reports_to": "sales-rep2" });
     let res = handle_agent_update(&params, home, "sales-lead").await;
+    assert_eq!(res["isError"], true, "{res}");
+    assert_eq!(read_parent("sales-rep"), "sales-lead");
+    assert!(update_text(&res).contains("管理介面"));
+    let res = handle_agent_update(&params, home, "dashboard").await;
     assert_ne!(res["isError"], true, "{res}");
     assert_eq!(read_parent("sales-rep"), "sales-rep2");
 }
@@ -443,9 +447,8 @@ async fn agent_update_gates_non_org_fields_too() {
 
 // ── WP-B: conversational database-source grants via agent_update ──────
 //
-// Chat route for 「把客戶 CRM 資料庫開給小美」. The grant list is
-// deny-by-default, so these tests pin both directions: what a legitimate
-// grant writes, and that an unknown id writes nothing at all.
+// Human-operator grant mechanics. AI narrowing / refusal is covered by
+// record_authz_tests; a superior is no longer a grant authority.
 
 /// `db_sources` REPLACES the list, and the success text names the result.
 #[tokio::test]
@@ -456,7 +459,7 @@ async fn agent_update_db_sources_replaces_the_grant_list() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm, hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -473,7 +476,7 @@ async fn agent_update_db_sources_replaces_the_grant_list() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -496,7 +499,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "CRM" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -510,7 +513,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -522,7 +525,7 @@ async fn agent_update_db_sources_add_is_idempotent() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -539,14 +542,14 @@ async fn agent_update_db_sources_remove_ignores_unheld_ids() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
 
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "hr, crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -586,7 +589,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "old" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -595,7 +598,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "old" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -606,7 +609,7 @@ async fn agent_update_db_sources_remove_clears_a_stale_unconfigured_grant() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_remove": "../../etc/passwd" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -622,7 +625,7 @@ async fn agent_update_db_sources_precedence_is_replace_add_remove() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
 
@@ -635,7 +638,7 @@ async fn agent_update_db_sources_precedence_is_replace_add_remove() {
             "db_sources_remove": "crm",
         }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -654,7 +657,7 @@ async fn agent_update_db_sources_rejects_unknown_id_without_writing() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm,payroll" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -680,7 +683,7 @@ async fn agent_update_db_sources_rejects_unknown_id_without_writing() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "nope" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(res["isError"], true, "{res}");
@@ -696,7 +699,7 @@ async fn agent_update_db_sources_empty_string_revokes_all() {
     handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "crm,hr" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_eq!(read_db_grants(home, "sales-rep").len(), 2);
@@ -704,7 +707,7 @@ async fn agent_update_db_sources_empty_string_revokes_all() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources": "" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");
@@ -735,7 +738,7 @@ async fn agent_update_db_sources_preserves_unrelated_sections() {
     let res = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "db_sources_add": "crm" }),
         home,
-        "sales-lead",
+        "dashboard",
     )
     .await;
     assert_ne!(res["isError"], true, "{res}");

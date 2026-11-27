@@ -253,7 +253,13 @@ impl MethodHandler {
             return WsFrame::error_response("", "permission denied");
         }
         if let Some(frame) = super::tasks_rpc::task_assignee_refusal(&self.home_dir, Some(&runner.agent_id)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, &runner.agent_id) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
             return frame;
+        }
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &runner.agent_id) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
         }
         // Files are decoded only once the caller may assign to the runner,
         // and all of them are checked before anything is written.

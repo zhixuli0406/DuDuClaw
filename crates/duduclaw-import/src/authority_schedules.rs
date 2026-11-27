@@ -23,12 +23,12 @@ pub(super) fn sqlite(input: impl Read, wal: Option<&mut dyn Read>, builder: &mut
     // The reviewed workflow authority trigger has more than 32 comparisons.
     if workflow { conn.set_limit(rusqlite::limits::Limit::SQLITE_LIMIT_EXPR_DEPTH, 128)?; }
     check_sqlite(&conn)?;
-    // Autopilot: v1.79.3 (unchanged) or v1.82 (plus the approval-gate ledger,
-    // which is never authorized for reading below). Exact match only.
+    // Autopilot: v1.79.3, v1.82 (approval ledger), or v1.86 (durable runs).
+    // Ledgers, runs and steps are never authorized for reading. Exact match only.
     let catalogs: &[&str] = if workflow {
         &[include_str!("workflow-v1793.sql")]
     } else {
-        &[include_str!("autopilot-v1793.sql"), include_str!("autopilot-v182.sql")]
+        &[include_str!("autopilot-v1793.sql"), include_str!("autopilot-v182.sql"), include_str!("autopilot-v186.sql")]
     };
     let actual = crate::sqlite::schema(&conn)?;
     let mut matched = false;
@@ -138,6 +138,25 @@ mod tests {
         inert(&proposals, 1);
     }
     #[test]
+    fn authority_autopilot_v186_is_accepted_without_reading_runs_or_steps() {
+        let file = db(include_str!("autopilot-v186.sql"), "INSERT INTO autopilot_rules
+            (id,name,trigger_event,action,created_at,owner_department,created_by_user_id)
+            VALUES ('a','Multi-step','SECRET-EVENT','SECRET-ACTION','now','SECRET-DEPT','SECRET-USER');
+            INSERT INTO autopilot_runs
+            (run_id,rule_id,rule_name,rule_hash,event_name,event_ref,dedupe_key,fields_json,state,step_count,created_at,updated_at)
+            VALUES ('SECRET-RUN','a','SECRET-NAME','SECRET-HASH','SECRET-EVENT','SECRET-REF',
+                'SECRET-DEDUPE','SECRET-FIELDS','running',1,'now','now');
+            INSERT INTO autopilot_run_steps
+            (run_id,step_index,step_type,state,idempotency_key,dispatch_id,queue_message_id,detail)
+            VALUES ('SECRET-RUN',0,'SECRET-TYPE','running','SECRET-KEY','SECRET-DISPATCH','SECRET-QUEUE','SECRET-DETAIL');
+            INSERT INTO autopilot_approval_dispatch
+            (dispatch_id,rule_id,rule_name,rule_hash,event_name,event_ref,dedupe_key,frozen_json,frozen_digest,state,created_at,updated_at,run_id,step_index)
+            VALUES ('SECRET-DISPATCH','a','SECRET-NAME','SECRET-HASH','SECRET-EVENT','SECRET-REF',
+                'SECRET-DEDUPE','SECRET-FROZEN','SECRET-DIGEST','awaiting','now','now','SECRET-RUN',0);");
+        let proposals = extract(&request(SourceKind::AuthorityAutopilotSqlite), std::fs::File::open(file.path()).unwrap(), None).unwrap();
+        inert(&proposals, 1);
+    }
+    #[test]
     fn authority_workflow_proposes_latest_revisions_without_old_acceptance_or_grants() {
         let file = db(include_str!("workflow-v1793.sql"), "INSERT INTO workflow_revisions VALUES
             ('report',1,'SECRET-HASH','SECRET-GRANTS'),('report',2,'SECRET-HASH','SECRET-GRANTS');
@@ -150,6 +169,7 @@ mod tests {
     fn authority_scheduling_databases_reject_schema_or_version_drift() {
         for (kind, schema) in [(SourceKind::AuthorityAutopilotSqlite, include_str!("autopilot-v1793.sql")),
             (SourceKind::AuthorityAutopilotSqlite, include_str!("autopilot-v182.sql")),
+            (SourceKind::AuthorityAutopilotSqlite, include_str!("autopilot-v186.sql")),
             (SourceKind::AuthorityWorkflowSqlite, include_str!("workflow-v1793.sql"))] {
             for mutation in ["PRAGMA user_version=1;", "CREATE VIEW planted AS SELECT 1;", "CREATE TABLE planted(secret TEXT);"] {
                 let file = db(schema, mutation);

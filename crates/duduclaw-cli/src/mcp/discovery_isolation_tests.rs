@@ -32,15 +32,15 @@ async fn discovery_isolation_requires_both_verified_scopes_without_minting_ident
     assert!(TrustedCaller::from_isolated_agent(home, "worker").is_err());
     let call = call(home);
     ISOLATED_CALL.scope(call.clone(), async {
-        assert!(caller(home, "worker").is_err(), "missing gateway scope must not fall back to a token");
+        assert!(caller(home, "worker").await.is_err(), "missing gateway scope must not fall back to a token");
     }).await;
     duduclaw_gateway::isolation_egress::scope(home, "worker", &call.context, None,
         ISOLATED_CALL.scope(call.clone(), async {
             // FD-SEL: both scopes are not enough without the label's live
             // confirmed lifecycle for this very employee (incarnation binding).
-            assert!(caller(home, "worker").is_err());
-            assert!(caller(home, "other").is_err());
-            assert!(caller(&home.join("other-home"), "worker").is_err());
+            assert!(caller(home, "worker").await.is_err());
+            assert!(caller(home, "other").await.is_err());
+            assert!(caller(&home.join("other-home"), "worker").await.is_err());
             assert!(TrustedCaller::from_isolated_agent(home, "other").is_err());
         })).await.unwrap();
     assert!(!home.join("identity.key").exists());
@@ -59,7 +59,7 @@ async fn fdsel_discovery_caller_binds_exact_employee_and_incarnation() {
         let call = call_for(home, employee);
         duduclaw_gateway::isolation_egress::scope(home, "worker", &call.context, None,
             ISOLATED_CALL.scope(call.clone(), async {
-                let resolved = caller(home, "worker");
+                let resolved = caller(home, "worker").await;
                 assert_eq!(resolved.is_ok(), expected, "{employee}");
                 if let Ok(resolved) = resolved {
                     assert_eq!(resolved.isolated_creator(), Some(duduclaw_gateway::discovery::service::IsolatedCreator {

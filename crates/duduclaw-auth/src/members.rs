@@ -38,18 +38,20 @@ pub struct CreatedMember {
     pub invitation: Option<IssuedUserInvite>,
 }
 
+pub(crate) fn valid_member_email(email: &str) -> bool {
+    let parts: Vec<_> = email.split('@').collect();
+    !(email.len() > 254 || parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty()
+        || email.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | '<' | '>' | '"'))
+        || !parts[1].split('.').all(|label| !label.is_empty()) || parts[1].split('.').count() < 2)
+}
+
 impl NewMember {
     pub fn validate(&self) -> Result<(), &'static str> {
         let name = self.display_name.trim();
         if name.is_empty() || name.chars().count() > 200 || name.chars().any(char::is_control) {
             return Err("member_invalid_name");
         }
-        let email = self.email.trim();
-        let parts: Vec<_> = email.split('@').collect();
-        if email.len() > 254 || parts.len() != 2 || parts[0].is_empty() || parts[1].is_empty()
-            || email.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, ',' | ';' | '<' | '>' | '"'))
-            || !parts[1].split('.').all(|label| !label.is_empty()) || parts[1].split('.').count() < 2
-        { return Err("member_invalid_email"); }
+        if !valid_member_email(self.email.trim()) { return Err("member_invalid_email"); }
         if let Some(department) = self.department.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
             if !duduclaw_core::is_valid_department(department) { return Err("member_invalid_department"); }
         }

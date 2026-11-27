@@ -41,6 +41,14 @@ use fallback_rule::{FallbackDecision,PrimaryFailure,classify_primary_failure};
 
 use crate::runtime::{RuntimeContext, RuntimeRegistry, RuntimeResponse, RuntimeType};
 
+/// Claude's caller keeps its existing stop handling when switching is refused.
+pub(crate) fn claude_runtime_fallback_eligible(error: &str, fallback: Option<&RuntimeType>) -> bool {
+    fallback.is_some() && matches!(fallback_rule::apply_fallback_engine_limits(
+        classify_primary_failure(PrimaryFailure::Error {
+            error, autonomy_denied: crate::autonomous_runtime::was_denied(), kind: None,
+        }), fallback), FallbackDecision::Eligible(_))
+}
+
 /// Health status for a single provider/runtime.
 #[derive(Debug, Clone)]
 pub struct ProviderHealth {
@@ -146,7 +154,7 @@ impl FailoverManager {
     /// Tries primary runtime first. If it fails with a retryable error,
     /// falls back to fallback_runtime. If that also fails, returns error.
     ///
-    /// `model_fallbacks` is the agent's `agent.toml [model] fallbacks` chain
+    /// `model_fallbacks` is the agent's singular fallback followed by its plural chain
     /// (see [`crate::runtime_config::agent_model_fallbacks`]). It exists so the
     /// *fallback* runtime is handed a model it can actually serve — see
     /// [`resolve_fallback_model`] for the four-branch resolution. Passing an
@@ -177,7 +185,7 @@ impl FailoverManager {
         model_fallbacks:&[String],
     ) -> Result<RuntimeResponse,RuntimeDispatchFailure> {
         use RuntimeStepOutcome as Outcome;
-        use RuntimeStepRole::{Primary,Fallback};
+        use RuntimeStepRole::Primary;
         let mut failure=RuntimeDispatchFailure::new(*primary,&context.model);
         let policy=crate::product_policy::load(&context.home_dir).map_err(|error|RuntimeDispatchFailure::preflight(Some(*primary),&context.model,RuntimePreflightKind::Policy,error))?;
         let primary_policy=(|| {
@@ -243,6 +251,48 @@ impl FailoverManager {
             failure.push(Primary,*primary,Some(&context.model),Outcome::NotRegistered);
             classify_primary_failure(PrimaryFailure::NotRegistered)
         };
+        self.run_fallback_leg(registry, primary, fallback, prompt, context, model_fallbacks,
+            policy, failure, decision).await
+    }
+
+    /// Continue after the caller exhausted Claude's account rotation. Never run
+    /// the primary again; preserve the same decision/health rules as layer 3.
+    pub(crate) async fn after_claude_failure(
+        &self, registry: &RuntimeRegistry, fallback: Option<&RuntimeType>, prompt: &str,
+        context: &RuntimeContext, model_fallbacks: &[String], error: &str,
+    ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+        let primary = RuntimeType::Claude;
+        let mut failure = RuntimeDispatchFailure::new(primary, &context.model);
+        let decision = classify_primary_failure(PrimaryFailure::Error {
+            error, autonomy_denied: crate::autonomous_runtime::was_denied(), kind: None,
+        });
+        failure.push(RuntimeStepRole::Primary, primary, Some(&context.model),
+            RuntimeStepOutcome::ExecutionError(error.to_owned()));
+        if matches!(decision, FallbackDecision::Eligible(trigger)
+            if trigger != FallbackTrigger::EngineLocalConfig && trigger != FallbackTrigger::PromptTooLarge) {
+            self.record_failure(&primary).await;
+        }
+        let policy = crate::product_policy::load(&context.home_dir).map_err(|error|
+            RuntimeDispatchFailure::preflight(Some(primary), &context.model, RuntimePreflightKind::Policy, error))?;
+        policy.require_runtime(primary.as_str())
+            .and_then(|_| crate::product_policy::require_model(policy, &context.model))
+            .map_err(|error| RuntimeDispatchFailure::preflight(Some(primary), &context.model,
+                RuntimePreflightKind::Policy, error).skip_fallback(fallback, FallbackRefusal::Policy))?;
+        self.run_fallback_leg(registry, &primary, fallback, prompt, context, model_fallbacks,
+            policy, failure, fallback_rule::apply_fallback_engine_limits(decision, fallback)).await
+    }
+
+    /// Shared runtime-switch leg; every target executes its ordinary runtime
+    /// implementation, including its account selection and spawn gates.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fallback_leg(
+        &self, registry: &RuntimeRegistry, primary: &RuntimeType, fallback: Option<&RuntimeType>,
+        prompt: &str, context: &RuntimeContext, model_fallbacks: &[String],
+        policy: crate::product_policy::ProductProfile, mut failure: RuntimeDispatchFailure,
+        decision: FallbackDecision,
+    ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+        use RuntimeStepOutcome as Outcome;
+        use RuntimeStepRole::Fallback;
         match decision {
             FallbackDecision::Refused(reason)=>return Err(failure.skip_fallback(fallback,reason)),
             FallbackDecision::Eligible(trigger)=>{
@@ -262,10 +312,24 @@ impl FailoverManager {
         };
         if !fb_available {failure.push(Fallback,*fb,None,Outcome::Cooldown);return Err(failure);}
         let Some(runtime)=registry.get(fb) else {failure.push(Fallback,*fb,None,Outcome::NotRegistered);return Err(failure);};
-        let Some((fb_model,model_source))=resolve_fallback_model(fb,&context.model,model_fallbacks) else {
+        let Some((fb_model,mut model_source))=resolve_fallback_model(fb,&context.model,model_fallbacks) else {
             self.record_failure(fb).await;
             failure.push(Fallback,*fb,None,Outcome::NoCompatibleModel);return Err(failure);
         };
+        // The singular setting is first in the runtime candidate list. Tag it
+        // only when that candidate actually passed the family checks.
+        if model_source == "agent_fallbacks" {
+            if let Some(dir) = context.agent_dir.as_deref() {
+                let single = crate::runtime_config::agent_fallback_model(dir);
+                if let Some(single) = single {
+                    let candidate = vec![single];
+                    if resolve_fallback_model(fb, "", &candidate)
+                        .is_some_and(|(model, source)| source == "agent_fallbacks" && model == fb_model) {
+                        model_source = "agent_fallback_model";
+                    }
+                }
+            }
+        }
         // F5: a `catalog_default` model is one DuDuClaw substituted, attributed
         // to the fallback runtime's vendor; any other source keeps the v1.83.0 rule.
         let fb_model_policy=if model_source=="catalog_default" {
@@ -316,7 +380,7 @@ impl FailoverManager {
         }
     }
 
-    async fn record_success(&self, runtime_type: &RuntimeType) {
+    pub(crate) async fn record_success(&self, runtime_type: &RuntimeType) {
         let mut health = self.health.write().await;
         let entry = health
             .entry(runtime_type.clone())
@@ -933,6 +997,53 @@ mod tests {
         }
         async fn is_available(&self) -> bool {
             true
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_dispatch_honours_singular_fallback_model_and_source() {
+        use crate::runtime_dispatch::{AgentPrompt, SpawnPurpose, run_agent_prompt_detailed};
+        #[derive(Clone)]
+        struct Log(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Log {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let log = Log(Default::default());
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt().without_time().with_ansi(false)
+            .with_writer(move || writer.clone()).finish();
+        let _logs = tracing::subscriber::set_default(subscriber);
+        for (single, chain, expected, source) in [
+            ("grok-4", "", "grok-4", "agent_fallback_model"),
+            ("grok-4", "'grok-4.7'", "grok-4", "agent_fallback_model"),
+            ("claude-haiku-4-5", "'grok-4.7'", "grok-4.7", "agent_fallbacks"),
+            ("unknown-house-model", "", RuntimeType::Grok.spec().fallback_models[0].0, "catalog_default"),
+        ] {
+            log.0.lock().unwrap().clear();
+            let home = tempfile::tempdir().unwrap();
+            let dir = home.path().join("agents/worker");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("agent.toml"), format!(
+                "[runtime]\nprovider='codex'\nfallback='grok'\n[model]\npreferred='gpt-5.4'\nfallback='{single}'\nfallbacks=[{chain}]\n")).unwrap();
+            let mut map: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+            map.insert(RuntimeType::Codex, Box::new(StubRuntime { content: "" }));
+            map.insert(RuntimeType::Grok, Box::new(EchoModelRuntime));
+            let _registry = crate::runtime_dispatch::testing::RegistryGuard::install(
+                home.path(), RuntimeRegistry::with_runtimes(map)).await;
+            let result = run_agent_prompt_detailed(AgentPrompt {
+                agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+                system_prompt: "system", model: "gpt-5.4", max_tokens: 128, provider_override: None,
+                conversation_history: &[], request_type: crate::cost_telemetry::RequestType::Chat,
+                runtime_settings: None, effort: None, allow_cross_family_failover: true,
+                purpose: SpawnPurpose::EmployeeTurn,
+            }).await.unwrap();
+            assert_eq!(result.model_used, expected);
+            let logs = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+            assert!(logs.contains(&format!("model_source=\"{source}\"")), "{logs}");
         }
     }
 

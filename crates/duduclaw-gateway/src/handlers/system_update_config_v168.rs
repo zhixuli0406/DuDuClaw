@@ -100,6 +100,7 @@ pub(crate) fn normalize_legacy_aliases(params: Value) -> Value {
         ("general.default_agent", "default_agent"),
         ("general.inference_mode", "inference_mode"),
         ("general.default_language", "default_language"),
+        ("general.company_timezone", "company_timezone"),
         ("rotation.strategy", "rotation_strategy"),
         ("rotation.cooldown_after_rate_limit_seconds", "cooldown_after_rate_limit_seconds"),
         ("rotation.health_check_interval_seconds", "health_check_interval_seconds"),

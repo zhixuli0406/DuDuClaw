@@ -80,6 +80,7 @@ pub(crate) const CONFIG_KEY_TYPES: &[(&str, &str, Ty)] = &[
     ("general", "log_level", Str),
     ("general", "default_agent", Str),
     ("general", "default_language", Str),
+    ("general", "company_timezone", Str),
     ("general", "inference_mode", Str),
     ("general", "name", Str),
     ("gateway", "bind", Str),

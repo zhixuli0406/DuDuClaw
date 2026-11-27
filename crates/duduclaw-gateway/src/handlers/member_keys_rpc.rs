@@ -12,6 +12,8 @@ fn coded(code: &str, message: &str) -> WsFrame {
 }
 fn error(e: MemberKeyError) -> WsFrame {
     coded(e.code(), match e {
+        MemberKeyError::InvalidScopes => "選取的使用範圍無效，請重新選擇。",
+        MemberKeyError::CannotWiden => "這把金鑰只能縮小使用範圍；若要增加範圍，請撤銷後重新建立。",
         MemberKeyError::InvalidName => "名稱必須是 1 到 60 個字，不能包含控制字元。",
         MemberKeyError::InvalidExpiry => "有效期限必須是 1 到 365 天。",
         MemberKeyError::AdminForbidden => "管理員帳號不能建立本人金鑰，請使用一般成員帳號。",
@@ -41,7 +43,8 @@ impl MethodHandler {
         let home = self.home_dir.clone();
         let method = method.to_owned();
         let result = tokio::task::spawn_blocking(move || -> Result<Value, WsFrame> {
-            if !crate::member_keys::config(&home).enabled { return Err(coded("member_keys_disabled", "本人金鑰已關閉。")); }
+            let config = crate::member_keys::config(&home);
+            if !config.enabled { return Err(coded("member_keys_disabled", "本人金鑰已關閉。")); }
             let live = db.live_user_context(&user).map_err(|_| error(MemberKeyError::Store))?
                 .filter(|u| u.credential_epoch == epoch && !u.must_change_password)
                 .ok_or_else(|| error(MemberKeyError::AccountInactive))?;
@@ -61,6 +64,9 @@ impl MethodHandler {
                 },
                 "me.member_keys.create" => {
                     if live.is_admin() { return Err(error(MemberKeyError::AdminForbidden)); }
+                    let (include, scopes) = scope_params(&params)?;
+                    let include = include.unwrap_or(false);
+                    let scopes = scopes.unwrap_or_default();
                     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                     let days = params.get("expires_in_days").and_then(Value::as_u64)
                         .filter(|days| (1..=365).contains(days)).ok_or_else(|| error(MemberKeyError::InvalidExpiry))?;
@@ -73,12 +79,32 @@ impl MethodHandler {
                     let code = params.get("code").and_then(Value::as_str).unwrap_or("");
                     let proof = db.member_key_reauthenticate(&user, &session, epoch, password, code,
                         &crate::mfa::Cipher(&home), Utc::now().timestamp()).map_err(error)?;
-                    let created = db.member_key_create_authenticated(&user, name, days, epoch, &session, &proof).map_err(error)?;
+                    // Reauthentication can be slow. Validate the creation policy after it,
+                    // immediately before the authenticated insert; parse/read errors disable it.
+                    let config = crate::member_keys::config(&home);
+                    if !config.enabled { return Err(coded("member_keys_disabled", "本人金鑰已關閉。")); }
+                    if include && !config.allow_conversation_content {
+                        return Err(coded("member_key_conversation_not_allowed", "管理員尚未開放包含我的對話內容。"));
+                    }
+                    if scopes.iter().any(|scope| !config.allow_mcp_scopes.contains(scope)) {
+                        return Err(coded("member_key_scope_not_allowed", "管理員尚未開放選取的外部 AI 工具使用範圍。"));
+                    }
+                    let created = db.member_key_create_authenticated(&user, name, days, epoch, &session, &proof, include, &scopes).map_err(error)?;
                     Ok(json!({"key": created.info, "secret": created.secret}))
                 }
                 "me.member_keys.revoke" => {
                     db.member_key_revoke_own(&user, id()?).map_err(error)?;
                     Ok(json!({"revoked": true}))
+                }
+                "me.member_keys.narrow" => {
+                    let (include, scopes) = scope_params(&params)?;
+                    db.member_key_narrow_own(&user, id()?, include, scopes.as_deref()).map_err(error)?;
+                    Ok(json!({"narrowed": true}))
+                }
+                "member_keys.admin_narrow" if live.is_admin() => {
+                    let (include, scopes) = scope_params(&params)?;
+                    db.member_key_narrow_admin(&user, id()?, include, scopes.as_deref()).map_err(error)?;
+                    Ok(json!({"narrowed": true}))
                 }
                 "member_keys.admin_list" if live.is_admin() => {
                     let (limit, cursor) = pagination(&params)?;
@@ -99,6 +125,24 @@ impl MethodHandler {
         }
     }
 
+    pub(super) async fn member_key_memory_gate(&self, ctx: &UserContext, agent: &str) -> Result<(), WsFrame> {
+        if ctx.member_key_id.is_none() { return Ok(()); }
+        let denied = || coded("member_key_memory_scope", "這位 AI 員工的記憶包含其他人的對話，本人金鑰不能讀取。");
+        let db = self.user_db.read().await.clone().ok_or_else(denied)?;
+        let home = self.home_dir.clone();
+        let user = ctx.user_id.clone();
+        let agent = agent.to_owned();
+        let allowed = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
+            if agent.is_empty() || crate::personal_visibility::canonical_agent(&agent).is_err() { return Ok(false); }
+            let avatar = db.avatar_agent(&user).map_err(|_| ())?;
+            if avatar.as_deref() == Some(agent.as_str()) { return Ok(true); }
+            if !crate::runtime_readiness::isolation_active() { return Ok(false); }
+            crate::personal_visibility::personal_owner(&home, &agent)
+                .map(|owner| owner.as_deref() == Some(user.as_str())).map_err(|_| ())
+        }).await.map_err(|_| denied())?.map_err(|_| denied())?;
+        if allowed { Ok(()) } else { Err(denied()) }
+    }
+
     pub(super) async fn member_key_gate(&self, method: &str, params: &Value, ctx: &UserContext) -> Result<(), WsFrame> {
         if ctx.member_key_id.is_none() { return Ok(()); }
         let kind = super::member_contract::member_key_method(method);
@@ -110,10 +154,19 @@ impl MethodHandler {
         let home = self.home_dir.clone();
         let ctx = ctx.clone();
         let method = method.to_owned();
-        tokio::task::spawn_blocking(move || crate::member_keys::record_call(&home, &db, &ctx, &method,
-            kind == Some(super::member_contract::MemberContractKind::Write))).await
+        let conversation_method = super::member_contract::MEMBER_KEY_CONVERSATION_METHODS.contains(&method.as_str());
+        let include = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+            crate::member_keys::record_call(&home, &db, &ctx, &method,
+                kind == Some(super::member_contract::MemberContractKind::Write))?;
+            // Re-read after audit/rate charging. Never trust the socket's snapshot.
+            crate::member_keys::refresh_authority(&home, &db, &ctx).map(|live| live.include_conversations)
+        }).await
             .map_err(|_| error(MemberKeyError::Store))?
-            .map_err(|e| coded(if e == "member_key_rate_limited" { "member_key_rate_limited" } else { "member_key_refused" }, &e))?;
+            .map_err(|e| coded(if e == "member_key_rate_limited" { "member_key_rate_limited" } else { "member_key_refused" },
+                if e == "member_key_rate_limited" { "這把金鑰的使用次數過多，請稍後再試。" } else { "這把金鑰目前無法使用，請重新確認。" }))?;
+        if conversation_method && !include {
+            return Err(coded("member_key_conversation_scope", "這把金鑰沒有開啟『包含我的對話內容』。"));
+        }
         if let Some(message) = field_error { return Err(coded("member_key_forbidden_field", &message)); }
         if excluded { return Err(coded("member_key_forbidden", "此方法不開放給本人金鑰。")); }
         Ok(())
@@ -132,4 +185,23 @@ fn pagination(params: &Value) -> Result<(u32, Option<&str>), WsFrame> {
         _ => return Err(error(MemberKeyError::InvalidPage)),
     };
     Ok((limit, cursor))
+}
+
+/// Missing means unchanged/default; malformed or unknown values always refuse.
+fn scope_params(params: &Value) -> Result<(Option<bool>, Option<Vec<String>>), WsFrame> {
+    let include = params.get("include_conversations").map(|value| value.as_bool()
+        .ok_or_else(|| coded("member_key_invalid_conversations", "請選擇是否包含我的對話內容。"))).transpose()?;
+    let scopes = params.get("mcp_scopes").map(|value| -> Result<Vec<String>, WsFrame> {
+        let values = value.as_array().ok_or_else(|| error(MemberKeyError::InvalidScopes))?;
+        let mut scopes = Vec::new();
+        for value in values {
+            let scope = value.as_str().filter(|scope| duduclaw_core::mcp_scopes::PERSON_KEY_MCP_SCOPE_STRINGS.contains(scope))
+                .ok_or_else(|| error(MemberKeyError::InvalidScopes))?;
+            scopes.push(scope.to_owned());
+        }
+        scopes.sort();
+        scopes.dedup();
+        Ok(scopes)
+    }).transpose()?;
+    Ok((include, scopes))
 }

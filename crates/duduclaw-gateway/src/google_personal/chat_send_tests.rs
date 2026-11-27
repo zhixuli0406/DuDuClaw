@@ -10,8 +10,10 @@ async fn consent(f: &Fixture, code: &str) -> Result<Value, String> {
     let result = flow::start_chat_send(&f.home, &f.db, &f.alice.id, "login-a", "http://127.0.0.1:18889", &[], true).await?;
     let url = url::Url::parse(result["authorization_url"].as_str().unwrap()).unwrap();
     let scope = url.query_pairs().find(|(k,_)| k == "scope").unwrap().1.into_owned();
-    assert!(scope.contains("chat.messages.create"));
-    assert!(!scope.contains("gmail") && !scope.contains("chat.bot"));
+    let requested = scope.split_ascii_whitespace().collect::<Vec<_>>();
+    assert!(requested.contains(&"https://www.googleapis.com/auth/chat.messages.create"));
+    assert!(requested.contains(&"https://www.googleapis.com/auth/gmail.readonly"));
+    assert!(!requested.contains(&"https://www.googleapis.com/auth/chat.bot"));
     let state = result["state"].as_str().unwrap();
     pending::receive_code(&f.home, state, code)?;
     flow::finish(&f.home, &f.db, &f.alice.id, "login-a", state).await

@@ -511,6 +511,12 @@ mod tests {
 
     fn seq_rule(id: &str, sequence: Value) -> AutopilotRuleRow {
         AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: id.to_string(),
             name: id.to_string(),
             enabled: true,

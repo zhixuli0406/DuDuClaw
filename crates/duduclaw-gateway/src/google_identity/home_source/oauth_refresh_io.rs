@@ -33,7 +33,7 @@ impl Drop for JsonBody {
         scrub(&mut self.0);
     }
 }
-fn parse_tokens(body: Value, captured_scopes: &[String], now: u64) -> Result<ResponseTokens> {
+fn parse_tokens(body: Value, now: u64) -> Result<ResponseTokens> {
     let body = JsonBody(body);
     let value = &body.0;
     let access = value["access_token"]
@@ -65,7 +65,7 @@ fn parse_tokens(body: Value, captured_scopes: &[String], now: u64) -> Result<Res
         .and_then(|n| n.checked_add_signed(chrono::Duration::seconds(seconds as i64)))
         .ok_or(Error::Invalid)?;
     let scopes = match value.get("scope") {
-        None => home_store::normalized_scopes(captured_scopes.to_vec())?,
+        None => return Err(Error::ScopeUnverified),
         Some(Value::String(scope)) if !scope.is_empty() && scope.len() <= 128 * 2049 => {
             let pieces: Vec<_> = scope.split(' ').map(str::to_owned).collect();
             if pieces.len() > 128
@@ -82,8 +82,10 @@ fn parse_tokens(body: Value, captured_scopes: &[String], now: u64) -> Result<Res
         }
         _ => return Err(Error::Invalid),
     };
-    // Actual changed scopes are publishable. finish_refresh owns epoch/gen
-    // rotation; the old resolver refuses material AFTER confirmed publication.
+    if crate::google_identity::write_scope_guard::carries_write_scope(&scopes) {
+        return Err(Error::WriteScopeIsolated);
+    }
+    // Non-write scope changes still follow the existing epoch/gen fencing.
     Ok(ResponseTokens {
         access: Zeroizing::new(access.to_owned()),
         refresh,
@@ -286,7 +288,6 @@ pub(super) async fn refresh_once_budget(
     }
     let parsed = parse_tokens(
         serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?,
-        &capture.row.scopes,
         home_store::wall_time_now(home),
     )?;
     #[cfg(test)]

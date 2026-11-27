@@ -190,6 +190,7 @@ mod cost;
 mod cron_tasks;
 mod decision_tools;
 mod delegation;
+pub(crate) mod delegation_roles;
 mod discovery;
 mod group_history;
 

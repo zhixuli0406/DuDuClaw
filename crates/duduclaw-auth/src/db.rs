@@ -370,6 +370,19 @@ impl UserDb {
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
+        crate::chat_link::migrate(&conn)?;
+        crate::odoo_credentials::migrate(&conn)?;
+
+        // RM-143: old bindings retain their existing uses, without self-proof.
+        for (column, kind) in [
+            ("proof_method", "TEXT"), ("proof_user_id", "TEXT"),
+            ("proven_at", "INTEGER"), ("proof_account", "TEXT"), ("proof_dm", "TEXT"),
+        ] {
+            if !has_column(&conn, "channel_identities", column)? {
+                conn.execute(&format!("ALTER TABLE channel_identities ADD COLUMN {column} {kind}"), [])
+                    .map_err(|e| format!("failed to migrate channel identity proof: {e}"))?;
+            }
+        }
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
@@ -440,6 +453,8 @@ impl UserDb {
         // SR4 item 1: Admin attestations of Google delegate subjects.
         self.migrate_google_authority_if_needed(&conn, crate::google_delegate_attestation::migration_needed,
             crate::google_delegate_attestation::migrate)?;
+        self.migrate_google_authority_if_needed(&conn, crate::google_signin::migration_needed,
+            crate::google_signin::migrate)?;
         // RM-135: first-Admin setup codes; its triggers read users and every
         // MFA factor table, so it runs after all of them exist.
         crate::mfa::bootstrap::migrate(&conn)?;

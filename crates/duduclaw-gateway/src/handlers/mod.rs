@@ -97,6 +97,7 @@ mod accounts_basic;
 mod memory_rpc;
 mod memory_history_rpc;
 pub(crate) mod my_memory_rpc;
+mod chat_link_rpc;
 mod wiki_rpc;
 mod shared_wiki_rpc;
 pub(crate) use shared_wiki_rpc::SharedWikiReader;
@@ -135,6 +136,8 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod odoo_member_rpc;
+mod member_key_activity;
 mod transcription_credentials_rpc;
 mod analytics_rpc;
 mod evolution_rpc;
@@ -689,6 +692,18 @@ impl MethodHandler {
             return boxed_frame(|| self.handle_company(method, params, ctx)).await;
         }
 
+        // RM-143 is available in both editions. Reserve the entire namespace
+        // before extensions; no unknown member may bypass the JWT session gate.
+        if method.split('.').take(2).eq(["me", "chat_link"]) {
+            let Some(role) = chat_link_rpc::minimum_role(method) else {
+                return WsFrame::error_response("", "不支援此聊天連結操作。");
+            };
+            if ctx.role != role {
+                return WsFrame::error_response("", "只有管理員可以連結聊天帳號。");
+            }
+            return boxed_frame(|| self.handle_chat_link_rpc(method, params, ctx)).await;
+        }
+
         // RM-039 "my memory" is gateway-owned self-service: an extension must
         // never answer it, and every method has an explicit role entry. The
         // handler scopes every read and delete to the caller's own subjects.
@@ -736,6 +751,11 @@ impl MethodHandler {
         // this branch is embedded in the shared dispatcher future.
         if method.split('.').next() == Some("mcp_keys") {
             return boxed_frame(|| self.route_mcp_keys_rpc(method, params, ctx)).await;
+        }
+
+        // Personal Odoo secrets never pass through extension dispatch.
+        if odoo_member_rpc::owns(method) {
+            return boxed_frame(|| self.dispatch_org(method, params, ctx, conn)).await;
         }
 
         // RM-064 status credentials are gateway-owned bearer secrets. Route

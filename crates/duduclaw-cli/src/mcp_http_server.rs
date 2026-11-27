@@ -1350,7 +1350,7 @@ pub mod tests {
         let user = db
             .create_user("alice@test.invalid", "Alice", "isolated-password", duduclaw_auth::UserRole::Employee)
             .unwrap();
-        let raw = db.member_key_create(&user.id, "odoo", 90, user.credential_epoch).unwrap().secret;
+        let raw = db.member_key_create(&user.id, "odoo", 90, user.credential_epoch, false, &[]).unwrap().secret;
         let mut headers = HeaderMap::new();
         headers.insert("Authorization", format!("Bearer {raw}").parse().unwrap());
         let resource = "http://127.0.0.1:8765/mcp";

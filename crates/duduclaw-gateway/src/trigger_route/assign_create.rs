@@ -9,7 +9,7 @@ use super::assign::{AssignCaller, AssignReply, AssignedTask, CreateSpec, princip
 use super::assign_texts as t;
 use super::texts::Lang;
 use crate::chat_commands::GoalCommand;
-use crate::goal_create_core::{GoalCreateRequest, create_goal_task};
+use crate::goal_create_core::{GoalCreateRequest, GoalCreateError, create_goal_task_for_chat};
 use crate::goal_loop::{CHAT_ASSIGN_WINDOW_MINUTES, chat_assign_caps};
 use crate::task_store::TaskStore;
 
@@ -127,12 +127,16 @@ pub(crate) async fn create(home: &Path, lang: Lang, spec: CreateSpec, caller: &A
         grant_via: Some(via.clone()),
         ..Default::default()
     };
-    match create_goal_task(home, &store, req).await {
+    match create_goal_task_for_chat(home, &store, req).await {
         Ok(created) => {
             super::assign_audit::assigned(caller, &spec.agent, &created.task.id, &via);
             shown(&created.task)
         }
-        Err(e) => {
+        Err(GoalCreateError::Entry(refusal)) => {
+            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(home, &spec.agent).await;
+            AssignReply { text: refusal.user_text(caller.conversation, language.as_deref(), caller.event.unwrap_or("assign")), list: None, task: None }
+        }
+        Err(GoalCreateError::Other(e)) => {
             // The same message handled twice at once (webhook redelivery
             // racing durable ingress): the other run's insert won.
             if let Some(id) = &task_id {

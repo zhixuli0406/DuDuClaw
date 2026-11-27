@@ -151,7 +151,7 @@ pub(super) async fn handle(
             );
         }
     };
-    if gi::native_google_scope(request.tool()).is_none()
+    if gi::native_google_scope(request.tool()).is_none() || duduclaw_core::google_identity::is_drive_write_tool(request.tool())
         || !request.arguments().is_object()
         || !request.credential_ref().is_well_formed()
     {

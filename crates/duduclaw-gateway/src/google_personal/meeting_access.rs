@@ -17,6 +17,8 @@ pub(crate) fn has_scopes(scopes: &[String]) -> bool {
 }
 
 pub(crate) fn check_metadata(home: &Path, db: &UserDb, user: &str, metadata: &Metadata) -> Result<(), String> {
+    crate::google_identity::write_scope_guard::check_personal(home, metadata, &metadata.granted_scopes)
+        .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
     flow::active_user(db, user)?;
     if !crate::team_edition::team_grants_enabled(home) {
         return Err("請使用團隊版的個人 Google 連線。".into());
@@ -161,6 +163,8 @@ pub(crate) async fn resolve(home: &Path, db: &UserDb, user: &str) -> Result<Meet
         if tokens.secret.refresh_token.is_none() {
             tokens.secret.refresh_token = secret.refresh_token.take();
         }
+        crate::google_identity::write_scope_guard::check_personal_refresh(home, &record.metadata, tokens.granted_scopes.as_deref())
+            .map_err(|r| format!("{}: {}", r.code, r.message_zh))?;
         if !vault::finish_refresh_with_scopes(home, &key, &record.metadata, &tokens.secret, tokens.granted_scopes.as_deref())? {
             return Err(CHANGED.into());
         }
@@ -293,4 +297,20 @@ mod tests {
         assert!(material.validate(&f.home, &f.db).is_err());
         assert!(resolve(&f.home, &f.db, &f.alice.id).await.is_err());
     }
+    #[tokio::test]
+    async fn meeting_refresh_write_scope_isolated_before_vault_publication() {
+        let (f, _) = connected_fixture().await;
+        let record = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        let key = crate::google_identity::protection_gate_async(&f.home).await.unwrap();
+        let mut secret = vault::unseal(&key, &record).unwrap();
+        secret.expires_at = Some(1);
+        secret.refresh_token = Some("scope-isolation-drive".into());
+        assert!(vault::finish_refresh(&f.home, &key, &record.metadata, &secret).unwrap());
+        let error = resolve(&f.home, &f.db, &f.alice.id).await.err().unwrap();
+        assert!(error.starts_with("write_scope_isolated:"));
+        let current = vault::get(&f.home, &f.alice.id).unwrap().unwrap();
+        assert_eq!(current.metadata.status, Status::NeedsReconnect);
+        assert_ne!(vault::unseal(&key, &current).unwrap().access_token, "isolation-fresh-secret");
+    }
+
 }

@@ -1,7 +1,7 @@
 //! Who may run a chat command in a conversation.
 //!
 //! Every channel's command intercept runs before the reply pipeline, so it
-//! applies two checks of its own before a command takes effect:
+//! applies three checks of its own before a command takes effect:
 //!
 //! 1. the same per-user access gate the reply pipeline runs
 //!    (`channel_reply::check_command_access_gate`, on the same conversation id
@@ -25,6 +25,9 @@
 //!    Admin/Manager; there, any sender who passes the access gate (check 1)
 //!    may run these commands, exactly as before the rule existed. Check 1
 //!    itself is unconditional.
+//!
+//! 3. non-exempt commands check their employee's effective settings through
+//!    the shared entry gate, after access and shared-reset authorization.
 
 use std::path::Path;
 
@@ -115,6 +118,69 @@ pub async fn command_preflight(
         .map(str::to_string)
 }
 
+/// Check the employee only after the adapter has authorized the sender.
+/// Assignment planning authorizes and resolves the destination before its
+/// settings are inspected; an authorization/roster reply keeps its wording.
+pub async fn command_entry_refusal(
+    cmd: &ChatCommand,
+    ctx: &ReplyContext,
+    origin: &CommandOrigin<'_>,
+    agent_id: &str,
+) -> Option<String> {
+    if crate::entry_gate::command_is_exempt(cmd) {
+        return None;
+    }
+    let mut target = agent_id.to_string();
+    if let ChatCommand::Assign(assign) = cmd {
+        use crate::trigger_route::assign::{AssignCaller, Plan};
+        let caller = AssignCaller {
+            home: &ctx.home_dir, channel: origin.channel,
+            conversation: origin.gate_session, sender: origin.sender,
+            event: None, seq: 0, fallback: (!agent_id.is_empty()).then_some(agent_id),
+            access: crate::trigger_route::access::for_channel_sender(
+                &ctx.home_dir, origin.channel, origin.sender,
+            ),
+        };
+        let registry = ctx.registry.read().await;
+        match crate::trigger_route::assign::plan(
+            &*registry, crate::trigger_route::texts::lang_for(&ctx.home_dir), assign, &caller,
+        ) {
+            Plan::Arm { agent, .. } => target = agent,
+            Plan::Create(spec) | Plan::ScheduleCreate { spec, .. } => target = spec.agent,
+            Plan::Reply(reply) if reply.list.is_none() => return Some(reply.text),
+            _ => {}
+        }
+    }
+    if matches!(cmd, ChatCommand::Goal(_)) {
+        let access = crate::trigger_route::access::for_channel_sender(
+            &ctx.home_dir, origin.channel, origin.sender,
+        );
+        let principal = crate::trigger_route::assign::principal_of(&access);
+        let goal_principal = principal.clone().map(|p| (p, origin.channel.to_string()));
+        if let Err(refusal) = super::with_goal_principal(goal_principal,
+            crate::machine_employee::check_chat_goal(ctx, &target, origin.command_session),
+        ).await {
+            return Some(refusal);
+        }
+        if let Err(refusal) = crate::on_behalf_of::access::check_main_target(
+            &ctx.home_dir, principal.as_deref(), &target,
+        ).await {
+            return Some(refusal);
+        }
+    }
+    let result = {
+        let registry = ctx.registry.read().await;
+        crate::entry_gate::resolve_and_check(&ctx.home_dir, &*registry, &target)
+    };
+    if let Err(refusal) = result {
+        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(
+            &ctx.home_dir, &target,
+        ).await;
+        return Some(refusal.user_text(origin.gate_session, language.as_deref(), "command"));
+    }
+    None
+}
+
 /// [`super::handle_command_for_sender`] behind [`command_preflight`]. An
 /// empty result means "send nothing" (a blocked sender).
 pub async fn handle_gated_command(
@@ -124,6 +190,9 @@ pub async fn handle_gated_command(
     agent_id: &str,
 ) -> String {
     if let Some(reply) = command_preflight(cmd, ctx, origin).await {
+        return reply;
+    }
+    if let Some(reply) = command_entry_refusal(cmd, ctx, origin, agent_id).await {
         return reply;
     }
     super::handle_command_for_sender(
@@ -350,3 +419,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "entry_gate_tests.rs"]
+mod entry_gate_tests;

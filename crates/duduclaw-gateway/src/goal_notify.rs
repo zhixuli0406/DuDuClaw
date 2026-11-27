@@ -1500,6 +1500,12 @@ pub(crate) async fn apply_needs_human(
         "決定這件事",
     )?;
 
+    if act == DecisionAct::Retry {
+        crate::entry_gate::check_task_start(
+            home_dir, task_id, &format!("{channel}:{channel_user_id}"), "retry",
+        ).await?;
+    }
+
     // W1-5: "take over" claims the task by hand rather than resolving it out
     // of needs_human — it stays `needs_human` (already outside
     // `GoalLoopDriver::tick_once`'s dispatch-candidate query, so the loop is
@@ -1626,6 +1632,10 @@ pub(crate) async fn apply_needs_human_from_dashboard_checked(
         return Err("找不到此任務".into());
     };
 
+    if act == DecisionAct::Retry {
+        crate::entry_gate::check_task_start(home_dir, task_id, "dashboard:goal-decision", task_id).await?;
+    }
+
     if act == DecisionAct::Takeover {
         let changed = store
             .claim_needs_human_checked(task_id, decider, expected_updated_at)
@@ -1723,6 +1733,7 @@ pub(crate) async fn apply_continue_from_dashboard_checked(
     if !task.goal_mode {
         return Err("只有目標任務可以接著做".into());
     }
+    crate::entry_gate::check_task_start(home_dir, task_id, "dashboard:goal-decision", task_id).await?;
     let changed = store.continue_from_terminal_checked(task_id, message, expected_updated_at).await?;
     if !changed {
         return Ok("此任務目前的狀態不允許接著做（可能已被他人變更）。".into());
@@ -1865,6 +1876,10 @@ pub(crate) async fn apply_kickoff(
     }
     // Kickoff cards have no Google Chat button shape: no card target.
     authorize_goal_press(home_dir, &agent, None, channel, channel_user_id, "核准")?;
+
+    crate::entry_gate::check_approval_start(
+        home_dir, &record, approve, &format!("{channel}:{channel_user_id}"),
+    ).await?;
 
     let card_verb = crate::decision_notify::settled_verb(
         DecisionSource::Kickoff,
@@ -2336,7 +2351,7 @@ mod tests {
         std::fs::write(
             dir.join("agent.toml"),
             format!(
-                "[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"
+                "[agent]\nname = '{agent}'\nstatus = 'active'\n[model]\npreferred = 'claude-sonnet-4-6'\n[proactive]\nnotify_channel = \"{channel}\"\nnotify_chat_id = \"{chat_id}\"\n"
             ),
         )
         .unwrap();

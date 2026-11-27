@@ -107,7 +107,7 @@ pub(crate) fn read_home_native_selection(home: &Path, tool: &str) -> Result<Nati
 }
 
 fn capture_home_native_selection(home: &Path, tool: &str, migrate: bool) -> Result<NativeHomeSelection> {
-    if duduclaw_core::google_identity::native_google_scope(tool).is_none() {
+    if duduclaw_core::google_identity::native_google_scope(tool).is_none() || duduclaw_core::google_identity::is_drive_write_tool(tool) {
         return Err(Error::Invalid);
     }
     with_metadata(home, |g, source| {

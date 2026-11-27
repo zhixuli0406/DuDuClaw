@@ -985,6 +985,7 @@ impl MethodHandler {
         }
         if matches!(kind, RawFile::Config) {
             refuse_disclosure_ack_edit(&before, &after)?;
+            crate::google_signin::config::refuse_google_signin_widening(&before, &after)?;
         }
         // B11 L3: the raw editor follows the same one-bot / one-app rule as
         // the dashboard bind, under the same lock.

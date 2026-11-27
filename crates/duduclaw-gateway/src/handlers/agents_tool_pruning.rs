@@ -61,6 +61,7 @@ impl MethodHandler {
         let mut listed = Vec::new();
         for tool in tools() {
             let name = tool.name;
+            if duduclaw_core::google_identity::is_drive_write_tool(name) { continue; }
             if duduclaw_core::tool_catalog::tool_list_verdict(
                 name,
                 &caps.denied_tools,

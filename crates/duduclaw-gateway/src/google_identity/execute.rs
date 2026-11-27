@@ -145,6 +145,7 @@ async fn handle(
     let request = match serde_json::from_slice::<ExecuteRequest>(&body) {
         Ok(request)
             if native_google_scope(&request.tool).is_some()
+                && !duduclaw_core::google_identity::is_drive_write_tool(&request.tool)
                 && request.arguments.is_object()
                 && request.credential_ref.is_well_formed() =>
         {

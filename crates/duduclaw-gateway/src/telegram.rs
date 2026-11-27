@@ -55,9 +55,10 @@ struct TgUser {
     id: i64,
     username: Option<String>,
     first_name: Option<String>,
-    /// Bot API `User.is_bot`. A bot is never a decision maker (F4, L1).
-    #[serde(default)]
-    is_bot: bool,
+    last_name: Option<String>,
+    /// Keep presence for handshake proof: only explicit false is human.
+    /// Existing decision paths retain their previous false default (F4, L1).
+    is_bot: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,6 +153,9 @@ struct TgMessage {
     reply_to_message: Option<Box<TgMessage>>,
     /// Origin of a forwarded message (Bot API 7.0+ `MessageOrigin`).
     forward_origin: Option<TgForwardOrigin>,
+    // Legacy forwarding markers also disqualify handshake identity.
+    forward_from: Option<serde_json::Value>,
+    forward_date: Option<serde_json::Value>,
 }
 
 /// Bot API 7.0+ `MessageOrigin` — only the fields needed to label who the
@@ -193,6 +197,7 @@ struct TgCallbackQuery {
 struct TgUpdate {
     update_id: i64,
     message: Option<TgMessage>,
+    edited_message: Option<TgMessage>,
     callback_query: Option<TgCallbackQuery>,
 }
 
@@ -807,6 +812,10 @@ async fn poll_loop(
             for update in updates {
                 offset = update.update_id + 1;
 
+                // Edited messages never participate in handshakes or turns,
+                // including any old updates returned despite allowed_updates.
+                if update.edited_message.is_some() { continue; }
+
                 // ── Inline keyboard button presses ──
                 if let Some(cb) = update.callback_query {
                     handle_callback_query(
@@ -822,6 +831,11 @@ async fn poll_loop(
                 }
 
                 let Some(msg) = update.message else { continue };
+                // Control-plane exemption: before decisions, access/pairing,
+                // group capture, and the bounded conversation executor.
+                if telegram_handshake_intercept(&msg, &client, &api_base, &ctx, agent_name.as_deref()).await {
+                    continue;
+                }
                 if telegram_decision_fastlane(
                     &msg,
                     &client,
@@ -898,6 +912,10 @@ async fn process_telegram_message(
     verified_account_id: String,
     bot_username: String,
 ) {
+    // Defence in depth for internal callers that bypass the polling receiver.
+    if telegram_handshake_route(&msg, false) != crate::chat_link_intercept::CodeRoute::Conversation {
+        return;
+    }
     if ctx
         .channel_settings
         .refresh_channel_snapshot("telegram", "global")
@@ -1050,6 +1068,82 @@ async fn process_telegram_message(
             .await
     {
         return;
+    }
+
+    // Voice/audio also download bytes before transcription. Gate every media
+    // kind here, before either transcription or attachment persistence.
+    let has_files = msg.photo.as_ref().is_some_and(|p| !p.is_empty())
+        || msg.document.is_some() || msg.video.is_some() || msg.sticker.is_some()
+        || msg.voice.is_some() || msg.audio.is_some();
+    if has_files {
+        let session = telegram_gate_session(chat_id, thread_id);
+        let user = msg.from.as_ref().map(|u| u.id.to_string()).unwrap_or_default();
+        let raw = strip_bot_mention(msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or(""), &bot_username);
+        // Telegram accepts /command@BotName; use the same token normalization
+        // as handle_command before asking the shared exemption parser.
+        let text = if raw.trim_start().starts_with('/') {
+            let mut words = raw.trim().splitn(2, char::is_whitespace);
+            let token = words.next().unwrap_or("");
+            let command = token.split('@').next().unwrap_or(token);
+            let args = words.next().unwrap_or("").trim();
+            if args.is_empty() { command.to_string() } else { format!("{command} {args}") }
+        } else { raw };
+        let mut selected = agent_name.clone();
+        let mut reply_session = own_bot_session(&session, agent_name.as_deref());
+        let mut check_employee = true;
+        if agent_name.is_none() {
+            let private_chat = msg.chat.chat_type.as_deref() == Some("private")
+                && is_private_chat_with(chat_id, &user);
+            let route = resolve_shared_route(&ctx, &user, private_chat).await;
+            reply_session = shared_route_session(&session, &route);
+            selected = match route {
+                SharedRoute::Bound(id) | SharedRoute::Primary(id) => Some(id),
+                SharedRoute::Unbound => None,
+                SharedRoute::Guide(_) => { check_employee = false; None }
+            };
+            if check_employee {
+                let routing = telegram_routing_text(&msg, &bot_username)
+                    .unwrap_or_else(|| format!("{text}\n\n[附件]"));
+                match telegram_trigger_decision(&ctx, &session, &user, &routing,
+                    selected.as_deref(), "attachment-preflight", false).await {
+                    crate::trigger_route::turn::TurnDecision::Agent { id, via_trigger } => {
+                        if via_trigger {
+                            reply_session = crate::trigger_route::called_session(&session, &id);
+                        }
+                        selected = Some(id);
+                    }
+                    crate::trigger_route::turn::TurnDecision::Assign { id } => selected = Some(id),
+                    crate::trigger_route::turn::TurnDecision::Reply { .. } => check_employee = false,
+                    crate::trigger_route::turn::TurnDecision::Default => {
+                        if selected.is_none() {
+                            let registry = ctx.registry.read().await;
+                            selected = crate::channel_reply::resolve_fallback_agent(
+                                &ctx, &*registry, &session, &user,
+                            ).await.map(|agent| agent.config.agent.name.clone());
+                            check_employee = selected.is_some();
+                        }
+                    }
+                }
+            }
+        }
+        if check_employee {
+            match crate::channel_reply::attachment_gate::check(
+                &ctx, &session, &reply_session, &user, &text, selected.as_deref(), None,
+            ).await {
+                crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+                crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => {
+                    // The handler owns access/admin checks; no media reference
+                    // or quoted text may change the parsed exempt command.
+                    handle_command(&command, &client, &api_base, chat_id, thread_id,
+                        &ctx, &scope_id, agent_name.as_deref(), msg.from.as_ref().map(|u| u.id), msg_id).await;
+                    return;
+                }
+                crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => {
+                    send_reply(&ctx.home_dir, &client, &api_base, chat_id, &reply, thread_id, msg_id, None).await;
+                    return;
+                }
+            }
+        }
     }
 
     // Extract text — from text field or transcribed from voice/audio
@@ -1499,7 +1593,7 @@ async fn process_telegram_message(
     };
 
     // A bot sender keeps the reply breaker's strict frequency trip (B10).
-    let sender_kind = if msg.from.as_ref().is_some_and(|u| u.is_bot) {
+    let sender_kind = if msg.from.as_ref().is_some_and(|u| u.is_bot.unwrap_or(false)) {
         duduclaw_security::circuit_breaker::SenderKind::Bot
     } else {
         duduclaw_security::circuit_breaker::SenderKind::Person
@@ -1737,6 +1831,58 @@ async fn process_telegram_message(
     }).await;
 }
 
+/// Read only the whole inbound text/caption, before mention/command rewriting.
+fn telegram_handshake_text(msg: &TgMessage) -> &str {
+    msg.text.as_deref().or(msg.caption.as_deref()).unwrap_or("")
+}
+
+fn telegram_handshake_sender(msg: &TgMessage) -> bool {
+    msg.from.as_ref().is_some_and(|user| user.is_bot == Some(false))
+        && msg.sender_chat.is_none()
+        && msg.forward_origin.is_none()
+        && msg.forward_from.is_none()
+        && msg.forward_date.is_none()
+}
+
+fn telegram_handshake_private(msg: &TgMessage) -> bool {
+    telegram_handshake_sender(msg)
+        && msg.chat.chat_type.as_deref() == Some("private")
+        && msg.from.as_ref().is_some_and(|user| msg.chat.id == user.id)
+}
+
+fn telegram_handshake_route(msg: &TgMessage, edited: bool) -> crate::chat_link_intercept::CodeRoute {
+    crate::chat_link_intercept::route(telegram_handshake_text(msg), !edited && telegram_handshake_sender(msg))
+}
+
+async fn telegram_handshake_intercept(
+    msg: &TgMessage, client: &reqwest::Client, api_base: &str,
+    ctx: &ReplyContext, agent: Option<&str>,
+) -> bool {
+    use crate::chat_link_intercept::{self, CodeRoute};
+    match telegram_handshake_route(msg, false) {
+        CodeRoute::Conversation => return false,
+        CodeRoute::Consume => return true,
+        CodeRoute::Match => {},
+    }
+    let Some(user) = msg.from.as_ref() else { return true; };
+    let mut display = [user.first_name.as_deref(), user.last_name.as_deref()]
+        .into_iter().flatten().collect::<Vec<_>>().join(" ");
+    if let Some(username) = user.username.as_deref() {
+        display.push_str(&format!(" @{username}"));
+    }
+    let reply = chat_link_intercept::handle_at_home(
+        &ctx.home_dir, "telegram", chat_link_intercept::account_label("telegram", agent),
+        user.id.to_string(), msg.chat.id.to_string(), duduclaw_core::truncate_chars(&display, 200),
+        telegram_handshake_private(msg), telegram_handshake_text(msg),
+    ).await;
+    if let Some(Some(text)) = reply {
+        send_reply(&ctx.home_dir, client, api_base, msg.chat.id, text,
+            msg.message_thread_id, msg.message_id, None).await;
+    }
+    // Once classified as a code, even an unexpected missing reply is consumed.
+    true
+}
+
 /// The decision principal for a Telegram message: the sending person's id, or
 /// `""` for anonymous admins, "send as channel", linked-channel forwards,
 /// forwarded messages and bots
@@ -1744,7 +1890,7 @@ async fn process_telegram_message(
 fn telegram_message_principal(msg: &TgMessage) -> String {
     crate::channel_decision_route::telegram_decision_principal(
         msg.from.as_ref().map(|u| u.id),
-        msg.from.as_ref().is_some_and(|u| u.is_bot),
+        msg.from.as_ref().is_some_and(|u| u.is_bot.unwrap_or(false)),
         msg.sender_chat.is_some(),
         msg.forward_origin.is_some(),
     )
@@ -1867,7 +2013,7 @@ async fn handle_callback_query(
     // match against the individual account the card was delivered to — never
     // by "was in the same chat".
     if let Some(tg_uid) = cb.from.as_ref().map(|u| {
-        crate::channel_decision_route::telegram_decision_principal(Some(u.id), u.is_bot, false, false)
+        crate::channel_decision_route::telegram_decision_principal(Some(u.id), u.is_bot.unwrap_or(false), false, false)
     }) {
         let chat_id_string = chat_id.to_string();
         if let Some(result) = crate::decision_notify::route_verified_bound_press(
@@ -1912,7 +2058,7 @@ async fn handle_callback_query(
     // pressing user (never the shared chat id). A denied press only clears
     // the spinner.
     {
-        let presser = cb.from.as_ref().filter(|u| !u.is_bot).map(|u| u.id);
+        let presser = cb.from.as_ref().filter(|u| !u.is_bot.unwrap_or(false)).map(|u| u.id);
         if telegram_command_gate(ctx, chat_id, thread_id, presser, "")
             .await
             .is_some()
@@ -1940,7 +2086,7 @@ async fn handle_callback_query(
         let ctx = ctx.clone();
         let client = client.clone();
         let api_base = api_base.to_string();
-        let sender = cb.from.as_ref().filter(|user| !user.is_bot)
+        let sender = cb.from.as_ref().filter(|user| !user.is_bot.unwrap_or(false))
             .map(|user| user.id.to_string()).unwrap_or_default();
         // F6fb item 9: tracked in the bot's scope (stops with the bot).
         crate::isolation_label_bots::spawn_scoped(async move {
@@ -2320,6 +2466,26 @@ async fn handle_command(
             send_reply(&ctx.home_dir, client, api_base, chat_id, &status, thread_id, None, None).await;
         }
         "/voice" => {
+            let session = match thread_id {
+                Some(tid) => format!("telegram:{chat_id}:{tid}"),
+                None => format!("telegram:{chat_id}"),
+            };
+            let sender = from_user_id.map(|id| id.to_string()).unwrap_or_default();
+            let agent = match agent_name {
+                Some(agent) => agent.to_string(),
+                None => ctx.registry.read().await.main_agent()
+                    .map(|a| a.config.agent.name.clone()).unwrap_or_default(),
+            };
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "telegram", gate_session: &session, command_session: &session,
+                sender: &sender, text, shared: !is_private_chat_with(chat_id, &sender),
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &crate::chat_commands::ChatCommand::Voice, ctx, &origin, &agent,
+            ).await {
+                send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                return;
+            }
             let msg = toggle_voice(ctx, chat_id).await;
             send_reply(&ctx.home_dir, client, api_base, chat_id, msg, thread_id, None, None).await;
         }
@@ -2465,6 +2631,19 @@ async fn handle_command(
                 } else {
                     own_bot_session(&session_id, agent_name)
                 };
+                let origin = crate::chat_commands::CommandOrigin {
+                    channel: "telegram", gate_session: &session_id,
+                    command_session: &command_session, sender: own_sender,
+                    text: &normalized, shared: !is_private_chat_with(chat_id, own_sender),
+                };
+                if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                    &parsed, ctx, &origin, &agent_id,
+                ).await {
+                    if !refusal.is_empty() {
+                        send_reply(&ctx.home_dir, client, api_base, chat_id, &refusal, thread_id, None, None).await;
+                    }
+                    return;
+                }
                 let reply = crate::chat_commands::handle_command_with_caller(
                     &parsed,
                     ctx,
@@ -2894,6 +3073,11 @@ fn strip_bot_mention(text: &str, bot_username: &str) -> String {
 /// knows *something* was quoted. Returns `None` only for service messages
 /// with no representable content.
 fn quoted_message_excerpt(quoted: &TgMessage) -> Option<String> {
+    // Check both fields before selecting or shortening the quoted content.
+    if [quoted.text.as_deref(), quoted.caption.as_deref()].into_iter().flatten()
+        .any(|text| duduclaw_auth::chat_link::parse_code(text).is_some()) {
+        return Some("[連結代碼已隱藏]".to_string());
+    }
     let body = quoted
         .text
         .as_deref()
@@ -2960,7 +3144,7 @@ fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
     if let Some(origin) = &msg.forward_origin {
         lines.push(format!(
             "〔以下訊息由使用者轉發，原始來源：{}〕",
-            forward_origin_label(origin)
+            crate::chat_link_intercept::context_text(&forward_origin_label(origin))
         ));
     }
 
@@ -2982,7 +3166,7 @@ fn build_quoted_context(msg: &TgMessage, bot_username: &str) -> Option<String> {
                 .and_then(|u| u.first_name.clone().or_else(|| u.username.clone()))
                 .unwrap_or_else(|| "對方".to_string())
         };
-        lines.push(channel_format::format_quoted_context(&who, &excerpt));
+        lines.push(channel_format::format_quoted_context(crate::chat_link_intercept::context_text(&who), &excerpt));
     }
 
     if lines.is_empty() {
@@ -3685,6 +3869,46 @@ mod reply_context_tests {
             "〔以下訊息由使用者轉發，原始來源：Alice〕");
         // Forwarded body stays in msg.text; the helper returns the origin label only.
         assert_eq!(msg.text.as_deref(), Some("Third party forwarded instructions."));
+    }
+
+    #[test]
+    fn quoted_handshake_in_secondary_caption_and_provenance_are_hidden() {
+        let code = "DUDU-0000-0000";
+        let msg: TgMessage = serde_json::from_value(json!({
+            "chat": {"id": 42}, "text": "hello",
+            "forward_origin": {"type": "hidden_user", "sender_user_name": code},
+            "reply_to_message": {
+                "chat": {"id": 42}, "text": "ordinary text", "caption": code,
+                "from": {"id": 7, "first_name": code}
+            }
+        })).unwrap();
+        let block = build_quoted_context(&msg, "fixture_bot").unwrap();
+        assert!(!block.contains(code));
+        assert!(block.contains("[連結代碼已隱藏]"));
+    }
+
+    #[test]
+    fn quoted_handshake_text_and_caption_are_hidden() {
+        for code in ["DUDU-0000-0000", "  dudu-oooo-llll\n"] {
+            for field in ["text", "caption"] {
+                let mut value = json!({
+                    "chat": {"id": 42, "type": "private"}, "text": "這是什麼？",
+                    "reply_to_message": {
+                        "chat": {"id": 42, "type": "private"},
+                        "from": {"id": 7, "first_name": "Alice"},
+                        "forward_origin": {"type": "hidden_user", "sender_user_name": "Bob"}
+                    }
+                });
+                value["reply_to_message"][field] = json!(code);
+                let msg: TgMessage = serde_json::from_value(value).unwrap();
+                let block = build_quoted_context(&msg, "fixture_bot").unwrap();
+                let input = format!("{block}\n\n{}", msg.text.as_deref().unwrap());
+                assert!(!input.contains(code.trim()));
+                assert!(input.contains("[連結代碼已隱藏]"));
+                assert!(input.contains("Alice"));
+                assert!(input.ends_with("這是什麼？"));
+            }
+        }
     }
 
     #[test]
@@ -4639,5 +4863,87 @@ mod routing_text_tests {
             serde_json::json!([{"type": "text_mention", "offset": 2, "length": 6, "user": {"id": 7, "is_bot": false, "first_name": "X"}}]),
         );
         assert_eq!(telegram_routing_text(&msg, "dudu_bot").unwrap().trim(), "嗨");
+    }
+}
+
+#[cfg(test)]
+#[path = "telegram_attachment_gate_tests.rs"]
+mod attachment_gate_tests;
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use crate::chat_link_intercept::CodeRoute;
+
+    fn event() -> serde_json::Value {
+        json!({"message_id": 1, "text": "DUDU-0123-4567",
+            "chat": {"id": 123, "type": "private"},
+            "from": {"id": 123, "is_bot": false, "first_name": "王", "last_name": "小明", "username": "wang"}})
+    }
+
+    fn message(event: serde_json::Value) -> TgMessage { serde_json::from_value(event).unwrap() }
+
+    #[test]
+    fn private_handshake_requires_exact_human_dm_without_forwarding() {
+        assert!(telegram_handshake_private(&message(event())));
+        for change in [
+            json!({"chat": {"id": 456, "type": "private"}}),
+            json!({"chat": {"id": 123, "type": "group"}}),
+            json!({"chat": {"id": 123, "type": "supergroup"}}),
+            json!({"chat": {"id": 123}}),
+            json!({"from": {"id": 123, "is_bot": true}}),
+            json!({"from": {"id": 123}}),
+            json!({"from": null}),
+            json!({"sender_chat": {"id": 123, "type": "channel"}}),
+            json!({"forward_origin": {"type": "hidden_user"}}),
+            json!({"forward_from": {"id": 456}}),
+            json!({"forward_date": 1234}),
+        ] {
+            let mut value = event();
+            for (key, val) in change.as_object().unwrap() { value[key] = val.clone(); }
+            assert!(!telegram_handshake_private(&message(value)));
+        }
+    }
+
+    #[test]
+    fn bot_forwarded_sender_chat_and_edited_codes_are_consumed_without_matching() {
+        for change in [
+            json!({"from": {"id": 123, "is_bot": true}}),
+            json!({"from": {"id": 123}}),
+            json!({"from": null}),
+            json!({"sender_chat": {"id": -1, "type": "channel"}}),
+            json!({"forward_origin": {"type": "hidden_user"}}),
+            json!({"forward_from": {"id": 456}}),
+            json!({"forward_date": 1234}),
+        ] {
+            let mut value = event();
+            for (key, val) in change.as_object().unwrap() { value[key] = val.clone(); }
+            assert_eq!(telegram_handshake_route(&message(value), false), CodeRoute::Consume);
+        }
+        let edited: TgUpdate = serde_json::from_value(json!({
+            "update_id": 7, "edited_message": event(),
+        })).unwrap();
+        assert!(edited.message.is_none());
+        assert_eq!(telegram_handshake_route(edited.edited_message.as_ref().unwrap(), true), CodeRoute::Consume);
+    }
+
+    #[test]
+    fn handshake_code_never_reaches_ai() {
+        // These pure predicates are the actual receiver and processor guards;
+        // only Conversation is admitted to the ordinary message/queue path.
+        for kind in ["private", "group", "supergroup"] {
+            let mut value = event();
+            value["chat"]["type"] = json!(kind);
+            let msg = message(value);
+            assert_eq!(telegram_handshake_route(&msg, false), CodeRoute::Match);
+            assert_ne!(telegram_handshake_route(&msg, true), CodeRoute::Conversation);
+        }
+        let mut ordinary = event();
+        ordinary["text"] = json!("hello");
+        assert_eq!(telegram_handshake_route(&message(ordinary), false), CodeRoute::Conversation);
+        let mut caption = event();
+        caption["caption"] = caption["text"].clone();
+        caption["text"] = serde_json::Value::Null;
+        assert_eq!(telegram_handshake_route(&message(caption), false), CodeRoute::Match);
     }
 }

@@ -125,6 +125,7 @@ pub async fn mint_delegate(
     scopes: &[&str],
     mode: CacheMode,
 ) -> Result<MintedToken, Refusal> {
+    super::write_scope_guard::check_requested(scopes)?;
     let key = super::protection_gate_async(home).await?;
     let home_buf = home.to_path_buf();
     let sa_key = tokio::task::spawn_blocking(move || delegation_key::load(&home_buf, &key))
@@ -135,9 +136,13 @@ pub async fn mint_delegate(
                 "讀取服務帳號金鑰中斷，請稍後再試。",
             ))
         })?;
-    sa::mint_for_subject(&sa_key, email, scopes, mode)
+    let token = sa::mint_for_subject(&sa_key, email, scopes, mode)
         .await
-        .map_err(|e| explain_mint_error(&e, email))
+        .map_err(|e| explain_mint_error(&e, email))?;
+    if let Some(scopes) = &token.granted_scopes {
+        super::write_scope_guard::check_actual(scopes)?;
+    }
+    Ok(token)
 }
 
 /// The full decision for one employee and one turn.

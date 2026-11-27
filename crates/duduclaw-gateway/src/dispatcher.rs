@@ -711,6 +711,16 @@ pub(crate) async fn poll_and_dispatch_sqlite(
             &msg.target,
             "message_queue",
         );
+        let record_task = if msg.sender == crate::responsibility::GOAL_LOOP_SENDER {
+            extract_goal_loop_task_id_and_round(&msg.payload).map(|(id, _)| id.to_string())
+        } else if msg.sender == crate::responsibility::HEARTBEAT_SENDER {
+            extract_heartbeat_task_id(&msg.payload).map(str::to_owned)
+        } else { None };
+        let requester = crate::delegation_roles::initiators::lookup(home_dir, "message", &msg.id,
+            crate::delegation_gate::resolve_sender(msg.sender_agent.as_deref(), msg.origin_agent.as_deref()), &msg.target, principal.as_deref())
+            .or_else(|| record_task.and_then(|id| crate::delegation_roles::initiators::lookup(
+                home_dir, "task", &id, None, &msg.target, principal.as_deref())));
+        let dispatch_fut = crate::delegation_roles::initiators::scope(&msg.target, requester, dispatch_fut);
         let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
         // Boxed: the isolation record scope holds the task-store lookup, the
         // task row and the record verification frames beside the inner
@@ -1555,6 +1565,10 @@ async fn poll_and_dispatch(
                 &msg.agent_id,
                 "bus_queue",
             );
+            let requester = crate::delegation_roles::initiators::lookup(&home, "message", &msg.message_id,
+                crate::delegation_gate::resolve_sender(msg.sender_agent.as_deref(), msg.origin_agent.as_deref()),
+                &msg.agent_id, principal.as_deref());
+            let dispatch_fut = crate::delegation_roles::initiators::scope(&msg.agent_id, requester, dispatch_fut);
             let dispatch_fut = crate::on_behalf_of::scope_first(principal, dispatch_fut);
             let material = crate::isolation_background::material::delegation(
                 msg.sender_agent.as_deref().unwrap_or(""), &msg.agent_id, &msg.payload,
@@ -2201,8 +2215,11 @@ pub async fn dispatch_taskspec(
     let principal = crate::on_behalf_of::from_stored(
         home_dir, spec.on_behalf_of.as_deref(), &spec.agent_id, "task_spec",
     );
-    crate::on_behalf_of::scope_first(principal,
-        dispatch_taskspec_inner(home_dir, registry, spec, agent_dir)).await
+    let requester = crate::delegation_roles::initiators::lookup(home_dir, "task_spec", &spec.task_id,
+        None, &spec.agent_id, principal.as_deref());
+    let target = spec.agent_id.clone();
+    crate::delegation_roles::initiators::scope(&target, requester, crate::on_behalf_of::scope_first(principal,
+        dispatch_taskspec_inner(home_dir, registry, spec, agent_dir))).await
 }
 
 async fn dispatch_taskspec_inner(

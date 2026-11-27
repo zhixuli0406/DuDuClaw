@@ -143,6 +143,12 @@ pub(super) fn read_jsonl_tail_returns_last_n_parsed() {
 #[test]
 pub(super) fn rule_induced_and_target_detection() {
     let base = AutopilotRuleRow {
+        active_window: None,
+        run_policy: None,
+        owner_department: None,
+        created_by_user_id: None,
+        updated_by_user_id: None,
+        updated_at: None,
         id: "r1".into(),
         name: "n".into(),
         enabled: true,

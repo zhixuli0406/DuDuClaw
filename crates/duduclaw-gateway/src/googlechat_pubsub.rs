@@ -220,6 +220,12 @@ async fn drain_verified(state: &Arc<GoogleChatState>, config: &Subscription, inb
                 continue;
             }
         };
+        // Handshake/decision control text is never admitted to the model
+        // queue. The inbox stores resource references only, not code text.
+        if crate::googlechat::pubsub_control_message(&event) {
+            inbox.discard_pending(&stream, &row.id)?;
+            continue;
+        }
         let space = event.pointer("/message/space/name").and_then(Value::as_str).unwrap_or("");
         let verified_conversation = match crate::googlechat::resolve_conversation(state, &event).await {
             Ok(conversation) => conversation,

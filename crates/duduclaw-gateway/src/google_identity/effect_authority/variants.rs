@@ -298,7 +298,15 @@ impl Prepared {
                                 .map(|token| {
                                     (Choice::OAuthRemote(receipt), OwnerMaterial::OAuth(token))
                                 })
-                                .map_err(|_| CredentialResolveFailure::Credential(unavailable()))
+                                .map_err(|error| {
+                                    if error == crate::mcp_oauth::home_store::Error::WriteScopeIsolated {
+                                        CredentialResolveFailure::Authority(crate::google_identity::write_scope_guard::write_scope_isolated())
+                                    } else if error == crate::mcp_oauth::home_store::Error::ScopeUnverified {
+                                        CredentialResolveFailure::Authority(crate::google_identity::write_scope_guard::scope_unverified())
+                                    } else {
+                                        CredentialResolveFailure::Credential(unavailable())
+                                    }
+                                })
                         }
                         Err(_) => Err(CredentialResolveFailure::Credential(unavailable())),
                     }
@@ -331,7 +339,15 @@ impl Prepared {
                                 .map(|token| {
                                     (Choice::OAuthNative(receipt), OwnerMaterial::OAuth(token))
                                 })
-                                .map_err(|_| CredentialResolveFailure::Credential(unavailable()))
+                                .map_err(|error| {
+                                    if error == crate::mcp_oauth::home_store::Error::WriteScopeIsolated {
+                                        CredentialResolveFailure::Authority(crate::google_identity::write_scope_guard::write_scope_isolated())
+                                    } else if error == crate::mcp_oauth::home_store::Error::ScopeUnverified {
+                                        CredentialResolveFailure::Authority(crate::google_identity::write_scope_guard::scope_unverified())
+                                    } else {
+                                        CredentialResolveFailure::Credential(unavailable())
+                                    }
+                                })
                         }
                         Err(_) => Err(CredentialResolveFailure::Credential(unavailable())),
                     }

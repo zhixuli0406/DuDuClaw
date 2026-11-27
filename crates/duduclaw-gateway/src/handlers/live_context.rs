@@ -356,7 +356,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let db = UserDb::new(&home.path().join("users.db")).unwrap();
         let user = db.create_user("key-origin@example.test", "Origin", "password-test", duduclaw_auth::UserRole::Manager).unwrap();
-        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch).unwrap();
+        let key = db.member_key_create(&user.id, "origin", 1, user.credential_epoch, false, &[]).unwrap();
         let mut ctx = db.live_user_context(&user.id).unwrap().unwrap();
         ctx.origin = ContextOrigin::DashboardSession;
         let cache = LiveContextCache::default();

@@ -152,3 +152,8 @@ mod tests {
         }
     }
 }
+
+/// Scopes available to credentials bound to a member, never to unbound external keys.
+pub const PERSON_KEY_MCP_SCOPE_STRINGS: &[&str] = &[
+    "tasks:read", "agents:status", "odoo:read", "odoo:write",
+];

@@ -141,7 +141,7 @@ pub(crate) fn messages_response(data: &Value, args: &MessagesArgs) -> Value {
         let attachments: Vec<_> = row.get("attachment").and_then(Value::as_array).into_iter().flatten().take(20)
             .map(|a| field(a, "contentName", 256)).collect();
         json!({"name": field(row,"name",512), "sender_name": if display.is_empty() { "未知使用者".to_owned() } else { display },
-            "sender_resource": user, "create_time": field(row,"createTime",64), "text": field(row,"text",2_000),
+            "sender_resource": user, "create_time": field(row,"createTime",64), "text": duduclaw_core::truncate_chars(crate::chat_link_intercept::context_text(row.get("text").and_then(Value::as_str).unwrap_or("")), 2_000),
             "thread": field(&row["thread"],"name",512), "attachments":attachments, "links": rich_links(row, row["text"].as_str().unwrap_or("")),
             "text_truncated": row.get("text").and_then(Value::as_str).is_some_and(|s| s.chars().count()>2_000)})
     }).collect();
@@ -242,6 +242,18 @@ mod tests {
         for since in ["today","2026-11-05","2026-11-05T00:00:00Z\" OR true", "2026-02-30T00:00:00Z"] { assert!(messages_args(&json!({"space":"spaces/a","since":since})).is_err()); }
         assert!(messages_args(&json!({"space":"spaces/a","thread":"spaces/b/threads/t"})).is_err());
     }
+    #[test]
+    fn google_chat_history_projection_hides_handshake_codes() {
+        let args = messages_args(&json!({"space": "spaces/AAA"})).unwrap();
+        for code in ["DUDU-0000-0000", "  dudu-oooo-llll\n"] {
+            let result = messages_response(&json!({"messages": [{"text": code}, {"text": "hello"}]}), &args);
+            assert_eq!(result["messages"][0]["text"], "[連結代碼已隱藏]");
+            assert_eq!(result["messages"][1]["text"], "hello");
+            let block = scanned_envelope(&result).unwrap();
+            assert!(!block.contains(code.trim()));
+        }
+    }
+
     #[test]
     fn google_chat_fixture_projection_caps_and_scan() {
         let fixture:Value=serde_json::from_str(include_str!("fixtures/chat_messages.json")).unwrap();

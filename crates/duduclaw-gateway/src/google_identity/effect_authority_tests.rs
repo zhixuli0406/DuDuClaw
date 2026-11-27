@@ -261,7 +261,7 @@ async fn exact_refresh_revision_is_published_once_and_lease_order_is_separate() 
                 refresh_token: None,
                 expires_at: Some(4_000_000_000),
             },
-            granted_scopes: None,
+            granted_scopes: Some(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.granted_scopes),
         }),
     );
     let material = resolve_pinned(f.dedicated("gmail_read"), f.selected("gmail_read"))
@@ -333,7 +333,7 @@ async fn refreshed_secret_cannot_be_labelled_with_a_later_reload_revision() {
                 refresh_token: None,
                 expires_at: Some(4_000_000_000),
             },
-            granted_scopes: None,
+            granted_scopes: Some(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.granted_scopes),
         }),
     );
     let home = f.home.path().to_path_buf();
@@ -862,7 +862,7 @@ async fn late_refresh_cas_loss_returns_no_material_and_does_not_retry_or_overwri
                 refresh_token: None,
                 expires_at: Some(4_000_000_000),
             },
-            granted_scopes: None,
+            granted_scopes: Some(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.granted_scopes),
         }),
     );
     let home = f.home.path().to_path_buf();
@@ -999,7 +999,7 @@ fn fake_successful_refresh(f: &Fixture) {
                 refresh_token: None,
                 expires_at: Some(4_000_000_000),
             },
-            granted_scopes: None,
+            granted_scopes: Some(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.granted_scopes),
         }),
     );
 }
@@ -3334,7 +3334,7 @@ async fn m1_remote_personal_sync_decrypt_expiry_refuses_but_legacy_keeps_origina
                     refresh_token: Some("owned-refresh".into()),
                     expires_at: Some(4_000_000_000),
                 },
-                granted_scopes: None,
+                granted_scopes: Some(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.granted_scopes),
             }),
         );
         let result = if remote {
@@ -3799,5 +3799,63 @@ async fn rm159_closed_owners_require_a_fresh_snapshot_card_before_any_send_or_de
                 }
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn pinned_personal_refresh_write_scope_isolated_before_publication() {
+    let f = d1_fixture(false);
+    let record = vault::get(f.home.path(), &f.user).unwrap().unwrap();
+    let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
+    let mut secret = vault::unseal(&key, &record).unwrap();
+    secret.expires_at = Some(1);
+    assert!(vault::finish_refresh(f.home.path(), &key, &record.metadata, &secret).unwrap());
+    let selected = f.selected("google_remote_mcp");
+    let mut scopes = record.metadata.granted_scopes;
+    scopes.push(crate::google_personal::oauth::DRIVE_WRITE_SCOPE.into());
+    access::pinned_test::refresh_result(f.home.path(), Ok(crate::google_personal::oauth::Tokens {
+        secret: Secret { access_token: "isolated-pinned-token".into(), refresh_token: None, expires_at: Some(4_000_000_000) },
+        granted_scopes: Some(scopes),
+    }));
+    let error = access::resolve_pinned_mcp(f.home.path(), "bot", &RequesterIdentity::Unknown,
+        &UserDbPeople(f.db.clone()), &selected, tokio::time::Instant::now() + std::time::Duration::from_secs(10))
+        .await.err().expect("write token must be refused");
+    assert_eq!(error.code, "write_scope_isolated");
+    assert!(!error.fallback_eligible);
+    assert_eq!(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.status, Status::NeedsReconnect);
+    assert!(!access::pinned_test::events(f.home.path()).contains(&"refresh_published"));
+}
+
+#[tokio::test]
+async fn personal_closed_mcp_write_scope_never_reaches_the_wire() {
+    for refreshed in [false, true] {
+        let f = d1_fixture(false);
+        let wire = m1_wire(false).await;
+        let record = vault::get(f.home.path(), &f.user).unwrap().unwrap();
+        let key = crate::google_identity::protection_gate(f.home.path()).unwrap();
+        let mut secret = vault::unseal(&key, &record).unwrap();
+        let mut scopes = record.metadata.granted_scopes.clone();
+        scopes.push(crate::google_personal::oauth::DRIVE_WRITE_SCOPE.into());
+        if refreshed {
+            secret.expires_at = Some(1);
+            assert!(vault::finish_refresh(f.home.path(), &key, &record.metadata, &secret).unwrap());
+            access::pinned_test::refresh_result(f.home.path(), Ok(crate::google_personal::oauth::Tokens {
+                secret: Secret { access_token: "isolated-mount-token".into(), refresh_token: None, expires_at: Some(4_000_000_000) },
+                granted_scopes: Some(scopes),
+            }));
+        } else {
+            assert!(vault::finish_refresh_with_scopes(f.home.path(), &key, &record.metadata, &secret, Some(&scopes)).unwrap());
+        }
+        let path = f.home.path().join("agents/bot/agent.toml");
+        let original = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{original}\n[[mcp.external]]\nname='remote'\nurl='{}'\nbearer_token='oauth://google'\n", wire.endpoint)).unwrap();
+        let _endpoint = remote_testing::install(f.home.path(), &wire.endpoint);
+        let mut servers = crate::mcp_external::load_external_mcp_servers_resolved(&f.home.path().join("agents/bot"), f.home.path()).await;
+        let server = servers.remove(0);
+        assert!(duduclaw_llm::ToolRegistry::from_client_slots_named(
+            vec![(server.name, server.google_closed.unwrap().registry_slot())], vec![server.filter]).await.is_err());
+        assert_eq!(wire.hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(vault::get(f.home.path(), &f.user).unwrap().unwrap().metadata.status, Status::NeedsReconnect);
+        assert!(!access::pinned_test::events(f.home.path()).contains(&"refresh_published"));
     }
 }

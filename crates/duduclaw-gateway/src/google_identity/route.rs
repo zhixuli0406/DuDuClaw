@@ -191,6 +191,11 @@ pub(crate) async fn serve(
         );
         return outcome;
     }
+    if crate::google_workspace::drive_write_policy::DRIVE_WRITE_TOOLS.contains(&tool) {
+        let outcome = Err(Refusal::hard("write_tool_gateway_only", "雲端硬碟寫入必須由主程式執行，不能取得 Google 權杖。"));
+        audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
+        return outcome.map(|_| Value::Null);
+    }
     let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&state.home)
         .shared().await.map_err(|_| super::owner_snapshot::changed())?;
     refuse_owner_token(&state.home, agent)?;
@@ -216,7 +221,25 @@ pub(crate) async fn serve(
     }
     let people = people_for(&state.home, state.users.as_ref());
     let outcome =
-        resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await;
+        resolve_person_for_tool(&state.home, agent, requester, people.as_ref(), tool).await
+            .and_then(|resolved| {
+                match &resolved {
+                    Resolved::Delegated { token, .. } => {
+                        super::write_scope_guard::check_requested(super::delegated_scopes::for_tool(&state.home, tool)?)?;
+                        if let Some(scopes) = &token.granted_scopes {
+                            super::write_scope_guard::check_actual(scopes)?;
+                        }
+                    }
+                    // Personal access checked the exact cached/refresh scopes
+                    // before producing this token, including reconnect/notice.
+                    Resolved::Personal { token, .. } => {
+                        super::write_scope_guard::check_actual(token.granted_scopes.as_deref()
+                            .ok_or_else(super::write_scope_guard::write_scope_isolated)?)?;
+                    }
+                    Resolved::UseHome { .. } => {},
+                }
+                Ok(resolved)
+            });
     audit_issue(&state.home, agent, tool, requester.kind(), &outcome);
     refuse_owner_token(&state.home, agent)?;
     match outcome? {

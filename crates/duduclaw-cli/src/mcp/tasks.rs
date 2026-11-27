@@ -176,14 +176,17 @@ fn validate_created_task_assignee(
     assignee: &str,
     implicit_operator_task: bool,
 ) -> std::result::Result<(), &'static str> {
-    if implicit_operator_task
-        && matches!(duduclaw_core::agent_seats::resolve_agent_seat(home, assignee), Ok(None))
-        && matches!(std::fs::symlink_metadata(home.join("agents").join(assignee)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-    {
+    if implicit_operator_assignee(home, assignee, implicit_operator_task) {
         return Ok(());
     }
     duduclaw_core::agent_seats::validate_task_assignee(home, Some(assignee))
+}
+
+fn implicit_operator_assignee(home: &Path, assignee: &str, implicit_operator_task: bool) -> bool {
+    implicit_operator_task
+        && matches!(duduclaw_core::agent_seats::resolve_agent_seat(home, assignee), Ok(None))
+        && matches!(std::fs::symlink_metadata(home.join("agents").join(assignee)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// T5/O4 — the one agent-facing entry point for "create work".
@@ -315,30 +318,6 @@ pub(crate) async fn handle_tasks_create(
     if !is_valid_agent_id(default_agent) {
         return tool_error("invalid caller agent id");
     }
-    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
-        return tool_error(message);
-    }
-    // Giving a goal more time than its employee's own `[runtime]
-    // timeout_secs` is an Admin decision made on the dashboard; no MCP
-    // caller (employee or external key) may widen it, only narrow.
-    if let Err(e) = duduclaw_gateway::goal_create_core::check_timeout_widening(
-        home_dir,
-        &assigned_to,
-        timeout_secs,
-        false,
-    ) {
-        return tool_error(&e);
-    }
-    // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
-    // only ever written by the server itself — `goal_create_core` builds the
-    // `outcome:` tag from the `outcome` argument — never taken from a caller.
-    if let Some(tags) = args.get("tags").and_then(|v| v.as_str()) {
-        if let Err(refusal) =
-            check_no_reserved_tags(home_dir, actor, "tasks_create", &assigned_to, tags)
-        {
-            return refusal;
-        }
-    }
     // ── WP21 C3: department × hierarchy delegation gate ────────
     // Assigning to yourself never invokes the predicate (self-delegation is a
     // hard DENY under every policy in core) — this mirrors tasks_claim, which
@@ -362,6 +341,45 @@ pub(crate) async fn handle_tasks_create(
         // mode the person it is for must still be allowed to hand this
         // employee work (no laundering a hand-over through self-assignment).
         return tool_error(&reason);
+    }
+    if let Err(message) = validate_created_task_assignee(home_dir, &assigned_to, implicit_operator_task) {
+        if let Some(refusal) = duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, &assigned_to) {
+            return tool_error(&format!(
+                "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+                refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+            ));
+        }
+        return tool_error(message);
+    }
+    // Giving a goal more time than its employee's own `[runtime]
+    // timeout_secs` is an Admin decision made on the dashboard; no MCP
+    // caller (employee or external key) may widen it, only narrow.
+    if let Err(e) = duduclaw_gateway::goal_create_core::check_timeout_widening(
+        home_dir,
+        &assigned_to,
+        timeout_secs,
+        false,
+    ) {
+        return tool_error(&e);
+    }
+    // Reserved control tags (`outcome:` / `grant:` / `auto-research`) are
+    // only ever written by the server itself — `goal_create_core` builds the
+    // `outcome:` tag from the `outcome` argument — never taken from a caller.
+    if let Some(tags) = args.get("tags").and_then(|v| v.as_str()) {
+        if let Err(refusal) =
+            check_no_reserved_tags(home_dir, actor, "tasks_create", &assigned_to, tags)
+        {
+            return refusal;
+        }
+    }
+    // All creation rails (goal, board task, cron and one-shot reminder) share
+    // the gateway's effective-artifact gate before writing any record.
+    if !implicit_operator_assignee(home_dir, &assigned_to, implicit_operator_task)
+        && let Err(refusal) = duduclaw_gateway::entry_gate::check_task_assignee(home_dir, &assigned_to) {
+        return tool_error(&format!(
+            "Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+            refusal.user_text("mcp:tasks_create", Some("en"), "tasks-create"),
+        ));
     }
     // The person the new task is for: the host env only, never an argument.
     let on_behalf_of = host_on_behalf_of(home_dir, default_agent);
@@ -461,6 +479,8 @@ pub(crate) async fn handle_tasks_create(
         ).await
         {
             Ok(created) => {
+                super::delegation_roles::record_initiator(home_dir, "task", default_agent,
+                    &created.task.assigned_to, &created.task.id).await;
                 // The goal already exists. A pause here suppresses only its
                 // best-effort wake event, never reports a retryable create failure.
                 match admit_background_caller(home_dir, actor, "tasks_create").await {
@@ -669,6 +689,7 @@ pub(crate) async fn handle_tasks_create(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    super::delegation_roles::record_initiator(home_dir, "task", default_agent, &row.assigned_to, &row.id).await;
     if let Err(message) = validate_created_task_assignee(home_dir, &row.assigned_to, implicit_operator_task) {
         return tool_error(message);
     }
@@ -795,6 +816,19 @@ pub(crate) async fn check_task_update_by_employee(
     Ok(())
 }
 
+fn task_reassignment_error(refusal: duduclaw_gateway::entry_gate::EntryRefusal) -> Value {
+    tool_error(&format!(
+        "Task reassignment refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n{}",
+        refusal.user_text("mcp:tasks_update", Some("en"), "tasks-update"),
+    ))
+}
+
+/// Add the config gate only; callers retain their existing roster and access checks.
+fn task_reassignment_refusal(home: &Path, current: &str, dest: &str) -> Option<Value> {
+    if dest.is_empty() || dest == current { return None; }
+    duduclaw_gateway::entry_gate::check_task_assignee(home, dest).err().map(task_reassignment_error)
+}
+
 /// Update a task board row. An AI-employee caller additionally passes
 /// [`check_task_update_by_employee`]; the acceptance-criteria freeze applies
 /// to every MCP caller.
@@ -912,7 +946,8 @@ pub(crate) async fn handle_tasks_update(
     if let Some(new_owner) = args.get("assigned_to").and_then(|v| v.as_str()) {
         let new_owner = new_owner.trim();
         if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(home_dir, Some(new_owner)) {
-            return tool_error(message);
+            return duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, new_owner)
+                .map(task_reassignment_error).unwrap_or_else(|| tool_error(message));
         }
         if !is_valid_agent_id(new_owner) {
             return tool_error(&format!(
@@ -925,6 +960,9 @@ pub(crate) async fn handle_tasks_update(
             {
                 return tool_error(&reason);
             }
+        }
+        if let Some(refusal) = task_reassignment_refusal(home_dir, &current.assigned_to, new_owner) {
+            return refusal;
         }
         fields.insert(
             "assigned_to".into(),
@@ -969,12 +1007,19 @@ pub(crate) async fn handle_tasks_update(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
-    super::workflow_operation::effect_start();
     if let Err(message) = duduclaw_core::agent_seats::validate_task_assignee(
         home_dir, fields.get("assigned_to").and_then(Value::as_str),
     ) {
-        return tool_error(message);
+        return fields.get("assigned_to").and_then(Value::as_str)
+            .and_then(|dest| duduclaw_gateway::entry_gate::malformed_assignee_refusal(home_dir, dest))
+            .map(task_reassignment_error).unwrap_or_else(|| tool_error(message));
     }
+    if let Some(dest) = fields.get("assigned_to").and_then(Value::as_str) {
+        if let Some(refusal) = task_reassignment_refusal(home_dir, &current.assigned_to, dest) {
+            return refusal;
+        }
+    }
+    super::workflow_operation::effect_start();
     let updated = match store
         .update_task_with_cost_policy(task_id, &Value::Object(fields), employee_default_cap)
         .await
@@ -996,6 +1041,12 @@ pub(crate) async fn handle_tasks_update(
                 "row_hash": duduclaw_gateway::approval::payload_hash(&expected)
             }));
         }
+    }
+    if !updated.archived && !matches!(updated.status.as_str(), "cancelled" | "failed" | "done")
+        && (current.status != updated.status || current.archived != updated.archived
+            || duduclaw_gateway::isolation_background::material::task(&current)
+                != duduclaw_gateway::isolation_background::material::task(&updated)) {
+        super::delegation_roles::record_initiator(home_dir, "task", caller, &updated.assigned_to, &updated.id).await;
     }
     append_bus_event(home_dir, "task.updated", &task_row_to_json(&updated)).await;
     tool_text(&serde_json::json!({ "task": task_row_to_json(&updated) }).to_string())
@@ -1027,6 +1078,7 @@ pub(crate) async fn handle_tasks_claim(
     if let Err(refusal) = check_a2a_task_access(home_dir, &store, actor, task_id).await {
         return refusal;
     }
+    let mut employee_assignee = None;
     if let Some(me) = actor.agent() {
         match store.get_task(task_id).await {
             Ok(Some(t)) => {
@@ -1048,6 +1100,7 @@ pub(crate) async fn handle_tasks_claim(
                         return tool_error(&reason);
                     }
                 }
+                employee_assignee = Some(t.assigned_to);
             }
             Ok(None) => return tool_error(&format!("task not found: {task_id}")),
             Err(e) => return tool_error(&format!("claim task: {e}")),
@@ -1067,6 +1120,11 @@ pub(crate) async fn handle_tasks_claim(
         Ok(guard) => guard,
         Err(reason) => return tool_error(&reason),
     };
+    if let Some(current) = employee_assignee.as_deref() {
+        if let Some(refusal) = task_reassignment_refusal(home_dir, current, default_agent) {
+            return refusal;
+        }
+    }
     match store
         .atomic_claim(task_id, default_agent, &now_s, &lease)
         .await
@@ -1656,7 +1714,11 @@ mod live_assignee_tests {
             assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
         }
         std::fs::write(home.path().join("agents/dudu/agent.toml"), "[agent").unwrap();
-        assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
+        let malformed = handle_tasks_create(&params, home.path(), actor).await;
+        let text = malformed["content"][0]["text"].as_str().unwrap();
+        assert_eq!(malformed["isError"], true);
+        assert!(text.contains("agent_config_unreadable"));
+        assert!(!text.contains("agent.toml"));
         std::fs::remove_file(home.path().join("agents/dudu/agent.toml")).unwrap();
         assert_unavailable(handle_tasks_create(&params, home.path(), actor).await);
         assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
@@ -1723,5 +1785,147 @@ mod live_assignee_tests {
         let saved = store.get_task("old").await.unwrap().unwrap();
         assert_eq!(saved.assigned_to, "deleted");
         assert_eq!(saved.description, "仍可編輯");
+    }
+}
+
+#[cfg(test)]
+mod entry_gate_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_reassignment_entry_gate_matrix() {
+        for malformed in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='open'\n").unwrap();
+            for id in ["healthy", "worker"] {
+                super::super::tests::create_test_agent(&home.path().join("agents"), id, "");
+            }
+            let path = home.path().join("agents/worker/agent.toml");
+            let healthy = std::fs::read_to_string(&path).unwrap();
+            std::fs::write(&path, if malformed { "[model".to_string() }
+                else { healthy.replace("claude-sonnet-4-6", "gpt-5.4") }).unwrap();
+            let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+            for (id, owner) in [("to", "healthy"), ("away", "worker"), ("unassign", "worker"), ("same", "worker"), ("claim", "")] {
+                store.insert_task(&duduclaw_gateway::task_store::TaskRow::new(
+                    id.into(), "work".into(), String::new(), "medium".into(), owner.into(), "system".into(),
+                )).await.unwrap();
+            }
+            let before = task_row_to_json(&store.get_task("to").await.unwrap().unwrap());
+            let refused = handle_tasks_update(&serde_json::json!({
+                "task_id":"to", "assigned_to":"worker", "description":"must not write"
+            }), home.path(), RecordActor::Operator("worker")).await;
+            assert_eq!(refused["isError"], true, "{refused}");
+            let text = refused["content"][0]["text"].as_str().unwrap();
+            assert!(text.starts_with("Task reassignment refused: "), "{text}");
+            assert!(text.contains(if malformed { "agent_config_unreadable" } else { "model_provider_mismatch" }), "{text}");
+            assert_eq!(task_row_to_json(&store.get_task("to").await.unwrap().unwrap()), before);
+            let refused = handle_tasks_claim(&serde_json::json!({"task_id":"claim"}), home.path(), RecordActor::Agent("worker")).await;
+            assert_eq!(refused["isError"], true, "{refused}");
+            assert!(store.get_task("claim").await.unwrap().unwrap().assigned_to.is_empty());
+            // HEAD rejects an empty assignee at is_valid_agent_id, before delegation.
+            let before = task_row_to_json(&store.get_task("unassign").await.unwrap().unwrap());
+            let refused = handle_tasks_update(&serde_json::json!({
+                "task_id":"unassign", "assigned_to":"", "description":"must not write"
+            }), home.path(), RecordActor::Operator("healthy")).await;
+            assert_eq!(refused, tool_error(
+                "assigned_to must be a valid agent id (lowercase alphanumeric + hyphens), got: "
+            ));
+            assert_eq!(task_row_to_json(&store.get_task("unassign").await.unwrap().unwrap()), before);
+            for (id, dest) in [("away", "healthy"), ("same", "worker")] {
+                let before = task_row_to_json(&store.get_task(id).await.unwrap().unwrap());
+                let result = handle_tasks_update(&serde_json::json!({
+                    "task_id":id, "assigned_to":dest, "description":"edited"
+                }), home.path(), RecordActor::Operator("healthy")).await;
+                if id == "same" && malformed {
+                    assert_eq!(result["isError"], true, "{result}");
+                    assert!(result["content"][0]["text"].as_str().unwrap().contains("agent_config_unreadable"));
+                    assert_eq!(task_row_to_json(&store.get_task(id).await.unwrap().unwrap()), before);
+                    continue;
+                }
+                assert_ne!(result["isError"], true, "{result}");
+                let saved = store.get_task(id).await.unwrap().unwrap();
+                assert_eq!(saved.assigned_to, dest);
+                assert_eq!(saved.description, "edited");
+            }
+            std::fs::write(path, healthy).unwrap();
+            let result = handle_tasks_update(&serde_json::json!({
+                "task_id":"same", "assigned_to":"worker", "description":"healthy edit"
+            }), home.path(), RecordActor::Operator("worker")).await;
+            assert_ne!(result["isError"], true, "{result}");
+            let saved = store.get_task("same").await.unwrap().unwrap();
+            assert_eq!(saved.assigned_to, "worker");
+            assert_eq!(saved.description, "healthy edit");
+            let result = handle_tasks_update(&serde_json::json!({"task_id":"to", "assigned_to":"worker"}),
+                home.path(), RecordActor::Operator("worker")).await;
+            assert_ne!(result["isError"], true, "{result}");
+            assert_eq!(store.get_task("to").await.unwrap().unwrap().assigned_to, "worker");
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_non_employee_claim_needs_no_employee_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        let actor = RecordActor::Operator("external-key");
+        assert!(actor.agent().is_none());
+        assert!(!home.path().join("agents/external-key").exists());
+        for status in ["todo", "pending"] {
+            let mut row = duduclaw_gateway::task_store::TaskRow::new(
+                status.into(), "work".into(), String::new(), "medium".into(),
+                String::new(), "system".into(),
+            );
+            row.status = status.into();
+            store.insert_task(&row).await.unwrap();
+            let result = handle_tasks_claim(&serde_json::json!({"task_id":status}), home.path(), actor).await;
+            assert_ne!(result["isError"], true, "{result}");
+            let saved = store.get_task(status).await.unwrap().unwrap();
+            assert_eq!(saved.assigned_to, "external-key");
+            assert_eq!(saved.status, "in_progress");
+            if status == "pending" {
+                assert_eq!(saved.claimed_by.as_deref(), Some("external-key"));
+            }
+        }
+        assert!(!home.path().join("agents/external-key").exists());
+    }
+
+    #[tokio::test]
+    async fn goals_board_tasks_and_schedules_refuse_broken_target_settings() {
+        for broken in ["[model", "[agent]\nname='worker'\nstatus='active'\n[model]\npreferred='gpt-5.4'\n[runtime]\nprovider='grok'\n"] {
+            let home = tempfile::tempdir().unwrap();
+            super::super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
+            std::fs::write(home.path().join("agents/worker/agent.toml"), broken).unwrap();
+            for args in [
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"goal", "plan_first":true}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task"}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task", "schedule":"0 9 * * 1"}),
+                serde_json::json!({"title":"work", "assigned_to":"worker", "kind":"task", "schedule":"2099-01-01T09:00:00Z"}),
+            ] {
+                let reply = handle_tasks_create(&args, home.path(), RecordActor::Operator("worker")).await;
+                assert_eq!(reply["isError"], true, "{reply}");
+                let text = reply["content"][0]["text"].as_str().unwrap();
+                assert!(text.starts_with("Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.\n"), "{text}");
+                assert!(text.contains("agent_config_unreadable") || text.contains("model_provider_mismatch"), "{text}");
+                assert!(!text.contains("agent.toml"), "{text}");
+                assert!(!home.path().join("tasks.db").exists());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod implicit_entry_regression_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn existing_implicit_operator_employee_is_gated() {
+        let home = tempfile::tempdir().unwrap();
+        super::super::tests::create_test_agent(&home.path().join("agents"), "worker", "");
+        let path = home.path().join("agents/worker/agent.toml");
+        let healthy = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, healthy.replace("claude-sonnet-4-6", "gpt-5.4")).unwrap();
+        let reply = handle_tasks_create(&serde_json::json!({"title":"work"}), home.path(), RecordActor::Operator("worker")).await;
+        assert_eq!(reply["isError"], true);
+        assert!(reply["content"][0]["text"].as_str().unwrap().contains("model_provider_mismatch"));
+        assert!(!home.path().join("tasks.db").exists());
     }
 }

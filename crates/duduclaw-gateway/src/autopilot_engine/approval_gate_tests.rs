@@ -71,6 +71,12 @@ impl Harness {
     async fn insert_rule(&self, id: &str, action: Value) {
         self.store
             .insert_rule(&AutopilotRuleRow {
+                active_window: None,
+                run_policy: None,
+                owner_department: None,
+                created_by_user_id: None,
+                updated_by_user_id: None,
+                updated_at: None,
                 id: id.into(),
                 name: format!("rule {id}"),
                 enabled: true,
@@ -1088,6 +1094,12 @@ async fn a_forged_security_event_row_is_ignored() {
     let h = Harness::new();
     h.store
         .insert_rule(&AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "sec".into(),
             name: "on security".into(),
             enabled: true,
@@ -1178,4 +1190,42 @@ fn approved_actions_expire_after_the_execution_window() {
     assert!(!approval_gate::decided_within_window(&rec, now), "unparseable fails closed");
     rec.decided_at = None;
     assert!(!approval_gate::decided_within_window(&rec, now));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn outside_window_skips_before_other_gates_without_counting() {
+    use chrono::Datelike;
+    use crate::autopilot_store::RuleExtensionsPatch;
+
+    let h = Harness::new();
+    h.insert_rule("windowed", json!({
+        "type": "steps",
+        "steps": [{"type": "notify", "message": "must not run"}]
+    })).await;
+    let today = chrono::Utc::now().weekday().number_from_monday() as u8;
+    // Exclude today and tomorrow so even a midnight rollover cannot admit it.
+    let excluded_tomorrow = today % 7 + 1;
+    let day = (1u8..=7).find(|d| *d != today && *d != excluded_tomorrow).unwrap();
+    let rule = h.store.set_rule_extensions("windowed", &RuleExtensionsPatch {
+        active_window: Some(Some(json!({
+            "days": [day], "start": "00:00", "end": "23:59", "timezone": "UTC"
+        }).to_string())),
+        run_policy: None,
+        owner_department: None,
+        updated_by_user_id: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }).await.unwrap().unwrap();
+    let engine = h.engine(true);
+    engine.process_event(&task_created("window test")).await.unwrap();
+    let history = h.store.list_history(Some("windowed"), 100).await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].result, "outside_window");
+    assert!(history[0].details.as_deref().unwrap().contains("本次不執行"));
+    let saved = h.store.get_rule("windowed").await.unwrap().unwrap();
+    assert_eq!(saved.trigger_count, rule.trigger_count);
+    assert_eq!(saved.last_triggered_at, rule.last_triggered_at);
+    assert!(h.queued().await.is_empty());
+    assert!(h.cards().await.is_empty());
+    assert!(engine.circuit.lock().await.is_empty());
+    assert!(h.store.list_runs_for_rule("windowed", 100).await.unwrap().is_empty());
 }

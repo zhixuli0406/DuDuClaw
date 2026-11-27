@@ -58,7 +58,7 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
         sid,
         conv_nonce,
         content,
-        attachments,
+        mut attachments,
         assign_event,
         resume_acl: _,
         arrival_seq,
@@ -76,6 +76,15 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
     if let Err(frame) = state.authorize_turn(&auth_user, target, true).await {
         sink.frame(frame).await;
         return;
+    }
+    // Recheck after the FIFO wait, before attachments or accepted work.
+    if let Err(text) = crate::webchat::entry::check(
+        &state, &auth_user, effective_agent_id, sid, &user_id,
+        &content, !attachments.is_empty(), &ticket.id,
+    ).await {
+        sink.frame(ChatMessage::error(&text)).await;
+        if attachments.is_empty() || !crate::webchat::entry::continues_without_files(&content) { return; }
+        attachments.clear();
     }
     // Persist any uploaded files and append path references
     // to the prompt — the agent (Claude CLI) reads them from
@@ -191,10 +200,9 @@ pub(super) async fn run(input: TurnInput, mut sink: TurnSink, ticket: &Ticket) {
                 crate::chat_commands::ChatCommand::Assign(assign_cmd) => {
                     let ac =
                         caller.assign_caller(&state.ctx.home_dir, sid, Some(effective_agent_id));
-                    let r = Box::pin(crate::trigger_route::assign::run(
+                    let r = principal.scope(auth_user.clone(), Box::pin(crate::trigger_route::assign::run(
                         &state.ctx, assign_cmd, &ac,
-                    ))
-                    .await;
+                    ))).await;
                     (r.text, r.task)
                 }
                 crate::chat_commands::ChatCommand::Rules { .. } => (
@@ -974,3 +982,7 @@ mod model_frame_tests {
         assert_eq!(frames[0]["type"], "assistant_done");
     }
 }
+
+#[cfg(test)]
+#[path = "run_entry_tests.rs"]
+mod entry_tests;

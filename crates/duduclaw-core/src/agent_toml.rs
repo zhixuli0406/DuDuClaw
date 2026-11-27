@@ -90,6 +90,8 @@ pub struct ModelSectionView {
     #[serde(deserialize_with = "crate::lenient::opt")]
     pub preferred: Option<String>,
     #[serde(deserialize_with = "crate::lenient::opt")]
+    pub fallback: Option<String>,
+    #[serde(deserialize_with = "crate::lenient::opt")]
     pub utility: Option<String>,
     #[serde(deserialize_with = "crate::lenient::string_vec")]
     pub fallbacks: Vec<String>,
@@ -982,6 +984,7 @@ model = \"gpt-5.5\"
         let view = parse(&text).model;
         assert_eq!(view.preferred.as_deref(), Some(full_cfg.model.preferred.as_str()));
         assert_eq!(view.utility.as_deref(), Some(full_cfg.model.utility.as_str()));
+        assert_eq!(view.fallback.as_deref(), Some(full_cfg.model.fallback.as_str()));
         assert_eq!(view.fallbacks, full_cfg.model.fallbacks);
         assert_eq!(view.standard, full_cfg.model.standard);
         assert_eq!(view.delegation_routing, full_cfg.model.delegation_routing);
@@ -1562,5 +1565,324 @@ max_branches = "many"
         assert_eq!(back.capabilities.scoped_tools, vec!["a".to_string(), "b".to_string()]);
         assert_eq!(back.memory.decision_ttl_days, Some(3));
         assert_eq!(back.model.standard.as_deref(), Some("mid"));
+    }
+}
+
+/// Shared employee authority rules for dashboard edits and AI MCP edits.
+/// Runtime-policy overlays remain with the gateway; the MCP tool has no runtime writer.
+pub mod authority {
+    use serde_json::{json, Value};
+
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ProtectedChange {
+        pub key: String,
+        pub before: Value,
+        pub after: Value,
+    }
+
+    fn toml_at_json(table: &toml::Table, path: &str) -> Value {
+        let mut segments = path.split('.');
+        let mut value = segments.next().and_then(|key| table.get(key));
+        for key in segments {
+            value = value.and_then(|v| v.as_table()).and_then(|t| t.get(key));
+        }
+        value.and_then(|v| serde_json::to_value(v).ok()).unwrap_or(Value::Null)
+    }
+
+    /// What counts as a change that needs an admin.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AuthorityKind {
+        /// Any change of the effective value.
+        Change,
+        /// Only loosening: raising a budget cap (0 = no cap) or turning
+        /// `hard_stop` off. Tightening stays open to the Owner.
+        Loosen,
+        /// Becoming, or ceasing to be, `role = "main"`.
+        RoleMain,
+        /// `[google]`: whose Google account the employee acts as. The Owner may
+        /// only narrow — switch to `none`, drop `fallback = "home"`, or tighten
+        /// `requesters`; any other change needs an admin.
+        GoogleNarrow,
+    }
+
+    impl AuthorityKind {
+        #[cfg_attr(not(test), allow(dead_code))]
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Change => "change",
+                Self::Loosen => "loosen",
+                Self::RoleMain => "role_main",
+                Self::GoogleNarrow => "google_narrow",
+            }
+        }
+    }
+
+    /// One admin-only field: its TOML path (a whole table when it names one),
+    /// the dashboard form dirty-paths that edit it (a trailing `.` is a prefix),
+    /// and what counts as a change.
+    #[derive(Debug, Clone, Copy)]
+    pub struct AuthorityKey {
+        pub toml_key: &'static str,
+        pub form_paths: &'static [&'static str],
+        pub kind: AuthorityKind,
+    }
+
+    const fn key(toml_key: &'static str, form_paths: &'static [&'static str], kind: AuthorityKind) -> AuthorityKey {
+        AuthorityKey { toml_key, form_paths, kind }
+    }
+
+    use AuthorityKind::{Change, GoogleNarrow, Loosen, RoleMain};
+
+    /// Every admin-only field. Keep in sync with the fixture (a test enforces it).
+    pub const AUTHORITY: &[AuthorityKey] = &[
+        key("agent.reports_to", &["form.reports_to"], Change),
+        key("agent.department", &["form.department"], Change),
+        key("agent.name", &[], Change),
+        // `main` decides shared-wiki deletion and default dispatch.
+        key("agent.role", &["form.role"], RoleMain),
+        key("capabilities", &["caps."], Change),
+        key("container.sandbox_enabled", &["form.sandbox_enabled"], Change),
+        key("container.network_access", &["form.network_access"], Change),
+        // Not written by the form any more; listed so it cannot come back unguarded.
+        key("container.readonly_project", &[], Change),
+        key("permissions.can_modify_own_soul", &["form.can_modify_own_soul"], Change),
+        // v1.68: enforced at the MCP gate, so they are authority too.
+        key("permissions.can_create_agents", &["form.can_create_agents"], Change),
+        key("permissions.can_send_cross_agent", &["form.can_send_cross_agent"], Change),
+        key("permissions.can_schedule_tasks", &["form.can_schedule_tasks"], Change),
+        key("permissions.can_modify_own_skills", &["form.can_modify_own_skills"], Change),
+        // Which channels the employee may answer on.
+        key("permissions.allowed_channels", &[], Change),
+        key("guardrails.enabled", &["v.guardrails_enabled"], Change),
+        key("guardrails.block_secrets", &["v.guardrails_block_secrets"], Change),
+        // v1.76: opens the employee to `@` calls from unmapped channel senders.
+        key("channels.public_trigger", &["v.public_trigger"], Change),
+        // A per-employee bot token connects a new outside channel
+        // (`channels.add` is admin-only).
+        key("channels.discord", &[], Change),
+        key("channels.telegram", &[], Change),
+        key("channels.slack", &[], Change),
+        // B11: an employee's own Google Chat app (an organisation cloud
+        // credential and a new inbound endpoint).
+        key("channels.googlechat", &[], Change),
+        // ERP models, actions, companies and credentials
+        // (`odoo.agent_config_set` is admin-only).
+        key("odoo", &["odoo."], Change),
+        // The runtime decides the sandbox and the tool semantics.
+        key("runtime.provider", &["runtime.provider"], Change),
+        key("runtime.fallback", &["runtime.fallback"], Change),
+        // RM-205: which outside service receives the employee's conversation
+        // text for background work.
+        key("runtime.utility_provider", &["runtime.utility_provider"], Change),
+        key("runtime.idle_timeout_secs", &["runtime.idle_timeout_secs"], Loosen),
+        key("runtime.timeout_secs", &["runtime.timeout_secs"], Loosen),
+        key("runtime.max_turns", &["runtime.max_turns"], Loosen),
+        // `--bare` skips the hooks, the employee file guard included.
+        key("prompt.cli_bare_mode", &[], Change),
+        key("prompt.reply_language", &["form.reply_language"], Change),
+        key("memory.language", &["form.memory_language", "memory.language"], Change),
+        // Widens what the employee watches on the machine.
+        key("os_watch", &["osWatch."], Change),
+        // Which accounts' quota the employee spends.
+        key("model.account_pool", &["adv.account_pool"], Change),
+        key("budget.monthly_limit_cents", &["form.monthly_limit_cents"], Loosen),
+        key("budget.daily_cap_cents", &["v.daily_cap_cents"], Loosen),
+        key("budget.when_unavailable", &["form.when_unavailable"], Loosen),
+        key("budget.hard_stop", &["form.hard_stop"], Loosen),
+        // Whose Google account the employee acts as (a colleague's mailbox).
+        key("google", &["form.google."], GoogleNarrow),
+        // Protected mode: whether the issuer grants the public-web tools (owner
+        // decision 2026-11-08, separate from `container.network_access`).
+        key("isolation.public_web", &[], Change),
+    ];
+
+    /// The effective value of an authority key: an absent key reads as the value
+    /// the loader would use, so writing an explicit default over an absent key
+    /// is not a change.
+    fn effective(table: &toml::Table, key: &str) -> Value {
+        let raw = toml_at_json(table, key);
+        let or = |v: Value| if raw.is_null() { v } else { raw.clone() };
+        match key {
+            "agent.reports_to" | "agent.department" | "agent.name" | "agent.role" | "runtime.fallback"
+            | "runtime.utility_provider" => {
+                or(Value::String(String::new()))
+            }
+            "runtime.idle_timeout_secs" => json!(raw.as_i64().filter(|n| *n >= 0).unwrap_or(900)),
+            "runtime.max_turns" => json!(raw.as_i64().filter(|n| *n > 0).unwrap_or(50)),
+            "runtime.timeout_secs" => json!(raw.as_i64().map(|v| v.clamp(30, 14_400)).unwrap_or(300)),
+            "runtime.provider" => or(Value::String(crate::types::RuntimeType::default().as_str().into())),
+            "container.sandbox_enabled"
+            | "container.network_access"
+            | "permissions.can_modify_own_soul"
+            | "guardrails.enabled"
+            | "channels.public_trigger"
+            | "prompt.cli_bare_mode"
+            | "isolation.public_web"
+            | "budget.hard_stop" => or(Value::Bool(false)),
+            // v1.81 (S2): what the MCP gate enforces — an absent (or
+            // wrong-typed) key resolves by role, `true` only for `main`. Reading
+            // it as `true` let a non-admin Owner write an explicit `true` on a
+            // non-main employee as "no change", past this check.
+            "permissions.can_create_agents" => {
+                let role = toml_at_json(table, "agent.role");
+                Value::Bool(crate::agent_toml::effective_can_create_agents(
+                    raw.as_bool(),
+                    role.as_str(),
+                ))
+            }
+            // Absent ⇒ allowed (the gate refuses only an explicit `false`);
+            // `block_secrets` defaults on.
+            "permissions.can_send_cross_agent"
+            | "permissions.can_schedule_tasks"
+            | "permissions.can_modify_own_skills"
+            | "guardrails.block_secrets" => or(Value::Bool(true)),
+            "model.account_pool" | "permissions.allowed_channels" => or(json!([])),
+            "budget.when_unavailable" => json!(match raw.as_str() {
+                None if raw.is_null() => "allow",
+                Some("allow") => "allow",
+                _ => "deny",
+            }),
+            "budget.monthly_limit_cents" | "budget.daily_cap_cents" => or(json!(0)),
+            "capabilities" => if raw.is_null() { json!({}) } else { raw },
+            // Whole tables: an empty table is the same as none.
+            _ => match raw {
+                Value::Object(o) if o.is_empty() => Value::Null,
+                v => v,
+            },
+        }
+    }
+
+    /// A budget cap where 0 means "no cap": is `after` looser than `before`?
+    fn cap_loosened(before: &Value, after: &Value) -> bool {
+        let b = before.as_u64().unwrap_or(0);
+        let a = after.as_u64().unwrap_or(0);
+        b > 0 && (a == 0 || a > b)
+    }
+
+    fn needs_admin(k: &AuthorityKey, before: &Value, after: &Value) -> bool {
+        if before == after {
+            return false;
+        }
+        match k.kind {
+            Change if k.toml_key == "capabilities" => !capability_changes(before, after).is_empty(),
+            Change => true,
+            RoleMain => (before.as_str() == Some("main")) != (after.as_str() == Some("main")),
+            Loosen if k.toml_key == "budget.when_unavailable" => {
+                before.as_str() == Some("deny") && after.as_str() == Some("allow")
+            }
+            Loosen if k.toml_key == "budget.hard_stop" => {
+                before.as_bool() == Some(true) && after.as_bool() != Some(true)
+            }
+            Loosen if k.toml_key == "runtime.idle_timeout_secs" => after != before && (after.as_u64() == Some(0) || (before.as_u64() != Some(0) && after.as_u64() > before.as_u64())),
+            Loosen if matches!(k.toml_key, "runtime.timeout_secs" | "runtime.max_turns") => after.as_u64() > before.as_u64(),
+            Loosen => cap_loosened(before, after),
+            GoogleNarrow => !google_only_narrows(before, after),
+        }
+    }
+
+    /// `[google]` before/after (JSON of the table, `null` when absent): true
+    /// when the change only narrows what the employee can reach.
+    fn google_only_narrows(before: &Value, after: &Value) -> bool {
+        use crate::google_identity::{AgentGoogleSection, Fallback, section_from_table};
+        let read = |v: &Value| -> Option<AgentGoogleSection> {
+            if v.is_null() {
+                return Some(AgentGoogleSection::default());
+            }
+            let table: toml::Table = serde_json::from_value(v.clone()).ok()?;
+            section_from_table(&table).ok()
+        };
+        let (Some(b), Some(a)) = (read(before), read(after)) else { return false };
+        let identity_ok = a.identity == b.identity
+            || a.identity == Some(crate::google_identity::Selector::None);
+        let fallback_ok = a.fallback == b.fallback || a.fallback == Fallback::None;
+        identity_ok && fallback_ok && a.requesters >= b.requesters
+    }
+
+
+    /// Compare only changes proven to narrow authority. Unknown fields and complex
+    /// policies have no monotonic rule and remain administrator-only.
+    fn capability_changes(before: &Value, after: &Value) -> Vec<ProtectedChange> {
+        let defaults = match serde_json::to_value(crate::types::CapabilitiesConfig::default()) {
+            Ok(defaults) => defaults,
+            Err(_) => return vec![ProtectedChange {
+                key: "capabilities".into(), before: before.clone(), after: after.clone(),
+            }],
+        };
+        let keys: std::collections::BTreeSet<&str> = before.as_object().into_iter()
+            .flat_map(|o| o.keys().map(String::as_str))
+            .chain(after.as_object().into_iter().flat_map(|o| o.keys().map(String::as_str)))
+            .collect();
+        let empty = json!([]);
+        let null = Value::Null;
+        let read = |table: &Value, key: &str| {
+            table.get(key).or_else(|| defaults.get(key)).unwrap_or_else(|| {
+                match key {
+                    "db_sources" | "scoped_tools" | "approval_required_tools"
+                    | "irreversible_tools" | "maybe_irreversible_tools" => &empty,
+                    _ => &null,
+                }
+            }).clone()
+        };
+        let strings = |v: &Value| -> Option<Vec<String>> {
+            v.as_array()?.iter().map(|v| v.as_str().map(str::to_owned)).collect()
+        };
+        let subset = |a: &Value, b: &Value| -> bool {
+            match (strings(a), strings(b)) {
+                (Some(a), Some(b)) => a.iter().all(|id| b.contains(id)),
+                _ => false,
+            }
+        };
+        keys.into_iter().filter_map(|key| {
+            let (b, a) = (read(before, key), read(after, key));
+            if b == a { return None; }
+            let narrows = match key {
+                "computer_use" | "browser_via_bash" | "os_native" | "recording"
+                | "git_credentials" | "system_operator" | "codrive" => {
+                    b.as_bool() == Some(true) && a.as_bool() == Some(false)
+                }
+                "native_sandbox" => b.as_bool() == Some(false) && a.as_bool() == Some(true),
+                "auto_approve_install" => a.as_bool() == Some(false),
+                "db_sources" => subset(&a, &b),
+                // Empty uses the runtime's curated defaults, which are not the
+                // same set as any explicit list. Do not guess across that boundary.
+                "allowed_tools" => a.as_array().is_some_and(|a| !a.is_empty()) && subset(&a, &b),
+                "denied_tools" | "scoped_tools" | "approval_required_tools"
+                | "irreversible_tools" | "maybe_irreversible_tools" => subset(&b, &a),
+                "wiki_visible_to" => strings(&a).is_some() &&
+                    (strings(&b).is_some_and(|b| b.iter().any(|id| id == "*")) || subset(&a, &b)),
+                _ => false,
+            };
+            (!narrows).then(|| ProtectedChange {
+                key: format!("capabilities.{key}"), before: b, after: a,
+            })
+        }).collect()
+    }
+
+    /// Every change requiring an administrator, based on the effective artifact.
+    pub fn authority_diff(before: &toml::Table, after: &toml::Table) -> Vec<ProtectedChange> {
+        let mut changes = Vec::new();
+        for k in AUTHORITY {
+            let (b, a) = (effective(before, k.toml_key), effective(after, k.toml_key));
+            if k.toml_key == "capabilities" {
+                // Invalid sections cannot establish a baseline for a grant.
+                let invalid = |t: &toml::Table| t.get("capabilities").is_some_and(|v| !v.is_table());
+                if invalid(before) || invalid(after) {
+                    if before.get("capabilities") != after.get("capabilities") {
+                        changes.push(ProtectedChange { key: k.toml_key.into(), before: b, after: a });
+                    }
+                } else {
+                    changes.extend(capability_changes(&b, &a));
+                }
+            } else if needs_admin(k, &b, &a) {
+                changes.push(ProtectedChange { key: k.toml_key.into(), before: b, after: a });
+            }
+        }
+        changes
+    }
+
+    /// Conservative form paths: value-dependent narrowing is checked server-side.
+    pub fn admin_only_form_paths() -> Vec<&'static str> {
+        AUTHORITY.iter().filter(|k| k.kind == Change)
+            .flat_map(|k| k.form_paths.iter().copied()).collect()
     }
 }

@@ -47,6 +47,7 @@ fn has(granted: &[String], candidates: &[&str]) -> bool {
 }
 
 pub fn permitted(tool: &str, granted: &[String]) -> bool {
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) { return false; }
     match tool {
         "google_chat_send" => has(granted, &["https://www.googleapis.com/auth/chat.messages.create", "https://www.googleapis.com/auth/chat.messages"]),
         "google_chat_spaces" => has(granted, &["https://www.googleapis.com/auth/chat.spaces.readonly"]),
@@ -121,7 +122,7 @@ pub fn permitted(tool: &str, granted: &[String]) -> bool {
             granted,
             &[
                 "https://www.googleapis.com/auth/drive.readonly",
-                "https://www.googleapis.com/auth/drive",
+                super::oauth::DRIVE_WRITE_SCOPE,
             ],
         ),
         "docs_read" => has(
@@ -177,7 +178,10 @@ mod native_write_scope_tests {
             assert!(!permitted(tool, &[format!("https://www.googleapis.com/auth/{service}.readonly")]), "{tool}");
         }
         for tool in duduclaw_core::google_identity::NATIVE_GOOGLE_TOOLS {
-            if *tool != "google_status" {
+            if duduclaw_core::google_identity::is_drive_write_tool(tool) {
+                assert!(!token_tool(tool));
+                assert!(!permitted(tool, &[crate::google_personal::oauth::DRIVE_WRITE_SCOPE.to_owned()]));
+            } else if *tool != "google_status" {
                 assert!(token_tool(tool), "missing personal scope table entry: {tool}");
                 assert!(permitted(tool, &crate::google_workspace::REQUIRED_SCOPES.iter()
                     .chain(crate::google_workspace::CHAT_READ_SCOPES.iter()).chain(crate::google_workspace::CHAT_SEND_SCOPES.iter()).map(|s| s.to_string()).collect::<Vec<_>>()), "{tool}");

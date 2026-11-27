@@ -774,3 +774,10 @@ fn session_administration_requires_admin_scope() {
         assert_eq!(tool_requires_scope(method), Some(Scope::Admin));
     }
 }
+
+#[test]
+fn drive_write_tools_require_explicit_write_scope() {
+    for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        assert_eq!(tool_requires_scope(tool), Some(Scope::GoogleWrite), "{tool}");
+    }
+}
