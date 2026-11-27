@@ -12,8 +12,9 @@ fn fixture() -> (tempfile::TempDir, Arc<UserDb>, UserContext) {
     (home, db, ctx)
 }
 
-fn params(enabled: bool) -> Value {
-    json!({"enabled": enabled, "channels": ["telegram", "googlechat"],
+fn params(home: &Path, enabled: bool) -> Value {
+    let text = std::fs::read_to_string(home.join("config.toml")).unwrap_or_default();
+    json!({"expected_hash": config_commit::content_hash(&text), "enabled": enabled, "channels": ["telegram", "googlechat"],
         "step_up_methods": ["web"], "card_valid_hours": 168, "step_up_exempt_kinds": []})
 }
 
@@ -53,10 +54,10 @@ async fn enabling_requires_ack_and_jwt_but_no_password_or_totp() {
     let (home, db, ctx) = fixture();
     let handler = handler(home.path(), db.clone()).await;
     let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
-    assert!(!ok(&call(&handler, &ctx, "approvals.chat_admin.set", params(true)).await));
+    assert!(!ok(&call(&handler, &ctx, "approvals.chat_admin.set", params(home.path(), true)).await));
     assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
     assert_eq!(db.mfa_factors(&ctx.user_id).unwrap()["factors"]["totp"], false);
-    let mut value = params(true);
+    let mut value = params(home.path(), true);
     value["acknowledge_risk"] = json!(true);
     let response = payload(call(&handler, &ctx, "approvals.chat_admin.set", value).await);
     assert_eq!(response["success"], true);
@@ -75,7 +76,7 @@ async fn enabling_requires_ack_and_jwt_but_no_password_or_totp() {
 #[test]
 fn exemptions_need_exact_ack_and_rechecking_is_audited() {
     let (home, db, ctx) = fixture();
-    let mut value = params(false);
+    let mut value = params(home.path(), false);
     value["step_up_exempt_kinds"] = json!(["cli_egress", "org_change"]);
     let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
     assert!(write(home.path(), &db, &ctx, value.clone()).is_err());
@@ -88,16 +89,29 @@ fn exemptions_need_exact_ack_and_rechecking_is_audited() {
     value["acknowledge_exempt_risk"] = json!(["org_change", "cli_egress"]);
     write(home.path(), &db, &ctx, value).unwrap();
     let rows = audits(home.path());
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["details"]["phase"], "intent");
+    assert_eq!(rows[1]["details"]["phase"], "committed");
+    let change_id = rows[0]["details"]["change_id"].as_str().unwrap();
+    assert!(uuid::Uuid::parse_str(change_id).is_ok());
+    assert_eq!(rows[1]["details"]["change_id"], change_id);
+    let mut committed = rows[1]["details"].clone();
+    committed["phase"] = json!("intent");
+    assert_eq!(committed, rows[0]["details"]);
     assert_eq!(rows[0]["details"]["by"], ctx.user_id);
     assert_eq!(rows[0]["details"]["newly_exempted"], json!(["cli_egress", "org_change"]));
     assert_eq!(rows[0]["details"]["before"]["step_up_exempt_kinds"], json!([]));
     assert_eq!(rows[0]["details"]["after"]["step_up_exempt_kinds"], json!(["cli_egress", "org_change"]));
     assert!(chrono::DateTime::parse_from_rfc3339(rows[0]["details"]["at"].as_str().unwrap()).is_ok());
-    write(home.path(), &db, &ctx, params(false)).unwrap();
+    write(home.path(), &db, &ctx, params(home.path(), false)).unwrap();
     let rows = audits(home.path());
-    assert_eq!(rows[1]["details"]["newly_required"], json!(["cli_egress", "org_change"]));
-    assert_eq!(rows[1]["details"]["newly_exempted"], json!([]));
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[2]["details"]["phase"], "intent");
+    assert_eq!(rows[3]["details"]["phase"], "committed");
+    assert_eq!(rows[2]["details"]["change_id"], rows[3]["details"]["change_id"]);
+    assert_ne!(rows[0]["details"]["change_id"], rows[2]["details"]["change_id"]);
+    assert_eq!(rows[3]["details"]["newly_required"], json!(["cli_egress", "org_change"]));
+    assert_eq!(rows[3]["details"]["newly_exempted"], json!([]));
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
     assert!(audit.contains("config_changed"));
     assert!(!audit.contains("secret-canary"));
@@ -118,15 +132,15 @@ fn strict_fields_channels_methods_and_t2_values() {
         ("acknowledge_risk", Value::Null), ("acknowledge_exempt_risk", json!(true)),
         ("expected_hash", Value::Null),
     ] {
-        let mut value = params(false);
+        let mut value = params(home.path(), false);
         value[key] = invalid;
         assert!(write(home.path(), &db, &ctx, value).is_err(), "{key}");
     }
-    let mut value = params(true);
+    let mut value = params(home.path(), true);
     value["acknowledge_risk"] = json!(true);
     value["channels"] = json!([]);
     assert!(write(home.path(), &db, &ctx, value).is_err());
-    let mut valid = params(false);
+    let mut valid = params(home.path(), false);
     valid["step_up_methods"] = json!(["web", "dm_totp"]);
     write(home.path(), &db, &ctx, valid).unwrap();
 }
@@ -145,29 +159,29 @@ fn unreadable_config_get_is_off_all_required_and_set_never_overwrites() {
         assert_eq!(view["hash"], Value::Null);
         assert_eq!(view["kinds"].as_array().unwrap().len(), STEP_UP_KIND_KEYS.len());
         assert!(view["kinds"].as_array().unwrap().iter().all(|k| k["step_up_required"] == true));
-        assert!(write(home.path(), &db, &ctx, params(false)).is_err());
+        assert!(write(home.path(), &db, &ctx, params(home.path(), false)).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), broken);
     }
     std::fs::remove_file(&path).unwrap();
     assert_eq!(get(home.path(), &db, &[]).unwrap()["readable"], false);
-    assert!(write(home.path(), &db, &ctx, params(false)).is_err());
+    assert!(write(home.path(), &db, &ctx, params(home.path(), false)).is_err());
     assert!(!path.exists());
     std::fs::create_dir(&path).unwrap();
     assert_eq!(get(home.path(), &db, &[]).unwrap()["readable"], false);
-    assert!(write(home.path(), &db, &ctx, params(false)).is_err());
+    assert!(write(home.path(), &db, &ctx, params(home.path(), false)).is_err());
 }
 
 #[test]
 fn disabling_sweeps_after_durable_write_removes_ack_and_preserves_siblings() {
     let (home, db, ctx) = fixture();
-    let mut value = params(true);
+    let mut value = params(home.path(), true);
     value["acknowledge_risk"] = json!(true);
     write(home.path(), &db, &ctx, value).unwrap();
     let ack = read(home.path()).unwrap().2.enabled_ack;
-    write(home.path(), &db, &ctx, params(true)).unwrap();
+    write(home.path(), &db, &ctx, params(home.path(), true)).unwrap();
     assert_eq!(read(home.path()).unwrap().2.enabled_ack, ack);
     let swept = std::cell::Cell::new(false);
-    set(home.path(), &db, &ctx, request(params(false)).unwrap(), || {
+    set(home.path(), &db, &ctx, request(params(home.path(), false)).unwrap(), || {
         let (_, table, cfg) = read(home.path()).unwrap();
         assert!(!cfg.enabled);
         assert!(cfg.enabled_ack.is_none());
@@ -183,10 +197,40 @@ fn disabling_sweeps_after_durable_write_removes_ack_and_preserves_siblings() {
 }
 
 #[test]
+fn intent_failure_refuses_enable_and_exemption_without_config_write_or_sweep() {
+    let (home, db, ctx) = fixture();
+    let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    // A directory at the log path reliably rejects appends, including as root.
+    std::fs::create_dir(home.path().join("security_audit.jsonl")).unwrap();
+    for enabled in [false, true] {
+        let mut value = params(home.path(), enabled);
+        value["acknowledge_risk"] = json!(true);
+        value["step_up_exempt_kinds"] = json!(["cli_egress"]);
+        value["acknowledge_exempt_risk"] = json!(["cli_egress"]);
+        let error = set(home.path(), &db, &ctx, request(value).unwrap(),
+            || panic!("must not sweep")).unwrap_err();
+        assert!(error.contains("設定未儲存"));
+        assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
+    }
+}
+
+#[test]
+fn missing_hash_refused_without_audit_or_config_write() {
+    let (home, db, ctx) = fixture();
+    let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+    let mut value = params(home.path(), false);
+    value.as_object_mut().unwrap().remove("expected_hash");
+    assert_eq!(write(home.path(), &db, &ctx, value).unwrap_err(),
+        "請重新整理設定頁面後再儲存。");
+    assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
+    assert!(!home.path().join("security_audit.jsonl").exists());
+}
+
+#[test]
 fn stale_hash_refused_without_audit_or_sweep() {
     let (home, db, ctx) = fixture();
     let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
-    let mut value = params(false);
+    let mut value = params(home.path(), false);
     value["expected_hash"] = json!("stale");
     assert!(set(home.path(), &db, &ctx, request(value).unwrap(), || panic!("must not sweep")).is_err());
     assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
@@ -197,7 +241,7 @@ fn stale_hash_refused_without_audit_or_sweep() {
 async fn only_live_admin_jwt_session_can_get_or_set() {
     let (home, db, ctx) = fixture();
     let handler = handler(home.path(), db.clone()).await;
-    for (method, value) in [("approvals.chat_admin.get", json!({})), ("approvals.chat_admin.set", params(false))] {
+    for (method, value) in [("approvals.chat_admin.get", json!({})), ("approvals.chat_admin.set", params(home.path(), false))] {
         assert_eq!(minimum_role(method), Some(UserRole::Admin));
         assert!(!ok(&handler.handle_chat_admin_settings_rpc(method, value.clone(), &ctx).await));
         for other in [UserContext::admin_fallback(),
@@ -216,7 +260,7 @@ async fn only_live_admin_jwt_session_can_get_or_set() {
     }).await;
     db.update_user(&ctx.user_id, None, Some(UserRole::Manager), None).unwrap();
     assert!(!ok(&call(&handler, &ctx, "approvals.chat_admin.get", json!({})).await));
-    assert!(!ok(&call(&handler, &ctx, "approvals.chat_admin.set", params(false)).await));
+    assert!(!ok(&call(&handler, &ctx, "approvals.chat_admin.set", params(home.path(), false)).await));
 }
 
 #[test]
@@ -252,7 +296,7 @@ fn status_and_get_do_not_count_removed_bot_proofs_and_report_unsupported_channel
 #[tokio::test]
 async fn generic_update_refused_in_all_representations_before_other_writes() {
     let (home, db, ctx) = fixture();
-    write(home.path(), &db, &ctx, params(false)).unwrap();
+    write(home.path(), &db, &ctx, params(home.path(), false)).unwrap();
     let handler = handler(home.path(), db.clone()).await;
     let original = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
     for value in [json!({"approval": {"chat_admin": {"enabled": true}}, "log_level": "debug"}),
@@ -275,8 +319,8 @@ fn ineffective_ack_requires_fresh_enable_acknowledgement() {
         uuid::Uuid::new_v4())] {
         std::fs::write(home.path().join("config.toml"), format!("[approval.chat_admin]\nenabled=true\n{ack}\n")).unwrap();
         assert_eq!(get(home.path(), &db, &[]).unwrap()["enabled"], false);
-        assert!(write(home.path(), &db, &ctx, params(true)).is_err());
-        let mut value = params(true);
+        assert!(write(home.path(), &db, &ctx, params(home.path(), true)).is_err());
+        let mut value = params(home.path(), true);
         value["acknowledge_risk"] = json!(true);
         write(home.path(), &db, &ctx, value).unwrap();
         assert!(config::effective(home.path(), Some(&db)).is_some());

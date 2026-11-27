@@ -192,7 +192,7 @@ fn get(home: &Path, db: &UserDb, agents: &[String]) -> Result<Value, String> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetRequest {
-    expected_hash: Option<String>,
+    expected_hash: String,
     enabled: bool,
     channels: Vec<String>,
     step_up_methods: Vec<String>,
@@ -203,6 +203,9 @@ struct SetRequest {
 }
 
 fn request(params: Value) -> Result<SetRequest, String> {
+    if params.as_object().is_some_and(|p| !p.contains_key("expected_hash")) {
+        return Err("請重新整理設定頁面後再儲存。".into());
+    }
     // Optional means omitted, not null or a coerced type.
     if params.as_object().is_none_or(|p| p.values().any(Value::is_null)) {
         return Err("聊天核准設定格式不正確。".into());
@@ -215,7 +218,7 @@ fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
     require_live(db, ctx)?;
     let (text, mut table, before) = read(home)?;
     let hash = config_commit::content_hash(&text);
-    if req.expected_hash.as_ref().is_some_and(|expected| expected != &hash) {
+    if req.expected_hash != hash {
         return Err("設定已變更，請重新整理後再試。".into());
     }
     if req.channels.iter().any(|c| !["telegram", "googlechat"].contains(&c.as_str()))
@@ -246,8 +249,16 @@ fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
         return Err("取消加強確認前，請逐項確認新增豁免的風險。".into());
     }
     config_commit::table_at_mut(&mut table, &["approval"])?.insert("chat_admin".into(), value);
+    let mut event = AuditEvent::new("approval_chat_admin_settings_changed", "dashboard", Severity::Warning,
+        json!({"phase": "intent", "change_id": uuid::Uuid::new_v4().to_string(),
+            "by": ctx.user_id, "at": chrono::Utc::now().to_rfc3339(),
+            "before": settings(&before), "after": settings(&after),
+            "newly_exempted": newly_exempted, "newly_required": newly_required}));
+    // Fail closed: durable audit intent must precede any config publication.
+    duduclaw_security::audit::try_append_audit_event(home, &event)
+        .map_err(|_| "稽核紀錄寫入失敗，設定未儲存，請聯絡管理員。")?;
     let mut saved_hash = String::new();
-    config_commit::commit_rendered_locked(&home.join("config.toml"), &hash, |current| {
+    let published = config_commit::commit_rendered_locked(&home.join("config.toml"), &hash, |current| {
         require_live(db, ctx)?;
         // Check again under the commit lock. Never bless a missing file as empty.
         if !home.join("config.toml").is_file() { return Err(UNREADABLE.into()); }
@@ -257,16 +268,18 @@ fn set(home: &Path, db: &UserDb, ctx: &UserContext, req: SetRequest,
         if parsed != after { return Err(UNREADABLE.into()); }
         saved_hash = config_commit::content_hash(&rendered);
         Ok(rendered)
-    })?;
+    });
+    if let Err(error) = published {
+        event.details["phase"] = json!("aborted");
+        let _ = duduclaw_security::audit::try_append_audit_event(home, &event);
+        return Err(error);
+    }
     // Schedule immediately after durable publication, even if auditing fails.
     if !after.enabled { sweep(); }
     duduclaw_security::audit::log_config_changed(home, &ctx.email, "admin",
         &["approval.chat_admin".into()]);
     crate::security_autopilot::emit_config_changed();
-    let event = AuditEvent::new("approval_chat_admin_settings_changed", "dashboard", Severity::Warning,
-        json!({"by": ctx.user_id, "at": chrono::Utc::now().to_rfc3339(),
-            "before": settings(&before), "after": settings(&after),
-            "newly_exempted": newly_exempted, "newly_required": newly_required}));
+    event.details["phase"] = json!("committed");
     duduclaw_security::audit::try_append_audit_event(home, &event)
         .map_err(|_| "設定已儲存，但稽核紀錄寫入失敗，請重新整理並聯絡管理員。")?;
     crate::security_autopilot::emit_security_autopilot_event(&event.severity, &event.event_type,
