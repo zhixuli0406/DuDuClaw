@@ -2,7 +2,7 @@
 
 ## Department grants and main employee access (Enterprise, v1.86.0)
 
-Department authority comes from an Admin's explicit grant to an active Manager and the official org chart department, which must agree with the employee's own settings. A member's department label or an employee's self-edited settings cannot expand it. The main AI employee and other people's personal employees are excluded. Missing or unreadable authority grants no access.
+Department authority comes from an Admin's explicit grant to an active Manager and the official org chart department, which must agree with the employee's own settings. A member's department label or an employee's self-edited settings cannot expand it. The main AI employee and all personal employees are excluded from department grants; owners retain their existing personal-employee access. Missing or unreadable authority grants no access.
 
 Grants work only in signed-in dashboard sessions, never through personal API keys or chat apps. They start empty. Adding or widening access requires reading a risk note and ticking **I understand**; every grant and revocation is audited, as are writes authorized through a grant. Stopping an account or changing it away from Manager revokes department grants automatically. Existing routines and saved rules are not automatically disabled.
 
