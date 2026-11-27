@@ -31,6 +31,7 @@ fn payload(frame: WsFrame) -> Value {
 
 async fn handler(env: &DecisionEnv) -> MethodHandler {
     let handler = MethodHandler::new(env.home.clone()).await;
+    handler.set_task_store(Arc::new(crate::task_store::TaskStore::open(&env.home).unwrap())).await;
     handler.set_user_db(env.users.clone().unwrap(),
         Arc::new(duduclaw_auth::JwtConfig::new(b"rm143-p22-test-secret-32-bytes-long"))).await;
     handler
@@ -76,11 +77,17 @@ async fn request(f: &Fixture, kind: &str) -> ApprovalId {
 async fn workflow_card(f: &Fixture) -> approval::AcceptedRevisionGrant {
     let (_, store, accepted, _) = approval::workflow_grants::tests::fixture_at(&f.env.home, false).await;
     store.initialize_evidence().await.unwrap();
-    // Model an archived source task: current Admins retain draft oversight.
-    crate::task_store::TaskStore::open(&f.env.home).unwrap();
+    // Reuse the completed-source-task setup from workflow_review_tests::fx.
+    let tasks = crate::task_store::TaskStore::open(&f.env.home).unwrap();
+    let mut source = crate::task_store::TaskRow::new(
+        "p22-source-task".into(), "Report".into(), String::new(), "normal".into(),
+        accepted.spec.actor.clone(), "system".into(),
+    );
+    source.status = "done".into();
+    tasks.insert_task(&source).await.unwrap();
     let mut draft = crate::workflow_drafts::WorkflowDraft {
         schema_version:1, draft_id:"p22-draft".into(), revision:1,
-        owner:accepted.spec.actor.clone(), source_task:"p22-archived-task".into(),
+        owner:accepted.spec.actor.clone(), source_task:source.id.clone(),
         skill_id:"p22-skill".into(), source_snapshot_id:"p22-snapshot".into(),
         source_evidence_hash:"p22-evidence".into(),
         definition:accepted.revision.definition.clone(), revision_hash:accepted.spec.revision_hash.clone(),
@@ -390,6 +397,7 @@ async fn linked_card(kind: &str, exempt: bool) -> PressFixture {
         assert_eq!(sender.sent.lock().unwrap().len(), 1);
         receipts::list_live(&f.env.broker.store, &id).await.unwrap().pop().unwrap()
     };
+    assert_eq!(receipt.digest, approval::decision_digest_at(&f.env.home, &rec));
     PressFixture::from_service(f, id, receipt).await
 }
 
@@ -599,6 +607,7 @@ async fn workflow_web_password_totp_flow_grants_revision() {
         assert_eq!(deliver_record(&f.env.home, &f.env.broker.store, &rec, &sender).await, 1);
         receipts::list_live(&f.env.broker.store, &id).await.unwrap().pop().unwrap()
     };
+    assert_eq!(receipt.digest, approval::decision_digest_at(&f.env.home, &rec));
     let f = PressFixture::from_service(f, id.clone(), receipt.clone()).await;
     assert_eq!(f.press().await.refused_reason, Some("step_up_required"));
     f.pending().await;

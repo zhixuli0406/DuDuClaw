@@ -746,6 +746,7 @@ function EditAgentPageContent() {
       decision_continuity: agent.memory?.decision_continuity ?? DEFAULT_V168.decision_continuity,
       decision_ttl_days: agent.memory?.decision_ttl_days ?? DEFAULT_V168.decision_ttl_days,
       night_engine_enabled: agent.night_engine?.enabled ?? DEFAULT_V168.night_engine_enabled,
+      goal_intent_enabled: agent.goal_intent?.enabled ?? DEFAULT_V168.goal_intent_enabled,
       public_trigger: agent.channels?.public_trigger ?? DEFAULT_V168.public_trigger,
     });
   }, [agent]);
@@ -2204,6 +2205,12 @@ function EditAgentPageContent() {
           <SettingsSection title={t('agents.v168.night.title')}>
             <SettingsCard>
               <RowSwitch label={t('agents.v168.night.enabled')} description={t('agents.v168.night.enabled.help')} checked={v168.night_engine_enabled} onChange={(v) => updateV('night_engine_enabled', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection title={t('agents.v168.goalIntent.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.goalIntent.enabled')} description={t('agents.v168.goalIntent.enabled.help')} checked={v168.goal_intent_enabled} onChange={(v) => updateV('goal_intent_enabled', v)} />
             </SettingsCard>
           </SettingsSection>
 

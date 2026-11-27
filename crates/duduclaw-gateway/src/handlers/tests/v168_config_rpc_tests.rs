@@ -494,6 +494,34 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
 }
 
 #[tokio::test]
+async fn goal_intent_effective_and_own_values_round_trip_through_inspect() {
+    let (home, handler) = handler_with_agent().await;
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], true);
+    assert!(p["settings"]["goal_intent"].get("enabled").is_none());
+
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n[goal_intent]\nenabled = false\n").unwrap();
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], false);
+    assert!(p["settings"]["goal_intent"].get("enabled").is_none());
+
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "goal_intent": { "enabled": false },
+    }), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], false);
+    assert_eq!(p["settings"]["goal_intent"]["enabled"], false);
+
+    // Saving an employee value overrides the inherited global setting.
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "goal_intent": { "enabled": true },
+    }), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], true);
+    assert_eq!(p["settings"]["goal_intent"]["enabled"], true);
+}
+
+#[tokio::test]
 async fn skill_budget_unlimited_validates_and_round_trips_through_inspect() {
     let (home, handler) = handler_with_agent().await;
     for unlimited in [true, false] {

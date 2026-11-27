@@ -493,9 +493,15 @@ fn f1_missing_factory_setup_required() {
     assert!(stack.install_factory(broken.factory).is_err());
     assert!(!stack.has_factory());
 
-    // Refusing adapter for every connector tool (the inventory stays complete).
+    // Refusing adapter for executable connector tools; intentionally refused routes have no adapter.
     let handle = stack.for_employee(AGENT, EMPLOYEE).unwrap();
     for policy in POLICIES.iter().filter(|policy| policy.route == ToolRoute::Connector) {
+        if crate::isolation_connectors::intentionally_refused_connector(policy.name) {
+            assert!(!LiveConnectorSelectionPolicy::supports(&handle, policy.name), "{}", policy.name);
+            assert!(!BoundConnectorExecutor::supports(&handle, policy.name), "{}", policy.name);
+            assert!(!LiveConnectorSelectionPolicy::supports(stack.as_ref(), policy.name), "{}", policy.name);
+            continue;
+        }
         assert!(LiveConnectorSelectionPolicy::supports(&handle, policy.name), "{}", policy.name);
         assert!(BoundConnectorExecutor::supports(&handle, policy.name), "{}", policy.name);
         assert!(LiveConnectorSelectionPolicy::supports(stack.as_ref(), policy.name));

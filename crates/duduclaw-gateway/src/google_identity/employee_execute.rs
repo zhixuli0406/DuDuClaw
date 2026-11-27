@@ -214,8 +214,9 @@ mod tests {
                 let result = serve(&state, "bot", request).await;
                 let code = match case {
                     "disabled" => "disabled",
-                    "malformed" => "changed",
-                    _ => "identity_changed",
+                    "malformed" | "invalid_call" => "changed",
+                    "missing_ids" | "unknown" | "unregistered" => "identity_changed",
+                    _ => unreachable!("unknown early refusal case: {case}"),
                 };
                 assert_eq!(result.unwrap_err().code, code, "{tool}: {case}");
                 let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();

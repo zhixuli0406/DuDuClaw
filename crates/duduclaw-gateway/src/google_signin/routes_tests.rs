@@ -35,7 +35,7 @@ impl Fixture {
         let jwt = Arc::new(JwtConfig::new(b"google-login-http-test-at-least-32-bytes"));
         let handler = crate::handlers::MethodHandler::new(home.clone()).await;
         handler.set_user_db(db.clone(), jwt.clone()).await;
-        handler.set_edition_override(Some(if personal { duduclaw_core::EditionProfile::Personal }
+        handler.set_test_edition(Some(if personal { duduclaw_core::EditionProfile::Personal }
             else { duduclaw_core::EditionProfile::Enterprise })).await;
         let (tx, _) = tokio::sync::broadcast::channel(4);
         let (event_tx, _) = tokio::sync::broadcast::channel(4);

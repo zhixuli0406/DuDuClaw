@@ -1352,62 +1352,63 @@ pub fn digest_feedback_markup(channel: &str, refs: &[(u32, String)]) -> Option<V
 // button family in this file uses.
 
 use crate::goal_intent::{GIntentChoice, encode_gintent_action};
+use crate::trigger_route::texts::Lang;
 
 /// Telegram inline keyboard: accept as goal / plan first / dismiss to chat.
-pub fn telegram_gintent_buttons(nonce: &str) -> Value {
+pub fn telegram_gintent_buttons(nonce: &str, lang: Lang) -> Value {
     json!({
         "inline_keyboard": [[
-            { "text": "🎯 立為目標", "callback_data": encode_gintent_action(GIntentChoice::AcceptGoal, nonce) },
-            { "text": "🧭 想一想", "callback_data": encode_gintent_action(GIntentChoice::PlanFirst, nonce) },
-            { "text": "💬 只是聊聊", "callback_data": encode_gintent_action(GIntentChoice::DismissChat, nonce) }
+            { "text": format!("🎯 {}", GIntentChoice::AcceptGoal.word(lang)), "callback_data": encode_gintent_action(GIntentChoice::AcceptGoal, nonce) },
+            { "text": format!("🧭 {}", GIntentChoice::PlanFirst.word(lang)), "callback_data": encode_gintent_action(GIntentChoice::PlanFirst, nonce) },
+            { "text": format!("💬 {}", GIntentChoice::DismissChat.word(lang)), "callback_data": encode_gintent_action(GIntentChoice::DismissChat, nonce) }
         ]]
     })
 }
 
 /// Discord action row: accept as goal / plan first / dismiss to chat.
-pub fn discord_gintent_buttons(nonce: &str) -> Value {
+pub fn discord_gintent_buttons(nonce: &str, lang: Lang) -> Value {
     json!({
         "type": 1,
         "components": [
-            { "type": 2, "style": 3, "label": "🎯 立為目標",
+            { "type": 2, "style": 3, "label": format!("🎯 {}", GIntentChoice::AcceptGoal.word(lang)),
               "custom_id": encode_gintent_action(GIntentChoice::AcceptGoal, nonce) },
-            { "type": 2, "style": 2, "label": "🧭 想一想",
+            { "type": 2, "style": 2, "label": format!("🧭 {}", GIntentChoice::PlanFirst.word(lang)),
               "custom_id": encode_gintent_action(GIntentChoice::PlanFirst, nonce) },
-            { "type": 2, "style": 2, "label": "💬 只是聊聊",
+            { "type": 2, "style": 2, "label": format!("💬 {}", GIntentChoice::DismissChat.word(lang)),
               "custom_id": encode_gintent_action(GIntentChoice::DismissChat, nonce) }
         ]
     })
 }
 
 /// Slack actions block: accept as goal / plan first / dismiss to chat.
-pub fn slack_gintent_buttons(nonce: &str) -> Value {
+pub fn slack_gintent_buttons(nonce: &str, lang: Lang) -> Value {
     json!({
         "type": "actions",
         "elements": [
             { "type": "button", "style": "primary",
-              "text": { "type": "plain_text", "text": "🎯 立為目標" },
+              "text": { "type": "plain_text", "text": format!("🎯 {}", GIntentChoice::AcceptGoal.word(lang)) },
               "action_id": encode_gintent_action(GIntentChoice::AcceptGoal, nonce), "value": nonce },
-            { "type": "button", "text": { "type": "plain_text", "text": "🧭 想一想" },
+            { "type": "button", "text": { "type": "plain_text", "text": format!("🧭 {}", GIntentChoice::PlanFirst.word(lang)) },
               "action_id": encode_gintent_action(GIntentChoice::PlanFirst, nonce), "value": nonce },
-            { "type": "button", "text": { "type": "plain_text", "text": "💬 只是聊聊" },
+            { "type": "button", "text": { "type": "plain_text", "text": format!("💬 {}", GIntentChoice::DismissChat.word(lang)) },
               "action_id": encode_gintent_action(GIntentChoice::DismissChat, nonce), "value": nonce }
         ]
     })
 }
 
 /// LINE quickReply: accept as goal / plan first / dismiss to chat.
-pub fn line_gintent_quick_reply(nonce: &str) -> Value {
+pub fn line_gintent_quick_reply(nonce: &str, lang: Lang) -> Value {
     json!({
         "items": [
-            { "type": "action", "action": { "type": "postback", "label": "🎯 立為目標",
+            { "type": "action", "action": { "type": "postback", "label": format!("🎯 {}", GIntentChoice::AcceptGoal.word(lang)),
                 "data": encode_gintent_action(GIntentChoice::AcceptGoal, nonce),
-                "displayText": "立為目標任務" } },
-            { "type": "action", "action": { "type": "postback", "label": "🧭 想一想",
+                "displayText": GIntentChoice::AcceptGoal.word(lang) } },
+            { "type": "action", "action": { "type": "postback", "label": format!("🧭 {}", GIntentChoice::PlanFirst.word(lang)),
                 "data": encode_gintent_action(GIntentChoice::PlanFirst, nonce),
-                "displayText": "先給我計畫" } },
-            { "type": "action", "action": { "type": "postback", "label": "💬 只是聊聊",
+                "displayText": GIntentChoice::PlanFirst.word(lang) } },
+            { "type": "action", "action": { "type": "postback", "label": format!("💬 {}", GIntentChoice::DismissChat.word(lang)),
                 "data": encode_gintent_action(GIntentChoice::DismissChat, nonce),
-                "displayText": "繼續聊天" } }
+                "displayText": GIntentChoice::DismissChat.word(lang) } }
         ]
     })
 }
@@ -2164,10 +2165,35 @@ mod tests {
     // ── P1: goal-intent confirmation buttons ────────────────────────
 
     #[test]
+    fn gintent_buttons_localise_every_label_without_changing_callbacks() {
+        for (lang, words) in [(Lang::ZhTw, ["開始任務", "先給計畫", "繼續聊"]),
+            (Lang::En, ["start task", "plan first", "keep chatting"]),
+            (Lang::Ja, ["タスク開始", "先に計画", "このまま会話"])] {
+            let tg = telegram_gintent_buttons("test-nonce", lang);
+            let dc = discord_gintent_buttons("test-nonce", lang);
+            let sl = slack_gintent_buttons("test-nonce", lang);
+            let ln = line_gintent_quick_reply("test-nonce", lang);
+            for (i, token) in ["goal", "plan", "chat"].into_iter().enumerate() {
+                let label = format!("{} {}", ["🎯", "🧭", "💬"][i], words[i]);
+                let callback = format!("gintent:{token}:test-nonce");
+                assert_eq!(tg["inline_keyboard"][0][i]["text"], label);
+                assert_eq!(dc["components"][i]["label"], label);
+                assert_eq!(sl["elements"][i]["text"]["text"], label);
+                assert_eq!(ln["items"][i]["action"]["label"], label);
+                assert_eq!(ln["items"][i]["action"]["displayText"], words[i]);
+                assert_eq!(tg["inline_keyboard"][0][i]["callback_data"], callback);
+                assert_eq!(dc["components"][i]["custom_id"], callback);
+                assert_eq!(sl["elements"][i]["action_id"], callback);
+                assert_eq!(ln["items"][i]["action"]["data"], callback);
+            }
+        }
+    }
+
+    #[test]
     fn gintent_buttons_carry_the_gintent_wire_format_not_the_decision_codec() {
         use crate::goal_intent::parse_gintent_action;
 
-        let tg = telegram_gintent_buttons("nonce-1");
+        let tg = telegram_gintent_buttons("nonce-1", Lang::ZhTw);
         let row = tg["inline_keyboard"][0].as_array().unwrap();
         assert_eq!(row.len(), 3);
         let (choice, nonce) =
@@ -2178,7 +2204,7 @@ mod tests {
         // that would silently subject it to `authorize_press`'s role gate.
         assert!(crate::decision_action::parse(row[0]["callback_data"].as_str().unwrap()).is_none());
 
-        let dc = discord_gintent_buttons("nonce-2");
+        let dc = discord_gintent_buttons("nonce-2", Lang::ZhTw);
         let comps = dc["components"].as_array().unwrap();
         assert_eq!(comps.len(), 3);
         let (choice, nonce) =
@@ -2186,7 +2212,7 @@ mod tests {
         assert_eq!(choice, GIntentChoice::PlanFirst);
         assert_eq!(nonce, "nonce-2");
 
-        let sl = slack_gintent_buttons("nonce-3");
+        let sl = slack_gintent_buttons("nonce-3", Lang::ZhTw);
         let elements = sl["elements"].as_array().unwrap();
         assert_eq!(elements.len(), 3);
         let (choice, nonce) =
@@ -2195,7 +2221,7 @@ mod tests {
         assert_eq!(nonce, "nonce-3");
         assert_eq!(elements[2]["value"], "nonce-3");
 
-        let ln = line_gintent_quick_reply("nonce-4");
+        let ln = line_gintent_quick_reply("nonce-4", Lang::ZhTw);
         let items = ln["items"].as_array().unwrap();
         assert_eq!(items.len(), 3);
         let (choice, nonce) =
@@ -2209,7 +2235,7 @@ mod tests {
         // Telegram is the tightest (64-byte callback_data); a v4 UUID nonce
         // (36 chars) is what every real nonce looks like.
         let nonce = uuid::Uuid::new_v4().to_string();
-        let tg = telegram_gintent_buttons(&nonce);
+        let tg = telegram_gintent_buttons(&nonce, Lang::ZhTw);
         for btn in tg["inline_keyboard"][0].as_array().unwrap() {
             let data = btn["callback_data"].as_str().unwrap();
             assert!(data.len() <= 64, "{data} is {} bytes", data.len());
