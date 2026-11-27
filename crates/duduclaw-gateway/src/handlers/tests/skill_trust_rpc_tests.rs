@@ -2,7 +2,7 @@ use super::*;
 use duduclaw_core::publishers::{TrustStore, OFFICIAL_PUBLISHER_KEY, TRUST_STORE_FILE};
 use crate::approval::{ApprovalBroker, ApprovalId};
 use crate::skill_trust::minisign_key_id;
-use super::super::skill_trust_rpc::{live_browser_admin, pin};
+use super::super::skill_trust_rpc::{live_browser_admin, pin, trust_store_sync_failures};
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -123,6 +123,7 @@ async fn pin_requires_admin_and_reauth() {
     assert_eq!(rows[0]["agent_id"], f.admin.user_id);
     assert_eq!(rows[0]["details"]["publisher"], "in-house");
     assert_eq!(rows[0]["details"]["trust_store_changed"], true);
+    assert_eq!(rows[0]["details"]["durability_complete"], true);
     let db = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
     assert_eq!(db.query_row("SELECT COUNT(*) FROM skill_trust_pin_proofs", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
     let mut replay = args();
@@ -182,6 +183,28 @@ async fn pin_config_cas_failure_never_changes_trust_store() {
         assert!(audit(&f, "skill_trust_pinned").is_empty());
         assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
     }
+}
+
+#[tokio::test]
+async fn pin_post_persist_sync_failure_reports_active_success_and_durability_warning() {
+    let f = fixture().await;
+    trust_store_sync_failures().lock().unwrap().insert(f.home.path().to_path_buf());
+    let entry = payload(browser(&f, &f.admin, "skill_trust.pin", args()).await);
+    assert_eq!(entry["key_id"], key_id());
+    assert!(!trust_store_sync_failures().lock().unwrap().contains(f.home.path()), "post-persist hook must run");
+    assert_eq!(TrustStore::load(f.home.path()).unwrap().keys("in-house"), vec![OFFICIAL_PUBLISHER_KEY]);
+    let rows = audit(&f, "skill_trust_pinned");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["agent_id"], f.admin.user_id);
+    assert_eq!(rows[0]["details"]["publisher"], "in-house");
+    assert_eq!(rows[0]["details"]["key_id"], key_id());
+    assert_eq!(rows[0]["details"]["trust_store_changed"], true);
+    assert_eq!(rows[0]["details"]["durability_complete"], false);
+    assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
+    let got = payload(f.handler.handle("skill_trust.get", json!({}), &f.admin).await);
+    assert_eq!(got["auto_approve"].as_array().unwrap().len(), 1);
+    assert_eq!(got["auto_approve"][0]["in_trust_store"], true);
+    assert_eq!(got["auto_approve"][0]["conflicting"], false);
 }
 
 #[tokio::test]
@@ -270,6 +293,64 @@ async fn conflicting_key_id_refuses_pin_and_unpin_and_is_visible_in_get() {
     assert_eq!(audit(&f, "skill_trust_pinned").len(), 1);
     assert!(audit(&f, "skill_trust_unpinned").is_empty());
     assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
+}
+
+#[tokio::test]
+async fn forged_or_invalid_key_poisoning_is_visible_and_refuses_pin_and_unpin() {
+    use base64::Engine;
+    for invalid_key in [false, true] {
+        let f = fixture().await;
+        payload(browser(&f, &f.admin, "skill_trust.pin", args()).await);
+        let trust_before = std::fs::read(f.home.path().join(TRUST_STORE_FILE)).unwrap();
+        let mut table: toml::Table = config(&f).parse().unwrap();
+        let entries = table.get_mut("skill_trust").unwrap().get_mut("auto_approve").unwrap().as_array_mut().unwrap();
+        let mut second = entries[0].clone();
+        let claimed_id = if invalid_key { key_id() } else { "0000000000000000".to_owned() };
+        assert_ne!(key_id(), "0000000000000000");
+        second.as_table_mut().unwrap().insert("key".into(),
+            toml::Value::String(if invalid_key { "invalid".into() } else { colliding_key() }));
+        second.as_table_mut().unwrap().insert("key_id".into(), toml::Value::String(claimed_id.clone()));
+        entries.push(second);
+        let mut pin_attempts = vec![args()];
+        if !invalid_key {
+            // Also pin a valid key under the forged claim: both identities
+            // must be poisoned, not just the collision's canonical id.
+            let mut bytes = base64::engine::general_purpose::STANDARD.decode(OFFICIAL_PUBLISHER_KEY).unwrap();
+            bytes[2..10].fill(0);
+            let claimed_key = base64::engine::general_purpose::STANDARD.encode(bytes);
+            assert_eq!(minisign_key_id(&claimed_key).unwrap(), claimed_id);
+            let mut third = entries[0].clone();
+            third.as_table_mut().unwrap().insert("key".into(), toml::Value::String(claimed_key.clone()));
+            third.as_table_mut().unwrap().insert("key_id".into(), toml::Value::String(claimed_id.clone()));
+            entries.push(third);
+            for key in [colliding_key(), claimed_key] {
+                let mut params = args();
+                params["public_key"] = json!(key);
+                pin_attempts.push(params);
+            }
+        }
+        let poisoned = toml::to_string(&table).unwrap();
+        std::fs::write(f.home.path().join("config.toml"), &poisoned).unwrap();
+        let got = payload(f.handler.handle("skill_trust.get", json!({}), &f.admin).await);
+        let entries = got["auto_approve"].as_array().unwrap();
+        assert_eq!(entries.len(), if invalid_key { 2 } else { 3 });
+        assert!(entries.iter().all(|entry| entry["conflicting"] == true));
+        assert_eq!(entries[0]["in_trust_store"], true);
+        for params in pin_attempts {
+            refused(browser(&f, &f.admin, "skill_trust.pin", params).await);
+        }
+        for id in [key_id(), claimed_id] {
+            for disable in [true, false] {
+                refused(f.handler.handle("skill_trust.unpin",
+                    json!({"publisher":"in-house", "key_id":id, "disable_skills":disable}), &f.admin).await);
+            }
+        }
+        assert_eq!(config(&f), poisoned);
+        assert_eq!(std::fs::read(f.home.path().join(TRUST_STORE_FILE)).unwrap(), trust_before);
+        assert_eq!(audit(&f, "skill_trust_pinned").len(), 1);
+        assert!(audit(&f, "skill_trust_unpinned").is_empty());
+        assert!(audit(&f, "skill_trust_pin_incomplete").is_empty());
+    }
 }
 
 #[tokio::test]

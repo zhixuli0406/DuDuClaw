@@ -76,9 +76,18 @@ pub(crate) fn conflicting_pin_ids(entries: &[PinnedKey]) -> BTreeSet<(String, St
     let mut keys = BTreeMap::new();
     let mut conflicts = BTreeSet::new();
     for entry in entries {
-        let identity = (entry.publisher.as_str(), entry.key_id.as_str());
-        if keys.insert(identity, entry.key.as_str()).is_some_and(|key| key != entry.key.as_str()) {
-            conflicts.insert((entry.publisher.clone(), entry.key_id.clone()));
+        let claimed = (entry.publisher.clone(), entry.key_id.clone());
+        let Ok(key_id) = minisign_key_id(&entry.key) else {
+            conflicts.insert(claimed);
+            continue;
+        };
+        let identity = (entry.publisher.clone(), key_id);
+        if claimed != identity {
+            conflicts.insert(claimed);
+            conflicts.insert(identity.clone());
+        }
+        if keys.insert(identity.clone(), entry.key.as_str()).is_some_and(|key| key != entry.key.as_str()) {
+            conflicts.insert(identity);
         }
     }
     conflicts

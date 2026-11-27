@@ -41,7 +41,11 @@ fn config(home: &Path) -> Result<(toml::Table, String, Vec<PinnedKey>), String> 
         Some(value) => value.clone().try_into().map_err(|_| READ_ERROR)?,
         None => TrustConfig::default(),
     };
-    if trust.auto_approve.iter().any(|entry| !entry.usable()) { return Err(READ_ERROR.into()); }
+    // Keep invalid keys and mismatched ids visible for conflict reporting and
+    // refusal. Do not discard them before computing poisoned identities.
+    if trust.auto_approve.iter().any(|entry| entry.publisher == "duduclaw"
+        || validate_publisher_id(&entry.publisher).is_err()
+        || entry.added_by.is_empty() || entry.added_at.is_empty()) { return Err(READ_ERROR.into()); }
     Ok((table, config_commit::content_hash(&text), trust.auto_approve))
 }
 fn set_entries(table: &mut toml::Table, entries: &[PinnedKey]) -> Result<(), String> {
@@ -119,9 +123,29 @@ impl MethodHandler {
     }
 }
 
+struct TrustStoreWrite { changed: bool, durable: bool }
+
+#[cfg(test)]
+pub(super) fn trust_store_sync_failures() -> &'static std::sync::Mutex<BTreeSet<std::path::PathBuf>> {
+    static FAILURES: std::sync::OnceLock<std::sync::Mutex<BTreeSet<std::path::PathBuf>>> = std::sync::OnceLock::new();
+    FAILURES.get_or_init(Default::default)
+}
+
+fn sync_trust_store_directory(home: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if trust_store_sync_failures().lock().unwrap().remove(home) {
+        return Err(std::io::Error::other("injected post-persist directory sync failure"));
+    }
+    #[cfg(unix)]
+    std::fs::File::open(home)?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = home;
+    Ok(())
+}
+
 /// Same format and sidecar lock as the operator publisher CLI. Validate the
 /// complete resulting store before atomically publishing it.
-fn add_trusted_key(home: &Path, publisher: &str, key: &str, guard: impl FnOnce() -> Result<(), String>) -> Result<bool, String> {
+fn add_trusted_key(home: &Path, publisher: &str, key: &str, guard: impl FnOnce() -> Result<(), String>) -> Result<TrustStoreWrite, String> {
     let path = home.join(TRUST_STORE_FILE);
     duduclaw_core::with_file_lock(&path, || {
         match std::fs::symlink_metadata(&path) {
@@ -132,7 +156,7 @@ fn add_trusted_key(home: &Path, publisher: &str, key: &str, guard: impl FnOnce()
         }
         let mut store = TrustStore::load(home).map_err(std::io::Error::other)?;
         let keys = &mut store.publishers.entry(publisher.into()).or_insert_with(|| Publisher { keys: Vec::new() }).keys;
-        if keys.iter().any(|existing| existing == key) { return Ok(false); }
+        if keys.iter().any(|existing| existing == key) { return Ok(TrustStoreWrite { changed: false, durable: true }); }
         keys.push(key.into());
         let text = toml::to_string_pretty(&store).map_err(std::io::Error::other)?;
         TrustStore::parse(&text).map_err(std::io::Error::other)?;
@@ -143,9 +167,16 @@ fn add_trusted_key(home: &Path, publisher: &str, key: &str, guard: impl FnOnce()
         // final publication boundary (the config commit has already finished).
         guard().map_err(std::io::Error::other)?;
         temporary.persist(&path).map_err(|e| e.error)?;
-        #[cfg(unix)]
-        std::fs::File::open(home)?.sync_all()?;
-        Ok(true)
+        // Publication makes the source active. A later sync failure affects
+        // crash durability only and must not be reported as an inactive pin.
+        let durable = match sync_trust_store_directory(home) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(publisher, %error, "skill trust key published but directory sync failed");
+                false
+            }
+        };
+        Ok(TrustStoreWrite { changed: true, durable })
     }).map_err(|_| WRITE_ERROR.into())
 }
 
@@ -155,7 +186,9 @@ pub(super) fn pin(home: &Path, params: &Value, actor: &str, guard: impl Fn() -> 
     validate_pubkey(key).map_err(|_| "公鑰格式不正確，請確認後再試。")?;
     let key_id = minisign_key_id(key).map_err(|_| "公鑰格式不正確，請確認後再試。")?;
     let (mut table, hash, mut entries) = config(home)?;
-    if entries.iter().any(|entry| entry.publisher == publisher && entry.key_id == key_id && entry.key != key) {
+    if conflicting_pin_ids(&entries).contains(&(publisher.to_owned(), key_id.clone()))
+        || entries.iter().any(|entry| entry.publisher == publisher && entry.key != key
+            && minisign_key_id(&entry.key).is_ok_and(|id| id == key_id)) {
         return Err(KEY_CONFLICT.into());
     }
     let entry = entries.iter().find(|entry| entry.publisher == publisher && entry.key == key).cloned()
@@ -167,13 +200,14 @@ pub(super) fn pin(home: &Path, params: &Value, actor: &str, guard: impl Fn() -> 
     // A pin without its exact key in the trust store is inert. Commit this
     // first so a failed config CAS cannot broaden global publisher trust.
     config_commit::commit_skill_trust_table(home, &hash, &table, &guard).map_err(|_| WRITE_ERROR)?;
-    let trust_store_changed = add_trusted_key(home, publisher, key, &guard).map_err(|_| {
+    let write = add_trusted_key(home, publisher, key, &guard).map_err(|_| {
         append_audit_event(home, &AuditEvent::new("skill_trust_pin_incomplete", actor, Severity::Warning,
             json!({"publisher": publisher, "key_id": entry.key_id})));
         PIN_INCOMPLETE
     })?;
     append_audit_event(home, &AuditEvent::new("skill_trust_pinned", actor, Severity::Info,
-        json!({"publisher": publisher, "key_id": entry.key_id, "trust_store_changed": trust_store_changed})));
+        json!({"publisher": publisher, "key_id": entry.key_id, "trust_store_changed": write.changed,
+            "durability_complete": write.durable})));
     serde_json::to_value(entry).map_err(|_| WRITE_ERROR.into())
 }
 

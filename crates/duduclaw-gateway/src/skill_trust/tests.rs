@@ -188,12 +188,13 @@ async fn conflicting_pinned_key_ids_ignore_both_keys_and_go_manual() {
     assert_ne!(collision, KEY_A);
     let id = minisign_key_id(KEY_A).unwrap();
     assert_eq!(minisign_key_id(&collision).unwrap(), id);
-    for reverse in [false, true] {
+    for (reverse, forged_id) in [(false, false), (true, false), (false, true), (true, true)] {
         let f = Fixture::standard().await;
         let mut config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id)).unwrap();
         let mut second = config.skill_trust.auto_approve[0].clone();
         second.key = collision.clone();
         assert!(second.usable());
+        if forged_id { second.key_id = minisign_key_id(KEY_B).unwrap(); }
         config.skill_trust.auto_approve.push(second);
         if reverse { config.skill_trust.auto_approve.reverse(); }
         let mut table = toml::Table::new();
@@ -201,14 +202,38 @@ async fn conflicting_pinned_key_ids_ignore_both_keys_and_go_manual() {
         trust.insert("auto_approve".into(), toml::Value::try_from(&config.skill_trust.auto_approve).unwrap());
         table.insert("skill_trust".into(), toml::Value::Table(trust));
         std::fs::write(f.path().join("config.toml"), toml::to_string(&table).unwrap()).unwrap();
-        // Both keys are globally trusted; the ambiguous pin identity must
-        // still exclude even the real signer, regardless of entry order.
+        // Both keys are globally trusted; the ambiguous canonical identity
+        // must exclude the signer even with a forged id or reversed order.
         std::fs::write(f.path().join("trusted_publishers.toml"),
             format!("[publishers.fixture]\nkeys=['{KEY_A}', '{collision}']\n")).unwrap();
         assert!(read_config(&Directory::open(f.path()).unwrap()).unwrap().auto_approve.is_empty());
         assert_eq!(evaluate(f.path(), &f.record().await).await.unwrap_err(), KEY);
         f.manual(KEY).await;
     }
+}
+#[test]
+fn mismatched_and_unparseable_keys_poison_claimed_and_canonical_identities() {
+    let id_a = minisign_key_id(KEY_A).unwrap();
+    let id_b = minisign_key_id(KEY_B).unwrap();
+    let config: Config = toml::from_str(&pin_config("fixture", KEY_A, &id_a)).unwrap();
+    let first = config.skill_trust.auto_approve[0].clone();
+    let mut forged = first.clone();
+    forged.key_id = id_b.clone();
+    let mut claimed = first.clone();
+    claimed.key = KEY_B.into();
+    claimed.key_id = id_b.clone();
+    let mut other_publisher = first.clone();
+    other_publisher.publisher = "another".into();
+    let expected = BTreeSet::from([("fixture".to_owned(), id_a.clone()), ("fixture".to_owned(), id_b)]);
+    assert_eq!(conflicting_pin_ids(&[forged.clone()]), expected);
+    for reverse in [false, true] {
+        let mut entries = vec![first.clone(), forged.clone(), claimed.clone(), other_publisher.clone()];
+        if reverse { entries.reverse(); }
+        assert_eq!(conflicting_pin_ids(&entries), expected);
+    }
+    let mut invalid = first;
+    invalid.key = "invalid".into();
+    assert_eq!(conflicting_pin_ids(&[invalid]), BTreeSet::from([("fixture".to_owned(), id_a)]));
 }
 #[test]
 fn config_reader_checks_conflicts_before_usability_and_preserves_other_identities() {
