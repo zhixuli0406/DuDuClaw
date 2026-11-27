@@ -736,6 +736,8 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_users_me(&self, ctx: &UserContext) -> WsFrame {
+        let view = crate::dept_grants::DeptGrantView::load(self, ctx).await;
+        let dept_grants = super::dept_grants_rpc::effective_grants(&view);
         let db = match self.user_db.read().await.as_ref() {
             Some(db) => db.clone(),
             None => {
@@ -751,6 +753,7 @@ impl MethodHandler {
                             "role": ctx.role.to_string(),
                         },
                         "bindings": [],
+                        "dept_grants": dept_grants,
                     }),
                 );
             }
@@ -771,6 +774,7 @@ impl MethodHandler {
                     json!({
                         "user": user,
                         "bindings": bindings,
+                        "dept_grants": dept_grants,
                         "email_setup": {
                             "placeholder": setup.placeholder,
                             "password_required": setup.password_required,
@@ -789,6 +793,7 @@ impl MethodHandler {
                         "role": ctx.role.to_string(),
                     },
                     "bindings": [],
+                    "dept_grants": dept_grants,
                 }),
             ),
         }

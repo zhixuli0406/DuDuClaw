@@ -120,3 +120,4 @@ mod member_keys_rpc_tests;
 mod mcp_keys_rpc_tests;
 
 mod dept_grant_matrix_tests;
+mod dept_grants_rpc_tests;

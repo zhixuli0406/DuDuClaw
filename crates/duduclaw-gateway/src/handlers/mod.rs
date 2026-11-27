@@ -158,6 +158,7 @@ mod widgets_custom;
 mod departments_rpc;
 mod org_change_rpc;
 mod users_rpc;
+mod dept_grants_rpc;
 mod user_invites_rpc;
 pub(crate) mod company_rpc;
 mod members_rpc;
