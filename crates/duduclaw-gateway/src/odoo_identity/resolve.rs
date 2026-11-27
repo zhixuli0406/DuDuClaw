@@ -9,11 +9,12 @@ use duduclaw_odoo::access_policy::{OdooAccessConfig, IdentityKind, EffectiveMode
 use serde_json::{Value, json};
 
 use super::Refusal;
-use super::server::{Server, company_server_from_document};
+use super::server::{Server, company_server_from_document, member_credentials_enabled_from_document};
 
 pub(super) struct Settings {
     pub access: OdooAccessConfig,
     pub server: Option<Server>,
+    pub member_credentials_enabled: bool,
 }
 
 impl Settings {
@@ -24,7 +25,7 @@ impl Settings {
             .map_err(|_| Refusal::access_invalid())?;
         let doc = toml::from_str(&raw).map_err(|_| Refusal::access_invalid())?;
         let server = company_server_from_document(&doc).map_err(|_| Refusal::unavailable())?;
-        Ok(Self { access, server })
+        Ok(Self { access, server, member_credentials_enabled: member_credentials_enabled_from_document(&doc) })
     }
 }
 
@@ -63,6 +64,7 @@ impl Decision {
 
 fn personal(home: &Path, db: &UserDb, user: &str, settings: &Settings,
     permission: EffectiveMode) -> Result<Option<Decision>, Refusal> {
+    if !settings.member_credentials_enabled { return Ok(None); }
     let Some(server) = &settings.server else { return Ok(None); };
     // Missing credentials do not require a machine key. Once a row exists,
     // only unseal decides usability (including fingerprint invalidation).
@@ -144,6 +146,7 @@ pub(super) fn employee(home: &Path, db: &UserDb, agent: &str,
 
 pub(super) fn person_key(home: &Path, db: &UserDb, user: &str,
     settings: &Settings, write: bool) -> Result<Decision, Refusal> {
+    if !settings.member_credentials_enabled { return Err(Refusal::member_credentials_off()); }
     let mode = effective_mode(IdentityKind::Personal, &settings.access, PermissionOverride::Inherit);
     if write && mode != EffectiveMode::Follow {
         return Err(Refusal::new(axum::http::StatusCode::FORBIDDEN, "odoo_follow_required",

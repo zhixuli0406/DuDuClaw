@@ -393,6 +393,21 @@ The long-lived gateway holding the instance lock checks every effective identity
 
 The overview without filters returns model names and short labels only, capped at 16 KiB. Fields are included only for a specific `model` or a query matching at most five authorized models, capped at 32 KiB. Responses include total matching model count and truncation. The shared-wiki summary is capped at 16 KiB; `odoo/schema-fields` remains a search-only `deep` reference page capped at 32 KiB and is not automatically injected into context.
 
+## Integrations → Odoo → Personal member connections
+
+Personal Odoo connections require an administrator to opt in with `config.toml`:
+
+```toml
+[odoo]
+member_credentials = true # default: false
+```
+
+A missing key, unreadable configuration or non-boolean value disables personal connections. While disabled, `me.odoo.connect` and `me.odoo.test` refuse before contacting Odoo or decrypting a key. Identity selection skips personal credentials; person-key requests return `odoo_member_credentials_off`. Saved credentials remain stored, and members can still disconnect. Administrators can still list and revoke connections.
+
+The browser-only Admin RPC `odoo.member_credentials.set_enabled {enabled: bool}` returns `{enabled}`. It uses the locked, hash-checked, format-preserving config commit path. Before publishing the setting, it writes `odoo_member_credentials_toggled` with the live actor's user ID, the requested value and a timestamp. Audit failure aborts the change. Records with `phase: "before_commit"` are write-ahead intents: a subsequent config write failure may leave an intent without a completed change.
+
+`me.odoo.status` always includes `member_credentials_enabled`; `odoo.member_credentials.list` returns `{credentials: [...], enabled}`. Neither response includes secrets. Credentials are bound to the member's account credential epoch. A password reset or sign-out-everywhere that changes this epoch makes status report `needs_reverify` and prevents both use and testing of the old key. The member must enter the key again through `me.odoo.connect`. Suspended or deleted accounts cannot use stored credentials. Legacy rows without an epoch binding also require re-entry; the existing offboarding cleanup remains in place.
+
 ## Integrations → Odoo → Employee permissions
 
 Open an employee's edit page to choose allowed tables and add action rules. No checked tables means no additional table restriction; no action rules means no additional action restriction. Odoo's own ACLs, feature switches and the built-in sensitive-table block list still apply. Each rule chooses a table (or **All tables**) and actions: **Search and read** saves both `read` and `search`; **Create**, **Update**, **Delete**, **Button actions** and **Other methods** save `create`, `write`, `unlink`, `action` and `execute`. For generic `odoo_execute` calls, button actions cover `action_*`, `button_*` and `toggle_*` methods, such as confirm, validate and archive. Grant `action` for all tables or `action:sale.order` for one table; `execute` remains the category for other methods. The stored format remains bare verbs for all tables and `verb:model` for one table, for example `read:hr.employee` and `search:hr.employee`.

@@ -3,6 +3,19 @@ use std::path::Path;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+pub(crate) const MEMBER_CREDENTIALS_OFF: &str = "公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。";
+
+/// Only a literal boolean true grants access. Missing/unreadable/malformed is off.
+pub(crate) fn member_credentials_enabled(home: &Path) -> bool {
+    std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|raw| toml::from_str::<toml::Value>(&raw).ok())
+        .is_some_and(|doc| member_credentials_enabled_from_document(&doc))
+}
+pub(crate) fn member_credentials_enabled_from_document(doc: &toml::Value) -> bool {
+    doc.get("odoo").and_then(|v| v.get("member_credentials"))
+        .and_then(toml::Value::as_bool) == Some(true)
+}
+
 const CONFIG: &str = "公司還沒有設定 Odoo 連線，請找管理員。";
 
 #[derive(Deserialize)]

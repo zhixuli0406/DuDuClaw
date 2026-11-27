@@ -42,7 +42,7 @@ impl Fixture {
     }
     fn config(&self, access: &str, url: &str, scopes: &[&str]) {
         std::fs::write(self.home.path().join("config.toml"), format!(
-            "[odoo]\nurl='{url}'\ndb='company'\n[odoo_access]\n{access}\n\
+            "[odoo]\nmember_credentials=true\nurl='{url}'\ndb='company'\n[odoo_access]\n{access}\n\
              [member_api_keys]\nenabled=true\nallow_mcp_scopes={}\n\
              [mcp_keys.\"{INTERNAL_KEY}\"]\nclient_id='gateway-internal'\nis_external=false\n\
              created_at='2026-11-01T00:00:00Z'\nscopes=['admin']\n",
@@ -407,4 +407,59 @@ async fn inactive_member_and_failed_security_audit_never_release_a_secret() {
     let (status, value) = f.person(&key, read()).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(value.get("secret").is_none());
+}
+
+
+#[tokio::test]
+async fn member_switch_off_skips_personal_without_deleting_and_on_restores_it() {
+    let f = Fixture::new();
+    f.avatar(&f.a, "alice");
+    f.credential(&f.a, SECRET_A);
+    let key = f.key(&f.a, &["odoo:read", "odoo:write"]);
+    let path = f.home.path().join("config.toml");
+    let enabled = std::fs::read_to_string(&path).unwrap();
+    for setting in ["", "member_credentials=false", "member_credentials='true'"] {
+        std::fs::write(&path, enabled.replace("member_credentials=true", setting)).unwrap();
+        let (status, value) = f.employee("alice", read()).await;
+        refused(status, &value, "odoo_not_connected");
+        for request in [read(), json!({"tool":"odoo_write"})] {
+            let (status, value) = f.person(&key, request).await;
+            refused(status, &value, "odoo_member_credentials_off");
+        }
+        assert_eq!(f.state.users.odoo_credential_status(&f.a).unwrap().unwrap().state, "ok");
+        // Row three is still eligible, but carries no personal secret.
+        f.agent("alice", "[odoo]\nusername='service'\napi_key_enc='cipher'");
+        let (status, value) = f.employee("alice", read()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["identity"], "agent");
+        assert!(value.get("secret").is_none());
+        f.agent("alice", "");
+    }
+    std::fs::write(&path, enabled).unwrap();
+    let (status, value) = f.employee("alice", read()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["secret"], SECRET_A);
+    let (status, value) = f.person(&key, read()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["secret"], SECRET_A);
+}
+
+#[tokio::test]
+async fn password_epoch_change_stops_personal_handoff_even_with_new_person_key() {
+    let f = Fixture::new();
+    f.avatar(&f.a, "alice");
+    f.credential(&f.a, SECRET_A);
+    assert_eq!(f.employee("alice", read()).await.1["secret"], SECRET_A);
+    let db = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    db.execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1", [&f.a]).unwrap();
+    let (status, value) = f.employee("alice", read()).await;
+    refused(status, &value, "odoo_not_connected");
+    let new_key = f.key(&f.a, &["odoo:read"]);
+    let (status, value) = f.person(&new_key, read()).await;
+    refused(status, &value, "odoo_not_connected");
+    assert_eq!(f.state.users.odoo_credential_status(&f.a).unwrap().unwrap().state, "needs_reverify");
+    f.credential(&f.a, SECRET_B);
+    let (status, value) = f.employee("alice", read()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(value["secret"], SECRET_B);
 }

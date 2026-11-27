@@ -57,6 +57,9 @@ impl Refusal {
         Self::new(StatusCode::FORBIDDEN, "odoo_not_connected",
             duduclaw_odoo::access_policy::not_connected_message(person))
     }
+    fn member_credentials_off() -> Self {
+        Self::new(StatusCode::FORBIDDEN, "odoo_member_credentials_off", server::MEMBER_CREDENTIALS_OFF)
+    }
     fn scope() -> Self {
         Self::new(StatusCode::FORBIDDEN, "person_key_scope", "這把本人金鑰沒有這項 Odoo 操作的範圍。")
     }

@@ -44,6 +44,8 @@ pub struct OdooConfig {
     /// addresses are still pinned and no proxy is used.
     #[serde(default)]
     pub allow_private_network: bool,
+    /// Admin opt-in for personal member credentials; absent means disabled.
+    pub member_credentials: bool,
 }
 
 impl Default for OdooConfig {
@@ -79,6 +81,7 @@ impl Default for OdooConfig {
             features_hr: false,
             unblock_models: Vec::new(),
             allow_private_network: false,
+            member_credentials: false,
         }
     }
 }
@@ -144,6 +147,14 @@ impl OdooConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_credentials_requires_boolean_opt_in() {
+        for raw in ["", "[odoo]", "[odoo]\nmember_credentials=false", "[odoo]\nmember_credentials='true'"] {
+            assert!(!OdooConfig::from_toml(&raw.parse().unwrap()).member_credentials);
+        }
+        assert!(OdooConfig::from_toml(&"[odoo]\nmember_credentials=true".parse().unwrap()).member_credentials);
+    }
 
     #[test]
     fn default_config_is_not_configured() {
