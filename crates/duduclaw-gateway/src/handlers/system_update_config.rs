@@ -290,13 +290,14 @@ impl MethodHandler {
             }
         }
 
-        // ── G.3 [general] name / default_agent / inference_mode / default_language ──
+        // ── G.3 [general] name / default_agent / inference_mode / default_language / company_timezone ──
         {
             let has_gen = [
                 "name",
                 "default_agent",
                 "inference_mode",
                 "default_language",
+                "company_timezone",
             ]
             .iter()
             .any(|k| params.get(*k).is_some());
@@ -341,6 +342,22 @@ impl MethodHandler {
                                 "Invalid inference_mode. Valid: local, claude, hybrid",
                             );
                         }
+                    }
+                }
+                if let Some(value) = params.get("company_timezone") {
+                    let Some(v) = value.as_str() else {
+                        return WsFrame::error_response("", "general.company_timezone must be a string");
+                    };
+                    let v = v.trim();
+                    if v.is_empty() {
+                        general.remove("company_timezone");
+                        changes.push("general.company_timezone cleared".into());
+                    } else {
+                        if v.parse::<chrono_tz::Tz>().is_err() {
+                            return WsFrame::error_response("", "Invalid general.company_timezone");
+                        }
+                        general.insert("company_timezone".into(), toml::Value::String(v.into()));
+                        changes.push(format!("general.company_timezone = \"{v}\""));
                     }
                 }
                 // WP: global default reply language. Empty string clears it
@@ -1101,7 +1118,7 @@ impl MethodHandler {
         if changes.is_empty() {
             return WsFrame::error_response(
                 "",
-                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map), takeover, mail, webchat, tick, files.allowed_roots, night.llm_enabled, dispatch(judge_provider/judge_model), acp.trusted, telemetry.otlp_endpoint, container.sandbox, computer_use.image, memory.supersession_trust_guard, team, integrations.github, redaction.purge_after_expire_days",
+                "No valid fields to update. Supported: log_level, log_format, rotation_strategy, auto_update, voice, allowed_origins, gateway(bind/port/auth_token), rotation(health_check_interval_seconds/cooldown_after_rate_limit_seconds), general(default_agent/inference_mode/default_language/company_timezone), secret_manager, knowledge_guard(enabled/window_secs/max_per_subject), goal_loop(planner_enabled/iteration_cap_simple/resume_on_restart), dispatch(enabled/policy), memory(graph_embed_seed), topology_evolution(enabled), belief(flat_band_pct/tick_subject_map), takeover, mail, webchat, tick, files.allowed_roots, night.llm_enabled, dispatch(judge_provider/judge_model), acp.trusted, telemetry.otlp_endpoint, container.sandbox, computer_use.image, memory.supersession_trust_guard, team, integrations.github, redaction.purge_after_expire_days",
             );
         }
 
@@ -1309,5 +1326,49 @@ mod memory_privacy_toggle_tests {
             original,
             "custom_keywords survive"
         );
+    }
+}
+
+#[cfg(test)]
+mod company_timezone_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn company_timezone_setting_writes_and_empty_clears() {
+        for params in [
+            json!({"company_timezone": "Asia/Taipei"}),
+            json!({"general.company_timezone": "Asia/Taipei"}),
+            json!({"general": {"company_timezone": "Asia/Taipei"}}),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(home.path().join("config.toml"), "[general]\nname = 'test'\n").unwrap();
+            let handler = MethodHandler::new(home.path().to_path_buf()).await;
+            let frame = handler.handle_system_update_config(params, &UserContext::admin_fallback()).await;
+            assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+            assert_eq!(crate::autopilot_window::read_company_timezone(home.path()).unwrap(), Some(chrono_tz::Asia::Taipei));
+            let frame = handler.handle_system_update_config(
+                json!({"general": {"company_timezone": ""}}), &UserContext::admin_fallback(),
+            ).await;
+            assert!(matches!(frame, WsFrame::Response { ok: true, .. }), "{frame:?}");
+            let text = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+            let table: toml::Table = text.parse().unwrap();
+            assert!(table["general"].get("company_timezone").is_none());
+            assert_eq!(table["general"]["name"].as_str(), Some("test"));
+        }
+    }
+
+    #[tokio::test]
+    async fn company_timezone_setting_rejects_invalid_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let original = "[general]\ncompany_timezone = 'Asia/Taipei'\n";
+        std::fs::write(home.path().join("config.toml"), original).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        for value in [json!("Not/AZone"), json!(8), json!(null)] {
+            let frame = handler.handle_system_update_config(
+                json!({"general.company_timezone": value}), &UserContext::admin_fallback(),
+            ).await;
+            assert!(matches!(frame, WsFrame::Response { ok: false, .. }), "{frame:?}");
+            assert_eq!(std::fs::read_to_string(home.path().join("config.toml")).unwrap(), original);
+        }
     }
 }

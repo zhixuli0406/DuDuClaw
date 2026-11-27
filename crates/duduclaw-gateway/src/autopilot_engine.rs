@@ -1376,6 +1376,29 @@ impl AutopilotEngine {
     ) {
         debug!(rule = %rule.name, event = event_name, "autopilot: rule matched");
 
+        if rule.active_window.is_some() {
+            use crate::autopilot_window::{rule_window_decision, WindowDecision};
+            let skipped = match rule_window_decision(&self.home_dir, rule, chrono::Utc::now()) {
+                WindowDecision::Inside => None,
+                WindowDecision::Outside { detail } => Some(("outside_window", detail)),
+                WindowDecision::ZoneUnresolved { detail } => Some(("outside_window_tz_unresolved", detail)),
+                WindowDecision::Invalid { detail } => Some(("active_window_invalid", detail)),
+            };
+            if let Some((result, detail)) = skipped {
+                if let Err(error) = self.store.append_step_history(&AutopilotHistoryRow {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    rule_id: rule.id.clone(),
+                    rule_name: rule.name.clone(),
+                    triggered_at: chrono::Utc::now().to_rfc3339(),
+                    result: result.into(),
+                    details: Some(detail),
+                }).await {
+                    warn!(rule_id = %rule.id, %error, "autopilot: window history write failed");
+                }
+                return;
+            }
+        }
+
         let action: Value = serde_json::from_str(&rule.action).unwrap_or(Value::Null);
         if let Err(reason) = self.autonomy_check(&action, fields) {
             let _ = self.store.append_history(&AutopilotHistoryRow {

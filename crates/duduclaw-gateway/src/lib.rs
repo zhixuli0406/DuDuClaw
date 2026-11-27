@@ -274,6 +274,7 @@ pub mod autopilot_engine;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
 pub mod autopilot_store;
+pub mod autopilot_window;
 pub mod cep_matcher;
 pub mod cron_scheduler;
 pub mod cron_store;
