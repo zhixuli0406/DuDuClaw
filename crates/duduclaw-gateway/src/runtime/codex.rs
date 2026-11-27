@@ -1595,8 +1595,16 @@ impl CodexRuntime {
     }
 }
 
+#[cfg(test)]
 fn employee_base_command(codex_path: &str, model: &str) -> tokio::process::Command {
+    employee_base_command_with_caps(codex_path, model, None)
+}
+
+fn employee_base_command_with_caps(
+    codex_path: &str, model: &str, caps: Option<&CapabilitiesConfig>,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(duduclaw_core::path_compare::spawn_path(std::path::Path::new(codex_path)));
+    crate::runtime_dispatch::apply_claude_fallback_spawn_env(&mut cmd, caps);
     // Auth remains in the host store. These arguments
     // express the desired base but are NOT evidence of complete isolation.
     apply_codex_auth_env(&mut cmd);
@@ -1824,7 +1832,7 @@ impl AgentRuntime for CodexRuntime {
         if !system_prompt.is_empty() {
             write_owned_instructions(&codex_home, system_prompt)?;
         }
-        let mut cmd = employee_base_command(&self.codex_path, &context.model);
+        let mut cmd = employee_base_command_with_caps(&self.codex_path, &context.model, caps);
         cmd.env("CODEX_HOME", duduclaw_core::path_compare::spawn_path(&codex_home));
         let egress_mode = duduclaw_core::egress_guard::effective_mode(&context.home_dir, context.agent_dir.as_deref());
         let effective_caps = egress_sandbox_caps(caps, egress_mode);

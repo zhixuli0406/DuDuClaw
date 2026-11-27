@@ -5376,7 +5376,7 @@
   "agents.publicTrigger.title": "讓外部聯絡人用 @ 呼叫",
   "agents.edit.reportsTo.help": "選擇這位員工的上級；委派與通道權杖會沿此層級向上尋找。",
   "agents.edit.preferredModel.help": "日常優先使用的模型。",
-  "agents.edit.fallbackModel.help": "首選模型不可用時改用的備援模型。",
+  "agents.edit.fallbackModel.help": "同一引擎切換模型時使用；切換引擎時，只有這個模型屬於備援引擎支援的模型系列才會使用。",
   "agents.edit.apiMode.help": "決定用訂閱帳號還是 API 金鑰來呼叫模型。",
   "agents.edit.confidenceRouter.help": "自動判斷簡單問題交本地、困難問題交雲端。",
   "agents.edit.budgetLimit.help": "這位員工每月可花費的上限。",

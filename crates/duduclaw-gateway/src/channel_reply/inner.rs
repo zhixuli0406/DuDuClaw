@@ -2107,7 +2107,7 @@ async fn build_reply_with_session_inner_impl(
         Box::pin(async {
             #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,false);
             // A channel reply is chat work: keep its employee step budget.
-            Box::pin(crate::runtime_dispatch::with_work_request_type(
+            let result = Box::pin(crate::runtime_dispatch::with_work_request_type(
                 crate::cost_telemetry::RequestType::Chat, call_claude_cli_rotated(
             &effective_message,
             &model,
@@ -2121,9 +2121,46 @@ async fn build_reply_with_session_inner_impl(
             &account_pool,
             None,
             crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
-        ))).await
-            .map(|text| ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)))
-            .map_err(|error| ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
+        ))).await;
+            let error = match result {
+                Ok(text) => {
+                    crate::runtime_dispatch::record_claude_runtime_success(&ctx.home_dir).await;
+                    return Ok(ReplyAttempt::new(text, ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude)));
+                }
+                Err(error) => error,
+            };
+            let fallback = crate::runtime_dispatch::run_claude_runtime_fallback(
+                crate::runtime_dispatch::AgentPrompt {
+                    agent_dir: agent_dir.as_deref(), home_dir: &ctx.home_dir, agent_id: &agent_id,
+                    prompt: &effective_message, system_prompt: &full_system_prompt, model: &model,
+                    max_tokens: 8192, provider_override: None, conversation_history: &conversation_history,
+                    request_type: crate::cost_telemetry::RequestType::Chat,
+                    runtime_settings: runtime_settings.as_ref(), effort: None,
+                    allow_cross_family_failover: true, purpose: crate::runtime_dispatch::SpawnPurpose::EmployeeTurn,
+                }, &error);
+            let fallback = Box::pin(crate::runtime_dispatch::CHANNEL_REPLY_PARTIAL.scope((), fallback)).await;
+            if let Some(result) = fallback {
+                let resp = result.map_err(ReplyFailure::runtime)?;
+                let substituted = is_runtime_substitution("claude", &resp.runtime_name);
+                if substituted {
+                    let record = serde_json::json!({
+                        "event": "runtime_fallback_substitution", "agent": agent_id,
+                        "session_id": session_id,
+                        "channel": crate::trajectory_guard::channel_from_session_id(session_id),
+                        "requested": "claude", "actual": resp.runtime_name,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                    });
+                    if let Err(error) = crate::trajectory_guard::append_anomaly(&ctx.home_dir, &record) {
+                        warn!(%error, "runtime_fallback_substitution: 寫入 channel_failures.jsonl 失敗");
+                    }
+                }
+                if let Some(cb) = on_progress.as_ref() {
+                    cb(ProgressEvent::ModelInfo { model: runtime_model_label(&resp.model_used, &model, substituted) });
+                }
+                let origin = ReplyOrigin::runtime_name(&resp.runtime_name);
+                return Ok(ReplyAttempt::new(runtime_content_for_session(resp, session_id), origin));
+            }
+            Err(ReplyFailure::simple(ReplyOrigin::Runtime(duduclaw_core::types::RuntimeType::Claude), error))
         })
     }
     };

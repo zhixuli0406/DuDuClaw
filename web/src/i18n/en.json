@@ -5376,7 +5376,7 @@
   "agents.publicTrigger.title": "Callable by outside contacts",
   "agents.edit.reportsTo.help": "Pick this staffer's manager; delegation and channel tokens walk up this chain.",
   "agents.edit.preferredModel.help": "The model used first for day-to-day work.",
-  "agents.edit.fallbackModel.help": "Used when the preferred model is unavailable.",
+  "agents.edit.fallbackModel.help": "Used when switching models within the same runtime. When switching runtimes, it is used only if the fallback runtime supports its model family.",
   "agents.edit.apiMode.help": "Whether to call the model via a subscription account or an API key.",
   "agents.edit.confidenceRouter.help": "Automatically routes easy questions locally and hard ones to the cloud.",
   "agents.edit.budgetLimit.help": "The monthly spending cap for this staffer.",

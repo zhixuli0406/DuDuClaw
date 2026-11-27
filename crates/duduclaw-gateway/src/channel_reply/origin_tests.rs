@@ -273,7 +273,7 @@ async fn shared_pipeline_old_known_mismatch_is_call_zero_and_public_visitor_neve
     let path = home.path().join("agents/worker/agent.toml");
     let before = std::fs::read_to_string(&path)
         .unwrap()
-        .replace("provider='codex'", "provider='claude'");
+        .replace("provider='codex'", "provider='claude'\nfallback='codex'");
     std::fs::write(&path, &before).unwrap();
     let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
     let reply = build_reply_for_agent(
@@ -286,6 +286,7 @@ async fn shared_pipeline_old_known_mismatch_is_call_zero_and_public_visitor_neve
     )
     .await;
     assert!(reply.contains("model_provider_mismatch"), "{reply}");
+    assert!(reply.contains("已設定備援引擎，但模型設定本身有誤，因此沒有切換。"), "{reply}");
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(spy.counts(), [0, 0]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
@@ -623,6 +624,40 @@ fn claude_chat_runtime_fallback_preserves_history_and_empty_fallback_stops() {
                         }));
                     }
                 }
+            }
+        });
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn claude_chat_spawn_gate_and_budget_do_not_switch_runtime() {
+    crate::runtime_dispatch::testing::isolated_claude_test(
+        concat!(module_path!(), "::claude_chat_spawn_gate_and_budget_do_not_switch_runtime"), |cli_home| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            std::fs::write(cli_home.join("stream.jsonl"), "").unwrap();
+            for stop in ["spawn_gate", "budget"] {
+                let (home, ctx, _registry, calls) = owned_claude_fallback("codex").await;
+                let dir = home.path().join("agents/worker");
+                if stop == "spawn_gate" {
+                    std::fs::write(dir.join(".mcp.json"), "{broken").unwrap();
+                } else {
+                    // The singleton is confined to this isolated test process.
+                    let _ = crate::cost_telemetry::init_telemetry(home.path());
+                    crate::cost_telemetry::get_telemetry().unwrap().record("worker",
+                        crate::cost_telemetry::RequestType::Chat, "claude-sonnet-5",
+                        &crate::cost_telemetry::TokenUsage {
+                            input_tokens: 1000, output_tokens: 50_000_000,
+                            cache_read_tokens: 0, cache_creation_tokens: 0,
+                        }).await;
+                    assert!(crate::budget::gate_before_spawn(home.path(), Some(&dir), "worker", "test")
+                        .await.is_err(), "fixture must exceed the budget");
+                }
+                let reply = build_reply_for_agent("NEXT_USER", &ctx, "worker",
+                    "discord:claude-stopped", "owned-user", None).await;
+                assert!(calls.lock().unwrap().is_empty(), "{stop}: {reply}");
+                assert!(!reply.contains("CODEX_FALLBACK_OK"));
+                assert!(!cli_home.join("claude-argv").exists(), "stop must precede Claude spawn too");
             }
         });
     });

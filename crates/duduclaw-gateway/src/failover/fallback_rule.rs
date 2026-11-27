@@ -176,6 +176,10 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
         PrimaryFailure::Error { error, autonomy_denied, kind } => (error, autonomy_denied, kind),
     };
 
+    // Only unwrap gateway-authored rotation envelopes, never search the body.
+    let error = error.strip_prefix("All accounts exhausted. Last error: ")
+        .or_else(|| error.strip_prefix("no accounts available: ")).unwrap_or(error);
+
     // ── Refusals (checked first; fail closed) ──────────────────────────
     if crate::budget::budget_refusal_message(error).is_some() {
         return Refused(FallbackRefusal::Budget);
@@ -294,6 +298,9 @@ const PROCESS_PREFIXES: &[&str] = &[
     "Failed to run ",
     "Failed to read codex output: ",
     "claude CLI spawn error: ",
+    "claude CLI stream error [",
+    "claude CLI exit ",
+    "claude CLI assistant error: ",
 ];
 
 /// `grok.rs::grok_auth_error`.

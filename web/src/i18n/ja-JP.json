@@ -5376,7 +5376,7 @@
   "agents.publicTrigger.title": "外部の連絡先から @ で呼び出し",
   "agents.edit.reportsTo.help": "この社員の上長を選びます。委任やチャンネルトークンはこの階層を上へ辿ります。",
   "agents.edit.preferredModel.help": "普段優先して使うモデルです。",
-  "agents.edit.fallbackModel.help": "優先モデルが使えないときに切り替える予備モデルです。",
+  "agents.edit.fallbackModel.help": "同じ実行エンジン内でモデルを切り替える際に使います。実行エンジンを切り替える場合は、予備のエンジンが対応するモデル系列に属するときだけ使います。",
   "agents.edit.apiMode.help": "サブスクリプションとAPIキーのどちらでモデルを呼ぶかを決めます。",
   "agents.edit.confidenceRouter.help": "簡単な質問はローカル、難しい質問はクラウドへ自動で振り分けます。",
   "agents.edit.budgetLimit.help": "この社員が月に使える上限額です。",

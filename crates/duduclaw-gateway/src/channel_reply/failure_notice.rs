@@ -161,7 +161,21 @@ pub(super) async fn model_alignment_gate(
             tracing::warn!(agent, %error, "model/provider alignment refused");
             let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
             let reason = TurnFailureReason::ModelProviderMismatch;
-            Err(format!("{}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn)))
+            let fallback_note = if crate::runtime_config::agent_runtime_fallback(
+                &ctx.home_dir.join("agents").join(agent)).is_some() {
+                let language = language.as_deref().unwrap_or("zh-TW");
+                let sentence = if language == "en" || language == "en_US" || language.starts_with("en-") {
+                    "A fallback runtime is configured, but it was not used because the model setting itself is incorrect."
+                } else if matches!(language, "ja" | "ja-JP" | "ja_JP") {
+                    "予備の実行エンジンは設定されていますが、モデル設定自体が誤っているため切り替えませんでした。"
+                } else if matches!(language, "zh-CN" | "zh_CN") {
+                    "已设置备用引擎，但模型设置本身有误，因此没有切换。"
+                } else {
+                    "已設定備援引擎，但模型設定本身有誤，因此沒有切換。"
+                };
+                format!("\n{sentence}")
+            } else { String::new() };
+            Err(format!("{}{fallback_note}\n{}", reason.text(language.as_deref()), notice_suffix(language.as_deref(), Some(reason.code()), turn)))
         }
     }
 }
