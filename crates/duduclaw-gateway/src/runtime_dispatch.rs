@@ -1765,7 +1765,8 @@ pub(crate) mod testing {
         let bin = home.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
         crate::test_exec::write_executable(&bin.join("claude"),
-            "#!/bin/sh\nif [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+             if [ \"$#\" -eq 2 ] && [ \"$1\" = auth ] && [ \"$2\" = status ]; then echo '{\"loggedIn\":false}'; exit 1; fi\n\
              printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
              /bin/cat \"$HOME/stream.jsonl\"\nexit 1\n", 0o755);
         let name = full_name.split_once("::").unwrap().1;

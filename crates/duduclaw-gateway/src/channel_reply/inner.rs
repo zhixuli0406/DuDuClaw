@@ -616,8 +616,9 @@ async fn build_reply_with_session_inner_impl(
         warn!(agent = %agent_id, code = refusal.code(), ?refusal, "employee entry refused");
         super::health::receive(ctx, &agent_id, session_id).await;
         super::health::mark(&agent_id, Some("other"));
-        let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, &agent_id).await;
-        let text = refusal.user_text(session_id, language.as_deref(), &turn_id);
+        let text = super::failure_notice::entry_refusal_text(
+            ctx, session_id, &agent_id, &turn_id, refusal,
+        ).await;
         return if public_visitor { text } else { live_only_notice(format!("⚠️ {text}")) };
     }
     let model = match resolved_turn.as_ref() {
@@ -2359,7 +2360,7 @@ async fn build_reply_with_session_inner_impl(
     // for OAuth-only setups to avoid the misleading "未設定任何 API 帳號" error.
     let allow_direct_api = direct_api_allowed(non_claude,duduclaw_llm::is_moa_model_id(&model),mcp_gate_refused);
     let fallback_api_key = if reply.is_none() && allow_direct_api {
-        #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir,true);
+        #[cfg(test)] super::reply_origin::testing::before_direct_api_credentials(&ctx.home_dir);
         get_api_key(&ctx.home_dir).await
     } else { None };
     let reply = match reply {
@@ -2368,6 +2369,7 @@ async fn build_reply_with_session_inner_impl(
         // A `moa:` id is not an Anthropic model — the MoA branch above was
         // this request's API path; don't re-send the ensemble id upstream.
         None if allow_direct_api && fallback_api_key.is_some() => {
+            #[cfg(test)] super::reply_origin::testing::boundary(&ctx.home_dir, true);
             let key = fallback_api_key.as_deref().unwrap_or_default();
             // P34 #4: a `system_operator`-capable agent gets one attempt at
             // the real MCP tool loop before falling through to the plain

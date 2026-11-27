@@ -167,7 +167,7 @@ pub(super) const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "agent_update",
-        description: "Update one or more fields of an existing agent's configuration (agent.toml). Supports identity, model, budget, heartbeat, container, and database-source fields. AI callers may only narrow budget and database authority; protected changes require an administrator in the admin console. Tell the requesting person when administrator action is needed. Uses atomic write for safety.",
+        description: "Update an agent's configuration. AI callers may only narrow authority fields; widening budgets, capabilities, or database sources requires an administrator in the dashboard.",
         params: &[
             ParamDef {
                 name: "agent_id",

@@ -160,11 +160,13 @@ async fn shared_pipeline_old_known_mismatch_is_call_zero_and_public_visitor_neve
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(spy.counts(), [0, 0]);
     assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-    let visitor = crate::odoo_livechat::session_key("owned", 42);
-    let reply =
-        build_reply_for_agent("hello", &context, "worker", &visitor, "owned-visitor", None).await;
-    assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
-    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    for visitor in [crate::odoo_livechat::session_key("owned", 42), "widget-visitor:fallback".into()] {
+        let reply =
+            build_reply_for_agent("hello", &context, "worker", &visitor, "owned-visitor", None).await;
+        assert_eq!(reply, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE, "{visitor}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(spy.counts(), [0, 0]);
+    }
 }
 #[test]
 fn local_moa_and_api_failure_metadata_never_claim_claude_cli_origin() {
@@ -481,10 +483,11 @@ fn claude_chat_runtime_fallback_preserves_history_and_empty_fallback_stops() {
                     ctx.session_manager.get_or_create(sid, "worker").await.unwrap();
                     ctx.session_manager.append_message(sid, "user", "EARLIER_USER", 0).await.unwrap();
                     ctx.session_manager.append_message(sid, "assistant", "EARLIER_ASSISTANT", 0).await.unwrap();
-                    let spy = super::reply_origin::testing::NoImplicitCloud::at(home.path());
+                    let spy = super::reply_origin::testing::NoImplicitCloud::allowing_claude_at(home.path());
                     let reply = build_reply_for_agent("NEXT_USER", &ctx, "worker", sid, "owned-user", None).await;
                     let recorded = calls.lock().unwrap();
                     assert_eq!(recorded.len(), usize::from(!fallback.is_empty()), "{reply}");
+                    assert_eq!(spy.counts()[1], 0, "no Direct API call: fallback={fallback:?}");
                     if !fallback.is_empty() {
                         assert!(reply.contains("CODEX_FALLBACK_OK"), "{reply}");
                         assert_eq!(recorded[0].model, RuntimeType::Codex.spec().fallback_models[0].0);
@@ -493,12 +496,15 @@ fn claude_chat_runtime_fallback_preserves_history_and_empty_fallback_stops() {
                         assert_eq!(history, vec![("user", "EARLIER_USER"), ("assistant", "EARLIER_ASSISTANT")]);
                         let argv = std::fs::read_to_string(cli_home.join("claude-argv")).unwrap();
                         assert!(argv.contains("EARLIER_USER") && argv.contains("EARLIER_ASSISTANT"));
-                        assert_eq!(spy.counts()[1], 0, "explicit fallback must precede Direct API");
+                        assert_eq!(spy.counts(), [1, 0],
+                            "explicit fallback must follow Claude and precede Direct API");
                         let audit = std::fs::read_to_string(home.path().join("channel_failures.jsonl")).unwrap();
                         assert!(audit.lines().any(|row| {
                             let row: serde_json::Value = serde_json::from_str(row).unwrap();
                             row["event"] == "runtime_fallback_substitution" && row["actual"] == "codex"
                         }));
+                    } else {
+                        assert!(!reply.contains("CODEX_FALLBACK_OK"), "{reply}");
                     }
                 }
             }
@@ -533,8 +539,10 @@ fn claude_chat_spawn_gate_and_budget_do_not_switch_runtime() {
                 let reply = build_reply_for_agent("NEXT_USER", &ctx, "worker",
                     "discord:claude-stopped", "owned-user", None).await;
                 assert!(calls.lock().unwrap().is_empty(), "{stop}: {reply}");
-                assert!(!reply.contains("CODEX_FALLBACK_OK"));
-                assert!(!cli_home.join("claude-argv").exists(), "stop must precede Claude spawn too");
+                assert!(!reply.contains("CODEX_FALLBACK_OK"), "{stop}: {reply}");
+                assert!(!cli_home.join("claude-argv").exists(),
+                    "{stop}: stop must precede Claude model spawn too; argv={:?}; reply={reply}",
+                    std::fs::read_to_string(cli_home.join("claude-argv")));
             }
         });
     });

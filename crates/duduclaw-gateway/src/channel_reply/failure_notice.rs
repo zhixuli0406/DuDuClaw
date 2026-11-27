@@ -140,6 +140,33 @@ pub(super) async fn persist_failure_notice(
     }
 }
 
+/// Render both entry and late alignment refusals from the same fixed text.
+/// The late gate can still refuse if settings change after entry preflight.
+pub(super) async fn entry_refusal_text(
+    ctx: &ReplyContext, sid: &str, agent: &str, turn: &str,
+    error: &crate::entry_gate::EntryRefusal,
+) -> String {
+    let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
+    let base = error.user_text(sid, language.as_deref(), turn);
+    let fallback_note = if error.code() == "model_provider_mismatch"
+        && !crate::channel_reply::assembly::public_session(sid)
+        && crate::runtime_config::agent_runtime_fallback(
+        &ctx.home_dir.join("agents").join(agent)).is_some() {
+        let language = language.as_deref().unwrap_or("zh-TW");
+        let sentence = if language == "en" || language == "en_US" || language.starts_with("en-") {
+            "A fallback runtime is configured, but it was not used because the model setting itself is incorrect."
+        } else if matches!(language, "ja" | "ja-JP" | "ja_JP") {
+            "予備の実行エンジンは設定されていますが、モデル設定自体が誤っているため切り替えませんでした。"
+        } else if matches!(language, "zh-CN" | "zh_CN") {
+            "已设置备用引擎，但模型设置本身有误，因此没有切换。"
+        } else {
+            "已設定備援引擎，但模型設定本身有誤，因此沒有切換。"
+        };
+        format!("\n{sentence}")
+    } else { String::new() };
+    format!("{base}{fallback_note}")
+}
+
 /// Alignment refusals carry a fixed, specific code on the live transport and
 /// in the stored notice. Only a post-persist error can add that notice.
 pub(super) async fn model_alignment_gate(
@@ -158,25 +185,7 @@ pub(super) async fn model_alignment_gate(
         Ok(_) => Ok(()),
         Err(error) => {
             tracing::warn!(agent, ?error, "model/provider alignment refused");
-            let language = crate::prompt_identity::resolve_fixed_message_language_for_id(&ctx.home_dir, agent).await;
-            let base = error.user_text(sid, language.as_deref(), turn);
-            let fallback_note = if error.code() == "model_provider_mismatch"
-                && !crate::channel_reply::assembly::public_session(sid)
-                && crate::runtime_config::agent_runtime_fallback(
-                &ctx.home_dir.join("agents").join(agent)).is_some() {
-                let language = language.as_deref().unwrap_or("zh-TW");
-                let sentence = if language == "en" || language == "en_US" || language.starts_with("en-") {
-                    "A fallback runtime is configured, but it was not used because the model setting itself is incorrect."
-                } else if matches!(language, "ja" | "ja-JP" | "ja_JP") {
-                    "予備の実行エンジンは設定されていますが、モデル設定自体が誤っているため切り替えませんでした。"
-                } else if matches!(language, "zh-CN" | "zh_CN") {
-                    "已设置备用引擎，但模型设置本身有误，因此没有切换。"
-                } else {
-                    "已設定備援引擎，但模型設定本身有誤，因此沒有切換。"
-                };
-                format!("\n{sentence}")
-            } else { String::new() };
-            Err(format!("{base}{fallback_note}"))
+            Err(entry_refusal_text(ctx, sid, agent, turn, &error).await)
         }
     }
 }

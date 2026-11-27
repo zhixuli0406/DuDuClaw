@@ -498,8 +498,13 @@ listed for every caller and check the relationship per call:
 - **`agent_update` on yourself**: an AI employee cannot send `reports_to`,
   `db_sources`, `db_sources_add`, `db_sources_remove`, `budget_cents`,
   `reply_language`, `memory_language` (v1.84.0), `runtime`, `timeout_secs`,
-  `max_turns` or `role` about itself (audit `agent_authority_refused`). Editing a subordinate is
-  unchanged.
+  `max_turns` or `role` about itself (audit `agent_authority_refused`).
+- **`agent_update` authority changes**: updates are written atomically and support
+  identity, model, budget, heartbeat, container, and database-source fields.
+  AI callers may only narrow authority fields, including on subordinates;
+  widening budgets, capabilities, or database sources requires an administrator
+  in the dashboard. Existing self-edit and organization checks still apply.
+  Tell the requesting person when administrator action is needed.
 
 An operator (an MCP key that maps to no AI employee, in a process that is not
 running for one) is not restricted. The shared internal key in a process with
