@@ -47,7 +47,7 @@ pub(crate) async fn handle_odoo_tool(
     odoo: &OdooState,
     caller_agent: &str,
 ) -> Value {
-    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None)).await)
+    super::odoo_access::sanitize_result(identity_client::with_call(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), None, None)).await)
 }
 
 /// Isolation supplies the already selected connector; no account resolution or
@@ -55,8 +55,9 @@ pub(crate) async fn handle_odoo_tool(
 pub(crate) async fn handle_bound_odoo_tool(
     tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, caller_agent: &str,
     connector: std::sync::Arc<duduclaw_odoo::OdooConnector>,
+    attachment: Option<super::ValidatedAttachment>,
 ) -> Value {
-    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector)).await)
+    super::odoo_access::sanitize_result(handle_odoo_tool_with_connector(tool, params, home_dir, odoo, OdooActor::Employee(caller_agent), Some(connector), attachment).await)
 }
 
 /// Person tools enter here before employee dispatch, isolation or approvals.
@@ -67,12 +68,13 @@ pub(super) async fn handle_odoo_actor(
         .is_some_and(|t| t.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::McpWithPersonalOdoo) {
         return mcp_error("本人金鑰不提供這項 Odoo 工具。");
     }
-    handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None).await
+    handle_odoo_tool_with_connector(tool, params, home, odoo, actor, None, None).await
 }
 
 async fn handle_odoo_tool_with_connector(
     tool: &str, params: &Value, home_dir: &Path, odoo: &OdooState, actor: OdooActor<'_>,
     bound: Option<std::sync::Arc<duduclaw_odoo::OdooConnector>>,
+    attachment: Option<super::ValidatedAttachment>,
 ) -> Value {
     use duduclaw_odoo::connector::OdooConnector;
     use duduclaw_odoo::models::{accounting, crm, inventory, sale};
@@ -132,7 +134,7 @@ async fn handle_odoo_tool_with_connector(
     }
 
     if tool == "odoo_attachment_add" {
-        return super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound).await;
+        return super::odoo_attachment::handle(params, home_dir, odoo, caller_agent, bound, attachment).await;
     }
 
     if matches!(tool, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send") {

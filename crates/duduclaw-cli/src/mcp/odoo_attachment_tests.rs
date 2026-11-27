@@ -458,8 +458,8 @@ async fn protected_attachment_uses_verified_employee_host_root() {
         worker: None, execution: None, forks: None, record_resolver: None });
     ISOLATED_CALL.scope(isolated, async {
         let args = json!({"model":"crm.lead","res_id":9,"file":"x.pdf"});
-        assert!(odoo_attachment_precheck(home.path(), "bot", &args).is_ok());
-        assert!(odoo_attachment_precheck(home.path(), "other", &args).is_err());
+        assert!(validate_attachment(home.path(), "bot", &args).await.is_ok());
+        assert!(validate_attachment(home.path(), "other", &args).await.is_err());
         assert!(!verified_employee(&home.path().join("other-home"), "bot"));
         let expected = clean_pdf();
         std::fs::write(home.path().join("attachments/x.pdf"), b"host secret").unwrap();

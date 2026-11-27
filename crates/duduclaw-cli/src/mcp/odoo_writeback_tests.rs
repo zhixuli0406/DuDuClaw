@@ -3,6 +3,9 @@ use serde_json::json;
 use std::sync::Mutex;
 use super::super::odoo_identity_client::tests::with_decision;
 
+#[path = "odoo_preconnect_tests.rs"]
+mod preconnect_tests;
+
 #[test]
 fn text_is_escaped_without_mentions_or_truncation() {
     let body = "<b title=\"x\">中文 & '🙂'</b> @alice";

@@ -28,6 +28,11 @@ impl BoundConnectorExecutor for OdooBoundExecutor {
         Box::pin(async move {
             if !self.supports(call.name()) { return Err(VerificationError::Unavailable); }
             selected.verify_call(&call)?;
+            if let Err(error) = crate::mcp::odoo_bound_preconnect(
+                self.provider.home(), self.provider.agent(), call.name(), call.arguments())
+            {
+                return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]}));
+            }
             // Reject disallowed operations before credential resolution or an
             // authentication handshake. The handler repeats these same gates.
             let generic_write = crate::mcp::generic_write_verb(call.name()).is_some();
@@ -53,13 +58,14 @@ impl BoundConnectorExecutor for OdooBoundExecutor {
                     return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]}));
                 }
             }
-            if call.name() == "odoo_attachment_add" {
-                if let Err(error) = crate::mcp::odoo_attachment_precheck(
-                    self.provider.home(), self.provider.agent(), call.arguments())
+            let attachment = if call.name() == "odoo_attachment_add" {
+                match crate::mcp::validate_attachment(
+                    self.provider.home(), self.provider.agent(), call.arguments()).await
                 {
-                    return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]}));
+                    Ok(attachment) => Some(attachment),
+                    Err(error) => return Ok(serde_json::json!({"isError":true,"content":[{"type":"text","text":error}]})),
                 }
-            }
+            } else { None };
             let prepared = self.provider.prepare(selected, &call).await?;
             let pool = Arc::new(crate::odoo_pool::OdooConnectorPool::new(prepared.global));
             if let Some(config) = prepared.agent {
@@ -68,7 +74,7 @@ impl BoundConnectorExecutor for OdooBoundExecutor {
             prepared.connector.verify_io().map_err(|_| VerificationError::Unavailable)?;
             let connector = prepared.connector.clone();
             let result = crate::mcp::handle_bound_odoo_tool(call.name(), call.arguments(), self.provider.home(),
-                &pool, self.provider.agent(), prepared.connector).await;
+                &pool, self.provider.agent(), prepared.connector, attachment).await;
             if connector.verify_io().is_err() {
                 return Ok(serde_json::json!({"isError":true,"content":[{"type":"text", "text":
                     "無法確認 Odoo 操作的結果；若有寫入，請先到 Odoo 檢查，勿直接重試。"}]}));
