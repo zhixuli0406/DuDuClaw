@@ -306,6 +306,11 @@ enabled = true
 enabled = true
 [knowledge]
 enabled = true
+[odoo]
+url = "https://erp.example.com"
+db = "parity"
+[odoo_access]
+company_key_agents = ["main"]
 "#).unwrap();
     assert!(duduclaw_gateway::google_workspace::integration_enabled(home));
     assert!(duduclaw_gateway::github_workspace::integration_enabled(home));
