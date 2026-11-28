@@ -10181,6 +10181,10 @@ export const api = {
         email_setup?: EmailSetup;
       }>,
     deptGrants: {
+      list: () => client.call('users.dept_grants.list', {}) as Promise<DeptGrantEntry[]>,
+      options: () => client.call('users.dept_grants.options', {}) as Promise<DeptGrantOptions>,
+      set: (params: { user_id: string; department: string; groups: GrantGroup[]; acknowledged?: boolean }) =>
+        client.call('users.dept_grants.set', params) as Promise<{ ok: true }>,
       mine: (group?: GrantGroup) =>
         client.call('users.dept_grants.mine', group ? { group } : {}) as Promise<DeptGrantsMineResult>,
     },
@@ -10498,3 +10502,19 @@ export const api = {
   },
   // ── end v1.81 F5 part A ──
 };
+
+/** Admin-only department management grants (Enterprise). */
+export interface DeptGrantEntry {
+  user_id: string;
+  display_name: string;
+  email: string;
+  department: string;
+  groups: GrantGroup[];
+  granted_by: string;
+  granted_at: string;
+}
+
+export interface DeptGrantOptions {
+  departments: { name: string; agent_count: number }[];
+  mirror_mismatch_count: number;
+}

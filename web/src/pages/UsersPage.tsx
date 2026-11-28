@@ -16,6 +16,7 @@ import { SigninRequestsPanel, useSigninRequests } from './users/SigninRequestsPa
 import { OrgChartView } from './users/OrgChartView';
 import { OrgHistorySettings } from './users/OrgHistorySettings';
 import { EditUserDialog } from './users/UserFormDialogs';
+import { DeptGrantsDialog } from './users/DeptGrantsDialog';
 import { CreateAvatarDialog } from './users/CreateAvatarDialog';
 import { useAgentsStore } from '@/stores/agents-store';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
@@ -81,6 +82,7 @@ export function UsersPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
   const [showBind, setShowBind] = useState<string | null>(null);
+  const [deptGrantsUser, setDeptGrantsUser] = useState<UserDetail | null>(null);
   const [showEdit, setShowEdit] = useState<UserDetail | null>(null);
   const [createAvatarFor, setCreateAvatarFor] = useState<UserDetail | null>(null);
   const [showOffboard, setShowOffboard] = useState<UserDetail | null>(null);
@@ -124,6 +126,7 @@ export function UsersPage() {
   };
   const actionsFor = (user: UserDetail) => ({
     onEdit: () => setShowEdit(user),
+    ...(isAdmin && user.role === 'manager' ? { onDeptGrants: () => setDeptGrantsUser(user) } : {}),
     ...(isAdmin && user.google_signin_linked ? { onUnlinkGoogle: () => { setMemberError(null); setMemberConfirm({ user, action: 'unlink' }); } } : {}),
     ...(isAdmin && credentials[user.id] ? { onRevokeOdoo: () => { setMemberError(null); setMemberConfirm({ user, action: 'revoke' }); } } : {}),
     ...(isAdmin && user.status === 'active' && (user.invite_eligible === true || inviteStates[user.id] === 'pending' || inviteStates[user.id] === 'expired') ? { onInvite: () => setInviteUser(user) } : {}),
@@ -478,6 +481,8 @@ export function UsersPage() {
           <DialogFooter><Button variant="outline" disabled={inviting} onClick={() => setInviteUser(null)}>{intl.formatMessage({ id: 'common.cancel' })}</Button><Button disabled={inviting} onClick={() => void sendInvite()}>{intl.formatMessage({ id: 'users.invite.send' })}</Button></DialogFooter>
         </DialogContent>
       </Dialog>}
+      {isAdmin && deptGrantsUser && <DeptGrantsDialog key={deptGrantsUser.id} user={deptGrantsUser}
+        onClose={() => setDeptGrantsUser(null)} onUpdated={() => void fetchUsers()} />}
       {/* Edit User Dialog */}
       {showEdit && (
         <EditUserDialog
