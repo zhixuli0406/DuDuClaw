@@ -366,6 +366,7 @@ fn existential_listing_has_no_hardcoded_business_model_or_method() {
 
 #[test]
 fn user_messages_are_plain_and_stable() {
+    assert_eq!(MEMBER_CREDENTIALS_OFF, "公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。");
     for refusal in [FixedRefusal::F1, FixedRefusal::F2, FixedRefusal::F3, FixedRefusal::F4, FixedRefusal::F5] {
         assert_eq!(refusal.code(), format!("{refusal:?}"));
         assert_eq!(fixed_refusal_message(refusal), format!("DuDuClaw 不讓 AI 做這件事：{}。", refusal.reason()));

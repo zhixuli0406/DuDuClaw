@@ -699,6 +699,12 @@ async fn googlechat_bind_refuses_another_persons_google_identity_and_list_shows_
     let identities = listed["identities"].as_array().unwrap();
     assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i.get("source").is_none()));
     assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i["source"] == "google_account"));
+    for identity in identities {
+        assert_eq!(identity["proof_status"], "admin_prefilled");
+        assert_eq!(identity["proven_at"], Value::Null);
+        assert!(identity.get("proof_account").is_none());
+        assert!(identity.get("proof_dm").is_none());
+    }
     let (_, listed) = body(handle_channel_identity_list(State(state.clone()), headers.clone(),
         Query(ChannelIdentityListQuery { user_id: bob.id.clone() })).await.into_response()).await;
     assert!(listed["identities"].as_array().unwrap().is_empty());
@@ -1407,7 +1413,6 @@ async fn member_key_creation_consumes_a_fresh_recovery_factor() {
     assert_eq!(state.user_db.member_api_keys_for_user(&member.id).unwrap().len(), 1);
 }
 
-
 #[tokio::test]
 async fn mfa_email_http_first_enrollment_processes_proof_before_delivery_and_issues_tokens() {
     let (_dir,state,user)=fixture(false,true).await;
@@ -1432,4 +1437,46 @@ async fn mfa_email_http_first_enrollment_processes_proof_before_delivery_and_iss
     assert!(state.jwt_config.verify_access_token(value["access_token"].as_str().unwrap()).is_ok());
     assert!(value["refresh_token"].is_string());
     assert_eq!(value["recovery_codes"].as_array().unwrap().len(),10);
+}
+
+#[tokio::test]
+async fn channel_identity_list_proof_fields_and_admin_gate() {
+    let (_dir, state, admin) = fixture(false, false).await;
+    let employee = state.user_db.create_user("proof@company.test", "Proof", "password123", UserRole::Employee).unwrap();
+    for id in ["prefilled", "proven", "wrong-owner"] {
+        state.user_db.bind_channel_identity(&employee.id, "telegram", id, true).unwrap();
+    }
+    let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    conn.execute("UPDATE channel_identities SET proof_method='chat_handshake',proof_user_id=?1,
+        proof_account='private-bot',proof_dm='private-dm',proven_at=1700000000
+        WHERE channel_user_id IN ('proven','wrong-owner')", [&employee.id]).unwrap();
+    conn.execute("UPDATE channel_identities SET proof_user_id=?1 WHERE channel_user_id='wrong-owner'", [&admin.id]).unwrap();
+    let headers = |user: &duduclaw_auth::User| {
+        let mut headers = axum::http::HeaderMap::new();
+        let token = state.jwt_config.issue_access_token(user, &[]).unwrap();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    };
+    let (status, listed) = body(handle_channel_identity_list(State(state.clone()), headers(&admin),
+        Query(ChannelIdentityListQuery { user_id: employee.id.clone() })).await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    let identities = listed["identities"].as_array().unwrap();
+    assert_eq!(identities.len(), 3);
+    for identity in identities {
+        let proven = identity["channel_user_id"] == "proven";
+        assert_eq!(identity["proof_status"], if proven { "self_confirmed" } else { "admin_prefilled" });
+        assert_eq!(identity["proven_at"], if proven { json!("2023-11-14T22:13:20+00:00") } else { Value::Null });
+        let mut fields: Vec<_> = identity.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["channel", "channel_user_id", "created_at", "proof_status", "proven_at", "user_id", "verified"]);
+    }
+    let response = handle_channel_identity_list(State(state.clone()), headers(&employee),
+        Query(ChannelIdentityListQuery { user_id: employee.id.clone() })).await.into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    conn.execute("UPDATE channel_identities SET proven_at='unreadable' WHERE channel_user_id='proven'", []).unwrap();
+    let (status, error) = body(handle_channel_identity_list(State(state.clone()), headers(&admin),
+        Query(ChannelIdentityListQuery { user_id: employee.id })).await.into_response()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.get("error").is_some());
+    assert!(error.get("identities").is_none());
 }

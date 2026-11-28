@@ -3,12 +3,13 @@
 #[allow(unused_imports)]
 use super::*;
 use crate::trigger_route::texts::Lang;
+use crate::approval::decider_display::decider_display;
 
 impl MethodHandler {
     // ── Autopilot handlers ──────────────────────────────────
 
-    /// WP14-T14.7: list pending approvals for the approval center. Optional
-    /// `agent_id` filter. Read-only; opens approvals.db per call.
+    /// List pending approvals, or recent decided approvals for live Admins.
+    /// Optional exact agent/kind filters and a bounded result limit.
     pub(crate) async fn handle_approvals_list(&self, params: Value, ctx: &UserContext) -> WsFrame {
         self.approvals_read(params, ctx, false).await
     }
@@ -22,6 +23,18 @@ impl MethodHandler {
 
     async fn approvals_read(&self, mut params: Value, ctx: &UserContext, detail: bool) -> WsFrame {
         let step_up = super::personal_data_gate::take_step_up(&mut params);
+        let status = match params.get("status") {
+            None => "pending",
+            Some(Value::String(value)) if matches!(value.as_str(), "pending" | "decided") => value.as_str(),
+            _ => return WsFrame::error_response("", "invalid status"),
+        };
+        let requested_limit = match params.get("limit") {
+            None => None,
+            Some(value) => match value.as_u64().filter(|limit| (1..=100).contains(limit)) {
+                Some(limit) => Some(limit as u32),
+                None => return WsFrame::error_response("", "invalid limit"),
+            },
+        };
         let agent_filter = params.get("agent_id").and_then(|v| v.as_str());
         // Optional exact `action_kind` filter (e.g. "knowledge_quarantine" for the
         // D6 curation queue). Matches the raw stored action_kind string.
@@ -30,6 +43,22 @@ impl MethodHandler {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        // A-M-3: rows are filtered by the viewer's live role and employee
+        // bindings, not by the session's claims. One identity read per request.
+        let (fresh, department) = {
+            let (home, session) = (self.home_dir.clone(), ctx.clone());
+            match tokio::task::spawn_blocking(move || {
+                super::approval_visibility::fresh_reader(&home, &session)
+            })
+            .await
+            {
+                Ok(Some(reader)) => reader,
+                _ => return WsFrame::error_response("", "permission denied"),
+            }
+        };
+        if status == "decided" && !fresh.is_admin() {
+            return WsFrame::error_response("", "permission denied");
+        }
         let broker = match crate::approval::ApprovalBroker::open(&self.home_dir) {
             Ok(b) => b,
             Err(e) => return WsFrame::error_response("", &format!("open approvals: {e}")),
@@ -43,21 +72,15 @@ impl MethodHandler {
                         .filter(|r| agent_filter.is_none_or(|agent| agent == r.agent_id))
                         .collect()
                 })
+        } else if status == "decided" {
+            broker.list_decided(agent_filter, action_kind_filter, requested_limit.unwrap_or(50)).await
         } else {
-            broker.list_pending(agent_filter).await
-        };
-        // A-M-3: rows are filtered by the viewer's live role and employee
-        // bindings, not by the session's claims. One identity read per request.
-        let (fresh, department) = {
-            let (home, session) = (self.home_dir.clone(), ctx.clone());
-            match tokio::task::spawn_blocking(move || {
-                super::approval_visibility::fresh_reader(&home, &session)
-            })
-            .await
-            {
-                Ok(Some(reader)) => reader,
-                _ => return WsFrame::error_response("", "permission denied"),
-            }
+            broker.list_pending(agent_filter).await.map(|rows| rows.into_iter()
+                .filter(|r| action_kind_filter.is_none_or(|kind| r.action_kind == kind))
+                .collect::<Vec<_>>()).map(|rows| match requested_limit {
+                    Some(limit) => rows.into_iter().take(limit as usize).collect(),
+                    None => rows,
+                })
         };
         let grants = crate::dept_grants::DeptGrantView::load(self, ctx).await;
         match rows {
@@ -194,6 +217,10 @@ impl MethodHandler {
                             "redacted": true,
                             "payload_hash": r.binding.as_ref().map(|b|&b.payload_hash)
                         })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
+                        "execution_result": if !outbound && r.action_kind == crate::admin_ai::card::ACTION_KIND {
+                            json!(r.execution_result.as_ref().map(crate::admin_ai::card::execution_result_projection))
+                        } else { Value::Null },
+                        "decided_at": if may_decide && (!outbound || full_outbound) { json!(r.decided_at) } else { Value::Null },
                         "request_kind":r.request_kind,
                         "status":r.status,
                         "decided_by_display": viewer_decider_display(
@@ -336,56 +363,6 @@ fn viewer_decider_display(
     decider_display(marker.filter(|_| visible)?, name_of, lang)
 }
 
-fn decider_display(
-    marker: &str,
-    name_of: impl Fn(&str) -> Option<String>,
-    lang: Lang,
-) -> Option<String> {
-    let (user, source) = if let Some(user) = marker.strip_prefix("dashboard:") {
-        if user.is_empty() || user.contains(':') { return None; }
-        let source = match lang {
-            Lang::ZhTw => "儀表板",
-            Lang::En => "dashboard",
-            Lang::Ja => "ダッシュボード",
-        };
-        (user.to_owned(), source.to_owned())
-    } else {
-        let by = marker.parse::<crate::approval::chat_admin::ledger::DecidedBy>().ok()?;
-        let channel = match by.channel().as_str() {
-            "telegram" => "Telegram",
-            "googlechat" => "Google Chat",
-            "line" => "LINE",
-            "slack" => "Slack",
-            "discord" => "Discord",
-            _ => return None,
-        };
-        // The strict DecidedBy parser above validates the final step token.
-        let method = match (lang, marker.rsplit(':').next()?) {
-            (Lang::ZhTw, "tap") => "直接核准",
-            (Lang::ZhTw, "web") => "網頁確認",
-            (Lang::ZhTw, "totp") => "驗證碼確認",
-            (Lang::En, "tap") => "one tap",
-            (Lang::En, "web") => "web confirmation",
-            (Lang::En, "totp") => "code confirmation",
-            (Lang::Ja, "tap") => "ワンタップ",
-            (Lang::Ja, "web") => "Web 確認",
-            (Lang::Ja, "totp") => "コード確認",
-            _ => return None,
-        };
-        let separator = match lang {
-            Lang::ZhTw => "，",
-            Lang::En => ", ",
-            Lang::Ja => "、",
-        };
-        (by.user_id().to_owned(), format!("{channel}{separator}{method}"))
-    };
-    let name = duduclaw_core::plain_line(&name_of(&user)?, 80);
-    if name.trim().is_empty() { return None; }
-    Some(match lang {
-        Lang::En => format!("{name} ({source})"),
-        Lang::ZhTw | Lang::Ja => format!("{name}（{source}）"),
-    })
-}
 
 #[cfg(test)]
 mod live_event_tests {
@@ -680,5 +657,86 @@ mod egress_payload_tests {
             assert_eq!(dashboard_action_payload(&payload, true), payload);
             assert_eq!(dashboard_action_payload(&payload, false), json!({"redacted": true}));
         }
+    }
+}
+
+#[cfg(test)]
+mod decided_list_tests {
+    use super::*;
+    use crate::handlers::task_privacy_tests::{fixture, admin, payload};
+
+    #[tokio::test]
+    async fn decided_list_is_bounded_filtered_and_live_admin_only() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        let old = broker.request("sales", "mcp_call", "old", json!({}), 300).await.unwrap();
+        let newest = broker.request("sales", "mcp_call", "new", json!({}), 300).await.unwrap();
+        let other = broker.request("sales", "bus_task", "other", json!({}), 300).await.unwrap();
+        let pending = broker.request("sales", "mcp_call", "pending", json!({}), 300).await.unwrap();
+        let conn = rusqlite::Connection::open(f.home.join("approvals.db")).unwrap();
+        for (id, time, status) in [(&old, "2026-01-01T00:00:00Z", "denied"),
+            (&newest, "2026-01-02T00:00:00Z", "expired"),
+            (&other, "2026-01-03T00:00:00Z", "approved")] {
+            conn.execute("UPDATE approvals SET status=?1, decided_at=?2 WHERE id=?3",
+                rusqlite::params![status, time, id.as_str()]).unwrap();
+        }
+        let params = json!({"status":"decided", "limit":1, "action_kind":"mcp_call", "agent_id":"sales"});
+        let view = payload(f.handler.handle_approvals_list(params.clone(), &root).await);
+        assert_eq!(view["count"], 1);
+        assert_eq!(view["approvals"][0]["id"], newest.as_str());
+        assert_eq!(view["approvals"][0]["decided_at"], "2026-01-02T00:00:00Z");
+        assert_eq!(view["approvals"][0]["execution_result"], Value::Null);
+        let all = payload(f.handler.handle_approvals_list(json!({"status":"decided"}), &root).await);
+        assert_eq!(all["count"], 3);
+        assert_eq!(all["approvals"][0]["id"], other.as_str());
+        let pending_view = payload(f.handler.handle_approvals_list(json!({}), &root).await);
+        assert_eq!(pending_view["count"], 1);
+        assert_eq!(pending_view["approvals"][0]["id"], pending.as_str());
+        for role in [UserRole::Manager, UserRole::Employee] {
+            f.db.update_user(&f.alice.user_id, None, Some(role), None).unwrap();
+            let ctx = f.db.live_user_context(&f.alice.user_id).unwrap().unwrap();
+            let frame = f.handler.handle_approvals_list(params.clone(), &ctx).await;
+            assert!(matches!(frame, WsFrame::Response { ok:false, error:Some(e), payload:None, .. }
+                if e == json!("permission denied")));
+        }
+        f.db.update_user(&root.user_id, None, Some(UserRole::Manager), None).unwrap();
+        assert!(matches!(f.handler.handle_approvals_list(params, &root).await,
+            WsFrame::Response { ok:false, error:Some(e), .. } if e == json!("permission denied")));
+    }
+
+    #[tokio::test]
+    async fn approvals_list_rejects_invalid_status_and_limit() {
+        let f = fixture().await;
+        let root = admin(&f);
+        for params in [json!({"status":"approved"}), json!({"status":null}), json!({"status":1}),
+            json!({"limit":0}), json!({"limit":101}), json!({"limit":-1}),
+            json!({"limit":1.5}), json!({"limit":"1"}), json!({"limit":null})] {
+            assert!(matches!(f.handler.handle_approvals_list(params, &root).await,
+                WsFrame::Response { ok:false, payload:None, .. }));
+        }
+        for limit in [1, 100] {
+            assert!(matches!(f.handler.handle_approvals_list(json!({"status":"decided", "limit":limit}), &root).await,
+                WsFrame::Response { ok:true, .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_list_is_unbounded_by_default_and_honors_explicit_limit() {
+        let f = fixture().await;
+        let root = admin(&f);
+        let broker = crate::approval::ApprovalBroker::open(&f.home).unwrap();
+        for index in 0..51 {
+            broker.request("sales", "mcp_call", &format!("pending-{index}"), json!({}), 300)
+                .await.unwrap();
+        }
+
+        let all = payload(f.handler.handle_approvals_list(json!({}), &root).await);
+        assert_eq!(all["count"], 51);
+        assert_eq!(all["approvals"].as_array().unwrap().len(), 51);
+
+        let limited = payload(f.handler.handle_approvals_list(json!({"limit":2}), &root).await);
+        assert_eq!(limited["count"], 2);
+        assert_eq!(limited["approvals"].as_array().unwrap().len(), 2);
     }
 }

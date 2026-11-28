@@ -371,6 +371,11 @@ async fn pin_requires_current_mfa_and_server_session_and_socket_peer() {
 
 #[tokio::test]
 async fn raw_editor_refuses_skill_trust() {
+    let message = "請到技能匯入頁的自家技能來源變更自動放行清單。";
+    let exact_refusal = |frame: WsFrame| match frame {
+        WsFrame::Response { ok: false, error: Some(error), .. } => assert_eq!(error.as_str(), Some(message)),
+        other => panic!("expected skill-import refusal: {other:?}"),
+    };
     let f = fixture().await;
     payload(browser(&f, &f.admin, "skill_trust.pin", args()).await);
     let before = config(&f);
@@ -379,21 +384,21 @@ async fn raw_editor_refuses_skill_trust() {
     assert!(!got["content"].as_str().unwrap().contains(OFFICIAL_PUBLISHER_KEY));
     assert!(got["hidden_sections"].as_array().unwrap().contains(&json!("skill_trust")));
     for section in ["[skill_trust]\nauto_approve=[]\n", "skill_trust = { auto_approve = [] }\n", "[[skill_trust.auto_approve]]\npublisher='in-house'\n"] {
-        refused(f.handler.handle("config.raw.set", json!({"file":"config", "content": section, "base_hash":got["hash"]}), &f.admin).await);
+        exact_refusal(f.handler.handle("config.raw.set", json!({"file":"config", "content": section, "base_hash":got["hash"]}), &f.admin).await);
         assert_eq!(config(&f), before);
     }
     let restored = super::super::config_raw_rpc::restore_raw_toml(got["content"].as_str().unwrap(), &before).unwrap();
     assert_eq!(restored.parse::<toml::Table>().unwrap()["skill_trust"], before.parse::<toml::Table>().unwrap()["skill_trust"]);
     for params in [json!({"skill_trust":{"auto_approve":[]}}), json!({"skill_trust.auto_approve":[]}), json!({"skill_trust":null})] {
-        refused(f.handler.handle("system.update_config", params, &f.admin).await);
+        exact_refusal(f.handler.handle("system.update_config", params, &f.admin).await);
         assert_eq!(config(&f), before);
     }
     // Other generic config adapters must not bypass the raw-editor refusal.
     let mut table = before.parse::<toml::Table>().unwrap();
     table.remove("skill_trust");
     let path = f.home.path().join("config.toml");
-    assert!(super::super::config_commit::commit_table_locked(&path,
-        super::super::config_commit::content_hash(&before), &table).await.is_err());
+    assert_eq!(super::super::config_commit::commit_table_locked(&path,
+        super::super::config_commit::content_hash(&before), &table).await.unwrap_err(), message);
     assert_eq!(config(&f), before);
 }
 

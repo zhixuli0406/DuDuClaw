@@ -144,7 +144,11 @@ pub(super) fn employee(home: &Path, db: &UserDb, agent: &str,
     if settings.access.company_key_agents.iter().any(|id| id == parent) {
         return Ok(Decision { identity: IdentityKind::Company, permission: permission(IdentityKind::Company), personal: None });
     }
-    Err(Refusal::not_connected(avatar.is_some() || requester.is_some()))
+    let person = avatar.is_some() || requester.is_some();
+    if person && !settings.member_credentials_enabled {
+        return Err(Refusal::member_credentials_off());
+    }
+    Err(Refusal::not_connected(person))
 }
 
 pub(super) fn person_key(home: &Path, db: &UserDb, user: &str,

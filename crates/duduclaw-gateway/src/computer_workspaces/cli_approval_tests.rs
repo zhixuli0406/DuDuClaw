@@ -275,6 +275,7 @@ fn the_channel_notice_names_the_workspace_request_not_a_knowledge_review() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     for reminder in [false, true] {
         let body = crate::approval_notify::dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &rec, reminder);

@@ -1448,6 +1448,7 @@ mod tests {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: None,
+            execution_result: None,
         };
         let s = detail_summary(tempfile::tempdir().unwrap().path(), &rec);
         assert!(!s.contains("永久退款") && !s.contains("七天"), "{s}");

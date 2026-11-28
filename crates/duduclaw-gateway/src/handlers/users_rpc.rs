@@ -65,8 +65,25 @@ impl MethodHandler {
         };
         match db.list_users() {
             Ok(users) => {
+                let links = match db.google_signin_summaries() {
+                    Ok(value) => value,
+                    Err(_) => return WsFrame::error_response("", "無法讀取 Google 登入連結。"),
+                };
+                let passwords = match db.local_password_statuses() {
+                    Ok(value) => value,
+                    Err(_) => return WsFrame::error_response("", "無法讀取密碼狀態。"),
+                };
+                let avatars = match db.signin_avatar_summaries() {
+                    Ok(value) => value,
+                    Err(_) => return WsFrame::error_response("", "無法讀取登入分身狀態。"),
+                };
                 let mut result: Vec<Value> = Vec::new();
                 for u in &users {
+                    let link = links.get(&u.id);
+                    let has_password = match passwords.get(&u.id) {
+                        Some(value) => *value,
+                        None => return WsFrame::error_response("", "無法讀取密碼狀態。"),
+                    };
                     let bindings = match db.get_user_agents(&u.id) {
                         Ok(value) => value,
                         Err(_) => return WsFrame::error_response("", "unable to read bindings"),
@@ -103,6 +120,11 @@ impl MethodHandler {
                         "created_at": u.created_at,
                         "updated_at": u.updated_at,
                         "last_login": u.last_login,
+                        "google_signin_linked": link.is_some(),
+                        "google_signin_linked_at": link.map(|value| &value.linked_at),
+                        "google_signin_last_signin_at": link.and_then(|value| value.last_signin_at.as_ref()),
+                        "has_password": has_password,
+                        "signin_avatar": avatars.get(&u.id),
                         "invite_eligible": invite_eligible,
                         "bindings": bindings,
                         "primary_agent_id": primary,
@@ -1007,4 +1029,79 @@ impl MethodHandler {
 struct EmailSetupState {
     placeholder: bool,
     password_required: bool,
+}
+
+#[cfg(test)]
+mod signin_fields_tests {
+    use super::*;
+
+    async fn fixture() -> (tempfile::TempDir, Arc<UserDb>, MethodHandler, UserContext, String, String) {
+        let home = crate::fs_safe::private_test_home().unwrap();
+        let db = Arc::new(UserDb::new(&home.path().join("users.db")).unwrap());
+        let admin = db.create_user("admin@company.test", "Admin", "password123", UserRole::Admin).unwrap();
+        let normal = db.create_user("normal@company.test", "Normal", "password123", UserRole::Employee).unwrap();
+        let jit = db.create_user("jit@company.test", "JIT", "password123", UserRole::Employee).unwrap();
+        let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        conn.execute("UPDATE users SET password_hash='' WHERE id=?1", [&jit.id]).unwrap();
+        conn.execute("INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at,last_signin_at)
+            VALUES(?1,'123456789','company.test','jit@company.test','jit_direct','actor',1700000000,1700000060)", [&jit.id]).unwrap();
+        conn.execute("INSERT INTO user_onboarding(user_id,source,avatar,avatar_error)
+            VALUES(?1,'google_signin','waiting_admin','seats_full') ON CONFLICT(user_id) DO UPDATE SET
+            source=excluded.source,avatar=excluded.avatar,avatar_error=excluded.avatar_error", [&jit.id]).unwrap();
+        conn.execute("DELETE FROM user_onboarding WHERE user_id=?1", [&normal.id]).unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        handler.set_user_db(db.clone(), Arc::new(JwtConfig::new(b"users-list-signin-test-secret-32-bytes"))).await;
+        handler.set_test_edition(Some(duduclaw_core::EditionProfile::Enterprise)).await;
+        let ctx = db.live_user_context(&admin.id).unwrap().unwrap();
+        (home, db, handler, ctx, jit.id, normal.id)
+    }
+
+    #[tokio::test]
+    async fn users_list_signin_fields_are_exact_and_admin_only() {
+        let (_home, db, handler, admin, jit, normal) = fixture().await;
+        let frame = handler.handle("users.list", json!({}), &admin).await;
+        let WsFrame::Response { ok: true, payload: Some(payload), .. } = frame else { panic!("users.list failed: {frame:?}"); };
+        let users = payload["users"].as_array().unwrap();
+        let row = |id: &str| users.iter().find(|row| row["id"] == id).unwrap();
+        let fields = |value: &Value| json!({
+            "google_signin_linked": value["google_signin_linked"],
+            "google_signin_linked_at": value["google_signin_linked_at"],
+            "google_signin_last_signin_at": value["google_signin_last_signin_at"],
+            "has_password": value["has_password"], "signin_avatar": value["signin_avatar"],
+        });
+        assert_eq!(fields(row(&jit)), json!({"google_signin_linked": true,
+            "google_signin_linked_at": "2023-11-14T22:13:20+00:00",
+            "google_signin_last_signin_at": "2023-11-14T22:14:20+00:00",
+            "has_password": false,
+            "signin_avatar": {"state": "waiting_admin", "reason": "seats_full", "retry_allowed": true}}));
+        assert_eq!(fields(row(&normal)), json!({"google_signin_linked": false,
+            "google_signin_linked_at": null, "google_signin_last_signin_at": null,
+            "has_password": true, "signin_avatar": null}));
+        for user in users {
+            for secret in ["google_sub", "linked_by", "email_at_link", "password_hash"] {
+                assert!(user.get(secret).is_none());
+            }
+            for field in ["google_signin_linked", "google_signin_linked_at", "google_signin_last_signin_at", "has_password", "signin_avatar"] {
+                assert!(user.get(field).is_some());
+            }
+        }
+        let employee = db.live_user_context(&normal).unwrap().unwrap();
+        assert!(matches!(handler.handle("users.list", json!({}), &employee).await,
+            WsFrame::Response { ok: false, .. }));
+    }
+
+    #[tokio::test]
+    async fn users_list_signin_batch_read_errors_refuse_partial_payload() {
+        for table in ["google_signin_links", "user_onboarding", "password"] {
+            let (home, _db, handler, admin, _, _) = fixture().await;
+            let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+            match table {
+                "password" => conn.execute("ALTER TABLE users RENAME COLUMN password_hash TO unavailable", []).unwrap(),
+                "user_onboarding" => conn.execute("DROP TABLE user_onboarding", []).unwrap(),
+                _ => conn.execute("DROP TABLE google_signin_links", []).unwrap(),
+            };
+            assert!(matches!(handler.handle_users_list(&admin).await,
+                WsFrame::Response { ok: false, payload: None, .. }));
+        }
+    }
 }

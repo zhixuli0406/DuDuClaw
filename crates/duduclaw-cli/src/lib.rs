@@ -11401,7 +11401,7 @@ mod planned_scaffold_tests {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("agent.toml");
         let error = super::write_new_agent_toml(&path, "[odoo]\nact_as_requester=true\n").await.unwrap_err();
-        assert!(error.contains("Odoo 設定頁"));
+        assert!(error.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         assert!(!path.exists());
         let safe = "# retained\n[odoo]\npermission_override='inherit'\n";
         super::write_new_agent_toml(&path, safe).await.unwrap();
@@ -11419,7 +11419,7 @@ mod planned_scaffold_tests {
         let mut files = super::scaffold_agent_files(&scaffold).unwrap();
         files.get_mut("agent.toml").unwrap().extend_from_slice(b"\n[odoo]\nact_as_requester=true\n");
         let error = super::scaffold_planned_agent_dir(home.path(), &scaffold, &files).await.unwrap_err();
-        assert!(error.to_string().contains("Odoo 設定頁"));
+        assert!(error.to_string().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         assert!(!home.path().join("agents/planned").exists());
         // Legacy scaffolding interpolates model text. A syntactically valid
         // section injection must be checked as the final document too.
@@ -11428,7 +11428,7 @@ mod planned_scaffold_tests {
         let parsed: toml::Table = text.parse().unwrap();
         assert_eq!(parsed["odoo"]["act_as_requester"].as_bool(), Some(true));
         let error = super::scaffold_agent_dir(home.path(), &scaffold).await.unwrap_err();
-        assert!(error.to_string().contains("Odoo 設定頁"));
+        assert!(error.to_string().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         assert!(!home.path().join("agents/planned").exists());
     }
 

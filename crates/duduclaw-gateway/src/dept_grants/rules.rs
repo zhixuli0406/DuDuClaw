@@ -7,6 +7,114 @@ use crate::autopilot_store::AutopilotRuleRow;
 
 const DENIED: &str = "permission denied";
 
+struct DepartmentNotifyCandidate {
+    channel: String,
+    chat_id: String,
+    kind: &'static str,
+    agent_id: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct DepartmentNotifyDestination {
+    channel: String,
+    chat_id: String,
+    kind: &'static str,
+    agent_id: Option<String>,
+    label: String,
+}
+
+// Display only: never use this lenient projection to authorize a destination.
+fn notify_agent_display_name(agent_dir: &std::path::Path) -> String {
+    let info = duduclaw_core::agent_toml::load(agent_dir).agent;
+    let name = info.as_ref().and_then(|info| info.display_name.as_deref())
+        .map(str::trim).filter(|name| !name.is_empty()).unwrap_or("AI 員工");
+    duduclaw_core::truncate_chars(name, 40)
+}
+
+pub(crate) async fn department_notify_destinations(
+    h: &MethodHandler, view: Option<&DeptGrantView>, department: &str, owner: &str,
+) -> Result<Vec<DepartmentNotifyDestination>, String> {
+    let candidates = department_notify_candidates(h, view, department, owner).await?;
+    Ok(candidates.into_iter().map(|candidate| {
+        let channel_label = notify_channel_label(&candidate.channel);
+        let label = if let Some(agent) = candidate.agent_id.as_deref() {
+            let name = notify_agent_display_name(&h.home_dir().join("agents").join(agent));
+            format!("{name} 的通知對象（{channel_label}）")
+        } else {
+            format!("我的 {channel_label} 私訊")
+        };
+        DepartmentNotifyDestination {
+            channel: candidate.channel, chat_id: candidate.chat_id,
+            kind: candidate.kind, agent_id: candidate.agent_id, label,
+        }
+    }).collect())
+}
+
+fn notify_channel_label(channel: &str) -> &'static str {
+    match channel {
+        "telegram" => "Telegram",
+        "line" => "LINE",
+        "discord" => "Discord",
+        "slack" => "Slack",
+        "whatsapp" => "WhatsApp",
+        "feishu" => "飛書",
+        "googlechat" => "Google Chat",
+        "teams" => "Microsoft Teams",
+        "wecom" => "企業微信",
+        "dingtalk" => "釘釘",
+        "webchat" => "網頁聊天",
+        _ => "通知通道",
+    }
+}
+
+/// The complete save-time candidate set, also used by the rule dialog.
+/// `owner` is the authenticated creator for the picker, or the stored creator
+/// for updates. Never accept a caller-supplied user id. Any read error discards
+/// the whole result, including destinations that already matched.
+async fn department_notify_candidates(
+    h: &MethodHandler, view: Option<&DeptGrantView>, department: &str, owner: &str,
+) -> Result<Vec<DepartmentNotifyCandidate>, String> {
+    if !duduclaw_core::is_valid_department(department)
+        || view.is_some_and(|v| v.is_empty()
+            || !v.departments_for(GrantGroup::Automation).iter().any(|d| d == department))
+    { return Err(DENIED.into()); }
+    let admin_targets;
+    let targets = if let Some(view) = view { view } else {
+        admin_targets = DeptGrantView::load_targets(h).await.ok_or(DENIED)?;
+        &admin_targets
+    };
+    let db = h.user_db().await.ok_or(DENIED)?;
+    let own_destinations = db.verified_dm_destinations_for_user(owner).map_err(|_| DENIED)?;
+    let mut destinations = Vec::new();
+    let mut seen = BTreeSet::new();
+    for destination in own_destinations {
+        if !seen.insert((destination.channel.clone(), destination.channel_user_id.clone())) { continue; }
+        destinations.push(DepartmentNotifyCandidate {
+            channel: destination.channel, chat_id: destination.channel_user_id,
+            kind: "self", agent_id: None,
+        });
+    }
+    // Read ownership even for an empty registry; unreadable is never empty.
+    let owners = crate::personal_visibility::personal_owners(h.home_dir()).map_err(|_| DENIED)?;
+    let mut authoritative = false;
+    for agent in targets.loaded_agents.keys() {
+        if owners.contains_key(agent)
+            || grant_target_department(targets, agent).map_err(|_| DENIED)?.as_deref() != Some(department)
+        { continue; }
+        authoritative = true;
+        let destination = crate::goal_notify::try_agent_notify_target(h.home_dir(), agent)
+            .map_err(|_| DENIED)?;
+        let Some((channel, chat_id)) = destination else { continue; };
+        if !seen.insert((channel.clone(), chat_id.clone())) { continue; }
+        destinations.push(DepartmentNotifyCandidate {
+            channel, chat_id, kind: "agent", agent_id: Some(agent.clone()),
+        });
+    }
+    // Admin department saves require at least one authoritative employee too.
+    if view.is_none() && !authoritative { return Err(DENIED.into()); }
+    Ok(destinations)
+}
+
 /// `None` is the Admin path, selected only by the authenticated RPC context.
 /// Apply containment to the shared builder's validated, normalized row,
 /// including fields omitted by an update.
@@ -45,6 +153,7 @@ pub(crate) async fn validate_department_rule(
     // The shared save validator has checked the normalized envelope, templates,
     // screen, window and run policy. Only department containment remains here.
     let steps = action.get("steps").and_then(Value::as_array).ok_or(DENIED)?;
+    let mut notify_destinations = None;
     for step in steps {
         if step.get("type").and_then(Value::as_str) == Some("wait") { continue; }
         match step.get("type").and_then(Value::as_str) {
@@ -57,20 +166,13 @@ pub(crate) async fn validate_department_rule(
             Some("notify" | "proactive_notify") => {
                 let channel = step.get("channel").and_then(Value::as_str).ok_or(DENIED)?;
                 let chat_id = step.get("chat_id").and_then(Value::as_str).ok_or(DENIED)?;
-                let owner = row.created_by_user_id.as_deref().ok_or(DENIED)?;
-                let db = h.user_db().await.ok_or(DENIED)?;
-                let destinations = db.verified_dm_destinations_for_user(owner).map_err(|_| DENIED)?;
-                let mut allowed = destinations.iter().any(|dest|
-                    dest.channel == channel && dest.channel_user_id == chat_id);
-                // Read the entire candidate set: a failed authority/config read
-                // never becomes an absent destination or a fallback allow.
-                for agent in targets.loaded_agents.keys() {
-                    if !target_in_department(agent)? { continue; }
-                    let target = crate::goal_notify::try_agent_notify_target(h.home_dir(), agent)
-                        .map_err(|_| DENIED)?;
-                    allowed |= target.is_some_and(|(ch, chat)| ch == channel && chat == chat_id);
+                if notify_destinations.is_none() {
+                    let owner = row.created_by_user_id.as_deref().ok_or(DENIED)?;
+                    notify_destinations = Some(department_notify_candidates(h, view, department, owner).await?);
                 }
-                if !allowed { return Err(DENIED.into()); }
+                if !notify_destinations.as_ref().ok_or(DENIED)?.iter()
+                    .any(|dest| dest.channel == channel && dest.chat_id == chat_id)
+                { return Err(DENIED.into()); }
             }
             _ => return Err(DENIED.into()),
         }
@@ -245,6 +347,23 @@ pub(crate) mod runtime_tests {
             "created_at":"", "trigger_count":0, "owner_department":"sales",
             "created_by_user_id":"mgrA"
         })).unwrap()
+    }
+
+    #[test]
+    fn notify_display_name_is_lenient_trimmed_and_capped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.toml");
+        assert_eq!(notify_agent_display_name(dir.path()), "AI 員工");
+        for raw in ["invalid TOML !", "[proactive]", "[agent]", "[agent]\ndisplay_name = 42",
+            "[agent]\ndisplay_name = '   '"] {
+            std::fs::write(&path, raw).unwrap();
+            assert_eq!(notify_agent_display_name(dir.path()), "AI 員工");
+        }
+        std::fs::write(&path, "[agent]\ndisplay_name = '  小明  '").unwrap();
+        assert_eq!(notify_agent_display_name(dir.path()), "小明");
+        let name = "員🙂".repeat(25);
+        std::fs::write(&path, format!("[agent]\ndisplay_name = '  {name}  '")).unwrap();
+        assert_eq!(notify_agent_display_name(dir.path()), "員🙂".repeat(20));
     }
 
     #[tokio::test]

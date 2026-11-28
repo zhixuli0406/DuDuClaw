@@ -295,7 +295,7 @@ async fn changed_server_invalidates_personal_and_missing_server_cannot_unseal() 
     doc.remove("odoo");
     std::fs::write(path, toml::to_string(&doc).unwrap()).unwrap();
     let (status, value) = f.employee("alice", read()).await;
-    refused(status, &value, "odoo_not_connected");
+    refused(status, &value, "odoo_member_credentials_off");
     f.audit();
 }
 
@@ -450,7 +450,7 @@ async fn member_switch_off_skips_personal_without_deleting_and_on_restores_it() 
     for setting in ["", "member_credentials=false", "member_credentials='true'"] {
         std::fs::write(&path, enabled.replace("member_credentials=true", setting)).unwrap();
         let (status, value) = f.employee("alice", read()).await;
-        refused(status, &value, "odoo_not_connected");
+        refused(status, &value, "odoo_member_credentials_off");
         for request in [read(), json!({"tool":"odoo_write"})] {
             let (status, value) = f.person(&key, request).await;
             refused(status, &value, "odoo_member_credentials_off");
@@ -511,4 +511,38 @@ async fn person_odoo_route_accepts_exact_shared_subset() {
         if tool.scope == "odoo:write" { refused(status, &value, "person_key_scope"); }
         else { assert_eq!(status, StatusCode::OK); }
     }
+}
+
+
+#[tokio::test]
+async fn member_credentials_off_explains_personal_refusal_after_service_fallbacks() {
+    let f = Fixture::new();
+    f.avatar(&f.a, "alice");
+    f.credential(&f.a, SECRET_A);
+    f.config("company_key_agents=['company']", "https://erp.example.com", &["odoo:read"]);
+    let path = f.home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=false");
+    std::fs::write(&path, raw).unwrap();
+    let (status, value) = f.employee("alice", read()).await;
+    refused(status, &value, "odoo_member_credentials_off");
+    assert_eq!(value, json!({"ok":false,"code":"odoo_member_credentials_off",
+        "message":"公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。"}));
+
+    f.agent("bob", "[odoo]\nact_as_requester=true");
+    let turn = uuid::Uuid::new_v4().to_string();
+    let _guard = crate::knowledge::turn_requesters::register("bob", &turn,
+        RequesterIdentity::DashboardUser { user_id: f.a.clone() }).unwrap();
+    let (status, requester) = f.employee("bob", json!({"tool":"odoo_search","turn_id":turn})).await;
+    refused(status, &requester, "odoo_member_credentials_off");
+    assert_eq!(requester, value);
+
+    f.agent("alice", "[odoo]\nusername='service'\napi_key_enc='cipher'");
+    for (agent, identity) in [("alice", "agent"), ("company", "company")] {
+        let (status, value) = f.employee(agent, read()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["identity"], identity);
+    }
+    let (status, value) = f.employee("shared", read()).await;
+    refused(status, &value, "odoo_not_connected");
+    assert_eq!(value["message"], duduclaw_odoo::access_policy::not_connected_message(false));
 }

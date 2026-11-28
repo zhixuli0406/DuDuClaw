@@ -21,6 +21,7 @@ const SOURCES: &[(&str, &str)] = &[
     ("cron_scoped_rpc.rs", include_str!("../handlers/cron_scoped_rpc.rs")),
     ("cron_rpc.rs", include_str!("../handlers/cron_rpc.rs")),
     ("autopilot_rpc.rs", include_str!("../handlers/autopilot_rpc.rs")),
+    ("autopilot_department_rpc.rs", include_str!("../handlers/autopilot_department_rpc.rs")),
     ("skills_manage_rpc.rs", include_str!("../handlers/skills_manage_rpc.rs")),
     ("skills_rpc.rs", include_str!("../handlers/skills_rpc.rs")),
     ("skill_trust_rpc.rs", include_str!("../handlers/skill_trust_rpc.rs")),
@@ -140,4 +141,12 @@ fn skill_trust_methods_are_admin_only() {
         assert!(is_method_name(method));
         assert_eq!(coverage_for(method), Some((Skills, AdminOnly)));
     }
+}
+
+#[test]
+fn autopilot_helpers_are_read_scoped_and_cancel_remains_admin_only() {
+    for method in ["autopilot.template_fields", "autopilot.runs.list", "autopilot.notify_destinations"] {
+        assert_eq!(coverage_for(method), Some((Automation, Scoped(Read))));
+    }
+    assert_eq!(coverage_for("autopilot.runs.cancel"), Some((Automation, AdminOnly)));
 }

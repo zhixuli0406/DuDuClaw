@@ -853,3 +853,44 @@ fn odo_generic_write_opt_in_tokens_are_per_table_only() {
     assert!(config.generic_opt_in("create", "crm.lead") && config.generic_opt_in("write", "crm.lead"));
     assert!(config.permits("write", "crm.lead"), "existing verbs are unaffected");
 }
+
+
+#[test]
+fn odo_dedicated_tokens_accept_exact_runtime_models_only() {
+    for verb in ["activity", "note", "message", "attach"] {
+        for model in ["crm.lead", "res.partner", "1model.2segment", "_custom"] {
+            let token = format!("{verb}:{model}");
+            assert!(odo_valid_action(&token), "{token}");
+            let config = duduclaw_odoo::AgentOdooConfig {
+                allowed_actions: vec![token], ..Default::default()
+            };
+            assert!(config.dedicated_opt_in(verb, model));
+        }
+        assert!(!odo_valid_action(verb), "{verb}");
+        for model in ["", "*", "crm.*", "crm..lead", ".crm", "crm.", "Crm.lead", "bad model", "crm:lead"] {
+            let token = format!("{verb}:{model}");
+            assert!(!odo_valid_action(&token), "{token}");
+            let mut table = toml::Table::new();
+            assert!(apply_odoo_to_table(&mut table,
+                &json!({"odoo":{"allowed_actions":[token]}}), &std::env::temp_dir()).is_err());
+        }
+    }
+}
+
+#[test]
+fn odo_dedicated_tokens_roundtrip_all_four_grants() {
+    let actions = ["activity:crm.lead", "note:res.partner", "message:sale.order", "attach:project.task"];
+    let mut table = toml::Table::new();
+    apply_odoo_to_table(&mut table, &json!({"odoo":{"allowed_actions":actions}}),
+        &std::env::temp_dir()).unwrap();
+    let stored = table["odoo"]["allowed_actions"].as_array().unwrap().iter()
+        .map(|v| v.as_str().unwrap()).collect::<Vec<_>>();
+    assert_eq!(stored, actions);
+    let serialized = toml::to_string(&table).unwrap();
+    let config = duduclaw_odoo::AgentOdooConfig::parse_agent_toml(&serialized).unwrap().unwrap();
+    for token in actions {
+        let (verb, model) = token.split_once(':').unwrap();
+        assert!(config.dedicated_opt_in(verb, model));
+        assert!(!config.dedicated_opt_in(verb, "other.model"));
+    }
+}

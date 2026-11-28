@@ -35,6 +35,11 @@ fn payload(frame: WsFrame) -> Value {
     }
 }
 fn refused(frame: WsFrame) { assert!(matches!(frame, WsFrame::Response { ok: false, .. })); }
+fn assert_empty_impact(result: &Value) {
+    assert_eq!(result["follow_mode_impact"], json!({
+        "avatars_with_personal_credentials":0,"agents_acting_as_requester":0,
+    }));
+}
 fn raw(f: &Fixture) -> String { std::fs::read_to_string(f.home.path().join("config.toml")).unwrap() }
 
 #[tokio::test]
@@ -56,6 +61,8 @@ async fn admin_browser_only_and_live_authority() {
 async fn get_defaults_and_follow_ack_audit_then_engine_removes_ack() {
     let f = fixture().await;
     let get = payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await);
+    assert_eq!(get["readable"], true);
+    assert_empty_impact(&get);
     assert_eq!(get["config"]["permission_mode"], "engine");
     assert_eq!(get["defaults"]["always_refuse"], json!(DEFAULT_ALWAYS_REFUSE));
     assert_eq!(get["fixed_refusals"].as_array().unwrap().len(), 5);
@@ -64,6 +71,7 @@ async fn get_defaults_and_follow_ack_audit_then_engine_removes_ack() {
     refused(rpc(&f, &f.admin, "odoo.access_set", json!({"permission_mode":"follow_odoo_account"})).await);
     assert_eq!(raw(&f), "# retained\n");
     let set = payload(rpc(&f, &f.admin, "odoo.access_set", json!({"permission_mode":"follow_odoo_account","acknowledge_risk":true})).await);
+    assert_empty_impact(&set);
     assert_eq!(set["config"]["permission_mode"], "follow_odoo_account");
     assert_eq!(set["config"]["permission_mode_ack"]["by"], f.admin.user_id);
     chrono::DateTime::parse_from_rfc3339(set["config"]["permission_mode_ack"]["at"].as_str().unwrap()).unwrap();
@@ -86,6 +94,7 @@ async fn removing_refusals_and_adding_company_agents_require_ack() {
     payload(rpc(&f, &f.admin, "odoo.access_set", json!({"always_refuse":rules,"acknowledge_risk":true})).await);
     refused(rpc(&f, &f.admin, "odoo.access_set", json!({"company_key_agents":["a"]})).await);
     let set = payload(rpc(&f, &f.admin, "odoo.access_set", json!({"company_key_agents":["a","a"],"acknowledge_risk":true})).await);
+    assert_empty_impact(&set);
     assert_eq!(set["config"]["company_key_agents"], json!(["a"]));
     payload(rpc(&f, &f.admin, "odoo.access_set", json!({"always_refuse":DEFAULT_ALWAYS_REFUSE,"company_key_agents":[]})).await);
 }
@@ -106,10 +115,97 @@ async fn invalid_inputs_and_invalid_config_fail_closed() {
         assert_eq!(raw(&f), "# retained\n");
     }
     std::fs::write(f.home.path().join("config.toml"), "[odoo_access]\nattachment_max_mb=0\n").unwrap();
-    let frame = rpc(&f, &f.admin, "odoo.access_get", json!({})).await;
-    assert!(serde_json::to_string(&frame).unwrap().contains("[odoo_access]"));
-    refused(frame);
+    assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
+        json!({"readable":false,"message":UNREADABLE}));
     refused(rpc(&f, &f.admin, "odoo.access_set", json!({"attachment_max_mb":10})).await);
+}
+
+#[tokio::test]
+async fn unreadable_access_get_reports_recovery_and_set_preserves_config() {
+    let f = fixture().await;
+    for text in ["[odoo_access", "odoo_access='invalid'\n", "[odoo_access]\npermission_mode='invalid'\n"] {
+        std::fs::write(f.home.path().join("config.toml"), text).unwrap();
+        assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
+            json!({"readable":false,"message":UNREADABLE}));
+        refused(rpc(&f, &f.member, "odoo.access_get", json!({})).await);
+        refused(rpc(&f, &f.admin, "odoo.access_get", json!({"unknown":true})).await);
+        refused(rpc(&f, &f.admin, "odoo.access_set", json!({"attachment_max_mb":10})).await);
+        assert_eq!(raw(&f), text);
+    }
+    std::fs::remove_file(f.home.path().join("config.toml")).unwrap();
+    assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
+        json!({"readable":false,"message":UNREADABLE}));
+    std::fs::create_dir(f.home.path().join("config.toml")).unwrap();
+    assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
+        json!({"readable":false,"message":UNREADABLE}));
+    refused(rpc(&f, &f.admin, "odoo.access_set", json!({})).await);
+    assert!(f.home.path().join("config.toml").is_dir());
+}
+
+#[tokio::test]
+async fn follow_mode_impact_counts_active_avatars_and_literal_requester_flags() {
+    let f = fixture().await;
+    let conn = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    conn.execute("UPDATE users SET avatar_agent_id=?2 WHERE id=?1", rusqlite::params![f.admin.user_id, "a"]).unwrap();
+    conn.execute("UPDATE users SET avatar_agent_id=?2 WHERE id=?1", rusqlite::params![f.member.user_id, "b"]).unwrap();
+    for (email, status, avatar) in [
+        ("suspended@test.invalid", "suspended", Some("suspended-avatar")),
+        ("no-avatar@test.invalid", "active", None),
+    ] {
+        let user = f.db.create_user(email, "Excluded", "password", UserRole::Employee).unwrap();
+        conn.execute("UPDATE users SET status=?2,avatar_agent_id=?3 WHERE id=?1",
+            rusqlite::params![user.id, status, avatar]).unwrap();
+        conn.execute("INSERT INTO member_odoo_credentials
+            (user_id,login,odoo_uid,odoo_name,secret_ct,server_fp,rev,state,verified_at,updated_at)
+            VALUES(?1,'login',1,'Name',X'00','server',1,'needs_reverify','now','now')", [&user.id]).unwrap();
+    }
+    // Two active avatars, but only one has a stored credential.
+    // A stored row counts even when the credential needs re-verification.
+    conn.execute("INSERT INTO member_odoo_credentials
+        (user_id,login,odoo_uid,odoo_name,secret_ct,server_fp,rev,state,verified_at,updated_at)
+        VALUES(?1,'login',1,'Name',X'00','server',1,'needs_reverify','now','now')", [&f.admin.user_id]).unwrap();
+    std::fs::write(f.home.path().join("agents/a/agent.toml"), "[agent]\ndisplay_name='Agent A'\n[odoo]\nact_as_requester=true\n").unwrap();
+    std::fs::create_dir_all(f.home.path().join("agents/b")).unwrap();
+    std::fs::write(f.home.path().join("agents/b/agent.toml"), "[odoo]\nact_as_requester='true'\n").unwrap();
+    std::fs::create_dir_all(f.home.path().join("agents/eph-ignored")).unwrap();
+    std::fs::write(f.home.path().join("agents/eph-ignored/agent.toml"), "[odoo]\nact_as_requester=true\n").unwrap();
+    for method in ["odoo.access_get", "odoo.access_set"] {
+        let result = payload(rpc(&f, &f.admin, method, json!({})).await);
+        assert_eq!(result["readable"], true);
+        assert_eq!(result["follow_mode_impact"], json!({
+            "avatars_with_personal_credentials":1,"agents_acting_as_requester":1,
+        }));
+        assert_eq!(result["employees"].as_array().unwrap().len(), 2);
+    }
+    // Reporting a malformed flag must not relax the migration's strict parser.
+    assert!(employees(f.home.path()).is_err());
+}
+
+#[tokio::test]
+async fn follow_mode_impact_count_failure_returns_null_and_set_still_commits() {
+    let f = fixture().await;
+    std::fs::write(f.home.path().join("agents/a/agent.toml"), "[odoo").unwrap();
+    refused(rpc(&f, &f.admin, "odoo.access_get", json!({})).await);
+    assert_eq!(raw(&f), "# retained\n");
+    std::fs::write(f.home.path().join("agents/a/agent.toml"), "[agent]\nname='A'\n").unwrap();
+    let conn = rusqlite::Connection::open(f.home.path().join("users.db")).unwrap();
+    conn.execute("DROP TABLE member_odoo_credentials", []).unwrap();
+    let get = payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await);
+    assert_eq!(get["readable"], true);
+    assert_eq!(get.get("follow_mode_impact"), Some(&Value::Null));
+    assert_eq!(raw(&f), "# retained\n");
+    let set = payload(rpc(&f, &f.admin, "odoo.access_set", json!({"attachment_max_mb":5})).await);
+    assert_eq!(set["readable"], true);
+    assert_eq!(set.get("follow_mode_impact"), Some(&Value::Null));
+    assert_eq!(set["config"]["attachment_max_mb"], 5);
+    assert_eq!(OdooAccessConfig::parse_config_toml(&raw(&f)).unwrap().attachment_max_mb, 5);
+    let get = payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await);
+    assert_eq!(get["config"]["attachment_max_mb"], 5);
+    assert_eq!(get.get("follow_mode_impact"), Some(&Value::Null));
+    // Invalid config is still reportable even when counts cannot be read.
+    std::fs::write(f.home.path().join("config.toml"), "odoo_access=false").unwrap();
+    assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
+        json!({"readable":false,"message":UNREADABLE}));
 }
 
 #[tokio::test]
@@ -129,6 +225,7 @@ async fn audit_failure_aborts_and_notice_can_be_dismissed() {
     assert_eq!(raw(&f), initial);
     std::fs::remove_dir(f.home.path().join("security_audit.jsonl")).unwrap();
     let set = payload(rpc(&f, &f.admin, "odoo.access_set", json!({"dismiss_upgrade_notice":true})).await);
+    assert_empty_impact(&set);
     assert_eq!(set["upgrade_notice_pending"], false);
     assert!(!OdooAccessConfig::parse_config_toml(&raw(&f)).unwrap().upgrade_notice_pending);
 }
@@ -552,4 +649,23 @@ async fn agent_access_rechecks_authority_after_audit_before_replace() {
     }).await;
     assert!(result.is_err());
     assert_eq!(agent_raw(&f), initial);
+}
+
+
+#[test]
+fn agent_widening_guards_direct_to_employee_edit_page() {
+    let message = "這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。";
+    for (before, after) in [
+        ("", "[odoo]\nact_as_requester=true\n"),
+        ("[odoo]\npermission_override='read_only'\n", "[odoo]\npermission_override='engine'\n"),
+        ("", "odoo=false\n"),
+        ("", "[odoo]\npermission_override=false\n"),
+    ] {
+        let before_table = before.parse::<toml::Table>().unwrap();
+        let after_table = after.parse::<toml::Table>().unwrap();
+        assert_eq!(super::super::config_raw_rpc::refuse_odoo_agent_widening_edit(
+            &before_table, &after_table).unwrap_err(), message);
+        assert_eq!(super::super::config_commit::refuse_odoo_agent_widening_text_edit(
+            before, after).unwrap_err(), message);
+    }
 }

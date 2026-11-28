@@ -89,6 +89,7 @@ fn aged(age_secs: i64, ttl: i64, reminded: bool) -> ApprovalRecord {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     }
 }
 

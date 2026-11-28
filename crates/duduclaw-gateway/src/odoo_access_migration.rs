@@ -53,11 +53,24 @@ pub(crate) struct Employee {
     pub has_own_account: bool,
     #[serde(skip)]
     own_account: OwnAccount,
+    #[serde(skip)]
+    pub act_as_requester: bool,
 }
 
 /// Only immediate regular employee directories, never the ephemeral namespace.
 /// Unreadable/malformed employee credentials abort rather than grant a fallback.
 pub(crate) fn employees(home: &Path) -> Result<Vec<Employee>, String> {
+    employee_inventory(home, false)
+}
+
+/// Dashboard inventory only. The requester flag is reported from its literal
+/// value, separately from credential parsing; this never authorizes a route.
+/// Migration retains the strict parser through `employees` above.
+pub(crate) fn access_employees(home: &Path) -> Result<Vec<Employee>, String> {
+    employee_inventory(home, true)
+}
+
+fn employee_inventory(home: &Path, access_report: bool) -> Result<Vec<Employee>, String> {
     let entries = match std::fs::read_dir(home.join("agents")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -83,17 +96,27 @@ pub(crate) fn employees(home: &Path) -> Result<Vec<Employee>, String> {
         let raw = std::fs::read_to_string(path).map_err(|_| "無法讀取 AI 員工設定。")?;
         let table: toml::Table = raw.parse().map_err(|_| "AI 員工設定格式有誤。")?;
         let raw_odoo = table.get("odoo");
+        let act_as_requester = raw_odoo.and_then(|o| o.get("act_as_requester"))
+            .and_then(toml::Value::as_bool) == Some(true);
+        let mut account_table = table.clone();
+        if access_report {
+            // This policy flag has no bearing on the own-account summary.
+            // Do not coerce a string such as 'true' into enabled authority.
+            if let Some(odoo) = account_table.get_mut("odoo").and_then(toml::Value::as_table_mut) {
+                odoo.remove("act_as_requester");
+            }
+        }
         let odoo = if raw_odoo.is_some_and(|value| !value.is_table()) {
             None
         } else {
-            AgentOdooConfig::parse_agent_toml(&raw)?
+            AgentOdooConfig::from_table(&account_table)?
         };
         let own_account = classify_account(odoo.as_ref(), raw_odoo);
         let has_own_account = own_account == OwnAccount::Complete;
         let agent = table.get("agent").and_then(toml::Value::as_table);
         let display_name = agent.and_then(|a| a.get("display_name").or_else(|| a.get("name")))
             .and_then(toml::Value::as_str).map(str::to_owned);
-        rows.push(Employee { id, display_name, has_own_account, own_account });
+        rows.push(Employee { id, display_name, has_own_account, own_account, act_as_requester });
     }
     rows.sort_by(|a, b| a.id.cmp(&b.id));
     rows.dedup_by(|a, b| a.id == b.id);

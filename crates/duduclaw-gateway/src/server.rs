@@ -4415,7 +4415,7 @@ async fn handle_channel_identity_list(
         )
             .into_response();
     }
-    match state.user_db.verified_channels_for_user(&q.user_id) {
+    match state.user_db.verified_channels_with_proof(&q.user_id) {
         Ok(identities) => {
             let mut list = match serde_json::to_value(&identities) {
                 Ok(serde_json::Value::Array(list)) => list,
@@ -4439,9 +4439,14 @@ async fn handle_channel_identity_list(
                     "verified": true,
                     "created_at": linked_at,
                     "source": "google_account",
+                    "proof_status": "admin_prefilled",
+                    "proven_at": null,
                 })),
                 Ok(None) => {}
-                Err(e) => warn!(error = %e, "channel identity list: linked Google accounts unreadable"),
+                Err(_) => return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "identity list unavailable"})),
+                ).into_response(),
             }
             Json(serde_json::json!({ "identities": list })).into_response()
         }

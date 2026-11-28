@@ -78,6 +78,15 @@ fn require_admin(conn: &Connection, id: &str) -> Result<(), String> {
 }
 
 impl UserDb {
+    /// Advisory count of active avatar owners with stored credentials, including
+    /// credentials needing verification. Reads no secrets and changes no state.
+    pub fn odoo_credential_count_active_avatars(&self) -> Result<i64, String> {
+        self.conn().query_row("SELECT COUNT(*) FROM users u
+            JOIN member_odoo_credentials c ON c.user_id=u.id
+            WHERE u.status='active' AND u.avatar_agent_id IS NOT NULL", [], |row| row.get(0))
+            .map_err(store_error)
+    }
+
     /// This query deliberately never reads secret_ct (also used by onboarding).
     pub fn odoo_credential_status(&self, user_id: &str) -> Result<Option<OdooCredentialStatus>, String> {
         self.conn().query_row("SELECT c.login,c.odoo_uid,c.odoo_name,c.server_fp,c.rev,

@@ -179,6 +179,37 @@ fn notify_params(channel: &str, chat: &str) -> Value {
 }
 
 #[tokio::test]
+async fn automation_notify_label_fallback_preserves_destination_and_save() {
+    let f = fixture().await;
+    seed(&f, "a2").await;
+    let path = f.home.join("agents/a2/agent.toml");
+    let original = std::fs::read_to_string(&path).unwrap();
+    for display_name in [None, Some(toml::Value::Integer(42)), Some(toml::Value::String("  ".into()))] {
+        let mut config: toml::Value = original.parse().unwrap();
+        let agent = config.get_mut("agent").unwrap().as_table_mut().unwrap();
+        agent.remove("display_name");
+        if let Some(name) = display_name { agent.insert("display_name".into(), name); }
+        std::fs::write(&path, format!("{}\n[proactive]\nnotify_channel = 'line'\nnotify_chat_id = 'department-chat'\n",
+            toml::to_string(&config).unwrap())).unwrap();
+        for ctx in [&f.mgr_a, &f.admin] {
+            let payload = scoped_payload("fallback destination", Box::pin(f.h.handle(
+                "autopilot.notify_destinations", json!({"owner_department":"sales"}), ctx)).await);
+            let destinations = payload["destinations"].as_array().unwrap();
+            assert_eq!(destinations.iter().filter(|d| d["chat_id"] == "department-chat").collect::<Vec<_>>(),
+                vec![&json!({"channel":"line", "chat_id":"department-chat", "kind":"agent",
+                    "agent_id":"a2", "label":"AI 員工 的通知對象（LINE）"})]);
+            let created = scoped_payload("save fallback destination", Box::pin(f.h.handle(
+                "autopilot.create", notify_params("line", "department-chat"), ctx)).await);
+            let id = created["rule"]["id"].as_str().unwrap();
+            let stored = f.h.ap_store().await.unwrap().get_rule(id).await.unwrap().unwrap();
+            assert_eq!(serde_json::from_str::<Value>(&stored.action).unwrap()["steps"][0]["chat_id"], "department-chat");
+            assert_success("update fallback destination", Box::pin(f.h.handle("autopilot.update",
+                json!({"rule_id":id, "enabled":false}), ctx)).await);
+        }
+    }
+}
+
+#[tokio::test]
 async fn automation_notify_requires_exact_verified_owner_or_department_destination() {
     let f = fixture().await;
     seed(&f, "a2").await;
@@ -349,3 +380,6 @@ async fn department_create_and_update_share_normalized_save_validation() {
     let updated = store.get_rule(id).await.unwrap().unwrap();
     assert_eq!(serde_json::from_str::<Value>(&updated.action).unwrap()["type"], "steps");
 }
+
+#[path = "dept_automation_helpers_tests.rs"]
+mod helpers;

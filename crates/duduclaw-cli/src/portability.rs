@@ -26,7 +26,8 @@ use unicode_normalization::UnicodeNormalization;
 use duduclaw_gateway::backup_restore::RestoreLimits;
 use duduclaw_gateway::handlers::config_commit::{refuse_drive_write_text_edit, refuse_odoo_widening_text_edit,
     strip_drive_write_preserving, strip_odoo_widening_preserving, strip_odoo_agent_widening_preserving,
-    ODOO_RESTORE_NOTICE};
+    refuse_member_key_widening_text_edit, strip_member_key_widening_preserving,
+    ODOO_RESTORE_NOTICE, MEMBER_KEY_RESTORE_NOTICE};
 
 pub(crate) const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[
     duduclaw_core::OperatorCommand { name: "duduclaw import", path: &["import"] },
@@ -237,16 +238,20 @@ struct ImportDecision {
     publish_before_unpack: bool,
     removed_drive_write: bool,
     removed_odoo_widening: bool,
+    removed_member_key_widening: bool,
     prepared_agents: HashMap<PathBuf, String>,
 }
 
 impl ImportDecision {
+    fn member_key_notice(&self, narrowed_at_publication: bool) -> Option<&'static str> {
+        (self.removed_member_key_widening || narrowed_at_publication).then_some(MEMBER_KEY_RESTORE_NOTICE)
+    }
     fn odoo_notice(&self, narrowed_at_publication: bool) -> Option<&'static str> {
         (self.removed_odoo_widening || narrowed_at_publication).then_some(ODOO_RESTORE_NOTICE)
     }
 }
 
-fn publish_import_config(home: &Path, config: &str) -> Result<bool> {
+fn publish_import_config(home: &Path, config: &str) -> Result<(bool, bool)> {
     // The caller holds the config lock. Validate the exact bytes being published.
     let current = match fs::read_to_string(home.join("config.toml")) {
         Ok(text) => text,
@@ -256,13 +261,15 @@ fn publish_import_config(home: &Path, config: &str) -> Result<bool> {
     refuse_drive_write_text_edit(&current, config).map_err(DuDuClawError::Config)?;
     let (config, removed_odoo) = strip_odoo_widening_preserving(&current, config).map_err(DuDuClawError::Config)?;
     refuse_odoo_widening_text_edit(&current, &config).map_err(DuDuClawError::Config)?;
+    let (config, removed_member_keys) = strip_member_key_widening_preserving(&current, &config).map_err(DuDuClawError::Config)?;
+    refuse_member_key_widening_text_edit(&current, &config).map_err(DuDuClawError::Config)?;
     let mut pending = tempfile::NamedTempFile::new_in(home)
         .map_err(|e| io_err("import config", e))?;
     pending.write_all(config.as_bytes()).and_then(|_| pending.as_file().sync_all())
         .map_err(|e| io_err("import config", e))?;
     durable_publish(pending, &home.join("config.toml"))
         .map_err(|e| io_err("import config", e))?;
-    Ok(removed_odoo)
+    Ok((removed_odoo, removed_member_keys))
 }
 
 fn durable_publish(pending: tempfile::NamedTempFile, destination: &Path) -> std::io::Result<()> {
@@ -339,11 +346,14 @@ fn apply_import_snapshot_with_limits(
     // Publish sanitized config and strict policy durably before moving agents
     // or identity data; per-entry checks still guard subsequent changes.
     if decision.publish_before_unpack {
-        let removed_odoo = publish_import_config(home, &decision.prepared_config)?;
+        let (removed_odoo, removed_member_keys) = publish_import_config(home, &decision.prepared_config)?;
         if decision.removed_drive_write {
             println!("雲端硬碟寫入設定未匯入，請到 Google 整合設定頁重新確認。");
         }
         if let Some(notice) = decision.odoo_notice(removed_odoo) {
+            println!("{notice}");
+        }
+        if let Some(notice) = decision.member_key_notice(removed_member_keys) {
             println!("{notice}");
         }
     }
@@ -466,6 +476,33 @@ mod tests {
         table.insert("google".into(), toml::Value::Table(google));
         format!("# preserve this header\n[integrations]\ngoogle_workspace = true # keep this comment\n\n{}",
             toml::to_string(&table).unwrap())
+    }
+
+    #[test]
+    fn import_member_key_policy_narrows_with_notice_and_rechecks_publication() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let before = "[member_api_keys]\nallow_mcp_scopes=['tasks:read']\n";
+        fs::write(home.join("config.toml"), before).unwrap();
+        let backup = "# keep\n[member_api_keys]\nenabled=false # unchanged\nrate_per_minute=321\nallow_conversation_content=true\nallow_mcp_scopes=['tasks:read','odoo:write']\n";
+        let archive = root.path().join("input.tar.gz");
+        ordered_archive(&archive, &[("config.toml", backup.as_bytes())]);
+        let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
+        let decision = validate_import_policy(&mut snapshot, &home, true).unwrap();
+        assert!(decision.removed_member_key_widening);
+        assert_eq!(decision.member_key_notice(false), Some(MEMBER_KEY_RESTORE_NOTICE));
+        let prepared: toml::Table = decision.prepared_config.parse().unwrap();
+        assert_eq!(prepared["member_api_keys"]["allow_mcp_scopes"].as_array().unwrap(),
+            &vec![toml::Value::String("tasks:read".into())]);
+        fs::write(home.join("config.toml"), "").unwrap();
+        let (_, narrowed) = publish_import_config(&home, &decision.prepared_config).unwrap();
+        assert!(narrowed);
+        let published = fs::read_to_string(home.join("config.toml")).unwrap();
+        let table: toml::Table = published.parse().unwrap();
+        assert_eq!(table["member_api_keys"]["allow_conversation_content"].as_bool(), Some(false));
+        assert!(table["member_api_keys"]["allow_mcp_scopes"].as_array().unwrap().is_empty());
+        assert!(published.contains("enabled=false # unchanged\nrate_per_minute=321"));
     }
 
     #[test]
@@ -592,7 +629,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         fs::write(home.path().join("config.toml"), "[odoo_access]\nalways_refuse = ['write:res.partner']\n").unwrap();
         let backup = "[odoo_access]\npermission_mode = 'follow_odoo_account'\npermission_mode_ack = { by = 'a' }\nalways_refuse = []\n[odoo]\nmember_credentials = true\n";
-        assert!(publish_import_config(home.path(), backup).unwrap());
+        assert!(publish_import_config(home.path(), backup).unwrap().0);
         let table: toml::Table = fs::read_to_string(home.path().join("config.toml")).unwrap().parse().unwrap();
         assert_eq!(table["odoo_access"]["permission_mode"].as_str(), Some("engine"));
         assert!(table["odoo_access"].get("permission_mode_ack").is_none());
@@ -752,7 +789,7 @@ mod tests {
             assert!(error.to_string().contains(message), "{error}");
             assert_eq!(fs::read_dir(&home).unwrap().count(), 0, "validation must not unpack anything");
             let unpack_home = tempfile::tempdir().unwrap();
-            let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, prepared_agents: HashMap::new() };
+            let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, removed_member_key_widening: false, prepared_agents: HashMap::new() };
             let error = apply_import_snapshot_with_limits(&mut snapshot, unpack_home.path(), false, &decision, &limits, |_| Ok(())).unwrap_err();
             assert!(error.to_string().contains(message), "unpack: {error}");
             assert!(!unpack_home.path().join("second").exists());
@@ -795,7 +832,7 @@ mod tests {
         let mut snapshot = snapshot_archive(&archive, &home, MAX_IMPORT_ARCHIVE_BYTES).unwrap();
         let error = validate_import_policy(&mut snapshot, &home, true).unwrap_err();
         assert!(error.to_string().contains("中繼資料"), "{error}");
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, prepared_agents: HashMap::new() };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, removed_member_key_widening: false, prepared_agents: HashMap::new() };
         let error = apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).unwrap_err();
         assert!(error.to_string().contains("中繼資料"), "{error}");
         assert_eq!(fs::read_dir(&home).unwrap().count(), 0);
@@ -988,7 +1025,7 @@ mod tests {
         let home = root.path().join("home");
         fs::create_dir(&home).unwrap();
         let archive = root.path().join("input.tar.gz");
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, prepared_agents: HashMap::new() };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, removed_member_key_widening: false, prepared_agents: HashMap::new() };
         for name in ["config.toml.", "users.db:stream", "nested/NUL.txt"] {
             if !cfg!(windows) && name != "config.toml." { continue; }
             ordered_archive(&archive, &[(name, b"")]);
@@ -1334,7 +1371,7 @@ mod tests {
         let _admission = duduclaw_core::agent_seats::SeatAdmission::acquire(&home).unwrap();
         let _writer = authority.write().unwrap();
         let bumped = fs::read(home.join(".google-authority/epoch")).unwrap();
-        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, prepared_agents: HashMap::new() };
+        let decision = ImportDecision { prepared_config: String::new(), publish_before_unpack: false, removed_drive_write: false, removed_odoo_widening: false, removed_member_key_widening: false, prepared_agents: HashMap::new() };
         let mut snapshot = File::open(&archive).unwrap();
         assert!(apply_import_snapshot(&mut snapshot, &home, false, &decision, |_| Ok(())).is_err());
         assert_eq!(fs::read(home.join(".google-authority/epoch")).unwrap(), bumped);
@@ -1843,6 +1880,7 @@ fn validate_import_policy_with_limits(
     let mut restored_config = None;
     let mut removed_drive_write = false;
     let mut removed_odoo_widening = false;
+    let mut removed_member_key_widening = false;
     let mut prepared_agents = HashMap::new();
     let canonical_home = fs::canonicalize(home).map_err(|e| io_err("import destination", e))?;
     let mut replaces_identity = false;
@@ -1902,6 +1940,9 @@ fn validate_import_policy_with_limits(
                 let (text, removed) = strip_odoo_widening_preserving(&before, &text).map_err(DuDuClawError::Config)?;
                 removed_odoo_widening |= removed;
                 refuse_odoo_widening_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
+                let (text, removed) = strip_member_key_widening_preserving(&before, &text).map_err(DuDuClawError::Config)?;
+                removed_member_key_widening |= removed;
+                refuse_member_key_widening_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
                 duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
                     .map_err(DuDuClawError::Config)?;
                 restored_config = Some(text);
@@ -1950,15 +1991,20 @@ fn validate_import_policy_with_limits(
     removed_odoo_widening |= removed;
     prepared = stripped;
     refuse_odoo_widening_text_edit(&retained, &prepared).map_err(DuDuClawError::Config)?;
+    let (stripped, removed) = strip_member_key_widening_preserving(&retained, &prepared).map_err(DuDuClawError::Config)?;
+    removed_member_key_widening |= removed;
+    prepared = stripped;
+    refuse_member_key_widening_text_edit(&retained, &prepared).map_err(DuDuClawError::Config)?;
     let prepared_table: toml::Table = prepared.parse()
         .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
     let strict = prepared_table.get("auth").and_then(|auth| auth.get("mfa_enforced"))
         .and_then(|value| value.as_bool()) == Some(true);
     Ok(ImportDecision {
-        publish_before_unpack: removed_drive_write || removed_odoo_widening || has_imported_config || prepared != retained || (replaces_identity && strict),
+        publish_before_unpack: removed_drive_write || removed_odoo_widening || removed_member_key_widening || has_imported_config || prepared != retained || (replaces_identity && strict),
         prepared_config: prepared,
         removed_drive_write,
         removed_odoo_widening,
+        removed_member_key_widening,
         prepared_agents,
     })
 }

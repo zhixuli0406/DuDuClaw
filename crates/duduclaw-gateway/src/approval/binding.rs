@@ -304,6 +304,7 @@ impl ApprovalBroker {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: raising_principal(),
+            execution_result: None,
         })
     }
 

@@ -31,7 +31,13 @@ impl MethodHandler {
         };
         match store.list_rules().await {
             Ok(rows) => {
-                let rules: Vec<Value> = rows.iter().map(|r| autopilot_rule_to_json(r)).collect();
+                let mut display = crate::dept_grants::DisplayAutopilotCreatorAccessCache::load(self).await;
+                let rules: Vec<Value> = rows.iter().map(|r| {
+                    let mut rule = autopilot_rule_to_json(r);
+                    rule["creator_access_lost"] = json!(display.display_creator_access_lost(
+                        r.created_by_user_id.as_deref(), r.owner_department.as_deref()));
+                    rule
+                }).collect();
                 WsFrame::ok_response("", json!({ "rules": rules }))
             }
             Err(e) => WsFrame::error_response("", &format!("list autopilot: {e}")),

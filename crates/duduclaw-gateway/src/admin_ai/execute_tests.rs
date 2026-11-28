@@ -676,3 +676,65 @@ async fn preset_agent_write_accepts_distinct_matching_raw_and_effective_hashes()
     let table: toml::Value = f.profile("worker").parse().unwrap();
     assert_eq!(table["agent"]["icon"].as_str(), Some("🦊"));
 }
+
+#[tokio::test]
+async fn execution_results_persist_once_with_sanitized_projection() {
+    for outcome in ["complete", "partial", "voided"] {
+        let f = Fixture::new().await;
+        let items = if outcome == "partial" {
+            vec![schedule("duplicate"), schedule("duplicate"), schedule("never-run")]
+        } else { vec![field("worker", "icon", json!("🦊"))] };
+        let rec = f.card(items).await;
+        f.decide(&rec, true).await;
+        if outcome == "voided" {
+            std::fs::write(f.home.path().join("agents/worker/agent.toml"),
+                format!("{}\n# changed\n", f.profile("worker"))).unwrap();
+        }
+        let result = f.run(&rec).await.unwrap();
+        assert_eq!(result["outcome"], outcome);
+        let stored = f.broker.get(&rec.id).await.unwrap().unwrap().execution_result.unwrap();
+        assert_eq!(stored["outcome"], outcome);
+        assert_eq!(stored["completed"], result["completed"]);
+        assert_eq!(stored["not_executed"], result["not_executed"]);
+        let mut keys: Vec<_> = stored.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["completed", "items", "message", "not_executed", "outcome", "reason"]);
+        for item in stored["items"].as_array().unwrap() {
+            let mut keys: Vec<_> = item.as_object().unwrap().keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, ["error", "result", "seq"]);
+        }
+        assert!(!stored.to_string().contains(&f.turn.user_id));
+        assert!(!stored.to_string().contains("Summarize the daily report"));
+        let ctx = f.users.live_user_context(&f.turn.user_id).unwrap().unwrap();
+        let frame = f.handler.handle_approvals_get(json!({"id":rec.id.as_str()}), &ctx).await;
+        let WsFrame::Response { ok:true, payload:Some(view), .. } = frame else { panic!("{frame:?}"); };
+        assert_eq!(view["count"], 1);
+        assert_eq!(view["approvals"][0]["execution_result"], stored);
+        assert_eq!(view["approvals"][0]["decided_at"],
+            json!(f.broker.get(&rec.id).await.unwrap().unwrap().decided_at));
+        assert!(!view["approvals"][0]["decided_at"].is_null());
+
+        assert!(f.run(&rec).await.is_none());
+        assert!(!f.broker.set_execution_result_once(&rec.id, &json!({"outcome":"voided"})).await.unwrap());
+        assert_eq!(f.broker.get(&rec.id).await.unwrap().unwrap().execution_result, Some(stored));
+    }
+}
+
+#[tokio::test]
+async fn result_store_failure_does_not_change_outcome_or_reexecute() {
+    let f = Fixture::new().await;
+    let rec = f.card(vec![schedule("once-only")]).await;
+    f.decide(&rec, true).await;
+    rusqlite::Connection::open(f.home.path().join("approvals.db")).unwrap().execute_batch(
+        "CREATE TRIGGER refuse_execution_result BEFORE UPDATE OF execution_result ON approvals
+         BEGIN SELECT RAISE(FAIL, 'test result store unavailable'); END;").unwrap();
+    let result = f.run(&rec).await.unwrap();
+    assert_eq!(result["outcome"], "complete");
+    assert_eq!(result["completed"], 1);
+    assert!(f.broker.get(&rec.id).await.unwrap().unwrap().execution_result.is_none());
+    assert!(f.run(&rec).await.is_none());
+    let schedules = crate::cron_store::CronStore::open(f.home.path()).unwrap().list_all().await.unwrap();
+    assert_eq!(schedules.len(), 1);
+    assert_eq!(f.events("admin_ai_settings_changed").len(), 1);
+}

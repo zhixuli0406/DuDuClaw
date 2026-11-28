@@ -14,6 +14,10 @@ Adding or widening a grant, or adding people to the main list, requires reading 
 
 See [Department managers](../features/79-department-managers.md) for exact permissions, rule execution limits, revocation and existing work. Company-wide analytics and billing summaries remain visible to all Managers.
 
+`agents.main_access.get {}` / `agents.main_access.set {user_ids, acknowledged?}` include `granted_by_name` and `granted_at` on each `users[]` entry, so the grant can show who approved it and when. The name can be `null`.
+
+Managers with Automation access can call `autopilot.template_fields {trigger_event}` for `task_created`, `task_updated` and `task_status_changed` only, without `sequence`; `autopilot.runs.list {rule_id, limit?}` is limited to rules in their granted Automation departments. `autopilot.template_fields` returns `{fields:[...]}`; `autopilot.runs.list` returns `{runs:[...]}`, with `limit` defaulting to 20 and accepting 1–100. `autopilot.runs.cancel` remains Admin-only. Admins and the department's authorized Manager can call `autopilot.notify_destinations {owner_department}`. It returns `{destinations:[{channel, chat_id, kind, agent_id, label}]}`: `kind` is `self` or `agent`, and `agent_id` is nullable. These are exactly the destinations a department rule created by the caller may notify. Use `label` for display. Rules returned by `autopilot.list` and `autopilot.affecting_me` include `creator_access_lost` (`true`, `false` or `null` when undetermined); this is display information, not an authorization decision.
+
 ## Skill archive recovery
 
 Automatic skill staleness and archiving have been removed. `[skill_curator]`
@@ -342,6 +346,10 @@ Schedules, tasks and skills that people create from the dashboard, plus webhooks
 
 The card also shows role-exception eligibility and one-way pairs as outgoing and incoming. Current account and work context are still checked on every request.
 
+`delegation.effective {agent_id}` also returns nullable `owner_display_name` for the employee's owner. Use this name in the card rather than an internal account identifier.
+
+**Administrator AI.** Enable it at **Settings → Delegation permissions → Administrator AI**. `admin_ai.get {}` returns `config_state: "ok" | "unreadable" | "malformed"`; `enabled` is `false` unless the state is `ok`. When present, `enabled_ack` includes `by_name` (nullable) and `at` for display. See [Administrator AI settings](../features/79-admin-ai-settings.md).
+
 ## Channels
 
 - **Google Chat shared app (Admin only, v1.85):** in the Behavior tab, **Route by sender (shared Chat app)** writes `googlechat/global/shared_bot_binding` (default `false`), and **Reply for people without access** writes `googlechat/global/unbound_reply`. These settings are not available through employee MCP configuration. In one-to-one DMs, a manual Google Chat identity binding must first resolve the member and their AI avatar or primary AI; only then are existing `@` calls honored, and without one the message goes to that avatar or primary AI in its own conversation. Unresolved or unavailable targets receive only the configured reply, even with an `@` call, without a model call or conversation. Session commands operate on that employee's conversation. Groups and employee-owned apps keep their existing routing. Both settings apply to the next message. The reply accepts at most 1,000 characters of plain text and only `{onboarding_url}`; an invalid or missing HTTPS public dashboard URL removes that placeholder. Anyone who can DM the app can see a URL included in the reply. The Chat app name and avatar remain shared by the company. See [Google Chat shared app routing](channels-googlechat-teams.md#share-one-chat-app-across-ai-employees-v185).
@@ -433,7 +441,7 @@ Personal Odoo connections require an administrator to opt in with `config.toml`:
 member_credentials = true # default: false
 ```
 
-A missing key, unreadable configuration or non-boolean value disables personal connections. While disabled, `me.odoo.connect` and `me.odoo.test` refuse before contacting Odoo or decrypting a key. Identity selection skips personal credentials; person-key requests return `odoo_member_credentials_off`. Saved credentials remain stored, and members can still disconnect. Administrators can still list and revoke connections.
+A missing key, unreadable configuration or non-boolean value disables personal connections. While disabled, `me.odoo.connect` and `me.odoo.test` refuse before contacting Odoo or decrypting a key. Identity selection skips personal credentials; person-key requests and the employee identity route for avatar / `act_as_requester` employees with no usable own or permitted company credential return `odoo_member_credentials_off`. Saved credentials remain stored, and members can still disconnect. Administrators can still list and revoke connections.
 
 The browser-only Admin RPC `odoo.member_credentials.set_enabled {enabled: bool, acknowledge_risk?: bool}` returns `{enabled}`. Enabling requires `acknowledge_risk=true`. It uses the locked, hash-checked, format-preserving config commit path. Before publishing the setting, it writes `odoo_member_credentials_toggled` with the live actor's user ID, the requested value and a timestamp. Audit failure aborts the change. Records with `phase: "before_commit"` are write-ahead intents: a subsequent config write failure may leave an intent without a completed change.
 
@@ -450,6 +458,10 @@ The table choices use the existing `odoo.schema_scan` snapshot for the saved glo
 Available actions come from the connected Odoo account’s own read, create, write and delete rights, detected on connection/schema scan and cached with a timestamp. Rescan after changing rights in Odoo. Button actions and other methods use write as an availability hint; Odoo decides which operations can actually run and still enforces record rules. Unavailable actions are disabled; unknown rights remain selectable with a hint. Previously saved unavailable actions stay checked with a warning and can be removed. All-table rules stay selectable because rights differ per table. Models blocked by DuDuClaw are not probed. Account-rights availability uses the saved global connection. For an employee with a separate connection, credential or company scope, the editor shows unconfirmed rights instead of applying another account’s denials.
 
 Existing rules are grouped by table. A lone `read` or `search` appears as **Query and read — Partial** and becomes the pair on save. Existing `action` rules appear as editable **Button actions**. Unrecognized entries appear read-only under **Other settings** and are kept exactly until explicitly removed; the server permits preservation of existing entries but still rejects newly supplied invalid rules. The Odoo overview summarizes each rule as **Table: actions**.
+
+`agents.update` accepts `odoo.allowed_actions` entries `activity:<model>`, `note:<model>`, `message:<model>` and `attach:<model>`. These four actions require an exact model name; bare verbs and wildcard models are not accepted for new entries. Generic writers refuse employee-level Odoo permission widening and direct the administrator to that employee's edit page.
+
+For an avatar or `act_as_requester` employee with no usable own or permitted company credential, the employee identity route returns `odoo_member_credentials_off` while `[odoo] member_credentials` is not literally `true`; its message says the company has not enabled members' own Odoo connections and asks them to contact an administrator. When the switch is `true`, the corresponding missing-connection refusal is `odoo_not_connected`.
 
 ## Integrations → Odoo → Website live chat
 
@@ -822,6 +834,12 @@ Any read or parse error, an unknown key or value turns the feature off; the scre
 
 **My Connections → Chat accounts (Admins).** Generate a code, paste it in a private chat with the listed bot or Chat app within 10 minutes, then come back and confirm "this is me". A binding filled in by an Admin shows "not self-confirmed" on the Members page. **Cancel chat approval eligibility** clears only the proof.
 
+`approvals.list {status?, limit?, agent_id?, action_kind?}` accepts `status: "pending"` (default) or `"decided"`. Decided history requires a live Admin, defaults to 50 rows and is newest first. `limit` must be 1–100; pending requests have no limit unless supplied. `approvals.list` and `approvals.get {id}` include `decided_at` and nullable `execution_result` on visible rows. For `admin_ai_settings`, the latter is `{outcome, reason, completed, not_executed, message, items:[{seq,result,error}]}`; `outcome` is `complete`, `partial` or `voided`. Other categories return `null`; restricted card projections can also return `null`.
+
+`approvals.chat_admin.get {}` includes the `admin_ai_settings` category in `kinds[]`, with `label` keyed by `zh-TW`, `en` and `ja`, plus an `impact` string explaining that changes affect multiple AI employees' future behaviour. The current `impact` string is in Traditional Chinese.
+
+Successful `POST /api/me/approvals/step-up` returns `{status:"done", decision:"approve"|"reject", decided_by_display:string|null}`. The old `decided_by` response field is removed; show `decided_by_display`.
+
 ## Action claim check (advanced config editor only)
 
 `config.toml [action_claims] mode` has no switch on a settings page; an Admin sets it in **Settings → Advanced → Advanced config editor**. Values: `"notice"` (default) or `"shadow"`. A missing file, section or key uses the default; the editor refuses any other value, and a hand-edited unknown value is read as `"shadow"` with one warning in the gateway log. The value is read on every reply; no restart is needed.
@@ -857,6 +875,7 @@ Admin: **System → Security → Credential audit** shows metadata, filters, ser
 
 Administrators can open the resumable setup wizard at `/manage/integrations?tab=google`. Choose company delegation, Internal OAuth, Apps Script or personal External OAuth. The advanced credential form remains reachable. Confirm a path replacement before saving; stored OAuth tokens remain until an explicit disconnect. The connection test reports each service separately, and scope-only Sheets/Docs checks remain unverified. Follow [Connect Google](google-setup.md) for Console steps, remote-host tunnels and Testing expiry.
 
+The Drive-write step in `google.identity.test` checks a company OAuth connection using its separate home write credential. The administrator must first authorize company Drive writing; the ordinary company OAuth connection alone is insufficient. Apps Script remains unsupported for this write check.
 
 ## Inbox and work timeline
 
@@ -1014,6 +1033,8 @@ Employee accounts see an **A few steps left** connections card on Home when pers
 
 APIs (Admin JWT): `POST /api/channel-identity/bind {user_id, channel, channel_user_id}`, `POST /api/channel-identity/unbind {user_id, channel: "googlechat", channel_user_id}`, `GET /api/channel-identity/list?user_id=` (a Google-account-derived entry carries `"source": "google_account"`, and is listed only while automatic recognition is on). The setting is read by `google.credentials.get` (`chat_identity_from_account`) and written, Admin only, by `google.integration.set {chat_identity_from_account: bool}`. No self-service path creates a Google Chat binding.
 
+`GET /api/channel-identity/list?user_id=` adds `proof_status` and `proven_at` to each `identities[]` entry. `proof_status` is `self_confirmed` after the person confirms their own account, otherwise `admin_prefilled`; `proven_at` is an RFC 3339 timestamp or `null`. An automatically derived Google account entry is `admin_prefilled` with `proven_at: null`.
+
 ## AI avatars for members
 
 In **Users → Edit → AI avatar**, an Admin can select one of that member's Owner or Operator bindings, or **None**, then press **Set AI avatar**. Each AI can be one member's avatar at a time. This button saves only the avatar; use **Save** separately for other account fields. Assigning an avatar also makes it that member's primary AI. Clearing the avatar leaves the primary unchanged. Offboarding clears the avatar so the AI can be reassigned, while existing binding transfers continue as before. Assigning an avatar does not change who may read conversations or memory.
@@ -1074,8 +1095,8 @@ Administrators can enable or disable personal keys under **My account → Extern
 access**. Members create, list and revoke their own keys there; administrators
 list and revoke keys for all members. Admin accounts cannot create member keys.
 The switch defaults to off, including when configuration cannot be read or parsed.
-When off, both key use and management RPCs are refused; the normal configuration
-UI remains available to the administrator.
+When off, key use, member self-service and Admin key listing/revocation RPCs are
+refused. The Admin policy RPCs below and normal configuration UI remain available.
 
 ```toml
 [member_api_keys]
@@ -1109,6 +1130,8 @@ front-end code; call from your server. See the [member API contract](../api/memb
 | `approval_grants_mfa_enrollment` | `false`. Allows an administrator to grant first MFA enrollment explicitly when approving; one use within 72 hours. Enabling this key alone grants nothing. |
 
 Settings are reread at start, callback and completion. An unreadable or malformed config disables sign-in. Missing/wrong-type `enabled`, missing or blank acknowledgement fields, or an empty/invalid `allowed_hd` list disables it too; one malformed domain invalidates the entire list. Only exact `"direct"` selects direct creation; other approval values require admin approval. A missing cap uses 20; an invalid cap becomes zero and blocks new admissions. An invalid template blocks avatar creation without selecting a blank fallback. MFA preauthorization is enabled only by boolean `true`. The raw config editor can only disable sign-in, remove its acknowledgement or delete the section; it cannot enable or expand this feature.
+
+Admin-only `users.list {}` adds `google_signin_linked` (boolean), `google_signin_linked_at` and `google_signin_last_signin_at` (nullable timestamps), and `has_password` (boolean) to each `users[]` entry. `signin_avatar` is `null` or `{state, reason, retry_allowed}`. `state` is `pending`, `creating`, `retrying`, `waiting_admin` or `done`; `reason` is `done`, `name_taken`, `policy_changed`, `failed`, `protected_mode`, `template_changed`, `template_invalid`, `seats_full`, `not_eligible`, `unknown` or `null`. `retry_allowed` is a boolean; use it to decide whether to offer retry rather than inferring from the reason.
 
 ## Member-key and Odoo access settings (v1.86.0)
 
@@ -1144,3 +1167,11 @@ When upgrading an installation with a configured company Odoo URL/database, a on
 Members manage their connection through browser-only `me.odoo.status`, `me.odoo.connect {login, api_key}`, `me.odoo.test {}` and `me.odoo.disconnect {}`. Read status first to see the current server/database; after a server change read it again in the same browser session before re-verifying. Connect and test share a limit of five attempts per minute per member, including failed/malformed attempts. Password changes, sign-out-everywhere and suspension require re-entering the key. Admins can list/revoke with `odoo.member_credentials.list` and `.revoke {user_id}`; they cannot enter another person's secret.
 
 Before downgrading to v1.85.x, remove `allow_conversation_content` and `allow_mcp_scopes` from `[member_api_keys]`. Older versions reject unknown keys in this section and disable all personal keys. v1.85 ignores `[odoo_access]` and falls back to the global Odoo account; the new company-account list and refusal policy do not protect a downgraded installation.
+
+Admin dashboard-browser RPCs `member_keys.policy_get {}` and `member_keys.policy_set {allow_conversation_content?: bool, allow_mcp_scopes?: string[], acknowledge_risk?: bool}` work even while member keys are disabled. Both return `{readable:true, enabled, allow_conversation_content, allow_mcp_scopes, available_mcp_scopes, risk:{conversation,mcp_scopes}}`. With unreadable or malformed configuration, get returns `{readable:false, message}` and set refuses. A non-table `[member_api_keys]` is unreadable and disables keys. Unknown fields and explicit `null` values are refused.
+
+Enabling conversation content or adding a scope requires `acknowledge_risk:true`; narrowing does not. The `member_keys_policy_changed` audit is written before saving, and an audit failure blocks the write. Generic writers, including `config.raw.set`, `system.update_config`, `google.integration.set` and all ordinary configuration commits, refuse widening these two settings. Backup restore and CLI import strip widening and show a notice directing the administrator to confirm it through the dedicated settings.
+
+`me.member_keys.list {limit?, cursor?}` also returns `policy:{allow_conversation_content,allow_mcp_scopes}`. Conversation permission controls creation only. MCP permissions are checked on every call as the intersection of stored key scopes and current `allow_mcp_scopes`; re-adding a scope restores it for existing keys that were created with that scope.
+
+`odoo.access_get {}` returns `{readable:false, message}` if access settings cannot be read or parsed; `odoo.access_set` still refuses to write in that state. Normal get/set responses add `readable:true` and `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}`. These are counts: active members with an assigned avatar and stored personal Odoo credentials (including credentials needing verification), and employees configured to act as the requester. These counts are advisory: if counting fails, `follow_mode_impact` is `null`; get/set still succeed and a valid set is committed normally.

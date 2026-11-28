@@ -278,6 +278,9 @@ impl MethodHandler {
                 if let Err(error) = config_raw_rpc::refuse_odoo_widening_params(&self.home_dir, &params) {
                     return WsFrame::error_response("", &error);
                 }
+                if let Err(error) = config_raw_rpc::refuse_member_key_widening_params(&self.home_dir, &params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_system_update_config(params, ctx)).await
             }
             // ── v1.68: raw config editor (admin; masked read, validated +

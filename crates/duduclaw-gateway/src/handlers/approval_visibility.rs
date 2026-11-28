@@ -553,5 +553,24 @@ mod admin_ai_tests {
             "expected_digest":crate::approval::decision_digest_at(&f.home, &rec)}), &proposer).await;
         assert!(matches!(frame, WsFrame::Response { ok:true, .. }));
         assert_eq!(broker.get(&id).await.unwrap().unwrap().status, crate::approval::ApprovalStatus::Denied);
+        let result = json!({"outcome":"voided", "reason":"denied", "completed":0,
+            "not_executed":0, "message":"已取消", "items":[]});
+        assert!(broker.set_execution_result_once(&id, &result).await.unwrap());
+        let decided = broker.get(&id).await.unwrap().unwrap();
+        for params in [json!({"id":id.as_str()}),
+            json!({"status":"decided", "action_kind":crate::admin_ai::card::ACTION_KIND, "limit":1})] {
+            let frame = if params.get("id").is_some() {
+                f.handler.handle_approvals_get(params.clone(), &proposer).await
+            } else { f.handler.handle_approvals_list(params.clone(), &proposer).await };
+            let view = payload(frame);
+            assert_eq!(view["count"], 1);
+            assert_eq!(view["approvals"][0]["execution_result"], result);
+            assert_eq!(view["approvals"][0]["decided_at"], json!(decided.decided_at));
+            assert!(view["approvals"][0]["decided_by_display"].is_string());
+            assert!(!view.to_string().contains(&proposer.user_id));
+            let hidden = payload(f.handler.handle_approvals_list(params, &other_admin).await);
+            assert_eq!(hidden["count"], 0);
+        }
+
     }
 }

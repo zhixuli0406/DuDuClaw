@@ -5,6 +5,16 @@ use crate::UserDb;
 const STORAGE: &str = "signin_avatar_storage_unavailable";
 const STATE: &str = "signin_avatar_wrong_state";
 
+// Keep the read-only button eligibility and the retry mutation in step.
+const ADMIN_RETRY_SQL: &str = "source='google_signin' AND avatar='waiting_admin'";
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct SigninAvatarSummary {
+    pub state: &'static str,
+    pub reason: Option<String>,
+    pub retry_allowed: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct SigninAvatarJob {
     pub user_id: String,
@@ -32,6 +42,35 @@ mod tests {
     fn row(db: &UserDb) -> (String, Option<String>, i64, Option<i64>, Option<String>) {
         db.conn().query_row("SELECT avatar,avatar_agent_name,avatar_attempts,avatar_next_at,avatar_error
             FROM user_onboarding WHERE user_id='member'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).unwrap()
+    }
+
+    #[test]
+    fn signin_onboarding_batch_closed_fields_and_retry_match_mutation() {
+        for source in [None, Some("other"), Some("google_signin")] {
+            for (raw, expected) in [("pending", "pending"), ("reserved", "creating"),
+                ("creating", "creating"), ("retry", "retrying"), ("waiting_admin", "waiting_admin"),
+                ("done", "done"), ("unexpected", "waiting_admin")] {
+                let (_home, db) = fixture(raw, source);
+                db.conn().execute("UPDATE user_onboarding SET avatar_error='seats_full'", []).unwrap();
+                let summary = db.signin_avatar_summaries().unwrap().remove("member").unwrap();
+                assert_eq!(summary.state, expected);
+                assert_eq!(summary.reason.as_deref(), Some("seats_full"));
+                assert_eq!(summary.retry_allowed, db.signin_avatar_admin_retry("member").is_ok());
+            }
+        }
+        let (_home, db) = fixture("waiting_admin", Some("google_signin"));
+        for code in ["done", "name_taken", "policy_changed", "failed", "protected_mode",
+            "template_changed", "template_invalid", "seats_full", "not_eligible", "orphan:private-name"] {
+            db.conn().execute("UPDATE user_onboarding SET avatar_error=?1", [code]).unwrap();
+            let summaries = db.signin_avatar_summaries().unwrap();
+            assert_eq!(summaries["member"].reason.as_deref(), Some(if code == "orphan:private-name" { "unknown" } else { code }));
+        }
+        db.conn().execute("UPDATE user_onboarding SET avatar_error=NULL", []).unwrap();
+        assert_eq!(db.signin_avatar_summaries().unwrap()["member"].reason, None);
+        db.conn().execute("DELETE FROM user_onboarding", []).unwrap();
+        assert!(db.signin_avatar_summaries().unwrap().is_empty());
+        db.conn().execute("DROP TABLE user_onboarding", []).unwrap();
+        assert!(db.signin_avatar_summaries().is_err());
     }
 
     #[test]
@@ -137,6 +176,31 @@ mod tests {
 }
 
 impl UserDb {
+    pub fn signin_avatar_summaries(&self) -> Result<std::collections::HashMap<String, SigninAvatarSummary>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT user_id,avatar,avatar_error,
+            CASE WHEN {ADMIN_RETRY_SQL} THEN 1 ELSE 0 END FROM user_onboarding"))
+            .map_err(|_| STORAGE)?;
+        let rows = stmt.query_map([], |r| {
+            let raw: Option<String> = r.get(1)?;
+            let error: Option<String> = r.get(2)?;
+            let state = match raw.as_deref() {
+                Some("pending") => "pending",
+                Some("reserved" | "creating") => "creating",
+                Some("retry") => "retrying",
+                Some("done") => "done",
+                _ => "waiting_admin",
+            };
+            let reason = error.map(|code| match code.as_str() {
+                "done" | "name_taken" | "policy_changed" | "failed" | "protected_mode" |
+                "template_changed" | "template_invalid" | "seats_full" | "not_eligible" => code,
+                _ => "unknown".to_owned(),
+            });
+            Ok((r.get(0)?, SigninAvatarSummary { state, reason, retry_allowed: r.get(3)? }))
+        }).map_err(|_| STORAGE)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(|_| STORAGE.to_owned())
+    }
+
     fn signin_avatar_transaction<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T, String>) -> Result<T, String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|_| STORAGE)?;
@@ -205,9 +269,9 @@ impl UserDb {
     }
 
     pub fn signin_avatar_admin_retry(&self, user_id: &str) -> Result<(), String> {
-        self.signin_avatar_transaction(|tx| changed(tx.execute("UPDATE user_onboarding SET
+        self.signin_avatar_transaction(|tx| changed(tx.execute(&format!("UPDATE user_onboarding SET
             avatar='pending',avatar_attempts=0,avatar_next_at=NULL,avatar_error=NULL,avatar_agent_name=NULL
-            WHERE user_id=?1 AND source='google_signin' AND avatar='waiting_admin'",
+            WHERE user_id=?1 AND {ADMIN_RETRY_SQL}"),
             [user_id]), "signin_avatar_not_waiting"))
     }
 

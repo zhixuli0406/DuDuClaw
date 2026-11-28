@@ -362,6 +362,13 @@ pub fn refuse_odoo_widening_text_edit(before: &str, after: &str) -> Result<(), S
     super::config_raw_rpc::refuse_odoo_widening_edit(&parse(before)?, &parse(after)?)
 }
 
+/// Shared final-text creation-policy guard for every generic config writer.
+pub fn refuse_member_key_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
+    let parse = |text: &str| text.parse::<toml::Table>()
+        .map_err(|_| "無法讀取本人金鑰設定，這次沒有變更設定。".to_owned());
+    super::config_raw_rpc::refuse_member_key_widening_edit(&parse(before)?, &parse(after)?)
+}
+
 /// Shared final-text guard for profile edits and creation. A new employee uses
 /// an empty `before`, which denies requester impersonation but allows overrides.
 pub fn refuse_odoo_agent_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
@@ -399,7 +406,36 @@ pub(super) fn commit_odoo_table(
             if old != new { return Err("只能變更這項 Odoo 權限設定。".into()); }
             guard()?;
             render_preserving(current, table)
-        }, true, Some(source), None, None, false, false, true)
+        }, true, Some(source), None, None, false, false, true, false)
+    )).map_err(|e| e.to_string())?
+}
+
+/// Only the browser Admin policy RPC may change these two creation-policy keys.
+/// Keep all other consent gates active and compare unrelated values under lock.
+pub(super) fn commit_member_keys_policy_table(
+    home: &Path, expected_hash: &str, table: &toml::Table,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let path = home.join("config.toml");
+    crate::google_identity::home_source::with_source_guard(home, |source| Ok(
+        commit_rendered_inner_authorized(&path, expected_hash, |current| {
+            let mut old = current.parse::<toml::Table>().map_err(|e| e.to_string())?;
+            let mut new = table.clone();
+            for candidate in [&mut old, &mut new] {
+                if let Some(section) = candidate.get_mut("member_api_keys") {
+                    let section = section.as_table_mut().ok_or("本人金鑰設定格式不正確。")?;
+                    section.remove("allow_conversation_content");
+                    section.remove("allow_mcp_scopes");
+                    if section.is_empty() { candidate.remove("member_api_keys"); }
+                }
+            }
+            if old != new { return Err("只能變更本人金鑰的開放範圍。".into()); }
+            let rendered = render_preserving(current, table)?;
+            crate::member_keys::Config::parse(current).ok_or("無法讀取本人金鑰設定。")?;
+            crate::member_keys::Config::parse(&rendered).ok_or("本人金鑰設定格式不正確。")?;
+            guard()?;
+            Ok(rendered)
+        }, true, Some(source), None, None, false, false, false, true)
     )).map_err(|e| e.to_string())?
 }
 
@@ -436,7 +472,7 @@ pub(super) async fn commit_drive_write_policy(
                 let mut table = current.parse::<toml::Table>().map_err(|_| "無法讀取設定。".to_string())?;
                 table_at_mut(&mut table, &["google"])?.insert("drive_write".into(), section);
                 render_preserving(current, &table)
-            }, true, Some(g), None, None, true, false, false)
+            }, true, Some(g), None, None, true, false, false, false)
         )).map_err(|e| e.to_string())?
     }).await.map_err(|_| "無法儲存設定，請稍後重試。".to_string())?
 }
@@ -473,14 +509,14 @@ pub(super) fn commit_skill_trust_table(
             new.remove("skill_trust");
             if old != new { return Err("只能變更自家技能來源。".into()); }
             render_preserving(current, table)
-        }, true, Some(source), None, None, false, true, false)
+        }, true, Some(source), None, None, false, true, false, false)
     )).map_err(|e| e.to_string())?
 }
 
 fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
-    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false, false, false)
+    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false, false, false, false)
 }
-fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool,skill_trust_write:bool,odoo_write:bool)->Result<(),String> {
+fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool,skill_trust_write:bool,odoo_write:bool,member_key_policy_write:bool)->Result<(),String> {
     let authority_home = match path.file_name().and_then(|n| n.to_str()) {
         Some("config.toml") => path.parent(),
         Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
@@ -513,6 +549,11 @@ fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl Fn
                 return Ok(Err(error));
             }
         }
+        if !member_key_policy_write && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            if let Err(error) = refuse_member_key_widening_text_edit(&current, &new_content) {
+                return Ok(Err(error));
+            }
+        }
         if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
             if let Err(error) = refuse_odoo_agent_widening_text_edit(&current, &new_content) {
                 return Ok(Err(error));
@@ -525,7 +566,7 @@ fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl Fn
             let unchanged = current.parse::<toml::Table>().and_then(|old|
                 new_content.parse::<toml::Table>().map(|new| old.get("skill_trust") == new.get("skill_trust")));
             if !matches!(unchanged, Ok(true)) {
-                return Ok(Err("請到自家技能來源設定頁變更自動放行清單。".into()));
+                return Ok(Err("請到技能匯入頁的自家技能來源變更自動放行清單。".into()));
             }
         }
         if observer.is_some() && source.is_some() {
@@ -657,6 +698,7 @@ pub(crate) fn commit_boot_config<T>(
             if let Some(rendered) = rendered {
                 refuse_drive_write_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
                 refuse_odoo_widening_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
+                refuse_member_key_widening_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
                 use std::io::Write;
                 let tmp = home.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
                 let mut opts = std::fs::OpenOptions::new();
@@ -740,6 +782,47 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 }
 
 // ── Format-preserving render ────────────────────────────────────────────────
+
+pub const MEMBER_KEY_RESTORE_NOTICE: &str =
+    "本人金鑰的開放範圍未擴大，請到「外部系統存取」頁重新確認風險。";
+
+/// Preserve narrowing from the archive, but never import a wider creation policy.
+pub fn strip_member_key_widening_preserving(before: &str, after: &str) -> Result<(String, bool), String> {
+    let parse = |text: &str| text.parse::<toml::Table>()
+        .map_err(|_| "本人金鑰設定格式不正確，沒有匯入或還原。".to_owned());
+    let old = parse(before)?;
+    let original = parse(after)?;
+    let mut narrowed = original.clone();
+    for table in [&old, &original] {
+        if table.get("member_api_keys").is_some_and(|value| !value.is_table()) {
+            return Err("本人金鑰設定格式不正確，沒有匯入或還原。".into());
+        }
+    }
+    fn scopes(table: &toml::Table) -> Result<Vec<&str>, String> {
+        match toml_at(table, "member_api_keys.allow_mcp_scopes") {
+            None => Ok(Vec::new()),
+            Some(toml::Value::Array(values)) => values.iter().map(|value| value.as_str()
+                .ok_or_else(|| "本人金鑰使用範圍格式不正確，沒有匯入或還原。".to_owned())).collect(),
+            Some(_) => Err("本人金鑰使用範圍格式不正確，沒有匯入或還原。".into()),
+        }
+    }
+    let old_scopes = scopes(&old)?;
+    let new_scopes = scopes(&original)?;
+    if let Some(section) = narrowed.get_mut("member_api_keys").and_then(toml::Value::as_table_mut) {
+        if section.get("allow_conversation_content").and_then(toml::Value::as_bool) == Some(true)
+            && toml_at(&old, "member_api_keys.allow_conversation_content").and_then(toml::Value::as_bool) != Some(true) {
+            section.insert("allow_conversation_content".into(), toml::Value::Boolean(false));
+        }
+        if new_scopes.iter().any(|scope| !old_scopes.contains(scope)) {
+            section.insert("allow_mcp_scopes".into(), toml::Value::Array(new_scopes.into_iter()
+                .filter(|scope| old_scopes.contains(scope)).map(|scope| toml::Value::String(scope.into())).collect()));
+        }
+    }
+    let changed = narrowed != original;
+    let rendered = if changed { render_preserving(after, &narrowed)? } else { after.to_owned() };
+    refuse_member_key_widening_text_edit(before, &rendered)?;
+    Ok((rendered, changed))
+}
 
 pub const ODOO_RESTORE_NOTICE: &str =
     "Odoo 的權限模式與同仁 Odoo 帳號開關未還原，請到 Odoo 設定頁重新確認。";
@@ -1430,6 +1513,49 @@ name = "oa1"
             );
         });
         assert_eq!(tweaked, FIXTURE.replace("https://example.com", "https://example.org"));
+    }
+
+    #[test]
+    fn member_key_restore_strips_only_widening_and_preserves_format() {
+        let before = "[member_api_keys]\nallow_mcp_scopes=['tasks:read']\n";
+        let after = "# keep\n[member_api_keys]\nenabled=true # unchanged\nrate_per_minute=321\nallow_conversation_content=true\nallow_mcp_scopes=['tasks:read','odoo:write']\n";
+        let (out, changed) = strip_member_key_widening_preserving(before, after).unwrap();
+        assert!(changed);
+        refuse_member_key_widening_text_edit(before, &out).unwrap();
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(table["member_api_keys"]["allow_conversation_content"].as_bool(), Some(false));
+        assert_eq!(table["member_api_keys"]["allow_mcp_scopes"].as_array().unwrap(),
+            &vec![toml::Value::String("tasks:read".into())]);
+        assert!(out.contains("enabled=true # unchanged\nrate_per_minute=321"));
+        assert!(out.starts_with("# keep\n"));
+        assert_eq!(strip_member_key_widening_preserving(&out, &out).unwrap(), (out.clone(), false));
+        assert_eq!(strip_member_key_widening_preserving(&out, "# removed\n").unwrap(), ("# removed\n".into(), false));
+        for invalid in ["broken [", "member_api_keys=[]", "[member_api_keys]\nallow_mcp_scopes=[1]"] {
+            assert!(strip_member_key_widening_preserving(before, invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn member_key_policy_commit_is_scoped_hash_checked_and_guarded() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        let before = "[member_api_keys]\nenabled=false\nrate_per_minute=123\n";
+        std::fs::write(&path, before).unwrap();
+        for after in ["[member_api_keys]\nenabled=true\nrate_per_minute=123\n",
+            "[member_api_keys]\nenabled=false\nrate_per_minute=456\n",
+            "[member_api_keys]\nenabled=false\nrate_per_minute=123\n[general]\nlog_level='debug'"] {
+            assert!(commit_member_keys_policy_table(home.path(), &content_hash(before), &after.parse().unwrap(), || Ok(())).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        }
+        let table: toml::Table = format!("{before}allow_conversation_content=true\n").parse().unwrap();
+        assert!(commit_member_keys_policy_table(home.path(), "stale", &table, || panic!("hash must fail first")).is_err());
+        assert!(commit_member_keys_policy_table(home.path(), &content_hash(before), &table, || Err("revoked".into())).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+        commit_member_keys_policy_table(home.path(), &content_hash(before), &table, || {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+            Ok(())
+        }).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap(), table);
     }
 
     #[test]

@@ -133,6 +133,7 @@ impl ApprovalStore {
                  created_at   TEXT NOT NULL,
                  decided_at   TEXT,
                  decided_by   TEXT,
+                 execution_result TEXT,
                  ttl_seconds  INTEGER NOT NULL DEFAULT 3600
              );
 
@@ -216,6 +217,7 @@ impl ApprovalStore {
             ("invalidated_reason", "invalidated_reason TEXT"),
             // The person the raising run works for (`on_behalf_of`).
             ("on_behalf_of", "on_behalf_of TEXT"),
+            ("execution_result", "execution_result TEXT"),
             ("origin_session_id", "origin_session_id TEXT"),
             ("origin_turn_id", "origin_turn_id TEXT"),
             // RM-027: short exclusive decision lease (blocks the TTL sweep
@@ -327,8 +329,8 @@ impl ApprovalStore {
                 (id, agent_id, action_kind, summary, payload, status,
                  created_at, decided_at, decided_by, ttl_seconds,
                  notify_channel, notify_chat_id, reminded_at, simulation, request_kind, binding_json, answer_json,
-                invalidated_reason, on_behalf_of, origin_session_id, origin_turn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21){}",
+                invalidated_reason, on_behalf_of, origin_session_id, origin_turn_id, execution_result)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22){}",
             if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
         );
         let result = (|| {
@@ -404,6 +406,8 @@ impl ApprovalStore {
                     rec.on_behalf_of,
                     origin.as_ref().map(|(session, _)| session),
                     origin.as_ref().map(|(_, turn)| turn),
+                    rec.execution_result.as_ref().filter(|_| rec.action_kind == crate::admin_ai::card::ACTION_KIND)
+                        .map(crate::admin_ai::card::execution_result_projection).map(|v| v.to_string()),
                 ],
             )
             .map(|n| n == 1)
@@ -491,7 +495,7 @@ impl ApprovalStore {
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
                     notify_channel, notify_chat_id, reminded_at, simulation,
-                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -507,7 +511,7 @@ impl ApprovalStore {
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
                     notify_channel, notify_chat_id, reminded_at, simulation,
-                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -797,7 +801,7 @@ impl ApprovalStore {
                 "SELECT id, agent_id, action_kind, summary, payload, status,
                         created_at, decided_at, decided_by, ttl_seconds,
                         notify_channel, notify_chat_id, reminded_at, simulation,
-                        request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                        request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                  FROM approvals WHERE action_kind = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list_by_kind: {e}"))?;
@@ -862,6 +866,41 @@ impl ApprovalStore {
         Ok(result)
     }
 
+    /// Store only the first outcome, on the exact admin-AI card.
+    pub(super) async fn set_execution_result_once(&self, id: &ApprovalId, result: &Value) -> Result<bool, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
+        let n = tx.execute(
+            "UPDATE approvals SET execution_result=?1
+             WHERE id=?2 AND action_kind=?3 AND execution_result IS NULL",
+            params![result.to_string(), id.as_str(), crate::admin_ai::card::ACTION_KIND],
+        ).map_err(|e| format!("store approval execution result: {e}"))?;
+        commit_live_write(tx)?;
+        Ok(n == 1)
+    }
+
+    pub(super) async fn list_decided(
+        &self, agent_id: Option<&str>, action_kind: Option<&str>, limit: u32,
+    ) -> Result<Vec<ApprovalRecord>, String> {
+        if !(1..=100).contains(&limit) { return Err("invalid limit".into()); }
+        let conn = self.conn.lock().await;
+        verify_live_io()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, action_kind, summary, payload, status,
+                    created_at, decided_at, decided_by, ttl_seconds,
+                    notify_channel, notify_chat_id, reminded_at, simulation,
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
+             FROM approvals WHERE status != 'pending'
+               AND (?1 IS NULL OR agent_id=?1) AND (?2 IS NULL OR action_kind=?2)
+             ORDER BY julianday(decided_at) DESC, created_at DESC, id DESC LIMIT ?3",
+        ).map_err(|e| format!("prepare list_decided: {e}"))?;
+        let rows = stmt.query_map(params![agent_id, action_kind, limit], row_to_record)
+            .map_err(|e| format!("query list_decided: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_decided: {e}"))?;
+        Ok(rows)
+    }
+
     pub(super) async fn list_pending(
         &self,
         agent_id: Option<&str>,
@@ -875,7 +914,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                          FROM approvals
                          WHERE status = 'pending' AND agent_id = ?1
                          ORDER BY created_at ASC",
@@ -894,7 +933,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                          FROM approvals
                          WHERE status = 'pending'
                          ORDER BY created_at ASC",
@@ -955,6 +994,10 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
             .and_then(|s| serde_json::from_str(&s).ok()),
         invalidated_reason: row.get(17)?,
         on_behalf_of: row.get(18)?,
+        execution_result: row.get::<_, Option<String>>(19)?.map(|text| {
+            serde_json::from_str(&text).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                19, rusqlite::types::Type::Text, Box::new(e)))
+        }).transpose()?,
     })
 }
 
@@ -974,7 +1017,7 @@ pub(super) fn record_in_connection(conn: &Connection, id: &ApprovalId) -> Result
         "SELECT id, agent_id, action_kind, summary, payload, status,
                 created_at, decided_at, decided_by, ttl_seconds,
                 notify_channel, notify_chat_id, reminded_at, simulation,
-                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
          FROM approvals WHERE id = ?1",
         params![id.as_str()],
         row_to_record,
@@ -1094,6 +1137,23 @@ pub(crate) fn invalidate_unbound_cards(conn: &Connection, home: Option<&Path>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_adds_nullable_execution_result_to_existing_approvals() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE approvals (
+            id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, action_kind TEXT NOT NULL,
+            summary TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+            decided_at TEXT, decided_by TEXT, ttl_seconds INTEGER NOT NULL DEFAULT 3600);
+            INSERT INTO approvals(id,agent_id,action_kind,summary,created_at)
+            VALUES('old','a','mcp_call','old','2026-01-01T00:00:00Z');").unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        let rec = record_in_connection(&conn, &ApprovalId::from("old".to_owned())).unwrap().unwrap();
+        assert_eq!(rec.summary, "old");
+        assert_eq!(rec.execution_result, None);
+    }
 
     #[test]
     fn schema_migration_failure_rolls_back_all_schema_changes() {

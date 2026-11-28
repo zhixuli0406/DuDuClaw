@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, record_grant_use};
-use crate::dept_grants::rules::validate_department_rule;
+use crate::dept_grants::rules::{department_notify_destinations, validate_department_rule};
 use super::autopilot_rpc::{autopilot_create_definition, autopilot_update_definition};
 
 const DENIED: &str = "permission denied";
@@ -26,6 +26,8 @@ impl MethodHandler {
                 "autopilot.list" => return self.handle_autopilot_list().await,
                 "autopilot.remove" => return self.handle_autopilot_remove(params).await,
                 "autopilot.history" => return self.handle_autopilot_history(params).await,
+                "autopilot.template_fields" => return self.handle_autopilot_template_fields(params).await,
+                "autopilot.runs.list" => return self.handle_autopilot_runs_list(params).await,
                 "autopilot.create" if params.get("owner_department").is_none_or(Value::is_null) => {
                     return self.handle_autopilot_create(params, ctx).await;
                 }
@@ -39,10 +41,38 @@ impl MethodHandler {
             }
             Some(view)
         };
+        if method == "autopilot.template_fields" {
+            if params.get("sequence").is_some()
+                || !params.get("trigger_event").and_then(Value::as_str).is_some_and(|trigger|
+                    matches!(trigger, "task_created" | "task_updated" | "task_status_changed"))
+            {
+                return WsFrame::error_response("", DENIED);
+            }
+            return self.handle_autopilot_template_fields(params).await;
+        }
+        if method == "autopilot.notify_destinations" {
+            let Some(department) = params.get("owner_department").and_then(Value::as_str) else {
+                return WsFrame::error_response("", DENIED);
+            };
+            return match department_notify_destinations(self, view.as_ref(), department, &ctx.user_id).await {
+                Ok(destinations) => WsFrame::ok_response("", json!({"destinations": destinations})),
+                Err(error) => WsFrame::error_response("", &error),
+            };
+        }
         let store = match self.ap_store().await {
             Ok(store) => store,
             Err(frame) => return frame,
         };
+        if method == "autopilot.runs.list" {
+            let id = params.get("rule_id").and_then(Value::as_str).unwrap_or("");
+            // Missing and foreign rules have exactly the same refusal. Never
+            // query execution records until the rule's department is authorized.
+            match store.get_rule(id).await {
+                Ok(Some(row)) if view.as_ref().is_some_and(|v| owns_department(v, &row)) => {}
+                _ => return WsFrame::error_response("", DENIED),
+            }
+            return self.handle_autopilot_runs_list(params).await;
+        }
         // Company-wide legacy updates retain their validator and patch semantics.
         // Department updates below read/authorize/validate/write under one fence.
         if admin && method == "autopilot.update" {
@@ -66,8 +96,14 @@ impl MethodHandler {
         if method == "autopilot.list" {
             let view = view.ok_or(DENIED)?;
             let rows = store.list_rules().await?;
+            let mut display = crate::dept_grants::DisplayAutopilotCreatorAccessCache::load(self).await;
             let rules: Vec<Value> = rows.iter().filter(|row| owns_department(view, row))
-                .map(autopilot_rule_to_json).collect();
+                .map(|row| {
+                    let mut rule = autopilot_rule_to_json(row);
+                    rule["creator_access_lost"] = json!(display.display_creator_access_lost(
+                        row.created_by_user_id.as_deref(), row.owner_department.as_deref()));
+                    rule
+                }).collect();
             return Ok(json!({"rules": rules}));
         }
         if method == "autopilot.create" {

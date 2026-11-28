@@ -184,3 +184,35 @@ fn odoo_credential_suspended_and_deleted_accounts_never_unseal() {
     assert!(db.odoo_credential_unseal(&user.id, "server-a", &NeverOpen).unwrap().is_none());
     assert!(db.odoo_credential_status(&user.id).unwrap().is_none());
 }
+
+#[test]
+fn odoo_credential_count_active_avatars_is_read_only_and_reports_errors() {
+    let (db, path) = test_db();
+    assert_eq!(db.odoo_credential_count_active_avatars().unwrap(), 0);
+    for (email, status, avatar, credential) in [
+        ("counted@test.invalid", "active", Some("avatar-a"), true),
+        ("no-credential@test.invalid", "active", Some("avatar-b"), false),
+        ("no-avatar@test.invalid", "active", None, true),
+        ("suspended@test.invalid", "suspended", Some("avatar-c"), true),
+        ("offboarded@test.invalid", "offboarded", Some("avatar-d"), true),
+    ] {
+        let user = db.create_user(email, "Member", "password", UserRole::Employee).unwrap();
+        if credential { put(&db, &user.id); }
+        db.conn().execute("UPDATE users SET status=?2,avatar_agent_id=?3 WHERE id=?1",
+            params![user.id, status, avatar]).unwrap();
+    }
+    // Counts include stored credentials regardless of verification state or epoch.
+    for state in ["ok", "invalid", "needs_reverify"] {
+        db.conn().execute("UPDATE member_odoo_credentials SET state=?1,credential_epoch=-1", [state]).unwrap();
+        assert_eq!(db.odoo_credential_count_active_avatars().unwrap(), 1);
+    }
+    // No sealed secrets are needed, and a read-only handle can run the query.
+    db.conn().execute_batch("ALTER TABLE member_odoo_credentials DROP COLUMN secret_ct;").unwrap();
+    let read_only = UserDb::open_read_only(path.path()).unwrap();
+    assert_eq!(read_only.odoo_credential_count_active_avatars().unwrap(), 1);
+    let state: String = db.conn().query_row("SELECT state FROM member_odoo_credentials LIMIT 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(state, "needs_reverify");
+    db.conn().execute_batch("DROP TABLE member_odoo_credentials;").unwrap();
+    assert!(db.odoo_credential_count_active_avatars().is_err());
+    assert!(read_only.odoo_credential_count_active_avatars().is_err());
+}

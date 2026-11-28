@@ -206,6 +206,8 @@ fn protected_subject_gate(home: &Path, agent: &str, people: &dyn People) -> Resu
 #[cfg(test)]
 tokio::task_local! {
     pub(super) static WRITE_TEST_API_BASE: url::Url;
+    pub(super) static WRITE_TEST_AFTER_MINT: Box<dyn Fn(&Path) + Send + Sync>;
+    pub(super) static WRITE_TEST_AFTER_PROBE: Box<dyn Fn(&Path) + Send + Sync>;
 }
 
 /// The write token is consumed here and is never exposed by the diagnostic.
@@ -213,6 +215,7 @@ pub(in crate::google_identity) async fn drive_write_step(
     home: &Path, agent: &str, people: &dyn People,
     configured: &gi::EffectiveIdentity, effective: &gi::EffectiveIdentity,
 ) -> Step {
+    use super::drive_write::credential::{self, IdentityRoute, TokenMeta};
     use super::drive_write::transport::{WriteCall, WriteResult, WriteTransport};
     use crate::person_credentials::{write_store, Status};
     let report = |ok, detail| step("drive_write", "雲端硬碟寫入", ok, detail);
@@ -221,8 +224,12 @@ pub(in crate::google_identity) async fn drive_write_step(
         // Disabled optional diagnostics do not fail otherwise healthy identities.
         return report(true, "管理員尚未開放");
     }
+    let home_path = matches!(effective.effective, Effective::Home)
+        .then(|| gw::selected_path(home).ok()).flatten();
     let unchanged = || gi::effective_for(home, Some(agent)) == *configured
         && super::delegate_owner::effective_for(home, Some(agent)) == *effective
+        && (!matches!(effective.effective, Effective::Home)
+            || gw::selected_path(home).ok() == home_path)
         && gw::drive_write_policy::load(home).any_enabled();
     if !unchanged() { return report(false, FAILED); }
     if let Effective::Personal { selector } = &effective.effective {
@@ -249,39 +256,61 @@ pub(in crate::google_identity) async fn drive_write_step(
         Effective::Home => None,
         _ => return report(false, FAILED),
     };
-    let verify = || -> Result<(), super::Refusal> {
+    let verify = |token_meta: Option<&TokenMeta>| -> Result<(), super::Refusal> {
         if !unchanged() { return Err(super::Refusal::hard("identity_changed", FAILED)); }
         if let Some(identity) = &identity { identity.verify()?; }
+        if let Some(meta) = token_meta {
+            credential::validate_oauth_token(home, &IdentityRoute::HomeOAuth, meta)?;
+        }
         Ok(())
     };
-    if verify().is_err() { return report(false, FAILED); }
+    if verify(None).is_err() { return report(false, FAILED); }
     let minted = if let Some(identity) = &identity {
         super::resolve::mint_delegate_for_drive_write(home, identity.email, CacheMode::Bypass).await
+            .map(|token| (zeroize::Zeroizing::new(token.access_token), None))
     } else {
-        match gw::selected_path(home).as_deref() {
-            Ok("oauth" | "apps_script") => return report(false, "這種公司帳號連線方式不支援雲端硬碟寫入"),
-            Ok("service_account") => super::home_source::home_sa_token_for_drive_write(home).await,
+        match home_path.as_deref() {
+            Some("oauth") => {
+                credential::write_token(home, &IdentityRoute::HomeOAuth).await
+                    .map(|token| (token.bearer, Some(token.meta)))
+            }
+            Some("apps_script") => return report(false, "這種公司帳號連線方式不支援雲端硬碟寫入"),
+            Some("service_account") => super::home_source::home_sa_token_for_drive_write(home).await
+                .map(|token| (zeroize::Zeroizing::new(token.access_token), None)),
             _ => return report(false, FAILED),
         }
     };
-    if verify().is_err() { return report(false, FAILED); }
-    let token = match minted {
+    if verify(None).is_err() { return report(false, FAILED); }
+    let (token, token_meta) = match minted {
         Ok(token) => token,
-        Err(refusal) if refusal.code == "drive_write_admin_scope_missing" => {
+        Err(refusal) if matches!(refusal.code, "drive_write_admin_scope_missing" | "drive_write_needs_home_consent") => {
             return step("drive_write", "雲端硬碟寫入", false, refusal.message_zh);
         }
         Err(_) => return report(false, FAILED),
     };
-    let Ok(mut transport) = WriteTransport::new(zeroize::Zeroizing::new(token.access_token)) else {
+    #[cfg(test)]
+    let _ = WRITE_TEST_AFTER_MINT.try_with(|hook| hook(home));
+    // Same async-acquired revocation barrier as the runtime write executor.
+    // Keep it through transport construction, the final check, I/O and postcheck.
+    let _lease = if token_meta.is_some() {
+        match duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home).shared().await {
+            Ok(lease) => Some(lease),
+            Err(_) => return report(false, FAILED),
+        }
+    } else { None };
+    if verify(token_meta.as_ref()).is_err() { return report(false, FAILED); }
+    let Ok(mut transport) = WriteTransport::new(token) else {
         return report(false, FAILED);
     };
     #[cfg(test)]
     if let Ok(base) = WRITE_TEST_API_BASE.try_with(Clone::clone) {
         if transport.set_test_api_base(base).is_err() { return report(false, FAILED); }
     }
-    if verify().is_err() { return report(false, FAILED); }
+    if verify(token_meta.as_ref()).is_err() { return report(false, FAILED); }
     let result = transport.send(&WriteCall::DriveProbe).await;
-    if verify().is_err() { return report(false, FAILED); }
+    #[cfg(test)]
+    let _ = WRITE_TEST_AFTER_PROBE.try_with(|hook| hook(home));
+    if verify(token_meta.as_ref()).is_err() { return report(false, FAILED); }
     match result {
         WriteResult::Ok((status, _)) if (200..300).contains(&status) => report(true, "可以使用"),
         _ => report(false, FAILED),

@@ -72,7 +72,7 @@ pub(crate) async fn check(
         decided_at: None, decided_by: None, ttl_seconds: TTL_SECONDS,
         notify_channel: None, notify_chat_id: None, reminded_at: None, simulation: None,
         request_kind: RequestKind::Approval, binding: None, answer: None,
-        invalidated_reason: None, on_behalf_of: principal,
+        invalidated_reason: None, on_behalf_of: principal, execution_result: None,
     };
     // A hook must return promptly; this ticket is visible in the dashboard
     // without waiting for a channel provider or any model call.

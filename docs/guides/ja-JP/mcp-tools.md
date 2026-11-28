@@ -640,6 +640,10 @@ ID の代わりに、対応する Google ファイル・フォルダ URL も使�
 
 Engine は `allowed_models` の正確な対象と `allowed_actions` の `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` を必要とし、空リストでは許可しません。Follow は社員のモデル／操作権限と Engine の機密モデルブロックリストに代えて本人の Odoo 権限を使用します。会社の機能スイッチ、`always_refuse`、固定拒否、入力確認、承認、Odoo ACL は残ります。会社／AI 自身のアカウントは Engine のままです。社員の `permission_override=engine` は Engine を維持し、`read_only` は書き込みを除きます。有効な管理者確認がないグローバル Follow は Engine に戻ります。
 
+`agents.update` の `odoo.allowed_actions` は `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` を受け付けます。この 4 操作の新しい項目には完全一致するモデル名が必要で、動詞だけの指定やワイルドカードは使えません。汎用設定書き込みは社員の Odoo 権限を広げる変更を拒否し、その社員の編集ページへ案内します。
+
+個人 Odoo 接続は既定で無効で、`[odoo] member_credentials` が厳密に `true` の場合だけ有効です。無効時は保存済み個人認証情報を使わず、個人キーの要求は `odoo_member_credentials_off` を返します。アバターまたは `act_as_requester` 社員に利用可能な自己認証情報も許可済み会社認証情報もない場合、社員の認証経路も同じコードを返し、会社が個人 Odoo 接続を許可していないため管理者に連絡するよう案内します。有効時に接続がない場合は `odoo_not_connected` です。
+
 `always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。モデル完全一致、`*`、`ir.*` のようなドット区切りの子モデル、正確なメソッド名の `method:<name>` を使用します。専用操作は対象モデルと `activity:`、`note:`、`message:`、`attach:` で照合します。
 
 | ルール | 常に拒否する操作 |

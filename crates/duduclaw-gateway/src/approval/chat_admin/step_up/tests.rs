@@ -180,7 +180,10 @@ async fn reject_without_step_up_records_web_false_and_approve_records_required()
         let csrf = approve.then(|| f.step_up());
         let result = f.post(f.input(approve, csrf)).await.unwrap();
         let by = format!("chat-admin:{}:telegram:web", f.service.user);
-        assert_eq!(result["decided_by"], by);
+        assert_eq!(result, json!({"status":"done",
+            "decision":if approve { "approve" } else { "reject" },
+            "decided_by_display":"Ada（Telegram，網頁確認）"}));
+        assert!(!serde_json::to_string(&result).unwrap().contains(&f.service.user));
         let saved = f.service.env.broker.get(&f.id).await.unwrap().unwrap();
         assert_eq!(saved.decided_by.as_deref(), Some(by.as_str()));
         assert_eq!(saved.status, if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied });
@@ -190,6 +193,18 @@ async fn reject_without_step_up_records_web_false_and_approve_records_required()
             [f.id.as_str()], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
         assert_eq!(row, ("web".into(), approve, approve));
     }
+}
+
+#[tokio::test]
+async fn decider_display_lookup_failure_or_missing_user_returns_null() {
+    let f = WebFixture::new().await;
+    let marker = format!("chat-admin:{}:telegram:web", uuid::Uuid::new_v4());
+    assert_eq!(routes::lookup_decider_display(Some(f.service.db()), Some(&marker), Lang::ZhTw), None);
+    let marker = format!("chat-admin:{}:telegram:web", f.service.user);
+    assert_eq!(routes::lookup_decider_display(None, Some(&marker), Lang::ZhTw), None);
+    Connection::open(f.service.env.home.join("users.db")).unwrap()
+        .execute("ALTER TABLE users RENAME TO unavailable_users", []).unwrap();
+    assert_eq!(routes::lookup_decider_display(Some(f.service.db()), Some(&marker), Lang::ZhTw), None);
 }
 
 #[tokio::test]

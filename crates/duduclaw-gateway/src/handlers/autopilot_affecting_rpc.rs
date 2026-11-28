@@ -43,11 +43,14 @@ impl MethodHandler {
         }
         let store = self.autopilot_store.read().await.clone().ok_or("Autopilot store unavailable")?;
         let mut rules = Vec::new();
+        let mut display = crate::dept_grants::DisplayAutopilotCreatorAccessCache::load(self).await;
         for row in store.list_rules().await? {
             let Some(mut rule) = affecting_rule(&row, &visible, &hidden)? else { continue; };
             let history: Vec<Value> = store.list_history(Some(&row.id), 20).await?.into_iter()
                 .map(|entry| json!({"triggered_at": entry.triggered_at, "result": entry.result})).collect();
             rule["history"] = json!(history);
+            rule["creator_access_lost"] = json!(display.display_creator_access_lost(
+                row.created_by_user_id.as_deref(), row.owner_department.as_deref()));
             rules.push(rule);
         }
         Ok(json!({"rules": rules}))

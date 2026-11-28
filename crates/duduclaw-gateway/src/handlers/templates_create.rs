@@ -592,7 +592,7 @@ mod tests {
             &json!({"name":"unsafe","agent_toml":bad}), &admin, assets.path(), "owned-role", &assembled,
         ).await;
         assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
-            if e.as_str().is_some_and(|s| s.contains("Odoo 設定頁"))));
+            if e.as_str().is_some_and(|s| s.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"))));
         assert!(!home.path().join("agents/unsafe").exists());
         assert!(handler.registry.read().await.get("unsafe").is_none());
         // Team/template batch apply holds one admission and reaches the same
@@ -608,7 +608,7 @@ mod tests {
             Some(&std::collections::BTreeMap::new()), false, false, &[], Some(&admission),
         ).await;
         assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
-            if e.as_str().is_some_and(|s| s.contains("Odoo 設定頁"))));
+            if e.as_str().is_some_and(|s| s.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"))));
         assert!(!home.path().join("agents/unsafe-batch").exists());
         drop(admission);
         for (index, fields) in ["", "permission_override='inherit'", "permission_override='engine'",

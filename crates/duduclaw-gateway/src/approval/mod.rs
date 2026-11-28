@@ -11,6 +11,8 @@
 //! effects. Unknown execution outcomes require operator reconciliation and
 //! are never replayed automatically. Decision and execution CAS recheck TTL.
 
+pub(crate) mod decider_display;
+
 /// Channels supported by the bound in-chat decision sender/parser.
 pub fn supports_text_decisions(channel: &str) -> bool {
     matches!(channel, "telegram" | "discord" | "slack" | "line" | "googlechat")
@@ -420,6 +422,9 @@ pub struct ApprovalRecord {
     /// host, never from the request. Cards show it as 「由 ○○ 交辦」.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Sanitized admin-AI execution outcome, written once after execution.
+    #[serde(default)]
+    pub execution_result: Option<Value>,
 }
 
 /// Who the run raising a request works for: the gateway's task-local

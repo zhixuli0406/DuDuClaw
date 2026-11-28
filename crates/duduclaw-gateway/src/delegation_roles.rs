@@ -114,6 +114,15 @@ impl<'a> GatewayOwnerRoles<'a> {
         };
         Ok(id)
     }
+    /// Keep the owner identity and role tied to the same unique active row.
+    pub(crate) fn avatar_owner(&self, agent: &str) -> Result<Option<(String, String)>, OwnerRoleLookupError> {
+        let db = self.db()?;
+        // Reject ambiguous ownership even on an old database without the unique index.
+        db.query_row("SELECT id, role FROM users WHERE avatar_agent_id=?1 AND status='active'
+            AND (SELECT COUNT(*) FROM users WHERE avatar_agent_id=?1)=1", [agent], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional().map_err(|_| OwnerRoleLookupError)
+    }
+
     pub(crate) fn snapshot(&self, agent: &str) -> Result<RoleFacts, OwnerRoleLookupError> {
         let owner_role = self.avatar_owner_role(agent)?;
         let requester = self.requester_id()?;

@@ -69,6 +69,7 @@ impl ApprovalBroker {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: raising_principal(),
+            execution_result: None,
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;
@@ -142,6 +143,7 @@ impl ApprovalBroker {
                 Some(simulation.to_json())
             },
             on_behalf_of: raising_principal(),
+            execution_result: None,
         };
         let id = rec.id.clone();
         self.store.insert(&rec).await?;
@@ -664,6 +666,18 @@ impl ApprovalBroker {
     ) -> Result<Vec<ApprovalRecord>, String> {
         self.expire_stale().await?;
         self.store.list_pending(agent_id).await
+    }
+
+    pub(crate) async fn set_execution_result_once(&self, id: &ApprovalId, result: &Value) -> Result<bool, String> {
+        let result = crate::admin_ai::card::execution_result_projection(result);
+        self.store.set_execution_result_once(id, &result).await
+    }
+
+    pub(crate) async fn list_decided(
+        &self, agent_id: Option<&str>, action_kind: Option<&str>, limit: u32,
+    ) -> Result<Vec<ApprovalRecord>, String> {
+        self.expire_stale().await?;
+        self.store.list_decided(agent_id, action_kind, limit).await
     }
 
     /// Every approval of one `action_kind`, any status.

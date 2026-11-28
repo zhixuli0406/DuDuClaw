@@ -150,3 +150,15 @@ pub(super) async fn create(home: &Path, turn: &AdminTurn, mut prepared: Prepared
 #[cfg(test)]
 #[path = "card_tests.rs"]
 mod tests;
+
+/// Public outcome schema: never copy audit metadata or item targets/values.
+pub(crate) fn execution_result_projection(result: &Value) -> Value {
+    let text = |value: &Value| value.as_str().map(|text|
+        sanitize_output_text(&duduclaw_security::credential_detect::mask(text)));
+    let items: Vec<Value> = result["items"].as_array().into_iter().flatten().map(|item| json!({
+        "seq": item["seq"].as_u64(), "result": text(&item["result"]), "error": text(&item["error"]),
+    })).collect();
+    json!({"outcome": text(&result["outcome"]), "reason": text(&result["reason"]),
+        "completed": result["completed"].as_u64(), "not_executed": result["not_executed"].as_u64(),
+        "message": text(&result["message"]), "items": items})
+}

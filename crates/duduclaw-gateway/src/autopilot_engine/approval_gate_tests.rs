@@ -1235,6 +1235,7 @@ fn approved_actions_expire_after_the_execution_window() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     assert!(approval_gate::decided_within_window(&rec, now));
     assert_eq!(gate::APPROVED_EXECUTION_WINDOW_SECS, 15 * 60, "the window is 15 minutes");

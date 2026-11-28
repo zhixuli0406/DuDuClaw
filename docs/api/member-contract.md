@@ -290,7 +290,7 @@ than 90 days are purged. Recent history is retained even when the total cap
 refuses creation (`member_key_history_limit_reached`).
 
 `me.member_keys.list {"limit":25,"cursor":"<next_cursor>"}` returns
-`{"keys":[...],"next_cursor":null,"max_active":5,"max_total":50,"reauthentication":"password"}`
+`{"keys":[...],"next_cursor":null,"max_active":5,"max_total":50,"reauthentication":"password","policy":{"allow_conversation_content":false,"allow_mcp_scopes":[]}}`
 (`reauthentication` is `mfa` when enrolled). Omit the cursor for the first page.
 Both this method and `member_keys.admin_list` accept `limit` (default 25,
 1–100) and an opaque cursor; `next_cursor: null` ends the list. Ordering is
@@ -299,6 +299,12 @@ later pages. Invalid limits/cursors return `member_key_invalid_page`. The
 Dashboard shows one page at a time; **Next page** advances and **Refresh**
 returns to the first page. The create dialog requires the corresponding password
 or MFA input and clears it after submission or cancellation.
+
+Admin dashboard-browser RPCs `member_keys.policy_get {}` and `member_keys.policy_set {allow_conversation_content?: bool, allow_mcp_scopes?: string[], acknowledge_risk?: bool}` work even while member keys are disabled. Both return `{readable:true, enabled, allow_conversation_content, allow_mcp_scopes, available_mcp_scopes, risk:{conversation,mcp_scopes}}`. With unreadable or malformed configuration, get returns `{readable:false, message}` and set refuses. A non-table `[member_api_keys]` is unreadable and disables keys. Unknown fields and explicit `null` values are refused.
+
+Enabling conversation content or adding a scope requires `acknowledge_risk:true`; narrowing does not. The `member_keys_policy_changed` audit is written before saving, and an audit failure blocks the write. Generic writers, including `config.raw.set`, `system.update_config`, `google.integration.set` and all ordinary configuration commits, refuse widening these two settings. Backup restore and CLI import strip widening and show a notice directing the administrator to confirm it through the dedicated settings.
+
+`me.member_keys.list {limit?, cursor?}` also returns `policy:{allow_conversation_content,allow_mcp_scopes}`. Conversation permission controls creation only. MCP permissions are checked on every call as the intersection of stored key scopes and current `allow_mcp_scopes`; re-adding a scope restores it for existing keys that were created with that scope.
 
 `me.member_keys.revoke {"id":"..."}` revokes an owned key. Administrators use
 `member_keys.admin_list` and `member_keys.admin_revoke {"id":"..."}`; the latter

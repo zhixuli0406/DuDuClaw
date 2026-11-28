@@ -506,7 +506,8 @@ mod member_key_tests {
             "me.google.consents.set", "sessions.list", "mfa.status", "config.get",
             "system.update_config", "agents.delete", "unknown.method",
             "me.odoo.status", "me.odoo.connect", "me.odoo.test", "me.odoo.disconnect",
-            "me.odoo.future", "me.member_keys.narrow", "member_keys.admin_narrow"] {
+            "me.odoo.future", "me.member_keys.narrow", "member_keys.admin_narrow",
+            "member_keys.policy_get", "member_keys.policy_set"] {
             assert_eq!(member_key_method(method), None, "{method}");
         }
         assert_eq!(member_key_method("tasks.create"), Some(MemberContractKind::Write));

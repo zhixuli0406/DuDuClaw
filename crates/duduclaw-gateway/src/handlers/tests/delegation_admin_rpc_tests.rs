@@ -877,3 +877,33 @@ async fn set_accepts_directory_name_despite_unrelated_ambiguous_name() {
         json!([["sales-new", "warehouse-lead"]])
     );
 }
+
+#[test]
+fn effective_displays_avatar_owner_name_without_changing_policy() {
+    use crate::handlers::delegation_rpc::effective_delegation_json;
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "avatar", "sales");
+    let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let owner = db.create_user("owner@example.invalid", "王經理", "test-password", UserRole::Manager).unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+    conn.execute("UPDATE users SET avatar_agent_id='avatar' WHERE id=?1", [&owner.id]).unwrap();
+    let dir = home.path().join("agents/avatar");
+    for (config, expected_unrestricted) in [
+        ("[delegation]\npolicy='none'\nunrestricted_roles=['manager']\n", true),
+        ("[delegation]\npolicy='none'\nunrestricted_roles=[]\n", false),
+    ] {
+        std::fs::write(home.path().join("config.toml"), config).unwrap();
+        let data = effective_delegation_json(home.path(), &dir, "avatar", &|_| true, false);
+        assert_eq!(data["owner_display_name"], "王經理");
+        assert_eq!(data["unrestricted"], expected_unrestricted);
+        assert_eq!(data["owner_role"], if expected_unrestricted { json!("manager") } else { Value::Null });
+        conn.execute("UPDATE users SET avatar_agent_id=NULL WHERE id=?1", [&owner.id]).unwrap();
+        let data = effective_delegation_json(home.path(), &dir, "avatar", &|_| true, false);
+        assert!(data.get("owner_display_name").unwrap().is_null());
+        assert_eq!(data["unrestricted"], false);
+        conn.execute("UPDATE users SET avatar_agent_id='avatar' WHERE id=?1", [&owner.id]).unwrap();
+    }
+    conn.execute("DELETE FROM users WHERE id=?1", [&owner.id]).unwrap();
+    assert!(effective_delegation_json(home.path(), &dir, "avatar", &|_| true, false)
+        .get("owner_display_name").unwrap().is_null());
+}
