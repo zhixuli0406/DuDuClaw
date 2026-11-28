@@ -101,7 +101,7 @@ fn record_odoo_approval(grant: &duduclaw_gateway::approval::action_grant::Action
 /// Recheck the gateway's final mode before connecting. This closes a race
 /// where local policy was Engine at the approval gate but is now Follow.
 pub(super) fn require_follow_execution_approval(agent: &str, tool: &str, args: &Value,
-    decision: &super::odoo_identity_client::OdooIdentity) -> Result<(), String> {
+    decision: &super::odoo_identity_client::OdooIdentity) -> std::result::Result<(), String> {
     use super::odoo_identity_client::IdentityPermission;
     if decision.permission != IdentityPermission::Follow { return Ok(()); }
     let payload = serde_json::json!({"arguments":args});
