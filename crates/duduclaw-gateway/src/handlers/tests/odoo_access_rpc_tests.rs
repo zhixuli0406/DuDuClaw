@@ -54,6 +54,29 @@ fn assert_empty_impact(result: &Value) {
 fn raw(f: &Fixture) -> String { std::fs::read_to_string(f.home.path().join("config.toml")).unwrap() }
 
 #[tokio::test]
+async fn stale_snapshot_is_refused_before_risk_acknowledgement() {
+    let f = fixture().await;
+    let get = payload(rpc_raw(&f, &f.admin, "odoo.access_get", json!({})).await);
+    let changed = "# another admin saved\n";
+    std::fs::write(f.home.path().join("config.toml"), changed).unwrap();
+    let audit_path = f.home.path().join("security_audit.jsonl");
+    let audit_before = std::fs::read(&audit_path).ok();
+    for acknowledged in [false, true] {
+        let result = rpc_raw(&f, &f.admin, "odoo.access_set", json!({
+            "expected_hash":get["hash"], "permission_mode":"follow_odoo_account",
+            "acknowledge_risk":acknowledged,
+        })).await;
+        match result {
+            WsFrame::Response { ok:false, error:Some(error), .. } =>
+                assert_eq!(error, "設定已被其他人變更，請重新整理後再儲存。"),
+            other => panic!("expected conflict: {other:?}"),
+        }
+        assert_eq!(raw(&f), changed);
+        assert_eq!(std::fs::read(&audit_path).ok(), audit_before);
+    }
+}
+
+#[tokio::test]
 async fn admin_browser_only_and_live_authority() {
     let f = fixture().await;
     for method in ["odoo.access_get", "odoo.access_set"] {

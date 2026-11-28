@@ -179,6 +179,9 @@ pub fn write_settings(
     };
     let path = home.join("config.toml");
     let current = read_text_or_empty(&path).map_err(|_| "無法讀取設定，請稍後再試。")?;
+    if content_hash(&current) != expected_hash {
+        return Err("設定已被其他人變更，請重新整理後再儲存。".into());
+    }
     let mut root: toml::Table = current.parse().map_err(|_| "設定內容格式不正確，請先到設定頁修正。")?;
     let before = from_root(&root);
     let risk_changed = (update.enabled && !before.enabled)

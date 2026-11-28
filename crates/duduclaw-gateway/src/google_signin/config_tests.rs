@@ -292,3 +292,18 @@ fn client_hash_refuses_stale_write_and_disable_without_changing_text() {
     assert!(!after.enabled);
     assert_eq!(hash, read_with_hash(home.path()).unwrap().1);
 }
+
+#[test]
+fn stale_snapshot_is_refused_before_risk_acknowledgement() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    std::fs::write(&path, ACTIVE).unwrap();
+    let stale = read_with_hash(home.path()).unwrap().1;
+    let changed = "[google_signin]\nenabled=false\n";
+    std::fs::write(&path, changed).unwrap();
+    for acknowledged in [false, true] {
+        assert_eq!(super::config::write_settings(home.path(), "admin", &update(), acknowledged, NOW, &stale).unwrap_err(),
+            "設定已被其他人變更，請重新整理後再儲存。");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    }
+}

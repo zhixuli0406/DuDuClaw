@@ -331,6 +331,9 @@ impl MethodHandler {
         let original=match super::config_commit::read_text_or_empty(&config_path) {
             Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("寫入設定失敗:{e}")),
         };
+        if super::config_commit::content_hash(&original) != expected_hash {
+            return WsFrame::error_response("", "設定已被其他人變更，請重新整理後再儲存。");
+        }
         // RM-137: an unparsable config.toml is refused, never replaced by a
         // default table (nothing is written; the commit path below would
         // refuse too, this says why before any audit row is built).
@@ -759,6 +762,36 @@ fn pairs_overlap(one_way: &[(String, String)], two_way: &[(String, String)]) -> 
 #[cfg(test)]
 mod rm183_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stale_snapshot_is_refused_before_role_acknowledgement() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.toml");
+        std::fs::write(&path, "[delegation]\npolicy='none'\n").unwrap();
+        let handler = MethodHandler::new(home.path().to_path_buf()).await;
+        let ctx = UserContext::admin_fallback();
+        let get = handler.handle_delegation_get().await;
+        let WsFrame::Response { ok:true, payload:Some(get), .. } = get else {
+            panic!("expected settings snapshot: {get:?}");
+        };
+        let changed = "# another admin saved\n[delegation]\npolicy='none'\n";
+        std::fs::write(&path, changed).unwrap();
+        let audit_path = home.path().join("security_audit.jsonl");
+        let audit_before = std::fs::read(&audit_path).ok();
+        for acknowledged in [false, true] {
+            let result = handler.handle_delegation_set(json!({
+                "expected_hash":get["hash"], "unrestricted_roles":["admin"],
+                "acknowledge_risk":acknowledged,
+            }), &ctx).await;
+            match result {
+                WsFrame::Response { ok:false, error:Some(error), .. } =>
+                    assert_eq!(error, "設定已被其他人變更，請重新整理後再儲存。"),
+                other => panic!("expected conflict: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+            assert_eq!(std::fs::read(&audit_path).ok(), audit_before);
+        }
+    }
 
     async fn set_with_hash(handler: &MethodHandler, mut params: Value, ctx: &UserContext) -> WsFrame {
         let get = handler.handle_delegation_get().await;

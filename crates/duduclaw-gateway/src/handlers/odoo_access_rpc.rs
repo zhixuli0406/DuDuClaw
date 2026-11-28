@@ -161,6 +161,9 @@ impl MethodHandler {
                     let expected_hash = params.get("expected_hash").and_then(Value::as_str)
                         .ok_or("設定頁的資料已過期，請重新整理後再儲存。")?.to_owned();
                     let raw = std::fs::read_to_string(&path).map_err(|_| INVALID.to_owned())?;
+                    if super::config_commit::content_hash(&raw) != expected_hash {
+                        return Err("設定已被其他人變更，請重新整理後再儲存。".into());
+                    }
                     let mut table: toml::Table = raw.parse().map_err(|_| INVALID.to_owned())?;
                     let before = OdooAccessConfig::from_table(&table).map_err(|_| INVALID.to_owned())?;
                     let rows = access_employees(&home)?;

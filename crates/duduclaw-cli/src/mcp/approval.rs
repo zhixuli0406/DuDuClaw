@@ -118,7 +118,7 @@ pub(super) async fn consume_bound_approval(
 pub(super) async fn approve_odoo_call_for_test(agent: &str, tool: &str, args: &Value) {
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus, ApprovalStore};
     use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY};
-    let broker = ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()));
+    let broker = ApprovalBroker::new(std::sync::Arc::new(ApprovalStore::open_in_memory().unwrap()));
     let mut payload = serde_json::json!({"name": tool, "arguments": args});
     let grant = ActionGrant::build(agent, tool, &payload);
     payload[ACTION_GRANT_KEY] = grant.to_json();
