@@ -74,6 +74,7 @@ pub(super) struct Http {
     maybe_sent: bool,
     violation: bool,
     forbidden: bool,
+    forbidden_writes: bool,
     stall: bool,
     changed_scope: std::sync::atomic::AtomicBool,
     renamed_folder: std::sync::atomic::AtomicBool,
@@ -90,7 +91,7 @@ impl WriteHttp for Arc<Http> {
         let payload: Value = request.body().and_then(|b| b.as_bytes()).and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(Value::Null);
         let added_parent = request.url().query_pairs().find(|(k, _)| k == "addParents").map(|(_, v)| v.into_owned());
         Box::pin(async move {
-            if self.forbidden { return Ok((403, serde_json::to_vec(&json!({"error":{"errors":[{"reason":"insufficientPermissions"}]}})).unwrap())); }
+            if self.forbidden || (write && self.forbidden_writes) { return Ok((403, serde_json::to_vec(&json!({"error":{"errors":[{"reason":"insufficientPermissions"}]}})).unwrap())); }
             if write && self.stall { std::future::pending::<()>().await; }
             if write && self.maybe_sent { return Err(SendError::Network); }
             if path.starts_with("/v1/documents/") || path.starts_with("/v4/spreadsheets/") {
@@ -377,6 +378,31 @@ async fn insufficient_permissions_on_metadata_invalidates_only_write_grant() {
     assert_eq!(result.as_ref().unwrap_err().code, "insufficient_permissions"); assert_eq!(http.writes(), 0);
     assert_audit(&f, &result, "refused");
     assert_eq!(store::get(f.home.path(), "user", &f.user).unwrap().unwrap().metadata.status, Status::NeedsReconnect);
+    assert_eq!(std::fs::read(vault::path(f.home.path())).unwrap(), ordinary);
+}
+
+#[tokio::test]
+async fn home_insufficient_permissions_after_send_releases_reader_before_status_write() {
+    let f = Fixture::new(); let state = state(&f); policy(&f, ApprovalMode::None);
+    let mut config: toml::Value = std::fs::read_to_string(f.home.path().join("config.toml")).unwrap().parse().unwrap();
+    config["integrations"].as_table_mut().unwrap().insert("google_credential_path".into(), toml::Value::String("oauth".into()));
+    std::fs::write(f.home.path().join("config.toml"), toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(f.home.path().join("agents/bot/agent.toml"),
+        "[google]\nidentity='home'\nfallback='none'\n[capabilities]\nallowed_tools=['mcp__duduclaw__*']\n").unwrap();
+    f.connect(f.metadata("home"), false);
+    let coordinator = AuthorityCoordinator::new(f.home.path());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let ordinary = std::fs::read(vault::path(f.home.path())).unwrap();
+    let http = Arc::new(Http { forbidden_writes:true, ..Default::default() });
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), invoke(
+        &f, &state, http.clone(), "drive_create_file", create_args(),
+        RequesterIdentity::DashboardUser { user_id:f.user.clone() },
+    )).await.expect("status update must not upgrade its own shared lease");
+    assert_eq!(result.as_ref().unwrap_err().code, "insufficient_permissions");
+    assert_eq!(http.writes(), 1);
+    assert_eq!(store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata.status, Status::NeedsReconnect);
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
     assert_eq!(std::fs::read(vault::path(f.home.path())).unwrap(), ordinary);
 }
 

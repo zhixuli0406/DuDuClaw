@@ -786,6 +786,35 @@ pub(crate) fn validate_home_write_identity(home: &Path, expected: &HomeWriteIden
     })
 }
 
+/// Blocking consent commit: grant (caller) -> source -> authority ->
+/// config/client/token reads -> callback's DB reads and write-store lock.
+/// config_commit also takes source before authority. Never reacquire source
+/// or authority in the callback, and never hold these guards across an await.
+pub(crate) fn with_home_write_authority<T>(
+    home: &Path, expected: &HomeWriteIdentity,
+    commit: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<T, String> {
+    barrier(home).map_err(|_| "公司 Google 連線已變更，請重新開始。".to_owned())?;
+    with_source_guard(home, |g| {
+        let _authority = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home)
+            .write().map_err(|_| Error::Io)?;
+        home_store::ensure_publication_unblocked(g)?;
+        if crate::google_workspace::selected_path(home).ok().as_deref() != Some("oauth") {
+            return Err(Error::NotReady);
+        }
+        locked_metadata(g, |g, source| {
+            // The receipt pins client bytes and source generation as well as
+            // the ordinary credential; no source change/revert may pass.
+            require_receipt(g, source, &expected.receipt)?;
+            if home_store::observe_home_oauth(g, source)? != expected.row {
+                return Err(Error::Stale);
+            }
+            Ok(())
+        })?;
+        Ok(commit())
+    }).map_err(|_| "公司 Google 連線已變更，請重新開始。".to_owned())?
+}
+
 /// Read-only account probe. Even an expired access token is refreshed only in
 /// RAM; neither success nor refusal publishes/revokes ordinary Home material.
 /// The caller holds the shared Google grant lease for this operation.

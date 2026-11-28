@@ -41,6 +41,9 @@ impl Fixture {
         pending::receive_code(self.home(), state, code).unwrap();
         flow::finish_home(self.home(), &self.personal.db, &self.admin.id, "admin-session", state).await
     }
+    pub(crate) async fn disconnect(&self) -> Result<Value, String> {
+        home_write::disconnect(self.home(), &self.personal.db, &self.admin.id).await
+    }
     fn ordinary(&self) -> Vec<u8> { std::fs::read(self.home().join(crate::mcp_oauth::TOKEN_FILE)).unwrap() }
 }
 
@@ -49,7 +52,7 @@ async fn home_write_start_requires_admin_oauth_policy_ack_and_existing_connectio
     let f = Fixture::new().await;
     let ordinary = f.ordinary();
     assert!(f.start_as(&f.personal.alice.id, true, true).await.is_err());
-    assert!(home_write::disconnect(f.home(), &f.personal.db, &f.personal.alice.id).is_err());
+    assert!(home_write::disconnect(f.home(), &f.personal.db, &f.personal.alice.id).await.is_err());
     for (data, write) in [(false, false), (false, true), (true, false)] {
         assert!(f.start_as(&f.admin.id, data, write).await.is_err());
     }
@@ -126,7 +129,7 @@ async fn home_write_success_only_stores_home_and_disconnect_rejects_stale_epoch(
     assert!(write_store::get(f.home(), "user", &f.admin.id).unwrap().is_none());
     assert_eq!(f.ordinary(), ordinary);
     let stale = f.start().await.unwrap();
-    home_write::disconnect(f.home(), &f.personal.db, &f.admin.id).unwrap();
+    f.disconnect().await.unwrap();
     let before = std::fs::read(write_store::path(f.home())).unwrap();
     assert!(f.finish(&stale, "write-alice").await.unwrap_err().contains("較新的操作"));
     assert_eq!(std::fs::read(write_store::path(f.home())).unwrap(), before);
@@ -199,4 +202,135 @@ async fn home_write_identity_probe_refreshes_expired_access_only_in_memory() {
     let start = f.start().await.unwrap();
     f.finish(&start, "write-alice").await.unwrap();
     assert_eq!(f.ordinary(), ordinary);
+}
+
+#[tokio::test]
+async fn home_write_start_waits_for_authority_reader() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let coordinator = AuthorityCoordinator::new(f.home());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let start = f.start();
+    tokio::pin!(start);
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut start).await.is_err());
+    assert!(!write_store::ever_granted(f.home(), "home", "home").unwrap());
+    assert_eq!(coordinator.epoch().unwrap(), epoch);
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), &mut start).await.unwrap().unwrap();
+    assert!(write_store::ever_granted(f.home(), "home", "home").unwrap());
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
+}
+
+#[tokio::test]
+async fn home_write_disconnect_waits_for_in_flight_authority_reader() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let before = std::fs::read(write_store::path(f.home())).unwrap();
+    let disconnect = f.disconnect();
+    tokio::pin!(disconnect);
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut disconnect).await.is_err());
+    assert_eq!(std::fs::read(write_store::path(f.home())).unwrap(), before);
+    assert_eq!(coordinator.epoch().unwrap(), epoch);
+    drop(reader);
+    let result = tokio::time::timeout(Duration::from_secs(5), &mut disconnect).await.unwrap().unwrap();
+    assert_eq!(result["disconnected"], true);
+    assert!(write_store::get(f.home(), "home", "home").unwrap().is_none());
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
+}
+
+#[tokio::test]
+async fn home_write_reconnect_waits_for_in_flight_authority_reader() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    let reconnect = f.start().await.unwrap();
+    let old = write_store::get(f.home(), "home", "home").unwrap().unwrap().metadata;
+    let coordinator = AuthorityCoordinator::new(f.home());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let finish = f.finish(&reconnect, "write-alice");
+    tokio::pin!(finish);
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut finish).await.is_err());
+    assert_eq!(write_store::get(f.home(), "home", "home").unwrap().unwrap().metadata, old);
+    assert_eq!(coordinator.epoch().unwrap(), epoch);
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), &mut finish).await.unwrap().unwrap();
+    let new = write_store::get(f.home(), "home", "home").unwrap().unwrap().metadata;
+    assert_ne!(new.credential_id, old.credential_id);
+    assert_eq!(new.revision, old.revision);
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
+}
+
+#[tokio::test]
+async fn home_write_reconnect_revalidates_policy_after_authority_wait() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let start = f.start().await.unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home());
+    coordinator.initialize().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let finish = f.finish(&start, "write-alice");
+    tokio::pin!(finish);
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut finish).await.is_err());
+    // Out-of-band policy edit exercises the mandatory post-wait revalidation.
+    std::fs::write(f.home().join("config.toml"),
+        "[integrations]\ngoogle_workspace=true\ngoogle_credential_path='oauth'\n").unwrap();
+    drop(reader);
+    let error = tokio::time::timeout(Duration::from_secs(5), &mut finish).await.unwrap().unwrap_err();
+    assert!(matches!(error.as_str(), "管理員還沒開放 AI 在雲端硬碟寫入。"
+        | "公司 Google 連線已變更，請重新開始。"));
+    assert!(write_store::get(f.home(), "home", "home").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn home_write_commit_waits_for_source_before_authority() {
+    use crate::google_identity::home_source;
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::time::Duration;
+    let f = Fixture::new().await;
+    let start = f.start().await.unwrap();
+    let state = start["state"].as_str().unwrap();
+    pending::receive_code(f.home(), state, "write-alice").unwrap();
+    let pending = pending::take(f.home(), state, &f.admin.id, "admin-session").unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home());
+    let epoch = coordinator.epoch().unwrap();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let home = f.home().to_path_buf();
+    let source = tokio::task::spawn_blocking(move || {
+        home_source::with_source_guard(&home, |_| {
+            locked_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            Ok(())
+        }).unwrap();
+    });
+    locked_rx.await.unwrap();
+    let home = f.home().to_path_buf();
+    let mut commit = tokio::task::spawn_blocking(move || {
+        home_source::with_home_write_authority(&home, pending.expected_home_write.as_ref().unwrap(), || Ok(()))
+    });
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut commit).await.is_err());
+    // Waiting for source must not hold authority, or a source-first config
+    // writer would deadlock with the consent commit.
+    let reader = tokio::time::timeout(Duration::from_secs(1), coordinator.shared()).await.unwrap().unwrap();
+    assert_eq!(coordinator.epoch().unwrap(), epoch);
+    drop(reader);
+    release_tx.send(()).unwrap();
+    source.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), &mut commit).await.unwrap().unwrap().unwrap();
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
 }

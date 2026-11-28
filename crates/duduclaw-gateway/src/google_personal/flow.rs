@@ -200,7 +200,15 @@ pub(super) async fn start_consent(
         oauth::scopes_for_purposes(&purposes, chat_read)
     };
     if home_write { super::home_write::require_admin(db, user)?; require_write_policy(home)?; }
-    let epoch = if home_write { write_store::begin_connection(home, "home", "home")? }
+    let epoch = if home_write {
+        // The grant is held, but all network/protection work is finished.
+        let _authority = write_store::home_write_lease(home).await?;
+        super::home_write::require_admin(db, user)?;
+        require_write_policy(home)?;
+        // Do not reacquire Home source here: config writers take source before
+        // authority. The captured identity is checked again at consent finish.
+        write_store::begin_connection(home, "home", "home")?
+    }
         else if drive_write { write_store::begin_connection(home, "user", user)? }
         else { vault::begin_connection(home, user)? };
     let google_data_consent = crate::google_data_consent::Evidence::issue(user)?;
@@ -275,7 +283,7 @@ async fn finish_consent(
         if !pending.drive_write || authorization_request.is_some() {
             return Err("這次 Google 連結已失效，請重新開始。".into());
         }
-        return super::home_write::finish(home, db, user, &pending).await;
+        return super::home_write::finish(home, db, user, pending).await;
     }
     if pending.drive_write {
         if authorization_request.as_ref().is_some_and(|r| r.purpose != "drive_write") {

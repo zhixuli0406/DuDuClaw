@@ -155,7 +155,7 @@ impl MethodHandler {
                             params.get("acknowledge_write").and_then(Value::as_bool) == Some(true)).await
                     }
                     "google.drive_write.consent_home_disconnect" =>
-                        home_write::disconnect(&self.home_dir, &db, &ctx.user_id),
+                        home_write::disconnect(&self.home_dir, &db, &ctx.user_id).await,
                     _ => {
                         let state = if method == "google.drive_write.consent_home_paste" {
                             pending::receive_pasted(&self.home_dir, &ctx.user_id, &session,

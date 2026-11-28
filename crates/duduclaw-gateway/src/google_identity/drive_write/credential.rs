@@ -212,6 +212,11 @@ async fn oauth_token(home: &Path, route: &IdentityRoute) -> Result<WriteToken, R
         let mut updated = request.await.map_err(|_| consent(route))?;
         let scopes = updated.granted_scopes.as_deref().ok_or_else(||
             Refusal::hard("scope_unverified", "無法確認這個 Google 帳號是否已同意雲端硬碟寫入，這次沒有執行，請帳號本人重新連結。"))?;
+        // Grant -> authority -> store CAS. Refresh I/O has finished, and the
+        // runtime/diagnostic has not acquired its final shared lease yet.
+        let _authority = if matches!(route, IdentityRoute::HomeOAuth) {
+            Some(write_store::home_write_lease(home).await.map_err(|_| changed())?)
+        } else { None };
         if !scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE) {
             if !write_store::mark_needs_reconnect(home, &metadata).map_err(|_| changed())? {
                 return Err(changed());
@@ -248,10 +253,14 @@ async fn oauth_token(home: &Path, route: &IdentityRoute) -> Result<WriteToken, R
 }
 
 /// A late 403 must not invalidate a newer reconnect or another route's grant.
-pub(in crate::google_identity) fn on_insufficient_permissions(home: &Path, route: &IdentityRoute, token_meta: &TokenMeta) -> Result<(), Refusal> {
+/// Call only after dropping the runtime shared lease; never upgrade in place.
+pub(in crate::google_identity) async fn on_insufficient_permissions(home: &Path, route: &IdentityRoute, token_meta: &TokenMeta) -> Result<(), Refusal> {
     let Some((kind, id)) = owner_key(route) else { return Ok(()); };
     let expected = token_meta.write_record.as_ref().ok_or_else(changed)?;
     if expected.owner_kind != kind || expected.owner_id != id { return Err(changed()); }
+    let _authority = if matches!(route, IdentityRoute::HomeOAuth) {
+        Some(write_store::home_write_lease(home).await.map_err(|_| changed())?)
+    } else { None };
     if !write_store::mark_needs_reconnect(home, expected).map_err(|_| changed())? { return Err(changed()); }
     Ok(())
 }

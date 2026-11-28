@@ -1,4 +1,7 @@
 //! Gateway-only Drive-write vault. It never writes the ordinary store.json.
+//! Home mutations require a caller-held authority write lease, acquired before
+//! entering this store (never upgrade a live shared lease). User suspension is
+//! user-only; whole-home restore already holds its own authority write lease.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,6 +15,20 @@ pub use super::{Secret, Status};
 
 const PURPOSE: &str = "drive_write";
 const UNREADABLE: &str = "雲端硬碟寫入連線紀錄無法讀取，請聯絡管理員；沒有變更已保存的連線。";
+
+/// Order: OAuth grant lease (if needed) -> authority -> short DB/config reads
+/// -> store file lock. No Home source lock may be acquired under this lease:
+/// consent finish uses home_source::with_home_write_authority instead, taking
+/// source before authority like config_commit. Finish network/protection work
+/// and release pending-store mutexes first; revalidate after waiting. No caller
+/// may already hold authority. `write()` durably retires the epoch.
+pub(crate) async fn home_write_lease(home: &Path)
+    -> Result<duduclaw_core::authority_coordinator::WriteLease, String> {
+    let coordinator = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(home);
+    tokio::task::spawn_blocking(move || coordinator.write()).await
+        .map_err(|_| "無法確認公司 Google 寫入連線，請稍後重試。".to_owned())?
+        .map_err(|_| "無法確認公司 Google 寫入連線，請稍後重試。".to_owned())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

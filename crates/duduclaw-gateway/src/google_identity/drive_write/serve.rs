@@ -272,7 +272,18 @@ pub(in crate::google_identity) async fn serve(state: &ExecuteState, agent: &str,
         folder_rule: None, approval: audit::Approval { mode: String::new(), approval_ids: vec![], decided_by: vec![] },
         bytes: None, content_sha256: None, outcome: audit::Outcome::NotSent, reason: None, post_check: audit::PostCheck::None,
     } };
-    let result = serve_inner(state, agent, tool, args, turn, run, call, approved, progress, &mut audit.record).await;
+    let mut used_credential = None;
+    let mut result = serve_inner(state, agent, tool, args, turn, run, call, approved, progress,
+        &mut audit.record, &mut used_credential).await;
+    // serve_inner has dropped every shared lease before any status mutation.
+    // The CAS remains bound to the exact grant used by the failed request.
+    if result.as_ref().is_err_and(|error| error.code == "insufficient_permissions") {
+        if let Some((route, meta)) = used_credential {
+            if let Err(error) = credential::on_insufficient_permissions(&state.home, &route, &meta).await {
+                result = Err(error);
+            }
+        }
+    }
     if let Err(error) = &result {
         audit.record.reason = audit::Reason::from_code(error.code).or_else(|| audit::Reason::from_code("failed"));
         audit.record.outcome = if progress.load(Ordering::SeqCst) != 0 { audit::Outcome::MayHaveSent }
@@ -285,6 +296,7 @@ pub(in crate::google_identity) async fn serve(state: &ExecuteState, agent: &str,
 async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     turn: Option<String>, run: Option<String>, call: String, approved: Option<String>,
     progress: &AtomicUsize, record: &mut audit::DriveWriteAudit,
+    used_credential: &mut Option<(IdentityRoute, credential::TokenMeta)>,
 ) -> Result<Value, Refusal> {
     // Consume before recomputing anything: a failed execute cannot reuse a grant.
     let pending = if approved.is_some() { Some(state.drive_writes.take(agent, &call)) } else { None };
@@ -331,9 +343,9 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     if token.meta.account_email != binding.snapshot.account_email
         || token.meta.identity_kind != binding.snapshot.route_kind
         || token.meta.credential_revision != binding.snapshot.credential_revision { return Err(changed()); }
-    let token_meta = token.meta;
+    *used_credential = Some((route.clone(), token.meta.clone()));
     let mut transport = ScopedTransport {
-        transport: make_transport(token.bearer)?, home: &state.home, route: &route, meta: &token_meta, failure: None,
+        transport: make_transport(token.bearer)?, failure: None,
     };
     let mut budget = scope::Budget::new();
     let attachment = match &args {
@@ -353,7 +365,7 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     let metadata = checked_metadata(&args, &mut transport, &mut budget).await?;
     let docs_state = if let ToolArgs::DocsSheets(args) = &args {
         let call = program_docs::read_call(args, &verdict).map_err(arg_error)?;
-        Some(read_state(&state.home, &route, &token_meta, &mut transport, &call).await?)
+        Some(read_state(&mut transport, &call).await?)
     } else { None };
     let docs_plan = match (&args, &docs_state) {
         (ToolArgs::DocsSheets(args), Some(state)) => Some(program_docs::build(args, &verdict, state).map_err(arg_error)?),
@@ -422,6 +434,8 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     }
     // Do not hold authority or a mutex while waiting for a person. Reacquire
     // the revocation barrier for the final checks and the actual Google I/O.
+    // Minting released its grant lease; shared authority precedes metadata/DB
+    // reads. Status writes are deferred until serve_inner drops this lease.
     let _lease = coordinator.shared().await.map_err(|_| changed())?;
     budget.begin_fresh_phase();
     binding.snapshot.validate(&state.home, raw, who)?;
@@ -440,17 +454,17 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
     if checked_metadata(&args, &mut transport, &mut budget).await? != metadata { return Err(changed()); }
     if let ToolArgs::DocsSheets(args) = &args {
         let call = program_docs::read_call(args, &fresh).map_err(arg_error)?;
-        if Some(read_state(&state.home, &route, &token_meta, &mut transport, &call).await?) != docs_state { return Err(changed()); }
+        if Some(read_state(&mut transport, &call).await?) != docs_state { return Err(changed()); }
     }
     binding.snapshot.validate(&state.home, raw, who)?;
     let mut response = None;
     for call in calls {
-        response = Some(send_write(&state.home, &route, &token_meta, &mut transport, &call, progress).await?);
+        response = Some(send_write(&mut transport, &call, progress).await?);
     }
     let (status, body) = response.ok_or_else(not_sent)?;
     let (file_id, file_name, link, post) = match &args {
         ToolArgs::Drive(args) => {
-            let outcome = program::interpret(tool, status, &body).map_err(|error| outcome_error(&state.home, &route, &token_meta, error))?;
+            let outcome = program::interpret(tool, status, &body).map_err(outcome_error)?;
             if let Some(expected) = record.file_id.as_deref() {
                 if !matches!(args, DriveArgs::Copy { .. }) && outcome.file_id != expected { return Err(unconfirmed()); }
             }
@@ -465,11 +479,11 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
         }
         ToolArgs::DocsSheets(_) => {
             let program = docs_plan.ok_or_else(changed)?;
-            let outcome = program.interpret(status, &body).map_err(|e| outcome_error(&state.home, &route, &token_meta, e))?;
-            if let Some(call) = program.phase2(status, &body).map_err(|e| outcome_error(&state.home, &route, &token_meta, e))? {
+            let outcome = program.interpret(status, &body).map_err(outcome_error)?;
+            if let Some(call) = program.phase2(status, &body).map_err(outcome_error)? {
                 binding.snapshot.validate(&state.home, raw, who).map_err(|_| unconfirmed())?;
-                let (status, body) = send_write(&state.home, &route, &token_meta, &mut transport, &call, progress).await?;
-                program.interpret_phase2(status, &body).map_err(|e| outcome_error(&state.home, &route, &token_meta, e))?;
+                let (status, body) = send_write(&mut transport, &call, progress).await?;
+                program.interpret_phase2(status, &body).map_err(outcome_error)?;
             }
             let id = GoogleId::new(outcome.file_id.clone()).map_err(|_| unconfirmed())?;
             let post = scope::recheck(&mut transport, &mut budget, &policy, &id).await;
@@ -501,7 +515,7 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
 
 /// Display paths use the same bounded Google metadata source as scope checks.
 /// Missing visibility, cycles or ambiguous parents cannot produce a guessed path.
-async fn folder_path(transport: &mut ScopedTransport<'_>, budget: &mut scope::Budget,
+async fn folder_path(transport: &mut ScopedTransport, budget: &mut scope::Budget,
     id: &GoogleId, displayed: &mut Vec<scope::FileMeta>,
 ) -> Result<String, Refusal> {
     let mut current = id.clone();
@@ -527,13 +541,13 @@ async fn folder_path(transport: &mut ScopedTransport<'_>, budget: &mut scope::Bu
     Ok(names.iter().map(|name| json!(name).to_string()).collect::<Vec<_>>().join(" / "))
 }
 
-async fn checked_metadata(args: &ToolArgs, transport: &mut ScopedTransport<'_>, budget: &mut scope::Budget) -> Result<Option<scope::FileMeta>, Refusal> {
+async fn checked_metadata(args: &ToolArgs, transport: &mut ScopedTransport, budget: &mut scope::Budget) -> Result<Option<scope::FileMeta>, Refusal> {
     match target(&plan(args)) {
         Some(id) => get_metadata(transport, budget, id).await.map(Some),
         None => Ok(None),
     }
 }
-async fn get_metadata(transport: &mut ScopedTransport<'_>, budget: &mut scope::Budget, id: &GoogleId) -> Result<scope::FileMeta, Refusal> {
+async fn get_metadata(transport: &mut ScopedTransport, budget: &mut scope::Budget, id: &GoogleId) -> Result<scope::FileMeta, Refusal> {
     let result = budget.get(transport, id).await;
     transport.check_failure()?;
     result.map_err(|v| require_scope(&v).err().unwrap_or_else(changed))
@@ -589,29 +603,26 @@ fn read_attachment(home: &Path, agent: &str, turn: Option<&str>, who: &Requester
     Ok(program::AttachmentContent { file_name: file_name.into(), bytes: bytes.into(), sha256 })
 }
 
-fn outcome_error(home: &Path, route: &IdentityRoute, meta: &credential::TokenMeta, error: program::OutcomeError) -> Refusal {
-    if error == program::OutcomeError::InsufficientPermissions {
-        if let Err(error) = credential::on_insufficient_permissions(home, route, meta) { return error; }
-    }
+fn outcome_error(error: program::OutcomeError) -> Refusal {
     if error == program::OutcomeError::Unconfirmed { unconfirmed() }
     else { Refusal::hard(error.code(), error.user_text()) }
 }
-fn status_check(home: &Path, route: &IdentityRoute, meta: &credential::TokenMeta, status: u16, body: &[u8]) -> Result<(), Refusal> {
+fn status_check(status: u16, body: &[u8]) -> Result<(), Refusal> {
     if (200..=299).contains(&status) { return Ok(()); }
     // The common interpreter checks provider error reasons before any success fields.
     let error = program::interpret("drive_update_file", status, body).err().unwrap_or(program::OutcomeError::Unconfirmed);
-    Err(outcome_error(home, route, meta, error))
+    Err(outcome_error(error))
 }
-async fn read_state(home: &Path, route: &IdentityRoute, meta: &credential::TokenMeta, transport: &mut ScopedTransport<'_>, call: &WriteCall) -> Result<Value, Refusal> {
+async fn read_state(transport: &mut ScopedTransport, call: &WriteCall) -> Result<Value, Refusal> {
     match transport.send(call).await {
         WriteResult::Ok((status, body)) => {
-            status_check(home, route, meta, status, &body)?;
+            status_check(status, &body)?;
             serde_json::from_slice(&body).map_err(|_| arg_error(ArgError::InvalidState))
         }
         WriteResult::NotSent(_) | WriteResult::MaybeSent(_) => Err(not_sent()),
     }
 }
-async fn send_write(home: &Path, route: &IdentityRoute, meta: &credential::TokenMeta, transport: &mut ScopedTransport<'_>, call: &WriteCall, progress: &AtomicUsize) -> Result<(u16, Vec<u8>), Refusal> {
+async fn send_write(transport: &mut ScopedTransport, call: &WriteCall, progress: &AtomicUsize) -> Result<(u16, Vec<u8>), Refusal> {
     // Set before awaiting so cancellation cannot misreport a possibly sent write.
     progress.fetch_add(1, Ordering::SeqCst);
     match transport.send(call).await {
@@ -621,7 +632,7 @@ async fn send_write(home: &Path, route: &IdentityRoute, meta: &credential::Token
         }
         WriteResult::MaybeSent(_) => Err(unconfirmed()),
         WriteResult::Ok((status, body)) => {
-            status_check(home, route, meta, status, &body)?;
+            status_check(status, &body)?;
             Ok((status, body))
         }
     }
@@ -644,20 +655,17 @@ pub(super) mod tests;
 
 /// Preserve insufficientPermissions while the generic scope layer maps HTTP
 /// failures to non-visibility. The token invalidation is always revision-bound.
-struct ScopedTransport<'a> {
+struct ScopedTransport {
     transport: WriteTransport,
-    home: &'a Path,
-    route: &'a IdentityRoute,
-    meta: &'a credential::TokenMeta,
     failure: Option<Refusal>,
 }
-impl ScopedTransport<'_> {
+impl ScopedTransport {
     async fn send(&mut self, call: &WriteCall) -> WriteResult { self.transport.send(call).await }
     fn check_failure(&mut self) -> Result<(), Refusal> {
         match self.failure.take() { Some(error) => Err(error), None => Ok(()) }
     }
 }
-impl scope::MetadataSource for ScopedTransport<'_> {
+impl scope::MetadataSource for ScopedTransport {
     fn get(&mut self, id: &GoogleId) -> scope::BoxFuture<'_, Result<scope::FileMeta, scope::MetaError>> {
         let id = id.clone();
         Box::pin(async move {
@@ -665,7 +673,7 @@ impl scope::MetadataSource for ScopedTransport<'_> {
             let result = self.transport.send(&call).await;
             if let WriteResult::Ok((403, body)) = &result {
                 if program::interpret("drive_update_file", 403, body).err() == Some(program::OutcomeError::InsufficientPermissions) {
-                    self.failure = Some(outcome_error(self.home, self.route, self.meta, program::OutcomeError::InsufficientPermissions));
+                    self.failure = Some(outcome_error(program::OutcomeError::InsufficientPermissions));
                 }
             }
             scope::metadata_result(result, &id)

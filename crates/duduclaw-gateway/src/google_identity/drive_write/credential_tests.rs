@@ -5,6 +5,7 @@ use duduclaw_auth::{AccessLevel, UserDb, UserRole};
 use duduclaw_knowledge::requester::RequesterIdentity;
 use duduclaw_security::credential_protection::ProtectedKey;
 use serde_json::json;
+use std::time::Duration;
 
 struct Fixture {
     home: tempfile::TempDir,
@@ -252,12 +253,85 @@ async fn insufficient_permissions_only_invalidates_the_used_revision() {
     for (kind, route) in [("user", f.route()), ("home", IdentityRoute::HomeOAuth)] {
         f.connect(f.metadata(kind), false);
         let token = write_token(f.home.path(), &route).await.unwrap();
-        on_insufficient_permissions(f.home.path(), &route, &token.meta).unwrap();
+        on_insufficient_permissions(f.home.path(), &route, &token.meta).await.unwrap();
         assert_ne!(readiness(f.home.path(), &route), Readiness::Ready);
         f.connect(f.metadata(kind), false);
-        refusal(on_insufficient_permissions(f.home.path(), &route, &token.meta), "changed");
+        refusal(on_insufficient_permissions(f.home.path(), &route, &token.meta).await, "changed");
         assert_eq!(readiness(f.home.path(), &route), Readiness::Ready);
     }
+}
+
+#[tokio::test]
+async fn home_consent_reconnect_and_disconnect_reject_old_oauth_metadata() {
+    let f = crate::google_personal::home_write_tests::Fixture::new().await;
+    let route = IdentityRoute::HomeOAuth;
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    let old = write_token(f.home(), &route).await.unwrap();
+    validate_oauth_token(f.home(), &route, &old.meta).unwrap();
+    let reconnect = f.start().await.unwrap();
+    f.finish(&reconnect, "write-alice").await.unwrap();
+    let new = write_token(f.home(), &route).await.unwrap();
+    assert_eq!(old.meta.credential_revision, new.meta.credential_revision);
+    refusal(validate_oauth_token(f.home(), &route, &old.meta), "changed");
+    validate_oauth_token(f.home(), &route, &new.meta).unwrap();
+    f.disconnect().await.unwrap();
+    refusal(validate_oauth_token(f.home(), &route, &new.meta), "changed");
+}
+
+#[tokio::test]
+async fn home_refresh_and_scope_loss_wait_for_authority_reader() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    for scope in [oauth::DRIVE_WRITE_SCOPE, "https://www.googleapis.com/auth/drive.file"] {
+        let f = Fixture::new();
+        f.connect(f.metadata("home"), true);
+        let (_guard, server) = endpoint(f.home.path(), json!({
+            "access_token":"new-write-secret", "expires_in":3600, "token_type":"Bearer", "scope":scope,
+        })).await;
+        let coordinator = AuthorityCoordinator::new(f.home.path());
+        coordinator.initialize().unwrap();
+        let epoch = coordinator.epoch().unwrap();
+        let reader = coordinator.shared().await.unwrap();
+        let before = store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata;
+        let refresh = write_token(f.home.path(), &IdentityRoute::HomeOAuth);
+        tokio::pin!(refresh);
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut refresh).await.is_err());
+        assert_eq!(store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata, before);
+        assert_eq!(coordinator.epoch().unwrap(), epoch);
+        drop(reader);
+        let result = tokio::time::timeout(Duration::from_secs(5), &mut refresh).await.unwrap();
+        if scope == oauth::DRIVE_WRITE_SCOPE {
+            let token = result.unwrap();
+            validate_oauth_token(f.home.path(), &IdentityRoute::HomeOAuth, &token.meta).unwrap();
+            assert_eq!(token.meta.credential_revision, Some(2));
+        } else {
+            refusal(result, "drive_write_needs_member_consent");
+            assert_eq!(store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata.status, Status::NeedsReconnect);
+        }
+        assert_ne!(coordinator.epoch().unwrap(), epoch);
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn home_insufficient_permissions_waits_for_authority_reader() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    let f = Fixture::new();
+    f.connect(f.metadata("home"), false);
+    let route = IdentityRoute::HomeOAuth;
+    let token = write_token(f.home.path(), &route).await.unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home.path());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let invalidate = on_insufficient_permissions(f.home.path(), &route, &token.meta);
+    tokio::pin!(invalidate);
+    assert!(tokio::time::timeout(Duration::from_millis(200), &mut invalidate).await.is_err());
+    validate_oauth_token(f.home.path(), &route, &token.meta).unwrap();
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), &mut invalidate).await.unwrap().unwrap();
+    refusal(validate_oauth_token(f.home.path(), &route, &token.meta), "changed");
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
 }
 
 fn channel(channel: &str, user: Option<&str>) -> RequesterIdentity {
