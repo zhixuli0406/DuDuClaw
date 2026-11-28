@@ -1,5 +1,7 @@
 # Autopilot Rule Engine
 
+Open **Settings → Advanced → Automation rules** for up to five steps (delegate, notify, run skill or wait), an execution window, skill parameters with **Insert event field**, per-step run history and cancellation. Older rules carry **Created before upgrade**. On **Automation** (`/routines`), granted Managers use **Department automation rules**; members use the read-only **Rules affecting my AI employees** tab. Schedules show **Creator no longer has access** when applicable.
+
 > Event-driven automation — when *this* happens, do *that*, with a breaker panel that trips when a rule runs away.
 
 ---
@@ -270,7 +272,7 @@ Department scope is checked when a rule triggers, before conditions, screening, 
 
 Signed-in dashboard members also have a read-only view of company-wide and department rules that assign work or run skills on employees they can view. It includes conditions, visible targets, prompt templates or skill names, approval requirements and the last 20 trigger times and results. It omits notification destinations and text, other employees and detailed history. In protected mode, a rule naming another person's personal employee is hidden entirely. Personal API keys cannot use this view.
 
-The gateway supports these department and member views; their dashboard screens still need integration. See [Department managers](79-department-managers.md) for grants and limitations.
+These views are on **Automation** (`/routines`). See [Department managers](79-department-managers.md) for grants and limitations.
 
 ## Rule CRUD: Dashboard RPC + MCP
 
@@ -290,12 +292,12 @@ Every `create` / `update` validates the `trigger_event`, the `conditions` tree a
 
 ### The dashboard rule form
 
-Settings → Autopilot creates and edits rules. Before v1.67.1 its form sent an action with `agent_id` and `prompt_template` where the server requires `target_agent` and `prompt`, offered a `schedule` trigger that does not exist, and wrote conditions such as `from_status` / `idle_minutes` / `cron` that are not field/op/value leaves. The server refused every save, so no rule could be created from the dashboard. Since v1.67.1:
+Settings → Advanced → Automation rules creates and edits rules. Before v1.67.1 its form sent an action with `agent_id` and `prompt_template` where the server requires `target_agent` and `prompt`, offered a `schedule` trigger that does not exist, and wrote conditions such as `from_status` / `idle_minutes` / `cron` that are not field/op/value leaves. The server refused every save, so no rule could be created from the dashboard. Since v1.67.1:
 
 - The trigger list is the twelve events `autopilot.create` accepts, including `tick` ("A monitoring source reports new data") and `odoo_event` ("An Odoo record changes"). A stored rule whose trigger the form does not offer (for example `cron_tick`) keeps it and shows it.
 - Conditions are a list of field / operator / value rows joined by "all" or "any" matching. Field names are suggested per trigger; any name can be typed. For `tick` and `odoo_event` the field names come from your source or Odoo records, and the form says so. Values for `gt` / `gte` / `lt` / `lte` must be numbers; `in` / `not_in` take a comma-separated list. With no rows the form saves `{ "all": [] }`, which fires on every event.
-- Actions are `delegate`, `notify` and `run_skill`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
-- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than the three above are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, `require_approval`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
+- Steps (at most five) are `delegate`, `notify`, `run_skill` and `wait`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
+- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than these four step types are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, `require_approval`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
 - A refused save shows the server's message inside the dialog.
 
 ---

@@ -1,5 +1,7 @@
 # Skill Lifecycle Engine
 
+On **Skill import** (`/experts`), use **Own skill sources**: adding a source requires risk confirmation, password and authenticator code; removal can optionally disable its skills. **Approval lifetime** accepts 1–30 days.
+
 > Six stages from raw conversation to refined, reusable skill.
 
 New employees share the four office skills (`docx`, `pdf`, `pptx`, `xlsx`) from `<home>/skills/`; creation no longer copies bundled skills into personal `SKILLS/`. The first onboarding or gateway start installs missing office defaults once. The migration marker prevents reinstalling deliberately removed defaults. Existing company and personal files are preserved. `connect-google` keeps its independent company-wide backfill.

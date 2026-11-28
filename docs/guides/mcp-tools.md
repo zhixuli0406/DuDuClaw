@@ -1,5 +1,7 @@
 # MCP tools: what an agent is shown, and why
 
+Open **Integrations → Odoo** for the upgrade notice, permission mode (engine tables or follow the Odoo account, with risk confirmation), **Always refuse** (grouped defaults; removal requires confirmation; five fixed refusals remain), **Which AIs may use the company account**, and **Colleagues’ own Odoo accounts** (off by default) with the member credential list. In the **employee editor → Integrations → Odoo**, use **Narrow permissions**, **Use the current requester’s Odoo account**, and the per-table Activity / Internal note / Notify followers / Attachment controls; each requires confirmation. Members enter their own login and key under **My connections → Odoo**, which shows **Configured by administrator** until the Admin enables it. Admins revoke a member credential from **Members → row menu → Revoke Odoo account**.
+
 
 ## Verify the local caller
 
@@ -1074,7 +1076,7 @@ For AI callers, `agent_update` can only lower budgets. Budget increases and othe
 
 ## Cloud-drive write tools
 
-These nine native tools require `google:write`. Administrators control create, modify, move and trash separately; all four start off. Enabling an action or widening its policy requires an explicit acknowledgement of the risks and records the administrator and time. No additional sign-in is required for that settings change. The dashboard controls arrive with the settings page in this release; the Google integration and personal write-connection blocks are not available yet.
+These nine native tools require `google:write`. Administrators control create, modify, move and trash separately; all four start off. Enabling an action or widening its policy requires an explicit acknowledgement of the risks and records the administrator and time. No additional sign-in is required for that settings change. Use **Integrations → Google → Drive writing** for the four actions, approval mode per action and folder list. Its readiness panel shows delegated scopes, a per-employee test and company-account consent. Members connect through **My connections → Drive writing** and review write confirmation cards there. For records, open **Logs → History → Drive writing**.
 
 Each action defaults to confirmation by the member. An administrator can turn confirmation off per action, or require both member and administrator approval. Required member confirmation lasts five minutes and only that member can decide. Tool allowlists, Admin tokens and standing workflow approval cannot replace it. Background or unattended work is refused when confirmation is required. With personal connections or delegation to the owner, the requester must be the account holder; shared company and fixed-delegation connections use the verified requesting member.
 
@@ -1150,4 +1152,4 @@ Default `always_refuse`: `unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`
 
 Every mutating `odoo_execute` call and every `action_*`, `button_*` or `toggle_*` method requires human approval in all modes. `odoo_message_send` always requires it too. An allow rule never bypasses approval or a refusal; approval is single-use and bound to the tool and exact arguments. Other writes retain their normal approval and outgoing-data gates. Admins manage policy through audited `odoo.access_get/set`; widening Follow/company-account/refusal-list settings requires `acknowledge_risk`.
 
-Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls will be included in the Odoo settings page.
+Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls are in **employee editor → Integrations → Odoo**.

@@ -138,4 +138,4 @@ curl -s "https://ai.example.com/api/v1/status/employees?agent_id=sales" \
 
 上面的狀態專用憑證仍不會傳回對話。另一種本人 API 金鑰可在 `me.member_keys.create` 帶入 `include_conversations=true`，選擇「包含我的對話內容」，但須管理員的 `[member_api_keys] allow_conversation_content` 允許建立。預設關閉，只開放自己的網頁對話，即使是共用 AI 員工的 Owner 也不例外；舊金鑰保留此選項並標示已遷移。建立仍須密碼／MFA 重新驗證。
 
-可選 `mcp_scopes` 為 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`，受 `[member_api_keys] allow_mcp_scopes`（預設空）限制。目前先透過 RPC／設定操作，儀表板控制項會隨儀表板更新提供。詳見[成員 API 契約](../../api/member-contract.md#personal-member-api-keys-1850)。
+可選 `mcp_scopes` 為 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`，受 `[member_api_keys] allow_mcp_scopes`（預設空）限制。成員在「外部存取」（`/me/external-access`）建立金鑰時，勾選「包含我的對話內容」與外部工具權限，之後只能縮小範圍。管理員在同頁使用兩個總開關。詳見[成員 API 契約](../../api/member-contract.md#personal-member-api-keys-1850)。

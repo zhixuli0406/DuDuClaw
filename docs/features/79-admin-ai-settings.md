@@ -1,6 +1,8 @@
 # Administrator AI settings
 
-An administrator can ask their own AI avatar to read and change everyday settings for multiple AI employees at once. The feature is off by default. An administrator enables it in Settings after reading the risk explanation and acknowledging it; the system records who enabled it and when.
+An administrator can ask their own AI avatar to read and change everyday settings for multiple AI employees at once. The feature is off by default. An administrator enables it in **Settings → Advanced → Delegation permissions**, in the **Administrator AI** card at the bottom after reading the risk explanation and acknowledging it; the system records who enabled it and when.
+
+Turning the switch on requires **I understand**; turning it off takes effect immediately. In **Inbox → Administrator AI settings change confirmation**, the card counts down ten minutes and then shows done, partial or voided. Processed cards show the decision maker and decision time.
 
 ## Who can use it
 

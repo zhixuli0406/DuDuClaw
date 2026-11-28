@@ -1,5 +1,7 @@
 # Google Workspace 工具與安全模型
 
+在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。
+
 設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、三十八個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
@@ -165,7 +167,7 @@ allowed_subject_domains = ["customer.com"]
 
 網站的公開訪客（WebChat 小工具、Odoo 線上客服）在任何設定下都會被拒。沒有綁定帳號的通道發話者，除非設成 `anyone`，否則也會被拒。
 
-**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或——僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時——同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
+**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或，僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時，同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
 
 ### 用不了的時候
 

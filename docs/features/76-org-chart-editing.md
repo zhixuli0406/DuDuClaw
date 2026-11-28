@@ -1,5 +1,7 @@
 # Org chart editing (reporting lines and departments)
 
+The Inbox org-change card, org chart confirmation and employee department field show an **Impact** line describing the affected scope.
+
 ## Department manager reach (Enterprise, v1.86.0)
 
 Moving an AI employee between departments can change which Managers may manage its schedules, automation rules, skills and usage. The change summary states who gains or loses which controls, for example: “After approval, the Sales Manager can manage this employee's schedules and skills; the Manufacturing Manager will lose that access.” Approval checks the effect again. If it changed since the Admin reviewed it, the Admin must review and confirm again before applying the move. Org sync also reports the effect.
