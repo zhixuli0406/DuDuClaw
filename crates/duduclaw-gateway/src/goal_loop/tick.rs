@@ -90,6 +90,9 @@ impl GoalLoopDriver {
             //    Free the slot NOW — before the candidate check below, because
             //    such a task is still `todo` and therefore a candidate — so the
             //    Personal-edition cap is not held by a round that never ran. ──
+            // A fresh strict assignee check parks a broken employee immediately in
+            // on_dispatch_failed; escalated_this_tick prevents a stale candidate
+            // from being enqueued again in this same pass.
             if let Some(failed_error) = self.dispatch_failure_for(&inflight, &id).await {
                 if self
                     .on_dispatch_failed(&mut inflight, &id, &failed_error)
@@ -277,6 +280,7 @@ impl GoalLoopDriver {
         };
 
         for task in &candidates {
+            if escalated_this_tick.contains(&task.id) { continue; }
             // Preserve the employee origin before kickoff/planning can call a model.
             if let Some(caller) = crate::autonomous_runtime::task_caller(&self.home_dir, task) {
                 if duduclaw_core::autonomy_gate::check(&self.home_dir, &caller,
@@ -284,27 +288,37 @@ impl GoalLoopDriver {
                     continue;
                 }
             }
-            if let Err(pause) = duduclaw_core::autonomy_gate::check(
+            let autonomy = duduclaw_core::autonomy_gate::check(
                 &self.home_dir, &task.assigned_to,
                 duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
-            ) {
-                if pause.is_agent_config_refusal() {
-                    if let Err(detail) = crate::team_composer::check_team_dispatchable_for_task(
-                        &self.home_dir, &task.assigned_to, &task.id,
-                    ) {
-                        self.escalate(&mut inflight, task, &detail,
-                            crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
+            );
+            if let Err(pause) = &autonomy {
+                if !pause.is_agent_config_refusal() {
+                    // An operator pause still takes precedence over configuration checks.
+                    if (task.revision_round > 0 || task.status == "revising")
+                        && !crate::dispatcher::goal_turn_active(&self.home_dir, &task.id).await?
+                    {
+                        self.escalate(&mut inflight, task, &pause.to_string(),
+                            crate::pause_reason::PauseReason::OperatorPaused).await?;
                         active = inflight.len();
                     }
                     continue;
                 }
-                // Fresh tasks wait unchanged. A completed/rejected turn must
-                // require a human before a later round can be admitted.
-                if (task.revision_round > 0 || task.status == "revising")
-                    && !crate::dispatcher::goal_turn_active(&self.home_dir, &task.id).await?
-                {
-                    self.escalate(&mut inflight, task, &pause.to_string(),
-                        crate::pause_reason::PauseReason::OperatorPaused).await?;
+            }
+            // The autonomy gate does not validate provider/model compatibility.
+            // Refuse every admitted candidate before kickoff or planning can run.
+            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
+                active = inflight.len();
+                continue;
+            }
+            if autonomy.is_err() {
+                if let Err(detail) = crate::team_composer::check_team_dispatchable_for_task(
+                    &self.home_dir, &task.assigned_to, &task.id,
+                ) {
+                    self.escalate(&mut inflight, task, &detail,
+                        crate::pause_reason::PauseReason::BlockedNeedsDecision).await?;
                     active = inflight.len();
                 }
                 continue;
@@ -525,10 +539,20 @@ impl GoalLoopDriver {
 
             // The dispatch policy can select another employee. Check the
             // effective recipient before any kickoff or model work for them.
-            if duduclaw_core::autonomy_gate::check(
+            let autonomy = duduclaw_core::autonomy_gate::check(
                 &self.home_dir, &task.assigned_to,
                 duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
-            ).is_err() {
+            );
+            if autonomy.as_ref().is_err_and(|pause| !pause.is_agent_config_refusal()) {
+                continue;
+            }
+            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
+                active = inflight.len();
+                continue;
+            }
+            if autonomy.is_err() {
                 continue;
             }
 
@@ -1062,10 +1086,11 @@ impl GoalLoopDriver {
             {
                 continue;
             }
-            if duduclaw_core::autonomy_gate::check(
+            let autonomy = duduclaw_core::autonomy_gate::check(
                 &self.home_dir, &task.assigned_to,
                 duduclaw_core::autonomy_gate::AutonomyPath::GoalLoop,
-            ).is_err() {
+            );
+            if autonomy.as_ref().is_err_and(|pause| !pause.is_agent_config_refusal()) {
                 if let Some(lease) = acquired_lease.take() {
                     duduclaw_core::concurrency_release(&self.home_dir, &lease);
                 }
@@ -1080,6 +1105,22 @@ impl GoalLoopDriver {
                     continue;
                 }
             }
+            // Revalidate after awaited kickoff/state work, at the handoff boundary.
+            if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to) {
+                if let Some(lease) = acquired_lease.take() {
+                    duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                }
+                self.handle_dispatch_failure(&mut inflight, &task.id,
+                    dispatch::DispatchFailure::Entry(&refusal)).await?;
+                active = inflight.len();
+                continue;
+            }
+            if autonomy.is_err() {
+                if let Some(lease) = acquired_lease.take() {
+                    duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                }
+                continue;
+            }
             // P2-A: a durable round always runs Solo on the fixed-id rail.
             let team_result = if durable.is_some() {
                 crate::team_composer::check_team_dispatchable(&self.home_dir, &task.assigned_to)
@@ -1092,13 +1133,11 @@ impl GoalLoopDriver {
             let (team_dispatch, gate_inputs_json) = match team_result {
                 Ok(dispatch) => dispatch,
                 Err(enqueue::TeamDispatchError::ConfigRefused(detail)) => {
-                    self.escalate(
-                        &mut inflight,
-                        task,
-                        &detail,
-                        crate::pause_reason::PauseReason::BlockedNeedsDecision,
-                    )
-                    .await?;
+                    if let Some(lease) = acquired_lease.take() {
+                        duduclaw_core::concurrency_release(&self.home_dir, &lease);
+                    }
+                    self.handle_dispatch_failure(&mut inflight, &task.id,
+                        dispatch::DispatchFailure::TeamConfig(&detail)).await?;
                     active = inflight.len();
                     continue;
                 }

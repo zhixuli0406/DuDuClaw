@@ -6,6 +6,32 @@
 
 use super::*;
 use std::sync::Arc;
+use super::odoo_identity_client::tests::with_company;
+
+fn policy_home(odoo_options: &str) -> tempfile::TempDir {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), format!(
+        "[odoo]\nurl='http://127.0.0.1:1'\ndb='test'\n{odoo_options}\n[odoo_access]\ncompany_key_agents=['agnes']\n")).unwrap();
+    home
+}
+
+/// A regression must not turn a local refusal into an identity or Odoo request.
+pub(super) async fn local_refusal(home: &Path, pool: &OdooState, tool: &str, params: &Value) -> Value {
+    use super::odoo_identity_client::tests::{gateway, AUTH};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let path = home.join("config.toml");
+    let mut config: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    config["odoo"]["url"] = toml::Value::String(format!("http://{}", listener.local_addr().unwrap()));
+    std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
+    let gateway = gateway(home, 200, serde_json::json!({"ok":true,"identity":"company","permission":"engine"})).await;
+    let result = AUTH.scope((), handle_odoo_tool(tool, params, home, pool, "agnes")).await;
+    assert!(gateway.requests.lock().unwrap().is_empty(), "local gate contacted gateway: {result}");
+    assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+        "local gate contacted Odoo: {result}");
+    assert!(pool.slots().await.is_empty());
+    result
+}
 
 #[test]
 fn odoo_status_and_connect_neutralize_remote_version_and_modules() {
@@ -161,6 +187,7 @@ fn odoo_overview_marks_untrusted_metadata_and_screens_legacy_snapshots() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_overview_model_filter_hits_agent_gate_before_connection() {
+    let home = policy_home("");
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     pool.register_agent(
         "agnes",
@@ -170,12 +197,9 @@ async fn odoo_overview_model_filter_hits_agent_gate_before_connection() {
         },
     )
     .await;
-    let result = handle_odoo_tool(
+    let result = local_refusal(home.path(), &pool,
         "odoo_schema_overview",
         &serde_json::json!({"model":"res.partner"}),
-        Path::new("/tmp"),
-        &pool,
-        "agnes",
     )
     .await;
     assert!(result["isError"].as_bool().unwrap());
@@ -322,13 +346,15 @@ fn classify_returns_none_for_unknown_tool() {
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_status_reports_not_connected_for_fresh_agent() {
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool(
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(home.path().join("config.toml"), "[odoo]\nurl='http://localhost:1'\ndb='test'\n").unwrap();
+    let result = with_company(home.path(), handle_odoo_tool(
         "odoo_status",
         &serde_json::json!({}),
-        std::path::Path::new("/tmp"),
+        home.path(),
         &pool,
         "agnes",
-    )
+    ))
     .await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("Odoo not connected"), "got: {text}");
@@ -341,6 +367,7 @@ async fn odoo_status_reports_not_connected_for_fresh_agent() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_tool_blocks_disallowed_model_before_any_network_call() {
+    let home = policy_home("");
     // Register an agent override that whitelists only crm.lead.
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     pool.register_agent(
@@ -355,12 +382,9 @@ async fn odoo_tool_blocks_disallowed_model_before_any_network_call() {
 
     // Attempt a sale.order search — must be rejected at the gate, no
     // get_or_connect HTTP call attempted.
-    let result = handle_odoo_tool(
+    let result = local_refusal(home.path(), &pool,
         "odoo_sale_orders",
         &serde_json::json!({}),
-        std::path::Path::new("/tmp"),
-        &pool,
-        "agnes",
     )
     .await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
@@ -373,6 +397,7 @@ async fn odoo_tool_blocks_disallowed_model_before_any_network_call() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_tool_blocks_disallowed_action_verb() {
+    let home = policy_home("");
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
     pool.register_agent(
         "agnes",
@@ -386,12 +411,9 @@ async fn odoo_tool_blocks_disallowed_action_verb() {
 
     // Attempt a write — must be denied even though crm.lead is permitted
     // (no model whitelist set).
-    let result = handle_odoo_tool(
+    let result = local_refusal(home.path(), &pool,
         "odoo_crm_create_lead",
         &serde_json::json!({ "name": "test lead" }),
-        std::path::Path::new("/tmp"),
-        &pool,
-        "agnes",
     )
     .await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
@@ -402,18 +424,18 @@ async fn odoo_tool_blocks_disallowed_action_verb() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_tool_without_override_falls_through_to_connection_check() {
-    // No override → permission gate is permissive → handler proceeds to
-    // get_or_connect, which fails with the "not connected" message
-    // because no connect was issued.
+    let home = policy_home("");
+    // No private account and no company grant must never fall back to company credentials.
+    std::fs::write(home.path().join("config.toml"),
+        "[odoo]\nurl='http://127.0.0.1:1'\ndb='test'\nusername='company'\napi_key_enc='secret://missing/never-resolve'\n").unwrap();
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool(
-        "odoo_crm_leads",
-        &serde_json::json!({}),
-        std::path::Path::new("/tmp"),
-        &pool,
-        "agnes",
-    )
-    .await;
+    let result = local_refusal(home.path(), &pool, "odoo_crm_leads", &serde_json::json!({})).await;
+    assert!(result["isError"].as_bool().unwrap_or(false));
+    assert!(result["content"][0]["text"].as_str().unwrap().contains("not connected"), "{result}");
+    // An explicit company grant reaches the connection check after the gateway decision.
+    let home = policy_home("");
+    let result = with_company(home.path(), handle_odoo_tool(
+        "odoo_crm_leads", &serde_json::json!({}), home.path(), &pool, "agnes")).await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(result["isError"].as_bool().unwrap_or(false));
     assert!(text.contains("not connected"), "got: {text}");
@@ -423,6 +445,7 @@ async fn odoo_tool_without_override_falls_through_to_connection_check() {
 /// (and generic tools on that module's models) before any connection.
 #[tokio::test(flavor = "current_thread")]
 async fn odoo_feature_switch_off_blocks_module_tools() {
+    let home = policy_home("features_sale=false");
     let global = duduclaw_odoo::OdooConfig {
         features_sale: false,
         ..Default::default()
@@ -436,7 +459,7 @@ async fn odoo_feature_switch_off_blocks_module_tools() {
         ),
     ] {
         let result =
-            handle_odoo_tool(tool, &params, std::path::Path::new("/tmp"), &pool, "agnes").await;
+            local_refusal(home.path(), &pool, tool, &params).await;
         let text = result["content"][0]["text"].as_str().unwrap_or("");
         assert!(result["isError"].as_bool().unwrap_or(false), "{tool}");
         assert!(
@@ -447,13 +470,13 @@ async fn odoo_feature_switch_off_blocks_module_tools() {
         assert!(text.contains("功能模組"), "{tool}: {text}");
     }
     // A module still on goes on to the connection check.
-    let result = handle_odoo_tool(
+    let result = with_company(home.path(), handle_odoo_tool(
         "odoo_crm_leads",
         &serde_json::json!({}),
-        std::path::Path::new("/tmp"),
+        home.path(),
         &pool,
         "agnes",
-    )
+    ))
     .await;
     let text = result["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("not connected"), "got: {text}");
@@ -549,7 +572,7 @@ async fn fresh_pool_reads_project_switch_from_disk_without_network() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("config.toml"), "[odoo]\nfeatures_project = true\nurl = 'http://localhost:1'\ndb = 'test'\n").unwrap();
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes")).await;
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(!text.contains("switched off"), "{text}");
     assert!(text.contains("not connected"), "{text}");
@@ -563,15 +586,21 @@ async fn real_config_gates_run_before_auto_connect_or_secret_resolution() {
         ("odoo_search", serde_json::json!({"model":"project.project"}), "allowed_models = ['crm.lead']", "features_project = true", "allowed_models gate"),
         ("odoo_search", serde_json::json!({"model":"res.partner"}), "", "", "block list gate"),
         ("odoo_execute", serde_json::json!({"model":"ir.model","method":"write"}), "unblock_models = ['ir.model']", "", "system read-only"),
-        ("odoo_execute", serde_json::json!({"model":"crm.lead","method":"unlink"}), "", "", "method safety gate"),
+        // The default always_refuse list now rejects unlink before the legacy method gate.
+        ("odoo_execute", serde_json::json!({"model":"crm.lead","method":"unlink"}), "", "", "一律不允許"),
         ("odoo_inventory_check", serde_json::json!({"product_id":1}), "allowed_models = ['stock.quant']", "", "allowed_models gate"),
+        ("odoo_crm_leads", serde_json::json!({}), "", "", "not connected"),
     ] {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
-        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_config}\n")).unwrap();
+        // No account and no company grant must refuse locally, not resolve the company's secret.
+        let access = if expected == "not connected" { "" } else {
+            "[odoo_access]\ncompany_key_agents=['agnes']\n"
+        };
+        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_config}\n{access}")).unwrap();
         std::fs::write(home.path().join("agents/agnes/agent.toml"), format!("[odoo]\n{agent_config}\n")).unwrap();
         let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-        let result = handle_odoo_tool(tool, &params, home.path(), &pool, "agnes").await;
+        let result = local_refusal(home.path(), &pool, tool, &params).await;
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains(expected), "{tool}: {text}");
         assert!(text.contains("retrying the same call will not succeed"), "{text}");
@@ -619,15 +648,15 @@ async fn data_tool_auto_connects_and_explicit_connect_reuses_identity_across_pro
     let home = tempfile::tempdir().unwrap();
     std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = '{url}'\ndb = 'test'\nusername = 'tester'\napi_key_enc = 'literal-test-key'\nfeatures_project = true\n")).unwrap();
     let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &pool, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     assert!(pool.is_connected("agnes").await);
     assert_eq!(authentications.load(Ordering::SeqCst), 1);
-    let result = handle_odoo_tool("odoo_connect", &serde_json::json!({}), home.path(), &pool, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_connect", &serde_json::json!({}), home.path(), &pool, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     assert_eq!(authentications.load(Ordering::SeqCst), 1);
     let next_process: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-    let result = handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes").await;
+    let result = with_company(home.path(), handle_odoo_tool("odoo_search", &serde_json::json!({"model":"project.project"}), home.path(), &next_process, "agnes")).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     // Cross-process reuse comes from the on-disk connection cache, which is
     // descriptor-pinned and Unix-only; off Unix it is deliberately disabled
@@ -736,10 +765,10 @@ async fn schema_tools_refuse_blocked_models_before_connecting() {
         let home = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
         let global_unblock = if agent_config.is_empty() { "" } else { "unblock_models = ['res.partner']" };
-        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_unblock}\n")).unwrap();
+        std::fs::write(home.path().join("config.toml"), format!("[odoo]\nurl = 'http://localhost:1'\ndb = 'test'\napi_key_enc = 'secret://missing/never-resolve'\n{global_unblock}\n[odoo_access]\ncompany_key_agents=['agnes']\n")).unwrap();
         std::fs::write(home.path().join("agents/agnes/agent.toml"), format!("[odoo]\n{agent_config}\n")).unwrap();
         let pool: OdooState = Arc::new(crate::odoo_pool::OdooConnectorPool::default());
-        let result = handle_odoo_tool(tool, &serde_json::json!({"model":"res.partner"}), home.path(), &pool, "agnes").await;
+        let result = local_refusal(home.path(), &pool, tool, &serde_json::json!({"model":"res.partner"})).await;
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(result["isError"].as_bool().unwrap_or(false), "{tool}: {text}");
         assert!(text.contains("block list gate"), "{tool}: {text}");

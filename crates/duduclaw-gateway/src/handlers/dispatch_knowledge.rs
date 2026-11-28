@@ -243,15 +243,18 @@ impl MethodHandler {
                 }
             }
             "memory.search" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_search(params)).await
             }
             "memory.browse" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_browse(params)).await
             }
             "memory.key_facts" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_key_facts(params)).await
             }
             // Freshness histogram + top-N + accumulation trend for the memory
@@ -263,7 +266,8 @@ impl MethodHandler {
             }
             // F1 Temporal Memory (v1.19.0): supersession chain + point-in-time.
             "memory.history" => {
-                let _ = check_agent!(AccessLevel::Viewer);
+                let agent = check_agent!(AccessLevel::Viewer);
+                if let Err(frame) = self.member_key_memory_gate(ctx, &agent).await { return frame; }
                 boxed_frame(|| self.handle_memory_history(params)).await
             }
             "memory.at" => {
@@ -395,9 +399,18 @@ impl MethodHandler {
             "skills.restore" => boxed_frame(|| self.handle_skills_restore(params, ctx)).await,
             "skills.search" => boxed_frame(|| self.handle_skills_search(params, ctx)).await,
             "skills.content" => {
-                // HS4: skill content is read from a specific agent's registry —
-                // scope to an agent the caller is bound to.
-                let _ = check_agent!(AccessLevel::Viewer);
+                use crate::dept_grants::{department_grant_allows, DeptGrantView, GrantAction, GrantGroup};
+                // Match extract_and_check_agent's extraction and original denial.
+                let agent_id = match params.get("agent_id").and_then(|v| v.as_str()) {
+                    Some(id) => id,
+                    None => return WsFrame::error_response("", "missing agent_id parameter"),
+                };
+                let view = DeptGrantView::load(self, ctx).await;
+                if let Err(e) = acl::require_agent_access(ctx, agent_id, AccessLevel::Viewer) {
+                    if !department_grant_allows(&view, agent_id, GrantGroup::Skills, GrantAction::Read) {
+                        return WsFrame::error_response("", &e);
+                    }
+                }
                 boxed_frame(|| self.handle_skills_content(params)).await
             }
             // Read-only preview (fetch + security scan, no mutation): any

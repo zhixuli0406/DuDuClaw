@@ -581,7 +581,7 @@ fn p1g_http_routes_naming_an_employee_are_reviewed() {
     assert!(body("handle_reliability_summary_http").contains("caller.hides_agent(&agent_id)"));
     let webchat = include_str!("../webchat/access.rs");
     let refuse = webchat.find("denied(\"personal_employee\")").unwrap();
-    let shortcut = webchat.rfind("if snapshot.role() == duduclaw_auth::UserRole::Admin { return Ok(()); }").unwrap();
+    let shortcut = webchat.rfind("if snapshot.role() == duduclaw_auth::UserRole::Admin\n            && super::main_credential_origin() != duduclaw_auth::acl::ContextOrigin::MemberKey { return Ok(()); }").unwrap();
     assert!(refuse < shortcut, "the Personal check runs before the Admin shortcut");
 }
 

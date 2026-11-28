@@ -580,7 +580,7 @@ async fn g5_skill_tools_visible_internal_hidden_external() {
         .iter()
         .map(|t| t["name"].as_str().unwrap_or(""))
         .collect();
-    for tool in &["skill_hub_install", "skill_curator_status", "skill_pin"] {
+    for tool in &["skill_hub_install"] {
         assert!(
             internal_names.contains(tool),
             "{tool} must be in the internal list"
@@ -606,7 +606,7 @@ async fn g5_skill_tools_visible_internal_hidden_external() {
         .iter()
         .map(|t| t["name"].as_str().unwrap_or(""))
         .collect();
-    for tool in &["skill_hub_install", "skill_curator_status", "skill_pin"] {
+    for tool in &["skill_hub_install"] {
         assert!(
             !external_names.contains(tool),
             "{tool} must NOT be exposed to external principals"

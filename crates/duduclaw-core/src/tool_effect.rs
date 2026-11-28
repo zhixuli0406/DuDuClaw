@@ -153,6 +153,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
     use ToolEffect::*;
     let effect = match tool_name {
         // ── read ────────────────────────────────────────────────────────
+        "my_tasks_list" | "my_agents_status" => Read,
         "activity_list" | "agent_status" | "audit_trail_query" | "autopilot_list"
         | "belief_stats" | "group_history_read" | "channel_config_list" | "channel_status" | "check_responses"
         | "code_map" | "codrive_status" | "computer_screenshot" | "computer_workspace_list"
@@ -180,14 +181,14 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "os_spotlight_search" | "os_system_status" | "os_watch_status" | "os_wifi_scan"
         | "os_wifi_status" | "plan_get" | "reliability_summary" | "responsibility_get"
         | "route_query" | "session_restore_context" | "shared_skill_list" | "sheets_read"
-        | "skill_curator_status" | "skill_gaps" | "skill_list" | "skill_search" | "skill_security_scan"
+        | "skill_gaps" | "skill_list" | "skill_search" | "skill_security_scan"
         | "skill_synthesis_status" | "slides_read" | "task_status" | "tasks_list"
         | "transcribe_audio" | "user_code_profile" | "user_profile_get" | "web_extract"
         | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph" | "wiki_lint"
         | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search" | "wiki_stats"
         | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get" | "xlsx_read"
         | "calendar_list_events" | "discovery_catalog" | "discovery_list" | "discovery_tree"
-        | "discovery_artifact" | "meeting_transcribe_status" => Read,
+        | "discovery_artifact" | "meeting_transcribe_status" | "admin_settings_read" => Read,
 
         // ── draft ───────────────────────────────────────────────────────
         "gmail_create_draft" | "canvas_push" | "plan_start" | "skill_from_recording"
@@ -196,12 +197,12 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         // ── send ────────────────────────────────────────────────────────
         "send_message" | "send_photo" | "send_sticker" | "mail_send" | "send_to_agent"
         | "spawn_agent" | "team_handoff" | "create_reminder" | "responsibility_ask"
-        | "calendar_create_event" | "calendar_update_event" | "gmail_send_draft" | "google_chat_send" | "os_notify" => Send,
+        | "odoo_message_send" | "calendar_create_event" | "calendar_update_event" | "gmail_send_draft" | "google_chat_send" | "os_notify" => Send,
 
         // ── publish ─────────────────────────────────────────────────────
         // `knowledge_add_source` only files a proposal; a person decides in
         // the dashboard. Classified as publishing to a shared store.
-        "wiki_share" | "github_issue_comment" | "shared_skill_share" | "knowledge_add_source" => {
+        "wiki_share" | "github_issue_comment" | "shared_skill_share" | "knowledge_add_source" | "drive_create_file" | "drive_copy_file" | "drive_move_file" => {
             Publish
         }
 
@@ -210,7 +211,7 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 
         // ── delete ──────────────────────────────────────────────────────
         "agent_remove" | "delete_cron_task" | "cancel_reminder" | "shared_wiki_delete"
-        | "memory_invalidate_by_origin" | "calendar_delete_event" => Delete,
+        | "memory_invalidate_by_origin" | "calendar_delete_event" | "drive_trash_file" => Delete,
 
         // ── modify ──────────────────────────────────────────────────────
         "meeting_transcribe_cancel" | "activity_post" | "belief_settle" | "belief_submit" | "browser_record_start"
@@ -218,21 +219,21 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
         | "computer_navigate" | "computer_scroll" | "computer_session_start"
         | "computer_session_stop" | "computer_type" | "computer_login" | "credential_declare" | "computer_workspace_write"
         | "create_task" | "decision_resolve" | "desktop_record_start" | "desktop_record_stop"
-        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
+        | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_update_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "fork_run" | "goals_create" | "gtasks_complete" | "gtasks_create"
         | "memory_alias_add" | "memory_store" | "merge_or_select" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
-        | "odoo_create" | "odoo_write"
+        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post" | "odoo_attachment_add"
         | "office_script" | "os_audio_set" | "os_backup_create" | "os_display_set" | "os_open"
         | "pause_cron_task" | "plan_update_step" | "responsibility_followup" | "run_cron_task"
         | "sheets_append" | "skill_bank_feedback" | "skill_extract"
-        | "skill_pin" | "submit_feedback" | "tasks_block" | "tasks_claim" | "tasks_complete"
+        | "submit_feedback" | "tasks_block" | "tasks_claim" | "tasks_complete"
         | "tasks_create" | "tasks_renew" | "tasks_update" | "terminate_branch"
         | "update_cron_task" | "user_profile_record" | "wiki_export" | "wiki_rebuild_fts"
         | "wiki_write" | "working_state_clear" | "working_state_handoff"
         | "working_state_set" | "discovery_cancel" => Modify,
 
         // ── admin ───────────────────────────────────────────────────────
-        "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
+        "admin_settings_propose" | "agent_update" | "agent_update_soul" | "capability_request" | "channel_config"
         | "codrive_run" | "create_agent" | "evolution_toggle" | "execute_program"
         | "llamafile_start" | "llamafile_stop" | "model_download" | "model_load"
         | "model_unload" | "odoo_execute" | "os_apply_update" | "os_doctor_repair"
@@ -253,6 +254,9 @@ pub fn effect_of_builtin(tool_name: &str) -> Option<ToolEffect> {
 /// that return existing records count as private too. A write acknowledgement
 /// or a public model-catalog search does not introduce private data.
 pub fn reads_private(tool_name: &str) -> Option<bool> {
+    if tool_name == "admin_settings_read" { return Some(true); }
+    if tool_name == "admin_settings_propose" { return Some(false); }
+    if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(true); }
     if matches!(tool_name, "gmail_send_draft" | "calendar_delete_event") { return Some(true); }
     match tool_name {
         "meeting_upload_link" => Some(false),
@@ -288,7 +292,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "os_system_status" | "os_watch_status" | "os_wifi_scan" | "os_wifi_status"
         | "pairing_manage" | "plan_get" | "plan_update_step" | "reliability_summary"
         | "responsibility_get" | "route_query" | "run_cron_task" | "session_restore_context"
-        | "shared_skill_list" | "sheets_read" | "skill_curator_status" | "skill_extract"
+        | "shared_skill_list" | "sheets_read" | "skill_extract"
         | "skill_from_recording" | "skill_gaps" | "skill_list" | "skill_search"
         | "skill_security_scan" | "skill_synthesis_run" | "skill_synthesis_status"
         | "slides_read" | "task_status" | "tasks_claim" | "tasks_list" | "tasks_update"
@@ -296,7 +300,7 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "web_fetch" | "web_fetch_cached" | "web_search" | "wiki_dedup" | "wiki_graph"
         | "wiki_lint" | "wiki_ls" | "wiki_namespace_status" | "wiki_read" | "wiki_search"
         | "wiki_stats" | "wiki_trust_audit" | "wiki_trust_history" | "working_state_get"
-        | "xlsx_read" => Some(true),
+        | "xlsx_read" | "odoo_attachment_add" => Some(true),
         "activity_post" | "agent_remove" | "agent_update" | "agent_update_soul"
         | "belief_submit" | "browser_record_start" | "browser_record_stop"
         | "google_chat_send" | "calendar_create_event" | "cancel_reminder" | "canvas_clear" | "canvas_push"
@@ -304,20 +308,20 @@ pub fn reads_private(tool_name: &str) -> Option<bool> {
         | "computer_scroll" | "computer_session_stop" | "computer_type" | "computer_login"
         | "credential_declare" | "computer_workspace_write" | "create_agent" | "create_reminder" | "create_task"
         | "delete_cron_task" | "desktop_record_start" | "desktop_record_stop"
-        | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
+        | "discovery_cancel" | "docs_append" | "docs_create" | "docs_replace_text" | "sheets_create" | "sheets_update" | "drive_create_file" | "drive_copy_file" | "drive_update_file" | "drive_move_file" | "drive_trash_file" | "docs_insert_text" | "docs_format" | "sheets_add_sheet" | "sheets_add_note" | "calendar_update_event" | "evolution_toggle" | "github_issue_comment"
         | "gmail_create_draft" | "goals_create" | "gtasks_complete" | "gtasks_create"
-        | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send"
+        | "knowledge_add_source" | "llamafile_start" | "llamafile_stop" | "mail_send" | "odoo_message_send"
         | "memory_alias_add" | "memory_invalidate_by_origin" | "memory_store" | "model_download"
         | "model_load" | "model_search" | "model_unload" | "notion_page_append"
         | "odoo_crm_create_lead" | "odoo_crm_update_stage" | "odoo_sale_create_quotation"
-        | "odoo_create" | "odoo_write"
+        | "odoo_create" | "odoo_write" | "odoo_activity_create" | "odoo_note_post"
         | "os_apply_update" | "os_audio_set" | "os_backup_create" | "os_display_set"
         | "os_factory_reset" | "os_notify" | "os_open" | "os_power" | "os_update_rollback"
         | "os_wifi_connect" | "pause_cron_task" | "plan_start" | "responsibility_ask"
         | "responsibility_followup" | "send_message" | "send_photo" | "send_sticker"
         | "send_to_agent" | "shared_skill_adopt" | "shared_skill_share" | "shared_wiki_delete"
         | "sheets_append" | "skill_bank_feedback" | "skill_graduate" | "skill_hub_install"
-        | "skill_pin" | "spawn_agent" | "spawn_ephemeral" | "submit_feedback"
+        | "spawn_agent" | "spawn_ephemeral" | "submit_feedback"
         | "synthesize_speech" | "tasks_block" | "tasks_complete" | "tasks_create"
         | "tasks_renew" | "team_handoff" | "terminate_branch" | "update_cron_task"
         | "user_profile_record" | "wiki_export" | "wiki_rebuild_fts" | "wiki_share"
@@ -347,6 +351,15 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "docs_replace_text",
     "sheets_create",
     "sheets_update",
+    "drive_create_file",
+    "drive_copy_file",
+    "drive_update_file",
+    "drive_move_file",
+    "drive_trash_file",
+    "docs_insert_text",
+    "docs_format",
+    "sheets_add_sheet",
+    "sheets_add_note",
     "calendar_update_event",
     "calendar_delete_event",
     "gmail_send_draft",
@@ -374,6 +387,10 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
     "notion_page_append",
     "notion_page_read",
     "notion_search",
+    "odoo_attachment_add",
+    "odoo_activity_create",
+    "odoo_note_post",
+    "odoo_message_send",
     "odoo_create",
     "odoo_crm_create_lead",
     "odoo_crm_leads",
@@ -412,6 +429,8 @@ pub const EGRESS_CAPABLE_READS: &[&str] = &[
 /// negative entries independent of the private-read table, so completeness
 /// tests require a separate egress decision whenever a tool is added.
 pub fn egress_capable(tool_name: &str) -> Option<bool> {
+    if matches!(tool_name, "admin_settings_read" | "admin_settings_propose") { return Some(false); }
+    if matches!(tool_name, "my_tasks_list" | "my_agents_status") { return Some(false); }
     if EGRESS_CAPABLE_READS.contains(&tool_name) {
         return Some(true);
     }
@@ -456,8 +475,8 @@ pub fn egress_capable(tool_name: &str) -> Option<bool> {
         | "send_message" | "send_photo" | "send_sticker" | "send_to_agent"
         | "session_restore_context" | "shared_skill_adopt" | "shared_skill_list"
         | "shared_skill_share" | "shared_wiki_delete" | "skill_bank_feedback"
-        | "skill_curator_status" | "skill_extract" | "skill_from_recording" | "skill_gaps"
-        | "skill_graduate" | "skill_list" | "skill_pin" | "skill_security_scan"
+        | "skill_extract" | "skill_from_recording" | "skill_gaps"
+        | "skill_graduate" | "skill_list" | "skill_security_scan"
         | "skill_synthesis_run" | "skill_synthesis_status" | "spawn_agent" | "spawn_ephemeral"
         | "submit_feedback" | "task_status" | "tasks_block" | "tasks_claim" | "tasks_complete"
         | "tasks_list" | "tasks_renew" | "tasks_update" | "team_handoff" | "terminate_branch"
@@ -1123,6 +1142,15 @@ mod tests {
             "docs_replace_text",
             "sheets_create",
             "sheets_update",
+            "drive_create_file",
+            "drive_copy_file",
+            "drive_update_file",
+            "drive_move_file",
+            "drive_trash_file",
+            "docs_insert_text",
+            "docs_format",
+            "sheets_add_sheet",
+            "sheets_add_note",
             "calendar_update_event",
             "calendar_delete_event",
             "gmail_send_draft",
@@ -1449,5 +1477,24 @@ mod google_write_effect_tests {
             }
         }
         assert_eq!(effect_of("gmail_create_draft"), ToolEffect::Draft);
+    }
+}
+
+#[cfg(test)]
+mod drive_write_effect_tests {
+    use super::*;
+    #[test]
+    fn drive_writes_have_effects_and_never_enter_explore() {
+        for tool in crate::google_identity::DRIVE_WRITE_TOOLS {
+            let expected = match *tool {
+                "drive_create_file" | "drive_copy_file" | "drive_move_file" => ToolEffect::Publish,
+                "drive_trash_file" => ToolEffect::Delete,
+                _ => ToolEffect::Modify,
+            };
+            assert_eq!(effect_of_builtin(tool), Some(expected), "{tool}");
+            assert_eq!(reads_private(tool), Some(false), "{tool}");
+            assert_eq!(egress_capable(tool), Some(true), "{tool}");
+            assert!(!ProcessLane::Explore.permits(expected), "{tool}");
+        }
     }
 }

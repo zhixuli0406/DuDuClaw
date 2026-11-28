@@ -238,10 +238,8 @@ impl UserDb {
     ///   and the MAC key here is random per handle, so no presented
     ///   remembered-session token authenticates either.
     ///
-    /// `pub` only because its one caller,
-    /// `duduclaw_gateway::decision_notify::open_user_db_read_only`, is in
-    /// another crate; Rust has no narrower visibility that reaches it. Use
-    /// that wrapper, not this constructor.
+    /// Used by gateway request-time lookups and the CLI's advisory org-sync
+    /// reach preview. Never use this constructor for a mutation path.
     pub fn open_read_only(db_path: &Path) -> Result<Self, String> {
         use rusqlite::OpenFlags;
         let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI;
@@ -372,6 +370,20 @@ impl UserDb {
         crate::user_invites::migrate(&conn)?;
         crate::status_tokens::migrate(&conn)?;
         crate::member_keys::migrate(&conn)?;
+        crate::skill_trust::migrate(&conn)?;
+        crate::chat_link::migrate(&conn)?;
+        crate::odoo_credentials::migrate(&conn)?;
+
+        // RM-143: old bindings retain their existing uses, without self-proof.
+        for (column, kind) in [
+            ("proof_method", "TEXT"), ("proof_user_id", "TEXT"),
+            ("proven_at", "INTEGER"), ("proof_account", "TEXT"), ("proof_dm", "TEXT"),
+        ] {
+            if !has_column(&conn, "channel_identities", column)? {
+                conn.execute(&format!("ALTER TABLE channel_identities ADD COLUMN {column} {kind}"), [])
+                    .map_err(|e| format!("failed to migrate channel identity proof: {e}"))?;
+            }
+        }
 
         // Idempotent migrations: ADD COLUMN errors if the column is already
         // present, so each one probes table_info first.
@@ -430,6 +442,7 @@ impl UserDb {
         )
         .map_err(|e| format!("failed to migrate auth_meta: {e}"))?;
         migrate_isolation_personal_agents(&conn)?;
+        migrate_department_grants(&conn)?;
         crate::avatar_seats::migrate_grants(&conn, self.home.as_deref())?;
         crate::isolation::initialize_tenant(&conn)?;
         // Last: its triggers read users and every MFA table (F6 S1/S16).
@@ -441,6 +454,8 @@ impl UserDb {
         // SR4 item 1: Admin attestations of Google delegate subjects.
         self.migrate_google_authority_if_needed(&conn, crate::google_delegate_attestation::migration_needed,
             crate::google_delegate_attestation::migrate)?;
+        self.migrate_google_authority_if_needed(&conn, crate::google_signin::migration_needed,
+            crate::google_signin::migrate)?;
         // RM-135: first-Admin setup codes; its triggers read users and every
         // MFA factor table, so it runs after all of them exist.
         crate::mfa::bootstrap::migrate(&conn)?;
@@ -742,6 +757,7 @@ impl UserDb {
         self.apply_user_update(user_id, &update).map_err(|e| match e {
             UserWriteError::Org(OrgError::HasReports) => crate::org::MANAGER_HAS_REPORTS.to_string(),
             UserWriteError::Org(OrgError::UserNotFound) => "user not found".to_string(),
+            UserWriteError::Other(code) if code == "role_requires_local_password" => code,
             other => format!("update error: {other}"),
         })
     }
@@ -2485,4 +2501,49 @@ pub fn restore_shared_bindings_in_transaction(
     bump_acl_generation(tx).map_err(PersonalAgentError::store)?;
     bump_policy_epoch(tx)?;
     Ok(members.len())
+}
+
+/// Grant cleanup runs in the user's UPDATE/DELETE transaction, including raw
+/// SQL writers. Existing user writers own the ACL generation bump. Triggers
+/// cannot identify the authenticated actor, so audit attribution is system.
+fn migrate_department_grants(conn: &Connection) -> Result<(), String> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|e| format!("failed to migrate department grants: {e}"))?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS department_manager_grants (
+            user_id TEXT NOT NULL, department TEXT NOT NULL,
+            grp TEXT NOT NULL CHECK (grp IN ('schedules','automation','skills','cost','egress_review')),
+            granted_by TEXT NOT NULL, granted_at TEXT NOT NULL,
+            PRIMARY KEY (user_id, department, grp));
+         CREATE TABLE IF NOT EXISTS main_agent_users (
+            user_id TEXT PRIMARY KEY, granted_by TEXT NOT NULL, granted_at TEXT NOT NULL);
+         CREATE TRIGGER IF NOT EXISTS department_grants_user_update
+         AFTER UPDATE OF role, status ON users
+         WHEN NEW.role != 'manager' OR NEW.status != 'active'
+         BEGIN
+            INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
+            SELECT 'system', 'dept_grant_revoked', OLD.id,
+                json_object('reason', 'role_or_status_changed', 'actor_unknown', json('true'),
+                    'old_role', OLD.role, 'new_role', NEW.role,
+                    'old_status', OLD.status, 'new_status', NEW.status),
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE EXISTS(SELECT 1 FROM department_manager_grants WHERE user_id=OLD.id)
+               OR (NEW.status != 'active' AND EXISTS(SELECT 1 FROM main_agent_users WHERE user_id=OLD.id));
+            DELETE FROM department_manager_grants WHERE user_id=OLD.id;
+            DELETE FROM main_agent_users WHERE user_id=OLD.id AND NEW.status != 'active';
+         END;
+         CREATE TRIGGER IF NOT EXISTS department_grants_user_delete
+         AFTER DELETE ON users
+         BEGIN
+            INSERT INTO auth_audit_log(user_id, action, target, detail, ip, timestamp)
+            SELECT 'system', 'dept_grant_revoked', OLD.id,
+                json_object('reason', 'user_deleted', 'actor_unknown', json('true')),
+                NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE EXISTS(SELECT 1 FROM department_manager_grants WHERE user_id=OLD.id)
+               OR EXISTS(SELECT 1 FROM main_agent_users WHERE user_id=OLD.id);
+            DELETE FROM department_manager_grants WHERE user_id=OLD.id;
+            DELETE FROM main_agent_users WHERE user_id=OLD.id;
+         END;",
+    ).map_err(|e| format!("failed to migrate department grants: {e}"))?;
+    tx.commit().map_err(|e| format!("failed to migrate department grants: {e}"))
 }

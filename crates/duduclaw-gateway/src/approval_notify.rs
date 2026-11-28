@@ -78,15 +78,16 @@ pub(crate) fn zh_action_kind(kind: &str) -> &str {
     }
 }
 
-/// Render the deadline as a local `HH:MM` clock plus the remaining minutes —
+/// Render the deadline as a company-zone `HH:MM` clock with a zone label
+/// plus the remaining minutes —
 /// an ISO timestamp is not something a person reads on a phone.
-fn deadline_phrase(rec: &ApprovalRecord) -> String {
+fn deadline_phrase(home: &Path, rec: &ApprovalRecord) -> String {
     let mins = (rec.ttl_seconds as f64 / 60.0).ceil() as i64;
     match rec.deadline_rfc3339() {
         Some(iso) => match chrono::DateTime::parse_from_rfc3339(&iso) {
             Ok(dt) => format!(
                 "{} 前（約 {mins} 分鐘）",
-                dt.with_timezone(&chrono::Local).format("%H:%M")
+                duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), dt.with_timezone(&chrono::Utc), "%H:%M")
             ),
             Err(_) => format!("約 {mins} 分鐘內"),
         },
@@ -120,8 +121,8 @@ fn trajectory_line(rec: &ApprovalRecord) -> String {
 /// equivalent fields for its own message shape; this function mirrors that
 /// treatment for the button-push body so a crafted summary/trajectory can't
 /// forge a fake section boundary in the rendered message.
-pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
-    approval_body_with(rec, reminder, None)
+pub(crate) fn approval_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
+    approval_body_with(home, rec, reminder, None)
 }
 
 /// [`approval_body`] with the person the raising run works for
@@ -129,13 +130,14 @@ pub(crate) fn approval_body(rec: &ApprovalRecord, reminder: bool) -> String {
 /// 「由 ○○ 交辦」 under the employee, so whoever decides can tell a request
 /// raised on someone's behalf (including their own) from the employee's own.
 pub(crate) fn approval_body_with(
+    home: &Path,
     rec: &ApprovalRecord,
     reminder: bool,
     assigner: Option<&str>,
 ) -> String {
     // Private mail details have a separate, audience-gated renderer.
-    if rec.payload.get("egress_guard").is_some() {
-        return dashboard_only_notice_body(rec, reminder);
+    if crate::approval::is_outbound_data_card(rec) {
+        return dashboard_only_notice_body(home, rec, reminder);
     }
     let head = if reminder {
         "⏰ 這項核可快到期了，逾時會自動拒絕"
@@ -160,7 +162,7 @@ pub(crate) fn approval_body_with(
             SUMMARY_MAX_CHARS
         )),
         trajectory = crate::goal_state::xml_escape(&trajectory_line(rec)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = rec.id.as_str(),
     )
 }
@@ -208,6 +210,7 @@ pub async fn notify_reminder(home_dir: &Path, rec: &ApprovalRecord) -> Option<(S
 /// standing authority to act, only an Admin may decide it, and a channel
 /// press cannot establish that the presser is a current Admin.
 pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
+    if kind == "db_source_grant" { return true; }
     kind == crate::wiki_ingest::ACTION_KIND_KNOWLEDGE_QUARANTINE
         // Adding a document to a shared knowledge collection: the decider
         // must be an Admin or the collection's editor at decision time, which
@@ -231,8 +234,7 @@ pub(crate) fn is_dashboard_only_kind(kind: &str) -> bool {
 /// Record-level restrictions also cover outbound guards on arbitrary kinds.
 pub(crate) fn is_dashboard_only_record(home: Option<&Path>, rec: &ApprovalRecord) -> bool {
     is_dashboard_only_kind(&rec.action_kind)
-        || rec.action_kind == crate::approval::cli_egress::KIND
-        || (rec.payload.get("egress_guard").is_some()
+        || (crate::approval::is_outbound_data_card(rec)
             && !home.is_some_and(|home| crate::approval::mail_requester::eligible(home, rec)))
 }
 
@@ -276,32 +278,33 @@ pub(crate) fn dashboard_only_refusal(kind: &str) -> &'static str {
 /// The zh-TW body of the plain notice for a dashboard-only approval. Carries
 /// no claim text, no stored value and no decision verb — only that something
 /// is waiting, for which AI employee, and until when.
-pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
-    if rec.action_kind == crate::approval::cli_egress::KIND || rec.payload.get("egress_guard").is_some() {
-        let head = if reminder { "有一則對外操作審核快到期了。" } else { "有一則對外操作等待審核。" };
-        return format!("{head}\n請管理員開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
-            deadline_phrase(rec), rec.id.as_str());
+pub(crate) fn dashboard_only_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
+    if crate::approval::is_outbound_data_card(rec) {
+        let head = if reminder { "有一則對外操作審核快到期了。" } else { crate::approval::outbound::NOTICE_SUMMARY };
+        return format!("{head}\n請管理員或被授權的部門主管開啟儀表板的待辦清單處理。\n期限：{}\n編號：{}",
+            deadline_phrase(home, rec), rec.id.as_str());
     }
     if rec.action_kind == crate::approval::WORKFLOW_ACTIVATION_KIND {
-        return activation_notice_body(rec, reminder);
+        return activation_notice_body(home, rec, reminder);
     }
     if let Some(spec) = crate::approval::operator_cli_gate::spec_for(&rec.action_kind) {
-        return (spec.notice)(rec, reminder, &deadline_phrase(rec));
+        return (spec.notice)(rec, reminder, &deadline_phrase(home, rec));
     }
     if rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND {
-        return crate::knowledge::add_source_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+        return crate::knowledge::add_source_approval::notice_body(rec, reminder, &deadline_phrase(home, rec));
     }
     if rec.action_kind == crate::agent_files::approval::ACTION_KIND {
-        return agent_file_notice_body(rec, reminder);
+        return agent_file_notice_body(home, rec, reminder);
     }
     if rec.action_kind == crate::org_change_approval::ACTION_KIND {
-        return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(rec));
+        return crate::org_change_approval::notice_body(rec, reminder, &deadline_phrase(home, rec));
     }
     // v1.82 (L1): an automation action waits for an Admin — no action
     // content. The push path uses the home's configured language
     // (`push_dashboard_only`); everything else gets zh-TW.
     if rec.action_kind == crate::autopilot_approval::ACTION_KIND {
         return crate::autopilot_approval::pending_notice_body(
+            home,
             rec,
             reminder,
             crate::trigger_route::texts::Lang::ZhTw,
@@ -326,7 +329,7 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
          期限：{deadline}未審核將自動捨棄\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
@@ -334,7 +337,7 @@ pub(crate) fn dashboard_only_notice_body(rec: &ApprovalRecord, reminder: bool) -
 /// The plain notice for a profile file change: which employee and which
 /// file, never the proposed text or the diff (those stay behind the
 /// dashboard's admin check).
-pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+pub(crate) fn agent_file_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
     let head = if reminder {
         "⏰ 有一份設定檔修改的審核快到期了，逾時會自動拒絕"
     } else {
@@ -351,7 +354,7 @@ pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
@@ -359,7 +362,7 @@ pub(crate) fn agent_file_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
 /// The plain notice for a workflow activation: no workflow name, steps or
 /// targets (those live behind the dashboard's access checks), only that an
 /// activation waits for an Admin and when it lapses.
-pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> String {
+pub(crate) fn activation_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool) -> String {
     let head = if reminder {
         "⏰ 有一個工作流啟用審核快到期了，逾時會自動拒絕，工作流不會啟用"
     } else {
@@ -372,31 +375,83 @@ pub(crate) fn activation_notice_body(rec: &ApprovalRecord, reminder: bool) -> St
          期限：{deadline}未審核將自動拒絕\n\
          編號：{id}",
         agent = crate::goal_state::xml_escape(&duduclaw_core::truncate_chars(&rec.agent_id, 64)),
-        deadline = deadline_phrase(rec),
+        deadline = deadline_phrase(home, rec),
         id = duduclaw_core::truncate_chars(rec.id.as_str(), 8),
     )
 }
 
-/// Destinations for a dashboard-only notice: the agent's own control
-/// channel, else the approvers' linked chats — never the originating
-/// conversation, which is excluded explicitly rather than by relying on the
-/// reply-channel task-local being absent.
+/// Keep every outbound reviewer's identity and role until the delivery check.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NoticeTarget {
+    destination: (String, String),
+    expected_user_id: Option<String>,
+    department_manager: bool,
+}
+
+impl NoticeTarget {
+    fn unscoped(destination: (String, String)) -> Self {
+        Self { destination, expected_user_id: None, department_manager: false }
+    }
+
+    fn allows_send(&self, home: &Path, rec: &ApprovalRecord) -> bool {
+        let Some(user_id) = self.expected_user_id.as_deref() else {
+            return !crate::approval::is_outbound_data_card(rec);
+        };
+        let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return false; };
+        let Ok(Some(user)) = db.get_user(user_id) else { return false; };
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { return false; }
+        let allowed = if self.department_manager {
+            user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, user_id, &rec.agent_id)
+        } else {
+            user.role == duduclaw_auth::UserRole::Admin
+        };
+        if !allowed { return false; }
+        db.verified_dm_destinations_for_user(user_id).is_ok_and(|destinations|
+            destinations.iter().any(|dest|
+                dest.channel == self.destination.0 && dest.channel_user_id == self.destination.1))
+    }
+}
+
+fn outbound_targets(home: &Path, rec: &ApprovalRecord) -> Vec<NoticeTarget> {
+    let Ok(Some(db)) = crate::decision_notify::open_user_db_read_only(home) else { return vec![]; };
+    let Ok(users) = db.list_users() else { return vec![]; };
+    let mut targets = std::collections::BTreeSet::new();
+    for user in users {
+        if user.status != duduclaw_auth::UserStatus::Active || user.must_change_password { continue; }
+        let allowed = user.role == duduclaw_auth::UserRole::Admin
+            || (user.role == duduclaw_auth::UserRole::Manager
+                && crate::dept_grants::DeptGrantView::notification_allows(home, &user.id, &rec.agent_id));
+        if allowed && let Ok(destinations) = db.verified_dm_destinations_for_user(&user.id) {
+            targets.extend(destinations.into_iter().map(|dest| NoticeTarget {
+                destination: (dest.channel, dest.channel_user_id),
+                expected_user_id: Some(user.id.clone()),
+                department_manager: user.role == duduclaw_auth::UserRole::Manager,
+            }));
+        }
+    }
+    targets.into_iter().collect()
+}
+
 fn dashboard_only_targets(
     home_dir: &Path,
     rec: &ApprovalRecord,
     reminder: bool,
-) -> Vec<(String, String)> {
+) -> Vec<NoticeTarget> {
     let origin = origin_target();
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let owners = if kb { crate::knowledge::add_source_chat::owner_targets(home_dir, rec) } else { vec![] };
-    let base = if kb {
+    let base = if crate::approval::is_outbound_data_card(rec) {
+        // Recompute even for reminders; a previous destination is not authority.
+        outbound_targets(home_dir, rec)
+    } else if kb {
         let mut targets: Vec<_> = crate::knowledge::add_source_chat::decider_targets(home_dir, rec)
             .into_iter().map(|(_, ch, id)| (ch, id)).collect();
         if let Some(target) = crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id) { targets.push(target); }
         targets.extend(approver_links(home_dir));
         let mut seen = std::collections::HashSet::new();
         targets.retain(|t| seen.insert(t.clone()));
-        targets
+        targets.into_iter().map(NoticeTarget::unscoped).collect()
     } else { match (
         reminder,
         rec.notify_channel.as_deref(),
@@ -410,7 +465,7 @@ fn dashboard_only_targets(
             crate::goal_notify::agent_notify_target(home_dir, &rec.agent_id),
             approver_links(home_dir),
         ),
-    }
+    }.into_iter().map(NoticeTarget::unscoped).collect()
     };
     // R-L1: the origin recorded on the card at filing (captured before the
     // distillation was spawned) is the reliable one; the task-local is a
@@ -423,8 +478,8 @@ fn dashboard_only_targets(
         _ => None,
     };
     base.into_iter()
-        .filter(|t| (origin.as_ref() != Some(t) && recorded.as_ref() != Some(t))
-            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, t, &owners)))
+        .filter(|t| (origin.as_ref() != Some(&t.destination) && recorded.as_ref() != Some(&t.destination))
+            || (kb && crate::knowledge::add_source_chat::origin_exception(rec, &t.destination, &owners)))
         .collect()
 }
 
@@ -434,7 +489,7 @@ pub(crate) fn dashboard_only_targets_for_test(
     home_dir: &Path,
     rec: &ApprovalRecord,
 ) -> Vec<(String, String)> {
-    dashboard_only_targets(home_dir, rec, false)
+    dashboard_only_targets(home_dir, rec, false).into_iter().map(|t| t.destination).collect()
 }
 
 /// Push the plain dashboard-only notice: no buttons, no card record (so no
@@ -445,6 +500,15 @@ async fn push_dashboard_only(
     reminder: bool,
 ) -> Option<(String, String)> {
     let targets = dashboard_only_targets(home_dir, rec, reminder);
+    push_dashboard_only_targets(home_dir, rec, reminder, targets).await
+}
+
+async fn push_dashboard_only_targets(
+    home_dir: &Path,
+    rec: &ApprovalRecord,
+    reminder: bool,
+    targets: Vec<NoticeTarget>,
+) -> Option<(String, String)> {
     if targets.is_empty() {
         return None;
     }
@@ -464,15 +528,16 @@ async fn push_dashboard_only(
         return None;
     }
     let mut text = if rec.action_kind == crate::autopilot_approval::ACTION_KIND
-        && rec.payload.get("egress_guard").is_none()
+        && !crate::approval::is_outbound_data_card(rec)
     {
         crate::autopilot_approval::pending_notice_body(
+            home_dir,
             rec,
             reminder,
             crate::trigger_route::texts::lang_for(home_dir),
         )
     } else {
-        dashboard_only_notice_body(rec, reminder)
+        dashboard_only_notice_body(home_dir, rec, reminder)
     };
     if let Some(p) = rec.on_behalf_of.as_deref() {
         let who = crate::on_behalf_of::label::display_label(home_dir, p);
@@ -489,11 +554,14 @@ async fn push_dashboard_only(
     let kb = rec.action_kind == crate::knowledge::add_source_approval::ACTION_KIND;
     let mut delivered = None;
     let mut notified_users = std::collections::HashSet::new();
-    for (channel, chat_id) in targets {
+    let mut delivered_destinations = std::collections::HashSet::new();
+    for target in targets {
+        if delivered_destinations.contains(&target.destination) { continue; }
+        let (channel, chat_id) = target.destination.clone();
         // Re-read owner and destinations at delivery time. Never reuse a
         // queued content preview after an ACL or identity change.
         let uid = if kb {
-            crate::decision_notify::open_user_db(home_dir).ok().flatten().and_then(|db| {
+            crate::decision_notify::open_user_db_read_only(home_dir).ok().flatten().and_then(|db| {
                 db.list_users().ok()?.into_iter().find_map(|u| {
                     db.verified_dm_destinations_for_user(&u.id).ok()?.iter()
                         .any(|d| d.channel == channel && d.channel_user_id == chat_id).then_some(u.id)
@@ -505,13 +573,20 @@ async fn push_dashboard_only(
         if duduclaw_mcp_boundary::io_authority::verify_before_io().is_err() { return delivered; }
         let is_owner = kb && crate::knowledge::add_source_chat::owner_targets(home_dir, rec)
             .contains(&(channel.clone(), chat_id.clone()));
+        // Recheck the expected user, role/grant and exact verified DM after
+        // token resolution, immediately before each first send or reminder.
+        if !target.allows_send(home_dir, rec) {
+            tracing::debug!("approval notice skipped: recipient authority or verified DM unavailable");
+            continue;
+        }
         let sent = if is_owner {
             crate::knowledge::add_source_chat::push_owner_card(home_dir, &http, rec, &channel, &token, &chat_id).await
         } else {
             crate::channel_sender::send_plain_text(home_dir, &http, &channel, &token, &chat_id, &text).await
         };
         if sent {
-            if !kb { return Some((channel, chat_id)); }
+            delivered_destinations.insert((channel.clone(), chat_id.clone()));
+            if !kb && !crate::approval::is_outbound_data_card(rec) { return Some((channel, chat_id)); }
             if let Some(uid) = uid { notified_users.insert(uid); }
             if delivered.is_none() { delivered = Some((channel, chat_id)); }
         }
@@ -519,17 +594,26 @@ async fn push_dashboard_only(
     delivered
 }
 
+/// A successful receipt suppresses the old notice; zero deliveries preserves it.
+async fn chat_delivery_or_notice<F, Fut>(
+    result: crate::approval::chat_admin::deliver::DeliveryResult, notice: F,
+) -> Option<(String, String)>
+where F: FnOnce() -> Fut, Fut: std::future::Future<Output = Option<(String, String)>> {
+    if result.delivered > 0 { result.first } else { notice().await }
+}
+
 async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(String, String)> {
     // SR2 round 4 (N4): the owner-only Personal delegation card is never
     // pushed or reminded through the generic chain (defence in depth behind
     // `SELF_NOTIFYING_KINDS` and `approval::no_reminder`).
-    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND { return None; }
-    if crate::google_identity::chat_send::is_member_card(rec) {
-        if !crate::google_identity::chat_send::eligible(home_dir, rec) { return None; }
+    if rec.action_kind == crate::isolation_background::PERSONAL_DELEGATION_KIND
+        || rec.action_kind == crate::admin_ai::card::ACTION_KIND { return None; }
+    if crate::google_identity::member_card::is_member_card(rec) {
+        if !crate::google_identity::member_card::eligible(home_dir, rec) { return None; }
         let binding = rec.binding.as_ref()?;
         if binding.conversation_audience == crate::approval::ConversationAudience::Private {
             if let Some(target) = crate::turn_context::target_for(&rec.agent_id, &binding.run_id) {
-                let body = crate::google_identity::chat_send::card_body(rec);
+                let body = crate::google_identity::member_card::card_body(rec);
                 if target.context == binding.decision_context
                     && target.conversation_audience == crate::approval::ConversationAudience::Private
                     && body.chars().count() <= 1800 {
@@ -537,17 +621,45 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
                 }
             }
         }
-        let uid = rec.payload["chat_snapshot"]["member"].as_str()?;
+        let uid = crate::google_identity::member_card::member_id(rec)?;
+        if rec.payload["drive_write_member_confirmation"] == true {
+            // Group/thread targets receive no names, account or content.
+            if binding.conversation_audience == crate::approval::ConversationAudience::MultiParty {
+                if let Some(target) = crate::turn_context::target_for(&rec.agent_id, &binding.run_id) {
+                    if target.context == binding.decision_context
+                        && target.conversation_audience == crate::approval::ConversationAudience::MultiParty {
+                        let _ = crate::notify_push::push_exact_confirmation(&target,
+                            crate::google_identity::drive_write::approval::GROUP_NOTICE).await;
+                    }
+                }
+            }
+            // The dashboard RPC always carries the full escaped projection.
+            // Verified private destinations may read it too; group-origin
+            // decisions still require the authenticated dashboard member.
+            let body = crate::google_identity::member_card::card_body(rec);
+            let notice = "有一則雲端硬碟操作等待你本人確認。請到儀表板「我的連線」閱讀完整內容並決定。";
+            crate::notify_push::push_person_notice(home_dir, uid,
+                if body.chars().count() <= 1800 { &body } else { notice }).await;
+            return None;
+        }
         let body = duduclaw_security::credential_protection::sanitize_output_text(
             "有一則 Google Chat 訊息等待你本人確認。請開啟儀表板「我的連線」閱讀完整內容，五分鐘內確認或取消。");
         crate::notify_push::push_person_notice(home_dir, uid,
             &body).await;
         return None;
     }
+    if let Some(result) = crate::approval::chat_admin::deliver::try_push(home_dir, rec, reminder).await {
+        if crate::approval::is_outbound_data_card(rec) {
+            // Admin chat receipts do not suppress department reviewers' dashboard notices.
+            let notice = push_dashboard_only(home_dir, rec, reminder).await;
+            return result.first.or(notice);
+        }
+        return chat_delivery_or_notice(result, || push_dashboard_only(home_dir, rec, reminder)).await;
+    }
     if is_dashboard_only_record(Some(home_dir), rec) {
         return push_dashboard_only(home_dir, rec, reminder).await;
     }
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         // A config/identity change between checks must never enter the legacy
         // fallback chain with private mail content.
         if !crate::approval::mail_requester::eligible(home_dir, rec) { return None; }
@@ -582,7 +694,7 @@ async fn push(home_dir: &Path, rec: &ApprovalRecord, reminder: bool) -> Option<(
         .on_behalf_of
         .as_deref()
         .map(|p| crate::on_behalf_of::label::display_label(home_dir, p));
-    let body = approval_body_with(rec, reminder, assigner.as_deref());
+    let body = approval_body_with(home_dir, rec, reminder, assigner.as_deref());
     // A clickable deep link to the unified inbox — `None` when no valid
     // public dashboard address is configured (never a localhost link), in
     // which case the rendered text stays exactly as it reads without it.
@@ -668,6 +780,13 @@ pub(crate) async fn apply_decision(
     approval_id: &str,
     approve: bool,
 ) -> Result<String, String> {
+    apply_decision_in_session(home_dir, channel, channel_user_id, approval_id, approve, None).await
+}
+
+pub(crate) async fn apply_decision_in_session(
+    home_dir: &Path, channel: &str, channel_user_id: &str, approval_id: &str,
+    approve: bool, session: Option<&str>,
+) -> Result<String, String> {
     let broker = ApprovalBroker::open(home_dir).map_err(|e| format!("開啟審批資料庫失敗：{e}"))?;
     let id = ApprovalId::from(approval_id.to_string());
     let Some(rec) = broker.get(&id).await.map_err(|e| e.to_string())? else {
@@ -732,6 +851,16 @@ pub(crate) async fn apply_decision(
     ) {
         return Err(crate::on_behalf_of::self_approval::REFUSAL.into());
     }
+
+    // WebChat must supply its audience; other adapters can use their verified
+    // channel identity when no conversation is available.
+    if channel == "webchat" && approve && session.is_none() {
+        return Err(crate::channel_decision_route::DECISION_REFUSED.into());
+    }
+    let channel_session = format!("{channel}:{channel_user_id}");
+    crate::entry_gate::check_approval_start(
+        home_dir, &rec, approve, session.unwrap_or(&channel_session),
+    ).await?;
 
     // ── decide ──────────────────────────────────────────────
     let decided_by = format!("channel:{channel}:{channel_user_id}");
@@ -804,7 +933,7 @@ fn settled_verb_for(rec: &ApprovalRecord, approve: bool) -> crate::decision_card
 /// decision alike) so the collapsed card always reads the same regardless of
 /// where the decision was made.
 fn approval_collapse_summary(rec: &ApprovalRecord) -> String {
-    if rec.payload.get("egress_guard").is_some() {
+    if crate::approval::is_outbound_data_card(rec) {
         return "郵件或對外操作審核".into();
     }
     format!(
@@ -869,7 +998,11 @@ pub(crate) fn spawn_dashboard_collapse(
     approve: bool,
     decider_name: Option<String>,
 ) {
+    let authority = duduclaw_mcp_boundary::io_authority::capture();
     tokio::spawn(async move {
+        authority.scope(crate::approval::chat_admin::sync::collapse_after_decision(
+            &home_dir, &rec, approve, decider_name.clone(),
+        )).await;
         let http = reqwest::Client::new();
         let verb = settled_verb_for(&rec, approve);
         let summary = approval_collapse_summary(&rec);
@@ -896,6 +1029,19 @@ pub(crate) fn spawn_dashboard_collapse(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deadline_phrase_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut record = rec("mcp_install");
+        record.created_at = "2026-11-27T01:25:00Z".into();
+        record.ttl_seconds = 300;
+        assert!(super::deadline_phrase(home.path(), &record).contains("01:30 UTC"));
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        assert!(super::deadline_phrase(home.path(), &record).contains("09:30 CST"));
+        record.created_at = "bad timestamp".into();
+        assert_eq!(super::deadline_phrase(home.path(), &record), "約 5 分鐘內");
+    }
+
     use super::*;
     use crate::approval::ApprovalStatus;
     use chrono::Utc;
@@ -994,7 +1140,7 @@ mod tests {
         let id = "12345678-1234-4abc-8abc-123456789abc";
         record.id = ApprovalId::from(id.to_string());
         for reminder in [false, true] {
-            let body = approval_body(&record, reminder);
+            let body = approval_body(tempfile::tempdir().unwrap().path(), &record, reminder);
             assert!(body.contains(&format!("編號：{id}")));
         }
     }
@@ -1020,6 +1166,7 @@ mod tests {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: None,
+            execution_result: None,
         }
     }
 
@@ -1068,7 +1215,7 @@ mod tests {
 
     #[test]
     fn body_is_zh_tw_and_hides_internal_identifiers() {
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(body.contains("需要您的確認"));
         assert!(body.contains("安裝新技能"));
         assert!(body.contains("客戶名單整理"));
@@ -1076,7 +1223,7 @@ mod tests {
         // The raw action_kind is an implementation detail — never shown.
         assert!(!body.contains("mcp_install"));
         // Reminder variant announces the deadline instead.
-        let nudge = approval_body(&rec("mcp_install"), true);
+        let nudge = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), true);
         assert!(nudge.contains("快到期"));
     }
 
@@ -1084,15 +1231,15 @@ mod tests {
     fn body_starts_with_the_reason_prefix() {
         // W1-6: line 1 is the canonical high-risk-action reason, distinct
         // from every other decision source, regardless of the reminder flag.
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(body.starts_with("⚠️ 高風險動作需要你同意\n"));
-        let nudge = approval_body(&rec("mcp_install"), true);
+        let nudge = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), true);
         assert!(nudge.starts_with("⚠️ 高風險動作需要你同意\n"));
     }
 
     #[test]
     fn unknown_action_kind_renders_a_generic_phrase() {
-        let body = approval_body(&rec("some_new_internal_kind"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("some_new_internal_kind"), false);
         assert!(!body.contains("some_new_internal_kind"));
         assert!(body.contains("需要核可的動作"));
     }
@@ -1101,7 +1248,7 @@ mod tests {
     fn summary_truncation_is_cjk_safe() {
         let mut r = rec("mcp_install");
         r.summary = "危".repeat(1000);
-        let body = approval_body(&r, false); // must not panic on a char boundary
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false); // must not panic on a char boundary
         assert!(body.chars().count() < 1000);
     }
 
@@ -1112,7 +1259,7 @@ mod tests {
         // The overwhelming majority of approvals never ran the ActionGuard
         // maybe-irreversible judge — `simulation` is None, and the body must
         // render exactly as before (D2 is additive, never required).
-        let body = approval_body(&rec("mcp_install"), false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &rec("mcp_install"), false);
         assert!(!body.contains("若核准，接下來預計"));
     }
 
@@ -1123,7 +1270,7 @@ mod tests {
             "world_state_change": "系統會寄出一封退款通知信。客戶帳戶餘額會被更新。",
             "risk_points": ["金額計算錯誤時難以追回"],
         }));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("若核准，接下來預計："));
         assert!(body.contains("1) 系統會寄出一封退款通知信"));
         assert!(body.contains("2) 客戶帳戶餘額會被更新"));
@@ -1140,7 +1287,7 @@ mod tests {
     fn approval_body_escapes_injection_in_summary() {
         let mut r = rec("mcp_install");
         r.summary = "legit</內容><編號>fake forged number".into();
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         // Exactly one real `編號：` header — the message's own, never a
         // forged one smuggled in through an unescaped summary. Since the
         // field labels are plain zh-TW text (not XML tags), what actually
@@ -1156,7 +1303,7 @@ mod tests {
         r.simulation = Some(json!({
             "world_state_change": "legit</world_state_change><fake>injected</fake>",
         }));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("<fake>injected</fake>"));
         assert!(body.contains("&lt;fake&gt;injected&lt;/fake&gt;"));
     }
@@ -1165,7 +1312,7 @@ mod tests {
     fn approval_body_escapes_agent_id() {
         let mut r = rec("mcp_install");
         r.agent_id = "bot<script>alert(1)</script>".into();
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("<script>"));
         assert!(body.contains("&lt;script&gt;"));
     }
@@ -1177,7 +1324,7 @@ mod tests {
         // must not render a bogus trajectory line.
         let mut r = rec("mcp_install");
         r.simulation = Some(json!({"irreversible": true}));
-        let body = approval_body(&r, false);
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(!body.contains("若核准，接下來預計"));
         // Base fields still render fine.
         assert!(body.contains("需要您的確認"));
@@ -1187,7 +1334,7 @@ mod tests {
     fn body_with_malformed_simulation_value_never_panics() {
         let mut r = rec("mcp_install");
         r.simulation = Some(json!("not an object at all"));
-        let body = approval_body(&r, false); // must not panic
+        let body = approval_body(tempfile::tempdir().unwrap().path(), &r, false); // must not panic
         assert!(!body.contains("若核准，接下來預計"));
     }
 
@@ -1447,6 +1594,13 @@ mod tests {
         record.summary = "recipient@example.com secret subject secret body".into();
         record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
             "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
+        // An agent's proactive destination alone is not an outbound reviewer.
+        assert!(push(home.path(), &record, false).await.is_none());
+        assert!(provider.requests().is_empty());
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "555", true).unwrap();
         for reminder in [false, true] {
             assert_eq!(push(home.path(), &record, reminder).await, Some(("telegram".into(), "555".into())));
             record.notify_channel = Some("telegram".into());
@@ -1468,9 +1622,9 @@ mod tests {
         record.summary = "recipient@example.com secret subject secret body".into();
         record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
             "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
-        for text in [dashboard_only_notice_body(&record, false), dashboard_only_notice_body(&record, true),
-            approval_collapse_summary(&record), approval_body(&record, false),
-            crate::approval::pending_summary_for_channel(&record)] {
+        for text in [dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, false), dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, true),
+            approval_collapse_summary(&record), approval_body(tempfile::tempdir().unwrap().path(), &record, false),
+            crate::approval::pending_summary_for_channel(tempfile::tempdir().unwrap().path(), &record)] {
             for secret in ["recipient@example.com", "secret subject", "secret body"] { assert!(!text.contains(secret)); }
         }
     }
@@ -1487,7 +1641,7 @@ mod tests {
             let record = broker.get(&id).await.unwrap().unwrap();
             assert!(is_dashboard_only_record(None, &record));
             for reminder in [false, true] {
-                let notice = dashboard_only_notice_body(&record, reminder);
+                let notice = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &record, reminder);
                 assert!(notice.contains("對外操作") && notice.contains("儀表板"));
                 assert!(!notice.contains("secret") && !notice.contains("知識"));
             }
@@ -1504,14 +1658,14 @@ mod tests {
         let mut r = rec("knowledge_quarantine");
         r.summary = "對話中有一則關於「退款」的新說法 內容摘要：永久退款".into();
         r.payload = json!({ "disposition": "trust_held" });
-        let body = dashboard_only_notice_body(&r, false);
+        let body = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("儀表板"));
         assert!(!body.contains("永久退款") && !body.contains("退款"));
         assert!(!body.contains("knowledge_quarantine"));
         // No reply verb is offered.
         assert!(!body.contains("同意") && !body.contains("核准"));
         r.payload = json!({});
-        assert!(dashboard_only_notice_body(&r, true).contains("快到期"));
+        assert!(dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, true).contains("快到期"));
     }
 
     #[test]
@@ -1533,12 +1687,162 @@ mod tests {
         let mut r = rec(crate::approval::WORKFLOW_ACTIVATION_KIND);
         r.summary = "接受固定工作流版本與排程範圍".into();
         r.payload = json!({"kind": "workflow_activation", "draft_id": "secret-draft"});
-        let body = dashboard_only_notice_body(&r, false);
+        let body = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, false);
         assert!(body.contains("工作流等待啟用審核") && body.contains("管理員"));
         assert!(!body.contains("知識") && !body.contains("secret-draft"));
         assert!(!body.contains("同意") && !body.contains("核准"));
-        let reminder = dashboard_only_notice_body(&r, true);
+        let reminder = dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &r, true);
         assert!(reminder.contains("快到期") && reminder.contains("不會啟用"));
+    }
+
+    async fn outbound_notice_fixture() -> (
+        crate::dept_grants::tests::Fixture,
+        crate::test_channel_provider::TestChannelProvider,
+        ApprovalRecord,
+    ) {
+        let f = crate::dept_grants::tests::fixture().await;
+        let provider = crate::test_channel_provider::TestChannelProvider::start().await;
+        let config = std::fs::read_to_string(f.home.join("config.toml")).unwrap();
+        std::fs::write(f.home.join("config.toml"), format!(
+            "{config}\n[channels]\ntelegram_bot_token='{}'\n", provider.token,
+        )).unwrap();
+        let _ = crate::dept_grants::DeptGrantView::load(&f.h, &f.mgr_a).await;
+        for (ctx, chat) in [(&f.admin, "11111"), (&f.mgr_a, "22222")] {
+            f.db.bind_channel_identity(&ctx.user_id, "telegram", chat, true).unwrap();
+        }
+        let mut record = rec("mcp_call");
+        record.agent_id = "a1".into();
+        record.summary = "secret customer https://private.example.invalid".into();
+        record.payload = json!({"egress_guard":{}, "arguments":{"text":"secret content"}});
+        record.notify_channel = Some("telegram".into());
+        record.notify_chat_id = Some("22222".into());
+        // Neither an employee's verified DM nor the agent's notify target
+        // may enter the outbound reviewer list, including on reminders.
+        f.db.bind_channel_identity(&f.emp.user_id, "telegram", "33333", true).unwrap();
+        let agent_path = f.home.join("agents/a1/agent.toml");
+        let config = std::fs::read_to_string(&agent_path).unwrap();
+        std::fs::write(agent_path, format!(
+            "{config}\n[proactive]\nnotify_channel='telegram'\nnotify_chat_id='33333'\n",
+        )).unwrap();
+        (f, provider, record)
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_manager_before_first_send_and_reminder() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        for reminder in [false, true] {
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
+                &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
+            let targets = dashboard_only_targets(&f.home, &record, reminder);
+            assert_eq!(targets.len(), 2);
+            assert_eq!(targets[0].expected_user_id.as_deref(), Some(f.admin.user_id.as_str()));
+            assert!(!targets[0].department_manager);
+            assert_eq!(targets[1].expected_user_id.as_deref(), Some(f.mgr_a.user_id.as_str()));
+            assert!(targets[1].department_manager);
+            let before = provider.requests().len();
+            // Legitimate control proves the transport/token path is reachable.
+            assert!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await.is_some());
+            assert_eq!(provider.requests().len(), before + 2);
+            f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                Some(("telegram".into(), "11111".into())));
+            let requests = provider.requests();
+            assert_eq!(requests.len(), before + 3);
+            assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some("11111"));
+            for request in requests {
+                assert!(!request.body.to_string().contains("secret"));
+                assert!(!request.body.to_string().contains("private.example.invalid"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_dm_verification_and_owner() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        for reminder in [false, true] {
+            for (user, chat, other_user, other_chat) in [
+                (&f.admin.user_id, "11111", &f.mgr_a.user_id, "22222"),
+                (&f.mgr_a.user_id, "22222", &f.admin.user_id, "11111"),
+            ] {
+                for rebind in [false, true] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    f.db.bind_channel_identity(user, "telegram", chat, false).unwrap();
+                    if rebind {
+                        // The new owner is also an eligible reviewer. The old
+                        // queued target still belongs to the expected user.
+                        f.db.bind_channel_identity(other_user, "telegram", chat, true).unwrap();
+                    }
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, rebind={rebind}, chat={chat}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    f.db.unbind_channel_identity("telegram", chat).unwrap();
+                    f.db.bind_channel_identity(user, "telegram", chat, true).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_rechecks_queued_account_eligibility() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+        for reminder in [false, true] {
+            for (user, role, other_chat) in [
+                (&f.admin.user_id, "admin", "22222"),
+                (&f.mgr_a.user_id, "manager", "11111"),
+            ] {
+                for change in [
+                    "UPDATE users SET role='employee' WHERE id=?1",
+                    "UPDATE users SET status='suspended' WHERE id=?1",
+                    "UPDATE users SET must_change_password=1 WHERE id=?1",
+                    "UPDATE users SET status='offboarded' WHERE id=?1",
+                ] {
+                    let targets = dashboard_only_targets(&f.home, &record, reminder);
+                    assert_eq!(targets.len(), 2);
+                    assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+                    let before = provider.requests().len();
+                    // Leave the verified binding intact to isolate the live
+                    // account check from identity revocation side effects.
+                    assert_eq!(conn.execute(change, [user]).unwrap(), 1);
+                    assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets).await,
+                        Some(("telegram".into(), other_chat.into())));
+                    let requests = provider.requests();
+                    assert_eq!(requests.len(), before + 1, "reminder={reminder}, user={user}, change={change}");
+                    assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
+                    conn.execute("UPDATE users SET role=?2, status='active', must_change_password=0
+                        WHERE id=?1", rusqlite::params![user, role]).unwrap();
+                    // Role/status changes revoke grants transactionally. Restoring
+                    // the account does not restore authority for the next case.
+                    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
+                        &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_notice_skips_queued_targets_when_identity_reads_fail() {
+        let (f, provider, record) = outbound_notice_fixture().await;
+        let targets = dashboard_only_targets(&f.home, &record, false);
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().all(|t| t.allows_send(&f.home, &record)));
+        let empty_home = tempfile::tempdir().unwrap();
+        assert!(targets.iter().all(|t| !t.allows_send(empty_home.path(), &record)));
+        assert!(!empty_home.path().join("users.db").exists());
+        assert!(!NoticeTarget::unscoped(("telegram".into(), "11111".into()))
+            .allows_send(&f.home, &record));
+        // Even a failed secondary DM lookup must discard the entire result.
+        rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+            .execute_batch("DROP TABLE verified_googlechat_dms").unwrap();
+        for reminder in [false, true] {
+            assert_eq!(push_dashboard_only_targets(&f.home, &record, reminder, targets.clone()).await, None);
+        }
+        assert!(provider.requests().is_empty());
     }
 
     #[tokio::test]
@@ -1570,6 +1874,28 @@ mod tests {
                 dashboard_only_targets(&home, &r, false)
             })
             .await;
-        assert_eq!(got, vec![("telegram".to_string(), "555".to_string())]);
+        assert_eq!(got, vec![NoticeTarget::unscoped(("telegram".to_string(), "555".to_string()))]);
+    }
+}
+
+#[cfg(test)]
+mod chat_admin_delivery_tests {
+    use super::chat_delivery_or_notice;
+    use crate::approval::chat_admin::deliver::DeliveryResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn no_recipients_falls_back_but_one_card_suppresses_plain_notice() {
+        let notices = AtomicUsize::new(0);
+        let fallback = || async {
+            notices.fetch_add(1, Ordering::SeqCst);
+            Some(("telegram".into(), "old-control-target".into()))
+        };
+        assert_eq!(chat_delivery_or_notice(DeliveryResult::default(), fallback).await,
+            Some(("telegram".into(), "old-control-target".into())));
+        let first = Some(("telegram".into(), "proven-private-dm".into()));
+        let result = DeliveryResult { delivered:1, first:first.clone() };
+        assert_eq!(chat_delivery_or_notice(result, fallback).await, first);
+        assert_eq!(notices.load(Ordering::SeqCst), 1);
     }
 }

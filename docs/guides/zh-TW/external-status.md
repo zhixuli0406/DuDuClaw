@@ -100,7 +100,7 @@ curl -s "https://ai.example.com/api/v1/status/employees?agent_id=sales" \
 | --- | --- |
 | `in_progress` | 進行中與排隊中的任務（待辦、排隊、執行中、修改中）。 |
 | `awaiting_confirmation` | 等人處理的任務（待審查、需要人工確認、待核准），加上這位員工尚未決定的核准請求；核准請求只計入這位同仁在儀表板核准中心看得到的部分（主管〔Manager〕以上）。 |
-| `done_today` | 今天（gateway 主機時區）完成的任務數。 |
+| `done_today` | 今天完成的任務數，以公司時區計算；未設定時使用 UTC。 |
 | `done_7d` | 最近 7 天完成的任務數。 |
 | `latest_done` | 這位同仁看得到的最近完成任務：標題與完成時間；沒有就是 `null`。**只有安裝了本機個資偵測模型時才會給標題**（資料遮蔽規則組「AI 智慧偵測」的模型，即在本機執行的 OpenAI Privacy Filter；勾選該規則組時可從卡片下載，詳見[資料遮蔽說明](../../features/55-data-sources.md)），而且模型必須成功掃過這個標題；否則 `title` 一律為 `null`，只給 `completed_at`。偵測前會先移除看不見的字元、零寬字元與雙向控制字元，並做 NFKC 正規化；若同一個詞混用外觀相似的字母系統（例如拉丁字母的電子郵件裡夾了一個西里爾字母 `а`），`title` 為 `null`。接著標題會先遮蔽、再截成最多 60 個字：模型找到的姓名、地址、電子郵件、電話與帳號，以及憑證類字串、電子郵件、電話號碼（含全形數字與 `+886`）、身分證／居留證號、連續 8 位以上的數字（帳號、客戶、卡號）、有標籤的識別資料（「帳號」「客戶編號」、`account no.`）、帶稱謂的姓名（「王先生」、`Mr. Smith`）以及共用 wiki 人員名錄中的姓名，都會變成 `＊＊＊`；截短後的結果會再檢查一次。模型執行失敗或任何部分無法安全遮蔽時，`title` 為 `null`。模型能降低、但無法保證完全沒有個人資料。 |
 
@@ -133,3 +133,9 @@ curl -s "https://ai.example.com/api/v1/status/employees?agent_id=sales" \
 - 現有的 DuDuClaw Connector 模組把「Gateway URL」用於 `/ingest/transcript`（MCP 伺服器）並使用 MCP API Key。查詢員工狀態需要的是 **儀表板 gateway 網址** 與同仁自己的 `ddc_status_` 憑證，兩者不能互換。
 - 每位同仁的卡片應使用他自己的憑證，才只會看到自己綁定的員工；不要讓全公司共用一組。
 - Odoo 主機需要能連到儀表板 gateway。卡片的實作（Odoo 端模組更新）不在本次範圍。
+
+## 本人 API 金鑰選項（v1.86.0）
+
+上面的狀態專用憑證仍不會傳回對話。另一種本人 API 金鑰可在 `me.member_keys.create` 帶入 `include_conversations=true`，選擇「包含我的對話內容」，但須管理員的 `[member_api_keys] allow_conversation_content` 允許建立。預設關閉，只開放自己的網頁對話，即使是共用 AI 員工的 Owner 也不例外；舊金鑰保留此選項並標示已遷移。建立仍須密碼／MFA 重新驗證。
+
+可選 `mcp_scopes` 為 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`，受 `[member_api_keys] allow_mcp_scopes`（預設空）限制。成員在「外部存取」（`/me/external-access`）建立金鑰時，勾選「包含我的對話內容」與外部工具權限，之後只能縮小範圍。管理員在同頁使用兩個總開關。詳見[成員 API 契約](../../api/member-contract.md#personal-member-api-keys-1850)。

@@ -12,6 +12,9 @@ import { useSystemStore } from '@/stores/system-store';
 /** Shared response shape — satisfies security.status() / auditLog() /
  *  killswitch.get() in one mocked call (see the first test's own note). */
 const SECURITY_RESPONSE = {
+  enabled: false, channels: ['telegram'], step_up_methods: ['web'], card_valid_hours: 168,
+  readable: true, hash: 'chat-hash', enabled_ack: null, kinds: [], t1_kinds: [],
+  admins: [], web_link_available: false, unsupported_channels_ignored: false,
   events: [],
   triggers: {
     max_replies_per_minute: 30,
@@ -341,5 +344,7 @@ describe('Knowledge owner self-add master setting', () => {
     mockWsClient.call.mockResolvedValue(SECURITY_RESPONSE);
     renderWithProviders(<SecurityPage />);
     expect(screen.queryByRole('switch', { name: 'Allow owners to enable AI self-add' })).toBeNull();
+    expect(screen.queryByText('Approve in chat')).not.toBeInTheDocument();
+    expect(mockWsClient.call).not.toHaveBeenCalledWith('approvals.chat_admin.get', {});
   });
 });

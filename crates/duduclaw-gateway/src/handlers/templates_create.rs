@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::google_signin::avatar::AvatarCreation;
 
 impl MethodHandler {
     /// `templates.create_agent` — create ONE agent from a (possibly edited)
@@ -66,6 +67,18 @@ impl MethodHandler {
         skills: Option<&std::collections::BTreeMap<String, String>>, premium: bool, install_evals: bool, disabled_skills: &[String],
         batch_admission: Option<&duduclaw_core::agent_seats::SeatAdmission>,
     ) -> WsFrame {
+        self.create_template_with_skills_inner(params, Some(caller), premium_dir, role_id,
+            assembled, skills, premium, install_evals, disabled_skills, batch_admission,
+            AvatarCreation::None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_template_with_skills_inner(
+        &self, params: &Value, caller: Option<&UserContext>, premium_dir: &Path,
+        role_id: &str, assembled: &crate::premium_templates::AssembledRole,
+        skills: Option<&std::collections::BTreeMap<String, String>>, premium: bool, install_evals: bool, disabled_skills: &[String],
+        batch_admission: Option<&duduclaw_core::agent_seats::SeatAdmission>, avatar: AvatarCreation<'_>,
+    ) -> WsFrame {
         use crate::premium_templates as pt;
         // Native Linux protected mode (SR2 1c): a protected employee exists
         // only through an approved Employee proposal. Every template writer
@@ -74,7 +87,15 @@ impl MethodHandler {
             crate::runtime_readiness::isolation_active()) {
             return refused;
         }
-        if !caller.is_admin() { return WsFrame::error_response("", "Administrator required"); }
+        if !avatar.is_signin() && !caller.is_some_and(UserContext::is_admin) {
+            return WsFrame::error_response("", "Administrator required");
+        }
+        let avatar_db = if avatar.member().is_some() {
+            let Some(db) = self.user_db.read().await.clone() else {
+                return WsFrame::error_response("", "無法讀取成員資料，未建立分身。");
+            };
+            Some(db)
+        } else { None };
         if let Err(error) = self.validate_template_policy(assembled) {
             return WsFrame::error_response("", &error);
         }
@@ -232,12 +253,13 @@ impl MethodHandler {
         // passes its own held admission (all members admitted at once).
         let own_admission = match batch_admission {
             Some(_) => None,
-            None => match self.admit_agent_seats(1, None).await {
+            None => match self.admit_agent_seats(usize::from(avatar.member().is_none()), None).await {
                 Ok(admission) => Some(admission),
                 Err(refusal) => return super::agents_basic::seat_refusal_frame(refusal),
             },
         };
 
+        let seat_cap = self.effective_agent_cap().await;
         let agents_dir = self.registry.read().await.agents_dir().to_path_buf();
         let agent_dir = agents_dir.join(&name);
 
@@ -262,6 +284,24 @@ impl MethodHandler {
         };
         // Dropping `staged` on any early return removes the staging dir.
         let stage_dir = staged.path().to_path_buf();
+        let publication = match avatar.publication(&stage_dir, &agent_dir) {
+            Ok(proof) => proof,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to create directory: {e}")),
+        };
+
+        // Only onboarding uses this guard; existing template callers keep
+        // their original rollback behaviour. Restore only switches we added.
+        let mut signin_skills = if avatar.is_signin() && !disabled_skills.is_empty() {
+            let before = duduclaw_agent::skill_state::read_disabled(&self.home_dir, &name);
+            if before.error().is_some() {
+                return WsFrame::error_response("", "Unable to preserve disabled template skills");
+            }
+            Some(SigninSkillRollback {
+                home: self.home_dir.clone(), name: name.clone(),
+                added: disabled_skills.iter().filter(|key| !before.is_disabled(key)).cloned().collect(),
+                written: false, committed: false,
+            })
+        } else { None };
 
         // Write SOUL.md / CONTRACT.toml / extras / agent.toml into the
         // staging directory; the directory rename after the authority commit
@@ -309,10 +349,14 @@ impl MethodHandler {
             }
 
             if !disabled_skills.is_empty() {
+                if let Some(rollback) = &mut signin_skills { rollback.written = true; }
                 duduclaw_agent::skill_state::set_disabled(&self.home_dir, &name, disabled_skills, true)
                     .map_err(|_| "Unable to preserve disabled template skills")?;
             }
 
+            // Validate the final serialized profile, including caller edits and
+            // runtime alignment, against a new employee's absent Odoo baseline.
+            super::config_commit::refuse_odoo_agent_widening_text_edit("", &agent_toml)?;
             tokio::fs::write(stage_dir.join("agent.toml"), &agent_toml)
                 .await
                 .map_err(|e| format!("Failed to write agent.toml: {e}"))?;
@@ -355,9 +399,49 @@ impl MethodHandler {
                 };
                 duduclaw_core::OrgEntry::new(field("reports_to"), field("department"))
             };
-            if let Err(e) = staged.publish(&org, org_entry) {
+            // Prepare org authority before entering users.db, exactly as the
+            // blank-avatar writer does; no second SQLite writer inside the tx.
+            let result = if let (Some(db), Some(member), Some(actor)) =
+                (avatar_db.as_ref(), avatar.member(), avatar.actor()) {
+                let prior_org = duduclaw_core::org_store::load(&self.home_dir).get(&name).cloned();
+                let mut prepared_org = false;
+                let mut published = false;
+                let result = duduclaw_core::org_store::upsert(&org, &name, org_entry.clone())
+                    .map_err(|e| e.to_string()).and_then(|_| {
+                        prepared_org = true;
+                        let admission = own_admission.as_ref().or(batch_admission)
+                            .ok_or("Avatar seat admission unavailable")?;
+                        db.publish_new_avatar_under_as(actor, member, &name, admission, seat_cap, |conn| {
+                            let result = staged.publish_in_users_transaction(&org, org_entry, conn);
+                            published = match &publication {
+                                Some(proof) => proof.published(),
+                                None => match std::fs::symlink_metadata(&agent_dir) {
+                                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                                    _ => true,
+                                },
+                            };
+                            result.map(|_| ()).map_err(|e| e.to_string())
+                        })
+                    });
+                result.map_err(|mut error| {
+                    if published || prepared_org {
+                        let cleanup = if published { std::fs::remove_dir_all(&agent_dir) } else { Ok(()) };
+                        let authority = match prior_org {
+                            Some(entry) => duduclaw_core::org_store::upsert(&org, &name, entry).map(|_| ()),
+                            None => duduclaw_core::org_store::remove(&org, &name).map(|_| ()),
+                        };
+                        if cleanup.as_ref().is_err_and(|e| e.kind() != std::io::ErrorKind::NotFound) || authority.is_err() {
+                            error.push_str("；AI 建立失敗，清理未完成，請管理員檢查 AI 資料。未取得名額豁免。");
+                        }
+                    }
+                    error
+                })
+            } else {
+                staged.publish(&org, org_entry).map(|_| ()).map_err(|e| e.to_string())
+            };
+            if let Err(e) = result {
                 warn!(agent = %name, error = %e, "templates.create_agent refused: org authority not committed");
-                if !disabled_skills.is_empty() {
+                if !avatar.is_signin() && !disabled_skills.is_empty() {
                     let _ = duduclaw_agent::skill_state::set_disabled(&self.home_dir, &name, disabled_skills, false);
                 }
                 // RM-027 round 5: the create did not happen — put back the
@@ -366,6 +450,7 @@ impl MethodHandler {
                     Some(d) => self.restore_demoted_main(d).await.err(),
                     None => None,
                 };
+                drop(signin_skills.take());
                 drop(org);
                 drop(own_admission);
                 return WsFrame::error_response(
@@ -374,18 +459,25 @@ impl MethodHandler {
                 );
             }
         }
+        if let Some(rollback) = &mut signin_skills { rollback.committed = true; }
+        drop(publication);
         drop(org);
         // Verify the effective artifact before either the own or batch
         // admission can be released.
-        if let Some(admission) = own_admission.as_ref().or(batch_admission) {
-            if let Err(error) = admission.recount(self.effective_agent_cap().await) {
-                return WsFrame::error_response("", &error);
+        // Avatar recount already ran inside the users transaction, while both
+        // locks were held. Do not add a fallible step after that commit.
+        if avatar.member().is_none() {
+            if let Some(admission) = own_admission.as_ref().or(batch_admission) {
+                if let Err(error) = admission.recount(self.effective_agent_cap().await) {
+                    return WsFrame::error_response("", &error);
+                }
             }
         }
         drop(own_admission);
 
         // Same protections as agents.create: file-guard hook + registry rescan.
-        alignment.audit(&self.home_dir, &name, "templates.create_agent", &caller.user_id);
+        alignment.audit(&self.home_dir, &name, "templates.create_agent",
+            caller.map(|ctx| ctx.user_id.as_str()).unwrap_or("system:google_signin"));
 
         let bin = crate::agent_hook_installer::resolve_duduclaw_bin();
         if let Err(e) =
@@ -441,6 +533,26 @@ impl MethodHandler {
     }
 }
 
+/// Roll back skill switches on every onboarding failure, including an early
+/// write error or a users transaction failure after the directory was published.
+struct SigninSkillRollback {
+    home: PathBuf,
+    name: String,
+    added: Vec<String>,
+    written: bool,
+    committed: bool,
+}
+
+impl Drop for SigninSkillRollback {
+    fn drop(&mut self) {
+        if self.written && !self.committed && !self.added.is_empty() {
+            if let Err(error) = duduclaw_agent::skill_state::set_disabled(&self.home, &self.name, &self.added, false) {
+                warn!(agent = %self.name, error = %error, "signin avatar skill rollback failed");
+            }
+        }
+    }
+}
+
 /// Same final-document preparation used by the licensed template writer.
 pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(String,crate::runtime_config::ModelRuntimeAlignment),String> {
     let mut table:toml::Table=original.parse().map_err(|e|format!("Invalid agent.toml: {e}"))?;
@@ -460,6 +572,58 @@ pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn templates_create_agent_checks_final_caller_text_against_absent_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        let assets = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().into()).await;
+        handler.set_agent_cap_fixture(Some(0)).await;
+        let assembled = crate::premium_templates::AssembledRole {
+            role_id: "owned-role".into(), kind: crate::premium_templates::RoleKind::Worker,
+            name: "template".into(), display_name: "Template".into(), trigger: "@Template".into(),
+            reports_to: String::new(), summary: "Owned fixture".into(), soul_md: "Helpful".into(),
+            contract_toml: String::new(), extras_dir: None,
+            agent_toml: include_str!("../../../../templates/evaluator/agent.toml").into(),
+        };
+        let admin = UserContext::admin_fallback();
+        let bad = format!("{}\n[odoo]\nact_as_requester = true\n", assembled.agent_toml);
+        let response = handler.create_assembled_template_agent(
+            &json!({"name":"unsafe","agent_toml":bad}), &admin, assets.path(), "owned-role", &assembled,
+        ).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
+            if e.as_str().is_some_and(|s| s.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"))));
+        assert!(!home.path().join("agents/unsafe").exists());
+        assert!(handler.registry.read().await.get("unsafe").is_none());
+        // Team/template batch apply holds one admission and reaches the same
+        // final-text writer with assembled content rather than editor params.
+        let admission = match handler.admit_agent_seats(1, None).await {
+            Ok(value) => value,
+            Err(_) => panic!("owned fixture must admit one employee"),
+        };
+        let mut unsafe_role = assembled.clone();
+        unsafe_role.agent_toml = bad;
+        let response = handler.create_template_with_skills(
+            &json!({"name":"unsafe-batch"}), &admin, assets.path(), "owned-role", &unsafe_role,
+            Some(&std::collections::BTreeMap::new()), false, false, &[], Some(&admission),
+        ).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
+            if e.as_str().is_some_and(|s| s.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"))));
+        assert!(!home.path().join("agents/unsafe-batch").exists());
+        drop(admission);
+        for (index, fields) in ["", "permission_override='inherit'", "permission_override='engine'",
+            "permission_override='read_only'", "permission_override='unknown'"].into_iter().enumerate() {
+            let name = format!("safe-{index}");
+            let text = format!("{}\n[odoo]\n{fields}\n", assembled.agent_toml);
+            let response = handler.create_assembled_template_agent(
+                &json!({"name":name,"agent_toml":text}), &admin, assets.path(), "owned-role", &assembled,
+            ).await;
+            assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+            let published = std::fs::read_to_string(home.path().join("agents").join(&name).join("agent.toml")).unwrap();
+            super::super::config_commit::refuse_odoo_agent_widening_text_edit("", &published).unwrap();
+            assert!(handler.registry.read().await.get(&name).is_some());
+        }
+    }
 
     #[test]
     fn templates_create_evolution_defaults_on_and_preserves_explicit_false() {

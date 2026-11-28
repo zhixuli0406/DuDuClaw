@@ -174,3 +174,15 @@ it('explains disabled email and passkey enrollment choices on an insecure connec
   expect(screen.getByText(/server has no outgoing email/)).toHaveTextContent('SMTP');
   expect(screen.getByText(/Passkeys require HTTPS or localhost/)).toHaveTextContent('http://');
 });
+
+
+it('passes the login enrollment token and independent proof to Email setup', async () => {
+  const send = vi.spyOn(mfaApi, 'emailSend').mockResolvedValue({ sent: true, expires_in: 600 });
+  renderWithProviders(<LoginMfa challenge={{ mfa_enrollment_required: true, enrollment_token: 'email-enroll', challenge_ref: 'email-ref', email_available: true }} onComplete={vi.fn()} onCancel={vi.fn()} />);
+  fireEvent.change(screen.getByLabelText('Choose a verification method'), { target: { value: 'email' } });
+  expect(screen.getByText('email-ref')).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('Current password'), { target: { value: 'password' } });
+  fireEvent.change(screen.getByLabelText('Channel or Admin enrollment code'), { target: { value: 'proof' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Send code' }));
+  await waitFor(() => expect(send).toHaveBeenCalledWith({ enrollment_token: 'email-enroll', password: 'password', proof_code: 'proof' }));
+});

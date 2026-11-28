@@ -126,6 +126,10 @@ pub enum Scope {
     /// dashboard; not externally grantable (same reason as
     /// [`Scope::KnowledgeRead`]).
     KnowledgeWrite,
+    /// Personal-key task visibility, never the server employee's task board.
+    TasksRead,
+    /// Personal-key employee visibility, never the server employee's identity.
+    AgentsStatus,
     Admin,
 }
 
@@ -160,6 +164,8 @@ impl std::fmt::Display for Scope {
             Scope::DiscoveryExecute => "discovery:execute",
             Scope::KnowledgeRead => "knowledge:read",
             Scope::KnowledgeWrite => "knowledge:write",
+            Scope::TasksRead => "tasks:read",
+            Scope::AgentsStatus => "agents:status",
             Scope::Admin => "admin",
         };
         write!(f, "{s}")
@@ -202,6 +208,8 @@ fn scope_from_str(s: &str) -> Option<Scope> {
         "discovery:execute" => Scope::DiscoveryExecute,
         "knowledge:read" => Scope::KnowledgeRead,
         "knowledge:write" => Scope::KnowledgeWrite,
+        "tasks:read" => Scope::TasksRead,
+        "agents:status" => Scope::AgentsStatus,
         "admin" => Scope::Admin,
         _ => return None,
     })
@@ -252,6 +260,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         "knowledge_search" | "knowledge_get_passage" | "knowledge_list_collections" => Some(Scope::KnowledgeRead),
         // Proposing a source: always approval-gated by the gateway route.
         "knowledge_add_source" => Some(Scope::KnowledgeWrite),
+        "my_tasks_list" => Some(Scope::TasksRead),
+        "my_agents_status" => Some(Scope::AgentsStatus),
         // ── Memory: read family ──────────────────────────────────────────
         "memory_search"
         | "memory_read"
@@ -359,7 +369,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         | "odoo_crm_update_stage"
         | "odoo_sale_create_quotation"
         | "odoo_create"
-        | "odoo_write" => Some(Scope::OdooWrite),
+        | "odoo_write" | "odoo_activity_create" | "odoo_note_post"
+        | "odoo_message_send" | "odoo_attachment_add" => Some(Scope::OdooWrite),
         // Execute class: workflow buttons + generic execute_kw + report
         // generation. These can fire arbitrary Odoo-side actions.
         "odoo_sale_confirm" | "odoo_execute" | "odoo_report" => Some(Scope::OdooExecute),
@@ -511,6 +522,8 @@ pub fn tool_requires_scope(tool_name: &str) -> Option<Scope> {
         // lifecycle + dispatch) — enumerated explicitly instead of relying
         // on the Admin fall-through (2026-07 scope-table consistency).
         | "spawn_ephemeral"
+        | "admin_settings_read"
+        | "admin_settings_propose"
         | "agent_update"
         | "agent_update_soul"
         | "agent_remove"

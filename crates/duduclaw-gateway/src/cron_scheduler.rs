@@ -277,7 +277,11 @@ impl CronScheduler {
                 }
                 let Some(slot) = latest_routine_slot(&row, cursor, now)? else { return Ok(None) };
                 if let Err(pause) = cron_autonomy_check(&self.home_dir, &self.registry, &row.agent_id).await {
-                    self.store.record_autonomy_skip(&row.id, &pause).await?;
+                    if crate::entry_gate::background_refusal_code(&pause).is_some() {
+                        self.store.record_run(&row.id, false, Some(&pause)).await?;
+                    } else {
+                        self.store.record_autonomy_skip(&row.id, &pause).await?;
+                    }
                     self.store.advance_routine_cursor(&row.id, &material_hash, slot.timestamp()).await?;
                     return Ok(None);
                 }
@@ -809,7 +813,10 @@ async fn dispatch_cron_task_checked(
     match cron_autonomy_check(home_dir, registry, &task.agent_id).await {
         Ok(agent) => effective_task.agent_id = agent,
         Err(reason) => {
-            if let Err(error) = store.record_autonomy_skip(&task.id, &reason).await {
+            let recorded = if crate::entry_gate::background_refusal_code(&reason).is_some() {
+                store.record_run(&task.id, false, Some(&reason)).await
+            } else { store.record_autonomy_skip(&task.id, &reason).await };
+            if let Err(error) = recorded {
                 warn!(id = %task.id, %error, "cron autonomy skip could not be recorded");
             }
             return;
@@ -992,6 +999,8 @@ async fn cron_autonomy_check(home: &Path, registry: &Arc<RwLock<AgentRegistry>>,
     } else {
         agent.to_string()
     };
+    crate::entry_gate::check_task_assignee(home, &effective)
+        .map_err(|refusal| crate::entry_gate::background_refusal(&refusal))?;
     autonomy_gate::check(home, &effective, AutonomyPath::Cron)
         .map_err(|pause| {
             let reason = format!("autonomy paused: {pause}");
@@ -1849,6 +1858,25 @@ mod principal_tests;
 mod tests {
     use super::*;
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn real_cron_invoker_refuses_bad_employee_before_model_call() {
+        let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(
+            duduclaw_core::types::RuntimeType::Codex).await;
+        let path = {
+            let reg = ctx.registry.read().await;
+            crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path
+        };
+        let mut doc: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+        doc["runtime"]["provider"] = toml::Value::String("claude".into());
+        std::fs::write(path, toml::to_string(&doc).unwrap()).unwrap();
+        let before = crate::model_call_probe::calls();
+        let error = RealAgentInvoker.invoke(home.path(), &ctx.registry, "worker", "work").await.unwrap_err();
+        assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"));
+        assert_eq!(crate::model_call_probe::calls(), before);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+
     #[tokio::test]
     async fn cron_delivery_strips_markers_before_text_clamp() {
         let home = tempfile::tempdir().unwrap();
@@ -1864,6 +1892,23 @@ mod tests {
         }
     }
 
+
+    #[tokio::test]
+    async fn legacy_null_cron_row_still_fires_utc_with_company_zone_set() {
+        use chrono::TimeZone;
+        let home = tempfile::tempdir().unwrap();
+        let store = crate::cron_store::CronStore::open(home.path()).unwrap();
+        let row = CronTaskRow::new("legacy".into(), "Legacy".into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        store.insert(&row).await.unwrap();
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'\n").unwrap();
+        assert_eq!(duduclaw_core::company_timezone::read(home.path()),
+            duduclaw_core::company_timezone::CompanyZone::Set(chrono_tz::Asia::Taipei));
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(stored.cron_timezone, None);
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        assert_eq!(next_run(&stored, now), Some(Utc.with_ymd_and_hms(2026, 11, 27, 9, 0, 0).unwrap()));
+    }
 
     #[test]
     fn cron_next_run_matches_scheduler_in_taipei_and_new_york() {

@@ -1748,6 +1748,7 @@ dependencies = [
  "tracing",
  "uuid",
  "webauthn-rs",
+ "zeroize",
 ]
 
 [[package]]
@@ -1797,7 +1798,7 @@ dependencies = [
  "hex",
  "http",
  "http-body-util",
- "iana-time-zone",
+ "image",
  "json5",
  "libc",
  "minisign-verify",
@@ -1875,6 +1876,7 @@ dependencies = [
  "fs2",
  "getrandom 0.3.4",
  "hmac",
+ "iana-time-zone",
  "keyring",
  "libc",
  "minisign-verify",
@@ -2070,6 +2072,7 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha1",
  "sha2",
  "tar",
@@ -2362,6 +2365,7 @@ dependencies = [
 name = "duduclaw-odoo"
 version = "1.85.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "duduclaw-core",
  "duduclaw-security",

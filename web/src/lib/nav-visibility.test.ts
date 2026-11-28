@@ -88,3 +88,27 @@ describe('nav-visibility (dashboard-redesign WP11-T11.1)', () => {
     expect(asManagerPersonal).toEqual([{}]);
   });
 });
+
+
+describe('department grant alternatives', () => {
+  const routines: Gated = { minRole: 'admin', orGrant: 'schedules' };
+  const ctx = { deptGroups: new Set<import('./dept-grants-types').GrantGroup>(['schedules']) };
+
+  it('only substitutes the required role with the matching grant', () => {
+    expect(isVisible(routines, 'manager', false)).toBe(false);
+    expect(isVisible(routines, 'manager', false, { deptGroups: new Set() })).toBe(false);
+    expect(isVisible(routines, 'manager', false, ctx)).toBe(true);
+    expect(isVisible(routines, 'manager', false, { deptGroups: new Set(['skills']) })).toBe(false);
+    expect(isVisible(routines, 'admin', false)).toBe(true);
+  });
+
+  it.each<Gated>([
+    { enterprise: true }, { personalHidden: true }, { desktopOnly: true },
+    { operatorOnly: true }, { requiresData: 'forks' }, { requiresData: 'org' },
+    { requiresData: 'appliance' }, { requiresData: 'protected' },
+    { requiresFeature: 'decision' },
+  ])('does not bypass another gate: %j', (gate) => {
+    expect(isVisible({ ...routines, ...gate }, 'employee', true,
+      { ...ctx, decisionEnabled: false })).toBe(false);
+  });
+});

@@ -182,3 +182,227 @@ fn email_http_capability_refuses_consumed_login_and_inactive_user() {
     db.conn().execute("UPDATE users SET status='suspended' WHERE id=?1",[&id]).unwrap();
     assert!(db.mfa_email_http_capability(&token,false,None,3000).is_err());
 }
+
+fn pending_email(db: &UserDb, user: &str, now: i64) -> String {
+    let token=db.mfa_challenge(user,FirstFactor::Password,true,now).unwrap();
+    db.mfa_prepare_enrollment(&token,true,now).unwrap();
+    token
+}
+
+fn prove_email(db: &UserDb, user: &str, token: &str, now: i64) -> String {
+    let code=db.mfa_issue_enrollment_code(None,user,&enrollment_challenge_ref(token),now).unwrap();
+    db.mfa_prove_enrollment(token,&code,now).unwrap();
+    code
+}
+
+fn assert_email_not_written(db: &UserDb, user: &str) {
+    let counts:(i64,i64)=db.conn().query_row("SELECT
+        (SELECT COUNT(*) FROM mfa_email_credentials WHERE user_id=?1),
+        (SELECT COUNT(*) FROM mfa_recovery_codes WHERE user_id=?1)",
+        [user],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(counts,(0,0));
+}
+
+#[test]
+fn email_enforced_first_enrollment_requires_proof_before_send_and_write() {
+    for proof in ["missing", "admin", "password", "unknown"] {
+        let (_dir,db,id)=setup();
+        record_enforcement(&mut db.conn(),true,1000).unwrap();
+        let token=pending_email(&db,&id,1001);
+        match proof {
+            "missing" => { db.conn().execute("DELETE FROM mfa_enrollment_proofs WHERE token_hash=?1",[token_hash(&token)]).unwrap(); },
+            "admin" => {}, // The normal pending, unverified Admin proof.
+            kind => { db.conn().execute("UPDATE mfa_enrollment_proofs SET kind=?2,verified=1 WHERE token_hash=?1",params![token_hash(&token),kind]).unwrap(); },
+        }
+        assert!(db.mfa_email_http_capability(&token,true,None,1001).is_err(),"{proof}");
+        assert!(db.mfa_email_send(&token,true,1001).is_err(),"{proof}");
+        let counts:(i64,i64)=db.conn().query_row("SELECT (SELECT COUNT(*) FROM mfa_email_codes),
+            (SELECT COUNT(*) FROM mfa_email_sends)",[],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+        assert_eq!(counts,(0,0));
+        // A valid delivery record must not bypass the authoritative write gate.
+        db.conn().execute("INSERT INTO mfa_email_codes(token_hash,user_id,email,code_hash,expires_at)
+            SELECT ?1,id,email,?3,?4 FROM users WHERE id=?2",
+            params![token_hash(&token),id,email_hash(&token,"123456"),1601]).unwrap();
+        assert!(db.mfa_email_verify_and_issue(&token,"123456",true,1001,|_,_,_| -> Result<()> {
+            panic!("refused enrollment issued tokens")
+        }).is_err(),"{proof}");
+        assert_email_not_written(&db,&id);
+    }
+}
+
+#[test]
+fn email_admin_proof_is_single_use_and_enrollment_issues_recovery_and_tokens() {
+    let (_dir,db,id)=setup();
+    record_enforcement(&mut db.conn(),true,1000).unwrap();
+    let token=pending_email(&db,&id,1001);
+    let proof=prove_email(&db,&id,&token,1001);
+    let other=pending_email(&db,&id,1001);
+    assert!(db.mfa_prove_enrollment(&other,&proof,1001).is_err());
+    assert!(db.mfa_email_send(&other,true,1001).is_err());
+    db.mfa_email_http_capability(&token,true,None,1001).unwrap();
+    let (_,code)=db.mfa_email_send(&token,true,1001).unwrap();
+    let codes=db.mfa_email_verify_and_issue(&token,&code,true,1001,|account,_,codes| {
+        assert_eq!(account.id,id);
+        assert_eq!(account.credential_epoch,1);
+        Ok(codes)
+    }).unwrap();
+    assert_eq!(codes.len(),10);
+    assert!(db.mfa_active(&id).unwrap());
+    assert!(db.mfa_email_verify_and_issue(&token,&code,true,1001,|_,_,_| -> Result<()> {
+        panic!("reused proof issued tokens")
+    }).is_err());
+    db.mfa_operator_reset("mfa@example.com").unwrap();
+    let next=pending_email(&db,&id,1062);
+    assert!(db.mfa_prove_enrollment(&next,&proof,1062).is_err());
+    assert!(db.mfa_email_send(&next,true,1062).is_err());
+}
+
+#[test]
+fn email_prepared_proof_rechecks_epoch_factor_status_and_kind() {
+    for after_send in [false,true] {
+        for change in ["epoch", "factor", "disabled", "unknown", "unverified", "missing_epoch"] {
+            let (_dir,db,id)=setup();
+            record_enforcement(&mut db.conn(),true,1000).unwrap();
+            let token=pending_email(&db,&id,1001);
+            prove_email(&db,&id,&token,1001);
+            let code=if after_send { db.mfa_email_send(&token,true,1001).unwrap().1 } else { "123456".into() };
+            match change {
+                "epoch" => { db.conn().execute("UPDATE users SET credential_epoch=credential_epoch+1 WHERE id=?1",[&id]).unwrap(); },
+                // Keep the epoch unchanged to exercise the public capability guard.
+                "factor" => { db.conn().execute("INSERT INTO mfa_credentials(user_id,secret_enc,last_step) VALUES(?1,'fixture',0)",[&id]).unwrap(); },
+                "disabled" => { db.conn().execute("UPDATE users SET status='suspended' WHERE id=?1",[&id]).unwrap(); },
+                "unknown" => { db.conn().execute("UPDATE mfa_enrollment_proofs SET kind='unknown' WHERE token_hash=?1",[token_hash(&token)]).unwrap(); },
+                "unverified" => { db.conn().execute("UPDATE mfa_enrollment_proofs SET verified=0 WHERE token_hash=?1",[token_hash(&token)]).unwrap(); },
+                "missing_epoch" => { db.conn().execute("UPDATE mfa_enrollment_proofs SET credential_epoch=NULL WHERE token_hash=?1",[token_hash(&token)]).unwrap(); },
+                _ => unreachable!(),
+            }
+            assert!(db.mfa_email_http_capability(&token,true,None,1061).is_err(),"{change}");
+            assert!(db.mfa_email_send(&token,true,1061).is_err(),"{change}");
+            assert!(db.mfa_email_verify_and_issue(&token,&code,true,1061,|_,_,_| -> Result<()> {
+                panic!("stale proof issued tokens")
+            }).is_err(),"{change}");
+            assert_email_not_written(&db,&id);
+        }
+    }
+}
+
+#[test]
+fn email_legacy_database_without_epoch_column_upgrades_fail_closed() {
+    let (dir,db,id)=setup();
+    let path=dir.path().join("users.db");
+    db.conn().execute("UPDATE users SET credential_epoch=7 WHERE id=?1",[&id]).unwrap();
+    record_enforcement(&mut db.conn(),true,1000).unwrap();
+    let legacy=pending_email(&db,&id,1001);
+    prove_email(&db,&id,&legacy,1001);
+    let (_,legacy_code)=db.mfa_email_send(&legacy,true,1001).unwrap();
+    // Match the prototype migration tests: retain a pending enrollment and
+    // valid delivery, but remove the new schema before reopening the file DB.
+    db.conn().execute_batch("DROP TRIGGER mfa_email_enrollment_epoch;
+        ALTER TABLE mfa_enrollment_proofs DROP COLUMN credential_epoch;").unwrap();
+    assert!(!crate::user_row::has_column(&db.conn(),"mfa_enrollment_proofs","credential_epoch").unwrap());
+    drop(db);
+
+    let db=UserDb::new(&path).unwrap();
+    assert!(crate::user_row::has_column(&db.conn(),"mfa_enrollment_proofs","credential_epoch").unwrap());
+    let legacy_epoch:Option<i64>=db.conn().query_row(
+        "SELECT credential_epoch FROM mfa_enrollment_proofs WHERE token_hash=?1",
+        [token_hash(&legacy)],|r|r.get(0)).unwrap();
+    assert_eq!(legacy_epoch,None);
+    // The independent proof is valid; only its missing epoch must deny it.
+    db.mfa_require_independent_proof(&legacy,1002).unwrap();
+    assert!(db.mfa_email_http_capability(&legacy,true,None,1002).is_err());
+    assert!(db.mfa_email_send(&legacy,true,1061).is_err());
+    assert!(db.mfa_email_verify_and_issue(&legacy,&legacy_code,true,1002,|_,_,_| -> Result<()> {
+        panic!("legacy proof issued tokens")
+    }).is_err());
+    assert_email_not_written(&db,&id);
+    assert_eq!(factor_count(&db.conn(),&id).unwrap(),0);
+
+    let fresh=pending_email(&db,&id,1062);
+    let current_epoch=db.get_user(&id).unwrap().unwrap().credential_epoch;
+    let fresh_epoch:Option<u64>=db.conn().query_row(
+        "SELECT credential_epoch FROM mfa_enrollment_proofs WHERE token_hash=?1",
+        [token_hash(&fresh)],|r|r.get(0)).unwrap();
+    assert_eq!(current_epoch,7);
+    assert_eq!(fresh_epoch,Some(current_epoch));
+    prove_email(&db,&id,&fresh,1062);
+    let (_,code)=db.mfa_email_send(&fresh,true,1062).unwrap();
+    let recovery=db.mfa_email_verify_and_issue(&fresh,&code,true,1062,|_,_,codes|Ok(codes)).unwrap();
+    assert_eq!(recovery.len(),10);
+    assert_eq!(db.mfa_factors(&id).unwrap()["factors"]["email"],true);
+    assert_eq!(factor_count(&db.conn(),&id).unwrap(),1);
+}
+
+#[test]
+fn email_and_totp_racing_on_one_enrollment_token_enrol_at_most_one_factor() {
+    let (dir,db,id)=setup();
+    record_enforcement(&mut db.conn(),true,1000).unwrap();
+    let token=pending_email(&db,&id,1001);
+    prove_email(&db,&id,&token,1001);
+    db.mfa_require_independent_proof(&token,1001).unwrap();
+    let (_,email_code)=db.mfa_email_send(&token,true,1001).unwrap();
+    let secret=db.mfa_begin(&id,Some(&token),&Cipher,1001).unwrap();
+    let totp_code=hotp(&decode_secret(&secret).unwrap(),1001/30,6);
+    let second=UserDb::new(&dir.path().join("users.db")).unwrap();
+    let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));
+    let gate=barrier.clone();
+    let other_token=token.clone();
+    let other_id=id.clone();
+    // Separate handles race the authoritative write transactions after both
+    // factors have been prepared against the same verified enrollment proof.
+    let thread=std::thread::spawn(move|| {
+        gate.wait();
+        second.mfa_confirm(&other_id,Some(&other_token),&totp_code,&Cipher,1002)
+    });
+    barrier.wait();
+    let email=db.mfa_email_verify_and_issue(&token,&email_code,true,1002,|_,_,codes|Ok(codes));
+    let totp=thread.join().expect("TOTP enrollment must return a Result, not panic");
+    assert_eq!(usize::from(email.is_ok())+usize::from(totp.is_ok()),1,
+        "exactly one enrollment must succeed: email={email:?}, totp={totp:?}");
+    assert!(email.is_err() || totp.is_err(),"the losing enrollment must return an error");
+    let counts:(i64,i64)=db.conn().query_row("SELECT
+        (SELECT COUNT(*) FROM mfa_email_credentials WHERE user_id=?1),
+        (SELECT COUNT(*) FROM mfa_credentials WHERE user_id=?1)",
+        [&id],|r|Ok((r.get(0)?,r.get(1)?))).unwrap();
+    assert_eq!(counts,if email.is_ok() {(1,0)} else {(0,1)});
+    assert_eq!(factor_count(&db.conn(),&id).unwrap(),1);
+}
+
+#[test]
+fn email_policy_enabled_after_send_requires_independent_proof_at_write() {
+    let (_dir,db,id)=setup();
+    let token=db.mfa_factor_password_challenge(&id,"password-test","session",1000).unwrap();
+    let (_,code)=db.mfa_email_send(&token,true,1000).unwrap();
+    record_enforcement(&mut db.conn(),true,1001).unwrap();
+    assert!(db.mfa_email_verify_and_issue(&token,&code,true,1001,|_,_,_| -> Result<()> {
+        panic!("policy toggle bypass issued tokens")
+    }).is_err());
+    assert_email_not_written(&db,&id);
+}
+
+#[test]
+fn email_additional_factor_under_enforcement_needs_no_independent_code() {
+    let (_dir,db,id)=setup();
+    crate::mfa::tests::enroll(&db,&id);
+    record_enforcement(&mut db.conn(),true,3001).unwrap();
+    let token=db.mfa_password_challenge(&id,"password-test","session",3100).unwrap();
+    assert!(db.mfa_prepare_enrollment(&token,true,3100).unwrap().is_none());
+    db.mfa_prove_enrollment(&token,"",3100).unwrap();
+    db.mfa_check_session(&token,&id,"session",3100).unwrap();
+    let (_,code)=db.mfa_email_send(&token,true,3100).unwrap();
+    let codes=db.mfa_email_verify_and_issue(&token,&code,true,3100,|_,_,codes|Ok(codes)).unwrap();
+    assert!(codes.is_empty());
+    assert_eq!(db.mfa_factors(&id).unwrap()["factors"]["email"],true);
+}
+
+#[test]
+fn email_non_enforced_public_enrollment_needs_no_independent_code() {
+    let (_dir,db,id)=setup();
+    let token=db.mfa_challenge(&id,FirstFactor::Password,true,1000).unwrap();
+    db.mfa_prepare_enrollment(&token,false,1000).unwrap();
+    db.mfa_prove_enrollment(&token,"",1000).unwrap();
+    db.mfa_email_http_capability(&token,true,None,1000).unwrap();
+    let (_,code)=db.mfa_email_send(&token,true,1000).unwrap();
+    let recovery=db.mfa_email_verify_and_issue(&token,&code,true,1000,|_,_,codes|Ok(codes)).unwrap();
+    assert_eq!(recovery.len(),10);
+}

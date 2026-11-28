@@ -161,12 +161,11 @@ fn classify_mcp(name: &str) -> Option<ToolClass> {
 
         // ── Skills ──
         "skill_search" | "skill_gaps" => ToolClass::Search,
-        "skill_list" | "skill_curator_status" | "skill_synthesis_status" | "shared_skill_list" => {
+        "skill_list" | "skill_synthesis_status" | "shared_skill_list" => {
             ToolClass::Read
         }
         "skill_extract"
         | "skill_graduate"
-        | "skill_pin"
         | "skill_from_recording"
         | "skill_hub_install"
         | "skill_bank_feedback"
@@ -473,14 +472,12 @@ mod tests {
         "sheets_append",
         "sheets_read",
         "skill_bank_feedback",
-        "skill_curator_status",
         "skill_extract",
         "skill_from_recording",
         "skill_gaps",
         "skill_graduate",
         "skill_hub_install",
         "skill_list",
-        "skill_pin",
         "skill_search",
         "skill_security_scan",
         "skill_synthesis_run",

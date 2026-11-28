@@ -102,6 +102,9 @@ impl ApprovalStore {
     /// authority, and clients retain a slow reconciliation poll.
     pub(super) async fn emit_lifecycle(&self, event: &str, rec: &ApprovalRecord, status: ApprovalStatus) {
         let Some(home) = self.db_path.as_ref().and_then(|p| p.parent()) else { return };
+        if matches!(status, ApprovalStatus::Expired | ApprovalStatus::Invalidated) {
+            chat_admin::sync::spawn_expire(home.to_path_buf(), rec.clone());
+        }
         let bus = match crate::events_store::EventBusStore::open(home) {
             Ok(bus) => bus,
             Err(error) => {

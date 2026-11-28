@@ -20,6 +20,8 @@ impl AgentInvoker for PrincipalInvoker {
         if self.deny_main {
             let queue = crate::message_queue::MessageQueue::open(home).unwrap();
             let message = crate::message_queue::QueueMessage {
+                autopilot_department: None,
+                autopilot_rule_id: None,
                 id: uuid::Uuid::new_v4().to_string(), sender: agent.into(), target: "main".into(),
                 payload: "delegated from cron".into(), status: crate::message_queue::MessageStatus::Pending,
                 retry_count: 0, delegation_depth: 1, origin_agent: Some(agent.into()),
@@ -296,4 +298,36 @@ async fn scoped_cron_scheduler_skips_legacy_fast_rows_and_refreshes_before_dispa
     assert_eq!(invoker.seen.lock().unwrap().len(), 1);
     scheduler.reload().await;
     assert_eq!(scheduler.tasks.read().await.len(), 1);
+}
+
+#[tokio::test]
+async fn department_grant_created_cron_keeps_fire_time_authority_after_revocation() {
+    let f = crate::dept_grants::tests::fixture().await;
+    std::fs::write(f.home.join("config.toml"),
+        "[general]\ndefault_agent = 'main'\n[delegation]\nhuman_principal = 'enforce'\n").unwrap();
+    let store = Arc::new(CronStore::open(&f.home).unwrap());
+    f.h.set_cron_store(store.clone()).await;
+    assert!(!f.mgr_a.has_agent_access("a1", duduclaw_auth::AccessLevel::Operator));
+    let frame = Box::pin(f.h.handle("cron.add", serde_json::json!({
+        "agent_id": "a1", "name": "Department daily report", "cron": "0 9 * * *",
+        "task": "Prepare a daily report",
+    }), &f.mgr_a)).await;
+    let id = match frame {
+        crate::protocol::WsFrame::Response { ok: true, payload: Some(value), .. } =>
+            value["task"]["id"].as_str().unwrap().to_owned(),
+        other => panic!("grant-backed cron.add failed: {other:?}"),
+    };
+    let row = store.get(&id).await.unwrap().unwrap();
+    assert_eq!(row.created_by_user_id.as_deref(), Some(f.mgr_a.user_id.as_str()));
+    assert_eq!(row.scoped_by_user_id.as_deref(), Some(f.mgr_a.user_id.as_str()));
+    assert_eq!(row.on_behalf_of, Some(format!("user:{}", f.mgr_a.user_id)));
+    assert!(cron_principal_allowed(&f.home, &store, f.h.registry(), &row).await);
+
+    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales", &[], true).unwrap();
+    assert!(crate::dept_grants::DeptGrantView::load(&f.h, &f.mgr_a).await.is_empty());
+    // D14: removing management authority does not revoke stored cron work.
+    // The production principal gate still checks main/host/personal targets,
+    // but it must not start requiring a current binding or department grant.
+    assert!(cron_principal_allowed(&f.home, &store, f.h.registry(), &row).await);
+    assert!(store.get(&id).await.unwrap().unwrap().enabled);
 }

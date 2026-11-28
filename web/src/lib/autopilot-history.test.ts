@@ -1,3 +1,4 @@
+import { runStateMessageId, runReasonMessageId, canCancelRun } from './autopilot-history';
 import { describe, expect, it } from 'vitest';
 import en from '@/i18n/en.json';
 import zhTW from '@/i18n/zh-TW.json';
@@ -47,5 +48,21 @@ describe('autopilot history statuses', () => {
     expect(describeHistoryResult('empty').messageId).toBeNull();
     expect(describeHistoryResult(undefined).messageId).toBeNull();
     expect(describeHistoryResult(42).raw).toBe('42');
+  });
+});
+
+describe('multi-step run translations', () => {
+  it('translates every state and falls back without exposing unknown codes', () => {
+    for (const state of ['pending', 'waiting', 'awaiting_approval', 'running', 'completed', 'done', 'failed', 'skipped', 'expired', 'denied', 'settled']) {
+      expect(runStateMessageId(state)).toBe(`autopilot.runs.state.${state}`);
+    }
+    expect(runStateMessageId('new_private_code')).toBe('autopilot.runs.state.unknown');
+  });
+  it('translates stored parameter failures and only permits waiting cancellation', () => {
+    expect(runReasonMessageId('param_missing:private_name')).toBe('autopilot.runs.reason.missing_field');
+    expect(runReasonMessageId('param_injection_blocked')).toBe('autopilot.runs.reason.param_injection_blocked');
+    expect(runReasonMessageId('raw_private_detail')).toBe('autopilot.runs.reason.unknown');
+    expect(['pending', 'waiting', 'awaiting_approval'].every(canCancelRun)).toBe(true);
+    expect(['running', 'settled', 'failed'].some(canCancelRun)).toBe(false);
   });
 });

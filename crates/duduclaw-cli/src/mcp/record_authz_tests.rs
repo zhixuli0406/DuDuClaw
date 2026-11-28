@@ -326,6 +326,12 @@ async fn shared_check_allows_and_refuses_by_relationship() {
         .await
         .unwrap_err();
     assert!(err.contains("屬於「sales-rep」"), "{err}");
+    let shared = crate::mcp::check_delegation_allowed(h, "mkt-rep", "sales-rep", "t")
+        .await.unwrap_err();
+    assert!(err.contains(&shared), "{err}");
+    assert!(err.contains("部門模式") && err.contains("不同部門"), "{err}");
+    assert!(err.contains("未做任何變更。"), "{err}");
+    assert!(!err.contains("send_to_agent"), "{err}");
     assert!(!err.contains("reports_to"), "{err}");
     assert!(
         !audit_rows(h, "delegation_denied").is_empty(),
@@ -1047,10 +1053,10 @@ async fn agent_update_refuses_self_authority_changes() {
     assert_eq!(config.prompt.reply_language, None);
     assert_eq!(config.memory.language, None);
     let rows = audit_rows(h, "agent_authority_refused");
-    // `reports_to` to a non-subtree parent may be refused by the placement
-    // gate first; the other four always reach the self-authority guard.
+    // Invalid source ids may fail source validation first; protected changes
+    // with a valid value reach the shared authority guard and are audited.
     assert!(rows.len() >= 4, "{rows:?}");
-    assert_eq!(rows[0]["reason"], "self_authority_change");
+    assert_eq!(rows[0]["reason"], "authority_widening");
 
     // Ordinary self-edits are unchanged.
     let out = handle_agent_update(
@@ -1061,15 +1067,15 @@ async fn agent_update_refuses_self_authority_changes() {
     .await;
     assert!(!is_error(&out), "{out}");
 
-    // A manager may set a report's budget; an operator may set anyone's.
+    // An AI superior cannot widen; a human operator keeps its authority.
     let out = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "budget_cents": 2000 }),
         h,
         A("sales-lead"),
     )
     .await;
-    assert!(!is_error(&out), "{out}");
-    assert_eq!(budget_of(h, "sales-rep"), 2000);
+    assert!(is_error(&out), "{out}");
+    assert_eq!(budget_of(h, "sales-rep"), 1000);
     let out = handle_agent_update(
         &serde_json::json!({ "agent_id": "sales-rep", "budget_cents": 3000 }),
         h,
@@ -1082,9 +1088,8 @@ async fn agent_update_refuses_self_authority_changes() {
 
 /// RM-205 / security review: `[runtime] utility_provider` decides which
 /// outside service receives the employee's conversation text for background
-/// work. Through MCP `agent_update` an employee cannot set it on itself (the
-/// whole `runtime` parameter is a self-authority key), and no caller can set
-/// it at all: `agent_update` has no `[runtime]` write path.
+/// work. AI callers explicitly refuse runtime parameters on any target;
+/// `agent_update` has no `[runtime]` write path for any caller.
 #[tokio::test]
 async fn agent_update_never_writes_runtime_utility_provider() {
     let home = Home::new();
@@ -1094,7 +1099,7 @@ async fn agent_update_never_writes_runtime_utility_provider() {
     let params = serde_json::json!({ "agent_id": "sales-rep", "runtime": { "utility_provider": "openai_compat" } });
     let out = handle_agent_update(&params, h, A("sales-rep")).await;
     assert!(is_error(&out), "self: {out}");
-    assert!(text(&out).contains("runtime"), "{out}");
+    assert!(text(&out).contains("管理介面"), "{out}");
     assert_eq!(fs::read_to_string(&path).unwrap(), before, "self: file unchanged");
     let rows = audit_rows(h, "agent_authority_refused");
     assert!(rows.iter().any(|r| r["keys"].as_array().is_some_and(|k| k.iter().any(|k| k == "runtime"))), "{rows:?}");
@@ -1417,4 +1422,86 @@ fn autonomy_caller_reports_real_failure_and_allows_an_unused_home() {
             .contains("暫停狀態無法讀取")
     );
     assert!(!h.join("tasks.db").exists());
+}
+
+// v1.86: authority is independent of delegation policy and target relation.
+fn az1_policy(home: &std::path::Path, policy: &str) {
+    fs::write(home.join("config.toml"), format!(
+        "[delegation]\npolicy='{policy}'\n[db_sources.fixture_db]\ndriver='sqlite'\nurl='/tmp/az1-unused.db'\nallowed_tables=['fixture']\n"
+    )).unwrap();
+}
+
+#[tokio::test]
+async fn az1_u1_u2_budget_widening_is_refused_and_audited() {
+    for (policy, caller) in [("hierarchy", "sales-lead"), ("open", "mkt-rep")] {
+        let home = Home::new();
+        let h = home.path();
+        az1_policy(h, policy);
+        let path = h.join("agents/sales-rep/agent.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        let out = handle_agent_update(&serde_json::json!({
+            "agent_id": "sales-rep", "budget_cents": 2000, "icon": "changed"
+        }), h, A(caller)).await;
+        assert!(is_error(&out), "{policy}: {out}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before, "no partial write");
+        let message = text(&out);
+        assert!(message.contains("管理員") && message.contains("管理介面"), "{message}");
+        assert!(!message.contains("policy") && !message.contains(".toml"), "{message}");
+        let rows = audit_rows(h, "agent_authority_refused");
+        assert!(rows.iter().any(|r| r["caller"] == caller && r["target"] == "sales-rep"
+            && r["field"] == "budget.monthly_limit_cents"
+            && r["attempted_value_class"] == "limit_increase"), "{rows:?}");
+    }
+}
+
+#[tokio::test]
+async fn az1_u4_database_grant_is_refused_for_self() {
+    for caller in ["sales-rep"] {
+        let home = Home::new();
+        let h = home.path();
+        az1_policy(h, if caller == "mkt-rep" { "open" } else { "hierarchy" });
+        let path = h.join("agents/sales-rep/agent.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        let out = handle_agent_update(&serde_json::json!({
+            "agent_id": "sales-rep", "db_sources_add": "fixture_db"
+        }), h, A(caller)).await;
+        assert!(is_error(&out), "{caller}: {out}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), before);
+        let rows = audit_rows(h, "agent_authority_refused");
+        assert!(rows.iter().any(|r| r["caller"] == caller && r["target"] == "sales-rep"
+            && r["field"] == "capabilities.db_sources"
+            && r["attempted_value_class"] == "grant_expansion"), "{rows:?}");
+    }
+}
+
+#[tokio::test]
+async fn az1_budget_and_database_narrowing_and_daily_edits_stay_allowed() {
+    for caller in ["sales-lead", "sales-rep"] {
+        let home = Home::new();
+        let h = home.path();
+        az1_policy(h, "hierarchy");
+        let path = h.join("agents/sales-rep/agent.toml");
+        let before = fs::read_to_string(&path).unwrap();
+        fs::write(&path, before.replace("[capabilities]", "[capabilities]\ndb_sources=['fixture_db']")).unwrap();
+        let out = handle_agent_update(&serde_json::json!({
+            "agent_id": "sales-rep", "budget_cents": 500,
+            "db_sources_remove": "fixture_db", "icon": "📋"
+        }), h, A(caller)).await;
+        assert!(!is_error(&out), "{caller}: {out}");
+        let config: duduclaw_core::types::AgentConfig = toml::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(config.budget.monthly_limit_cents, 500);
+        assert!(config.capabilities.db_sources.is_empty());
+        assert_eq!(config.agent.icon, "📋");
+    }
+}
+
+#[tokio::test]
+async fn az1_u3_subordinate_still_cannot_edit_superior() {
+    let home = Home::new();
+    az1_policy(home.path(), "hierarchy");
+    let out = handle_agent_update(&serde_json::json!({
+        "agent_id": "sales-lead", "budget_cents": 500
+    }), home.path(), A("sales-rep")).await;
+    assert!(is_error(&out), "{out}");
+    assert_eq!(budget_of(home.path(), "sales-lead"), 1000);
 }

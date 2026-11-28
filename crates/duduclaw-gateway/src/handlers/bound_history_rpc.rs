@@ -6,6 +6,7 @@ use crate::team_history::{audit, limits, mask};
 
 /// Fresh dashboard identity for a history read. Missing, unreadable or
 /// password-change accounts are the same refusal as a missing session.
+/// The live reader retains the authenticated member-key restriction.
 pub(crate) fn live_bound_reader(home: &Path, ctx: &UserContext) -> Result<UserContext, String> {
     let live = task_privacy::live_reader_context(home, ctx).map_err(|_| "session not found")?;
     if live.requires_password_change() {
@@ -28,6 +29,9 @@ impl MethodHandler {
         let live = self.bound_history_live(ctx)?;
         let current =
             privacy::mode(&self.home_dir, &live, agent).map_err(|_| "session not found")?;
+        if initial == Mode::Full && live.member_key_id.is_some() {
+            return Err("session not found".into());
+        }
         if initial == Mode::Full && current != Mode::Full {
             return Err("history authority changed; refresh".into());
         }
@@ -45,14 +49,16 @@ impl MethodHandler {
             .map_err(|_| "history rate limited")?;
         let home = self.home_dir.clone();
         let user = ctx.user_id.clone();
+        let reader = ctx.clone();
         let agent_owned = agent.to_owned();
         let permit = read::permit()?;
         let list = tokio::task::spawn_blocking(move || {
             let _permit=permit;
             let c = read::open(&home)?;
-            let entries = read::list_in(&c, &user, &agent_owned, limit.max(1), archived)?;
+            let entries = read::list_in_for_reader(&c, &reader, &agent_owned, limit.max(1), archived)?;
             let mut out = Vec::new();
             for m in entries {
+                if !privacy::key_class_allowed(&reader, &m.class) { continue; }
                 let external = matches!(m.class, Class::External {..});
                 let channel = match &m.class { Class::External {channel} => channel.as_str(), _ => "webchat" };
                 // Stored external titles and summaries may be derived from
@@ -82,6 +88,10 @@ impl MethodHandler {
         channel: &str,
         limit: usize,
     ) -> Result<Value, String> {
+        let live = self.bound_history_live(ctx)?;
+        if !privacy::key_class_allowed(&live, &Class::External { channel: channel.into() }) {
+            return Err("session not found".into());
+        }
         limits::take(&self.home_dir, &format!("bound:{}", ctx.user_id), true)
             .map_err(|_| "history rate limited")?;
         let home = self.home_dir.clone();

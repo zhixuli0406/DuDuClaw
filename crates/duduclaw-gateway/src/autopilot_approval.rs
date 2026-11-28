@@ -45,6 +45,12 @@
 //!    and is never run again. A `requesting` row is re-linked to its card or
 //!    settled `approval_error`.
 //!
+//! v1.86 multi-step runs use the same lifecycle for each gated step, with
+//! [`step_dispatch_dedupe_key`] and a permanent unique (run, step) binding.
+//! The executor checks that binding under the rule fence before consuming
+//! the card. A durable sweep reconciles settled dispatches back into their
+//! waiting runs; step dispatches never count another rule fire.
+//!
 //! ## Announcements (durable outbox)
 //!
 //! Settling a ledger row, writing its one history row and recording what
@@ -335,6 +341,8 @@ impl FrozenDispatch {
     /// The ledger row for this dispatch (state `requesting`).
     pub fn ledger_row(&self, now: &str, dedupe_key: &str) -> AutopilotDispatchRow {
         AutopilotDispatchRow {
+            run_id: None,
+            step_index: None,
             dispatch_id: self.dispatch_id.clone(),
             approval_id: None,
             rule_id: self.rule_id.clone(),
@@ -423,17 +431,22 @@ pub fn verify_card_payload(row: &AutopilotDispatchRow, payload: &Value) -> Resul
 // ── Rule revision, event reference, dedupe key ──────────────
 
 /// Revision hash of everything that decides what a rule does: id, trigger,
-/// conditions, action (including `require_approval`) and sequence. Name,
+/// conditions, action (including `require_approval`), sequence, and non-NULL
+/// active_window, run_policy and owner_department. Name,
 /// enabled flag and counters are excluded (enabled is checked separately).
 pub fn rule_revision_hash(rule: &AutopilotRuleRow) -> String {
     let parse = |s: &str| serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.to_string()));
-    let body = json!({
+    let mut body = json!({
         "id": rule.id,
         "trigger_event": rule.trigger_event,
         "conditions": parse(&rule.conditions),
         "action": parse(&rule.action),
         "sequence": rule.sequence.as_deref().map(parse),
     });
+    // Preserve the exact v1.82 body when all extension columns are NULL.
+    if let Some(value) = &rule.active_window { body["active_window"] = parse(value); }
+    if let Some(value) = &rule.run_policy { body["run_policy"] = parse(value); }
+    if let Some(value) = &rule.owner_department { body["owner_department"] = Value::String(value.clone()); }
     digest_value(&body)
 }
 
@@ -471,6 +484,25 @@ pub fn event_ref(event_name: &str, fields: &serde_json::Map<String, Value>) -> S
 pub fn dedupe_key(rule_id: &str, rule_hash: &str, event_name: &str, fields: &serde_json::Map<String, Value>) -> String {
     digest_value(&json!({
         "v": 1,
+        "rule_id": rule_id,
+        "rule_hash": rule_hash,
+        "event": event_name,
+        "fields_sha256": digest_value(&Value::Object(fields.clone())),
+    }))
+}
+
+/// One approval dispatch per run step, independent of the ingress dedupe window.
+pub fn step_dispatch_dedupe_key(rule_id: &str, rule_hash: &str, run_id: &str, step_index: i64) -> String {
+    digest_value(&json!({
+        "v": 2, "rule_id": rule_id, "rule_hash": rule_hash,
+        "run_id": run_id, "step_index": step_index,
+    }))
+}
+
+/// Durable run dedupe key; versioned separately from the v1.82 dispatch ledger.
+pub fn run_dedupe_key(rule_id: &str, rule_hash: &str, event_name: &str, fields: &serde_json::Map<String, Value>) -> String {
+    digest_value(&json!({
+        "v": 2,
         "rule_id": rule_id,
         "rule_hash": rule_hash,
         "event": event_name,
@@ -534,6 +566,8 @@ pub fn notice_body(rule_name: &str, result: &str, detail: &str) -> String {
 /// What one chat push of an Admin notice achieved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoticePush {
+    /// Authority changed before delivery; never retry or fall back to Admins.
+    ScopeDenied,
     /// Sent to at least one Admin's verified channel.
     Sent,
     /// Durably queued for after quiet hours.
@@ -550,7 +584,23 @@ pub enum NoticePush {
 /// it carries the existing 「暫停這條規則」 button for this rule. The
 /// dashboard copy (Activity Feed + live event) is written by the caller.
 pub(crate) async fn push_admin_notice(home: &Path, rule_id: &str, body: &str) -> NoticePush {
-    let targets = crate::macos_folder_access::admin_links(home);
+    push_notice_to(home, rule_id, body, crate::macos_folder_access::admin_links(home)).await
+}
+
+/// Re-check immediately inside the detached delivery task, then bind destinations.
+pub(crate) async fn push_scoped_notice(
+    home: &Path, store: &crate::autopilot_store::AutopilotStore,
+    rule_id: &str, department: Option<&str>, body: &str,
+) -> NoticePush {
+    let targets = match crate::autopilot_scope::notice_targets(home, store, rule_id, department).await {
+        Ok(Some(targets)) => targets,
+        Ok(None) => crate::macos_folder_access::admin_links(home),
+        Err(_) => return NoticePush::ScopeDenied,
+    };
+    push_notice_to(home, rule_id, body, targets).await
+}
+
+async fn push_notice_to(home: &Path, rule_id: &str, body: &str, targets: Vec<(String, String)>) -> NoticePush {
     if targets.is_empty() {
         tracing::info!(rule_id, "autopilot approval notice: no Admin with a verified channel; dashboard only");
         return NoticePush::NoTarget;
@@ -590,11 +640,11 @@ pub(crate) async fn push_admin_notice(home: &Path, rule_id: &str, body: &str) ->
 /// that an automation action waits for an administrator to review it in the
 /// dashboard, until when, and the card number — never the rule's action,
 /// prompt, message, target or the rule name.
-pub(crate) fn pending_notice_body(rec: &ApprovalRecord, reminder: bool, lang: Lang) -> String {
+pub(crate) fn pending_notice_body(home: &Path, rec: &ApprovalRecord, reminder: bool, lang: Lang) -> String {
     let deadline = rec
         .expires_at_epoch()
         .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
-        .map(|dt| dt.with_timezone(&chrono::Local).format("%H:%M").to_string());
+        .map(|dt| duduclaw_core::company_timezone::format_local(&duduclaw_core::company_timezone::read(home), dt, "%H:%M"));
     let id = duduclaw_core::truncate_chars(rec.id.as_str(), 8);
     match lang {
         Lang::ZhTw => format!(
@@ -642,6 +692,12 @@ mod tests {
 
     fn rule(action: Value) -> AutopilotRuleRow {
         AutopilotRuleRow {
+            active_window: None,
+            run_policy: None,
+            owner_department: None,
+            created_by_user_id: None,
+            updated_by_user_id: None,
+            updated_at: None,
             id: "r1".into(),
             name: "gate".into(),
             enabled: true,
@@ -681,6 +737,46 @@ mod tests {
             edit(&mut d);
             assert_ne!(rule_revision_hash(&a), rule_revision_hash(&d));
         }
+    }
+
+    #[test]
+    fn revision_hash_preserves_legacy_body_and_tracks_only_present_extensions() {
+        let original = rule(json!({"type": "notify", "text": "hello"}));
+        // Literal pre-v1.86 body: adding even null extension keys would break this.
+        let old_body = json!({
+            "id": "r1", "trigger_event": "task_created", "conditions": {},
+            "action": {"type": "notify", "text": "hello"}, "sequence": null,
+        });
+        assert_eq!(rule_revision_hash(&original), digest_value(&old_body));
+        let edits: [fn(&mut AutopilotRuleRow); 3] = [
+            |r| r.active_window = Some(r#"{"days":[1]}"#.into()),
+            |r| r.run_policy = Some(r#"{"outside_window":"skip"}"#.into()),
+            |r| r.owner_department = Some("sales".into()),
+        ];
+        for edit in edits {
+            let mut changed = original.clone();
+            edit(&mut changed);
+            assert_ne!(rule_revision_hash(&changed), digest_value(&old_body));
+        }
+        let mut changed = original.clone();
+        changed.created_by_user_id = Some("creator".into());
+        changed.updated_by_user_id = Some("editor".into());
+        changed.updated_at = Some("later".into());
+        assert_eq!(rule_revision_hash(&changed), digest_value(&old_body));
+        changed.active_window = Some(r#"{"days":[1],"start":"09:00"}"#.into());
+        let hash = rule_revision_hash(&changed);
+        changed.active_window = Some(r#"{ "start": "09:00", "days": [1] }"#.into());
+        assert_eq!(rule_revision_hash(&changed), hash);
+    }
+
+    #[test]
+    fn run_dedupe_key_uses_v2_without_changing_dispatch_key() {
+        let fields = json!({"task_id":"t1"}).as_object().unwrap().clone();
+        let expected = digest_value(&json!({"v":2,"rule_id":"r","rule_hash":"h","event":"e",
+            "fields_sha256":digest_value(&Value::Object(fields.clone()))}));
+        assert_eq!(run_dedupe_key("r", "h", "e", &fields), expected);
+        assert_ne!(expected, dedupe_key("r", "h", "e", &fields));
+        assert_ne!(expected, run_dedupe_key("r", "other", "e", &fields));
     }
 
     fn dispatch() -> FrozenDispatch {
@@ -723,12 +819,14 @@ mod tests {
     #[test]
     fn event_ref_names_the_task_and_digests_the_fields() {
         let fields = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "x"}),
         }
         .to_fields();
         let r = event_ref("task_created", &fields);
         assert!(r.starts_with("task_created:task=t-42:sha256="), "{r}");
         let other = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "y"}),
         }
         .to_fields();
@@ -738,6 +836,7 @@ mod tests {
     #[test]
     fn dedupe_key_is_stable_per_event_rule_and_revision() {
         let fields = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "x"}),
         }
         .to_fields();
@@ -746,6 +845,7 @@ mod tests {
         assert_ne!(k, dedupe_key("r2", "h1", "task_created", &fields));
         assert_ne!(k, dedupe_key("r1", "h2", "task_created", &fields));
         let other = crate::autopilot_engine::AutopilotEvent::TaskCreated {
+            origin: crate::autopilot_engine::EventOrigin::external(),
             task: json!({"id": "t-42", "title": "y"}),
         }
         .to_fields();
@@ -832,6 +932,23 @@ mod tests {
         assert_eq!(latest_execution_at(now, 3600), "2026-11-13T11:15:00Z");
     }
 
+    #[test]
+    fn pending_notice_labels_company_zone() {
+        let home = tempfile::tempdir().unwrap();
+        let mut rec = pending_card();
+        rec.created_at = "2026-11-27T00:30:00Z".into();
+        rec.ttl_seconds = 3600;
+        for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
+            assert!(pending_notice_body(home.path(), &rec, false, lang).contains("01:30 UTC"));
+        }
+        std::fs::write(home.path().join("config.toml"), "[general]\ncompany_timezone = 'Asia/Taipei'").unwrap();
+        for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
+            assert!(pending_notice_body(home.path(), &rec, false, lang).contains("09:30 CST"));
+        }
+        rec.created_at = "bad timestamp".into();
+        assert!(!pending_notice_body(home.path(), &rec, false, Lang::En).contains("before "));
+    }
+
     fn pending_card() -> ApprovalRecord {
         ApprovalRecord {
             id: crate::approval::ApprovalId::new(),
@@ -853,6 +970,7 @@ mod tests {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: None,
+            execution_result: None,
         }
     }
 
@@ -860,10 +978,11 @@ mod tests {
     /// each language, and is not the knowledge-review text.
     #[test]
     fn pending_notice_body_carries_no_action_content() {
+        let home = tempfile::tempdir().unwrap();
         let rec = pending_card();
         for lang in [Lang::ZhTw, Lang::En, Lang::Ja] {
             for reminder in [false, true] {
-                let body = pending_notice_body(&rec, reminder, lang);
+                let body = pending_notice_body(home.path(), &rec, reminder, lang);
                 for secret in ["季報", "plain", "secret-rule", "task_created", "gate"] {
                     assert!(!body.contains(secret), "{lang:?}: {body}");
                 }
@@ -871,12 +990,12 @@ mod tests {
                 assert!(body.contains(&duduclaw_core::truncate_chars(rec.id.as_str(), 8)));
             }
         }
-        assert!(pending_notice_body(&rec, false, Lang::ZhTw).contains("自動化規則的動作"));
-        assert!(pending_notice_body(&rec, false, Lang::En).contains("automation action"));
-        assert!(pending_notice_body(&rec, false, Lang::Ja).contains("自動化ルールの動作"));
-        assert!(pending_notice_body(&rec, true, Lang::ZhTw).contains("快到期"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::ZhTw).contains("自動化規則的動作"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::En).contains("automation action"));
+        assert!(pending_notice_body(home.path(), &rec, false, Lang::Ja).contains("自動化ルールの動作"));
+        assert!(pending_notice_body(home.path(), &rec, true, Lang::ZhTw).contains("快到期"));
         // The dashboard-only notice dispatcher routes this kind to it.
-        let body = crate::approval_notify::dashboard_only_notice_body(&rec, false);
+        let body = crate::approval_notify::dashboard_only_notice_body(home.path(), &rec, false);
         assert!(body.contains("自動化規則的動作") && !body.contains("知識"), "{body}");
     }
 }

@@ -18,11 +18,20 @@ impl From<String> for TeamDispatchError {
 pub(super) fn check_frozen_team_runtime(task: &TaskRow) -> Result<(), TeamDispatchError> {
     if let Some(spec) = crate::team_composer::frozen_spec(task) {
         for role in duduclaw_core::types::Role::ALL {
-            if let Some(removed) = spec.role(*role)
-                .and_then(|spec| duduclaw_core::runtime_catalog::removed_runtime(&spec.runtime)) {
-                return Err(TeamDispatchError::ConfigRefused(
-                    removed.refusal(&format!("frozen [team.roles.{}] runtime", role.as_str())),
-                ));
+            let Some(role) = spec.role(*role) else { continue; };
+            let refusal = if let Some(removed) = duduclaw_core::runtime_catalog::removed_runtime(&role.runtime) {
+                Some(crate::entry_gate::EntryRefusal::InactiveRuntime {
+                    diagnostic: removed.refusal("frozen team role runtime"),
+                })
+            } else if let Some(provider) = duduclaw_core::types::RuntimeType::parse(&role.runtime) {
+                role.model.as_ref().filter(|model|
+                    crate::runtime_config::ensure_model_provider(model, provider).is_err())
+                    .map(|model| crate::entry_gate::EntryRefusal::ModelProviderMismatch { model: model.clone(), provider })
+            } else {
+                Some(crate::entry_gate::EntryRefusal::Config(crate::runtime_config::RuntimeSettingsError::UnknownProvider))
+            };
+            if let Some(refusal) = refusal {
+                return Err(TeamDispatchError::ConfigRefused(crate::entry_gate::background_refusal(&refusal)));
             }
         }
     }
@@ -201,6 +210,10 @@ impl GoalLoopDriver {
             episode_id: task.id.clone(),
             round: Some(task.revision_round + 1),
         };
+        // No await between the strict assignee check and creating the detached round.
+        crate::entry_gate::check_task_assignee(&self.home_dir, &task.assigned_to)
+            .map_err(|refusal| TeamDispatchError::ConfigRefused(
+                crate::entry_gate::background_refusal(&refusal)))?;
         // P2-A: registered before the spawn so a stop never reports
         // "stopped" while this round may still run (the queue never sees it).
         let round_guard = crate::responsibility::team_activity::RoundGuard::register(&task.id);
@@ -271,6 +284,24 @@ impl GoalLoopDriver {
                     }
                 }
                 crate::team_composer::TeamRoundOutcome::Failed { error } => {
+                    if let Some(code) = crate::entry_gate::background_refusal_code(&error) {
+                        let pause = crate::pause_reason::PauseReason::BlockedNeedsDecision;
+                        if let Err(e) = store.mark_needs_human_with_pause(&task.id, &error, pause).await {
+                            warn!(task = %task.id, "team entry-refusal pause failed: {e}");
+                        } else {
+                            let _ = store.stamp_iteration_pause(&task.id, pause.as_str()).await;
+                            let row = ActivityRow {
+                                id: uuid::Uuid::new_v4().to_string(), event_type: "goal_loop.entry_refused".into(),
+                                agent_id: task.assigned_to.clone(), task_id: Some(task.id.clone()),
+                                summary: format!("blocked_needs_decision: {code}"),
+                                timestamp: Utc::now().to_rfc3339(), metadata: None,
+                            };
+                            if let Err(e) = store.append_activity(&row).await {
+                                warn!(task = %task.id, "team entry-refusal activity failed: {e}");
+                            }
+                        }
+                        return;
+                    }
                     // Left in flight on purpose: the driver's `stalled_secs`
                     // guard re-dispatches an un-picked-up round exactly as it
                     // does for a work message nobody consumed, and
@@ -433,6 +464,8 @@ pub(crate) fn assigner_label(home: &std::path::Path, task: &TaskRow) -> Option<S
 /// The queue row of one goal round with the given message id.
 pub(super) fn goal_queue_message(id: String, task: &TaskRow, payload: String) -> QueueMessage {
     QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id,
         sender: "goal-loop-driver".to_string(),
         target: task.assigned_to.clone(),

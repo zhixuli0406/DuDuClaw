@@ -138,6 +138,37 @@ impl ApprovalStore {
 
              CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
              CREATE INDEX IF NOT EXISTS idx_approvals_agent  ON approvals(agent_id);
+
+             CREATE TABLE IF NOT EXISTS chat_admin_cards (
+                 card_id TEXT PRIMARY KEY,
+                 approval_id TEXT NOT NULL,
+                 purpose TEXT NOT NULL,
+                 user_id TEXT NOT NULL,
+                 channel TEXT NOT NULL,
+                 account TEXT NOT NULL,
+                 principal TEXT NOT NULL,
+                 dm TEXT NOT NULL,
+                 message_id TEXT,
+                 digest TEXT NOT NULL,
+                 tier TEXT NOT NULL,
+                 valid_until TEXT NOT NULL,
+                 status TEXT NOT NULL CHECK(status IN ('live','consumed','retired','expired')),
+                 sent_at TEXT NOT NULL,
+                 UNIQUE(channel, account, dm, message_id)
+             );
+             CREATE INDEX IF NOT EXISTS idx_chat_admin_cards_approval
+                 ON chat_admin_cards(approval_id, status);
+             CREATE TABLE IF NOT EXISTS chat_admin_decisions (
+                 approval_id TEXT PRIMARY KEY,
+                 card_id TEXT NOT NULL,
+                 user_id TEXT NOT NULL,
+                 channel TEXT NOT NULL,
+                 step TEXT NOT NULL CHECK(step IN ('tap','web','totp')),
+                 step_required INTEGER NOT NULL CHECK(step_required IN (0,1)),
+                 digest TEXT NOT NULL,
+                 approve INTEGER NOT NULL CHECK(approve IN (0,1)),
+                 decided_at TEXT NOT NULL
+             );
              ",
         )
         .map_err(|e| format!("init approvals schema: {e}"))?;
@@ -195,6 +226,9 @@ impl ApprovalStore {
             // at creation (protected mode; NULL for other cards / older rows).
             // `consume_approved` refuses a card whose employee changed since.
             ("employee_incarnation", "employee_incarnation INTEGER"),
+            // Source-local display record; append after older migrations so
+            // fresh and upgraded stores have the same column order and SQL.
+            ("execution_result", "execution_result TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {
@@ -296,8 +330,8 @@ impl ApprovalStore {
                 (id, agent_id, action_kind, summary, payload, status,
                  created_at, decided_at, decided_by, ttl_seconds,
                  notify_channel, notify_chat_id, reminded_at, simulation, request_kind, binding_json, answer_json,
-                invalidated_reason, on_behalf_of, origin_session_id, origin_turn_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21){}",
+                invalidated_reason, on_behalf_of, origin_session_id, origin_turn_id, execution_result)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22){}",
             if if_absent { " ON CONFLICT(id) DO NOTHING" } else { "" }
         );
         let result = (|| {
@@ -334,6 +368,11 @@ impl ApprovalStore {
                     return Ok(false);
                 }
             }
+            // Count and insert under the same SQLite writer transaction, including
+            // other broker instances/processes. No in-memory quota can race this.
+            if rec.action_kind == crate::admin_ai::card::ACTION_KIND {
+                super::admin_ai::check_rate(&tx, rec)?;
+            }
             if let Some((session, turn)) = &origin {
                 let cancelled: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM cancelled_approval_turns WHERE session_id=?1 AND turn_id=?2)",
@@ -368,6 +407,8 @@ impl ApprovalStore {
                     rec.on_behalf_of,
                     origin.as_ref().map(|(session, _)| session),
                     origin.as_ref().map(|(_, turn)| turn),
+                    rec.execution_result.as_ref().filter(|_| rec.action_kind == crate::admin_ai::card::ACTION_KIND)
+                        .map(crate::admin_ai::card::execution_result_projection).map(|v| v.to_string()),
                 ],
             )
             .map(|n| n == 1)
@@ -455,7 +496,7 @@ impl ApprovalStore {
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
                     notify_channel, notify_chat_id, reminded_at, simulation,
-                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -471,7 +512,7 @@ impl ApprovalStore {
             "SELECT id, agent_id, action_kind, summary, payload, status,
                     created_at, decided_at, decided_by, ttl_seconds,
                     notify_channel, notify_chat_id, reminded_at, simulation,
-                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
              FROM approvals WHERE id = ?1",
             params![id.as_str()],
             row_to_record,
@@ -491,6 +532,87 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
+        self.decide_if_pending_inner(id, status, decided_by, decided_at, None).await
+    }
+
+    /// The ledger, receipt consumption and approval status share approvals.db.
+    /// Only the caller-verified ChatAdmin decision path may supply an entry.
+    pub(super) async fn decide_if_pending_with_ledger(
+        &self,
+        id: &ApprovalId,
+        approve: bool,
+        entry: &chat_admin::LedgerEntry,
+        decided_at: &str,
+    ) -> Result<usize, String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        self.decide_if_pending_inner(
+            id, status, &entry.decided_by().to_string(), decided_at, Some(entry),
+        ).await
+    }
+
+    /// Shared by ordinary and leased writes, inside the status transaction.
+    fn validate_chat_decision(&self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry) -> Result<(), String> {
+        // Re-read classification and binding under the write lock.
+        // Live Admin/proof checks belong to the decision service.
+        if !matches!(chat_admin::tier(rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_some() || rec.request_kind != RequestKind::Approval {
+            return Err("bound requests require authenticated decision context".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        let digest = match self.db_path.as_ref().and_then(|path| path.parent()) {
+            Some(home) => decision_digest_at(home, rec),
+            None => decision_digest(rec),
+        };
+        if entry.digest != digest {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
+    /// Bound decisions have their own gates; never relax the unbound writer.
+    /// Called before and inside resolve_bound's transaction. No store re-locks.
+    pub(super) fn validate_bound_chat_decision(
+        &self, rec: &ApprovalRecord, entry: &chat_admin::LedgerEntry,
+    ) -> Result<(), String> {
+        let home = self.db_path.as_deref().and_then(Path::parent)
+            .ok_or("chat-admin bound decisions require durable identity")?;
+        if crate::google_identity::member_card::is_member_card(rec) {
+            return Err("Only the requesting member may confirm".into());
+        }
+        if rec.action_kind == crate::admin_ai::card::ACTION_KIND
+            && !crate::admin_ai::may_decide(home, rec, &entry.user_id.to_string()) {
+            return Err(crate::admin_ai::REFUSAL.into());
+        }
+        // chat_tier also excludes live mail-requester-eligible egress cards.
+        if !matches!(chat_admin::chat_tier(Some(home), rec), chat_admin::Tier::T1 | chat_admin::Tier::T2) {
+            return Err("chat-admin decisions refuse T3 approvals".into());
+        }
+        if rec.binding.is_none() || rec.request_kind != RequestKind::Approval {
+            return Err("chat-admin bound decisions require a bound approval".into());
+        }
+        if entry.step_required && entry.step == chat_admin::ledger::Step::Tap {
+            return Err("chat-admin decision requires step-up".into());
+        }
+        // Identical to the dashboard digest: activation facts include live
+        // pricing. A bare decision_digest would omit those displayed facts.
+        if entry.digest != decision_digest_at(home, rec) {
+            return Err("approval digest mismatch; refetch the approval before deciding".into());
+        }
+        Ok(())
+    }
+
+    async fn decide_if_pending_inner(
+        &self,
+        id: &ApprovalId,
+        status: ApprovalStatus,
+        decided_by: &str,
+        decided_at: &str,
+        ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
             verify_live_io()?;
@@ -507,6 +629,9 @@ impl ApprovalStore {
                     }
                     check_expected_digest(rec)?;
                 }
+                if let Some(entry) = ledger {
+                    self.validate_chat_decision(rec, entry)?;
+                }
             }
             let n = tx.execute(
                 &format!("UPDATE approvals
@@ -521,6 +646,9 @@ impl ApprovalStore {
                     no_live_lease = no_live_lease_sql("?3")),
                 params![status.as_str(), decided_by, decided_at, id.as_str()],
             ).map_err(|e| format!("decide approval: {e}"))?;
+            if n > 0 && let Some(entry) = ledger {
+                chat_admin::ledger::insert_and_consume(&tx, id, status.is_granted(), entry, decided_at)?;
+            }
             duduclaw_mcp_boundary::io_authority::verify_before_io().map_err(|e| e.to_string())?;
             commit_live_write(tx)?;
             (n, rec)
@@ -618,13 +746,30 @@ impl ApprovalStore {
         decided_by: &str,
         decided_at: &str,
     ) -> Result<usize, String> {
+        self.decide_leased_inner(id, token, status, decided_by, decided_at, None).await
+    }
+
+    pub(super) async fn decide_leased_with_ledger(
+        &self, id: &ApprovalId, token: &str, approve: bool,
+        entry: &chat_admin::LedgerEntry, decided_at: &str,
+    ) -> Result<usize, String> {
+        let status = if approve { ApprovalStatus::Approved } else { ApprovalStatus::Denied };
+        self.decide_leased_inner(id, token, status, &entry.decided_by().to_string(), decided_at, Some(entry)).await
+    }
+
+    async fn decide_leased_inner(
+        &self, id: &ApprovalId, token: &str, status: ApprovalStatus,
+        decided_by: &str, decided_at: &str, ledger: Option<&chat_admin::LedgerEntry>,
+    ) -> Result<usize, String> {
         let (n, rec) = {
             let mut conn = self.conn.lock().await;
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .map_err(|e| format!("begin leased approval decision: {e}"))?;
+            let tx = begin_live_write(&mut conn)?;
             let rec = record_in_connection(&tx, id)?;
             match &rec {
-                Some(r) if r.status == ApprovalStatus::Pending => check_expected_digest(r)?,
+                Some(r) if r.status == ApprovalStatus::Pending => {
+                    check_expected_digest(r)?;
+                    if let Some(entry) = ledger { self.validate_chat_decision(r, entry)?; }
+                }
                 _ => return Ok(0),
             }
             let n = tx.execute(
@@ -636,7 +781,10 @@ impl ApprovalStore {
                     live_origin = super::turn_origin::LIVE_ORIGIN_SQL),
                 params![status.as_str(), decided_by, decided_at, id.as_str(), token],
             ).map_err(|e| format!("decide leased approval: {e}"))?;
-            tx.commit().map_err(|e| format!("commit leased approval decision: {e}"))?;
+            if n > 0 && let Some(entry) = ledger {
+                chat_admin::ledger::insert_and_consume(&tx, id, status.is_granted(), entry, decided_at)?;
+            }
+            commit_live_write(tx)?;
             (n, rec)
         };
         if n > 0 && let Some(rec) = rec {
@@ -654,7 +802,7 @@ impl ApprovalStore {
                 "SELECT id, agent_id, action_kind, summary, payload, status,
                         created_at, decided_at, decided_by, ttl_seconds,
                         notify_channel, notify_chat_id, reminded_at, simulation,
-                        request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                        request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                  FROM approvals WHERE action_kind = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list_by_kind: {e}"))?;
@@ -691,19 +839,67 @@ impl ApprovalStore {
         payload: &Value,
     ) -> Result<usize, String> {
         require_credential_free_payload(payload)?;
-        let mut connection = self.conn.lock().await;
-        let conn = begin_live_write(&mut connection)?;
-        verify_live_io()?;
-        let result = conn.execute(
-            "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
-             status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
-             invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
-                END WHERE id = ?3",
-            params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
-        )
-        .map_err(|e| format!("scrub approval: {e}"))?;
-        commit_live_write(conn)?;
+        // End the transaction and connection guard's scope before any async readback.
+        let result = {
+            let mut connection = self.conn.lock().await;
+            let conn = begin_live_write(&mut connection)?;
+            verify_live_io()?;
+            let result = conn.execute(
+                "UPDATE approvals SET summary = ?1, payload = ?2, simulation = NULL,
+                 status = CASE WHEN binding_json IS NOT NULL THEN 'invalidated' ELSE status END,
+                 invalidated_reason = CASE WHEN binding_json IS NOT NULL THEN 'payload_scrubbed' ELSE invalidated_reason
+                    END WHERE id = ?3",
+                params![duduclaw_security::credential_detect::mask(summary), payload.to_string(), id.as_str()],
+            )
+            .map_err(|e| format!("scrub approval: {e}"))?;
+            commit_live_write(conn)?;
+            result
+        };
+        if result > 0 && let Some(home) = self.db_path.as_deref().and_then(Path::parent) {
+            match self.get(id).await {
+                Ok(Some(rec)) if rec.status == ApprovalStatus::Invalidated => {
+                    chat_admin::sync::spawn_expire(home.to_path_buf(), rec);
+                }
+                Ok(_) => (),
+                Err(_) => warn!("chat-admin scrubbed card snapshot unavailable"),
+            }
+        }
         Ok(result)
+    }
+
+    /// Store only the first outcome, on the exact admin-AI card.
+    pub(super) async fn set_execution_result_once(&self, id: &ApprovalId, result: &Value) -> Result<bool, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = begin_live_write(&mut conn)?;
+        let n = tx.execute(
+            "UPDATE approvals SET execution_result=?1
+             WHERE id=?2 AND action_kind=?3 AND execution_result IS NULL",
+            params![result.to_string(), id.as_str(), crate::admin_ai::card::ACTION_KIND],
+        ).map_err(|e| format!("store approval execution result: {e}"))?;
+        commit_live_write(tx)?;
+        Ok(n == 1)
+    }
+
+    pub(super) async fn list_decided(
+        &self, agent_id: Option<&str>, action_kind: Option<&str>, limit: u32,
+    ) -> Result<Vec<ApprovalRecord>, String> {
+        if !(1..=100).contains(&limit) { return Err("invalid limit".into()); }
+        let conn = self.conn.lock().await;
+        verify_live_io()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, action_kind, summary, payload, status,
+                    created_at, decided_at, decided_by, ttl_seconds,
+                    notify_channel, notify_chat_id, reminded_at, simulation,
+                    request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
+             FROM approvals WHERE status != 'pending'
+               AND (?1 IS NULL OR agent_id=?1) AND (?2 IS NULL OR action_kind=?2)
+             ORDER BY julianday(decided_at) DESC, created_at DESC, id DESC LIMIT ?3",
+        ).map_err(|e| format!("prepare list_decided: {e}"))?;
+        let rows = stmt.query_map(params![agent_id, action_kind, limit], row_to_record)
+            .map_err(|e| format!("query list_decided: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect list_decided: {e}"))?;
+        Ok(rows)
     }
 
     pub(super) async fn list_pending(
@@ -719,7 +915,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                          FROM approvals
                          WHERE status = 'pending' AND agent_id = ?1
                          ORDER BY created_at ASC",
@@ -738,7 +934,7 @@ impl ApprovalStore {
                         "SELECT id, agent_id, action_kind, summary, payload, status,
                                 created_at, decided_at, decided_by, ttl_seconds,
                                 notify_channel, notify_chat_id, reminded_at, simulation,
-                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
                          FROM approvals
                          WHERE status = 'pending'
                          ORDER BY created_at ASC",
@@ -799,6 +995,10 @@ fn row_to_record(row: &rusqlite::Row) -> rusqlite::Result<ApprovalRecord> {
             .and_then(|s| serde_json::from_str(&s).ok()),
         invalidated_reason: row.get(17)?,
         on_behalf_of: row.get(18)?,
+        execution_result: row.get::<_, Option<String>>(19)?.map(|text| {
+            serde_json::from_str(&text).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                19, rusqlite::types::Type::Text, Box::new(e)))
+        }).transpose()?,
     })
 }
 
@@ -818,7 +1018,7 @@ pub(super) fn record_in_connection(conn: &Connection, id: &ApprovalId) -> Result
         "SELECT id, agent_id, action_kind, summary, payload, status,
                 created_at, decided_at, decided_by, ttl_seconds,
                 notify_channel, notify_chat_id, reminded_at, simulation,
-                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of
+                request_kind, binding_json, answer_json, invalidated_reason, on_behalf_of, execution_result
          FROM approvals WHERE id = ?1",
         params![id.as_str()],
         row_to_record,
@@ -938,6 +1138,23 @@ pub(crate) fn invalidate_unbound_cards(conn: &Connection, home: Option<&Path>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_adds_nullable_execution_result_to_existing_approvals() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE approvals (
+            id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, action_kind TEXT NOT NULL,
+            summary TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL,
+            decided_at TEXT, decided_by TEXT, ttl_seconds INTEGER NOT NULL DEFAULT 3600);
+            INSERT INTO approvals(id,agent_id,action_kind,summary,created_at)
+            VALUES('old','a','mcp_call','old','2026-01-01T00:00:00Z');").unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        ApprovalStore::init_schema(&conn).unwrap();
+        let rec = record_in_connection(&conn, &ApprovalId::from("old".to_owned())).unwrap().unwrap();
+        assert_eq!(rec.summary, "old");
+        assert_eq!(rec.execution_result, None);
+    }
 
     #[test]
     fn schema_migration_failure_rolls_back_all_schema_changes() {

@@ -570,6 +570,49 @@ pub fn append_tool_call_with_extras(
     success: bool,
     extras: &[(&str, serde_json::Value)],
 ) {
+    let path = home_dir.join("tool_calls.jsonl");
+    let map = tool_call_record(agent_id, tool_name, params_summary, success, extras);
+    if let Err(e) = duduclaw_core::with_file_lock(&path, || {
+        maybe_rotate_tool_calls(&path);
+        crate::audit_chain::append_chained_line_locked(&path, map, Some(SECURITY_AUDIT_FILE_MODE))
+    }) {
+        warn!("Failed to write tool call record to {}: {e}", path.display());
+    }
+}
+
+/// Persist the same masked, chained tool-call record before releasing protected
+/// content. Lock, write and sync failures must cause the caller to refuse access.
+pub fn try_append_tool_call_with_extras(
+    home_dir: &Path,
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+    extras: &[(&str, serde_json::Value)],
+) -> Result<(), String> {
+    let path = home_dir.join("tool_calls.jsonl");
+    let map = tool_call_record(agent_id, tool_name, params_summary, success, extras);
+    duduclaw_core::with_file_lock(&path, || {
+        // Refuse non-files before rotation could move an invalid target away.
+        crate::audit_chain::chained_len(&path)?;
+        maybe_rotate_tool_calls(&path);
+        crate::audit_chain::append_chained_line_locked(&path, map, Some(SECURITY_AUDIT_FILE_MODE))?;
+        // The chained writer writes directly to File. Keep the family lock
+        // until the appended bytes and (on Unix) directory entry are durable.
+        std::fs::OpenOptions::new().append(true).open(&path)?.sync_all()?;
+        #[cfg(unix)]
+        std::fs::File::open(home_dir)?.sync_all()?;
+        Ok(())
+    }).map_err(|e| e.to_string())
+}
+
+fn tool_call_record(
+    agent_id: &str,
+    tool_name: &str,
+    params_summary: &str,
+    success: bool,
+    extras: &[(&str, serde_json::Value)],
+) -> serde_json::Map<String, serde_json::Value> {
     const RESERVED: &[&str] = &[
         "timestamp",
         "agent_id",
@@ -577,7 +620,6 @@ pub fn append_tool_call_with_extras(
         "params_summary",
         "success",
     ];
-    let path = home_dir.join("tool_calls.jsonl");
     let mut map = serde_json::Map::new();
     map.insert("timestamp".into(), Utc::now().to_rfc3339().into());
     map.insert("agent_id".into(), agent_id.into());
@@ -632,16 +674,7 @@ pub fn append_tool_call_with_extras(
         }
     }
 
-    // 0600 on create: since result_text landed, rows can carry business
-    // data (e.g. Odoo reads), so the file must not be world/group-readable.
-    // `append_chained_line` tightens an existing file's permissions if they
-    // drifted wider (upgraded installs), same discipline as before B1.
-    if let Err(e) = duduclaw_core::with_file_lock(&path, || {
-        maybe_rotate_tool_calls(&path);
-        crate::audit_chain::append_chained_line_locked(&path, map, Some(SECURITY_AUDIT_FILE_MODE))
-    }) {
-        warn!("Failed to write tool call record to {}: {e}", path.display());
-    }
+    map
 }
 
 // ── R4: input capture (TraceElephant) ─────────────────────────
@@ -2060,6 +2093,40 @@ mod tests {
         assert!(!raw.contains("/tmp"), "no path/value should leak into the audit record");
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn strict_tool_call_writer_preserves_record_format_and_chain() {
+        let home = fresh_home();
+        let extras = [("tool", serde_json::json!("odoo_read")),
+            ("agent_id", serde_json::json!("forged"))];
+        append_tool_call_with_extras(&home, "alice", "odoo_identity", "identity decision", true, &extras);
+        try_append_tool_call_with_extras(&home, "alice", "odoo_identity", "identity decision", true, &extras).unwrap();
+        let path = home.join("tool_calls.jsonl");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let rows: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row["agent_id"], "alice");
+            assert_eq!(row["tool_name"], "odoo_identity");
+            assert_eq!(row["params_summary"], "identity decision");
+            assert_eq!(row["success"], true);
+            assert_eq!(row["tool"], "odoo_read");
+            assert!(row["timestamp"].is_string());
+        }
+        assert_eq!(crate::audit_chain::verify_chain(&path).unwrap(),
+            crate::audit_chain::ChainVerifyResult::Intact { lines_checked: 2 });
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn strict_tool_call_writer_returns_error_for_directory_target() {
+        let home = fresh_home();
+        let path = home.join("tool_calls.jsonl");
+        std::fs::create_dir(&path).unwrap();
+        assert!(try_append_tool_call_with_extras(&home, "alice", "odoo_identity", "identity decision", true, &[]).is_err());
+        assert!(path.is_dir());
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[cfg(unix)]

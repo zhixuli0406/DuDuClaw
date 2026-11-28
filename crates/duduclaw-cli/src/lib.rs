@@ -6873,6 +6873,9 @@ fn agent_file_guard_decision(
                             duduclaw_core::bash_operator_command_decision(command, &caller, meeting_cmd::OPERATOR_COMMANDS)
                         })
                         .or_else(|| {
+                            duduclaw_core::bash_operator_command_decision(command, &caller, portability::OPERATOR_COMMANDS)
+                        })
+                        .or_else(|| {
                             // RM-137 H3: an employee may not run its own ACP server.
                             duduclaw_core::bash_operator_command_decision(command, &caller, acp::server::OPERATOR_COMMANDS)
                         })
@@ -9018,7 +9021,7 @@ can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
-allowed_channels = ["*"]
+allowed_channels = []
 permissions_enforced_since = "1.68.0"
 
 [evolution]
@@ -9033,14 +9036,7 @@ max_active_skills = 5
 "#,
         gvu_enabled = enable_gvu,
     );
-    tokio::fs::write(&agent_toml_path, agent_toml)
-        .await
-        .map_err(|e| {
-            DuDuClawError::Config(format!(
-                "Failed to write {}: {e}",
-                agent_toml_path.display()
-            ))
-        })?;
+    write_new_agent_toml(&agent_toml_path, &agent_toml).await.map_err(DuDuClawError::Config)?;
     println!("  {} {}", style("✓").green(), agent_toml_path.display());
 
     // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
@@ -10505,6 +10501,22 @@ fn refuse_org_write_in_agent_session(claimed: &str) -> String {
 /// automatic re-import on every boot would let anyone who can write an
 /// `agent.toml` promote their edit to authority just by waiting for a restart.
 /// Making the adoption a typed command keeps that decision with a human.
+/// Operator-only advisory output: never create/migrate the user store and
+/// never prevent sync when grant impact cannot be read. Use sync's actual
+/// before/after authority entries, including for dry runs.
+fn org_sync_reach_line(home: &std::path::Path, before: Option<&duduclaw_core::org_store::OrgEntry>,
+    after: &duduclaw_core::org_store::OrgEntry) -> Option<String> {
+    use duduclaw_auth::dept_grants::{reach_change, reach_sentence_zh};
+    let from = before.map(|entry| entry.department.as_str()).filter(|d| !d.is_empty());
+    let to = (!after.department.is_empty()).then_some(after.department.as_str());
+    if from == to { return None; }
+    match duduclaw_auth::UserDb::open_read_only(&home.join("users.db"))
+        .and_then(|db| reach_change(&db, from, to)) {
+        Ok(lines) => reach_sentence_zh(&lines),
+        Err(_) => Some("警告：授權影響無法計算，請到儀表板確認部門主管的管理範圍。".to_owned()),
+    }
+}
+
 fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Result<()> {
     let home = duduclaw_home();
 
@@ -10551,6 +10563,9 @@ fn cmd_org_sync(agent: Option<&str>, dry_run: bool) -> duduclaw_core::error::Res
                 org_entry_label(&c.after)
             ),
             None => println!("  • {}(新增): {}", c.agent_id, org_entry_label(&c.after)),
+        }
+        if let Some(sentence) = org_sync_reach_line(&home, c.before.as_ref(), &c.after) {
+            println!("    {sentence}");
         }
     }
 
@@ -11293,6 +11308,13 @@ pub(crate) fn scaffold_agent_files(
     Ok(files)
 }
 
+/// Publish exactly the checked text against a new employee's absent baseline.
+/// Used by initial onboarding, CLI scaffolding and wizard template copies.
+pub(crate) async fn write_new_agent_toml(path: &std::path::Path, content: &str) -> Result<(), String> {
+    duduclaw_gateway::handlers::config_commit::refuse_odoo_agent_widening_text_edit("", content)?;
+    tokio::fs::write(path, content).await.map_err(|e| format!("Failed to write {}: {e}", path.display()))
+}
+
 /// Import-only writer: no rendering, re-resolution, or source reads after review.
 pub(crate) async fn scaffold_planned_agent_dir(
     home: &std::path::Path,
@@ -11306,6 +11328,10 @@ pub(crate) async fn scaffold_planned_agent_dir(
     let agent_dir = home.join("agents").join(&s.name);
     let config = files.get("agent.toml").ok_or_else(|| DuDuClawError::Agent("Missing planned settings".into()))?;
     let config = std::str::from_utf8(config).map_err(|e| DuDuClawError::Agent(e.to_string()))?;
+    // Refuse before publishing a directory or any profile slot. The shared
+    // locked writer checks these same final bytes again when writing the slot.
+    duduclaw_gateway::handlers::config_commit::refuse_odoo_agent_widening_text_edit("", config)
+        .map_err(DuDuClawError::Agent)?;
     duduclaw_gateway::product_policy::validate_write(home, &agent_dir.join("agent.toml"), "", config)
         .map_err(DuDuClawError::Agent)?;
     duduclaw_core::config::create_home_dir(home)?;
@@ -11370,6 +11396,42 @@ pub(crate) async fn scaffold_planned_agent_dir(
 
 #[cfg(test)]
 mod planned_scaffold_tests {
+    #[tokio::test]
+    async fn initial_onboarding_profile_writer_checks_exact_published_text() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("agent.toml");
+        let error = super::write_new_agent_toml(&path, "[odoo]\nact_as_requester=true\n").await.unwrap_err();
+        assert!(error.contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
+        assert!(!path.exists());
+        let safe = "# retained\n[odoo]\npermission_override='inherit'\n";
+        super::write_new_agent_toml(&path, safe).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), safe);
+    }
+
+    #[tokio::test]
+    async fn planned_import_and_legacy_scaffold_refuse_odoo_requester() {
+        let home = tempfile::tempdir().unwrap();
+        let mut scaffold = super::AgentScaffold {
+            name: "planned".into(), display_name: "Planned".into(), role: "worker".into(),
+            reports_to: String::new(), icon: "X".into(), trigger: "@Planned".into(),
+            provider: duduclaw_core::types::RuntimeType::Claude, model_preferred: None, soul_body: None,
+        };
+        let mut files = super::scaffold_agent_files(&scaffold).unwrap();
+        files.get_mut("agent.toml").unwrap().extend_from_slice(b"\n[odoo]\nact_as_requester=true\n");
+        let error = super::scaffold_planned_agent_dir(home.path(), &scaffold, &files).await.unwrap_err();
+        assert!(error.to_string().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
+        assert!(!home.path().join("agents/planned").exists());
+        // Legacy scaffolding interpolates model text. A syntactically valid
+        // section injection must be checked as the final document too.
+        scaffold.model_preferred = Some("model\"\n[odoo]\nact_as_requester=true\n[model.extra]\nunused=\"x".into());
+        let text = super::scaffold_agent_toml(&scaffold);
+        let parsed: toml::Table = text.parse().unwrap();
+        assert_eq!(parsed["odoo"]["act_as_requester"].as_bool(), Some(true));
+        let error = super::scaffold_agent_dir(home.path(), &scaffold).await.unwrap_err();
+        assert!(error.to_string().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
+        assert!(!home.path().join("agents/planned").exists());
+    }
+
     // NOT RUN: this change was made with builds and tests explicitly disabled.
     #[tokio::test]
     async fn planned_files_are_exact_and_protected_baselines_are_established() {
@@ -11409,6 +11471,9 @@ pub(crate) async fn scaffold_agent_dir(
     if let Some(e) = reserved_agent_name_error(&s.name) {
         return Err(e);
     }
+    let agent_toml = scaffold_agent_toml(s);
+    duduclaw_gateway::handlers::config_commit::refuse_odoo_agent_widening_text_edit("", &agent_toml)
+        .map_err(DuDuClawError::Agent)?;
     let admission = duduclaw_core::agent_seats::SeatAdmission::acquire_async(home).await
         .map_err(|e| DuDuClawError::Agent(e.to_string()))?;
     let cap = duduclaw_gateway::license_runtime::agent_cap_from_disk(home).await;
@@ -11477,10 +11542,8 @@ pub(crate) async fn scaffold_agent_dir(
     } = s;
     let role_str = role.as_str();
 
-    let agent_toml = scaffold_agent_toml(s);
-    tokio::fs::write(agent_dir.join("agent.toml"), &agent_toml)
-        .await
-        .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
+    write_new_agent_toml(&agent_dir.join("agent.toml"), &agent_toml)
+        .await.map_err(DuDuClawError::Agent)?;
 
     // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
     // This one call covers every CLI creation path that funnels through this
@@ -12336,6 +12399,7 @@ async fn cmd_export_data(out: Option<PathBuf>) -> duduclaw_core::error::Result<(
 
 /// `duduclaw import <file>` — restore a personal-edition `.tar.gz` into `~/.duduclaw/`.
 async fn cmd_import_data(file: PathBuf, force: bool) -> duduclaw_core::error::Result<()> {
+    portability::refuse_import_in_ai_session()?;
     let home = duduclaw_home();
     println!("Importing personal-edition data...");
     println!("  Archive: {}", file.display());
@@ -13866,6 +13930,17 @@ mod agent_scaffold_tests {
     use duduclaw_core::types::RuntimeType;
 
     #[test]
+    fn scaffold_agent_toml_has_no_allowed_channels() {
+        let scaffold = AgentScaffold {
+            name: "fresh".into(), display_name: "Fresh".into(), role: "worker".into(),
+            reports_to: String::new(), icon: "🐾".into(), trigger: "@Fresh".into(),
+            provider: RuntimeType::Claude, model_preferred: None, soul_body: None,
+        };
+        let config: toml::Table = scaffold_agent_toml(&scaffold).parse().unwrap();
+        assert!(config["permissions"]["allowed_channels"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
     fn context_filenames_per_provider() {
         assert_eq!(
             provider_context_filenames(RuntimeType::Claude),
@@ -15345,6 +15420,28 @@ mod removed_name_hook_tests {
         assert!(audit.contains("agent_name_reserved") && audit.contains("cli_bash_agent_create"));
     }
 
+    #[test]
+    fn import_bash_is_operator_only_through_agent_file_guard() {
+        let h = home_with_trash();
+        for binary in ["duduclaw", "duduclaw-pro", "duduclaw.exe", "duduclaw-pro.exe", "/opt/bin/duduclaw"] {
+            for suffix in ["import input.tar.gz --force", "--redact on import input.tar.gz", "im''port input.tar.gz"] {
+                let command = format!("{binary} {suffix}");
+                for caller in [agent("ceo"), HookCaller::Untrusted("unknown".into())] {
+                    let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &caller).unwrap();
+                    assert!(!decision.is_allowed(), "{command}: {decision:?}");
+                    if matches!(caller, HookCaller::Agent(_)) {
+                        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
+                    }
+                }
+                let decision = agent_file_guard_decision("Bash", &bash(&command), h.path(), &HookCaller::Absent);
+                assert!(decision.is_none_or(|d| d.is_allowed()), "{command}");
+            }
+        }
+        let command = "bash -c 'env -u DUDUCLAW_AGENT_ID duduclaw import input.tar.gz --force'";
+        let decision = agent_file_guard_decision("Bash", &bash(command), h.path(), &agent("ceo")).unwrap();
+        assert!(matches!(decision, GuardDecision::BlockedOperatorCommand { command: "duduclaw import", .. }));
+    }
+
     /// P2-A appendix D.1 (moved from core onto the shared operator-command
     /// matcher at the S9 rebase): `duduclaw responsibility …`, every
     /// subcommand, is refused for employees and unverified callers.
@@ -15732,7 +15829,7 @@ can_send_cross_agent = true
 can_modify_own_skills = true
 can_modify_own_soul = false
 can_schedule_tasks = true
-allowed_channels = ["*"]
+allowed_channels = []
 permissions_enforced_since = "1.68.0"
 
 [evolution]
@@ -15791,3 +15888,6 @@ mod users_mfa_cmd;
 
 #[cfg(test)]
 mod third_party_mcp_tests;
+
+#[cfg(test)]
+mod org_sync_reach_tests;

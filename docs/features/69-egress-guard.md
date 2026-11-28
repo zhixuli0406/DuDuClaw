@@ -1,5 +1,7 @@
 # Outgoing data guard
 
+Open approval cards in **Inbox**; processed cards show **Decision maker** and decision time. Admins grant department reviewers in **Members → Manager row → Department management grants**. Chat approval is configured in **Security settings → Approve in chat apps**.
+
 **Codex external configuration gate (since v1.80.0):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
 
 Available from v1.77.0. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
@@ -73,7 +75,13 @@ Clearing a lease removes its protection against concurrent private reads. Restar
 
 ## Review before approving
 
-Outgoing-data approvals require a current dashboard Admin, except eligible `mail_send` requests: the verified turn requester with current Operator access may decide in the original one-to-one conversation or authenticated dashboard WebChat when `[security] mail_requester_approval` allows it. See [requester rules and configuration failures](05-security-defense.md#requester-confirmation-for-mail). Other channel decisions are refused. The Admin-only dashboard outgoing-data approval shows the destination, full arguments expanded in a scrollable panel, source tools and expiry. Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
+Outbound-data approval cards can be opened and decided in the dashboard by a current Admin or an active Manager granted outbound-data review for the employee’s department. A Manager cannot decide a request made on their own behalf, and personal employees are never covered by department grants. The reviewer sees the destination, full arguments expanded in a scrollable panel, source tools and expiry. Lists, timelines and notifications show only a fixed summary without request content; full details are available in the card view. Every non-Admin opening must first be audited; opening is refused if the audit cannot be written. Decisions audit the reviewer type on a best-effort basis, with the decision maker also kept on the approval record.
+
+Notifications go only to active Admins and active Managers holding that department grant. Their eligibility and exact verified direct-message destination are checked before every send, including reminders. Chat decisions for these cards remain Admin-only. See [Department managers](79-department-managers.md) for grants and limits, including Members → Department management grants.
+
+Eligible `mail_send` requests retain the separate exception: the verified turn requester with current Operator access may decide in the original one-to-one conversation or authenticated dashboard WebChat when `[security] mail_requester_approval` allows it. See [requester rules and configuration failures](05-security-defense.md#requester-confirmation-for-mail).
+
+Send, Publish and Purchase approvals also show full arguments. One approval binds one employee, tool and digest of the complete canonical arguments and can be used once. An action-rule approval and the outgoing-data reason share one request.
 
 Action-rule approvals show the matching tool or effect rule, including for read and draft calls. Purchase and Delete actions cannot receive new standing capability or workflow grants; grants saved before this feature are ignored without changing the stored records. Other gates and explicit approvals still apply.
 
@@ -90,7 +98,7 @@ Claude and Grok receive a `PreToolUse` hook for `WebFetch`, `WebSearch` and lite
 
 The hook posts raw tool arguments to `/api/internal/egress-guard/hook-check`. The gateway canonicalizes and hashes them and builds the card; client digests and summaries are rejected. Requests and responses are signed; the port comes from `config.toml`, not an inherited port variable. Hook checks have their own per-employee 120/minute bucket. The live host principal context supplies the requester for self-approval checks; an unavailable context cannot create an ask ticket.
 
-In `ask`, retry the exact same arguments in the same turn after a current Admin approves in the dashboard. The ticket binds employee, turn, tool, complete arguments and covered sources; `WebFetch` includes the full URL and query. Identical pending requests reuse one ticket. New sources invalidate the previous ticket. Consumption is single-use, so a second retry needs another approval. Bash tickets require one direct simple command and one network verb: no expansion, substitution, pipes, redirects, `@file`, wrappers or interpreters. Unsupported shapes are refused with an explanation when approval would be required. This binds text, not DNS results, executable contents, configuration files or symlink targets.
+In `ask`, retry the exact same arguments in the same turn after an authorized outbound-data reviewer approves in the dashboard. The ticket binds employee, turn, tool, complete arguments and covered sources; `WebFetch` includes the full URL and query. Identical pending requests reuse one ticket. New sources invalidate the previous ticket. Consumption is single-use, so a second retry needs another approval. Bash tickets require one direct simple command and one network verb: no expansion, substitution, pipes, redirects, `@file`, wrappers or interpreters. Unsupported shapes are refused with an explanation when approval would be required. This binds text, not DNS results, executable contents, configuration files or symlink targets.
 
 In `ask`/`block`, handled hook errors and panics exit 2, and hook installation failure stops the spawn without account/runtime rotation. `shadow` logs and continues. In enforcing modes Claude loads only the identity owner's `.claude/settings.json` via `--setting-sources "" --settings <file>`, even when cwd differs (ambient project/local/user settings are excluded); `cli_bare_mode` is refused in enforcing modes because it skips hooks. Grok adds `--disable-web-search`; enforcing modes currently refuse borrowed/shared work roots or another employee's guard file in the same hook directory. Use an independent employee directory or Claude/Codex for these runs.
 
@@ -105,6 +113,8 @@ DuDuClaw does not guarantee that Grok alias matching or environment propagation 
 ## Server-bound recipients
 
 For `mail_send` only, the verified requester may use the original conversation under the [mail-requester rule](05-security-defense.md#requester-confirmation-for-mail). All other targets in the table retain dashboard Admin approval. Only an adapter-attested one-to-one conversation or authenticated dashboard WebChat is eligible. Group chats and unknown chat types still need a dashboard Admin; public WebChat widget visitors are never eligible. Channel notices for ineligible requests contain no recipients, subject or body; full content stays in the dashboard.
+
+The department review grant above applies only to outbound-data cards. Other approval types keep their existing reviewer rules.
 
 Recipient protection is independent of whether private data was read. Set `config.toml [security] recipient_guard` to `off`, `shadow` (default), or `ask`. An unknown value warns and behaves as `ask`. An employee's `[capabilities] recipient_guard` can only tighten the global setting (`off < shadow < ask`). In the dashboard, use Security → Outgoing data guard → Recipient guard; an Admin edits additional recipients under the employee's Tools & permissions → Allowed recipients.
 

@@ -1,3 +1,4 @@
+import { useDepartmentAgents } from '@/lib/use-department-agents';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useState, useEffect, useCallback, useMemo } from 'react';
@@ -401,6 +402,7 @@ function MarketTab({
 
 function SkillCard({ skill, onInstall }: { skill: SkillIndexEntry; onInstall: () => void }) {
   const intl = useIntl();
+  const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const hasUrl = skill.url && /^https?:\/\//i.test(skill.url);
   return (
     <Card className="gap-3">
@@ -443,7 +445,7 @@ function SkillCard({ skill, onInstall }: { skill: SkillIndexEntry; onInstall: ()
         )}
         <Button variant="brand" size="sm" onClick={onInstall}>
           <Download />
-          {intl.formatMessage({ id: 'skills.market.install' })}
+          {intl.formatMessage({ id: isAdmin ? 'skills.market.install' : 'skills.install.requestAction' })}
         </Button>
       </div>
     </Card>
@@ -541,12 +543,17 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   const agents = useVisibleAgents(false);
   const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
-  const [scope, setScope] = useState<string | null>('global');
+  const departmentGrants = useAuthStore(s => s.deptGrants);
+  const { data: departmentAccess } = useDepartmentAgents('skills');
+  const requestAgents = useMemo(() => [...selectableAgents,
+    ...departmentAccess.agents.filter(a => !selectableAgents.some(b => b.name === a.id))
+      .map(a => ({ name: a.id, display_name: a.display_name }))], [selectableAgents, departmentAccess.agents]);
+  const [scope, setScope] = useState<string | null>(isAdmin ? 'global' : null);
   const agentScope = scope !== null && scope !== 'global' && !scope.startsWith('department:');
-  const validScope = scope !== null && (!agentScope || canSelectAgent(scope ?? ''));
+  const validScope = scope !== null && (isAdmin ? (!agentScope || canSelectAgent(scope)) : agentScope && (departmentAccess.agents.some(a => a.id === scope) || canSelectAgent(scope)));
   useEffect(() => {
-    if (agentScope && !selectableAgents.some(a => a.name === scope)) setScope(null);
-  }, [agentScope, scope, selectableAgents]);
+    if (agentScope && !requestAgents.some(a => a.name === scope)) setScope(null);
+  }, [agentScope, scope, requestAgents]);
   const [scanning, setScanning] = useState(false);
   const [scanResult, setScanResult] = useState<VetResponse | null>(null);
   const [installing, setInstalling] = useState(false);
@@ -574,7 +581,14 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   }, [skill.url]);
 
   const handleInstall = useCallback(async () => {
-    if (!scanResult?.passed || !skill.url || !scope || (agentScope && !canSelectAgent(scope ?? ''))) return;
+    if (!scanResult?.passed || !skill.url || !scope || !validScope) return;
+    // Recheck live grants at submission: a store revocation can precede React's render.
+    if (agentScope && !canSelectAgent(scope)
+      && !(departmentAccess.agents.some(a => a.id === scope)
+        && useAuthStore.getState().deptGrants === departmentGrants)) {
+      setScope(null);
+      return;
+    }
     setInstalling(true);
     setError(null);
     try {
@@ -591,7 +605,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
     } finally {
       setInstalling(false);
     }
-  }, [scanResult, skill.url, scope, isAdmin, agentScope]);
+  }, [scanResult, skill.url, scope, isAdmin, validScope, agentScope, departmentAccess.agents, departmentGrants]);
 
   const scanPassed = scanResult?.passed === true;
   const scanFailed = scanResult !== null && !scanResult.passed;
@@ -599,14 +613,14 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   // WP7 — departments already in use, for the `department:<dept>` scope option.
   // Hidden in the Personal edition (no departments there).
   const isPersonal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
-  const departmentOptions: string[] = isPersonal ? [] : departmentsOf(agents);
+  const departmentOptions: string[] = isPersonal || !isAdmin ? [] : departmentsOf(agents);
 
   const scopeLabel = (s: string): string => {
     if (s === 'global') return intl.formatMessage({ id: 'skills.install.scopeGlobal' });
     if (s.startsWith('department:')) {
       return intl.formatMessage({ id: 'skills.install.scopeDept' }, { dept: s.slice('department:'.length) });
     }
-    const agent = agents.find((a) => a.name === s);
+    const agent = requestAgents.find((a) => a.name === s);
     return intl.formatMessage({ id: 'skills.install.scopeAgent' }, { agent: agent?.display_name || s });
   };
 
@@ -634,9 +648,9 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
                 <SelectValue>{scope === null ? intl.formatMessage({ id: 'skills.install.scope' }) : scopeLabel(scope)}</SelectValue>
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="global">
+                {isAdmin && <SelectItem value="global">
                   {intl.formatMessage({ id: 'skills.install.scopeGlobal' })}
-                </SelectItem>
+                </SelectItem>}
                 {departmentOptions.length > 0 && (
                   <SelectGroup>
                     <SelectLabel>{intl.formatMessage({ id: 'skills.install.scopeDeptGroup' })}</SelectLabel>
@@ -649,7 +663,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
                 )}
                 <SelectGroup>
                   <SelectLabel>{intl.formatMessage({ id: 'skills.install.scopeAgentGroup' })}</SelectLabel>
-                  {sortAgentsByName(selectableAgents, intl.locale).map((agent) => (
+                  {sortAgentsByName(requestAgents, intl.locale).map((agent) => (
                     <SelectItem key={agent.name} value={agent.name}>
                       {intl.formatMessage(
                         { id: 'skills.install.scopeAgent' },
@@ -759,7 +773,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
               {installing ? <Loader2 className="animate-spin" /> : <Download />}
               {installing
                 ? intl.formatMessage({ id: isAdmin ? 'skills.install.installing' : 'install.request.submitting' })
-                : intl.formatMessage({ id: isAdmin ? 'skills.install.installBtn' : 'install.request.submit' })}
+                : intl.formatMessage({ id: isAdmin ? 'skills.install.installBtn' : 'skills.install.requestAction' })}
             </Button>
           )}
         </DialogFooter>

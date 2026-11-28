@@ -1,3 +1,6 @@
+import { orgErrorCode, orgErrorField } from '@/lib/org-change';
+import type { ReachReview } from '@/lib/api';
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -58,6 +61,7 @@ import {
   payloadBytes,
   type AutopilotActionCard,
 } from './autopilot-action-payload';
+import { AdminAiSettingsView, parseAdminAiSettings } from './AdminAiSettingsView';
 import { visibleEscapes } from '@/lib/visible-escapes';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
@@ -183,6 +187,8 @@ export function parseActionGrant(payload: unknown): ActionGrantView | null {
 }
 
 function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; expiresAt: number | null; t: (id: string) => string }) {
+  const intl = useIntl();
+  useCompanyTimeZone();
   const destinations = Object.entries(grant.fullArgs ?? {}).filter(([key]) =>
     ['channel', 'chat_id', 'recipient', 'recipients', 'to', 'cc', 'bcc', 'email', 'url', 'destination', 'agent', 'agent_id', 'notify_channel', 'notify_chat_id', 'notify_thread_id', 'attendees'].includes(key),
   );
@@ -239,7 +245,7 @@ function ActionGrantSection({ grant, expiresAt, t }: { grant: ActionGrantView; e
             </div>
           )}
           {expiresAt != null && Number.isFinite(expiresAt) && (
-            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={new Date(expiresAt * 1000).toISOString()}>{new Date(expiresAt * 1000).toLocaleString()}</time></p>
+            <p className="text-xs">{t('approval.grant.expires')}: <time dateTime={new Date(expiresAt * 1000).toISOString()}>{formatDateTime(expiresAt * 1000, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time></p>
           )}
         </div>
         <p className="text-[11px] text-muted-foreground">
@@ -482,14 +488,34 @@ function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
 
 function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; outcome?: 'approved' | 'denied' }) {
   const intl = useIntl();
+  useCompanyTimeZone();
+  const execution = approval.kind === 'admin_ai_settings' ? approval.execution_result : null;
   const status = outcome ?? approval.status;
   const labelKey = status === 'approved' ? 'inbox.status.approved'
     : status === 'denied' ? 'inbox.status.denied'
     : status === 'expired' ? 'inbox.status.expired'
     : status === 'answered' ? 'approval.question.answered' : 'inbox.processed.receipt';
+  const adminAiResult = status === 'approved' ? 'approved'
+    : ['admin_ai:expired', 'expired'].includes(approval.invalidated_reason ?? '') || status === 'expired' ? 'expired'
+    : approval.invalidated_reason === 'restart_requires_reobserve' ? 'restart'
+    : approval.invalidated_reason === 'admin_changed' ? 'adminChanged'
+    : status === 'denied' ? 'denied' : 'invalidated';
   return (
     <div className="space-y-4">
       <Badge variant="secondary">{intl.formatMessage({ id: labelKey })}</Badge>
+      {execution ? <div className="space-y-2 text-sm">
+        {execution.outcome === 'complete' && <p>{intl.formatMessage({ id: 'approval.adminAi.result.complete' }, { completed: execution.completed ?? '—' })}</p>}
+        {execution.outcome === 'partial' && <>
+          <p>{intl.formatMessage({ id: 'approval.adminAi.result.partial' }, { completed: execution.completed ?? '—', notExecuted: execution.not_executed ?? '—' })}</p>
+          {execution.message && <p className="whitespace-pre-wrap break-words">{execution.message}</p>}
+          {execution.items.map((item, index) => item.error ? <p key={index} className="whitespace-pre-wrap break-words">{intl.formatMessage({ id: 'approval.adminAi.result.itemError' }, { seq: item.seq ?? '—', error: item.error })}</p> : null)}
+        </>}
+        {execution.outcome === 'voided' && <p className="whitespace-pre-wrap break-words">{execution.message || intl.formatMessage({ id: 'approval.adminAi.result.voided' })}</p>}
+      </div> : approval.kind === 'admin_ai_settings' && <p className="text-sm">{intl.formatMessage({ id: `approval.adminAi.result.${adminAiResult}` })}</p>}
+      {approval.decided_at && <Row label={intl.formatMessage({ id: 'approval.decidedAt' })}>{formatDateTime(approval.decided_at, { locale: intl.locale })}</Row>}
+      {typeof approval.decided_by_display === 'string' && approval.decided_by_display.trim() && (
+        <Row label={intl.formatMessage({ id: 'approval.decidedBy' })}><span className="break-words">{approval.decided_by_display}</span></Row>
+      )}
       <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
       {typeof approval.answer === 'string' && <p className="whitespace-pre-wrap text-sm">{approval.answer}</p>}
       <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
@@ -512,7 +538,7 @@ export function ApprovalDetailPanel({
   /** `expectedDigest`: the review digest of the card the view rendered
    *  (autopilot actions always pass it; the parent sends it as
    *  `expected_digest`). */
-  onApprove: (expectedDigest?: string) => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
@@ -542,6 +568,10 @@ export function ApprovalDetailPanel({
       );
     }
     // Missing artifact → fall through to the generic view.
+  }
+  if (approval.kind === 'admin_ai_settings') {
+    const payload = parseAdminAiSettings(approval.payload);
+    if (payload) return <AdminAiSettingsView approval={approval} payload={payload} onApprove={onApprove} onReject={onReject} decideError={decideError} />;
   }
   // ── v1.82 autopilot rule action: the complete frozen action, always ──
   if (approval.kind === 'autopilot_action') {
@@ -583,7 +613,7 @@ function GenericApprovalView({
 }: {
   approval: ApprovalItem;
   agentName?: string;
-  onApprove: () => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   decideError?: unknown;
 }) {
@@ -596,6 +626,15 @@ function GenericApprovalView({
   // org_change: a request made against an org position that has since moved
   // can only be rejected.
   const [orgStale, setOrgStale] = useState(false);
+  const [orgReachDigest, setOrgReachDigest] = useState<string>();
+  const [reachOverride, setReachOverride] = useState<ReachReview>();
+  useEffect(() => {
+    if (approval.kind === 'org_change' && orgErrorCode(decideError) === 'reach_changed') {
+      const current = orgErrorField<ReachReview>(decideError, 'current');
+      if (current) setReachOverride(current);
+    }
+  }, [approval.kind, decideError]);
+  const approveReviewed = () => approval.kind === 'org_change' ? onApprove(undefined, orgReachDigest) : onApprove();
 
   const risk = approvalRisk(approval.kind, approval.payload);
   const facts = extractPlanFacts(approval.payload);
@@ -635,12 +674,14 @@ function GenericApprovalView({
   const expiry = tracksExpiry
     ? expiryState({ timestamp: approval.created_at, expiresAt: expiresAtEpoch }, now)
     : null;
-  const payload =
-    typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
+  // Internal admin settings identifiers must stay hidden even in the generic fallback.
+  const payload = approval.kind === 'org_change' ? undefined : approval.kind === 'admin_ai_settings'
+    ? JSON.stringify(approval.payload, (key, value) => key === 'id' || key === 'target' ? undefined : value, 2)
+    : typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
 
   const requestApprove = () => {
     if (riskNeedsConfirm(risk)) setConfirmOpen(true);
-    else onApprove();
+    else approveReviewed();
   };
 
   return (
@@ -686,7 +727,7 @@ function GenericApprovalView({
 
       {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={agentName} />}
 
-      {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={agentName} onStale={setOrgStale} />}
+      {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={agentName} onStale={setOrgStale} onReachDigest={setOrgReachDigest} reachOverride={reachOverride} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (
@@ -801,7 +842,7 @@ function GenericApprovalView({
           <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
           <div className="min-w-0 space-y-0.5">
             <p className="font-medium">{t('approval.decide.failed')}</p>
-            <p className="whitespace-pre-wrap break-words">{formatErrorDetail(decideError) || formatError(decideError)}</p>
+            <p className="whitespace-pre-wrap break-words">{orgErrorCode(decideError) === 'reach_changed' ? t('orgReach.changed') : formatErrorDetail(decideError) || formatError(decideError)}</p>
           </div>
         </div>
       )}
@@ -836,7 +877,7 @@ function GenericApprovalView({
               variant="brand"
               onClick={() => {
                 setConfirmOpen(false);
-                onApprove();
+                approveReviewed();
               }}
             >
               {t('approval.confirm.approve')}
@@ -864,10 +905,10 @@ function Escaped({ value, mono }: { value: string; mono?: boolean }) {
   );
 }
 
-function localTime(value: string | number | null | undefined): string | null {
+function localTime(value: string | number | null | undefined, locale: string): string | null {
   if (value == null || value === '') return null;
   const date = typeof value === 'number' ? new Date(value * 1000) : new Date(value);
-  return Number.isNaN(date.getTime()) ? null : date.toLocaleString();
+  return Number.isNaN(date.getTime()) ? null : formatDateTime(date, { locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
 }
 
 /**
@@ -887,11 +928,12 @@ function AutopilotActionApprovalView({
   decideError,
 }: {
   approval: ApprovalItem;
-  onApprove: (expectedDigest?: string) => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   decideError?: unknown;
 }) {
   const intl = useIntl();
+  useCompanyTimeZone();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const card: AutopilotActionCard | null = useMemo(() => parseAutopilotAction(approval.payload), [approval.payload]);
   const tooLarge = useMemo(
@@ -922,8 +964,8 @@ function AutopilotActionApprovalView({
       ? 'approval.autopilot.content.notify'
       : `approval.autopilot.content.${card.actionType}`
     : null;
-  const decideBy = localTime(approval.expires_at ?? null);
-  const latest = localTime(card?.latestExecutionAt ?? null);
+  const decideBy = localTime(approval.expires_at ?? null, intl.locale);
+  const latest = localTime(card?.latestExecutionAt ?? null, intl.locale);
   const windowMinutes = Math.round((card?.executionWindowSecs ?? 900) / 60);
 
   return (

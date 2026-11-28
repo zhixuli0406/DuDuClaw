@@ -48,6 +48,12 @@ pub(crate) const TASKS_V182: &str = concat!(
     include_str!("tasks-v181.sql"),
     "ALTER TABLE tasks ADD COLUMN source_origin_proof TEXT;\n"
 );
+/// v1.86 adds only the employee task listing index; retain the v1.80 reader.
+pub(crate) const TASKS_V186: &str = concat!(
+    include_str!("tasks-v181.sql"),
+    "ALTER TABLE tasks ADD COLUMN source_origin_proof TEXT;\n",
+    include_str!("tasks-employee-created-v186.sql")
+);
 pub(crate) const CRON_V1793: &str = include_str!("cron-v1793.sql");
 pub(crate) const CRON_V180: &str = include_str!("cron-v180.sql");
 pub(crate) const CRON_V182: &str = include_str!("cron-v182.sql");
@@ -56,6 +62,13 @@ pub(crate) const MEMORY_V180: &str = include_str!("memory-v180.sql");
 pub(crate) const APPROVALS_V1793: &str = include_str!("approvals-v1793.sql");
 pub(crate) const APPROVALS_V180: &str = include_str!("approvals-v180.sql");
 pub(crate) const APPROVALS_V181: &str = include_str!("approvals-v181.sql");
+pub(crate) const APPROVALS_V186: &str = include_str!("approvals-v186.sql");
+// The additive result column changes no imported fields. Preserve the older
+// exact pin and recognize only this complete new shape alongside it.
+pub(crate) const APPROVALS_V186_EXECUTION_RESULT: &str = concat!(
+    include_str!("approvals-v186.sql"),
+    "ALTER TABLE approvals ADD COLUMN execution_result TEXT;\n"
+);
 const MAX_REPORTED: usize = 16;
 
 /// A legacy store with more than one accepted schema version.
@@ -115,9 +128,10 @@ static SESSIONS: [Catalog; 10] = [Catalog::new(SchemaVersion::V1793, SESSION_V17
 // importer (the authorizer denies that table), so it maps as V180.
 // Tasks v1.82 adds `tasks.source_origin_proof`, routing provenance the reader
 // never selects or imports, so it also maps as V180.
-static TASKS: [Catalog; 4] = [Catalog::new(SchemaVersion::V1793, TASKS_V1793), Catalog::new(SchemaVersion::V180, TASKS_V180),
+static TASKS: [Catalog; 5] = [Catalog::new(SchemaVersion::V1793, TASKS_V1793), Catalog::new(SchemaVersion::V180, TASKS_V180),
     Catalog { version: SchemaVersion::V180, sql: TASKS_V181, label: "v1.81" },
-    Catalog { version: SchemaVersion::V180, sql: TASKS_V182, label: "v1.82" }];
+    Catalog { version: SchemaVersion::V180, sql: TASKS_V182, label: "v1.82" },
+    Catalog { version: SchemaVersion::V180, sql: TASKS_V186, label: "v1.86" }];
 // v1.82 adds routing provenance and delivery state, never imported as authority.
 static CRON: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Catalog::new(SchemaVersion::V180, CRON_V180),
     Catalog { version: SchemaVersion::V180, sql: CRON_V182, label: "v1.82" }];
@@ -126,8 +140,12 @@ static CRON: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, CRON_V1793), Cat
 static MEMORY: [Catalog; 2] = [Catalog::new(SchemaVersion::V1793, MEMORY_V1793), Catalog::new(SchemaVersion::V180, MEMORY_V180)];
 // Approvals v1.81 = v1.80.x plus the SR5 `approvals.employee_incarnation`
 // column; the reader never authorizes it, so it maps as V180.
-static APPROVALS: [Catalog; 3] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
-    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" }];
+// v1.86 adds installation-local receipts and decisions, never authorized for reading.
+// Execution results also stay on the source; both exact v1.86 shapes map as V180.
+static APPROVALS: [Catalog; 5] = [Catalog::new(SchemaVersion::V1793, APPROVALS_V1793), Catalog::new(SchemaVersion::V180, APPROVALS_V180),
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V181, label: "v1.81" },
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V186, label: "v1.86" },
+    Catalog { version: SchemaVersion::V180, sql: APPROVALS_V186_EXECUTION_RESULT, label: "v1.86" }];
 // Recovery state is fingerprinted for schema inventory, never imported or replayed.
 const GOOGLECHAT_INBOX_V182: &str = include_str!("googlechat-inbox-v182.sql");
 const GOOGLECHAT_INBOX_V183_V1: &str = concat!(include_str!("googlechat-inbox-v182.sql"), include_str!("googlechat-placeholders-v183.sql"));

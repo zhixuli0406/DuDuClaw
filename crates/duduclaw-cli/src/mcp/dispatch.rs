@@ -15,6 +15,11 @@ pub(crate) async fn handle_tools_call(
 ) -> Value {
     let caller_client_id = principal.client_id.as_str();
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+    if let Some(message) = drive_write_refusal(home_dir,
+        acting_agent_id(caller_client_id, default_agent), tool_name, principal,
+        &crate::mcp_isolation::process_lane()) {
+        return jsonrpc_error(id, -32003, &message);
+    }
     let arguments = params
         .get("arguments")
         .cloned()
@@ -157,7 +162,6 @@ pub(crate) async fn handle_tools_call(
             | "channel_config"
             | "pairing_manage"
             | "skill_hub_install"
-            | "skill_pin"
             | "memory_store"
             | "memory_invalidate_by_origin"
             | "memory_alias_add"
@@ -635,6 +639,8 @@ impl GatewayHandler<'_> {
         "agent_status" => handle_agent_status(&arguments, home_dir, default_agent).await,
         "spawn_agent" => handle_spawn_agent(&arguments, home_dir, record_actor.id()).await,
         "spawn_ephemeral" => handle_spawn_ephemeral(&arguments, home_dir, record_actor.id()).await,
+        "admin_settings_read" | "admin_settings_propose" => super::admin_ai_client::handle(
+            tool_name, &arguments, home_dir, acting_agent_id(caller_client_id, default_agent)).await,
         "agent_update" => handle_agent_update(&arguments, home_dir, record_actor).await,
         "agent_remove" => {
             handle_agent_remove(
@@ -658,10 +664,6 @@ impl GatewayHandler<'_> {
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
         }
-        "skill_curator_status" => {
-            handle_skill_curator_status(&arguments, home_dir, record_actor, caller_is_admin).await
-        }
-        "skill_pin" => handle_skill_pin(&arguments, home_dir, record_actor, caller_is_admin).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,
         "evolution_status" => {
@@ -1063,6 +1065,9 @@ impl GatewayHandler<'_> {
                 "isError": true
             })
         }
+        name if duduclaw_core::google_identity::is_drive_write_tool(name) => {
+            crate::mcp::google_owner_client::execute(home_dir, name, &arguments).await
+        }
         name if GOOGLE_WORKSPACE_TOOLS.contains(&name) && google_caller.owner_execution(home_dir) => {
             google_caller.execute_owner(home_dir, name, &arguments).await
         }
@@ -1132,7 +1137,7 @@ impl GatewayHandler<'_> {
         "github_issue_comment" => handle_github_issue_comment(&arguments, home_dir).await,
         // Odoo ERP tools
         t if t.starts_with("odoo_") => {
-            handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent).await
+            Box::pin(handle_odoo_tool(t, &arguments, home_dir, odoo, default_agent)).await
         }
         // A name removed after its deprecation window. `McpDispatcher` answers
         // these before any gate; this arm covers direct callers of this

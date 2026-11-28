@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows, record_grant_use};
 
 impl MethodHandler {
     // ── Analytics ────────────────────────────────────────────
@@ -336,12 +337,22 @@ impl MethodHandler {
             return WsFrame::error_response("", "agent_id is required");
         }
 
+        let grant_only = if let Err(reason) = require_heartbeat_operation(ctx, agent_id) {
+            let view = DeptGrantView::load(self, ctx).await;
+            if !department_grant_allows(&view, agent_id, GrantGroup::Schedules, GrantAction::RunNow) {
+                return WsFrame::error_response("", &reason);
+            }
+            true
+        } else { false };
         if let Err(frame) = self.deny_main_for_non_admin(ctx, agent_id).await { return frame; }
         let hb = self.heartbeat.read().await;
         match hb.as_ref() {
             Some(scheduler) => {
                 let triggered = scheduler.trigger(agent_id).await;
                 if triggered {
+                    if grant_only {
+                        record_grant_use(self, ctx, agent_id, GrantGroup::Schedules, GrantAction::RunNow, "heartbeat.trigger").await;
+                    }
                     WsFrame::ok_response(
                         "",
                         json!({
@@ -394,4 +405,11 @@ impl MethodHandler {
             }),
         )
     }
+}
+
+/// Operation scope is deliberately separate from visibility and team calling.
+/// The dispatch chokepoint supplies a live context; lookup failures deny there.
+fn require_heartbeat_operation(ctx: &UserContext, agent_id: &str) -> Result<(), String> {
+    if ctx.is_admin() { return Ok(()); }
+    duduclaw_auth::acl::require_agent_access(ctx, agent_id, AccessLevel::Operator)
 }

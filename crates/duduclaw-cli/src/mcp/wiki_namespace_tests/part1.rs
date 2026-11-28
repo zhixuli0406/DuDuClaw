@@ -219,6 +219,13 @@ fn tool_catalog_covers_all_advertised_tools() {
             .map(|e| e.name.to_string())
             .collect();
     for tool in super::tools() {
+        if duduclaw_core::mcp_person_tools::person_tool(tool.name).is_some_and(|person|
+            person.executes_in == duduclaw_core::mcp_person_tools::PersonToolHost::Gateway) {
+            // Only gateway-hosted person tools are absent from the employee picker.
+            // Personal Odoo tools share the employee schemas and catalog entries.
+            assert!(!catalog.contains(tool.name), "{}", tool.name);
+            continue;
+        }
         assert!(
             catalog.contains(tool.name),
             "advertised tool `{}` is missing from builtin_tool_catalog — add it \

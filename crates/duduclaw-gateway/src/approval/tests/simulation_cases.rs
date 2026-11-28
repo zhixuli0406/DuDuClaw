@@ -134,8 +134,9 @@ fn channel_summary_is_zh_tw_and_xml_safe() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
-    let msg = pending_summary_for_channel(&rec);
+    let msg = pending_summary_for_channel(tempfile::tempdir().unwrap().path(), &rec);
     assert!(msg.contains("需要您的核准"));
     assert!(msg.contains("確認"));
     assert!(msg.contains("&lt;all&gt;"));

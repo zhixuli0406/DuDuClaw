@@ -431,3 +431,42 @@ async fn a_task_id_held_by_someone_else_is_never_shown_or_echoed() {
     assert_eq!(r.text, t::failed(Lang::ZhTw));
     assert!(!r.text.contains("別人的") && !r.text.contains("duplicate"));
 }
+
+#[tokio::test]
+async fn listed_main_assignment_is_precomputed_and_schedules_keep_the_legacy_gate() {
+    let home = tempfile::tempdir().unwrap();
+    let org = org(home.path());
+    let db = UserDb::new(&home.path().join("users.db")).unwrap();
+    let admin = db.create_user("admin@test.local", "Admin", "TeamPass-12345", UserRole::Admin).unwrap();
+    db.set_main_agent_users(&admin.id, &[org.emp1.clone()], true).unwrap();
+    super::super::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+        "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    let mut reg = AgentRegistry::new(home.path().join("agents"));
+    reg.scan().await.unwrap();
+    let mut caller = caller(home.path(), "line:main-list", "U_emp1", None);
+    // A mapped channel account alone cannot acquire the dashboard-only grant.
+    let channel_access = caller.access.clone().for_assign(home.path()).await;
+    assert_eq!(assign_right(&reg, &channel_access, "main", None), AssignRight::Denied);
+    caller.channel = "webchat";
+    caller.access = caller.access.with_credential_origin(duduclaw_auth::acl::ContextOrigin::DashboardSession)
+        .for_assign(home.path()).await;
+    assert_eq!(assign_right(&reg, &caller.access, "main", None), AssignRight::Denied);
+    assert_eq!(caller.access.main_assign_refusal(reg.get("main").unwrap()),
+        Some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
+    caller.access = caller.access.clone().for_assign(home.path()).await;
+    assert!(matches!(assign_right(&reg, &caller.access, "main", None), AssignRight::Allowed(_)));
+    assert!(!caller.access.webchat_allows_work(reg.get("main").unwrap()));
+    let scheduled = plan(&reg, Lang::ZhTw, &cmd("/交辦 @main 工作 || 時間:每天早上九點"), &caller);
+    assert!(matches!(&scheduled, Plan::ScheduleCreate { .. }));
+    assert_eq!(execute(home.path(), Lang::ZhTw, scheduled, &caller).await.text, "主代理僅管理員可以使用。");
+    }
+    super::super::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
+        "[capabilities]\nallowed_tools = ['Bash']\n");
+    reg.scan().await.unwrap();
+    assert_eq!(assign_right(&reg, &caller.access, "main", None), AssignRight::Denied);
+    let reply = plan(&reg, Lang::ZhTw, &cmd("/交辦 @main 工作"), &caller);
+    assert!(matches!(reply, Plan::Reply(AssignReply { text, .. }) if text == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+}

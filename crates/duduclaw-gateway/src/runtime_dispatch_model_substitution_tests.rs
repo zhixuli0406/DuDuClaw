@@ -77,7 +77,7 @@ async fn codex_with_a_bare_claude_alias_runs_on_the_codex_default() {
 async fn codex_with_a_full_claude_name_is_still_refused() {
     let (result, seen) = dispatch(RuntimeType::Codex, "codex", "subst-codex-full", "claude-opus-4-6").await;
     let error = result.err().expect("refused at preflight").legacy_message();
-    assert!(error.contains("Model/runtime configuration mismatch"), "{error}");
+    assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("model_provider_mismatch"), "{error}");
     assert!(seen.is_empty(), "nothing started");
     assert!(crate::runtime_config::model_substitution_notice("subst-codex-full").is_none());
 }

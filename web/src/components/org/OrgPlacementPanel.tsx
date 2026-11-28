@@ -1,7 +1,8 @@
+import { ReachSummary } from './ReachSummary';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertCircle, Clock } from 'lucide-react';
-import { api, type OrgChangeFields, type OrgPendingChange, type OrgPlacement } from '@/lib/api';
+import { api, type OrgChangeFields, type OrgPendingChange, type OrgPlacement, type ReachReview } from '@/lib/api';
 import {
   Badge,
   Button,
@@ -72,7 +73,7 @@ type Confirm =
   | { state: 'closed' }
   | { state: 'loading' }
   | { state: 'failed'; code: string | null }
-  | { state: 'ready'; placement: OrgPlacement; base: string };
+  | { state: 'ready'; placement: OrgPlacement; base: string; review?: ReachReview; reachChanged?: boolean };
 
 export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onChanged, onRefresh }: Props) {
   const intl = useIntl();
@@ -80,6 +81,8 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
     [intl],
   );
+  const personal = useSystemStore(s => s.status?.edition_profile === 'personal');
+  const [filedReview, setFiledReview] = useState<ReachReview>();
   const version = useSystemStore((s) => s.status?.version ?? null);
 
   const [loaded, setLoaded] = useState<{ placement: OrgPlacement; base: string } | null>(null);
@@ -242,7 +245,15 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
       return;
     }
     setLoaded(r);
-    setConfirm({ state: 'ready', placement: r.placement, base: r.base });
+    let review: ReachReview | undefined;
+    if (!personal && isAdmin) {
+      try {
+        review = await api.users.deptGrants.reachPreview(agent.name, dept);
+      } catch {
+        review = { reach: null, reach_digest: null };
+      }
+    }
+    setConfirm({ state: 'ready', placement: r.placement, base: r.base, review });
   };
 
   const doApply = async () => {
@@ -256,7 +267,7 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
     };
     setBusy(true);
     try {
-      const res = await api.org.applyChange(agent.name, body, confirm.base);
+      const res = await api.org.applyChange(agent.name, body, confirm.base, personal ? undefined : confirm.review?.reach_digest);
       setConfirm({ state: 'closed' });
       const after = normPlacement(res.after ?? res.placement ?? { reports_to: mgr, department: dept });
       setLoaded({ placement: after, base: res.base });
@@ -267,6 +278,11 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
       setMirrorRetry(null);
       onChanged();
     } catch (e) {
+      if (orgErrorCode(e) === 'reach_changed') {
+        const current = orgErrorField<ReachReview>(e, 'current');
+        setConfirm({ ...confirm, review: current ?? { reach: null, reach_digest: null }, reachChanged: true });
+        return;
+      }
       setConfirm({ state: 'closed' });
       fail(e, snapshot);
     } finally {
@@ -301,7 +317,8 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
     const snapshot = { mgr, dept };
     setBusy(true);
     try {
-      await api.org.proposeChange(agent.name, fields());
+      const result = await api.org.proposeChange(agent.name, fields());
+      setFiledReview({ reach: result.reach ?? null, reach_digest: result.reach_digest ?? null });
       toast.success(t('orgEdit.toast.proposed'));
       resetSelection();
       setError(null);
@@ -412,6 +429,8 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
         {deptError && errorBox(`${ids.dept}-err`, deptError)}
       </div>
 
+      {!isAdmin && <ReachSummary reach={pending?.reach !== undefined ? pending.reach : filedReview?.reach} />}
+
       {!isAdmin && (
         <p role="note" className="rounded-lg bg-muted px-3 py-2 text-xs text-foreground">
           {hasPendingForAgent ? t('orgEdit.err.pending_exists') : t('orgEdit.managerNote')}
@@ -498,6 +517,10 @@ export function OrgPlacementPanel({ agent, agents, isAdmin, pending, draft, onCh
               </div>
             </div>
           )}
+          {confirm.state === 'ready' && <>
+            {confirm.reachChanged && <p role="alert" className="text-sm text-destructive">{t('orgReach.changed')}</p>}
+            <ReachSummary reach={confirm.review?.reach} />
+          </>}
           <DialogFooter>
             <DialogClose render={<Button variant="outline" disabled={busy}>{t('common.cancel')}</Button>} />
             <Button variant="brand" disabled={confirm.state !== 'ready' || busy} onClick={() => void doApply()}>

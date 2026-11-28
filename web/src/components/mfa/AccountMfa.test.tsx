@@ -1,3 +1,5 @@
+import { StrictMode } from 'react';
+import { memberGoogleSignin } from '@/lib/google-signin';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
@@ -16,6 +18,7 @@ beforeEach(() => {
   useAuthStore.setState({ ...originalAuth, isAuthenticated: true }, true);
   sessionStorage.clear();
   vi.restoreAllMocks();
+  vi.spyOn(memberGoogleSignin, 'status').mockResolvedValue({ available: true, linked: false, has_password: true });
   useSystemStore.setState({ status: { edition_profile: 'enterprise' } as never });
 });
 afterEach(() => { originalAuth.logout(); });
@@ -123,4 +126,38 @@ it('lets an Email-only account replace recovery codes using an unused recovery c
   expect(await screen.findByLabelText('Recovery codes')).toHaveTextContent('replacement-recovery');
   expect(regenerate).toHaveBeenCalledWith('unused-recovery');
   expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+});
+
+it('loads Google status once and disables TOTP without a password', async () => {
+  const google = vi.spyOn(memberGoogleSignin, 'status').mockResolvedValue({ available: true, linked: true, has_password: false });
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: true, enforced: false });
+  const disable = vi.spyOn(mfaApi, 'disable').mockResolvedValue({ enabled: false, ...tokens });
+  renderWithProviders(<StrictMode><AccountMfa /></StrictMode>);
+  await screen.findByRole('button', { name: 'Re-authenticate with company Google account' });
+  expect(screen.queryByLabelText('Current password')).toBeNull();
+  fireEvent.change(screen.getByLabelText('Fresh authenticator code or unused recovery code'), { target: { value: '123456' } });
+  const button = screen.getByRole('button', { name: 'Disable two-factor login' });
+  expect(button).toBeEnabled(); fireEvent.click(button);
+  await waitFor(() => expect(disable).toHaveBeenCalledWith('123456', ''));
+  expect(google).toHaveBeenCalledTimes(1);
+});
+
+it('falls back to password mode when Google status fails', async () => {
+  vi.spyOn(memberGoogleSignin, 'status').mockRejectedValue(new Error('Unavailable'));
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: true, enforced: false });
+  renderWithProviders(<AccountMfa />);
+  expect(await screen.findByLabelText('Current password')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Disable two-factor login' })).toBeDisabled();
+});
+
+it('starts passwordless TOTP enrollment without a password', async () => {
+  vi.spyOn(memberGoogleSignin, 'status').mockResolvedValue({ available: true, linked: true, has_password: false });
+  vi.spyOn(mfaApi, 'status').mockResolvedValue({ enabled: false, enforced: false });
+  const begin = vi.spyOn(mfaApi, 'begin').mockResolvedValue({ enrollment_token: 'enroll', secret: 'SECRET' });
+  renderWithProviders(<AccountMfa />);
+  await screen.findByRole('button', { name: 'Re-authenticate with company Google account' });
+  fireEvent.click(await screen.findByRole('button', { name: 'Set up two-factor login' }));
+  expect(screen.queryByLabelText('Current password')).toBeNull();
+  fireEvent.click(screen.getByRole('button', { name: 'Continue setup' }));
+  await waitFor(() => expect(begin).toHaveBeenCalledWith(expect.objectContaining({ password: '' })));
 });

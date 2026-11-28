@@ -176,7 +176,14 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
         PrimaryFailure::Error { error, autonomy_denied, kind } => (error, autonomy_denied, kind),
     };
 
+    // Only unwrap gateway-authored rotation envelopes, never search the body.
+    let error = error.strip_prefix("All accounts exhausted. Last error: ")
+        .or_else(|| error.strip_prefix("no accounts available: ")).unwrap_or(error);
+
     // ── Refusals (checked first; fail closed) ──────────────────────────
+    if crate::entry_gate::background_refusal_code(error).is_some() {
+        return Refused(FallbackRefusal::Policy);
+    }
     if crate::budget::budget_refusal_message(error).is_some() {
         return Refused(FallbackRefusal::Budget);
     }
@@ -201,7 +208,8 @@ pub(crate) fn classify_primary_failure(failure: PrimaryFailure<'_>) -> FallbackD
             Refused(FallbackRefusal::EngineLocalConfig)
         };
     }
-    if duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
+    if error == crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+        || duduclaw_agent::mcp_spawn_gate::is_spawn_gate_error(error) {
         return Refused(FallbackRefusal::EmployeeToolConfig);
     }
     // `duduclaw_core::product_profile` refusals raised inside a runtime are
@@ -294,6 +302,9 @@ const PROCESS_PREFIXES: &[&str] = &[
     "Failed to run ",
     "Failed to read codex output: ",
     "claude CLI spawn error: ",
+    "claude CLI stream error [",
+    "claude CLI exit ",
+    "claude CLI assistant error: ",
 ];
 
 /// `grok.rs::grok_auth_error`.
@@ -418,6 +429,15 @@ mod tests {
             ("API error (404 Not Found): The model `opus` does not exist", Refused(FallbackRefusal::RequestRejected)),
             ("API error (400 Bad Request): invalid model 'opus'", Refused(FallbackRefusal::RequestRejected)),
             ("API error (422 Unprocessable Entity): unknown model grok-x", Refused(FallbackRefusal::RequestRejected)),
+            // Claude wrapper/prefix classification must ignore provider-written bodies.
+            ("claude CLI stream error [error]: 404 model not found", Eligible(FallbackTrigger::ProcessError)),
+            ("claude CLI exit 1: invalid_api_key", Eligible(FallbackTrigger::ProcessError)),
+            ("claude CLI assistant error: content policy violation", Eligible(FallbackTrigger::ProcessError)),
+            ("Empty response from claude CLI", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: claude CLI stream error [error]: 404 not found", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: claude CLI exit 1", Eligible(FallbackTrigger::ProcessError)),
+            ("no accounts available: claude CLI assistant error: 400 bad request", Eligible(FallbackTrigger::ProcessError)),
+            ("All accounts exhausted. Last error: Empty response from claude CLI", Eligible(FallbackTrigger::ProcessError)),
             // ── Eligible ──
             (engine_local.as_str(), Eligible(FallbackTrigger::EngineLocalConfig)),
             ("Empty response from Codex CLI (exit 0); stderr tail: ", Eligible(FallbackTrigger::ProcessError)),

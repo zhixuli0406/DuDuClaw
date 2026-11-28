@@ -4,12 +4,14 @@ import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
 import { MyConnectionsPage } from './MyConnectionsPage';
 
-const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], local_purposes: ['base'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
+const status: PersonalGoogleStatus = {
+  drive_write: { connected: false, status: null, account_email: null, granted_scopes: [] }, enabled_by_admin: false, connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], local_purposes: ['base'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
   requests: [{ agent_id: 'helper', allowed: null, requesters: 'bound_people', bound_people: [{ user_id:'bob', name:'Bob', email:'bob@example.com' }], channels: ['line'], public_visitors_allowed:false }], delegated: [], recent_usage: [] };
 
-beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
+beforeEach(() => { useAuthStore.setState({ user: null }); vi.restoreAllMocks(); vi.spyOn(api.myOdoo, 'status').mockResolvedValue({ member_credentials_enabled: false, connected: false, state: null, login: null, odoo_name: null, server: null, database: null, verified_at: null, last_used_at: null }); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); vi.spyOn(api.personalGoogle, 'writeConfirmations').mockResolvedValue({ requests: [] }); });
 
 describe('MyConnectionsPage', () => {
   it('renders only the escaped Chat confirmation display text', async () => {
@@ -159,4 +161,52 @@ it('shows Chat reconnect guidance after the administrator opts in', async () => 
   vi.mocked(api.personalGoogle.status).mockResolvedValue({...status,chat_read:true});
   renderWithProviders(<MyConnectionsPage/>);
   expect(await screen.findByText(/users reconnect Google in My Connections/)).toBeInTheDocument();
+});
+
+it('keeps the admin chat link card visible when Google fails and retries Google', async () => {
+  useAuthStore.setState({ user: { id: 'admin', email: 'a@example.com', display_name: 'Admin', role: 'admin', status: 'active' } });
+  vi.spyOn(api.chatLink, 'list').mockResolvedValue({ identities: [], handshakes: [] });
+  vi.mocked(api.personalGoogle.status).mockRejectedValueOnce(new Error('Google unavailable'));
+  renderWithProviders(<MyConnectionsPage />);
+  expect(await screen.findByText('Chat account links (administrators)')).toBeInTheDocument();
+  expect(await screen.findByRole('alert')).toBeInTheDocument();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText('other@gmail.com')).toBeInTheDocument();
+  expect(api.personalGoogle.status).toHaveBeenCalledTimes(2);
+});
+it('hides chat link management for non-admins', async () => {
+  useAuthStore.setState({ user: { id: 'member', email: 'm@example.com', display_name: 'Member', role: 'employee', status: 'active' } });
+  const list = vi.spyOn(api.chatLink, 'list');
+  renderWithProviders(<MyConnectionsPage />);
+  await screen.findByText('other@gmail.com');
+  expect(screen.queryByText('Chat account links (administrators)')).not.toBeInTheDocument();
+  expect(list).not.toHaveBeenCalled();
+});
+
+
+it('shows member Drive write access on the connections page', async () => {
+  vi.mocked(api.personalGoogle.status).mockResolvedValue({ ...status, enabled_by_admin: true });
+  renderWithProviders(<MyConnectionsPage />);
+  expect(await screen.findByRole('button', { name: 'Link Drive write access' })).toBeDisabled();
+  expect(api.personalGoogle.writeConfirmations).toHaveBeenCalledOnce();
+});
+
+it('reuses the existing Google return path for a Drive write connection', async () => {
+  const finish = vi.spyOn(api.personalGoogle, 'finish').mockResolvedValue({});
+  const { MemoryRouter } = await import('react-router');
+  const { IntlProvider } = await import('react-intl');
+  const { render } = await import('@testing-library/react');
+  const { default: messages } = await import('@/i18n/en.json');
+  render(<IntlProvider locale="en" messages={messages}><MemoryRouter initialEntries={['/me/connections?google_state=drive-state']}><MyConnectionsPage /></MemoryRouter></IntlProvider>);
+  await waitFor(() => expect(finish).toHaveBeenCalledWith('drive-state'));
+  expect(finish).toHaveBeenCalledOnce();
+});
+
+it('keeps the other connections visible when the Odoo card fails', async () => {
+  vi.mocked(api.myOdoo.status).mockRejectedValue('目前無法確認 Odoo 連線，請稍後再試。');
+  renderWithProviders(<MyConnectionsPage />);
+  expect(await screen.findByText('目前無法確認 Odoo 連線，請稍後再試。')).toBeInTheDocument();
+  expect(await screen.findByText('other@gmail.com')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument();
+  expect(screen.getByText('Google')).toBeInTheDocument();
 });

@@ -125,6 +125,8 @@ pub(crate) fn bind_job_tools(home: &Path, kind: &str, id: &str, material: Value)
 pub fn child_message(job: &EphemeralJob) -> Result<crate::message_queue::QueueMessage, VerificationError> {
     let agent = job.parent.agent.clone();
     Ok(crate::message_queue::QueueMessage {
+        autopilot_department: None,
+        autopilot_rule_id: None,
         id: message_id(&job.id), sender: agent.clone(), target: agent.clone(), payload: child_prompt(job)?,
         status: crate::message_queue::MessageStatus::Pending, retry_count: 0, delegation_depth: i32::from(CHILD_DEPTH),
         origin_agent: Some(agent.clone()), sender_agent: Some(agent), error: None, response: None,

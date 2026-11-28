@@ -1116,6 +1116,7 @@ dependencies = [
  "fs2",
  "getrandom 0.3.4",
  "hmac",
+ "iana-time-zone",
  "libc",
  "minisign-verify",
  "percent-encoding",

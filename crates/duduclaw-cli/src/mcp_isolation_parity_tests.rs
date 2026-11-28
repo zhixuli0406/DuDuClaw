@@ -102,12 +102,16 @@ fn documented_refusals() -> BTreeSet<String> {
     // refusal must change the reviewed product matrix before it can pass parity.
     let matrix = include_str!("../../../docs/architecture/native-linux-isolation-tools.md");
     let names: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && (line.contains("Refused: HostAuthority")
-            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")))
+            || line.contains("Refused: ProposalRequired") || line.contains("Refused: ForkNextRelease")
+            || line.contains("Refused: AdminSettingsUnavailable")))
         .filter_map(|line| line.split('`').nth(1)).map(str::to_owned).collect();
     assert!(names.contains("os_power"), "matrix must enumerate the host-authority exception");
     let proposal: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ProposalRequired"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(proposal, BTreeSet::from(["create_agent"]), "protected employee creation is proposal-only");
+    let admin_settings: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: AdminSettingsUnavailable"))
+        .filter_map(|line| line.split('`').nth(1)).collect();
+    assert_eq!(admin_settings, BTreeSet::from(["admin_settings_read", "admin_settings_propose"]));
     let deferred: BTreeSet<_> = matrix.lines().filter(|line| line.starts_with("| `") && line.contains("Refused: ForkNextRelease"))
         .filter_map(|line| line.split('`').nth(1)).collect();
     assert_eq!(deferred, BTreeSet::from(["fork_run", "merge_or_select", "terminate_branch"]));
@@ -134,7 +138,7 @@ fn documented_refusals() -> BTreeSet<String> {
 // and the admin's `public_web` switch is on, so the issuer signs it.
 fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
-    // skill_graduate and skill_curator_status: they select the issuer's own
+    // and skill_graduate: they select the issuer's own
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
     // HX5 removed execute_program, office_script and code_map: they are routed
     // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
@@ -206,8 +210,8 @@ fn hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact() {
 }
 
 /// H12a tools the production issuer must make eligible without new selectors.
-const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
-    "skill_graduate", "skill_curator_status"];
+const H12A_OWN_SKILL_TOOLS: [&str; 4] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
+    "skill_graduate"];
 /// H12b/H12c tools eligible from the production issuer's own grants.
 const H12BC_OWN_SKILL_JOB_TOOLS: [&str; 2] = ["skill_hub_install", "skill_synthesis_run"];
 
@@ -274,7 +278,7 @@ id = "parity-group"
 "#)
 }
 
-fn fixture(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
+pub(super) fn fixture(home: &std::path::Path) -> (IsolationDispatcher, RequestContext) {
     fixture_with_principal(home, false)
 }
 
@@ -302,6 +306,11 @@ enabled = true
 enabled = true
 [knowledge]
 enabled = true
+[odoo]
+url = "https://erp.example.com"
+db = "parity"
+[odoo_access]
+company_key_agents = ["main"]
 "#).unwrap();
     assert!(duduclaw_gateway::google_workspace::integration_enabled(home));
     assert!(duduclaw_gateway::github_workspace::integration_enabled(home));
@@ -568,7 +577,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
                 "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
                 "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend",
-                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status",
+                "shared_skill_adopt", "skill_security_scan", "skill_graduate",
                 "skill_from_recording"] {
                 assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
                 assert_eq!(isolated.contains(tool), !pending.contains(tool),
@@ -676,6 +685,10 @@ fn every_connector_checks_executor_for_its_effective_route() {
         .filter(|p| p.route == Route::Connector).collect();
     assert!(connectors.len() > 28, "must cover providers beyond Google/Notion/GitHub");
     for policy in connectors {
+        if duduclaw_gateway::isolation_connectors::intentionally_refused_connector(policy.name) {
+            assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_none(), "{}", policy.name);
+            continue;
+        }
         assert!(duduclaw_gateway::isolation_connectors::provider_for_tool(policy.name).is_some(), "{}", policy.name);
         dispatcher.services = Some(Arc::new(WithoutOne { omitted: policy.name, inner: complete.clone() }));
         let state = dispatcher.service_manifest().iter().find(|(n, _)| *n == policy.name).unwrap().1;

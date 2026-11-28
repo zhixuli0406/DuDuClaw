@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, ArrowRight } from 'lucide-react';
-import { api, type ApprovalItem, type OrgPlacement } from '@/lib/api';
+import { api, type ApprovalItem, type OrgPlacement, type ReachReview } from '@/lib/api';
+import { ReachSummary } from '@/components/org/ReachSummary';
+import { useSystemStore } from '@/stores/system-store';
 import { normPlacement } from '@/lib/org-change';
 
 function asRecord(v: unknown): Record<string, unknown> | null {
@@ -24,6 +26,13 @@ function placementOf(v: unknown): OrgPlacement {
   });
 }
 
+/** Validate review evidence without changing the inbox's fallback rendering. */
+export function isOrgChangePlacement(value: unknown): boolean {
+  const placement = asRecord(value);
+  return placement !== null && typeof placement.reports_to === 'string'
+    && typeof placement.department === 'string';
+}
+
 /**
  * The 「組織調整申請」 card body (`org_change` approvals): which employee, the
  * 調整前 / 調整後 manager and department, who asked and why. Whether the
@@ -34,16 +43,25 @@ export function OrgChangeFacts({
   approval,
   agentName,
   onStale,
+  resolveAgentName,
+  resolvePerson,
+  onReachDigest,
+  reachOverride,
 }: {
   approval: ApprovalItem;
+  onReachDigest?: (digest: string | undefined) => void;
+  reachOverride?: ReachReview;
   agentName?: string;
+  resolveAgentName?: (id: string) => string;
+  resolvePerson?: (id: string) => string;
   onStale?: (stale: boolean) => void;
 }) {
+  const personal = useSystemStore(s => s.status?.edition_profile === 'personal');
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const payload = asRecord(approval.payload);
   const agentId = approval.agent_id || (typeof payload?.agent_id === 'string' ? payload.agent_id : '');
-  const [row, setRow] = useState<{ before: OrgPlacement; after: OrgPlacement; stale: boolean; proposer: string; reason: string } | null>(null);
+  const [row, setRow] = useState<{ before: OrgPlacement; after: OrgPlacement; stale: boolean; proposer: string; reason: string; reach?: ReachReview['reach']; reach_digest?: string | null } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -59,6 +77,8 @@ export function OrgChangeFacts({
           stale: hit.stale === true,
           proposer: hit.proposer_email || hit.proposer,
           reason: hit.reason,
+          reach: hit.reach,
+          reach_digest: hit.reach_digest,
         });
         onStale?.(hit.stale === true);
       })
@@ -70,6 +90,10 @@ export function OrgChangeFacts({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [approval.id, agentId]);
 
+  const review = reachOverride ?? (row?.reach !== undefined ? row : payload);
+  const digest = !personal && typeof review?.reach_digest === 'string' ? review.reach_digest : undefined;
+  useEffect(() => { onReachDigest?.(digest); }, [digest, onReachDigest]);
+
   const before = row?.before ?? placementOf(payload?.before);
   const after = row?.after ?? placementOf(payload?.after);
   const proposer = row?.proposer ?? (typeof payload?.proposer_email === 'string' && payload.proposer_email
@@ -77,7 +101,7 @@ export function OrgChangeFacts({
     : typeof payload?.proposer === 'string' ? payload.proposer : '');
   const reason = row?.reason ?? (typeof payload?.reason === 'string' ? payload.reason : '');
   const stale = row?.stale === true;
-  const mgr = (id: string) => (id || t('orgEdit.topLevel'));
+  const mgr = (id: string) => (id ? resolveAgentName?.(id) ?? id : t('orgEdit.topLevel'));
   const dept = (d: string) => (d || t('orgEdit.noDepartment'));
 
   return (
@@ -117,9 +141,11 @@ export function OrgChangeFacts({
         </dd>
       </dl>
 
+      <ReachSummary reach={review?.reach as ReachReview['reach'] | undefined} />
+
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
         <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.requestedBy')}</dt>
-        <dd className="min-w-0 break-words">{proposer || '—'}</dd>
+        <dd className="min-w-0 break-words">{resolvePerson && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(proposer) ? resolvePerson(proposer) : proposer || '—'}</dd>
         {reason && (
           <>
             <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.reason')}</dt>

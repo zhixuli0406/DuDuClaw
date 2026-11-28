@@ -1,3 +1,4 @@
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Eye, Loader2, RefreshCw } from 'lucide-react';
 import { useIntl } from 'react-intl';
@@ -7,6 +8,7 @@ import { Button } from '@/components/mds';
 /** A self-service receipt page. Neither the request nor the rendered row
  * accepts an audience, session identifier or arbitrary audit details. */
 export function MyHistoryViewsPage() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const msg = (key: string) => intl.formatMessage({ id: `myHistoryViews.${key}` });
   const [views, setViews] = useState<MyHistoryView[]>([]);
@@ -52,7 +54,7 @@ export function MyHistoryViewsPage() {
           <p className="break-words text-sm font-medium">{view.viewer_display_name ?? msg('formerManager')}</p>
           <p className="break-words text-sm text-muted-foreground">{view.agent_display_name ?? msg('formerAgent')} · {msg('webchat')}</p>
         </div>
-        <time className="text-xs text-muted-foreground" dateTime={view.timestamp}>{new Date(view.timestamp).toLocaleString(intl.locale)}</time>
+        <time className="text-xs text-muted-foreground" dateTime={view.timestamp}>{formatDateTime(view.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time>
       </li>)}
     </ul>
     {loading && <Loader2 aria-label={msg('loading')} className="mx-auto size-5 animate-spin" />}

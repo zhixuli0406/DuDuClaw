@@ -1,5 +1,7 @@
 # MCP tools: what an agent is shown, and why
 
+Open **Integrations → Odoo** for the upgrade notice, permission mode (engine tables or follow the Odoo account, with risk confirmation), **Always refuse** (grouped defaults; removal requires confirmation; five fixed refusals remain), **Which AIs may use the company account**, and **Colleagues’ own Odoo accounts** (off by default) with the member credential list. In the **employee editor → Integrations → Odoo**, use **Narrow permissions**, **Use the current requester’s Odoo account**, and the per-table Activity / Internal note / Notify followers / Attachment controls; each requires confirmation. Members enter their own login and key under **My connections → Odoo**, which shows **Configured by administrator** until the Admin enables it. Admins revoke a member credential from **Members → row menu → Revoke Odoo account**.
+
 
 ## Verify the local caller
 
@@ -20,14 +22,9 @@ remain in `skills-archive` for manual recovery. Linux and macOS restore flat glo
 descriptors, without following symlinked components. Other platforms retain archives
 for manual recovery.
 
-| Deprecated tool (removal target v1.86.0) | Behaviour |
-|---|---|
-| `skill_curator_status` | Read-only archive recovery status. `run=true` is accepted but ignored with a notice. Only skill names and scopes are shown. Employees see only their own scope; Admin operators may see all |
-| `skill_pin` | `pinned=true` restores a recorded archived skill without overwriting; otherwise pinning has no effect. Restoration is supported on Linux and macOS. Employees may restore only their own scope; global and other agent scopes require an Admin operator |
 
 Use `skill_list` to inspect loaded skills. Resolve a destination conflict before
-retrying restoration; keep the archived file until recovery succeeds. Existing
-authorization and employee scope gates still apply to both compatibility tools.
+retrying restoration; keep the archived file until recovery succeeds. Gateway startup retries recorded archives on the next start.
 
 
 DuDuClaw's MCP server advertises its tools through the standard `tools/list`
@@ -394,7 +391,7 @@ still reaches the real gates, which accept or refuse it under the existing rules
 |---|---|---|
 | External client whitelist | `principal.is_external` | Only the 7 legacy whitelist tools plus tools in explicitly granted scopes; then the scope row below applies |
 | Scopes of a non-employee caller | `principal.scopes`, for a key that holds no `admin` and is not an AI employee (not the gateway-internal key, not a per-agent key, not a process the gateway spawned for an employee) | Only tools whose minimum scope the key holds; tools that act for the process's own agent (`working_state_*`, `canvas_*`, `shared_wiki_delete`, `memory_search_by_layer` and three consolidation reads, …) are hidden from it, and from every external key, and the dispatch gate refuses them by the same rule (`process_agent_tool`). See [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | All 29 Google tools, including `google_status`, are hidden while off. Dashboard setup and tests remain available: [Connect Google](google-setup.md). |
+| Google Workspace | `config.toml [integrations] google_workspace` | All 38 Google tools, including `google_status`, are hidden while off. Dashboard setup and tests remain available: [Connect Google](google-setup.md). |
 | Google identity (v1.76.0) | `agent.toml [google] identity`, else `config.toml [integrations.google_identity] default_identity` | `none` hides the same 29 tools and the dispatch gate refuses them. Any other value keeps them listed; a call that cannot use the identity returns the reason. `google_status` now starts with who the employee acts as |
 | GitHub | `config.toml [integrations] github` | 5 `github_*` tools hidden |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | Denied tools hidden; a non-empty allowlist hides everything else. An entry matches a tool exactly, or by a trailing `*`: `*`, `mcp__duduclaw__*` (every DuDuClaw tool), `mcp__duduclaw__odoo_*` / `memory_*` (anchored prefix). `mcp__<other server>__…` never names a DuDuClaw tool; a `*` elsewhere is literal. The approval lists and `scoped_tools` use the same rule |
@@ -449,7 +446,7 @@ the failure mode the rule above exists to remove.
 
 Two new gates refuse a call without removing the tool from `tools/list`:
 
-- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
+- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
 - `config.toml [odoo] features_*`: Odoo tools stay listed and are refused per call for models of a switched-off module (project and hr are off by default).
 
 ### Record relationship checks: listed but refused
@@ -498,8 +495,13 @@ listed for every caller and check the relationship per call:
 - **`agent_update` on yourself**: an AI employee cannot send `reports_to`,
   `db_sources`, `db_sources_add`, `db_sources_remove`, `budget_cents`,
   `reply_language`, `memory_language` (v1.84.0), `runtime`, `timeout_secs`,
-  `max_turns` or `role` about itself (audit `agent_authority_refused`). Editing a subordinate is
-  unchanged.
+  `max_turns` or `role` about itself (audit `agent_authority_refused`).
+- **`agent_update` authority changes**: updates are written atomically and support
+  identity, model, budget, heartbeat, container, and database-source fields.
+  AI callers may only narrow authority fields, including on subordinates;
+  widening budgets, capabilities, or database sources requires an administrator
+  in the dashboard. Existing self-edit and organization checks still apply.
+  Tell the requesting person when administrator action is needed.
 
 An operator (an MCP key that maps to no AI employee, in a process that is not
 running for one) is not restricted. The shared internal key in a process with
@@ -562,6 +564,12 @@ are also left out of the description budget above, because Claude Code and Codex
 build the model's tool list from name, description and input schema only.
 
 ## Long-form details moved out of descriptions
+
+### `tasks_create` schedules
+
+For a cron `schedule`, `cron_timezone` defaults to the company time zone. If it is unset or invalid, the schedule uses UTC and the confirmation says so. Member-created routines use UTC with a notice when the company time zone observes daylight saving. One-shot `schedule` times must include a UTC offset, for example `2026-11-28T09:00:00+08:00`.
+
+
 
 ### `tasks_create` / `tasks_update` — goal cost cap
 
@@ -670,8 +678,8 @@ the original four fields, using the same identity check and organization gate
 as `agent_update`. The `open` delegation policy permits cross-team changes;
 human operators remain unrestricted. Callers rejected by either check are
 refused before reading the target configuration. Only an administrator may
-change `skill_budget_unlimited`, because it removes the cap on injected skill
-content.
+change `skill_budget_unlimited` through this tool, because it removes the cap on injected skill
+content. The employee's Owner can turn it off in the dashboard.
 
 ### `execute_program` — where the script runs
 
@@ -905,6 +913,8 @@ coverage. Vectors only ever rank passages inside the collections the call may re
 
 ### `odoo_schema_overview` — saved Odoo structure
 
+The employee model/action and sensitive-model restrictions below describe Engine mode. Follow uses the selected personal Odoo account while retaining feature switches and common refusals.
+
 - `odoo_schema_overview` requires **`odoo:read`**. With no parameters it lists scanned model names and short labels. Optional `model` returns fields for one model; optional `query` searches model / field names and labels. The response is narrowed to models the employee's Odoo model / action settings, feature switches and block list (with the employee's effective unblock list) allow; a blocked model's name, fields and relations are never returned. Snapshot metadata does not grant access to blocked business records.
 - Odoo schema scans are available only to dashboard administrators through **Re-scan Odoo structure** (`odoo.schema_scan`), with a persisted 60-second limit per saved profile, including failures. The overview marks metadata as untrusted, screens and caps labels, and drops invalid technical names.
 - `odoo_schema_fields {model}` still reads live metadata for one permitted model; a blocked model is refused before contacting Odoo, and relations naming models hidden from the employee are omitted. Built-in and generic reads with explicit field lists drop missing fields using live `fields_get`; a metadata failure or an empty surviving projection refuses the read.
@@ -912,12 +922,34 @@ coverage. Vectors only ever rank passages inside the collections the call may re
 
 Each scan retains at most **400 models and 500 fields per model**. Metadata and field discovery have a **five-minute budget**, with four concurrent `fields_get` calls; account ACL probing has a separate 30-second overall limit. Built-in models come first, followed by models from installed business modules (CRM, sales, purchase, stock, accounting, project, HR, manufacturing, helpdesk and website), then remaining models alphabetically. A timed-out scan is marked truncated and reuses completed fields next cycle when identity, server version and modules are unchanged. Module/model catalogs cap at 5,000 entries. A partial diff never proves removal.
 
+Odoo personal identities use the gateway's verified URL, database and SHA-256 server fingerprint for the whole connection. Local endpoint changes cannot redirect an already issued personal credential; the fingerprint also separates connection and credential caches. Agent and company credentials retain their existing endpoint selection.
+
+Person-key Odoo listing and dispatch both load the local Odoo access policy. Invalid policy hides and refuses these tools. Personal writes require `follow_odoo_account` with a valid administrator acknowledgement; gateway-hosted person tools retain scope-only listing.
+
+Generic mutations of `ir.model`, any `ir.model.*` model, `ir.rule`, and any `mail.*` model are refused in every mode. Engine mode preserves v1.85 approval behavior for `odoo_execute` and button actions, including `odoo_sale_confirm`: employee approval lists, action rules and effect classes still apply, with no additional forced approval. Follow-Odoo-account mode requires human approval for every non-read `odoo_execute` call and every `action_*`, `button_*` or `toggle_*` action, including `odoo_sale_confirm`. Follower messages (`odoo_message_send`) always require approval in every mode. These forced approvals cannot be waived by an `allow` rule; they bind the exact tool and arguments and are single-use.
+
+Follow-mode and person-key audits retain result metadata only: model, method, record/ID counts and byte length; no result hashes. This also applies in every mode to `ir.config_parameter`, `res.users.apikeys` and its dot descendants, `ir.mail_server`, `fetchmail.server`, `payment.provider`, `res.users`, `ir.attachment`, and models with an exact dot- or underscore-delimited segment of `token`, `tokens`, `secret`, `secrets`, `key`, `keys`, `password`, `passwords`, `credential`, `credentials`, `apikey` or `apikeys`. Result bodies and upstream error text are omitted from these audit rows.
+
+### `odoo_attachment_add` — employee file attachment (v1.86.0)
+
+`odoo_attachment_add {model, res_id, file, name?}` creates a private attachment on an existing, readable Odoo record and returns its ID and the account used. It requires `odoo:write`, has effect `modify`, reads private data and is classified as outbound data transfer. The caller must have a verified employee identity; person API keys cannot use this tool.
+
+- `file` is relative to `<home>/agents/<verified employee>/attachments/`. Shared attachments, other employee folders, absolute paths, parent traversal, symlinks and Windows reparse points are refused. The tool reads the validated open file with a size bound; inline content and base64 arguments are refused.
+- `[odoo_access] attachment_max_mb` defaults to 10 MiB and must be an integer from 1 through 25. Invalid configuration refuses the operation. Optional `name` defaults to the file name and must contain 1–255 plain-text characters without control characters or path separators. Its extension must match the validated format (for example, a PDF may only be named `*.pdf`; JPEG allows `.jpg` or `.jpeg`).
+- Allowed extensions and content must agree: PDF, PNG, JPG/JPEG, WebP, UTF-8 TXT/CSV without NUL, and XLSX/DOCX/PPTX. HTML, HTM, SVG, XML, executables, scripts and all other extensions are refused.
+- Images must fully decode in the format implied by the source extension, with width and height each limited to 12,000 pixels and a decoder allocation budget of 256 MiB. Decode or encode errors refuse the upload. Fresh encoders write only decoded pixels: PNG stays PNG, JPEG is re-encoded at quality 90, and WebP is converted to PNG with the Odoo display-name extension changed to `.png` and MIME type to `image/png`. Original metadata and trailing payloads are discarded; for example, an otherwise decodable PNG with trailing bytes uploads only the re-encoded PNG. Animated inputs produce a single decoded image. Both the original file and encoded output must fit `attachment_max_mb`.
+- PDFs must start with `%PDF-1.` or `%PDF-2.` and contain `%%EOF` within the last 1 KiB with only PDF whitespace afterward. A bounded scan checks the **whole original byte buffer**, including incremental updates and unindexed objects, instead of relying on a parser's reference table. PDF names are decoded for `#xx` escapes (malformed escapes are refused) and matched case-insensitively against `JavaScript`, `JS`, `Launch`, `EmbeddedFile`, `EmbeddedFiles`, `OpenAction`, `AA`, `RichMedia`, `XFA`, `SubmitForm`, `ImportData`, `GoToR`, `GoToE`, `Sound`, `Movie` and `Encrypt`. This conservative scan also checks name-like bytes in strings, comments and raw stream data.
+- PDF streams may be unfiltered or use only `FlateDecode` (`Fl`), including arrays/chains of Flate filters. Flate output is name-scanned at every stage and bounded by both a per-stream cap of `min(10 × compressed stream length, 50 MiB)` and a cumulative per-file cap of `min(10 × original file size, 50 MiB)`; reaching a cap or an inflate error refuses the upload. Stream bounds use a consistent `/Length` or search for `endstream`; duplicate `/Length` or `/Filter` keys are refused. Delimited `stream` + EOL syntax is refused in every raw stream payload (including compressed bytes before inflation) and every inflated Flate stage, without recursive decoding. Sole image filters `DCTDecode`, `JPXDecode`, `CCITTFaxDecode` and `JBIG2Decode` are allowed without decoding, but their raw bytes undergo the same nested-stream check; even genuine images containing that syntax are refused. All other filters and mixed filter chains are refused. Limits are 100,000 name tokens across original/inflated bytes, 10,000 streams, and 32 structural nesting levels or Flate stages. Reading and scanning run on a blocking worker. This is a conservative content scan, not full PDF conformance validation or an antivirus scan; valid PDFs outside these limits can be refused. PDFs that pass upload exactly their original bytes.
+- Office files require ZIP structure, `[Content_Types].xml` and the corresponding document part; VBA, ActiveX and external relationships in any `.rels` part are refused. Relationship inspection is bounded and refuses unsupported encodings, entities and DTDs. These format checks and PDF active-content refusals are **not an antivirus scan**.
+- Engine mode requires the target in `allowed_models` and an exact `attach:<model>` token in `allowed_actions`. Follow-account mode uses the selected personal Odoo account. Both modes retain fixed refusals and `always_refuse` rules such as `attach:*`; read-only mode refuses attachment creation.
+- The connector writes only `name`, file-derived `datas`, `res_model`, `res_id`, validated `mimetype` and `public=false`. It never sets `access_token`; generic tools cannot create, write or unlink `ir.attachment`.
+
 ### `odoo_create` / `odoo_write` — generic create and update (v1.81.0)
 
 - `odoo_create {model, values}` creates one record and returns its id; `odoo_write {model, ids, values}` updates 1–100 records (duplicate ids are dropped) and returns `ok`. Both require **`odoo:write`** and are effect class `modify`, so `action_rules`, approval lists and the explore lane apply as to `odoo_crm_create_lead`.
-- **Explicit grant plus a separate opt-in.** The tools are listed and callable only when the employee has its own Odoo settings (`agent.toml [odoo]`), `allowed_models` names the model exactly, `allowed_actions` holds `create` / `write` (or `create:<model>` / `write:<model>`), **and** the per-table opt-in token `generic_create:<model>` / `generic_write:<model>` is in `allowed_actions`. The opt-in is off by default and has no all-tables or `*` form; **existing settings are unchanged** — a configuration that already granted Create / Update does not gain the generic tools until the opt-in is switched on. No own settings, an empty list or `*` grants nothing. This is stricter than the other Odoo tools, where empty lists are unrestricted; those tools are unchanged and ignore the opt-in tokens. Grant in the dashboard: Employees → Edit → Integrations → Odoo, tick the table, give it **Create** or **Update** in a rule for that table and switch on **Allow general create / update** (允許通用新增／修改) next to them; this lets the AI set any writable field of that table. The tool is listed exactly when some granted table also clears the never-writable list, the feature switch and the block list.
-- **Never generically writable**, whatever the grants, opt-ins or unblock settings ("This capability is not available"): `res.users`, `res.groups`, `res.company`, `res.users.apikeys` (and other `res.users.*` / `res.groups.*` tables), every `ir.*` table (including `ir.actions.*` and `ir.ui.*`), `mail.mail`, `mail.followers`, `mail.message`, `mail.template`, `mail.compose.message`, `discuss.channel`, `mail.channel` (and their `.*` sub-tables). The same list applies to tables reached through x2many commands.
-- Checked in order before any record is changed: never-writable list, grant and opt-in, feature switch, block list, then `values` locally (an object, at most 64 KiB; x2many command lists may use only 0 create, 1 update and 4 link — 2 delete, 3 unlink, 5 clear and 6 set are refused; nesting at most 3 levels; `active` may only be set to `true`, archiving is refused), then, after connecting, the account ACL from the schema snapshot (`create` / `write` must be known to be allowed; unknown refuses) and every key of `values` against the snapshot: a stored, non-readonly field that is not a related / `_inherits` field (which would write through to another record). One2many / many2many values must be a non-empty command list: `false`, `null`, `[]` and plain id lists (which clear or replace the set) are refused. Every table a command reaches must pass the same never-writable list, feature switch and block list; commands 0 and 1 (and 4 on a one2many, which moves the record from its current parent) also need that table's own grant, opt-in and account right, and their nested values are checked against that table's snapshot. A link (4 on a many2many) needs no grant of its own. Without a snapshot for this connection the call asks to wait for the background schema preparation; a snapshot scanned before v1.81.0 does not record related fields, so such fields are refused until the schema is re-scanned. Deleting and archiving records are not offered.
+- **Engine mode: explicit grant plus a separate opt-in.** The tools are listed and callable only when the employee has its own Odoo settings (`agent.toml [odoo]`), `allowed_models` names the model exactly, `allowed_actions` holds `create` / `write` (or `create:<model>` / `write:<model>`), **and** the per-table opt-in token `generic_create:<model>` / `generic_write:<model>` is in `allowed_actions`. The opt-in is off by default and has no all-tables or `*` form; **existing settings are unchanged** — a configuration that already granted Create / Update does not gain the generic tools until the opt-in is switched on. No own settings, an empty list or `*` grants nothing. This is stricter than the legacy dedicated Odoo tools, where empty lists are unrestricted; those tools are unchanged and ignore the opt-in tokens. Grant in the dashboard: Employees → Edit → Integrations → Odoo, tick the table, give it **Create** or **Update** in a rule for that table and switch on **Allow general create / update** (允許通用新增／修改) next to them; this lets the AI set any writable field of that table. The tool is listed exactly when some granted table also clears the never-writable list, the feature switch and the block list.
+- **Never generically writable in Engine mode**, whatever the grants, opt-ins or unblock settings ("This capability is not available"): `res.users`, `res.groups`, `res.company`, `res.users.apikeys` (and other `res.users.*` / `res.groups.*` tables), every `ir.*` table (including `ir.actions.*` and `ir.ui.*`), `mail.mail`, `mail.followers`, `mail.message`, `mail.template`, `mail.compose.message`, `discuss.channel`, `mail.channel` (and their `.*` sub-tables). The same list applies to tables reached through x2many commands.
+- In Engine mode, checked in order before any record is changed: never-writable list, grant and opt-in, feature switch, block list, then `values` locally (an object, at most 64 KiB; x2many command lists may use only 0 create, 1 update and 4 link — 2 delete, 3 unlink, 5 clear and 6 set are refused; nesting at most 3 levels; `active` may only be set to `true`, archiving is refused), then, after connecting, the account ACL from the schema snapshot (`create` / `write` must be known to be allowed; unknown refuses) and every key of `values` against the snapshot: a stored, non-readonly field that is not a related / `_inherits` field (which would write through to another record). One2many / many2many values must be a non-empty command list: `false`, `null`, `[]` and plain id lists (which clear or replace the set) are refused. Every table a command reaches must pass the same never-writable list, feature switch and block list; commands 0 and 1 (and 4 on a one2many, which moves the record from its current parent) also need that table's own grant, opt-in and account right, and their nested values are checked against that table's snapshot. A link (4 on a many2many) needs no grant of its own. Without a snapshot for this connection the call asks to wait for the background schema preparation; a snapshot scanned before v1.81.0 does not record related fields, so such fields are refused until the schema is re-scanned. Deleting and archiving records are not offered.
 - Audit lines name the model, field names and record count, never the values; a failed call records only the error class and length, never Odoo's error text.
 
 The overview without filters returns model names and short labels only, capped at 16 KiB. Fields are included only for a specific `model` or a query matching at most five authorized models, capped at 32 KiB. Responses include total matching model count and truncation. The shared-wiki summary is capped at 16 KiB; `odoo/schema-fields` remains a search-only `deep` reference page capped at 32 KiB and is not automatically injected into context.
@@ -1028,8 +1060,100 @@ The transport contract follows [Gmail drafts](https://developers.google.com/work
 
 `google_chat_send {space, text, thread?}` sends text to an existing space using the verified requesting member's own Google account. It requires `google:write` and is off until an administrator enables `[google] chat_send = true`. A home/shared account, another member, Apps Script, or a Chat app token (`chat.bot`) cannot substitute for the member.
 
-For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Incremental consent requests `https://www.googleapis.com/auth/chat.messages.create`; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
+For personal OAuth, connect your account first, then open **My connections → Google Chat sending** and grant the separate `chat_send` purpose. Additional-service consent explicitly requests the already-consented ordinary services plus `https://www.googleapis.com/auth/chat.messages.create`, without automatic merging of prior Google grants; the existing Google subject must remain unchanged and Google must actually grant the scope. Domain-wide delegation requests a separate send scope set for this tool; a Workspace administrator must authorize it. It is never added to every Google request.
 
 Every send waits for the member's own single-use confirmation, valid for five minutes. The card shows the account, space resource name, thread and full final text, with a private-data warning. A verified private conversation can carry a short card; group requests and long messages use the member-only **My connections** page. Admin approval, an `allow` rule, Admin MCP scope and recipient allowlists cannot replace this confirmation. Any organisation-required egress approval still applies in addition. Editing the message, destination, account, credential or policy invalidates confirmation.
 
 The gateway keeps one request ID with the operation and never automatically resends an unknown outcome (`result_unconfirmed`). Check Google Chat before asking for a new send. Attachments and space creation are not supported; a specified thread must belong to the same space. Google displays the user as sender and also attributes the application by name. [Google Chat API reference](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create).
+
+## Administrator AI settings
+
+`admin_settings_read` reads the everyday settings exposed by the administrator AI feature. `admin_settings_propose` creates a review card; it does not apply changes directly. Both are available only during an eligible administrator's personally attended conversation through their own AI avatar. Changes can be proposed only in private chats or signed-in WebChat. Group reads omit schedule prompt text and skill descriptions. The feature must first be enabled by an administrator with a risk acknowledgement. Every proposal, including one item, requires confirmation in the dashboard inbox by its proposer within ten minutes.
+
+The feature can change ordinary profile, model, runtime limit, wake-up, prompt-only schedule and installed-skill enabled settings. Dashboard-only settings include permissions, channels and credentials, isolation, engines, budget increases, organization and delegation authority, external tool connections, personality/work contract, employee deletion and installing external skills.
+
+For AI callers, `agent_update` can only lower budgets. Budget increases and other protected security changes are refused. Adding database sources creates an approval card that only an administrator can decide in the dashboard; removing sources remains a reduction. These restrictions apply under every delegation policy, including `open`.
+
+## Cloud-drive write tools
+
+These nine native tools require `google:write`. Administrators control create, modify, move and trash separately; all four start off. Enabling an action or widening its policy requires an explicit acknowledgement of the risks and records the administrator and time. No additional sign-in is required for that settings change. Use **Integrations → Google → Drive writing** for the four actions, approval mode per action and folder list. Its readiness panel shows delegated scopes, a per-employee test and company-account consent. Members connect through **My connections → Drive writing** and review write confirmation cards there. For records, open **Logs → History → Drive writing**.
+
+Each action defaults to confirmation by the member. An administrator can turn confirmation off per action, or require both member and administrator approval. Required member confirmation lasts five minutes and only that member can decide. Tool allowlists, Admin tokens and standing workflow approval cannot replace it. Background or unattended work is refused when confirmation is required. With personal connections or delegation to the owner, the requester must be the account holder; shared company and fixed-delegation connections use the verified requesting member.
+
+| Tool | Parameters and result | Action switch | Effect class |
+|---|---|---|---|
+| `drive_create_file` | Required `name`; optional `parent_folder_id`. Choose exactly one of `text` (up to 100,000 characters), `attachment` (this conversation's attachment filename), or `folder=true`. Optional `convert_to`: `document` or `spreadsheet`; `mime_type`: `text/plain`, `text/csv` or `text/markdown`. Creates a file or folder. | Create | Publish |
+| `drive_copy_file` | Required `file_id`, `parent_folder_id`; optional `name`. Copies a readable source file into the destination folder. | Create | Publish |
+| `drive_update_file` | Required `file_id`; at least one of `name`, `description`, `text`. Renames, changes the description or replaces text (up to 100,000 characters, non-Google-format text files only). | Modify | Modify |
+| `drive_move_file` | Required `file_id`, `destination_folder_id`. Moves within the same drive; current parents are read from Google. | Move | Publish |
+| `drive_trash_file` | Required `file_id`. Moves the item to trash only. | Trash | Delete |
+| `docs_insert_text` | Required `document_id`, `text` (1–20,000 characters). Choose `at="start"`, `at="end"` or `after_text` (a unique anchor, 1–1,000 characters). Optional `tab_id`. | Modify | Modify |
+| `docs_format` | Required `document_id`, `operations` (1–50). Supports paragraph/text styles, table-cell background, a header and adding a document tab; details below. | Modify | Modify |
+| `sheets_add_sheet` | Required `spreadsheet_id`, `title`; optional `copy_from_sheet` (an existing sheet name). Adds a blank sheet or duplicates a sheet in that spreadsheet. | Modify | Modify |
+| `sheets_add_note` | Required `spreadsheet_id`, `range` (A1, up to 1,000 cells), `note` (up to 5,000 characters; empty clears notes). Sets cell notes, not threaded comments. | Modify | Modify |
+
+IDs can also be supplied as supported Google file or folder URLs. Omitting `parent_folder_id` for creation means the My Drive root and is allowed only with an empty folder list. Uploads accept only attachments attached to the current conversation request, up to 5 MB (5 MiB); arbitrary local paths and employee workspace files are refused. Conversion to a Google document or spreadsheet is optional. Permanent deletion, emptying trash and sharing or permission changes are unavailable.
+
+For `docs_format`, each operation has a `type` and only its supported fields:
+
+- `paragraph_style`: `text` as a unique anchor, `named_style` (`NORMAL_TEXT`, `TITLE`, `SUBTITLE`, `HEADING_1`–`HEADING_6`), optional `alignment` (`START`, `CENTER`, `END`, `JUSTIFIED`).
+- `text_style`: unique `text`, and at least one of `bold`, `italic`, `underline`, `font_size_pt` (6–96).
+- `table_cell_style`: zero-based `table_index` (0–99), `row` (0–499), `column` (0–49), and `background_hex` (`#RRGGBB`).
+- `header`: `text` (up to 1,000 characters).
+- `add_tab`: `title` (1–100 characters).
+
+### Folder rules and limits
+
+An administrator can list folders or entire shared drives. A file in a listed shared drive is in scope. Otherwise every parent chain must reach a listed folder within 12 parent steps. Unreadable parents, trashed targets or ancestors, exceeded check limits, and insufficient Google permissions refuse the action. A call has a shared limit of 16 metadata lookups, including rechecks.
+
+Create and copy check the destination folder; a copied source must be readable and not trashed. Modify, move and trash check the target's location. Listed folders themselves cannot be renamed, moved or trashed. Moves require both source and destination in scope and cannot cross from My Drive to a shared drive or between shared drives. Shortcuts cannot be listed as allowed folders or used as destinations. Modify refuses shortcuts; move and trash affect the shortcut itself and check its own parents, without following the target.
+
+With an empty folder list, create and modify can act anywhere the account can write; move and trash are unavailable. Folder checks run before and after writes, with another check after approval. They are best effort: Google has no folder allowlist and concurrent changes can occur. Detected post-write violations notify administrators; incomplete checks are recorded. Every attempt, including refusals and uncertain outcomes, is logged without file contents or tokens. An uncertain result is not automatically retried; check Google before requesting another write.
+
+The existing `docs_append`, `docs_create`, `docs_replace_text`, `sheets_append`, `sheets_create` and `sheets_update` keep their existing gates and remain outside these four switches and folder rules. The four new Docs/Sheets tools above use Modify. The official Google Drive remote MCP never receives a token with full Drive access; these write tools execute only inside the main gateway process.
+
+See [connection setup](google-setup.md) and [personal write consent](google-personal-connections.md) for account requirements. Real Google OAuth isolation and revocation, delegated scopes, document tabs, conversion, shared-drive roles and private-message confirmation delivery still require real-account acceptance; this reference does not certify those checks.
+
+## Person tools and Odoo access (v1.86.0)
+
+Personal member keys expose only the following tools, intersected with the key's scopes and the administrator's current `allow_mcp_scopes`:
+
+| Scope | Tools |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`: authorized tasks, default limit 50, range 1–200; `truncated` reports bounded or omitted results. |
+| `agents:status` | `my_agents_status {}`: visible employee IDs, names, status and `can_call`. |
+| `odoo:read` | `odoo_search`, `odoo_crm_leads`, `odoo_sale_orders`, `odoo_inventory_products`, `odoo_inventory_check`, `odoo_invoice_list`, `odoo_payment_status`, `odoo_partner_search`, `odoo_schema_overview`, `odoo_schema_fields`, `odoo_status`. |
+| `odoo:write` | `odoo_create`, `odoo_write`, `odoo_activity_create`, `odoo_note_post`. Requires acknowledged `follow_odoo_account`. |
+
+These calls use the holder's current authority. Odoo uses only their own connected account, never an employee or company credential. `odoo_execute`, `odoo_report`, `odoo_connect`, `odoo_message_send`, `odoo_attachment_add` and dedicated CRM/sales mutations are outside the person-key subset. The two `my_*` tools are person-only and are not employee tools.
+
+### Four dedicated Odoo write tools
+
+All four require `odoo:write` and an existing, readable target record. Text is plain text, HTML-escaped, with no mentions or caller-chosen recipient list.
+
+| Tool / arguments | Behavior |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | Schedule an activity. Text fields allow at most 10,000 characters; deadline is `YYYY-MM-DD`; default type is `mail.mail_activity_data_todo`. Engine assigns the connected account; only Follow accepts `user_id`. |
+| `odoo_note_post {model, res_id, body}` | Add an internal note; body at most 10,000 characters. |
+| `odoo_message_send {model, res_id, body}` | Notify record followers; body at most 10,000 characters. Always requires human approval bound to the exact content. Employee identity required. |
+| `odoo_attachment_add {model, res_id, file, name?}` | Add a private attachment from the calling employee's own attachment folder. No inline/base64 data, absolute paths, traversal, symlinks or shared folder. Accepts PDF, PNG, JPEG, WebP, UTF-8 TXT/CSV and OOXML XLSX/DOCX/PPTX with matching validated content. Original and encoded files must fit `attachment_max_mb` (10 MiB by default, 1–25). Employee identity required. |
+
+Engine requires the exact target in `allowed_models` and exact `activity:<model>`, `note:<model>`, `message:<model>` or `attach:<model>` in `allowed_actions`; empty lists do not grant these tools. Follow uses the personal Odoo account's permissions instead of employee model/action grants and the Engine sensitive-model block list. Company feature switches, `always_refuse`, fixed refusals, input checks, approvals and Odoo ACLs remain. Company/AI-owned identities always use Engine. Employee `permission_override=engine` keeps Engine; `read_only` removes writes. Global Follow requires a valid administrator acknowledgement; missing/invalid acknowledgement falls back to Engine.
+
+`agents.update` accepts `odoo.allowed_actions` entries `activity:<model>`, `note:<model>`, `message:<model>` and `attach:<model>`. These four actions require an exact model name; bare verbs and wildcard models are not accepted for new entries. Generic writers refuse employee-level Odoo permission widening and direct the administrator to that employee's edit page.
+
+For an avatar or `act_as_requester` employee with no usable own or permitted company credential, the employee identity route returns `odoo_member_credentials_off` while `[odoo] member_credentials` is not literally `true`; its message says the company has not enabled members' own Odoo connections and asks them to contact an administrator. When the switch is `true`, the corresponding missing-connection refusal is `odoo_not_connected`.
+
+Default `always_refuse`: `unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`. Rules use an exact model, `*` or dot descendants such as `ir.*`; `method:<name>` matches an exact method. Dedicated rules use semantic verbs (`activity:`, `note:`, `message:`, `attach:`) against the target model.
+
+| Rule | Always refused |
+| --- | --- |
+| F1 | Updating or deleting `ir.attachment`; creating it through a generic tool. Use `odoo_attachment_add` to create an attachment from a file. |
+| F2 | Mutations of `ir.model`, every `ir.model.*` descendant, and `ir.rule`. |
+| F3 | Mutations of `res.users.apikeys` and its dot descendants. |
+| F4 | Mutations of `mail` and every `mail.*` descendant; generic calls to `message_post`, `message_notify`, `message_subscribe`, `send_mail`, or `action_send_mail`. Use the dedicated note/message tools. |
+| F5 | Methods starting with `_`, plus `init` and `uninstall_hook`. |
+
+Engine mode preserves v1.85 approval behavior for `odoo_execute` and button actions, including `odoo_sale_confirm`: employee approval lists, action rules and effect classes still apply, with no additional forced approval. Follow-Odoo-account mode requires human approval for every non-read `odoo_execute` call and every `action_*`, `button_*` or `toggle_*` action, including `odoo_sale_confirm`. Follower messages (`odoo_message_send`) always require approval in every mode. These forced approvals cannot be waived by an `allow` rule; they bind the exact tool and arguments and are single-use. Other writes retain their normal approval and outgoing-data gates. Admins manage policy through audited `odoo.access_get/set`; widening Follow/company-account/refusal-list settings requires `acknowledge_risk`.
+
+Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls are in **employee editor → Integrations → Odoo**.

@@ -103,6 +103,34 @@ pub struct QueueMessage {
     /// `crate::on_behalf_of`). Validated again by the dispatcher before use.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Host-set department fence; presence always adds a fire-time check.
+    #[serde(default)]
+    pub autopilot_department: Option<String>,
+    #[serde(default)]
+    pub autopilot_rule_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueOutcome {
+    Inserted,
+    AlreadyPresent,
+}
+
+impl QueueMessage {
+    /// Compare immutable delivery identity, using the payload actually stored.
+    /// Status, retries and timestamps can change after a successful enqueue.
+    pub(crate) fn matches_enqueue(&self, expected: &QueueMessage) -> bool {
+        self.id == expected.id
+            && self.sender == expected.sender
+            && self.target == expected.target
+            && self.payload == duduclaw_security::credential_detect::mask(&expected.payload)
+            && self.autopilot_department == expected.autopilot_department
+            && self.autopilot_rule_id == expected.autopilot_rule_id
+            && self.lane == expected.lane
+            && self.origin_agent == expected.origin_agent
+            && self.sender_agent == expected.sender_agent
+            && self.delegation_depth == expected.delegation_depth
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +141,7 @@ pub struct QueueMessage {
 /// `idx_mq_sender_status`, pinned by a query-plan test).
 const OPEN_TASK_MESSAGES_SQL: &str = "SELECT id, sender, target, payload, status, retry_count, \
      delegation_depth, origin_agent, sender_agent, error, response, created_at, acked_at, \
-     completed_at, reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
+     completed_at, reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id \
      FROM message_queue \
      WHERE sender IN ('goal-loop-driver', 'heartbeat-scheduler') \
        AND status IN ('pending', 'acked', 'processing')";
@@ -206,6 +234,8 @@ impl MessageQueue {
         // `user:<id>` / `unmapped:<channel>:<digest>`). Written by the MCP
         // server from its host env, or by the gateway from a task row.
         Self::ensure_column(conn, "message_queue", "on_behalf_of", "TEXT")?;
+        Self::ensure_column(conn, "message_queue", "autopilot_department", "TEXT")?;
+        Self::ensure_column(conn, "message_queue", "autopilot_rule_id", "TEXT")?;
         // B11: the employee whose own bot / app the originating conversation
         // came in through (NULL = shared bot / app or a legacy row).
         Self::ensure_column(conn, "delegation_callbacks", "sender_agent", "TEXT")?;
@@ -250,8 +280,8 @@ impl MessageQueue {
             "INSERT INTO message_queue \
              (id, sender, target, payload, status, retry_count, delegation_depth, \
               origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id, \
-              upstream_unknown, lane, on_behalf_of) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 msg.id,
                 msg.sender,
@@ -268,11 +298,49 @@ impl MessageQueue {
                 msg.session_id,
                 msg.upstream_unknown,
                 msg.lane,
-                msg.on_behalf_of,
+                msg.on_behalf_of, msg.autopilot_department, msg.autopilot_rule_id,
             ],
         )
         .map_err(|e| format!("enqueue: {e}"))?;
         Ok(())
+    }
+
+    /// An id collision is success only for the exact same delivery. Keep the
+    /// insert and comparison in one write transaction, including across processes.
+    pub async fn enqueue_or_verify_exact(&self, msg: &QueueMessage) -> Result<EnqueueOutcome, String> {
+        let mut conn = self.conn.lock().await;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|e| format!("begin exact enqueue: {e}"))?;
+        let inserted = tx.execute(
+            "INSERT INTO message_queue
+             (id, sender, target, payload, status, retry_count, delegation_depth,
+              origin_agent, sender_agent, created_at, reply_channel, turn_id, session_id,
+              upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+             ON CONFLICT(id) DO NOTHING",
+            params![msg.id, msg.sender, msg.target,
+                duduclaw_security::credential_detect::mask(&msg.payload),
+                msg.status.as_str(), msg.retry_count, msg.delegation_depth,
+                msg.origin_agent, msg.sender_agent, msg.created_at, msg.reply_channel,
+                msg.turn_id, msg.session_id, msg.upstream_unknown, msg.lane, msg.on_behalf_of, msg.autopilot_department, msg.autopilot_rule_id],
+        ).map_err(|e| format!("exact enqueue: {e}"))?;
+        let outcome = if inserted == 1 {
+            EnqueueOutcome::Inserted
+        } else {
+            let existing = tx.query_row(
+                "SELECT id, sender, target, payload, status, retry_count, delegation_depth,
+                 origin_agent, sender_agent, error, response, created_at, acked_at, completed_at,
+                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id
+                 FROM message_queue WHERE id=?1",
+                params![msg.id], Self::row_to_message,
+            ).map_err(|e| format!("verify exact enqueue: {e}"))?;
+            if !existing.matches_enqueue(msg) {
+                return Err("queue id delivery mismatch".into());
+            }
+            EnqueueOutcome::AlreadyPresent
+        };
+        tx.commit().map_err(|e| format!("commit exact enqueue: {e}"))?;
+        Ok(outcome)
     }
 
     /// Cancel only delegations not yet handed to the dispatcher. The existing
@@ -376,7 +444,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id \
                  FROM message_queue WHERE status = 'pending' \
                  AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
                  ORDER BY created_at ASC, id ASC LIMIT ?1",
@@ -405,7 +473,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id \
                  FROM message_queue WHERE status = 'acked' AND acked_at < ?1",
             )
             .map_err(|e| format!("prepare stale: {e}"))?;
@@ -430,7 +498,7 @@ impl MessageQueue {
         conn.query_row(
             "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
              origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-             reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
+             reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id \
              FROM message_queue WHERE id = ?1",
             params![message_id],
             |row| Self::row_to_message(row),
@@ -480,6 +548,7 @@ impl MessageQueue {
     /// Column order must match the SELECT statements above.
     fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<QueueMessage> {
         Ok(QueueMessage {
+            autopilot_department: row.get(20)?, autopilot_rule_id: row.get(21)?,
             id: row.get(0)?,
             sender: row.get(1)?,
             target: row.get(2)?,
@@ -538,7 +607,7 @@ impl MessageQueue {
             .prepare(
                 "SELECT id, sender, target, payload, status, retry_count, delegation_depth, \
                  origin_agent, sender_agent, error, response, created_at, acked_at, completed_at, \
-                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of \
+                 reply_channel, turn_id, session_id, upstream_unknown, lane, on_behalf_of, autopilot_department, autopilot_rule_id \
                  FROM message_queue \
                  WHERE sender = 'goal-loop-driver' \
                    AND (id LIKE ?1 ESCAPE '\\' OR payload LIKE ?2 ESCAPE '\\') \
@@ -693,8 +762,37 @@ mod tests {
         assert!(!text.contains("SCAN message_queue"), "{text}");
     }
 
+    #[tokio::test]
+    async fn department_queue_tags_roundtrip_and_bind_exact_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = MessageQueue::open(dir.path()).unwrap();
+        let mut legacy = serde_json::to_value(sample_msg("legacy", None)).unwrap();
+        legacy.as_object_mut().unwrap().remove("autopilot_department");
+        legacy.as_object_mut().unwrap().remove("autopilot_rule_id");
+        let legacy: QueueMessage = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.autopilot_department.is_none());
+        assert!(legacy.autopilot_rule_id.is_none());
+        queue.enqueue(&legacy).await.unwrap();
+        assert!(queue.get_by_id("legacy").await.unwrap().unwrap().autopilot_department.is_none());
+        let mut tagged = sample_msg("tagged", None);
+        tagged.autopilot_department = Some("sales".into());
+        tagged.autopilot_rule_id = Some("rule".into());
+        queue.enqueue_or_verify_exact(&tagged).await.unwrap();
+        let read = queue.get_by_id("tagged").await.unwrap().unwrap();
+        assert_eq!(read.autopilot_department, tagged.autopilot_department);
+        assert_eq!(read.autopilot_rule_id, tagged.autopilot_rule_id);
+        assert_eq!(queue.enqueue_or_verify_exact(&tagged).await.unwrap(), EnqueueOutcome::AlreadyPresent);
+        tagged.autopilot_department = None;
+        assert!(queue.enqueue_or_verify_exact(&tagged).await.is_err());
+        tagged.autopilot_department = Some("sales".into());
+        tagged.autopilot_rule_id = Some("different".into());
+        assert!(queue.enqueue_or_verify_exact(&tagged).await.is_err());
+    }
+
     fn sample_msg(id: &str, reply_channel: Option<&str>) -> QueueMessage {
         QueueMessage {
+            autopilot_department: None,
+            autopilot_rule_id: None,
             id: id.into(),
             sender: "agnes".into(),
             target: "duduclaw-tl".into(),
@@ -801,6 +899,8 @@ mod tests {
         // Legacy row is intact and reads back with NULL reply_channel.
         let legacy = queue.get_by_id("legacy-1").await.unwrap().unwrap();
         assert_eq!(legacy.reply_channel, None);
+        assert_eq!(legacy.autopilot_department, None);
+        assert_eq!(legacy.autopilot_rule_id, None);
         assert_eq!(legacy.sender, "agnes");
     }
 }

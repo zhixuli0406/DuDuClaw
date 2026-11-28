@@ -1,10 +1,13 @@
+import { dashboardEndpoint } from '@/lib/dashboard-base';
+import { LogIn } from 'lucide-react';
+import { approvalConfirmReturn } from '@/lib/approval-step-up';
 import { googleAuthorizationReturn } from '@/lib/google-authorization';
-import { useState, useEffect, type FormEvent } from 'react';
+import { useState, useEffect, useRef, type FormEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { browserWatchReturn } from '@/lib/browser-watch-return';
 import { useIntl } from 'react-intl';
 import { LoginMfa } from '@/components/mfa/LoginMfa';
-import { useAuthStore, type LoginChallenge } from '@/stores/auth-store';
+import { apiPost, useAuthStore, type LoginChallenge } from '@/stores/auth-store';
 import { Card, Button, Input, Spinner } from '@/components/mds';
 import { Field } from '@/components/onboarding';
 import { ProductMascot as DuDu } from '@/components/brand/ProductLogo';
@@ -15,16 +18,26 @@ import { useEffectiveName } from '@/lib/product-identity';
 type Mode = 'password' | 'otp';
 type OtpStep = 'email' | 'code';
 
+const googleResultKeys = new Map([
+  ['domain_not_allowed', 'domainNotAllowed'], ['personal_account', 'personalAccount'],
+  ['existing_account', 'existingAccount'], ['pending_approval', 'pendingApproval'],
+  ['account_disabled', 'cannotSignIn'], ['rejected', 'cannotSignIn'],
+  ['daily_limit', 'dailyLimit'],
+]);
+
 export function LoginPage() {
   const intl = useIntl();
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: unknown } | null)?.from;
-  const returnTo = googleAuthorizationReturn(from) ?? browserWatchReturn(from) ?? '/';
+  const googleReturn = useRef(/^#gsi=[A-Za-z0-9_-]+$/.test(window.location.hash)
+    || window.location.hash === '#gsi_error=expired');
+  const returnTo = googleReturn.current ? '/' : googleAuthorizationReturn(from) ?? approvalConfirmReturn(from) ?? browserWatchReturn(from) ?? '/';
   const brandName = useEffectiveName();
   const companyName = useCompanyName();
   const company = useCompanyStore((state) => state.company);
   const hasCompany = Boolean(company.name || company.logo_url);
+  const googleComplete = useAuthStore((s) => s.googleComplete);
   const login = useAuthStore((s) => s.login);
   const otpRequest = useAuthStore((s) => s.otpRequest);
   const otpVerify = useAuthStore((s) => s.otpVerify);
@@ -39,6 +52,59 @@ export function LoginPage() {
   const [password, setPassword] = useState('');
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
+  const [googleAvailable, setGoogleAvailable] = useState(false);
+  const [googleMessage, setGoogleMessage] = useState('');
+  const [googleCompleting, setGoogleCompleting] = useState(googleReturn.current
+    && window.location.hash !== '#gsi_error=expired');
+  const [googleStarting, setGoogleStarting] = useState(false);
+  const googleHandled = useRef(false);
+  const googleStartPending = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    void fetch(dashboardEndpoint('/api/login/methods'), { credentials: 'same-origin', cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) return;
+        const data = await response.json();
+        if (active) setGoogleAvailable(data?.google === 'available');
+      }).catch(() => { /* Unavailable methods stay hidden. */ });
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (!googleReturn.current || googleHandled.current) return;
+    googleHandled.current = true;
+    const fragment = window.location.hash;
+    // Preserve React Router's history state; the ticket only enters the POST body.
+    window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
+    if (fragment === '#gsi_error=expired') {
+      setGoogleMessage('incomplete');
+      return;
+    }
+    void googleComplete(fragment.slice('#gsi='.length)).then((result) => {
+      if (result && 'result' in result) setGoogleMessage(googleResultKeys.get(result.result) ?? 'incomplete');
+      else if (result) setMfa(result);
+      else navigate('/', { replace: true });
+    }).catch(() => setGoogleMessage('incomplete'))
+      .finally(() => setGoogleCompleting(false));
+  }, [googleComplete, navigate]);
+
+  const handleGoogleStart = async () => {
+    if (googleStartPending.current) return;
+    googleStartPending.current = true;
+    setGoogleStarting(true);
+    setGoogleMessage('');
+    try {
+      const data = await apiPost<{ authorization_url: string }>('/api/login/google/start', {});
+      const url = new URL(data.authorization_url);
+      if (url.origin !== 'https://accounts.google.com' || url.username || url.password) throw new Error('Invalid authorization origin');
+      window.location.assign(url.href);
+    } catch {
+      setGoogleMessage('incomplete');
+      googleStartPending.current = false;
+      setGoogleStarting(false);
+    }
+  };
 
   // First-run onboarding: an unclaimed instance lets the first (localhost)
   // visitor SET the admin password in the browser — no console one-time
@@ -49,6 +115,7 @@ export function LoginPage() {
   const [confirmPassword, setConfirmPassword] = useState('');
 
   useEffect(() => {
+    if (googleReturn.current) { setFirstRun(false); return; }
     let active = true;
     firstRunStatus().then((claimable) => {
       if (active) setFirstRun(claimable);
@@ -64,6 +131,7 @@ export function LoginPage() {
   // load; the store's one-shot flag makes this a no-op when it did, so a
   // refused instance shows the form immediately with no extra request.
   useEffect(() => {
+    if (googleReturn.current) return;
     let active = true;
     void tryLocalSession().then((ok) => {
       if (ok && active) navigate(returnTo, { replace: true });
@@ -190,6 +258,7 @@ export function LoginPage() {
         </div>
 
         <Card className="gap-5 p-6">
+          {approvalConfirmReturn(returnTo) && <p role="note" className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'approvalConfirm.loginNote' })}</p>}
           {error && (
             <div
               role="alert"
@@ -199,11 +268,16 @@ export function LoginPage() {
             </div>
           )}
 
-          {!mfa && !firstRun && <label className="flex items-center gap-2 text-sm">
+          {!googleCompleting && !mfa && !firstRun && <label className="flex items-center gap-2 text-sm">
             <input type="checkbox" checked={remember} onChange={e => setRemember(e.target.checked)} />
             {intl.formatMessage({ id: 'login.remember' })}
           </label>}
-          {mfa ? (
+          {googleCompleting ? (
+            <div role="status" className="space-y-2 py-8 text-center">
+              <p>{intl.formatMessage({ id: 'login.google.completing' })}</p>
+              <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'login.google.wait' })}</p>
+            </div>
+          ) : mfa ? (
             <LoginMfa challenge={mfa} onComplete={() => navigate(returnTo, { replace: true })}
               onCancel={() => { setMfa(null); setFirstRun(false); setOtpStep('email'); setError(''); }} />
           ) : firstRun ? (
@@ -363,6 +437,23 @@ export function LoginPage() {
                 </Button>
               </div>
             </form>
+          )}
+          {!googleCompleting && !mfa && !firstRun && (googleAvailable || googleMessage) && (
+            <div className="space-y-4">
+              {googleAvailable && <div className="flex items-center gap-3 text-sm text-muted-foreground">
+                <span className="h-px flex-1 bg-border" />
+                {intl.formatMessage({ id: 'login.google.or' })}
+                <span className="h-px flex-1 bg-border" />
+              </div>}
+              {googleMessage && <p role="alert" className="rounded-lg border border-border bg-muted px-3 py-2 text-sm">
+                {intl.formatMessage({ id: `login.google.result.${googleMessage}` })}
+              </p>}
+              {googleAvailable && <Button type="button" variant="outline" size="lg" className="w-full"
+                disabled={googleStarting || loading || otpBusy} onClick={handleGoogleStart}>
+                <LogIn size={16} aria-hidden="true" />
+                {intl.formatMessage({ id: 'login.google.button' })}
+              </Button>}
+            </div>
           )}
         </Card>
 

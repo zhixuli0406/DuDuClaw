@@ -33,10 +33,16 @@ export const RUNTIME_PROVIDERS: ReadonlyArray<RuntimeProvider> = [
   'qwen', 'kimi', 'copilot', 'kiro', 'cursor', 'vibe', 'opencode',
 ];
 
-/** v1.68 W1 — runtimes driven as plain command-line tools. Per-employee tool
- *  limits (allowed/denied tools, approval lists) do not reach them. */
+/** Runtimes driven as plain command-line tools. DuDuClaw tools retain their
+ *  permission checks; native write/shell constraints require read-only
+ *  enforcement or refusal, while native per-tool allowlists are incomplete. */
 export const GENERIC_CLI_RUNTIMES: ReadonlySet<string> = new Set([
   'qwen', 'kimi', 'copilot', 'kiro', 'cursor', 'vibe', 'opencode',
+]);
+
+/** Engines whose built-in tools have coarse write/shell enforcement. */
+export const COARSE_TOOL_RUNTIMES: ReadonlySet<string> = new Set([
+  ...GENERIC_CLI_RUNTIMES, 'codex', 'grok',
 ]);
 
 /** v1.84 (RM-205) — runtimes with a verified background-work (utility) lane;
@@ -82,8 +88,8 @@ export const DEFAULT_EVOLUTION_ADVANCED: {
   skill_graduation_min_lift: number;
 } = {
   external_factors: {
-    user_feedback: true,
-    security_events: true,
+    user_feedback: false,
+    security_events: false,
     channel_metrics: false,
     business_context: false,
     peer_signals: false,
@@ -256,6 +262,7 @@ export const DEFAULT_V168: {
   decision_continuity: boolean;
   decision_ttl_days: number;
   night_engine_enabled: boolean;
+  goal_intent_enabled: boolean;
   public_trigger: boolean;
 } = {
   daily_cap_cents: 0,
@@ -277,5 +284,6 @@ export const DEFAULT_V168: {
   decision_continuity: false,
   decision_ttl_days: 7,
   night_engine_enabled: false,
+  goal_intent_enabled: true,
   public_trigger: false,
 };

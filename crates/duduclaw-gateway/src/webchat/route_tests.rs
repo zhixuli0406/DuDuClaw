@@ -1,5 +1,5 @@
-//! WebChat routing on every edition: non-admins never reach main, including
-//! bound main agents, queued commands and stored conversations.
+//! WebChat routing: main conversations require Admin or an effective Enterprise
+//! person-list grant; bindings alone never open main.
 
 use super::*;
 use crate::webchat::build_session_info_frame;
@@ -603,6 +603,125 @@ async fn final_reply_main_gate_preserves_admin_token_admin_and_widget() {
         }).await.expect("privileged/widget main route must reach the seam");
         assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{kind}: {reply}");
     }
+}
+
+async fn listed_main_fixture(shell: bool) -> Fixture {
+    let f = fixture().await;
+    let admin = f.state.user_db.create_user(
+        "list-admin@test.local", "Admin", "EmpPass-12345", UserRole::Admin,
+    ).unwrap();
+    f.state.user_db.set_main_agent_users(&admin.id, &[f.emp.clone()], true).unwrap();
+    write_agent(&f._dir.path().join("agents"), "dudu", "嘟嘟總機", "@嘟嘟總機", "main",
+        if shell { "[capabilities]\nallowed_tools = ['Read', 'Bash']\n" }
+        else { "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n" });
+    f.state.ctx.registry.write().await.scan().await.unwrap();
+    f
+}
+
+#[tokio::test]
+async fn listed_shell_free_main_conversation_needs_no_binding() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
+    let f = listed_main_fixture(false).await;
+    assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
+    let refused = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
+    assert!(matches!(refused, ChatMessage::Error { message, .. }
+        if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    for text in ["你好", "@嘟嘟總機 你好"] {
+        let refused = route(&f, text, Some("dudu")).await.unwrap_err();
+        assert!(matches!(*refused, ChatMessage::Error { message, .. }
+            if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    }
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(f._dir.path());
+    assert!(f.state.agent_access_allowed(&f.emp, "dudu").await);
+    assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_ok());
+    assert_eq!(route(&f, "你好", Some("dudu")).await.unwrap().agent.as_deref(), Some("dudu"));
+    assert_eq!(route(&f, "@嘟嘟總機 你好", Some("finance")).await.unwrap().agent.as_deref(), Some("dudu"));
+    assert!(f.state.may_resume_into(&f.emp, "dudu", "webchat:x", "webchat:u").await);
+    let sender = f.state.sender_access(&f.emp).await;
+    let loaded = f.state.ctx.registry.read().await.get("dudu").unwrap().clone();
+    assert!(sender.webchat_allows(&loaded));
+    assert!(!sender.webchat_allows_work(&loaded), "Converse must not open assignment");
+    assert!(crate::webchat::access::primary_candidate(&sender, &loaded));
+    let policy = f.state.target_policy(&f.emp, "dudu", false).await.unwrap();
+    assert!(policy.with_current(|| ()).is_ok());
+    for sender in [crate::trigger_route::SenderAccess::unmapped(),
+        crate::trigger_route::SenderAccess::no_bindings("widget-visitor:listed-main")]
+    {
+        let sender = sender.for_webchat_converse(f._dir.path()).await;
+        assert!(!sender.main_converse_allowed(&loaded));
+        assert!(!sender.webchat_allows(&loaded));
+    }
+    let mut model = crate::agent_channels::e2e_seam::arm_waiting(f._dir.path());
+    let (reply, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+                crate::channel_reply::build_reply_for_agent("Hello", &f.state.ctx,
+                    "dudu", "webchat:listed-main", "webchat:user", None)),
+            async { model.entered.recv().await.unwrap().release.send(()).unwrap(); },
+        )
+    }).await.expect("listed shell-free conversation must reach the model seam");
+    assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{reply}");
+    }
+    }).await;
+}
+
+#[tokio::test]
+async fn main_conversation_refusals_distinguish_ineffective_list() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
+    for kind in ["shell", "unlisted", "personal", "corrupt"] {
+        let f = listed_main_fixture(kind == "shell").await;
+        match kind {
+            "unlisted" => {
+                let db = &f.state.user_db;
+                let admin = db.create_user("revoke@test.local", "Admin", "EmpPass-12345", UserRole::Admin).unwrap();
+                db.set_main_agent_users(&admin.id, &[], true).unwrap();
+            }
+            "personal" => crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal),
+            "corrupt" => std::fs::write(f._dir.path().join("agents/dudu/agent.toml"), "invalid TOML !").unwrap(),
+            _ => assert!(!duduclaw_core::execution_gate::isolation_required()),
+        }
+        let sender = f.state.sender_access(&f.emp).await;
+        assert!(!sender.webchat_allows(f.state.ctx.registry.read().await.get("dudu").unwrap()));
+        assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
+        let expected = if matches!(kind, "shell" | "corrupt") {
+            crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+        } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT };
+        let refused = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
+        assert!(matches!(refused, ChatMessage::Error { message, .. } if message == expected), "{kind}");
+        let refused = route(&f, "你好", Some("dudu")).await.unwrap_err();
+        assert!(matches!(*refused, ChatMessage::Error { message, .. } if message == expected), "{kind}");
+        let mut model = crate::agent_channels::e2e_seam::arm_waiting(f._dir.path());
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(5),
+            crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
+                crate::channel_reply::build_reply_for_agent("Hello", &f.state.ctx,
+                    "dudu", "webchat:refused-main", "webchat:user", None)),
+        ).await.expect("refusal must precede the model seam");
+        assert_eq!(reply, expected, "{kind}");
+        assert!(model.entered.try_recv().is_err());
+    }
+    }).await;
+}
+
+#[tokio::test]
+async fn precomputed_main_admission_cannot_survive_shell_reload_or_open_assignment() {
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
+    let f = listed_main_fixture(false).await;
+    f.state.user_db.bind_agent(&f.emp, "dudu", AccessLevel::Owner).unwrap();
+    let sender = f.state.sender_access(&f.emp).await;
+    let policy = f.state.target_policy(&f.emp, "dudu", false).await.unwrap();
+    {
+        let reg = f.state.ctx.registry.read().await;
+        assert!(matches!(crate::trigger_route::assign::assign_right_under(
+            &reg, &sender, "dudu", None, None,
+        ), crate::trigger_route::assign::AssignRight::Denied));
+    }
+    write_agent(&f._dir.path().join("agents"), "dudu", "嘟嘟總機", "@嘟嘟總機", "main",
+        "[capabilities]\nallowed_tools = ['Read', 'Bash']\n");
+    f.state.ctx.registry.write().await.scan().await.unwrap();
+    assert!(!sender.webchat_allows(f.state.ctx.registry.read().await.get("dudu").unwrap()));
+    assert!(policy.with_current(|| ()).is_err());
+    }).await;
 }
 
 #[tokio::test]

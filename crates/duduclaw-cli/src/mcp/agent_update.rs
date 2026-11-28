@@ -185,27 +185,50 @@ pub(crate) fn canonicalize_db_source_ids(
 /// or soft-deleted employee (the Admin-only lifecycle).
 pub(crate) const ADMIN_LIFECYCLE_STATUS_REFUSED: &str = "Error: 這位 AI 員工已封存或已刪除，狀態只能由管理員在儀表板變更（解除封存，或新建一位 AI 員工）。未做任何變更。";
 
-/// `agent_update` parameters that change an employee's authority: the MCP
-/// counterparts of the keys the dashboard's `agents.update` treats as
-/// admin-only (`AUTHORITY_KEYS` in `duduclaw-gateway/src/handlers/
-/// agents_update_v168.rs`: `[agent] reports_to`, all of `[capabilities]` —
-/// here the `db_sources*` grant params), plus the budget and `[agent] role`
-/// (`role = "main"` is what the shared-wiki delete check and the
-/// dispatcher's `default` alias read as the main agent). An AI employee may
-/// not send any of these about itself.
-pub(crate) const SELF_AUTHORITY_PARAMS: &[&str] = &[
-    "reports_to",
-    "db_sources",
-    "db_sources_add",
-    "db_sources_remove",
-    "budget_cents",
-    "reply_language",
-    "memory_language",
-    "runtime",
-    "timeout_secs",
-    "max_turns",
-    "role",
-];
+/// Runtime writes are not supported by this MCP tool; never silently accept
+/// these parameters alongside an otherwise valid day-to-day edit.
+const UNSUPPORTED_RUNTIME_PARAMS: &[&str] = &["runtime", "timeout_secs", "max_turns"];
+const AI_AUTHORITY_REFUSED: &str = "這項設定只能由管理員在管理介面變更，未做任何變更。請向提出要求的人說明，並請他聯絡管理員處理。";
+
+fn audit_ai_authority_refusal(home: &Path, caller: &str, target: &str, field: &str, class: &str) {
+    duduclaw_security::audit::append_tool_call_with_extras(
+        home, caller, "agent_authority_refused", "agent_update authority change refused", false,
+        &[
+            ("caller", serde_json::json!(caller)),
+            ("target", serde_json::json!(target)),
+            ("agent", serde_json::json!(target)),
+            ("field", serde_json::json!(field)),
+            ("keys", serde_json::json!([field])),
+            ("attempted_value_class", serde_json::json!(class)),
+            ("source", serde_json::json!("mcp.agent_update")),
+            ("reason", serde_json::json!("authority_widening")),
+        ],
+    );
+}
+
+fn check_ai_authority(
+    home: &Path, actor: RecordActor<'_>, target: &str,
+    before: &toml::Table, after: &toml::Table, approved_db: Option<&[String]>,
+) -> std::result::Result<(), String> {
+    let Some(caller) = actor.agent() else { return Ok(()); };
+    let changes: Vec<_> = duduclaw_core::agent_toml::authority::authority_diff(before, after)
+        .into_iter().filter(|change| !(change.key == "capabilities.db_sources"
+            && approved_db.is_some_and(|ids| change.after == serde_json::json!(ids))))
+        .collect();
+    for change in &changes {
+        let class = match change.key.as_str() {
+            "budget.monthly_limit_cents" | "budget.daily_cap_cents" => {
+                if change.after.as_u64() == Some(0) { "limit_removed" } else { "limit_increase" }
+            }
+            "budget.hard_stop" => "hard_stop_disabled",
+            "budget.when_unavailable" => "failure_policy_loosened",
+            "capabilities.db_sources" => "grant_expansion",
+            _ => "protected_value_change",
+        };
+        audit_ai_authority_refusal(home, caller, target, &change.key, class);
+    }
+    if changes.is_empty() { Ok(()) } else { Err(AI_AUTHORITY_REFUSED.into()) }
+}
 
 /// RM-137 H4: every `agent_update` parameter that creates, resumes or
 /// reschedules background work for the target employee. The handler accepts
@@ -233,12 +256,8 @@ pub(crate) fn background_delegation_sender<'a>(
 /// Update one or more fields of an existing agent's `agent.toml` (see the
 /// notes at the top of this file for the org gate).
 ///
-/// Self-edit authority guard: when an AI-employee caller targets itself, any
-/// [`SELF_AUTHORITY_PARAMS`] key refuses the whole call and is audited as
-/// `agent_authority_refused` — the org gate's `node == caller` short-circuit
-/// would otherwise let an employee grant itself a database source, raise its
-/// own budget or re-parent itself. Operators are not restricted; editing a
-/// subordinate is unchanged.
+/// AI callers share the dashboard's non-admin authority rules, for both
+/// self-edits and other employees. Delegation policies never widen authority.
 pub(crate) async fn handle_agent_update(
     params: &Value,
     home_dir: &Path,
@@ -307,32 +326,14 @@ pub(crate) async fn handle_agent_update(
     }
 
     if let Some(me) = actor.agent() {
-        let is_self = agent_id == me.trim();
-        let keys: Vec<&str> = SELF_AUTHORITY_PARAMS
-            .iter()
-            .copied()
-            .filter(|k| params.get(*k).is_some())
-            .collect();
-        if is_self && !keys.is_empty() {
-            duduclaw_security::audit::append_tool_call_with_extras(
-                home_dir,
-                me,
-                "agent_authority_refused",
-                &format!("agent_update: '{agent_id}' may not change its own {}", keys.join(", ")),
-                false,
-                &[
-                    ("agent", serde_json::json!(agent_id)),
-                    ("keys", serde_json::json!(keys)),
-                    ("source", serde_json::json!("mcp.agent_update")),
-                    ("reason", serde_json::json!("self_authority_change")),
-                ],
-            );
+        let keys: Vec<_> = UNSUPPORTED_RUNTIME_PARAMS.iter()
+            .filter(|key| params.get(**key).is_some()).collect();
+        if !keys.is_empty() {
+            for key in keys {
+                audit_ai_authority_refusal(home_dir, me, agent_id, key, "unsupported_runtime_write");
+            }
             return serde_json::json!({
-                "content": [{"type": "text", "text": format!(
-                    "Error: 不能調整自己的權限類設定（{}），未做任何變更。這些設定只能由主管（委派政策允許的上級）或操作者在儀表板調整。",
-                    keys.join("、")
-                )}],
-                "isError": true
+                "content": [{"type":"text", "text":AI_AUTHORITY_REFUSED}], "isError":true
             });
         }
     }
@@ -462,6 +463,17 @@ pub(crate) async fn handle_agent_update(
         changes.push(format!("icon = \"{v}\""));
     }
     if let Some(v) = params.get("reports_to").and_then(|v| v.as_str()) {
+        let before: toml::Table = match content.parse() {
+            Ok(table) => table,
+            Err(_) => return serde_json::json!({"content":[{"type":"text", "text":"無法確認目前設定，未做任何變更。"}], "isError":true}),
+        };
+        let mut after = before.clone();
+        if let Some(agent) = after.get_mut("agent").and_then(toml::Value::as_table_mut) {
+            agent.insert("reports_to".into(), toml::Value::String(v.into()));
+        }
+        if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before, &after, None) {
+            return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true});
+        }
         // Validate reports_to references an existing agent and won't create a cycle
         if let Err(reason) = validate_reports_to(home_dir, agent_id, v).await {
             return serde_json::json!({
@@ -580,13 +592,8 @@ pub(crate) async fn handle_agent_update(
 
     // -- Capability fields: read-only database source grants (WP-B) --
     //
-    // `[capabilities] db_sources` is deny-by-default: an agent with no grant
-    // cannot even list the configured sources, let alone query one. Until now
-    // the only way to open a source was hand-editing agent.toml, so a manager
-    // could not say 「把客戶 CRM 資料庫開給小美」 and have it happen. These three
-    // params are the conversational route to the same authority the dashboard
-    // writes, behind the `check_org_subject_allowed` front gate this handler
-    // already applied (you may only edit yourself or your own subtree).
+    // AI expansions for another employee require a bound Admin approval.
+    // Self-expansions remain refused; revocations apply directly.
     //
     // Fail-closed on the granting side: every id named by `db_sources` /
     // `db_sources_add` is validated against the configured
@@ -768,6 +775,20 @@ pub(crate) async fn handle_agent_update(
             return serde_json::json!({ "content": [{"type": "text", "text": e}], "isError": true });
         }
     };
+    // Refuse unrelated authority changes before filing a card. Only this
+    // other-employee database expansion is eligible for the Admin exception.
+    let needs_db_approval = actor.agent().is_some_and(|me| me != agent_id)
+        && !db_sources_added.is_empty();
+    let approved_sources = if needs_db_approval { db_sources_after.as_deref() } else { None };
+    if let Err(reason) = check_ai_authority(home_dir, actor, agent_id, &before_t, &after_t, approved_sources) {
+        return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true});
+    }
+    let db_approval = if let Some(sources) = approved_sources {
+        match super::approval::approve_db_source_grant(home_dir, caller, agent_id, sources).await {
+            Ok(proof) => Some(proof),
+            Err(reason) => return serde_json::json!({"content":[{"type":"text", "text":reason}], "isError":true}),
+        }
+    } else { None };
     // RM-027 review: a re-parenting holds the global org mutation lock
     // (shared with the dashboard `org.*` RPCs, `agents.update` and
     // `duduclaw org sync`), taken BEFORE the agent.toml lock — the order every
@@ -803,6 +824,7 @@ pub(crate) async fn handle_agent_update(
         {
             return Err(ADMIN_LIFECYCLE_STATUS_REFUSED.to_string());
         }
+        let authority_before = raw.clone();
         duduclaw_gateway::agent_files::external::apply_typed_changes(raw, &before_t, &after_t);
         // A requested stop must reach the fresh artifact even if the initial
         // snapshot had that status already and another writer resumed it.
@@ -813,6 +835,27 @@ pub(crate) async fn handle_agent_update(
                 .ok_or_else(|| "agent.toml missing [agent] section".to_string())?
                 .insert("status".into(), status);
         }
+        // Compare the artifact read under the cross-process lock with the
+        // final artifact. A concurrent admin tightening cannot be overwritten
+        // using an older, more permissive baseline.
+        if let Some(sources) = approved_sources {
+            // A concurrent revocation must not be undone by an old approval.
+            let current = authority_before.get("capabilities").and_then(|v| v.get("db_sources"));
+            let held: Option<Vec<&str>> = match current {
+                None => Some(Vec::new()),
+                Some(toml::Value::Array(ids)) => ids.iter().map(toml::Value::as_str).collect(),
+                _ => None,
+            };
+            let baseline: Vec<&str> = config_before.capabilities.db_sources.iter().map(String::as_str).collect();
+            if held.as_ref() != Some(&baseline) { return Err("資料庫授權已變更，請重新提出核准。".into()); }
+            let final_list = raw.get("capabilities").and_then(|v| v.get("db_sources"))
+                .and_then(toml::Value::as_array).ok_or("核准清單不符。")?;
+            let exact: Option<Vec<&str>> = final_list.iter().map(toml::Value::as_str).collect();
+            if exact.as_deref() != Some(sources.iter().map(String::as_str).collect::<Vec<_>>().as_slice()) {
+                return Err("核准清單不符。".into());
+            }
+        }
+        check_ai_authority(home_dir, actor, agent_id, &authority_before, raw, approved_sources)?;
         Ok(())
     }, || {
         // RM-137 H4: the policy / org tree may have changed since the front
@@ -857,6 +900,11 @@ pub(crate) async fn handle_agent_update(
             tracing::warn!(agent = %agent_id, error = %re, "org.toml rollback failed on agent_update");
         }
         drop(org_lock);
+        if e == AI_AUTHORITY_REFUSED {
+            return serde_json::json!({
+                "content":[{"type":"text", "text":AI_AUTHORITY_REFUSED}], "isError":true
+            });
+        }
         if duduclaw_gateway::agent_files::external::is_lock_wait_timeout(&e) {
             return org_locked_wait_timeout_error("agent.toml", &e);
         }
@@ -866,6 +914,14 @@ pub(crate) async fn handle_agent_update(
         });
     }
     drop(org_lock);
+
+    if let Some((approval_id, user_id)) = &db_approval {
+        duduclaw_security::audit::append_tool_call_with_extras(
+            home_dir, caller, "db_source_grant_applied", "Admin approved database source grant applied", true,
+            &[("target", serde_json::json!(agent_id)), ("added", serde_json::json!(db_sources_added)),
+              ("approval_id", serde_json::json!(approval_id)), ("decider_user_id", serde_json::json!(user_id))],
+        );
+    }
 
     if config_before.agent.status != config.agent.status {
         duduclaw_gateway::dashboard_feedback::emit(home_dir, "agent.status_changed",
@@ -950,4 +1006,70 @@ pub(crate) async fn handle_agent_update(
             changes.iter().map(|c| format!("  • {c}")).collect::<Vec<_>>().join("\n")
         )}]
     })
+}
+
+#[cfg(test)]
+mod skill_budget_authority_tests {
+    use super::*;
+
+    #[test]
+    fn ai_skill_budget_unlimited_enabling_is_refused_and_audited() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before = toml::Table::new();
+        let after: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+        for caller in ["rep", "lead"] {
+            assert_eq!(check_ai_authority(
+                tmp.path(), RecordActor::Agent(caller), "rep", &before, &after, None,
+            ), Err(AI_AUTHORITY_REFUSED.into()));
+        }
+        let log = std::fs::read_to_string(tmp.path().join("tool_calls.jsonl")).unwrap();
+        let rows: Vec<Value> = log.lines().map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|row| row["tool_name"] == "agent_authority_refused").collect();
+        assert_eq!(rows.len(), 2);
+        for (row, caller) in rows.iter().zip(["rep", "lead"]) {
+            assert_eq!(row["caller"], caller);
+            assert_eq!(row["target"], "rep");
+            assert_eq!(row["field"], "evolution.skill_budget_unlimited");
+            assert_eq!(row["keys"], serde_json::json!(["evolution.skill_budget_unlimited"]));
+            assert_eq!(row["source"], "mcp.agent_update");
+            assert_eq!(row["reason"], "authority_widening");
+            assert_eq!(row["attempted_value_class"], "protected_value_change");
+        }
+    }
+
+    #[test]
+    fn ai_skill_budget_unlimited_disabling_is_allowed_without_refusal_audit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before: toml::Table = "[evolution]\nskill_budget_unlimited = true\n".parse().unwrap();
+        let off: toml::Table = "[evolution]\nskill_budget_unlimited = false\n".parse().unwrap();
+        let absent = toml::Table::new();
+        // Seed a refusal so successful narrowing must leave the audit unchanged.
+        assert!(check_ai_authority(
+            tmp.path(), RecordActor::Agent("rep"), "rep", &absent, &before, None,
+        ).is_err());
+        let audit_path = tmp.path().join("tool_calls.jsonl");
+        let audit_before = std::fs::read(&audit_path).unwrap();
+        for caller in ["rep", "lead"] {
+            for after in [&off, &absent] {
+                assert_eq!(check_ai_authority(
+                    tmp.path(), RecordActor::Agent(caller), "rep", &before, after, None,
+                ), Ok(()));
+                assert_eq!(std::fs::read(&audit_path).unwrap(), audit_before);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod db_source_grant_binding_tests {
+    use super::*;
+
+    #[test]
+    fn approved_list_cannot_exempt_a_different_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let before: toml::Table = toml::from_str("[capabilities]\ndb_sources=[]\n").unwrap();
+        let after: toml::Table = toml::from_str("[capabilities]\ndb_sources=['crm','hr']\n").unwrap();
+        assert!(check_ai_authority(tmp.path(), RecordActor::Agent("lead"), "rep", &before, &after, Some(&["crm".into()])).is_err());
+        assert!(check_ai_authority(tmp.path(), RecordActor::Agent("lead"), "rep", &before, &after, Some(&["crm".into(), "hr".into()])).is_ok());
+    }
 }

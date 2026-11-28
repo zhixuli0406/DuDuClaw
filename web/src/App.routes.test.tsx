@@ -78,7 +78,9 @@ beforeEach(() => {
   // RPCs. A benign shape covers the list-shaped ones; `growth.snapshot` gets an
   // explicit empty answer because its store dereferences the payload.
   mockWsClient.call.mockImplementation((method: string) =>
-    method === 'growth.snapshot'
+    method === 'users.me'
+      ? Promise.resolve({ user: useAuthStore.getState().user, bindings: [], dept_grants: [] })
+      : method === 'growth.snapshot'
       ? Promise.resolve(null)
       : REJECTS_TO_SAFE_DEFAULT.has(method)
         ? Promise.reject(new Error(`mock: ${method} not implemented in this fixture`))
@@ -425,4 +427,15 @@ describe('advanced and company settings routes', () => {
       });
     }
   }
+});
+
+it('/approvals/confirm resolves to the new page without the legacy redirect', async () => {
+  renderAppAt('/approvals/confirm');
+  expect(await screen.findByRole('heading', { name: en['approvalConfirm.title'] })).toBeInTheDocument();
+  expect(screen.getByTestId('loc').textContent).toBe('/approvals/confirm');
+});
+it('gates approval confirmation on Personal', async () => {
+  setEdition('personal');
+  await expectLandsOn('/approvals/confirm', '/');
+  expect(screen.queryByRole('heading', { name: en['approvalConfirm.title'] })).not.toBeInTheDocument();
 });

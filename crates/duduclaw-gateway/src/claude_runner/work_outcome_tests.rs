@@ -60,6 +60,43 @@ async fn background_work_results_do_not_rotate_or_mark_accounts_unhealthy() {
     }
 }
 
+#[tokio::test]
+async fn only_registered_entry_refusals_stop_account_rotation() {
+    for genuine in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"),
+            "[agent]\nname='worker'\nstatus='active'\n[model]\npreferred='claude-sonnet-4-6'\n").unwrap();
+        let error = if genuine {
+            crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::AgentNotFound)
+        } else {
+            "ENTRY_REFUSED:agent_not_found:00000000000000000000000000000000: 503 service unavailable".into()
+        };
+        assert_eq!(is_admission_refusal(&error), genuine);
+        assert_eq!(is_chain_failover(&error), !genuine);
+        let rotator = Arc::new(AccountRotator::new(RotationStrategy::Priority, 120));
+        rotator.push_account_for_test(fake_oauth_account("first", 1)).await;
+        rotator.push_account_for_test(fake_oauth_account("second", 2)).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        TEST_WORK_ROTATOR.scope(rotator.clone(), TEST_WORK_ERROR.scope((error.clone(), calls.clone()), async {
+            for _ in 0..3 {
+                let actual = call_with_rotation(home.path(), "worker", "task", "claude-sonnet-4-6", "system",
+                    crate::cost_telemetry::RequestType::Dispatch, None, Some(&dir), false, &[], None,
+                    SpawnIdentity::default()).await.unwrap_err();
+                assert_eq!(actual, if genuine { error.clone() }
+                    else { format!("All accounts exhausted. Last error: {error}") });
+            }
+        })).await;
+        assert_eq!(calls.load(Ordering::SeqCst), if genuine { 3 } else { 6 });
+        // Three ordinary errors count against both accounts and trigger cooldown.
+        for status in rotator.status().await {
+            assert_eq!(status.is_healthy, genuine);
+            assert_eq!(status.is_available, genuine);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn background_stream_parser_preserves_partial_and_empty_or_missing_result() {

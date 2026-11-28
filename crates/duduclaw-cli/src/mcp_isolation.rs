@@ -54,7 +54,7 @@ pub(crate) fn boundary_route(name: &str) -> Option<BoundaryRoute> {
 }
 
 fn host_e_control(name: &str) -> bool {
-    matches!(name, "skill_from_recording" | "skill_hub_install" | "skill_curator_status" | "skill_synthesis_run" | "meeting_transcribe")
+    matches!(name, "skill_from_recording" | "skill_hub_install" | "skill_synthesis_run" | "meeting_transcribe")
 }
 
 /// Target fields in the original tool schema are data, never caller identity.

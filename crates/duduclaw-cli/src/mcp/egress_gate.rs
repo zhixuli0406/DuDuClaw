@@ -22,6 +22,13 @@ pub(crate) fn model_visible_payload(response: &Value) -> bool {
 /// Never infer completion from arbitrary content or a generic success shape:
 /// search aggregators and background launchers can hide unfinished effects.
 pub(crate) fn confirmed_sink_completion(tool: &str, response: &Value) -> bool {
+    // The gateway reports Drive writes as confirmed only with an explicit ok.
+    // Refusals and uncertain transport outcomes must not clear egress taint.
+    if duduclaw_core::google_identity::is_drive_write_tool(tool) {
+        return response.get("error").is_none() && response.get("result").is_some_and(|result|
+            result.get("ok") == Some(&Value::Bool(true))
+                && result.get("isError") != Some(&Value::Bool(true)));
+    }
     let terminal_contract = matches!(tool,
         "send_message" | "send_photo" | "send_sticker" | "web_search"
         | "web_fetch_cached" | "web_extract"
@@ -127,12 +134,23 @@ mod dispatch_observation_tests {
             assert_eq!(response["isError"], true);
             assert!(local, "{channel}: {response}");
         }
+        let odoo_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        odoo_listener.set_nonblocking(true).unwrap();
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[odoo]\nurl='http://{}'\ndb='test'\nfeatures_accounting=false\n[odoo_access]\ncompany_key_agents=['bot']\n",
+            odoo_listener.local_addr().unwrap())).unwrap();
+        let identity = crate::mcp::odoo_identity_client::tests::gateway(home.path(), 200,
+            json!({"ok":true,"identity":"company","permission":"engine"})).await;
         let odoo = std::sync::Arc::new(crate::odoo_pool::OdooConnectorPool::new(Default::default()));
-        let (response, local) = observe_builtin_dispatch(
+        let (response, local) = crate::mcp::odoo_identity_client::tests::AUTH.scope((), observe_builtin_dispatch(
             crate::mcp::odoo::handle_odoo_tool("odoo_invoice_list", &json!({}), home.path(), &odoo, "bot")
-        ).await;
+        )).await;
         assert_eq!(response["isError"], true);
+        assert!(response["content"][0]["text"].as_str().unwrap().contains("feature_gate"), "{response}");
         assert!(local, "{response}");
+        assert!(identity.requests.lock().unwrap().is_empty());
+        assert_eq!(odoo_listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(odoo.slots().await.is_empty());
         let (response, local) = observe_builtin_dispatch(
             crate::mcp_db::handle_db_tables(&json!({"source":"unknown"}), home.path(), "bot")
         ).await;
@@ -198,5 +216,20 @@ mod dispatch_observation_tests {
         assert_eq!(duduclaw_core::tool_effect::effect_of_builtin("credential_declare"), Some(duduclaw_core::ToolEffect::Modify));
         assert_eq!(duduclaw_core::tool_effect::egress_capable("credential_declare"), Some(false));
         assert_eq!(duduclaw_core::tool_effect::reads_private("credential_declare"), Some(false));
+    }
+}
+
+#[cfg(test)]
+mod drive_write_tests {
+    use super::*;
+    #[test]
+    fn drive_writes_are_egress_sinks_and_require_confirmed_completion() {
+        for tool in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+            assert_eq!(duduclaw_core::tool_effect::egress_capable(tool), Some(true));
+            assert!(confirmed_sink_completion(tool, &json!({"result":{"ok":true}})));
+            for result in [json!({}), json!({"isError":true}), json!({"ok":false})] {
+                assert!(!confirmed_sink_completion(tool, &json!({"result":result})));
+            }
+        }
     }
 }

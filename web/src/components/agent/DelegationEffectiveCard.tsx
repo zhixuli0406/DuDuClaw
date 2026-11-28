@@ -4,6 +4,8 @@ import { AlertTriangle } from 'lucide-react';
 import { api, type DelegationEffective } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
+import { useAgentsStore } from '@/stores/agents-store';
+import { settingsWarningMessage } from '@/lib/settings-refusal';
 import { hasMinRole } from '@/lib/roles';
 import { Badge, Card, CardContent, CardHeader, CardTitle, useErrorMessage } from '@/components/mds';
 
@@ -26,6 +28,9 @@ export function isDelegationEffective(v: unknown): v is DelegationEffective {
     && (d.source === 'global' || d.source === 'agent_permissions')
     && typeof d.may_delegate === 'boolean' && typeof d.may_create_agents === 'boolean'
     && isPairList(d.allow_pairs) && isPairList(d.inactive_allow_pairs)
+    && (d.unrestricted === undefined || typeof d.unrestricted === 'boolean')
+    && [d.allow_one_way, d.inactive_allow_one_way].every((list) => list === undefined || (Array.isArray(list) && list.every((p) =>
+      p && typeof p.from === 'string' && typeof p.to === 'string' && ['outgoing', 'incoming'].includes(p.direction))))
     && (d.allow_warning_count === undefined || typeof d.allow_warning_count === 'number');
 }
 
@@ -36,7 +41,7 @@ export function isDelegationEffective(v: unknown): v is DelegationEffective {
  * cross-department pairs naming it, a config problem when there is one (as a
  * fixed message per category — never the config text), and
  * how many `[delegation] allow` entries were dropped (count only — the texts
- * stay in Settings, Admin-only).
+ * are never rendered).
  * Changing it happens in 設定 › 委派權限 (Admin) or on the edit page.
  *
  * Shown to Manager and up — the gateway gates the RPC the same way (plus
@@ -53,6 +58,7 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const errorText = useErrorMessage();
+  const agents = useAgentsStore((s) => s.agents);
   const [data, setData] = useState<DelegationEffective | null>(null);
   const [error, setError] = useState<unknown>(null);
   const alive = useRef(true);
@@ -75,7 +81,7 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
   // RM-137 L1: the gateway masks a peer this viewer cannot view; render it as
   // words, never as the raw placeholder.
   const hidden = data?.hidden_peer_placeholder || DELEGATION_HIDDEN_PEER;
-  const peer = (id: string) => (id === hidden ? t('agentDetail.delegation.hiddenPeer') : id);
+  const peer = (id: string) => (id === hidden ? t('agentDetail.delegation.hiddenPeer') : agents.find((a) => a.name === id)?.display_name || t('agentDetail.delegation.unknownPeer'));
   const pairText = (pairs: Array<[string, string]>) =>
     pairs.map(([a, b]) => `${peer(a)} ⇄ ${peer(b)}`).join('、');
   // RM-137 re-review: `config_error` is a category, never text; the detail
@@ -88,6 +94,9 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
     <Card data-size="sm">
       <CardHeader>
         <CardTitle className="text-sm">{t('agentDetail.delegation.title')}</CardTitle>
+        {(data?.unrestricted || data?.owner_role != null) && typeof data?.owner_display_name === 'string' && data.owner_display_name.trim() && (
+          <p className="break-words text-sm">{t('agentDetail.delegation.avatar', { name: data.owner_display_name })}</p>
+        )}
       </CardHeader>
       <CardContent className="space-y-2 text-sm">
         {data && (
@@ -109,6 +118,19 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
             <p className="text-xs text-muted-foreground">
               {t(data.may_create_agents ? 'agentDetail.delegation.mayCreate' : 'agentDetail.delegation.mayNotCreate')}
             </p>
+            {data.unrestricted && data.owner_role && ['admin', 'manager', 'employee'].includes(data.owner_role) && (
+              <p className="text-xs text-foreground">{t('agentDetail.delegation.unrestricted', { role: t(`settings.delegation.roles.${data.owner_role}`) })}</p>
+            )}
+            {data.unrestricted_error === 'users_unreadable' && (
+              <p className="text-xs text-muted-foreground">{t('agentDetail.delegation.unrestrictedUnknown')}</p>
+            )}
+            {[...(data.allow_one_way ?? []), ...(data.inactive_allow_one_way ?? [])].map((pair, index) => (
+              <p key={index} className="text-xs text-muted-foreground">
+                {t(`agentDetail.delegation.${pair.direction}`, { peer: peer(pair.direction === 'outgoing' ? pair.to : pair.from) })}
+                {' '}<Badge variant="secondary">{t('agentDetail.delegation.oneWay')}</Badge>
+                {(data.inactive_allow_one_way ?? []).includes(pair) && <Badge variant="secondary">{t('agentDetail.delegation.oneWayInactive')}</Badge>}
+              </p>
+            ))}
             {data.allow_pairs.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 {t('agentDetail.delegation.pairs', { pairs: pairText(data.allow_pairs) })}
@@ -122,13 +144,13 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
             {data.policy === 'none' && (
               <p className="text-xs text-muted-foreground">{t('agentDetail.delegation.teamNote')}</p>
             )}
-            {(data.config_error || data.policy_warning) && (
+            {(data.config_error || data.policy_warning != null) && (
               <p role="alert" className="flex items-start gap-1.5 text-xs text-warning">
                 <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                 <span>
                   {t('agentDetail.delegation.configProblem')}
                   {' '}
-                  {data.config_error ? configErrorText(data.config_error) : data.policy_warning}
+                  {data.config_error ? configErrorText(data.config_error) : settingsWarningMessage(data.policy_warning, t('settings.delegation.safeWarning'))}
                 </span>
               </p>
             )}

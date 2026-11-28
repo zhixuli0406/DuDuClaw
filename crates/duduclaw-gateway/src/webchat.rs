@@ -3,6 +3,7 @@
 //! Provides a WebSocket endpoint `/ws/chat` for real-time conversation
 //! directly from the web browser, without requiring any external messaging app.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,9 @@ const MAX_CONNECTIONS_PER_USER: usize = 3;
 
 /// Global limit on concurrent WebChat connections (prevents API quota exhaustion).
 const MAX_TOTAL_WEBCHAT_CONNECTIONS: usize = 10;
+
+/// Bound the member-key new-conversation exemptions retained by one socket.
+const MAX_SOCKET_NEW_SESSIONS: usize = 256;
 
 static WEBCHAT_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(MAX_TOTAL_WEBCHAT_CONNECTIONS));
@@ -321,6 +325,8 @@ impl ChatMessage {
 pub(crate) mod ag_ui;
 mod liveness;
 mod turns;
+#[cfg(test)]
+pub(crate) use turns::entry_gate_all_helpers;
 
 pub(crate) use turns::configured_global_limit;
 
@@ -339,6 +345,7 @@ const NO_REPLY_TEXT: &str = "這則訊息沒有產生回覆，請稍後再傳一
 /// Machine code of [`NO_REPLY_TEXT`] for clients that word it themselves.
 const NO_REPLY_CODE: &str = "no_reply";
 mod route;
+mod entry;
 mod uploads;
 pub(crate) mod access;
 
@@ -521,7 +528,23 @@ pub(crate) enum ChatCredential {
     Jwt(duduclaw_auth::jwt::Claims),
     Member(duduclaw_auth::UserContext),
 }
+tokio::task_local! {
+    /// Host-set credential provenance; explicitly carried across turn tasks.
+    pub(crate) static MAIN_CREDENTIAL_ORIGIN: duduclaw_auth::acl::ContextOrigin;
+}
+
+pub(crate) fn main_credential_origin() -> duduclaw_auth::acl::ContextOrigin {
+    MAIN_CREDENTIAL_ORIGIN.try_with(|origin| *origin)
+        .unwrap_or(duduclaw_auth::acl::ContextOrigin::Other)
+}
+
 impl ChatCredential {
+    pub(crate) fn origin(&self) -> duduclaw_auth::acl::ContextOrigin {
+        match self {
+            Self::Jwt(_) => duduclaw_auth::acl::ContextOrigin::DashboardSession,
+            Self::Member(_) => duduclaw_auth::acl::ContextOrigin::MemberKey,
+        }
+    }
     fn user_id(&self) -> &str {
         match self { Self::Jwt(claims) => &claims.sub, Self::Member(ctx) => &ctx.user_id }
     }
@@ -575,6 +598,18 @@ impl WebChatState {
         authenticate_with(&self.jwt_config, &self.user_db, token)
     }
 
+    // Existing conversations require a live opt-in; new turns do not use this gate.
+    async fn member_conversation_allowed(&self, credential: Option<&ChatCredential>) -> bool {
+        let Some(ChatCredential::Member(ctx)) = credential else { return true; };
+        let home = self.ctx.home_dir.clone();
+        let db = self.user_db.clone();
+        let ctx = ctx.clone();
+        matches!(tokio::task::spawn_blocking(move || {
+            crate::member_keys::refresh_authority(&home, &db, &ctx)
+                .map(|live| live.include_conversations)
+        }).await, Ok(Ok(true)))
+    }
+
     async fn chat_credential_validity(&self, credential: Option<&ChatCredential>, heartbeat: bool) -> crate::handlers::live_context::SocketValidity {
         use crate::handlers::live_context::SocketValidity;
         match credential {
@@ -626,17 +661,20 @@ impl WebChatState {
         if let Err(e) = &lookup {
             warn!(user_id, agent = %agent_name, "WebChat ACL lookup failed — denying agent selection: {e}");
         }
-        if !resolve_agent_acl(&lookup, agent_name) { return false; }
-        if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin) {
+        if is_widget_visitor(user_id) { return false; }
+        let Ok(snapshot) = &lookup else { return false; };
+        if matches!(&lookup, Ok(s) if s.role() == duduclaw_auth::UserRole::Admin)
+            && main_credential_origin() != duduclaw_auth::acl::ContextOrigin::MemberKey {
             return true;
         }
-        // This helper checks the named grant, not operational status (the
-        // execution/resume gate checks that separately). A binding never grants
-        // dashboard access to Main or the configured gateway default.
-        let sender = crate::trigger_route::SenderAccess::no_bindings(user_id)
-            .for_webchat(access::gateway_default_id(&self.ctx.home_dir).await);
+        // This helper checks named grants or effective main-list admission;
+        // execution/resume checks operational status separately.
+        let sender = crate::trigger_route::SenderAccess::from_effective(snapshot.access.clone())
+            .with_credential_origin(crate::webchat::main_credential_origin())
+            .for_webchat_converse(&self.ctx.home_dir).await;
         self.ctx.registry.read().await.get(agent_name)
-            .is_some_and(|agent| sender.webchat_allows(agent))
+            .is_some_and(|agent| sender.webchat_allows(agent)
+                && (resolve_agent_acl(&lookup, agent_name) || sender.main_converse_allowed(agent)))
     }
 
     async fn acquire_connection(&self, user_id: &str) -> bool {
@@ -958,6 +996,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
         }
     };
 
+    let origin = credential.as_ref().map(ChatCredential::origin)
+        .unwrap_or(duduclaw_auth::acl::ContextOrigin::Other);
+    MAIN_CREDENTIAL_ORIGIN.scope(origin, async {
     // Ownership anchor. The authenticated user is the only durable identity this
     // socket has; the per-connection random suffix is NOT one. Keying sessions by
     // the connection (the previous behaviour) meant every page reload minted a
@@ -1007,6 +1048,9 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     // name/icon/model without touching the client's session state.
     let mut announced_sid = session_id.clone();
     let mut announced_agent: Option<String> = None;
+    // Only a successful first-turn lookup of an absent session grants this exemption.
+    // Never learn ids from resume or subscribe frames, and never share across sockets.
+    let mut new_sessions: HashSet<String> = HashSet::new();
     let mut cfg_rx = crate::channel_reply::agent_config_events().subscribe();
 
     // Heartbeat: send ping every 30s, close if no pong in 60s
@@ -1334,7 +1378,20 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     // Authenticated users retain a stable ownership tag across
                                     // sockets. Widget identities rotate per connection; their
                                     // previous visit and every other user's sessions stay denied.
-                                    let owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    let mut owns_session = owns_webchat_session(&want, &owner_tag) && !ag_ui::is_session(&want);
+                                    if owns_session {
+                                        if let Some(ChatCredential::Member(ctx)) = credential.as_ref() {
+                                            // A matching id is not stored-origin authority. Missing,
+                                            // unknown or external origins never admit a key resume.
+                                            owns_session = (new_sessions.contains(&want)
+                                                || state.member_conversation_allowed(credential.as_ref()).await)
+                                                && match state.ctx.session_manager.session_origin(&want).await {
+                                                Ok(origin) => crate::history_privacy::key_class_allowed(ctx,
+                                                    &crate::history_privacy::classify(&want, origin.as_ref(), &ctx.user_id)),
+                                                Err(_) => false,
+                                            };
+                                        }
+                                    }
                                     if !owns_session {
                                         warn!(
                                             "WebChat resume denied: session {want} not owned by this user"
@@ -1496,6 +1553,13 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                 }
 
                                 if subscribe_only {
+                                    // Subscriptions do not route or establish new-session provenance.
+                                    if !new_sessions.contains(sid)
+                                        && !state.member_conversation_allowed(credential.as_ref()).await
+                                    {
+                                        let _ = sink.send(subscription_unavailable(sid, conv_nonce.as_deref())).await;
+                                        continue;
+                                    }
                                     subscription.subscribe(sid, conv_nonce.clone());
                                     let _ = sink.send(Message::Text(serde_json::json!({"type":"subscribed", "session_id":sid, "conv":conv_nonce}).to_string().into())).await;
                                     continue;
@@ -1593,14 +1657,49 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                     turn_sink.identity_unavailable(validity, true).await;
                                     continue;
                                 }
-                                let attachments = match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
+                                let entry_result = entry::check(
+                                    &state, &auth_user, effective_agent.as_deref().unwrap_or(&agent_id),
+                                    sid, &user_id, &content, !attachments.is_empty(), &msg_id,
+                                ).await;
+                                // A refused file must not disable an emergency stop or
+                                // a repair command. Report and discard the refused files,
+                                // then let the runner execute the exempt command.
+                                let exempt_files = entry_result.is_err() && !attachments.is_empty() && entry::continues_without_files(&content);
+                                if let Err(text) = entry_result {
+                                    turn_sink.frame(ChatMessage::error(&text)).await;
+                                    if !exempt_files { continue; }
+                                }
+                                let attachments = if exempt_files { Vec::new() } else { match uploads::admit(&state.ctx.home_dir, &auth_user, attachments).await {
                                     Ok(files) => files,
                                     Err(error) => {
                                         turn_sink.frame(ChatMessage::error_coded(error, "attachment_upload_refused")).await;
                                         continue;
                                     }
-                                };
+                                }};
                                 let admission_generation = state.ctx.session_manager.turn_generation(sid).await.ok().flatten();
+                                // Only the final routed id can establish socket-local provenance.
+                                // An @ call may replace a new selected session with an old one.
+                                let existing_conversation = if matches!(credential.as_ref(), Some(ChatCredential::Member(_))) {
+                                    match state.ctx.session_manager.session_agent(sid).await {
+                                        Ok(Some(_)) => !new_sessions.contains(sid),
+                                        Ok(None) => {
+                                            if new_sessions.len() < MAX_SOCKET_NEW_SESSIONS {
+                                                new_sessions.insert(sid.to_owned());
+                                            }
+                                            // At capacity, retain the strict lookup on future turns.
+                                            false
+                                        }
+                                        Err(_) => {
+                                            turn_sink.frame(ChatMessage::error("conversation not found")).await;
+                                            continue;
+                                        }
+                                    }
+                                } else { false };
+
+                                if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
+                                    turn_sink.frame(ChatMessage::error("conversation not found")).await;
+                                    continue;
+                                }
                                 match Box::pin(state.turns.admit_persistent(
                                     state.approvals.as_ref(), &cancel_principal, &auth_user, sid, conv_nonce.clone(), &msg_id,
                                     turns::configured_limit(&state.ctx.home_dir),
@@ -1612,6 +1711,10 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
                                         recovery.observe(validity, false);
                                         if !turns::credential_allows_turn(validity, &turn_sink).await {
                                             if recovery.closed() { break; }
+                                            continue;
+                                        }
+                                        if existing_conversation && !state.member_conversation_allowed(credential.as_ref()).await {
+                                            turn_sink.frame(ChatMessage::error("conversation not found")).await;
                                             continue;
                                         }
                                         // Commands can arm an assignment at admission. From this
@@ -1708,6 +1811,7 @@ async fn handle_chat_socket(socket: WebSocket, state: Arc<WebChatState>, peer_ip
     let _ = writer.await;
     state.release_connection(&rate_limit_id).await;
     info!("WebChat connection terminated: {user_id}");
+    }).await;
 }
 
 /// Build a `session_info` frame for `session_id` describing the agent that will

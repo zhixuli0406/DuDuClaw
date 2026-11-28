@@ -4,6 +4,68 @@
   "identity_semantics": "identity records current execution domain; target_identity is a pending migration destination. test/operator/host_service are inventory-only domains outside the native wire contract",
   "entries": [
     {
+      "symbol": "crates/duduclaw-gateway/src/admin_ai/execute_tests.rs::audit_uses_gateway_turn",
+      "apis": { "command_constructor": 1, "terminal_output": 1 },
+      "effects": ["process_spawn"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only child process verifies gateway audit provenance against hostile environment values."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/admin_ai/execute_tests.rs::preset_raw_cas_refuses_cross_process_replace_with_stale_resolved_text",
+      "apis": { "command_constructor": 1, "terminal_output": 1 },
+      "effects": ["process_spawn"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only child process replaces a raw preset artifact to exercise the compare-and-swap refusal."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/delegation_roles/tests.rs::concurrent_message_consumers_get_only_one_allow",
+      "apis": { "terminal_spawn": 2 },
+      "effects": ["side_effect"],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only scoped threads race two consumers of the same delegation initiator."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime_dispatch.rs::testing::isolated_claude_test",
+      "apis": {
+        "command_constructor": 1,
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only helper launches exactly one regression test in an isolated child process with a fake Claude CLI."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/runtime_dispatch.rs::claude_fallback_stop_tests::claude_fallback_spawn_env_is_scoped_and_preserves_explicit_vendor_credentials",
+      "apis": {
+        "command_constructor": 2,
+        "terminal_output": 2
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only /usr/bin/env children verify fallback environment scoping and explicit vendor credential preservation."
+    },
+    {
+      "symbol": "crates/duduclaw-gateway/src/google_identity/write_scope_guard.rs::isolate_personal",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "side_effect"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Tokio Handle::spawn sends a reconnect notice after marking the personal credential; it creates an async task, not an OS child process."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/run_identity/tests.rs::dedicated_listener_requires_lock_and_publishes_only_local_ipc",
       "apis": {
         "command_constructor": 1
@@ -3665,6 +3727,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/handlers/chat_admin_settings_rpc.rs::MethodHandler::handle_chat_admin_settings_rpc",
+      "apis": {
+        "terminal_spawn": 1
+      },
+      "effects": [
+        "task_or_thread"
+      ],
+      "identity": "gateway",
+      "migration": "not_process",
+      "rationale": "Runs the cosmetic chat-card sweep as a Tokio task after the settings write; no process is created."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/handlers/experts_import_rpc.rs::MethodHandler::spawn_cli_group_detailed",
       "apis": {
         "backend_spawn": 1,
@@ -3901,6 +3975,18 @@
       "rationale": "Test fixture or test helper; compiled/run only for regression verification, not a production employee execution entry point."
     },
     {
+      "symbol": "crates/duduclaw-gateway/src/on_behalf_of/main_target_tests.rs::frozen_command",
+      "apis": {
+        "command_constructor": 1
+      },
+      "effects": [
+        "process_spawn"
+      ],
+      "identity": "test",
+      "migration": "test_only",
+      "rationale": "Test-only constructor of a never-spawned Claude command whose argv is inspected by the main-agent final-spawn check tests; not a production spawn path."
+    },
+    {
       "symbol": "crates/duduclaw-gateway/src/on_behalf_of/native_tests.rs::mcp_call",
       "apis": {
         "command_constructor": 1,
@@ -4073,7 +4159,7 @@
       "rationale": "The lexical spawn match starts a Rust thread or Tokio task/JoinSet worker in this function; it does not create an OS child process."
     },
     {
-      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::employee_base_command",
+      "symbol": "crates/duduclaw-gateway/src/runtime/codex.rs::employee_base_command_with_caps",
       "apis": {
         "command_constructor": 1
       },

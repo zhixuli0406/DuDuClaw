@@ -1,31 +1,5 @@
 use super::*;
 
-/// Detect the host system's IANA timezone name (e.g. `"Asia/Taipei"`,
-/// `"America/New_York"`, `"UTC"`).
-///
-/// Uses `iana_time_zone::get_timezone()` which reads `/etc/localtime` on
-/// Unix / the registry on Windows. Validated against `chrono-tz` so we
-/// never return a name the scheduler would reject — defensive because
-/// `iana-time-zone` is allowed to surface historical aliases that
-/// `chrono-tz`'s database has dropped.
-///
-/// Returns `None` when the host has no discoverable TZ (extremely rare
-/// on real machines — typical in minimal Docker images with no
-/// `/etc/localtime`). Callers should fall back to UTC.
-///
-/// Used so a cron schedule created without `cron_timezone` is evaluated in
-/// the host's local zone rather than silently in UTC.
-pub(crate) fn detect_local_timezone() -> Option<String> {
-    let name = iana_time_zone::get_timezone().ok()?;
-    // Round-trip through chrono-tz so we only ever hand back names the
-    // scheduler's `duduclaw_core::parse_timezone` will accept.
-    if duduclaw_core::parse_timezone(&name).is_some() {
-        Some(name)
-    } else {
-        None
-    }
-}
-
 /// Validate agent ID is safe for filesystem paths (no traversal).
 ///
 /// WP-4I (2026-08): this hand-rolled copy had drifted from its two siblings
@@ -605,4 +579,56 @@ mod google_chat_audit_tests {
             assert!(audit_result_text(tool, &serde_json::json!({"content":[{"type":"text","text":"private message"}]})).is_none());
         }
     }
+}
+
+/// Shared discovery/admission gate. Identity comes only from the authenticated
+/// employee, never tool arguments; the gateway rechecks policy at execution.
+pub(crate) fn drive_write_refusal(
+    home: &Path,
+    agent: &str,
+    tool: &str,
+    principal: &crate::mcp_auth::Principal,
+    lane: &duduclaw_core::ProcessLane,
+) -> Option<String> {
+    use duduclaw_gateway::google_workspace::drive_write_policy as policy;
+    let action = policy::action_for_tool(tool)?;
+    if principal.is_external || crate::mcp_isolation::current().is_some() {
+        return Some("此連線不支援雲端硬碟寫入。".into());
+    }
+    if let Some(message) = lane_refusal(lane, tool) { return Some(message); }
+    if !policy::tool_available(home, tool) {
+        let current = policy::load(home);
+        if (tool == "drive_move_file" && current.move_
+            || tool == "drive_trash_file" && current.trash) && current.folders.is_empty() {
+            return Some("這項操作需要先限定可使用的資料夾，請管理員設定。".into());
+        }
+        let verb = match action {
+            policy::DriveWriteAction::Create => "建立檔案",
+            policy::DriveWriteAction::Modify => "修改檔案",
+            policy::DriveWriteAction::Move => "搬移檔案",
+            policy::DriveWriteAction::Trash => "將檔案移到垃圾桶",
+        };
+        return Some(format!("管理員還沒開放 AI 在雲端硬碟{verb}。"));
+    }
+    if !duduclaw_core::is_valid_agent_id(agent)
+        || !duduclaw_gateway::google_workspace::native_rest_available(home, Some(agent)) {
+        return Some("此 Google 連線不支援雲端硬碟寫入。".into());
+    }
+    let dir = caller_agent_dir(home, agent);
+    let caps = std::fs::read_to_string(dir.join("agent.toml")).ok()
+        .and_then(|raw| toml::from_str::<crate::mcp_dispatch::PolicyOnlyConfig>(&raw).ok());
+    let Some(config) = caps else {
+        return Some("無法確認這位 AI 員工的工具權限，這次沒有執行，請管理員檢查 AI 員工設定。".into());
+    };
+    if duduclaw_core::tool_catalog::tool_list_verdict(
+        tool, &config.capabilities.denied_tools, &config.capabilities.allowed_tools,
+    ) != duduclaw_core::tool_catalog::ToolListVerdict::Allowed {
+        return Some("這位 AI 員工沒有使用這項工具的權限，可請管理員在 AI 員工設定中調整。".into());
+    }
+    if crate::mcp_dispatch::action_rule_verdict(
+        &duduclaw_core::agent_toml::load_action_rules(&dir), tool,
+    ) == Some(duduclaw_core::ActionVerdict::Block) {
+        return Some("這位 AI 員工的動作規則不允許這項操作，可請管理員調整。".into());
+    }
+    None
 }

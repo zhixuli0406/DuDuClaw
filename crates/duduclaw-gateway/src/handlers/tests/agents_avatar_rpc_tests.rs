@@ -9,6 +9,7 @@ fn viewer_ctx(agents: &[&str]) -> UserContext {
         agent_access.insert((*a).to_string(), AccessLevel::Viewer);
     }
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "u1".to_string(),

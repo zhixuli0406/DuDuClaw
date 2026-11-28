@@ -99,7 +99,7 @@ Response:
 | --- | --- |
 | `in_progress` | Tasks being worked on or queued (to do, queued, in progress, revising). |
 | `awaiting_confirmation` | Tasks waiting on a person (review, needs a human decision, pending approval), plus this employee's undecided approval requests that this person could read in the dashboard approval center (Managers and above). |
-| `done_today` | Tasks finished today (gateway host time zone). |
+| `done_today` | Tasks finished today (company time zone; UTC when it is not set). |
 | `done_7d` | Tasks finished in the last 7 days. |
 | `latest_done` | The most recently finished task this person may see: title and completion time; `null` when there is none. **The title is sent only when the on-device PII detection model is installed** (the "AI smart detection" redaction model — OpenAI Privacy Filter, run locally — downloaded from its card when that rule set is ticked; see [data redaction](../features/55-data-sources.md)) and runs successfully on that title; otherwise `title` is always `null` and only `completed_at` is given. Before detection, invisible, zero-width and bidirectional control characters are removed and the text is NFKC-normalised; a word that mixes look-alike alphabets (for example a Cyrillic `а` inside a Latin e-mail address) makes `title` `null`. The title is then masked before it is cut to 60 characters — credentials, names, addresses, e-mail addresses, phone numbers and account numbers the model finds, plus e-mail addresses, phone numbers (including full-width digits and `+886`), national / resident ID numbers, runs of 8 or more digits (account, customer, card numbers), labelled identifiers (「帳號」「客戶編號」, `account no.`), honorific-marked names (「王先生」, `Mr. Smith`) and names in the shared wiki's people directory, all become `＊＊＊` — and the shortened result is checked again. If the model fails or anything cannot be masked safely, `title` is `null`. The model reduces but does not guarantee the absence of personal data. |
 
@@ -132,3 +132,9 @@ Turning the feature off from the dashboard applies to the next request; a hand e
 - The existing DuDuClaw Connector module uses its "Gateway URL" for `/ingest/transcript` (the MCP server) with an MCP API key. Employee status needs the **dashboard gateway URL** and the person's own `ddc_status_` credential; the two are not interchangeable.
 - Give each person's card that person's own credential so it shows only their bound employees; do not share one credential across the company.
 - The Odoo host must be able to reach the dashboard gateway. The card itself (an Odoo module update) is not part of this release.
+
+## Personal API key options (v1.86.0)
+
+The status-only credential above still never returns conversations. A separate personal API key can request **Include my conversation content** with `me.member_keys.create` parameter `include_conversations=true`, only when `[member_api_keys] allow_conversation_content` permits creation. Default is off. It opens only your own web conversations, even if you own a shared AI employee; old keys retain this option and are labelled migrated. Creation still requires password/MFA re-verification.
+
+Optional `mcp_scopes` are `tasks:read`, `agents:status`, `odoo:read`, `odoo:write`, limited by `[member_api_keys] allow_mcp_scopes` (default empty). On **External access** (`/me/external-access`), members select **Include my conversation content** and external tool scopes when creating a key; later changes can only narrow access. Admins use the two master switches on the same page. See the [member API contract](../api/member-contract.md#personal-member-api-keys-1850).

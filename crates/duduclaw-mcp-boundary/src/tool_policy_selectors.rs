@@ -31,7 +31,7 @@ pub fn create_task_selector(context: &RequestContext) -> Result<ResourceGrant, V
 /// `Employee` grant); the agent label is bound by the host producer, never an
 /// argument. Task-limited records (no EmployeeScope) never list them.
 pub const OWN_SKILL_TOOLS: &[&str] = &["skill_extract", "shared_skill_adopt", "skill_security_scan",
-    "skill_graduate", "skill_curator_status"];
+    "skill_graduate"];
 
 /// The exact argument schema of [`OWN_SKILL_TOOLS`] in protected mode. No
 /// selector names another employee: `target_agent`, `scope`, `namespace`,
@@ -41,16 +41,14 @@ pub const OWN_SKILL_TOOLS: &[&str] = &["skill_extract", "shared_skill_adopt", "s
 pub fn check_own_skill_arguments(name: &str, arguments: &Value) -> Result<(), VerificationError> {
     let object = arguments.as_object().ok_or(VerificationError::Invalid)?;
     let allowed: &[&str] = match name {
-        "skill_curator_status" => &["run"],
         "shared_skill_adopt" => &["skill_name"],
         "skill_extract" | "skill_security_scan" | "skill_graduate" => &["skill_name", "agent_id"],
         _ => return Err(VerificationError::Invalid),
     };
     if object.keys().any(|key| !allowed.contains(&key.as_str())) { return Err(VerificationError::Invalid); }
-    if object.get("run").is_some_and(|value| !value.is_boolean()) { return Err(VerificationError::Invalid); }
     let slug = |value: &Value| value.as_str().is_some_and(|s| !s.is_empty() && s.len() <= 64
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'));
-    if name != "skill_curator_status" && !object.get("skill_name").is_some_and(slug) {
+    if !object.get("skill_name").is_some_and(slug) {
         return Err(VerificationError::Invalid);
     }
     if object.get("agent_id").is_some_and(|value| !slug(value)) { return Err(VerificationError::Invalid); }

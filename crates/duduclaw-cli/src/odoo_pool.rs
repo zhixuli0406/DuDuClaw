@@ -8,15 +8,9 @@
 //!
 //! ## Pool key
 //!
-//! The pool key is `(agent_id, profile)`:
-//! - **Without** an override: every agent shares profile `"default"`, so the
-//!   pool collapses to a single slot keyed by `(agent_id, "default")`.
-//!   Two different agents *still* get separate connector slots — they may
-//!   share the same global credentials but the pool key is distinct, which
-//!   makes the audit trail and connector lifecycle per-agent.
-//! - **With** an override: profile is whatever the operator set in
-//!   `agent.toml [odoo].profile`, and credentials come from the override
-//!   (`username` / `api_key_enc` / `password_enc`).
+//! A gateway decision is mandatory: personal uses `person:<user>:<rev>:<server_fp>`,
+//! company uses `company`, and an agent account uses its configured profile.
+//! Reserved personal/company profiles cannot be selected by agent config.
 //!
 //! ## Locking
 //!
@@ -33,12 +27,23 @@ use std::sync::Arc;
 use duduclaw_odoo::{AgentOdooConfig, OdooConfig, OdooConfigResolver, OdooConnector};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
+use zeroize::Zeroizing;
+use crate::mcp::odoo_identity_client::{IdentityCache, IdentityKind, OdooIdentity};
+
+// NUL is not a valid employee id. Employee APIs also reject this slot explicitly.
+pub(crate) const PERSON_KEY_SLOT: &str = "\0person-key";
 
 /// Resolved credentials ready to hand to [`OdooConnector::connect`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct ResolvedCredentials {
     config: OdooConfig,
-    credential: String,
+    credential: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for ResolvedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResolvedCredentials([REDACTED])")
+    }
 }
 
 /// One slot in the pool. Wrapped in a `Mutex` so concurrent first-use
@@ -68,6 +73,7 @@ pub struct OdooConnectorPool {
     resolver: RwLock<OdooConfigResolver>,
     global_loaded: std::sync::atomic::AtomicBool,
     cache_home: RwLock<Option<std::path::PathBuf>>,
+    pub(crate) identity_cache: Mutex<IdentityCache>,
 }
 
 impl Default for OdooConnectorPool {
@@ -85,6 +91,7 @@ impl OdooConnectorPool {
             resolver: RwLock::new(OdooConfigResolver::new(global)),
             global_loaded: std::sync::atomic::AtomicBool::new(true),
             cache_home: RwLock::new(None),
+            identity_cache: Mutex::new(IdentityCache::default()),
         }
     }
 
@@ -99,10 +106,11 @@ impl OdooConnectorPool {
         let mut resolver = self.resolver.write().await;
         if resolver.global() != &global {
             // Keep slots whose effective connection settings did not change.
-            pool.retain(|(agent, _), _| {
+            pool.retain(|(agent, profile), _| {
                 let mut old = resolver.global().clone();
                 let mut new = global.clone();
-                if let Some(over) = resolver.for_agent(agent) {
+                if profile != "company" && profile.split_once(':').map(|(kind, _)| kind) != Some("person")
+                    && let Some(over) = resolver.for_agent(agent) {
                     if over.apply_to(&mut old).is_err() || over.apply_to(&mut new).is_err() { return false; }
                 }
                 Self::same_connection_config(&old, &new)
@@ -226,26 +234,32 @@ impl OdooConnectorPool {
         Ok((config.url, config.db))
     }
 
-    /// Decrypted credentials for the given agent. Falls back to the global
-    /// `[odoo]` block when no per-agent override sets the relevant fields.
-    /// `decrypt` is invoked lazily so a miss in either pool slot never
-    /// surfaces a decryption error to handlers that don't actually need a
-    /// credential (e.g. `odoo_status` on an unconnected pool).
+    /// Only an explicit Company decision may resolve a global secret. Agent
+    /// configuration starts with empty credential fields before its overlay.
     async fn merge_credentials<F, Fut>(
         global: &OdooConfig,
         override_cfg: Option<&AgentOdooConfig>,
+        kind: IdentityKind,
         resolve: F,
     ) -> Result<ResolvedCredentials, String>
     where
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        // One merge function shared with `odoo.agent_test` and the decision
-        // export (`AgentOdooConfig::apply_to`): url / db / username / secrets,
-        // with url + db validated (fail closed).
         let mut config = global.clone();
-        if let Some(o) = override_cfg {
-            o.apply_to(&mut config)?;
+        match kind {
+            IdentityKind::Company => {},
+            IdentityKind::Agent => {
+                config.username.clear();
+                config.api_key_enc.clear();
+                config.password_enc.clear();
+                let over = override_cfg.ok_or("Odoo agent credentials are missing")?;
+                over.apply_to(&mut config)?;
+                if config.username.trim().is_empty() {
+                    return Err("Odoo agent username is missing".into());
+                }
+            }
+            IdentityKind::Personal => return Err("Personal credentials require a gateway handoff".into()),
         }
 
         // Pick which credential source to resolve. Prefer api_key over
@@ -263,45 +277,107 @@ impl OdooConnectorPool {
         };
 
         let credential = resolve(enc).await?;
-        Ok(ResolvedCredentials { config, credential })
+        Ok(ResolvedCredentials { config, credential: Zeroizing::new(credential) })
     }
 
-    /// Local-only readiness check run before auto-connect: the effective
-    /// endpoint is configured and a credential source exists. Never resolves
-    /// a secret and never dials Odoo, so a failure here is a pre-dispatch
-    /// refusal (egress observation: not dispatched).
-    pub async fn connect_precheck(&self, agent_id: &str) -> Result<(), String> {
-        let resolver = self.resolver.read().await;
-        let mut config = resolver.global().clone();
-        if let Some(over) = resolver.for_agent(agent_id) {
-            over.apply_to(&mut config)?;
-        }
-        if !config.is_configured() {
-            return Err("Odoo not configured: url and db are required".into());
-        }
-        if config.api_key_enc.is_empty() && config.password_enc.is_empty() {
-            return Err("no Odoo credential configured (api_key_enc / password_enc both empty)".into());
-        }
-        Ok(())
+    pub(crate) async fn key_for_identity(&self, agent: &str, identity: &OdooIdentity)
+        -> Result<(String, String), String> {
+        if agent == PERSON_KEY_SLOT { return Err("Reserved person-key pool namespace".into()); }
+        let profile = match identity.kind {
+            IdentityKind::Company => "company".to_owned(),
+            IdentityKind::Personal => identity.personal_profile()?,
+            IdentityKind::Agent => {
+                let profile = self.pool_key(agent).await.1;
+                if profile == "company" || profile.split_once(':').map(|(kind, _)| kind) == Some("person") {
+                    return Err("Odoo agent profile uses a reserved identity name".into());
+                }
+                profile
+            }
+        };
+        Ok((agent.to_owned(), profile))
     }
 
     /// Resolve current credentials before reuse, including rotated secret references.
     /// Only a changed connection identity causes another Odoo handshake.
-    pub async fn get_or_connect<F, Fut>(
+    pub(crate) async fn get_or_connect<F, Fut>(
         &self,
         agent_id: &str,
+        identity: &OdooIdentity,
         resolve: F,
     ) -> Result<Arc<OdooConnector>, String>
     where
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<String, String>>,
     {
-        let key = self.pool_key(agent_id).await;
-        let endpoint = {
-            let resolver = self.resolver.read().await;
-            Self::effective_endpoint(resolver.global(), resolver.for_agent(agent_id))?
-        };
+        let key = self.key_for_identity(agent_id, identity).await?;
+        let resolver = self.resolver.read().await;
+        let global = resolver.global().clone();
+        let agent_override = resolver.for_agent(agent_id).cloned();
+        drop(resolver);
 
+        let creds = if identity.kind == IdentityKind::Personal {
+            // Never decrypt a config secret or apply agent url/db to a person.
+            let (url, db, _) = identity.personal_endpoint()?;
+            let mut config = global;
+            config.url = url.to_owned();
+            config.db = db.to_owned();
+            config.auth_method = "api_key".into();
+            config.username = identity.login.clone().ok_or("Missing personal login")?;
+            config.api_key_enc.clear();
+            config.password_enc.clear();
+            let credential = identity.secret.clone().ok_or("Missing personal credential")?;
+            ResolvedCredentials { config, credential }
+        } else {
+            Self::merge_credentials(&global, agent_override.as_ref(), identity.kind, resolve).await?
+        };
+        let companies: Vec<i64> = agent_override.as_ref().map(|cfg| cfg.company_ids.iter().map(|&id| id as i64).collect()).unwrap_or_default();
+        let expected_uid = if identity.kind == IdentityKind::Personal { identity.odoo_uid } else { None };
+        self.connect_resolved(key, creds, companies, expected_uid).await
+    }
+
+    /// Person-key entry: no resolver, employee override or secret-resolution closure.
+    /// Only the gateway-issued personal login/key can reach connect_resolved.
+    pub(crate) async fn connect_person_key(&self, mut config: OdooConfig, identity: &OdooIdentity)
+        -> Result<Arc<OdooConnector>, String> {
+        use crate::mcp::odoo_identity_client::IdentityPermission;
+        if identity.kind != IdentityKind::Personal || identity.permission == IdentityPermission::Engine {
+            return Err("Personal Odoo identity required".into());
+        }
+        let user = identity.user_id.as_deref().ok_or("Missing personal user")?;
+        let (url, db, _) = identity.personal_endpoint()?;
+        config.url = url.to_owned();
+        config.db = db.to_owned();
+        let uid = identity.odoo_uid.filter(|uid| *uid > 0).ok_or("Missing personal uid")?;
+        config.auth_method = "api_key".into();
+        config.username = identity.login.clone().ok_or("Missing personal login")?;
+        config.api_key_enc.clear();
+        config.password_enc.clear();
+        let credential = identity.secret.clone().ok_or("Missing personal credential")?;
+        let key = (PERSON_KEY_SLOT.to_owned(), identity.personal_profile()?);
+        // Serialized by identity_cache at the actor boundary. Retire old revisions
+        // and cap this namespace without touching any employee's entries.
+        {
+            let mut pool = self.pool.write().await;
+            pool.retain(|(slot, profile), _| slot != PERSON_KEY_SLOT
+                || !profile.strip_prefix("person:").and_then(|s| s.rsplit_once(':')).and_then(|(s, _)| s.rsplit_once(':')).is_some_and(|(u, _)| u == user) || profile == &key.1);
+            if !pool.contains_key(&key) && pool.keys().filter(|(slot, _)| slot == PERSON_KEY_SLOT).count() >= 32 {
+                let evict = pool.keys().find(|(slot, _)| slot == PERSON_KEY_SLOT).cloned();
+                if let Some(evict) = evict { pool.remove(&evict); }
+            }
+        }
+        self.connect_resolved(key, ResolvedCredentials { config, credential }, vec![], Some(uid)).await
+    }
+
+    pub(crate) async fn forget_person_key(&self, user: &str) {
+        self.pool.write().await.retain(|(slot, profile), _|
+            slot != PERSON_KEY_SLOT || !profile.strip_prefix("person:").and_then(|s| s.rsplit_once(':')).and_then(|(s, _)| s.rsplit_once(':')).is_some_and(|(u, _)| u == user));
+    }
+
+    async fn connect_resolved(&self, key: (String, String), creds: ResolvedCredentials,
+        companies: Vec<i64>, expected_uid: Option<i64>) -> Result<Arc<OdooConnector>, String> {
+        let endpoint = (creds.config.url.clone(), creds.config.db.clone());
+        if !creds.config.is_configured() { return Err("Odoo not configured: url and db are required".into()); }
+        if creds.credential.is_empty() { return Err("Odoo credential is empty".into()); }
         // Slow path — acquire the slot, holding only the inner Mutex during
         // the connect call so other agents can still progress.
         let slot = {
@@ -312,25 +388,23 @@ impl OdooConnectorPool {
         };
 
         let mut guard = slot.lock().await;
-        let resolver = self.resolver.read().await;
-        let global = resolver.global().clone();
-        let agent_override = resolver.for_agent(agent_id).cloned();
-        drop(resolver);
-
-        let creds = Self::merge_credentials(&global, agent_override.as_ref(), resolve).await?;
         let home = self.cache_home.read().await.clone();
-        let companies: Vec<i64> = agent_override.as_ref().map(|cfg| cfg.company_ids.iter().map(|&id| id as i64).collect()).unwrap_or_default();
         if let Some(conn) = guard.connector_for(&endpoint) {
-            if conn.matches_connection(&creds.config, &creds.credential, &companies) { return Ok(conn); }
+            if conn.matches_connection(&creds.config, &creds.credential, &companies)
+                && (expected_uid.is_none() || conn.status().uid == expected_uid) { return Ok(conn); }
         }
         guard.connector = None;
         guard.endpoint = None;
-        let conn = OdooConnector::connect_cached(&creds.config, &creds.credential, home.as_deref(), companies).await?;
+        let conn = OdooConnector::connect_cached(&creds.config, &creds.credential, home.as_deref(), companies).await
+            .map_err(|error| error.replace(creds.credential.as_str(), "[REDACTED]"))?;
+        if expected_uid.is_some() && expected_uid != conn.status().uid {
+            return Err("Odoo 本人帳號驗證結果已變更，請重新連接。".into());
+        }
         let arc = Arc::new(conn);
         guard.connector = Some(arc.clone());
         guard.endpoint = Some((creds.config.url.clone(), creds.config.db.clone()));
         info!(
-            agent_id = %agent_id,
+            actor = %key.0,
             profile = %key.1,
             "Odoo connector established"
         );
@@ -338,11 +412,11 @@ impl OdooConnectorPool {
     }
 
     /// Status-only lookup; never resolve credentials or open a connection.
-    pub async fn cached_connector(&self, agent_id: &str) -> Result<Arc<OdooConnector>, String> {
-        let key = self.pool_key(agent_id).await;
+    pub(crate) async fn cached_connector(&self, agent_id: &str, identity: &OdooIdentity) -> Result<Arc<OdooConnector>, String> {
+        let key = self.key_for_identity(agent_id, identity).await?;
         let endpoint = {
             let resolver = self.resolver.read().await;
-            Self::effective_endpoint(resolver.global(), resolver.for_agent(agent_id))?
+            Self::effective_endpoint(resolver.global(), if identity.kind == IdentityKind::Agent { resolver.for_agent(agent_id) } else { None })?
         };
         let pool = self.pool.read().await;
         let slot = pool.get(&key).ok_or("Odoo connector not cached")?;
@@ -352,13 +426,11 @@ impl OdooConnectorPool {
 
     /// Probe whether an `agent_id`'s slot already holds a live connector.
     pub async fn is_connected(&self, agent_id: &str) -> bool {
-        let key = self.pool_key(agent_id).await;
         let pool = self.pool.read().await;
-        if let Some(slot) = pool.get(&key) {
-            slot.lock().await.connector.is_some()
-        } else {
-            false
+        for ((agent, _), slot) in pool.iter() {
+            if agent == agent_id && slot.lock().await.connector.is_some() { return true; }
         }
+        false
     }
 
     /// Drop the cached connector for `agent_id`. The next call will
@@ -371,7 +443,7 @@ impl OdooConnectorPool {
     /// Drop the cached connector at an already-resolved pool key. Shared by
     /// [`disconnect`] (resolves the key itself) and [`register_agent`] (needs
     /// the *pre-update* key — see its doc comment).
-    async fn drop_slot(&self, key: &(String, String)) {
+    pub(crate) async fn drop_slot(&self, key: &(String, String)) {
         if let Some(slot) = self.pool.write().await.remove(key) {
             // Hold the slot lock briefly so any in-flight call sees the
             // explicit disconnect rather than a stale Arc.
@@ -463,6 +535,39 @@ mod tests {
     use super::*;
     use duduclaw_odoo::AgentOdooConfig;
 
+    fn company_identity() -> OdooIdentity {
+        OdooIdentity { kind: IdentityKind::Company,
+            permission: crate::mcp::odoo_identity_client::IdentityPermission::Engine,
+            user_id: None, url: None, db: None, server_fp: None, odoo_uid: None, login: None, rev: None, secret: None }
+    }
+    fn agent_identity() -> OdooIdentity {
+        OdooIdentity { kind: IdentityKind::Agent, ..company_identity() }
+    }
+
+    #[tokio::test]
+    async fn agent_profiles_cannot_alias_person_or_company_slots() {
+        let pool = OdooConnectorPool::default();
+        for profile in ["company", "person:alice:1"] {
+            pool.register_agent("bot", AgentOdooConfig { profile: Some(profile.into()), ..Default::default() }).await;
+            assert!(pool.key_for_identity("bot", &agent_identity()).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn absent_or_partial_agent_account_never_resolves_global_secret() {
+        let global = global_with("https://company.example.com");
+        for over in [None, Some(AgentOdooConfig::default()),
+            Some(AgentOdooConfig { username: Some("own".into()), ..Default::default() }),
+            Some(AgentOdooConfig { api_key_enc: Some("own-key".into()), ..Default::default() })] {
+            assert!(OdooConnectorPool::merge_credentials(&global, over.as_ref(), IdentityKind::Agent,
+                |_| async { panic!("must not resolve credentials") }).await.is_err());
+        }
+        let over = AgentOdooConfig { username: Some("own".into()), password_enc: Some("own-password".into()), ..Default::default() };
+        let creds = OdooConnectorPool::merge_credentials(&global, Some(&over), IdentityKind::Agent, dec).await.unwrap();
+        assert!(creds.config.api_key_enc.is_empty());
+        assert_eq!(creds.credential.as_str(), "dec(own-password)");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn pool_key_uses_default_for_unregistered_agent() {
         let pool = OdooConnectorPool::default();
@@ -511,8 +616,7 @@ mod tests {
 
     /// `set_global` must drop EVERY cached slot, not just the caller's own —
     /// a per-agent override only replaces the fields it sets, so any slot
-    /// may still be resting on the global credential that was just rotated
-    /// (`merge_credentials` falls back to it). A real connector needs live
+    /// may be using the company credential that was just rotated. A real connector needs live
     /// network I/O to establish, so slots are seeded directly here — the
     /// property under test is "does `set_global` clear the pool map", not
     /// "can we actually connect".
@@ -626,16 +730,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn merge_credentials_falls_back_to_global() {
+    async fn merge_credentials_uses_global_only_for_company() {
         let mut global = OdooConfig::default();
         global.api_key_enc = "ENC_GLOBAL".into();
 
-        let creds = OdooConnectorPool::merge_credentials(&global, None, |enc: String| async move {
+        let creds = OdooConnectorPool::merge_credentials(&global, None, IdentityKind::Company, |enc: String| async move {
             Ok(format!("dec({enc})"))
         })
         .await
         .unwrap();
-        assert_eq!(creds.credential, "dec(ENC_GLOBAL)");
+        assert_eq!(creds.credential.as_str(), "dec(ENC_GLOBAL)");
         assert_eq!(creds.config.api_key_enc, "ENC_GLOBAL");
     }
 
@@ -654,18 +758,19 @@ mod tests {
         let creds = OdooConnectorPool::merge_credentials(
             &global,
             Some(&agent_cfg),
+            IdentityKind::Agent,
             |enc: String| async move { Ok(format!("dec({enc})")) },
         )
         .await
         .unwrap();
-        assert_eq!(creds.credential, "dec(ENC_ALPHA)");
+        assert_eq!(creds.credential.as_str(), "dec(ENC_ALPHA)");
         assert_eq!(creds.config.username, "alpha_user");
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn merge_credentials_errors_when_no_credential_present() {
         let global = OdooConfig::default(); // empty
-        let err = OdooConnectorPool::merge_credentials(&global, None, |_: String| async {
+        let err = OdooConnectorPool::merge_credentials(&global, None, IdentityKind::Company, |_: String| async {
             Ok(String::new())
         })
         .await
@@ -681,13 +786,13 @@ mod tests {
         global.api_key_enc = "secret://vault/odoo-api-key".into();
 
         let creds =
-            OdooConnectorPool::merge_credentials(&global, None, |cred: String| async move {
+            OdooConnectorPool::merge_credentials(&global, None, IdentityKind::Company, |cred: String| async move {
                 assert!(cred.starts_with("secret://"));
                 Ok(format!("resolved({cred})"))
             })
             .await
             .unwrap();
-        assert_eq!(creds.credential, "resolved(secret://vault/odoo-api-key)");
+        assert_eq!(creds.credential.as_str(), "resolved(secret://vault/odoo-api-key)");
     }
 
     // ── B1: per-agent url / db override ──────────────────────────────────
@@ -741,11 +846,12 @@ mod tests {
     async fn merge_credentials_applies_url_and_db_override() {
         let global = global_with("https://global.example.com");
         let over = AgentOdooConfig {
+            username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()),
             url: Some("https://alpha.example.com".into()),
             db: Some("alpha_db".into()),
             ..Default::default()
         };
-        let creds = OdooConnectorPool::merge_credentials(&global, Some(&over), dec)
+        let creds = OdooConnectorPool::merge_credentials(&global, Some(&over), IdentityKind::Agent, dec)
             .await
             .unwrap();
         assert_eq!(creds.config.url, "https://alpha.example.com");
@@ -756,8 +862,8 @@ mod tests {
     async fn merge_credentials_refuses_ssrf_url_override() {
         let global = global_with("https://global.example.com");
         for bad in ["https://169.254.169.254", "http://erp.example.com", "https://192.168.1.9"] {
-            let over = AgentOdooConfig { url: Some(bad.into()), ..Default::default() };
-            let err = OdooConnectorPool::merge_credentials(&global, Some(&over), dec)
+            let over = AgentOdooConfig { username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), url: Some(bad.into()), ..Default::default() };
+            let err = OdooConnectorPool::merge_credentials(&global, Some(&over), IdentityKind::Agent, dec)
                 .await
                 .unwrap_err();
             assert!(err.contains("Odoo 網址"), "{bad}: {err}");
@@ -782,18 +888,18 @@ mod tests {
         let pool = OdooConnectorPool::new(config.clone());
         let over = AgentOdooConfig { username: Some("own".into()), api_key_enc: Some("OWN".into()), ..Default::default() };
         pool.register_agent("alpha", over.clone()).await;
-        let first = pool.get_or_connect("alpha", dec).await.unwrap();
+        let first = pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap();
         let count = hits.load(std::sync::atomic::Ordering::SeqCst);
         pool.set_global(config.clone()).await;
         let mut feature_edit = config.clone();
         feature_edit.features_project = true;
         pool.set_global(feature_edit).await;
         pool.register_agent("alpha", over).await;
-        assert!(Arc::ptr_eq(&first, &pool.get_or_connect("alpha", dec).await.unwrap()));
+        assert!(Arc::ptr_eq(&first, &pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap()));
         let mut rotated = config;
         rotated.api_key_enc = "NEW-GLOBAL".into();
         pool.set_global(rotated).await;
-        assert!(Arc::ptr_eq(&first, &pool.get_or_connect("alpha", dec).await.unwrap()));
+        assert!(Arc::ptr_eq(&first, &pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap()));
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), count);
     }
 
@@ -803,9 +909,9 @@ mod tests {
         let mut config = global_with(&url);
         config.api_key_enc = "secret://vault/odoo".into();
         let pool = OdooConnectorPool::new(config);
-        let first = pool.get_or_connect("alpha", |_| async { Ok("key-one".into()) }).await.unwrap();
+        let first = pool.get_or_connect("alpha", &company_identity(), |_| async { Ok("key-one".into()) }).await.unwrap();
         let count = hits.load(std::sync::atomic::Ordering::SeqCst);
-        let second = pool.get_or_connect("alpha", |_| async { Ok("key-two".into()) }).await.unwrap();
+        let second = pool.get_or_connect("alpha", &company_identity(), |_| async { Ok("key-two".into()) }).await.unwrap();
         assert!(!Arc::ptr_eq(&first, &second));
         assert_ne!(first.connection_identity(), second.connection_identity());
         assert!(hits.load(std::sync::atomic::Ordering::SeqCst) > count);
@@ -818,16 +924,16 @@ mod tests {
         let pool = OdooConnectorPool::new(global_with(&global_url));
         pool.register_agent(
             "alpha",
-            AgentOdooConfig { url: Some(agent_url.clone()), db: Some("alpha_db".into()), ..Default::default() },
+            AgentOdooConfig { username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), url: Some(agent_url.clone()), db: Some("alpha_db".into()), ..Default::default() },
         )
         .await;
-        let conn = pool.get_or_connect("alpha", dec).await.expect("connect");
+        let conn = pool.get_or_connect("alpha", &agent_identity(), dec).await.expect("connect");
         assert_eq!(conn.status().url, agent_url);
         assert_eq!(conn.status().db, "alpha_db");
         assert!(agent_hits.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         assert_eq!(global_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
-        // An agent without an override still uses the global server.
-        let other = pool.get_or_connect("beta", dec).await.expect("connect");
+        // Only an explicit company decision uses the global server.
+        let other = pool.get_or_connect("beta", &company_identity(), dec).await.expect("connect");
         assert_eq!(other.status().url, global_url);
     }
 
@@ -838,23 +944,23 @@ mod tests {
         let pool = OdooConnectorPool::new(global_with(&url_a));
         pool.register_agent(
             "alpha",
-            AgentOdooConfig { url: Some(url_a.clone()), ..Default::default() },
+            AgentOdooConfig { username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), url: Some(url_a.clone()), ..Default::default() },
         )
         .await;
-        let first = pool.get_or_connect("alpha", dec).await.unwrap();
+        let first = pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap();
         assert_eq!(first.status().url, url_a);
         // Same endpoint ⇒ cached connector is reused.
-        let again = pool.get_or_connect("alpha", dec).await.unwrap();
+        let again = pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap();
         assert!(Arc::ptr_eq(&first, &again));
 
         // Change only the URL, keeping the profile (so the pool key is
         // unchanged): the slot must not hand back the old session.
         pool.register_agent(
             "alpha",
-            AgentOdooConfig { url: Some(url_b.clone()), ..Default::default() },
+            AgentOdooConfig { username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), url: Some(url_b.clone()), ..Default::default() },
         )
         .await;
-        let moved = pool.get_or_connect("alpha", dec).await.unwrap();
+        let moved = pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap();
         assert_eq!(moved.status().url, url_b);
         assert!(hits_b.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     }
@@ -867,10 +973,10 @@ mod tests {
         let (url_a, _) = fake_odoo().await;
         let (url_b, _) = fake_odoo().await;
         let pool = OdooConnectorPool::new(global_with(&url_a));
-        let first = pool.get_or_connect("alpha", dec).await.unwrap();
+        let first = pool.get_or_connect("alpha", &company_identity(), dec).await.unwrap();
         assert_eq!(first.status().url, url_a);
         pool.resolver.write().await.set_global(global_with(&url_b));
-        let second = pool.get_or_connect("alpha", dec).await.unwrap();
+        let second = pool.get_or_connect("alpha", &company_identity(), dec).await.unwrap();
         assert_eq!(second.status().url, url_b);
     }
 
@@ -878,13 +984,16 @@ mod tests {
     async fn unsafe_override_url_fails_closed_even_with_cached_connector() {
         let (url_a, _) = fake_odoo().await;
         let pool = OdooConnectorPool::new(global_with(&url_a));
-        pool.get_or_connect("alpha", dec).await.unwrap();
+        pool.register_agent("alpha", AgentOdooConfig {
+            username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), ..Default::default()
+        }).await;
+        pool.get_or_connect("alpha", &agent_identity(), dec).await.unwrap();
         pool.register_agent(
             "alpha",
-            AgentOdooConfig { url: Some("https://169.254.169.254".into()), ..Default::default() },
+            AgentOdooConfig { username: Some("agent-user".into()), api_key_enc: Some("AGENT".into()), url: Some("https://169.254.169.254".into()), ..Default::default() },
         )
         .await;
-        let err = pool.get_or_connect("alpha", dec).await.err().expect("must refuse");
+        let err = pool.get_or_connect("alpha", &agent_identity(), dec).await.err().expect("must refuse");
         assert!(err.contains("Odoo 網址"), "{err}");
     }
 

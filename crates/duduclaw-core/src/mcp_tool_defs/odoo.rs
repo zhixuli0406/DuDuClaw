@@ -325,4 +325,45 @@ pub(super) const TOOLS: &[ToolDef] = &[
             },
         ],
     },
+    ToolDef {
+        name: "odoo_activity_create",
+        description: "Schedule an activity on a readable Odoo record. Engine mode assigns the connected account; only follow mode accepts user_id.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
+            ParamDef { name: "res_id", description: "Positive target record ID", required: true },
+            ParamDef { name: "summary", description: "Plain-text summary, at most 10,000 characters", required: true },
+            ParamDef { name: "note", description: "Plain-text note, at most 10,000 characters; no mentions", required: false },
+            ParamDef { name: "date_deadline", description: "Deadline in YYYY-MM-DD format", required: false },
+            ParamDef { name: "activity_type_xmlid", description: "Activity type XML ID (default mail.mail_activity_data_todo)", required: false },
+            ParamDef { name: "user_id", description: "Positive Odoo assignee ID; only accepted in follow mode", required: false },
+        ],
+    },
+    ToolDef {
+        name: "odoo_note_post",
+        description: "Post an internal note on a readable Odoo record. Plain text is HTML-escaped; no mentions or explicit recipients. Engine mode requires note:model permission.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
+            ParamDef { name: "res_id", description: "Positive target record ID", required: true },
+            ParamDef { name: "body", description: "Plain-text body, at most 10,000 characters; no mentions", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_message_send",
+        description: "Notify followers of a readable Odoo record with a plain-text message. Always requires single-use human approval bound to the exact content.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
+            ParamDef { name: "res_id", description: "Positive target record ID", required: true },
+            ParamDef { name: "body", description: "Plain-text body, at most 10,000 characters; no mentions", required: true },
+        ],
+    },
+    ToolDef {
+        name: "odoo_attachment_add",
+        description: "Add a private attachment to a readable Odoo record. The file must be in the calling employee's own attachments folder; pass its relative path, not inline/base64 content.",
+        params: &[
+            ParamDef { name: "model", description: "Odoo model name (e.g. crm.lead)", required: true },
+            ParamDef { name: "res_id", description: "Positive target record ID", required: true },
+            ParamDef { name: "file", description: "Relative path within agents/<verified calling employee>/attachments/", required: true },
+            ParamDef { name: "name", description: "Optional plain-text display name, at most 255 characters, without path separators or control characters; defaults to the file name", required: false },
+        ],
+    },
 ];

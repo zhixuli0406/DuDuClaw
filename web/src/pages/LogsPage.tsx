@@ -1,3 +1,5 @@
+import { DriveWriteHistory, isDriveWriteEvent } from '@/components/google/DriveWriteHistory';
+import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { ComplianceReportButton } from '@/components/ComplianceReportButton';
 import { auditEventSummary } from '@/lib/home-overview';
 import { useEffect, useRef, useMemo, useState } from 'react';
@@ -116,6 +118,7 @@ const ALL_SOURCES: UnifiedAuditSource[] = [
 function HistoryTab() {
   const intl = useIntl();
   const connectionState = useConnectionStore((s) => s.state);
+  const [toolFilter, setToolFilter] = useUrlState('tool_name_filter', '', { allowed: ['', 'google_drive_write'] });
   const [events, setEvents] = useState<UnifiedAuditEvent[]>([]);
   const [sourceCounts, setSourceCounts] = useState<Record<UnifiedAuditSource, number>>({
     security: 0,
@@ -154,7 +157,9 @@ function HistoryTab() {
       limit: number;
       sources?: UnifiedAuditSource[];
       severity_filter?: 'info' | 'warning' | 'critical';
+      tool_name_filter?: string;
     } = { limit: 300 };
+    if (toolFilter) params.tool_name_filter = toolFilter;
     if (selectedSources !== null) params.sources = selectedSources;
     if (severityFilter !== 'all') params.severity_filter = severityFilter;
 
@@ -188,7 +193,7 @@ function HistoryTab() {
     return () => {
       cancelled = true;
     };
-  }, [connectionState, selectedSources, severityFilter, intl]);
+  }, [connectionState, selectedSources, severityFilter, toolFilter, intl]);
 
   const toggleSource = (src: UnifiedAuditSource) => {
     const prev = selectedSources;
@@ -227,6 +232,10 @@ function HistoryTab() {
     <div className="flex flex-1 flex-col gap-4 overflow-hidden">
       {/* Filter bar */}
       <div className="flex flex-wrap items-center gap-2">
+        <button type="button" aria-pressed={toolFilter === 'google_drive_write'} onClick={() => setToolFilter(toolFilter ? '' : 'google_drive_write')}
+          className={cn('rounded-full border px-3 py-1 text-xs font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50', toolFilter ? 'border-brand bg-brand/10 text-brand' : 'border-surface-border bg-surface text-muted-foreground')}>
+          {intl.formatMessage({ id: 'driveWrite.title' })}
+        </button>
         <SourceChip
           active={selectedSources === null}
           onClick={() => setSelectedSources(null)}
@@ -257,7 +266,8 @@ function HistoryTab() {
         <Empty icon={Inbox} title={intl.formatMessage({ id: 'logs.empty.noMatch' })} />
       ) : (
         <div className="flex-1 space-y-2 overflow-y-auto pr-1">
-          {events.map((evt, i) => {
+          {events.some(isDriveWriteEvent) && <DriveWriteHistory events={events.filter(isDriveWriteEvent)} />}
+          {events.filter(evt => !isDriveWriteEvent(evt)).map((evt, i) => {
             const key = `${evt.timestamp}-${evt.source}-${i}`;
             return (
               <AuditRow
@@ -332,11 +342,12 @@ function AuditRow({
   readonly expanded: boolean;
   readonly onToggle: () => void;
 }) {
+  useCompanyTimeZone();
   const intl = useIntl();
   const agentName = useAgentsStore((s) => s.agents.find((a) => a.name === event.agent_id)?.display_name || event.agent_id);
   const time = (() => {
     try {
-      return new Date(event.timestamp).toLocaleString('zh-TW', {
+      return formatDateTime(event.timestamp, { locale: 'zh-TW',
         hour12: false,
         year: 'numeric',
         month: '2-digit',
@@ -405,6 +416,7 @@ function AuditRow({
 type LevelFilter = 'all' | 'trace' | 'debug' | 'info' | 'warn' | 'error';
 
 function RealtimeTab() {
+  useCompanyTimeZone();
   const intl = useIntl();
   const {
     entries,
@@ -563,7 +575,7 @@ function RealtimeTab() {
 function formatTimestamp(ts: string): string {
   try {
     const date = new Date(ts);
-    return date.toLocaleTimeString('zh-TW', {
+    return formatDateTime(date, { locale: 'zh-TW',
       hour12: false,
       hour: '2-digit',
       minute: '2-digit',

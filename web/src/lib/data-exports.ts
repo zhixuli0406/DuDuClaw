@@ -1,3 +1,4 @@
+import { getCompanyTimeZone, localDateToInstant, nextLocalMidnight } from './company-time';
 import { client } from './ws-client';
 import { useAuthStore } from '@/stores/auth-store';
 export type ExportDataset = 'tasks' | 'conversations' | 'usage' | 'memories' | 'wiki';
@@ -16,19 +17,18 @@ export const dataExports = {
   get: (export_id: string) => client.call('data_exports.get', { export_id }) as Promise<ExportJob>,
   cancel: (export_id: string) => client.call('data_exports.cancel', { export_id }) as Promise<unknown>,
 };
-/** Date-only controls are always Taipei calendar dates, independent of browser locale. */
-export function exportDateRange(start: string, end: string): Pick<ExportRequest, 'from' | 'until'> {
-  const parse = (value: string) => {
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new Error('EXPORT_INVALID_DATE');
-    const time = Date.parse(`${value}T00:00:00+08:00`);
-    if (!Number.isFinite(time) || new Date(time + 8 * 3600_000).toISOString().slice(0, 10) !== value) throw new Error('EXPORT_INVALID_DATE');
-    return time;
-  };
-  const from = start ? parse(start) : undefined;
-  const until = end ? parse(end) + 86400_000 : undefined;
-  if (from !== undefined && until !== undefined && until <= from) throw new Error('EXPORT_INVALID_DATE');
-  return { ...(from !== undefined ? {from: new Date(from).toISOString()} : {}), ...(until !== undefined ? {until: new Date(until).toISOString()} : {}) };
+/** Date-only controls use company calendar days, or the browser zone when unset. */
+export function exportDateRange(start: string, end: string, zone: string | undefined = getCompanyTimeZone()): Pick<ExportRequest, 'from' | 'until'> {
+  try {
+    const from = start ? localDateToInstant(start, zone) : undefined;
+    const until = end ? nextLocalMidnight(end, zone) : undefined;
+    if (from !== undefined && until !== undefined && until <= from) throw new Error('EXPORT_INVALID_DATE');
+    return { ...(from !== undefined ? {from: new Date(from).toISOString()} : {}), ...(until !== undefined ? {until: new Date(until).toISOString()} : {}) };
+  } catch {
+    throw new Error('EXPORT_INVALID_DATE');
+  }
 }
+
 export async function downloadDataExport(id: string, dataset: ExportDataset, format: ExportFormat): Promise<void> {
   const jwt = useAuthStore.getState().jwt;
   if (!jwt) throw new Error('EXPORT_FORBIDDEN');

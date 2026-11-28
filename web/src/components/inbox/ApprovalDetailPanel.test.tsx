@@ -5,6 +5,9 @@ import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { useAuthStore } from '@/stores/auth-store';
+import { formatDateTime, resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
+
+afterEach(() => resetCompanyTimeZone());
 
 // The panel imports decideApproval → api-custom-skills → ws-client. Stub the
 // socket so the module graph loads without a live connection.
@@ -854,6 +857,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
   });
 
   it.each(['read', 'draft'])('shows the matching rule and expiry for %s approvals without full arguments', (effect) => {
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
     const approval = genericApproval({
       expires_at: 1793210400,
       payload: {
@@ -869,6 +873,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"tool": "memory_search"');
     expect(within(box).getByTestId('approval-action-rules')).toHaveTextContent('"verdict": "ask"');
     expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+    expect(box.querySelector('time')).toHaveTextContent('10/29/2026, 2:00:00 AM');
     expect(screen.queryByTestId('approval-full-content')).not.toBeInTheDocument();
   });
 
@@ -950,6 +955,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(box).toHaveTextContent('An action rule requires approval');
   });
   it.each(['send', 'publish', 'purchase', 'read'])('expands complete %s arguments, sources, destination and expiry', (effect) => {
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
     const content = 'Confidential customer note '.repeat(100) + 'END OF FULL CONTENT';
     const approval = genericApproval({
       expires_at: 1793210400,
@@ -967,6 +973,7 @@ describe('<ApprovalDetailPanel> egress review', () => {
     expect(box).toHaveTextContent('mail_read');
     expect(box).toHaveTextContent('Private data was read during this turn');
     expect(box.querySelector('time')).toHaveAttribute('datetime', new Date(1793210400000).toISOString());
+    expect(box.querySelector('time')).toHaveTextContent('10/29/2026, 2:00:00 AM');
   });
 });
 
@@ -1005,5 +1012,144 @@ describe('<ApprovalDetailPanel> processed receipts', () => {
     fireEvent.click(screen.getByRole('button', { name: en['approval.spotCheck.toggle'] }));
     expect(screen.queryByText(kind)).not.toBeInTheDocument();
     expect(screen.getByText(en['approvals.kind.unknown'])).toBeInTheDocument();
+  });
+});
+
+describe('admin AI settings approval', () => {
+  const prompt = '整理上週所有請購單。\n依供應商分組，寄送完整摘要。\n' + '保留每筆明細。'.repeat(80);
+  const payload = {
+    id: 'hidden-payload-id', admin: '王小明', avatar: '王小明的 AI 分身', employee_count: 2, item_count: 3,
+    items: [
+      { seq: 1, target: 'hidden-target-one', employee: '業務小美', label: '主要模型', before: 'model-before', after: 'model-after' },
+      { seq: 2, target: 'hidden-target-two', employee: '客服小安', label: '定時喚醒', before: false, after: true },
+      { seq: 3, target: 'hidden-target-two', employee: '客服小安', label: '新增排程', before: null, after: { name: '週報', cron: '0 9 * * 1', timezone: 'Asia/Taipei', enabled: true, task: prompt } },
+    ], reason: '整理每週工作', expires_at: null,
+  };
+  const approval = (over: Partial<ApprovalItem> = {}): ApprovalItem => genericApproval({
+    id: 'hidden-approval-id', kind: 'admin_ai_settings', payload, digest: 'review-digest',
+    summary: 'Admin settings summary', created_at: new Date().toISOString(), ttl_seconds: 600,
+    expires_at: Math.floor(Date.now() / 1000) + 600, ...over,
+  });
+  const show = (item = approval(), props: Partial<React.ComponentProps<typeof ApprovalDetailPanel>> = {}) => renderWithProviders(
+    <ApprovalDetailPanel approval={item} onApprove={vi.fn()} onReject={vi.fn()} {...props} />,
+  );
+
+  it('renders names, localized labels, raw strings, booleans, none and the complete schedule', () => {
+    show();
+    for (const text of ['Confirm admin AI settings changes', '王小明', '王小明的 AI 分身', '業務小美', '主要模型', 'model-before', 'model-after', 'Off', '(None)', '週報', 'Every Monday at 09:00', 'Asia/Taipei', '整理每週工作']) {
+      expect(screen.getAllByText(text, { exact: false }).length).toBeGreaterThan(0);
+    }
+    expect(screen.getAllByText('On').length).toBeGreaterThan(0);
+    const task = screen.getByText((_, element) => element?.textContent === prompt && element.tagName === 'SPAN');
+    expect(task.textContent).toBe(prompt);
+    expect(task).toHaveClass('whitespace-pre-wrap');
+    expect(screen.getByRole('region')).toHaveClass('overflow-x-auto');
+    expect(screen.getByText(/remaining$/)).toBeInTheDocument();
+    for (const id of ['hidden-payload-id', 'hidden-approval-id', 'hidden-target-one', 'hidden-target-two']) {
+      expect(document.body.textContent).not.toContain(id);
+    }
+  });
+
+  it('passes the digest on approval and calls reject on cancel', () => {
+    const onApprove = vi.fn(); const onReject = vi.fn();
+    show(approval(), { onApprove, onReject });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 3 changes' }));
+    expect(onApprove).toHaveBeenCalledWith('review-digest');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onReject).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles absent digest, empty avatar and reason, and a server error sentence', () => {
+    const onApprove = vi.fn();
+    show(approval({ digest: null, payload: { ...payload, avatar: '', reason: null } }), { onApprove, decideError: new Error('設定已變更，請重新提出。') });
+    expect(screen.queryByText(/Via:/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Reason')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('設定已變更，請重新提出。');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 3 changes' }));
+    expect(onApprove).toHaveBeenCalledWith(undefined);
+  });
+
+  it.each([null, {}, { ...payload, item_count: 4 }, { ...payload, items: [{ ...payload.items[0], after: { task: 123 } }] }])('falls back for malformed payload %j', (bad) => {
+    show(approval({ payload: bad }));
+    expect(screen.getByText('Admin settings summary')).toBeInTheDocument();
+    expect(screen.queryByTestId('admin-ai-settings')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(en['approval.spotCheck.toggle']));
+    for (const id of ['hidden-payload-id', 'hidden-target-one', 'hidden-target-two']) {
+      expect(document.body.textContent).not.toContain(id);
+    }
+  });
+
+  it.each(['tool_call', 'admin_ai_settings'])('shows only server-formatted decision attribution for processed %s', (kind) => {
+    const { rerender } = show(approval({ kind, status: 'approved', decided_by_display: '王小明（Telegram，網頁確認）' }));
+    expect(screen.getByText('Decided by')).toBeInTheDocument();
+    expect(screen.getByText('王小明（Telegram，網頁確認）')).toBeInTheDocument();
+    for (const decided_by_display of [null, '', '   ']) {
+      rerender(<ApprovalDetailPanel approval={approval({ kind, status: 'approved', decided_by_display })} onApprove={vi.fn()} onReject={vi.fn()} />);
+      expect(screen.queryByText('Decided by')).not.toBeInTheDocument();
+    }
+  });
+
+  it.each([
+    ['approved', null, 'approved'],
+    ['expired', null, 'expired'],
+    ['denied', 'admin_ai:expired', 'expired'],
+    ['invalidated', 'expired', 'expired'],
+    ['denied', 'restart_requires_reobserve', 'restart'],
+    ['invalidated', 'admin_changed', 'adminChanged'],
+    ['denied', null, 'denied'],
+    ['invalidated', 'settings_changed', 'invalidated'],
+  ] as const)('maps status %s and reason %s', (status, invalidated_reason, result) => {
+    show(approval({ status, invalidated_reason }));
+    expect(screen.getByText(en[`approval.adminAi.result.${result}`])).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Confirm .* changes/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('processed execution receipts', () => {
+  const receipt = (execution_result: ApprovalItem['execution_result'], kind: ApprovalItem['kind'] = 'admin_ai_settings') => renderWithProviders(
+    <ApprovalDetailPanel approval={genericApproval({ kind, status: 'approved', decided_at: '2026-11-27T14:03:00Z', execution_result })} onApprove={vi.fn()} onReject={vi.fn()} />,
+  );
+  const base = { reason: null, completed: 2, not_executed: 1, message: null, items: [] };
+
+  it('shows the formatted decision time and exact completed count', () => {
+    receipt({ ...base, outcome: 'complete' });
+    expect(screen.getByText('Decision time')).toBeInTheDocument();
+    expect(screen.getByText(formatDateTime('2026-11-27T14:03:00Z', { locale: 'en' }))).toBeInTheDocument();
+    expect(screen.getByText('Completed 2 changes.')).toBeInTheDocument();
+    expect(screen.queryByText(en['approval.adminAi.result.approved'])).not.toBeInTheDocument();
+  });
+
+  it('shows partial counts, message and only item errors as plain pre-wrapped text', () => {
+    const message = '<b>部分完成</b>\n請重試';
+    const error = '<img src=x onerror=alert(1)>\n無法儲存';
+    const { container } = receipt({ ...base, outcome: 'partial', message, items: [
+      { seq: 3, result: null, error }, { seq: 1, result: 'hidden result', error: null },
+    ] });
+    expect(screen.getByText('Completed 2 changes; the remaining 1 were not executed.')).toBeInTheDocument();
+    expect(screen.getByText(message, { normalizer: value => value })).toHaveClass('whitespace-pre-wrap');
+    expect(screen.getByText(`Item 3: ${error}`, { normalizer: value => value })).toHaveClass('whitespace-pre-wrap');
+    expect(container.querySelector('b, img')).toBeNull();
+    expect(screen.queryByText('hidden result')).not.toBeInTheDocument();
+  });
+
+  it.each([null, '<b>這批已取消</b>\n請重提'])('shows a voided receipt with message %j', message => {
+    receipt({ ...base, outcome: 'voided', completed: null, not_executed: null, message });
+    expect(screen.getByText(message || 'None of these changes were executed.', { normalizer: value => value })).toBeInTheDocument();
+    expect(document.querySelector('b')).toBeNull();
+  });
+
+  it('keeps the old result for a null receipt', () => {
+    receipt(null);
+    expect(screen.getByText(en['approval.adminAi.result.approved'])).toBeInTheDocument();
+  });
+
+  it('does not show an admin settings receipt for another kind', () => {
+    receipt({ ...base, outcome: 'complete' }, 'tool_call');
+    expect(screen.queryByText('Completed 2 changes.')).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, null])('omits the decision time when absent (%s)', decided_at => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ status: 'approved', decided_at })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText('Decision time')).not.toBeInTheDocument();
   });
 });

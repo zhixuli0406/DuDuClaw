@@ -46,6 +46,7 @@ duduclaw start
   add-on module, the licence has to be rebound to the new machine by whoever issued it.
 - **Channel tokens**: channel bot tokens live inside the encrypted config and move along with
   everything else; remember to update the webhook URL when the IP or domain changes.
+- **Odoo permissions**: Dashboard restore and `duduclaw import` return Follow to Engine, remove risk acknowledgements, and keep a previously disabled member-credentials switch off. They retain the union of the current and imported effective refusal lists (missing lists use defaults), disable agent `act_as_requester`, and keep conservative `engine` / `read_only` overrides. A notice asks the administrator to confirm permissions again on the Odoo settings page. These protections apply to the product's restore/import flows; manually unpacking a tar archive bypasses them.
 - **EditionProfile**: all builds derive the maximum edition from the verified licence
   (Business, OEM, Partner and Self-Host Pro allow `enterprise`). A missing or invalid licence
   means `personal`. `DUDUCLAW_EDITION` (`personal` or `enterprise`) takes precedence over an

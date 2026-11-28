@@ -1,8 +1,9 @@
 import { TASK_ENTRY_POINTS_HIDDEN } from '@/lib/task-entry-visibility';
-import { useEffect, lazy, Suspense } from 'react';
+import { useEffect, useRef, lazy, Suspense } from 'react';
 import { Routes, Route, Navigate, useNavigate } from 'react-router';
 import { onPetOpenStudio } from './lib/pet';
 import { client } from './lib/ws-client';
+import { resetCompanyTimeZone, useCompanyTimeStore } from './lib/company-time';
 import { handleDashboardNavigate } from './lib/dashboard-navigate';
 import { toast } from './lib/toast';
 import { MainLayout } from './components/layout/MainLayout';
@@ -86,6 +87,7 @@ const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
 const ExternalAccessPage = lazyPage(() => import('./pages/ExternalAccessPage'), 'ExternalAccessPage');
+const ApprovalConfirmPage = lazyPage(() => import('./pages/ApprovalConfirmPage'), 'ApprovalConfirmPage');
 const GoogleAuthorizationPage = lazyPage(() => import('./pages/GoogleAuthorizationPage'), 'GoogleAuthorizationPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const MyMemoryPage = lazyPage(() => import('./pages/MyMemoryPage'), 'MyMemoryPage');
@@ -164,6 +166,19 @@ export function App() {
   const isAuthenticated = useAuthStore((s) => s.isAuthenticated);
   const initialized = useAuthStore((s) => s.initialized);
   const navigate = useNavigate();
+  const connectionState = useConnectionStore((s) => s.state);
+  const companyTimeLoaded = useRef(false);
+
+  useEffect(() => {
+    if (!initialized) return;
+    if (!isAuthenticated) {
+      companyTimeLoaded.current = false;
+      resetCompanyTimeZone();
+    } else if (connectionState === 'authenticated' && !companyTimeLoaded.current) {
+      companyTimeLoaded.current = true;
+      void useCompanyTimeStore.getState().load();
+    }
+  }, [initialized, isAuthenticated, connectionState]);
 
   // The desktop pet's right-click "open studio" item fires a Tauri event on the
   // main window; navigate there when it arrives (no-op outside Tauri).
@@ -486,6 +501,7 @@ export function App() {
                   new-skill request reduced to a plain approve/reject with the
                   skill's own content and security scan nowhere in sight (§2-6).
                   One door for decisions; this one redirects to it. */}
+              <Route element={<EditionGuard enterprise />}><Route path="approvals/confirm" element={<ApprovalConfirmPage />} /></Route>
               <Route path="approvals" element={<Navigate to="/inbox" replace />} />
               {/* These three are the source files behind 管理 → 整合's tabs, not
                   standalone pages (§2-8). Their old paths land on the tab that

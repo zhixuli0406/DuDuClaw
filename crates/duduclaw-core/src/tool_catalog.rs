@@ -69,8 +69,8 @@ pub struct ToolCatalogEntry {
     pub effect: crate::tool_effect::ToolEffect,
 }
 
-/// Compatibility tools retained until v1.86.0; automatic curation was removed.
-pub const DEPRECATED_MCP_TOOLS: &[&str] = &["skill_curator_status", "skill_pin"];
+/// MCP compatibility tools currently within their deprecation window.
+pub const DEPRECATED_MCP_TOOLS: &[&str] = &[];
 
 /// Is this MCP tool name a deprecated alias? Exact match, never a prefix or
 /// substring test (coding convention 2).
@@ -123,6 +123,20 @@ impl RemovedMcpTool {
 /// `shared_wiki_delete` and `wiki_share` were never aliases and stay; neither
 /// do `goals_create` (goal hierarchy) or `create_task` (multi-step plans).
 pub const REMOVED_MCP_TOOLS: &[RemovedMcpTool] = &[
+    RemovedMcpTool {
+        name: "skill_curator_status",
+        removed_in: "1.86.0",
+        replacement: "skill_list",
+        replacement_args: "{}",
+        note: "Lists loaded skills. Resolve archive conflicts manually.",
+    },
+    RemovedMcpTool {
+        name: "skill_pin",
+        removed_in: "1.86.0",
+        replacement: "skill_list",
+        replacement_args: "{}",
+        note: "Lists loaded skills; pinning is unnecessary. Gateway startup restores recorded archived skills on Linux and macOS without overwriting destinations. Resolve conflicts manually; other platforms retain archives for manual recovery.",
+    },
     RemovedMcpTool {
         name: "shared_wiki_ls",
         removed_in: "1.69.0",
@@ -615,6 +629,10 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo:write",
         "odoo",
     ),
+    ("odoo_message_send", "Send a message on an Odoo record", "odoo:write", "odoo"),
+    ("odoo_attachment_add", "Attach a file from the employee's attachments folder to an Odoo record", "odoo:write", "odoo"),
+    ("odoo_activity_create", "Schedule an activity on an Odoo record", "odoo:write", "odoo"),
+    ("odoo_note_post", "Post an internal note on an Odoo record", "odoo:write", "odoo"),
     // ── Odoo: execute (odoo:execute) ─────────────────────────────────────
     (
         "odoo_sale_confirm",
@@ -717,6 +735,15 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "google:read",
         "google",
     ),
+    ("drive_create_file", "Create a Drive file from text or a conversation attachment, or create a folder.", "google:write", "google"),
+    ("drive_copy_file", "Copy a Drive file to a folder.", "google:write", "google"),
+    ("drive_update_file", "Rename a Drive file, change its description, or replace non-Google text file contents.", "google:write", "google"),
+    ("drive_move_file", "Move a Drive file to a destination folder.", "google:write", "google"),
+    ("drive_trash_file", "Move a Drive file to the trash; does not permanently delete it.", "google:write", "google"),
+    ("docs_insert_text", "Insert text at the start, end, or after unique text in a Google Doc.", "google:write", "google"),
+    ("docs_format", "Apply supported styles, a header, or a tab operation to a Google Doc.", "google:write", "google"),
+    ("sheets_add_sheet", "Add a spreadsheet sheet, optionally copying an existing sheet.", "google:write", "google"),
+    ("sheets_add_note", "Set a note on up to 1000 spreadsheet cells; an empty note clears it.", "google:write", "google"),
     // ── Google Workspace: write (google:write) ───────────────────────────
     (
         "gmail_create_draft",
@@ -1511,12 +1538,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "skill",
     ),
     (
-        "skill_pin",
-        "[deprecated → skill_list] Restore an archived skill; pinning has no effect",
-        "admin",
-        "skill",
-    ),
-    (
         "skill_gaps",
         "Report inferred capability gaps",
         "admin",
@@ -1525,12 +1546,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "skill_bank_feedback",
         "Record skill execution feedback",
-        "admin",
-        "skill",
-    ),
-    (
-        "skill_curator_status",
-        "[deprecated → skill_list] Read-only archive recovery status",
         "admin",
         "skill",
     ),
@@ -1547,6 +1562,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "skill",
     ),
     // ── Local inference / models (inference) ─────────────────────────────
+    ("admin_settings_read", "Read employee settings in a verified administrator turn", "admin", "agent"),
+    ("admin_settings_propose", "Propose administrator settings changes for confirmation", "admin", "agent"),
     ("model_list", "List local GGUF models", "admin", "inference"),
     (
         "model_search",
@@ -2057,7 +2074,7 @@ mod tests {
     #[test]
     fn removed_tools_are_out_of_the_catalog_and_their_replacements_are_in() {
         let catalog = builtin_tool_catalog();
-        assert_eq!(REMOVED_MCP_TOOLS.len(), 8);
+        assert_eq!(REMOVED_MCP_TOOLS.len(), 10);
         for removed in REMOVED_MCP_TOOLS {
             assert!(
                 !catalog.iter().any(|e| e.name == removed.name),
@@ -2074,16 +2091,6 @@ mod tests {
         for kept in ["shared_wiki_delete", "wiki_share"] {
             assert!(catalog.iter().any(|e| e.name == kept), "{kept}");
             assert!(removed_mcp_tool(kept).is_none(), "{kept}");
-        }
-    }
-
-    #[test]
-    fn curator_compatibility_tools_remain_deprecated_and_listed() {
-        for name in ["skill_curator_status", "skill_pin"] {
-            assert!(is_deprecated_tool(name));
-            let entry = builtin_tool_catalog().into_iter().find(|tool| tool.name == name).unwrap();
-            assert!(entry.deprecated);
-            assert!(entry.description.starts_with("[deprecated → "));
         }
     }
 

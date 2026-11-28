@@ -8,7 +8,7 @@
 Disposition summary:
 
 - **Routed**: every row below without a `Refused:` prefix. This covers the 66 connector tools, the own-skill tools, spawn tools, `create_task`, the in-run helpers, the file tools, discovery job tools and fork reads, and every employee-handler tool.
-- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`) and `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`). These three categories are the complete exception set.
+- **Refused with a reason**: `HostAuthority` (host desktop, devices, power, network, local model services), `ProposalRequired` (`create_agent`), `ForkNextRelease` (`fork_run`, `merge_or_select`, `terminate_branch`) and `AdminSettingsUnavailable` (`admin_settings_read`, `admin_settings_propose`). Person-only gateway tools (`PersonalKeyRequired`) and Drive writes (`DriveWriteUnavailable`) are also intentionally refused.
 - **Gated off by default**: `browser_record_start`, `browser_record_stop` and `skill_from_recording` stay hidden until the host's recording probe passes (`RECORDING_BUILD_ENABLED`, spawnd `helper_recording`; readiness names `helper_recording_unsupported`) and the employee's admin-only `[isolation] public_web` is on. `web_fetch_cached`, `web_extract` and `skill_hub_install` also need `public_web = true` (default `false`). The file tools and in-run helpers stay hidden while spawnd's readiness report lacks `work_broker` (helpers: also `helper_calls`).
 
 **CONTRACT CHANGE: capability canonical encoding v2.** `EmployeeScope { id }` is an explicit MAC-covered resource variant (tag 9), bound to the verified employee. Service/Connector calls use either exact resource grants or current live employee authority. A scope cannot be combined with task/table/wiki/mailbox/recipient/connector grants or a task-limited run. Workspace and URL-origin entries may accompany scope as explicit File/A/E inputs. Tag 10, `Confined { resource }`, carries other exact File/A/E input/output grants (for example a wiki namespace or a worker connector account); it requires EmployeeScope and forbids nesting. Neither form narrows or expands employee-scope Service/Connector authority. Older capability MACs are not reused.
@@ -139,14 +139,13 @@ workspace grant; a foreign and an unknown fork both answer `fork_not_found`. The
 fork mutations stay `ForkNextRelease`. Unprotected installations are unchanged.
 
 H12a (v1.81): the own-skill tools `skill_extract`, `shared_skill_adopt`,
-`skill_security_scan`, `skill_graduate` and `skill_curator_status` no longer
+`skill_security_scan` and `skill_graduate` no longer
 require a workspace grant. They are eligible only under EmployeeScope with the
 record's own `Employee` grant (plus exactly one own `agent:` Confined wiki for
 `skill_extract`), take no subject selector (a legacy `agent_id` must equal the
 bound employee; `target_agent` refuses), parse skill bytes only in the E worker,
 and publish only into the caller's own wiki or own `SKILLS/`. Global graduation
-needs the dashboard admin card; the deprecated curator status (D-H4) is read-only
-and reports only the caller's own archived skills. `run=true` is ignored.
+needs the dashboard admin card.
 
 H13 (v1.81): `spawn_agent` and `spawn_ephemeral` require no workspace grant and no
 new capability grant. They are eligible with the record's own `Employee` grant
@@ -213,7 +212,7 @@ Service/Connector tools enter `BoundaryRoute::Resource` unless an explicit host 
 
 A/Execution requires a backend that explicitly supports retained workspace authority. `SpawndBackend::with_workspace_bridge` installs the trusted root-receipt hookup and verifies the held directory, exact reservation/runtime/workspace/cwd and live authority. Production boot installs the receipt producer through the run-bound work brokers (W1); a backend without it still refuses workspace plans. Worker/file plans retain authorized tokens through queued work and checked transport. These are implementation readiness requirements, not Linux acceptance.
 
-Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. Executor source coverage is 66/66: native Google/Notion/GitHub (30), Odoo (20, including RM-120 `odoo_create` / `odoo_write`), DB (4), channels (8), models (2), computer login (1), search (1). The typed boot registry requires complete selection/execution support before dispatcher construction, and production boot installs it (F1, per-employee registry in the CLI). Google uses its sealed gateway owner for personal/home OAuth and consent/refresh with the authenticated requester (E1, E3); domain-wide delegation and service-account tenant sources are served as SharedTenant sources under the D-5 rule (E4). Credentials are not copied into the run. Source coverage and fixture tests do not establish provider parity: that needs real provider test accounts on a Linux host. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
+Calls routed to a connector require an installed per-tool live selection policy, active catalog account, binding verification and bound executor. The executable connector inventory includes: native Google/Notion/GitHub (30), Odoo (24, including RM-120 generic writes and the four RM-141 write-back tools), DB (4), channels (8), models (2), computer login (1), search (1). Intentionally refused Drive write routes count as covered but cannot select a provider or execute. The typed boot registry requires complete selection/execution support before dispatcher construction, and production boot installs it (F1, per-employee registry in the CLI). Google uses its sealed gateway owner for personal/home OAuth and consent/refresh with the authenticated requester (E1, E3); domain-wide delegation and service-account tenant sources are served as SharedTenant sources under the D-5 rule (E4). Credentials are not copied into the run. Source coverage and fixture tests do not establish provider parity: that needs real provider test accounts on a Linux host. See the [round 3 report](native-linux-isolation-security-fixes-2026-11-05.md).
 
 RM-103 S3 holds in protected mode: Codex, Grok and registered generic CLIs check `CapabilitiesConfig::native_tool_constraints` before the isolated route (`runtime::protected_coarse_native_gate`, repeated in `isolation_mcp::runtime::execute_native` / `execute_registered_cli` before the one-shot authority is consumed). The isolated native profile is root-derived and has no per-run read-only mode, so a native shell **or** write constraint (including the fail-closed config of a malformed `[capabilities]`) refuses the spawn. Protected Claude runs with `--tools ""` (no native tools).
 
@@ -221,13 +220,16 @@ Existing scope, allowed/denied tools, permissions, approvals, record/audience, e
 
 | Refusal category | Reason |
 | --- | --- |
+| PersonalKeyRequired | Person-only gateway tools require a personal API key; protected employees cannot call them. |
+| DriveWriteUnavailable | Drive writes have boundary policies but no protected executor; refused before provider selection. |
+| AdminSettingsUnavailable | Admin settings require a non-isolated administrator conversation; protected Personal and Shared employees cannot list or call either tool, even with grants. |
 | Existing Admin/operator gate | The original employee policy decides access. |
 | HostAuthority | A run cannot control or observe the host desktop, devices, power, network configuration or local model services. |
 | Missing adapter | Boot fails; this is unfinished parity, not an intentional tool restriction. |
 | ProposalRequired | Isolation architecture (planned for a later release): `create_agent` is refused; a protected employee exists only through an approved Employee proposal and its root allocation. |
 | ForkNextRelease | v1.80.0 protected TEAM only: `fork_run`, `merge_or_select`, `terminate_branch` are deferred until fresh child capability/account/budget authority and immutable result apply are complete. Non-protected installations retain their existing behavior. |
 
-`Refused: HostAuthority`, `Refused: ProposalRequired` and `Refused: ForkNextRelease` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
+`Refused: HostAuthority`, `Refused: ProposalRequired`, `Refused: ForkNextRelease` `Refused: AdminSettingsUnavailable`, `Refused: PersonalKeyRequired` and `Refused: DriveWriteUnavailable` rows below are the complete isolation exception set. Every other row is served subject to the same original employee gates, even when its scope is Admin. The three deferred fork tools remain in this inventory, are hidden from protected tools/list, and return a localized refusal on tools/call; an injected service cannot enable them. Apart from that explicit v1.80.0 deferral, missing A/E factories are wiring errors: `require_complete_services()` rejects incomplete boot assembly. The matrix and tests describe implementation, not live provider or native acceptance.
 
 A readiness excludes exactly the three deferred mutations and requires all five signed helper/control producers plus the three host fork readers. An absent or changed signed helper publication still blocks readiness. This does not enable the other composite components, claim native/provider acceptance, or remove any of the original 22 A tools from the inventory.
 
@@ -264,6 +266,15 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `gtasks_create` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `gtasks_complete` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `drive_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
+| `drive_create_file` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `drive_copy_file` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `drive_update_file` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `docs_insert_text` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `docs_format` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `sheets_add_sheet` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `sheets_add_note` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `drive_move_file` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
+| `drive_trash_file` | Refused: DriveWriteUnavailable — boundary policy only; no protected executor; denied before account selection or credentials. |
 | `drive_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `docs_append` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
@@ -295,6 +306,10 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `os_display_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_get` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
 | `os_audio_set` | Refused: HostAuthority — controls or observes host desktop, devices or system services. |
+| `my_agents_status` | Refused: PersonalKeyRequired — person-only tool; never listed or executed for protected employees. |
+| `my_tasks_list` | Refused: PersonalKeyRequired — person-only tool; never listed or executed for protected employees. |
+| `admin_settings_read` | Refused: AdminSettingsUnavailable — read effect; Service route with own Employee grant; never listed in protected mode. |
+| `admin_settings_propose` | Refused: AdminSettingsUnavailable — admin effect; Service route with own Employee grant; never listed in protected mode. |
 | `create_agent` | Refused: ProposalRequired — protected employees are created only through an approved Employee proposal. |
 | `list_agents` | Resource → AuthorizedToolCall → original live employee handler |
 | `create_task` | Host authenticated target queue admission; fresh target run authority required; each call is authorized against the capability before the TaskSpec is written; a task/schedule run plans under its record Task grant (H8 selector, issued only while the employee owns the task, otherwise the run is refused); an interactive run uses the NewTask grant (tag 12) for new top-level plans only, assigned to the calling employee and filed for the signed human requester |
@@ -324,6 +339,10 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `odoo_partner_search` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
 | `odoo_schema_overview` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
 | `odoo_schema_fields` | Resource → bound Odoo provider; original approval/business gates; live RPC checks; installed at production boot (F1) |
+| `odoo_activity_create` | Resource → bound Odoo provider; Engine grants and target-table gates; activity assignee restricted to the connected account; live RPC checks |
+| `odoo_note_post` | Resource → bound Odoo provider; Engine grants and target-table gates; internal note only; live RPC checks |
+| `odoo_message_send` | Resource → bound Odoo provider; Engine grants and target-table gates; mandatory content-bound single-use approval before sending; live RPC checks |
+| `odoo_attachment_add` | Resource → bound Odoo provider; Engine attach grant; verified isolated employee identity; host-owned `agents/<employee>/attachments` root, descriptor-pinned no-symlink reads, size/type/content checks, private upload; live RPC checks |
 | `odoo_create` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
 | `odoo_write` | Resource → bound Odoo provider; RM-120 gates on the bound connector (explicit grant + per-table generic opt-in, never-writable list, module/block list, x2many commands, related-model authorization, account ACL and field checks); live RPC checks; installed at production boot (F1) |
 | `skill_extract` | E WorkerPlanFactory + WorkerLauncher/WorkerSession; EmployeeScope + own Employee + exactly one own Wiki output grant (Confined Wiki), rechecked at publication; own SKILLS bytes parsed by E as data; publishes only into the caller's own wiki, body pages read back before the completion marker (H12a) |
@@ -423,8 +442,6 @@ The matrix is checked for unique tool names, complete policy inventory, and exac
 | `skill_synthesis_status` | Resource → AuthorizedToolCall → original live employee handler |
 | `skill_synthesis_run` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee, no Workspace; own events only, host provider call under the employee's own runtime/budget, E prepares and scans, published no-clobber into the caller's own SKILLS (H12c) |
 | `skill_hub_install` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee + signed PublicOrigins; host-selected hub archive via the protected public fetch, expanded only by E, single SKILL.md scanned by E before approval and at install, published no-clobber into the caller's own SKILLS (H12b) |
-| `skill_curator_status` | Resource → original authenticated host orchestration; checked E parser required; EmployeeScope + own Employee; deprecated until v1.86.0; read-only archive status limited to the caller's own skills (D-H4), `run` ignored, no maintenance or wiki report |
-| `skill_pin` | Resource → AuthorizedToolCall → original live employee handler; deprecated until v1.86.0. Only `pinned=true` on an archived skill restores; pinning otherwise has no effect. Linux and macOS restoration in both modes uses directory descriptors, publishes the opened file bytes and refuses overwrites. Employees may restore only their own scope; global and other agent scopes require an Admin operator. Unknown callers are denied; other platforms retain archives for manual recovery |
 | `notion_status` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `notion_search` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |
 | `notion_page_read` | Resource → Native account-bound executor; installed at production boot (F1); real provider acceptance needs a Linux host |

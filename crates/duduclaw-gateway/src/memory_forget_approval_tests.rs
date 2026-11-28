@@ -196,8 +196,9 @@ fn the_notice_names_counts_but_no_content() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
-    let body = crate::approval_notify::dashboard_only_notice_body(&rec, false);
+    let body = crate::approval_notify::dashboard_only_notice_body(tempfile::tempdir().unwrap().path(), &rec, false);
     assert!(
         body.contains("記憶 2 筆") && body.contains("儀表板"),
         "{body}"

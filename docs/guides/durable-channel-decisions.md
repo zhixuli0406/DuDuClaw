@@ -1,5 +1,7 @@
 # Approvals and answers in chat channels
 
+Use **Security settings → Approve in chat apps** for Telegram and Google Chat. All step-up categories start checked; unchecking one requires risk confirmation. Card lifetime is 1–720 hours. Personal edition shows this card read-only. Admins prove their identity under **My connections → Chat app links (administrator)** using the one-time-code handshake; **Cancel chat approval eligibility** clears only that proof. **Members** labels chat identities **Self-confirmed / Entered by administrator**. Chat links open `/approvals/confirm`: sign in if needed, then enter password + authenticator code to approve; rejection needs no password. Processed Inbox cards show **Decision maker** and the decision time.
+
 When an AI employee wants to take a high-risk action (today: a high-risk computer-use step), it can ask for a decision in the chat it is answering. The request has a full ID. Reply in the same bot account and the same conversation or thread with that ID:
 
 ```text
@@ -73,7 +75,7 @@ The gateway's dashboard-only list is the authority; today it contains:
 - workflow activation
 - reconciling an operation whose result is unknown (`approvals.resolve_uncertain`, Admin)
 
-A channel reply to one of these never takes effect.
+A channel reply to one of these never takes effect. Exception (v1.86): when a customer Admin turns on Approve in chat apps, knowledge reviews and workflow activation can also be decided from a gateway-sent card in a self-confirmed Admin's private Telegram or Google Chat chat; typed replies still never decide them. See [Admin approval in chat apps](../features/05-security-defense.md#admin-approval-in-chat-apps-v186).
 
 ## Slack: the `users:read` scope
 

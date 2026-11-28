@@ -1,3 +1,4 @@
+import { orgErrorCode } from '@/lib/org-change';
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate, useSearchParams } from 'react-router';
@@ -483,7 +484,7 @@ export function InboxPage() {
   const [decideErrors, setDecideErrors] = useState<Record<string, unknown>>({});
 
   const decide = useCallback(
-    async (item: InboxItem, approve: boolean, renderedDigest?: string) => {
+    async (item: InboxItem, approve: boolean, renderedDigest?: string, reachDigest?: string) => {
       const entry = findEntry(item.id);
       if (!entry) return;
       const a = entry.raw as ApprovalItem;
@@ -499,8 +500,8 @@ export function InboxPage() {
         // v1.81 P1 break-glass: see lib/break-glass.ts.
         const res = await withBreakGlass(
           (token) => (token
-            ? api.approvals.decide(a.id, approve, undefined, digest, token)
-            : api.approvals.decide(a.id, approve, undefined, digest)),
+            ? api.approvals.decide(a.id, approve, undefined, digest, token, reachDigest)
+            : api.approvals.decide(a.id, approve, undefined, digest, undefined, reachDigest)),
           { purpose: 'decide' },
         );
         if (approve) setApprovedToday(bumpApprovedToday());
@@ -519,7 +520,7 @@ export function InboxPage() {
         markProcessed(item.id);
       } catch (e) {
         setDecideErrors((prev) => ({ ...prev, [item.id]: e }));
-        toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+        toast.error(orgErrorCode(e) === 'reach_changed' ? t('orgReach.changed') : intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
       }
     },
     [findEntry, intl, t, markProcessed],
@@ -736,7 +737,7 @@ export function InboxPage() {
             outcome={outcomes[item.id]}
             approval={raw as ApprovalItem}
             agentName={agentName((raw as ApprovalItem).agent_id)}
-            onApprove={(renderedDigest) => decide(item, true, renderedDigest)}
+            onApprove={(renderedDigest, reachDigest) => decide(item, true, renderedDigest, reachDigest)}
             onReject={() => decide(item, false)}
             decideError={decideErrors[item.id]}
             onDecided={(outcome) => { if (outcome) setOutcomes((previous) => ({ ...previous, [item.id]: outcome })); markProcessed(item.id); }}

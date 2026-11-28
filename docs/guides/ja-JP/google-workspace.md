@@ -1,10 +1,12 @@
 # Google Workspace ツールと安全モデル
 
-設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・二十九ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
+「連携 → Google → ドライブへの書き込み」で４操作、操作ごとの承認方法、フォルダ一覧を設定します。準備状況には委任スコープ、スタッフごとのテスト、会社アカウントの同意が表示されます。メンバーは「自分の接続 → ドライブへの書き込み」で接続し、書き込み確認カードを処理します。記録は「ログ → 履歴」の「ドライブへの書き込み」で絞り込みます。
+
+設定は [Google を接続する](google-setup.md)を参照してください。ネイティブ REST は九サービス・三十八ツール、Apps Script は三サービス・状態確認込み八アクションに対応します。連携がオフでもダッシュボードは表示され、ツールは `[integrations] google_workspace = true` で有効になります。共用 OAuth 認証情報は同梱しません。
 
 ## 何が使えるようになるか
 
-2つのスコープ(`google:read` / `google:write`)で管理される、29個のエージェント向け
+2つのスコープ(`google:read` / `google:write`)で管理される、38個のエージェント向け
 MCPツールです。
 
 | ツール | 分類 | 内容 |
@@ -58,17 +60,15 @@ MCPツールです。
 この2つのサービスは記載されていません)。これがここでネイティブに提供している
 理由です。
 
+上表は既存のツールです。新しい九つのドライブ書き込みツールのパラメーター、操作スイッチ、効果クラスは [Drive 書き込みリファレンス](google-mcp.md#クラウドドライブへの書き込みツール)を参照してください。新ツールにはネイティブ REST と `google:write` が必要です。既存の Docs／Sheets 書き込み六ツールは従来の規則を維持します。
+
 ### 安全設計
 
 - **送信は毎回確認が必要です。** `gmail_create_draft` は下書きを保存し、`gmail_send_draft` は新しいカードを人が確認したときだけ送信します。
 - **読み取りは読み取りのままです。** read分類のツールはGmailやCalendarの
   内容を一切変更できません。
-- **Forms、Drive、Slidesは読み取り専用です。** フォームの作成・編集、Driveへの
-  書き込み、プレゼンテーションの変更を行うツールはありません。書き込み用ツールが
-  あるのはGmail(下書き・承認済み送信)、Google Chat(本人確認後の送信)、Calendar、Sheets、Docs、Tasksだけです。
-- **最小権限。** Driveは`drive.readonly`のみを要求します(`drive`や
-  `drive.file`は要求しません。DocsとSheetsの作成は各サービスのスコープを使います)。
-  Slidesは`presentations.readonly`を要求します。Docsの書き込みツールは既存の完全な`documents`スコープを使います。
+- **Forms と Slides は読み取り専用です。** Drive 書き込みには個別に制御する九つのツールがあり、四つの操作スイッチは既定でオフです。[ツールとフォルダ規則](google-mcp.md#クラウドドライブへの書き込みツール)を参照してください。
+- **書き込み権限を分離します。** 通常の Drive 読み取りは `drive.readonly` を使います。独立した書き込み接続は `drive`、`documents`、`spreadsheets` を要求し、資格情報は gateway 内に保持します。録画の取り込みは別途 `drive.file`、Slides は `presentations.readonly` を使います。
 - **オプションの承認ゲート。** より慎重にしたい場合は、書き込み系ツールを
   エージェントの`agent.toml [capabilities] approval_required_tools`に
   リストアップすることで、下書き・イベント・スプレッドシートへの書き込みの

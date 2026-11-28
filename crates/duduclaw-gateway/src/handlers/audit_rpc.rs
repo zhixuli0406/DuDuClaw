@@ -54,6 +54,18 @@ pub(crate) fn permission_history_page(
     (rows.into_iter().map(|(_, v)| v).collect(), next)
 }
 
+fn tool_name_filter(params: &Value) -> Result<Option<&str>, &'static str> {
+    match params.get("tool_name_filter") {
+        None => Ok(None),
+        Some(Value::String(name)) if name.chars().count() <= 64 => Ok(Some(name)),
+        _ => Err("tool_name_filter must be a string of at most 64 characters"),
+    }
+}
+
+fn matches_tool_name(row: &Value, filter: Option<&str>) -> bool {
+    filter.is_none_or(|name| row.get("tool_name").and_then(Value::as_str) == Some(name))
+}
+
 impl MethodHandler {
     // ── Security ────────────────────────────────────────────
 
@@ -145,6 +157,10 @@ impl MethodHandler {
             .map(|n| (n as usize).min(MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT);
 
+        let tool_name_filter = match tool_name_filter(&params) {
+            Ok(filter) => filter,
+            Err(error) => return WsFrame::error_response("", error),
+        };
         let all_sources = ["security", "tool_call", "channel_failure", "feedback"];
         let requested_sources: Vec<String> = params
             .get("sources")
@@ -188,7 +204,7 @@ impl MethodHandler {
         }
 
         // ── Source: security_audit.jsonl ────────────────────────────
-        if requested_sources.iter().any(|s| s == "security") {
+        if tool_name_filter.is_none() && requested_sources.iter().any(|s| s == "security") {
             let home = self.home_dir.clone();
             let rows = tokio::task::spawn_blocking(move || {
                 crate::protected_policy_audit::dashboard_events(&home, usize::MAX).into_iter()
@@ -257,7 +273,8 @@ impl MethodHandler {
         // ── Source: tool_calls.jsonl ────────────────────────────────
         if requested_sources.iter().any(|s| s == "tool_call") {
             let path = self.home_dir.join("tool_calls.jsonl");
-            let rows = read_jsonl_lines(&path).await;
+            let rows: Vec<_> = read_jsonl_lines(&path).await.into_iter()
+                .filter(|row| matches_tool_name(row, tool_name_filter)).collect();
             *source_counts.entry("tool_call".into()).or_insert(0) += rows.len();
             for row in &rows {
                 let timestamp = row
@@ -294,6 +311,12 @@ impl MethodHandler {
                     continue;
                 }
 
+                let mut presented_row = row.clone();
+                if tool_name == "google_drive_write" {
+                    // Historical strings may contain Debug-formatted ids and sender names.
+                    // Both record formats are accepted, but UI details receive labels only.
+                    presented_row["requester"] = drive_write_requester_label(row.get("requester"));
+                }
                 events.push(json!({
                     "timestamp": timestamp,
                     "source": "tool_call",
@@ -301,13 +324,13 @@ impl MethodHandler {
                     "agent_id": agent_id,
                     "severity": severity,
                     "summary": summary,
-                    "details": { "tool_call": row },
+                    "details": { "tool_call": presented_row },
                 }));
             }
         }
 
         // ── Source: channel_failures.jsonl ──────────────────────────
-        if requested_sources.iter().any(|s| s == "channel_failure") {
+        if tool_name_filter.is_none() && requested_sources.iter().any(|s| s == "channel_failure") {
             let path = self.home_dir.join("channel_failures.jsonl");
             let rows = read_jsonl_lines(&path).await;
             *source_counts.entry("channel_failure".into()).or_insert(0) += rows.len();
@@ -377,7 +400,7 @@ impl MethodHandler {
         }
 
         // ── Source: feedback.jsonl (heterogeneous shape) ────────────
-        if requested_sources.iter().any(|s| s == "feedback") {
+        if tool_name_filter.is_none() && requested_sources.iter().any(|s| s == "feedback") {
             let path = self.home_dir.join("feedback.jsonl");
             let rows = read_jsonl_lines(&path).await;
             *source_counts.entry("feedback".into()).or_insert(0) += rows.len();
@@ -615,4 +638,20 @@ impl MethodHandler {
             }
         }
     }
+}
+
+/// Closed presentation mapping shared by historical and current Drive audit rows.
+fn drive_write_requester_label(requester: Option<&Value>) -> Value {
+    let (kind, label) = match requester {
+        Some(Value::String(_)) => ("legacy", "先前的紀錄"),
+        Some(Value::Object(fields)) => match fields.get("kind").and_then(Value::as_str) {
+            Some("dashboard_user") => ("dashboard_user", "控制台使用者"),
+            Some("channel_user") => ("channel_user", "通訊軟體使用者"),
+            Some("channel_unbound") => ("channel_unbound", "未連結帳號的使用者"),
+            Some("system") => ("system", "系統作業"),
+            _ => ("unknown", "無法確認使用者"),
+        },
+        _ => ("unknown", "無法確認使用者"),
+    };
+    json!({"kind":kind, "label":label})
 }

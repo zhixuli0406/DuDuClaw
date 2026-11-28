@@ -3,7 +3,7 @@ import { useIntl } from 'react-intl';
 import { Link, useNavigate } from 'react-router';
 import { Check } from 'lucide-react';
 import { ConnectionsChecklist } from './ConnectionsChecklist';
-import { api } from '@/lib/api';
+import { api, type SigninSteps } from '@/lib/api';
 import { formatError, toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConversationsStore } from '@/stores/conversations-store';
@@ -17,6 +17,8 @@ interface Progress {
   password_done: boolean;
   steps: Record<Step, Status>;
   examples: string[];
+  signin_steps?: SigninSteps;
+  steps_remaining?: number;
 }
 const STEPS: Step[] = ['channel', 'google', 'example', 'capabilities'];
 
@@ -58,13 +60,58 @@ export function FirstLoginCard({ enabled }: { enabled: boolean }) {
   if (error != null) return <Card><CardContent className="space-y-3"><p role="alert" className="text-sm">{formatError(error)}</p>
     <Button variant="outline" onClick={() => setRevision(r => r + 1)}>{t('errorState.retry')}</Button></CardContent></Card>;
   if (data && loadedFor !== user.id) return null;
-  if (data && !data.enabled) return <ConnectionsChecklist enabled={enabled} />;
-  if (!data || data.dismissed || (data.password_done && STEPS.every(step => data.steps[step] !== 'pending'))) return null;
+  if (data && !data.signin_steps && !data.enabled) return <ConnectionsChecklist enabled={enabled} />;
+  if (!data || data.dismissed || (!data.signin_steps && data.password_done && STEPS.every(step => data.steps[step] !== 'pending'))) return null;
   const tryExample = async (example: string) => {
     if (!await update({ step: 'example', status: 'done' })) return;
     useConversationsStore.getState().startNew();
     navigate('/chat', { state: { draft: example } });
   };
+
+  if (data.signin_steps) {
+    const steps = data.signin_steps;
+    const order = ['mfa', 'avatar', 'google', 'google_chat', 'odoo'] as const;
+    const counted = order.filter(step => !(step === 'odoo' && steps.odoo.status === 'not_applicable'));
+    const done = counted.filter(step => steps[step].status === 'done').length;
+    return <Card>
+      <CardHeader className="flex-row items-center justify-between gap-3">
+        <CardTitle>{t('firstLogin.title')}</CardTitle>
+        <Button variant="ghost" size="sm" disabled={busy} onClick={() => void update({ dismissed: true })}>{t('firstLogin.dismiss')}</Button>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">{t('firstLogin.description')}</p>
+        <p className="text-sm font-medium">{intl.formatMessage({ id: 'firstLogin.signin.progress' }, { done, total: counted.length })}</p>
+        <ol className="divide-y divide-border">{order.map(step => {
+          const status = steps[step].status;
+          let message = 'unknown';
+          let href: string | undefined;
+          let action: string | undefined;
+          let tag: string | undefined;
+          if (status === 'done') message = step === 'mfa' ? 'mfaDone' : 'done';
+          else if (step === 'mfa' && (status === 'recommended' || status === 'required')) {
+            message = 'mfaRecommended'; href = '/me/account?tab=account'; action = 'security';
+          } else if (step === 'avatar' && status === 'preparing') { message = 'avatarPreparing'; tag = 'preparing'; }
+          else if (step === 'avatar' && status === 'waiting_admin') { message = 'avatarWaiting'; tag = 'waitingAdmin'; }
+          else if (step === 'google' && status === 'pending') { message = 'googlePending'; href = '/me/connections'; action = 'google'; }
+          else if (step === 'google' && status === 'blocked_domain') message = 'googleBlocked';
+          else if (step === 'google_chat' && status === 'admin_binds') { message = 'chatAdmin'; tag = 'waitingAdmin'; }
+          else if (step === 'odoo' && status === 'not_applicable') message = 'odooAdmin';
+          else if (step === 'odoo' && ['pending', 'needs_reverify', 'invalid'].includes(status)) {
+            message = status === 'pending' ? 'odooPending' : 'odooReverify'; href = '/me/connections'; action = 'connections';
+          }
+          return <li key={step} className="space-y-2 py-3 text-sm">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <span className="flex items-center gap-2">{status === 'done' && <Check className="size-4 text-success" aria-hidden="true" />}{t(`firstLogin.signin.step.${step}`)}</span>
+              {tag && <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">{t(`firstLogin.signin.${tag}`)}</span>}
+            </div>
+            <p className="break-words text-muted-foreground">{intl.formatMessage({ id: `firstLogin.signin.${message}` }, { email: user.email ?? '' })}</p>
+            {href && <Link to={href} className="inline-block underline underline-offset-4 focus-visible:ring-3 focus-visible:ring-ring/50">{t(`firstLogin.signin.action.${action}`)}</Link>}
+          </li>;
+        })}</ol>
+        <Button variant="ghost" size="sm" disabled={busy} onClick={() => setRevision(r => r + 1)}>{t('firstLogin.refresh')}</Button>
+      </CardContent>
+    </Card>;
+  }
 
   return <>
     <Card>

@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
+mod runs;
+mod department;
+pub use runs::{
+    AutopilotRunRow, AutopilotRunStepRow, RunInsertOutcome, RunNext, StepApprovalBindMode,
+    is_known_run_state, run_ts, step_idempotency_key,
+    RUN_PENDING, RUN_RUNNING, RUN_WAITING, RUN_AWAITING_APPROVAL, RUN_DEFERRED, RUN_SETTLED,
+    STEP_PENDING, STEP_RUNNING, STEP_DONE, STEP_FAILED, STEP_SKIPPED,
+    MAX_UNSETTLED_RUNS_PER_RULE, MAX_UNSETTLED_RUNS_TOTAL, RUN_LEASE_SECS,
+};
+pub(crate) use runs::RUNS_SCHEMA_SQL;
+
 // ── Rule row ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,6 +49,47 @@ pub struct AutopilotRuleRow {
     /// "source":"pbd_rule_induction"}` so the dashboard can badge them and a
     /// future lifecycle pass can retire them. `None` for hand-authored rules.
     pub metadata: Option<String>,
+    /// Optional active-window JSON; NULL means unrestricted.
+    #[serde(default)]
+    pub active_window: Option<String>,
+    /// Optional run-policy JSON (outside-window handling and future policy).
+    #[serde(default)]
+    pub run_policy: Option<String>,
+    /// Authoritative organization department; NULL means company-wide.
+    #[serde(default)]
+    pub owner_department: Option<String>,
+    /// Creating account; NULL for legacy or system-created rules.
+    #[serde(default)]
+    pub created_by_user_id: Option<String>,
+    /// Last modifying account; NULL for system updates.
+    #[serde(default)]
+    pub updated_by_user_id: Option<String>,
+    /// Timestamp of the last definition or extension update.
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
+
+fn extensions_require_steps_envelope(row: &AutopilotRuleRow) -> Result<(), String> {
+    if row.active_window.is_some() || row.run_policy.is_some() || row.owner_department.is_some() {
+        let action = serde_json::from_str::<serde_json::Value>(&row.action).ok();
+        let action_type = action.as_ref().and_then(|v| v.as_object())
+            .and_then(|object| object.get("type")).and_then(|v| v.as_str());
+        if action_type != Some("steps") {
+            return Err("rules with an active window, run policy or owning department must use a steps action".into());
+        }
+    }
+    Ok(())
+}
+
+/// Typed extension writes only. Callers must validate contents and authority first.
+/// Outer None preserves a value; Some(None) clears it. Audit fields always change.
+#[derive(Debug, Clone)]
+pub struct RuleExtensionsPatch {
+    pub active_window: Option<Option<String>>,
+    pub run_policy: Option<Option<String>>,
+    pub owner_department: Option<Option<String>>,
+    pub updated_by_user_id: Option<String>,
+    pub updated_at: String,
 }
 
 // ── History row ─────────────────────────────────────────────
@@ -58,8 +110,9 @@ pub struct AutopilotHistoryRow {
 // ── Approval-gated dispatch ledger (v1.82) ──────────────────
 
 /// DDL of the approval-gated dispatch ledger. Must stay byte-identical to the
-/// `autopilot_approval_dispatch` statements at the end of
-/// `crates/duduclaw-import/src/autopilot-v182.sql` (the importer compares
+/// `autopilot_approval_dispatch` CREATE statements in
+/// `crates/duduclaw-import/src/autopilot-v182.sql` and `autopilot-v186.sql`
+/// (before the v1.86 ALTERs; the importer compares
 /// `sqlite_schema` exactly; `migration_import`'s catalog test pins the two).
 ///
 /// `dedupe_key` identifies (ingress event, rule, rule revision): one ingress
@@ -160,12 +213,18 @@ pub struct AutopilotDispatchRow {
     pub notice_pushed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Multi-step run owning this dispatch; NULL for single actions.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Step within the owning run; NULL for single actions.
+    #[serde(default)]
+    pub step_index: Option<i64>,
 }
 
 const DISPATCH_COLUMNS: &str = "dispatch_id, approval_id, rule_id, rule_name, rule_hash, event_name, \
      event_ref, dedupe_key, frozen_json, frozen_digest, state, outcome, detail, \
      notice_activity_pending, notice_push_state, notice_push_attempts, notice_push_next_at, \
-     notice_pushed_at, created_at, updated_at";
+     notice_pushed_at, created_at, updated_at, run_id, step_index";
 
 /// Run `f` inside `BEGIN IMMEDIATE` on `conn`: commit on `Ok`, roll back on
 /// `Err` (the connection is never left inside a transaction).
@@ -192,7 +251,8 @@ fn in_immediate_tx<T>(
 
 /// SELECT list of one rule (shared by `get_rule` and the rule fence).
 const RULE_SELECT: &str = "SELECT id, name, enabled, trigger_event, conditions, action,
-                    created_at, last_triggered_at, trigger_count, sequence, metadata
+                    created_at, last_triggered_at, trigger_count, sequence, metadata,
+                        active_window, run_policy, owner_department, created_by_user_id, updated_by_user_id, updated_at
              FROM autopilot_rules WHERE id = ?1";
 
 // ── Store ───────────────────────────────────────────────────
@@ -211,7 +271,9 @@ pub struct AutopilotStore {
 /// other process's rule write waits on SQLite's write lock, up to its busy
 /// timeout). Rule update / delete / disable therefore cannot land between
 /// the executor's final `enabled` + revision check and the point of no
-/// return. [`RuleFence::release`] commits (nothing is written under it);
+/// return. Multi-step execution may write only its lease-guarded step start
+/// or atomic wait completion on this connection. [`RuleFence::release`]
+/// commits those narrowly scoped writes;
 /// dropping it rolls back. Never call another store method while holding
 /// one — it would wait on the same connection.
 pub struct RuleFence<'a> {
@@ -220,7 +282,7 @@ pub struct RuleFence<'a> {
 }
 
 impl RuleFence<'_> {
-    /// End the fence (commit the empty write transaction).
+    /// End the fence, committing any step start or wait completion.
     pub fn release(mut self) -> Result<(), String> {
         self.open = false;
         match self.conn.execute_batch("COMMIT") {
@@ -316,6 +378,30 @@ impl AutopilotStore {
         // v1.82 approval gate: the durable ledger of approval-gated fires.
         conn.execute_batch(DISPATCH_SCHEMA_SQL)
             .map_err(|e| format!("init autopilot approval dispatch schema: {e}"))?;
+        // Fresh and upgraded stores must append columns in the same order.
+        for sql in [
+            "ALTER TABLE autopilot_rules ADD COLUMN active_window TEXT",
+            "ALTER TABLE autopilot_rules ADD COLUMN run_policy TEXT",
+            "ALTER TABLE autopilot_rules ADD COLUMN owner_department TEXT",
+            "ALTER TABLE autopilot_rules ADD COLUMN created_by_user_id TEXT",
+            "ALTER TABLE autopilot_rules ADD COLUMN updated_by_user_id TEXT",
+            "ALTER TABLE autopilot_rules ADD COLUMN updated_at TEXT",
+            "ALTER TABLE autopilot_approval_dispatch ADD COLUMN run_id TEXT",
+            "ALTER TABLE autopilot_approval_dispatch ADD COLUMN step_index INTEGER",
+        ] {
+            if let Err(e) = conn.execute(sql, []) {
+                if !e.to_string().contains("duplicate column name") {
+                    return Err(format!("autopilot v1.86 migration failed: {e}"));
+                }
+            }
+        }
+        conn.execute_batch(RUNS_SCHEMA_SQL)
+            .map_err(|e| format!("init autopilot runs schema: {e}"))?;
+        if let Err(e) = conn.execute("ALTER TABLE autopilot_runs ADD COLUMN gateway_origin INTEGER NOT NULL DEFAULT 0", []) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(format!("autopilot origin migration failed: {e}"));
+            }
+        }
         Ok(())
     }
 
@@ -326,7 +412,8 @@ impl AutopilotStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, enabled, trigger_event, conditions, action,
-                        created_at, last_triggered_at, trigger_count, sequence, metadata
+                        created_at, last_triggered_at, trigger_count, sequence, metadata,
+                        active_window, run_policy, owner_department, created_by_user_id, updated_by_user_id, updated_at
                  FROM autopilot_rules ORDER BY created_at ASC",
             )
             .map_err(|e| format!("prepare list rules: {e}"))?;
@@ -364,12 +451,14 @@ impl AutopilotStore {
     }
 
     pub async fn insert_rule(&self, row: &AutopilotRuleRow) -> Result<(), String> {
+        extensions_require_steps_envelope(row)?;
         let conn = self.conn.lock().await;
         conn.execute(
             "INSERT INTO autopilot_rules
                 (id, name, enabled, trigger_event, conditions, action,
-                 created_at, last_triggered_at, trigger_count, sequence, metadata)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 created_at, last_triggered_at, trigger_count, sequence, metadata,
+                 active_window, run_policy, owner_department, created_by_user_id, updated_by_user_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 row.id,
                 row.name,
@@ -382,6 +471,12 @@ impl AutopilotStore {
                 row.trigger_count,
                 row.sequence,
                 row.metadata,
+                row.active_window,
+                row.run_policy,
+                row.owner_department,
+                row.created_by_user_id,
+                row.updated_by_user_id,
+                row.updated_at,
             ],
         )
         .map_err(|e| format!("insert rule: {e}"))?;
@@ -395,8 +490,28 @@ impl AutopilotStore {
         id: &str,
         fields: &serde_json::Value,
     ) -> Result<Option<AutopilotRuleRow>, String> {
-        let has_changes = {
-            let conn = self.conn.lock().await;
+        self.update_rule_inner(id, fields, false).await
+    }
+
+    /// Legacy RPC admission must not race a typed department reassignment.
+    pub(crate) async fn update_company_rule(
+        &self, id: &str, fields: &serde_json::Value,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        self.update_rule_inner(id, fields, true).await
+    }
+
+    async fn update_rule_inner(
+        &self, id: &str, fields: &serde_json::Value, company_only: bool,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "update rule", |conn| {
+            if company_only {
+                let current = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                    .optional().map_err(|e| format!("read rule scope: {e}"))?;
+                if current.is_some_and(|row| row.owner_department.is_some()) {
+                    return Err("permission denied".into());
+                }
+            }
             let mut sets: Vec<String> = Vec::new();
             let mut binds: Vec<String> = Vec::new();
 
@@ -447,9 +562,7 @@ impl AutopilotStore {
                 }
             }
 
-            if sets.is_empty() {
-                false
-            } else {
+            if !sets.is_empty() {
                 binds.push(id.to_string());
                 let sql = format!(
                     "UPDATE autopilot_rules SET {} WHERE id = ?{}",
@@ -462,10 +575,96 @@ impl AutopilotStore {
                     .collect();
                 conn.execute(&sql, params_ref.as_slice())
                     .map_err(|e| format!("update rule: {e}"))?;
-                true
             }
-        };
-        self.get_rule(id).await
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read updated rule: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
+        })
+    }
+
+    /// Atomically persist a validated definition and its editor. Identity,
+    /// ownership, metadata and execution counters remain database-owned.
+    pub async fn replace_rule_definition(
+        &self,
+        id: &str,
+        definition: &AutopilotRuleRow,
+        updated_by: Option<&str>,
+        updated_at: &str,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        self.replace_rule_definition_inner(id, definition, updated_by, updated_at, false).await
+    }
+
+    /// Legacy Admin updates cannot modify department rules, even after a scope race.
+    pub(crate) async fn replace_company_rule_definition(
+        &self, id: &str, definition: &AutopilotRuleRow,
+        updated_by: Option<&str>, updated_at: &str,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        self.replace_rule_definition_inner(id, definition, updated_by, updated_at, true).await
+    }
+
+    async fn replace_rule_definition_inner(
+        &self, id: &str, definition: &AutopilotRuleRow,
+        updated_by: Option<&str>, updated_at: &str, company_only: bool,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "replace rule definition", |conn| {
+            if company_only {
+                let current = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                    .optional().map_err(|e| format!("read rule scope: {e}"))?;
+                if current.is_some_and(|row| row.owner_department.is_some()) {
+                    return Err("permission denied".into());
+                }
+            }
+            let n = conn.execute(
+                "UPDATE autopilot_rules SET name = ?1, enabled = ?2,
+                 trigger_event = ?3, conditions = ?4, action = ?5, sequence = ?6,
+                 active_window = ?7, run_policy = ?8, updated_by_user_id = ?9,
+                 updated_at = ?10 WHERE id = ?11",
+                params![definition.name, definition.enabled, definition.trigger_event,
+                    definition.conditions, definition.action, definition.sequence,
+                    definition.active_window, definition.run_policy, updated_by, updated_at, id],
+            ).map_err(|e| format!("replace rule definition: {e}"))?;
+            if n == 0 { return Ok(None); }
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read replaced rule: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
+        })
+    }
+
+    /// Callers must validate extension contents and authorization before writing.
+    /// Raw RPC maps deliberately cannot reach these columns through update_rule.
+    pub async fn set_rule_extensions(
+        &self,
+        id: &str,
+        patch: &RuleExtensionsPatch,
+    ) -> Result<Option<AutopilotRuleRow>, String> {
+        let conn = self.conn.lock().await;
+        in_immediate_tx(&conn, "set rule extensions", |conn| {
+            let n = conn.execute(
+                "UPDATE autopilot_rules SET
+                 active_window = CASE WHEN ?1 THEN ?2 ELSE active_window END,
+                 run_policy = CASE WHEN ?3 THEN ?4 ELSE run_policy END,
+                 owner_department = CASE WHEN ?5 THEN ?6 ELSE owner_department END,
+                 updated_by_user_id = ?7, updated_at = ?8 WHERE id = ?9",
+                params![patch.active_window.is_some(), patch.active_window.as_ref().and_then(|v| v.as_deref()),
+                    patch.run_policy.is_some(), patch.run_policy.as_ref().and_then(|v| v.as_deref()),
+                    patch.owner_department.is_some(), patch.owner_department.as_ref().and_then(|v| v.as_deref()),
+                    patch.updated_by_user_id, patch.updated_at, id],
+            ).map_err(|e| format!("set rule extensions: {e}"))?;
+            if n == 0 { return Ok(None); }
+            let row = conn.query_row(RULE_SELECT, params![id], row_to_rule)
+                .optional().map_err(|e| format!("read rule extensions: {e}"))?;
+            if let Some(row) = &row {
+                extensions_require_steps_envelope(row)?;
+            }
+            Ok(row)
+        })
     }
 
     pub async fn remove_rule(&self, id: &str) -> Result<bool, String> {
@@ -558,6 +757,12 @@ impl AutopilotStore {
     /// the insert run in one `BEGIN IMMEDIATE` transaction, so two writers
     /// (two gateway processes on one home) cannot both insert.
     pub async fn insert_dispatch(&self, row: &AutopilotDispatchRow) -> Result<bool, String> {
+        if (row.run_id.is_some() || row.step_index.is_some())
+            && (row.run_id.is_none() || row.step_index.is_none()
+                || row.state != DISPATCH_REQUESTING || row.approval_id.is_some())
+        {
+            return Err("step dispatch must start requesting and unbound".into());
+        }
         let conn = self.conn.lock().await;
         let cutoff = (chrono::Utc::now()
             - chrono::Duration::seconds(crate::autopilot_approval::DEDUPE_WINDOW_SECS))
@@ -580,7 +785,7 @@ impl AutopilotStore {
                 &format!(
                     "INSERT INTO autopilot_approval_dispatch ({DISPATCH_COLUMNS})
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                             ?17, ?18, ?19, ?20)"
+                             ?17, ?18, ?19, ?20, ?21, ?22)"
                 ),
                 params![
                     row.dispatch_id,
@@ -603,6 +808,8 @@ impl AutopilotStore {
                     row.notice_pushed_at,
                     row.created_at,
                     row.updated_at,
+                    row.run_id,
+                    row.step_index,
                 ],
             )
             .map_err(|e| format!("insert approval dispatch: {e}"))?;
@@ -651,6 +858,16 @@ impl AutopilotStore {
 
     /// The outcome's Activity Feed entry exists: clear the flag. `Ok(true)`
     /// only for the caller that cleared it.
+    /// A scope denial settles the durable notice, without an Activity or push.
+    pub async fn deny_dispatch_notice(&self, dispatch_id: &str) -> Result<(), String> {
+        let conn = self.conn.lock().await;
+        conn.execute("UPDATE autopilot_approval_dispatch SET notice_activity_pending=0,
+            notice_push_state='scope_denied', notice_push_next_at=NULL
+            WHERE dispatch_id=?1 AND state='settled'", params![dispatch_id])
+            .map_err(|_| "settle scope-denied approval notice".to_string())?;
+        Ok(())
+    }
+
     pub async fn mark_dispatch_activity_done(&self, dispatch_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let n = conn
@@ -748,13 +965,14 @@ impl AutopilotStore {
     }
 
     /// [`DISPATCH_REQUESTING`] → [`DISPATCH_AWAITING`] with the filed
-    /// approval id. `false` when the row is no longer requesting.
+    /// approval id for a single action. Run steps must use the atomic bind.
+    /// `false` when the row is no longer requesting or belongs to a run.
     pub async fn mark_dispatch_awaiting(&self, dispatch_id: &str, approval_id: &str) -> Result<bool, String> {
         let conn = self.conn.lock().await;
         let n = conn
             .execute(
                 "UPDATE autopilot_approval_dispatch SET state = ?1, approval_id = ?2, updated_at = ?3
-                 WHERE dispatch_id = ?4 AND state = ?5",
+                 WHERE dispatch_id = ?4 AND state = ?5 AND run_id IS NULL AND step_index IS NULL",
                 params![
                     DISPATCH_AWAITING,
                     approval_id,
@@ -774,7 +992,15 @@ impl AutopilotStore {
         let n = conn
             .execute(
                 "UPDATE autopilot_approval_dispatch SET state = ?1, updated_at = ?2
-                 WHERE dispatch_id = ?3 AND state = ?4",
+                 WHERE dispatch_id = ?3 AND state = ?4
+                   AND (?1 != 'awaiting' OR (run_id IS NULL AND step_index IS NULL)
+                     OR (state='executing' AND approval_id IS NOT NULL AND EXISTS (
+                       SELECT 1 FROM autopilot_runs r JOIN autopilot_run_steps s
+                         ON s.run_id=r.run_id AND s.step_index=r.step_index
+                       WHERE r.run_id=autopilot_approval_dispatch.run_id
+                         AND r.step_index=autopilot_approval_dispatch.step_index
+                         AND r.state='awaiting_approval' AND s.state='running'
+                         AND s.dispatch_id=autopilot_approval_dispatch.dispatch_id)))",
                 params![to, chrono::Utc::now().to_rfc3339(), dispatch_id, from],
             )
             .map_err(|e| format!("transition dispatch: {e}"))?;
@@ -836,7 +1062,7 @@ impl AutopilotStore {
             if count_fire {
                 conn.execute(
                     "UPDATE autopilot_rules SET trigger_count = trigger_count + 1, last_triggered_at = ?1
-                     WHERE id = (SELECT rule_id FROM autopilot_approval_dispatch WHERE dispatch_id = ?2)",
+                     WHERE id = (SELECT rule_id FROM autopilot_approval_dispatch WHERE dispatch_id = ?2 AND run_id IS NULL)",
                     params![now, dispatch_id],
                 )
                 .map_err(|e| format!("settle dispatch trigger count: {e}"))?;
@@ -848,6 +1074,8 @@ impl AutopilotStore {
 
 fn row_to_dispatch(row: &rusqlite::Row) -> rusqlite::Result<AutopilotDispatchRow> {
     Ok(AutopilotDispatchRow {
+        run_id: row.get(20)?,
+        step_index: row.get(21)?,
         dispatch_id: row.get(0)?,
         approval_id: row.get(1)?,
         rule_id: row.get(2)?,
@@ -873,6 +1101,12 @@ fn row_to_dispatch(row: &rusqlite::Row) -> rusqlite::Result<AutopilotDispatchRow
 
 fn row_to_rule(row: &rusqlite::Row) -> rusqlite::Result<AutopilotRuleRow> {
     Ok(AutopilotRuleRow {
+        active_window: row.get(11)?,
+        run_policy: row.get(12)?,
+        owner_department: row.get(13)?,
+        created_by_user_id: row.get(14)?,
+        updated_by_user_id: row.get(15)?,
+        updated_at: row.get(16)?,
         id: row.get(0)?,
         name: row.get(1)?,
         enabled: row.get::<_, i32>(2)? != 0,
@@ -897,3 +1131,6 @@ fn row_to_history(row: &rusqlite::Row) -> rusqlite::Result<AutopilotHistoryRow> 
         details: row.get(5)?,
     })
 }
+
+#[cfg(test)]
+mod tests;

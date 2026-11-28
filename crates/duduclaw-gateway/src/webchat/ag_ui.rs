@@ -114,6 +114,7 @@ async fn authenticate(state: &WebChatState, headers: &HeaderMap) -> Result<ChatC
 
 async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
     let claims = match authenticate(&state.chat, &headers).await { Ok(c) => c, Err(r) => return r };
+    crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(claims.origin(), async {
     if headers.get(axum::http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(';').next()).map(str::trim) != Some("application/json") {
         return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, "json_required");
@@ -138,6 +139,13 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     if !state.chat.ctx.registry.read().await.get(&agent).is_some_and(|a| a.config.agent.status.is_operational()) {
         return error(StatusCode::FORBIDDEN, "agent_unavailable");
     }
+    let sid = session_id(&user, &agent, &input.thread_id);
+    if input.resume.is_empty() {
+        if let Err(text) = crate::webchat::entry::check(&state.chat, &user, &agent, &sid, &user,
+            text.as_deref().unwrap_or(""), false, &input.run_id).await {
+            return (StatusCode::CONFLICT, Json(json!({"error":"employee_entry_refused", "message":text}))).into_response();
+        }
+    }
     let lifetime = run_lifetime(&state.chat.ctx.home_dir, &agent);
     let Some(broker) = state.chat.approvals.clone() else { return error(StatusCode::SERVICE_UNAVAILABLE, "approvals_unavailable") };
     let principal = duduclaw_core::HumanPrincipal::user(&user).map(|p| p.to_string());
@@ -145,7 +153,6 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
     if broker.check_webchat_turn_admission(&principal).await.is_err() {
         return error(StatusCode::SERVICE_UNAVAILABLE, "approval_capacity");
     }
-    let sid = session_id(&user, &agent, &input.thread_id);
     let _admission = state.admission.lock().await;
     let has_live_thread = match state.runs.lock() {
         Ok(runs) => runs.contains_key(&sid),
@@ -218,7 +225,8 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
         let waiting = Arc::new(AtomicBool::new(false));
         runs.insert(sid.clone(), Entry { user: user.clone(), resume, waiting: waiting.clone() });
         let lease = RunLease { state: state.clone(), sid: sid.clone() };
-        tokio::spawn(run::start(state.clone(), broker, lease, user, agent, sid, turn, principal, text, connection, incoming, waiting, lifetime));
+        let origin = connection.claims.origin();
+        tokio::spawn(crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(origin, run::start(state.clone(), broker, lease, user, agent, sid, turn, principal, text, connection, incoming, waiting, lifetime)));
     }
     drop(runs);
     // Acknowledgement happens when axum asks for the next frame. Dropping the
@@ -232,6 +240,7 @@ async fn handle(State(state): State<Arc<AgUiState>>, Path(agent): Path<String>, 
         Some((Ok::<_, Infallible>(event), (receiver, Some(frame.ack), lease)))
     });
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive")).into_response()
+    }).await
 }
 
 async fn send(connection: &Connection, value: Value) -> Result<(), ()> {

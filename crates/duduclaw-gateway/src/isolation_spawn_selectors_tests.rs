@@ -162,17 +162,46 @@ fn spawn_agent_personal_source_to_shared_target_defers_to_owner_card() {
 
 #[test]
 fn spawn_agent_target_must_pass_delegation_policy() {
-    let (home, resolver, context) = fixture(None);
+    let (home, _resolver, context) = fixture(None);
+    let users = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let admin = users.create_user("spawn-admin@test.invalid", "Admin", "test-password",
+        duduclaw_auth::UserRole::Admin).unwrap();
+    std::fs::create_dir_all(home.path().join("agents/target")).unwrap();
+    let mut record = context.record().clone();
+    record.principal = Principal::Human { user_id: t(&admin.id), generation: 1 };
+    record.employee_binding = EmployeeBinding::Personal(t(&admin.id));
+    // Keep the live user, record and source binding consistent so identity()
+    // does not refuse the call before the delegation policy is evaluated.
+    let mut bindings = BindingStore::new(Connection::open_in_memory().unwrap()).unwrap();
+    bindings.register_principal(&record.principal).unwrap();
+    bindings.create_employee(EMPLOYEE, &record.employee_binding).unwrap();
+    let resolver = GatewayResourceResolver::new(home.path().to_owned(), EMPLOYEE, "employee-a".into(),
+        Arc::new(Mutex::new(bindings))).unwrap();
+    let context = RequestContext::from_verified_record(record);
+    assert_eq!(resolver.identity(&context), Ok(()));
+    let principal = duduclaw_core::HumanPrincipal::user(&admin.id).unwrap().to_string();
     let spawn = duduclaw_mcp_boundary::tool_policy::policy("spawn_agent").unwrap();
     let args = json!({"agent_id":"target", "task":"Prepare the report."});
     // Hierarchy: unrelated (unknown) employees fail closed before any binding read.
     policy(home.path(), "hierarchy");
+    let boundaries = crate::delegation_roles::sync_boundaries(home.path(), "employee-a", "target", Some(&principal));
+    assert!(boundaries.main_target_allowed, "main boundary must not mask the delegation-policy refusal");
+    assert!(boundaries.personal_target_allowed);
+    let read = duduclaw_core::delegation_policy::read_delegation_config(home.path());
+    assert!(read.overrides.unrestricted_roles.is_empty());
+    let roles = crate::delegation_roles::GatewayOwnerRoles::new(home.path(),
+        crate::delegation_roles::Requester::isolated(&context, None));
+    let org = crate::delegation_gate::DispatchOrgView::new(home.path(), None);
+    let denied = duduclaw_core::delegation_policy::evaluate_delegation(&read.rules, &org, "employee-a", "target",
+        &duduclaw_core::delegation_policy::DelegationContext {
+            overrides: &read.overrides, owner_roles: Some(&roles), boundaries, extra_system_senders: &[],
+        }).unwrap_err();
+    assert_eq!(denied.reason, duduclaw_core::delegation_policy::DenyReason::NoHierarchyRelation);
     assert_eq!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Invalid));
     // Open: the policy passes, so the refusal now comes from the binding read
     // (no apply.db: unavailable, never a grant).
     policy(home.path(), "open");
-    assert_ne!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Invalid));
-    assert!(resolver.resolve(&context, spawn, &args).is_err());
+    assert_eq!(resolver.resolve(&context, spawn, &args), Err(VerificationError::Unavailable));
     // Self-delegation and ephemeral/reserved targets are refused outright.
     for target in ["employee-a", "eph-1a2b3c4d5e6f", "cron"] {
         let args = json!({"agent_id": target, "task":"work"});

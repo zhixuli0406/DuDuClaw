@@ -18,6 +18,69 @@ use crate::cost_telemetry::{RequestType, TokenUsage};
 use crate::runtime::{ConversationTurn, RuntimeContext, RuntimeRegistry, RuntimeResponse};
 use crate::runtime_config::RuntimeSettings;
 
+tokio::task_local! {
+    // Owned employee snapshot, scoped over one chat or background execution.
+    // It survives registry unlock, rotation and runtime fallback, not spawn().
+    static CHAT_TURN_CONFIG: std::sync::Arc<crate::entry_gate::ResolvedTurnConfig>;
+}
+
+pub(crate) async fn with_chat_turn_config<F: std::future::Future>(
+    snapshot: std::sync::Arc<crate::entry_gate::ResolvedTurnConfig>, future: F,
+) -> F::Output {
+    CHAT_TURN_CONFIG.scope(snapshot, future).await
+}
+
+/// None means this is a different employee or a caller without a snapshot.
+/// Once Some is returned, absent fields are authoritative: never reread disk.
+pub(crate) fn chat_turn_config(
+    agent_dir: Option<&Path>,
+) -> Option<std::sync::Arc<crate::entry_gate::ResolvedTurnConfig>> {
+    if in_utility_call() { return None; }
+    CHAT_TURN_CONFIG.try_with(|turn| {
+        (agent_dir == Some(turn.registry_agent.dir.as_path())).then(|| turn.clone())
+    }).ok().flatten()
+}
+
+/// Prompt assembly shares the admitted employee document just like runtime routing.
+pub(crate) fn chat_profile(agent_dir: &Path) -> std::io::Result<duduclaw_core::profile_sections::ProfileSections> {
+    use duduclaw_core::profile_sections::ProfileSections;
+    match chat_turn_config(Some(agent_dir)) {
+        Some(turn) => {
+            let config = turn.document.as_table().ok_or_else(||
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "turn configuration is not a table"))?;
+            ProfileSections::load_with_config(agent_dir, config)
+        }
+        None => ProfileSections::load(agent_dir),
+    }
+}
+
+/// Preserve read_agent_effort's parser semantics, including absence/invalid
+/// values meaning provider default, without falling through to another read.
+pub(crate) fn chat_effort(agent_dir: Option<&Path>) -> Option<duduclaw_core::effort::Effort> {
+    match chat_turn_config(agent_dir) {
+        Some(turn) => {
+            let value = turn.document.get("model")?.get("effort")?.as_str()?;
+            match value.parse() {
+                Ok(effort) => Some(effort),
+                Err(()) => {
+                    tracing::warn!(agent_dir = %turn.registry_agent.dir.display(), value,
+                        "agent.toml [model] effort is not one of low/medium/high/xhigh/max — ignoring");
+                    None
+                }
+            }
+        }
+        None => agent_dir.and_then(duduclaw_core::effort::read_agent_effort),
+    }
+}
+
+pub(crate) fn chat_fallback_model(agent_dir: &Path) -> Option<String> {
+    match chat_turn_config(Some(agent_dir)) {
+        Some(turn) => turn.sections.model.fallback.as_deref()
+            .map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        None => crate::runtime_config::agent_fallback_model(agent_dir),
+    }
+}
+
 /// Per-`home_dir` registry cache (RFC-25 R2).
 ///
 /// Previously a single `OnceCell` bound the registry to the *first* `home_dir`
@@ -278,6 +341,67 @@ pub struct AgentPrompt<'a> {
 pub async fn run_agent_prompt_detailed(
     req: AgentPrompt<'_>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    run_agent_prompt_scoped(req, None).await
+}
+
+tokio::task_local! {
+    /// Applies only to the new Claude continuation; older primary paths keep
+    /// their existing environment behavior.
+    pub(crate) static CLAUDE_FALLBACK_SPAWN: ();
+
+    /// Host-declared purpose of this exact call; nested employee calls replace it.
+    static CURRENT_SPAWN_PURPOSE: SpawnPurpose;
+}
+
+pub(crate) fn is_agentless_utility_call() -> bool {
+    CURRENT_SPAWN_PURPOSE.try_with(|purpose| *purpose == SpawnPurpose::Utility)
+        .unwrap_or_else(|_| in_utility_call())
+}
+
+pub(crate) fn in_claude_runtime_fallback() -> bool {
+    CLAUDE_FALLBACK_SPAWN.try_with(|_| ()).is_ok()
+}
+
+pub(crate) fn apply_claude_fallback_spawn_env(
+    cmd: &mut tokio::process::Command, caps: Option<&duduclaw_core::types::CapabilitiesConfig>,
+) {
+    if in_claude_runtime_fallback() {
+        // Use the common environment list without changing the runtime's
+        // namespace policy: Codex/Grok native sandboxes may need namespaces.
+        cmd.env_clear();
+        cmd.envs(duduclaw_core::spawn_env::agent_cli_spawn_env_pairs_for(caps));
+        let granted = duduclaw_core::spawn_env::git_credentials_granted_names(caps);
+        if !granted.is_empty() {
+            tracing::info!(names = ?granted, "runtime fallback: forwarding granted git credential references");
+        }
+    }
+}
+
+/// Keep Claude primary successes in the same health ledger as its failures.
+pub(crate) async fn record_claude_runtime_success(home: &Path) {
+    failover(home).record_success(&RuntimeType::Claude).await;
+}
+
+/// Continue a failed Claude call through the same dispatch context and spawn
+/// gates, without executing the primary again. None preserves caller stop logic.
+pub(crate) async fn run_claude_runtime_fallback(
+    req: AgentPrompt<'_>, error: &str,
+) -> Option<Result<RuntimeResponse, RuntimeDispatchFailure>> {
+    let fallback = req.runtime_settings.map(|s| s.fallback)
+        .unwrap_or_else(|| req.agent_dir.and_then(crate::runtime_config::agent_runtime_fallback));
+    if !crate::failover::claude_runtime_fallback_eligible(error, fallback.as_ref()) {
+        return None;
+    }
+    Some(CLAUDE_FALLBACK_SPAWN.scope((), run_agent_prompt_scoped(req, Some(error))).await)
+}
+
+async fn run_agent_prompt_scoped(
+    req: AgentPrompt<'_>, primary_error: Option<&str>,
+) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
+    // Direct dispatch callers also need the marker; Chat preserves the
+    // WebChat/shared-member scope (or the absence of one for ordinary channels).
+    let dispatch = req.request_type == RequestType::Dispatch;
+    let purpose = req.purpose;
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -286,7 +410,7 @@ pub async fn run_agent_prompt_detailed(
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_string();
-    crate::process_group::with_class(crate::process_group::request_class(req.request_type),
+    let run = Box::pin(crate::process_group::with_class(crate::process_group::request_class(req.request_type),
     crate::autonomous_runtime::request_scope(
         req.home_dir,
         &owner,
@@ -298,10 +422,18 @@ pub async fn run_agent_prompt_detailed(
             crate::on_behalf_of::context::scope(
                 req.home_dir,
                 req.agent_id,
-                crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req)),
+                crate::runtime_turn::scope(req.agent_id, run_agent_prompt_inner(req, primary_error)),
             ),
         ),
-    )).await
+    )));
+    let run = CURRENT_SPAWN_PURPOSE.scope(purpose, run);
+    if dispatch {
+        crate::on_behalf_of::access::MAIN_TURN_USE.scope(
+            crate::on_behalf_of::access::MainUse::Assign, run,
+        ).await
+    } else {
+        run.await
+    }
 }
 
 /// Backward-compatible String view; execution/usage happens only in detailed.
@@ -312,7 +444,7 @@ pub async fn run_agent_prompt(req: AgentPrompt<'_>) -> Result<RuntimeResponse, S
 }
 
 async fn run_agent_prompt_inner(
-    req: AgentPrompt<'_>,
+    req: AgentPrompt<'_>, primary_error: Option<&str>,
 ) -> Result<RuntimeResponse, RuntimeDispatchFailure> {
     // Every runtime (Codex, Grok, OpenAI-compatible, generic CLIs, Claude via
     // failover) would otherwise start an employee's work with no employee
@@ -333,16 +465,7 @@ async fn run_agent_prompt_inner(
     }
     crate::isolation_readiness::check_execution().map_err(|error|
         RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config, error))?;
-    if let Some(dir) = req.agent_dir {
-        crate::runtime_config::ensure_active_agent_provider(dir).map_err(|error| {
-            RuntimeDispatchFailure::preflight(
-                req.provider_override,
-                req.model,
-                RuntimePreflightKind::Config,
-                error,
-            )
-        })?;
-    }
+    let snapshot = chat_turn_config(req.agent_dir);
     // Knowledge-base tool calls made during this call learn who the turn is
     // for from the gateway's own record (every runtime, not just Claude).
     // Nothing is registered outside a channel turn; dropped on return.
@@ -356,21 +479,41 @@ async fn run_agent_prompt_inner(
     let owned_settings;
     let settings: &RuntimeSettings = match req.runtime_settings {
         Some(s) => s,
-        None => {
-            owned_settings = req
-                .agent_dir
-                .map(crate::runtime_config::load_runtime_settings)
-                .unwrap_or_default();
-            &owned_settings
-        }
+        None => match snapshot.as_ref().map(|turn| &turn.runtime_settings) {
+            Some(s) => s,
+            None => {
+                owned_settings = match req.agent_dir {
+                    Some(dir) => crate::runtime_config::load_runtime_settings_strict(dir)
+                        .map_err(|error| RuntimeDispatchFailure::preflight(
+                            req.provider_override, req.model, RuntimePreflightKind::Config,
+                            crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::Config(error)),
+                        ))?,
+                    None => RuntimeSettings::default(),
+                };
+                &owned_settings
+            }
+        },
     };
+    // Snapshots already passed this gate. Legacy direct callers still check
+    // removed runtime/team selectors, but never recover from an invalid read.
+    if let Some(dir) = req.agent_dir.filter(|_| snapshot.is_none()) {
+        crate::runtime_config::ensure_active_agent_provider(dir).map_err(|diagnostic|
+            RuntimeDispatchFailure::preflight(req.provider_override, req.model, RuntimePreflightKind::Config,
+                crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::InactiveRuntime { diagnostic })))?;
+    }
     let provider = req.provider_override.unwrap_or(settings.provider);
     // v1.84.0: a bare Claude alias saved on a prefixed non-Claude engine runs
     // with that engine's catalog default (warned once per agent) instead of
     // being refused; every other mismatch keeps the refusal below.
     let runnable_model = crate::runtime_config::runnable_model(req.agent_id, req.model, provider);
     let model: &str = &runnable_model;
-    crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Config,error))?;
+    crate::runtime_config::ensure_model_provider(model, provider).map_err(|error|
+        RuntimeDispatchFailure::preflight(Some(provider), model, RuntimePreflightKind::Config,
+            if req.agent_dir.is_some() {
+                crate::entry_gate::background_refusal(&crate::entry_gate::EntryRefusal::ModelProviderMismatch {
+                    model: model.to_owned(), provider,
+                })
+            } else { crate::runtime_config::alignment_refusal_with_fallback(error, settings.fallback) }))?;
     crate::product_policy::require_runtime(req.home_dir, provider.as_str()).map_err(|error|RuntimeDispatchFailure::preflight(Some(provider),model,RuntimePreflightKind::Policy,error))?;
     // F5: only a catalog default DuDuClaw substituted is attributed to its
     // runtime's vendor; every other model keeps the v1.83.0 selector rule
@@ -413,6 +556,7 @@ async fn run_agent_prompt_inner(
         // Capability enforcement (W1): resolved from `agent.toml [capabilities]`
         // so every runtime (Claude AND non-Claude) receives the agent's tool
         // restrictions. `None` only for agent-less utility calls (no agent_dir).
+        // TODO(W6): capabilities and account_pool remain raw agent.toml reads pending a scope decision.
         capabilities: req
             .agent_dir
             .and_then(crate::runtime::load_agent_capabilities),
@@ -428,23 +572,21 @@ async fn run_agent_prompt_inner(
         // team role spec) wins; otherwise fall back to the agent's own
         // `agent.toml [model] effort`. Both absent ⇒ `None`, and every runtime
         // builds a byte-identical argv.
-        effort: req.effort.or_else(|| {
-            req.agent_dir
-                .and_then(duduclaw_core::effort::read_agent_effort)
-        }),
+        effort: req.effort.or_else(|| chat_effort(req.agent_dir)),
         allow_cross_family_failover: req.allow_cross_family_failover && !in_utility_call(),
     };
 
-    // WP-A1: the agent's cross-provider model chain. Cross-runtime failover uses
+    // The singular fallback precedes the cross-provider chain. Runtime failover uses
     // it to pick a model the *fallback* runtime actually serves instead of
     // forwarding the primary's model id verbatim (a codex agent's `gpt-5.4`
     // used to be handed to the Claude runtime). Empty for agent-less utility
-    // calls and for agents that configure no chain — the failover resolver then
+    // calls and for agents that configure no candidates — the resolver then
     // falls through to `context.model` / the runtime catalog default.
-    let model_fallbacks = req
-        .agent_dir
-        .map(crate::runtime_config::agent_model_fallbacks)
-        .unwrap_or_default();
+    let model_fallbacks = match snapshot.as_ref() {
+        Some(turn) => turn.sections.model.fallback.iter().chain(&turn.sections.model.fallbacks)
+            .map(|value| value.trim().to_string()).filter(|value| !value.is_empty()).collect(),
+        None => req.agent_dir.map(crate::runtime_config::agent_model_fallbacks).unwrap_or_default(),
+    };
 
     // RFC-25 R1: route through the FailoverManager so provider health is tracked
     // (3 consecutive failures → cooldown) and a failing primary auto-falls back to
@@ -455,14 +597,15 @@ async fn run_agent_prompt_inner(
     let resp = crate::cost_telemetry::USAGE_ESTIMATED
         .scope(
             usage_estimated.clone(),
-            RUNTIME_USAGE_REQUEST_TYPE.scope(req.request_type, failover(req.home_dir).execute_with_failover_detailed(
-                &reg,
-                &provider,
-                fallback.as_ref(),
-                req.prompt,
-                &ctx,
-                &model_fallbacks,
-            )),
+            RUNTIME_USAGE_REQUEST_TYPE.scope(req.request_type, async {
+                if let Some(error) = primary_error {
+                    failover(req.home_dir).after_claude_failure(&reg, fallback.as_ref(), req.prompt,
+                        &ctx, &model_fallbacks, error).await
+                } else {
+                    failover(req.home_dir).execute_with_failover_detailed(&reg, &provider,
+                        fallback.as_ref(), req.prompt, &ctx, &model_fallbacks).await
+                }
+            }),
         )
         .await?;
     let usage_estimated = usage_estimated.load(std::sync::atomic::Ordering::Relaxed);
@@ -1653,7 +1796,7 @@ pub(crate) mod testing {
     pub(super) fn owned_registry(home: &Path) -> Option<Arc<RuntimeRegistry>> {
         OWNED_REGISTRIES
             .get()
-            .and_then(|map| map.lock().unwrap().get(home).cloned())
+            .and_then(|map| map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(home).cloned())
     }
 
     pub(crate) struct RegistryGuard {
@@ -1664,11 +1807,19 @@ pub(crate) mod testing {
         pub(crate) async fn install(home: &Path, registry: RuntimeRegistry) -> Self {
             assert!(home.is_dir());
             let registry = Arc::new(registry);
-            let mut map = OWNED_REGISTRIES
-                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
-            assert!(map.insert(home.to_owned(), registry.clone()).is_none());
+            let installed = {
+                let mut map = OWNED_REGISTRIES
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(home.to_owned()) {
+                    entry.insert(registry.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            assert!(installed, "a RegistryGuard for this home is already installed: {}", home.display());
             Self {
                 home: home.to_owned(),
                 registry,
@@ -1677,13 +1828,66 @@ pub(crate) mod testing {
     }
     impl Drop for RegistryGuard {
         fn drop(&mut self) {
-            let mut map = OWNED_REGISTRIES.get().unwrap().lock().unwrap();
-            assert!(
-                map.get(&self.home)
-                    .is_some_and(|actual| Arc::ptr_eq(actual, &self.registry))
-            );
-            map.remove(&self.home);
+            if let Some(map) = OWNED_REGISTRIES.get() {
+                let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if map.get(&self.home).is_some_and(|actual| Arc::ptr_eq(actual, &self.registry)) {
+                    map.remove(&self.home);
+                }
+            }
         }
+    }
+
+    pub(crate) type RecordedFallback = Arc<std::sync::Mutex<Vec<RuntimeContext>>>;
+
+    pub(crate) struct RecordingCodex(pub RecordedFallback);
+    #[async_trait::async_trait]
+    impl crate::runtime::AgentRuntime for RecordingCodex {
+        fn name(&self) -> &str { "codex" }
+        async fn is_available(&self) -> bool { true }
+        async fn execute(&self, _: &str, context: &RuntimeContext) -> Result<RuntimeResponse, String> {
+            self.0.lock().unwrap().push(context.clone());
+            Ok(RuntimeResponse { content: "CODEX_FALLBACK_OK".into(), runtime_name: "codex".into(),
+                model_used: context.model.clone(), ..Default::default() })
+        }
+    }
+
+    /// Run exactly one test in an isolated process; never discover a host CLI.
+    #[cfg(unix)]
+    pub(crate) fn isolated_claude_test(full_name: &str, child_test: impl FnOnce(&Path)) {
+        const CHILD_HOME: &str = "DUDU_TEST_RUNTIME_FALLBACK_HOME";
+        if let Some(home) = std::env::var_os(CHILD_HOME) {
+            let home = Path::new(&home); assert_eq!(duduclaw_core::which_claude().as_deref(), home.join("bin/claude").to_str()); child_test(home);
+            return;
+        }
+        use std::os::unix::process::CommandExt;
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::test_exec::write_executable(&bin.join("claude"),
+            "#!/bin/sh\nif [ \"$#\" -eq 1 ] && [ \"$1\" = --version ]; then echo 99999.0.0; exit 0; fi\n\
+             if [ \"$#\" -eq 2 ] && [ \"$1\" = auth ] && [ \"$2\" = status ]; then echo '{\"loggedIn\":false}'; exit 1; fi\n\
+             printf '%s\\n' \"$@\" >> \"$HOME/claude-argv\"\n\
+             /bin/cat \"$HOME/stream.jsonl\"\nexit 1\n", 0o755);
+        let name = full_name.split_once("::").unwrap().1;
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.env_clear().env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", home.path()).env("DUDUCLAW_HOME", home.path()).env(CHILD_HOME, home.path())
+            .args(["--exact", name, "--nocapture"])
+            .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).process_group(0);
+        let mut child = command.spawn().unwrap();
+        let start = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if start.elapsed() > std::time::Duration::from_secs(45) {
+                let _ = duduclaw_core::platform::kill_process_group(child.id());
+                let _ = child.wait();
+                panic!("isolated runtime fallback test exceeded deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("running 1 test"), "{stdout}");
+        assert!(output.status.success(), "{stdout}\n{}", String::from_utf8_lossy(&output.stderr));
     }
 
     // ── RM-181: a test-owned builder for the PRODUCTION cache ──────────
@@ -2195,5 +2399,181 @@ mod budget_preflight_tests {
         assert!(failure.to_string().contains("402.00"));
         assert!(failure.steps.is_empty());
         assert_eq!(crate::budget::budget_refusal_message(&failure.legacy_message()), Some(refusal.to_string().as_str()));
+    }
+}
+
+#[cfg(test)]
+mod claude_fallback_stop_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn claude_fallback_spawn_env_is_scoped_and_preserves_explicit_vendor_credentials() {
+        testing::isolated_claude_test(
+            concat!(module_path!(), "::claude_fallback_spawn_env_is_scoped_and_preserves_explicit_vendor_credentials"), |_| {
+            tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                let mut original = tokio::process::Command::new("/usr/bin/env");
+                apply_claude_fallback_spawn_env(&mut original, None);
+                let original = original.output().await.unwrap();
+                assert!(String::from_utf8(original.stdout).unwrap().contains("DUDU_TEST_RUNTIME_FALLBACK_HOME="));
+                CLAUDE_FALLBACK_SPAWN.scope((), async {
+                    let mut command = tokio::process::Command::new("/usr/bin/env");
+                    apply_claude_fallback_spawn_env(&mut command, None);
+                    // Vendors add only their own credentials after the base allowlist.
+                    command.env("OPENAI_API_KEY", "fixture-vendor-key");
+                    let result = command.output().await.unwrap();
+                    assert!(result.status.success());
+                    let env = String::from_utf8(result.stdout).unwrap();
+                    assert!(!env.contains("DUDU_TEST_RUNTIME_FALLBACK_HOME="));
+                    assert!(env.lines().any(|line| line == "OPENAI_API_KEY=fixture-vendor-key"));
+                    assert!(env.lines().any(|line| line.starts_with("HOME=")));
+                }).await;
+                assert!(!in_claude_runtime_fallback());
+            });
+        });
+    }
+
+    #[tokio::test]
+    async fn claude_runtime_continuation_refuses_budget_spawn_policy_and_work_limits() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("agents/worker");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("agent.toml"), "[runtime]\nprovider='claude'\nfallback='codex'\n").unwrap();
+        let calls: testing::RecordedFallback = Default::default();
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = HashMap::new();
+        runtimes.insert(RuntimeType::Codex, Box::new(testing::RecordingCodex(calls.clone())));
+        let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(runtimes)).await;
+        let stops = [
+            format!("{}budget exhausted", crate::budget::BUDGET_REFUSAL_PREFIX),
+            duduclaw_agent::mcp_spawn_gate::spawn_gate_error("invalid employee MCP config"),
+            "Product profile does not allow runtime 'codex'".into(),
+            "AUTONOMY_PAUSED: owner paused".into(),
+            crate::work_outcome::WorkOutcome::MaxTurns { limit: 1, partial: String::new() }.encode(),
+            crate::work_outcome::WorkOutcome::TimeoutTotal { seconds: 1, partial: String::new() }.encode(),
+            crate::work_outcome::WorkOutcome::TimeoutNoProgress { seconds: 1, tool: None, partial: String::new() }.encode(),
+        ];
+        for error in stops {
+            for wrapped in [error.clone(), format!("All accounts exhausted. Last error: {error}")] {
+                let result = run_claude_runtime_fallback(AgentPrompt {
+                    agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+                    system_prompt: "", model: "claude-sonnet-4-6", max_tokens: 128, provider_override: None,
+                    conversation_history: &[], request_type: RequestType::Chat, runtime_settings: None,
+                    effort: None, allow_cross_family_failover: true, purpose: SpawnPurpose::EmployeeTurn,
+                }, &wrapped).await;
+                assert!(result.is_none(), "{wrapped}");
+                assert!(calls.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod chat_snapshot_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn claude_continuation_uses_snapshot_fallback_runtime_model_and_effort() {
+        let (home, ctx, _registry, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let dir = home.path().join("agents/worker");
+        let path = dir.join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap()
+            .replace("preferred='gpt-5.4'", "preferred='claude-sonnet-4-6'\neffort='high'")
+            .replace("fallback=''", "fallback='gpt-5.4-mini'\nfallbacks=['gpt-5.4']")
+            .replace("provider='codex'", "provider='claude'\nfallback='codex'");
+        std::fs::write(&path, raw).unwrap();
+        let snapshot = {
+            let registry = ctx.registry.read().await;
+            crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").unwrap()
+        };
+        drop(_registry);
+        let calls: testing::RecordedFallback = Default::default();
+        let mut runtimes: HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
+        runtimes.insert(RuntimeType::Codex, Box::new(testing::RecordingCodex(calls.clone())));
+        let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(runtimes)).await;
+        std::fs::write(&path, "[runtime]\nprovider='grok'\nfallback='grok'\n[model]\npreferred='opus'\nfallback='grok-4'\neffort='low'\n").unwrap();
+        let snapshot = std::sync::Arc::new(snapshot);
+        let response = with_chat_turn_config(snapshot.clone(), run_claude_runtime_fallback(AgentPrompt {
+            agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+            system_prompt: "", model: &snapshot.model, max_tokens: 128, provider_override: None,
+            conversation_history: &[], request_type: RequestType::Chat,
+            runtime_settings: Some(&snapshot.runtime_settings), effort: None,
+            allow_cross_family_failover: true, purpose: SpawnPurpose::EmployeeTurn,
+        }, "network timeout")).await.unwrap().unwrap();
+        assert_eq!(response.runtime_name, "codex");
+        assert_eq!(response.model_used, "gpt-5.4-mini");
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].model, "gpt-5.4-mini");
+        assert_eq!(calls[0].effort, Some(duduclaw_core::effort::Effort::High));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_fallback_that_is_not_registered_never_executes() {
+        let (home, ctx, registry_guard, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let dir = home.path().join("agents/worker");
+        let path = dir.join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap()
+            .replace("preferred='gpt-5.4'", "preferred='claude-sonnet-4-6'")
+            .replace("fallback=''", "fallback='gpt-5.4'")
+            .replace("provider='codex'", "provider='claude'\nfallback='codex'");
+        std::fs::write(&path, raw).unwrap();
+        let snapshot = {
+            let registry = ctx.registry.read().await;
+            std::sync::Arc::new(crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").unwrap())
+        };
+        drop(registry_guard);
+        let _registry = testing::RegistryGuard::install(home.path(), RuntimeRegistry::with_runtimes(HashMap::new())).await;
+        let before = crate::model_call_probe::calls();
+        let failure = with_chat_turn_config(snapshot.clone(), run_claude_runtime_fallback(AgentPrompt {
+            agent_dir: Some(&dir), home_dir: home.path(), agent_id: "worker", prompt: "hello",
+            system_prompt: "", model: &snapshot.model, max_tokens: 128, provider_override: None,
+            conversation_history: &[], request_type: RequestType::Chat,
+            runtime_settings: Some(&snapshot.runtime_settings), effort: None,
+            allow_cross_family_failover: true, purpose: SpawnPurpose::EmployeeTurn,
+        }, "network timeout")).await.unwrap().unwrap_err();
+        assert!(failure.steps.iter().any(|step| step.runtime == RuntimeType::Codex
+            && matches!(&step.outcome, crate::failover::RuntimeStepOutcome::NotRegistered)));
+        assert_eq!(crate::model_call_probe::calls(), before);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn removed_or_unknown_fallback_is_refused_at_snapshot_entry() {
+        let (home, ctx, _registry, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let path = home.path().join("agents/worker/agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for fallback in ["gemini", "antigravity", "unknown-runtime"] {
+            std::fs::write(&path, raw.replace("provider='codex'", &format!("provider='codex'\nfallback='{fallback}'"))).unwrap();
+            let registry = ctx.registry.read().await;
+            assert!(crate::entry_gate::resolve_and_check(home.path(), &registry, "worker").is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod background_strict_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_snapshot_employee_calls_fail_closed_before_runtime_execution() {
+        for contents in [b"[runtime]\nprovider='typo'\n".as_slice(), b"[runtime", b"\xff\xfe"] {
+            let (home, ctx, _runtime, calls) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+            let turn = {
+                let reg = ctx.registry.read().await;
+                crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap()
+            };
+            std::fs::write(&turn.config_path, contents).unwrap();
+            let before = crate::model_call_probe::calls();
+            let error = run_agent_prompt(AgentPrompt {
+                agent_dir: Some(&turn.registry_agent.dir), home_dir: home.path(), agent_id: "worker",
+                prompt: "work", system_prompt: "", model: "gpt-5.4", max_tokens: 128,
+                provider_override: None, conversation_history: &[], request_type: RequestType::Dispatch,
+                runtime_settings: None, effort: None, allow_cross_family_failover: true,
+                purpose: SpawnPurpose::EmployeeTurn,
+            }).await.unwrap_err();
+            assert_eq!(crate::entry_gate::background_refusal_code(&error), Some("agent_config_unreadable"));
+            assert_eq!(crate::model_call_probe::calls(), before);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        }
     }
 }

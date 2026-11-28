@@ -76,10 +76,10 @@ impl Transport<'_, '_> {
         self.view.permit.test_boundary(_stage);
         self.check()
     }
-    fn endpoint(&mut self, original: &str) -> Result<reqwest::Url, GoogleApiError> {
-        let url = match reqwest::Url::parse(original) {
-            Ok(u) => u,
-            Err(_) => return Err(self.fail()),
+    fn endpoint(&mut self, method: &reqwest::Method, original: &str) -> Result<reqwest::Url, GoogleApiError> {
+        let url = match crate::google_workspace::native_confirmation::drive_request_url(method, original) {
+            Some(u) => u,
+            None => return Err(self.fail()),
         };
         let valid = crate::google_workspace::native_confirmation::endpoint_allowed(self.template, &url)
             && url.scheme() == "https"
@@ -99,7 +99,7 @@ impl Transport<'_, '_> {
                     crate::google_workspace::native_confirmation::calendar_endpoint(self.template, &url)
                         || url.path()
                         .starts_with("/calendar/v3/calendars/primary/events")
-                        || url.path().starts_with("/drive/v3/files")
+                        || crate::google_workspace::native_confirmation::drive_read_path_allowed(&url)
                 }
                 Some("sheets.googleapis.com") => url.path().starts_with("/v4/spreadsheets/")
                     || (self.template.tool() == "sheets_create" && url.path() == "/v4/spreadsheets"),
@@ -127,6 +127,8 @@ impl Transport<'_, '_> {
         &mut self,
         step: program::NativeStep<'_>,
     ) -> Result<(u16, Vec<u8>), GoogleApiError> {
+        #[cfg(test)]
+        let step = step.with_test_drive_request();
         self.at("before_builder")?;
         if !std::ptr::eq(step.template(), self.template)
             || self.requests >= MAX_REQUESTS
@@ -162,7 +164,7 @@ impl Transport<'_, '_> {
         }) {
             return Err(self.fail());
         }
-        let endpoint = self.endpoint(step.url())?;
+        let endpoint = self.endpoint(step.method(), step.url())?;
         // The raw header, builder and authenticated request never leave owner.
         let mut builder = self
             .client

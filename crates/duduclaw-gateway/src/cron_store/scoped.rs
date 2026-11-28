@@ -36,13 +36,6 @@ pub(crate) fn validate_cadence(expression: &str) -> Result<(), String> {
     }
 }
 
-/// Daily samples over two years (731 days covers a leap year). A zone's UTC
-/// offset changes only at a transition and then holds for the whole period
-/// until the next one; every real period is far longer than one day (the
-/// shortest current one, Africa/Casablanca's Ramadan change, lasts weeks), so
-/// any transition inside the window changes at least one daily sample.
-const FIXED_OFFSET_SAMPLE_DAYS: i64 = 731;
-
 /// Human-origin schedules run in UTC or in an IANA zone whose UTC offset is
 /// constant from now through the next two years (no DST, no announced offset
 /// change), e.g. `Asia/Taipei`, which versions up to v1.79.3 stored from the
@@ -65,16 +58,8 @@ pub(crate) fn scoped_cron_timezone_allowed(row: &CronTaskRow) -> bool {
 fn scoped_timezone_allowed_at(name: Option<&str>, now: chrono::DateTime<Utc>) -> bool {
     match name {
         None | Some("") | Some("UTC") | Some("Etc/UTC") | Some("Etc/GMT") | Some("GMT") => true,
-        Some(name) => duduclaw_core::parse_timezone(name).is_some_and(|tz| fixed_offset_zone(tz, now)),
+        Some(name) => duduclaw_core::parse_timezone(name).is_some_and(|tz| duduclaw_core::company_timezone::fixed_offset_zone(tz, now)),
     }
-}
-
-/// Same total UTC offset at `now` and at every daily sample up to two years ahead.
-fn fixed_offset_zone(tz: chrono_tz::Tz, now: chrono::DateTime<Utc>) -> bool {
-    use chrono::{Offset, TimeZone};
-    let offset = |day: i64| tz.offset_from_utc_datetime(&(now + chrono::Duration::days(day)).naive_utc()).fix();
-    let first = offset(0);
-    (1..=FIXED_OFFSET_SAMPLE_DAYS).all(|day| offset(day) == first)
 }
 
 pub(crate) fn validate_scoped_schedule(row: &CronTaskRow) -> Result<(), String> {
@@ -183,11 +168,11 @@ mod tests {
         use chrono::TimeZone;
         let now = Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap();
         for zone in ["Asia/Taipei", "Asia/Tokyo", "Asia/Kolkata", "UTC", "Asia/Calcutta", "Etc/GMT-14", "Australia/Eucla"] {
-            assert!(fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
+            assert!(duduclaw_core::company_timezone::fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
             assert!(scoped_timezone_allowed_at(Some(zone), now), "{zone}");
         }
         for zone in ["America/New_York", "Europe/London", "Australia/Sydney"] {
-            assert!(!fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
+            assert!(!duduclaw_core::company_timezone::fixed_offset_zone(duduclaw_core::parse_timezone(zone).unwrap(), now), "{zone}");
             assert!(!scoped_timezone_allowed_at(Some(zone), now), "{zone}");
         }
         // Unknown and non-empty garbage names fail closed; None/"" remain UTC.

@@ -1,18 +1,22 @@
-//! Dashboard automation access is tied to the stored record and live direct bindings.
+//! Dashboard automation access uses stored ownership, live bindings and department grants.
 use super::*;
+use duduclaw_core::company_timezone;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows, record_grant_use};
 
 // v1.81 P1g: a routine of another person's Personal employee is never
 // readable or writable through a creator right or the Admin role.
-fn may_read(ctx: &UserContext, row: &CronTaskRow) -> bool {
+fn may_read(ctx: &UserContext, view: &DeptGrantView, row: &CronTaskRow) -> bool {
     !ctx.owner_only_denied(&row.agent_id)
         && (ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
-            || ctx.has_agent_access(&row.agent_id, AccessLevel::Viewer))
+            || ctx.has_agent_access(&row.agent_id, AccessLevel::Viewer)
+            || department_grant_allows(view, &row.agent_id, GrantGroup::Schedules, GrantAction::Read))
 }
 
-fn may_write(ctx: &UserContext, row: &CronTaskRow) -> bool {
+fn may_write(ctx: &UserContext, view: &DeptGrantView, row: &CronTaskRow, action: GrantAction) -> bool {
     !ctx.owner_only_denied(&row.agent_id)
         && (ctx.is_admin() || row.created_by_user_id.as_deref() == Some(ctx.user_id.as_str())
-            || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator))
+            || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)
+            || department_grant_allows(view, &row.agent_id, GrantGroup::Schedules, action))
 }
 
 fn prompt_only(row: &CronTaskRow) -> bool {
@@ -20,15 +24,15 @@ fn prompt_only(row: &CronTaskRow) -> bool {
         && row.notify_channel.is_none() && row.notify_chat_id.is_none() && row.notify_thread_id.is_none()
 }
 
-fn member_cron_row(row: &CronTaskRow, writable: bool, can_edit: bool, can_activate: bool) -> Value {
+fn member_cron_row(row: &CronTaskRow, writable: bool, can_edit: bool, can_resume: bool, can_run: bool) -> Value {
     json!({ "id": row.id, "name": row.name, "agent_id": row.agent_id,
-        "cron": row.cron, "schedule": row.cron, "task": row.task, "enabled": row.enabled,
+        "cron": row.cron, "schedule": row.cron, "cron_timezone": row.cron_timezone, "task": row.task, "enabled": row.enabled,
         "last_run_at": row.last_run_at, "last_status": row.last_status,
         "skip_reason": row.skip_reason(),
         "last_delivery_status": row.last_delivery_status,
         "last_delivery_reason": row.last_delivery_reason,
-        "can_manage": writable, "can_edit": can_edit, "can_resume": can_activate,
-        "can_run": can_activate })
+        "can_manage": writable, "can_edit": can_edit, "can_resume": can_resume,
+        "can_run": can_run })
 }
 
 impl MethodHandler {
@@ -44,15 +48,17 @@ impl MethodHandler {
     pub(crate) async fn handle_dashboard_reminders(&self, params: Value, ctx: &UserContext, cancel: bool) -> WsFrame {
         let id = params.get("id").and_then(Value::as_str);
         if cancel && id.is_none() { return WsFrame::error_response("", "id is required"); }
-        match crate::reminder_scheduler::dashboard_reminders(&self.home_dir, ctx, if cancel { id } else { None }).await {
-            Ok(rows) => {
-                let principal = format!("user:{}", ctx.user_id);
-                let reminders: Vec<Value> = rows.into_iter().map(|r| json!({
+        let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
+        match crate::reminder_scheduler::dashboard_reminders(&self.home_dir, ctx, view, if cancel { id } else { None }).await {
+            Ok((rows, grant_cancelled_agent)) => {
+                if let Some(agent) = grant_cancelled_agent {
+                    record_grant_use(self, ctx, &agent, GrantGroup::Schedules, GrantAction::Remove, "reminders.cancel").await;
+                }
+                let reminders: Vec<Value> = rows.into_iter().map(|(r, can_manage)| json!({
                     "id": r.id, "agent_id": r.agent_id, "trigger_at": r.trigger_at,
                     "message": if r.mode == crate::reminder_scheduler::ReminderMode::Direct { r.message.as_deref().unwrap_or("") } else { r.prompt.as_deref().unwrap_or("") },
                     "status": r.status,
-                    "can_manage": ctx.is_admin() || r.on_behalf_of.as_deref() == Some(principal.as_str())
-                        || ctx.has_agent_access(&r.agent_id, AccessLevel::Operator),
+                    "can_manage": can_manage,
                 })).collect();
                 WsFrame::ok_response("", json!({ "reminders": reminders }))
             }
@@ -61,6 +67,80 @@ impl MethodHandler {
     }
 
     pub(crate) async fn handle_scoped_cron(&self, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+        self.handle_scoped_cron_inner(method, params, ctx, false).await
+    }
+
+    /// Internal Admin-AI path. The creator cannot be supplied by RPC callers.
+    pub(crate) async fn handle_admin_ai_cron(
+        &self, method: &str, params: Value, ctx: &UserContext, expected_hash: Option<&str>,
+    ) -> WsFrame {
+        use crate::admin_ai::proposal::STALE;
+        if !ctx.is_admin() { return WsFrame::error_response("", PERMISSION_DENIED); }
+        if method == "cron.add" {
+            return self.handle_scoped_cron_inner(method, params, ctx, true).await;
+        }
+        let Some(expected_hash) = expected_hash else { return WsFrame::error_response("", STALE); };
+        if let Err(frame) = self.p1g_admin_cron_guard(method, &params, ctx).await { return frame; }
+        let store = match self.cron_store().await { Ok(s) => s, Err(f) => return f };
+        let id = params["id"].as_str().unwrap_or("");
+        let row = match store.get(id).await {
+            Ok(Some(row)) if prompt_only(&row) => row,
+            _ => return WsFrame::error_response("", STALE),
+        };
+        let mut changed = row.clone();
+        match method {
+            "cron.update" => {
+                if !params.as_object().is_some_and(|p| p.keys().all(|k|
+                    matches!(k.as_str(), "id" | "name" | "cron" | "cron_timezone" | "task"))) {
+                    return WsFrame::error_response("", PERMISSION_DENIED);
+                }
+                for key in ["name", "cron", "task", "cron_timezone"] {
+                    if let Some(value) = params.get(key) {
+                        let Some(value) = value.as_str() else { return WsFrame::error_response("", "Invalid automation field"); };
+                        match key {
+                            "name" => changed.name = value.into(),
+                            "cron" => changed.cron = value.into(),
+                            "task" => changed.task = value.into(),
+                            _ => changed.cron_timezone = Some(value.into()),
+                        }
+                    }
+                }
+                if changed.name != row.name {
+                    if let Err(error) = crate::scheduled_webchat::check_name(&changed.name) {
+                        return WsFrame::error_response("", &error);
+                    }
+                }
+                if changed.name.trim().is_empty() || changed.task.len() > 16_384
+                    || changed.cron.len() > crate::cron_store::MAX_CRON_BYTES
+                    || crate::cron_scheduler::normalise_cron(&changed.cron).parse::<cron::Schedule>().is_err()
+                    || changed.cron_timezone.as_deref().is_some_and(|tz| duduclaw_core::parse_timezone(tz).is_none()) {
+                    return WsFrame::error_response("", "Invalid automation name, schedule or message");
+                }
+                if self.cron_task_input_blocked(&changed.agent_id, &changed.name, &changed.task) {
+                    return WsFrame::error_response("", "Automation message rejected by input protection");
+                }
+            }
+            "cron.pause" => changed.enabled = false,
+            "cron.resume" => changed.enabled = true,
+            "cron.remove" => (),
+            _ => return WsFrame::error_response("", PERMISSION_DENIED),
+        }
+        match store.edit_admin_ai(&row, (method != "cron.remove").then_some(&changed), expected_hash).await {
+            Ok(true) => {
+                if method == "cron.remove" {
+                    crate::recipient_guard::origin::forget_async(&self.home_dir,
+                        row.notify_origin_proof.into_iter().collect()).await;
+                }
+                self.notify_cron_reload().await;
+                self.emit_cron_changed(json!({"action":"updated", "id":id})).await;
+                WsFrame::ok_response("", json!({"success":true}))
+            }
+            Ok(false) => WsFrame::error_response("", STALE),
+            Err(error) => WsFrame::error_response("", &error),
+        }
+    }
+
+    async fn handle_scoped_cron_inner(&self, method: &str, params: Value, ctx: &UserContext, record_creator: bool) -> WsFrame {
         if ctx.is_admin() {
             // v1.81 P1g: a cron routine makes its employee run work, so on
             // another person's Personal employee it is owner-only — the
@@ -72,7 +152,7 @@ impl MethodHandler {
             }
             return match method {
                 "cron.list" => self.handle_cron_list().await,
-                "cron.add" => self.handle_cron_add(params).await,
+                "cron.add" => self.handle_cron_add_with_creator(params, record_creator.then_some(ctx)).await,
                 "cron.update" => self.handle_cron_update(params).await,
                 "cron.pause" => self.handle_cron_set_enabled(params, false).await,
                 "cron.resume" => self.handle_cron_set_enabled(params, true).await,
@@ -83,6 +163,7 @@ impl MethodHandler {
             };
         }
         if method == "cron.templates" { return self.handle_cron_templates().await; }
+        let view = DeptGrantView::load(self, ctx).await;
         let store = match self.cron_store().await { Ok(s) => s, Err(f) => return f };
         if method == "cron.list" {
             let rows = match store.list_all().await {
@@ -90,19 +171,34 @@ impl MethodHandler {
                 Err(_) => return WsFrame::error_response("", "Automation data unavailable"),
             };
             let mut tasks = Vec::new();
-            for row in rows.into_iter().filter(|r| may_read(ctx, r)) {
+            let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
+            for row in rows.into_iter().filter(|r| may_read(ctx, &view, r)) {
                 let bound = match store.workflow_binding(&row.id).await {
                     Ok(binding) => binding.is_some(),
                     Err(_) => return WsFrame::error_response("", "Automation data unavailable"),
                 };
-                let writable = may_write(ctx, &row) && !bound;
-                let can_edit = writable && prompt_only(&row)
+                // can_manage covers narrowing controls (pause/remove). Editing
+                // needs Edit; activation keeps its structural checks and uses
+                // Toggle for resume, RunNow for an immediate run.
+                let writable = !bound
+                    && may_write(ctx, &view, &row, GrantAction::Toggle)
+                    && may_write(ctx, &view, &row, GrantAction::Remove);
+                let operator = ctx.has_agent_access(&row.agent_id, AccessLevel::Operator);
+                let structural = !bound && prompt_only(&row)
                     && crate::cron_store::scoped_cron_timezone_allowed(&row)
-                    && crate::cron_scheduler::scoped_cron_target_allowed(&*self.registry.read().await, &row.agent_id)
-                    && ctx.has_agent_access(&row.agent_id, AccessLevel::Operator);
-                let can_activate = can_edit && crate::cron_store::validate_scoped_schedule(&row).is_ok();
+                    && crate::cron_scheduler::scoped_cron_target_allowed(&*self.registry.read().await, &row.agent_id);
+                let can_edit = structural && (operator
+                    || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, GrantAction::Edit));
+                let can_activate = structural && crate::cron_store::validate_scoped_schedule(&row).is_ok();
+                let can_resume = can_activate && (operator
+                    || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, GrantAction::Toggle));
+                let can_run = can_activate && (operator
+                    || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, GrantAction::RunNow));
                 // Script bodies and notification destinations remain operator-only configuration.
-                tasks.push(member_cron_row(&row, writable, can_edit, can_activate));
+                let mut value = member_cron_row(&row, writable, can_edit, can_resume, can_run);
+                value["creator_access_lost"] = json!(display.display_creator_access_lost(
+                    row.created_by_user_id.as_deref(), &row.agent_id));
+                tasks.push(value);
             }
             return WsFrame::ok_response("", json!({ "tasks": tasks }));
         }
@@ -113,8 +209,9 @@ impl MethodHandler {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
             let agent = params["agent_id"].as_str().unwrap_or("");
+            let operator = ctx.has_agent_access(agent, AccessLevel::Operator);
             if agent == "default" || !is_valid_agent_id(agent)
-                || !ctx.has_agent_access(agent, AccessLevel::Operator) {
+                || !(operator || department_grant_allows(&view, agent, GrantGroup::Schedules, GrantAction::Create)) {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
             if !crate::cron_scheduler::scoped_cron_target_allowed(&*self.registry.read().await, agent) {
@@ -137,15 +234,30 @@ impl MethodHandler {
             row.on_behalf_of = Some(principal);
             row.created_by_user_id = Some(ctx.user_id.clone());
             row.scoped_by_user_id = Some(ctx.user_id.clone());
+            let choice = company_timezone::default_for_new_schedule(
+                &company_timezone::read(&self.home_dir), true, Utc::now(),
+            );
+            let zone_note = company_timezone::zone_note_zh(&choice.source);
+            row.cron_timezone = Some(choice.zone);
             if let Err(error) = store.insert_scoped(&row).await { return WsFrame::error_response("", &error); }
+            if !operator {
+                record_grant_use(self, ctx, agent, GrantGroup::Schedules, GrantAction::Create, method).await;
+            }
             self.notify_cron_reload().await;
             self.emit_cron_changed(json!({ "action": "created", "id": row.id })).await;
-            return WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row) }));
+            return WsFrame::ok_response("", json!({ "success": true, "task": Self::cron_row_to_json(&row), "zone_note": zone_note }));
         }
         // Resolve once by id; legacy name-only changes are deliberately not employee APIs.
+        let action = match method {
+            "cron.update" => GrantAction::Edit,
+            "cron.pause" | "cron.resume" => GrantAction::Toggle,
+            "cron.remove" => GrantAction::Remove,
+            "cron.run_now" => GrantAction::RunNow,
+            _ => return WsFrame::error_response("", PERMISSION_DENIED),
+        };
         let id = params["id"].as_str().unwrap_or("");
         let row = match store.get(id).await {
-            Ok(Some(row)) if may_write(ctx, &row) => row,
+            Ok(Some(row)) if may_write(ctx, &view, &row, action) => row,
             _ => return WsFrame::error_response("", PERMISSION_DENIED),
         };
         let bound = match store.workflow_binding(id).await {
@@ -153,8 +265,14 @@ impl MethodHandler {
         };
         if bound { return WsFrame::error_response("", PERMISSION_DENIED); }
         let activating = matches!(method, "cron.add" | "cron.update" | "cron.resume" | "cron.run_now");
+        let operator = ctx.has_agent_access(&row.agent_id, AccessLevel::Operator);
+        // Creator rights suffice only for narrowing operations. Activating
+        // another time still requires an Operator binding or the action grant.
+        let grant_backed = !operator
+            && (activating || row.created_by_user_id.as_deref() != Some(ctx.user_id.as_str()));
         if activating {
-            if !prompt_only(&row) || !ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)
+            if !prompt_only(&row) || !(operator
+                || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, action))
                 || !crate::cron_scheduler::scoped_cron_target_allowed(&*self.registry.read().await, &row.agent_id) {
                 return WsFrame::error_response("", PERMISSION_DENIED);
             }
@@ -204,8 +322,14 @@ impl MethodHandler {
                 let scheduler = match self.cron_scheduler.read().await.as_ref() {
                     Some(s) => s.clone(), None => return WsFrame::error_response("", "Automation scheduler unavailable"),
                 };
+                let agent = row.agent_id.clone();
                 return match scheduler.run_now_scoped(row, &principal).await {
-                    Ok(name) => WsFrame::ok_response("", json!({ "success": true, "name": name })),
+                    Ok(name) => {
+                        if grant_backed {
+                            record_grant_use(self, ctx, &agent, GrantGroup::Schedules, action, method).await;
+                        }
+                        WsFrame::ok_response("", json!({ "success": true, "name": name }))
+                    }
                     Err(error) => WsFrame::error_response("", &error),
                 };
             }
@@ -213,6 +337,9 @@ impl MethodHandler {
         }
         match store.edit_scoped(&row, if method == "cron.remove" { None } else { Some(&changed) }).await {
             Ok(true) => {
+                if grant_backed {
+                    record_grant_use(self, ctx, &row.agent_id, GrantGroup::Schedules, action, method).await;
+                }
                 self.notify_cron_reload().await;
                 self.emit_cron_changed(json!({ "action": "updated", "id": id })).await;
                 WsFrame::ok_response("", json!({ "success": true }))
@@ -227,18 +354,56 @@ impl MethodHandler {
 mod tests {
     use super::*;
 
+    async fn assert_member_default(company: &str, expected: &str, source: company_timezone::ZoneSource) {
+        use chrono::TimeZone;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("config.toml"),
+            format!("[general]\ncompany_timezone = '{company}'\n")).unwrap();
+        let store = CronStore::open(home.path()).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 11, 27, 0, 0, 0).unwrap();
+        let choice = company_timezone::default_for_new_schedule(&company_timezone::read(home.path()), true, now);
+        assert_eq!(choice.source, source);
+        assert_eq!(choice.zone, expected);
+        let mut row = CronTaskRow::new("member-zone".into(), "Morning".into(), "worker".into(),
+            "0 9 * * *".into(), "report".into());
+        row.on_behalf_of = Some("user:member".into());
+        row.created_by_user_id = Some("member".into());
+        row.scoped_by_user_id = Some("member".into());
+        row.cron_timezone = Some(choice.zone);
+        store.insert_scoped(&row).await.unwrap();
+        let stored = store.get(&row.id).await.unwrap().unwrap();
+        assert_eq!(stored.cron_timezone.as_deref(), Some(expected));
+        assert_eq!(member_cron_row(&stored, true, true, true, true)["cron_timezone"], expected);
+        match source {
+            company_timezone::ZoneSource::Company => assert_eq!(company_timezone::zone_note_zh(&source), None),
+            company_timezone::ZoneSource::UtcMemberDst => assert_eq!(company_timezone::zone_note_zh(&source),
+                Some("公司時區有夏令時間，成員自建的例行工作以 UTC 計時；要依當地時間請管理員建立。")),
+            _ => panic!("unexpected fixture source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn member_default_with_dst_company_zone_is_utc_with_note() {
+        assert_member_default("America/New_York", "UTC", company_timezone::ZoneSource::UtcMemberDst).await;
+    }
+
+    #[tokio::test]
+    async fn member_default_with_taipei_is_taipei() {
+        assert_member_default("Asia/Taipei", "Asia/Taipei", company_timezone::ZoneSource::Company).await;
+    }
+
     #[test]
     fn member_row_only_exposes_the_fixed_skip_reason() {
         let mut row = CronTaskRow::new("id".into(), "Morning".into(), "agent".into(),
             "0 9 * * *".into(), "report".into());
         row.last_status = Some("skipped".into());
         row.last_error = Some(crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED.into());
-        let member = member_cron_row(&row, false, false, false);
+        let member = member_cron_row(&row, false, false, false, false);
         assert_eq!(member["skip_reason"], "timezone_or_interval");
         assert!(member.get("last_error").is_none());
 
         row.last_error = Some("internal detail".into());
-        let member = member_cron_row(&row, false, false, false);
+        let member = member_cron_row(&row, false, false, false, false);
         assert!(member["skip_reason"].is_null());
         assert!(member.get("last_error").is_none());
     }
@@ -253,10 +418,10 @@ mod tests {
         store.insert(&row).await.unwrap();
         store.record_scoped_schedule_skip(&row.id, crate::cron_scheduler::SCOPED_SCHEDULE_SKIPPED).await.unwrap();
         let skipped = store.get(&row.id).await.unwrap().unwrap();
-        assert_eq!(member_cron_row(&skipped, false, false, false)["skip_reason"], "timezone_or_interval");
+        assert_eq!(member_cron_row(&skipped, false, false, false, false)["skip_reason"], "timezone_or_interval");
         store.update_cron_timezone(&row.id, Some("Asia/Taipei")).await.unwrap();
         let cleared = store.get(&row.id).await.unwrap().unwrap();
-        let member = member_cron_row(&cleared, false, false, false);
+        let member = member_cron_row(&cleared, false, false, false, false);
         assert!(member["last_status"].is_null());
         assert!(member["skip_reason"].is_null());
         assert!(cleared.last_error.is_none());

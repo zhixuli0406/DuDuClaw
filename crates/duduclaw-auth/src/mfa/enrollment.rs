@@ -2,8 +2,28 @@
 use super::*;
 
 pub(super) fn proof_verified(tx: &Connection, token: &str) -> Result<bool> {
-    tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_enrollment_proofs WHERE token_hash=?1 AND verified=1)",
-        [token_hash(token)], |r| r.get(0)).map_err(|e|e.to_string())
+    let proof: Option<(String,String,String)> = tx.query_row(
+        "SELECT p.kind,c.user_id,c.first_factor FROM mfa_enrollment_proofs p
+         JOIN mfa_challenges c USING(token_hash) WHERE p.token_hash=?1 AND p.verified=1",
+        [token_hash(token)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))
+        .optional().map_err(|e|e.to_string())?;
+    match proof {
+        Some((kind,user,first)) => match kind.as_str() {
+            "signin_approval" => Ok(first=="google_oidc" && signin_approval_allowed(tx,&user)?),
+            "password" | "channel" | "admin" | "bootstrap" => Ok(true),
+            _ => Ok(false),
+        },
+        None => Ok(false),
+    }
+}
+
+fn signin_approval_allowed(conn: &Connection, user: &str) -> Result<bool> {
+    let account = crate::user_row::load_user(conn,user)?.ok_or(DENIED)?;
+    // JIT accounts start at zero; TOTP, email and passkey enrollment all bump
+    // the epoch. Re-check at factor write time so this grant cannot add a
+    // later factor or survive a credential change after preparation.
+    Ok(account.status==crate::UserStatus::Active && account.credential_epoch==0
+        && !any_factor(conn,user)?)
 }
 
 impl UserDb {
@@ -25,10 +45,15 @@ impl UserDb {
             (user,first,session)
         };
         if session.is_some() { return Err(DENIED.into()); }
-        if first=="channel_otp" {
-            let password=password.filter(|p| !p.is_empty() && p.len()<=4096).ok_or(DENIED)?;
-            let account=self.get_user(&user)?.ok_or(DENIED)?;
-            if self.verify_password(&account.email,password)?.id != user { return Err(DENIED.into()); }
+        match first.as_str() {
+            "password" => {},
+            "google_oidc" => {},
+            "channel_otp" => {
+                let password=password.filter(|p| !p.is_empty() && p.len()<=4096).ok_or(DENIED)?;
+                let account=self.get_user(&user)?.ok_or(DENIED)?;
+                if self.verify_password(&account.email,password)?.id != user { return Err(DENIED.into()); }
+            },
+            _ => return Err(DENIED.into()),
         }
         Ok(())
     }
@@ -57,6 +82,35 @@ impl UserDb {
             params![token_hash(&token), session]).map_err(|e|e.to_string())?;
         conn.commit().map_err(|e|e.to_string())?;
         Ok(token)
+    }
+
+    /// Gateway-only entry after consuming a Google reauthentication grant.
+    /// The epoch is captured by the authenticated transport, never a request field.
+    pub fn mfa_reauth_challenge(&self, user: &str, session: &str, epoch: u64, now: i64) -> Result<String> {
+        if session.is_empty() { return Err(DENIED.into()); }
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let valid: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM users u JOIN google_signin_links l ON l.user_id=u.id
+            WHERE u.id=?1 AND u.status='active' AND u.password_hash='' AND u.credential_epoch=?2)",
+            params![user,epoch], |r|r.get(0)).map_err(|_|DENIED)?;
+        if !valid { return Err(DENIED.into()); }
+        let recent: i64 = tx.query_row("SELECT COUNT(*) FROM mfa_challenges WHERE user_id=?1 AND purpose='enroll' AND expires_at>?2",
+            params![user,now+TTL-60], |r|r.get(0)).map_err(|e|e.to_string())?;
+        if recent>=3 { return Err("嘗試次數過多，請稍後再試。".into()); }
+        let existing = any_factor(&tx,user)?;
+        let token = random_hex(32)?;
+        tx.execute("INSERT INTO mfa_challenges(token_hash,user_id,first_factor,purpose,expires_at) VALUES(?1,?2,'google_oidc','enroll',?3)",
+            params![token_hash(&token),user,now+TTL]).map_err(|e|e.to_string())?;
+        // Preserve the password entry's independent-proof policy. The proof
+        // kind describes step-up; first_factor remains google_oidc for Email.
+        tx.execute("INSERT INTO mfa_enrollment_proofs(token_hash,session,kind,verified) VALUES(?1,?2,?3,?4)",
+            params![token_hash(&token),session,if existing {"password"} else {"pending"},existing]).map_err(|e|e.to_string())?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(token)
+    }
+
+    pub fn mfa_factor_reauth_challenge(&self, user: &str, session: &str, epoch: u64, now: i64) -> Result<String> {
+        self.mfa_reauth_challenge(user, session, epoch, now)
     }
 
     pub fn mfa_check_session(&self, token: &str, user: &str, session: &str, now: i64) -> Result<()> {
@@ -96,10 +150,29 @@ impl UserDb {
             return Ok(None);
         }
         if old.as_deref().is_some_and(|v|v!="pending") { return Err(DENIED.into()); }
-        let kind = if !required { "password" } else if channel.is_some() { "channel" } else { "admin" };
+        let mut kind = if !required { "password" } else if channel.is_some() { "channel" } else { "admin" };
+        if kind=="admin" {
+            let first: String = tx.query_row("SELECT first_factor FROM mfa_challenges WHERE token_hash=?1",
+                [token_hash(token)], |r|r.get(0)).map_err(|_|DENIED)?;
+            if first=="google_oidc" && signin_approval_allowed(&tx,&user)? {
+                let oldest = now.checked_sub(72*3600).ok_or(DENIED)?;
+                let request: Option<String> = tx.query_row(
+                    "SELECT id FROM google_signin_requests WHERE user_id=?1 AND status='approved'
+                     AND mfa_preauthorized=1 AND decided_at>?2 AND decided_at<=?3
+                     ORDER BY decided_at,id LIMIT 1",
+                    params![user,oldest,now], |r|r.get(0)).optional().map_err(|_|DENIED)?;
+                if let Some(request) = request {
+                    let consumed = tx.execute("UPDATE google_signin_requests SET mfa_preauthorized=0
+                        WHERE id=?1 AND user_id=?2 AND status='approved' AND mfa_preauthorized=1",
+                        params![request,user]).map_err(|_|DENIED)?;
+                    if consumed!=1 { return Err(DENIED.into()); }
+                    kind="signin_approval";
+                }
+            }
+        }
         tx.execute("INSERT INTO mfa_enrollment_proofs(token_hash,code_hash,kind,verified) VALUES(?1,?2,?3,?4)
             ON CONFLICT(token_hash) DO UPDATE SET code_hash=excluded.code_hash,kind=excluded.kind,verified=excluded.verified",
-            params![token_hash(token), if kind=="channel" {Some(hash)} else {None}, kind, !required]).map_err(|e|e.to_string())?;
+            params![token_hash(token), if kind=="channel" {Some(hash)} else {None}, kind, !required || kind=="signin_approval"]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(channel.filter(|_|required).map(|c|crate::otp::OtpChallenge {
             challenge_id: token.to_string(), code, user_id:user, channel:c.0,
@@ -174,6 +247,7 @@ pub(super) fn require_independent_proof(conn: &Connection, token: &str, now: i64
     let valid=match kind.as_deref() {
         Some("channel" | "admin") => true,
         Some("bootstrap") => super::bootstrap::bootstrap_allowed(conn,&user)?,
+        Some("signin_approval") => proof_verified(conn,token)?,
         _ => false,
     };
     if valid { Ok(()) } else { Err("請重新開始註冊並完成獨立身分驗證。".into()) }

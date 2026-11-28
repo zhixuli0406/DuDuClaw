@@ -6,6 +6,7 @@ use crate::approval::ApprovalStore;
 use std::collections::HashMap;
 fn context(id: &str, role: UserRole) -> UserContext {
     UserContext {
+            origin: duduclaw_auth::acl::ContextOrigin::Other,
             member_key_id: None,credential_epoch:0,user_id:id.into(),email:format!("{id}@example.invalid"),role,
         agent_access:HashMap::from([("worker".into(),AccessLevel::Operator)]),must_change_password:false, team_access: Default::default(), acl_generation: 0,}
 }

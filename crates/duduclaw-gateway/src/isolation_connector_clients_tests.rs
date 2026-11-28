@@ -280,3 +280,23 @@ async fn odoo_disallowed_operation_refused_before_auth() {
     }
     assert!(tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept()).await.is_err());
 }
+
+#[tokio::test]
+async fn isolated_native_drive_writes_refused_before_credentials() {
+    let provider = Arc::new(SpyProvider::new(ALICE_GOOGLE));
+    let client = executor(provider.clone());
+    for name in duduclaw_core::google_identity::DRIVE_WRITE_TOOLS {
+        let (_, selected, original) = fixture();
+        let mut record = original.context().record().clone();
+        record.tools = List::new(vec![text(name)]).unwrap();
+        let context = RequestContext::with_live_verifier(record, Arc::new(FixtureAuthority));
+        let call = authorize(&context, name, &json!({}), &Fixed).unwrap();
+        assert_eq!(provider_for_tool(name), None, "{name}");
+        assert!(!client.supports(name), "{name}");
+        // Even a direct executor call carrying valid boundary grants is refused
+        // before inspecting a selected account or acquiring credentials.
+        assert!(matches!(client.execute(selected, call).await,
+            Err(VerificationError::Unavailable)), "{name}");
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}

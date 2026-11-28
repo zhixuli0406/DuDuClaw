@@ -336,3 +336,13 @@ async fn personal_selectors_refuse_external_mount_even_with_anyone_and_available
         assert!(seen_for("mount-personal-unsupported@c.test").is_empty());
     }
 }
+
+#[tokio::test]
+async fn legacy_delegate_mcp_write_scope_refuses_before_bearer_handoff() {
+    let home = Home::new();
+    home.ready("write-mount", "write-scope@c.test", "requesters='anyone'\nfallback='home'\n");
+    let error = mcp_mount::GoogleMountGuard::prepare(home.p(), &home.p().join("agents/write-mount"),
+        "https://drivemcp.googleapis.com/mcp/v1").await.unwrap_err();
+    assert_eq!(error.code, "write_scope_isolated");
+    assert!(!error.fallback_eligible);
+}

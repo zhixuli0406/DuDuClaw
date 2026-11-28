@@ -7,6 +7,9 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::dept_grants::{DeptGrantView, GrantAction, GrantGroup, department_grant_allows, record_grant_use};
+
+use duduclaw_core::company_timezone;
 
 use crate::assign_schedule::{
     AssignKind, AssignPayload, CreateError, Creator, ManageAction, NewSchedule, ScheduleSpec, Zone,
@@ -26,6 +29,8 @@ fn create_error(e: &CreateError) -> String {
                 e.code()
             )
         }
+        CreateError::AssigneeUnavailable => format!("{}: {}", e.code(), duduclaw_core::agent_seats::TASK_ASSIGNEE_ERROR_MESSAGE),
+        CreateError::Entry(refusal) => refusal.user_text("dashboard:schedule", None, "schedule-create"),
         CreateError::Store(detail) => format!("{}: {detail}", e.code()),
         other => other.code().to_string(),
     }
@@ -160,6 +165,15 @@ impl MethodHandler {
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_string);
+        let (timezone, zone_note) = match timezone {
+            Some(name) => (Some(name), None),
+            None => {
+                let choice = company_timezone::default_for_new_schedule(
+                    &company_timezone::read(&self.home_dir), false, Utc::now(),
+                );
+                (Some(choice.zone), company_timezone::zone_note_zh(&choice.source))
+            }
+        };
         let zone = match Zone::parse(timezone.as_deref()) {
             Ok(z) => z,
             Err(e) => return WsFrame::error_response("", e.code()),
@@ -194,14 +208,14 @@ impl MethodHandler {
                 let view = manage::row_json(&row, None);
                 self.broadcast_event("assign_schedule.changed", json!({}))
                     .await;
-                WsFrame::ok_response("", json!({ "schedule": view }))
+                WsFrame::ok_response("", json!({ "schedule": view, "zone_note": zone_note }))
             }
             Err(e) => WsFrame::error_response("", &create_error(&e)),
         }
     }
 
-    /// `assign_schedules.list` — `{scope: "mine" | "all"}` (`all` for
-    /// Admins; anyone else gets their own).
+    /// `assign_schedules.list` — mine, all (Admin), or accessible
+    /// (own records plus bindings and department read grants).
     pub(crate) async fn handle_assign_schedules_list(
         &self,
         params: Value,
@@ -219,25 +233,42 @@ impl MethodHandler {
             Err(f) => return f,
         };
         let accessible = params.get("scope").and_then(Value::as_str) == Some("accessible");
+        let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
         let result = if accessible && !ctx.is_admin() {
-            store.list_bound_assign_schedules(&ctx.user_id, &ctx.agent_access.keys().cloned().collect::<Vec<_>>()).await
+            let mut agents: Vec<String> = ctx.agent_access.keys().cloned().collect();
+            // Pass exact directory ids into the existing pre-limit SQL filter;
+            // a config display name is never a department-grant target alias.
+            {
+                let registry = self.registry.read().await;
+                for agent in registry.list() {
+                    if let Some(id) = agent.dir.file_name().and_then(|name| name.to_str()) {
+                        if department_grant_allows(&view, id, GrantGroup::Schedules, GrantAction::Read) {
+                            agents.push(id.to_owned());
+                        }
+                    }
+                }
+            }
+            agents.sort();
+            agents.dedup();
+            store.list_bound_assign_schedules(&ctx.user_id, &agents).await
         } else { manage::list(&store, &actor, all || accessible).await };
         let rows = match result {
             Ok(r) => r,
             Err(e) => return WsFrame::error_response("", &format!("list schedules: {e}")),
         };
-        let home = self.home_dir.clone();
+        let mut display = crate::dept_grants::DisplayCreatorAccessCache::load(self).await;
         let schedules: Vec<Value> = rows
             .iter()
             .map(|r| {
+                let lost = display.display_creator_access_lost(Some(&r.creator_user_id), &r.agent_id);
                 let name = (r.creator_user_id != actor.user_id)
-                    .then(|| {
-                        crate::trigger_route::assign_create::account_name(&home, &r.creator_user_id)
-                    })
-                    .flatten();
-                let mut value = manage::row_json(r, name.as_deref());
+                    .then(|| display.display_creator_name(&r.creator_user_id)).flatten();
+                let mut value = manage::row_json(r, name);
+                value["creator_access_lost"] = json!(lost);
                 value["can_manage"] = json!(actor.is_admin || r.creator_user_id == actor.user_id
-                    || ctx.has_agent_access(&r.agent_id, AccessLevel::Operator));
+                    || ctx.has_agent_access(&r.agent_id, AccessLevel::Operator)
+                    || (department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, GrantAction::Toggle)
+                        && department_grant_allows(&view, &r.agent_id, GrantGroup::Schedules, GrantAction::Remove)));
                 if !ctx.is_admin() && r.creator_user_id != actor.user_id {
                     value["creator_user_id"] = Value::Null;
                     value["creator_name"] = Value::Null;
@@ -283,18 +314,35 @@ impl MethodHandler {
         // v1.81 P1g: a schedule of another person's Personal employee is
         // managed by its owner only (it makes the employee run work) — the
         // Admin role and a stale creator right no longer reach it.
+        let view = if ctx.is_admin() { DeptGrantView::empty() } else { DeptGrantView::load(self, ctx).await };
+        let grant_action = match action {
+            ManageAction::Pause | ManageAction::Resume => GrantAction::Toggle,
+            ManageAction::Remove => GrantAction::Remove,
+        };
         let row = match store.get_assign_schedule(id).await {
             Ok(Some(row)) if !ctx.owner_only_denied(&row.agent_id)
                 && (actor.is_admin || row.creator_user_id == actor.user_id
-                    || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)) => row,
+                    || ctx.has_agent_access(&row.agent_id, AccessLevel::Operator)
+                    || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, grant_action)) => row,
             _ => return WsFrame::error_response("", "not_found"),
         };
         if matches!(action, ManageAction::Resume) {
             if let Err(frame) = self.deny_main_for_non_admin(ctx, &row.agent_id).await { return frame; }
         }
-        let bound = ctx.has_agent_access(&row.agent_id, AccessLevel::Operator).then_some(row.agent_id.as_str());
+        let operator = ctx.has_agent_access(&row.agent_id, AccessLevel::Operator);
+        let grant_backed = !actor.is_admin && row.creator_user_id != actor.user_id && !operator;
+        let bound = (operator || department_grant_allows(&view, &row.agent_id, GrantGroup::Schedules, grant_action))
+            .then_some(row.agent_id.as_str());
         match manage::manage_with_binding(&self.home_dir, &store, &actor, id, action, Utc::now(), bound).await {
             Ok(row) => {
+                if grant_backed {
+                    let method = match action {
+                        ManageAction::Pause => "assign_schedules.pause",
+                        ManageAction::Resume => "assign_schedules.resume",
+                        ManageAction::Remove => "assign_schedules.remove",
+                    };
+                    record_grant_use(self, ctx, &row.agent_id, GrantGroup::Schedules, grant_action, method).await;
+                }
                 self.broadcast_event("assign_schedule.changed", json!({}))
                     .await;
                 WsFrame::ok_response("", json!({ "schedule": manage::row_json(&row, None) }))

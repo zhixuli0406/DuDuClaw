@@ -506,6 +506,7 @@ async fn os_events_recent_reads_os_events_only() {
 
 fn manager_ctx() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "m1".to_string(),
@@ -557,4 +558,48 @@ async fn os_events_subscribe_denies_non_admin() {
         .handle("os.events.unsubscribe", json!({}), &ctx)
         .await;
     assert!(!frame_ok(&frame2), "manager must be denied, got {frame2:?}");
+}
+
+#[tokio::test]
+async fn unified_log_tool_name_filter_is_exact_optional_and_strictly_typed() {
+    let home=tempfile::tempdir().unwrap();
+    let rows=["google_drive_write","drive_read","google_drive_write_extra"].map(|name|
+        json!({"timestamp":"2026-11-27T00:00:00Z","tool_name":name,"agent_id":"bot"}).to_string());
+    std::fs::write(home.path().join("tool_calls.jsonl"),rows.join("\n")).unwrap();
+    std::fs::write(home.path().join("channel_failures.jsonl"),
+        json!({"timestamp":"2026-11-27T00:00:00Z","event":"send_failed"}).to_string()).unwrap();
+    let handler=MethodHandler::new(home.path().to_path_buf()).await;
+    for (params,count) in [(json!({}),4), (json!({"tool_name_filter":"google_drive_write"}),1),
+        (json!({"tool_name_filter":"google_drive"}),0)] {
+        let WsFrame::Response {ok:true,payload:Some(payload),..}=handler.handle_audit_unified_log(params.clone()).await
+            else { panic!("expected successful audit response"); };
+        assert_eq!(payload["events"].as_array().unwrap().len(),count);
+        assert_eq!(payload["total"],json!(count));
+        if params.get("tool_name_filter").is_some() {
+            assert!(payload["events"].as_array().unwrap().iter().all(|r| r["source"]=="tool_call"));
+        }
+    }
+    for filter in [json!(null),json!(true),json!(1),json!([]),json!({}),json!("x".repeat(65))] {
+        assert!(matches!(handler.handle_audit_unified_log(json!({"tool_name_filter":filter})).await,
+            WsFrame::Response {ok:false,..}));
+    }
+}
+
+#[tokio::test]
+async fn unified_log_accepts_legacy_and_structured_drive_requesters() {
+    let home = tempfile::tempdir().unwrap();
+    let rows = [json!("DashboardUser { user_id: \"old-secret-id\" }"),
+        json!({"kind":"channel_user", "user_id":"bound-id", "channel":"line"})]
+        .map(|requester| json!({"timestamp":"2026-11-27T00:00:00Z", "agent_id":"bot", "tool_name":"google_drive_write", "requester":requester}).to_string());
+    std::fs::write(home.path().join("tool_calls.jsonl"), rows.join("\n")).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let WsFrame::Response {ok:true,payload:Some(p),..} = handler.handle_audit_unified_log(json!({"tool_name_filter":"google_drive_write"})).await else {panic!("audit response")};
+    let events = p["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    let requesters: Vec<_> = events.iter().map(|r| &r["details"]["tool_call"]["requester"]).collect();
+    assert!(requesters.iter().any(|r| r["kind"] == "legacy" && r["label"] == "先前的紀錄"));
+    assert!(requesters.iter().any(|r| r["kind"] == "channel_user" && r["label"] == "通訊軟體使用者"));
+    assert!(!p.to_string().contains("DashboardUser"));
+    assert!(!p.to_string().contains("old-secret-id"));
+    assert!(!p.to_string().contains("bound-id"));
 }

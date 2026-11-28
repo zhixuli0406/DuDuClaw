@@ -203,6 +203,26 @@ pub(super) fn approval_pending(value: &RecordAuthority) -> Result<bool, Verifica
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn t3_consumers_refuse_chat_admin() {
+        use crate::approval::chat_admin::ledger::consumer_test_support::{self, Evidence};
+        for evidence in [Evidence::Missing, Evidence::Matching] {
+            let home = crate::fs_safe::private_test_home().unwrap();
+            let receipt = super::super::tests::receipt(home.path());
+            let mut pending = receipt.clone(); pending.approval = None;
+            let payload = serde_json::json!({"authority":pending,"record":{"task":"original"}});
+            let broker = crate::approval::ApprovalBroker::open(home.path()).unwrap();
+            let id = broker.request("alice", APPROVAL_KIND, "background", payload, 86400).await.unwrap();
+            broker.decide(&id, true, "dashboard:admin").await.unwrap();
+            assert!(check_approval(&receipt, id.as_str()).is_ok());
+            let conn = Connection::open(home.path().join("approvals.db")).unwrap();
+            consumer_test_support::install(&conn, id.as_str(), evidence);
+            assert_eq!(check_approval(&receipt, id.as_str()), Err(VerificationError::Revoked), "{evidence:?}");
+        }
+    }
+
     #[test]
     fn background_material_digest_is_order_independent_bounded_and_content_bound() {
         let a: Value = serde_json::from_str(r#"{"b":{"z":1,"a":2},"a":[1,2]}"#).unwrap();

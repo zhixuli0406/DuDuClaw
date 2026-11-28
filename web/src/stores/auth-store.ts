@@ -1,3 +1,4 @@
+import { isGrantGroup, type DepartmentGrant, type GrantGroup, type MeGrantFields } from '@/lib/dept-grants-types';
 import { dashboardEndpoint } from '@/lib/dashboard-base';
 import { create } from 'zustand';
 import { client } from '@/lib/ws-client';
@@ -38,8 +39,72 @@ export type LoginChallenge = FactorAvailability & (
   | { mfa_required: true; challenge_id: string }
   | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string; setup_code_required?: boolean });
 export type LoginResult = LoginChallenge | void;
+export type GoogleLoginResult = LoginResult | { result: string };
+
+interface AuthMe extends MeGrantFields {
+  user: AuthUser;
+  bindings: AgentBinding[];
+}
+
+const EMPTY_DEPT_GROUPS: ReadonlySet<GrantGroup> = new Set();
+
+function isMinimalMeUser(v: unknown): v is Pick<AuthUser, 'id' | 'email' | 'role'> {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const user = v as Record<string, unknown>;
+  return typeof user.id === 'string'
+    && typeof user.email === 'string'
+    && (user.role === 'admin' || user.role === 'manager' || user.role === 'employee');
+}
+
+function isAuthUser(v: unknown): v is AuthUser {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const user = v as Record<string, unknown>;
+  return typeof user.id === 'string'
+    && typeof user.email === 'string'
+    && typeof user.display_name === 'string'
+    && typeof user.status === 'string'
+    && (user.role === 'admin' || user.role === 'manager' || user.role === 'employee')
+    && [user.avatar_agent_id, user.primary_agent_id, user.department]
+      .every((value) => value === undefined || value === null || typeof value === 'string');
+}
+
+function isAgentBinding(v: unknown): v is AgentBinding {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const binding = v as Record<string, unknown>;
+  return typeof binding.user_id === 'string'
+    && typeof binding.agent_name === 'string'
+    && typeof binding.bound_at === 'string'
+    && (binding.access_level === 'owner' || binding.access_level === 'operator' || binding.access_level === 'viewer');
+}
+
+function isDepartmentGrant(v: unknown): v is { department: string; groups: string[] } {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const grant = v as Record<string, unknown>;
+  return typeof grant.department === 'string' && grant.department.length > 0
+    && Array.isArray(grant.groups) && grant.groups.every((group) => typeof group === 'string');
+}
+
+function grantState(me: MeGrantFields = {}) {
+  if ('dept_grants' in me
+    && (!Array.isArray(me.dept_grants) || !me.dept_grants.every(isDepartmentGrant))) {
+    return { deptGrants: [], deptGroups: EMPTY_DEPT_GROUPS, mainAgentAccess: false };
+  }
+  const deptGrants: DepartmentGrant[] = (Array.isArray(me.dept_grants) ? me.dept_grants : []).map((grant) => ({
+    department: grant.department,
+    groups: grant.groups.filter(isGrantGroup),
+  }));
+  return {
+    deptGrants,
+    deptGroups: new Set(deptGrants.flatMap((grant) => grant.groups)) as ReadonlySet<GrantGroup>,
+    mainAgentAccess: me.main_agent_access === true,
+  };
+}
 
 interface AuthStore {
+  readonly deptGrants: readonly DepartmentGrant[];
+  readonly deptGroups: ReadonlySet<GrantGroup>;
+  readonly mainAgentAccess: boolean;
+  refreshMe: () => Promise<void>;
   readonly user: AuthUser | null;
   readonly jwt: string | null;
   readonly refreshToken: string | null;
@@ -50,6 +115,7 @@ interface AuthStore {
   readonly authAttempt: number;
 
   login: (email: string, password: string, remember?: boolean) => Promise<LoginResult>;
+  googleComplete: (ticket: string) => Promise<GoogleLoginResult>;
   establishSession: (tokens: SessionTokens, attempt?: number, isActive?: () => boolean) => Promise<boolean>;
   /** The MFA RPC has already rebound this socket; keep the mounted route. */
   replaceSessionTokens: (tokens: SessionTokens, previousRefreshToken: string | null) => void;
@@ -74,7 +140,7 @@ interface AuthStore {
   logout: () => void;
   refresh: () => Promise<void>;
   loadFromStorage: () => Promise<boolean>;
-  setUser: (user: AuthUser, bindings: AgentBinding[]) => void;
+  setUser: (user: AuthUser, bindings: AgentBinding[], me?: MeGrantFields) => void;
 }
 
 const STORAGE_KEY_REFRESH = 'duduclaw-refresh-token';
@@ -271,6 +337,7 @@ export function resetLocalSessionProbe(): void {
 const LOCAL_SESSION_HEADER = 'X-DuDuClaw-Local';
 
 export const useAuthStore = create<AuthStore>((set, get) => ({
+  ...grantState(),
   user: null,
   jwt: null,
   refreshToken: null,
@@ -297,11 +364,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     }
     const token = data.remembered ? COOKIE_SESSION : data.refresh_token;
     if (!token) throw new Error('Missing session credential');
-    const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>('/api/me', data.access_token);
+    const me = await apiGet<AuthMe>('/api/me', data.access_token);
     if (attempt !== get().authAttempt || !isActive()) return false;
     refreshTokenStorage.set(token);
     pendingRemember = null;
-    set({ user: me.user, jwt: data.access_token, refreshToken: token,
+    set({ ...grantState(me), user: me.user, jwt: data.access_token, refreshToken: token,
       isAuthenticated: true, initialized: true, bindings: me.bindings });
     startRefreshTimer(get().refresh);
     return true;
@@ -343,6 +410,21 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       if (attempt !== get().authAttempt) return;
       if ('mfa_required' in data || 'mfa_enrollment_required' in data) return data;
       await get().establishSession(data, attempt);
+    } finally { if (attempt === get().authAttempt) set({ loading: false }); }
+  },
+
+  googleComplete: async (ticket) => {
+    // Google sign-in does not opt into persistent sessions.
+    pendingRemember = false;
+    const attempt = get().authAttempt + 1;
+    set({ loading: true, authAttempt: attempt });
+    try {
+      const data = await apiPost<SessionTokens | LoginChallenge | { result: string }>(
+        '/api/login/google/complete', { ticket },
+      );
+      if (attempt !== get().authAttempt) return { result: 'failed' };
+      if ('mfa_required' in data || 'mfa_enrollment_required' in data || 'result' in data) return data;
+      if (!await get().establishSession(data, attempt)) return { result: 'failed' };
     } finally { if (attempt === get().authAttempt) set({ loading: false }); }
   },
 
@@ -427,6 +509,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     client.disconnect();
     refreshTokenStorage.clear();
     set({
+      ...grantState(),
       user: null,
       jwt: null,
       refreshToken: null,
@@ -454,7 +537,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
         if (!stillCurrent()) return;
 
-        const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        const me = await apiGet<AuthMe>(
           '/api/me',
           data.access_token
         );
@@ -462,6 +545,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         if (!stillCurrent()) return;
         set({
           jwt: data.access_token,
+          ...grantState(me),
           user: me.user,
           bindings: me.bindings,
           isAuthenticated: true,
@@ -514,12 +598,13 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
           ? await cookieOperation(() => apiPost<SessionTokens>('/api/session/refresh', {}))
           : await apiPost<SessionTokens>('/api/refresh', { refresh_token: refreshToken });
 
-        const me = await apiGet<{ user: AuthUser; bindings: AgentBinding[] }>(
+        const me = await apiGet<AuthMe>(
           '/api/me',
           data.access_token
         );
 
         set({
+          ...grantState(me),
           user: me.user,
           jwt: data.access_token,
           refreshToken,
@@ -553,7 +638,36 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
     return false;
   },
 
-  setUser: (user: AuthUser, bindings: AgentBinding[]) => {
-    set({ user, bindings });
+  refreshMe: async () => {
+    const { authAttempt, jwt, user } = get();
+    if (!user || !get().isAuthenticated) return;
+    const stillCurrent = () => get().authAttempt === authAttempt && get().jwt === jwt
+      && get().user?.id === user.id && get().isAuthenticated;
+    try {
+      const me = await client.call('users.me') as MeGrantFields & { user: unknown; bindings: unknown };
+      if (!stillCurrent()) return;
+      if (!me || !Array.isArray(me.bindings) || !me.bindings.every(isAgentBinding)) {
+        set(grantState());
+        return;
+      }
+      if (isAuthUser(me.user) && me.user.id === user.id) {
+        set({ user: me.user, bindings: me.bindings, ...grantState(me) });
+      } else if (isMinimalMeUser(me.user) && me.user.id === user.id) {
+        set({ user: { ...get().user!, role: me.user.role }, bindings: me.bindings, ...grantState(me) });
+      } else {
+        set(grantState());
+      }
+    } catch {
+      if (stillCurrent()) set(grantState());
+    }
+  },
+
+  setUser: (user: AuthUser, bindings: AgentBinding[], me?: MeGrantFields) => {
+    set({ user, bindings, ...(me === undefined ? {} : grantState(me)) });
   },
 }));
+
+/** Stable store-owned union; never create a Set inside a Zustand selector. */
+export function useDeptGroups(): ReadonlySet<GrantGroup> {
+  return useAuthStore((state) => state.deptGroups ?? EMPTY_DEPT_GROUPS);
+}

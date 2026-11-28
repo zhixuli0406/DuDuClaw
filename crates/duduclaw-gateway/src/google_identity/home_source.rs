@@ -29,6 +29,7 @@ pub(crate) use native_selection::{
 };
 pub use oauth_material::{get_valid_google_token, get_valid_google_token_for_tool, get_valid_google_token_for_endpoint};
 pub(crate) use oauth_material::{
+    HomeWriteIdentity, home_write_identity, validate_home_write_identity, with_home_write_authority,
     HomeOAuthBearer, HomeOAuthCapture, HomeOAuthMaterialProof, HomeOAuthResolved,
     capture_from_store, resolve_home_oauth_pinned, resolve_home_oauth_pinned_mcp,
     validate_home_oauth_material,
@@ -656,3 +657,20 @@ pub(crate) async fn resolve_home_native_preflight<'a>(
 pub(crate) use oauth_material::W3RefreshEndpointGuard;
 
 pub(crate) use oauth_material::resolve_home_oauth_preflight;
+
+/// Fixed write scopes; this material never enters the ordinary token adapter.
+pub(in crate::google_identity) async fn home_sa_token_for_drive_write(
+    home: &Path,
+) -> std::result::Result<crate::google_service_account::MintedToken, super::Refusal> {
+    use crate::google_service_account as sa;
+    let failure = || super::Refusal::hard("config_invalid", "無法確認公司服務帳號設定。");
+    if crate::google_workspace::selected_path(home).map_err(|_| failure())? != "service_account" {
+        return Err(failure());
+    }
+    let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| failure())?;
+    let cfg = sa::parse_config(&raw, home).map_err(|_| failure())?.ok_or_else(failure)?;
+    let key = sa::load_key(&cfg.key_file).map_err(|_| failure())?;
+    super::resolve::validate_drive_write_mint(sa::mint_for_subject(
+        &key, &cfg.subject, super::delegated_scopes::for_drive_write(), sa::CacheMode::Bypass,
+    ).await, &cfg.subject)
+}

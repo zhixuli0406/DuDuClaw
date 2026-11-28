@@ -33,7 +33,8 @@ use duduclaw_mcp_boundary::tool_policy::{self as policy_table, ResourceKind};
 
 /// The reviewed catalog size (same pin as `isolated_round4_*`). A new tool
 /// must be given a policy, a boundary route and a G1 review before this moves.
-const CATALOG_TOOLS: usize = 271;
+// Includes RM-194 admin settings, nine RM-131 Drive writes and the four RM-141 Odoo write-back tools.
+const CATALOG_TOOLS: usize = 286;
 const SHARED_LABEL: &str = "team";
 const PERSONAL_LABEL: &str = "alice-personal";
 const SHARED_EMPLOYEE: EmployeeId = EmployeeId([0x21; 16]);
@@ -393,7 +394,16 @@ github = true
         } else {
             assert!(policy.required[0] == ResourceKind::Employee, "{name}: policy must start with the own Employee grant");
         }
-        if policy.route == Route::Connector {
+        if duduclaw_core::google_identity::is_drive_write_tool(name) {
+            assert_eq!(policy.route, Route::Connector, "{name}");
+            assert_eq!(policy.required, &[ResourceKind::Employee, ResourceKind::Connector], "{name}");
+            assert_eq!(crate::mcp_isolation_disposition::intentional_refusal(name),
+                Some(crate::mcp_isolation_disposition::Refusal::DriveWriteUnavailable), "{name}");
+            assert_eq!(provider_for_tool(name), None, "{name}");
+            for manifest in &manifests {
+                assert!(matches!(manifest.get(name), Some(ServiceState::IntentionalRefusal(_))), "{name}");
+            }
+        } else if policy.route == Route::Connector {
             assert!(provider_for_tool(name).is_some(), "{name}: connector policy without a provider");
         }
         if policy_table::IN_RUN_HELPER_TOOLS.contains(&name) || policy_table::IN_RUN_RECORDING_TOOLS.contains(&name) {

@@ -28,6 +28,19 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
             DELETE FROM mfa_factor_preferences WHERE user_id=OLD.id;
             DELETE FROM mfa_factor_failures WHERE user_id=OLD.id;
         END;") .map_err(|e|e.to_string())?;
+    // Bind Email enrollment to the credential state at proof creation. Legacy
+    // pending proofs have no snapshot and must restart; never bless them here.
+    if !crate::user_row::has_column(conn, "mfa_enrollment_proofs", "credential_epoch")? {
+        conn.execute_batch("ALTER TABLE mfa_enrollment_proofs ADD COLUMN credential_epoch INTEGER;")
+            .map_err(|e|e.to_string())?;
+    }
+    conn.execute_batch("CREATE TRIGGER IF NOT EXISTS mfa_email_enrollment_epoch
+        AFTER INSERT ON mfa_enrollment_proofs BEGIN
+            UPDATE mfa_enrollment_proofs SET credential_epoch=(
+                SELECT u.credential_epoch FROM users u JOIN mfa_challenges c ON c.user_id=u.id
+                WHERE c.token_hash=NEW.token_hash)
+            WHERE token_hash=NEW.token_hash;
+        END;") .map_err(|e|e.to_string())?;
     // F6d: purpose-bound restore codes (same sender, own single-use table).
     super::owner_factor::migrate(conn)
 }
@@ -44,6 +57,31 @@ pub(super) fn numeric_code() -> Result<String> {
 fn email_hash(token: &str, code: &str) -> String {
     // The random challenge is not persisted, preventing an offline six-digit dictionary.
     token_hash(&format!("email:{token}:{code}"))
+}
+
+fn require_email_first_factor(conn: &Connection, token: &str) -> Result<()> {
+    let first: String = conn.query_row("SELECT first_factor FROM mfa_challenges WHERE token_hash=?1",
+        [token_hash(token)], |r|r.get(0)).map_err(|_|DENIED)?;
+    // The Google mailbox is not independent of Google sign-in. Unknown
+    // first factors must be explicitly evaluated before allowing email.
+    match first.as_str() {
+        "password" | "channel_otp" => Ok(()),
+        _ => Err(DENIED.into()),
+    }
+}
+
+/// Public login enrollment cannot become an additional-factor capability.
+/// Both delivery and the authoritative factor-write transaction call this.
+fn require_email_enrollment(conn: &Connection, user: &str, token: &str) -> Result<()> {
+    let (current,public): (bool,bool) = conn.query_row(
+        "SELECT p.credential_epoch=u.credential_epoch,p.session IS NULL
+         FROM mfa_enrollment_proofs p JOIN mfa_challenges c USING(token_hash)
+         JOIN users u ON u.id=c.user_id WHERE p.token_hash=?1 AND u.id=?2",
+        params![token_hash(token),user], |r|Ok((r.get(0)?,r.get(1)?))).map_err(|_|DENIED)?;
+    if !current || (public && any_factor(conn,user)?) || !proof_verified(conn,token)? {
+        return Err(DENIED.into());
+    }
+    Ok(())
 }
 
 impl UserDb {
@@ -113,7 +151,14 @@ impl UserDb {
         if enrollment { self.mfa_http_enrollment(token, password, now)?; }
         let conn = self.conn();
         let user = challenge_user(&conn, token, if enrollment {"enroll"} else {"login"}, now)?;
+        require_email_first_factor(&conn, token)?;
         active_user(&conn, &user)?;
+        if enrollment {
+            require_email_enrollment(&conn,&user,token)?;
+            if policy_enforced(&conn)? && !any_factor(&conn,&user)? {
+                enrollment::require_independent_proof(&conn,token,now)?;
+            }
+        }
         if !enrollment {
             let verified: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials e JOIN users u ON u.id=e.user_id WHERE e.user_id=?1 AND e.email=u.email)",
                 [&user], |r| r.get(0)).map_err(|e| e.to_string())?;
@@ -127,7 +172,14 @@ impl UserDb {
         let mut conn=self.conn();
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let user=challenge_user(&tx,token,if enrollment {"enroll"} else {"login"},now)?;
+        require_email_first_factor(&tx,token)?;
         active_user(&tx,&user)?;
+        if enrollment {
+            require_email_enrollment(&tx,&user,token)?;
+            if policy_enforced(&tx)? && !any_factor(&tx,&user)? {
+                enrollment::require_independent_proof(&tx,token,now)?;
+            }
+        }
         let email:String=tx.query_row("SELECT email FROM users WHERE id=?1",[&user],|r|r.get(0)).map_err(|_|DENIED)?;
         if !enrollment {
             let verified:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials WHERE user_id=?1 AND email=?2)",params![user,email],|r|r.get(0)).map_err(|e|e.to_string())?;
@@ -162,7 +214,9 @@ impl UserDb {
         let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let since=crate::credential_changes::high_water(&tx)?;
         let user=challenge_user(&tx,token,if enrollment {"enroll"} else {"login"},now)?;
+        require_email_first_factor(&tx,token)?;
         active_user(&tx,&user)?;
+        if enrollment { require_email_enrollment(&tx,&user,token)?; }
         tx.execute("UPDATE mfa_challenges SET attempts=attempts+1 WHERE token_hash=?1",[token_hash(token)]).map_err(|e|e.to_string())?;
         let record:Option<(String,String)>=tx.query_row("SELECT c.email,c.code_hash FROM mfa_email_codes c JOIN users u ON u.id=c.user_id
             WHERE c.token_hash=?1 AND c.user_id=?2 AND c.email=u.email AND c.expires_at>?3",params![token_hash(token),user,now],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
@@ -177,6 +231,11 @@ impl UserDb {
             let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM mfa_email_credentials WHERE user_id=?1 AND email=?2)",params![user,email],|r|r.get(0)).map_err(|e|e.to_string())?;
             if exists { return Err("Email 驗證碼已啟用。".into()); }
             let had_factor=any_factor(&tx,&user)?;
+            // Match TOTP / Passkey: enforce independent proof in the same
+            // Immediate transaction that writes the first factor and tokens.
+            if policy_enforced(&tx)? && !had_factor {
+                enrollment::require_independent_proof(&tx,token,now)?;
+            }
             tx.execute("INSERT INTO mfa_email_credentials(user_id,email,verified_at) VALUES(?1,?2,?3)
                 ON CONFLICT(user_id) DO UPDATE SET email=excluded.email,verified_at=excluded.verified_at",params![user,email,now]).map_err(|e|e.to_string())?;
             bump_epoch(&tx,&user)?;

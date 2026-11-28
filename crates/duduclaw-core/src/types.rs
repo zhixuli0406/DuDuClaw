@@ -2022,6 +2022,12 @@ pub const POLICY_FS_WRITE_TOOLS: &[&str] = &[
 /// Runtime tool names in the PolicyKernel's `shell_exec` family.
 pub const POLICY_SHELL_EXEC_TOOLS: &[&str] = &["Bash", "shell", "run_shell_command", "run_command"];
 
+/// Shell-capable tool names shared by hooks and task-change tracking.
+pub const SHELL_TOOLS: &[&str] = &[
+    "Bash", "Shell", "shell", "run_shell_command", "run_terminal_cmd",
+    "run_terminal_command", "run_command", "shell_exec",
+];
+
 /// Map a runtime-specific tool name to its PolicyKernel canonical family
 /// (`fs_write` / `shell_exec` / `mcp_call`).
 ///

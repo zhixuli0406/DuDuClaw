@@ -1383,6 +1383,86 @@ fn discord_reply_context(data: &Value, bot_id: &str) -> Option<String> {
     Some(channel_format::format_quoted_context(&who, &excerpt))
 }
 
+/// Media admission uses the final reply session, including a newly created
+/// thread. The caller has already passed the incoming guild/channel policy.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_discord_attachments(
+    data: &Value, token: &str, ctx: &Arc<ReplyContext>, storage_agent: Option<&str>,
+    selected: Option<&str>, session: &str, sender: &str, text: &str,
+    combined: &str, policy: &crate::channel_reply::UserAccessPolicy,
+) -> Result<String, String> {
+    match crate::channel_reply::attachment_gate::check(
+        ctx, session, session, sender, text, selected, Some(policy),
+    ).await {
+        crate::channel_reply::attachment_gate::AttachmentEntry::Proceed => {}
+        crate::channel_reply::attachment_gate::AttachmentEntry::SkipFiles => return Ok(combined.to_string()),
+        crate::channel_reply::attachment_gate::AttachmentEntry::DropFilesAndContinue(command) => return Ok(command),
+        crate::channel_reply::attachment_gate::AttachmentEntry::Refuse(reply) => return Err(reply),
+    }
+    // WP1.3: download attachments to disk (agent-Readable absolute paths) so
+    // office documents can be parsed by skills, not just linked. Files land in
+    // the shared `{home}/attachments/` (the DELIVER validator trusts this root
+    // too); download failures degrade to a plain URL reference.
+    let mut attachment_lines: Vec<String> = Vec::new();
+    if let Some(arr) = data["attachments"].as_array() {
+        let attach_base =
+            crate::channel_reply::resolve_attachment_base(ctx.as_ref(), storage_agent).await;
+        for att in arr {
+            let Some(url) = att["url"].as_str() else {
+                continue;
+            };
+            let content_type = att["content_type"]
+                .as_str()
+                .unwrap_or("application/octet-stream");
+            let filename = att["filename"].as_str().unwrap_or("file");
+            let mt = crate::media::media_type_from_mime(content_type);
+            #[cfg(test)]
+            attachment_download_probe::record(token);
+            // F5-C (review F4-M1): bounded, so one slow attachment cannot
+            // hold an ordinary permit indefinitely.
+            let download = tokio::time::timeout(
+                DISCORD_ATTACHMENT_TIMEOUT,
+                crate::media::download_url(
+                    url,
+                    None,
+                    crate::media::MAX_FILE_SIZE as usize,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| Err("attachment download timed out".into()));
+            match download
+            {
+                Ok(bytes) => {
+                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename)
+                        .await
+                    {
+                        Ok(path) => {
+                            attachment_lines
+                                .push(crate::media::format_attachment_ref(&mt, filename, &path));
+                        }
+                        Err(e) => {
+                            warn!("Discord: failed to save attachment {filename}: {e}");
+                            attachment_lines.push(format!("[Attached file: {filename}]({url})"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Discord: failed to download attachment {filename}: {e}");
+                    attachment_lines.push(crate::media::attachment_download_failed(filename));
+                }
+            }
+        }
+    }
+
+    Ok(if attachment_lines.is_empty() {
+        combined.to_string()
+    } else if combined.is_empty() {
+        attachment_lines.join("\n")
+    } else {
+        format!("{combined}\n\n{}", attachment_lines.join("\n"))
+    })
+}
+
 async fn handle_message_create(
     data: &Value,
     bot_id: &str,
@@ -1516,65 +1596,10 @@ async fn handle_message_create(
         return;
     }
 
-    // WP1.3: download attachments to disk (agent-Readable absolute paths) so
-    // office documents can be parsed by skills, not just linked. Files land in
-    // the shared `{home}/attachments/` (the DELIVER validator trusts this root
-    // too); download failures degrade to a plain URL reference.
-    let mut attachment_lines: Vec<String> = Vec::new();
-    if let Some(arr) = data["attachments"].as_array() {
-        let attach_base =
-            crate::channel_reply::resolve_attachment_base(ctx.as_ref(), agent_name).await;
-        for att in arr {
-            let Some(url) = att["url"].as_str() else {
-                continue;
-            };
-            let content_type = att["content_type"]
-                .as_str()
-                .unwrap_or("application/octet-stream");
-            let filename = att["filename"].as_str().unwrap_or("file");
-            let mt = crate::media::media_type_from_mime(content_type);
-            #[cfg(test)]
-            attachment_download_probe::record(token);
-            // F5-C (review F4-M1): bounded, so one slow attachment cannot
-            // hold an ordinary permit indefinitely.
-            let download = tokio::time::timeout(
-                DISCORD_ATTACHMENT_TIMEOUT,
-                crate::media::download_url(
-                    url,
-                    None,
-                    crate::media::MAX_FILE_SIZE as usize,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| Err("attachment download timed out".into()));
-            match download
-            {
-                Ok(bytes) => {
-                    match crate::media::save_attachment_in_base(&attach_base, &bytes, filename)
-                        .await
-                    {
-                        Ok(path) => {
-                            attachment_lines
-                                .push(crate::media::format_attachment_ref(&mt, filename, &path));
-                        }
-                        Err(e) => {
-                            warn!("Discord: failed to save attachment {filename}: {e}");
-                            attachment_lines.push(format!("[Attached file: {filename}]({url})"));
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!("Discord: failed to download attachment {filename}: {e}");
-                    attachment_lines.push(crate::media::attachment_download_failed(filename));
-                }
-            }
-        }
-    }
-
-    if content.is_empty() && attachment_lines.is_empty() {
+    let has_attachments = data["attachments"].as_array().is_some_and(|a| !a.is_empty());
+    if content.is_empty() && !has_attachments {
         return;
     }
-
 
     // W2-7: cache channel->guild before any filtering below returns early —
     // maximizes the chance the mapping is already known by the time a
@@ -1652,12 +1677,16 @@ async fn handle_message_create(
             .and_then(|m| m.get("id"))
             .and_then(|v| v.as_str())
         {
-            if let Some(outcome) = crate::decision_text::route_text_reply(
-                &ctx.home_dir,
-                "discord",
-                author_id,
-                channel_id,
-                ref_mid,
+            if let Some(outcome) = crate::decision_text::route_verified_text_reply(
+                ctx, &decision_context,
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: Some(ref_mid.into()), private: false,
+                    account: crate::chat_link_intercept::account_label("discord", agent_name), dm: channel_id.into(),
+                },
+                crate::decision_notify::DecisionAccessScope {
+                    channel_id: (!guild_id.is_empty()).then_some(channel_id),
+                    guild_id: (!guild_id.is_empty()).then_some(guild_id), session_id: Some(current_session_id),
+                },
                 content,
             )
             .await
@@ -1684,17 +1713,30 @@ async fn handle_message_create(
         None => stripped.to_string(),
     };
 
-    // Combine text content with attachment references
-    let combined = if attachment_lines.is_empty() {
-        combined
-    } else if combined.is_empty() {
-        attachment_lines.join("\n")
-    } else {
-        format!("{combined}\n\n{}", attachment_lines.join("\n"))
-    };
+    // Commands act on the incoming conversation and never create a thread.
+    // Ordinary media waits until Discord has returned the actual thread id:
+    // channel and thread bindings can select different employees.
+    let command_with_files = has_attachments
+        && crate::chat_commands::parse_command(combined.trim(), None).is_some();
+    let combined = if command_with_files {
+        match agent_selection::explicit_agent(ctx, agent_name, guild_id).await {
+            Ok(selected) => {
+                match prepare_discord_attachments(data, token, ctx, agent_name,
+                    selected.as_deref(), current_session_id, user_id,
+                    stripped, &combined, &user_access_policy).await {
+                    Ok(text) => text,
+                    Err(reply) => {
+                        let _ = send_discord_message(http, token, channel_id, json!({ "content": reply })).await;
+                        return;
+                    }
+                }
+            }
+            // No download; preserve the existing command intercept's answer.
+            Err(()) => combined,
+        }
+    } else { combined };
     let clean_content = combined.trim();
-
-    if clean_content.is_empty() {
+    if clean_content.is_empty() && !has_attachments {
         return;
     }
 
@@ -1809,6 +1851,18 @@ async fn handle_message_create(
                 crate::channel_reply::is_channel_admin(ctx, "discord", &[user_id, &session_id])
                     .await;
             let caller = crate::chat_commands::CommandCaller::for_channel(&ctx.home_dir, "discord", user_id);
+            let origin = crate::chat_commands::CommandOrigin {
+                channel: "discord", gate_session: session_id, command_session: session_id,
+                sender: user_id, text: clean_content, shared: !guild_id.is_empty(),
+            };
+            if let Some(refusal) = crate::chat_commands::command_entry_refusal(
+                &cmd, ctx, &origin, &agent_id,
+            ).await {
+                if !refusal.is_empty() {
+                    let _ = send_discord_message(http, token, channel_id, json!({ "content": refusal })).await;
+                }
+                return;
+            }
             let reply = crate::chat_commands::handle_command_with_caller(
                 &cmd,
                 ctx,
@@ -1834,6 +1888,10 @@ async fn handle_message_create(
         }
     };
 
+    // A media-only message has no local file reference yet. Use a temporary
+    // nonempty title; after admission/download restore the usual final title.
+    let thread_seed = if clean_content.is_empty() { "附件" } else { clean_content };
+    let initial_thread_name = discord_thread_name(thread_seed);
     // Track whether we created a new thread (for guide message later)
     let mut created_thread = false;
     let reply_channel_id = if auto_thread && !is_thread && !guild_id.is_empty() {
@@ -1849,7 +1907,7 @@ async fn handle_message_create(
             token,
             channel_id,
             message_id,
-            clean_content,
+            thread_seed,
             archive_minutes,
         )
         .await
@@ -1871,6 +1929,58 @@ async fn handle_message_create(
     } else {
         current_session_id.clone()
     };
+
+    let combined = if has_attachments && !command_with_files {
+        match prepare_discord_attachments(data, token, ctx, agent_name,
+            effective_agent.as_deref(), &session_id, user_id,
+            stripped, clean_content, &user_access_policy).await {
+            Ok(text) => text,
+            Err(reply) => {
+                let _ = send_discord_message(http, token, &reply_channel_id, json!({ "content": reply })).await;
+                return;
+            }
+        }
+    } else { combined };
+    let clean_content = combined.trim();
+    if clean_content.is_empty() { return; }
+    // Dropping files also removes quoted context. An exempt command that
+    // was hidden by that context now needs its command handler, rather than
+    // entering the ordinary model pipeline after the earlier intercept.
+    if has_attachments && !command_with_files
+        && let Some(cmd) = crate::chat_commands::parse_command(clean_content, None)
+        && crate::entry_gate::command_is_exempt(&cmd)
+    {
+        let agent = match agent_selection::command_agent(ctx, effective_agent.as_deref(), &session_id, user_id).await {
+            Ok(agent) => agent,
+            Err(()) => {
+                let _ = send_discord_message(http, token, &reply_channel_id,
+                    json!({ "content": crate::channel_reply::SELECTED_AGENT_UNAVAILABLE })).await;
+                return;
+            }
+        };
+        let origin = crate::chat_commands::CommandOrigin {
+            channel: "discord", gate_session: &session_id, command_session: &session_id,
+            sender: user_id, text: clean_content, shared: !guild_id.is_empty(),
+        };
+        let reply = crate::chat_commands::handle_gated_command(&cmd, ctx, &origin, &agent).await;
+        if !reply.is_empty() {
+            let _ = send_discord_message(http, token, &reply_channel_id, json!({ "content": reply })).await;
+        }
+        return;
+    }
+    if created_thread && has_attachments {
+        let name = discord_thread_name(clean_content);
+        if name != initial_thread_name {
+            let url = format!("{DISCORD_API}/channels/{reply_channel_id}");
+            #[cfg(test)]
+            let url = crate::test_channel_provider::url(token, &url);
+            let renamed = http.patch(url).header("Authorization", format!("Bot {token}"))
+                .json(&json!({ "name": name })).send().await;
+            if !matches!(renamed, Ok(response) if response.status().is_success()) {
+                warn!("Discord: failed to restore the attachment thread title");
+            }
+        }
+    }
 
     #[cfg(test)]
     if ordinary_dispatch_probe::record_if_installed(token, &session_id) {
@@ -2156,7 +2266,7 @@ async fn handle_message_create(
     // embedded in `reply` still works fine on its own.
     let buttons = if crate::goal_intent::reply_has_confirmation_menu(&reply) {
         crate::goal_intent::pending_button_nonce(&session_id)
-            .map(|nonce| channel_format::discord_gintent_buttons(&nonce))
+            .map(|nonce| channel_format::discord_gintent_buttons(&nonce, crate::trigger_route::texts::lang_for(&ctx.home_dir)))
             .unwrap_or_else(|| channel_format::discord_conversation_buttons(&session_id))
     } else {
         channel_format::discord_conversation_buttons(&session_id)
@@ -2283,6 +2393,20 @@ fn thread_archive_minutes(raw: &str) -> u32 {
     }
 }
 
+fn discord_thread_name(content: &str) -> String {
+    // Thread name: first 97 chars, filter control characters (safe for CJK multi-byte)
+    let name: String = content
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(97)
+        .collect();
+    if content.chars().filter(|c| !c.is_control()).count() > 97 {
+        format!("{name}...")
+    } else {
+        name
+    }
+}
+
 async fn create_thread(
     http: &reqwest::Client,
     token: &str,
@@ -2291,17 +2415,7 @@ async fn create_thread(
     content: &str,
     archive_minutes: u32,
 ) -> Option<String> {
-    // Thread name: first 97 chars, filter control characters (safe for CJK multi-byte)
-    let name: String = content
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(97)
-        .collect();
-    let name = if content.chars().filter(|c| !c.is_control()).count() > 97 {
-        format!("{name}...")
-    } else {
-        name
-    };
+    let name = discord_thread_name(content);
 
     let url = format!("{DISCORD_API}/channels/{channel_id}/messages/{message_id}/threads");
     #[cfg(test)]
@@ -2510,6 +2624,7 @@ async fn handle_interaction(
                 app_id,
                 http,
                 ctx,
+                agent_name,
             )
             .await;
         }
@@ -2698,6 +2813,7 @@ async fn handle_component_interaction(
     app_id: &str,
     http: &reqwest::Client,
     ctx: &Arc<ReplyContext>,
+    agent_name: Option<&str>,
 ) {
     let cdata = match data.get("data") {
         Some(d) => d,
@@ -2797,8 +2913,14 @@ async fn handle_component_interaction(
                     guild_id: data["guild_id"].as_str(),
                     session_id: Some(&discord_component_session(data)),
                 },
+                &crate::approval::chat_admin::press::PressOrigin {
+                    message_id: data["message"]["id"].as_str().map(str::to_owned),
+                    private: false,
+                    account: crate::chat_link_intercept::account_label("discord", agent_name),
+                    dm: data["channel_id"].as_str().unwrap_or("").into(),
+                },
             )
-            .await
+            .await.map(crate::approval::chat_admin::press::PressOutcome::into_reply)
         };
         match outcome {
             // Decision landed → light ephemeral ack. The persistent card
@@ -3878,6 +4000,7 @@ mod native_callback_acl_tests {
                 "A1",
                 &reqwest::Client::new(),
                 &fixture.ctx,
+                None,
             )
             .await;
             if allowed {
@@ -3972,6 +4095,7 @@ mod thread_type_decision_acl_tests {
                             "A1",
                             &reqwest::Client::new(),
                             &fixture.ctx,
+                            None,
                         )
                         .await;
                     } else {
@@ -4876,6 +5000,10 @@ mod normal_pairing_acl_tests {
 #[cfg(test)]
 #[path = "channel_decision_route/adapter_tests/discord.rs"]
 mod f4_decision_route_tests;
+
+#[cfg(test)]
+#[path = "discord/attachment_gate_tests.rs"]
+mod attachment_gate_tests;
 
 /// Progress-callback filter: only events a text channel can render
 /// (allowlist — Step / ModelInfo / Thinking are dashboard-only and would

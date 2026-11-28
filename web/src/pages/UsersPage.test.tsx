@@ -353,7 +353,7 @@ describe('IdentityChips — Google Chat (RM-152)', () => {
     expect(remove).toHaveLength(1);
     await user.click(remove[0]);
     expect(onRemove).toHaveBeenCalledWith(identities[1]);
-    expect(screen.getByText('Google Chat · users/2')).toBeInTheDocument();
+    expect(screen.getByText('Google Chat · rs/2')).toBeInTheDocument();
     expect(screen.getByText('Telegram · 42')).toBeInTheDocument();
   });
 
@@ -382,7 +382,8 @@ describe('UsersPage — primary AI', () => {
     });
     renderWithProviders(<UsersPage />);
     expect(await screen.findByText('AI avatar conflicts to resolve')).toBeInTheDocument();
-    expect(screen.getByText('shared-ai: Member, another-member')).toBeInTheDocument();
+    expect(screen.getByText('shared-ai: Member, Unknown member')).toBeInTheDocument();
+    expect(screen.queryByText(/another-member/)).not.toBeInTheDocument();
     expect(mockWsClient.call).toHaveBeenCalledWith('users.avatar_conflicts');
   });
 
@@ -444,5 +445,68 @@ describe('UsersPage — primary AI', () => {
     renderWithProviders(<UsersPage />);
     await screen.findByText('Member');
     expect(screen.queryByRole('button', { name: 'Set to their first AI' })).not.toBeInTheDocument();
+  });
+});
+
+
+describe('IdentityChips — proof status', () => {
+  it('shows proof tags and time, masks ids, and retains the full removal identity', async () => {
+    const identity: ChannelIdentity = { user_id: 'private-user', channel: 'googlechat', channel_user_id: 'users/123456789', verified: true, created_at: '', proof_status: 'self_confirmed', proven_at: '2026-11-27T08:52:00Z' };
+    const onRemove = vi.fn();
+    const { container } = renderWithProviders(<IdentityChips state={[identity, { ...identity, channel: 'telegram', proof_status: 'admin_prefilled', proven_at: null }]} onAdd={vi.fn()} onRemove={onRemove} />);
+    expect(screen.getByText('Self-confirmed')).toBeInTheDocument();
+    expect(screen.getByText('Admin-prefilled')).toBeInTheDocument();
+    expect(screen.getByText('Google Chat · 6789')).toBeInTheDocument();
+    expect(screen.getByText('Telegram · 6789')).toBeInTheDocument();
+    expect(screen.getByTitle(/Nov 27, 2026, 8:52 AM Self-confirmed/)).toBeInTheDocument();
+    expect(container.innerHTML).not.toContain(identity.channel_user_id);
+    expect(container.innerHTML).not.toContain(identity.user_id);
+    await userEvent.click(screen.getByRole('button', { name: 'Remove binding Google Chat · 6789' }));
+    expect(onRemove).toHaveBeenCalledWith(identity);
+  });
+});
+
+
+it('sends the full channel id when a masked member binding is removed', async () => {
+  const identity: ChannelIdentity = { user_id: 'member-private', channel: 'googlechat', channel_user_id: 'users/987654321', verified: true, created_at: '', proof_status: 'admin_prefilled' };
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue({ ok: true, json: async () => ({ identities: [identity] }) } as Response);
+  mockWsClient.call.mockImplementation(async (method: string) => method === 'users.list'
+    ? { users: [{ id: identity.user_id, email: 'member@example.com', display_name: 'Member', role: 'employee', status: 'active', bindings: [] }] }
+    : { users: [], agents: [], departments: [], conflicts: [], requests: [] });
+  try {
+    renderWithProviders(<UsersPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove binding Google Chat · 4321' }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/channel-identity/unbind', expect.objectContaining({
+      method: 'POST', body: JSON.stringify({ user_id: identity.user_id, channel: identity.channel, channel_user_id: identity.channel_user_id }),
+    })));
+  } finally { fetchMock.mockRestore(); }
+});
+
+describe('UsersPage — department management grants', () => {
+  it.each([
+    ['admin', 'manager', true],
+    ['admin', 'employee', false],
+    ['admin', 'admin', false],
+    ['manager', 'manager', false],
+    ['employee', 'manager', false],
+  ])('gates the row action for viewer=%s, member=%s', async (viewer, role, visible) => {
+    useAuthStore.setState({ user: { id: 'viewer', role: viewer } as never });
+    useAgentsStore.setState({ agents: [], loaded: true, loading: false });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [{ id: 'target', display_name: 'Chen', email: 'chen@example.com', role, status: 'active', bindings: [], created_at: '', updated_at: '' }] };
+      if (method === 'users.dept_grants.list') return [];
+      if (method === 'users.dept_grants.options') return { departments: [], mirror_mismatch_count: 0 };
+      return { users: [], departments: [], agents: [], identities: [], conflicts: [], statuses: {} };
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<UsersPage />);
+    await screen.findByText('Chen');
+    await user.click(screen.getByRole('button', { name: 'More' }));
+    await screen.findByRole('menuitem', { name: 'Edit' });
+    expect(screen.queryByRole('menuitem', { name: 'Department management grants' }) !== null).toBe(visible);
+    if (visible) {
+      await user.click(screen.getByRole('menuitem', { name: 'Department management grants' }));
+      expect(await screen.findByRole('dialog', { name: 'Department management grants for Chen' })).toBeInTheDocument();
+    }
   });
 });

@@ -1,5 +1,7 @@
 # MCP 工具：AI 員工看得到哪些、為什麼
 
+「整合 → Odoo」提供升級通知、權限模式（引擎資料表或跟隨 Odoo 帳號，須確認風險）、「一律不允許」（預設分類顯示，移除須確認，五項固定拒絕仍保留）、「全公司帳號給哪些 AI」，以及預設關閉的「同仁本人 Odoo 帳號」與成員憑證清單。「員工編輯頁 → 整合 → Odoo」提供「權限收窄」、「使用當下請求者的 Odoo 帳號」，以及各資料表的「活動／內部備註／通知追蹤者／附件」，各項都須確認。成員在「我的連線 → Odoo」填自己的登入名稱與金鑰；管理員開放前顯示「由管理員設定」。管理員可在「成員 → 列選單 → 撤銷 Odoo 帳號」撤銷憑證。
+
 
 ## 查證本機呼叫者
 
@@ -10,12 +12,8 @@
 
 技能不再因閒置而被標成過時或自動封存。`[skill_curator]` 設定仍可讀取，但所有值都無作用，每個程序會警告一次。Gateway 啟動時會將有紀錄的封存技能搬回原位並恢復使用，不覆蓋既有技能；衝突檔留在 `skills-archive`，由管理員處理。Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，並拒絕符號連結路徑；其他平台保留封存檔，供管理員手動還原。
 
-| 已棄用工具（預計 v1.86.0 移除） | 行為 |
-|---|---|
-| `skill_curator_status` | 唯讀封存清單與還原指引；接受 `run=true`，但只回覆參數無作用。只顯示技能名稱與範圍；員工只能查看自己的範圍，管理員可查看全部 |
-| `skill_pin` | `pinned=true` 仍可還原有紀錄的封存技能，不覆蓋既有檔；其他釘選操作無作用。Linux 與 macOS 支援還原；員工僅能還原自己的技能，全域與其他員工技能需由管理員操作 |
 
-請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。兩個相容工具仍受既有授權與員工範圍限制。
+請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。下次 gateway 啟動時會重試有紀錄的封存技能。
 
 
 DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋兩件最容易誤解的事：
@@ -134,15 +132,15 @@ CIMD `private_key_jwt`。
 **內部金鑰用在 `duduclaw http-server`。** HTTP 伺服器對所有呼叫者都以同一位固定員工（它的預設員工）的身分執行，而許多工具是以那位員工、而不是金鑰本身的身分讀寫：`working_state_*`、`mail_*`、所有 `wiki_*` 工具、`canvas_*`、`send_message`、`tasks_list`、`plan_*`、`odoo_*`、電腦操作、分支與知識庫工具，以及 `crates/duduclaw-cli/src/mcp/tools_list.rs` 裡 `DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` 的其餘工具。在 HTTP 上採「預設拒絕」：
 
 - 只有閘道自己的內部金鑰（閘道記錄過指紋的 `gateway-internal` 金鑰，且伺服器本身的員工身分已驗證）可以呼叫這些工具。
-- 其他所有非外部金鑰——員工專用金鑰、以顯示名稱建立的金鑰、搬移過來的金鑰、任何未知的內部用戶端 ID——這些工具一律拒絕（`-32003`，稽核類別 `per_agent_key_process_tool`，不論金鑰帶哪些權限範圍），`tools/list` 也不會列出。這個判斷只依金鑰通過驗證的方式，不看磁碟上的檔案。
+- 其他所有非外部金鑰，員工專用金鑰、以顯示名稱建立的金鑰、搬移過來的金鑰、任何未知的內部用戶端 ID，這些工具一律拒絕（`-32003`，稽核類別 `per_agent_key_process_tool`，不論金鑰帶哪些權限範圍），`tools/list` 也不會列出。這個判斷只依金鑰通過驗證的方式，不看磁碟上的檔案。
 - 其餘工具（`memory_store`、`memory_search`、`file_read`……）一律以金鑰**所綁定的員工**身分執行，絕不會改用伺服器的預設員工。`tools/list` 只列出這把金鑰的權限範圍實際能呼叫的工具（例如只有 `memory:read` 的金鑰看不到 `memory_store`）；需要 `admin` 的工具（例如 `tasks_create`）員工專用金鑰一律不能呼叫，也不會列出。
 - 沒有綁定員工、或綁定的員工已不存在（資料夾被移除或改名，或 `status = "deleted"`）的非外部金鑰，**所有**工具都會被拒絕（`-32003`，稽核類別 `remote_key_unbound` 並記下原因），`tools/list` 為空；金鑰頁會把它標成「員工已不存在」。
 
-**刪除員工會永久撤銷它的金鑰。** 在儀表板刪除員工時，綁定這位員工的每把金鑰會在同一個操作中被刪除（保留指紋作為墓碑，永遠不會再通過驗證），並逐把寫入稽核 `mcp_key_deleted`（原因 `employee_deleted`）。已刪除的員工無法從儀表板還原；即使管理者在磁碟上恢復員工資料，金鑰仍維持已刪除。**之後以相同代號建立的員工也拿不到這些金鑰**：請為新員工發新的金鑰。在閘道以外移除的員工（MCP `agent_remove` 把資料夾移到 `agents/_trash`，或手動刪除資料夾）或 `status = "deleted"` 的員工，會在閘道下一次金鑰檢查（啟動時與每 10 分鐘）以同樣方式撤銷金鑰（整個 `agents/` 資料夾不存在時不做任何判斷）。第二道防線：比所綁定員工資料夾還早建立的金鑰，HTTP 伺服器一律拒絕（原因 `employee_recreated`，金鑰頁標示「員工已不存在」）——那代表員工是以被移除者的代號重新建立的，即使還沒到下一次檢查也一樣。這項檢查需要作業系統提供資料夾建立時間（macOS、Windows、多數 Linux 檔案系統）；無法取得時，以上述撤銷機制為準。把整個 DuDuClaw 資料夾從備份還原或複製到別處，會重設這些建立時間，還原前發出的員工專用金鑰會被拒絕，需要重新發行。
+**刪除員工會永久撤銷它的金鑰。** 在儀表板刪除員工時，綁定這位員工的每把金鑰會在同一個操作中被刪除（保留指紋作為墓碑，永遠不會再通過驗證），並逐把寫入稽核 `mcp_key_deleted`（原因 `employee_deleted`）。已刪除的員工無法從儀表板還原；即使管理者在磁碟上恢復員工資料，金鑰仍維持已刪除。**之後以相同代號建立的員工也拿不到這些金鑰**：請為新員工發新的金鑰。在閘道以外移除的員工（MCP `agent_remove` 把資料夾移到 `agents/_trash`，或手動刪除資料夾）或 `status = "deleted"` 的員工，會在閘道下一次金鑰檢查（啟動時與每 10 分鐘）以同樣方式撤銷金鑰（整個 `agents/` 資料夾不存在時不做任何判斷）。第二道防線：比所綁定員工資料夾還早建立的金鑰，HTTP 伺服器一律拒絕（原因 `employee_recreated`，金鑰頁標示「員工已不存在」），那代表員工是以被移除者的代號重新建立的，即使還沒到下一次檢查也一樣。這項檢查需要作業系統提供資料夾建立時間（macOS、Windows、多數 Linux 檔案系統）；無法取得時，以上述撤銷機制為準。把整個 DuDuClaw 資料夾從備份還原或複製到別處，會重設這些建立時間，還原前發出的員工專用金鑰會被拒絕，需要重新發行。
 
-**被拒絕的金鑰會留下紀錄。** 每次 MCP 金鑰驗證失敗都會記下 `reason`——`missing_header`（沒帶金鑰）、`bad_scheme`（不是 `Bearer`）、`malformed_key`（格式錯誤）、`wrong_credential_type`（憑證種類不對）、`unknown_key`（不存在）、`key_disabled`（已停用）、`key_expired`（已到期）、`key_deleted`（已刪除）、`key_unbound`（員工已不存在）或 `store_unavailable`（儲存區無法讀取）之一——以及固定的路徑代號 `route`（`mcp`、`mcp_v1_call`、`mcp_v1_stream`……）。已停用、已到期、已刪除或員工已不存在的金鑰會附上金鑰 ID（`mk_…`）。紀錄絕不包含金鑰本身、金鑰的任何片段或指紋，也不含網址參數或 User-Agent。紀錄分成兩個檔案：
+**被拒絕的金鑰會留下紀錄。** 每次 MCP 金鑰驗證失敗都會記下 `reason`，`missing_header`（沒帶金鑰）、`bad_scheme`（不是 `Bearer`）、`malformed_key`（格式錯誤）、`wrong_credential_type`（憑證種類不對）、`unknown_key`（不存在）、`key_disabled`（已停用）、`key_expired`（已到期）、`key_deleted`（已刪除）、`key_unbound`（員工已不存在）或 `store_unavailable`（儲存區無法讀取）之一，以及固定的路徑代號 `route`（`mcp`、`mcp_v1_call`、`mcp_v1_stream`……）。已停用、已到期、已刪除或員工已不存在的金鑰會附上金鑰 ID（`mk_…`）。紀錄絕不包含金鑰本身、金鑰的任何片段或指紋，也不含網址參數或 User-Agent。紀錄分成兩個檔案：
 
-- `<home>/security_audit.jsonl`（具雜湊鏈的安全稽核，伺服器紀錄也有一行警告）：**已存在金鑰**（停用、到期、已刪除、員工已不存在）的驗證失敗會立即寫入一筆附金鑰 ID 的 `mcp_auth_failed`——每把金鑰、每種原因每小時一筆，該小時其餘的次數在整點後再寫一筆並附次數（`count`）。**其他失敗**每小時彙總成一筆 `mcp_auth_failed_summary`：各原因次數、來源數（最多算到 1,024）、沒寫進去的紀錄數，並註明明細檔名稱。所以沒有有效金鑰的人無論怎麼嘗試，每小時最多只會讓安全稽核多一筆；整合服務若一直用已撤銷的金鑰重試，會立即以帶金鑰 ID 的紀錄出現。
+- `<home>/security_audit.jsonl`（具雜湊鏈的安全稽核，伺服器紀錄也有一行警告）：**已存在金鑰**（停用、到期、已刪除、員工已不存在）的驗證失敗會立即寫入一筆附金鑰 ID 的 `mcp_auth_failed`，每把金鑰、每種原因每小時一筆，該小時其餘的次數在整點後再寫一筆並附次數（`count`）。**其他失敗**每小時彙總成一筆 `mcp_auth_failed_summary`：各原因次數、來源數（最多算到 1,024）、沒寫進去的紀錄數，並註明明細檔名稱。所以沒有有效金鑰的人無論怎麼嘗試，每小時最多只會讓安全稽核多一筆；整合服務若一直用已撤銷的金鑰重試，會立即以帶金鑰 ID 的紀錄出現。
 - `<home>/mcp_auth_failures.jsonl`（只有擁有者可讀寫）：逐分鐘、含來源位址 `source` 的明細，來源是伺服器連線看到的 IP（不採用 `X-Forwarded-For`，經反向代理時就是代理的位址）。`http-server` 上，同一來源、同一原因、同一把金鑰每分鐘的第一次失敗立即寫入，該分鐘其餘的合併成一筆並附次數；每分鐘最多 60 筆，超出的合併成一筆 `source: "many"`。檔案到 4 MiB 時改名為 `mcp_auth_failures.jsonl.1`（取代前一份），兩份合計約 8 MiB 以內。`duduclaw import` 不會搬移這個檔案。
 
 stdio `mcp-server` 每個行程最多在安全稽核寫一筆 `mcp_auth_failed`，不寫明細。
@@ -191,7 +189,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 |---|---|---|
 | 外部用戶端白名單 | `principal.is_external` | 只列 7 個舊白名單工具加上明確授予 scope 的工具，接著再套下一列的 scope 規則 |
 | 非員工呼叫者的 scope | `principal.scopes`，適用於不持有 `admin`、也不是 AI 員工的金鑰（不是 gateway 內部金鑰、不是單一員工金鑰、也不是 gateway 為員工啟動的行程） | 只列金鑰持有其最低 scope 的工具；替行程本身的 agent 動作的工具（`working_state_*`、`canvas_*`、`shared_wiki_delete`、`memory_search_by_layer` 與三個整併狀態查詢等）不列，對所有外部金鑰也不列；呼叫時 dispatch 閘依同一條規則拒絕（`process_agent_tool`）。見 [mcp-standalone.md](mcp-standalone.md) |
-| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 29 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
+| Google Workspace | `config.toml [integrations] google_workspace` | 關閉時隱藏全部 38 個 Google 工具，包含 `google_status`；儀表板仍可設定與測試，見[連接 Google](google-setup.md)。 |
 | Google 身分（v1.76.0） | `agent.toml [google] identity`，沒寫時看 `config.toml [integrations.google_identity] default_identity` | `none` 隱藏同樣 29 個工具，呼叫也被拒。其他值都照常列出；用不了的呼叫會回原因。`google_status` 改為先講員工目前代表誰 |
 | GitHub | `config.toml [integrations] github` | 隱藏 5 個 `github_*` |
 | `denied_tools` / `allowed_tools` | `agent.toml [capabilities]` | 被拒的隱藏；允許清單非空時其餘全隱藏。清單項目完全相同才算，或用結尾的 `*` 比對：`*`、`mcp__duduclaw__*`（全部 DuDuClaw 工具）、`mcp__duduclaw__odoo_*`／`memory_*`（從開頭比對的前綴）。`mcp__<其他伺服器>__…` 不會對到 DuDuClaw 工具；其他位置的 `*` 只是一般字元。三份審批清單與 `scoped_tools` 用同一套規則 |
@@ -232,7 +230,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 兩道新的閘門會拒絕呼叫，但不會把工具從 `tools/list` 拿掉：
 
-- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
+- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
 - `config.toml [odoo] features_*`：Odoo 工具照樣列出，呼叫到已關閉模組的模型時逐次拒絕（project 與 hr 預設關閉）。
 
 ### 紀錄關係檢查：列出但會拒絕
@@ -244,7 +242,8 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 - **新任務的上層任務**：閘道會告訴 MCP 伺服器這一輪在處理哪個任務（`DUDUCLAW_TASK_ID`，和核准卡片帶的是同一個值）。這個任務是呼叫者自己的、而且屬於[持續任務](continuous-responsibilities.md)的某一次執行（執行本身或它底下的任務，包括任務看板喚醒的子任務）時，沒給 `parent_task_id` 的 `tasks_create`（含 `kind="goal"`）會掛在它底下，員工自己給的 `parent_task_id` 必須是那個任務或它的子任務，否則拒絕。這個值存在但是空白或格式不對時一律拒絕，不會當成「沒有輪次」。其他情況（一般 goal 輪次、執行之外任務的看板喚醒、沒有輪次資訊）不預設上層任務。這一版對所有呼叫者都新增的規則：給了 `parent_task_id` 需要與上層任務有關係（指派、認領、建立或委派規則），v1.69 原本不檢查；`kind="goal"` 也接受 `parent_task_id`，v1.69 原本忽略；AI 員工在一個任務底下最多建 200 個尚未結束的子任務（`schedule` 建的例行工作與提醒不是子任務）。從 Bash 啟動的伺服器，以及 Grok 執行環境，拿不到輪次資訊；在那裡建立的任務除非員工指定這次執行為上層任務，否則不會掛到執行底下，也不計入它的花費。掛對位置還要靠員工改不了自己 `.mcp.json` 裡的 `duduclaw` 項目，這是另一項平台修補，必須先合併。
 - **例行工作**：`update_cron_task`、`delete_cron_task`、`pause_cron_task`、`run_cron_task` 要求呼叫者就是這筆例行工作的執行員工，或與它有關係。以 `name` 指定時只作用於一筆；多筆同名會被拒絕，並列出候選 id。
 - **提醒**：`create_reminder` 的 `agent_id` 不是呼叫者自己時，要與該員工有關係。
-- **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`reply_language`、`memory_language`（v1.84.0）、`runtime`、`timeout_secs`、`max_turns` 或 `role`（稽核 `agent_authority_refused`）。修改下屬不變。
+- **對自己用 `agent_update`**：AI 員工不能對自己送出 `reports_to`、`db_sources`、`db_sources_add`、`db_sources_remove`、`budget_cents`、`reply_language`、`memory_language`（v1.84.0）、`runtime`、`timeout_secs`、`max_turns` 或 `role`（稽核 `agent_authority_refused`）。
+- **`agent_update` 權限變更**：支援身分、模型、預算、心跳、容器與資料庫來源欄位，以原子寫入儲存。AI 呼叫者只能縮減權限欄位，修改下屬也適用；提高預算、擴大能力或資料庫來源範圍，只能由管理員在儀表板操作。既有的自身編輯限制與組織授權檢查仍然適用。需要管理員操作時，應告知提出要求的人。
 
 操作者（不對應任何 AI 員工的 MCP 金鑰，且行程不是為某位員工啟動的）不受限。行程沒有員工身分時，內部共用金鑰不擁有任何紀錄，所以碰任何人的紀錄都會被拒絕。身分是系統 sender 名稱（`dashboard`、`cron` 等）的行程會被當成不受信任。每次拒絕都記在 `tool_calls.jsonl`。詳見[任務看板](../../features/zh-TW/24-task-board.md)、[委派隔離](../../features/zh-TW/37-delegation-isolation.md)。
 
@@ -281,23 +280,29 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 ## 從說明搬出來的長版細節
 
-### `tasks_create`／`tasks_update` — 目標費用上限
+### `tasks_create` 排程
+
+cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未設定或無效時改用 UTC，並在確認訊息說明。公司時區有夏令時間時，成員建立的例行工作以 UTC 儲存並提示。一次性 `schedule` 時間必須包含 UTC 偏移，例如 `2026-11-28T09:00:00+08:00`。
+
+
+
+### `tasks_create`／`tasks_update`，目標費用上限
 
 `tasks_create` 搭配 `kind="goal"` 時接受 `cost_cap_cents`，單位是美分，須為正整數（最大 `9223372036854775807`）。省略時使用 `[goal_loop] default_cost_cap_cents`（`0` 代表沒有預設上限）。一般任務與排程請求帶這個參數會被拒絕。例如 `{"kind":"goal","title":"檢查報告","assigned_to":"agnes","cost_cap_cents":500}`，其他目標說明與驗收標準仍照常填寫。
 
 `tasks_update` 可為目標修改同一欄位。員工只能新增或收緊上限，不能提高或移除生效中的上限；提高上限須由操作者執行。儲存新上限不會自行恢復暫停目標；儀表板的「提高上限並重試」會先儲存，再走既有重試決策。目標與子任務的已量測費用達上限時以 `budget_exhausted` 暫停，費用讀不到時跳過派工。見[目標迴圈](../../features/zh-TW/34-goal-loop.md)。
 
-### `tasks_create` — 目標的單次執行時限
+### `tasks_create`，目標的單次執行時限
 
 `tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工也適用；執行時仍受目前全域 `[runtime] max_timeout_secs` 約束。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
 
-### `office_script` — 內建 Office 腳本
+### `office_script`，內建 Office 腳本
 
 `office_script` 會執行內嵌於程式、經 manifest 驗證的 `docx`、`xlsx`、`pptx` 或 `pdf` 腳本。可選 `create`、`extract` 或 `to_pdf`；`.py` 後綴可省略，腳本名稱不能含路徑。員工技能資料夾只能改變提示／指示，不能替換可執行腳本。此工具支援 Linux 與 macOS。
 
 `args` 必須是 JSON 字串陣列，例如 `["outline.md", "--out", "attachments/deck.pptx"]`。輸入檔可在員工目錄或共用附件；輸出必須是員工目錄內的新檔案，父目錄須已存在，副檔名須符合該腳本。旗標與值要分開傳入；拒絕 `--key=value`、符號連結及路徑穿越。若要交付產生的檔案，回覆最後一行使用 `DELIVER:<absolute path>`。
 
-### `codrive_run` — 三段式執行階梯
+### `codrive_run`，三段式執行階梯
 
 每個步驟依序嘗試三段，能用高的就用高的：
 
@@ -314,28 +319,28 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 - `watch_mode: true` 在本次執行剩餘時間內啟用閒置監看。
 - 最多 50 步。
 
-### `working_state_handoff` — 結構化模式
+### `working_state_handoff`，結構化模式
 
 兩種模式：
 
 - **純筆記。** 不傳 `status`；沿用舊行為，約 1,200 字處靜默截斷。
 - **結構化（Ralph-loop 式）。** 傳 `status`，並與 `next_steps` / `evidence` / `blocker` 一起校驗：
-  - `continue` — 必須有 `next_steps`，不得有 `blocker`。
-  - `complete` — 必須有 `evidence`，且 `blocker` 與 `next_steps` 都不得存在。沒有證據的自稱完成、或還留著下一步的完成，一律拒絕：「我做完了」不是證據。
-  - `blocked` — 必須有具體的 `blocker`。
+  - `continue`，必須有 `next_steps`，不得有 `blocker`。
+  - `complete`，必須有 `evidence`，且 `blocker` 與 `next_steps` 都不得存在。沒有證據的自稱完成、或還留著下一步的完成，一律拒絕：「我做完了」不是證據。
+  - `blocked`，必須有具體的 `blocker`。
 
   合併後的內容由 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384，CJK 安全位元組計算）限制。超過**整筆拒絕**，絕不靜默截斷，因為截掉的可能正是讓這份交接成為權威的證據。
 
-### `skill_search` — 怎麼挑 source
+### `skill_search`，怎麼挑 source
 
 除非你已經知道技能在哪，否則不要動 `source`。
 
-- `all`（預設）— 已設定的 hub 加上這個 AI 員工學到的技能庫，依名稱去重並標註來源。Hub 結果依相關度 × 信任 × 安裝數 × 新鮮度排序，官方第一方技能保底進前段。
-- `github` — 預期在公開 GitHub repo 裡的技能。
-- `hub` — 策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
-- `bank` — 只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
+- `all`（預設），已設定的 hub 加上這個 AI 員工學到的技能庫，依名稱去重並標註來源。Hub 結果依相關度 × 信任 × 安裝數 × 新鮮度排序，官方第一方技能保底進前段。
+- `github`，預期在公開 GitHub repo 裡的技能。
+- `hub`，策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
+- `bank`，只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
 
-### `evolution_toggle` — 欄位與權限
+### `evolution_toggle`，欄位與權限
 
 `field` 接受 `gvu_enabled`、`skill_budget_unlimited`（布林值；`skill_budget_unlimited` 僅限管理員），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
 
@@ -441,6 +446,8 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 每次最多保留 **400 個模型、每模型 500 個欄位**。中繼資料與欄位探索上限 **5 分鐘**，`fields_get` 同時最多四個；帳號權限探測另外設 30 秒整體上限。優先順序為內建工具模型、已安裝業務模組的模型（CRM、銷售、採購、庫存、會計、專案、人資、製造、客服及網站），其餘按名稱排序。逾時會標記不完整；身分、版本與模組未變時，下輪沿用已取得的完整欄位，接續處理未完成模型。模組／模型目錄各上限 5,000 筆；不完整的差異不代表資料已刪除。
 
+以下既有通用寫入與結構查詢的員工授權／敏感模型限制適用於引擎模式。依 Odoo 帳號模式改用本人 Odoo 權限，仍保留公司功能開關及共同拒絕規則。
+
 ### `odoo_create` / `odoo_write`：通用新增與修改（v1.81.0）
 
 - `odoo_create {model, values}` 新增一筆紀錄並回傳 ID；`odoo_write {model, ids, values}` 修改 1–100 筆紀錄（重複 ID 只算一次）並回傳 `ok`。兩者都需要 **`odoo:write`**，效果類別為 `modify`，`action_rules`、審批清單與探索通道的規則與 `odoo_crm_create_lead` 相同。
@@ -459,11 +466,11 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 ## 相關文件
 
-- [custom-mcp-tool.md](../custom-mcp-tool.md) — 新增工具
-- [mcp-bridge.md](../mcp-bridge.md) — 掛載外部 MCP server
-- [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth 傳輸
-- [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 規格
-- [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
+- [custom-mcp-tool.md](../custom-mcp-tool.md)，新增工具
+- [mcp-bridge.md](../mcp-bridge.md)，掛載外部 MCP server
+- [remote-mcp.md](../remote-mcp.md)，HTTP/OAuth 傳輸
+- [../../spec/task-packet.md](../../spec/task-packet.md)，TaskPacket 規格
+- [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md)，`duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
 
 ## 宣告憑證用途
 
@@ -496,7 +503,7 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 
 回傳內容只作為不可信參考資料，使用群組歷史的包覆格式與注入掃描；任何命中都會拒絕整次回覆，顯示 `not available`。稽核僅保留聊天室識別碼與數量，不記錄訊息文字。本機與固定資料測試不代表真實帳號可讀，交付前仍須以客戶帳號驗證同意流程及讀取結果。
 
-## `mail_send` — 寄信由交辦人在原對話確認
+## `mail_send`，寄信由交辦人在原對話確認
 
 `mail_send` 沿用收件人與資料外送防護。已驗證且目前有該員工 Operator 操作權限的交辦人，僅可在一對一對話或已登入的儀表板 WebChat 確認完整收件人、主旨與內文摘要；不符資格時由儀表板 Admin 決定。核准綁定最終參數，只能用一次，逾期視為拒絕。`[security] mail_requester_approval = false` 恢復僅 Admin 核准；預設 `true`，但設定無法讀取或格式錯誤時採拒絕此例外。詳見[資格與限制](../../features/zh-TW/05-security-defense.md#寄信由交辦人在原對話確認)。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
@@ -534,8 +541,100 @@ Google Chat 依既有順序選用員工自己的 App、該空間記錄的 App �
 
 `google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
 
-個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。新增服務同意會明列已同意的一般服務，再加上 `https://www.googleapis.com/auth/chat.messages.create`，不要求 Google 自動合併先前授權；必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
 
 每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
 
 Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。
+
+## 管理員 AI 設定
+
+`admin_settings_read` 讀取管理員 AI 功能開放的日常設定；`admin_settings_propose` 只會建立待檢視的確認卡，不會直接套用變更。兩者只在符合資格的管理員本人親自參與、且使用其專屬 AI 分身的對話中提供。只有私訊或已登入的 WebChat 能提出變更。群組讀取不包含排程提示全文與技能說明。管理員必須先閱讀風險說明並確認後啟用功能。每份提案即使只有一項，也必須由提出者在十分鐘內到儀表板收件匣確認。
+
+此功能可修改一般資料、模型、執行上限、定時喚醒、純提示型排程及已安裝技能的啟用狀態。權限、通道與憑證、隔離、執行引擎、預算放寬、組織與委派權限、外部工具連線、人格與工作合約、刪除員工及安裝外部技能仍只能在儀表板處理。
+
+AI 呼叫者使用 `agent_update` 時只能調低預算；調高預算及其他受保護的安全設定會遭拒。新增資料庫來源會建立只能由管理員在儀表板決定的核准卡；移除來源仍可作為權限縮減。這些限制適用於所有委派政策，包括 `open`。
+
+## 雲端硬碟寫入工具
+
+這九個原生工具需要 `google:write`。管理員分別決定是否開放建立、修改、搬移與移到垃圾桶，四項預設全關。開啟動作或放寬規則前，須明確確認了解風險，系統會記錄管理員與時間；這項設定變更不要求額外重新登入。在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。
+
+每項動作預設由成員本人確認。管理員可逐項關閉確認，也可要求本人確認後再由管理員核准。本人確認有效五分鐘，只有該成員可以決定；工具允許清單、Admin 權杖與工作流程常駐授權都不能代替。需要確認時，排程與背景工作會被拒絕。使用本人連線或委派給主要擁有者時，請求者必須是帳號持有人；公司共用帳號與固定委派則由已驗證的請求成員確認。
+
+| 工具 | 參數與結果 | 動作開關 | 效果類別 |
+|---|---|---|---|
+| `drive_create_file` | 必填 `name`，選填 `parent_folder_id`。`text`（最多 100,000 字元）、`attachment`（這次對話的附件檔名）、`folder=true` 三選一。選填 `convert_to`：`document`／`spreadsheet`；`mime_type`：`text/plain`／`text/csv`／`text/markdown`。建立檔案或資料夾。 | 建立 | Publish |
+| `drive_copy_file` | 必填 `file_id`、`parent_folder_id`，選填 `name`。將可讀取的來源檔案複製到目的資料夾。 | 建立 | Publish |
+| `drive_update_file` | 必填 `file_id`；`name`、`description`、`text` 至少一項。改名、修改說明或取代文字內容（最多 100,000 字元，只限非 Google 格式文字檔）。 | 修改 | Modify |
+| `drive_move_file` | 必填 `file_id`、`destination_folder_id`。在同一雲端硬碟內搬移，原有上層位置由 Google 讀取。 | 搬移 | Publish |
+| `drive_trash_file` | 必填 `file_id`。只移到垃圾桶。 | 移到垃圾桶 | Delete |
+| `docs_insert_text` | 必填 `document_id`、`text`（1～20,000 字元）。位置三選一：`at="start"`、`at="end"`、`after_text`（全文唯一的定位文字，1～1,000 字元）；選填 `tab_id`。 | 修改 | Modify |
+| `docs_format` | 必填 `document_id`、`operations`（1～50 項）。支援段落與文字樣式、表格儲存格背景、頁首與新增文件分頁，細節見下方。 | 修改 | Modify |
+| `sheets_add_sheet` | 必填 `spreadsheet_id`、`title`，選填 `copy_from_sheet`（既有分頁名稱）。在同一試算表新增空白分頁或複製分頁。 | 修改 | Modify |
+| `sheets_add_note` | 必填 `spreadsheet_id`、`range`（A1，最多 1,000 格）、`note`（最多 5,000 字元，空字串會清除）。設定儲存格註解，不建立討論串留言。 | 修改 | Modify |
+
+ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `parent_folder_id` 代表「我的雲端硬碟」根目錄，只能在資料夾清單為空時使用。上傳只接受這輪對話附上的檔案，最多 5 MB（5 MiB），不接受任意本機路徑或員工工作資料夾中的檔案。可選擇轉成 Google 文件或試算表。不提供永久刪除、清空垃圾桶、分享或變更權限。
+
+`docs_format` 每項操作使用 `type`，並只接受對應欄位：
+
+- `paragraph_style`：`text` 為唯一定位文字；`named_style` 可用 `NORMAL_TEXT`、`TITLE`、`SUBTITLE`、`HEADING_1`～`HEADING_6`；選填 `alignment`（`START`、`CENTER`、`END`、`JUSTIFIED`）。
+- `text_style`：唯一的 `text`，以及 `bold`、`italic`、`underline`、`font_size_pt`（6～96）至少一項。
+- `table_cell_style`：從零起算的 `table_index`（0～99）、`row`（0～499）、`column`（0～49），以及 `background_hex`（`#RRGGBB`）。
+- `header`：`text`（最多 1,000 字元）。
+- `add_tab`：`title`（1～100 字元）。
+
+### 資料夾規則與限制
+
+管理員可列出資料夾或整個共用雲端硬碟。檔案位於清單中的共用雲端硬碟內，即符合範圍；其餘情況，每一條上層路徑都須在十二層內到達清單中的資料夾。上層無法讀取、目標或上層已在垃圾桶、超出檢查上限，或 Google 權限不足，都會拒絕操作。每次呼叫連同重新檢查，最多讀取十六次中繼資料。
+
+建立與複製檢查目的資料夾；複製來源須可讀取且未在垃圾桶。修改、搬移與移到垃圾桶會檢查目標位置。清單上的資料夾本身不能改名、搬移或丟進垃圾桶。搬移的來源與目的都須在範圍內，不能跨「我的雲端硬碟」與共用雲端硬碟，也不能跨不同共用雲端硬碟。捷徑不能列入允許資料夾或當作目的位置；修改會拒絕捷徑，搬移與丟垃圾桶只作用於捷徑本身，依捷徑自己的上層位置檢查，不跟隨原始檔案。
+
+資料夾清單為空時，建立與修改可在帳號能寫入的任何位置執行；搬移與移到垃圾桶不能使用。寫入前後都會檢查資料夾，核准後也會再查一次。這是盡力檢查：Google 本身沒有資料夾允許清單，檢查期間仍可能有其他人變更位置。事後發現超出範圍會通知管理員；無法完成的檢查也會記錄。每次嘗試（含拒絕與結果不明）都留紀錄，不記檔案內容與權杖。結果不明不會自動重試，請先到 Google 確認再要求寫入。
+
+既有 `docs_append`、`docs_create`、`docs_replace_text`、`sheets_append`、`sheets_create`、`sheets_update` 沿用原本的授權規則，不受這四項開關與資料夾規則控制。上表四個新增的 Docs／Sheets 工具歸入「修改」。Google 官方 Drive 遠端 MCP 永遠拿不到完整 Drive 權限的權杖；這九個寫入工具只在主 gateway 行程內執行。
+
+帳號需求見[連線設定](google-setup.md)與[個人寫入同意](google-personal-connections.md)。Google OAuth 隔離與撤銷、委派範圍、文件分頁、格式轉換、共用雲端硬碟角色及私訊確認送達仍待實際帳號驗收；本文不代表這些項目已通過驗證。
+
+## 人工具與 Odoo 權限（v1.86.0）
+
+本人金鑰只提供下列工具，並與金鑰範圍、管理員目前的 `allow_mcp_scopes` 取交集：
+
+| 範圍 | 工具 |
+| --- | --- |
+| `tasks:read` | `my_tasks_list {status?, limit?}`：目前有權查看的任務，預設 50 筆、範圍 1～200；結果受限或省略時以 `truncated` 標示。 |
+| `agents:status` | `my_agents_status {}`：可見員工的 ID、名稱、狀態與 `can_call`。 |
+| `odoo:read` | `odoo_search`、`odoo_crm_leads`、`odoo_sale_orders`、`odoo_inventory_products`、`odoo_inventory_check`、`odoo_invoice_list`、`odoo_payment_status`、`odoo_partner_search`、`odoo_schema_overview`、`odoo_schema_fields`、`odoo_status`。 |
+| `odoo:write` | `odoo_create`、`odoo_write`、`odoo_activity_create`、`odoo_note_post`，須已確認啟用 `follow_odoo_account`。 |
+
+工具依持有人目前權限執行。Odoo 只用本人已連接的帳號，不借用員工或公司憑證。`odoo_execute`、`odoo_report`、`odoo_connect`、`odoo_message_send`、`odoo_attachment_add` 及 CRM／銷售專用修改工具不在本人金鑰子集中。兩個 `my_*` 工具只供本人金鑰，不是員工工具。
+
+### 四個 Odoo 專用寫入工具
+
+四者都需要 `odoo:write`，目標記錄必須存在且可讀。文字採純文字、HTML 跳脫，不接受提及或呼叫者指定的收件人清單。
+
+| 工具／參數 | 用途 |
+| --- | --- |
+| `odoo_activity_create {model, res_id, summary, note?, date_deadline?, activity_type_xmlid?, user_id?}` | 建立活動，文字欄位各限 10,000 字元，期限格式 `YYYY-MM-DD`，預設類型 `mail.mail_activity_data_todo`。引擎模式指派給連線帳號，只有依 Odoo 帳號模式接受 `user_id`。 |
+| `odoo_note_post {model, res_id, body}` | 新增內部備註，本文限 10,000 字元。 |
+| `odoo_message_send {model, res_id, body}` | 通知記錄追蹤者，本文限 10,000 字元；每次都須綁定完整內容的人工核准，且須有員工身分。 |
+| `odoo_attachment_add {model, res_id, file, name?}` | 從呼叫員工自己的附件資料夾建立私人附件。不接受內嵌／base64、絕對路徑、路徑跳脫、符號連結或共用資料夾。接受經內容驗證且格式相符的 PDF、PNG、JPEG、WebP、UTF-8 TXT／CSV、OOXML XLSX／DOCX／PPTX。原檔及編碼後檔案都須符合 `attachment_max_mb`（預設 10 MiB、範圍 1～25）。須有員工身分。 |
+
+引擎模式須在 `allowed_models` 明列目標，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`，空清單不授權。依 Odoo 帳號模式以本人 Odoo 帳號權限取代員工模型／動作授權及引擎敏感模型封鎖清單；公司功能開關、`always_refuse`、固定拒絕、輸入檢查、核准與 Odoo ACL 仍適用。公司／AI 自有帳號仍用引擎模式。員工 `permission_override=engine` 保留引擎模式，`read_only` 移除寫入。全域 Follow 缺少有效管理員確認時退回引擎模式。
+
+`agents.update` 的 `odoo.allowed_actions` 接受 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`。這四種操作都要指定完整資料表名稱；新增規則不能只寫動作名稱，也不能使用萬用字元。通用設定寫入若會放寬員工的 Odoo 權限，會拒絕並引導管理員前往該員工的編輯頁。
+
+本人 Odoo 連線預設關閉；`[odoo] member_credentials` 只有明確設為 `true` 才算開放。關閉時不使用已存的本人憑證，本人金鑰呼叫會收到 `odoo_member_credentials_off`。分身或啟用 `act_as_requester` 的 AI 員工若沒有可用的自有憑證或獲准使用的公司憑證，員工身分路由也回傳此代碼，訊息為「公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。」開關為 `true` 時，同樣缺少連線的情況回傳 `odoo_not_connected`。
+
+`always_refuse` 預設：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。規則可用完整模型、`*` 或 `ir.*` 等點號子模型；`method:<name>` 精確比對方法。專用工具以目標模型與 `activity:`、`note:`、`message:`、`attach:` 動作比對。
+
+| 規則 | 固定拒絕的操作 |
+| --- | --- |
+| F1 | 修改、刪除 `ir.attachment`，或透過通用工具新增附件。新增附件請用 `odoo_attachment_add`，從檔案建立。 |
+| F2 | 修改 `ir.model`、所有 `ir.model.*` 子模型及 `ir.rule`。 |
+| F3 | 修改 `res.users.apikeys` 及其點號分隔的子模型。 |
+| F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
+| F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |
+
+引擎模式下，`odoo_execute` 與按鈕動作（含 `odoo_sale_confirm`）維持 v1.85 的核准行為：仍套用員工審批清單、動作規則與效果分類，不額外強制核准。「依 Odoo 帳號」模式下，非讀取的 `odoo_execute` 及所有 `action_*`、`button_*`、`toggle_*` 按鈕動作（含 `odoo_sale_confirm`）都須人工核准。通知追蹤者的訊息（`odoo_message_send`）在所有模式一律須核准。Allow 規則不能略過這些強制核准；核准綁定工具與完整參數，而且只能使用一次。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。
+
+個別員工透過管理員瀏覽器 RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` 調整；override 僅接受 `inherit`、`engine`、`read_only`，啟用請求者身分或放寬 override 須帶 `acknowledge_risk=true`。此操作只改這兩個欄位，重新確認有效的管理員工作階段，先寫稽核再儲存；稽核失敗不變更設定。`odoo.agent_config_get` 回傳這兩個欄位，原始／個人檔案設定寫入仍拒絕擴權，操作畫面在「員工編輯頁 → 整合 → Odoo」。

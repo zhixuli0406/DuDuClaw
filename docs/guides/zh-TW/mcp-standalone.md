@@ -115,3 +115,11 @@ npx duduclaw mcp init --client cursor
 ## 上架到 MCP Registry
 
 Registry 用的 metadata 是 `distribution/registries/mcp/server.json`；送件步驟（擁有者執行，每次 release 之後）見 [`distribution/registries/README.md`](../../../distribution/registries/README.md)。
+
+## 本人金鑰作為 MCP 憑證（v1.86.0）
+
+`ddc_member_` 本人金鑰需要運作中的 gateway，且管理員已開啟本人金鑰功能；它與獨立 MCP 金鑰不同。MCP HTTP 傳輸使用 `Authorization: Bearer <member-key>`，stdio 則在伺服器環境設定 `DUDUCLAW_MCP_API_KEY`。本人金鑰不能放在 URL query；HTTP／SSE 用戶端必須能傳送授權標頭。
+
+有效範圍是金鑰的 `mcp_scopes` 與管理員目前設定的 `[member_api_keys] allow_mcp_scopes`（預設 `[]`）交集，只提供 `tasks:read`、`agents:status`、`odoo:read`、`odoo:write`。工具以持有人身分執行，每次檢查目前權限，不借用 AI 員工身分。Odoo 只使用持有人已連接的本人帳號，不會改用公司或員工帳號。完整工具子集見 [MCP 工具](mcp-tools.md)。
+
+此版本的 OAuth 同意頁拒絕本人金鑰。請直接設定標頭或 stdio 環境變數，不能透過 OAuth 同意頁交換憑證。

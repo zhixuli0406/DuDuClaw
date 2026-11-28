@@ -1,3 +1,4 @@
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import { useIntl } from 'react-intl';
 import { Button, Input } from '@/components/mds';
@@ -42,7 +43,8 @@ export function RecoveryCodes({ codes, onSaved }: { codes: string[]; onSaved: ()
   </div>;
 }
 
-export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
+export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel, hasPassword = true }: {
+  hasPassword?: boolean;
   initial?: Enrollment;
   begin: (input: EnrollmentInput) => Promise<Enrollment>;
   confirm: (input: EnrollmentInput) => Promise<RecoveryResult>;
@@ -65,7 +67,7 @@ export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
     e.preventDefault();
     setBusy(true); setError('');
     try {
-      const input = { password, enrollment_token: enrollment?.enrollment_token, proof_code: proof };
+      const input = { password: hasPassword ? password : '', enrollment_token: enrollment?.enrollment_token, proof_code: proof };
       if (enrollment?.secret) {
         const result = await confirm({ ...input, code });
         if (!mounted.current) return;
@@ -76,7 +78,7 @@ export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
         const result = await begin(input);
         if (mounted.current) setEnrollment(result);
       }
-    } catch (error) { if (mounted.current) setError(t(mfaErrorId(error))); }
+    } catch (error) { if (mounted.current) setError(settingsRefusal(error, t(mfaErrorId(error)))); }
     finally { if (mounted.current) setBusy(false); }
   };
   if (codes) return <RecoveryCodes codes={codes} onSaved={async () => { await onSaved(); if (mounted.current) setCodes(null); }} />;
@@ -90,7 +92,7 @@ export function MfaEnrollment({ initial, begin, confirm, onSaved, onCancel }: {
       <code className="block break-all select-all">{enrollment.secret}</code>
       <label className="block space-y-2">{t('mfa.code')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} required pattern="[0-9]{6}" /></label>
     </> : <>
-      <label className="block space-y-2">{t('mfa.password')}<Input type="password" maxLength={4096} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>
+      {hasPassword && <label className="block space-y-2">{t('mfa.password')}<Input type="password" maxLength={4096} autoComplete="current-password" value={password} onChange={e => setPassword(e.target.value)} required /></label>}
       {enrollment?.enrollment_token && enrollment.proof_required !== false && <>
         <p className="text-sm">{t('mfa.proof.hint')}</p>
         {enrollment.challenge_ref && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{enrollment.challenge_ref}</code></p>}

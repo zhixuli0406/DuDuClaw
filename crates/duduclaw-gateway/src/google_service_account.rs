@@ -259,6 +259,7 @@ pub fn build_claims(
 #[derive(Debug, Clone)]
 struct CachedToken {
     access_token: String,
+    granted_scopes: Option<Vec<String>>,
     /// When the token stops being usable, already reduced by [`EXPIRY_SKEW`].
     good_until: Instant,
 }
@@ -290,6 +291,8 @@ pub enum CacheMode {
 /// A minted access token. `Debug` never prints the token.
 #[derive(Clone)]
 pub struct MintedToken {
+    /// Actual response scopes, retained through cache hits; None means omitted.
+    pub granted_scopes: Option<Vec<String>>,
     pub access_token: String,
     /// Seconds until Google says it expires (not reduced by the skew).
     pub expires_in: u64,
@@ -337,6 +340,7 @@ pub async fn mint_for_subject(
         let now = Instant::now();
         if now < hit.good_until {
             return Ok(MintedToken {
+                granted_scopes: hit.granted_scopes.clone(),
                 access_token: hit.access_token.clone(),
                 expires_in: (hit.good_until - now + EXPIRY_SKEW).as_secs(),
             });
@@ -387,18 +391,20 @@ pub async fn mint_for_subject(
     let parsed: TokenResponse = serde_json::from_str(&body).map_err(|e| {
         ServiceAccountError::RequestFailed(format!("malformed token response: {e}"))
     })?;
+    let granted_scopes = parsed.scope.as_deref().map(|scope| scope.split_ascii_whitespace().map(str::to_owned).collect::<Vec<_>>());
     let expires_in = parsed.expires_in.unwrap_or(ASSERTION_TTL_SECS);
     if cache_mode == CacheMode::Use {
         let good_until = Instant::now() + Duration::from_secs(expires_in).saturating_sub(EXPIRY_SKEW);
         cache().write().await.insert(
             cache_key,
             CachedToken {
+                granted_scopes: granted_scopes.clone(),
                 access_token: parsed.access_token.clone(),
                 good_until,
             },
         );
     }
-    Ok(MintedToken { access_token: parsed.access_token, expires_in })
+    Ok(MintedToken { access_token: parsed.access_token, expires_in, granted_scopes })
 }
 
 /// The OAuth error code of a [`ServiceAccountError::Rejected`]
@@ -415,6 +421,8 @@ pub fn rejection_code(err: &ServiceAccountError) -> Option<&str> {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
+    #[serde(default)]
+    scope: Option<String>,
     access_token: String,
     #[serde(default)]
     expires_in: Option<u64>,
@@ -691,6 +699,16 @@ subject = "boss@customer.com"
     }
 
     #[test]
+    fn cache_key_separates_drive_write_from_ordinary_scopes() {
+        let write = ["https://www.googleapis.com/auth/drive",
+            "https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/spreadsheets"];
+        let ordinary = ["https://www.googleapis.com/auth/drive.readonly",
+            "https://www.googleapis.com/auth/documents", "https://www.googleapis.com/auth/spreadsheets"];
+        assert_ne!(cache_key("sa", "person@c.test", &write), cache_key("sa", "person@c.test", &ordinary));
+        assert_ne!(cache_key("sa", "person@c.test", &write), cache_key("sa", "person@c.test", &write[1..]));
+    }
+
+    #[test]
     fn cache_key_separates_scopes_and_subjects() {
         assert_eq!(cache_key("sa", "a@c.com", &["y", "x", "x"]), cache_key("sa", "a@c.com", &["x", "y"]));
         assert_ne!(cache_key("sa", "a@c.com", &["x"]), cache_key("sa", "a@c.com", &["x", "y"]));
@@ -699,7 +717,7 @@ subject = "boss@customer.com"
 
     #[test]
     fn minted_token_debug_hides_the_token() {
-        let t = MintedToken { access_token: "ya29.SECRET".into(), expires_in: 10 };
+        let t = MintedToken { access_token: "ya29.SECRET".into(), expires_in: 10, granted_scopes: None };
         assert!(!format!("{t:?}").contains("SECRET"));
     }
 

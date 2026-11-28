@@ -22,6 +22,9 @@ fn text_of(result: &Value) -> String {
 fn home_with(global: &str, agent_odoo: Option<&str>) -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("agents/agnes")).unwrap();
+    let global = if global.parse::<toml::Table>().is_ok_and(|table| !table.contains_key("odoo_access")) {
+        format!("{global}\n[odoo_access]\ncompany_key_agents=['agnes']\n")
+    } else { global.to_owned() };
     std::fs::write(home.path().join("config.toml"), global).unwrap();
     let mut agent = "[agent]\nname = \"agnes\"\nstatus = \"active\"\n".to_string();
     if let Some(body) = agent_odoo {
@@ -36,13 +39,23 @@ fn pool() -> OdooState {
 }
 
 async fn call(tool: &str, params: Value, home: &std::path::Path, pool: &OdooState) -> Value {
-    handle_odoo_tool(tool, &params, home, pool, "agnes").await
+    // Malformed config tests must retain their original artifact and refusal.
+    if std::fs::read_to_string(home.join("config.toml")).ok()
+        .and_then(|raw| raw.parse::<toml::Table>().ok()).is_none() {
+        return handle_odoo_tool(tool, &params, home, pool, "agnes").await;
+    }
+    super::odoo_identity_client::tests::with_company(home,
+        handle_odoo_tool(tool, &params, home, pool, "agnes")).await
 }
 
 /// Minimal Odoo JSON-RPC mock on 127.0.0.1: authenticates as uid 7, answers
 /// `create` with 42 and `write` with true (or with an RPC error carrying
 /// `fault_text` when set), and records every ORM method.
 async fn mock_odoo_with(fault_text: Option<&'static str>) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+    mock_odoo_error("odoo.exceptions.ValidationError", fault_text).await
+}
+
+async fn mock_odoo_error(error_class: &'static str, fault_text: Option<&'static str>) -> (String, Arc<Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -72,7 +85,7 @@ async fn mock_odoo_with(fault_text: Option<&'static str>) -> (String, Arc<Mutex<
             let body = match fault_text {
                 Some(text) if mutating => serde_json::json!({"jsonrpc":"2.0","id":1,"error":{
                     "code": 200, "message": "Odoo Server Error",
-                    "data": {"name": "odoo.exceptions.ValidationError", "message": text},
+                    "data": {"name": error_class, "message": text},
                 }}),
                 _ => {
                     let result = match request["params"]["method"].as_str().unwrap_or("") {
@@ -186,8 +199,8 @@ fn full_access(create: Value, write: Value) -> Value {
 async fn connect_and_snapshot(home: &std::path::Path, pool: &OdooState, access: Option<Value>) {
     let connected = call("odoo_connect", serde_json::json!({}), home, pool).await;
     assert!(!connected["isError"].as_bool().unwrap_or(false), "{connected}");
-    let conn = pool.cached_connector("agnes").await.unwrap();
-    let profile = conn.schema_profile(&pool.pool_key("agnes").await.1);
+    let conn = pool.cached_connector("agnes", &super::odoo_identity_client::tests::company()).await.unwrap();
+    let profile = conn.schema_profile("company");
     duduclaw_odoo::schema::save_snapshot(home, &profile, &lead_snapshot(&conn.connection_identity(), access)).unwrap();
 }
 
@@ -218,7 +231,7 @@ async fn odoo_create_refused_without_override() {
     let text = text_of(&result);
     assert!(result["isError"].as_bool().unwrap(), "{text}");
     assert!(text.contains("explicit grant gate"), "{text}");
-    assert!(text.contains("no own Odoo settings"), "{text}");
+    assert!(text.contains("allowed_models"), "{text}");
     assert!(text.contains("員工 → 編輯 → 整合 → Odoo"), "{text}");
     assert!(pool.slots().await.is_empty(), "refused before any connection");
     // No agent.toml at all is the same answer.
@@ -315,7 +328,7 @@ async fn odoo_create_allowed_with_explicit_grant() {
     }), home.path(), &pool).await;
     let text = text_of(&result);
     assert!(!result["isError"].as_bool().unwrap_or(false), "{text}");
-    let body: Value = serde_json::from_str(&text).unwrap();
+    let body: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
     assert_eq!(body["id"], 42);
     assert_eq!(body["model"], "crm.lead");
 
@@ -325,7 +338,7 @@ async fn odoo_create_allowed_with_explicit_grant() {
     }), home.path(), &pool).await;
     let text = text_of(&result);
     assert!(!result["isError"].as_bool().unwrap_or(false), "{text}");
-    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["ids"], serde_json::json!([5, 6]));
+    assert_eq!(serde_json::from_str::<Value>(text.lines().next().unwrap()).unwrap()["ids"], serde_json::json!([5, 6]));
     let seen = methods.lock().unwrap().clone();
     assert_eq!(seen.iter().filter(|m| *m == "create").count(), 1, "{seen:?}");
     assert_eq!(seen.iter().filter(|m| *m == "write").count(), 1, "{seen:?}");
@@ -520,13 +533,13 @@ async fn nested_commands_on_ungranted_or_never_writable_related_models_are_refus
     connect_and_snapshot(home.path(), &pool, Some(full_access(serde_json::json!(true), serde_json::json!(true)))).await;
     for (values, related, expected) in [
         // Subscribe someone to the lead's chatter.
-        (serde_json::json!({"message_follower_ids": [[0, 0, {"res_model": "crm.lead", "res_id": 1, "partner_id": 3}]]}), "mail.followers", "This capability is not available"),
-        (serde_json::json!({"message_follower_ids": [[4, 3]]}), "mail.followers", "This capability is not available"),
+        (serde_json::json!({"message_follower_ids": [[0, 0, {"res_model": "crm.lead", "res_id": 1, "partner_id": 3}]]}), "mail.followers", "DuDuClaw 不讓 AI 做這件事："),
+        (serde_json::json!({"message_follower_ids": [[4, 3]]}), "mail.followers", "DuDuClaw 不讓 AI 做這件事："),
         // Post a message.
-        (serde_json::json!({"message_ids": [[0, 0, {"body": "hello"}]]}), "mail.message", "This capability is not available"),
+        (serde_json::json!({"message_ids": [[0, 0, {"body": "hello"}]]}), "mail.message", "訊息與通知必須透過專用功能處理"),
         // Create a user with groups, or link users.
-        (serde_json::json!({"user_ids": [[0, 0, {"name": "u", "groups_id": [[4, 1]]}]]}), "res.users", "This capability is not available"),
-        (serde_json::json!({"user_ids": [[4, 2]]}), "res.users", "This capability is not available"),
+        (serde_json::json!({"user_ids": [[0, 0, {"name": "u", "groups_id": [[4, 1]]}]]}), "res.users", "一律不允許"),
+        (serde_json::json!({"user_ids": [[4, 2]]}), "res.users", "一律不允許"),
         // A blocked table, linked without unblocking.
         (serde_json::json!({"partner_ids": [[4, 2]]}), "res.partner", "block list"),
         // A writable but ungranted table.
@@ -665,15 +678,22 @@ async fn odoo_write_system_readonly_model_says_capability_unavailable() {
         let result = call("odoo_write", serde_json::json!({"model":"ir.model","ids":[1],"values":{"name":"x"}}), home.path(), &pool).await;
         let text = text_of(&result);
         assert!(result["isError"].as_bool().unwrap(), "{agent}: {text}");
-        assert!(text.contains("This capability is not available"), "{agent}: {text}");
-        assert!(text.contains("這項功能不提供"), "{agent}: {text}");
+        assert!(text.contains("DuDuClaw 不讓 AI 做這件事："), "{agent}: {text}");
+        assert!(text.contains("欄位定義或權限設定"), "{agent}: {text}");
         assert!(!text.to_lowercase().contains("admin"), "{agent}: must not send the user to an admin: {text}");
         assert!(pool.slots().await.is_empty(), "{agent}");
     }
     // The same rule now covers odoo_execute writes on a read-only system model.
     let home = home_with(NEVER_RESOLVE, Some("profile = 'p'"));
-    let text = text_of(&call("odoo_execute", serde_json::json!({"model":"ir.model","method":"write","ids":"[1]"}), home.path(), &pool()).await);
-    assert!(text.contains("這項功能不提供") && !text.to_lowercase().contains("admin"), "{text}");
+    // Execute preserves the local metadata-fence diagnostic and must refuse
+    // before even requesting an identity, as well as before any Odoo I/O.
+    let result = super::odoo_pool_dispatch_tests::local_refusal(home.path(), &pool(), "odoo_execute",
+        &serde_json::json!({"model":"ir.model","method":"write","ids":"[1]"})).await;
+    let text = text_of(&result);
+    assert_eq!(result["isError"], true, "{text}");
+    assert!(text.contains("system read-only") && text.contains("This capability is not available"), "{text}");
+    assert!(text.contains("writing or deleting is always refused, even when unblocked"), "{text}");
+    assert!(!text.to_lowercase().contains("admin"), "{text}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -688,16 +708,26 @@ async fn never_writable_models_are_refused_whatever_the_settings() {
         let agent = format!(
             "allowed_models = ['{model}']\nallowed_actions = ['create', 'write', 'generic_create:{model}', 'generic_write:{model}']\nunblock_models = ['{model}']"
         );
-        let home = home_with(NEVER_RESOLVE, Some(&agent));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let global = NEVER_RESOLVE.replace("http://localhost:1", &format!("http://{}", listener.local_addr().unwrap()));
+        let home = home_with(&global, Some(&agent));
         let pool = pool();
         for tool in ["odoo_create", "odoo_write"] {
             let result = call(tool, serde_json::json!({"model":model,"ids":[1],"values":{"name":"x"}}), home.path(), &pool).await;
             let text = text_of(&result);
             assert!(result["isError"].as_bool().unwrap(), "{model} {tool}: {text}");
-            assert!(text.contains("This capability is not available") && text.contains("這項功能不提供"), "{model} {tool}: {text}");
+            let expected = match model {
+                "res.users.apikeys" | "mail.mail" | "mail.followers" | "mail.message" | "mail.template" | "mail.compose.message" | "mail.channel" | "ir.rule" => "DuDuClaw 不讓 AI 做這件事：",
+                "res.users" | "res.groups" | "ir.actions.server" | "ir.ui.view" | "ir.config_parameter" => "一律不允許",
+                _ => "This capability is not available",
+            };
+            assert!(text.contains(expected), "{model} {tool}: {text}");
             assert!(!text.to_lowercase().contains("admin"), "{model} {tool}: {text}");
         }
         assert!(pool.slots().await.is_empty(), "{model}");
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock,
+            "never-writable model contacted Odoo: {model}");
     }
     for model in ["crm.lead", "res.partner", "sale.order", "mail.activity", "res.users_like"] {
         assert!(!never_generically_writable(model), "{model}");
@@ -742,7 +772,8 @@ async fn tools_list_hides_generic_write_without_grant() {
         let names = visible_tool_names(&principal, home.path(), "agnes").await;
         assert_eq!(names.contains(&"odoo_create"), create, "{global} {agent:?}");
         assert_eq!(names.contains(&"odoo_write"), write, "{global} {agent:?}");
-        assert!(names.contains(&"odoo_crm_create_lead"), "existing tools stay listed: {agent:?}");
+        assert_eq!(names.contains(&"odoo_crm_create_lead"),
+            super::odoo_access::ToolPolicy::load(home.path(), "agnes").unwrap().listed("odoo_crm_create_lead", None));
         // Listed ⇔ the call passes every policy gate and stops only at the
         // connection precheck (this home has no credential).
         for (tool, listed) in [("odoo_create", create), ("odoo_write", write)] {
@@ -824,14 +855,18 @@ async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() 
     // mock, with a snapshot of its connection identity.
     let setup = pool();
     connect_and_snapshot(home.path(), &setup, Some(full_access(serde_json::json!(true), serde_json::json!(true)))).await;
-    let connector = setup.cached_connector("agnes").await.unwrap();
+    let connector = setup.cached_connector("agnes", &super::odoo_identity_client::tests::company()).await.unwrap();
+    // The isolation provider still supplies its own default-profile snapshot.
+    // This setup connector was acquired through the explicit company lane.
+    let snapshot = duduclaw_odoo::schema::load_snapshot(home.path(), &connector.schema_profile("company")).unwrap().unwrap();
+    duduclaw_odoo::schema::save_snapshot(home.path(), &connector.schema_profile("default"), &snapshot).unwrap();
     let bound = |tool: &'static str, params: Value| {
         let connector = connector.clone();
         let home = home.path().to_path_buf();
         async move {
             // A fresh pool per call, as the isolation executor builds one.
             let isolated = pool();
-            let result = handle_bound_odoo_tool(tool, &params, &home, &isolated, "agnes", connector).await;
+            let result = handle_bound_odoo_tool(tool, &params, &home, &isolated, "agnes", connector, None).await;
             assert!(isolated.slots().await.is_empty(), "the bound path never connects through the pool");
             result
         }
@@ -842,7 +877,7 @@ async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() 
     let result = bound("odoo_create", serde_json::json!({"model": "crm.lead", "values": {
         "name": "Deal", "tag_ids": [[4, 1]], "line_ids": [[0, 0, {"name": "Line"}]]}})).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
-    assert_eq!(serde_json::from_str::<Value>(&text_of(&result)).unwrap()["id"], 42);
+    assert_eq!(serde_json::from_str::<Value>(text_of(&result).lines().next().unwrap()).unwrap()["id"], 42);
     let result = bound("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [5], "values": {"name": "R"}})).await;
     assert!(!result["isError"].as_bool().unwrap_or(false), "{result}");
     assert_eq!(creates(), 2);
@@ -850,7 +885,7 @@ async fn bound_generic_write_runs_every_rm120_gate_on_the_isolation_connector() 
     // Every gate still refuses on the bound path, before any create / write RPC.
     for (tool, params, expected) in [
         // Never-writable list.
-        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "never created or changed by the generic tools"),
+        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "一律不允許"),
         // x2many command rules.
         ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": [[3, 5]]}}), "x2many command"),
         ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": false}}), "false / null"),
@@ -897,7 +932,7 @@ fn generic_write_local_gate_refuses_before_credentials() {
     assert_eq!(classify_generic_write_call("odoo_create", &serde_json::json!({"model": "Bad Model"})), None);
     for (tool, params, expected) in [
         ("odoo_create", serde_json::json!({"values": {"name": "x"}}), "model is required"),
-        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "never created or changed"),
+        ("odoo_create", serde_json::json!({"model": "res.users", "values": {"name": "x"}}), "一律不允許"),
         ("odoo_create", serde_json::json!({"model": "sale.order", "values": {"name": "x"}}), "explicit grant gate"),
         ("odoo_write", serde_json::json!({"model": "crm.lead", "ids": [1], "values": {"tag_ids": [[5]]}}), "x2many command"),
         ("odoo_write", serde_json::json!({"model": "crm.lead", "values": {"name": "x"}}), "ids is required"),
@@ -918,4 +953,157 @@ fn generic_write_local_gate_refuses_before_credentials() {
         .contains("switched off"));
     std::fs::write(home.path().join("config.toml"), "not toml [[[").unwrap();
     assert!(generic_write_local_gate("odoo_create", &ok, home.path(), "agnes").is_err(), "unreadable global fails closed");
+}
+
+
+// RM-141 scenarios 9–10, using the existing TCP Odoo stub and gateway stub.
+const FOLLOW_ACCESS: &str = "[odoo_access]\npermission_mode='follow_odoo_account'\npermission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}\ncompany_key_agents=['agnes']\n";
+
+fn personal_decision(mode: &str) -> Value {
+    serde_json::json!({"ok":true,"identity":"personal","permission":mode,"user_id":"alice",
+        "odoo_uid":7,"login":"alice","rev":1,"secret":"personal-test-secret"})
+}
+
+async fn personal_call(mode: &str, tool: &str, params: Value, home: &Path, pool: &OdooState) -> Value {
+    super::odoo_identity_client::tests::with_decision(home, personal_decision(mode),
+        handle_odoo_tool(tool, &params, home, pool, "agnes")).await
+}
+
+async fn personal_call_with_required_approval(
+    mode: &str, tool: &str, params: Value, home: &Path, pool: &OdooState,
+) -> Value {
+    use super::approval::{approve_odoo_call_for_test, odoo_requires_approval,
+        with_odoo_approval_call, OdooApprovalMode};
+    // Reproduce the production dispatch scope; engine calls get no approval.
+    with_odoo_approval_call(async {
+        if mode == "follow" && odoo_requires_approval(tool,
+            &serde_json::json!({"arguments": &params}), OdooApprovalMode::FollowPossible)
+        {
+            approve_odoo_call_for_test("agnes", tool, &params).await;
+        }
+        personal_call(mode, tool, params, home, pool).await
+    }).await
+}
+
+fn follow_home(url: &str, agent: Option<&str>, rules: &str) -> tempfile::TempDir {
+    let global = format!("{}member_credentials=true\n{FOLLOW_ACCESS}always_refuse={rules}\n", mock_global(url));
+    let home = home_with(&global, agent);
+    super::odoo_access_tests::personal_db(home.path(), "agnes", true);
+    home
+}
+
+#[tokio::test]
+async fn rm141_follow_and_engine_write_success_refusal_matrix() {
+    for mode in ["follow", "engine"] {
+        for (model, rules, expected) in [
+            ("crm.lead", "[]", "ok"),
+            ("crm.lead", "['write:crm.lead']", "一律不允許"),
+            ("ir.attachment", "[]", "附件只能"),
+            ("ir.model.fields", "[]", "欄位定義或權限設定"),
+        ] {
+            let (url, calls, server) = mock_odoo().await;
+            let home = follow_home(&url, Some(LEAD_FULL), rules);
+            let pool = pool();
+            // Engine uses the exact personal connector's schema identity.
+            if mode == "engine" && expected == "ok" {
+                let result = personal_call(mode, "odoo_connect", serde_json::json!({}), home.path(), &pool).await;
+                assert_ne!(result["isError"], true, "{result}");
+                let decision = super::odoo_identity_client::OdooIdentity {
+                    kind: super::odoo_identity_client::IdentityKind::Personal,
+                    permission: super::odoo_identity_client::IdentityPermission::Engine,
+                    url: Some(url.clone()), db: Some("test".into()),
+                    server_fp: Some(super::odoo_identity_client::tests::fingerprint(&url, "test")),
+                    user_id: Some("alice".into()), odoo_uid: Some(7), login: Some("alice".into()), rev: Some(1), secret: None,
+                };
+                let connector = pool.cached_connector("agnes", &decision).await.unwrap();
+                let snapshot = lead_snapshot(&connector.connection_identity(), Some(full_access(serde_json::json!(true), serde_json::json!(true))));
+                duduclaw_odoo::schema::save_snapshot(home.path(), &connector.schema_profile(&decision.personal_profile().unwrap()), &snapshot).unwrap();
+            }
+            let result = personal_call(mode, "odoo_write", serde_json::json!({"model":model,"ids":[1],"values":{"name":"new"}}), home.path(), &pool).await;
+            let text = text_of(&result);
+            if expected == "ok" {
+                assert_ne!(result["isError"], true, "{mode}: {result}");
+                assert!(text.contains("以你的 Odoo 帳號 alice 修改"), "{text}");
+                assert_eq!(calls.lock().unwrap().iter().filter(|m| *m == "write").count(), 1);
+                let audit = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+                assert!(audit.contains("alice") && !audit.contains("personal-test-secret"));
+            } else {
+                assert_eq!(result["isError"], true, "{result}");
+                assert!(text.contains(expected), "{mode}: {text}");
+                assert!(!calls.lock().unwrap().iter().any(|m| m == "write"));
+            }
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn rm141_follow_skips_employee_tables_snapshot_and_old_blocked_method() {
+    let (url, calls, server) = mock_odoo().await;
+    let home = follow_home(&url, Some("allowed_models=['sale.order']\nallowed_actions=['read']"), "[]");
+    let pool = pool();
+    for (tool, params) in [
+        ("odoo_write", serde_json::json!({"model":"res.partner","ids":[1],"values":{"name":"new"}})),
+        ("odoo_create", serde_json::json!({"model":"res.partner","values":{"name":"new"}})),
+        ("odoo_execute", serde_json::json!({"model":"res.partner","method":"unlink","ids":"[1]"})),
+        ("odoo_search", serde_json::json!({"model":"res.partner"})),
+    ] {
+        let result = personal_call_with_required_approval("follow", tool, params.clone(), home.path(), &pool).await;
+        assert_ne!(result["isError"], true, "{tool}: {result}");
+        let engine = personal_call("engine", tool, params, home.path(), &pool).await;
+        assert_eq!(engine["isError"], true, "{tool}: {engine}");
+    }
+    let read_only = personal_call("read_only", "odoo_write",
+        serde_json::json!({"model":"res.partner","ids":[1],"values":{"name":"new"}}), home.path(), &pool).await;
+    assert!(text_of(&read_only).contains("唯讀"), "{read_only}");
+    assert_eq!(calls.lock().unwrap().iter().filter(|m| *m == "write").count(), 1);
+    server.abort();
+}
+
+#[tokio::test]
+async fn rm141_personal_access_error_has_bounded_summary_engine_keeps_old_text() {
+    let (url, _, server) = mock_odoo_error("odoo.exceptions.AccessError", Some("沒有這筆客戶的修改權限")).await;
+    let home = follow_home(&url, Some("allowed_models=['crm.lead']\nallowed_actions=['write']"), "[]");
+    let pool = pool();
+    for mode in ["follow", "engine"] {
+        // Execute preserves its empty kwargs and does not need a generic-write snapshot.
+        let result = personal_call_with_required_approval(mode, "odoo_execute", serde_json::json!({"model":"crm.lead","method":"write","ids":"[1]"}), home.path(), &pool).await;
+        let text = text_of(&result);
+        assert_eq!(result["isError"], true);
+        if mode == "follow" {
+            assert!(text.contains("你的 Odoo 帳號（alice）") && text.contains("沒有這筆客戶的修改權限"), "{text}");
+            assert!(text.contains("公司的 Odoo 管理員"));
+            assert!(!text.contains("allowed_models"));
+            let visitor = super::odoo_access::sanitize_for_session(result.clone(), Some("odoolivechat:site:1"));
+            let visitor_text = text_of(&visitor);
+            assert!(!visitor_text.contains("alice") && !visitor_text.contains("管理員") && !visitor_text.contains("權限"));
+        } else {
+            assert!(text.contains("Odoo server ACL gate"), "{text}");
+            assert!(!text.contains("你的 Odoo 帳號"));
+        }
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn rm141_tools_list_uses_same_policy_for_personal_and_read_only() {
+    let home = follow_home("http://localhost:1", None, "[]");
+    let principal = crate::mcp_auth::Principal { client_id: "agnes".into(), scopes: Default::default(),
+        is_external: false, created_at: chrono::Utc::now() };
+    for override_ in ["inherit", "engine", "read_only"] {
+        write_agnes_odoo(home.path(), &format!("permission_override='{override_}'"));
+        let names = visible_tool_names(&principal, home.path(), "agnes").await;
+        let policy = super::odoo_access::ToolPolicy::load(home.path(), "agnes").unwrap();
+        for tool in ["odoo_search", "odoo_create", "odoo_write", "odoo_execute"] {
+            assert_eq!(names.contains(&tool), policy.listed(tool, None), "{override_}: {tool}");
+        }
+        assert_eq!(names.contains(&"odoo_write"), override_ == "inherit");
+    }
+    std::fs::write(home.path().join("config.toml"), "[odoo_access]\npermission_mode='broken'").unwrap();
+    let names = visible_tool_names(&principal, home.path(), "agnes").await;
+    assert!(!names.iter().any(|name| name.starts_with("odoo_")));
+    for tool in ["odoo_connect", "odoo_status", "odoo_search", "odoo_execute", "odoo_write"] {
+        let result = handle_odoo_tool(tool, &serde_json::json!({}), home.path(), &pool(), "agnes").await;
+        assert!(text_of(&result).contains("權限設定讀不到或格式有誤"), "{tool}: {result}");
+    }
 }

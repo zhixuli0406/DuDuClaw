@@ -316,11 +316,11 @@ fn rm173_import_refuses_v181_sessions_with_planted_objects() {
 
 #[test]
 fn import_refuses_tasks_store_with_extra_unknown_table() {
-    for schema in [TASKS_V180, TASKS_V181] {
+    for schema in [TASKS_V180, TASKS_V181, TASKS_V182, TASKS_V186] {
         let file = store(schema, "CREATE TABLE planted_markers(name TEXT);");
         assert_eq!(extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).err(), Some(Error::Schema));
         let message = take_schema_refusal().expect("refusal report").to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.82, v1.86)"), "{message}");
         assert!(message.contains("unexpected table planted_markers"), "{message}");
     }
 }
@@ -343,11 +343,11 @@ fn sr5r3_import_accepts_v181_approvals_and_never_reads_incarnation() {
 
 #[test]
 fn sr5r3_import_refuses_approvals_with_an_extra_column() {
-    for schema in [APPROVALS_V180, APPROVALS_V181] {
+    for schema in [APPROVALS_V180, APPROVALS_V181, APPROVALS_V186] {
         let file = store(schema, "ALTER TABLE approvals ADD COLUMN planted_column TEXT;");
         assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
         let message = take_schema_refusal().expect("refusal report").to_string();
-        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81)"), "{message}");
+        assert!(message.contains("known catalogs (v1.79.3, v1.80.x, v1.81, v1.86)"), "{message}");
         assert!(message.contains("changed table approvals"), "{message}");
     }
     // Half-upgraded: v1.80.x plus the incarnation column with a different type.
@@ -401,15 +401,17 @@ fn import_refuses_unknown_schema_with_diff() {
 }
 
 #[test]
-fn import_accepts_v182_tasks_without_importing_origin_proofs() {
-    assert_eq!(detected(TASKS_V182, Store::Tasks, None).version, SchemaVersion::V180);
+fn import_accepts_v182_and_v186_tasks_without_importing_origin_proofs() {
+    for schema in [TASKS_V182, TASKS_V186] {
+    assert_eq!(detected(schema, Store::Tasks, None).version, SchemaVersion::V180);
     assert!(take_schema_refusal().is_none());
-    let file = store(TASKS_V182, "INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode,source_channel,source_chat_id,source_origin_proof)
+    let file = store(schema, "INSERT INTO tasks(id,title,description,assigned_to,created_at,updated_at,kind,goal_mode,source_channel,source_chat_id,source_origin_proof)
         VALUES ('goal','Quarterly goal','Do work','sales','now','now','goal',1,'googlechat','spaces/SECRET-CHAT','SECRET-PROOF');");
     let p = extract(&request(SourceKind::AuthorityTasksSqlite, "tasks.db"), source(&file), None).unwrap();
     assert_eq!(p.len(), 1);
     let encoded = serde_json::to_string(&p).unwrap();
     assert!(encoded.contains("Quarterly goal") && !encoded.contains("SECRET-PROOF"));
+    }
 }
 
 #[test]
@@ -437,4 +439,84 @@ fn googlechat_recovery_catalogs_match_initializer_and_refuse_unknown_objects() {
     let legacy = catalog_connection(GOOGLECHAT_INBOX_V183_V1, None).unwrap();
     legacy.execute_batch(include_str!("googlechat-placeholder-state-v183.sql")).unwrap();
     assert_eq!(detect(&legacy, Store::GoogleChatInbox, None).unwrap().version, SchemaVersion::V181);
+}
+
+#[test]
+fn v186_import_approvals_discards_source_execution_result() {
+    assert_eq!(detected(APPROVALS_V186_EXECUTION_RESULT, Store::Approvals, None).version, SchemaVersion::V180);
+    let file = store(APPROVALS_V186_EXECUTION_RESULT,
+        "INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,execution_result)
+        VALUES ('SOURCE-APPROVAL','sales','admin_ai_settings','old','approved','now',
+            '{\"outcome\":\"complete\",\"message\":\"SOURCE-EXECUTION-RESULT\"}');");
+    let proposals = extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].category, C::LegacyApproval);
+    assert_eq!(proposals[0].fields.len(), 1);
+    assert_eq!(proposals[0].fields[0].name, "reference");
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SOURCE-APPROVAL", "execution_result", "SOURCE-EXECUTION-RESULT"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    for extra in ["ALTER TABLE approvals ADD COLUMN planted TEXT;",
+        "CREATE TRIGGER planted AFTER INSERT ON approvals BEGIN SELECT 1; END;"] {
+        let file = store(APPROVALS_V186_EXECUTION_RESULT, extra);
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+    }
+}
+
+#[test]
+fn rm143_import_v186_approvals_discards_chat_admin_evidence() {
+    assert_eq!(detected(APPROVALS_V186, Store::Approvals, None).version, SchemaVersion::V180);
+    let rows = "INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,decided_by)
+        VALUES ('SECRET-APPROVAL','sales','expert_skills_enable','old','approved','now',
+            'chat-admin:3f2afc12-4f13-4a28-8b7f-df31eadbb013:telegram:totp');
+        INSERT INTO chat_admin_cards VALUES ('SECRET-CARD','SECRET-APPROVAL','rm143','SECRET-USER',
+            'telegram','SECRET-BOT','SECRET-PRINCIPAL','SECRET-DM','42','SECRET-DIGEST','T2','later','consumed','now');
+        INSERT INTO chat_admin_decisions VALUES ('SECRET-APPROVAL','SECRET-CARD','SECRET-USER',
+            'telegram','totp',1,'SECRET-DIGEST',1,'now');";
+    let file = store(APPROVALS_V186, rows);
+    let proposals = extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].category, C::LegacyApproval);
+    assert_eq!(proposals[0].fields.len(), 1);
+    assert_eq!(proposals[0].fields[0].name, "reference");
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SECRET", "chat-admin:", "chat_admin_cards", "chat_admin_decisions"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    // Unknown additions to the evidence tables still reject the entire source.
+    for extra in ["ALTER TABLE chat_admin_cards ADD COLUMN planted TEXT;",
+        "CREATE TRIGGER planted AFTER INSERT ON chat_admin_decisions BEGIN SELECT 1; END;"] {
+        let file = store(APPROVALS_V186, extra);
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+    }
+}
+
+#[test]
+fn rm143_import_users_requires_reentry_and_refuses_unpinned_proofs() {
+    let rows = "INSERT INTO users(id,email,display_name,password_hash,role,created_at,updated_at)
+        VALUES ('u','admin@example.com','Admin','SECRET-PASSWORD','admin','now','now');
+        INSERT INTO channel_identities(user_id,channel,channel_user_id,verified,created_at)
+        VALUES ('u','telegram','SECRET-PRINCIPAL',1,'now');";
+    let file = store(include_str!("users-v1793.sql"), rows);
+    let proposals = extract(&request(SourceKind::AuthorityUsersSqlite, "users.db"), source(&file), None).unwrap();
+    let binding = proposals.iter().find(|p| p.category == C::ChannelBinding).unwrap();
+    assert_eq!(value(binding, "requires_reentry"), "true");
+    assert_eq!(value(binding, "binding"), r#"{"owner":"admin@example.com","requires_new_login":true}"#);
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SECRET", "proof_method", "proof_user_id", "proven_at", "proof_account", "proof_dm", "chat_link_"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    // Users is intentionally still an exact v1.79.3-only reader. Even one
+    // RM-143 column or table refuses the whole source, never a partial copy.
+    let chat_link = include_str!("../../duduclaw-auth/src/chat_link.rs");
+    let ddl = chat_link.split("conn.execute_batch(\"").nth(1).unwrap().split("\")").next().unwrap();
+    for extra in ["ALTER TABLE channel_identities ADD COLUMN proof_method TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_user_id TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proven_at INTEGER;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_account TEXT;",
+        "ALTER TABLE channel_identities ADD COLUMN proof_dm TEXT;", ddl] {
+        let file = store(include_str!("users-v1793.sql"), &format!("{rows} {extra}"));
+        assert_eq!(extract(&request(SourceKind::AuthorityUsersSqlite, "users.db"), source(&file), None).err(), Some(Error::Schema));
+    }
 }

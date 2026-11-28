@@ -234,3 +234,44 @@ describe('<OrgPlacementPanel> errors beside the field (B5)', () => {
     expect(screen.getByRole('button', { name: 'Apply change' })).toBeDisabled();
   });
 });
+
+it('reviews reach, sends the digest and keeps the new review after reach_changed', async () => {
+  let attempts = 0;
+  route({
+    'org.placement': placement('dudu', 'Sales'),
+    'departments.list': departments,
+    'users.dept_grants.reach_preview': () => ({ reach: [{ user_id: 'hidden-user', display_name: 'Alice', department: 'Sales', groups: ['schedules'], change: 'gains' }], reach_digest: 'reach-1', sentence: 'hidden-sentence' }),
+    'org.apply_change': () => {
+      attempts++;
+      if (attempts === 1) throw { code: 'reach_changed', message: '授權範圍在你檢視後有變動，請重新確認。', current: { reach: [], reach_digest: 'reach-2', sentence: 'hidden-new-sentence' } };
+      return { status: 'applied', after: { reports_to: 'sales', department: 'Sales' }, base: 'b2' };
+    },
+  });
+  renderPanel();
+  await waitFor(() => expect(calls('org.placement')).toHaveLength(1));
+  pick('Manager', 'sales');
+  fireEvent.click(screen.getByRole('button', { name: 'Apply change' }));
+  expect(await screen.findByText(/Once approved, Alice/)).toBeInTheDocument();
+  expect(screen.queryByText(/hidden-user|hidden-sentence/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm change' }));
+  expect(await screen.findByText('No managers will gain or lose management access.')).toBeInTheDocument();
+  expect(screen.getByRole('alert')).toHaveTextContent('Management access has changed');
+  expect(calls('org.apply_change')[0][1]).toMatchObject({ reach_digest: 'reach-1' });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm change' }));
+  await waitFor(() => expect(calls('org.apply_change')).toHaveLength(2));
+  expect(calls('org.apply_change')[1][1]).toMatchObject({ reach_digest: 'reach-2' });
+});
+
+it('shows a manager the filed proposal reach without calling the admin preview', async () => {
+  route({
+    'org.placement': placement('dudu', 'Sales'),
+    'departments.list': departments,
+    'org.propose_change': () => ({ reach: null, reach_digest: null }),
+  });
+  renderPanel({ isAdmin: false });
+  await waitFor(() => expect(calls('org.placement')).toHaveLength(1));
+  pick('Manager', 'sales');
+  fireEvent.click(screen.getByRole('button', { name: 'Submit request' }));
+  expect(await screen.findByText('The impact cannot be calculated right now.')).toBeInTheDocument();
+  expect(calls('users.dept_grants.reach_preview')).toHaveLength(0);
+});

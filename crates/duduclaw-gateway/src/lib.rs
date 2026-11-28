@@ -30,6 +30,7 @@
 #![allow(clippy::sliced_string_as_bytes)]
 #![allow(clippy::if_same_then_else)]
 
+pub mod company_timezone_init;
 pub mod isolation_mcp;
 pub mod isolation_background;
 /// H13: protected `spawn_ephemeral` children as pending jobs (D-H3, D8).
@@ -222,11 +223,13 @@ pub mod doctor_probes;
 pub mod extension;
 pub mod external_status;
 pub(crate) mod member_keys;
+pub mod person_key_route;
 pub mod github_workspace;
 pub mod google_apps_script;
 pub(crate) mod google_data_consent;
 pub mod google_identity;
 pub mod google_personal;
+mod google_signin;
 pub mod google_service_account;
 pub mod google_workspace;
 mod shared_app_route;
@@ -271,9 +274,13 @@ pub mod channel_decision_route;
 // and the scheduled daily digest.
 pub mod autopilot_approval;
 pub mod autopilot_engine;
+pub mod autopilot_fields;
 pub mod autopilot_notify;
 pub mod autopilot_screen;
+pub mod autopilot_scope;
 pub mod autopilot_store;
+pub mod autopilot_template;
+pub mod autopilot_window;
 pub mod cep_matcher;
 pub mod cron_scheduler;
 pub mod cron_store;
@@ -341,6 +348,7 @@ pub mod deep_link;
 pub mod delegation;
 /// WP21 C1 — delegation gate on the bus-consumption path (`dispatcher.rs`).
 pub mod delegation_gate;
+pub mod delegation_roles;
 pub mod delegation_router;
 pub mod direct_api;
 pub mod discord;
@@ -365,6 +373,7 @@ pub mod foresight;
 pub mod growth;
 pub mod guardrail;
 pub mod handlers;
+pub(crate) mod dept_grants;
 pub mod process_group;
 // G5 (2026-09 feature audit) — one `config.toml [identity]` → provider
 // builder shared by the dashboard RPC, the channel `<sender>` block, and the
@@ -388,6 +397,7 @@ pub mod memory_privacy;
 pub mod memory_provenance;
 pub mod message_queue;
 pub mod miniapp;
+pub mod admin_ai;
 pub mod on_behalf_of;
 pub(crate) mod machine_employee;
 pub mod wiki_host_sources;
@@ -460,6 +470,7 @@ pub mod decision_task_board_shadow;
 pub mod defensive_prompt;
 /// One-time upgrade migration for `[odoo] allow_private_network`.
 pub mod odoo_private_network_migration;
+pub(crate) mod odoo_access_migration;
 /// RM-166: identity-token transition (first-start notice record, dashboard
 /// status, bounded manual grace). Never weakens strict mode on its own.
 pub mod identity_transition;
@@ -523,6 +534,7 @@ pub mod run_steps;
 pub(crate) mod autonomous_runtime;
 pub mod runtime;
 pub mod runtime_config;
+pub mod entry_gate;
 pub mod runtime_dispatch;
 mod runtime_turn;
 pub mod runtime_install;
@@ -534,6 +546,8 @@ pub mod secret_redact;
 pub mod run_identity;
 pub mod server;
 mod mfa;
+pub(crate) mod odoo_credentials;
+pub(crate) mod odoo_identity;
 mod mfa_email;
 /// Installation Ed25519 key and the shared descriptor-pinned `state/` store.
 pub mod installation_identity;
@@ -547,11 +561,14 @@ pub mod session_summarizer;
 pub mod session_summarizer_task;
 pub mod session_titler_task;
 pub mod skill_approval;
+pub mod skill_ttl;
+pub mod skill_trust;
 pub mod skill_gap_digest;
 pub mod skill_lifecycle;
 pub mod slack;
 pub mod stt;
 pub mod task_spec;
+mod chat_link_intercept;
 pub mod telegram;
 mod telegram_send;
 pub mod tts;

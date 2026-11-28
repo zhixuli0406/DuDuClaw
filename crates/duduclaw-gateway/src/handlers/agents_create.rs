@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::google_signin::avatar::AvatarCreation;
 
 impl MethodHandler {
     /// Test entry point without a caller identity. Production goes through
@@ -56,6 +57,25 @@ impl MethodHandler {
             if params.get("role").and_then(Value::as_str).unwrap_or("specialist") != "specialist" {
                 return WsFrame::error_response("", "AI 分身必須使用 specialist 角色。");
             }
+            Some(db)
+        } else { None };
+        let avatar = match (avatar_member, caller) {
+            (Some(member), Some(ctx)) => AvatarCreation::Admin { member, ctx },
+            _ => AvatarCreation::None,
+        };
+        drop(avatar_db);
+        self.create_agent_files_inner(&params, caller, avatar).await
+    }
+
+    /// Internal authority is a Rust argument, never a field in RPC params.
+    pub(crate) async fn create_agent_files_inner(
+        &self, params: &Value, caller: Option<&UserContext>, avatar: AvatarCreation<'_>,
+    ) -> WsFrame {
+        let avatar_member = avatar.member();
+        let avatar_db = if avatar_member.is_some() {
+            let Some(db) = self.user_db.read().await.clone() else {
+                return WsFrame::error_response("", "無法讀取成員資料，未建立分身。");
+            };
             Some(db)
         } else { None };
         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -243,6 +263,10 @@ impl MethodHandler {
         // Every early return below drops `staged`, which removes the
         // staging directory: an aborted create leaves no trace.
         let stage_dir = staged.path().to_path_buf();
+        let publication = match avatar.publication(&stage_dir, &agent_dir) {
+            Ok(proof) => proof,
+            Err(e) => return WsFrame::error_response("", &format!("Failed to create directory: {e}")),
+        };
 
         let skills_dir = stage_dir.join("SKILLS");
         if let Err(e) = tokio::fs::create_dir_all(&skills_dir).await {
@@ -296,7 +320,7 @@ impl MethodHandler {
             can_modify_own_skills = true
             can_modify_own_soul = false
             can_schedule_tasks = true
-            allowed_channels = ["*"]
+            allowed_channels = []
             permissions_enforced_since = "1.68.0"
 
             // v1.68: the `*_reflection`, `skill_auto_activate` and
@@ -383,7 +407,7 @@ impl MethodHandler {
         // Publishing below repeats the same upsert under this org lock, so it
         // is a no-op and cannot open a second SQLite writer inside that tx.
         let mut prepared_org = false;
-        let prepare = if avatar_db.is_some() && avatar_member.is_some() && caller.is_some() {
+        let prepare = if avatar_db.is_some() && avatar_member.is_some() {
             duduclaw_core::org_store::upsert(&org, name, org_entry.clone())
                 .map(|_| { prepared_org = true; }).map_err(|e| e.to_string())
         } else { Ok(()) };
@@ -396,15 +420,18 @@ impl MethodHandler {
                 };
                 // A nonce failure can happen after rename, while an authority
                 // refusal happens before it. Only compensate a published tree.
-                published = match std::fs::symlink_metadata(&agent_dir) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    _ => true,
+                published = match &publication {
+                    Some(proof) => proof.published(),
+                    None => match std::fs::symlink_metadata(&agent_dir) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        _ => true,
+                    },
                 };
                 result.map(|_| ()).map_err(|e| e.to_string())
             };
-            match (avatar_db.as_ref(), avatar_member, caller) {
-                (Some(db), Some(member), Some(ctx)) => db.publish_new_avatar_under(
-                    &ctx.user_id, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
+            match (avatar_db.as_ref(), avatar_member, avatar.actor()) {
+                (Some(db), Some(member), Some(actor)) => db.publish_new_avatar_under_as(
+                    actor, member, name, &seat_admission, seat_cap, |conn| publish(Some(conn)),
                 ),
                 _ => publish(None).and_then(|()| seat_admission.recount(seat_cap)),
             }
@@ -434,6 +461,7 @@ impl MethodHandler {
             drop(seat_admission);
             return WsFrame::error_response("", &create_failed_text(&e.to_string(), restore.as_deref()));
         }
+        drop(publication);
         drop(org);
         // Published: the new employee is on disk, so the next admission
         // counts it.

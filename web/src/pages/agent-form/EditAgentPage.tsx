@@ -1,3 +1,7 @@
+import { MainAccessSection } from './MainAccessSection';
+import { ReachSummary } from '@/components/org/ReachSummary';
+import type { ReachReview } from '@/lib/api';
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
 import { useProductPolicy } from '@/lib/product-policy';
@@ -39,9 +43,11 @@ import {
   ScheduleBuilder,
   DangerZone,
   ConfirmDialog,
+  RiskConfirmDialog,
   type SelectOption,
 } from '@/components/settings/controls';
 import { toast } from '@/lib/toast';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import {
   Bot,
   Sparkles,
@@ -85,7 +91,7 @@ import {
 } from '@/components/mds';
 import {
   RUNTIME_PROVIDERS,
-  GENERIC_CLI_RUNTIMES,
+  COARSE_TOOL_RUNTIMES,
   UTILITY_CAPABLE_RUNTIMES,
   EFFORT_LEVELS,
   TEAM_ROLE_KEYS,
@@ -251,6 +257,8 @@ export function EditAgentPage() {
 }
 
 function EditAgentPageContent() {
+  const companyTime = useCompanyTimeZone();
+  const timezonePlaceholder = companyTime.status === 'set' ? companyTime.zone ?? 'Asia/Taipei' : 'Asia/Taipei';
   const policy = useProductPolicy();
   const intl = useIntl();
   const errorText = useErrorMessage();
@@ -479,6 +487,45 @@ function EditAgentPageContent() {
   // can_modify_own_soul): the gateway refuses and audits them for anyone
   // else, so the page disables them and never sends them for a non-admin.
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  const [odooAccessBusy, setOdooAccessBusy] = useState(false);
+  const [odooAccessError, setOdooAccessError] = useState<string | null>(null);
+  const [odooAccessPending, setOdooAccessPending] = useState<Partial<Pick<import('@/lib/api').OdooAgentAccessSet, 'permission_override' | 'act_as_requester'>> | null>(null);
+  const odooAccessSaving = useRef(false);
+  const odooAccessAgent = useRef(agent?.name);
+  odooAccessAgent.current = agent?.name;
+  useEffect(() => { setOdooAccessPending(null); setOdooAccessError(null); }, [agent?.name]);
+  async function saveOdooAccess(patch: NonNullable<typeof odooAccessPending>, acknowledgeRisk: boolean) {
+    if (!isAdmin || !agent || !odooEffective || odooAccessSaving.current) return;
+    const agentId = agent.name;
+    odooAccessSaving.current = true;
+    setOdooAccessBusy(true);
+    setOdooAccessError(null);
+    try {
+      const result = await api.odoo.agentAccessSet({ agent_id: agentId, ...patch, acknowledge_risk: acknowledgeRisk });
+      if (odooAccessAgent.current !== agentId) return;
+      setOdooEffective((current) => current ? { ...current, permission_override: result.permission_override, act_as_requester: result.act_as_requester } : current);
+      setOdooAccessPending(null);
+    } catch (err) {
+      if (odooAccessAgent.current === agentId) setOdooAccessError(settingsRefusal(err, errorText(err)));
+    } finally {
+      odooAccessSaving.current = false;
+      setOdooAccessBusy(false);
+    }
+  }
+  const [departmentReview, setDepartmentReview] = useState<{ department: string; review: ReachReview }>();
+  const targetDepartment = form.department ?? '';
+  useEffect(() => {
+    setDepartmentReview(undefined);
+    if (!isAdmin || isPersonal || !agent || targetDepartment === (agent.department ?? '')) return;
+    let alive = true;
+    const timer = setTimeout(() => {
+      api.users.deptGrants.reachPreview(agent.name, targetDepartment)
+        .then(review => { if (alive) setDepartmentReview({ department: targetDepartment, review }); })
+        .catch(() => { if (alive) setDepartmentReview({ department: targetDepartment, review: { reach: null, reach_digest: null } }); });
+    }, 300);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [isAdmin, isPersonal, agent, targetDepartment]);
+
   const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
   const savedRuntimeTimeoutRef = useRef(300);
   const savedRuntimeIdleRef = useRef(900);
@@ -743,6 +790,7 @@ function EditAgentPageContent() {
       decision_continuity: agent.memory?.decision_continuity ?? DEFAULT_V168.decision_continuity,
       decision_ttl_days: agent.memory?.decision_ttl_days ?? DEFAULT_V168.decision_ttl_days,
       night_engine_enabled: agent.night_engine?.enabled ?? DEFAULT_V168.night_engine_enabled,
+      goal_intent_enabled: agent.goal_intent?.enabled ?? DEFAULT_V168.goal_intent_enabled,
       public_trigger: agent.channels?.public_trigger ?? DEFAULT_V168.public_trigger,
     });
   }, [agent]);
@@ -1238,7 +1286,7 @@ function EditAgentPageContent() {
     raw: code,
   }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
-  const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
+  const usesCoarseTools = COARSE_TOOL_RUNTIMES.has(runtime.provider) || COARSE_TOOL_RUNTIMES.has(runtime.fallback);
   // Show an old saved runtime for migration without offering it as a new choice.
   const withSavedRemoved = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
     saved && isRemovedRuntime(saved) && !opts.some((o) => o.value === saved)
@@ -1377,7 +1425,12 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
               <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
-              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} disabled={!isAdmin && !form.skill_budget_unlimited} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              {!isAdmin && (
+                <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
+                  {t('agents.adv.skillBudgetUnlimited.ownerHint')}
+                </p>
+              )}
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} disabled={form.skill_budget_unlimited ?? false} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1598,7 +1651,7 @@ function EditAgentPageContent() {
             <ToolNameListField label={t('agents.v168.toolGates.irreversible')} description={t('agents.v168.toolGates.irreversible.help')} values={caps.irreversible_tools} onChange={(v) => updateCap('irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.maybe')} description={t('agents.v168.toolGates.maybe.help')} values={caps.maybe_irreversible_tools} onChange={(v) => updateCap('maybe_irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.scoped')} description={t('agents.v168.toolGates.scoped.help')} values={caps.scoped_tools} onChange={(v) => updateCap('scoped_tools', v)} disabled={!isAdmin} />
-            {usesGenericCli && (
+            {usesCoarseTools && (
               <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
             )}
           </SettingsSection>
@@ -1809,6 +1862,37 @@ function EditAgentPageContent() {
             {odooEffective && <OdooPermissionSummary actions={agent.odoo?.allowed_actions ?? []}
               effectiveBlockedModels={odooEffective.effective_blocked_models}
               unblockInherited={odooEffective.unblock_inherited} />}
+            {isAdmin && <>
+              <SettingsCard>
+                <RowSelect label={t('agents.odoo.access.override')} description={t('agents.odoo.access.overrideHelp')}
+                  value={odooEffective?.permission_override ?? 'inherit'} disabled={!odooEffective || odooAccessBusy}
+                  options={(['inherit', 'engine', 'read_only'] as const).map((value) => ({ value, label: t(`agents.odoo.access.${value}`) }))}
+                  onChange={(value) => {
+                    if (!odooEffective || odooAccessBusy) return;
+                    const next = value as import('@/lib/api').OdooPermissionOverride;
+                    const rank = { inherit: 0, engine: 1, read_only: 2 };
+                    if (next === odooEffective.permission_override) return;
+                    setOdooAccessError(null);
+                    if (rank[next] < rank[odooEffective.permission_override]) setOdooAccessPending({ permission_override: next });
+                    else void saveOdooAccess({ permission_override: next }, false);
+                  }} />
+                <RowSwitch label={t('agents.odoo.access.requester')} description={t('agents.odoo.access.requesterHelp')}
+                  checked={odooEffective?.act_as_requester ?? false} disabled={!odooEffective || odooAccessBusy}
+                  onChange={(checked) => {
+                    setOdooAccessError(null);
+                    if (checked) setOdooAccessPending({ act_as_requester: true });
+                    else void saveOdooAccess({ act_as_requester: false }, false);
+                  }} />
+              </SettingsCard>
+              {odooAccessError && !odooAccessPending && <p role="alert" className="text-sm text-destructive">{odooAccessError}</p>}
+              <RiskConfirmDialog open={odooAccessPending !== null} onClose={() => { if (!odooAccessBusy) { setOdooAccessPending(null); setOdooAccessError(null); } }}
+                title={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requester' : 'agents.odoo.access.override')}
+                body={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterHelp' : 'agents.odoo.access.loosenHelp')}
+                acknowledgeLabel={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterAck' : 'agents.odoo.access.loosenAck')}
+                auditNote={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterAudit' : 'agents.odoo.access.loosenAudit')}
+                confirmLabel={t('common.save')} busy={odooAccessBusy} error={odooAccessError}
+                onConfirm={() => { if (odooAccessPending) void saveOdooAccess(odooAccessPending, true); }} />
+            </>}
             <OdooPermissionsEditor key={agent.name} value={odoo}
               defaultAccount={!odoo.url && !odoo.db && !odoo.username && !odoo.company_ids
                 && !odoo.api_key && !odoo.password && !agent.odoo_api_key_set && !agent.odoo_password_set
@@ -1948,6 +2032,9 @@ function EditAgentPageContent() {
                     disabled={!isAdmin}
                     onChange={(e) => updateField('department', e.target.value)}
                   />
+                  {isAdmin && departmentReview?.department === targetDepartment && targetDepartment !== (agent?.department ?? '') && (
+                    <ReachSummary reach={departmentReview.review.reach} applied />
+                  )}
                   <datalist id="agent-department-options">
                     {departmentOptions.map((d) => (
                       <option key={d} value={d} />
@@ -1961,6 +2048,7 @@ function EditAgentPageContent() {
             </SettingsCard>
             {adminHint}
           </SettingsSection>
+          <MainAccessSection agentRole={agent.role ?? ''} agentName={agent.display_name || agent.name} />
         </SettingsTab>
 
         {/* ── 腦袋與引擎 (WP-C §2-2: 模型 ∪ 執行環境) ────────────
@@ -2012,7 +2100,7 @@ function EditAgentPageContent() {
               {runtimeTimeoutError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{intl.formatMessage({ id: 'agents.runtime.timeout.overCeiling' }, { ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</p>}
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
-            {usesGenericCli && (
+            {usesCoarseTools && (
               <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
             )}
           </SettingsSection>
@@ -2121,7 +2209,7 @@ function EditAgentPageContent() {
                 <DurationField seconds={form.heartbeat_interval ?? 3600} onChange={(s) => updateField('heartbeat_interval', s)} units={['sec', 'min', 'hour']} min={60} />
               </SettingsRow>
               <RowNumber label={t('agents.adv.maxConcurrentRuns')} value={adv.heartbeat_max_concurrent_runs} min={1} max={64} onChange={(v) => updateAdv('heartbeat_max_concurrent_runs', v)} />
-              <RowText label={t('agents.adv.cronTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
+              <RowText label={t('agents.adv.cronTimezone')} description={intl.formatMessage({ id: 'agents.adv.timezone.exampleHint' }, { zone: timezonePlaceholder })} tier="select-wide" value={adv.heartbeat_cron_timezone} placeholder={timezonePlaceholder} onChange={(v) => updateAdv('heartbeat_cron_timezone', v)} />
             </SettingsCard>
             <FieldBlock label={t('agents.edit.heartbeatCron')} description={t('agents.edit.heartbeatCron.help')}>
               <ScheduleBuilder value={form.heartbeat_cron ?? ''} onChange={(c) => updateField('heartbeat_cron', c)} />
@@ -2142,7 +2230,7 @@ function EditAgentPageContent() {
                   onChange={(e) => updateAdv('proactive_max_turns', e.target.value === '' ? null : Number(e.target.value))}
                 />
               </SettingsRow>
-              <RowText label={t('agents.adv.proactiveTimezone')} description={t('agents.v168.timezone.clearHint')} tier="select-wide" value={adv.proactive_timezone} placeholder="Asia/Taipei" onChange={(v) => updateAdv('proactive_timezone', v)} />
+              <RowText label={t('agents.adv.proactiveTimezone')} description={intl.formatMessage({ id: 'agents.adv.timezone.exampleHint' }, { zone: timezonePlaceholder })} tier="select-wide" value={adv.proactive_timezone} placeholder={timezonePlaceholder} onChange={(v) => updateAdv('proactive_timezone', v)} />
               <RowNumber label={t('agents.edit.maxSilenceHours')} value={form.max_silence_hours ?? 12} min={1} step={0.5} onChange={(v) => updateField('max_silence_hours', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -2196,6 +2284,12 @@ function EditAgentPageContent() {
           <SettingsSection title={t('agents.v168.night.title')}>
             <SettingsCard>
               <RowSwitch label={t('agents.v168.night.enabled')} description={t('agents.v168.night.enabled.help')} checked={v168.night_engine_enabled} onChange={(v) => updateV('night_engine_enabled', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection title={t('agents.v168.goalIntent.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.goalIntent.enabled')} description={t('agents.v168.goalIntent.enabled.help')} checked={v168.goal_intent_enabled} onChange={(v) => updateV('goal_intent_enabled', v)} />
             </SettingsCard>
           </SettingsSection>
 

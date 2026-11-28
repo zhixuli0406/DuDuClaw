@@ -84,7 +84,7 @@ async fn serve_workflow_browser_fixture() {
     );
     let state = Arc::new(AppState {
         auth: AuthManager::new(None),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
         prepared_events: Default::default(),

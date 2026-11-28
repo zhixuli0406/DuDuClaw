@@ -26,7 +26,7 @@
 
 需要既有員工 Drive 工具或 Google 遠端 MCP 時，帳號本人可在完成連線後，另外於「我的連線」選擇「啟用員工的 Drive 工具」。這會要求 `https://www.googleapis.com/auth/drive.readonly`，允許唯讀存取該 Google 帳號可存取的所有 Drive 檔案。這是獨立的同意步驟，不是錄影匯入的必要條件；員工仍受本人使用同意與角色權限限制。每次請完成一種額外授權流程。
 
-Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 或 `drive`，也不會啟用員工 Drive 工具。增量授權保留先前用途，但必須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
+Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 也不會啟用員工 Drive 工具。一般憑證若含完整 `drive` 範圍，會被拒絕並要求重新連結。新增服務同意使用 `include_granted_scopes=false`，明列已同意的一般服務與新增服務，Google 可能再次顯示這些權限。新增授權保留先前用途，也須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
 
 `drive.file` 搭配 Google Picker 可選取不是由應用程式建立的既有錄影，因此匯入不要求 `drive.readonly`。Google 的 `drive.file` 權限也允許建立與修改選取／分享的檔案，但 DuDuClaw 匯入只執行讀取。DuDuClaw 內的搜尋只列出已分享給應用程式的音訊／影片，其他檔案（包括尚未分享的近期 Meet 錄影）可透過 Google Picker 選取。詳見 [Google 權限範圍說明](https://developers.google.com/workspace/drive/api/guides/api-specific-auth)與 [Picker 設定](https://developers.google.com/workspace/drive/picker/guides/web-picker)。
 
@@ -169,8 +169,20 @@ external_server = "合作夥伴 Google MCP" # 選填，最多 120 字
 
 `google_chat_send {space, text, thread?}` 使用提出要求的已驗證成員本人的 Google 帳號，傳送文字到既有空間。需要 `google:write`；管理員須先啟用 `[google] chat_send = true`，預設關閉。不接受指定寄件者，也不會改用公司共用帳號、其他成員、Apps Script 或 Chat app 的 `chat.bot` 權杖。
 
-個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。增量授權要求最小範圍 `https://www.googleapis.com/auth/chat.messages.create`，必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
+個人 OAuth 請先連結帳號，再到「我的連線 → Google Chat 傳送」開放獨立的 `chat_send` 用途。新增服務同意會明列已同意的一般服務，再加上 `https://www.googleapis.com/auth/chat.messages.create`，不要求 Google 自動合併先前授權；必須維持相同 Google `sub` 且實際取得權限。公司全網域委派也使用獨立的傳送範圍，仍須 Workspace 管理員授權；不會把傳送範圍加入每項 Google 工具。
 
 每次都由本人確認，五分鐘內有效、只能使用一次。確認卡顯示帳號、空間資源名稱、討論串、完整最終文字及私人資料外傳提醒。短文可在已驗證私訊確認；群組要求與長文改到本人限定的「我的連線」頁面確認。管理員核准、`allow` 規則、Admin MCP scope、收件人白名單都不能代替本人確認；組織要求的外傳核准仍另外執行。文字、目的地、帳號、憑證或政策變更後，須重新確認。
 
 Gateway 保存單次操作的固定 request ID。結果不明會回報 `result_unconfirmed`，不會自動重送；請先檢查 Google Chat，再決定是否提出新的傳送要求。第一版不支援附件或建立空間；指定的討論串必須屬於同一空間。Google 顯示本人為寄件者，同時附上應用程式名稱。[Google Chat API 說明](https://developers.google.com/workspace/chat/api/reference/rest/v1/spaces.messages/create)。
+
+## 另外連結雲端硬碟寫入
+
+AI 員工使用你的 Google 連線時，寫入需要第二次 Google 同意，授予 Drive、Docs 與 Sheets 寫入權限，憑證會與一般連線分開保存。請使用同一個 Google 帳號。管理員須先開放所需動作，個人同意不會自行開啟功能。在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。
+
+建立、修改、搬移與移到垃圾桶預設全關。管理員開啟或放寬存取前須確認了解風險，系統會記錄身分與時間，不要求額外重新驗證。每項動作預設由成員本人確認；管理員可逐項關閉確認，或加上管理員核准。資料夾清單為空時，建立與修改可在帳號能寫入的任何位置執行，搬移與移到垃圾桶不能使用。詳見[寫入工具與資料夾規則](google-mcp.md#雲端硬碟寫入工具)。
+
+需要確認時，只有該成員能在五分鐘內核准或拒絕。使用你的個人連線時，請求者也須是你本人。決定前請檢查 Google 帳號、動作、目的位置與預計寫入的內容；Admin 權杖與工具允許清單不能代你確認。內容、憑證、帳號或規則改變，就需要重新確認。無人值守與背景工作無法等待確認，因此不會寫入；要讓排程寫入，管理員須先關閉該動作的確認要求，帳號與存取檢查仍會照常執行。
+
+移除寫入連線只會刪除 DuDuClaw 本機的寫入憑證，一般連線仍保留在本機，也不會撤銷 Google 授權。若要完整撤銷，請到 [Google 帳戶的第三方存取頁面](https://myaccount.google.com/connections)移除這個應用程式的存取權。這也會影響同一應用程式的一般 Google 連線，之後請只勾選需要的服務重新連結。Google 端撤銷與權杖隔離仍待實際帳號驗收。移除連線不會復原已完成的寫入。
+
+一般同意流程不再要求 Google 自動合併先前授予的權限。DuDuClaw 會明列已同意的一般服務，加上這次新增的服務，因此 Google 可能再次列出所有這些權限。一般連線若含完整 Drive 權限，系統會拒絕使用並要求重新連結；獨立寫入憑證不會交給員工 CLI 或官方遠端 MCP。

@@ -9,7 +9,7 @@ impl GoogleCallContext {
         home: &Path, agent: &str, requester: RequesterIdentity,
         people: Box<dyn People>, tool: &str, args: &Value, turn_id: Option<String>, run_id: Option<String>,
     ) -> Result<Self, Refusal> {
-        if gi::native_google_scope(tool).is_none() || requester == RequesterIdentity::Unknown {
+        if gi::native_google_scope(tool).is_none() || duduclaw_core::google_identity::is_drive_write_tool(tool) || requester == RequesterIdentity::Unknown {
             return Err(changed());
         }
         let (home, agent_dir, canonical_agent) = Self::canonical(home, &home.join("agents").join(agent))?;

@@ -41,6 +41,13 @@ impl MethodHandler {
                 Ok(s) => Some(s), Err(_) => return WsFrame::error_response("", "請重新使用帳號登入後再註冊雙因素驗證。"),
             }
         } else { None };
+        let disable_session = if method == "mfa.disable" {
+            match db.has_local_password(&ctx.user_id) {
+                Ok(false) => Some(crate::google_personal::session_for(&ctx.user_id)),
+                Ok(true) => None,
+                Err(e) => return WsFrame::error_response("", &e),
+            }
+        } else { None };
         if matches!(method, "mfa.enroll_begin" | "mfa.disable" | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove") && !crate::server::check_login_rate_limit(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), &ctx.email) {
             return WsFrame::error_response("", "嘗試次數過多，請稍後再試。");
@@ -57,9 +64,13 @@ impl MethodHandler {
             _ => None,
         };
         let notify_db = db.clone();
+        let ctx_member_key = ctx.member_key_id.is_some();
         let method = method.to_owned();
         let result=tokio::task::spawn_blocking(move || -> Result<Value,String> {
             let user=db.get_user(&id)?.filter(|u|u.status==duduclaw_auth::UserStatus::Active).ok_or("無法讀取帳號資料。")?;
+            if !db.has_local_password(&id)? && (user.credential_epoch != previous_epoch || ctx_member_key) {
+                return Err("登入憑證已失效，請重新登入。".into());
+            }
             let now=chrono::Utc::now().timestamp();
             let cipher=crate::mfa::Cipher(&home);
             match method.as_str() {
@@ -87,7 +98,15 @@ impl MethodHandler {
                         db.verify_password(&user.email,password)?;
                         db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                         token.to_owned()
-                    } else {db.mfa_factor_password_challenge(&id,password,session.as_deref().unwrap(),now)?};
+                    } else {
+                        let token=db.mfa_password_challenge(&id,password,session.as_deref().unwrap(),now)?;
+                        let delivery=db.mfa_prepare_enrollment(&token,required,now)?;
+                        if required && !db.mfa_active(&id)? {
+                            return Ok(json!({"enrollment_token":token,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&token),"proof_required":true,"_delivery":delivery.map(|o|json!({"channel":o.channel,"target":o.channel_user_id,"code":o.code}))}));
+                        }
+                        token
+                    };
+                    db.mfa_prove_enrollment(&token,params.get("proof_code").and_then(Value::as_str).unwrap_or(""),now)?;
                     let (email,code)=db.mfa_email_send(&token,true,now)?;
                     Ok(json!({"enrollment_token":token,"sent":true,"expires_in":600,"_email":{"email":email,"code":code,"token":token}}))
                 },
@@ -96,15 +115,18 @@ impl MethodHandler {
                     let token=params.get("enrollment_token").and_then(Value::as_str).ok_or("缺少註冊憑證。")?;
                     db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                     let code=params.get("code").and_then(Value::as_str).unwrap_or("");
+                    db.mfa_prove_enrollment(token,params.get("proof_code").and_then(Value::as_str).unwrap_or(""),now)?;
                     let jwt=jwt.as_ref().ok_or("登入服務無法使用。")?;
                     db.mfa_email_verify_and_issue(token,code,true,now,|user,access,codes| {
                         crate::mfa::replacement_session(jwt,user,access,previous_epoch,codes,true)
                     })
                 },
                 "mfa.email_remove"=> {
-                    let password=params.get("password").and_then(Value::as_str).ok_or("請輸入目前密碼。")?;
+                    let password=if db.has_local_password(&id)? {
+                        params.get("password").and_then(Value::as_str).ok_or("請輸入目前密碼。")?
+                    } else { params.get("password").and_then(Value::as_str).unwrap_or("") };
                     let session=session.as_deref().unwrap();
-                    let token=db.mfa_factor_password_challenge(&id,password,session,now)?;
+                    let token=crate::google_signin::routes::me::challenge(&home,&db,&id,session,previous_epoch,password,now,true)?;
                     let jwt=jwt.as_ref().ok_or("登入服務無法使用。")?;
                     let result=db.mfa_email_remove_and_issue(&id,&token,session,now,personal,|user,access,codes| {
                         crate::mfa::replacement_session(jwt,user,access,previous_epoch,codes,false)
@@ -112,14 +134,14 @@ impl MethodHandler {
                     Ok(result)
                 },
                 "mfa.enroll_begin"=> {
-                    let password=params.get("password").and_then(Value::as_str).ok_or("請輸入目前密碼。");
+                    let password=if db.has_local_password(&id)? {
+                        params.get("password").and_then(Value::as_str).ok_or("請輸入目前密碼。")?
+                    } else { params.get("password").and_then(Value::as_str).unwrap_or("") };
                     let token=if let Some(token)=params.get("enrollment_token").and_then(Value::as_str) {
-                        // Every begin, including a proof retry, requires fresh password knowledge.
-                        db.verify_password(&user.email,password?)?;
-                        db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
+                        crate::google_signin::routes::me::retry(&home,&db,&id,session.as_deref().unwrap(),previous_epoch,password,token,now)?;
                         token.to_owned()
                     } else {
-                        let token=db.mfa_password_challenge(&id,password?,session.as_deref().unwrap(),now)?;
+                        let token=crate::google_signin::routes::me::challenge(&home,&db,&id,session.as_deref().unwrap(),previous_epoch,password,now,false)?;
                         let delivery=db.mfa_prepare_enrollment(&token,required,now)?;
                         if required && !db.mfa_active(&id)? {
                             // The code travels only through the private blocking result, never the RPC response.
@@ -146,11 +168,17 @@ impl MethodHandler {
                 "mfa.disable" | "mfa.recovery_regenerate" => {
                     let code=params.get("code").and_then(Value::as_str).unwrap_or("");
                     if method == "mfa.disable" {
-                        let password = params.get("password").and_then(Value::as_str)
-                            .filter(|p| !p.is_empty() && p.len() <= 4096).ok_or("請輸入目前密碼。")?;
-                        let verified = db.verify_password(&user.email, password)?;
-                        if verified.id != id || verified.credential_epoch != previous_epoch {
-                            return Err("登入憑證已失效，請重新登入。".into());
+                        if db.has_local_password(&id)? {
+                            let password = params.get("password").and_then(Value::as_str)
+                                .filter(|p| !p.is_empty() && p.len() <= 4096).ok_or("請輸入目前密碼。")?;
+                            let verified = db.verify_password(&user.email, password)?;
+                            if verified.id != id || verified.credential_epoch != previous_epoch {
+                                return Err("登入憑證已失效，請重新登入。".into());
+                            }
+                        } else {
+                            let session = disable_session.as_ref().and_then(|s| s.as_ref().ok())
+                                .ok_or("請先用公司 Google 帳號重新驗證身分；無法驗證時，請管理員重設兩步驟驗證。")?;
+                            crate::google_signin::routes::me::consume_grant(&home,&db,&id,session,previous_epoch)?;
                         }
                         let jwt = jwt.as_ref().ok_or("登入服務無法使用。")?;
                         db.mfa_change_and_issue(&id, code, true, &cipher, now, |user, access, codes| {

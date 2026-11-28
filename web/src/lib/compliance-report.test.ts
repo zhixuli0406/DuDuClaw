@@ -1,10 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { complianceDateRange, complianceLanguage } from './compliance-report';
+import { resetCompanyTimeZone, useCompanyTimeStore } from './company-time';
 import en from '@/i18n/en.json';
 import zh from '@/i18n/zh-TW.json';
 import ja from '@/i18n/ja-JP.json';
 
 describe('compliance report requests', () => {
+  beforeEach(() => {
+    resetCompanyTimeZone();
+    useCompanyTimeStore.setState({ status: 'set', zone: 'Asia/Taipei' });
+  });
+  afterEach(() => { resetCompanyTimeZone(); });
+
   it('uses Taipei calendar dates with an exclusive UTC end', () => {
     expect(complianceDateRange('2026-11-01', '2026-11-01')).toEqual({ from: '2026-10-31T16:00:00.000Z', until: '2026-11-01T16:00:00.000Z' });
   });

@@ -1,3 +1,4 @@
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { client } from '@/lib/ws-client';
 import { passkeyUnavailableReason } from '@/lib/passkey';
 import { ApiError, apiPost, useAuthStore, type FactorAvailability, type SessionTokens } from '@/stores/auth-store';
@@ -47,7 +48,7 @@ export async function accountRequest<T>(path: string, body?: Record<string, unkn
     headers: { Authorization: `Bearer ${jwt}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}) });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new ApiError(response.status, 'Request failed');
+  if (!response.ok) throw new ApiError(response.status, settingsRefusal(data.error ?? data, 'Request failed'));
   return data as T;
 }
 export const mfaApi = {
@@ -55,7 +56,7 @@ export const mfaApi = {
   begin: (input: EnrollmentInput) => client.call('mfa.enroll_begin', { ...input }) as Promise<Enrollment>,
   confirm: (input: EnrollmentInput) => client.call('mfa.enroll_confirm', { ...input }) as Promise<RecoveryResult & SessionTokens>,
   regenerate: (code: string) => client.call('mfa.recovery_regenerate', { code }) as Promise<RecoveryResult>,
-  disable: (code: string, password: string) => client.call('mfa.disable', { code, password }) as Promise<{ enabled: false } & SessionTokens>,
+  disable: (code: string, password = '') => client.call('mfa.disable', { code, password }) as Promise<{ enabled: false } & SessionTokens>,
   overview: () => client.call('mfa.overview') as Promise<MfaOverview>,
   reset: (actor: string, user_id: string, code: string) => {
     if (actor === user_id) return Promise.reject(new Error('MFA_SELF_RESET'));
@@ -88,9 +89,9 @@ export const mfaApi = {
     }
   },
   emailVerify: (input: Record<string, unknown>) => apiPost<SessionTokens & { recovery_codes?: string[] }>('/api/mfa/email/verify', input),
-  emailBegin: (password: string) => client.call('mfa.email_begin', { password }) as Promise<{ enrollment_token: string }>,
-  emailConfirm: (enrollment_token: string, code: string) => client.call('mfa.email_confirm', { enrollment_token, code }) as Promise<SessionTokens & { recovery_codes?: string[] }>,
-  emailRemove: (password: string) => client.call('mfa.email_remove', { password }) as Promise<SessionTokens>,
+  emailBegin: (input: EnrollmentInput) => client.call('mfa.email_begin', { ...input }) as Promise<Enrollment & { sent?: boolean }>,
+  emailConfirm: (enrollment_token: string, code: string, proof_code?: string) => client.call('mfa.email_confirm', { enrollment_token, code, ...(proof_code ? { proof_code } : {}) }) as Promise<SessionTokens & { recovery_codes?: string[] }>,
+  emailRemove: (password = '') => client.call('mfa.email_remove', { password }) as Promise<SessionTokens>,
   httpBegin: (input: EnrollmentInput) => apiPost<Enrollment>('/api/mfa/enroll/begin', { ...input }),
   httpConfirm: (input: EnrollmentInput) => apiPost<SessionTokens & RecoveryResult>('/api/mfa/enroll/confirm', { ...input }),
 };

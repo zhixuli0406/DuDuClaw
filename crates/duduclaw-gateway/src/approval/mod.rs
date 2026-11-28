@@ -11,6 +11,8 @@
 //! effects. Unknown execution outcomes require operator reconciliation and
 //! are never replayed automatically. Decision and execution CAS recheck TTL.
 
+pub(crate) mod decider_display;
+
 /// Channels supported by the bound in-chat decision sender/parser.
 pub fn supports_text_decisions(channel: &str) -> bool {
     matches!(channel, "telegram" | "discord" | "slack" | "line" | "googlechat")
@@ -133,9 +135,13 @@ fn masked_approval_value(value: &Value) -> Value {
 // ── Types ───────────────────────────────────────────────────
 
 pub mod action_grant;
+pub(crate) mod chat_admin;
+pub(crate) mod decision_service;
 mod autopilot_consume;
 pub(crate) mod mail_requester;
 pub(crate) mod cli_egress;
+pub(crate) mod outbound;
+pub(crate) use outbound::{is_outbound_data_card, outbound_reviewer};
 mod action_guard;
 mod binding;
 mod fixture_decision;
@@ -144,6 +150,7 @@ pub mod policy_snapshot;
 mod delivery;
 pub(crate) use delivery::{CURRENT_TRUSTED_REPLY_TARGET, TrustedReplyTarget, scope_trusted_reply};
 mod broker;
+mod admin_ai;
 mod ag_ui;
 pub(crate) use ag_ui::same_ag_ui_request;
 mod turn_origin;
@@ -415,6 +422,9 @@ pub struct ApprovalRecord {
     /// host, never from the request. Cards show it as 「由 ○○ 交辦」.
     #[serde(default)]
     pub on_behalf_of: Option<String>,
+    /// Sanitized admin-AI execution outcome, written once after execution.
+    #[serde(default)]
+    pub execution_result: Option<Value>,
 }
 
 /// Who the run raising a request works for: the gateway's task-local
@@ -430,7 +440,7 @@ impl ApprovalRecord {
     /// The instant this approval expires (created_at + ttl). `None` if
     /// `created_at` is unparseable — treated as "already expired" by
     /// [`is_stale`] (fail-closed).
-    fn expires_at(&self) -> Option<DateTime<Utc>> {
+    pub(crate) fn expires_at(&self) -> Option<DateTime<Utc>> {
         let created = DateTime::parse_from_rfc3339(&self.created_at).ok()?;
         Some(created.with_timezone(&Utc) + chrono::Duration::seconds(self.ttl_seconds))
     }

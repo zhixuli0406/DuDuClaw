@@ -52,7 +52,7 @@ async fn fixture_policy(
     let (event_tx, _) = broadcast::channel(4);
     let state = Arc::new(AppState {
         auth: AuthManager::new(None),
-        handler,
+        handler: Arc::new(handler),
         tx,
         event_tx,
         prepared_events: Default::default(),
@@ -699,6 +699,12 @@ async fn googlechat_bind_refuses_another_persons_google_identity_and_list_shows_
     let identities = listed["identities"].as_array().unwrap();
     assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i.get("source").is_none()));
     assert!(identities.iter().any(|i| i["channel"] == "googlechat" && i["channel_user_id"] == "users/246810" && i["source"] == "google_account"));
+    for identity in identities {
+        assert_eq!(identity["proof_status"], "admin_prefilled");
+        assert_eq!(identity["proven_at"], Value::Null);
+        assert!(identity.get("proof_account").is_none());
+        assert!(identity.get("proof_dm").is_none());
+    }
     let (_, listed) = body(handle_channel_identity_list(State(state.clone()), headers.clone(),
         Query(ChannelIdentityListQuery { user_id: bob.id.clone() })).await.into_response()).await;
     assert!(listed["identities"].as_array().unwrap().is_empty());
@@ -1320,7 +1326,10 @@ async fn mfa_email_http_verify_succeeds_after_smtp_config_is_removed() {
 async fn mfa_enforced_email_user_can_add_totp_without_another_proof() {
     let (_dir,state,user)=fixture(false,true).await;
     let now=chrono::Utc::now().timestamp();
-    let token=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","setup",now).unwrap();
+    let token=state.user_db.mfa_password_challenge(&user.id,"correct horse battery","setup",now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,true,now).unwrap();
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,&duduclaw_auth::mfa::enrollment_challenge_ref(&token),now).unwrap();
+    state.user_db.mfa_prove_enrollment(&token,&proof,now).unwrap();
     let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
     state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
     let user=state.user_db.get_user(&user.id).unwrap().unwrap();
@@ -1367,7 +1376,7 @@ async fn member_key_http_and_prefix_separation() {
     let (_dir, state, _) = fixture(false, false).await;
     std::fs::write(state.home_dir.join("config.toml"), "[member_api_keys]\nenabled=true").unwrap();
     let member = state.user_db.create_user("member@http.test", "Member", "test-password", UserRole::Employee).unwrap();
-    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch).unwrap();
+    let key = state.user_db.member_key_create(&member.id, "x", 1, member.credential_epoch, false, &[]).unwrap();
     let status = state.user_db.status_token_create(&member.id, "x").unwrap();
     let jwt = state.jwt_config.issue_access_token(&member, &[]).unwrap();
     assert!(authenticate_jwt(&state, &key.secret).is_err());
@@ -1378,13 +1387,13 @@ async fn member_key_http_and_prefix_separation() {
     for (raw, allowed) in [(key.secret.as_str(), true), (jwt.as_str(), true), (status.secret.as_str(), false), ("ddc_prod_0123456789abcdef0123456789abcdef", false)] {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("authorization", format!("Bearer {raw}").parse().unwrap());
-        assert_eq!(member_http_caller(&state, &headers, None).is_ok(), allowed);
+        assert_eq!(member_http_caller(&state, &headers, None).await.is_ok(), allowed);
         assert_eq!(handle_me(State(state.clone()), headers).await.into_response().status() == StatusCode::OK, allowed);
     }
     state.user_db.member_key_revoke_own(&member.id, &key.info.id).unwrap();
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("authorization", format!("Bearer {}", key.secret).parse().unwrap());
-    assert!(member_http_caller(&state, &headers, None).is_err());
+    assert!(member_http_caller(&state, &headers, None).await.is_err());
 }
 
 #[tokio::test]
@@ -1402,4 +1411,72 @@ async fn member_key_creation_consumes_a_fresh_recovery_factor() {
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: true, .. }));
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: false, .. }));
     assert_eq!(state.user_db.member_api_keys_for_user(&member.id).unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn mfa_email_http_first_enrollment_processes_proof_before_delivery_and_issues_tokens() {
+    let (_dir,state,user)=fixture(false,true).await;
+    let now=chrono::Utc::now().timestamp();
+    let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,true,now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token})).unwrap();
+    let (status,value)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    assert_eq!(status,StatusCode::UNAUTHORIZED);
+    assert!(value.get("access_token").is_none());
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,&duduclaw_auth::mfa::enrollment_challenge_ref(&token),now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token,"proof_code":proof})).unwrap();
+    let (status,_)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    // No sender is configured: the request gets past proof validation, but
+    // cannot deliver. Create the private delivery data through the real DB API.
+    assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);
+    let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token,"proof_code":proof,"code":code})).unwrap();
+    let (status,value)=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(state.jwt_config.verify_access_token(value["access_token"].as_str().unwrap()).is_ok());
+    assert!(value["refresh_token"].is_string());
+    assert_eq!(value["recovery_codes"].as_array().unwrap().len(),10);
+}
+
+#[tokio::test]
+async fn channel_identity_list_proof_fields_and_admin_gate() {
+    let (_dir, state, admin) = fixture(false, false).await;
+    let employee = state.user_db.create_user("proof@company.test", "Proof", "password123", UserRole::Employee).unwrap();
+    for id in ["prefilled", "proven", "wrong-owner"] {
+        state.user_db.bind_channel_identity(&employee.id, "telegram", id, true).unwrap();
+    }
+    let conn = rusqlite::Connection::open(state.home_dir.join("users.db")).unwrap();
+    conn.execute("UPDATE channel_identities SET proof_method='chat_handshake',proof_user_id=?1,
+        proof_account='private-bot',proof_dm='private-dm',proven_at=1700000000
+        WHERE channel_user_id IN ('proven','wrong-owner')", [&employee.id]).unwrap();
+    conn.execute("UPDATE channel_identities SET proof_user_id=?1 WHERE channel_user_id='wrong-owner'", [&admin.id]).unwrap();
+    let headers = |user: &duduclaw_auth::User| {
+        let mut headers = axum::http::HeaderMap::new();
+        let token = state.jwt_config.issue_access_token(user, &[]).unwrap();
+        headers.insert("authorization", format!("Bearer {token}").parse().unwrap());
+        headers
+    };
+    let (status, listed) = body(handle_channel_identity_list(State(state.clone()), headers(&admin),
+        Query(ChannelIdentityListQuery { user_id: employee.id.clone() })).await.into_response()).await;
+    assert_eq!(status, StatusCode::OK);
+    let identities = listed["identities"].as_array().unwrap();
+    assert_eq!(identities.len(), 3);
+    for identity in identities {
+        let proven = identity["channel_user_id"] == "proven";
+        assert_eq!(identity["proof_status"], if proven { "self_confirmed" } else { "admin_prefilled" });
+        assert_eq!(identity["proven_at"], if proven { json!("2023-11-14T22:13:20+00:00") } else { Value::Null });
+        let mut fields: Vec<_> = identity.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["channel", "channel_user_id", "created_at", "proof_status", "proven_at", "user_id", "verified"]);
+    }
+    let response = handle_channel_identity_list(State(state.clone()), headers(&employee),
+        Query(ChannelIdentityListQuery { user_id: employee.id.clone() })).await.into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    conn.execute("UPDATE channel_identities SET proven_at='unreadable' WHERE channel_user_id='proven'", []).unwrap();
+    let (status, error) = body(handle_channel_identity_list(State(state.clone()), headers(&admin),
+        Query(ChannelIdentityListQuery { user_id: employee.id })).await.into_response()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(error.get("error").is_some());
+    assert!(error.get("identities").is_none());
 }

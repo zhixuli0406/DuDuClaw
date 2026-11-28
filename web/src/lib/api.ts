@@ -1,3 +1,6 @@
+import type { OdooAccess, OdooAccessPatch } from './odoo-access';
+import type { AutopilotRun } from './autopilot-history';
+import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
 import { client } from './ws-client';
@@ -42,6 +45,41 @@ import type {
   AutopilotCreateParams,
   AutopilotUpdateFields,
 } from './autopilot-rules';
+
+export type ChatLinkChannel = 'telegram' | 'googlechat';
+export interface ChatLinkStatus {
+  handshake_id: string;
+  status: 'waiting' | 'matched' | 'confirmed' | 'rejected' | 'expired';
+  channel: ChatLinkChannel;
+  expires_at: string;
+  display_name: string | null;
+  masked_target: string | null;
+}
+export interface ChatLinkTarget {
+  channel: ChatLinkChannel;
+  account: string;
+  agent_id: string;
+  display_name: string;
+  bot_username?: string | null;
+  service_account_email?: string | null;
+  project_number?: string | null;
+}
+export interface ChatLinkStart {
+  handshake_id: string;
+  code: string;
+  expires_at: string;
+  targets: ChatLinkTarget[];
+}
+export interface ChatLinkIdentity {
+  channel: ChatLinkChannel;
+  channel_user_id: string;
+  verified: boolean;
+  proof_status: 'self_confirmed' | 'admin_prefilled';
+}
+export interface ChatLinkList {
+  identities: ChatLinkIdentity[];
+  handshakes: ChatLinkStatus[];
+}
 
 // Type definitions matching Rust types
 export interface EgressShadowReport {
@@ -680,6 +718,8 @@ export interface GoalCreateResult {
 }
 
 export interface SkillInfo {
+  can_manage?: boolean;
+  can_restore?: boolean;
   name: string;
   agent_id?: string | null;
   content: string;
@@ -706,6 +746,8 @@ export interface SkillInfo {
 
 /** B8: one employee holding a company-wide skill. */
 export interface SkillHolder {
+  can_manage?: boolean;
+  can_restore?: boolean;
   agent_id: string;
   display_name?: string;
   enabled: boolean;
@@ -952,7 +994,29 @@ export interface CredentialInventoryReport {
  *  unrecognised value or an unreadable config is enforced as `none` too. */
 export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 
+export type DelegationRole = 'admin' | 'manager';
+export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
+
+export interface AdminAiSettings {
+  enabled: boolean;
+  config_state?: 'ok' | 'unreadable' | 'malformed';
+  enabled_ack?: { by: string; by_name?: string; at: string };
+}
+
+export interface AdminAiUpdate {
+  enabled: boolean;
+  acknowledge_risk?: boolean;
+}
+
+export interface DelegationWarning {
+  code: string;
+  message: string;
+}
+
 export interface DelegationSettings {
+  hash: string;
+  unrestricted_roles?: DelegationRole[];
+  allow_one_way?: Array<[string, string]>;
   /** The policy the gateway enforces (an unrecognised value reads `none`). */
   policy: DelegationPolicy;
   /** The value as written in config.toml, when present (v1.82+). */
@@ -960,7 +1024,7 @@ export interface DelegationSettings {
   /** Unordered agent-id pairs — a pair permits delegation in both directions. */
   allow: Array<[string, string]>;
   /** Operator-facing notes about values the gateway had to fall back on. */
-  warnings: string[];
+  warnings: DelegationWarning[];
 }
 
 /** `delegation.effective.config_error` categories (v1.82, RM-137). */
@@ -968,6 +1032,13 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 
 /** `delegation.effective` (v1.82, RM-137) — what applies to one employee. */
 export interface DelegationEffective {
+  unrestricted?: boolean;
+  owner_role?: DelegationRole | 'employee' | null;
+  owner_display_name?: string | null;
+  /** Owner role lookup failed; role exceptions cannot be confirmed. */
+  unrestricted_error?: 'users_unreadable' | null;
+  allow_one_way?: DelegationOneWayPair[];
+  inactive_allow_one_way?: DelegationOneWayPair[];
   agent_id: string;
   /** Effective for this employee: `none` when the global policy or its own switch stops it. */
   policy: DelegationPolicy;
@@ -976,7 +1047,7 @@ export interface DelegationEffective {
   global_policy: DelegationPolicy;
   configured_policy: string | null;
   /** Set when the configured policy value was not recognised (enforced as `none`). */
-  policy_warning: string | null;
+  policy_warning: DelegationWarning | null;
   /**
    * Set when config.toml or this employee's agent.toml could not be read or
    * parsed — a category only, never config text (it can quote raw config).
@@ -1174,6 +1245,7 @@ export type AssignScheduleSpec =
 
 /** One scheduled assignment. Every fire re-checks the creator's right. */
 export interface AssignScheduleInfo {
+  creator_access_lost?: boolean | null;
   can_manage?: boolean;
   id: string;
   agent_id: string;
@@ -1562,6 +1634,30 @@ export type {
   AutopilotUpdateFields,
 } from './autopilot-rules';
 export type { AutopilotHistoryResult } from './autopilot-history';
+/** Safe member-facing rule projection returned by autopilot.affecting_me. */
+export interface AutopilotNotifyDestination {
+  channel: string;
+  chat_id: string;
+  kind: 'self' | 'agent';
+  agent_id: string | null;
+  label: string;
+}
+
+export interface AffectingAutopilotRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_event: string;
+  conditions: AutopilotRule['conditions'];
+  action_kinds: string[];
+  target_agents: string[];
+  actions: Array<{ type: string; target_agent: string; require_approval: boolean; prompt?: string; skill_name?: string }>;
+  require_approval: boolean;
+  owner_department: string | null;
+  creator_access_lost: boolean | null;
+  history: Array<{ triggered_at: string; result: string }>;
+}
+
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
@@ -2609,11 +2705,15 @@ export interface InvitationPreview {
 }
 export type OnboardingStep = 'channel' | 'google' | 'example' | 'capabilities';
 export type OnboardingStepStatus = 'pending' | 'done' | 'skipped';
+export type SigninStepStatus = 'done' | 'recommended' | 'required' | 'unknown' | 'waiting_admin' | 'preparing' | 'blocked_domain' | 'pending' | 'admin_binds' | 'not_applicable' | 'needs_reverify' | 'invalid';
+export type SigninSteps = Record<'mfa' | 'avatar' | 'google' | 'google_chat' | 'odoo', { status: SigninStepStatus; reason?: string }>;
 export interface OnboardingProgress {
   enabled: boolean;
   dismissed: boolean;
   password_done: boolean;
   steps: Record<OnboardingStep, OnboardingStepStatus>;
+  signin_steps?: SigninSteps;
+  steps_remaining?: number;
   examples: string[];
 }
 export interface NewMemberInput {
@@ -2635,7 +2735,42 @@ export interface CreateMemberResult {
 
 export interface AvatarConflict { agent_id: string; user_ids: string[] }
 
+export interface SigninAvatar {
+  state: 'pending' | 'creating' | 'retrying' | 'waiting_admin' | 'done';
+  reason: 'done' | 'name_taken' | 'policy_changed' | 'failed' | 'protected_mode' | 'template_changed' | 'template_invalid' | 'seats_full' | 'not_eligible' | 'unknown' | null;
+  retry_allowed: boolean;
+}
+
+export interface MainAccessUser {
+  user_id: string;
+  display_name: string;
+  email: string;
+  role: UserInfo['role'];
+  status: UserInfo['status'];
+  granted_by_name: string | null;
+  granted_at: string | null;
+}
+
+export interface MainAccess {
+  hash: string;
+  users: MainAccessUser[];
+  risk_notice: string;
+  effective: boolean;
+  ineffective_reason?: string;
+}
+
+export interface MainAccessSetParams {
+  expected_hash: string;
+  user_ids: string[];
+  acknowledged?: boolean;
+}
+
 export interface UserInfo {
+  google_signin_linked?: boolean;
+  google_signin_linked_at?: string | null;
+  google_signin_last_signin_at?: string | null;
+  has_password?: boolean;
+  signin_avatar?: SigninAvatar | null;
   avatar_agent_id?: string | null;
   primary_agent_id?: string | null;
   id: string;
@@ -2952,6 +3087,8 @@ export interface OdooPermissionOptions {
 }
 
 export interface OdooConfig {
+  /** Admin opt-in, default false; changed via odoo.member_credentials.set_enabled. */
+  member_credentials?: boolean;
   blocked_models?: string[];
   read_only_models?: string[];
   url: string;
@@ -3735,6 +3872,8 @@ export interface AgentUpdateParamsV168 {
   guardrails?: AgentGuardrailsSection;
   memory?: AgentMemorySection;
   night_engine?: { enabled?: boolean };
+  /** Per-employee task suggestions in chat. */
+  goal_intent?: { enabled?: boolean };
   /** v1.76 — `[channels] public_trigger` (admin-only). */
   channels?: { public_trigger?: boolean };
   advanced_kv?: AgentKvEntry[];
@@ -3778,6 +3917,8 @@ export interface AgentDetailV168 {
   guardrails?: AgentGuardrailsSection;
   memory?: AgentMemorySection;
   night_engine?: { enabled?: boolean };
+  /** Per-employee task suggestions in chat. */
+  goal_intent?: { enabled?: boolean };
   /** v1.76 — `[channels] public_trigger`. Older gateways omit it. */
   channels?: { public_trigger?: boolean };
   evolution?: {
@@ -5665,7 +5806,22 @@ export interface McpKeyCreateResult {
 // ── RM-064: read-only status credentials (external work-status query) ──
 
 /** One `ddc_status_…` credential as listed. Never carries the secret. */
-export interface MemberKeyInfo {
+export type MemberKeyScope = 'tasks:read' | 'agents:status' | 'odoo:read' | 'odoo:write';
+export interface MemberKeyPermissions {
+  include_conversations: boolean;
+  mcp_scopes: MemberKeyScope[];
+}
+export interface MemberKeyPolicy {
+  allow_conversation_content: boolean;
+  allow_mcp_scopes: MemberKeyScope[];
+}
+export type MemberKeyPolicyResult = ({ readable: true; enabled: boolean;
+  available_mcp_scopes: MemberKeyScope[]; risk: { conversation: string; mcp_scopes: string };
+} & MemberKeyPolicy) | { readable: false; message: string };
+export type MemberKeyPolicyUpdate = Partial<MemberKeyPolicy> & { acknowledge_risk?: boolean };
+
+export interface MemberKeyInfo extends MemberKeyPermissions {
+  conversations_migrated: boolean;
   id: string;
   name: string;
   created_at: string;
@@ -5814,6 +5970,23 @@ export interface CostRecentRow {
   created_at: string;
 }
 
+export interface DepartmentCostTotals {
+  total_requests: number;
+  total_input_tokens: number;
+  total_output_tokens: number;
+  total_cost_millicents: number;
+  total_cache_savings_millicents: number;
+  avg_cache_efficiency: number;
+}
+
+export interface DepartmentCostSummary {
+  available: boolean;
+  department: string;
+  days: number;
+  agents: (DepartmentCostTotals & { agent_id: string; display_name: string })[];
+  totals: DepartmentCostTotals;
+}
+
 export interface CostRecentResult {
   available: boolean;
   records: CostRecentRow[];
@@ -5927,7 +6100,24 @@ export interface MemoryGraphResult {
 /** Response of `odoo.agent_config_get`. `configured:false` = no override, the
  *  agent inherits the global config. `api_key`/`password` are never returned in
  *  cleartext — only the `*_set` booleans plus a masked placeholder. */
+export type OdooPermissionOverride = 'inherit' | 'engine' | 'read_only';
+export interface OdooAgentAccessSet {
+  agent_id: string;
+  permission_override?: OdooPermissionOverride;
+  act_as_requester?: boolean;
+  acknowledge_risk: boolean;
+}
+export interface OdooAgentAccessResult {
+  success: boolean;
+  agent_id: string;
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
+  hot_reloaded: boolean;
+}
+
 export interface OdooAgentConfig {
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
   effective_unblock_models: string[];
   unblock_inherited: boolean;
   effective_blocked_models: string[];
@@ -6049,6 +6239,7 @@ export interface WikiScopeNamespace {
 
 /** Known approval kinds. Unknown kinds are surfaced verbatim as a fallback. */
 export type ApprovalKind =
+  | 'admin_ai_settings'
   | 'browser_action'
   | 'tool_call'
   | 'skill_activation'
@@ -6074,6 +6265,18 @@ export interface ApprovalItem {
   status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
   answer?: unknown;
   invalidated_reason?: string | null;
+  /** Server-formatted decision attribution, omitted when not visible. */
+  decided_by_display?: string | null;
+  decided_at?: string | null;
+  /** Sanitized server text; only used for admin AI settings receipts. */
+  execution_result?: {
+    outcome: 'complete' | 'partial' | 'voided';
+    reason: string | null;
+    completed: number | null;
+    not_executed: number | null;
+    message: string | null;
+    items: Array<{ seq: number | null; result: string | null; error: string | null }>;
+  } | null;
   id: string;
   agent_id: string;
   kind: ApprovalKind;
@@ -6386,6 +6589,32 @@ export interface GoogleDelegationStatus {
   agents: AgentGoogleIdentity[];
   personal_connections?: { owner_id: string; account_email: string; status: 'connected' | 'needs_reconnect' | 'suspended' }[] | null;
 }
+export type DriveWriteAction = 'create' | 'modify' | 'move' | 'trash';
+export type DriveWriteApproval = 'none' | 'member' | 'member_and_admin';
+export interface DriveWriteForm {
+  expected_hash: string;
+  create: boolean;
+  modify: boolean;
+  move: boolean;
+  trash: boolean;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: string[];
+}
+export interface DriveWriteStatus {
+  hash: string;
+  configured: Record<DriveWriteAction, boolean>;
+  effective: Record<DriveWriteAction, boolean>;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: { id: string; name: string; kind: 'folder' | 'shared_drive' | 'unverified' }[];
+  ack: { by_email: string; by_role: string; at: string } | null;
+  integration_enabled: boolean;
+  folder_list_empty_note: boolean;
+  write_connections: { connected: number } | null;
+  write_store_unreadable: boolean;
+  home_write: { route_oauth: boolean; connected: boolean; status: string; account_email: string | null };
+  identity_routes: unknown[];
+}
+
 export interface GoogleIdentityTestStep {
   id: string;
   label: string;
@@ -6578,7 +6807,29 @@ export interface MyMemoryForgetResult {
   agent: string;
 }
 
+export interface DriveWriteConfirmation {
+  id: string;
+  expires_at: string;
+  agent: string;
+  employee: string;
+  account: string;
+  action: string;
+  file_id: string;
+  file_name: string;
+  destination: string;
+  destination_name: string;
+  size: string;
+  preview: string;
+  attachment_name: string;
+  rename_before: string;
+  rename_after: string;
+  parents_before: string;
+  source_names: string;
+}
+
 export interface PersonalGoogleStatus {
+  drive_write: { connected: boolean; status: string | null; account_email: string | null; granted_scopes: string[] };
+  enabled_by_admin: boolean;
   authorization_requests?: { id: string; agent: string; purpose: string; status: string }[];
   notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
@@ -6789,8 +7040,22 @@ export interface OrgChangeFields {
   department?: string;
 }
 
+export interface ReachLine {
+  user_id: string;
+  display_name: string;
+  department: string;
+  groups: GrantGroup[];
+  change: 'gains' | 'loses';
+}
+
+export interface ReachReview {
+  reach: ReachLine[] | null;
+  reach_digest: string | null;
+  sentence?: string | null;
+}
+
 /** `org.propose_change` — a Manager's (or Admin's) proposal, waiting for an Admin. */
-export interface OrgProposeResult {
+export interface OrgProposeResult extends Partial<ReachReview> {
   status: 'pending_approval';
   approval_id: string;
   agent_id: string;
@@ -6803,7 +7068,7 @@ export interface OrgProposeResult {
 }
 
 /** `org.apply_change` — an Admin's change, applied immediately. */
-export interface OrgApplyResult {
+export interface OrgApplyResult extends Partial<ReachReview> {
   /** `mirror_synced`: nothing changed in the org data; only the employee-settings copy was re-synced. */
   status: 'applied' | 'mirror_synced';
   agent_id: string;
@@ -6821,7 +7086,7 @@ export interface OrgApplyResult {
 }
 
 /** One row of `org.pending_changes`. */
-export interface OrgPendingChange {
+export interface OrgPendingChange extends Partial<ReachReview> {
   approval_id: string;
   agent_id: string;
   before: OrgPlacement;
@@ -7046,7 +7311,81 @@ export type ResponsibilityCas =
   | { responsibility: ResponsibilityRow; conflict?: undefined }
   | { conflict: true; current: ResponsibilityRow };
 
+export interface ChatApprovalKind {
+  key: string;
+  label: { 'zh-TW': string; en: string; ja: string };
+  impact: string;
+}
+export interface ChatAdminSettings {
+  enabled: boolean;
+  channels: ('telegram' | 'googlechat')[];
+  step_up_methods: ('web' | 'dm_totp')[];
+  card_valid_hours: number;
+  readable: boolean;
+  hash: string | null;
+  enabled_ack: { by_name: string; at: string } | null;
+  kinds: (ChatApprovalKind & { tier: 'T2'; step_up_required: boolean })[];
+  t1_kinds: ChatApprovalKind[];
+  admins: { user_id: string; name: string; proven_channels: string[]; has_totp: boolean }[];
+  web_link_available: boolean;
+  unsupported_channels_ignored: boolean;
+}
+export interface ChatAdminSetParams {
+  expected_hash: string;
+  enabled: boolean;
+  channels: ChatAdminSettings['channels'];
+  step_up_methods: ChatAdminSettings['step_up_methods'];
+  card_valid_hours: number;
+  step_up_exempt_kinds: string[];
+  acknowledge_risk?: true;
+  acknowledge_exempt_risk?: string[];
+}
+
+export interface SkillTrustPin {
+  publisher: string;
+  key_id: string;
+  added_by: string;
+  added_at: string;
+  conflicting: boolean;
+  in_trust_store: boolean;
+}
+
+export interface SkillTrustSettings {
+  publishers: { publisher: string; built_in: boolean; keys: { public_key: string; key_id: string }[] }[];
+  auto_approve: SkillTrustPin[];
+  skill_ttl_days: number | null;
+  recent_auto_approvals: {
+    id: string; slug: string; decided_at: string; publisher: string; key_id: string;
+    skills: { agent: string; name: string; digest: string }[];
+  }[];
+}
+
+export interface MyOdooStatus {
+  member_credentials_enabled: boolean;
+  connected: boolean;
+  state: 'ok' | 'needs_reverify' | 'invalid' | null;
+  login: string | null;
+  odoo_name: string | null;
+  server: string | null;
+  database: string | null;
+  verified_at: string | null;
+  last_used_at: string | null;
+}
+
+const odooStatus = () => client.call('me.odoo.status', {}) as Promise<MyOdooStatus>;
+
 export const api = {
+  skillTrust: {
+    get: () => client.call('skill_trust.get', {}) as Promise<SkillTrustSettings>,
+    pin: (params: { publisher: string; public_key: string; acknowledge_risk: true; password: string; code: string }) =>
+      client.call('skill_trust.pin', params),
+    unpin: (params: { publisher: string; key_id: string; disable_skills: boolean }) =>
+      client.call('skill_trust.unpin', params) as Promise<{ removed: boolean; disabled: number }>,
+  },
+  chatAdmin: {
+    get: () => client.call('approvals.chat_admin.get', {}) as Promise<ChatAdminSettings>,
+    set: (params: ChatAdminSetParams) => client.call('approvals.chat_admin.set', { ...params }) as Promise<{ success: true; hash: string }>,
+  },
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
    *  visible `agent_id`; other agents' sessions are never returned). */
@@ -7309,11 +7648,12 @@ export const api = {
         ...(reason ? { reason } : {}),
       }) as Promise<OrgProposeResult>,
     /** Apply now (Admin only). `expectedBase` is the `base` the confirmation dialog showed. */
-    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string) =>
+    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string, reachDigest?: string | null) =>
       client.call('org.apply_change', {
         agent_id: agentId,
         ...fields,
         expected_base: expectedBase,
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
       }) as Promise<OrgApplyResult>,
     /**
      * The employee's authoritative placement and its `base` (Manager or
@@ -8243,15 +8583,21 @@ export const api = {
   /** Delegation permissions (WP21 §2.8) — owner/admin only, gateway-side gated.
    *  `allow` holds unordered agent-id pairs; a pair means the two may hand work
    *  to each other in both directions. */
+  adminAi: {
+    get: () => client.call('admin_ai.get', {}) as Promise<AdminAiSettings>,
+    set: (params: AdminAiUpdate) => client.call('admin_ai.set', { ...params }) as Promise<AdminAiSettings>,
+  },
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]> }) =>
+    set: (params: { expected_hash: string; policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;
         allow: Array<[string, string]>;
         applied: boolean;
+        unrestricted_roles: DelegationRole[];
+        allow_one_way: Array<[string, string]>;
       }>,
     /** Read-only effective delegation for one employee (Manager+ with view access). */
     effective: (agentId: string) =>
@@ -8267,6 +8613,12 @@ export const api = {
       >,
   },
   system: {
+    companyTimezone: () =>
+      client.call('system.company_timezone', {}) as Promise<{
+        timezone: string | null;
+        status: 'set' | 'unset' | 'invalid';
+        source: 'detected_at_upgrade' | null;
+      }>,
     status: () =>
       client.call('system.status') as Promise<SystemStatus>,
     /** Login/boot autostart registration state (admin). */
@@ -8433,6 +8785,8 @@ export const api = {
           agent_id: string;
           cron: string;
           schedule?: string;
+          creator_access_lost?: boolean | null;
+          cron_timezone?: string | null;
           task?: string;
           enabled: boolean;
           last_run_at?: string | null;
@@ -8443,7 +8797,7 @@ export const api = {
         }>;
       }>,
     add: (params: { name: string; agent_id: string; cron: string; task?: string }) =>
-      client.call('cron.add', params),
+      client.call('cron.add', params) as Promise<{ zone_note?: string | null }>,
     update: (
       id: string,
       params: {
@@ -8549,6 +8903,7 @@ export const api = {
       sources?: UnifiedAuditSource[];
       severity_filter?: 'info' | 'warning' | 'critical';
       agent_id_filter?: string;
+      tool_name_filter?: string;
     }) => client.call('audit.unified_log', params ?? {}) as Promise<UnifiedAuditResponse>,
     reliabilitySummary: (agentId: string, windowDays = 7) =>
       client.call('audit.reliability_summary', {
@@ -8666,6 +9021,10 @@ export const api = {
   // Cache-efficiency telemetry (CostTelemetry). `available:false` on every
   // response when telemetry isn't initialized.
   cost: {
+    departmentSummary: (department: string, days: 7 | 30 | 90 = 30) =>
+      client.call('cost.department_summary', { department, days }) as Promise<DepartmentCostSummary>,
+    departmentRecent: (department: string, limit = 50) =>
+      client.call('cost.department_recent', { department, limit }) as Promise<CostRecentResult & { department: string }>,
     summary: (hours = 24) =>
       client.call('cost.summary', { hours }) as Promise<CostSummary>,
     agents: (hours = 24) =>
@@ -8688,22 +9047,25 @@ export const api = {
   // WP14-T14.7 — HITL approval center. `list` is manager-gated; `decide` errors
   // on already-terminal requests or board-kind requests without admin scope.
   approvals: {
+    get: (id: string) => client.call('approvals.list', { id }) as Promise<{ approvals: ApprovalItem[]; count: number }>,
     /** `actionKind` (e.g. 'knowledge_quarantine') filters to one approval kind. */
-    list: (agentId?: string, actionKind?: string) =>
+    list: (agentId?: string, actionKind?: string, options?: { status?: 'pending' | 'decided'; limit?: number }) =>
       client.call('approvals.list', {
         ...(agentId ? { agent_id: agentId } : {}),
         ...(actionKind ? { action_kind: actionKind } : {}),
+        ...options,
       }) as Promise<{
         approvals: ApprovalItem[];
         count: number;
       }>,
     /** `stepUpCsrf` (v1.81 P1 break-glass): an Admin deciding a Personal
      *  employee's card they do not own — see `lib/break-glass.ts`. */
-    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[]) =>
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[], reachDigest?: string | null) =>
       client.call('approvals.decide', {
         id,
         approve,
         ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
         ...(reason ? { reason } : {}),
         ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
@@ -8778,6 +9140,10 @@ export const api = {
         ...(env && Object.keys(env).length > 0 ? { env } : {}),
       }) as Promise<{ success: boolean; agent_id: string }>,
   },
+  odooAccess: {
+    get: () => client.call('odoo.access_get', {}) as Promise<OdooAccess>,
+    set: (patch: OdooAccessPatch) => client.call('odoo.access_set', { ...patch }) as Promise<OdooAccess>,
+  },
   odoo: {
     permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,
     // The gateway scans each effective identity in bounded batches.
@@ -8794,6 +9160,8 @@ export const api = {
         message: string;
       }>,
     /** Per-agent credential override. `configured:false` = inherits global. */
+    agentAccessSet: (params: OdooAgentAccessSet) =>
+      client.call('odoo.agent_access_set', { ...params }) as Promise<OdooAgentAccessResult>,
     agentConfigGet: (agentId: string) =>
       client.call('odoo.agent_config_get', { agent_id: agentId }) as Promise<OdooAgentConfig>,
     /** api_key/password write-only: new value sets, '' clears, omit keeps. */
@@ -8920,6 +9288,17 @@ export const api = {
         changed: boolean;
       }>,
   },
+  googleDriveWrite: {
+    get: () => client.call('google.drive_write.get', {}) as Promise<DriveWriteStatus>,
+    set: (params: DriveWriteForm & { acknowledge_risk?: boolean }) =>
+      client.call('google.drive_write.set', { ...params }) as Promise<DriveWriteStatus>,
+    consentHomeStart: (params: { redirect_origin: string; acknowledge_google_data: boolean; acknowledge_write: boolean }) =>
+      client.call('google.drive_write.consent_home_start', { ...params }) as Promise<{
+        authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number;
+      }>,
+    consentHomePaste: (url: string) => client.call('google.drive_write.consent_home_paste', { url }),
+    consentHomeDisconnect: () => client.call('google.drive_write.consent_home_disconnect', {}),
+  },
   /** Per-employee Google identity (B2a). Writes are admin-only. */
   googleIdentity: {
     delegation: () => client.call('google.delegation.get') as Promise<GoogleDelegationStatus>,
@@ -8943,7 +9322,20 @@ export const api = {
         steps: GoogleIdentityTestStep[];
       }>,
   },
+  chatLink: {
+    start: (channel: ChatLinkChannel) => client.call('me.chat_link.start', { channel }) as Promise<ChatLinkStart>,
+    status: (handshakeId: string) => client.call('me.chat_link.status', { handshake_id: handshakeId }) as Promise<ChatLinkStatus>,
+    confirm: (handshakeId: string) => client.call('me.chat_link.confirm', { handshake_id: handshakeId }) as Promise<{ confirmed: true }>,
+    reject: (handshakeId: string) => client.call('me.chat_link.reject', { handshake_id: handshakeId }) as Promise<{ rejected: true }>,
+    cancel: (handshakeId: string) => client.call('me.chat_link.cancel', { handshake_id: handshakeId }) as Promise<{ cancelled: true }>,
+    list: () => client.call('me.chat_link.list', {}) as Promise<ChatLinkList>,
+    remove: (channel: ChatLinkChannel, channelUserId: string) => client.call('me.chat_link.remove', { channel, channel_user_id: channelUserId }) as Promise<{ revoked: true }>,
+  },
   personalGoogle: {
+    writeConnectStart: (acknowledgeGoogleData: boolean, acknowledgeWrite: boolean) => client.call('me.google.write_connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, acknowledge_write: acknowledgeWrite }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    writeDisconnect: () => client.call('me.google.write_disconnect', { confirm: true }) as Promise<{ disconnected: true; provider_note?: string | null }>,
+    writeConfirmations: () => client.call('me.google.write_confirmations', {}) as Promise<{ requests: DriveWriteConfirmation[] }>,
+    writeConfirm: (id: string, approve: boolean) => client.call('me.google.write_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
     confirmChat: (id: string, approve: boolean) => client.call('me.google.chat_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,
@@ -9284,7 +9676,7 @@ export const api = {
       /** Saved once, when the schedule is created; every run points at the
        *  same saved copies. */
       attachments?: TaskAttachmentInput[];
-    }) => callTaskRpc<{ schedule: AssignScheduleInfo }>('tasks.goal_create', { ...params }),
+    }) => callTaskRpc<{ schedule: AssignScheduleInfo; zone_note?: string | null }>('tasks.goal_create', { ...params }),
     /** One goal task's whole loop story: rounds, task-scoped activity,
      *  pending kickoff approval. */
     timeline: (taskId: string) =>
@@ -9464,6 +9856,18 @@ export const api = {
       ) as Promise<CanvasGetResult>,
   },
   autopilot: {
+    notifyDestinations: (department: string) =>
+      client.call('autopilot.notify_destinations', { owner_department: department }) as Promise<{ destinations: AutopilotNotifyDestination[] }>,
+    affectingMe: (agentId?: string) =>
+      client.call('autopilot.affecting_me', agentId ? { agent_id: agentId } : {}) as Promise<{ rules: AffectingAutopilotRule[] }>,
+    templateFields: (triggerEvent: string, sequence?: unknown) =>
+      client.call('autopilot.template_fields', { trigger_event: triggerEvent, ...(sequence != null ? { sequence } : {}) }) as Promise<{ fields: string[] }>,
+    runs: {
+      list: (ruleId: string, limit = 20) =>
+        client.call('autopilot.runs.list', { rule_id: ruleId, limit }) as Promise<{ runs: AutopilotRun[] }>,
+      cancel: (runId: string) =>
+        client.call('autopilot.runs.cancel', { run_id: runId }) as Promise<{ cancelled: true; run_id: string }>,
+    },
     list: () =>
       client.call('autopilot.list') as Promise<{ rules: AutopilotRule[] }>,
     create: (params: AutopilotCreateParams) =>
@@ -9715,11 +10119,22 @@ export const api = {
     dismissMigrationHint: () =>
       client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
+  myOdoo: {
+    status: odooStatus,
+    connect: (params: { login: string; api_key: string }) => client.call('me.odoo.connect', params) as Promise<MyOdooStatus>,
+    test: () => client.call('me.odoo.test', {}) as Promise<MyOdooStatus>,
+    disconnect: () => client.call('me.odoo.disconnect', {}) as Promise<{ disconnected: true }>,
+  },
   /** RM-064: the caller's own read-only status credentials. */
   memberKeys: {
-    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa' }>,
-    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }) =>
-      client.call('me.member_keys.create', { name, expires_in_days, ...proof }) as Promise<MemberKeyCreated>,
+    policyGet: () => client.call('member_keys.policy_get', {}) as Promise<MemberKeyPolicyResult>,
+    policySet: (update: MemberKeyPolicyUpdate) => client.call('member_keys.policy_set', update),
+    narrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('me.member_keys.narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    adminNarrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('member_keys.admin_narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    odooStatus,
+    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa'; policy: MemberKeyPolicy }>,
+    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }, permissions?: MemberKeyPermissions) =>
+      client.call('me.member_keys.create', { name, expires_in_days, ...proof, ...permissions }) as Promise<MemberKeyCreated>,
     revoke: (id: string) => client.call('me.member_keys.revoke', { id }) as Promise<{ revoked: boolean }>,
     adminList: (cursor?: string, limit = 25) => client.call('member_keys.admin_list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null }>,
     adminRevoke: (id: string) => client.call('member_keys.admin_revoke', { id }) as Promise<{ revoked: boolean }>,
@@ -9842,6 +10257,11 @@ export const api = {
     update: (change: { step?: OnboardingStep; status?: 'done' | 'skipped'; dismissed?: true }, locale = 'zh-TW') =>
       client.call('onboarding.update', { ...change, locale }) as Promise<OnboardingProgress>,
   },
+  mainAccess: {
+    get: () => client.call('agents.main_access.get', {}) as Promise<MainAccess>,
+    set: (params: MainAccessSetParams) =>
+      client.call('agents.main_access.set', { ...params }) as Promise<MainAccess>,
+  },
   users: {
     createMembers: (params: { members: NewMemberInput[]; public_url?: string; locale?: string }) =>
       client.call('users.create_members', params, false, 330000) as Promise<{ results: CreateMemberResult[] }>,
@@ -9928,12 +10348,22 @@ export const api = {
     setPrimaryAgent: (agentId: string | null, userId?: string) =>
       client.call('users.set_primary_agent', { agent_id: agentId, ...(userId ? { user_id: userId } : {}) }) as Promise<{ primary_agent_id: string | null }>,
     me: () =>
-      client.call('users.me') as Promise<{
+      client.call('users.me') as Promise<MeGrantFields & {
         user: UserInfo;
         bindings: UserAgentBinding[];
         /** Absent on gateways older than v1.73. */
         email_setup?: EmailSetup;
       }>,
+    deptGrants: {
+      reachPreview: (agentId: string, department: string) =>
+        client.call('users.dept_grants.reach_preview', { agent_id: agentId, department }) as Promise<ReachReview>,
+      list: () => client.call('users.dept_grants.list', {}) as Promise<DeptGrantEntry[]>,
+      options: () => client.call('users.dept_grants.options', {}) as Promise<DeptGrantOptions>,
+      set: (params: { user_id: string; department: string; groups: GrantGroup[]; acknowledged?: boolean }) =>
+        client.call('users.dept_grants.set', params) as Promise<{ ok: true }>,
+      mine: (group?: GrantGroup) =>
+        client.call('users.dept_grants.mine', group ? { group } : {}) as Promise<DeptGrantsMineResult>,
+    },
     /** Self-service: the logged-in user changes their OWN login email. */
     changeEmail: (email: string, currentPassword?: string) =>
       client.call('users.change_email', {
@@ -10248,3 +10678,19 @@ export const api = {
   },
   // ── end v1.81 F5 part A ──
 };
+
+/** Admin-only department management grants (Enterprise). */
+export interface DeptGrantEntry {
+  user_id: string;
+  display_name: string;
+  email: string;
+  department: string;
+  groups: GrantGroup[];
+  granted_by: string;
+  granted_at: string;
+}
+
+export interface DeptGrantOptions {
+  departments: { name: string; agent_count: number }[];
+  mirror_mismatch_count: number;
+}

@@ -183,13 +183,19 @@ pub(super) fn build_system_prompt(
     }
 
     if let Some(a) = agent {
-        let mut profile = duduclaw_core::profile_sections::ProfileSections::load(&a.dir)?;
+        let mut profile = crate::runtime_dispatch::chat_profile(&a.dir)?;
         // The caller already inserted the authoritative name/language directive.
         profile.set_identity_directive(None);
         for section in profile.rendered(Default::default()) {
             audit.push(crate::prompt_audit::PromptSection::new(section.kind.label(), &section.content));
             parts.push(section.content);
         }
+
+        audit.push(crate::prompt_audit::PromptSection::new(
+            "delegation_guidance",
+            crate::prompt_identity::DELEGATION_GUIDANCE,
+        ));
+        parts.push(crate::prompt_identity::DELEGATION_GUIDANCE.to_string());
 
         // WP1.3 hardening (2026-07-28): the 📎DELIVER protocol used to live
         // only in the office SKILL.md files, so a model that skipped skill

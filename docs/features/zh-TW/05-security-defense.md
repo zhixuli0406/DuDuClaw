@@ -1,5 +1,15 @@
 # 安全防線
 
+## 部門授權與主要 AI 員工名單（企業版，v1.86.0）
+
+部門權限來自管理員對使用中主管的明確授權，以及組織圖的正式部門紀錄；該紀錄須與員工自己的設定一致。成員的部門欄位或員工自行修改的設定，都不會擴大權限。主要 AI 員工與所有個人專屬員工都不在部門授權範圍內；擁有者保留既有的個人專屬員工權限。權限資料缺漏或無法讀取時，不會放行。
+
+授權只在登入儀表板時有效，本人 API 金鑰與聊天軟體不適用。預設無人有授權；新增或擴大前須閱讀風險說明並勾選「我了解」。每次授權、撤銷與透過部門授權進行的寫入都有稽核紀錄。停用帳號或不再是主管時，部門授權自動撤銷。既有例行工作與已儲存規則不會自動停用。
+
+主要 AI 員工另有預設為空的開放名單，新增成員也須確認風險。名單只在受保護模式、員工工作已隔離執行時，開放對話與一般工作；其他情況下，這些入口仍只限管理員，設定回應會說明名單尚未生效。本人 API 金鑰一律不能使用主要 AI 員工。排程、建立員工與修改員工設定仍只限管理員。被加入的人可能問到主要 AI 員工記得的內容，包括管理員對話。
+
+主要 AI 員工替名單內的非管理員成員工作時，管理類工具會隱藏，嘗試使用也會被拒絕：「這個動作需要管理員本人操作。」它仍可能依原有委派規則轉交工作給其他員工；建議設定 `[delegation] human_principal = "enforce"`，在轉交時也檢查交辦者本人的權限。範圍、整合狀態與限制請見[部門主管](79-department-managers.md)。
+
 
 ## 每次執行的呼叫者身分
 
@@ -66,6 +76,49 @@ I1d 開發接線已加入隔離 API 工作者的 Chat Completions、Responses、
 ## v1.80.x 已發行
 
 非管理員成員（Employee、Manager）在側欄、對話篩選、指令面板、WebChat 的 `@` 建議與其他員工選擇器，只會看到 `agents.callable` 明確標示可選取的員工。主 AI 員工預設不顯示，除非該回應明確允許選取。只有 `agents.callable` 依即時 Admin 身分確認 `unrestricted: true` 後，才顯示完整名單，包含個人版的本機管理員。所有帳號在初次載入或讀取失敗時都不顯示員工。頁面可見時每 60 秒、恢復可見及開啟選單時會刷新權限；刷新期間保留同一身分已確認的名單，失敗則清空。檔案與設定選擇器另須直接存取權，團隊呼叫權不會增加檔案或設定權限。新對話仍由伺服器決定指派對象。這次 dashboard 過濾不變更 RPC 授權。
+
+## 設定有誤的員工在每個入口都會被擋下（v1.86）
+
+把工作交給員工的每一條路，現在都先做同一個檢查：找到員工、讀一次它實際生效的設定（有套用預設角色時讀解析後的設定，否則讀 `agent.toml`），再確認這組設定能執行。檢查沒過，工作在任何動作發生前就被拒絕：不呼叫模型、不存附件、不建立任務或排程、不把訊息收進佇列，也不記錄核准。
+
+**哪些情況算設定有誤。** 可以看到原因的人會看到下列原因碼：
+
+- `model_provider_mismatch`：模型不屬於這個引擎。
+- `agent_config_unreadable`：設定檔不存在、讀不到或格式錯誤，`[runtime]`／`[model]` 欄位型別錯誤，引擎名稱不認識，或一定要指定模型的引擎（OpenAI 相容）沒有指定模型。
+- `runtime_unavailable`：引擎（或團隊角色的引擎）已移除或未啟用。
+- `runtime_policy_refused`：產品政策不允許這個引擎或替換後的模型。
+- `agent_not_found`：沒有這位員工。
+
+沒有填 `[model] preferred` 的員工照 v1.85 的方式運作：使用引擎的預設模型，Kiro 則使用它自己 CLI 設定裡選的模型。
+
+**涵蓋的入口。**
+
+- 對話：所有通道與網頁對話的一般訊息；網頁對話在訊息到達時檢查，排隊等待後再檢查一次；AG-UI 執行。
+- 十一個通道與網頁對話的聊天指令。檢查排在通道的存取檢查之後，被封鎖的人仍然收不到任何回覆；`/交辦` 檢查的是被交辦的員工。
+- 附件：下載或存檔之前先檢查（Telegram、LINE、Discord、Slack、WhatsApp、Feishu、Google Chat、Teams、網頁對話）。通道封鎖的寄件者，附件一律不下載，也不會收到拒絕說明。
+- 觸發詞：`@員工` 交辦，以及只打 `@員工` 等待下一則訊息的情況，都會檢查那位員工。
+- 建立任務：儀表板（任務、目標、技能交辦、排程）、MCP `tasks_create`（目標、看板任務、cron 與提醒）、A2A `SendMessage`，以及聊天的 `/交辦` 和 `/goal`。把任務改派給設定有誤的員工也會以同樣方式拒絕（儀表板 `tasks.update`／`tasks.assign`、MCP `tasks_update`，以及員工透過 MCP `tasks_claim` 認領）；取消指派，或把任務從設定有誤的員工移走，不受影響。
+- 決定：「核准」「開始」「重試」「接著做」檢查任務實際指派的員工（不看卡片上寫的名字）；「拒絕」「取消」「放棄」「完成」一律不讀設定。附帶檔案的決定仍會送到決定處理，檔案會被丟棄。
+- 背景工作：派工、目標迴圈（含 Team-as-Agent 回合）、cron、提醒、心跳、郵件工作、自動化規則、工作流程佇列、排程交辦與任務沙箱。
+
+授權先檢查。沒有權限把工作交給某位員工的人，只會收到原本的拒絕，看不出那位員工的設定狀態；已刪除、已封存或不存在的員工，維持原本「員工無法使用」的錯誤。
+
+**大家會看到什麼。** 聊天使用者看到和 v1.84 對話拒絕相同的提示，附原因碼與回合參考編號。網站訪客（Odoo 即時客服、網站小工具的訪客與小工具帳號）只會看到「抱歉，目前暫時無法回覆，請稍後再試一次。」。儀表板顯示給管理者的說明。透過 MCP 呼叫的 AI 會收到英文說明「Task creation refused: the target employee's settings are broken or unavailable. An administrator must fix them before this employee can accept work.」（改派時為「Task reassignment refused: …」）。A2A 呼叫端收到 `EMPLOYEE_CONFIGURATION_REFUSED`。所有訊息都不含檔案路徑或解析錯誤，這些只寫進閘道紀錄。
+
+**設定壞掉時仍可使用的指令。** `!STOP`、`!STOP ALL`、`!RESUME`、`!STATUS`、`/takeover`、`/status`、`/help`、`/new`、`/pair` 與 `/model` 不做設定檢查，所以仍然可以停止、恢復、接手、重新開始、配對與修正模型。不做設定檢查不代表略過存取與管理者檢查：`!STOP`、`!STOP ALL`、`!RESUME` 與 `/model <名稱>` 仍需要管理者，從沒有自己指令處理的通道進來時也一樣。附帶檔案的指令照常執行，檔案不收。
+
+另有兩個流程不經過檢查，因為它們只恢復存取或調整路由，不會讓員工執行工作：
+
+- Telegram `/start <token>`：把 Telegram 帳號綁到儀表板帳號（只限共用機器人），作用和 `/pair` 一樣是恢復存取。
+- Discord 原生 `/config`、`/session`、`/agent`：通道設定、對話管理，以及選擇由哪位員工回覆。改選另一位員工，正是繞開設定壞掉的員工的方法之一。
+
+**一回合只讀一次設定。** 一回合對話或一次背景執行，從頭到尾都用開始時讀到的設定：引擎、模型、備援引擎與模型、本機模型、推理強度與精簡情境。回合進行中修改 `agent.toml`，只影響下一則訊息，不會讓正在跑的回合換引擎。v1.86 以前，檔案在兩次讀取之間變成讀不到時，回合後半段可能改用 Claude 預設值執行。
+
+**背景工作不再改用 Claude。** v1.86 以前，排程與派工的工作用寬鬆的方式讀引擎：`[runtime] provider` 打錯字或檔案讀不到，工作會改由 Claude 執行；Claude 引擎配上不相容的模型也照樣啟動。現在這些工作一律拒絕。拒絕屬於設定錯誤，所以不會輪換帳號、不切到備援引擎，也不算引擎故障。目標任務會停在待決定狀態（活動紀錄寫入 `goal_loop.entry_refused` 與原因碼），不會重試；設定還壞著時，Observer 模式不會把它自動結束。cron 與提醒記為一次失敗。排程交辦到點時員工設定有誤，排程會暫停並標為 `agent_unavailable`。
+
+**行為變更。** 把工作交辦或改派給設定有誤的員工，現在當下就拒絕，不會等到之後才失敗。排程交辦的員工設定有誤時，排程會暫停。Team-as-Agent 的角色成員固定使用凍結的模型，不再被改派到其他模型等級。Discord 開啟自動討論串時，帶檔案的訊息改在討論串建立後才下載（新的討論串可能綁定另一位員工）；只有檔案的訊息，討論串先用暫時名稱，下載完成後改回原本的命名方式。
+
+**已知限制。** 閘道從未啟動過時就先啟動的 MCP 伺服器，會讀原始的 `agent.toml`，因為解析後的預設角色設定是閘道寫的；這時模型只寫在預設角色裡的員工，透過 MCP 建立任務可能被拒絕，直到閘道啟動過一次。員工的工具限制與帳號池，目前仍在啟動時另外讀 `agent.toml`，不在「一回合只讀一次」的範圍內。
 
 ## `code_map` 只掃描員工自己的目錄（v1.81）
 
@@ -144,9 +197,9 @@ WebChat 等連線可寫入後，再次確認使用者能否使用實際回答的
 
 ## 儀表板 MCP API 金鑰改以雜湊保存（v1.82）
 
-在「整合 → MCP API 金鑰」發出的金鑰，以前存在 `config.toml [mcp_keys]`，完整金鑰就是 TOML 表名，而且固定 30 天到期。現在改存在 `<home>/mcp_keys.db`：隨機的公開金鑰 ID、金鑰的 SHA-256 指紋（絕不存金鑰本身）、不重複的名稱、權限範圍、建立者、建立時間、由管理員選擇的到期日（30／90／365 天、指定日期，或在明確確認風險後選擇不過期）、停用／刪除標記，以及版本號。金鑰只在建立時顯示一次，不寫入紀錄，也不寫入稽核。所有驗證端——閘道的 Google 橋接、stdio `mcp-server`、`http-server` 與它的 OAuth 同意檢查——每次呼叫都以唯讀方式讀同一個儲存區：先以指紋做索引查詢，再對查到的那筆以固定時間比對指紋；儲存區存在卻無法讀取、缺少資料表、或結構與 `user_version` 不符時一律拒絕。最後使用時間由這些程序寫到另一個 `mcp_keys_usage.db`，它不參與任何驗證。已到期與已停用的金鑰對外收到相同的拒絕，紀錄裡會寫明是哪一種。刪除的金鑰會保留指紋作為墓碑，所以還原的 `config.toml` 舊副本無法讓它復活。管理一律以金鑰 ID 進行、只限管理員；每次建立、重新命名、變更到期、停用、啟用、刪除、關閉搬移提示（以及每次被拒的嘗試）都會寫入含操作者的安全稽核紀錄。放寬類變更若稽核寫不進去就會復原——只還原該變更改過的欄位，而且只在金鑰仍停在該變更產生的版本時；之後的停用或刪除絕不會被復原。金鑰到期前 7 天與 1 天會通知管理員，通知要真的送達才算完成。變更到期、停用或刪除會在同一筆交易裡關閉這把金鑰尚未送出的通知，每則通知送出前也會再核對金鑰 ID、到期日、版本號與這次檢查自己的認領憑證，所以不會通知舊的日期；記為已送達時也以同一次認領與金鑰資料列做條件更新。
+在「整合 → MCP API 金鑰」發出的金鑰，以前存在 `config.toml [mcp_keys]`，完整金鑰就是 TOML 表名，而且固定 30 天到期。現在改存在 `<home>/mcp_keys.db`：隨機的公開金鑰 ID、金鑰的 SHA-256 指紋（絕不存金鑰本身）、不重複的名稱、權限範圍、建立者、建立時間、由管理員選擇的到期日（30／90／365 天、指定日期，或在明確確認風險後選擇不過期）、停用／刪除標記，以及版本號。金鑰只在建立時顯示一次，不寫入紀錄，也不寫入稽核。所有驗證端，閘道的 Google 橋接、stdio `mcp-server`、`http-server` 與它的 OAuth 同意檢查，每次呼叫都以唯讀方式讀同一個儲存區：先以指紋做索引查詢，再對查到的那筆以固定時間比對指紋；儲存區存在卻無法讀取、缺少資料表、或結構與 `user_version` 不符時一律拒絕。最後使用時間由這些程序寫到另一個 `mcp_keys_usage.db`，它不參與任何驗證。已到期與已停用的金鑰對外收到相同的拒絕，紀錄裡會寫明是哪一種。刪除的金鑰會保留指紋作為墓碑，所以還原的 `config.toml` 舊副本無法讓它復活。管理一律以金鑰 ID 進行、只限管理員；每次建立、重新命名、變更到期、停用、啟用、刪除、關閉搬移提示（以及每次被拒的嘗試）都會寫入含操作者的安全稽核紀錄。放寬類變更若稽核寫不進去就會復原，只還原該變更改過的欄位，而且只在金鑰仍停在該變更產生的版本時；之後的停用或刪除絕不會被復原。金鑰到期前 7 天與 1 天會通知管理員，通知要真的送達才算完成。變更到期、停用或刪除會在同一筆交易裡關閉這把金鑰尚未送出的通知，每則通知送出前也會再核對金鑰 ID、到期日、版本號與這次檢查自己的認領憑證，所以不會通知舊的日期；記為已送達時也以同一次認領與金鑰資料列做條件更新。
 
-以用戶端 ID 發出的金鑰一律是外部金鑰，只帶可給外部金鑰的權限範圍，用戶端 ID 不會是 AI 員工或系統保留名稱；AI 員工自己的內部金鑰（`agent_id`，不能帶 `admin`）受個人專屬員工的保護，必須以員工代號（資料夾名稱，大小寫須相同；顯示名稱會被拒絕）建立，建立時就綁定這位員工。`http-server` 對所有呼叫者只有一位固定的預設員工，在那裡採「預設拒絕」：以那位預設員工身分執行的工具——工作狀態、信件、wiki、畫布、訊息、Odoo，以及 `DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` 的其餘工具——只有閘道自己的內部金鑰能呼叫；其他所有非外部金鑰都不能使用、也看不到（依金鑰通過驗證的方式判斷），其餘工具一律以金鑰所綁定的員工身分執行，絕不改用伺服器的員工。沒有綁定、或綁定的員工已不存在（被移除、改名或刪除）的非外部金鑰，在 HTTP 上任何工具都會被拒絕，金鑰頁會標成「員工已不存在」。所以一位員工的金鑰碰不到另一位員工的資料（見 [MCP 工具](../../guides/zh-TW/mcp-tools.md)）。
+以用戶端 ID 發出的金鑰一律是外部金鑰，只帶可給外部金鑰的權限範圍，用戶端 ID 不會是 AI 員工或系統保留名稱；AI 員工自己的內部金鑰（`agent_id`，不能帶 `admin`）受個人專屬員工的保護，必須以員工代號（資料夾名稱，大小寫須相同；顯示名稱會被拒絕）建立，建立時就綁定這位員工。`http-server` 對所有呼叫者只有一位固定的預設員工，在那裡採「預設拒絕」：以那位預設員工身分執行的工具，工作狀態、信件、wiki、畫布、訊息、Odoo，以及 `DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` 的其餘工具，只有閘道自己的內部金鑰能呼叫；其他所有非外部金鑰都不能使用、也看不到（依金鑰通過驗證的方式判斷），其餘工具一律以金鑰所綁定的員工身分執行，絕不改用伺服器的員工。沒有綁定、或綁定的員工已不存在（被移除、改名或刪除）的非外部金鑰，在 HTTP 上任何工具都會被拒絕，金鑰頁會標成「員工已不存在」。所以一位員工的金鑰碰不到另一位員工的資料（見 [MCP 工具](../../guides/zh-TW/mcp-tools.md)）。
 
 `config.toml` 不再能授予金鑰。閘道的 `gateway-internal` 金鑰仍留在那裡，但只接受閘道產生或輪替時記錄在 `mcp_keys.db` 的那個指紋。升級後第一次啟動時，閘道會為自己發一把新的內部金鑰並只記錄這一把（同一次啟動中也會寫進每位員工的 `.mcp.json`）；`config.toml` 裡原有的 `gateway-internal` 項目不論日期都會被忽略並以提示列出。建立時間比現在晚超過幾分鐘的舊項目，一律不接受、不選用、不搬移。閘道第一次以 v1.82 啟動時，會把現有 `[mcp_keys]` 的指紋記為待搬移，搬進儲存區（每一項都要儲存區已有、稽核也已寫入，才從 `config.toml` 移除），再寫下完成標記；之後才加入 `config.toml` 的項目會被忽略並列出。只有在 `mcp_keys.db` 還不存在時（這個資料夾還沒跑過 v1.82 閘道），`config.toml` 才能單獨通過驗證。詳見[儀表板設定](../../guides/zh-TW/dashboard-settings.md)。
 
@@ -278,7 +331,7 @@ Unix 子行程仍有自己的行程群組，並限制 CPU 120 秒、單一檔案
 
 ---
 
-## 守衛 1 — `agent-file-guard`（PreToolUse，Rust）
+## 守衛 1，`agent-file-guard`（PreToolUse，Rust）
 
 `duduclaw hook agent-file-guard` 是真正的子命令而不是 shell 腳本，所以 macOS／Linux／Windows 行為一致。Gateway 以 matcher `Write|Edit|MultiEdit|NotebookEdit|Bash` 把它註冊進 `<agent_dir>/.claude/settings.json`，每次開機重新註冊（`agent_hook_installer`），並且是合併進操作者既有設定，不是整份覆寫。
 
@@ -318,7 +371,7 @@ Hook 依序從這些地方取得資料目錄：`--home`（只認絕對路徑）�
 
 Live fork（`fork_run`）從另一側守住同一批檔案：分支可以讀 agent 的結構檔，但把分支採用回 agent 目錄時，絕不會用分支的版本覆蓋上層的 `SOUL.md`、`CONTRACT.toml`、`agent.toml`、`.mcp.json`、`.claude/` 或其他 agent 結構檔。
 
-## 守衛 2 — `data-file-guard`（PreToolUse，Rust，RFC-23 §14.4）
+## 守衛 2，`data-file-guard`（PreToolUse，Rust，RFC-23 §14.4）
 
 守衛 1 保護 DuDuClaw 自己的結構檔，這一道保護的是客戶的資料。
 
@@ -330,7 +383,7 @@ Live fork（`fork_run`）從另一側守住同一批檔案：分支可以讀 age
 
 **明講限制**：`Bash` 那道檢查比對的是檔名。動態組路徑的指令（`python -c "open(chr(99)+…)"`）照樣走得過去。真正的保護是 MCP 工具面，這道守衛只是降低模型走上未設防路徑的機率。它是啟發式，不是沙箱。
 
-## 守衛 3 — `input_guard`（提示注入掃描器，Rust 函式庫）
+## 守衛 3，`input_guard`（提示注入掃描器，Rust 函式庫）
 
 `duduclaw_security::input_guard::scan_input` 以**十一類規則**對文字評 0–100 分，達到或超過 `DEFAULT_BLOCK_THRESHOLD`（60）就擋：
 
@@ -384,7 +437,7 @@ Live fork（`fork_run`）從另一側守住同一批檔案：分支可以讀 age
 - Agent Mail：比對到的來信照樣存下但會加上標記，有標記的信永遠不會觸發 AI 員工。
 - 提醒：提示內容被封鎖的提醒不會執行。
 
-## 守衛 4 — `org_field_guard`（組織權威凍結）
+## 守衛 4，`org_field_guard`（組織權威凍結）
 
 A2A 委派判定（`delegation_policy::can_delegate`）靠 `agent.toml` 的 `[agent] reports_to`／`department`／`name` 與 `config.toml` 的 `[delegation]`、`[acp]` 決定誰能命令誰。這兩個都是普通檔案：一個手上有 `Edit` 的 agent 可以把自己的 `reports_to` 改指向受害者，再宣稱「下屬 → 上級」那條規則。被審判的一方握有證據。
 
@@ -481,11 +534,11 @@ v1.76 之前，`[agent] trigger` 的比對是不看發話者、不分邊界的�
 v1.82 以前，Google Chat 的傳訊者（`users/<id>`）根本無法綁定到帳號，所以每位 Chat 傳訊者都是「未對應」：`[google] requesters = "bound_people"`（預設）與 `owner_only` 會拒絕他們，`@` 路由也把他們當外人。現在 Chat 傳訊者最多透過兩個來源對應到帳號（決策 C-152-Q1 = A，不做 Email 比對）：
 
 1. **管理員綁定**（一律採用）：在 **使用者 → 驗證身分** 建立的 `channel_identities` 列（通道 `googlechat`；`POST /api/channel-identity/bind`，管理員身分從 `users.db` 重讀；目標帳號必須是啟用中，在同一個 `BEGIN IMMEDIATE` 交易內重讀，否則回 409）。以 `POST /api/channel-identity/unbind` 移除（僅管理員、僅 Google Chat、只刪指定同仁的那一列）。兩者都會在 `security_audit.jsonl` 寫入 `googlechat_identity_bound`／`googlechat_identity_unbound`。
-2. **同仁自己連結的 Google 帳號**（選用，**預設關閉**：`config.toml [google] chat_identity_from_account = true`，只有管理員能透過 `google.integration.set` 寫入，並以 `config_changed` 寫入稽核；只有 `config.toml`、`[google]` 表格或這個鍵不存在才當作關閉——檔案讀不到、TOML 無法解析、`google` 不是表格或值不是布林值都是錯誤，一律從嚴處理：任何 Google Chat 傳訊者都不認（連管理員綁定也不採用），並視為有認得出的核准者）：同仁在 **我的連線** 連結 Google 時保存的 OpenID `sub`（`person_credentials`，沒有新增任何儲存資料）與 Chat 使用者代號比對。**前提假設，尚未以真實 Google Workspace 驗證**：Chat 的 `users/{id}` 與 OIDC `sub` 是同一套代號。整個代號完全相同的比對可排除前綴或差一碼的誤配，但若兩者其實是不同的編號體系，碰巧相同的字串就會把別人認成這位同仁——所以這條來源預設關閉。除非管理員已在自己的租用戶確認兩種代號一致，否則請保持關閉。關閉時，連結的 Google 帳號在任何地方都不算身分（儀表板不顯示、不阻擋管理員綁定、不算作核准者身分）。
+2. **同仁自己連結的 Google 帳號**（選用，**預設關閉**：`config.toml [google] chat_identity_from_account = true`，只有管理員能透過 `google.integration.set` 寫入，並以 `config_changed` 寫入稽核；只有 `config.toml`、`[google]` 表格或這個鍵不存在才當作關閉，檔案讀不到、TOML 無法解析、`google` 不是表格或值不是布林值都是錯誤，一律從嚴處理：任何 Google Chat 傳訊者都不認（連管理員綁定也不採用），並視為有認得出的核准者）：同仁在 **我的連線** 連結 Google 時保存的 OpenID `sub`（`person_credentials`，沒有新增任何儲存資料）與 Chat 使用者代號比對。**前提假設，尚未以真實 Google Workspace 驗證**：Chat 的 `users/{id}` 與 OIDC `sub` 是同一套代號。整個代號完全相同的比對可排除前綴或差一碼的誤配，但若兩者其實是不同的編號體系，碰巧相同的字串就會把別人認成這位同仁，所以這條來源預設關閉。除非管理員已在自己的租用戶確認兩種代號一致，否則請保持關閉。關閉時，連結的 Google 帳號在任何地方都不算身分（儀表板不顯示、不阻擋管理員綁定、不算作核准者身分）。
 
 代號只在一個地方正規化（`googlechat_identity::normalize_user_id`：只去掉開頭一個 `users/`，其餘必須是 ASCII 數字、最多 64 位；Email 別名與 `users/app` 一律拒絕），並以整個值相等比對。一個 Chat 代號最多一位擁有者：`(channel, channel_user_id)` 主鍵與防奪取檢查拒絕第二位已驗證擁有者；自動比對開啟時，管理員綁定也會拒絕已由另一位同仁自己的 Google 帳號認出的代號，兩個連結帳號推出同一代號，或管理員綁定與 Google 帳號指向不同的人時，誰都不認。所有從通道認人的地方（決策按鈕、安裝簽核、摘要回饋、接手對話顯示名稱、卡片上的決定者、`@` 路由、請求者對應）都只經過同一個解析函式 `googlechat_identity::verified_user_id`，不會直接讀 `channel_identities` 而繞過衝突規則。「是否有認得出的核准者」（決定 `authorize_press` 能否退回「從送達的目的地按下」的單人模式）由 `decision_notify::has_recognisable_approver_identity` 判斷：任何啟用中的管理員／主管有任一通道的已驗證 `channel_identities` 列，或（僅在自動比對開啟時）可用的 Google 推導身分即為真；衝突與任何讀取錯誤都當作真；不從通知目的地清單推導。Google Chat 身分只用來認人：`duduclaw_auth::otp::is_dm_destination_channel` 排除 `googlechat`，所有主動通知清單都改用 `UserDb::verified_dm_destinations_for_user`。任何查詢失敗（`users.db` 或連結帳號紀錄讀不到）都當作未對應。帳號必須是啟用中（每一輪重讀）；停用帳號的連結紀錄不採用，中斷 Google 連結後下一輪就不再認出（Google Chat 的查詢不使用幾秒鐘的傳訊者快取），已刪除帳號留下的紀錄也不採用。
 
-信任邊界：Chat 傳訊者代號只在事件通過驗證後才使用——共用 HTTP app 與員工自己的 HTTP app 在分派前驗證 Google 簽署的請求權杖（RS256，issuer `chat@system.gserviceaccount.com`，audience 為專案編號），並要求 `message.sender.type == "HUMAN"`（其他一律回應後丟棄，不排入佇列也不對應身分）；Pub/Sub 工作程序不採用通知內容，而是用 app 自己的憑證向 Chat API 重新讀取訊息，並要求寄件者是 `HUMAN` 的 `users/…`。Google Chat 可以綁定，但**不是** OTP 通道：登入驗證碼與雙因素註冊碼只會送到 Telegram、LINE、Discord 或 Slack（`duduclaw-auth` 的 `BINDABLE_CHANNELS` 與 `OTP_DELIVERY_CHANNELS`）。其他通道的查詢不變。
+信任邊界：Chat 傳訊者代號只在事件通過驗證後才使用，共用 HTTP app 與員工自己的 HTTP app 在分派前驗證 Google 簽署的請求權杖（RS256，issuer `chat@system.gserviceaccount.com`，audience 為專案編號），並要求 `message.sender.type == "HUMAN"`（其他一律回應後丟棄，不排入佇列也不對應身分）；Pub/Sub 工作程序不採用通知內容，而是用 app 自己的憑證向 Chat API 重新讀取訊息，並要求寄件者是 `HUMAN` 的 `users/…`。Google Chat 可以綁定，但**不是** OTP 通道：登入驗證碼與雙因素註冊碼只會送到 Telegram、LINE、Discord 或 Slack（`duduclaw-auth` 的 `BINDABLE_CHANNELS` 與 `OTP_DELIVERY_CHANNELS`）。其他通道的查詢不變。
 
 ## dashboard 權限每次呼叫即時讀取（v1.76）
 
@@ -520,33 +573,33 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 
 **員工預算。** `[budget] daily_cap_cents` 與 `monthly_limit_cents` 分別比對最近 24 小時與 30 天的已記錄花費，`hard_stop = true` 時達上限就拒絕下一次模型呼叫；0 代表不限額，執行中的呼叫仍可能超過上限。檢查涵蓋 Claude 與其他員工後端、派工與排程、提醒、郵件、心跳、輔助工作及 CLI 分支／評測。短期員工的已記錄花費也算進父員工，先以千分之一美分加總，再換算美分。員工設定檔可讀時，`[budget] when_unavailable = "allow"`（未填時的預設值）會在費用資料庫或查詢讀不到時留下明確警告與稽核紀錄並繼續；設成 `"deny"` 則在模型呼叫前拒絕。設定檔本身讀不到或無法解析時，無法確認這項政策，一律拒絕。未知政策值按 `"deny"` 處理並警告。無法檢查會顯示自己的原因與稽核事件，不會說成「花費達上限」，也不會發出斷路器開關通知。預算拒絕不觸發帳號輪替或備援。沒有員工 id 的呼叫不適用此政策。 指定員工目錄的輔助呼叫，以有效設定的 `[agent].name` 檢查預算並記錄後續花費，即使呼叫端原本使用作業名稱。舊有只記在作業名稱下的費用，無法可靠回填到各員工。
 
-**MCP 授權閘** — 每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
+**MCP 授權閘**，每個 MCP 工具都在 scope 表裡逐項列舉；沒被列的工具預設需要 Admin scope。Scope、per-agent capability 授權、`denied_tools` 三者各自在分派總門強制，每次拒絕都帶 `error_class` 落稽核。
 
-**SOUL.md 漂移偵測** — `soul_guard` 在開機與每次 heartbeat tick 以 SHA-256 對每份 `SOUL.md` 取指紋，在 `.soul_history/` 保留最多 10 個版本備份，並連同 Agent Stability Index 一起回報漂移。
+**SOUL.md 漂移偵測**，`soul_guard` 在開機與每次 heartbeat tick 以 SHA-256 對每份 `SOUL.md` 取指紋，在 `.soul_history/` 保留最多 10 個版本備份，並連同 Agent Stability Index 一起回報漂移。
 
-**稽核軌跡** — `tool_calls.jsonl` 記錄每次工具呼叫，`result_text`／`input_text` 都經遮罩（三輪秘密遮罩，先遮再截斷），權限 `0600`，行與行之間雜湊串接，16 MB 輪替。`security_audit.jsonl` 另外承載安全事件。這份 log 同時是 grounding precheck 與驗收判官讀的證據來源，弱化它等於弱化驗證。 在 macOS／Linux，`security_audit.jsonl` 也只有執行 DuDuClaw 的帳號可讀寫（0600），既有檔案會在下一次寫入時自動收緊；Windows 維持使用 NTFS ACL。
+**稽核軌跡**，`tool_calls.jsonl` 記錄每次工具呼叫，`result_text`／`input_text` 都經遮罩（三輪秘密遮罩，先遮再截斷），權限 `0600`，行與行之間雜湊串接，16 MB 輪替。`security_audit.jsonl` 另外承載安全事件。這份 log 同時是 grounding precheck 與驗收判官讀的證據來源，弱化它等於弱化驗證。 在 macOS／Linux，`security_audit.jsonl` 也只有執行 DuDuClaw 的帳號可讀寫（0600），既有檔案會在下一次寫入時自動收緊；Windows 維持使用 NTFS ACL。
 
-**每 agent 金鑰隔離** — MCP API key 與連接器憑證都是 per-agent，經 `secret_ref` 解析，所以單一 agent 外洩不等於平台外洩。通道憑證分兩種：LINE、WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘使用 `config.toml [channels]` 裡整個部署共用的憑證；只有 Telegram、Discord、Slack 有員工專屬的 bot token（員工沒有自己的 token 時沿 `reports_to` 往上找，最後用全域 token）。
+**每 agent 金鑰隔離**，MCP API key 與連接器憑證都是 per-agent，經 `secret_ref` 解析，所以單一 agent 外洩不等於平台外洩。通道憑證分兩種：LINE、WhatsApp、飛書、Google Chat、Teams、企業微信、釘釘使用 `config.toml [channels]` 裡整個部署共用的憑證；只有 Telegram、Discord、Slack 有員工專屬的 bot token（員工沒有自己的 token 時沿 `reports_to` 往上找，最後用全域 token）。
 
-**Google Chat Pub/Sub（v1.80.0 起）** — Pub/Sub 通知不作為 Chat 傳訊者的身分證明。閘道嚴格驗證訊息資源名稱，先以應用程式的 `chat.bot` 向 Chat API 回讀，再建立回合；傳訊者、聊天室、本文、附件與討論串均取自 API，回應名稱與聊天室必須符合資源及通知聊天室。既有傳訊者存取、配對與核准規則仍生效。回讀失敗（包括 403／404）或沒有訊息的事件不建立回合。匯入與啟動時驗證訂閱指向服務帳戶專案的固定主題，拉取另用只有 `pubsub` scope 的權杖。僅支援 Unix 的持久化收件匣只存資源參照，不存本文、傳訊者資料或附件；以事件類型與資源名稱去重七天，API 建立時間超過七天的訊息在清理後仍拒絕。每個 app stream（員工／共用 app 與專案編號）上限為 1,000 筆、10 筆 pending／queued／running，避免單一 stream 用盡部署容量；全域硬上限仍為 10,000 筆、100 筆待處理或執行中事件，每筆參照 2 KiB、資料庫 64 MiB；正在排隊或執行的紀錄不淘汰，中斷的執行標為 uncertain 且不自動重跑。佇列滿時確認收件並丟棄，不啟動回合。資料庫與附屬檔案均驗證私密權限，其他平台在具備等價防護前拒絕 Pub/Sub。Pub/Sub 建立腳本先驗證雲端資源再建立金鑰，破壞性的復原指令只列出供人工處理。見[設定與投遞限制](../../guides/zh-TW/channels-googlechat-teams.md)。 匯入與 worker 啟動均拒絕啟用 exactly-once（恰好一次投遞）的訂閱，請在 Google Cloud 關閉該選項。ACK 無效或過期（HTTP 400）時只清除舊投遞批次並重新拉取，持久化去重紀錄仍保留；暫時性 ACK 失敗則保留批次重試。
+**Google Chat Pub/Sub（v1.80.0 起）**，Pub/Sub 通知不作為 Chat 傳訊者的身分證明。閘道嚴格驗證訊息資源名稱，先以應用程式的 `chat.bot` 向 Chat API 回讀，再建立回合；傳訊者、聊天室、本文、附件與討論串均取自 API，回應名稱與聊天室必須符合資源及通知聊天室。既有傳訊者存取、配對與核准規則仍生效。回讀失敗（包括 403／404）或沒有訊息的事件不建立回合。匯入與啟動時驗證訂閱指向服務帳戶專案的固定主題，拉取另用只有 `pubsub` scope 的權杖。僅支援 Unix 的持久化收件匣只存資源參照，不存本文、傳訊者資料或附件；以事件類型與資源名稱去重七天，API 建立時間超過七天的訊息在清理後仍拒絕。每個 app stream（員工／共用 app 與專案編號）上限為 1,000 筆、10 筆 pending／queued／running，避免單一 stream 用盡部署容量；全域硬上限仍為 10,000 筆、100 筆待處理或執行中事件，每筆參照 2 KiB、資料庫 64 MiB；正在排隊或執行的紀錄不淘汰，中斷的執行標為 uncertain 且不自動重跑。佇列滿時確認收件並丟棄，不啟動回合。資料庫與附屬檔案均驗證私密權限，其他平台在具備等價防護前拒絕 Pub/Sub。Pub/Sub 建立腳本先驗證雲端資源再建立金鑰，破壞性的復原指令只列出供人工處理。見[設定與投遞限制](../../guides/zh-TW/channels-googlechat-teams.md)。 匯入與 worker 啟動均拒絕啟用 exactly-once（恰好一次投遞）的訂閱，請在 Google Cloud 關閉該選項。ACK 無效或過期（HTTP 400）時只清除舊投遞批次並重新拉取，持久化去重紀錄仍保留；暫時性 ACK 失敗則保留批次重試。
 
-**通道上的聊天指令（v1.68.0）** — `!STOP`、`!STOP ALL`、`!RESUME`、`/model <名稱>` 需要管理員。WhatsApp、飛書、Teams、企業微信、Google Chat、釘釘以前對每位傳訊者都傳 `is_admin = true`，能傳訊給 bot 的人都能停止或恢復它。現在這些通道用該通道的 `admin_users` 設定（全域範圍；Google Chat 與 Teams 也能設定了）完全比對傳訊者 id 或對話 id，沒有清單就沒有人是管理員。WebChat 只有啟用中、角色為管理員的儀表板帳號算數，網站聊天元件的訪客一律不算。
+**通道上的聊天指令（v1.68.0）**，`!STOP`、`!STOP ALL`、`!RESUME`、`/model <名稱>` 需要管理員。WhatsApp、飛書、Teams、企業微信、Google Chat、釘釘以前對每位傳訊者都傳 `is_admin = true`，能傳訊給 bot 的人都能停止或恢復它。現在這些通道用該通道的 `admin_users` 設定（全域範圍；Google Chat 與 Teams 也能設定了）完全比對傳訊者 id 或對話 id，沒有清單就沒有人是管理員。WebChat 只有啟用中、角色為管理員的儀表板帳號算數，網站聊天元件的訪客一律不算。
 
-**緊急停止門檻（v1.68.0）** — `KILLSWITCH.toml [triggers]` 的四個門檻以前沒有讀取端。現在只有寫在檔案裡且數值在範圍內的鍵才生效，安全設定頁每個門檻多了一個勾選框（取消勾選會送 `null`，把它移除）。檔案改動後會重讀。`cost_limit_usd` 比對所有員工 24 小時的花費，達到時把全域 failsafe 等級降為受限，直到 failsafe 自行恢復或有人送 `!RESUME`；`max_replies_per_minute` 依對話計算，超出的訊息靜默丟棄；`max_consecutive_errors` 與 `error_rate_threshold`（最近 20 次、至少 10 次）讓該對話的 failsafe 升一級。每次觸發記稽核 `killswitch_trigger`。`KILLSWITCH.toml` 的 `[audit]` 區段不再讀取。
+**緊急停止門檻（v1.68.0）**，`KILLSWITCH.toml [triggers]` 的四個門檻以前沒有讀取端。現在只有寫在檔案裡且數值在範圍內的鍵才生效，安全設定頁每個門檻多了一個勾選框（取消勾選會送 `null`，把它移除）。檔案改動後會重讀。`cost_limit_usd` 比對所有員工 24 小時的花費，達到時把全域 failsafe 等級降為受限，直到 failsafe 自行恢復或有人送 `!RESUME`；`max_replies_per_minute` 依對話計算，超出的訊息靜默丟棄；`max_consecutive_errors` 與 `error_rate_threshold`（最近 20 次、至少 10 次）讓該對話的 failsafe 升一級。每次觸發記稽核 `killswitch_trigger`。`KILLSWITCH.toml` 的 `[audit]` 區段不再讀取。
 
-**回覆斷路器與分好幾則傳訊息的人** — 每個通道回覆前、依對話計算的斷路器（`KILLSWITCH.toml [circuit_breaker]`）以前在三種很平常的情況會靜默丟掉訊息：上一則回覆比最近幾則長很多之後的下一則訊息（`token_explosion_multiplier`，這是我們自己輸出的特性）、連續三則相似的訊息（例如等回覆時傳的「在嗎？」）、`frequency_window_secs` 內超過 `frequency_max_replies` 則訊息。斷路之後整個對話在 `cooldown_secs` 內都不回，failsafe 等級還會升一級，反覆斷路最後變成受限回覆或靜音。現在回覆過長只記紀錄；少於 20 個字的訊息不算重複；超過頻率上限的訊息會等到視窗有空位再回答；等了 30 秒仍沒有空位（大量灌訊息）的那則不回答，但仍會計數，發話者每分鐘最多收到一次說明。仍會斷路的有三種：完全照抄我們上一則回覆的訊息、連續三則長而幾乎相同的訊息，以及新增的硬上限：同一個對話在 `hard_window_secs`（預設 60 秒）內超過 `hard_max_messages`（預設 30）則，用來擋兩個機器人互傳短而不同的訊息。通道標示為機器人的發話者（Telegram `is_bot`）維持舊的嚴格規則，短時間窗超過頻率就斷路。原有設定的名稱與範圍不變。管理員可在安全設定頁的緊急停止卡（進階：斷路器門檻）修改這兩個新值；`killswitch.update` 改用共用的設定寫入流程寫 `KILLSWITCH.toml`（檔案鎖、讀取後檔案被改過或無法解析就拒絕、保留註解）。
+**回覆斷路器與分好幾則傳訊息的人**，每個通道回覆前、依對話計算的斷路器（`KILLSWITCH.toml [circuit_breaker]`）以前在三種很平常的情況會靜默丟掉訊息：上一則回覆比最近幾則長很多之後的下一則訊息（`token_explosion_multiplier`，這是我們自己輸出的特性）、連續三則相似的訊息（例如等回覆時傳的「在嗎？」）、`frequency_window_secs` 內超過 `frequency_max_replies` 則訊息。斷路之後整個對話在 `cooldown_secs` 內都不回，failsafe 等級還會升一級，反覆斷路最後變成受限回覆或靜音。現在回覆過長只記紀錄；少於 20 個字的訊息不算重複；超過頻率上限的訊息會等到視窗有空位再回答；等了 30 秒仍沒有空位（大量灌訊息）的那則不回答，但仍會計數，發話者每分鐘最多收到一次說明。仍會斷路的有三種：完全照抄我們上一則回覆的訊息、連續三則長而幾乎相同的訊息，以及新增的硬上限：同一個對話在 `hard_window_secs`（預設 60 秒）內超過 `hard_max_messages`（預設 30）則，用來擋兩個機器人互傳短而不同的訊息。通道標示為機器人的發話者（Telegram `is_bot`）維持舊的嚴格規則，短時間窗超過頻率就斷路。原有設定的名稱與範圍不變。管理員可在安全設定頁的緊急停止卡（進階：斷路器門檻）修改這兩個新值；`killswitch.update` 改用共用的設定寫入流程寫 `KILLSWITCH.toml`（檔案鎖、讀取後檔案被改過或無法解析就拒絕、保留註解）。
 
-**去識別化的資料來源保護（v1.68.0）** — 「隱私 / 去識別化」分頁的「資料來源保護」開關開始生效：`user_input` 在通道訊息送進 AI 前遮蔽，`system_prompt` 遮蔽組好的提示（預設只套用標了 `apply_to_system_prompt` 的規則），`cron_context` 遮蔽條件腳本的觸發訊息。出錯時停止這一輪，不送出未遮蔽的內容。`sub_agent`（在同一個分頁或 `config.toml [redaction.sources]` 設定）負責受委派員工的回覆被 gateway 寫進委派方對話紀錄的那條路（`send_to_agent`、`spawn_agent`、`spawn_ephemeral` 的回覆，包含轉寫給發起整條委派鏈那位員工的副本）。設為 `on` 時，回覆先用接收方員工的規則遮蔽再存進紀錄，等那位員工回覆使用者時再還原。預設 `inherit` 照原樣寫入，因為子代理本來就在同一套 `[redaction]` 規則下執行。遮蔽出錯時改存一段固定的提示文字，不寫入原文。不涵蓋：送到使用者通道的那份回覆（那是使用者自己看的）、員工用 `check_responses` 自己去取的回覆（屬於工具結果，依 `tool_results` 處理）、團隊角色之間的交接、Agent Mail。`purge_after_expire_days` 現在決定保管庫清理的天數。
+**去識別化的資料來源保護（v1.68.0）**，「隱私 / 去識別化」分頁的「資料來源保護」開關開始生效：`user_input` 在通道訊息送進 AI 前遮蔽，`system_prompt` 遮蔽組好的提示（預設只套用標了 `apply_to_system_prompt` 的規則），`cron_context` 遮蔽條件腳本的觸發訊息。出錯時停止這一輪，不送出未遮蔽的內容。`sub_agent`（在同一個分頁或 `config.toml [redaction.sources]` 設定）負責受委派員工的回覆被 gateway 寫進委派方對話紀錄的那條路（`send_to_agent`、`spawn_agent`、`spawn_ephemeral` 的回覆，包含轉寫給發起整條委派鏈那位員工的副本）。設為 `on` 時，回覆先用接收方員工的規則遮蔽再存進紀錄，等那位員工回覆使用者時再還原。預設 `inherit` 照原樣寫入，因為子代理本來就在同一套 `[redaction]` 規則下執行。遮蔽出錯時改存一段固定的提示文字，不寫入原文。不涵蓋：送到使用者通道的那份回覆（那是使用者自己看的）、員工用 `check_responses` 自己去取的回覆（屬於工具結果，依 `tool_results` 處理）、團隊角色之間的交接、Agent Mail。`purge_after_expire_days` 現在決定保管庫清理的天數。
 
-**權限旗標（v1.68.0）** — `agent.toml [permissions]` 的 `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 寫成 `false` 時，MCP 分派閘會拒絕對應工具（稽核 `permission_denied`）。升級後第一次開機會把舊範本的 `false` 改成 `true`，見[儀表板設定對照](../../guides/zh-TW/dashboard-settings.md#ai-員工編輯頁)。
+**權限旗標（v1.68.0）**，`agent.toml [permissions]` 的 `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 寫成 `false` 時，MCP 分派閘會拒絕對應工具（稽核 `permission_denied`）。升級後第一次開機會把舊範本的 `false` 改成 `true`，見[儀表板設定對照](../../guides/zh-TW/dashboard-settings.md#ai-員工編輯頁)。
 
-**Rootless 容器引擎（DuDuClaw OS v0.4.0）** — 從 DuDuClaw OS v0.4.0（內嵌平台 v1.73.4）起，閘道以非 root 的 `duduclaw` 帳號執行，容器改用 rootless Podman，閘道經 `DOCKER_HOST`／`CONTAINER_HOST` 連線；v0.3.0 以前的映像，閘道與 Docker 仍以 root 執行。平台這邊配合兩件事：會清空環境變數的容器用戶端（任務沙箱、Discovery 嘗試與評分、清理）在閘道有設這兩個變數時只多帶這兩個，它們不在 AI CLI 的允許清單裡。腳本沙箱在 `mcp-server` 裡執行，所以閘道也會把這兩個變數寫進每位員工 MCP 設定中 DuDuClaw 自己那一項。容器引擎回報 rootless 時，任務沙箱、腳本沙箱、電腦操作與 Discovery 的嘗試和評分容器要先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`；讀到 `max`（cgroup 控制器沒有委派時，引擎接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這些功能就停用並說明原因（任務沙箱的代碼是 `resource_limits_unenforced`），不會在沒有上限的情況下執行。一般（rootful）Docker 不做這個檢查。結果沿用十分鐘（檢查失敗則一分鐘），容器引擎從無法使用恢復時立刻作廢。
+**Rootless 容器引擎（DuDuClaw OS v0.4.0）**，從 DuDuClaw OS v0.4.0（內嵌平台 v1.73.4）起，閘道以非 root 的 `duduclaw` 帳號執行，容器改用 rootless Podman，閘道經 `DOCKER_HOST`／`CONTAINER_HOST` 連線；v0.3.0 以前的映像，閘道與 Docker 仍以 root 執行。平台這邊配合兩件事：會清空環境變數的容器用戶端（任務沙箱、Discovery 嘗試與評分、清理）在閘道有設這兩個變數時只多帶這兩個，它們不在 AI CLI 的允許清單裡。腳本沙箱在 `mcp-server` 裡執行，所以閘道也會把這兩個變數寫進每位員工 MCP 設定中 DuDuClaw 自己那一項。容器引擎回報 rootless 時，任務沙箱、腳本沙箱、電腦操作與 Discovery 的嘗試和評分容器要先跑一個 32 MiB 記憶體、32 個行程上限的臨時容器，讀回它自己的 `memory.max` 與 `pids.max`；讀到 `max`（cgroup 控制器沒有委派時，引擎接受上限卻不套用）、讀到跟要求不同的值，或檢查沒跑完，這些功能就停用並說明原因（任務沙箱的代碼是 `resource_limits_unenforced`），不會在沒有上限的情況下執行。一般（rootful）Docker 不做這個檢查。結果沿用十分鐘（檢查失敗則一分鐘），容器引擎從無法使用恢復時立刻作廢。
 
-**`duduclaw-sysd` 的呼叫者（DuDuClaw OS v0.4.0）** — DuDuClaw OS v0.4.0 把這個輔助程式的允許 uid 改成閘道的 uid，而這個 uid 也是 AI 員工的 CLI 執行身分，只比對 uid 的話，任何員工都能直接開 socket，繞過閘道的所有核准。這不只是可用性風險：`update_rollback` 會開回上一個系統槽，第一次升級成非 root 之後，那是閘道（連同員工）仍以 root 執行的舊映像；`ssh_service_start` 會打開網路服務。所以輔助程式新增 `--require-main-pid-of <unit>`：呼叫者必須是該 systemd 單元的主行程，透過 pidfd（`SO_PEERPIDFD`，Linux 6.5 以上）確認，閘道重啟後被重複使用的 pid 無法冒充，而且它必須位在該單元自己的 cgroup；同時最多四個檢查、每個最多兩秒，任何一步失敗都拒絕（非 Linux 主機上這個旗標一律拒絕）。這是選擇性開啟，舊的 OS 映像不受影響；v0.4.0 在閘道改成非 root 的同一版把它打開。它的前提是 yama `ptrace_scope` 至少為 1（員工行程是閘道的子孫，不能 ptrace 閘道），以及閘道從不把 sysd 連線交給子行程（每次呼叫開一條連線，建立時就設 close-on-exec）。變更時間設定的操作者終端指令（`duduclaw os system timezone-set`／`ntp-set`）也在獨立行程執行，打開旗標後會失敗並請操作者改用儀表板的系統設定。因此在獨立 `mcp-server` 行程裡執行的 `os_*` MCP 工具不再自己開 socket：在裝置上它們先過完自己的檢查，再經閘道的簽章本機路由（`/api/internal/sysd`）送出，這條路由只接受這些工具需要的指令（沒有 SSH、網路、主機名稱、時區與本地模型），由閘道自己呼叫 sysd。能讀到閘道金鑰檔的同一使用者行程仍可簽章呼叫這條路由，路由把這種呼叫者能做的事限縮在上述指令，其中的回退之所以安全，是因為 sysd 會拒絕舊的目標（見下一段）。帶參數的指令也依「呼叫者不可信」重新檢查：主機名稱改成最長 64 位元組的 RFC 1123 名稱（之前只檢查長度，`-` 開頭的值會被 `hostnamectl` 當成選項）；時區與網路介面名稱必須以英數字開頭；這類值一律放在 `--` 之後。輔助程式另外多了固定的本地模型指令（只能停止或重啟那一個模型服務），閘道不再自己執行 `systemctl`。恢復原廠改成一個指令，連同「一併清除網路設定」的選擇一起送：映像有 `duduclaw-factory-reset.service` 這個 oneshot 時，寫入 `/data/system/factory-reset.pending` 後重開機，由 oneshot 在閘道啟動前清除閘道資料、kiosk 家目錄、閘道的容器儲存區與（有勾選時）Wi-Fi；較舊的映像照舊立即清除，改由 root 端執行。閘道遇到舊版輔助程式時會拒絕恢復原廠、不刪任何東西，裝置上連不到輔助程式時也一樣。閘道與輔助程式必須來自同一版 OS 映像。
+**`duduclaw-sysd` 的呼叫者（DuDuClaw OS v0.4.0）**，DuDuClaw OS v0.4.0 把這個輔助程式的允許 uid 改成閘道的 uid，而這個 uid 也是 AI 員工的 CLI 執行身分，只比對 uid 的話，任何員工都能直接開 socket，繞過閘道的所有核准。這不只是可用性風險：`update_rollback` 會開回上一個系統槽，第一次升級成非 root 之後，那是閘道（連同員工）仍以 root 執行的舊映像；`ssh_service_start` 會打開網路服務。所以輔助程式新增 `--require-main-pid-of <unit>`：呼叫者必須是該 systemd 單元的主行程，透過 pidfd（`SO_PEERPIDFD`，Linux 6.5 以上）確認，閘道重啟後被重複使用的 pid 無法冒充，而且它必須位在該單元自己的 cgroup；同時最多四個檢查、每個最多兩秒，任何一步失敗都拒絕（非 Linux 主機上這個旗標一律拒絕）。這是選擇性開啟，舊的 OS 映像不受影響；v0.4.0 在閘道改成非 root 的同一版把它打開。它的前提是 yama `ptrace_scope` 至少為 1（員工行程是閘道的子孫，不能 ptrace 閘道），以及閘道從不把 sysd 連線交給子行程（每次呼叫開一條連線，建立時就設 close-on-exec）。變更時間設定的操作者終端指令（`duduclaw os system timezone-set`／`ntp-set`）也在獨立行程執行，打開旗標後會失敗並請操作者改用儀表板的系統設定。因此在獨立 `mcp-server` 行程裡執行的 `os_*` MCP 工具不再自己開 socket：在裝置上它們先過完自己的檢查，再經閘道的簽章本機路由（`/api/internal/sysd`）送出，這條路由只接受這些工具需要的指令（沒有 SSH、網路、主機名稱、時區與本地模型），由閘道自己呼叫 sysd。能讀到閘道金鑰檔的同一使用者行程仍可簽章呼叫這條路由，路由把這種呼叫者能做的事限縮在上述指令，其中的回退之所以安全，是因為 sysd 會拒絕舊的目標（見下一段）。帶參數的指令也依「呼叫者不可信」重新檢查：主機名稱改成最長 64 位元組的 RFC 1123 名稱（之前只檢查長度，`-` 開頭的值會被 `hostnamectl` 當成選項）；時區與網路介面名稱必須以英數字開頭；這類值一律放在 `--` 之後。輔助程式另外多了固定的本地模型指令（只能停止或重啟那一個模型服務），閘道不再自己執行 `systemctl`。恢復原廠改成一個指令，連同「一併清除網路設定」的選擇一起送：映像有 `duduclaw-factory-reset.service` 這個 oneshot 時，寫入 `/data/system/factory-reset.pending` 後重開機，由 oneshot 在閘道啟動前清除閘道資料、kiosk 家目錄、閘道的容器儲存區與（有勾選時）Wi-Fi；較舊的映像照舊立即清除，改由 root 端執行。閘道遇到舊版輔助程式時會拒絕恢復原廠、不刪任何東西，裝置上連不到輔助程式時也一樣。閘道與輔助程式必須來自同一版 OS 映像。
 
-**非 root 閘道擋得住什麼、擋不住什麼（DuDuClaw OS v0.4.0）** — 在 DuDuClaw OS v0.4.0 以後的映像上，拿到 shell 的 AI 員工就是以閘道的使用者身分執行。它讀得到閘道的金鑰，所以閘道能做的事它都能做，包括偽造閘道的簽章內部請求與儀表板登入狀態。閘道改成非 root，是讓這樣的員工碰不到 root，不是讓它碰不到閘道本身的權力。原本的規則仍然成立：真正的隔離是不給 Bash，或把工作放進任務沙箱。所以防止取回 root 的關卡不信任任何呼叫者：`duduclaw-sysd --min-rollback-version <版本>`（第一個閘道非 root 的版本 v0.4.0 把它設成自己的映像版本 `1.73.4-y1-bringup`）在回退可能開機的任何項目比這個版本舊、或無法從開機映像本身（內嵌的 `os-release`，並與檔名交叉核對）讀出版本時，拒絕回退。Type #1 開機項目（`loader/entries/*.conf`）無法同樣嚴格地核對，只要存在就拒絕回退。安裝更新原本也是一條回到 root 的路：系統更新程式會安裝來源目錄裡的任何東西、不做檢查，而那個目錄就是閘道自己的下載資料夾，同一使用者的行程可以放進任何映像（包括改名成較高版本的舊簽章映像）。現在安裝改走輔助程式的新指令：以 root 用內建在輔助程式裡的 OS 簽章金鑰驗證版本的簽章校驗清單，只把清單列出的檔案（不跟隨連結、只接受一般檔案、邊複製邊比對雜湊）複製到只有 root 能存取的暫存目錄，挑出綁定目的槽位的開機映像，並且只有在該映像內嵌的版本比目前執行的新、也不低於回退下限時才安裝。閘道自己的檢查保留，用來更早給出清楚的錯誤。原本的安裝指令不再能經閘道內部路由呼叫。清除用盡的開機項目只會刪掉它。輔助程式管不到的部分：開機載入器自己的開機計數，在新項目被標記成功前連續三次開不起來時會退回另一個項目，所以 v0.4.0 在第一次開機被標記成功後，會刪掉比下限舊的開機項目。這讓升級變成單向：v0.4.0 映像成功開機過一次之後，裝置就回不去 v0.3.0 或更早的版本，之後的版本出問題只能裝更新的映像或用救援項目。第一次開機被標記成功之前，舊的 root 閘道項目仍是開機載入器的備援，新映像上的員工可以故意讓試開機失敗回到那裡；這個窗口只有幾次開機。
+**非 root 閘道擋得住什麼、擋不住什麼（DuDuClaw OS v0.4.0）**，在 DuDuClaw OS v0.4.0 以後的映像上，拿到 shell 的 AI 員工就是以閘道的使用者身分執行。它讀得到閘道的金鑰，所以閘道能做的事它都能做，包括偽造閘道的簽章內部請求與儀表板登入狀態。閘道改成非 root，是讓這樣的員工碰不到 root，不是讓它碰不到閘道本身的權力。原本的規則仍然成立：真正的隔離是不給 Bash，或把工作放進任務沙箱。所以防止取回 root 的關卡不信任任何呼叫者：`duduclaw-sysd --min-rollback-version <版本>`（第一個閘道非 root 的版本 v0.4.0 把它設成自己的映像版本 `1.73.4-y1-bringup`）在回退可能開機的任何項目比這個版本舊、或無法從開機映像本身（內嵌的 `os-release`，並與檔名交叉核對）讀出版本時，拒絕回退。Type #1 開機項目（`loader/entries/*.conf`）無法同樣嚴格地核對，只要存在就拒絕回退。安裝更新原本也是一條回到 root 的路：系統更新程式會安裝來源目錄裡的任何東西、不做檢查，而那個目錄就是閘道自己的下載資料夾，同一使用者的行程可以放進任何映像（包括改名成較高版本的舊簽章映像）。現在安裝改走輔助程式的新指令：以 root 用內建在輔助程式裡的 OS 簽章金鑰驗證版本的簽章校驗清單，只把清單列出的檔案（不跟隨連結、只接受一般檔案、邊複製邊比對雜湊）複製到只有 root 能存取的暫存目錄，挑出綁定目的槽位的開機映像，並且只有在該映像內嵌的版本比目前執行的新、也不低於回退下限時才安裝。閘道自己的檢查保留，用來更早給出清楚的錯誤。原本的安裝指令不再能經閘道內部路由呼叫。清除用盡的開機項目只會刪掉它。輔助程式管不到的部分：開機載入器自己的開機計數，在新項目被標記成功前連續三次開不起來時會退回另一個項目，所以 v0.4.0 在第一次開機被標記成功後，會刪掉比下限舊的開機項目。這讓升級變成單向：v0.4.0 映像成功開機過一次之後，裝置就回不去 v0.3.0 或更早的版本，之後的版本出問題只能裝更新的映像或用救援項目。第一次開機被標記成功之前，舊的 root 閘道項目仍是開機載入器的備援，新映像上的員工可以故意讓試開機失敗回到那裡；這個窗口只有幾次開機。
 
-**維修 SSH 改用專用帳號與臨時金鑰（輔助程式端，v1.75.0，目前還不能用）** — 輔助程式新增 `ssh_maint_open`、`ssh_maint_status` 兩個指令，讓維修登入改用專用帳號（`duduclaw-maint`，uid／gid 4800）加上每個視窗一把公鑰。閘道與 AI 員工是同一個使用者，所以金鑰只由輔助程式決定：只收一把（Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元、指數為奇數且不超過 64 位元的 RSA），解碼後逐欄檢查型別與長度，拒絕 `authorized_keys` 選項、憑證、私鑰（OpenSSH、PEM、PuTTY）、RFC 4716 區塊，以及多把或多行；寫進檔案的只有固定選項（`no-port-forwarding,no-agent-forwarding,no-X11-forwarding`）加上解碼後位元組的標準編碼。金鑰檔放在 tmpfs（`/run/duduclaw-maint-ssh/authorized_keys`，root:duduclaw-maint 0640），經目錄控制代碼寫入、不跟隨符號連結，以不會覆蓋既有金鑰的 rename 放到定位，再讀回比對。寫入前輔助程式先檢查實際生效的設定（systemd 合併後的單元與已載入的 nftables 規則）：OS 的就緒標記、帳號的 uid 與 gid、dropbear 合併後的指令列與預期值逐個 token 相同、dropbear 的單元綁在輔助程式上（`BindsTo=`）、拒絕這個帳號 loopback 流量的防火牆規則與通往它的跳轉，以及 22 埠只收區網／VPN 來源的集合；任何一項不符就拒絕開窗。視窗在下列情況結束：輔助程式自己的期限到（最多 24 小時，以 `CLOCK_BOOTTIME` 計，改系統時間延長不了）、閘道關閉、輔助程式重啟時發現殘留，或輔助程式停擺時由它開窗時掛上的 systemd 臨時計時器收回（關窗時會撤掉）。輔助程式每 15 秒從 journal 讀登入與登出，只認 journald 自己填的欄位（`_SYSTEMD_SLICE=system-dropbear.slice`、`_UID`），寫進只有 root 能讀寫的稽核檔 `/data/system/maint-ssh-audit.log`；這件事不經過閘道，閘道停掉或被入侵都不會讓這些紀錄停止寫入。輔助程式等稽核檔的鎖最多幾秒：寫不進去時視窗不會打開；關窗時則回報問題，把紀錄（以及還沒讀到的 journal 事件）留著，之後寫進去為止。視窗狀態與 journal 讀取位置存在持久儲存上只有 root 能存取的目錄（`/data/system/maint-ssh/`），視窗期間重開機也抹不掉登入紀錄：下次開機的清理會從存下的位置重讀 journal，並以 `reboot` 寫入關窗紀錄。視窗開著時，每次檢查也會重讀防火牆的維修出站規則，規則不見就關窗。開窗有頻率限制（間隔至少 5 秒、每小時最多 12 次）。事件裡的字串截到 128 字元並去掉控制字元。每個視窗前 50 筆登入逐筆寫，之後只計數；檔案輪替時會把本視窗的開窗紀錄重寫到新檔開頭。映像有這個帳號時，舊的只開埠 `ssh_service_start` 會被拒絕。這兩個指令都不能經閘道給 `os_*` 工具用的內部路由呼叫。要等 OS 映像帶上這個帳號、閘道與儀表板部分也完成後才能使用。
+**維修 SSH 改用專用帳號與臨時金鑰（輔助程式端，v1.75.0，目前還不能用）**，輔助程式新增 `ssh_maint_open`、`ssh_maint_status` 兩個指令，讓維修登入改用專用帳號（`duduclaw-maint`，uid／gid 4800）加上每個視窗一把公鑰。閘道與 AI 員工是同一個使用者，所以金鑰只由輔助程式決定：只收一把（Ed25519、ECDSA P-256／P-384／P-521、兩種 FIDO 安全金鑰，或 3072–8192 位元、指數為奇數且不超過 64 位元的 RSA），解碼後逐欄檢查型別與長度，拒絕 `authorized_keys` 選項、憑證、私鑰（OpenSSH、PEM、PuTTY）、RFC 4716 區塊，以及多把或多行；寫進檔案的只有固定選項（`no-port-forwarding,no-agent-forwarding,no-X11-forwarding`）加上解碼後位元組的標準編碼。金鑰檔放在 tmpfs（`/run/duduclaw-maint-ssh/authorized_keys`，root:duduclaw-maint 0640），經目錄控制代碼寫入、不跟隨符號連結，以不會覆蓋既有金鑰的 rename 放到定位，再讀回比對。寫入前輔助程式先檢查實際生效的設定（systemd 合併後的單元與已載入的 nftables 規則）：OS 的就緒標記、帳號的 uid 與 gid、dropbear 合併後的指令列與預期值逐個 token 相同、dropbear 的單元綁在輔助程式上（`BindsTo=`）、拒絕這個帳號 loopback 流量的防火牆規則與通往它的跳轉，以及 22 埠只收區網／VPN 來源的集合；任何一項不符就拒絕開窗。視窗在下列情況結束：輔助程式自己的期限到（最多 24 小時，以 `CLOCK_BOOTTIME` 計，改系統時間延長不了）、閘道關閉、輔助程式重啟時發現殘留，或輔助程式停擺時由它開窗時掛上的 systemd 臨時計時器收回（關窗時會撤掉）。輔助程式每 15 秒從 journal 讀登入與登出，只認 journald 自己填的欄位（`_SYSTEMD_SLICE=system-dropbear.slice`、`_UID`），寫進只有 root 能讀寫的稽核檔 `/data/system/maint-ssh-audit.log`；這件事不經過閘道，閘道停掉或被入侵都不會讓這些紀錄停止寫入。輔助程式等稽核檔的鎖最多幾秒：寫不進去時視窗不會打開；關窗時則回報問題，把紀錄（以及還沒讀到的 journal 事件）留著，之後寫進去為止。視窗狀態與 journal 讀取位置存在持久儲存上只有 root 能存取的目錄（`/data/system/maint-ssh/`），視窗期間重開機也抹不掉登入紀錄：下次開機的清理會從存下的位置重讀 journal，並以 `reboot` 寫入關窗紀錄。視窗開著時，每次檢查也會重讀防火牆的維修出站規則，規則不見就關窗。開窗有頻率限制（間隔至少 5 秒、每小時最多 12 次）。事件裡的字串截到 128 字元並去掉控制字元。每個視窗前 50 筆登入逐筆寫，之後只計數；檔案輪替時會把本視窗的開窗紀錄重寫到新檔開頭。映像有這個帳號時，舊的只開埠 `ssh_service_start` 會被拒絕。這兩個指令都不能經閘道給 `os_*` 工具用的內部路由呼叫。要等 OS 映像帶上這個帳號、閘道與儀表板部分也完成後才能使用。
 
 ---
 
@@ -624,9 +677,9 @@ v1.76 之前，dashboard 的 WebSocket 連線一直沿用握手時讀到的角�
 ## 與其他系統的互動
 
 - **CONTRACT.toml** 定義 agent 絕不能做什麼，`duduclaw test` 對它紅隊；守衛負責工具呼叫層級的強制。
-- **演化引擎** — 因為 `SOUL.md` 對 agent 唯讀，會演化的產物是 playbook，見 [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)。
-- **去識別化與資料來源** — `data-file-guard` 補的是哪條管線，見 [55-data-sources.md](55-data-sources.md)。
-- **委派隔離** — `org_field_guard` 保護的是哪個判定，見 [37-delegation-isolation.md](37-delegation-isolation.md)。
+- **演化引擎**，因為 `SOUL.md` 對 agent 唯讀，會演化的產物是 playbook，見 [38-aee-playbook-evolution.md](38-aee-playbook-evolution.md)。
+- **去識別化與資料來源**，`data-file-guard` 補的是哪條管線，見 [55-data-sources.md](55-data-sources.md)。
+- **委派隔離**，`org_field_guard` 保護的是哪個判定，見 [37-delegation-isolation.md](37-delegation-isolation.md)。
 
 ---
 
@@ -657,6 +710,42 @@ Claude/Grok 網頁工具與 Bash 字面網路指令新增由 gateway 判定的�
 `config.toml [security] mail_requester_approval` 為布林值，依擁有者決策預設 `true`。檔案或鍵不存在時使用預設值；設定無法讀取、格式錯誤、值無效或設為 `false` 時，只能由儀表板 Admin 決定。管理員可在安全設定關閉。例外僅限 `mail_send`；訊息、行事曆、第三方 MCP、CLI 外送與工作流程啟用，仍維持原有的管理員外送核准。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
 已登入的儀表板 WebChat 可通過 audience 資格檢查，但非 Admin 的 WebChat 確認介面與決策入口尚未接通，目前仍須 Admin 完成核准。
+
+## 在聊天軟體核准（v1.86）
+
+在「安全設定 → 在聊天軟體核准」設定 Telegram 與 Google Chat。各類別預設全勾選再次確認，取消勾選須確認風險；卡片有效時間為 1–720 小時。個人版只供檢視。管理員在「我的連線 → 聊天軟體連結（管理員）」用一次性代碼完成本人連結；「取消聊天核准資格」只清除本人證明。「成員」的聊天身分標示「本人確認／管理員代填」。聊天卡片連到 `/approvals/confirm`，需要時先登入，再輸入密碼與驗證器代碼核准；拒絕不需密碼。已處理的收件匣卡片會顯示「決定者」與決定時間。
+
+只能在儀表板決定的審批，預設仍然只在儀表板。客戶管理員在安全設定開啟「在聊天軟體核准」後，完成本人連結的管理員可以在和機器人或 Chat app 的 Telegram、Google Chat 私訊裡，按卡片決定其中一部分審批。這個功能預設關閉。
+
+| 級別 | 審批 | 在聊天裡 |
+|---|---|---|
+| T1 | 知識審核（`knowledge_quarantine`）、把文件加入共享集合（`knowledge_add_source`） | 一按即可核准或拒絕 |
+| T2 | 啟用技能、啟用工作流程、修改 AI 員工設定檔、調整組織、執行自動化動作、CLI 對外操作，以及被對外資料防護攔下的卡片 | 一按即可拒絕；核准預設要再確認一次，除非管理員對該類別關閉 |
+| T3 | 個人員工委派、操作員命令列的各種類，以及未列出的種類 | 只能在儀表板；不送聊天卡 |
+
+上面的「寄信由交辦人在原對話確認」不受影響；個人員工的卡片一律回儀表板。
+
+**誰能決定。** 只有按下當下仍是有效管理員的人。Manager、solo 模式與 `system` 身分都不能走這條路。聊天帳號要由管理員本人證明：在儀表板「我的連線」產生一次性代碼 `DUDU-XXXX-XXXX`（10 分鐘內有效），到和機器人或 app 的私訊貼上，再回儀表板用同一個登入工作階段按「是我」。如果儀表板顯示的不是自己的帳號，按「不是我」會作廢代碼並寫入 `channel_link_rejected`。貼在群組的代碼會立即作廢。代碼由閘道直接處理，不會進到 AI 員工；猜錯的次數依發送者與全體分別限制。管理員替別人代填的綁定，通知與登入碼照常可用，但標示「尚未本人確認」，不能用來核准。「取消聊天核准資格」只清除本人證明，通知與登入碼照常可用。
+
+**按下按鈕時檢查什麼。**
+
+- 卡片只送到管理員本人證明過的私訊，每位管理員一張，不送群組或員工控制頻道。Google Chat 只由能收到 JWT 驗證過的 HTTP 點擊的 app 送卡；Pub/Sub 一律不能決定。
+- 每張送出的卡都有送達收據。按下時要和收據完全相符（收到的機器人、對話、訊息、完整審批編號、按的人），而且必須在私訊裡。打字的「確認 <編號>」或回覆其他訊息都不會決定這些審批，所以 AI 員工仿造的卡片沒有作用。
+- 每次按下都重新讀取：按的人仍是有效管理員、本人證明仍在、設定仍開啟、機器人或 app 仍在設定中。卡片送出後內容被改過，會拒絕並送出新卡。同一張連按兩次只執行一次；儀表板和聊天共用同一把鎖。
+- **再確認一次。** 依 owner 決定，所有 T2 類別預設都要。管理員可以逐類關閉，關閉時要明確確認風險，並留下稽核紀錄。預設方式是回儀表板的一次性連結（10 分鐘、只能用一次、只保存雜湊）：登入後輸入密碼與驗證器 App 的驗證碼。在該頁按拒絕不需要密碼。沒有設定驗證器 App 的管理員，這些類別請在儀表板核准。管理員也可以另外開啟 Telegram 私訊輸入驗證碼：在 3 分鐘內回覆機器人的提示訊息，輸入 6 位數驗證碼；復原碼與用過的碼都會被拒絕，錯 5 次作廢，含驗證碼的訊息會被機器人刪除。Google Chat 不提供這個方式。
+- 聊天決定記為 `chat-admin:<使用者>:<通道>:<tap|web|totp>`，並在同一個交易寫入一筆核准紀錄。後續的授權（工作流程版本、單次動作授權）只有在對應紀錄存在時才接受聊天決定。操作員命令列、個人員工委派、斷開連線後遺忘這三處仍只接受儀表板決定。
+- 稽核事件：`channel_identity_proven`、`channel_link_rejected`、`channel_identity_proof_revoked`、`approval_chat_admin_card_sent`、`approval_chat_admin_decided`、`approval_chat_admin_refused`（同一發送者每分鐘最多 5 筆）、`approval_chat_admin_settings_changed`（寫入設定前先記一筆意圖，寫入後再記一筆完成）。
+- 關閉功能後，送出中的卡片會改成「聊天核准已關閉，請到儀表板處理」，再按會被拒絕。有人決定後，其他管理員的卡片會改成結果；審批逾期時改成「已失效」。
+- 搬移到另一台主機時，不會匯入送達收據、核准紀錄、本人證明或確認連結；到新主機後要重新連結一次。
+
+**限制。**
+
+- 本版只開放 Telegram 與 Google Chat。設定裡的 LINE、Slack、Discord 會被忽略並留下一次警告。
+- 只要任一位 AI 員工的 `agent.toml` 讀不到，聊天核准會拒絕所有按鈕，因為閘道無法確認卡片是由仍在設定中的機器人送出。症狀：卡片回覆「目前無法確認你的核准權限，請到儀表板處理。」，稽核紀錄出現 `approval_chat_admin_refused`。處理方式：到 AI 員工頁修正或移除設定異常的員工；期間仍可在儀表板核准。
+- 確認連結需要儀表板的對外 https 網址。沒有設定時，需要再確認的類別請在儀表板核准。
+- Google Chat 的卡片、按鈕、訊息更新與連結尚未在真實 Workspace 實測；Telegram 也尚未對真實 Bot API 實測。
+- 卡片預設 168 小時有效（1 到 720），但不會超過審批本身的期限；多數審批在 1 小時到 3 天內到期。
+- 有不受限 Bash 的 AI 員工可以直接修改本機資料庫，見[這些守衛擋不住什麼](#這些守衛擋不住什麼)。這條路徑不會讓這個缺口更大。
 
 ## 斷開連線的刪除審批與收據
 
@@ -698,20 +787,20 @@ Dashboard 註冊改為 `mfa.enroll_begin {password}`，在 blocking pool 驗證�
 
 **已知限制：設定碼指令擋不住有 Bash 的 AI 員工（v1.82.0）。** `duduclaw ops users mfa-setup-code` 在 AI 工作階段中會拒絕，Bash 通道也會擋下員工與身分未驗證的呼叫者，而且只在標準輸出是互動式終端機時才印出設定碼。但被授予 Bash 的 AI 員工與操作者是同一個作業系統身分：它可以清掉工作階段環境變數、換個寫法讓 Bash 通道的文字比對對不上，再用虛擬終端機（例如 `script`）包住指令執行。這些檢查是減速帶，不是隔離，和守衛 1 所說的 Bash 通道相同。後果：首次設定尚未關閉時，有 Bash、又知道第一位管理員密碼的 AI 員工，可以取得設定碼並替該帳號註冊第二因素。目前可用的緩解：不要把 Bash 給不該接觸主機指令列的員工，或讓它們在[任務沙箱](../../guides/zh-TW/task-sandbox.md)中執行；留意 auth 稽核紀錄中不是你造成的 `mfa.bootstrap_code_issued`。規劃中：改由以獨立作業系統身分執行的特權輔助程式核發設定碼（規劃於之後的版本，v1.83.0 不包含）。
 
-Enterprise 強制期間，首次註冊驗證器／通行金鑰還需獨立證明。只有已記錄且早於強制啟用時間的已驗證通道綁定，系統透過既有通道服務送出另一組 OTP，以 `proof_code` 提交；沒有綁定者，由另一位目前有效的 Admin 呼叫 `users.mfa_enrollment_code {user_id,challenge_ref}` 核發一次性註冊碼並交給本人。註冊碼綁定帳號及指定的待完成 challenge、雜湊保存、5 分鐘有效、只顯示一次並留下稽核，不能自行核發。最後一位管理員可在主機執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`。證明綁定該次第一因素 challenge、同時到期、最多 5 次嘗試，成功後不能移用至其他 challenge。若第一因素是通道 OTP，註冊時還必須提供目前 `password`，避免同一通道的兩組碼被當成獨立因素。
+Enterprise 強制期間，首次註冊驗證器／通行金鑰／Email 還需獨立證明。只有已記錄且早於強制啟用時間的已驗證通道綁定，系統透過既有通道服務送出另一組 OTP，以 `proof_code` 提交；沒有綁定者，由另一位目前有效的 Admin 呼叫 `users.mfa_enrollment_code {user_id,challenge_ref}` 核發一次性註冊碼並交給本人。註冊碼綁定帳號及指定的待完成 challenge、雜湊保存、5 分鐘有效、只顯示一次並留下稽核，不能自行核發。最後一位管理員可在主機執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`。證明綁定該次第一因素 challenge、同時到期、最多 5 次嘗試，成功後不能移用至其他 challenge。若第一因素是通道 OTP，註冊時還必須提供目前 `password`，避免同一通道的兩組碼被當成獨立因素。
 
 強制期間未註冊者登入只取得 `mfa_enrollment_required`、`enrollment_token` 與 12 字元 `challenge_ref`，沒有 session token。呼叫 `/api/mfa/enroll/begin {enrollment_token,proof_code}` 後，再呼叫 `/api/mfa/enroll/confirm {enrollment_token,code}`；通道 OTP 登入者兩次都要帶 `password`。Dashboard 強制註冊的第一次 begin 回傳 `proof_required`、`enrollment_token` 與 `challenge_ref`，再以 `password`、該 token 及 `proof_code` 重呼 begin，才取得 `secret` 與 `otpauth_uri`。Confirm 才會啟用。註冊憑證不能登入 `/ws`、refresh 或一般 HTTP；dashboard 的註冊憑證也不能拿去 HTTP 註冊路由換 session。
 
 已註冊者的密碼與通道 OTP 登入回傳 `mfa_required`、`challenge_id` 與可用因素資料。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能移除最後一種驗證方式。每帳號因素驗證錯誤最多 5 次／15 分鐘。
 
 新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。自 v1.82 起，第一位 Admin 也可改用上述 bootstrap 證明（主機設定碼，每套安裝一次），全程在儀表板完成。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。所有版本都依儲存的政策強制驗證，授權過期、驗證失敗回退或指定 Personal 啟動都不會停用；只有 Admin 主動關閉才取消強制。沒有政策資料庫的全新 Personal 安裝仍預設不強制；本機自動登入不能略過已啟用的強制驗證。
-新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。已設定 Email 寄信者可改用信箱驗證；自 v1.82 起也可用上述 bootstrap 證明在儀表板完成。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
+新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。已設定 Email 寄信者可在完成相同的獨立證明後改用 Email；上述 bootstrap 證明適用於驗證器、通行金鑰及 Email 註冊。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
 
 單純開啟強制不立即撤銷帳號 access token；未註冊者不能 refresh，原 token 自然到期（預設 30 分鐘）。所有版本的 MFA WebSocket 在到期後的下一次心跳關閉，最多延後 30 秒，不取消執行中工作。強制期間拒絕舊共用 token 的 `/ws` 登入及 RPC；已建立的共用 token 連線在下一次心跳關閉，停止推播訂閱。註冊、停用、重設會增加該帳號的 credential epoch，之後變更／重設密碼也會增加；舊 access／refresh token 失效，既有 dashboard 連線於下一次即時身分檢查拒絕，沿用 ACL 快取失效機制。沒有 claim 的 token 視為 epoch 0；從未註冊者即使變更密碼仍維持 0，以保持既有客戶行為。任何密碼變更都會作廢待註冊 challenge。
 
 MFA 設定在啟動時載入有效的記憶體快照，dashboard 設定寫入後立即更新，外部檔案變更每 30 秒重載。失敗時保留上次有效值，於 `mfa.overview.policy` 及 `system.status.mfa_policy` 顯示 degraded 與警告；任何版本從未取得有效快照都拒絕；啟動時既有政策資料庫無法讀取或已損壞也會拒絕。缺少 `[auth]` 表格或設定鍵時保留資料庫中的政策；新團隊初始化會明確記錄 true。登入不再讀取或解析設定檔。
 
-`users.mfa_reset` 禁止自我重設，在同一交易內判斷並套用（目前有效的 Admin 角色、有效的對象、證明、清除因素、增加 epoch、稽核）。證明方式：`{user_id,code}`（新的 TOTP 或未用過的備援碼）；`{user_id,password}`（僅限一般成員對象）；`{user_id,password,send_email_code:true}` 之後 `{user_id,reset_token,email_code}`（沒有驗證器 App 的操作者：寄到操作者自己目前信箱的 6 位數確認碼，與其憑證一起雜湊、綁定對象、5 分鐘、單次使用、共用 Email 因素的寄送限制）。**管理員對象**——目前角色是 `admin`，或過去 7 天內在 `admin_eligibility_log` 有任何紀錄，因此「降級→重設→升回」無法跳過規則——拒絕只用密碼（`MFA_RESET_SECOND_FACTOR_REQUIRED`），並要求操作者在 F6c2 規則下是「合格」Admin（冷卻期 7 天內連續具資格、未在期間內被建立或升級；否則 `MFA_RESET_COOLING`，紀錄無法讀取或不一致為 `MFA_RESET_ADMIN_LOG_UNAVAILABLE`）；紀錄未滿 7 天時所有操作者都會被拒絕，因此**全新安裝的前 7 天內，除了主機指令 `duduclaw ops users mfa-reset <email>`，沒有任何管理員能重設另一位管理員的 MFA**。一般成員對象維持密碼或因素確認，沒有冷卻期。之所以保留 Email 確認碼路徑，是因為 `check_factor` 只接受 TOTP 與備援碼，而首次註冊通行金鑰不會發給備援碼。拒絕以 `{code,message}` 回傳，代碼為封閉集合 `MFA_RESET_*`。**稽核待送區。** 每次嘗試都有唯一的 `attempt_id`，從第一道關卡起（角色、users.db 無法使用、政策讀不到、沒有儀表板工作階段、限流，以及重設本身）都由閘道的同一個守衛負責；結果列（嘗試編號、操作者、對象、證明種類、結果 `allowed`／`refused`／`challenge_sent`、原因、時間；不含密碼、驗證碼或憑證）寫進 `users.db` 的 `mfa_reset_audit_outbox`：重設與在重設交易內決定的拒絕，寫在該交易內（重設不可能沒有結果列就提交）；寄出 Email 確認碼時，在產生確認碼的交易內寫一筆保留中的列，寄送結果確定後再放行；更早就決定的拒絕，以一次短的專用寫入記錄。users.db 無法使用時直接寫入安全稽核。送出步驟以 `try_append_audit_event` 把每一列寫成雜湊鏈上的 `mfa.admin_reset` 事件（含 `attempt_id`、`attempted_at`；已停止的行程留下的保留列標示 `interrupted`），寫入成功後才刪除該列；每次嘗試結束後與閘道啟動時執行（啟動時只在持有閘道鎖的行程，且只有這時才送保留列）。每個 `attempt_id` 只會有一筆稽核紀錄；重送不會新增第二筆。待送區上限 1,000 列；滿了會在檢查任何證明之前就拒絕，拒絕直接寫入安全稽核（嘗試本來就有每位操作者的限流，且每次嘗試後都會清空，只有在稽核檔寫不進去時才可能滿）。重設後以 SMTP Email 與已驗證的通訊頻道（遵守勿擾時段）通知對方；都送不到時，`auth_audit_log` 寫入 `mfa.reset_notification_failed`（只記各管道結果），安全稽核寫入同名事件，`mfa.overview.reset_notice_failures` 列出 30 天。主機人員可執行 `duduclaw ops users mfa-reset <email>` 重設任意帳號，包含金鑰遺失時的多位管理員。兩個主機救援指令都拒絕 AI 工作階段及員工／未驗證 Bash 呼叫；稽核標示「本機指令列（身分未驗證）」。這些規則不提供任意主機檔案寫入的 OS 隔離。註冊、證明／註冊碼核發、停用、備援碼使用與驗證失敗均稽核，不記錄密鑰或驗證碼。
+`users.mfa_reset` 禁止自我重設，在同一交易內判斷並套用（目前有效的 Admin 角色、有效的對象、證明、清除因素、增加 epoch、稽核）。證明方式：`{user_id,code}`（新的 TOTP 或未用過的備援碼）；`{user_id,password}`（僅限一般成員對象）；`{user_id,password,send_email_code:true}` 之後 `{user_id,reset_token,email_code}`（沒有驗證器 App 的操作者：寄到操作者自己目前信箱的 6 位數確認碼，與其憑證一起雜湊、綁定對象、5 分鐘、單次使用、共用 Email 因素的寄送限制）。**管理員對象**，目前角色是 `admin`，或過去 7 天內在 `admin_eligibility_log` 有任何紀錄，因此「降級→重設→升回」無法跳過規則，拒絕只用密碼（`MFA_RESET_SECOND_FACTOR_REQUIRED`），並要求操作者在 F6c2 規則下是「合格」Admin（冷卻期 7 天內連續具資格、未在期間內被建立或升級；否則 `MFA_RESET_COOLING`，紀錄無法讀取或不一致為 `MFA_RESET_ADMIN_LOG_UNAVAILABLE`）；紀錄未滿 7 天時所有操作者都會被拒絕，因此**全新安裝的前 7 天內，除了主機指令 `duduclaw ops users mfa-reset <email>`，沒有任何管理員能重設另一位管理員的 MFA**。一般成員對象維持密碼或因素確認，沒有冷卻期。之所以保留 Email 確認碼路徑，是因為 `check_factor` 只接受 TOTP 與備援碼，而首次註冊通行金鑰不會發給備援碼。拒絕以 `{code,message}` 回傳，代碼為封閉集合 `MFA_RESET_*`。**稽核待送區。** 每次嘗試都有唯一的 `attempt_id`，從第一道關卡起（角色、users.db 無法使用、政策讀不到、沒有儀表板工作階段、限流，以及重設本身）都由閘道的同一個守衛負責；結果列（嘗試編號、操作者、對象、證明種類、結果 `allowed`／`refused`／`challenge_sent`、原因、時間；不含密碼、驗證碼或憑證）寫進 `users.db` 的 `mfa_reset_audit_outbox`：重設與在重設交易內決定的拒絕，寫在該交易內（重設不可能沒有結果列就提交）；寄出 Email 確認碼時，在產生確認碼的交易內寫一筆保留中的列，寄送結果確定後再放行；更早就決定的拒絕，以一次短的專用寫入記錄。users.db 無法使用時直接寫入安全稽核。送出步驟以 `try_append_audit_event` 把每一列寫成雜湊鏈上的 `mfa.admin_reset` 事件（含 `attempt_id`、`attempted_at`；已停止的行程留下的保留列標示 `interrupted`），寫入成功後才刪除該列；每次嘗試結束後與閘道啟動時執行（啟動時只在持有閘道鎖的行程，且只有這時才送保留列）。每個 `attempt_id` 只會有一筆稽核紀錄；重送不會新增第二筆。待送區上限 1,000 列；滿了會在檢查任何證明之前就拒絕，拒絕直接寫入安全稽核（嘗試本來就有每位操作者的限流，且每次嘗試後都會清空，只有在稽核檔寫不進去時才可能滿）。重設後以 SMTP Email 與已驗證的通訊頻道（遵守勿擾時段）通知對方；都送不到時，`auth_audit_log` 寫入 `mfa.reset_notification_failed`（只記各管道結果），安全稽核寫入同名事件，`mfa.overview.reset_notice_failures` 列出 30 天。主機人員可執行 `duduclaw ops users mfa-reset <email>` 重設任意帳號，包含金鑰遺失時的多位管理員。兩個主機救援指令都拒絕 AI 工作階段及員工／未驗證 Bash 呼叫；稽核標示「本機指令列（身分未驗證）」。這些規則不提供任意主機檔案寫入的 OS 隔離。註冊、證明／註冊碼核發、停用、備援碼使用與驗證失敗均稽核，不記錄密鑰或驗證碼。
 
 啟用前請檢查 `mfa.overview` 各帳號的 `channel_bindings.verified_at` 與政策 `enforced_at`（Unix 微秒）。無法確認的歷史綁定時間為 null，不能作為註冊證明；每次綁定或重新綁定都記錄新時間。強制期間，未註冊帳號不得自行綁定，需另一位有效 Admin 或主機人員核准。仍有一項限制：持有密碼的人在強制啟用前預先植入綁定，系統無法辨識。請將短 `challenge_ref` 讀給 Admin，不要提供完整註冊 token；註冊碼只會對符合的帳號與 challenge 兌換並刪除。
 
@@ -723,7 +812,9 @@ JWT epoch 必須完全相等。Dashboard 每次心跳重查；WebChat 在心跳�
 
 輸入密碼後，可選擇已設定的驗證方式，預選上次成功使用的方式。Email 驗證碼限用一次、10 分鐘到期，每次登入挑戰最多嘗試五次；每分鐘可重寄一次，每個帳號每小時最多五次。通行金鑰使用裝置鎖定、指紋、臉部辨識或安全金鑰驗證。管理員需將公開儀表板網址設定於 `[dashboard] public_url`，並以完全相同的 HTTPS 來源開啟儀表板；只有本機 localhost 可用 HTTP。每把金鑰可命名、個別移除，建議另留一種驗證方式，以免失去裝置後無法登入。首次只註冊通行金鑰不會產生復原碼，既有驗證器復原碼維持有效。首次 Email 註冊會顯示一次復原碼，確認保存後才能繼續。
 
-強制兩步驟驗證接受任何一種已設定因素，也會拒絕移除最後一種。原有驗證器與復原碼不需重新註冊。強制首次 Email 註冊以信箱代碼證明收信權；驗證器及通行金鑰仍需獨立的通道／管理員證明。以通道碼完成第一步登入者還需目前密碼。管理員重設會清除所有因素與保持登入的裝置。操作者可用目前密碼或新的驗證器／復原碼確認身分，因此只用通行金鑰的管理員也能執行。
+強制兩步驟驗證接受任何一種已設定因素，也會拒絕移除最後一種。原有驗證器與復原碼不需重新註冊。強制 MFA 時，首次註冊 Email 與驗證器、通行金鑰一樣，需要獨立的通道／管理員證明，或符合資格的第一位管理員首次設定碼。須先以 `proof_code` 提交註冊證明，才會寄送 Email 驗證碼；只有收信權無法完成首次註冊。系統會在啟用因素與核發工作階段憑證的同一筆交易重新檢查，拒絕過期、重用、未驗證或憑證已變更的證明。已通過 MFA 的工作階段新增 Email 不需另一組註冊碼；未強制時的自願註冊維持原流程。Google 登入仍不能使用 Email 作為第二因素。以通道碼完成第一步登入者還需目前密碼。管理員重設會清除所有因素與保持登入的裝置。操作者可用目前密碼或新的驗證器／復原碼確認身分，因此只用通行金鑰的管理員也能執行。
+
+升級前尚未完成的 Email 註冊須重新開始，因為舊證明未保存憑證版本。
 
 登入頁的「保持登入」預設不勾選。勾選後以輪替的瀏覽器 Cookie 保持登入，預設採 180 天滑動續期：每次成功更新登入，都從該次使用時間重新計算到期日。管理員可在「安全 → 保持登入」設定 1 至 365 的整數，預設 180 天。政策永久存入 `users.db`；讀取失敗或值無效時回到 180 天，不會變成無限期。變更設定不立即改動既有到期日，下次成功續期才改為該次使用時間加上新天數，縮短天數也一樣適用。開發版原有的 `[auth] remember_days` 不再讀取。未勾選時維持原有工作階段行為。帳號設定的「已登入的裝置」列出保持登入的裝置、建立與最近使用日期及已記錄的 IP，可個別撤銷或「登出所有裝置」。密碼、因素、帳號狀態或角色變更、兩步驟驗證重設及刪除帳號都會撤銷保持登入；登出會撤銷目前裝置。
 
@@ -799,7 +890,7 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 第三輪接線新增錄製蒸餾的主機控制流程：真正的 HAR／操作／事件快照交給 E 解析，模型輸出也先經 E 掃描，才沿用既有待核准草稿流程。送進模型前會移除或替換網址憑證、片段與查詢值；一般錄製畫面文字仍可能包含敏感內容。Hub 安裝目前僅支援已設定的官方固定版本來源，依序執行有界抓取、E 的 YAML 驗證與掃描、既有安裝核准、鎖定下的信任重查及新檔發布／讀回。受保護會議工作以 E 檢查真正 WAV／MP3 快照，憑證、取消、計費與逐字稿發布留在主機；目前拒絕超過 25 MiB 或 30 分鐘的錄音，不執行主機 ffmpeg／ffprobe。技能合成僅提供隔離事件解析的預覽，完整合成及 curator 維護仍拒絕，兩者的 producer 清單仍列缺少，整體 E 就緒檢查維持未完成。這些接線尚未啟用，不代表完整產品編譯、原生執行或真實供應商驗收通過。
 
 
-第四輪接線取代上述技能合成與維護限制。受保護模式會保留同一份模型結果與生成時間，由 E 解析 YAML、產生實際發布內容並掃描，再送交管理員於儀表板核准；核准綁定內容與目標，主機端只新增技能，拒絕覆寫，並保留發布收據。技能自動過時標記、封存搬移及 wiki 報告現已移除。`skill_curator_status` 已改為唯讀並忽略 `run`；`skill_pin` 僅在 `pinned=true` 時還原封存技能，兩者預計 v1.86.0 移除。`[skill_curator]` 設定無作用。啟動還原不覆蓋同名技能；Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，只發布從已開啟的一般檔案讀取的內容；封存目錄項目若被替換則保留。其他平台保留封存檔供手動還原。清單只顯示名稱與範圍；員工只能查看與還原自己的技能，全域與其他員工技能需要管理員操作，無法確認身分時拒絕。E 就緒改為檢查明確安裝的 launcher、健康主機組裝及新鮮的驗證世代證據，其他總閘仍保留。尚未啟用，也尚未完成完整 gateway／cli 編譯、原生環境、提供者或核准發布活驗。
+第四輪接線取代上述技能合成與維護限制。受保護模式會保留同一份模型結果與生成時間，由 E 解析 YAML、產生實際發布內容並掃描，再送交管理員於儀表板核准；核准綁定內容與目標，主機端只新增技能，拒絕覆寫，並保留發布收據。技能自動過時標記、封存搬移及 wiki 報告現已移除。`[skill_curator]` 設定無作用。啟動還原不覆蓋同名技能；Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，只發布從已開啟的一般檔案讀取的內容；封存目錄項目若被替換則保留。其他平台保留封存檔供手動還原。E 就緒改為檢查明確安裝的 launcher、健康主機組裝及新鮮的驗證世代證據，其他總閘仍保留。尚未啟用，也尚未完成完整 gateway／cli 編譯、原生環境、提供者或核准發布活驗。
 
 ## 一般自我更新的檔案替換
 
@@ -860,7 +951,7 @@ Drive／Meet 採增量授權：本人啟用錄影存取時，才要求 `https://
 
 Gateway 驗證檔案 ID，即使連線已有較廣的舊授權，仍要求 Drive 回傳 `isAppAuthorized=true`。這個 Google 旗標可能來自先前授權，不能證明當次 Picker 點擊；匯入另須持有下述綁定使用者、員工與檔案的確認收據。請求使用固定的官方 Google API 位址，拒絕轉址。中繼資料回應有大小上限，媒體沿用既有分段上傳儲存及檔案大小、暫存配額、長度限制。傳輸期間及建立工作前會重查連線本人、實際授權範圍與本機權限；斷線或偵測到撤銷後停止後續存取。本機來源紀錄將上傳連到選取者、Google 帳號、Drive 檔案 ID 與版本；稽核使用雜湊識別，不保存權杖、檔案內容與敏感名稱。
 
-Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 或 `drive`，也不會啟用員工 Drive 工具。增量授權保留先前用途，但必須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
+Gateway 分別保存基本服務、會議錄影與員工 Drive 工具的本機用途同意，並綁定封存憑證及其授權紀錄。每項能力都必須同時符合 Google 實際範圍與本機用途同意；會議授權額外回傳 `drive.readonly` 也不會啟用員工 Drive 工具。一般憑證若含完整 `drive` 範圍，會被拒絕並要求重新連結。新增服務同意使用 `include_granted_scopes=false`，明列已同意的一般服務與新增服務，Google 可能再次顯示這些權限。新增授權保留先前用途，也須完整保留舊有 Google 範圍，保存時也會比對原憑證版本；缺少範圍或憑證已被其他操作更新，就拒絕取代舊憑證。沒有本機用途同意的舊紀錄須重新連結。重新連結基本服務會將本機用途重設為基本服務，之後須另行開啟會議錄影與員工 Drive 工具。
 
 每次匯入都需要伺服器簽發的確認收據。它證明經 JWT 驗證的控制台使用者，在最近五分鐘內明確登記並確認將這個確切的 Drive 檔案 ID 交給這位接收員工；員工／MCP 權杖不能登記收據。收據限用一次，綁定該使用者、員工與檔案 ID；同一使用者對同一員工的新確認會取代上一張收據。控制台只在使用者確認匯入時登記檔案。缺少、過期、已用過或綁定不符的收據會遭拒。進入匯入程序後，即使後續檢查失敗也會用掉收據，重試須重新確認。伺服器另以該使用者的 Google 連線檢查 Drive 中繼資料，要求 `isAppAuthorized=true`。收據與這個 Google 旗標都不能證明曾在 Google Picker 點擊；控制台呼叫者可用已知 ID 明確確認先前已授權給應用程式的檔案。
 
@@ -898,7 +989,7 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 
 員工 cron 支援 UTC（含零時差 UTC／GMT 別名），以及未來兩年內 UTC 時差不變的 IANA 時區，例如 `Asia/Taipei`；時差固定時，時鐘間隔等於實際經過時間，15 分鐘的檢查仍然成立。有夏令時間或其他時差變更的時區，新增、編輯、恢復與手動執行會拒絕，排程器也會略過，避免夏令時間縮短實際間隔；仍可讀取，有權限者仍可暫停／刪除。其他時區的排程由 Admin 管理，被略過的排程需由 Admin 改成 UTC 或沒有夏令時間的時區。
 
-帶人類來源的 MCP 新增排程預設 UTC，也可明確指定沒有夏令時間的時區；未帶來源標記的 Admin／背景排程保留本地時區偵測。
+新排程未指定時區時使用公司時區；公司時區未設定或無效時使用 UTC。公司時區有夏令時間時，成員建立的例行工作以 UTC 儲存並提示。既有排程不變。
 
 ### 知識庫路徑與政策檢查
 
@@ -921,3 +1012,57 @@ Cron admission 是所有帶 `on_behalf_of`、`created_by_user_id` 或 `scoped_by
 
 **不要把金鑰放進瀏覽器前端程式碼，請由你的伺服器呼叫。**
 完整用法與限制見[成員 API 驗證說明](../../api/member-contract.md#personal-member-api-keys-1850)。
+
+## 管理員 AI：確認對話中的本人
+
+只有閘道確認提出者是已更改初始密碼的啟用中管理員、使用其唯一指派的 AI 分身，且該回合由本人親自參與時，才會提供管理員 AI 設定工具。閘道會驗證簽署的對話脈絡並重新解析發話者身分；工具參數不能自行宣稱使用者身分。寫入還必須來自私訊或已登入的 WebChat。排程、委派、背景及受保護模式回合一律拒絕。每份變更提案仍須由提出的管理員在儀表板確認。
+
+## 管理員控制的 Drive 寫入
+
+九個雲端硬碟寫入工具只在主 gateway 行程內執行，寫入憑證與一般 Google 憑證分開保存。每個交出權杖的位置都拒絕完整 Drive 權限的權杖，包含更新權杖與遠端 MCP 路徑；一般連線若帶有這個範圍，須重新連結。官方 Drive 遠端 MCP 永遠拿不到這種權杖。這些措施保護產品內路徑；服務帳號金鑰若可被 CLI 讀取，Google 授予範圍後仍可能被用來自行取得權杖，建議使用 gateway 封存的委派金鑰。
+
+建立、修改、搬移與移到垃圾桶分別預設關閉。開啟或放寬存取前，管理員須確認了解風險並留下紀錄，不要求額外重新驗證。需要本人確認時，確認綁定確切操作、帳號、憑證與規則，五分鐘到期，只有該成員可以決定。工具允許清單、Admin 權杖與工作流程常駐授權都不能跳過。管理員可逐項關閉確認或要求額外管理員核准；無人值守工作遇到需要確認的操作就會拒絕。匯入或還原設定會移除這些寫入設定，目的安裝的管理員須重新明確開放。
+
+DuDuClaw 每條 Google 請求路徑都拒絕 Drive 永久刪除與分享／權限端點。寫入傳輸只接受列舉的操作；移到垃圾桶只更新檔案的垃圾桶狀態，不執行永久刪除。既有傳輸不能靠更換方法或端點使用新寫入路徑。這些規則不控制任意第三方程式或不受限的 shell。
+
+Google 本身沒有資料夾允許清單，因此資料夾檢查只能盡力而為。寫入前後及核准後都會檢查，期間仍可能有其他人同時變更。事後發現超出範圍會通知管理員，檢查未完成也會記錄，不會宣稱成功。清單為空時，建立與修改可觸及帳號能寫入的任何位置，搬移與移到垃圾桶則拒絕。清單上的資料夾不能改名、搬移或丟垃圾桶，也不允許跨雲端硬碟搬移。詳見[寫入工具與資料夾規則](../guides/google-mcp.md#雲端硬碟寫入工具)。
+
+每次寫入嘗試（含拒絕與結果不明）都記錄動作、帳號、請求者、檔案與位置資訊、核准決定及結果，不記檔案內容與權杖；紀錄可能包含檔名及內容摘要雜湊。管理員可使用 `audit.unified_log`，以 `tool_name_filter="google_drive_write"` 查詢。在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。Google 實際同意隔離與撤銷、委派、API 行為、私訊送達、Windows 與原生 Linux 受保護模式驗收，本次均未實機驗證。
+
+## 公司 Google 登入
+
+伺服器支援以 Google 登入，與密碼、通道一次性驗證碼並列。預設關閉，個人版不提供。使用前須由管理員確認風險、設定允許的公司網域、公司 Google OAuth 用戶端 ID 與密鑰，以及有效的 `[dashboard] public_url`（HTTPS，或 localhost／loopback 的 HTTP）。在「整合 → Google → 公司 Google 帳號登入」設定網域、管理員核准或直接建立、每日上限、分身範本及核准時的 MFA 預先授權。卡片提供要登記的重新導向 URI 與檢查清單；除了關閉功能，每次儲存都須輸入密碼與驗證器代碼。啟用且已設定公開網址時，登入頁會顯示「使用公司 Google 帳號登入」。在「成員」（`/manage/users`）的「待開通」核准或拒絕申請，勾選多人後可用「批次確認 Google 登入」，列選單可「取消 Google 登入」。成員列有 Google 登入、Odoo 與 AI 分身標章。本人在「我的連線 → Google 登入」輸入密碼後開啟或關閉。透過 Google 開通的成員會在首頁「還差幾步」看到五個步驟，Odoo 步驟連到「我的連線」。沒有密碼的帳號須先在帳號頁重新驗證 Google，才能變更兩步驟驗證方式。
+
+僅接受 Google Workspace／Cloud Identity 帳號，且經驗證的 ID token 必須包含 `email_verified=true`，`hd` 也須在允許清單內。個人 Gmail 帳號會被拒絕。網域轉成小寫後完整比對，不涵蓋子網域，也不從電子郵件地址推定網域。Google 未說明次要網域或別名會回傳哪個 `hd`；請逐一列出允許的網域，並確認實際回傳值。
+
+帳號以 Google 穩定的 `sub` 識別。同信箱的既有帳號不會自動合併。同仁須先以原有方式登入，重新驗證密碼後自行綁定 Google；兩邊的信箱須相同，比對時忽略 ASCII 大小寫。管理員也可批次確認既有帳號，每批最多 100 個仍啟用且未綁定的帳號。確認有效期為 14 天，信箱或憑證變更即失效。
+
+新同仁首次登入預設提出申請，等待管理員核准。申請 14 天後到期，最多保留 50 筆待核准申請；被拒絕者須等 7 天。管理員確認風險後可改為直接建立帳號。新增帳號上限預設為滾動 24 小時內 20 個，可設為 1～200，待核准申請也計入。新帳號一律為一般員工，沒有本機密碼。沒有本機密碼的帳號無法升為管理員或主管。
+
+公司的兩步驟驗證政策仍適用，Google 自身的兩步驟驗證不計入。以 Google 登入後，Email 驗證碼不能作為第二因素，因為信箱與登入使用同一個 Google 帳號；請使用驗證器 App（TOTP）或通行金鑰。強制啟用政策下，新同仁需要管理員核發註冊碼，或由管理員在核准時明確允許首次註冊兩步驟驗證。後者須先開啟預設關閉的 `approval_grants_mfa_enrollment`，核准後 72 小時內限用一次。無密碼帳號管理自身驗證方式前，須重新向 Google 驗證身分。Google 必須回傳近期的 `auth_time`，否則須請管理員重設兩步驟驗證。
+
+系統會自動為新同仁建立 AI 分身，可使用空白分身，或鎖定版本的非付費公司單一員工範本。範本變更、範本無效、席次已滿或原生 Linux 隔離保護模式下，會等待管理員處理。建立失敗後分別於 1、10 分鐘後重試，第三次失敗便等待管理員。
+
+管理員或本人解除 Google 登入綁定，都會使該同仁所有工作階段失效。自行解除需要本機密碼並重新驗證密碼。離職時請停用 DuDuClaw 帳號或解除 Google 登入綁定；只在 Google Workspace 停用帳號，不會結束既有的 DuDuClaw 工作階段。只有 Google 登入、沒有本機密碼的帳號，降版至 v1.85.0 或更舊版本後無法登入。
+
+請參閱[設定對照](../../guides/zh-TW/dashboard-settings.md#公司-google-登入)及 [OAuth 設定](../../guides/zh-TW/google-setup.md#公司-google-登入)。
+
+## 本人金鑰與 Odoo 帳號邊界（v1.86.0）
+
+成員在「外部存取」（`/me/external-access`）建立金鑰時，勾選「包含我的對話內容」與外部工具權限，之後只能縮小範圍。管理員在同頁使用兩個總開關。「整合 → Odoo」提供升級通知、權限模式（引擎資料表或跟隨 Odoo 帳號，須確認風險）、「一律不允許」（預設分類顯示，移除須確認，五項固定拒絕仍保留）、「全公司帳號給哪些 AI」，以及預設關閉的「同仁本人 Odoo 帳號」與成員憑證清單。「員工編輯頁 → 整合 → Odoo」提供「權限收窄」、「使用當下請求者的 Odoo 帳號」，以及各資料表的「活動／內部備註／通知追蹤者／附件」，各項都須確認。成員在「我的連線 → Odoo」填自己的登入名稱與金鑰；管理員開放前顯示「由管理員設定」。管理員可在「成員 → 列選單 → 撤銷 Odoo 帳號」撤銷憑證。
+
+本人金鑰只看持有人自己的網頁對話；即使持有人是 AI 員工的 Owner，也不能看其他同仁或外部通道的對話。新金鑰的 `include_conversations` 預設為 `false`；未開啟時不能讀取對話方法、恢復或訂閱既有 WebChat 對話，也不能下載對話附件或由對話產生的檔案。`activity.list` 只有開啟選項時才顯示本人對話的文字。記憶讀取只限自己的指定分身，或隔離功能啟用下屬於自己的個人員工；共用員工的 Owner 權限不夠。
+
+`[member_api_keys] allow_conversation_content` 預設 `false`，只管建立金鑰時能否授予對話權限；關閉不會移除既有授權。升級前建立的金鑰保留對話權限，標記 `conversations_migrated=true`，但仍只限本人的網頁對話。瀏覽器限定的 `me.member_keys.narrow` 與管理員 `member_keys.admin_narrow` 可移除對話權限或 MCP 範圍，不能擴大。建立金鑰仍須原有的密碼／MFA 重新驗證。
+
+Odoo 依序選擇身分：分身持有人的本人憑證；開啟 `act_as_requester` 時，經驗證請求者的本人憑證；AI 員工自己的帳號；只有列入 `company_key_agents` 的 AI 才能使用公司帳號；最後為未連接。分身不能借用另一位請求者的憑證。本人 API 金鑰只使用持有人的本人 Odoo 憑證，不會改用員工或公司帳號。
+
+本人 Odoo 憑證以 gateway 的機器加密金鑰封存，封裝內容綁定持有人，僅由 gateway 解封。使用時必須符合有效帳號、帳號憑證世代（credential epoch）與已驗證的伺服器指紋（URL、資料庫）。伺服器變更後，須先在同一瀏覽器工作階段透過 `me.odoo.status` 查看新位址與資料庫，才能重新測試。改密碼、登出所有裝置或停權後，舊憑證不能使用；帳號恢復可用時須重新輸入金鑰。離職會刪除憑證，管理員也可撤銷，不會看到秘密。gateway 交給獲授權 MCP 行程的是身分決策、驗證過的端點、帳號資訊與憑證版本；快取版本不同時才附上選定的秘密，絕不交出封存用的機器金鑰。這是應用程式的權限邊界，不是對同一作業系統使用者下無限制行程的隔離。
+
+| 規則 | 固定拒絕的操作 |
+| --- | --- |
+| F1 | 修改、刪除 `ir.attachment`，或透過通用工具新增附件。新增附件請用 `odoo_attachment_add`，從檔案建立。 |
+| F2 | 修改 `ir.model`、所有 `ir.model.*` 子模型及 `ir.rule`。 |
+| F3 | 修改 `res.users.apikeys` 及其點號分隔的子模型。 |
+| F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
+| F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |

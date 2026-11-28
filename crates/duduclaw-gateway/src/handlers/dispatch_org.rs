@@ -102,6 +102,12 @@ impl MethodHandler {
         }
 
         match method {
+            "google.drive_write.get" | "google.drive_write.set"
+            | "google.drive_write.consent_home_start" | "google.drive_write.consent_home_disconnect"
+            | "google.drive_write.consent_home_finish" | "google.drive_write.consent_home_paste" => {
+                require_admin!();
+                boxed_frame(|| self.handle_google_drive_write_rpc(method, params, ctx)).await
+            }
             "mfa.status" | "mfa.enroll_begin" | "mfa.enroll_confirm"
             | "mfa.email_begin" | "mfa.email_confirm" | "mfa.email_remove"
             | "mfa.recovery_regenerate" | "mfa.disable" => {
@@ -113,7 +119,13 @@ impl MethodHandler {
                 require_admin!();
                 self.handle_mfa_rpc(method, params, ctx).await
             }
-            "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            method if super::odoo_member_rpc::owns(method) => {
+                boxed_frame(|| self.handle_odoo_member_rpc(method, params, ctx)).await
+            }
+            "me.google.write_confirmations" | "me.google.write_confirm"
+            | "me.google.chat_confirmations" | "me.google.chat_confirm" | "me.google.status"
+            | "me.google.write_connect_start"
+            | "me.google.write_disconnect"
             | "me.google.connect_start"
             | "me.google.connect_finish"
             | "me.google.connect_paste"
@@ -122,6 +134,14 @@ impl MethodHandler {
             | "users.google_disconnect"
             | "agents.primary_owner_set" => {
                 boxed_frame(|| self.handle_personal_google_rpc(method, params, ctx)).await
+            }
+            "agents.main_access.get" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_get()).await
+            }
+            "agents.main_access.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_main_access_set(params, ctx)).await
             }
             "users.my_history_views" => boxed_frame(|| self.handle_my_history_views(params, ctx)).await,
             "users.team_history.list" => boxed_frame(|| self.handle_team_history_list(params, ctx)).await,
@@ -198,6 +218,33 @@ impl MethodHandler {
             "users.list" => {
                 require_admin!();
                 boxed_frame(|| self.handle_users_list(ctx)).await
+            }
+            "users.dept_grants.list" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_list()).await
+            }
+            "users.dept_grants.set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_set(params, ctx)).await
+            }
+            "users.dept_grants.options" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_options()).await
+            }
+            "users.dept_grants.mine" => boxed_frame(|| self.handle_dept_grants_mine(params, ctx)).await,
+            "me.google_signin.status" | "me.google_signin.link_start" | "me.google_signin.link_complete"
+            | "me.google_signin.unlink" | "me.google_signin.reauth_start" | "me.google_signin.reauth_complete" => {
+                boxed_frame(|| self.handle_google_signin_me_rpc(method, params, ctx)).await
+            }
+            "google.signin.get" | "google.signin.set"
+            | "users.signin_requests.list" | "users.signin_requests.approve" | "users.signin_requests.reject"
+            | "users.google_signin.attest" | "users.google_signin.unlink"
+            | "users.signin_onboarding.retry_avatar" => {
+                boxed_frame(|| self.handle_google_signin_rpc(method, params, ctx)).await
+            }
+            "users.dept_grants.reach_preview" => {
+                require_admin!();
+                boxed_frame(|| self.handle_dept_grants_reach_preview(params)).await
             }
             "users.invite" | "users.invite_status" => {
                 require_admin!();
@@ -375,6 +422,15 @@ impl MethodHandler {
             // and offers this switch instead.
             "google.integration.set" => {
                 require_admin!();
+                if let Err(error) = config_raw_rpc::refuse_drive_write_params(&params) {
+                    return WsFrame::error_response("", &error);
+                }
+                if let Err(error) = config_raw_rpc::refuse_odoo_widening_params(&self.home_dir, &params) {
+                    return WsFrame::error_response("", &error);
+                }
+                if let Err(error) = config_raw_rpc::refuse_member_key_widening_params(&self.home_dir, &params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────
@@ -541,7 +597,15 @@ impl MethodHandler {
                 // Assigning work: a direct Operator/Owner binding, Admin, or
                 // a team grant that derived Operator (a Manager handing work
                 // to a report's employee). Never wider than that.
-                if !ctx.can_assign_to(assigned_to) {
+                let ordinary = params.get("schedule").is_none_or(|v| v.is_null())
+                    && params.get("kind").and_then(Value::as_str)
+                        .is_none_or(|kind| matches!(kind.trim().to_ascii_lowercase().as_str(), "" | "task" | "goal"));
+                if ordinary {
+                    if let Err(frame) = self.deny_main_unless_admitted(ctx, assigned_to,
+                        crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
+                }
+                if !ctx.can_assign_to(assigned_to)
+                    && !(ordinary && self.main_assignment_admitted(ctx, assigned_to).await) {
                     return WsFrame::error_response("", "permission denied");
                 }
                 boxed_frame(|| self.handle_tasks_create(params, ctx)).await
@@ -794,7 +858,11 @@ impl MethodHandler {
                 {
                     return WsFrame::error_response("", "id is required");
                 }
-                boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                if method == "approvals.get" {
+                    boxed_frame(|| self.handle_approvals_get(params, ctx)).await
+                } else {
+                    boxed_frame(|| self.handle_approvals_list(params, ctx)).await
+                }
             }
             "approvals.decide" => {
                 require_manager!();
@@ -886,17 +954,16 @@ impl MethodHandler {
             // ── Budget incidents (WP14-T14.6) ───────────────
             "budget.incidents" => {
                 require_manager!();
-                boxed_frame(|| self.handle_budget_incidents(params)).await
+                boxed_frame(|| self.handle_budget_incidents(params, ctx)).await
             }
 
-            // ── Autopilot (admin only) ──────────────────────
+            // ── Autopilot (department-scoped rules; admin-only breakers) ──────────────────────
             "autopilot.breakers" => {
                 require_admin!();
                 boxed_frame(|| self.handle_autopilot_breakers()).await
             }
             "autopilot.list" => {
-                require_admin!();
-                boxed_frame(|| self.handle_autopilot_list()).await
+                boxed_frame(|| self.handle_department_autopilot(method, params, ctx)).await
             }
 
             _ => boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await,

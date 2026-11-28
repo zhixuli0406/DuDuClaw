@@ -10,7 +10,7 @@
 //!    department and own layers, per-employee switches, usage index), over the
 //!    employees the caller may see there (Viewer or above);
 //! 2. holders that have it switched off, or whose copy failed the install
-//!    scan, are out; non-Admins also exclude main/default employees;
+//!    scan, are out; non-Admins need effective Assign admission for main/default employees;
 //! 3. the runner is the remaining holder with the latest `last_used_at`; if
 //!    none of them ever ran it, the first one by employee id (the order
 //!    `skills.list` returns).
@@ -191,11 +191,12 @@ impl MethodHandler {
             }
             if requested.len() > 5 { return WsFrame::error_response("", "at most five skills may be assigned together"); }
         }
-        let fresh =
+        let mut fresh =
             match crate::review_evidence::audience::fresh_dashboard_context(&self.home_dir, ctx) {
                 Ok(f) => f,
                 Err(_) => return WsFrame::error_response("", "permission denied"),
             };
+        fresh.origin = ctx.origin;
         let (mut holdings, usage_error) = self.skill_holdings(&fresh, skill_name).await;
         if let Some(e) = usage_error {
             warn!(skill = skill_name, error = %e, "skill_assign: usage unavailable, runner falls back to the first holder");
@@ -215,22 +216,31 @@ impl MethodHandler {
                 "skill_not_found: no AI employee you can see has this skill",
             );
         }
+        let mut main_admitted = std::collections::HashSet::new();
         if !fresh.is_admin() {
             let mut eligible = Vec::new();
+            let mut refusal = None;
             for holding in holdings {
-                if self.deny_main_for_non_admin(&fresh, &holding.agent_id).await.is_ok() {
-                    eligible.push(holding);
+                match self.deny_main_unless_admitted(&fresh, &holding.agent_id,
+                    crate::on_behalf_of::access::MainUse::Assign).await {
+                    Ok(()) => {
+                        if self.main_assignment_admitted(&fresh, &holding.agent_id).await {
+                            main_admitted.insert(holding.agent_id.clone());
+                        }
+                        eligible.push(holding);
+                    }
+                    Err(frame) => refusal = Some(frame),
                 }
             }
             if eligible.is_empty() {
-                return WsFrame::error_response("", "主代理僅管理員可以使用。");
+                return refusal.unwrap_or_else(|| WsFrame::error_response("", "主代理僅管理員可以使用。"));
             }
             holdings = eligible;
         }
-        if !holdings.iter().any(|h| fresh.can_assign_to(&h.agent_id)) {
+        if !holdings.iter().any(|h| fresh.can_assign_to(&h.agent_id) || main_admitted.contains(&h.agent_id)) {
             return WsFrame::error_response("", "permission denied");
         }
-        holdings.retain(|h| fresh.can_assign_to(&h.agent_id));
+        holdings.retain(|h| fresh.can_assign_to(&h.agent_id) || main_admitted.contains(&h.agent_id));
         // Multiple chips must all be executable by the same authorized runner.
         // Inline every selected skill: goal rounds do not always load skills.
         for name in requested.iter().skip(1) {
@@ -248,12 +258,22 @@ impl MethodHandler {
                 else { "skill_not_enabled: no AI employee has this skill switched on" },
             );
         };
+        // Recheck the selected runner after the asynchronous skill reads.
+        if let Err(frame) = self.deny_main_unless_admitted(&fresh, &runner.agent_id,
+            crate::on_behalf_of::access::MainUse::Assign).await { return frame; }
         // The same right `tasks.goal_create` asks for, on the runner.
-        if !fresh.can_assign_to(&runner.agent_id) {
+        if !fresh.can_assign_to(&runner.agent_id)
+            && !self.main_assignment_admitted(&fresh, &runner.agent_id).await {
             return WsFrame::error_response("", "permission denied");
         }
         if let Some(frame) = super::tasks_rpc::task_assignee_refusal(&self.home_dir, Some(&runner.agent_id)) {
+            if let Some(refusal) = crate::entry_gate::malformed_assignee_refusal(&self.home_dir, &runner.agent_id) {
+                return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
+            }
             return frame;
+        }
+        if let Err(refusal) = crate::entry_gate::check_task_assignee(&self.home_dir, &runner.agent_id) {
+            return WsFrame::error_response("", &refusal.user_text("dashboard:task-create", None, "task-create"));
         }
         // Files are decoded only once the caller may assign to the runner,
         // and all of them are checked before anything is written.

@@ -268,7 +268,7 @@ mod tests {
     async fn ingress_member_key_scope_rechecks_the_original_key_at_verification() {
         for reason in ["revoke", "delete", "expiry", "malformed_expiry", "epoch", "account", "admin", "switch"] {
             let (home, db, claims) = web_fixture();
-            let key = db.member_key_create(&claims.sub, "ingress", 1, claims.credential_epoch).unwrap();
+            let key = db.member_key_create(&claims.sub, "ingress", 1, claims.credential_epoch, false, &[]).unwrap();
             let ctx = crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap();
             let credential = ChatCredential::Member(ctx.clone());
             let human = capture_web(home.path(), &claims.sub, Some(credential.clone())).await.unwrap();
@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn ingress_member_key_grant_is_capped_by_key_expiry() {
         let (home, db, employee) = issuer_fixture();
-        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch()).unwrap();
+        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch(), false, &[]).unwrap();
         let credential = ChatCredential::Member(crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap());
         let now = duduclaw_mcp_boundary::authority::now_seconds().unwrap();
         // Set the expiry explicitly; no sleeps or dependence on creation TTL.
@@ -345,7 +345,7 @@ mod tests {
     #[test]
     fn ingress_member_key_revoke_between_refresh_and_issuer_snapshot_is_refused() {
         let (home, db, employee) = issuer_fixture();
-        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch()).unwrap();
+        let key = db.member_key_create(employee.user(), "ingress", 1, employee.epoch(), false, &[]).unwrap();
         let credential = ChatCredential::Member(crate::member_keys::authenticate(home.path(), &db, &key.secret).unwrap());
         let live = check_web_identity(home.path(), &credential, employee.user(),
             duduclaw_mcp_boundary::authority::now_seconds().unwrap()).unwrap();
@@ -371,7 +371,7 @@ mod tests {
             assert_eq!(live.expiry, Some(claims.exp));
             assert_eq!(live.generation, None);
             // Unrelated member-key revocation must not change JWT semantics.
-            let key = db.member_key_create(employee.user(), "unrelated", 1, employee.epoch()).unwrap();
+            let key = db.member_key_create(employee.user(), "unrelated", 1, employee.epoch(), false, &[]).unwrap();
             db.member_key_revoke_own(employee.user(), &key.info.id).unwrap();
             let authorization = issue_web(&employee, &live).unwrap();
             assert_eq!(authorization.grant.expires_at, claims.exp.min(authorization.grant.not_before + 30 * 60));

@@ -705,7 +705,7 @@ fn maybe_irreversible_entry_for_a_removed_name_marks_the_new_call() {
     );
     let dir = home.path().join("agents").join("dudu");
     let call = |tool: &str, args: serde_json::Value| {
-        super::static_gate_flags(&dir, tool, &serde_json::json!({ "arguments": args }))
+        super::static_gate_flags(&dir, tool, &serde_json::json!({ "arguments": args }), crate::mcp::approval::OdooApprovalMode::Engine)
     };
     assert_eq!(call("wiki_write", serde_json::json!({"scope": "shared"})), (false, true));
     assert_eq!(call("skill_search", serde_json::json!({"source": "bank"})), (false, true));

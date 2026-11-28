@@ -28,6 +28,7 @@ fn admin() -> UserContext {
 /// A non-admin user who owns agent `a1`.
 fn owner_of_a1() -> UserContext {
     UserContext {
+        origin: duduclaw_auth::acl::ContextOrigin::Other,
         member_key_id: None,
         credential_epoch: 0,
         user_id: "owner-7".into(),
@@ -308,6 +309,64 @@ async fn raw_editor_rejects_invalid_toml_and_escaping_agent_ids() {
 // ── agents.update / agents.inspect ───────────────────────────────────────────
 
 #[tokio::test]
+async fn skill_budget_unlimited_requires_admin_for_flat_and_advanced_updates() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    let owner = owner_of_a1();
+    let initial = std::fs::read_to_string(&path).unwrap();
+    let mut table: toml::Table = initial.parse().unwrap();
+    table.get_mut("evolution").and_then(toml::Value::as_table_mut).unwrap()
+        .remove("skill_budget_unlimited");
+    std::fs::write(&path, toml::to_string_pretty(&table).unwrap()).unwrap();
+
+    // Explicit false over the loader default is allowed, as are other evolution keys.
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "skill_budget_unlimited": false, "skill_token_budget": 1200,
+    }), &owner).await);
+    let stored: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert_eq!(stored["evolution"]["skill_budget_unlimited"].as_bool(), Some(false));
+    assert_eq!(stored["evolution"]["skill_token_budget"].as_integer(), Some(1200));
+
+    for advanced in [false, true] {
+        let params = |value: bool| if advanced {
+            json!({ "agent_id": "a1", "advanced_kv": [{
+                "section": "evolution", "key": "skill_budget_unlimited",
+                "type": "boolean", "value": value,
+            }] })
+        } else {
+            json!({ "agent_id": "a1", "skill_budget_unlimited": value })
+        };
+        let before = std::fs::read(&path).unwrap();
+        let refused_before = audit_rows(home.path(), "agent_authority_refused").len();
+        let e = err(&handler.handle("agents.update", params(true), &owner).await);
+        assert!(e.contains("administrator"), "{e}");
+        assert!(e.contains("evolution.skill_budget_unlimited"), "{e}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let refused = audit_rows(home.path(), "agent_authority_refused");
+        assert_eq!(refused.len(), refused_before + 1);
+        let row = refused.last().unwrap();
+        assert_eq!(row["details"]["keys"], json!(["evolution.skill_budget_unlimited"]));
+        assert_eq!(row["details"]["user_id"], "owner-7");
+
+        // Both owners and admins can narrow an enabled setting; only admins enable it.
+        let administrator = admin();
+        for actor in [&owner, &administrator] {
+            ok(&handler.handle("agents.update", params(true), &admin()).await);
+            let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(true));
+            ok(&handler.handle("agents.update", params(false), actor).await);
+            let written: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            assert_eq!(written["evolution"]["skill_budget_unlimited"].as_bool(), Some(false));
+            assert_eq!(written["evolution"]["skill_token_budget"].as_integer(), Some(1200));
+        }
+        assert_eq!(audit_rows(home.path(), "agent_authority_refused").len(), refused_before + 1);
+    }
+    let inspect = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &owner).await);
+    assert!(!inspect["admin_only_fields"].as_array().unwrap()
+        .contains(&json!("form.skill_budget_unlimited")));
+}
+
+#[tokio::test]
 async fn non_admin_owner_cannot_change_authority_keys_but_can_edit_the_rest() {
     let (home, handler) = handler_with_agent().await;
     let owner = owner_of_a1();
@@ -432,6 +491,34 @@ async fn partial_writes_keep_cron_and_new_keys_round_trip_through_inspect() {
     let raw = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap();
     assert!(!raw.contains("utility = \"\""), "{raw}");
     assert!(!raw.contains("[sticker]"), "{raw}");
+}
+
+#[tokio::test]
+async fn goal_intent_effective_and_own_values_round_trip_through_inspect() {
+    let (home, handler) = handler_with_agent().await;
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], true);
+    assert!(p["settings"]["goal_intent"].get("enabled").is_none());
+
+    std::fs::write(home.path().join("config.toml"), "[general]\ndefault_agent = \"dudu\"\n[goal_intent]\nenabled = false\n").unwrap();
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], false);
+    assert!(p["settings"]["goal_intent"].get("enabled").is_none());
+
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "goal_intent": { "enabled": false },
+    }), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], false);
+    assert_eq!(p["settings"]["goal_intent"]["enabled"], false);
+
+    // Saving an employee value overrides the inherited global setting.
+    ok(&handler.handle("agents.update", json!({
+        "agent_id": "a1", "goal_intent": { "enabled": true },
+    }), &admin()).await);
+    let p = ok(&handler.handle("agents.inspect", json!({ "agent_id": "a1" }), &admin()).await);
+    assert_eq!(p["goal_intent"]["enabled"], true);
+    assert_eq!(p["settings"]["goal_intent"]["enabled"], true);
 }
 
 #[tokio::test]
@@ -737,10 +824,14 @@ channel_token_enc = "abc=="
 
 /// Write the fixture after the handler is built (construction may touch
 /// config.toml), then run one RPC and return the file text.
-async fn rpc_on_fixture(method: &str, params: Value) -> String {
+async fn rpc_on_fixture(method: &str, mut params: Value) -> String {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     std::fs::write(home.path().join("config.toml"), COMMENTED).unwrap();
+    if method == "delegation.set" {
+        let get = ok(&handler.handle("delegation.get", json!({}), &admin()).await);
+        params["expected_hash"] = get["hash"].clone();
+    }
     ok(&handler.handle(method, params, &admin()).await);
     std::fs::read_to_string(home.path().join("config.toml")).unwrap()
 }
@@ -960,4 +1051,109 @@ async fn egress_guard_mode_is_validated_and_audited() {
         assert!(error.contains("security.egress_guard"));
         assert_eq!(config(home.path())["security"]["egress_guard"].as_str(), Some("block"));
     }
+}
+
+#[tokio::test]
+async fn az1_dashboard_admin_can_widen_and_owner_can_only_narrow() {
+    let (home, handler) = handler_with_agent().await;
+    let update = json!({"agent_id":"a1", "monthly_limit_cents":500,
+        "hard_stop":true, "budget":{"daily_cap_cents":100}, "when_unavailable":"deny",
+        "capabilities":{"git_credentials":true}});
+    ok(&handler.handle("agents.update", update, &admin()).await);
+    let widened = json!({"agent_id":"a1", "monthly_limit_cents":1500});
+    assert!(err(&handler.handle("agents.update", widened.clone(), &owner_of_a1()).await).contains("administrator"));
+    ok(&handler.handle("agents.update", widened, &admin()).await);
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1", "monthly_limit_cents":400,
+        "capabilities":{"git_credentials":false}}), &owner_of_a1()).await);
+    let table: toml::Table = std::fs::read_to_string(home.path().join("agents/a1/agent.toml")).unwrap().parse().unwrap();
+    assert_eq!(table["budget"]["monthly_limit_cents"].as_integer(), Some(400));
+    assert_eq!(table["capabilities"]["git_credentials"].as_bool(), Some(false));
+}
+
+
+#[tokio::test]
+async fn raw_agent_editor_and_profile_writer_refuse_odoo_widening() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    let initial: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let with_odoo = |fields: &str| {
+        let mut table = initial.clone();
+        table.insert("odoo".into(), toml::Value::Table(fields.parse::<toml::Table>().unwrap()));
+        toml::to_string(&table).unwrap()
+    };
+    for (before_odoo, after_odoo) in [
+        ("", "act_as_requester=true"),
+        ("act_as_requester=false", "act_as_requester=true"),
+        ("permission_override='engine'", "permission_override='inherit'"),
+        ("permission_override='read_only'", "permission_override='engine'"),
+        ("permission_override='read_only'", ""),
+        ("permission_override='unknown'", "permission_override='engine'"),
+        ("permission_override='unknown'", "permission_override='inherit'"),
+    ] {
+        let before = with_odoo(before_odoo);
+        let after = with_odoo(after_odoo);
+        std::fs::write(&path, &before).unwrap();
+        let frame = handler.handle("config.raw.set", json!({"file":"agent:a1","content":after,
+            "base_hash":super::super::config_commit::content_hash(&before)}), &admin()).await;
+        assert!(err(&frame).contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
+        let error = crate::agent_files::writer::commit_locked(
+            &crate::agent_files::writer::Commit {
+                home:home.path(), agent_id:"a1", key:crate::agent_files::FileKey::AgentToml,
+                expected_hash:None, meta:crate::agent_files::writer::CommitMeta::new("admin-1", "test"),
+                baseline:crate::agent_files::writer::Baseline::Accept,
+            }, |_| Ok(after), || Ok(()),
+        ).err().unwrap();
+        assert!(error.message().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    for (before_odoo, after_odoo) in [
+        ("act_as_requester=true", "act_as_requester=false"),
+        ("permission_override='inherit'", "permission_override='engine'"),
+        ("permission_override='inherit'", "permission_override='read_only'"),
+        ("permission_override='engine'", "permission_override='read_only'"),
+        ("permission_override='read_only'", "permission_override='unknown'"),
+        ("permission_override='engine'", "permission_override='engine'"),
+    ] {
+        let before = with_odoo(before_odoo);
+        let after = with_odoo(after_odoo);
+        std::fs::write(&path, &before).unwrap();
+        ok(&handler.handle("config.raw.set", json!({"file":"agent:a1","content":after,
+            "base_hash":super::super::config_commit::content_hash(&before)}), &admin()).await);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+        std::fs::write(&path, &before).unwrap();
+        crate::agent_files::writer::commit_locked(
+            &crate::agent_files::writer::Commit {
+                home:home.path(), agent_id:"a1", key:crate::agent_files::FileKey::AgentToml,
+                expected_hash:None, meta:crate::agent_files::writer::CommitMeta::new("admin-1", "test"),
+                baseline:crate::agent_files::writer::Baseline::Accept,
+            }, |_| Ok(after.clone()), || Ok(()),
+        ).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+    }
+}
+
+#[tokio::test]
+async fn agents_update_cannot_write_new_odoo_identity_or_permission_fields() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    // Existing whitelisted fields still work; the new keys are not in that whitelist.
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1","odoo":{
+        "profile":"test", "act_as_requester":true, "permission_override":"inherit"}}), &admin()).await);
+    let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(table["odoo"].get("act_as_requester").is_none());
+    assert!(table["odoo"].get("permission_override").is_none());
+    assert!(!err(&handler.handle("agents.update", json!({"agent_id":"a1","advanced_kv":[{
+        "section":"odoo","key":"act_as_requester","type":"boolean","value":true}]}), &admin()).await).is_empty());
+}
+
+#[tokio::test]
+async fn agents_create_cannot_import_caller_supplied_odoo_sections() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().into()).await;
+    ok(&handler.handle_agents_create_as(json!({"name":"created",
+        "agent_toml":"[odoo]\nact_as_requester=true\n",
+        "odoo":{"act_as_requester":true,"permission_override":"inherit"}}), Some(&admin())).await);
+    let text = std::fs::read_to_string(home.path().join("agents/created/agent.toml")).unwrap();
+    let table: toml::Table = text.parse().unwrap();
+    assert!(table.get("odoo").is_none());
 }

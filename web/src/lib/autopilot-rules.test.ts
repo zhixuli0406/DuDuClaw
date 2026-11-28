@@ -5,6 +5,8 @@ import {
   FORM_TRIGGER_EVENTS,
   LEGACY_TRIGGER_EVENTS,
   SERVER_TRIGGER_EVENTS,
+  buildAction,
+  emptyStep,
   buildCreatePayload,
   buildUpdatePayload,
   conditionsToRows,
@@ -69,12 +71,13 @@ function filledForm(trigger: string, actionType: FormActionType): RuleFormState 
     ...emptyRuleForm('sales-lead'),
     name: `rule ${trigger} ${actionType}`,
     triggerEvent: trigger,
-    actionType,
-    prompt: 'Handle {task.title}',
-    skillName: 'weekly-report',
-    channel: 'line',
-    chatId: 'C1234567890',
-    text: 'Heads up: {text}',
+    steps: [{ ...emptyStep(actionType, 'sales-lead'),
+      prompt: 'Handle {task.title}',
+      skillName: 'weekly-report',
+      channel: 'line',
+      chatId: 'C1234567890',
+      text: 'Heads up: {text}',
+    }],
   };
 }
 
@@ -169,12 +172,14 @@ describe('buildCreatePayload — every offered trigger × action', () => {
   });
 
   it('reports missing required fields instead of sending', () => {
-    const form: RuleFormState = { ...filledForm('task_created', 'notify'), chatId: '  ', name: '' };
+    const form = filledForm('task_created', 'notify');
+    form.name = '';
+    form.steps[0].chatId = '  ';
     const { payload, issues } = buildCreatePayload(form);
     expect(payload).toBeNull();
     expect(issues).toEqual([
       { kind: 'missing', field: 'name' },
-      { kind: 'missing', field: 'chat_id' },
+      { kind: 'missing', field: 'chat_id', step: 0 },
     ]);
   });
 
@@ -245,7 +250,8 @@ describe('round-trip of a template-created rule', () => {
   });
 
   it('editing the text keeps unknown-but-valid action keys', () => {
-    const state = { ...formStateFromRule(TEMPLATE_RULE), text: '請藥師立即接手' };
+    const state = formStateFromRule(TEMPLATE_RULE);
+    state.steps[0].text = '請藥師立即接手';
     const { fields } = buildUpdatePayload(state, TEMPLATE_RULE);
     expect(fields).toEqual({
       action: {
@@ -326,9 +332,9 @@ describe('round-trip of a template-created rule', () => {
   it('switching action type drops the old type\'s fields but keeps extras', () => {
     const state: RuleFormState = {
       ...formStateFromRule(TEMPLATE_RULE),
-      actionType: 'delegate',
-      targetAgent: 'pharmacy-care',
-      prompt: 'Follow up: {text}',
+      steps: [{ ...formStateFromRule(TEMPLATE_RULE).steps[0],
+        actionType: 'delegate', targetAgent: 'pharmacy-care', prompt: 'Follow up: {text}',
+      }],
     };
     const { fields } = buildUpdatePayload(state, TEMPLATE_RULE);
     expect(fields?.action).toEqual({
@@ -337,5 +343,157 @@ describe('round-trip of a template-created rule', () => {
       prompt: 'Follow up: {text}',
       screen: { mode: 'local', prompt: 'is it urgent?' },
     });
+  });
+});
+
+
+describe('editable steps', () => {
+  const delegate = { type: 'delegate', target_agent: 'sales-lead', prompt: 'Follow up', require_approval: true };
+  const skill = { type: 'run_skill', target_agent: 'sales-lead', skill_name: 'report', params: { note: '{{task.title}}', count: 3 } };
+  const rule: AutopilotRule = {
+    ...TEMPLATE_RULE,
+    active_window: { days: [1, 2], start: '09:00', end: '18:00', timezone: 'Asia/Taipei' },
+    run_policy: { mode: 'skip' },
+    action: { type: 'steps', screen: { mode: 'local' }, steps: [delegate, { type: 'wait', minutes: 30 }, skill] },
+  };
+
+  it('parses and serializes an ordered steps rule with per-step approval', () => {
+    const form = formStateFromRule(rule);
+    expect(form.actionLocked).toBe(false);
+    expect(form.steps.map(s => [s.actionType, s.requireApproval])).toEqual([
+      ['delegate', true], ['wait', false], ['run_skill', false],
+    ]);
+    expect(buildAction(form)).toEqual({ action: rule.action, issues: [] });
+    expect(buildUpdatePayload(form, rule)).toEqual({ fields: {}, issues: [] });
+  });
+
+  it('preserves extensions, params, screen and step extras when editing and moving steps', () => {
+    const form = formStateFromRule(rule);
+    expect(form.active_window).toEqual(rule.active_window);
+    expect(form.run_policy).toEqual(rule.run_policy);
+    form.name = 'Edited';
+    form.steps[0].prompt = 'New prompt';
+    form.steps = [form.steps[2], form.steps[1], form.steps[0]];
+    const result = buildUpdatePayload(form, rule);
+    expect(result.issues).toEqual([]);
+    expect(result.fields).toEqual({ name: 'Edited', action: {
+      type: 'steps', screen: rule.action.screen,
+      steps: [skill, { type: 'wait', minutes: 30 }, { ...delegate, prompt: 'New prompt' }],
+    } });
+    expect(result.fields).not.toHaveProperty('active_window');
+    expect(result.fields).not.toHaveProperty('run_policy');
+  });
+
+  it('keeps an untouched legacy action exact, and wraps it only for new capabilities', () => {
+    const legacy = { ...TEMPLATE_RULE, action: { ...delegate, require_approval: undefined } };
+    delete legacy.action.require_approval;
+    const form = formStateFromRule(legacy);
+    expect(buildAction(form).action).toEqual(legacy.action);
+    form.steps[0].requireApproval = true;
+    expect(buildAction(form).action).toEqual({ type: 'steps', steps: [{ ...legacy.action, require_approval: true }] });
+  });
+
+  it.each(['active_window', 'run_policy', 'params'] as const)('keeps a single action wrapped for %s', key => {
+    const original = { ...TEMPLATE_RULE, ...(key !== 'params' ? { [key]: {} } : {}),
+      action: key === 'params' ? skill : TEMPLATE_RULE.action };
+    expect(buildAction(formStateFromRule(original)).action.type).toBe('steps');
+  });
+
+  it('keeps a single-step envelope and false approval on the step', () => {
+    const original = { ...rule, action: { type: 'steps', steps: [{ ...skill, require_approval: false }] } };
+    expect(buildAction(formStateFromRule(original)).action).toEqual(original.action);
+    expect(buildAction(formStateFromRule(original)).action).not.toHaveProperty('require_approval');
+  });
+
+  it('keeps truly unknown actions locked', () => {
+    const original = { ...rule, action: { type: 'steps', steps: [{ type: 'future_action' }] } };
+    const form = formStateFromRule(original);
+    expect(form.actionLocked).toBe(true);
+    expect(buildUpdatePayload({ ...form, name: 'Renamed' }, original).fields).toEqual({ name: 'Renamed' });
+  });
+
+  const actionStep = () => ({ ...emptyStep('delegate', 'sales-lead'), prompt: 'Follow up' });
+  const wait = (minutes: number) => ({ ...emptyStep('wait'), minutes });
+  it.each([
+    ['no steps', [], 'stepCount'],
+    ['too many steps', Array.from({ length: 6 }, actionStep), 'stepCount'],
+    ['wait over limit', [wait(1441), actionStep()], 'waitDuration'],
+    ['zero wait', [wait(0), actionStep()], 'waitDuration'],
+    ['fractional wait', [wait(1.5), actionStep()], 'waitDuration'],
+    ['empty wait', [wait(NaN), actionStep()], 'waitDuration'],
+    ['total wait over limit', [wait(800), actionStep(), wait(800), actionStep()], 'waitDuration'],
+    ['consecutive waits', [wait(1), wait(1), actionStep()], 'waitOrder'],
+    ['last wait', [actionStep(), wait(1)], 'waitOrder'],
+    ['only waits', [wait(1)], 'waitOrder'],
+  ])('refuses %s', (_, steps, kind) => {
+    const form = { ...emptyRuleForm(), name: 'Test', steps: steps as ReturnType<typeof emptyStep>[] };
+    const result = buildCreatePayload(form);
+    expect(result.payload).toBeNull();
+    expect(result.issues).toEqual(expect.arrayContaining([expect.objectContaining({ kind })]));
+  });
+
+  it('accepts exactly five steps and 24 hours of waiting; wait has only two keys', () => {
+    const form = { ...emptyRuleForm(), name: 'Test', steps: [actionStep(), wait(700), actionStep(), wait(740), actionStep()] };
+    form.steps[1].requireApproval = true;
+    const result = buildCreatePayload(form);
+    expect(result.issues).toEqual([]);
+    expect((result.payload?.action.steps as unknown[])[1]).toEqual({ type: 'wait', minutes: 700 });
+  });
+});
+
+describe('execution windows and skill parameters', () => {
+  const window = { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00', timezone: null };
+  const context = { companyZone: 'Asia/Taipei', templateFields: ['task.id', 'task.title'] };
+  it('round trips a company-zone window and sets the skip policy', () => {
+    const form = { ...filledForm('task_created', 'run_skill'), active_window: window, windowTouched: true };
+    const { payload, issues } = buildCreatePayload(form, context);
+    expect(issues).toEqual([]);
+    expect(payload).toMatchObject({ active_window: window, run_policy: { outside_window: 'skip' } });
+    const rule = { ...TEMPLATE_RULE, ...payload } as AutopilotRule;
+    expect(formStateFromRule(rule).active_window).toEqual(window);
+    expect(buildUpdatePayload(formStateFromRule(rule), rule, context)).toEqual({ fields: {}, issues: [] });
+  });
+  it.each([['18:00', '18:00'], ['19:00', '09:00']])('rejects a window from %s to %s', (start, end) => {
+    const form = { ...filledForm('task_created', 'delegate'), active_window: { ...window, start, end } };
+    expect(buildCreatePayload(form, context).issues).toContainEqual({ kind: 'windowTime' });
+  });
+  it('rejects no days, no company zone and an invalid explicit zone', () => {
+    const form = { ...filledForm('task_created', 'delegate'), active_window: { ...window, days: [] } };
+    expect(buildCreatePayload(form).issues).toEqual(expect.arrayContaining([{ kind: 'windowDays' }, { kind: 'windowZone' }]));
+    const invalidForm = { ...form, active_window: { ...window, timezone: 'Invalid/Zone' } };
+    expect(buildCreatePayload(invalidForm).issues).toContainEqual({ kind: 'windowZoneInvalid' });
+  });
+  it('clears the window and policy together', () => {
+    const rule = { ...TEMPLATE_RULE, active_window: window, run_policy: { outside_window: 'skip' } };
+    const form = { ...formStateFromRule(rule), active_window: null, windowTouched: true };
+    expect(buildUpdatePayload(form, rule, context).fields).toMatchObject({ active_window: null, run_policy: null });
+  });
+  it('serializes plain text, templates and typed literals', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].params = [
+      { name: 'plain', value: 'hello', type: 'text' },
+      { name: 'title', value: '{{task.title}}', type: 'text' },
+      { name: 'count', value: '3', type: 'number' },
+    ];
+    const result = buildAction(form, context);
+    expect(result.issues).toEqual([]);
+    expect(result.action.steps).toEqual([expect.objectContaining({ params: { plain: 'hello', title: { template: '{{task.title}}', type: 'text' }, count: { template: '3', type: 'number' } } })]);
+  });
+  it('rejects invalid names, duplicates, over ten rows and unavailable fields', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].params = Array.from({ length: 11 }, () => ({ name: 'Bad', value: '{{order.id}}', type: 'text' }));
+    const issues = buildAction(form, context).issues;
+    expect(issues).toContainEqual({ kind: 'paramCount', step: 0, row: 10 });
+    expect(issues).toContainEqual({ kind: 'paramName', step: 0, row: 0 });
+    expect(issues).toContainEqual({ kind: 'paramDuplicate', step: 0, row: 1 });
+    expect(issues).toContainEqual({ kind: 'paramField', step: 0, row: 0, name: 'Bad', path: 'order.id' });
+  });
+  it('rejects malformed references and failed field loading', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].paramsTouched = true;
+    form.steps[0].params = [{ name: 'note', value: '{{ task.title }}', type: 'text' }];
+    expect(buildAction(form, context).issues).toContainEqual({ kind: 'paramSyntax', step: 0, row: 0 });
+    form.steps[0].params[0].value = '{{task.title}}';
+    expect(buildAction(form).issues).toContainEqual({ kind: 'paramFieldsUnavailable', step: 0, row: 0 });
   });
 });

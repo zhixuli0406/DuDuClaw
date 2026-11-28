@@ -37,7 +37,9 @@ impl WebChatState {
                 self.authorize_no_target(user).await.map_err(|_| "account unavailable".to_owned())?;
             }
             let snapshot = self.acl_snapshot(user).await?;
-            (Some(SenderAccess::from_effective(snapshot.access)), Some(snapshot.edition))
+            (Some(SenderAccess::from_effective(snapshot.access)
+                .with_credential_origin(crate::webchat::main_credential_origin())
+                .for_webchat_converse(&self.ctx.home_dir).await), Some(snapshot.edition))
         };
         Ok(TargetPolicy {
             home: self.ctx.home_dir.clone(), registry: self.ctx.registry.clone(),
@@ -61,7 +63,8 @@ impl TargetPolicy {
     fn with_agent_current<T>(&self, write: impl FnOnce() -> T) -> Result<T, String> {
         // Preserve authorize_target's explicit Admin and anonymous-widget rules.
         let Some(sender) = &self.sender else { return Ok(write()); };
-        if matches!(sender.sender, crate::trigger_route::Sender::Admin { .. }) { return Ok(write()); }
+        if matches!(sender.sender, crate::trigger_route::Sender::Admin { .. })
+            && sender.credential_origin != duduclaw_auth::acl::ContextOrigin::MemberKey { return Ok(write()); }
         // No target employee: nothing here depends on one. The account was
         // Active when this policy was built; the caller's generation lease
         // refuses any later change to it.
@@ -85,7 +88,7 @@ impl TargetPolicy {
     pub(crate) fn test_admin() -> Self {
         Self {
             home: PathBuf::new(), registry: Arc::new(tokio::sync::RwLock::new(AgentRegistry::new(PathBuf::new()))),
-            sender: Some(SenderAccess { sender: crate::trigger_route::Sender::Admin { user_id: None }, webchat_scope: None }),
+            sender: Some(SenderAccess { sender: crate::trigger_route::Sender::Admin { user_id: None }, credential_origin: duduclaw_auth::acl::ContextOrigin::Other, webchat_scope: None }),
             edition: None, agent: None, public: true,
         }
     }

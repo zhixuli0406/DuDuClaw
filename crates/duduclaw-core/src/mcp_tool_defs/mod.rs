@@ -27,7 +27,8 @@
 //! 1. Add the `ToolDef` to the matching family file (create a new one and
 //!    register it in [`TOOL_GROUPS`] if no family fits).
 //! 2. Add the enforced scope arm in `mcp_auth::tool_requires_scope`.
-//! 3. Add the catalog row in `crate::tool_catalog` — the drift tests
+//! 3. Add the catalog row in `crate::tool_catalog` (person-only tools use
+//!    `crate::mcp_person_tools` instead and never enter employee pickers) — the drift tests
 //!    (`tool_catalog_covers_all_advertised_tools`,
 //!    `test_catalog_scopes_match_tool_requires_scope`) fail otherwise.
 //! 4. If the tool is gated by a per-agent capability, add it to the matching
@@ -124,6 +125,12 @@ pub const EXTERNAL_TOOLS_WHITELIST: &[&str] = &[
 /// spelled out on every one of them. `param_types_name_real_params` keeps
 /// each row pointing at a parameter that exists.
 pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("drive_create_file", "folder", "boolean"),
+    ("docs_format", "operations", "array"),
+    ("my_tasks_list", "limit", "integer"),
+    ("admin_settings_read", "agent_ids", "array"),
+    ("admin_settings_read", "sections", "array"),
+    ("admin_settings_propose", "items", "array"),
     ("docs_replace_text", "match_case", "boolean"),
     ("calendar_update_event", "notify_attendees", "boolean"),
     ("calendar_delete_event", "notify_attendees", "boolean"),
@@ -146,6 +153,11 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("odoo_search", "limit", "integer"),
     ("odoo_report", "record_id", "integer"),
     ("odoo_partner_search", "limit", "integer"),
+    ("odoo_activity_create", "res_id", "integer"),
+    ("odoo_activity_create", "user_id", "integer"),
+    ("odoo_note_post", "res_id", "integer"),
+    ("odoo_attachment_add", "res_id", "integer"),
+    ("odoo_message_send", "res_id", "integer"),
     ("odoo_create", "values", "object"),
     ("odoo_write", "ids", "array"),
     ("odoo_write", "values", "object"),
@@ -217,6 +229,25 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
         }
     }
 
+    let writeback = matches!(tool.name, "odoo_activity_create" | "odoo_note_post" | "odoo_message_send" | "odoo_attachment_add");
+    if writeback {
+        for name in ["res_id", "user_id"] {
+            if let Some(prop) = properties.get_mut(name) { prop["minimum"] = serde_json::json!(1); }
+        }
+        for name in ["body", "summary", "note"] {
+            if let Some(prop) = properties.get_mut(name) { prop["maxLength"] = serde_json::json!(10_000); }
+        }
+        if let Some(prop) = properties.get_mut("date_deadline") {
+            prop["pattern"] = serde_json::json!("^[0-9]{4}-[0-9]{2}-[0-9]{2}$");
+            prop["format"] = serde_json::json!("date");
+        }
+    }
+    if tool.name == "odoo_attachment_add" {
+        properties.get_mut("name").unwrap()["maxLength"] = serde_json::json!(255);
+        properties.get_mut("file").unwrap()["minLength"] = serde_json::json!(1);
+    }
+    agents::admin_settings_properties(tool.name, &mut properties);
+
     if tool.name == "sheets_update" {
         properties.get_mut("values").unwrap()["items"] = serde_json::json!({
             "type":"array", "items":{"type":["string","number","boolean","null"]}
@@ -274,21 +305,88 @@ pub fn build_tool_schema(tool: &ToolDef) -> Value {
             serde_json::json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
         );
     }
-    serde_json::json!({
+    let mut input_schema = serde_json::json!({"type":"object","properties":properties,"required":required});
+    google::drive_write_schema(tool.name, &mut input_schema);
+    let mut schema = serde_json::json!({
         "name": tool.name,
         "description": tool.description,
-        "inputSchema": {
-            "type": "object",
-            "properties": properties,
-            "required": required
-        },
+        "inputSchema": input_schema,
         "annotations": annotations::tool_annotations(tool.name)
-    })
+    });
+    if writeback { schema["inputSchema"]["additionalProperties"] = serde_json::json!(false); }
+    if matches!(tool.name, "admin_settings_read" | "admin_settings_propose") {
+        schema["inputSchema"]["additionalProperties"] = serde_json::json!(false);
+    }
+    schema
 }
 
 #[cfg(test)]
 mod registration_tests {
     use super::{build_tool_schema, tools, EXTERNAL_TOOLS_WHITELIST, PARAM_TYPES, TOOL_GROUPS};
+
+    #[test]
+    fn company_timezone_schedule_and_reminder_descriptions() {
+        let description = |tool: &str, param: &str| {
+            tools().find(|t| t.name == tool).unwrap().params.iter()
+                .find(|p| p.name == param).unwrap().description
+        };
+        let schedule = description("tasks_create", "schedule");
+        assert!(schedule.contains("company time zone"));
+        assert!(schedule.contains("RFC3339 instant with an offset"));
+        let zone = description("tasks_create", "cron_timezone");
+        for rule in ["administrator's company time zone", "UTC if unset", "member-origin", "daylight saving", "Explicit zones kept", "member DST zones refused"] {
+            assert!(zone.contains(rule), "{zone}");
+        }
+        let reminder = description("create_reminder", "time");
+        assert!(reminder.contains("with an offset"));
+        assert!(reminder.contains("company time zone local time"));
+        for text in [schedule, zone, reminder] {
+            assert!(text.len() <= 200, "description exceeds prompt budget: {text}");
+        }
+        assert!(tools().find(|t| t.name == "create_reminder").unwrap().description.len() <= 200);
+    }
+
+    #[test]
+    fn mcp_odoo_attachment_schema_and_effects() {
+        let tool = tools().find(|t| t.name == "odoo_attachment_add").unwrap();
+        let schema = build_tool_schema(tool);
+        let input = &schema["inputSchema"];
+        assert_eq!(input["additionalProperties"], false);
+        assert_eq!(input["required"], serde_json::json!(["model", "res_id", "file"]));
+        assert_eq!(input["properties"].as_object().unwrap().len(), 4);
+        assert_eq!(input["properties"]["res_id"]["type"], "integer");
+        assert_eq!(input["properties"]["res_id"]["minimum"], 1);
+        assert_eq!(input["properties"]["file"]["type"], "string");
+        assert_eq!(input["properties"]["file"]["minLength"], 1);
+        assert_eq!(input["properties"]["name"]["maxLength"], 255);
+        assert!(input["properties"].get("content").is_none());
+        assert_eq!(crate::effect_of(tool.name), crate::ToolEffect::Modify);
+        assert_eq!(crate::tool_effect::reads_private(tool.name), Some(true));
+        assert_eq!(crate::tool_effect::egress_capable(tool.name), Some(true));
+        assert!(!EXTERNAL_TOOLS_WHITELIST.contains(&tool.name));
+    }
+
+    #[test]
+    fn mcp_odoo_writeback_schemas_and_effects() {
+        for (name, effect) in [("odoo_activity_create", crate::ToolEffect::Modify),
+            ("odoo_note_post", crate::ToolEffect::Modify), ("odoo_message_send", crate::ToolEffect::Send)] {
+            let tool = tools().find(|t| t.name == name).unwrap();
+            let schema = build_tool_schema(tool);
+            let input = &schema["inputSchema"];
+            assert_eq!(input["additionalProperties"], false);
+            assert_eq!(input["properties"]["res_id"]["type"], "integer");
+            assert_eq!(input["properties"]["res_id"]["minimum"], 1);
+            let text = if name == "odoo_activity_create" { "summary" } else { "body" };
+            assert_eq!(input["properties"][text]["maxLength"], 10_000);
+            assert_eq!(input["required"], serde_json::json!(["model", "res_id", text]));
+            assert_eq!(crate::effect_of(name), effect);
+            assert_eq!(crate::tool_effect::reads_private(name), Some(false));
+        }
+        let tool = tools().find(|t| t.name == "odoo_activity_create").unwrap();
+        let schema = build_tool_schema(tool);
+        assert_eq!(schema["inputSchema"]["properties"]["user_id"]["type"], "integer");
+        assert_eq!(schema["inputSchema"]["properties"]["date_deadline"]["format"], "date");
+    }
 
     #[test]
     fn odoo_schemas_declare_numeric_and_boolean_parameters() {

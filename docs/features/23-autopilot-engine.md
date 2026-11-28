@@ -1,5 +1,7 @@
 # Autopilot Rule Engine
 
+Open **Settings → Advanced → Automation rules** for up to five steps (delegate, notify, run skill or wait), an execution window, skill parameters with **Insert event field**, per-step run history and cancellation. Older rules carry **Created before upgrade**. On **Automation** (`/routines`), granted Managers use **Department automation rules**; members use the read-only **Rules affecting my AI employees** tab. Schedules show **Creator no longer has access** when applicable.
+
 > Event-driven automation — when *this* happens, do *that*, with a breaker panel that trips when a rule runs away.
 
 ---
@@ -177,7 +179,7 @@ Admin denies, or 1 hour passes ───> denied / expired (nothing runs)
 
 **Known limitations.**
 
-- `[approval] forbid_self_approval` does not cover the person who wrote the rule: cards are filed by the background `autopilot` sender, and rules do not record who created them, so the Admin who wrote a rule can approve its actions.
+- `[approval] forbid_self_approval` does not cover the person who wrote the rule: cards are filed by the background `autopilot` sender, so the Admin who wrote a rule can approve its actions. Recording a department rule's creator does not change this approval rule.
 - If the gateway stops in the moment after a chat notice was sent but before that was recorded, the notice is sent again after the restart (the Activity Feed entry is never duplicated).
 - Approval integrity relies on AI employees not having write access to the gateway's data files (`approvals.db`, `autopilot.db`) — the same as for every approval — and the native Linux isolation mode provides that boundary.
 
@@ -260,9 +262,21 @@ A `notify` rule that pings a channel when an agent goes idle too long:
 
 ---
 
+## Department rules and member visibility (v1.86.0)
+
+In Enterprise, an Admin may grant a Manager automation controls for named departments. From a signed-in dashboard session, the Manager can list, create, edit, enable, disable and remove those department rules and read their history. Company-wide rules, circuit breakers and monitoring tick sources remain Admin-only. The Manager cannot change a rule's department.
+
+Department rules accept only three triggers: task created, task updated and task status changed. Only task changes made through the dashboard can trigger them; events reported by AI employees themselves cannot. New activity, channel messages, employee idle and run-at-risk events are unavailable. Event sequences and automatically induced rules are unavailable. Work and skill actions must target the same department, excluding the main and personal employees. Notifications must go to the rule owner's verified direct message or a department employee's notification target. Actions requiring approval still need an Admin.
+
+Department scope is checked when a rule triggers, before conditions, screening, approval or actions, and again before each action and after approval. Events from other departments are ignored silently. If a target or notification destination has left the department, the rule is skipped with “部門範圍不符，已略過” (department scope mismatch, skipped). Queued work is checked again before routing and immediately before execution, including whether the rule is still enabled for that department. The owner’s verified direct message qualifies only while the owner is an active Admin or an active Manager with the automation grant for that department; losing that eligibility removes the destination. Rule and recipient eligibility are also re-checked before run and approval notifications. Revoking a Manager’s grant does not automatically disable saved rules.
+
+Signed-in dashboard members also have a read-only view of company-wide and department rules that assign work or run skills on employees they can view. It includes conditions, visible targets, prompt templates or skill names, approval requirements and the last 20 trigger times and results. It omits notification destinations and text, other employees and detailed history. In protected mode, a rule naming another person's personal employee is hidden entirely. Personal API keys cannot use this view.
+
+These views are on **Automation** (`/routines`). See [Department managers](79-department-managers.md) for grants and limitations.
+
 ## Rule CRUD: Dashboard RPC + MCP
 
-Rules are managed from two surfaces, both fail-closed (Admin scope required):
+The following is the Admin rule-management interface. Signed-in dashboard Managers with department grants use the restricted department path described above; the MCP interface still requires Admin scope. Missing authority denies access:
 
 ```
 Dashboard (web UI)                         Agent (MCP)
@@ -278,12 +292,12 @@ Every `create` / `update` validates the `trigger_event`, the `conditions` tree a
 
 ### The dashboard rule form
 
-Settings → Autopilot creates and edits rules. Before v1.67.1 its form sent an action with `agent_id` and `prompt_template` where the server requires `target_agent` and `prompt`, offered a `schedule` trigger that does not exist, and wrote conditions such as `from_status` / `idle_minutes` / `cron` that are not field/op/value leaves. The server refused every save, so no rule could be created from the dashboard. Since v1.67.1:
+Settings → Advanced → Automation rules creates and edits rules. Before v1.67.1 its form sent an action with `agent_id` and `prompt_template` where the server requires `target_agent` and `prompt`, offered a `schedule` trigger that does not exist, and wrote conditions such as `from_status` / `idle_minutes` / `cron` that are not field/op/value leaves. The server refused every save, so no rule could be created from the dashboard. Since v1.67.1:
 
 - The trigger list is the twelve events `autopilot.create` accepts, including `tick` ("A monitoring source reports new data") and `odoo_event` ("An Odoo record changes"). A stored rule whose trigger the form does not offer (for example `cron_tick`) keeps it and shows it.
 - Conditions are a list of field / operator / value rows joined by "all" or "any" matching. Field names are suggested per trigger; any name can be typed. For `tick` and `odoo_event` the field names come from your source or Odoo records, and the form says so. Values for `gt` / `gte` / `lt` / `lte` must be numbers; `in` / `not_in` take a comma-separated list. With no rows the form saves `{ "all": [] }`, which fires on every event.
-- Actions are `delegate`, `notify` and `run_skill`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
-- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than the three above are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, `require_approval`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
+- Steps (at most five) are `delegate`, `notify`, `run_skill` and `wait`, with the required fields from the table above. `notify` offers telegram, line, discord, slack, whatsapp, feishu, googlechat, teams, wecom and dingtalk.
+- Each rule has an edit button. Editing sends only the fields that changed. Conditions the form cannot show as a flat list, event-sequence rules and actions other than these four step types are shown as locked and kept exactly as stored. Action keys the form does not own (`screen`, `context_ticks`, `require_approval`, …) are kept as stored; the form cannot add them to a new rule, so set those through `autopilot.create` / `autopilot.update`.
 - A refused save shows the server's message inside the dialog.
 
 ---

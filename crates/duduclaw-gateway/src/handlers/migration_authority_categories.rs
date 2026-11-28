@@ -86,6 +86,46 @@ impl McpPlan {
 #[cfg(test)] mod tests {
     use super::*;
     use duduclaw_migration::{confirmation::{ConfirmationStore,ApprovalSession},import_manifest::PendingProposal,ids::RequestId};
+    #[test]
+    fn rm143_imported_channel_binding_requires_reentry_and_fresh_handshake() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("users.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../../../duduclaw-import/src/users-v1793.sql")).unwrap();
+        conn.execute_batch("INSERT INTO users(id,email,display_name,password_hash,role,created_at,updated_at)
+            VALUES ('old-user','admin@example.com','Admin','old-secret','admin','now','now');
+            INSERT INTO channel_identities(user_id,channel,channel_user_id,verified,created_at)
+            VALUES ('old-user','telegram','123456789',1,'now');
+            PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        drop(conn);
+        let request = duduclaw_import::ImportRequest { version:1, migration_id:RequestId([4;16]), employee:None,
+            source_id:"old:users".into(), kind:duduclaw_import::SourceKind::AuthorityUsersSqlite,
+            title:"users.db".into(), legacy_agent:None, has_wal:false, blob_handle:None };
+        let extracted = duduclaw_import::authority::extract(&request, std::fs::File::open(path).unwrap(), None).unwrap();
+        let proposals: Vec<PendingProposal> = serde_json::from_value(serde_json::to_value(extracted).unwrap()).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(duduclaw_auth::UserDb::new(&target.path().join("users.db")).unwrap());
+        stage_import_proposals(target.path(), &proposals).unwrap();
+        let store = ConfirmationStore::open_existing(&target.path().join("migration-confirmations.db")).unwrap();
+        let binding = store.list().unwrap().into_iter().find(|p| p.category == ConfirmationCategory::ChannelBinding).unwrap();
+        let authority = GatewayAuthority::new(target.path().into()).unwrap().with_user_db(db.clone());
+        assert!(authority.validate_fresh(&binding).is_err());
+        let conn = rusqlite::Connection::open(target.path().join("users.db")).unwrap();
+        for table in ["channel_identities", "chat_link_handshakes", "chat_link_attempts"] {
+            assert_eq!(conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        }
+        // A manual re-entry is an Admin prefill, never restored source proof.
+        let user = db.create_user("admin@example.com", "Admin", "fixture-password-only", duduclaw_auth::UserRole::Admin).unwrap();
+        db.bind_channel_identity(&user.id, "telegram", "123456789", true).unwrap();
+        let unproven: bool = conn.query_row("SELECT proof_method IS NULL AND proof_user_id IS NULL
+            AND proven_at IS NULL AND proof_account IS NULL AND proof_dm IS NULL FROM channel_identities",
+            [], |r| r.get(0)).unwrap();
+        assert!(unproven);
+        assert_eq!(db.channel_identity_proof_status(&user.id, "telegram", "123456789").unwrap(),
+            Some(duduclaw_auth::otp::ChannelProofStatus::AdminPrefilled));
+        assert!(db.approval_proof(&user.id, "telegram").unwrap().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn migration_authority_planted_admin_and_mcp_inactive_until_individual_confirmation() {
@@ -199,9 +239,10 @@ impl ProfilePlan {
     fn migration_authority_task_schema_matches_fresh_store() {
         let home=tempfile::tempdir().unwrap();let _store=crate::task_store::TaskStore::open(home.path()).unwrap();
         let actual=rusqlite::Connection::open(home.path().join("tasks.db")).unwrap();let expected=rusqlite::Connection::open_in_memory().unwrap();
-        // Fresh stores are the newest catalog: v1.81 plus the v1.82 goal origin proof column.
+        // Fresh stores include the v1.82 origin proof column and v1.86 listing index.
         expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-v181.sql")).unwrap();
         expected.execute_batch("ALTER TABLE tasks ADD COLUMN source_origin_proof TEXT;").unwrap();
+        expected.execute_batch(include_str!("../../../duduclaw-import/src/tasks-employee-created-v186.sql")).unwrap();
         fn schema(c:&rusqlite::Connection)->Vec<(String,String,String,Option<String>)> {c.prepare("SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name,tbl_name,sql").unwrap().query_map([],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect()}
         assert_eq!(schema(&actual),schema(&expected));
     }

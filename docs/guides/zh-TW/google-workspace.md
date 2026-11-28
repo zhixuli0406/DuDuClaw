@@ -1,10 +1,12 @@
 # Google Workspace 工具與安全模型
 
-設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、二十九個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
+在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。
+
+設定步驟見[連接 Google](google-setup.md)。原生 REST 涵蓋九項服務、三十八個工具；Apps Script 涵蓋三項服務，含狀態查詢共八個動作。整合關閉時仍可開啟儀表板，工具要等 `[integrations] google_workspace = true` 才會顯示。DuDuClaw 不提供共用 OAuth 憑證。
 
 ## 你會拿到什麼
 
-二十九個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
+三十八個面向 agent 的 MCP 工具，由兩個 scope 管控（`google:read` / `google:write`）：
 
 | 工具 | 類別 | 做什麼 |
 |------|-------|--------------|
@@ -55,17 +57,15 @@
 `tasksmcp` 兩個端點都回 404，Google 的 MCP 文件也沒有列出這兩項服務），
 這正是這裡選擇原生實作的原因。
 
+上表列出既有工具；九個新增雲端硬碟寫入工具的參數、動作開關與效果類別見 [Drive 寫入參考](google-mcp.md#雲端硬碟寫入工具)。新工具需要原生 REST 與 `google:write`；既有六個 Docs／Sheets 寫入工具沿用原本規則。
+
 ### 安全設計
 
 - **寄信需要逐次確認。** `gmail_create_draft` 只存草稿；`gmail_send_draft` 每次都要人確認卡片才會寄出。
 - **讀取就只是讀取。** 屬於 read 類別的工具無法修改 Gmail 或 Calendar 中的
   任何內容。
-- **Forms、Drive、Slides 全部唯讀。** 沒有任何工具會建立或編輯表單、寫入
-  Drive、或修改簡報。只有 Gmail（草稿與核准寄出）、Google Chat（本人確認後傳送）、
-  Calendar、Sheets、Docs 和 Tasks 有寫入工具。
-- **最小權限原則。** Drive 申請的是 `drive.readonly`（絕不是 `drive` 或
-  `drive.file`，文件與試算表建立使用各自服務的範圍），Slides 申請
-  `presentations.readonly`。Docs 的寫入工具沿用完整的 `documents` scope。
+- **Forms 與 Slides 維持唯讀。** Drive 寫入由九個工具另外管控，四項動作開關預設全關，詳見[寫入工具與資料夾規則](google-mcp.md#雲端硬碟寫入工具)。
+- **寫入權限分開保存。** 一般 Drive 讀取使用 `drive.readonly`；獨立寫入連線要求 `drive`、`documents` 與 `spreadsheets`，憑證留在 gateway。錄影匯入另用 `drive.file`，Slides 使用 `presentations.readonly`。
 - **可選的審批閘門。** 想更謹慎的話，可以把寫入類工具列進 agent 的
   `agent.toml [capabilities] approval_required_tools`，讓每一次草稿、
   活動或試算表寫入都要等待 HITL 審批：
@@ -167,7 +167,7 @@ allowed_subject_domains = ["customer.com"]
 
 網站的公開訪客（WebChat 小工具、Odoo 線上客服）在任何設定下都會被拒。沒有綁定帳號的通道發話者，除非設成 `anyone`，否則也會被拒。
 
-**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或——僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時——同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
+**Google Chat 的發話者（v1.82）**：管理員在 **使用者 → 驗證身分** 綁定了他的 Chat 使用者代號，或，僅在管理員開啟預設關閉的選用設定 `[google] chat_identity_from_account`（管理 → 整合 → Google）時，同仁在 **我的連線** 連結了自己的 Google 帳號（以 Google 帳號代號比對；這項自動認出**尚未以真實 Google Workspace 驗證**，除非您已在自己的 Workspace 確認兩種代號一致，否則請保持關閉）時，這裡就把他當成該同仁本人。不做 Email 比對。v1.82 以前所有 Chat 發話者都算沒有綁定，只有 `anyone` 會放行。詳見 [儀表板設定 → 使用者 → 驗證身分](dashboard-settings.md#使用者--驗證身分通訊軟體身分v182)。
 
 ### 用不了的時候
 
