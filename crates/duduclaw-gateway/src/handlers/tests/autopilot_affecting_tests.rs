@@ -71,8 +71,9 @@ async fn affecting_me_projects_company_and_department_rules_and_twenty_history_r
     for row in rules {
         let keys: BTreeSet<&str> = row.as_object().unwrap().keys().map(String::as_str).collect();
         assert_eq!(keys, ["id", "name", "enabled", "trigger_event", "conditions", "action_kinds",
-            "target_agents", "actions", "require_approval", "owner_department", "history"].into());
+            "target_agents", "actions", "require_approval", "owner_department", "history", "creator_access_lost"].into());
         assert_eq!(row["target_agents"], json!(["a1"]));
+        assert_eq!(row["creator_access_lost"], true);
     }
     assert!(company["owner_department"].is_null());
     assert_eq!(company["require_approval"], false);

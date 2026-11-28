@@ -416,3 +416,53 @@ async fn display_creator_access_lost_preserves_unknown_reads_and_mirror_drift() 
     assert_eq!(display.display_creator_access_lost(Some("mgrA"), "a1"), None);
     assert_eq!(display.display_creator_access_lost(None, "a1"), Some(false));
 }
+
+#[tokio::test]
+async fn display_autopilot_creator_access_checks_exact_automation_grants_and_accounts() {
+    let f = fixture().await;
+    let mut display = DisplayAutopilotCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(None, None), Some(false));
+    assert_eq!(display.display_creator_access_lost(Some("missing"), Some("sales")), Some(true));
+    for department in [None, Some("sales"), Some("mfg")] {
+        assert_eq!(display.display_creator_access_lost(Some("admin"), department), Some(false));
+    }
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), Some("sales")), Some(false));
+    for department in [None, Some("mfg"), Some("Sales"), Some("sale"), Some("sales-extra")] {
+        assert_eq!(display.display_creator_access_lost(Some("mgrA"), department), Some(true));
+    }
+    for user in ["mgrB", "emp", ""] {
+        assert_eq!(display.display_creator_access_lost(Some(user), Some("sales")), Some(true));
+    }
+    // A direct binding never substitutes for Automation authority.
+    f.db.bind_agent("mgrA", "a2", duduclaw_auth::AccessLevel::Owner).unwrap();
+    f.db.set_dept_grants("admin", "mgrA", "sales", &[GrantGroup::Schedules], true).unwrap();
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), Some("sales")), Some(false));
+    let mut fresh = DisplayAutopilotCreatorAccessCache::load(&f.h).await;
+    assert_eq!(fresh.display_creator_access_lost(Some("mgrA"), Some("sales")), Some(true));
+    assert_eq!(fresh.creators.len(), 1);
+    f.db.set_dept_grants("admin", "mgrA", "sales", &[GrantGroup::Automation], true).unwrap();
+    f.h.set_test_edition(Some(EditionProfile::Personal)).await;
+    let mut personal = DisplayAutopilotCreatorAccessCache::load(&f.h).await;
+    assert_eq!(personal.display_creator_access_lost(Some("mgrA"), Some("sales")), Some(true));
+    assert_eq!(personal.display_creator_access_lost(Some("admin"), Some("sales")), Some(false));
+    f.db.set_user_status("admin", UserStatus::Suspended).unwrap();
+    f.db.set_user_status("mgrA", UserStatus::Suspended).unwrap();
+    let mut suspended = DisplayAutopilotCreatorAccessCache::load(&f.h).await;
+    for user in ["admin", "mgrA"] {
+        assert_eq!(suspended.display_creator_access_lost(Some(user), Some("sales")), Some(true));
+    }
+}
+
+#[tokio::test]
+async fn display_autopilot_creator_access_preserves_unknown_and_legacy() {
+    let f = fixture().await;
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute_batch("DROP TABLE department_manager_grants").unwrap();
+    let mut display = DisplayAutopilotCreatorAccessCache::load(&f.h).await;
+    assert_eq!(display.display_creator_access_lost(Some("mgrA"), Some("sales")), None);
+    assert_eq!(display.display_creator_access_lost(None, Some("sales")), Some(false));
+    assert_eq!(display.display_creator_access_lost(Some("admin"), None), Some(false));
+    display.db = None;
+    assert_eq!(display.display_creator_access_lost(Some("admin"), None), None);
+    assert_eq!(display.display_creator_access_lost(None, None), Some(false));
+}

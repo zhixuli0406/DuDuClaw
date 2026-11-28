@@ -294,6 +294,41 @@ impl DisplayCreatorAccessCache {
     }
 }
 
+/// DISPLAY ONLY: rule ownership is department-based, never an agent binding.
+/// Batch all rows through one request-local cache, reading each creator once.
+pub(crate) struct DisplayAutopilotCreatorAccessCache {
+    db: Option<std::sync::Arc<duduclaw_auth::UserDb>>,
+    grants_enabled: bool,
+    creators: BTreeMap<String, Result<Option<duduclaw_auth::dept_grants::DisplayCreatorAccess>, String>>,
+}
+
+impl DisplayAutopilotCreatorAccessCache {
+    pub(crate) async fn load(h: &MethodHandler) -> Self {
+        Self {
+            db: h.user_db().await,
+            grants_enabled: !h.resolve_edition_profile().await.is_personal(),
+            creators: BTreeMap::new(),
+        }
+    }
+
+    /// None is unknown and must become JSON null. Never use this to authorize.
+    pub(crate) fn display_creator_access_lost(
+        &mut self, user_id: Option<&str>, owner_department: Option<&str>,
+    ) -> Option<bool> {
+        let Some(user_id) = user_id else { return Some(false); };
+        let db = self.db.as_ref()?;
+        let record = self.creators.entry(user_id.to_owned())
+            .or_insert_with(|| db.display_creator_access(user_id));
+        let Some(record) = record.as_ref().ok()? else { return Some(true); };
+        if record.user.status != UserStatus::Active { return Some(true); }
+        if record.user.role == UserRole::Admin { return Some(false); }
+        let Some(department) = owner_department else { return Some(true); };
+        Some(!self.grants_enabled || record.user.role != UserRole::Manager
+            || !record.grants.iter().any(|(name, groups)|
+                name == department && groups.contains(&GrantGroup::Automation)))
+    }
+}
+
 /// Exhaustive on both axes: every new group or action requires an explicit decision.
 pub(crate) fn action_allowed(g: GrantGroup, a: GrantAction) -> bool {
     use GrantAction::*;
