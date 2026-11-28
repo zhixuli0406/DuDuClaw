@@ -2678,11 +2678,15 @@ export interface InvitationPreview {
 }
 export type OnboardingStep = 'channel' | 'google' | 'example' | 'capabilities';
 export type OnboardingStepStatus = 'pending' | 'done' | 'skipped';
+export type SigninStepStatus = 'done' | 'recommended' | 'required' | 'unknown' | 'waiting_admin' | 'preparing' | 'blocked_domain' | 'pending' | 'admin_binds' | 'not_applicable' | 'needs_reverify' | 'invalid';
+export type SigninSteps = Record<'mfa' | 'avatar' | 'google' | 'google_chat' | 'odoo', { status: SigninStepStatus; reason?: string }>;
 export interface OnboardingProgress {
   enabled: boolean;
   dismissed: boolean;
   password_done: boolean;
   steps: Record<OnboardingStep, OnboardingStepStatus>;
+  signin_steps?: SigninSteps;
+  steps_remaining?: number;
   examples: string[];
 }
 export interface NewMemberInput {

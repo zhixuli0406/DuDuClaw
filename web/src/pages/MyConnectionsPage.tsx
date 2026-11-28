@@ -5,6 +5,7 @@ import { Link, useSearchParams } from 'react-router';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { DriveWriteMemberCard } from '@/components/connections/DriveWriteMemberCard';
 import { DriveWriteConfirmations } from '@/components/connections/DriveWriteConfirmationCard';
+import { GoogleSigninCard } from '@/components/connections/GoogleSigninCard';
 import { ChatLinkCard } from '@/components/connections/ChatLinkCard';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast } from '@/lib/toast';
@@ -123,6 +124,7 @@ export function MyConnectionsPage() {
       </>}
     </CardContent></Card>
     {status && !error && <DriveWriteMemberCard status={status} onRefresh={load} onStarted={started => { setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); }} />}
+    <GoogleSigninCard />
     <DriveWriteConfirmations />
     {isAdmin && <ChatLinkCard />}
     {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">

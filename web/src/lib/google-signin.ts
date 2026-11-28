@@ -46,3 +46,18 @@ export const signinRequests = {
   }) as Promise<{ user_id: string }>,
   reject: (id: string) => client.call('users.signin_requests.reject', { id }) as Promise<{ rejected: boolean }>,
 };
+
+export interface MemberGoogleSigninStatus {
+  available: boolean;
+  linked: boolean;
+  has_password: boolean;
+  hd?: string;
+  email_at_link?: string;
+  linked_at?: number;
+}
+export const memberGoogleSignin = {
+  status: () => client.call('me.google_signin.status', {}) as Promise<MemberGoogleSigninStatus>,
+  linkStart: (password: string) => client.call('me.google_signin.link_start', { password }) as Promise<{ authorization_url: string }>,
+  linkComplete: (ticket: string) => client.call('me.google_signin.link_complete', { ticket }) as Promise<Record<string, never>>,
+  unlink: (password: string) => client.call('me.google_signin.unlink', { password }) as Promise<{ unlinked: boolean }>,
+};
