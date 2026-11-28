@@ -8826,6 +8826,7 @@ export const api = {
   // WP14-T14.7 — HITL approval center. `list` is manager-gated; `decide` errors
   // on already-terminal requests or board-kind requests without admin scope.
   approvals: {
+    get: (id: string) => client.call('approvals.list', { id }) as Promise<{ approvals: ApprovalItem[]; count: number }>,
     /** `actionKind` (e.g. 'knowledge_quarantine') filters to one approval kind. */
     list: (agentId?: string, actionKind?: string) =>
       client.call('approvals.list', {

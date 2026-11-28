@@ -35,16 +35,16 @@ function payloadField(payload: unknown, key: string): string {
  * change itself. Content and diff come from `agent_files.pending_get`
  * (admins only); every server string is shown as plain text.
  */
-export function AgentFileChangeFacts({ approval, agentName }: { approval: ApprovalItem; agentName?: string }) {
+export function AgentFileChangeFacts({ approval, agentName, preview }: { approval: ApprovalItem; agentName?: string; preview?: AgentFilePendingResponse | null }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const role = useAuthStore((s) => s.user?.role);
   const isAdmin = hasMinRole(role, 'admin');
-  const [data, setData] = useState<AgentFilePendingResponse | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [data, setData] = useState<AgentFilePendingResponse | null>(preview ?? null);
+  const [failed, setFailed] = useState(preview === null);
 
   useEffect(() => {
-    if (!isAdmin) return;
+    if (preview !== undefined || !isAdmin) return;
     let alive = true;
     setData(null);
     setFailed(false);
@@ -55,7 +55,7 @@ export function AgentFileChangeFacts({ approval, agentName }: { approval: Approv
     return () => {
       alive = false;
     };
-  }, [approval.id, isAdmin]);
+  }, [approval.id, isAdmin, preview]);
 
   const file = data?.file ?? payloadField(approval.payload, 'file');
   const employee = agentName ?? data?.agent_id ?? approval.agent_id ?? payloadField(approval.payload, 'agent_id');
@@ -93,7 +93,7 @@ export function AgentFileChangeFacts({ approval, agentName }: { approval: Approv
         <dd className="min-w-0 whitespace-pre-wrap break-words">{reason || '—'}</dd>
       </dl>
 
-      {!isAdmin ? (
+      {!isAdmin && preview === undefined ? (
         <p className="text-xs text-muted-foreground">{t('agentFiles.approval.adminOnly')}</p>
       ) : failed ? (
         <p role="alert" className="text-xs text-destructive">{t('agentFiles.approval.loadFailed')}</p>

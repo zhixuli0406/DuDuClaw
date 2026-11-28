@@ -4,7 +4,10 @@ import { screen, fireEvent, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore } from '@/stores/auth-store';
 import { LoginPage } from './LoginPage';
-import { useLocation } from 'react-router';
+import { MemoryRouter, useLocation } from 'react-router';
+import { render } from '@testing-library/react';
+import { IntlProvider } from 'react-intl';
+import en from '@/i18n/en.json';
 
 function LocationProbe() {
   const location = useLocation();
@@ -130,4 +133,24 @@ it('keeps persistence opt-in and passes the checked choice to password login', a
   fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'current-password' } });
   fireEvent.click(screen.getByRole('button', { name: 'Sign In' }));
   await waitFor(() => expect(login).toHaveBeenCalledWith('owner@example.com', 'current-password', true));
+});
+
+function ConfirmReturnProbe() { const loc = useLocation(); return <div data-testid="confirm-location">{loc.pathname + loc.hash}</div>; }
+it.each([
+  [`/approvals/confirm#ticket=${'b'.repeat(64)}`, `/approvals/confirm#ticket=${'b'.repeat(64)}`],
+  ['/approvals/confirm#ticket=bad', '/'],
+  ['/arbitrary', '/'],
+  ['https://evil.test/approvals/confirm', '/'],
+])('keeps only an allowlisted confirmation return after login: %s', async (from, expected) => {
+  useAuthStore.setState({ tryLocalSession: vi.fn().mockResolvedValue(false) });
+  render(<IntlProvider locale="en" messages={en}><MemoryRouter initialEntries={[{ pathname: '/login', state: { from } }]}>
+    <LoginPage /><ConfirmReturnProbe />
+  </MemoryRouter></IntlProvider>);
+  await screen.findByLabelText('Email');
+  if (expected !== '/') expect(screen.getByText(en['approvalConfirm.loginNote'])).toBeInTheDocument();
+  else expect(screen.queryByText(en['approvalConfirm.loginNote'])).not.toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'owner@example.com' } });
+  fireEvent.change(screen.getByLabelText('Password'), { target: { value: 'password' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Sign In' }));
+  await waitFor(() => expect(screen.getByTestId('confirm-location').textContent).toBe(expected));
 });

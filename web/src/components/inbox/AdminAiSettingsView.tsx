@@ -48,18 +48,9 @@ export function parseAdminAiSettings(payload: unknown): SettingsPayload | null {
   return payload as unknown as SettingsPayload;
 }
 
-export function AdminAiSettingsView({ approval, payload, onApprove, onReject, decideError }: {
-  approval: ApprovalItem;
-  payload: SettingsPayload;
-  onApprove: (expectedDigest?: string) => void;
-  onReject: () => void;
-  decideError?: unknown;
-}) {
+export function AdminAiSettingsFacts({ payload }: { payload: SettingsPayload }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
-  const expiresAt = approval.expires_at ?? Math.round(Date.parse(approval.created_at) / 1000) + approval.ttl_seconds;
-  const now = useNowTick(Number.isFinite(expiresAt));
-  const expiry = expiryState({ timestamp: approval.created_at, expiresAt }, now);
   const cronText = (raw: string) => describeCron(raw, {
     hourly: (mm) => t('controls.cron.desc.hourly', { mm }),
     daily: (time) => t('controls.cron.desc.daily', { time }),
@@ -79,12 +70,7 @@ export function AdminAiSettingsView({ approval, payload, onApprove, onReject, de
       </div>
     ));
   };
-  return (
-    <div className="min-w-0 space-y-4" data-testid="admin-ai-settings">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <h3 className="font-medium">{t('approvals.kind.admin_ai_settings')}</h3>
-        {expiry && <Badge variant="secondary">{t('approval.adminAi.remaining', { time: timeRemaining(expiry.remainingMs) })}</Badge>}
-      </div>
+  return <div className="min-w-0 space-y-4">
       <section className="space-y-1 text-sm">
         <h4 className="text-xs font-medium text-muted-foreground">{t('approval.adminAi.source')}</h4>
         <p className="break-words">{t('approval.adminAi.admin')}: {payload.admin}</p>
@@ -107,6 +93,28 @@ export function AdminAiSettingsView({ approval, payload, onApprove, onReject, de
         </div>
       </section>
       {payload.reason?.trim() && <section className="space-y-1 text-sm"><h4 className="text-xs font-medium text-muted-foreground">{t('approval.adminAi.reason')}</h4><p className="whitespace-pre-wrap break-words">{payload.reason}</p></section>}
+    </div>;
+}
+
+export function AdminAiSettingsView({ approval, payload, onApprove, onReject, decideError }: {
+  approval: ApprovalItem;
+  payload: SettingsPayload;
+  onApprove: (expectedDigest?: string) => void;
+  onReject: () => void;
+  decideError?: unknown;
+}) {
+  const intl = useIntl();
+  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const expiresAt = approval.expires_at ?? Math.round(Date.parse(approval.created_at) / 1000) + approval.ttl_seconds;
+  const now = useNowTick(Number.isFinite(expiresAt));
+  const expiry = expiryState({ timestamp: approval.created_at, expiresAt }, now);
+  return (
+    <div className="min-w-0 space-y-4" data-testid="admin-ai-settings">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <h3 className="font-medium">{t('approvals.kind.admin_ai_settings')}</h3>
+        {expiry && <Badge variant="secondary">{t('approval.adminAi.remaining', { time: timeRemaining(expiry.remainingMs) })}</Badge>}
+      </div>
+      <AdminAiSettingsFacts payload={payload} />
       <p className="rounded-lg bg-muted p-3 text-sm">{t('approval.adminAi.recheck')}</p>
       {decideError != null && <div role="alert" className="whitespace-pre-wrap break-words text-sm text-destructive">{formatErrorDetail(decideError) || formatError(decideError)}</div>}
       <div className="flex flex-wrap gap-2 border-t border-surface-border pt-3">

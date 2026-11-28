@@ -1,3 +1,4 @@
+import { approvalConfirmReturn } from '@/lib/approval-step-up';
 import { googleAuthorizationReturn } from '@/lib/google-authorization';
 import { useState, useEffect, type FormEvent } from 'react';
 import { useLocation, useNavigate } from 'react-router';
@@ -20,7 +21,7 @@ export function LoginPage() {
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: unknown } | null)?.from;
-  const returnTo = googleAuthorizationReturn(from) ?? browserWatchReturn(from) ?? '/';
+  const returnTo = googleAuthorizationReturn(from) ?? approvalConfirmReturn(from) ?? browserWatchReturn(from) ?? '/';
   const brandName = useEffectiveName();
   const companyName = useCompanyName();
   const company = useCompanyStore((state) => state.company);
@@ -190,6 +191,7 @@ export function LoginPage() {
         </div>
 
         <Card className="gap-5 p-6">
+          {approvalConfirmReturn(returnTo) && <p role="note" className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'approvalConfirm.loginNote' })}</p>}
           {error && (
             <div
               role="alert"

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter, Routes, Route } from 'react-router';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import { IntlProvider } from 'react-intl';
 import '@/test/mocks';
 import { AuthGuard, EditionGuard } from './AuthGuard';
@@ -214,4 +214,20 @@ describe('<EditionGuard>', () => {
     );
     expect(screen.getByText('both-editions')).toBeInTheDocument();
   });
+});
+
+function ReturnProbe() {
+  return <div data-testid="return-from">{(useLocation().state as { from?: string } | null)?.from ?? 'no return'}</div>;
+}
+it.each([
+  [`/approvals/confirm#ticket=${'a'.repeat(64)}`, `/approvals/confirm#ticket=${'a'.repeat(64)}`],
+  ['/approvals/confirm#ticket=bad', 'no return'],
+  ['/arbitrary', 'no return'],
+])('restricts the approval login return for %s', (path, expected) => {
+  useAuthStore.setState({ initialized: true, isAuthenticated: false });
+  render(<MemoryRouter initialEntries={[path]}><Routes>
+    <Route element={<AuthGuard />}><Route path="*" element={<div>protected</div>} /></Route>
+    <Route path="/login" element={<ReturnProbe />} />
+  </Routes></MemoryRouter>);
+  expect(screen.getByTestId('return-from')).toHaveTextContent(expected);
 });
