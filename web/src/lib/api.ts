@@ -7340,6 +7340,20 @@ export interface SkillTrustSettings {
   }[];
 }
 
+export interface MyOdooStatus {
+  member_credentials_enabled: boolean;
+  connected: boolean;
+  state: 'ok' | 'needs_reverify' | 'invalid' | null;
+  login: string | null;
+  odoo_name: string | null;
+  server: string | null;
+  database: string | null;
+  verified_at: string | null;
+  last_used_at: string | null;
+}
+
+const odooStatus = () => client.call('me.odoo.status', {}) as Promise<MyOdooStatus>;
+
 export const api = {
   skillTrust: {
     get: () => client.call('skill_trust.get', {}) as Promise<SkillTrustSettings>,
@@ -10079,13 +10093,19 @@ export const api = {
     dismissMigrationHint: () =>
       client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
+  myOdoo: {
+    status: odooStatus,
+    connect: (params: { login: string; api_key: string }) => client.call('me.odoo.connect', params) as Promise<MyOdooStatus>,
+    test: () => client.call('me.odoo.test', {}) as Promise<MyOdooStatus>,
+    disconnect: () => client.call('me.odoo.disconnect', {}) as Promise<{ disconnected: true }>,
+  },
   /** RM-064: the caller's own read-only status credentials. */
   memberKeys: {
     policyGet: () => client.call('member_keys.policy_get', {}) as Promise<MemberKeyPolicyResult>,
     policySet: (update: MemberKeyPolicyUpdate) => client.call('member_keys.policy_set', update),
     narrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('me.member_keys.narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
     adminNarrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('member_keys.admin_narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
-    odooStatus: () => client.call('me.odoo.status', {}) as Promise<{ connected: boolean; member_credentials_enabled: boolean }>,
+    odooStatus,
     list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa'; policy: MemberKeyPolicy }>,
     create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }, permissions?: MemberKeyPermissions) =>
       client.call('me.member_keys.create', { name, expires_in_days, ...proof, ...permissions }) as Promise<MemberKeyCreated>,
