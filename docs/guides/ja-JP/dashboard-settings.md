@@ -1103,4 +1103,4 @@ v1.85.x に戻す前に `[member_api_keys]` の `allow_conversation_content`、`
 
 `me.member_keys.list {limit?, cursor?}` は `policy:{allow_conversation_content,allow_mcp_scopes}` も返します。会話内容の許可は作成時のみ適用します。MCP は保存済みキースコープと現在の `allow_mcp_scopes` の共通部分を毎回適用し、スコープを再追加すると作成時にそのスコープがあった既存キーも再び利用できます。
 
-`odoo.access_get {}` は権限設定が読み取れない、または形式不正の場合に `{readable:false, message}` を返し、その状態では `odoo.access_set` は保存を拒否します。正常な get/set は `readable:true` と `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}` を返します。値はそれぞれ、アバターが割り当てられ個人 Odoo 認証情報を保存している有効なメンバー数（再検証が必要なものも含む）、依頼者として操作する設定の AI 社員数です。
+`odoo.access_get {}` は権限設定が読み取れない、または形式不正の場合に `{readable:false, message}` を返し、その状態では `odoo.access_set` は保存を拒否します。正常な get/set は `readable:true` と `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}` を返します。値はそれぞれ、アバターが割り当てられ個人 Odoo 認証情報を保存している有効なメンバー数（再検証が必要なものも含む）、依頼者として操作する設定の AI 社員数です。 この件数は参考情報です。集計に失敗した場合は `follow_mode_impact` が `null` となり、get/set は引き続き成功し、有効な設定変更は通常どおり保存されます。

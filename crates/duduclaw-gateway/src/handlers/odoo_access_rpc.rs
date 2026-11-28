@@ -7,7 +7,6 @@ use crate::odoo_access_migration::{Employee, access_employees, employees};
 
 const INVALID: &str = "[odoo_access] 權限設定無效，請管理員修正設定後再試。";
 const UNREADABLE: &str = "Odoo 權限設定讀不到或格式有誤。目前所有 Odoo 工具都會拒絕執行；請檢查設定後重新儲存。";
-const IMPACT_UNAVAILABLE: &str = "無法讀取 Odoo 權限模式的影響數量，請稍後再試。";
 const LOGIN: &str = "請以管理員帳號登入瀏覽器後管理 Odoo 權限。";
 const STORE: &str = "無法儲存 Odoo 權限設定，請重新整理後再試。";
 const FOLLOW_RISK: &str = "依 Odoo 帳號模式會略過員工的引擎權限表與模型封鎖；一律不允許清單、固定拒絕與必要核准仍生效。請確認已了解風險。";
@@ -56,18 +55,12 @@ fn summary(access: &OdooAccessConfig) -> Value {
         "upgrade_notice_pending":access.upgrade_notice_pending,
     })
 }
-fn follow_mode_impact(home: &std::path::Path, rows: &[Employee]) -> Result<Value, String> {
-    // One read-only query; count stored rows, including ones needing verification.
-    // Never read sealed secrets or return member identities in this summary.
-    let conn = rusqlite::Connection::open_with_flags(home.join("users.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW)
-        .map_err(|_| IMPACT_UNAVAILABLE.to_owned())?;
-    let avatars: i64 = conn.query_row("SELECT COUNT(*) FROM users u
-        JOIN member_odoo_credentials c ON c.user_id=u.id
-        WHERE u.status='active' AND u.avatar_agent_id IS NOT NULL", [], |row| row.get(0))
-        .map_err(|_| IMPACT_UNAVAILABLE.to_owned())?;
-    Ok(json!({"avatars_with_personal_credentials":avatars,
-        "agents_acting_as_requester":rows.iter().filter(|row| row.act_as_requester).count()}))
+fn follow_mode_impact(db: &UserDb, rows: &[Employee]) -> Value {
+    // Advisory only: an unavailable count is unknown, never zero or a write gate.
+    // Reuse the handler's database instead of reopening a possibly symlinked path.
+    let Ok(avatars) = db.odoo_credential_count_active_avatars() else { return Value::Null; };
+    json!({"avatars_with_personal_credentials":avatars,
+        "agents_acting_as_requester":rows.iter().filter(|row| row.act_as_requester).count()})
 }
 
 fn response(access: &OdooAccessConfig, rows: &[Employee], impact: Value) -> Value {
@@ -158,7 +151,7 @@ impl MethodHandler {
                         return Ok(json!({"readable":false,"message":UNREADABLE}));
                     };
                     let rows = access_employees(&home)?;
-                    let impact = follow_mode_impact(&home, &rows)?;
+                    let impact = follow_mode_impact(&db, &rows);
                     Ok(response(&access, &rows, impact))
                 }
                 "odoo.access_set" => {
@@ -166,8 +159,6 @@ impl MethodHandler {
                     let mut table: toml::Table = raw.parse().map_err(|_| INVALID.to_owned())?;
                     let before = OdooAccessConfig::from_table(&table).map_err(|_| INVALID.to_owned())?;
                     let rows = access_employees(&home)?;
-                    // Read before publishing so a failed count never disguises a committed write.
-                    let impact = follow_mode_impact(&home, &rows)?;
                     if params.as_object().is_some_and(|p| p.values().any(Value::is_null)) {
                         return Err("Odoo 權限參數不能是 null。".into());
                     }
@@ -192,7 +183,7 @@ impl MethodHandler {
                             )).map_err(|_| STORE.to_owned())
                         },
                     ).map_err(|_| STORE.to_owned())?;
-                    Ok(response(&after, &rows, impact))
+                    Ok(response(&after, &rows, follow_mode_impact(&db, &rows)))
                 }
                 _ => Err("沒有這項 Odoo 權限操作。".into()),
             }

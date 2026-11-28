@@ -1097,4 +1097,4 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 
 `me.member_keys.list {limit?, cursor?}` 另回傳 `policy:{allow_conversation_content,allow_mcp_scopes}`。對話內容開關只管建立金鑰時的授權；工具權限則每次呼叫都取金鑰原有範圍與目前 `allow_mcp_scopes` 的交集。重新開放某範圍後，建立時已有該範圍的舊金鑰也會恢復使用。
 
-`odoo.access_get {}` 在權限設定讀不到或格式有誤時，回傳 `{readable:false, message}`；此時 `odoo.access_set` 仍拒絕儲存。正常讀取與儲存的回應增加 `readable:true` 及 `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}`。兩個數字分別計算：已有分身且存有本人 Odoo 憑證的啟用中成員（包含待重新驗證的憑證），以及設定成代交辦人操作的 AI 員工。
+`odoo.access_get {}` 在權限設定讀不到或格式有誤時，回傳 `{readable:false, message}`；此時 `odoo.access_set` 仍拒絕儲存。正常讀取與儲存的回應增加 `readable:true` 及 `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}`。兩個數字分別計算：已有分身且存有本人 Odoo 憑證的啟用中成員（包含待重新驗證的憑證），以及設定成代交辦人操作的 AI 員工。 這些數字僅供提示；計算失敗時，`follow_mode_impact` 為 `null`，讀取與儲存仍可成功，有效的設定變更仍會正常儲存。
