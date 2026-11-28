@@ -88,3 +88,41 @@ export const HISTORY_TONE_CLASS: Record<AutopilotHistoryTone, string> = {
   warning: 'bg-warning/10 text-warning',
   error: 'bg-destructive/10 text-destructive',
 };
+
+
+export interface AutopilotRunStep {
+  step_index: number;
+  step_type: string;
+  state: string;
+  started_at: string | null;
+  finished_at: string | null;
+  detail: string | null;
+}
+export interface AutopilotRun {
+  run_id: string;
+  state: string;
+  step_index: number;
+  step_count: number;
+  next_at: string | null;
+  outcome: string | null;
+  detail: string | null;
+  event_name: string;
+  created_at: string;
+  updated_at: string;
+  steps: AutopilotRunStep[];
+}
+const RUN_STATES = new Set(['pending', 'waiting', 'awaiting_approval', 'running', 'completed', 'done', 'failed', 'skipped', 'expired', 'denied', 'settled']);
+const RUN_REASONS = new Set(['outside_window', 'outside_window_tz_unresolved', 'stale_rule_changed', 'rule_disabled', 'rule_removed', 'missed_late', 'param_injection_blocked', 'scope_denied', 'cancelled_by_admin', 'missing_field']);
+export function runStateMessageId(state: string): string {
+  return `autopilot.runs.state.${RUN_STATES.has(state) ? state : 'unknown'}`;
+}
+/** Never expose untrusted details or internal codes, including parameter suffixes. */
+export function runReasonMessageId(code: string): string {
+  if (code === 'completed' || code === 'done') return runStateMessageId(code);
+  const base = code.split(':')[0];
+  const reason = base === 'param_missing' ? 'missing_field' : base;
+  return `autopilot.runs.reason.${RUN_REASONS.has(reason) ? reason : 'unknown'}`;
+}
+export function canCancelRun(state: string): boolean {
+  return ['pending', 'waiting', 'awaiting_approval'].includes(state);
+}

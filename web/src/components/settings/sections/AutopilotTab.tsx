@@ -4,8 +4,8 @@ import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
 import { useUserNames } from '@/lib/use-user-names';
-import { ruleActionTarget } from '@/lib/autopilot-rules';
-import { describeHistoryResult, HISTORY_TONE_CLASS } from '@/lib/autopilot-history';
+import { windowSummary, type ActiveWindow, ruleActionTarget } from '@/lib/autopilot-rules';
+import { canCancelRun, runStateMessageId, runReasonMessageId, type AutopilotRun, describeHistoryResult, HISTORY_TONE_CLASS } from '@/lib/autopilot-history';
 import { toast, formatError } from '@/lib/toast';
 import {
   Card,
@@ -167,6 +167,7 @@ export function AutopilotTab() {
                           ? intl.formatMessage({ id: 'autopilot.steps.count' }, { count: rule.action.steps.length })
                           : actionLabel(rule.action?.type ?? '')}
                       </Badge>
+                      {rule.active_window != null && <Badge variant="outline">{windowSummary(rule.active_window as ActiveWindow, id => intl.formatMessage({ id }), getCompanyTimeZone())}</Badge>}
                       {rule.created_by_user_id == null && <Badge variant="secondary">{intl.formatMessage({ id: 'autopilot.provenance.legacy' })}</Badge>}
                       {rule.creator_access_lost === true && <Badge className="text-destructive">{intl.formatMessage({ id: 'autopilot.provenance.accessLost' })}</Badge>}
                       {ruleActionTarget(rule.action) && (
@@ -219,6 +220,7 @@ export function AutopilotTab() {
                   </span>
                 )}
               </div>
+              <RuleRuns rule={rule} />
             </Card>
           ))}
         </div>
@@ -332,4 +334,65 @@ function AutopilotHistoryDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+
+function RuleRuns({ rule }: { rule: AutopilotRule }) {
+  const intl = useIntl();
+  const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
+  const actionLabel = useActionLabel();
+  const [open, setOpen] = useState(false);
+  const [runs, setRuns] = useState<AutopilotRun[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<unknown>(null);
+  const [cancelTarget, setCancelTarget] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState(false);
+  const load = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try { setRuns((await api.autopilot.runs.list(rule.id, 20)).runs); }
+    catch (e) { setError(e); }
+    finally { setLoading(false); }
+  }, [rule.id]);
+  useEffect(() => { if (open) void load(); }, [open, load]);
+  const cancel = async () => {
+    if (!cancelTarget || cancelling) return;
+    setCancelling(true);
+    setCancelError(false);
+    try {
+      await api.autopilot.runs.cancel(cancelTarget);
+      setCancelTarget(null);
+      await load();
+    } catch { setCancelError(true); }
+    finally { setCancelling(false); }
+  };
+  const actions = rule.action.type === 'steps' && Array.isArray(rule.action.steps) ? rule.action.steps as Array<{ type: string; minutes?: number }> : [rule.action];
+  return <div className="space-y-2 border-t border-surface-border pt-2">
+    <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(value => !value)}>{t('autopilot.runs.title')}</Button>
+    {open && <div className="space-y-3">
+      <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>{t('autopilot.runs.refresh')}</Button>
+      {loading ? <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p> : error != null ? <div role="alert" className="text-sm text-destructive">{t('autopilot.runs.loadFailed')}</div> : runs.length === 0 ? <p className="text-sm text-muted-foreground">{t('autopilot.runs.empty')}</p> : runs.map(run => <div key={run.run_id} className="space-y-2 rounded-md border border-surface-border p-3 text-sm">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <time>{formatDateTime(run.created_at, { locale: intl.locale })}</time>
+          <Badge variant="secondary">{t(runStateMessageId(run.state))}</Badge>
+        </div>
+        {(run.outcome || run.detail) && <p>{t(runReasonMessageId(run.outcome === 'completed' ? 'completed' : run.detail && runReasonMessageId(run.detail) !== 'autopilot.runs.reason.unknown' ? run.detail : run.outcome ?? run.detail!))}</p>}
+        <ol className="space-y-1">{run.steps.map(step => {
+          const action = actions[step.step_index];
+          const minutes = action?.type === 'wait' && typeof action.minutes === 'number' ? action.minutes : undefined;
+          return <li key={step.step_index} className="flex flex-wrap gap-x-3 gap-y-1">
+            <span>{step.step_index + 1}</span>
+            <span>{step.step_type === 'wait' && minutes !== undefined ? t('autopilot.runs.waitMinutes', { minutes }) : ['delegate', 'notify', 'run_skill', 'wait'].includes(step.step_type) ? actionLabel(step.step_type) : t('autopilot.runs.step')}</span>
+            <span>{t(step.detail ? runReasonMessageId(step.detail) : runStateMessageId(step.state))}</span>
+            {step.step_type === 'wait' && step.step_index === run.step_index && run.state === 'waiting' && run.next_at && <span>{t('autopilot.runs.resume', { time: formatDateTime(run.next_at, { locale: intl.locale, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) })}</span>}
+          </li>;
+        })}</ol>
+        {canCancelRun(run.state) && <Button variant="outline" size="sm" onClick={() => { setCancelTarget(run.run_id); setCancelError(false); }}>{t('autopilot.runs.cancel')}</Button>}
+      </div>)}
+    </div>}
+    <ConfirmDialog open={cancelTarget != null} onClose={() => { if (!cancelling) setCancelTarget(null); }} onConfirm={() => void cancel()} busy={cancelling} title={t('autopilot.runs.cancel')} message={t('autopilot.runs.cancelConfirm')} confirmLabel={t('autopilot.runs.cancel')}>
+      {cancelError && <p role="alert" className="text-sm text-destructive">{t('autopilot.runs.cancelFailed')}</p>}
+    </ConfirmDialog>
+  </div>;
 }

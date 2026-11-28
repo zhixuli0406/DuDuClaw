@@ -1,3 +1,4 @@
+import type { AutopilotRun } from './autopilot-history';
 import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
@@ -9748,6 +9749,14 @@ export const api = {
       ) as Promise<CanvasGetResult>,
   },
   autopilot: {
+    templateFields: (triggerEvent: string, sequence?: unknown) =>
+      client.call('autopilot.template_fields', { trigger_event: triggerEvent, ...(sequence != null ? { sequence } : {}) }) as Promise<{ fields: string[] }>,
+    runs: {
+      list: (ruleId: string, limit = 20) =>
+        client.call('autopilot.runs.list', { rule_id: ruleId, limit }) as Promise<{ runs: AutopilotRun[] }>,
+      cancel: (runId: string) =>
+        client.call('autopilot.runs.cancel', { run_id: runId }) as Promise<{ cancelled: true; run_id: string }>,
+    },
     list: () =>
       client.call('autopilot.list') as Promise<{ rules: AutopilotRule[] }>,
     create: (params: AutopilotCreateParams) =>

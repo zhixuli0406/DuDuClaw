@@ -106,6 +106,22 @@ export interface AutopilotAction {
   [key: string]: unknown;
 }
 
+export interface ActiveWindow {
+  days: number[];
+  start: string;
+  end: string;
+  timezone: string | null;
+}
+export interface ParamDraft {
+  name: string;
+  value: string;
+  type: 'text' | 'number' | 'id' | 'date';
+}
+export interface BuildContext {
+  companyZone?: string | null;
+  templateFields?: readonly string[];
+}
+
 export interface AutopilotRule {
   id: string;
   name: string;
@@ -130,6 +146,8 @@ export interface AutopilotRule {
 }
 
 export interface AutopilotCreateParams {
+  active_window?: ActiveWindow | null;
+  run_policy?: { outside_window: 'skip' } | null;
   name: string;
   trigger_event: AutopilotCreateTriggerEvent;
   conditions: AutopilotCondition;
@@ -137,6 +155,8 @@ export interface AutopilotCreateParams {
 }
 
 export interface AutopilotUpdateFields {
+  active_window?: ActiveWindow | null;
+  run_policy?: { outside_window: 'skip' } | null;
   name?: string;
   trigger_event?: AutopilotTriggerEvent | string;
   conditions?: AutopilotCondition;
@@ -162,6 +182,7 @@ const FORM_OWNED_ACTION_KEYS = new Set([
   'prompt_template',
   'require_approval',
   'minutes',
+  'params',
   ...Object.values(ACTION_REQUIRED_FIELDS).flat(),
 ]);
 
@@ -229,6 +250,7 @@ export interface RuleFormState {
   steps: StepDraft[];
   /** Preserve the existing envelope and extensions even with a single step. */
   stepsEnvelope: boolean;
+  windowTouched?: boolean;
   screen?: unknown;
   active_window?: unknown;
   run_policy?: unknown;
@@ -244,6 +266,8 @@ export interface StepDraft {
   text: string;
   minutes: number;
   requireApproval: boolean;
+  params: ParamDraft[];
+  paramsTouched?: boolean;
   /** Unowned fields travel with the step when reordered. */
   original?: AutopilotAction;
 }
@@ -251,7 +275,7 @@ export interface StepDraft {
 export function emptyStep(actionType: StepDraft['actionType'] = 'delegate', defaultAgent = ''): StepDraft {
   return {
     actionType, targetAgent: defaultAgent, prompt: '', skillName: '',
-    channel: 'telegram', chatId: '', text: '', minutes: 1, requireApproval: false,
+    channel: 'telegram', chatId: '', text: '', minutes: 1, requireApproval: false, params: [],
   };
 }
 
@@ -266,6 +290,10 @@ export function emptyRuleForm(defaultAgent = ''): RuleFormState {
 // ── Value parsing ───────────────────────────────────────────
 
 export type BuildIssue =
+  | { kind: 'windowTime' | 'windowDays' | 'windowZone' | 'windowZoneInvalid' }
+  | { kind: 'paramCount' | 'paramName' | 'paramDuplicate' | 'paramSyntax' | 'paramLength'; step: number; row: number }
+  | { kind: 'paramField'; step: number; row: number; name: string; path: string }
+  | { kind: 'paramFieldsUnavailable'; step: number; row: number }
   | { kind: 'missing'; field: string; step?: number }
   | { kind: 'stepCount' | 'waitDuration' | 'waitOrder'; steps: number[] }
   | { kind: 'conditionField'; row: number }
@@ -348,6 +376,7 @@ export function buildConditions(
 /** Build steps without moving per-step approval or extras onto the envelope. */
 export function buildAction(
   state: RuleFormState,
+  context: BuildContext = {},
 ): { action: AutopilotAction; issues: BuildIssue[] } {
   const issues: BuildIssue[] = [];
   const drafts = state.steps;
@@ -374,11 +403,36 @@ export function buildAction(
       action[key] = step.original?.[key] === values[key] ? values[key] : values[key].trim();
       if (!values[key].trim()) issues.push({ kind: 'missing', field: key, step: index });
     }
+    if (step.actionType === 'run_skill') {
+      const rows = step.params;
+      if (rows.length > 10) issues.push({ kind: 'paramCount', step: index, row: 10 });
+      const names = new Set<string>();
+      rows.forEach((row, i) => {
+        const issue = (kind: 'paramName' | 'paramDuplicate' | 'paramSyntax' | 'paramLength') => issues.push({ kind, step: index, row: i });
+        if (!/^[a-z][a-z0-9_]{0,31}$/.test(row.name)) issue('paramName');
+        if (names.has(row.name)) issue('paramDuplicate');
+        names.add(row.name);
+        if ([...row.value].length > 500) issue('paramLength');
+        const refs = [...row.value.matchAll(/\{\{([^{}]*)\}\}/g)];
+        if (/[{}]/.test(row.value.replace(/\{\{[^{}]*\}\}/g, '')) || refs.some(m => !/^[a-z0-9_]{1,64}(\.[a-z0-9_]{1,64}){0,3}$/.test(m[1]))) issue('paramSyntax');
+        for (const ref of refs) {
+          if (!context.templateFields) {
+            if (step.paramsTouched || Object.hasOwn(context, 'templateFields')) issues.push({ kind: 'paramFieldsUnavailable', step: index, row: i });
+          } else if (!templateFieldAllowed(ref[1], context.templateFields)) {
+            issues.push({ kind: 'paramField', step: index, row: i, name: row.name, path: ref[1] });
+          }
+        }
+      });
+      if (step.paramsTouched || !step.original?.params) {
+        if (rows.length || step.original?.params) action.params = Object.fromEntries(rows.map(row => [row.name,
+          row.value.includes('{{') || row.type !== 'text' ? { template: row.value, type: row.type } : row.value]));
+      } else action.params = step.original.params;
+    }
     if (step.requireApproval || step.original?.require_approval === false) action.require_approval = step.requireApproval;
     return action;
   });
   const useEnvelope = state.stepsEnvelope || steps.length !== 1 || steps[0]?.type === 'wait'
-    || drafts.some(s => s.requireApproval || s.original?.require_approval !== undefined || s.original?.params != null)
+    || drafts.some(s => s.requireApproval || s.original?.require_approval !== undefined || s.original?.params != null || s.params.length > 0)
     || state.active_window != null || state.run_policy != null;
   if (!useEnvelope) return { action: steps[0], issues };
   // screen belongs to the envelope, never copied to its single legacy step.
@@ -391,12 +445,13 @@ export function buildAction(
 
 export function buildCreatePayload(
   state: RuleFormState,
+  context: BuildContext = {},
 ): { payload: AutopilotCreateParams | null; issues: BuildIssue[] } {
   const issues: BuildIssue[] = [];
   if (!state.name.trim()) issues.push({ kind: 'missing', field: 'name' });
   const cond = buildConditions(state);
-  const act = buildAction(state);
-  issues.push(...cond.issues, ...act.issues);
+  const act = buildAction(state, context);
+  issues.push(...cond.issues, ...act.issues, ...validateWindow(state, context));
   if (issues.length > 0) return { payload: null, issues };
   return {
     payload: {
@@ -404,6 +459,7 @@ export function buildCreatePayload(
       trigger_event: state.triggerEvent as AutopilotCreateTriggerEvent,
       conditions: cond.conditions,
       action: act.action,
+      ...(state.windowTouched || state.active_window != null ? windowPayload(state) : {}),
     },
     issues,
   };
@@ -429,6 +485,7 @@ export function stableStringify(v: unknown): string {
 export function buildUpdatePayload(
   state: RuleFormState,
   original: AutopilotRule,
+  context: BuildContext = {},
 ): { fields: AutopilotUpdateFields | null; issues: BuildIssue[] } {
   const issues: BuildIssue[] = [];
   const fields: AutopilotUpdateFields = {};
@@ -449,13 +506,17 @@ export function buildUpdatePayload(
   }
 
   if (!state.actionLocked) {
-    const act = buildAction(state);
+    const act = buildAction(state, context);
     issues.push(...act.issues);
     if (stableStringify(act.action) !== stableStringify(original.action)) {
       fields.action = act.action;
     }
   }
 
+  issues.push(...validateWindow(state, context));
+  if (state.windowTouched) {
+    Object.assign(fields, windowPayload(state));
+  }
   if (issues.length > 0) return { fields: null, issues };
   return { fields, issues };
 }
@@ -522,6 +583,10 @@ export function formStateFromRule(rule: AutopilotRule, defaultAgent = ''): RuleF
     channel: str(step.channel) || 'telegram', chatId: str(step.chat_id), text: str(step.text),
     minutes: typeof step.minutes === 'number' ? step.minutes : 1,
     requireApproval: step.require_approval === true, original: step,
+    params: Object.entries((step.params && typeof step.params === 'object' ? step.params : {}) as Record<string, unknown>).map(([name, value]) => {
+      const spec = value && typeof value === 'object' ? value as { template?: string; type?: ParamDraft['type'] } : null;
+      return { name, value: typeof value === 'string' ? value : spec?.template ?? String(value), type: spec?.type ?? 'text' };
+    }),
   })) : base.steps;
   return {
     ...base,
@@ -548,4 +613,53 @@ export function ruleActionTarget(action: AutopilotAction | undefined): string {
     return str(action.channel);
   }
   return str(action.target_agent) || str(action.agent_id);
+}
+
+export function templateFieldAllowed(path: string, fields: readonly string[]): boolean {
+  return fields.includes(path) || fields.some(field => field.endsWith('.*')
+    && path.startsWith(field.slice(0, -1)) && /^[a-z0-9_]{1,64}$/.test(path.slice(field.length - 1)));
+}
+
+function windowPayload(state: RuleFormState) {
+  return { active_window: (state.active_window ?? null) as ActiveWindow | null,
+    run_policy: state.active_window ? { outside_window: 'skip' as const } : null };
+}
+function validateWindow(state: RuleFormState, context: BuildContext): BuildIssue[] {
+  const window = state.active_window as ActiveWindow | null | undefined;
+  if (!window) return [];
+  const issues: BuildIssue[] = [];
+  if (!window.days?.length || window.days.some(day => !Number.isInteger(day) || day < 1 || day > 7)) issues.push({ kind: 'windowDays' });
+  const time = /^(?:[01][0-9]|2[0-3]):[0-5][0-9]$/;
+  if (!time.test(window.start) || !time.test(window.end) || window.start >= window.end) issues.push({ kind: 'windowTime' });
+  if (!window.timezone && !context.companyZone) issues.push({ kind: 'windowZone' });
+  if (window.timezone) {
+    try { new Intl.DateTimeFormat('en', { timeZone: window.timezone }); }
+    catch { issues.push({ kind: 'windowZoneInvalid' }); }
+  }
+  return issues;
+}
+
+export const EVENT_FIELD_LABELS: Record<string, string> = {
+  'task.id': 'taskId', task_id: 'taskId', 'task.title': 'taskTitle',
+  'task.description': 'description', 'task.status': 'status', 'task.priority': 'priority',
+  'task.assigned_to': 'agent', 'task.created_by': 'creator', 'task.deadline_at': 'deadline', 'task.tags': 'tags',
+  to: 'newStatus', from: 'oldStatus', agent_id: 'agent', 'activity.agent_id': 'agent',
+  'activity.event_type': 'eventType', 'activity.summary': 'summary', text: 'text', channel: 'channel',
+  idle_minutes: 'idleMinutes', level: 'level', score: 'score', file_name: 'fileName', extension: 'extension',
+  kind: 'kind', app: 'app', window_title: 'windowTitle', source: 'source', ts: 'time',
+  event_type: 'eventType', model: 'model', record_id: 'recordId', name: 'eventName', server: 'server',
+  event_id: 'eventId', severity: 'severity',
+};
+export function eventFieldLabel(path: string, t: (id: string) => string): string {
+  return EVENT_FIELD_LABELS[path] ? t(`autopilot.eventField.${EVENT_FIELD_LABELS[path]}`) : path.split('.').at(-1) ?? path;
+}
+export function paramPreview(value: string, label: (path: string) => string): string {
+  return value.replace(/\{\{([^{}]+)\}\}/g, (_, path: string) => `〔${label(path)}〕`);
+}
+export function windowSummary(window: ActiveWindow, t: (id: string) => string, companyZone?: string | null): string {
+  const days = [...new Set(window.days)].sort((a, b) => a - b);
+  const label = (day: number) => t(`autopilot.window.weekday.${day}`);
+  const consecutive = days.length > 1 && days.every((day, i) => i === 0 || day === days[i - 1] + 1);
+  const shown = consecutive ? `${label(days[0])}${t('autopilot.window.through')}${label(days.at(-1)!)}` : days.map(label).join('、');
+  return `${shown} ${window.start}–${window.end}${window.timezone && window.timezone !== companyZone ? ` · ${window.timezone}` : ''}`;
 }

@@ -440,3 +440,60 @@ describe('editable steps', () => {
     expect((result.payload?.action.steps as unknown[])[1]).toEqual({ type: 'wait', minutes: 700 });
   });
 });
+
+describe('execution windows and skill parameters', () => {
+  const window = { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00', timezone: null };
+  const context = { companyZone: 'Asia/Taipei', templateFields: ['task.id', 'task.title'] };
+  it('round trips a company-zone window and sets the skip policy', () => {
+    const form = { ...filledForm('task_created', 'run_skill'), active_window: window, windowTouched: true };
+    const { payload, issues } = buildCreatePayload(form, context);
+    expect(issues).toEqual([]);
+    expect(payload).toMatchObject({ active_window: window, run_policy: { outside_window: 'skip' } });
+    const rule = { ...TEMPLATE_RULE, ...payload } as AutopilotRule;
+    expect(formStateFromRule(rule).active_window).toEqual(window);
+    expect(buildUpdatePayload(formStateFromRule(rule), rule, context)).toEqual({ fields: {}, issues: [] });
+  });
+  it.each([['18:00', '18:00'], ['19:00', '09:00']])('rejects a window from %s to %s', (start, end) => {
+    const form = { ...filledForm('task_created', 'delegate'), active_window: { ...window, start, end } };
+    expect(buildCreatePayload(form, context).issues).toContainEqual({ kind: 'windowTime' });
+  });
+  it('rejects no days, no company zone and an invalid explicit zone', () => {
+    const form = { ...filledForm('task_created', 'delegate'), active_window: { ...window, days: [] } };
+    expect(buildCreatePayload(form).issues).toEqual(expect.arrayContaining([{ kind: 'windowDays' }, { kind: 'windowZone' }]));
+    const invalidForm = { ...form, active_window: { ...window, timezone: 'Invalid/Zone' } };
+    expect(buildCreatePayload(invalidForm).issues).toContainEqual({ kind: 'windowZoneInvalid' });
+  });
+  it('clears the window and policy together', () => {
+    const rule = { ...TEMPLATE_RULE, active_window: window, run_policy: { outside_window: 'skip' } };
+    const form = { ...formStateFromRule(rule), active_window: null, windowTouched: true };
+    expect(buildUpdatePayload(form, rule, context).fields).toMatchObject({ active_window: null, run_policy: null });
+  });
+  it('serializes plain text, templates and typed literals', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].params = [
+      { name: 'plain', value: 'hello', type: 'text' },
+      { name: 'title', value: '{{task.title}}', type: 'text' },
+      { name: 'count', value: '3', type: 'number' },
+    ];
+    const result = buildAction(form, context);
+    expect(result.issues).toEqual([]);
+    expect(result.action.steps).toEqual([expect.objectContaining({ params: { plain: 'hello', title: { template: '{{task.title}}', type: 'text' }, count: { template: '3', type: 'number' } } })]);
+  });
+  it('rejects invalid names, duplicates, over ten rows and unavailable fields', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].params = Array.from({ length: 11 }, () => ({ name: 'Bad', value: '{{order.id}}', type: 'text' }));
+    const issues = buildAction(form, context).issues;
+    expect(issues).toContainEqual({ kind: 'paramCount', step: 0, row: 10 });
+    expect(issues).toContainEqual({ kind: 'paramName', step: 0, row: 0 });
+    expect(issues).toContainEqual({ kind: 'paramDuplicate', step: 0, row: 1 });
+    expect(issues).toContainEqual({ kind: 'paramField', step: 0, row: 0, name: 'Bad', path: 'order.id' });
+  });
+  it('rejects malformed references and failed field loading', () => {
+    const form = filledForm('task_created', 'run_skill');
+    form.steps[0].paramsTouched = true;
+    form.steps[0].params = [{ name: 'note', value: '{{ task.title }}', type: 'text' }];
+    expect(buildAction(form, context).issues).toContainEqual({ kind: 'paramSyntax', step: 0, row: 0 });
+    form.steps[0].params[0].value = '{{task.title}}';
+    expect(buildAction(form).issues).toContainEqual({ kind: 'paramFieldsUnavailable', step: 0, row: 0 });
+  });
+});

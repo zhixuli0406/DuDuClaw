@@ -1,3 +1,4 @@
+import { useCompanyTimeZone } from '@/lib/company-time';
 import { useProductPolicy } from '@/lib/product-policy';
 import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -9,6 +10,10 @@ import { formatError, formatErrorDetail } from '@/lib/toast';
 import { channelLabel } from '@/lib/session-channel';
 import { glyphText } from '@/lib/agent-glyph';
 import {
+  eventFieldLabel,
+  paramPreview,
+  type ActiveWindow,
+  type ParamDraft,
   ACTION_REQUIRED_FIELDS,
   CONDITION_OPS,
   FORM_ACTION_TYPES,
@@ -146,6 +151,26 @@ export function AutopilotRuleDialog({
   const [serverError, setServerError] = useState<unknown>(null);
   const [submitting, setSubmitting] = useState(false);
   const datalistId = useId();
+  const company = useCompanyTimeZone();
+  const companyZone = company.status === 'set' ? company.zone : null;
+  const [templateFields, setTemplateFields] = useState<{ trigger: string; fields: string[] } | null>(null);
+  const [fieldsError, setFieldsError] = useState(false);
+  const [fieldsRetry, setFieldsRetry] = useState(0);
+  const availableFields = templateFields?.trigger === form.triggerEvent ? templateFields.fields : undefined;
+  useEffect(() => {
+    let active = true;
+    setTemplateFields(null);
+    setFieldsError(false);
+    api.autopilot.templateFields(form.triggerEvent, rule?.sequence).then(result => {
+      if (active) setTemplateFields({ trigger: form.triggerEvent, fields: result.fields });
+    }).catch(() => { if (active) setFieldsError(true); });
+    return () => { active = false; };
+  }, [form.triggerEvent, rule?.sequence, fieldsRetry]);
+  const fieldLabel = (path: string) => eventFieldLabel(path, t);
+  const window = form.active_window as ActiveWindow | null | undefined;
+  const patchWindow = (change: Partial<ActiveWindow>) => setForm(f => ({ ...f, windowTouched: true,
+    active_window: { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00', timezone: null, ...(f.active_window as Partial<ActiveWindow> | null), ...change } }));
+
 
   useEffect(() => { fetchAgents(); }, [fetchAgents]);
   useEffect(() => {
@@ -221,6 +246,11 @@ export function AutopilotRuleDialog({
 
   const issueText = (issue: BuildIssue): string => {
     switch (issue.kind) {
+      case 'windowTime': case 'windowDays': case 'windowZone': case 'windowZoneInvalid':
+      case 'paramCount': case 'paramName': case 'paramDuplicate': case 'paramSyntax': case 'paramLength': case 'paramFieldsUnavailable':
+        return t(`autopilot.validation.${issue.kind}`);
+      case 'paramField':
+        return t('autopilot.validation.paramField', { name: issue.name, label: fieldLabel(issue.path) });
       case 'stepCount':
       case 'waitDuration':
       case 'waitOrder':
@@ -234,14 +264,14 @@ export function AutopilotRuleDialog({
       case 'conditionNumber':
         return t('autopilot.form.conditionNumber', { row: issue.row + 1 });
       default:
-        return t('autopilot.form.conditionValue', { row: issue.row + 1 });
+        return t('autopilot.form.conditionValue', { row: 'row' in issue ? issue.row + 1 : 1 });
     }
   };
 
   const handleSubmit = useCallback(async () => {
     setServerError(null);
     if (rule) {
-      const { fields, issues: found } = buildUpdatePayload(form, rule);
+      const { fields, issues: found } = buildUpdatePayload(form, rule, { companyZone, templateFields: availableFields });
       setIssues(found);
       if (!fields) return;
       if (Object.keys(fields).length === 0) {
@@ -259,7 +289,7 @@ export function AutopilotRuleDialog({
       }
       return;
     }
-    const { payload, issues: found } = buildCreatePayload(form);
+    const { payload, issues: found } = buildCreatePayload(form, { companyZone, templateFields: availableFields });
     setIssues(found);
     if (!payload) return;
     setSubmitting(true);
@@ -271,7 +301,7 @@ export function AutopilotRuleDialog({
     } finally {
       setSubmitting(false);
     }
-  }, [form, rule, onSaved]);
+  }, [form, rule, onSaved, companyZone, availableFields]);
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
@@ -449,6 +479,33 @@ export function AutopilotRuleDialog({
                         </FieldBlock>
                       )}
 
+                      {step.actionType === 'run_skill' && <fieldset className="space-y-2">
+                        <legend className="text-sm font-medium">{t('autopilot.params.title')}</legend>
+                        {fieldsError && <div className="text-sm text-destructive">{t('autopilot.params.loadFailed')} <Button variant="ghost" size="sm" onClick={() => setFieldsRetry(n => n + 1)}>{t('common.retry')}</Button></div>}
+                        {step.params.map((param, row) => {
+                          const change = (p: Partial<ParamDraft>) => patchStep(index, { paramsTouched: true, params: step.params.map((v, i) => i === row ? { ...v, ...p } : v) });
+                          const invalidParam = issues.some(issue => 'step' in issue && issue.step === index && 'row' in issue && issue.row === row);
+                          return <div key={row} className={`space-y-2 rounded-md border p-2 ${invalidParam ? 'border-destructive outline outline-1 outline-destructive' : 'border-surface-border'}`}>
+                            <div className="grid gap-2 sm:grid-cols-3">
+                              <FieldBlock label={t('autopilot.params.name')}><Input aria-label={t('autopilot.params.name')} value={param.name} onChange={e => change({ name: e.target.value })} aria-invalid={invalidParam} /></FieldBlock>
+                              <FieldBlock label={t('autopilot.params.value')}><Input aria-label={t('autopilot.params.value')} value={param.value} onChange={e => change({ value: e.target.value })} aria-invalid={invalidParam} /></FieldBlock>
+                              <DialogSelect label={t('autopilot.params.type')} value={param.type} onChange={v => change({ type: v as ParamDraft['type'] })} options={(['text', 'number', 'id', 'date'] as const).map(type => ({ value: type, label: t(`autopilot.params.type.${type}`) }))} />
+                            </div>
+                            {param.value.includes('{{') && <p className="break-words text-sm text-muted-foreground">{paramPreview(param.value, fieldLabel)}</p>}
+                            <div className="flex flex-wrap gap-2">
+                              <DropdownMenu>
+                                <DropdownMenuTrigger render={<Button variant="outline" size="sm" disabled={!availableFields?.some(path => !path.includes('*'))} />}>{t('autopilot.params.insert')}</DropdownMenuTrigger>
+                                <DropdownMenuContent aria-label={t('autopilot.params.insert')}>
+                                  {availableFields?.filter(path => !path.includes('*')).map(path => <DropdownMenuItem key={path} onClick={() => change({ value: param.value + '{{' + path + '}}' })}>{fieldLabel(path)}</DropdownMenuItem>)}
+                                </DropdownMenuContent>
+                              </DropdownMenu>
+                              <Button variant="ghost" size="sm" onClick={() => patchStep(index, { paramsTouched: true, params: step.params.filter((_, i) => i !== row) })}>{t('autopilot.params.remove')}</Button>
+                            </div>
+                          </div>;
+                        })}
+                        <Button variant="outline" size="sm" disabled={step.params.length >= 10} onClick={() => patchStep(index, { paramsTouched: true, params: [...step.params, { name: '', value: '', type: 'text' }] })}><Plus />{t('autopilot.params.add')}</Button>
+                      </fieldset>}
+
                       {actionNeeds('chat_id') && (
                         <FieldBlock label={t('autopilot.field.chatId')} description={t('autopilot.field.chatId.help')}>
                           <Input
@@ -491,6 +548,25 @@ export function AutopilotRuleDialog({
 
             </fieldset>
           )}
+
+
+          <fieldset className={`space-y-3 rounded-lg border p-3 ${issues.some(issue => issue.kind.startsWith('window')) ? 'border-destructive' : 'border-surface-border'}`}>
+            <legend className="text-sm font-medium">{t('autopilot.window.title')}</legend>
+            <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={!window} onChange={e => e.target.checked ? patch({ active_window: null, run_policy: null, windowTouched: true }) : patchWindow({})} />{t('autopilot.window.unlimited')}</label>
+            {window && <>
+              <div className="flex flex-wrap gap-2">{[1, 2, 3, 4, 5, 6, 7].map(day => <Button key={day} size="sm" variant={window.days.includes(day) ? 'brand' : 'outline'} aria-pressed={window.days.includes(day)} aria-label={t(`autopilot.window.weekday.${day}`)} onClick={() => patchWindow({ days: window.days.includes(day) ? window.days.filter(d => d !== day) : [...window.days, day].sort() })}>{t(`autopilot.window.day.${day}`)}</Button>)}</div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <FieldBlock label={t('autopilot.window.start')}><Input type="time" aria-label={t('autopilot.window.start')} value={window.start} onChange={e => patchWindow({ start: e.target.value })} /></FieldBlock>
+                <FieldBlock label={t('autopilot.window.end')}><Input type="time" aria-label={t('autopilot.window.end')} value={window.end} onChange={e => patchWindow({ end: e.target.value })} /></FieldBlock>
+              </div>
+              <DialogSelect label={t('autopilot.window.zone')} value={window.timezone ?? 'company'} onChange={v => patchWindow({ timezone: v === 'company' ? null : v })} options={[
+                { value: 'company', label: t('autopilot.window.company', { zone: companyZone ?? t('autopilot.window.unset') }) },
+                ...[...new Set(['Asia/Taipei', 'Asia/Tokyo', 'Asia/Hong_Kong', 'Asia/Singapore', 'America/New_York', 'America/Los_Angeles', 'Europe/London', 'Europe/Paris', 'UTC', ...(window.timezone ? [window.timezone] : [])])].map(zone => ({ value: zone, label: zone })),
+              ]} />
+              {!window.timezone && !companyZone && <p className="text-sm text-destructive">{t('autopilot.validation.windowZone')} <Link className="underline underline-offset-2" to="/settings?tab=general">{t('autopilot.window.settings')}</Link></p>}
+            </>}
+            <p className="text-xs text-muted-foreground">{t('autopilot.window.hint')}</p>
+          </fieldset>
 
 
         </div>
