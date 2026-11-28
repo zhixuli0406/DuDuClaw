@@ -1138,6 +1138,10 @@ All four require `odoo:write` and an existing, readable target record. Text is p
 
 Engine requires the exact target in `allowed_models` and exact `activity:<model>`, `note:<model>`, `message:<model>` or `attach:<model>` in `allowed_actions`; empty lists do not grant these tools. Follow uses the personal Odoo account's permissions instead of employee model/action grants and the Engine sensitive-model block list. Company feature switches, `always_refuse`, fixed refusals, input checks, approvals and Odoo ACLs remain. Company/AI-owned identities always use Engine. Employee `permission_override=engine` keeps Engine; `read_only` removes writes. Global Follow requires a valid administrator acknowledgement; missing/invalid acknowledgement falls back to Engine.
 
+`agents.update` accepts `odoo.allowed_actions` entries `activity:<model>`, `note:<model>`, `message:<model>` and `attach:<model>`. These four actions require an exact model name; bare verbs and wildcard models are not accepted for new entries. Generic writers refuse employee-level Odoo permission widening and direct the administrator to that employee's edit page.
+
+For an avatar or `act_as_requester` employee with no usable own or permitted company credential, the employee identity route returns `odoo_member_credentials_off` while `[odoo] member_credentials` is not literally `true`; its message says the company has not enabled members' own Odoo connections and asks them to contact an administrator. When the switch is `true`, the corresponding missing-connection refusal is `odoo_not_connected`.
+
 Default `always_refuse`: `unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`. Rules use an exact model, `*` or dot descendants such as `ir.*`; `method:<name>` matches an exact method. Dedicated rules use semantic verbs (`activity:`, `note:`, `message:`, `attach:`) against the target model.
 
 | Rule | Always refused |

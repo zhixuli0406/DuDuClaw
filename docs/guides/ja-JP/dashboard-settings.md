@@ -14,6 +14,10 @@
 
 詳しい権限、ルールの実行制限、取り消し後の既存業務は[部門マネージャー](../../features/ja-JP/79-department-managers.md)を参照してください。全社の分析と請求の集計は、引き続きすべての Manager に表示されます。
 
+`agents.main_access.get {}`／`agents.main_access.set {user_ids, acknowledged?}` は `users[]` の各項目に `granted_by_name` と `granted_at` を返し、許可した人と日時を表示できます。名前を取得できない場合は `null` です。
+
+自動化権限を持つ部門管理者は `autopilot.template_fields {trigger_event}` を利用できます。対象は `task_created`、`task_updated`、`task_status_changed` のみで、`sequence` は指定できません。`autopilot.runs.list {rule_id, limit?}` は自動化権限のある部門のルールに限定されます。`autopilot.template_fields` は `{fields:[...]}`、`autopilot.runs.list` は `{runs:[...]}` を返します。`limit` は既定 20、範囲 1～100 です。`autopilot.runs.cancel` は管理者専用のままです。管理者または当該部門の権限を持つ部門管理者は `autopilot.notify_destinations {owner_department}` を呼び出せます。応答は `{destinations:[{channel, chat_id, kind, agent_id, label}]}` で、`kind` は `self` または `agent`、`agent_id` は `null` も返します。呼び出した人が作成する部門ルールから通知できる宛先だけを返します。表示には `label` を使います。`autopilot.list` と `autopilot.affecting_me` のルールには `creator_access_lost`（`true`／`false`／判定できない場合の `null`）が加わります。表示専用で、認可の判断には使いません。
+
 ## スキルのアーカイブ復元
 
 未使用期間によるスキルの stale 化と自動アーカイブは削除されました。`[skill_curator]` は読み取れますが全設定が無効で、プロセスごとに一度警告します。Gateway 起動時に記録済みのアーカイブを元の場所へ戻し、Active にします。既存ファイルは上書きせず、競合したアーカイブは `skills-archive` に残します。Linux と macOS は両モードでディレクトリ FD を使ってグローバルと社員の平面形式スキルを復元します。シンボリックリンクはたどりません。他の OS はアーカイブを残し、手動復元が必要です。
@@ -336,6 +340,10 @@ public_url を設定すると、すべての OAuth コールバックと戻り�
 
 カードにはロールによる例外と、一方向ペアの送信先・受信元も表示します。各依頼では現在のアカウントと仕事の開始元を確認します。
 
+`delegation.effective {agent_id}` は担当者の `owner_display_name` も返します。取得できない場合は `null` です。カードには内部のアカウント識別子ではなく、この名前を表示します。
+
+**管理者 AI。** 有効化する場所は **設定 → 委任権限 → 管理者 AI** です。`admin_ai.get {}` は `config_state: "ok" | "unreadable" | "malformed"` を返し、`ok` 以外では `enabled` は `false` です。`enabled_ack` がある場合、`by_name`（`null` 可）と `at` で有効にした人と日時を表示できます。[管理者 AI による設定変更](../../features/ja-JP/79-admin-ai-settings.md)を参照してください。
+
 ## チャネル管理
 
 - グループの「メンションのみ」（`mention_only`、グループごと）：v1.76 から、LINE グループでオンにすると、`@` で AI スタッフを呼ぶメッセージ（または @ 一覧の要求）と、呼ばれたスタッフが待っている 1 件にだけ返信します。以前はグループ全体が無反応になっていました。Telegram の共有 bot もスタッフ名を受け付けます。[@ で AI スタッフを呼び出す](../../features/ja-JP/62-calling-ai-staff.md)を参照。
@@ -424,6 +432,10 @@ WebChat は再接続後も元の会話とサーバー側セッションを保持
 利用可能な操作は、接続した Odoo アカウント自身の読み取り・作成・更新・削除権限から取得し、接続時または構造スキャン時に確認して日時とともにキャッシュします。Odoo 側で権限を変更した場合は再スキャンしてください。ボタン操作とその他のメソッドは更新権限を目安とし、実際に実行できる操作とレコードルールは Odoo が判断します。権限のない操作は選択不可、不明な操作は注記付きで選択可能です。保存済みで利用不可になった操作は警告付きでチェックを保持し、チェックを外して削除できます。「すべてのテーブル」はテーブルごとに権限が異なるため選択を制限しません。DuDuClaw が読み取りを禁止したテーブルは照会しません。 操作の権限情報は保存済みの全体接続に基づきます。個別の接続、認証情報、会社範囲を使う従業員には、別アカウントの拒否結果を適用せず未確認と表示します。
 
 既存ルールはテーブルごとにまとめます。`read` または `search` だけなら「検索と読み取り／一部のみ」と表示し、保存時に両方へ正規化します。既存の `action` ルールは編集可能な「ボタン操作」として表示します。不明な項目は読み取り専用の「その他の設定」に表示し、個別に削除するまでそのまま保持します。サーバーは既存の値の保持だけを許し、新しい不正なルールは拒否します。Odoo 一覧では「テーブル：操作、操作」と表示します。
+
+`agents.update` の `odoo.allowed_actions` は `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` を受け付けます。この 4 操作の新しい項目には完全一致するモデル名が必要で、動詞だけの指定やワイルドカードは使えません。汎用設定書き込みは社員の Odoo 権限を広げる変更を拒否し、その社員の編集ページへ案内します。
+
+個人 Odoo 接続は既定で無効で、`[odoo] member_credentials` が厳密に `true` の場合だけ有効です。無効時は保存済み個人認証情報を使わず、個人キーの要求は `odoo_member_credentials_off` を返します。アバターまたは `act_as_requester` 社員に利用可能な自己認証情報も許可済み会社認証情報もない場合、社員の認証経路も同じコードを返し、会社が個人 Odoo 接続を許可していないため管理者に連絡するよう案内します。有効時に接続がない場合は `odoo_not_connected` です。
 
 ## 連携 → Odoo → Web サイトのライブチャット
 
@@ -778,6 +790,12 @@ AI スタッフが同じターンで非公開データの読み取りに成功�
 
 **マイ接続 → チャットアカウント（管理者）。** コードを発行し、10 分以内に表示されたボットまたは Chat アプリとの個別チャットに貼り付けてから、ここに戻って「本人です」を押します。管理者が代わりに登録した紐付けはメンバーページで「本人未確認」と表示されます。「チャット承認の資格を取り消す」は本人確認だけを消します。
 
+`approvals.list {status?, limit?, agent_id?, action_kind?}` は `status: "pending"`（既定）または `"decided"` を受け付けます。処理済み履歴は現在も権限のある管理者専用で、既定は 50 件、新しい順です。`limit` は 1～100 で、未処理は未指定なら件数制限なしです。`approvals.list` と `approvals.get {id}` の閲覧可能な項目には `decided_at` と `execution_result` が加わります。管理者 AI 設定カードの実行結果は `{outcome, reason, completed, not_executed, message, items:[{seq,result,error}]}` で、`outcome` は `complete`、`partial`、`voided` です。他の種類は `null`、制限されたカードでも `null` になる場合があります。
+
+`approvals.chat_admin.get {}` の `kinds[]` は `admin_ai_settings` を含み、`label` に `zh-TW`、`en`、`ja` の名前、`impact` に複数社員の設定変更が今後の動作に影響する旨を返します。現在の `impact` は繁体字中国語の単一文字列です。
+
+`POST /api/me/approvals/step-up` の成功応答は `{status:"done", decision:"approve"|"reject", decided_by_display:string|null}` です。従来の `decided_by` は削除されました。表示には `decided_by_display` を使います。
+
 ## 完了報告のチェック（設定ファイルの詳細編集でのみ変更）
 
 `config.toml [action_claims] mode` には設定ページのスイッチがなく、管理者が「システム設定 → 詳細設定 → 設定ファイルの詳細編集」で変更します。値は `"notice"`（既定）または `"shadow"` です。ファイル、セクション、キーがない場合は既定値を使います。エディターはそれ以外の値を拒否し、手で書き込んだ不明な値は `"shadow"` として扱い、gateway のログに一度だけ警告を記録します。返信ごとに読み直すため、再起動は不要です。
@@ -812,6 +830,7 @@ Admin は「システム → セキュリティ → 認証情報の監査」で�
 
 管理者は `/manage/integrations?tab=google` の再開可能なウィザードで、会社委任、Internal OAuth、Apps Script、個人 External OAuth を選べます。詳細フォームも利用できます。有効経路の切り替えは保存前に確認し、OAuth トークンは明示的な切断まで保持します。テストはサービス別で、スコープのみの Sheets/Docs は未検証です。Console、SSH 転送、Testing 期限は [Google 接続](google-setup.md)を参照してください。
 
+`google.identity.test` の Drive 書き込み確認は、会社 OAuth 接続の専用書き込み認証情報を使います。管理者が会社の Drive 書き込みを別途承認する必要があり、通常の会社 OAuth 接続だけでは不足します。Apps Script は引き続きこの書き込み確認に対応しません。
 
 ## 受信トレイと作業タイムライン
 
@@ -972,6 +991,8 @@ AI スタッフの返信中も、入力して次のメッセージを送信で�
 
 API（管理者 JWT）：`POST /api/channel-identity/bind {user_id, channel, channel_user_id}`、`POST /api/channel-identity/unbind {user_id, channel: "googlechat", channel_user_id}`、`GET /api/channel-identity/list?user_id=`（Google アカウントから見分けた項目には `"source": "google_account"` が付き、自動照合がオンのときだけ表示されます）。設定は `google.credentials.get`（`chat_identity_from_account`）で読み取り、管理者だけが `google.integration.set {chat_identity_from_account: bool}` で書き込めます。セルフサービスで Google Chat の紐付けを作る方法はありません。
 
+`GET /api/channel-identity/list?user_id=` は `identities[]` の各項目に `proof_status` と `proven_at` を返します。本人が確認済みなら `self_confirmed`、それ以外は `admin_prefilled` です。`proven_at` は RFC 3339 の日時または `null` です。Google アカウントから自動認識された項目は `admin_prefilled`、`proven_at: null` となります。
+
 ## メンバーのAI分身
 
 Admin は「ユーザー → 編集 → AI分身」で、そのメンバーのオーナーまたは操作権限のあるAI、または「なし」を選び、「AI分身を設定」を押します。同じAIを複数のメンバーの分身にはできません。このボタンは分身だけを保存し、他の項目は別途「保存」で変更します。分身の指定時にはメインAIも同じスタッフに設定し、分身の解除時はメインAIを保持します。退職処理では分身を解除して再割り当て可能にし、既存の紐付け移管は維持します。会話やメモリの閲覧権限は変更しません。
@@ -1039,6 +1060,8 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 
 開始、コールバック、完了時に設定を読み直します。ファイルを読めない、または解析できない場合はログインを無効にします。`enabled` の欠落・型不正、確認記録の欠落・空白、空または無効な `allowed_hd` も無効になります。ドメインが一つでも不正ならリスト全体が無効です。`"direct"` の完全一致だけが直接作成を選び、他の値は管理者承認になります。上限の省略時は 20、不正な値は 0 となり、新規受付を拒否します。不正なテンプレートは分身作成を止め、空白へ切り替えません。MFA 事前許可は boolean の `true` のみ有効です。生の設定エディターはログインの無効化、確認記録の削除、セクションの削除だけを許可し、有効化や範囲拡大はできません。
 
+管理者専用の `users.list {}` は `users[]` の各項目に `google_signin_linked`（真偽値）、`google_signin_linked_at`、`google_signin_last_signin_at`（日時または `null`）、`has_password`（真偽値）を返します。`signin_avatar` は `null` または `{state, reason, retry_allowed}` です。`state` は `pending`、`creating`、`retrying`、`waiting_admin`、`done`、`reason` は `done`、`name_taken`、`policy_changed`、`failed`、`protected_mode`、`template_changed`、`template_invalid`、`seats_full`、`not_eligible`、`unknown` または `null` です。再試行の表示は理由から推測せず、真偽値の `retry_allowed` に従います。
+
 ## 個人キーと Odoo 権限の設定（v1.86.0）
 
 追加項目は現在、設定／RPC で操作します。ダッシュボードの操作項目はダッシュボード更新時に提供します。
@@ -1073,3 +1096,11 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 本人の接続はブラウザー限定の `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` で管理します。先に status でサーバー／データベースを確認し、変更後は同じブラウザーセッションで読み直して再検証します。Connect と test は失敗・不正入力を含め、メンバーごとに毎分 5 回を共有します。パスワード変更、全端末サインアウト、利用停止後はキーの再入力が必要です。管理者は `odoo.member_credentials.list`、`.revoke {user_id}` で一覧・取り消しができますが、他人の秘密は設定できません。
 
 v1.85.x に戻す前に `[member_api_keys]` の `allow_conversation_content`、`allow_mcp_scopes` を削除してください。旧版は未知のキーを含むセクションを無効と判断し、全個人キーを停止します。v1.85 は `[odoo_access]` を無視してグローバル Odoo アカウントに戻るため、新しい会社アカウント一覧や拒否ポリシーは適用されません。
+
+管理者がダッシュボードのブラウザーにログインしている場合、`member_keys.policy_get {}` と `member_keys.policy_set {allow_conversation_content?: bool, allow_mcp_scopes?: string[], acknowledge_risk?: bool}` を利用できます。個人キーが無効でも操作可能です。正常応答はどちらも `{readable:true, enabled, allow_conversation_content, allow_mcp_scopes, available_mcp_scopes, risk:{conversation,mcp_scopes}}` です。設定の読み取り失敗や形式不正では get は `{readable:false, message}` を返し、set は拒否します。`[member_api_keys]` がテーブルでない場合も読み取り不能としてキーを無効にします。不明なフィールドと明示的な `null` は拒否します。
+
+会話内容の許可やスコープの追加には `acknowledge_risk:true` が必要で、縮小には不要です。保存前に `member_keys_policy_changed` を監査記録へ書き、記録できなければ保存しません。`config.raw.set`、`system.update_config`、`google.integration.set` と通常の設定保存経路は、この 2 項目の権限拡大を拒否します。バックアップ復元と CLI インポートでは拡大部分を除去し、管理者に専用設定での確認を案内します。
+
+`me.member_keys.list {limit?, cursor?}` は `policy:{allow_conversation_content,allow_mcp_scopes}` も返します。会話内容の許可は作成時のみ適用します。MCP は保存済みキースコープと現在の `allow_mcp_scopes` の共通部分を毎回適用し、スコープを再追加すると作成時にそのスコープがあった既存キーも再び利用できます。
+
+`odoo.access_get {}` は権限設定が読み取れない、または形式不正の場合に `{readable:false, message}` を返し、その状態では `odoo.access_set` は保存を拒否します。正常な get/set は `readable:true` と `follow_mode_impact:{avatars_with_personal_credentials,agents_acting_as_requester}` を返します。値はそれぞれ、アバターが割り当てられ個人 Odoo 認証情報を保存している有効なメンバー数（再検証が必要なものも含む）、依頼者として操作する設定の AI 社員数です。

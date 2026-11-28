@@ -619,6 +619,10 @@ ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `pare
 
 引擎模式須在 `allowed_models` 明列目標，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`，空清單不授權。依 Odoo 帳號模式以本人 Odoo 帳號權限取代員工模型／動作授權及引擎敏感模型封鎖清單；公司功能開關、`always_refuse`、固定拒絕、輸入檢查、核准與 Odoo ACL 仍適用。公司／AI 自有帳號仍用引擎模式。員工 `permission_override=engine` 保留引擎模式，`read_only` 移除寫入。全域 Follow 缺少有效管理員確認時退回引擎模式。
 
+`agents.update` 的 `odoo.allowed_actions` 接受 `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>`。這四種操作都要指定完整資料表名稱；新增規則不能只寫動作名稱，也不能使用萬用字元。通用設定寫入若會放寬員工的 Odoo 權限，會拒絕並引導管理員前往該員工的編輯頁。
+
+本人 Odoo 連線預設關閉；`[odoo] member_credentials` 只有明確設為 `true` 才算開放。關閉時不使用已存的本人憑證，本人金鑰呼叫會收到 `odoo_member_credentials_off`。分身或啟用 `act_as_requester` 的 AI 員工若沒有可用的自有憑證或獲准使用的公司憑證，員工身分路由也回傳此代碼，訊息為「公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。」開關為 `true` 時，同樣缺少連線的情況回傳 `odoo_not_connected`。
+
 `always_refuse` 預設：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。規則可用完整模型、`*` 或 `ir.*` 等點號子模型；`method:<name>` 精確比對方法。專用工具以目標模型與 `activity:`、`note:`、`message:`、`attach:` 動作比對。
 
 | 規則 | 固定拒絕的操作 |
