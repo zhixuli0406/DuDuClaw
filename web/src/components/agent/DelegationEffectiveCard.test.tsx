@@ -243,3 +243,12 @@ it('does not label an ordinary employee as a named avatar', async () => {
   await screen.findByText(en['settings.delegation.policy.department']);
   expect(screen.queryByText(/’s AI avatar$/)).not.toBeInTheDocument();
 });
+
+it('renders structured policy warning messages as plain text without codes', async () => {
+  signIn('manager');
+  effectiveMock.mockResolvedValue({ ...BASE, policy_warning: { code: 'private-code', message: '<b>The policy was ignored.</b>' } });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText(/<b>The policy was ignored.<\/b>/)).toBeInTheDocument();
+  expect(document.body).not.toHaveTextContent('private-code');
+  expect(document.querySelector('b')).toBeNull();
+});

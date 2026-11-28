@@ -6,7 +6,7 @@ import { ConfirmDialog, RiskConfirmDialog } from '@/components/settings/controls
 import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 import { api, type DriveWriteAction, type DriveWriteApproval, type DriveWriteForm, type DriveWriteStatus, type GoogleIdentityTestStep } from '@/lib/api';
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
-import { settingsRefusal } from '@/lib/settings-refusal';
+import { isSettingsConflict, settingsRefusal } from '@/lib/settings-refusal';
 import { useAgentsStore } from '@/stores/agents-store';
 
 const ACTIONS: DriveWriteAction[] = ['create', 'modify', 'move', 'trash'];
@@ -14,16 +14,8 @@ const MODES: DriveWriteApproval[] = ['none', 'member', 'member_and_admin'];
 const SCOPES = ['https://www.googleapis.com/auth/drive', 'https://www.googleapis.com/auth/documents', 'https://www.googleapis.com/auth/spreadsheets'];
 const selectClass = 'w-full rounded-lg border border-input bg-surface px-3 py-2 text-sm disabled:opacity-50';
 
-// Compare only the stored values, independently of metadata and property order.
-function snapshot(status: DriveWriteStatus): string {
-  return JSON.stringify([
-    ACTIONS.map(action => status.configured[action]),
-    ACTIONS.map(action => status.approval[action]),
-    status.folders.map(folder => folder.id).sort(),
-  ]);
-}
 function formOf(status: DriveWriteStatus): DriveWriteForm {
-  return { ...status.configured, approval: { ...status.approval }, folders: status.folders.map(folder => folder.id) };
+  return { ...status.configured, expected_hash: status.hash, approval: { ...status.approval }, folders: status.folders.map(folder => folder.id) };
 }
 function widens(before: DriveWriteStatus, next: DriveWriteForm): boolean {
   return ACTIONS.some(action => (!before.configured[action] && next[action])
@@ -39,7 +31,6 @@ export function GoogleDriveWriteCard({ integrationEnabled }: { integrationEnable
   const location = useLocation();
   useCompanyTimeZone();
   const [status, setStatus] = useState<DriveWriteStatus | null>(null);
-  const snapshotRef = useRef<string | null>(null);
   const lock = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -57,7 +48,6 @@ export function GoogleDriveWriteCard({ integrationEnabled }: { integrationEnable
   const agents = useAgentsStore(s => s.agents);
   const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const accept = useCallback((result: DriveWriteStatus) => {
-    snapshotRef.current = snapshot(result);
     setStatus(result);
     setConflict(false);
   }, []);
@@ -65,21 +55,23 @@ export function GoogleDriveWriteCard({ integrationEnabled }: { integrationEnable
     if (lock.current) return;
     lock.current = true; setBusy(true); setError(null);
     try { accept(await api.googleDriveWrite.get()); }
-    catch (err) { setStatus(null); snapshotRef.current = null; setError(settingsRefusal(err, errorText(err))); }
+    catch (err) { setStatus(null); setError(settingsRefusal(err, errorText(err))); }
     finally { lock.current = false; setBusy(false); }
   }, [accept, errorText]);
   useEffect(() => { void load(); }, [load, integrationEnabled]);
   useEffect(() => { void fetchAgents(); }, [fetchAgents]);
 
   const save = async (form: DriveWriteForm, acknowledge = false) => {
-    if (!status || lock.current || conflict || snapshotRef.current == null) return;
+    if (!status || lock.current || conflict || typeof status.hash !== 'string' || !status.hash) return;
     lock.current = true; setBusy(true); setError(null);
     try {
-      const current = await api.googleDriveWrite.get();
-      if (snapshotRef.current !== snapshot(current)) { setConflict(true); return; }
-      accept(await api.googleDriveWrite.set({ ...form, ...(acknowledge ? { acknowledge_risk: true } : {}) }));
+      accept(await api.googleDriveWrite.set({ ...form, expected_hash: status.hash, ...(acknowledge ? { acknowledge_risk: true } : {}) }));
       setFolderInput('');
-    } catch (err) { setError(settingsRefusal(err, errorText(err))); }
+    } catch (err) {
+      const message = settingsRefusal(err, errorText(err));
+      setError(message);
+      if (isSettingsConflict(message)) setConflict(true);
+    }
     finally { lock.current = false; setBusy(false); setPending(null); }
   };
   const change = (form: DriveWriteForm, action: DriveWriteAction | 'write') => {
@@ -108,7 +100,7 @@ export function GoogleDriveWriteCard({ integrationEnabled }: { integrationEnable
       } catch (err) { popup?.close(); throw err; }
     });
   };
-  const disabled = busy || conflict || pending !== null;
+  const disabled = busy || conflict || pending !== null || typeof status?.hash !== 'string' || !status.hash;
   const on = status ? ACTIONS.filter(action => status.effective[action]) : [];
   const integrationOff = !status?.integration_enabled || integrationEnabled === false;
   const logsPath = location.pathname.startsWith('/app/') ? '/app/system/logs' : '/logs';
@@ -116,7 +108,6 @@ export function GoogleDriveWriteCard({ integrationEnabled }: { integrationEnable
   return <Card data-testid="google-drive-write"><CardContent className="space-y-5 py-5">
     <div><h2 className="font-medium">{t('title')}</h2><p className="mt-1 text-sm text-muted-foreground">{t('intro')}</p></div>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    {conflict && <p role="alert" className="text-sm text-warning">{t('conflict')}</p>}
     {(conflict || !status) && <Button disabled={busy} variant="outline" onClick={() => void load()}>{t('reload')}</Button>}
     {status && <>
       <div className="space-y-1 text-sm" aria-live="polite">

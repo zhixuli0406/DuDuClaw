@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, ArrowLeftRight, Plus, Trash2 } from 'lucide-react';
-import { api, type AgentDetail, type DelegationSettings, type DelegationPolicy, type DelegationRole } from '@/lib/api';
+import { api, type AgentDetail, type DelegationPolicy, type DelegationRole } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
@@ -14,7 +14,7 @@ import {
   useErrorMessage,
 } from '@/components/mds';
 import { AdminAiCard } from './AdminAiCard';
-import { settingsRefusal } from '@/lib/settings-refusal';
+import { isSettingsConflict, settingsRefusal, settingsWarningMessage } from '@/lib/settings-refusal';
 import { RiskConfirmDialog, OptionSelect, type SelectOption } from '@/components/settings/controls';
 
 export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy', 'open', 'none'];
@@ -22,18 +22,6 @@ export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy
 /** A whitelist row while it is being edited — either side may still be blank. */
 type PairDraft = { a: string; b: string; direction?: 'two_way' | 'one_way' };
 const ROLES: DelegationRole[] = ['admin', 'manager'];
-
-// Capture values independently of the editable form and normalize list order.
-function settingsSnapshot(settings: DelegationSettings): string {
-  const pairs = (list: Array<[string, string]>, twoWay = false) =>
-    list.map(pair => JSON.stringify(twoWay ? [...pair].sort() : pair)).sort();
-  return JSON.stringify({
-    policy: settings.policy,
-    allow: pairs(settings.allow, true),
-    allow_one_way: pairs(settings.allow_one_way ?? []),
-    unrestricted_roles: [...(settings.unrestricted_roles ?? [])].sort(),
-  });
-}
 
 /**
  * 委派權限 (WP21 §2.8) — who may hand work to whom, org-wide.
@@ -65,14 +53,14 @@ export function DelegationTab() {
   const [savedRoles, setSavedRoles] = useState<DelegationRole[]>([]);
   const [pendingRole, setPendingRole] = useState<DelegationRole | null>(null);
   const [pairs, setPairs] = useState<PairDraft[]>([]);
-  const [warnings, setWarnings] = useState<string[]>([]);
+  const [warnings, setWarnings] = useState<unknown[]>([]);
   const [agents, setAgents] = useState<AgentDetail[]>([]);
   const [loading, setLoading] = useState(true);
   // True only after the latest load succeeded.
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
-  const snapshotRef = useRef<string | null>(null);
+  const hashRef = useRef<string | null>(null);
   const [conflict, setConflict] = useState(false);
   // P05: a failed read left the radio group on its `department` default and an
   // empty pair list — visually identical to a real, saved configuration.
@@ -84,14 +72,16 @@ export function DelegationTab() {
 
   const load = useCallback(async () => {
     setLoadError(null);
+    setSaveError(null);
     setLoaded(false);
     setLoading(true);
+    hashRef.current = null;
     try {
       const [settings, list] = await Promise.all([
         api.delegation.get(),
         api.agents.list(),
       ]);
-      snapshotRef.current = settingsSnapshot(settings);
+      hashRef.current = typeof settings.hash === 'string' && settings.hash ? settings.hash : null;
       setConflict(false);
       setPolicy(settings.policy);
       setPairs([...settings.allow.map(([a, b]) => ({ a, b })), ...(settings.allow_one_way ?? []).map(([a, b]) => ({ a, b, direction: 'one_way' as const }))]);
@@ -99,7 +89,7 @@ export function DelegationTab() {
       setRoles(loadedRoles);
       setSavedRoles(loadedRoles);
       setPendingRole(null);
-      setWarnings(settings.warnings ?? []);
+      setWarnings(Array.isArray(settings.warnings) ? settings.warnings : [null]);
       setAgents(list.agents ?? []);
       setLoaded(true);
     } catch (e) {
@@ -163,7 +153,7 @@ export function DelegationTab() {
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
   const tooManyPairs = pairs.length > 200;
   // Editing is possible only on a successfully loaded setting.
-  const editable = loaded && !loading && loadError == null && !conflict;
+  const editable = hashRef.current != null && loaded && !loading && loadError == null && !conflict;
   const addsRole = roles.some((role) => !savedRoles.includes(role));
   const canSave = editable && !saving && !incomplete && !hasSelfPair && !hasDuplicate && !tooManyPairs;
 
@@ -178,12 +168,8 @@ export function DelegationTab() {
     setSaved(false);
     setSaveError(null);
     try {
-      const current = await api.delegation.get();
-      if (snapshotRef.current !== settingsSnapshot(current)) {
-        setConflict(true);
-        return;
-      }
       await api.delegation.set({
+        expected_hash: hashRef.current!,
         policy,
         allow: pairs.filter((p) => p.direction !== 'one_way').map((p) => [p.a, p.b] as [string, string]),
         allow_one_way: pairs.filter((p) => p.direction === 'one_way').map((p) => [p.a, p.b] as [string, string]),
@@ -198,6 +184,7 @@ export function DelegationTab() {
     } catch (e) {
       console.warn('[api]', e);
       setSaveError(e);
+      if (isSettingsConflict(settingsRefusal(e, errorText(e)))) setConflict(true);
       toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     } finally {
       setSaving(false);
@@ -221,15 +208,14 @@ export function DelegationTab() {
             <AlertTriangle className="size-3.5 text-warning" />
             {t('settings.delegation.warnings')}
           </p>
-          <p className="text-muted-foreground">
-            {t('settings.delegation.safeWarning')}
-            {warnings.length > 1 && intl.formatMessage({ id: 'settings.delegation.warningCount' }, { count: warnings.length })}
-          </p>
+          <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+            {warnings.map((warning, index) => <li key={index}>{settingsWarningMessage(warning, t('settings.delegation.safeWarning'))}</li>)}
+          </ul>
         </div>
       )}
 
       {conflict && <div className="space-y-2">
-        <p role="alert" className="text-sm text-destructive">{t('settings.delegation.changed')}</p>
+        <p role="alert" className="text-sm text-destructive">{refusal}</p>
         <Button disabled={loading || saving} onClick={() => void load()}>{t('settings.delegation.reload')}</Button>
       </div>}
 
@@ -396,7 +382,7 @@ export function DelegationTab() {
       </SettingsSection>
 
       <div className="space-y-3">
-        {(saveError != null || tooManyPairs || hasSelfPair || hasDuplicate) && (
+        {((saveError != null && !conflict) || tooManyPairs || hasSelfPair || hasDuplicate) && (
           <p role="alert" className="text-sm text-destructive">
             {tooManyPairs ? t('settings.delegation.pairs.limit') : hasSelfPair ? t('settings.delegation.pair.same') : hasDuplicate ? t('settings.delegation.pair.duplicate') : refusal}
           </p>

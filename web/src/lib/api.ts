@@ -1006,7 +1006,13 @@ export interface AdminAiUpdate {
   acknowledge_risk?: boolean;
 }
 
+export interface DelegationWarning {
+  code: string;
+  message: string;
+}
+
 export interface DelegationSettings {
+  hash: string;
   unrestricted_roles?: DelegationRole[];
   allow_one_way?: Array<[string, string]>;
   /** The policy the gateway enforces (an unrecognised value reads `none`). */
@@ -1016,7 +1022,7 @@ export interface DelegationSettings {
   /** Unordered agent-id pairs — a pair permits delegation in both directions. */
   allow: Array<[string, string]>;
   /** Operator-facing notes about values the gateway had to fall back on. */
-  warnings: string[];
+  warnings: DelegationWarning[];
 }
 
 /** `delegation.effective.config_error` categories (v1.82, RM-137). */
@@ -1039,7 +1045,7 @@ export interface DelegationEffective {
   global_policy: DelegationPolicy;
   configured_policy: string | null;
   /** Set when the configured policy value was not recognised (enforced as `none`). */
-  policy_warning: string | null;
+  policy_warning: DelegationWarning | null;
   /**
    * Set when config.toml or this employee's agent.toml could not be read or
    * parsed — a category only, never config text (it can quote raw config).
@@ -6499,6 +6505,7 @@ export interface GoogleDelegationStatus {
 export type DriveWriteAction = 'create' | 'modify' | 'move' | 'trash';
 export type DriveWriteApproval = 'none' | 'member' | 'member_and_admin';
 export interface DriveWriteForm {
+  expected_hash: string;
   create: boolean;
   modify: boolean;
   move: boolean;
@@ -6507,6 +6514,7 @@ export interface DriveWriteForm {
   folders: string[];
 }
 export interface DriveWriteStatus {
+  hash: string;
   configured: Record<DriveWriteAction, boolean>;
   effective: Record<DriveWriteAction, boolean>;
   approval: Record<DriveWriteAction, DriveWriteApproval>;
@@ -8440,7 +8448,7 @@ export const api = {
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
+    set: (params: { expected_hash: string; policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;

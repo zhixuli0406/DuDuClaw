@@ -184,7 +184,7 @@ describe('S-10 Drive write history', () => {
       if (method === 'agents.list') return { agents: [{ name: 'agent-secret', display_name: 'Sales assistant' }] };
       if (method === 'users.list') return { users: [{ id: 'user-secret', display_name: 'Mei', email: 'mei@example.test' }] };
       return { events: [{ timestamp: '2026-11-27T01:30:00Z', source: 'tool_call', event_type: 'google_drive_write', agent_id: 'agent-secret', severity: 'warning', summary: 'raw-secret', details: { tool_call: {
-        tool_name: 'google_drive_write', identity_kind: 'personal', account_email: 'mei@example.test', requester: 'DashboardUser { user_id: "user-secret" }', action: 'move', file_name: 'Proposal.pdf', folder_rule: 'folder-secret', approval: { mode: 'member_and_admin', approval_ids: ['approval-secret'], decided_by: ['dashboard:user-secret', 'admin@example.test'] }, outcome: 'refused', reason: 'folder_out_of_scope', post_check: 'none', file_id: 'file-secret', token: 'token-secret',
+        tool_name: 'google_drive_write', identity_kind: 'personal', account_email: 'mei@example.test', requester: { kind: 'dashboard_user', label: 'Mei' }, action: 'move', file_name: 'Proposal.pdf', folder_rule: 'folder-secret', approval: { mode: 'member_and_admin', approval_ids: ['approval-secret'], decided_by: ['dashboard:user-secret', 'admin@example.test'] }, outcome: 'refused', reason: 'folder_out_of_scope', post_check: 'none', file_id: 'file-secret', token: 'token-secret',
       } } }] };
     });
     renderAt('/manage/logs?tool_name_filter=google_drive_write');
@@ -196,15 +196,23 @@ describe('S-10 Drive write history', () => {
   });
 });
 
-it('handles system requesters, unknown reason codes and post-checks without raw values', async () => {
+it.each([
+  ['system', '(Schedule)', '(Schedule)'],
+  ['unknown', '', '(System)'],
+  ['system', '   ', '(System)'],
+  ['legacy', '<b>Legacy label</b>', '<b>Legacy label</b>'],
+  ['channel_user', 'Channel member', 'Channel member'],
+  ['channel_unbound', 'Unbound visitor', 'Unbound visitor'],
+])('renders requester %s labels as text and handles empty system labels', async (kind, label, expected) => {
   mockWsClient.call.mockImplementation(async (method: string) => {
     if (method === 'agents.list') return { agents: [] };
     if (method === 'users.list') return { users: [] };
     if (method === 'google.drive_write.get') return { folders: [{ id: 'hidden-folder', name: 'Sales', kind: 'folder' }] };
-    return { events: [{ timestamp: '2026-11-27T00:00:00Z', source: 'tool_call', event_type: 'google_drive_write', agent_id: 'hidden-agent', severity: 'info', details: { tool_call: { tool_name: 'google_drive_write', identity_kind: 'home_oauth', account_email: 'office@example.test', requester: 'System { kind: "cron", on_behalf_of: Some("hidden-user") }', action: 'create', file_name: 'Note.txt', folder_rule: 'hidden-folder', approval: { mode: 'none', approval_ids: ['hidden-approval'], decided_by: [] }, outcome: 'confirmed', reason: 'unknown_reason_secret', post_check: 'ok' } } }] };
+    return { events: [{ timestamp: '2026-11-27T00:00:00Z', source: 'tool_call', event_type: 'google_drive_write', agent_id: 'hidden-agent', severity: 'info', details: { tool_call: { tool_name: 'google_drive_write', identity_kind: 'home_oauth', account_email: 'office@example.test', requester: { kind, label }, action: 'create', file_name: 'Note.txt', folder_rule: 'hidden-folder', approval: { mode: 'none', approval_ids: ['hidden-approval'], decided_by: [] }, outcome: 'confirmed', reason: 'unknown_reason_secret', post_check: 'ok' } } }] };
   });
   renderAt('/manage/logs');
-  expect(await screen.findByText('(Schedule)')).toBeInTheDocument();
+  expect(await screen.findByText(expected)).toBeInTheDocument();
+  expect(document.querySelector('b')).toBeNull();
   expect(await screen.findByText('Sales')).toBeInTheDocument();
   expect(screen.getByText('Company account')).toBeInTheDocument(); expect(screen.getByText('Location verified')).toBeInTheDocument();
   expect(screen.getByText('Incomplete')).toBeInTheDocument();

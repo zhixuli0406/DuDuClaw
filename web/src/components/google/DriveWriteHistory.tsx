@@ -38,13 +38,6 @@ export function DriveWriteHistory({ events }: { events: UnifiedAuditEvent[] }) {
   useCompanyTimeZone();
   const person = (value: unknown): string => {
     const raw = text(value);
-    // RequesterIdentity is currently serialized using Rust Debug, not JSON.
-    if (/^System \{ kind: "(?:cron|schedule|scheduled)"[, ]/.test(raw) || ['cron', 'schedule', 'scheduled'].includes(raw)) return t('person.schedule');
-    if (/^System \{/.test(raw) || ['Unknown', 'unknown', 'system', 'heartbeat', 'dispatch', 'external', 'public_visitor'].includes(raw) || !raw) return t('person.system');
-    if (/^(?:DashboardUser|ChannelUser) \{/.test(raw)) {
-      const id = raw.match(/\buser_id: (?:Some\()?"([^"\\]+)"\)?(?:,| \})/)?.[1];
-      return id ? nameOf(id) || t('person.system') : t('person.system');
-    }
     const dashboardId = raw.match(/^dashboard:([^:]+)$/)?.[1];
     if (dashboardId) return nameOf(dashboardId) || t('person.system');
     // Channel principals are not dashboard user ids; never expose them.
@@ -69,7 +62,7 @@ export function DriveWriteHistory({ events }: { events: UnifiedAuditEvent[] }) {
         const cells = [
           formatDateTime(event.timestamp, { locale: intl.locale }), agent?.display_name || t('unnamedEmployee'),
           <><span>{identity ? t(`identity.${identity}`) : t('person.system')}</span>{text(row.account_email).includes('@') && <span className="mt-1 block">{text(row.account_email)}</span>}</>,
-          person(row.requester), ACTIONS.includes(action) ? t(`action.${action}`) : t('unfinished'), text(row.file_name) || '—',
+          text(object(row.requester).label).trim() ? text(object(row.requester).label) : t('person.system'), ACTIONS.includes(action) ? t(`action.${action}`) : t('unfinished'), text(row.file_name) || '—',
           folder ? folder === 'global' ? t('rule.global') : folder.split(',').map(id => folderNames.get(id) || t('rule.limited')).join('、') : '—',
           <>{MODES.includes(mode) ? t(`approval.${mode}`) : '—'}{deciders && <span className="mt-1 block">{deciders}</span>}</>,
           <><span>{OUTCOMES.includes(outcome) ? t(`outcome.${outcome}`) : t('unfinished')}</span>{reason && <span className="mt-1 block text-muted-foreground">{DRIVE_WRITE_REASONS.includes(reason) ? t(`reason.${reason}`) : t('unfinished')}</span>}</>,

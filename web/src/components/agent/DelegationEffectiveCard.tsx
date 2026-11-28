@@ -5,6 +5,7 @@ import { api, type DelegationEffective } from '@/lib/api';
 import { useAuthStore } from '@/stores/auth-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAgentsStore } from '@/stores/agents-store';
+import { settingsWarningMessage } from '@/lib/settings-refusal';
 import { hasMinRole } from '@/lib/roles';
 import { Badge, Card, CardContent, CardHeader, CardTitle, useErrorMessage } from '@/components/mds';
 
@@ -143,13 +144,13 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
             {data.policy === 'none' && (
               <p className="text-xs text-muted-foreground">{t('agentDetail.delegation.teamNote')}</p>
             )}
-            {(data.config_error || data.policy_warning) && (
+            {(data.config_error || data.policy_warning != null) && (
               <p role="alert" className="flex items-start gap-1.5 text-xs text-warning">
                 <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                 <span>
                   {t('agentDetail.delegation.configProblem')}
                   {' '}
-                  {data.config_error ? configErrorText(data.config_error) : t('settings.delegation.safeWarning')}
+                  {data.config_error ? configErrorText(data.config_error) : settingsWarningMessage(data.policy_warning, t('settings.delegation.safeWarning'))}
                 </span>
               </p>
             )}

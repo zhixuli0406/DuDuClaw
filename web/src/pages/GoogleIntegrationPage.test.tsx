@@ -120,6 +120,7 @@ import { mockWsClient } from '@/test/mocks';
 import { useAgentsStore } from '@/stores/agents-store';
 
 const DRIVE = {
+  hash: 'drive-1',
   configured: { create: false, modify: false, move: false, trash: false },
   effective: { create: false, modify: false, move: false, trash: false },
   approval: { create: 'member', modify: 'member', move: 'member', trash: 'member' },
@@ -136,7 +137,7 @@ function driveSetup(overrides: Partial<typeof DRIVE> = {}) {
   mockGet();
   mockWsClient.call.mockImplementation(async (method: string, params: Record<string, unknown>) => {
     if (method === 'google.drive_write.get') return state;
-    if (method === 'google.drive_write.set') return { ...state, configured: params, effective: params, approval: params.approval,
+    if (method === 'google.drive_write.set') return { ...state, hash: 'drive-2', configured: Object.fromEntries(['create', 'modify', 'move', 'trash'].map(key => [key, params[key]])), effective: params, approval: params.approval,
       folders: (params.folders as string[]).map(id => ({ id, name: 'Team folder', kind: 'folder' })) };
     return {};
   });
@@ -170,7 +171,7 @@ describe('S-08 Drive write administration', () => {
     expect(await screen.findByText('Existing document and spreadsheet editing tools are not controlled by these switches.')).toBeInTheDocument();
     await acknowledge();
     await waitFor(() => expect(sets()).toHaveLength(1));
-    expect(sets()[0][1]).toEqual({ ...DRIVE.configured, create: true, approval: DRIVE.approval, folders: [], acknowledge_risk: true });
+    expect(sets()[0][1]).toEqual({ expected_hash: 'drive-1', ...DRIVE.configured, create: true, approval: DRIVE.approval, folders: [], acknowledge_risk: true });
   });
   it('turns off without acknowledgement', async () => {
     driveSetup({ configured: { ...DRIVE.configured, create: true }, effective: { ...DRIVE.effective, create: true } });
@@ -208,17 +209,56 @@ describe('S-08 Drive write administration', () => {
     expect(sets()).toHaveLength(0); await acknowledge();
     await waitFor(() => expect(sets()).toHaveLength(1)); expect(sets()[0][1]).toHaveProperty('acknowledge_risk', true);
   });
-  it.each(['mismatch', 'failure'])('blocks saves after a stale re-read %s', async kind => {
+  it.each([
+    '設定已被其他人變更，請重新整理後再儲存。',
+    '設定頁的資料已過期，請重新整理後再儲存。',
+  ])('locks editing on server refusal: %s', async message => {
     const state = driveSetup(); const card = await driveCard();
-    await card.findByRole('switch', { name: 'Create' });
+    await waitFor(() => expect(card.getByRole('switch', { name: 'Create' })).toBeEnabled());
+    const getsBefore = mockWsClient.call.mock.calls.filter(c => c[0] === 'google.drive_write.get').length;
     mockWsClient.call.mockImplementation(async (method: string) => {
-      if (method === 'google.drive_write.get') { if (kind === 'failure') throw new Error('technical secret'); return { ...state, approval: { ...state.approval, trash: 'none' } }; }
+      if (method === 'google.drive_write.get') return state;
+      if (method === 'google.drive_write.set') throw new Error(message);
       return {};
     });
     await userEvent.click(card.getByRole('switch', { name: 'Create' })); await acknowledge();
-    await waitFor(() => expect(card.getByRole('alert')).toBeInTheDocument());
-    expect(sets()).toHaveLength(0); expect(card.queryByText('technical secret')).not.toBeInTheDocument();
-    if (kind === 'mismatch') expect(card.getByRole('button', { name: 'Reload' })).toBeInTheDocument();
+    expect(await card.findByRole('alert')).toHaveTextContent(message);
+    expect(sets()).toHaveLength(1);
+    expect(mockWsClient.call.mock.calls.filter(c => c[0] === 'google.drive_write.get')).toHaveLength(getsBefore);
+    card.getAllByRole('switch').forEach(toggle => expect(toggle).toBeDisabled());
+    expect(card.getByRole('textbox', { name: 'Paste a folder link' })).toBeDisabled();
+    await userEvent.click(card.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(card.getByRole('switch', { name: 'Create' })).toBeEnabled());
+  });
+  it('uses the set response hash on the next save without re-reading', async () => {
+    driveSetup(); const card = await driveCard();
+    await waitFor(() => expect(card.getByRole('switch', { name: 'Create' })).toBeEnabled());
+    const getsBefore = mockWsClient.call.mock.calls.filter(c => c[0] === 'google.drive_write.get').length;
+    await userEvent.click(card.getByRole('switch', { name: 'Create' })); await acknowledge();
+    await waitFor(() => expect(card.getByRole('switch', { name: 'Create' })).toBeEnabled());
+    await userEvent.click(card.getByRole('switch', { name: 'Create' }));
+    await waitFor(() => expect(sets()).toHaveLength(2));
+    expect(sets()[0][1]).toHaveProperty('expected_hash', 'drive-1');
+    expect(sets()[1][1]).toHaveProperty('expected_hash', 'drive-2');
+    expect(mockWsClient.call.mock.calls.filter(c => c[0] === 'google.drive_write.get')).toHaveLength(getsBefore);
+  });
+  it('cannot save after an unreadable settings load', async () => {
+    driveSetup();
+    const original = mockWsClient.call.getMockImplementation()!;
+    mockWsClient.call.mockImplementation(async (...args) => {
+      if (args[0] === 'google.drive_write.get') throw new Error('unreadable');
+      return original(...args);
+    });
+    const card = await driveCard();
+    expect(await card.findByRole('alert')).toBeInTheDocument();
+    expect(card.queryByRole('switch')).not.toBeInTheDocument();
+    expect(sets()).toHaveLength(0);
+  });
+  it('disables saves when the loaded response has no hash', async () => {
+    driveSetup({ hash: '' }); const card = await driveCard();
+    expect(await card.findByRole('switch', { name: 'Create' })).toBeDisabled();
+    expect(card.getByRole('textbox', { name: 'Paste a folder link' })).toBeDisabled();
+    expect(sets()).toHaveLength(0);
   });
   it('disables the four rows when the integration is off but allows folders', async () => {
     driveSetup({ integration_enabled: false, configured: { ...DRIVE.configured, create: true } }); const card = await driveCard();
@@ -270,7 +310,7 @@ describe('S-08 consent and refusal states', () => {
   });
   it('shows plain server refusals without modifying the saved form', async () => {
     const state = driveSetup(); const card = await driveCard();
-    await card.findByRole('switch', { name: 'Create' });
+    await waitFor(() => expect(card.getByRole('switch', { name: 'Create' })).toBeEnabled());
     mockWsClient.call.mockImplementation(async (method: string) => {
       if (method === 'google.drive_write.set') throw new Error('這個連結不是資料夾');
       return state;
