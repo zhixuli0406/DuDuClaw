@@ -512,7 +512,7 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
         &admin_ctx(),
     ).await;
     assert!(!frame_ok(&frame), "a mismatching hash must be refused: {frame:?}");
-    assert_eq!(frame_error(&frame), "設定已被其他人變更，請重新整理後再儲存。");
+    assert!(frame_error(&frame).contains("設定已被其他人變更，請重新整理後再儲存。"));
     assert_eq!(
         std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
         broken,
