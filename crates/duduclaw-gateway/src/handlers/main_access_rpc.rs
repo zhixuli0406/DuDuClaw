@@ -14,13 +14,14 @@ const MAX_USERS: usize = 500;
 const INEFFECTIVE_REASON: &str = "目前沒有啟用受保護模式，名單暫時不會生效；只有管理員能使用主要 AI 員工。啟用受保護模式後，名單內的成員才能和主要 AI 員工對話、交辦工作。";
 
 fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
-    let ids = db.main_agent_users().map_err(|_| UNAVAILABLE)?;
-    let mut users = Vec::with_capacity(ids.len());
-    for id in ids {
-        let user = db.get_user(&id).map_err(|_| UNAVAILABLE)?.ok_or(UNAVAILABLE)?;
+    let entries = db.main_agent_users_display().map_err(|_| UNAVAILABLE)?;
+    let mut users = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let user = entry.user;
         users.push(json!({
             "user_id": user.id, "display_name": user.display_name, "email": user.email,
             "role": user.role, "status": user.status,
+            "granted_by_name": entry.granted_by_name, "granted_at": entry.granted_at,
         }));
     }
     Ok(json!({"users": users, "risk_notice": RISK_NOTICE}))

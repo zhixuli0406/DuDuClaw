@@ -38,9 +38,12 @@ async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor()
     let f = fixture().await;
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await),
         json!({"users": [], "risk_notice": RISK_NOTICE, "effective": true}));
+    let saved = payload(rpc(&f, SET, json!({"user_ids": ["emp"], "acknowledged": true}), &f.admin).await);
+    let granted_at = saved["users"][0]["granted_at"].as_str().unwrap();
     let expected = json!({"users": [{
         "user_id": "emp", "display_name": "emp", "email": "emp@example.invalid",
         "role": "employee", "status": "active",
+        "granted_by_name": "admin", "granted_at": granted_at,
     }], "risk_notice": RISK_NOTICE, "effective": false, "ineffective_reason": INEFFECTIVE_REASON});
     assert_eq!(payload(rpc(&f, SET, json!({
         "user_ids": ["emp", "emp"], "acknowledged": true, "actor": "mgrA", "user_id": "mgrA",
@@ -211,4 +214,27 @@ async fn isolation_controls_get_set_effectiveness_even_without_shell() {
         assert_eq!(response["ineffective_reason"], INEFFECTIVE_REASON);
     }
     assert_eq!(payload(rpc(&f, "users.me", json!({}), &f.emp).await)["main_agent_access"], false);
+}
+
+#[tokio::test]
+async fn main_access_displays_granter_name_timestamp_and_null_after_deletion() {
+    let f = fixture().await;
+    f.db.set_main_agent_users("admin", &["emp".into()], true).unwrap();
+    let conn = rusqlite::Connection::open(f.home.join("users.db")).unwrap();
+    conn.execute("UPDATE users SET display_name='王管理員' WHERE id='admin'", []).unwrap();
+    conn.execute("UPDATE main_agent_users SET granted_at='2026-11-28T01:02:03Z'", []).unwrap();
+    let data = payload(rpc(&f, GET, json!({}), &f.admin).await);
+    assert_eq!(data["users"][0], json!({
+        "user_id": "emp", "display_name": "emp", "email": "emp@example.invalid",
+        "role": "employee", "status": "active", "granted_by_name": "王管理員",
+        "granted_at": "2026-11-28T01:02:03Z",
+    }));
+    // Preserve the live caller while pointing the grant at a deleted account.
+    conn.execute("UPDATE main_agent_users SET granted_by='mgrA'", []).unwrap();
+    conn.execute("DELETE FROM users WHERE id='mgrA'", []).unwrap();
+    let data = payload(rpc(&f, GET, json!({}), &f.admin).await);
+    let row = &data["users"][0];
+    assert!(row.get("granted_by_name").unwrap().is_null());
+    assert!(row.get("granted_by").is_none());
+    assert_eq!(row["granted_at"], "2026-11-28T01:02:03Z");
 }

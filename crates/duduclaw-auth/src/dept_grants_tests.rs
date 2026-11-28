@@ -384,3 +384,24 @@ fn dept_grants_display_creator_snapshot_reads_fresh_facts_and_reports_errors() {
     db.conn().execute("DROP TABLE department_manager_grants", []).unwrap();
     assert!(db.display_creator_access(&manager).is_err());
 }
+
+#[test]
+fn main_access_display_batch_resolves_names_preserves_time_and_fails_on_read_error() {
+    let (db, _path) = test_db();
+    let granter = user(&db, "王管理員", UserRole::Admin);
+    let member = user(&db, "李成員", UserRole::Employee);
+    db.set_main_agent_users(&granter, &[member.clone()], true).unwrap();
+    db.conn().execute("UPDATE main_agent_users SET granted_at='stored-time'", []).unwrap();
+    let rows = db.main_agent_users_display().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].user.id, member);
+    assert_eq!(rows[0].granted_by_name.as_deref(), Some("王管理員"));
+    assert_eq!(rows[0].granted_at, "stored-time");
+    db.conn().execute("DELETE FROM users WHERE id=?1", [&granter]).unwrap();
+    let rows = db.main_agent_users_display().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].granted_by_name, None);
+    assert_eq!(rows[0].granted_at, "stored-time");
+    db.conn().execute("ALTER TABLE main_agent_users RENAME COLUMN granted_at TO broken", []).unwrap();
+    assert!(db.main_agent_users_display().is_err());
+}

@@ -19,6 +19,13 @@ pub struct DisplayCreatorAccess {
     pub grants: Vec<(String, Vec<GrantGroup>)>,
 }
 
+/// One batch projection for the dashboard; granter identities are never names.
+pub struct MainAgentUserDisplay {
+    pub user: User,
+    pub granted_by_name: Option<String>,
+    pub granted_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrantGroup {
@@ -329,6 +336,25 @@ impl UserDb {
 
     pub fn main_agent_users(&self) -> Result<Vec<String>, String> {
         read_main_users(&self.conn())
+    }
+
+    /// Read members and grant evidence in a single statement/snapshot.
+    pub fn main_agent_users_display(&self) -> Result<Vec<MainAgentUserDisplay>, String> {
+        let conn = self.conn();
+        let columns = crate::user_row::USER_COLUMNS.split(',')
+            .map(|column| format!("u.{}", column.trim())).collect::<Vec<_>>().join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {columns}, g.display_name AS granted_by_name, m.granted_at
+             FROM main_agent_users m LEFT JOIN users u ON u.id=m.user_id
+             LEFT JOIN users g ON g.id=m.granted_by ORDER BY m.user_id"
+        )).map_err(store_error)?;
+        let rows = stmt.query_map([], |row| Ok(MainAgentUserDisplay {
+            // A stale member row still fails the whole RPC, as before.
+            user: crate::user_row::user_from_row(row)?,
+            granted_by_name: row.get("granted_by_name")?,
+            granted_at: row.get("granted_at")?,
+        })).map_err(store_error)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(store_error)
     }
 
     pub fn is_main_agent_user(&self, user_id: &str) -> Result<bool, String> {

@@ -596,15 +596,17 @@ pub(crate) fn effective_delegation_json(
             // The gate refuses every permission-gated tool on this error.
             Err(e) => (false, false, Some(e)),
         };
-    use duduclaw_core::delegation_policy::OwnerRoleView;
-    let owner = if read.overrides.unrestricted_roles.is_empty() {
-        Ok(None)
+    let owner = crate::delegation_roles::GatewayOwnerRoles::new(
+        home, crate::delegation_roles::Requester::background()).avatar_owner(&dir_name);
+    // Name lookup is display-only, including when role overrides are disabled.
+    let owner_display_name = owner.as_ref().ok().and_then(|owner| owner.as_ref())
+        .and_then(|(id, _)| crate::decision_notify::open_user_db_read_only(home).ok().flatten()
+            .and_then(|db| db.get_user(id).ok().flatten()).map(|user| user.display_name));
+    let (owner_error, owner_role) = if read.overrides.unrestricted_roles.is_empty() {
+        (false, None)
     } else {
-        crate::delegation_roles::GatewayOwnerRoles::new(home, crate::delegation_roles::Requester::background())
-            .avatar_owner_role(&dir_name)
+        (owner.is_err(), owner.ok().flatten().map(|(_, role)| role))
     };
-    let owner_error = owner.is_err();
-    let owner_role = owner.ok().flatten();
     let unrestricted = owner_role.as_ref().is_some_and(|r| read.overrides.unrestricted_roles.contains(r));
     let global = read.rules.policy;
     let (policy, source) = if global == DelegationPolicy::Disabled {
@@ -673,6 +675,7 @@ pub(crate) fn effective_delegation_json(
         "agent_id": agent_name,
         "unrestricted": unrestricted,
         "owner_role": owner_role,
+        "owner_display_name": owner_display_name,
         "unrestricted_error": if owner_error { Some("users_unreadable") } else { None },
         "allow_one_way": if pairs_apply { one_way.clone() } else { Vec::new() },
         "inactive_allow_one_way": if pairs_apply { Vec::new() } else { one_way },
@@ -938,7 +941,7 @@ mod rm183_owner_tests {
         std::fs::write(agent.join("agent.toml"), "[agent]\nname='a'").unwrap();
         std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='none'\nunrestricted_roles=['admin']\nallow_one_way=[['a','b']]").unwrap();
         let db = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
-        db.execute_batch("CREATE TABLE users (role TEXT, status TEXT, avatar_agent_id TEXT); INSERT INTO users VALUES ('admin', 'active', 'a');").unwrap();
+        db.execute_batch("CREATE TABLE users (id TEXT, role TEXT, status TEXT, avatar_agent_id TEXT); INSERT INTO users VALUES ('owner', 'admin', 'active', 'a');").unwrap();
         let value = effective_delegation_json(home.path(), &agent, "a", &|_| false, false);
         assert_eq!(value["unrestricted"], true);
         assert_eq!(value["owner_role"], "admin");
@@ -946,7 +949,7 @@ mod rm183_owner_tests {
         assert_eq!(value["inactive_allow_one_way"][0]["to"], HIDDEN_PEER_PLACEHOLDER);
         db.execute("UPDATE users SET status='disabled'", []).unwrap();
         assert_eq!(effective_delegation_json(home.path(), &agent, "a", &|_| false, false)["unrestricted"], false);
-        db.execute_batch("UPDATE users SET status='active'; INSERT INTO users VALUES ('admin', 'active', 'a');").unwrap();
+        db.execute_batch("UPDATE users SET status='active'; INSERT INTO users VALUES ('other', 'admin', 'active', 'a');").unwrap();
         assert_eq!(effective_delegation_json(home.path(), &agent, "a", &|_| false, false)["unrestricted"], false);
     }
 }

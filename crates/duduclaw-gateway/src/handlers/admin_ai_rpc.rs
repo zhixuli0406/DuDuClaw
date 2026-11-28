@@ -2,6 +2,8 @@
 use super::*;
 use super::config_commit::{content_hash, read_text_or_empty, commit_table_locked_with_guard};
 
+const CONFIG_UNREADABLE: &str = "設定檔目前無法讀取，請先修正設定檔再變更管理員 AI 設定。";
+
 fn stamp_ack(section: &mut toml::Table, user_id: &str) {
     let mut ack = toml::Table::new();
     ack.insert("by".into(), toml::Value::String(user_id.into()));
@@ -42,12 +44,27 @@ pub(super) fn audit_admin_ai_toggle(home: &Path, user_id: &str, before: &toml::T
 impl MethodHandler {
     pub(crate) async fn handle_admin_ai_get(&self, ctx: &UserContext) -> WsFrame {
         if let Err(e) = acl::require_role(ctx, UserRole::Admin) { return WsFrame::error_response("", &e); }
-        let table = read_text_or_empty(&self.home_dir.join("config.toml")).ok()
-            .and_then(|text| text.parse::<toml::Table>().ok()).unwrap_or_default();
-        let mut payload = json!({"enabled": duduclaw_core::admin_ai_settings::enabled_from_table(&table)});
+        let (table, config_state) = match read_text_or_empty(&self.home_dir.join("config.toml")) {
+            Err(_) => (toml::Table::new(), "unreadable"),
+            Ok(text) => match text.parse::<toml::Table>() {
+                Err(_) => (toml::Table::new(), "malformed"),
+                Ok(table) => {
+                    let valid = table.get("admin_ai").is_none_or(|section| section.as_table()
+                        .is_some_and(|section| section.get("enabled").is_none_or(|value| value.as_bool().is_some())));
+                    (table, if valid { "ok" } else { "malformed" })
+                }
+            },
+        };
+        let mut payload = json!({"enabled": config_state == "ok"
+            && duduclaw_core::admin_ai_settings::enabled_from_table(&table), "config_state": config_state});
         if let Some(ack) = table.get("admin_ai").and_then(|s| s.get("enabled_ack")).and_then(toml::Value::as_table) {
             if let (Some(by), Some(at)) = (ack.get("by").and_then(toml::Value::as_str), ack.get("at").and_then(toml::Value::as_str)) {
-                payload["enabled_ack"] = json!({"by": by, "at": at});
+                let by_name = match self.user_db().await {
+                    Some(db) => db.get_user(by).ok().flatten()
+                        .map(|user| duduclaw_core::plain_line(&user.display_name, 200)),
+                    None => None,
+                };
+                payload["enabled_ack"] = json!({"by": by, "by_name": by_name, "at": at});
             }
         }
         WsFrame::ok_response("", payload)
@@ -63,8 +80,8 @@ impl MethodHandler {
             return WsFrame::error_response("", "開啟管理員 AI 前，請明確確認風險（acknowledge_risk = true）。");
         }
         let path = self.home_dir.join("config.toml");
-        let original = match read_text_or_empty(&path) { Ok(text) => text, Err(e) => return WsFrame::error_response("", &e) };
-        let before: toml::Table = match original.parse() { Ok(table) => table, Err(_) => return WsFrame::error_response("", "設定檔格式錯誤，無法儲存。") };
+        let original = match read_text_or_empty(&path) { Ok(text) => text, Err(_) => return WsFrame::error_response("", CONFIG_UNREADABLE) };
+        let before: toml::Table = match original.parse() { Ok(table) => table, Err(_) => return WsFrame::error_response("", CONFIG_UNREADABLE) };
         let mut after = before.clone();
         let section = after.entry("admin_ai").or_insert_with(|| toml::Value::Table(toml::Table::new()));
         let Some(section) = section.as_table_mut() else { return WsFrame::error_response("", "[admin_ai] 必須是設定區段。"); };
@@ -92,6 +109,53 @@ mod tests {
     fn ok(frame: &WsFrame) -> bool { matches!(frame, WsFrame::Response { ok: true, .. }) }
     fn payload(frame: &WsFrame) -> Value {
         match frame { WsFrame::Response { payload, .. } => payload.clone().unwrap_or(Value::Null), _ => panic!("{frame:?}") }
+    }
+
+    #[tokio::test]
+    async fn admin_ai_get_reports_config_state_and_set_sanitizes_read_errors() {
+        let home = tempfile::tempdir().unwrap();
+        let h = MethodHandler::new(home.path().to_owned()).await;
+        let admin = UserContext::admin_fallback();
+        let path = home.path().join("config.toml");
+        assert_eq!(payload(&h.handle_admin_ai_get(&admin).await), json!({"enabled": false, "config_state": "ok"}));
+        for (text, state, enabled) in [
+            ("[admin_ai]\nenabled=true\n", "ok", true),
+            ("[admin_ai]\nenabled=false\n", "ok", false),
+            ("broken=[", "malformed", false),
+            ("[admin_ai]\nenabled='yes'\n", "malformed", false),
+            ("admin_ai=true\n", "malformed", false),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert_eq!(payload(&h.handle_admin_ai_get(&admin).await),
+                json!({"enabled": enabled, "config_state": state}));
+        }
+        std::fs::write(&path, "broken=[").unwrap();
+        let expected = "設定檔目前無法讀取，請先修正設定檔再變更管理員 AI 設定。";
+        let frame = h.handle_admin_ai_set(json!({"enabled": false}), &admin).await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, error: Some(ref e), .. } if e == &json!(expected)));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(payload(&h.handle_admin_ai_get(&admin).await), json!({"enabled": false, "config_state": "unreadable"}));
+        let frame = h.handle_admin_ai_set(json!({"enabled": false}), &admin).await;
+        assert!(matches!(frame, WsFrame::Response { ok: false, error: Some(ref e), .. } if e == &json!(expected)));
+    }
+
+    #[tokio::test]
+    async fn admin_ai_get_ack_name_resolves_and_is_null_for_deleted_user() {
+        let home = tempfile::tempdir().unwrap();
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let user = db.create_user("admin@example.invalid", "王管理員", "test-password", UserRole::Admin).unwrap();
+        let h = MethodHandler::new(home.path().to_owned()).await;
+        std::fs::write(home.path().join("config.toml"), format!(
+            "[admin_ai]\nenabled=true\nenabled_ack={{by='{}',at='2026-11-28T01:02:03Z'}}\n", user.id)).unwrap();
+        let admin = UserContext::admin_fallback();
+        let data = payload(&h.handle_admin_ai_get(&admin).await);
+        assert_eq!(data["enabled_ack"], json!({"by": user.id, "by_name": "王管理員", "at": "2026-11-28T01:02:03Z"}));
+        rusqlite::Connection::open(home.path().join("users.db")).unwrap()
+            .execute("DELETE FROM users WHERE id=?1", [&user.id]).unwrap();
+        let data = payload(&h.handle_admin_ai_get(&admin).await);
+        assert_eq!(data["enabled_ack"], json!({"by": user.id, "by_name": null, "at": "2026-11-28T01:02:03Z"}));
+        assert_eq!(data["enabled"], true);
     }
 
     #[tokio::test]
