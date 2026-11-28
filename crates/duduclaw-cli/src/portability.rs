@@ -508,8 +508,38 @@ mod tests {
             assert!(published_agent.contains("provider = 'claude' # keep"));
             let table: toml::Table = published_agent.parse().unwrap();
             assert_eq!(table["odoo"]["act_as_requester"].as_bool(), Some(false));
-            assert_eq!(table["odoo"]["permission_override"].as_str(), Some(if force { "read_only" } else { "engine" }));
+            // A new employee keeps the imported override (same as creating one); company mode is narrowed separately. Existing stricter overrides are kept.
+            assert_eq!(table["odoo"]["permission_override"].as_str(), Some(if force { "read_only" } else { "inherit" }));
             assert_eq!(fs::read_to_string(home.join("payload.txt")).unwrap(), "ok");
+        }
+    }
+
+    #[test]
+    fn import_new_odoo_agents_keep_override_but_never_act_as_requester() {
+        let _operator = crate::ai_session_guard::test_session(&[]);
+        for force in [false, true] {
+            for agent in [
+                "# imported agent\n[odoo]\npermission_override = 'inherit' # keep\n",
+                "# imported agent\n[odoo]\nact_as_requester = false # keep\n",
+                "# imported agent\nodoo = { permission_override = 'inherit', act_as_requester = true } # keep\n",
+            ] {
+                let root = tempfile::tempdir().unwrap();
+                let home = root.path().join("home");
+                fs::create_dir(&home).unwrap();
+                let archive = root.path().join("input.tar.gz");
+                ordered_archive(&archive, &[("agents/dudu/agent.toml", agent.as_bytes())]);
+                import_archive(&archive, &home, force, true).unwrap();
+                let published = fs::read_to_string(home.join("agents/dudu/agent.toml")).unwrap();
+                assert!(published.starts_with("# imported agent\n"));
+                assert!(published.contains("# keep"));
+                let table: toml::Table = published.parse().unwrap();
+                if agent.contains("permission_override") {
+                    assert_eq!(table["odoo"]["permission_override"].as_str(), Some("inherit"));
+                } else {
+                    assert!(table["odoo"].get("permission_override").is_none());
+                }
+                assert_ne!(table["odoo"].get("act_as_requester").and_then(toml::Value::as_bool), Some(true));
+            }
         }
     }
 

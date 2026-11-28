@@ -264,7 +264,12 @@ async fn employee_listing_is_unchanged_and_unverified_internal_background_is_hid
     ];
     // Odoo tools are intentionally hidden without a configured company Odoo server.
     assert!(!per_agent.iter().any(|name| name.starts_with("odoo_")), "{per_agent:?}");
-    assert_eq!(per_agent.len(), 168 - previously_listed_odoo.len(), "{per_agent:?}");
+    // v1.86 removed these deprecated tools from the old listing budget.
+    let removed_in_v186 = ["skill_curator_status", "skill_pin"];
+    assert_eq!(per_agent.len(), 168 - previously_listed_odoo.len() - removed_in_v186.len(), "{per_agent:?}");
+    for name in removed_in_v186 {
+        assert!(!per_agent.contains(name), "{per_agent:?}");
+    }
     assert!(!per_agent.contains("team_handoff"), "{per_agent:?}");
     assert!(per_agent.contains("credential_declare"));
     assert!(!per_agent.contains("odoo_schema_scan"));
