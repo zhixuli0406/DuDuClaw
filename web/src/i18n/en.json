@@ -11805,5 +11805,13 @@
   "agentDetail.delegation.incoming": "Can accept work from: {peer}",
   "agentDetail.delegation.oneWayInactive": "Inactive in the current mode",
   "agentDetail.delegation.unrestrictedUnknown": "The avatar owner’s role could not be checked. Role exceptions are not applied.",
-  "settings.delegation.pair.direction": "Pair direction"
+  "settings.delegation.pair.direction": "Pair direction",
+  "adminStepUp.title": "Confirm your identity",
+  "adminStepUp.reason": "Please verify your identity again to continue.",
+  "adminStepUp.note": "Verification is valid for 5 minutes and will be recorded.",
+  "riskConfirm.acknowledge": "I understand the effects of enabling this",
+  "riskConfirm.auditNote": "Enabling this will be recorded in the audit log.",
+  "riskConfirm.confirm": "Enable",
+  "userNames.removed": "Removed member",
+  "userNames.failed": "Unable to load member names"
 }

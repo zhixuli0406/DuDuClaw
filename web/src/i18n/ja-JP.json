@@ -11805,5 +11805,13 @@
   "agentDetail.delegation.incoming": "依頼元：{peer}",
   "agentDetail.delegation.oneWayInactive": "現在のモードでは無効",
   "agentDetail.delegation.unrestrictedUnknown": "分身の所有者の役割を確認できないため、役割による例外は適用されません。",
-  "settings.delegation.pair.direction": "ペアの方向"
+  "settings.delegation.pair.direction": "ペアの方向",
+  "adminStepUp.title": "本人確認",
+  "adminStepUp.reason": "続行するには、もう一度本人確認を行ってください。",
+  "adminStepUp.note": "確認は5分間有効で、記録が残ります。",
+  "riskConfirm.acknowledge": "有効にした場合の影響を理解しました",
+  "riskConfirm.auditNote": "有効にすると監査記録が残ります。",
+  "riskConfirm.confirm": "有効にする",
+  "userNames.removed": "削除されたメンバー",
+  "userNames.failed": "メンバー名を読み込めません"
 }
