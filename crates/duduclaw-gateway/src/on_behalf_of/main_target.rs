@@ -68,8 +68,9 @@ pub(crate) fn main_access_listed(home: &Path, user_id: &str, use_: MainUse) -> R
 }
 
 /// Read membership only to explain a refusal, including an inactive list.
-/// This never establishes account, edition, credential or execution authority.
+/// Only Enterprise homes use the list; this never establishes admission.
 pub(crate) fn main_list_refusal(home: &Path, principal: Option<&str>) -> &'static str {
+    if !crate::team_edition::team_grants_enabled(home) { return REFUSAL; }
     let super::super::PrincipalState::Human(HumanPrincipal::User(id)) =
         super::super::PrincipalState::from_wire(principal) else { return REFUSAL; };
     let listed = crate::decision_notify::open_user_db_read_only(home).ok().flatten()
