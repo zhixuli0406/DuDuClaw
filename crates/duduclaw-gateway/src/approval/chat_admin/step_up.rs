@@ -33,7 +33,9 @@
 //! this RPC does not require a migration database or active isolation mode.
 //! POST: `{decision:"approve"|"reject",expected_digest:string,
 //! step_up_csrf?:[32 bytes]}`. Reject needs no password, TOTP or CSRF proof.
-//! POST 200: `{status:"done",decision:"approve"|"reject",decided_by:string}`.
+//! POST 200: `{status:"done",decision:"approve"|"reject",decided_by_display:string|null}`.
+//! Attribution uses the deciding user's display name; unavailable names return
+//! null. Internal decision markers and user IDs are never returned.
 //!
 //! Errors are JSON `{status:<code>,error:<plain localized sentence>}`:
 //! 401 unauthenticated; 404 not_found for unknown/malformed/foreign tickets;

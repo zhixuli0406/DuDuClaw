@@ -125,5 +125,17 @@ pub(crate) async fn confirm(env: &DecisionEnv, ctx: &UserContext, session: &str,
     // by the ledger, so explicitly render its durable result using its own bot.
     super::super::sync::collapse_step_up_card(&env.home, &env.broker.store, &loaded.receipt).await;
     let result = result.map_err(|e| Error::decision(e, lang))?;
-    Ok(json!({"status":"done", "decision":input.decision.as_str(), "decided_by":result.decided_by}))
+    let users = env.users.clone();
+    // Attribution is presentation-only: a lookup failure must not fail a
+    // committed decision or expose the durable internal marker.
+    let decided_by_display = tokio::task::spawn_blocking(move || {
+        lookup_decider_display(users.as_deref(), Some(&result.decided_by), lang)
+    }).await.ok().flatten();
+    Ok(json!({"status":"done", "decision":input.decision.as_str(), "decided_by_display":decided_by_display}))
+}
+
+pub(super) fn lookup_decider_display(db: Option<&UserDb>, marker: Option<&str>, lang: Lang) -> Option<String> {
+    crate::approval::decider_display::decider_display(marker?, |user_id| {
+        db?.get_user(user_id).ok()?.map(|user| user.display_name)
+    }, lang)
 }

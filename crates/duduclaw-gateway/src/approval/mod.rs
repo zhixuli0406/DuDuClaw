@@ -11,6 +11,8 @@
 //! effects. Unknown execution outcomes require operator reconciliation and
 //! are never replayed automatically. Decision and execution CAS recheck TTL.
 
+pub(crate) mod decider_display;
+
 /// Channels supported by the bound in-chat decision sender/parser.
 pub fn supports_text_decisions(channel: &str) -> bool {
     matches!(channel, "telegram" | "discord" | "slack" | "line" | "googlechat")
