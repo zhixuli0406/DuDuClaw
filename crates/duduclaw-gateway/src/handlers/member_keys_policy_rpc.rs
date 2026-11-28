@@ -8,7 +8,7 @@ const INVALID: &str = "無法讀取本人金鑰設定，請管理員檢查設定
 const LOGIN: &str = "請以管理員帳號登入瀏覽器後管理本人金鑰的開放範圍。";
 const STORE: &str = "無法儲存本人金鑰的開放範圍，請重新整理後再試。";
 const CONVERSATION_RISK: &str = "開放後，成員可讓新金鑰讀取自己的對話內容，持有金鑰的外部系統也能讀取。請確認已了解風險。";
-const SCOPES_RISK: &str = "開放後，成員可讓新金鑰使用選取的外部工具功能，持有金鑰的外部系統可能讀取資料或執行寫入。請確認已了解風險。";
+const SCOPES_RISK: &str = "開放後，成員可讓新金鑰使用選取的外部工具功能；先前建立並勾選這些功能的金鑰也會恢復可用。移除功能後，這些金鑰也會停止使用該功能。持有金鑰的外部系統可能讀取資料或執行寫入。請確認已了解風險。";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -65,7 +65,7 @@ async fn policy_defaults_and_acknowledged_widening_work_while_disabled() {
     let get = payload(rpc(&f, &f.admin, "member_keys.policy_get", json!({})).await);
     assert_eq!(get, json!({"readable":true,"enabled":false,"allow_conversation_content":false,
         "allow_mcp_scopes":[],"available_mcp_scopes":PERSON_KEY_MCP_SCOPE_STRINGS,
-        "risk":{"conversation":CONVERSATION_RISK,"mcp_scopes":SCOPES_RISK}}));
+        "risk":{"conversation":CONVERSATION_RISK,"mcp_scopes":"開放後，成員可讓新金鑰使用選取的外部工具功能；先前建立並勾選這些功能的金鑰也會恢復可用。移除功能後，這些金鑰也會停止使用該功能。持有金鑰的外部系統可能讀取資料或執行寫入。請確認已了解風險。"}}));
     for params in [json!({"allow_conversation_content":true}), json!({"allow_mcp_scopes":["tasks:read"]})] {
         refused(rpc(&f, &f.admin, "member_keys.policy_set", params).await);
         assert_eq!(raw(&f), initial);
