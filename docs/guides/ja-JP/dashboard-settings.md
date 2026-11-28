@@ -1058,6 +1058,10 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 | 社員 `[odoo] permission_override` | 既定 `"inherit"`。`"engine"`、`"read_only"` で制限を強められます。未知の値は読み取り専用です。 |
 | 社員 `[odoo] act_as_requester` | `false`。確認済み依頼者の個人 Odoo 認証を使用します。アバターが別の人のアカウントを借用することはできません。 |
 
+`[odoo_access] permission_mode` の `follow_odoo_account` への変更、`permission_mode_ack` の追加・変更、有効な `always_refuse` 項目の削除、`[odoo] member_credentials` の有効化は、Odoo 設定ページまたは専用 RPC（`odoo.access_set`／`odoo.member_credentials.set_enabled`）でリスクを確認してから行い、生の設定エディターや汎用設定書き込みでは変更できません。
+
+バックアップ復元と CLI インポートでは、復旧を拒否せず権限を制限して続行します。Follow は Engine に戻り、確認記録は削除され、無効だったメンバーの Odoo アカウント設定は有効になりません。`always_refuse` は現在の環境とバックアップの有効なルールの和集合を保持し、リスト省略時は既定値を使います。AI の `act_as_requester` は無効化し、`permission_override` は `engine`／`read_only` のみを保持します。バックアップで省略された現在の制限も補います。制限した場合は Odoo 設定ページでの再確認を案内し、変更不要の設定は元の書式を保持します。
+
 `always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
 
 管理者のブラウザー RPC `odoo.access_get {}` と `odoo.access_set` で読み取り・更新します。Set は `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk` を受け付けます。Follow の選択、会社アカウント AI の追加、拒否ルールの削除には `acknowledge_risk=true` が必要です。変更は監査し、監査失敗時は書き込みません。不正な権限設定では Odoo 操作を拒否します。Engine の新ツールは `allowed_models` の明示的な対象モデルと、`allowed_actions` の正確な `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` が必要です。空リストでは許可しません。

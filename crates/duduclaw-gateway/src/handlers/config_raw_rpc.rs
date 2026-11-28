@@ -816,6 +816,112 @@ pub(crate) fn refuse_drive_write_edit(before: &toml::Table, after: &toml::Table)
     Ok(())
 }
 
+const ODOO_WIDENING_REFUSED: &str = "這項 Odoo 權限設定只能在 Odoo 設定頁確認風險後變更。";
+
+/// Compare raw acknowledgements (never normalized policy) and effective refusals.
+/// Missing refusal lists inherit the defaults, including on section removal.
+pub(crate) fn refuse_odoo_widening_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    use super::config_commit::toml_at;
+    for table in [before, after] {
+        for section in ["odoo_access", "odoo"] {
+            if table.get(section).is_some_and(|value| !value.is_table()) {
+                return Err(ODOO_WIDENING_REFUSED.into());
+            }
+        }
+    }
+    let mode = toml_at(after, "odoo_access.permission_mode");
+    let ack = toml_at(after, "odoo_access.permission_mode_ack");
+    if (mode.and_then(toml::Value::as_str) == Some("follow_odoo_account")
+        && mode != toml_at(before, "odoo_access.permission_mode"))
+        || (ack.is_some() && ack != toml_at(before, "odoo_access.permission_mode_ack"))
+        || (toml_at(after, "odoo.member_credentials").and_then(toml::Value::as_bool) == Some(true)
+            && toml_at(before, "odoo.member_credentials").and_then(toml::Value::as_bool) != Some(true))
+    {
+        return Err(ODOO_WIDENING_REFUSED.into());
+    }
+    fn refusals(table: &toml::Table) -> Result<Vec<&str>, String> {
+        match super::config_commit::toml_at(table, "odoo_access.always_refuse") {
+            None => Ok(duduclaw_odoo::access_policy::DEFAULT_ALWAYS_REFUSE.to_vec()),
+            Some(toml::Value::Array(values)) => values.iter().map(|value|
+                value.as_str().ok_or_else(|| ODOO_WIDENING_REFUSED.to_owned())).collect(),
+            Some(_) => Err(ODOO_WIDENING_REFUSED.into()),
+        }
+    }
+    let old = refusals(before)?;
+    let new = refusals(after)?;
+    if old.iter().any(|entry| !new.contains(entry)) {
+        return Err(ODOO_WIDENING_REFUSED.into());
+    }
+    Ok(())
+}
+
+/// Agent raw/profile writers have no risk-confirming Odoo widening adapter yet.
+pub(crate) fn refuse_odoo_agent_widening_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    use super::config_commit::toml_at;
+    use duduclaw_odoo::access_policy::PermissionOverride;
+    for table in [before, after] {
+        if table.get("odoo").is_some_and(|value| !value.is_table()) {
+            return Err(ODOO_WIDENING_REFUSED.into());
+        }
+    }
+    let override_mode = |table: &toml::Table| -> Result<PermissionOverride, String> {
+        let value = toml_at(table, "odoo.permission_override");
+        if value.is_some_and(|value| !value.is_str()) {
+            return Err(ODOO_WIDENING_REFUSED.into());
+        }
+        Ok(PermissionOverride::from_config(value.and_then(toml::Value::as_str)))
+    };
+    if (toml_at(after, "odoo.act_as_requester").and_then(toml::Value::as_bool) == Some(true)
+        && toml_at(before, "odoo.act_as_requester").and_then(toml::Value::as_bool) != Some(true))
+        || (override_mode(after)?.restriction_rank() < override_mode(before)?.restriction_rank())
+    {
+        return Err(ODOO_WIDENING_REFUSED.into());
+    }
+    Ok(())
+}
+
+/// Reject widening params even when a generic RPC would otherwise ignore them.
+/// Project only protected keys; nested and dotted spellings share the same guard.
+pub(crate) fn refuse_odoo_widening_params(home: &Path, params: &Value) -> Result<(), String> {
+    const KEYS: &[&str] = &["odoo_access.permission_mode", "odoo_access.permission_mode_ack",
+        "odoo_access.always_refuse", "odoo.member_credentials"];
+    fn collect<'a>(value: &'a Value, path: &str, edits: &mut Vec<(String, &'a Value)>) {
+        let related = |key: &str, prefix: &str| key == prefix
+            || key.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'));
+        if !path.is_empty() && !KEYS.iter().any(|key| related(key, path) || related(path, key)) {
+            return;
+        }
+        if !path.is_empty() && (KEYS.contains(&path) || !value.is_object()) {
+            edits.push((path.to_owned(), value));
+        } else if let Some(object) = value.as_object() {
+            for (key, value) in object {
+                let next = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                collect(value, &next, edits);
+            }
+        }
+    }
+    let mut edits = Vec::new();
+    collect(params, "", &mut edits);
+    if edits.is_empty() { return Ok(()); }
+    let raw = super::config_commit::read_text_or_empty(&home.join("config.toml"))
+        .map_err(|_| ODOO_WIDENING_REFUSED.to_owned())?;
+    let before: toml::Table = raw.parse().map_err(|_| ODOO_WIDENING_REFUSED.to_owned())?;
+    let mut after = before.clone();
+    for (path, value) in edits {
+        let mut parts: Vec<_> = path.split('.').collect();
+        let key = parts.pop().ok_or(ODOO_WIDENING_REFUSED)?;
+        let section = super::config_commit::table_at_mut(&mut after, &parts)
+            .map_err(|_| ODOO_WIDENING_REFUSED.to_owned())?;
+        if value.is_null() {
+            section.remove(key);
+        } else {
+            section.insert(key.into(), toml::Value::try_from(value)
+                .map_err(|_| ODOO_WIDENING_REFUSED.to_owned())?);
+        }
+    }
+    refuse_odoo_widening_edit(&before, &after)
+}
+
 /// Generic settings RPCs must not silently accept a misplaced consent edit.
 pub(crate) fn refuse_drive_write_params(params: &Value) -> Result<(), String> {
     let forbidden = params.as_object().is_some_and(|object| object.keys().any(|key| {
@@ -1032,6 +1138,10 @@ impl MethodHandler {
             refuse_disclosure_ack_edit(&before, &after)?;
             crate::google_signin::config::refuse_google_signin_widening(&before, &after)?;
             refuse_drive_write_edit(&before, &after)?;
+            refuse_odoo_widening_edit(&before, &after)?;
+        }
+        if matches!(kind, RawFile::Agent(_)) {
+            refuse_odoo_agent_widening_edit(&before, &after)?;
         }
         // B11 L3: the raw editor follows the same one-bot / one-app rule as
         // the dashboard bind, under the same lock.

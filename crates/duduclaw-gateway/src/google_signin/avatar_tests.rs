@@ -208,6 +208,17 @@ async fn template_rewritten_to_specialist() {
 }
 
 #[tokio::test]
+async fn signin_avatar_template_schema_cannot_carry_odoo_requester() {
+    let f = fixture().await;
+    let text = format!("{}\n[odoo]\nact_as_requester=true\n",
+        include_str!("../../../../templates/evaluator/agent.toml"));
+    let error = company::create(f.home.path(), "Unsafe avatar", "", &text,
+        "Helpful", "", BTreeMap::new(), false, vec![]).unwrap_err();
+    assert!(error.contains("not supported by company templates"));
+    assert_absent(&f, "unsafe-avatar");
+}
+
+#[tokio::test]
 async fn team_or_premium_template_refused() {
     let f = fixture().await;
     let premium = template(&f, true);

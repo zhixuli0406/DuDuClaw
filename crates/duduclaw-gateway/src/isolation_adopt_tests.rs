@@ -239,6 +239,32 @@ fn adopt_new_label_rewrites_agent_name_only() {
 }
 
 #[test]
+fn adopt_new_employee_refuses_sealed_odoo_requester() {
+    for requester in [false, true] {
+        let f = fixture();
+        let home = f.home();
+        let item = applied(home, 1, LABEL, &personal(&f.alice));
+        let root = receipt(&item, 1, false);
+        save(home, &item, &root).unwrap();
+        write_full_tree(home, LABEL, "soul");
+        let text = format!("{}\n[odoo]\nact_as_requester={requester}\npermission_override='inherit'\n", agent_toml(LABEL));
+        std::fs::write(home.join("agents").join(LABEL).join("agent.toml"), text).unwrap();
+        let outcome = tombstone_employee(home, LABEL, root.employee,
+            &TombstoneEnv { actor: "admin-user", runs: &NoLiveRuns, now: now() }).unwrap();
+        assert_eq!(outcome.seal, "sealed");
+        let ax = new_ax();
+        let request = file_personal(&f, &ax, Some("alice-next")).unwrap();
+        let plan = prepare_proposal(home, &env(&ax), &request.request_id);
+        if requester {
+            assert_eq!(plan.err(), Some(AdoptError::SettingsInvalid));
+        } else {
+            assert!(plan.is_ok());
+        }
+        assert!(!home.join("agents/alice-next").exists());
+    }
+}
+
+#[test]
 fn adopt_keeps_only_allowed_top() {
     let f = fixture();
     tombstoned_full(&f, "soul");

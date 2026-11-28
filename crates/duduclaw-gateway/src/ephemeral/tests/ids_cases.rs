@@ -177,7 +177,7 @@ fn scaffold_creates_contained_dir_with_valid_agent_config() {
     write_parent(
         home,
         "boss",
-        "[capabilities]\nallowed_tools = [\"Read\", \"Grep\"]\n",
+        "[capabilities]\nallowed_tools = [\"Read\", \"Grep\"]\n[odoo]\nact_as_requester=true\npermission_override='inherit'\n",
     );
 
     let spec = EphemeralSpawnSpec {
@@ -192,9 +192,10 @@ fn scaffold_creates_contained_dir_with_valid_agent_config() {
     // Dir is under the ephemeral root.
     assert!(result.dir.starts_with(ephemeral_root(home)));
     // agent.toml parses as a full AgentConfig with the restricted subset.
-    let cfg: duduclaw_core::types::AgentConfig =
-        toml::from_str(&std::fs::read_to_string(result.dir.join("agent.toml")).unwrap())
-            .unwrap();
+    let text = std::fs::read_to_string(result.dir.join("agent.toml")).unwrap();
+    let table: toml::Table = text.parse().unwrap();
+    assert!(table.get("odoo").is_none());
+    let cfg: duduclaw_core::types::AgentConfig = toml::from_str(&text).unwrap();
     assert_eq!(cfg.agent.reports_to, "boss");
     assert_eq!(cfg.capabilities.allowed_tools, vec!["Read".to_string()]);
     // Parent's model config copied verbatim — no hardcoded ids injected.

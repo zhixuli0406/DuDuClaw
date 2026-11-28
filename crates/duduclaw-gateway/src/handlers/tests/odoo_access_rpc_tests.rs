@@ -132,3 +132,155 @@ async fn audit_failure_aborts_and_notice_can_be_dismissed() {
     assert_eq!(set["upgrade_notice_pending"], false);
     assert!(!OdooAccessConfig::parse_config_toml(&raw(&f)).unwrap().upgrade_notice_pending);
 }
+
+
+const RAW_ODOO_REFUSAL: &str = "這項 Odoo 權限設定只能在 Odoo 設定頁確認風險後變更。";
+
+fn access_text(value: Value) -> String {
+    let table: toml::Table = serde_json::from_value(json!({"odoo_access":value})).unwrap();
+    toml::to_string(&table).unwrap()
+}
+
+fn widening_cases() -> Vec<(String, String)> {
+    let defaults = json!(DEFAULT_ALWAYS_REFUSE);
+    let reduced: Vec<_> = DEFAULT_ALWAYS_REFUSE.iter().copied().filter(|r| *r != "unlink:*").collect();
+    vec![
+        (String::new(), access_text(json!({"permission_mode":"follow_odoo_account"}))),
+        (String::new(), access_text(json!({"permission_mode_ack":{"by":"forged","at":"2026-11-27T00:00:00Z"}}))),
+        (String::new(), access_text(json!({"always_refuse":reduced}))),
+        (access_text(json!({"always_refuse":["write:crm.lead"]})), String::new()),
+        (access_text(json!({"always_refuse":defaults})), access_text(json!({"always_refuse":[]}))),
+        (String::new(), "[odoo]\nmember_credentials=true\n".into()),
+        ("[odoo]\nmember_credentials=false\n".into(), "[odoo]\nmember_credentials=true\n".into()),
+    ]
+}
+
+fn narrowing_cases() -> Vec<(String, String)> {
+    let follow = json!({"permission_mode":"follow_odoo_account",
+        "permission_mode_ack":{"by":"admin","at":"2026-11-27T00:00:00Z"}});
+    let mut added: Vec<_> = DEFAULT_ALWAYS_REFUSE.to_vec();
+    added.push("write:crm.lead");
+    vec![
+        (access_text(follow.clone()), access_text(json!({"permission_mode":"engine"}))),
+        (access_text(follow.clone()), access_text(json!({"permission_mode":"follow_odoo_account"}))),
+        (access_text(follow.clone()), access_text(follow)),
+        (String::new(), access_text(json!({"always_refuse":added}))),
+        (access_text(json!({"always_refuse":DEFAULT_ALWAYS_REFUSE})), String::new()),
+        (String::new(), access_text(json!({"company_key_agents":["a"],"company_key_agents_migrated":"done",
+            "upgrade_notice_pending":true,"attachment_max_mb":25}))),
+        (access_text(json!({"company_key_agents":["a"]})), access_text(json!({"company_key_agents":[]}))),
+        ("[odoo]\nmember_credentials=true\n".into(), "[odoo]\nmember_credentials=false\n".into()),
+        ("[odoo]\nmember_credentials=true\n".into(), "[odoo]\nmember_credentials=true\n".into()),
+    ]
+}
+
+#[test]
+fn odoo_guard_compares_effective_refusals_and_raw_acknowledgements() {
+    use super::super::config_commit::refuse_odoo_widening_text_edit as guard;
+    for (before, after) in widening_cases() {
+        assert_eq!(guard(&before, &after).unwrap_err(), RAW_ODOO_REFUSAL, "{before} -> {after}");
+    }
+    for (before, after) in narrowing_cases() {
+        assert!(guard(&before, &after).is_ok(), "{before} -> {after}");
+    }
+    let before = access_text(json!({"permission_mode":"follow_odoo_account",
+        "permission_mode_ack":{"by":"admin","at":"2026-11-27T00:00:00Z"}}));
+    let after = before.replace("admin", "forged");
+    assert!(guard(&before, &after).is_err());
+    for invalid in ["broken [", "odoo_access=[]", "[odoo_access]\nalways_refuse=1", "odoo=[]"] {
+        assert!(guard("", invalid).is_err(), "{invalid}");
+    }
+}
+
+#[tokio::test]
+async fn raw_editor_and_shared_commit_refuse_odoo_widening() {
+    let f = fixture().await;
+    let path = f.home.path().join("config.toml");
+    for (before, after) in widening_cases() {
+        std::fs::write(&path, &before).unwrap();
+        let hash = super::super::config_commit::content_hash(&before);
+        let table: toml::Table = after.parse().unwrap();
+        let error = super::super::config_commit::commit_table_locked(&path, hash.clone(), &table).await.unwrap_err();
+        assert!(error.contains(RAW_ODOO_REFUSAL), "{error}");
+        let frame = rpc(&f, &f.admin, "config.raw.set", json!({"file":"config","content":after,"base_hash":hash})).await;
+        match frame {
+            WsFrame::Response { ok:false, error:Some(error), .. } => assert_eq!(error.as_str(), Some(RAW_ODOO_REFUSAL)),
+            other => panic!("expected Odoo refusal: {other:?}"),
+        }
+        assert_eq!(raw(&f), before);
+    }
+}
+
+#[tokio::test]
+async fn raw_editor_allows_odoo_narrowing_and_admin_bookkeeping() {
+    let f = fixture().await;
+    let path = f.home.path().join("config.toml");
+    for (before, after) in narrowing_cases() {
+        std::fs::write(&path, &before).unwrap();
+        payload(rpc(&f, &f.admin, "config.raw.set", json!({"file":"config","content":after,
+            "base_hash":super::super::config_commit::content_hash(&before)})).await);
+        assert_eq!(raw(&f).parse::<toml::Table>().unwrap(), after.parse::<toml::Table>().unwrap());
+    }
+}
+
+#[tokio::test]
+async fn generic_settings_refuse_nested_and_flat_odoo_widening() {
+    let f = fixture().await;
+    let reduced: Vec<_> = DEFAULT_ALWAYS_REFUSE.iter().copied().filter(|r| *r != "unlink:*").collect();
+    for method in ["system.update_config", "google.integration.set"] {
+        for edit in [
+            json!({"odoo_access":{"permission_mode":"follow_odoo_account"}}),
+            json!({"odoo_access.permission_mode":"follow_odoo_account"}),
+            json!({"odoo_access":{"permission_mode_ack":{"by":"forged","at":"2026-11-27T00:00:00Z"}}}),
+            json!({"odoo_access.permission_mode_ack.by":"forged"}),
+            json!({"odoo_access":{"always_refuse":reduced}}),
+            json!({"odoo_access.always_refuse":[]}),
+            json!({"odoo":{"member_credentials":true}}),
+            json!({"odoo.member_credentials":true}),
+        ] {
+            let mut params = json!({"log_level":"debug","enabled":true});
+            params.as_object_mut().unwrap().extend(edit.as_object().unwrap().clone());
+            let before = raw(&f);
+            let frame = rpc(&f, &f.admin, method, params).await;
+            match frame {
+                WsFrame::Response { ok:false, error:Some(error), .. } => assert_eq!(error.as_str(), Some(RAW_ODOO_REFUSAL)),
+                other => panic!("expected Odoo refusal: {other:?}"),
+            }
+            assert_eq!(raw(&f), before);
+        }
+    }
+    // Removing a custom refusal key must not restore weaker defaults.
+    std::fs::write(f.home.path().join("config.toml"), access_text(json!({"always_refuse":["write:crm.lead"]}))).unwrap();
+    refused(rpc(&f, &f.admin, "system.update_config", json!({"log_level":"debug","odoo_access.always_refuse":null})).await);
+}
+
+#[tokio::test]
+async fn generic_settings_allow_odoo_narrowing_params_without_writing_unsupported_keys() {
+    let f = fixture().await;
+    let mut added = DEFAULT_ALWAYS_REFUSE.to_vec();
+    added.push("write:crm.lead");
+    for params in [
+        json!({"odoo_access":{"permission_mode":"engine"}}),
+        json!({"odoo_access.permission_mode_ack":null}),
+        json!({"odoo_access.always_refuse":added}),
+        json!({"odoo_access.company_key_agents":["a"]}),
+        json!({"odoo.member_credentials":false}),
+    ] {
+        let mut params = params;
+        params["log_level"] = json!("debug");
+        payload(rpc(&f, &f.admin, "system.update_config", params).await);
+    }
+}
+
+#[test]
+fn dedicated_odoo_commit_cannot_change_unrelated_fields() {
+    use super::super::config_commit::{commit_odoo_table, content_hash, OdooWrite};
+    let dir = tempfile::tempdir().unwrap();
+    let before = "[general]\nlog_level='info'\n";
+    std::fs::write(dir.path().join("config.toml"), before).unwrap();
+    for scope in [OdooWrite::Access, OdooWrite::MemberCredentials] {
+        let after: toml::Table = "[general]\nlog_level='debug'\n".parse().unwrap();
+        assert!(commit_odoo_table(dir.path(), &content_hash(before), &after, scope, || Ok(())).is_err());
+        assert_eq!(std::fs::read_to_string(dir.path().join("config.toml")).unwrap(), before);
+    }
+}

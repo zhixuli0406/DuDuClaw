@@ -221,8 +221,8 @@ impl MethodHandler {
                     let guard_home = home.clone();
                     let guard_ctx = ctx.clone();
                     let guard_session = session.clone();
-                    runtime.block_on(super::config_commit::commit_table_locked_with_guard(
-                        &path, super::config_commit::content_hash(&raw), &table, move || {
+                    super::config_commit::commit_odoo_table(
+                        &home, &super::config_commit::content_hash(&raw), &table, super::config_commit::OdooWrite::MemberCredentials, move || {
                             let actor = fresh(&guard_db, &guard_ctx, &guard_session, UserRole::Admin)?;
                             // Write-ahead audit under the config lock, after CAS and
                             // live authorization. Failure aborts publication; a later
@@ -231,7 +231,7 @@ impl MethodHandler {
                                 json!({"actor_user_id":actor.user_id,"enabled":args.enabled,"acknowledged":args.acknowledge_risk,"phase":"before_commit"}));
                             try_append_audit_event(&guard_home, &event).map_err(|_| STORE.to_owned())
                         },
-                    )).map_err(|_| STORE.to_owned())?;
+                    ).map_err(|_| STORE.to_owned())?;
                     Ok(json!({"enabled":args.enabled}))
                 }
                 "odoo.member_credentials.revoke" => {

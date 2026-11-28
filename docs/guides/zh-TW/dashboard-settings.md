@@ -1052,6 +1052,10 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 | 員工 `[odoo] permission_override` | 預設 `"inherit"`，也可選 `"engine"`、`"read_only"`，只能收窄。未知值視為唯讀。 |
 | 員工 `[odoo] act_as_requester` | `false`；允許使用經驗證請求者的本人 Odoo 身分，分身不能借用別人的帳號。 |
 
+將 `[odoo_access] permission_mode` 改為 `follow_odoo_account`、新增或修改 `permission_mode_ack`、移除有效的 `always_refuse` 項目，以及開啟 `[odoo] member_credentials`，只能在 Odoo 設定頁或其專用 RPC（`odoo.access_set`／`odoo.member_credentials.set_enabled`）確認風險後變更，原始設定編輯器與通用設定寫入路徑均會拒絕這些擴權操作。
+
+備份還原與 CLI 匯入會先收窄權限，讓復原繼續進行：依 Odoo 帳號模式退回引擎模式、移除風險確認紀錄，原本未開啟的同仁 Odoo 帳號開關維持關閉。`always_refuse` 保留目前安裝與備份兩邊的有效規則，未指定清單時採用預設清單。AI 備份中的 `act_as_requester` 會關閉，`permission_override` 僅保留 `engine`／`read_only`，備份漏掉的現有覆寫限制也會補回。發生收窄時會提示管理員到 Odoo 設定頁重新確認；不需收窄的設定保留原有格式。
+
 `always_refuse` 預設清單：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
 
 管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
