@@ -133,7 +133,6 @@ impl ApprovalStore {
                  created_at   TEXT NOT NULL,
                  decided_at   TEXT,
                  decided_by   TEXT,
-                 execution_result TEXT,
                  ttl_seconds  INTEGER NOT NULL DEFAULT 3600
              );
 
@@ -217,7 +216,6 @@ impl ApprovalStore {
             ("invalidated_reason", "invalidated_reason TEXT"),
             // The person the raising run works for (`on_behalf_of`).
             ("on_behalf_of", "on_behalf_of TEXT"),
-            ("execution_result", "execution_result TEXT"),
             ("origin_session_id", "origin_session_id TEXT"),
             ("origin_turn_id", "origin_turn_id TEXT"),
             // RM-027: short exclusive decision lease (blocks the TTL sweep
@@ -228,6 +226,9 @@ impl ApprovalStore {
             // at creation (protected mode; NULL for other cards / older rows).
             // `consume_approved` refuses a card whose employee changed since.
             ("employee_incarnation", "employee_incarnation INTEGER"),
+            // Source-local display record; append after older migrations so
+            // fresh and upgraded stores have the same column order and SQL.
+            ("execution_result", "execution_result TEXT"),
         ];
         for (col, ddl) in migrations {
             if !existing.contains(*col) {

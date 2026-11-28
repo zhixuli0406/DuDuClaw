@@ -442,6 +442,29 @@ fn googlechat_recovery_catalogs_match_initializer_and_refuse_unknown_objects() {
 }
 
 #[test]
+fn v186_import_approvals_discards_source_execution_result() {
+    assert_eq!(detected(APPROVALS_V186_EXECUTION_RESULT, Store::Approvals, None).version, SchemaVersion::V180);
+    let file = store(APPROVALS_V186_EXECUTION_RESULT,
+        "INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,execution_result)
+        VALUES ('SOURCE-APPROVAL','sales','admin_ai_settings','old','approved','now',
+            '{\"outcome\":\"complete\",\"message\":\"SOURCE-EXECUTION-RESULT\"}');");
+    let proposals = extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).unwrap();
+    assert_eq!(proposals.len(), 1);
+    assert_eq!(proposals[0].category, C::LegacyApproval);
+    assert_eq!(proposals[0].fields.len(), 1);
+    assert_eq!(proposals[0].fields[0].name, "reference");
+    let encoded = serde_json::to_string(&proposals).unwrap();
+    for forbidden in ["SOURCE-APPROVAL", "execution_result", "SOURCE-EXECUTION-RESULT"] {
+        assert!(!encoded.contains(forbidden));
+    }
+    for extra in ["ALTER TABLE approvals ADD COLUMN planted TEXT;",
+        "CREATE TRIGGER planted AFTER INSERT ON approvals BEGIN SELECT 1; END;"] {
+        let file = store(APPROVALS_V186_EXECUTION_RESULT, extra);
+        assert_eq!(extract(&request(SourceKind::AuthorityApprovalsSqlite, "approvals.db"), source(&file), None).err(), Some(Error::Schema));
+    }
+}
+
+#[test]
 fn rm143_import_v186_approvals_discards_chat_admin_evidence() {
     assert_eq!(detected(APPROVALS_V186, Store::Approvals, None).version, SchemaVersion::V180);
     let rows = "INSERT INTO approvals(id,agent_id,action_kind,summary,status,created_at,decided_by)

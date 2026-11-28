@@ -143,9 +143,10 @@ mod tests {
     #[tokio::test]
     async fn admin_ai_get_ack_name_resolves_and_is_null_for_deleted_user() {
         let home = tempfile::tempdir().unwrap();
-        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let db = Arc::new(duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap());
         let user = db.create_user("admin@example.invalid", "王管理員", "test-password", UserRole::Admin).unwrap();
         let h = MethodHandler::new(home.path().to_owned()).await;
+        h.set_user_db(db, Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
         std::fs::write(home.path().join("config.toml"), format!(
             "[admin_ai]\nenabled=true\nenabled_ack={{by='{}',at='2026-11-28T01:02:03Z'}}\n", user.id)).unwrap();
         let admin = UserContext::admin_fallback();

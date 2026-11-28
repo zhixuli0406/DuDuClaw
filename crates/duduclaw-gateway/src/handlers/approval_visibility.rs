@@ -505,6 +505,8 @@ mod admin_ai_tests {
     #[tokio::test]
     async fn admin_ai_other_admin_inbox_hidden_and_proposer_gets_display_only() {
         let f = fixture().await;
+        f.handler.set_user_db(Arc::new(UserDb::new(&f.home.join("users.db")).unwrap()),
+            Arc::new(JwtConfig::new(b"test-secret-at-least-32-bytes-long!!"))).await;
         let other_admin = admin(&f);
         f.db.update_user(&f.alice.user_id, None, Some(UserRole::Admin), None).unwrap();
         rusqlite::Connection::open(f.home.join("users.db")).unwrap().execute(
@@ -566,7 +568,9 @@ mod admin_ai_tests {
             assert_eq!(view["count"], 1);
             assert_eq!(view["approvals"][0]["execution_result"], result);
             assert_eq!(view["approvals"][0]["decided_at"], json!(decided.decided_at));
-            assert!(view["approvals"][0]["decided_by_display"].is_string());
+            assert_eq!(view["approvals"][0]["may_decide"], true);
+            let proposer_name = f.db.get_user(&proposer.user_id).unwrap().unwrap().display_name;
+            assert_eq!(view["approvals"][0]["decided_by_display"], format!("{proposer_name}（儀表板）"));
             assert!(!view.to_string().contains(&proposer.user_id));
             let hidden = payload(f.handler.handle_approvals_list(params, &other_admin).await);
             assert_eq!(hidden["count"], 0);

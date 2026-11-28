@@ -643,7 +643,12 @@ async fn workflow_web_password_totp_flow_grants_revision() {
     let csrf = web.step_up(); // Real password + TOTP verifier, same dashboard session.
     assert_eq!(web.get().await.unwrap()["has_totp"], true);
     let result = web.post(web.input(true, Some(csrf))).await.unwrap();
-    assert_eq!(result["decided_by"], format!("chat-admin:{}:telegram:web", web.service.user));
+    assert_eq!(result, json!({"status":"done", "decision":"approve",
+        "decided_by_display":"Ada（Telegram，網頁確認）"}));
+    assert!(!result.to_string().contains(&web.service.user));
+    let by = format!("chat-admin:{}:telegram:web", web.service.user);
+    let saved = web.service.env.broker.get(&id).await.unwrap().unwrap();
+    assert_eq!(saved.decided_by.as_deref(), Some(by.as_str()));
     evidence(&web.service.env, &id, &web.service.user, "telegram", "web", true, true, true).await;
     let prepared = web.service.env.broker.prepare_revision_grant(&accepted).await.unwrap();
     let active = web.service.env.broker.activate_revision_grant(&prepared).await.unwrap();
