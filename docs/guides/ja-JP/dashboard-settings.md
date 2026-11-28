@@ -18,12 +18,8 @@
 
 未使用期間によるスキルの stale 化と自動アーカイブは削除されました。`[skill_curator]` は読み取れますが全設定が無効で、プロセスごとに一度警告します。Gateway 起動時に記録済みのアーカイブを元の場所へ戻し、Active にします。既存ファイルは上書きせず、競合したアーカイブは `skills-archive` に残します。Linux と macOS は両モードでディレクトリ FD を使ってグローバルと社員の平面形式スキルを復元します。シンボリックリンクはたどりません。他の OS はアーカイブを残し、手動復元が必要です。
 
-| 非推奨ツール（削除予定 v1.86.0） | 動作 |
-|---|---|
-| `skill_curator_status` | 読み取り専用のアーカイブ一覧と復元案内。`run=true` は受け付けますが無効である旨を返します。スキル名とスコープのみ表示します。社員は自分の範囲のみ、管理者は全範囲を参照できます |
-| `skill_pin` | `pinned=true` は記録済みアーカイブを上書きせず復元します。それ以外のピン操作は無効です。Linux と macOS で復元できます。社員は自分の範囲のみ復元でき、グローバルと他の社員の範囲には管理者権限が必要です |
 
-読み込まれたスキルは `skill_list` で確認してください。同名の競合を解消してから復元を再試行し、成功までアーカイブを保管してください。既存の認可と社員スコープの制限は両ツールに引き続き適用されます。
+読み込まれたスキルは `skill_list` で確認してください。同名の競合を解消してから復元を再試行し、成功までアーカイブを保管してください。次回の gateway 起動時に記録済みアーカイブの復元を再試行します。
 
 
 ## 自動化 → 実行・スケジュール・ファイルレビュー制限（v1.82.0）
@@ -493,7 +489,7 @@ Claude の補助呼び出しは CLI が使える認証情報で軽量パスを�
 
 **保存できる人（v1.76.0、動作の変更）。** `agents.update` は保存のたびに呼び出し元のロールと社員への紐付けをアカウントデータベースから読み直し、書き込み直前にファイルロック内でもう一度確認します。紐付けの解除、アカウントの停止、パスワード変更の要求は、セッションの期限を待たず次の保存から有効です。どの経路からの `agent.toml` の書き込みも（このページ、チャットの `/model`、設定ファイルの詳細編集、自動の変更）コメントとキーの順序を保ち、版を残し（[設定ファイル](#設定ファイルv1760)を参照）、`agent_file_changed` を記録します。保存後に社員一覧を再読み込みできなかったときのメッセージは「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」です（定期的な再読み込みはありません）。
 
-**権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。ただし `can_create_agents` は例外です。v1.81.0 から、このキーがない場合に `true` とみなすのは `main` 社員だけで、それ以外の社員は `false` です。v1.68 の起動時移行は main 以外の社員でこれをオンにしなくなり、MCP `create_agent` で作成された社員は常に `false` です（[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照）。v1.82.0 から、このページのスイッチはゲートが実際に適用する値を表示します（`agents.inspect` の `effective_permissions`。MCP ゲートと同じ読み取り関数）。main 以外の社員で `can_create_agents` がない場合はオフ、`agent.toml` を読めない場合や、古い gateway が `effective_permissions` を返さない場合はすべてオフと表示されます（ファイルの値は使いません）。触れていないスイッチは保存時に送信されないため、変更していないフォームで権限が変わることはありません。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
+**権限フラグが有効に（動作の変更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` には以前は読み取り側がありませんでした。v1.68.0 からは `false` と書かれたフラグが、MCP のディスパッチゲートで対応するツールを止めます（`create_agent`。`send_to_agent`、`spawn_agent`。`create_reminder`、`schedule` 付きの `tasks_create`。`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_from_recording`）。未記載や型の誤りは許可扱いです。ただし `can_create_agents` は例外です。v1.81.0 から、このキーがない場合に `true` とみなすのは `main` 社員だけで、それ以外の社員は `false` です。v1.68 の起動時移行は main 以外の社員でこれをオンにしなくなり、MCP `create_agent` で作成された社員は常に `false` です（[セキュリティ防御](../../features/ja-JP/05-security-defense.md)を参照）。v1.82.0 から、このページのスイッチはゲートが実際に適用する値を表示します（`agents.inspect` の `effective_permissions`。MCP ゲートと同じ読み取り関数）。main 以外の社員で `can_create_agents` がない場合はオフ、`agent.toml` を読めない場合や、古い gateway が `effective_permissions` を返さない場合はすべてオフと表示されます（ファイルの値は使いません）。触れていないスイッチは保存時に送信されないため、変更していないフォームで権限が変わることはありません。古いテンプレートはこれらを `false` と書いていることが多いため、アップグレード後の最初の起動で全社員に一度だけ移行を行います。`permissions_enforced_since` の印がない `[permissions]` では、4 つのフラグのうち `false` のものを `true` に変え、`permissions_enforced_since = "1.68.0"` を追加し、リセットごとに監査イベント `permission_flags_reset` を記録します。その後このページや設定ファイルの詳細編集で書いた `false` はオペレーターの判断として扱われます。一時的な役割メンバー（`agents/.ephemeral/`）は移行の対象外で、最小権限のままです。
 
 ## 管理 → メンバー：直属の上司と組織図（Enterprise 版、1.76.0）
 

@@ -162,7 +162,6 @@ pub(crate) async fn handle_tools_call(
             | "channel_config"
             | "pairing_manage"
             | "skill_hub_install"
-            | "skill_pin"
             | "memory_store"
             | "memory_invalidate_by_origin"
             | "memory_alias_add"
@@ -665,10 +664,6 @@ impl GatewayHandler<'_> {
         "skill_hub_install" => {
             handle_skill_hub_install(&arguments, home_dir, default_agent, caller_is_admin).await
         }
-        "skill_curator_status" => {
-            handle_skill_curator_status(&arguments, home_dir, record_actor, caller_is_admin).await
-        }
-        "skill_pin" => handle_skill_pin(&arguments, home_dir, record_actor, caller_is_admin).await,
         "submit_feedback" => handle_submit_feedback(&arguments, home_dir, default_agent).await,
         "evolution_toggle" => handle_evolution_toggle(&arguments, home_dir, record_actor).await,
         "evolution_status" => {

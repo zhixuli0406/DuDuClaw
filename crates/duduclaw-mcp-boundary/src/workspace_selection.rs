@@ -127,7 +127,7 @@ mod tests {
         }
         assert!(!PENDING_WORKSPACE_SELECTOR_TOOLS.contains(&"skill_from_recording"));
         for tool in ["file_read", "csv_read", "xlsx_read", "tasks_update", "computer_session_start",
-            "computer_login", "skill_curator_status", "unknown_tool"] {
+            "computer_login", "unknown_tool"] {
             assert!(!needs_execution_workspace(tool, true), "{tool}");
             assert!(!drops_from_signed(tool, true, false), "{tool}");
             assert!(!drops_from_signed(tool, true, true), "{tool}");

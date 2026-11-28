@@ -329,7 +329,6 @@ pub(crate) const PERMISSION_GATED_TOOLS: &[(&str, &str)] = &[
     ("skill_hub_install", "can_modify_own_skills"),
     ("shared_skill_adopt", "can_modify_own_skills"),
     ("skill_graduate", "can_modify_own_skills"),
-    ("skill_pin", "can_modify_own_skills"),
     ("skill_from_recording", "can_modify_own_skills"),
     ("skill_extract", "can_modify_own_skills"),
     ("skill_synthesis_run", "can_modify_own_skills"),
@@ -5787,7 +5786,6 @@ effect = "forbid"
         "sheets_append",
         "sheets_read",
         "skill_bank_feedback",
-        "skill_curator_status",
         "skill_gaps",
         "skill_list",
         "skill_search",
@@ -5863,7 +5861,7 @@ effect = "forbid"
             .collect();
         assert_eq!(
             names.len(),
-            288,
+            286,
             "tool count changed — classify the new tool here"
         );
         let all: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();

@@ -1,4 +1,4 @@
-//! Skill discovery, synthesis, vetting and pinning.
+//! Skill discovery, synthesis, and vetting.
 //!
 //! Part of the split `tools_def` registration face (O7). Every `description`
 //! here is bounded by the O7 budget (<=200 bytes for a tool, <=200 bytes for a
@@ -136,36 +136,6 @@ pub(super) const TOOLS: &[ToolDef] = &[
             ParamDef {
                 name: "scope",
                 description: "Install target: 'global' (default, all agents), 'department:<name>' (only agents in that department), or an agent id (that agent only)",
-                required: false,
-            },
-        ],
-    },
-    ToolDef {
-        name: "skill_curator_status",
-        description: "[deprecated → skill_list] Read-only archive recovery status. Automatic staleness and archiving were removed; run is ignored. Removal target v1.86.0.",
-        params: &[ParamDef {
-            name: "run",
-            description: "Ignored compatibility parameter; automatic skill archiving was removed.",
-            required: false,
-        }],
-    },
-    ToolDef {
-        name: "skill_pin",
-        description: "[deprecated → skill_list] Pinning has no effect. pinned=true still restores an archived skill without overwriting an existing destination. Removal target v1.86.0.",
-        params: &[
-            ParamDef {
-                name: "skill_name",
-                description: "Skill name (machine identity)",
-                required: true,
-            },
-            ParamDef {
-                name: "scope",
-                description: "'global' (default) or an agent id",
-                required: false,
-            },
-            ParamDef {
-                name: "pinned",
-                description: "true (default) restores an archived skill; otherwise no effect",
                 required: false,
             },
         ],

@@ -539,7 +539,7 @@ fn source_and_skill_producers_require_finite_wiki_authority_in_employee_scope() 
 
 #[test]
 fn i1c_host_controls_keep_real_worker_stages_and_original_resource_grants() {
-    for name in ["skill_from_recording", "skill_hub_install", "meeting_transcribe", "skill_curator_status", "skill_synthesis_run"] {
+    for name in ["skill_from_recording", "skill_hub_install", "meeting_transcribe", "skill_synthesis_run"] {
         assert_eq!(policy(name).unwrap().route, Route::Service);
         assert!(policy(name).unwrap().required.contains(&ResourceKind::Employee));
     }
@@ -550,7 +550,7 @@ fn i1c_host_controls_keep_real_worker_stages_and_original_resource_grants() {
 #[test]
 fn i1c_host_control_routes_cannot_widen_employee_scope() {
     for name in ["skill_from_recording", "skill_synthesis_run", "skill_hub_install",
-        "skill_curator_status", "meeting_transcribe", "meeting_transcribe_status",
+        "meeting_transcribe", "meeting_transcribe_status",
         "meeting_transcribe_cancel", "meeting_upload_link", "knowledge_add_source",
         "web_fetch_cached", "route_query"] {
         let ctx = context(name, vec![ResourceGrant::EmployeeScope { id: EmployeeId([2;16]) }]);
@@ -708,30 +708,6 @@ fn hx6url_other_tools_keep_url_origin_semantics() {
         && !required.contains(&ResourceKind::UrlOrigin));
 }
 
-#[test]
-fn i1c_curator_run_flag_is_data_and_keeps_finite_grants() {
-    // H12a: the curator is an own-employee service under EmployeeScope; the
-    // selection is exactly the record's own Employee grant.
-    let ctx = context("skill_curator_status", vec![scope(), employee()]);
-    for args in [json!({}), json!({"run":true}), json!({"run":false})] {
-        let call = authorize(&ctx, "skill_curator_status", &args, &Fixed(vec![employee()])).unwrap();
-        assert_eq!(call.resources(), &[employee()]);
-    }
-    for args in [json!({"run":"true"}), json!({"run":null}), json!({"agent_id":"other"}),
-        json!({"scope":"agent:bob"}), json!({"run":true,"employee_id":"x"})] {
-        assert!(authorize(&ctx, "skill_curator_status", &args, &Fixed(vec![employee()])).is_err());
-    }
-    // A resolver cannot widen the selection to a workspace or another employee.
-    for resources in [vec![employee(), ResourceGrant::Workspace { handle: text("work") }],
-        vec![ResourceGrant::Employee { id: EmployeeId([7; 16]) }], vec![]] {
-        assert!(authorize(&ctx, "skill_curator_status", &json!({"run":true}), &Fixed(resources)).is_err());
-    }
-    // Finite grants without EmployeeScope no longer reach the curator.
-    let finite = context("skill_curator_status", vec![employee(), ResourceGrant::Workspace { handle: text("work") }]);
-    assert!(!eligible(&finite, "skill_curator_status"));
-    assert!(authorize(&finite, "skill_curator_status", &json!({}), &Fixed(vec![employee()])).is_err());
-}
-
 // ── H12a own-skill tools ───────────────────────────────────────────────────
 fn own_wiki(namespace: &str) -> ResourceGrant {
     ResourceGrant::Confined { resource: Box::new(ResourceGrant::Wiki { namespace: text(namespace) }) }
@@ -747,7 +723,7 @@ fn h12a_identity_never_from_args() {
         let selection = if *tool == "skill_extract" {
             vec![employee(), ResourceGrant::Wiki { namespace: text("agent:alice") }]
         } else { vec![employee()] };
-        let good = if *tool == "skill_curator_status" { json!({"run":true}) } else { json!({"skill_name":"notes"}) };
+        let good = json!({"skill_name":"notes"});
         let call = authorize(&ctx, tool, &good, &Fixed(selection.clone())).unwrap_or_else(|_| panic!("{tool}"));
         assert!(call.resources().contains(&employee()), "{tool}");
         let mut forged = Vec::new();
