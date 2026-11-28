@@ -42,6 +42,31 @@ pub(in crate::google_identity) struct Approval {
     pub decided_by: Vec<String>,
 }
 
+/// Audit identity projection: no chat ids, sender names or Debug payloads.
+#[derive(Debug, Clone, Serialize)]
+pub(in crate::google_identity) struct AuditRequester {
+    pub kind: &'static str,
+    pub user_id: Option<String>,
+    pub channel: Option<String>,
+}
+
+impl AuditRequester {
+    pub(in crate::google_identity) fn from_identity(who: &duduclaw_knowledge::requester::RequesterIdentity) -> Self {
+        use duduclaw_knowledge::requester::{RequesterIdentity, is_public_visitor_channel};
+        let (kind, user_id, channel) = match who {
+            RequesterIdentity::DashboardUser { user_id } => ("dashboard_user", Some(user_id.clone()), None),
+            RequesterIdentity::ChannelUser { user_id, channel, .. } => {
+                let user_id = if is_public_visitor_channel(channel) { None } else { user_id.clone() };
+                let kind = if user_id.is_some() { "channel_user" } else { "channel_unbound" };
+                (kind, user_id, Some(channel.clone()))
+            }
+            RequesterIdentity::System { on_behalf_of, .. } => ("system", on_behalf_of.clone(), None),
+            RequesterIdentity::Unknown => ("unknown", None, None),
+        };
+        Self { kind, user_id, channel }
+    }
+}
+
 /// Explicit fields only: no argument/content bags or token-bearing structs.
 pub(in crate::google_identity) struct DriveWriteAudit {
     pub call_id: String,
@@ -51,7 +76,7 @@ pub(in crate::google_identity) struct DriveWriteAudit {
     pub agent_id: String,
     pub identity_kind: String,
     pub account_email: String,
-    pub requester: String,
+    pub requester: AuditRequester,
     pub action: String,
     pub tool: String,
     pub file_id: Option<String>,

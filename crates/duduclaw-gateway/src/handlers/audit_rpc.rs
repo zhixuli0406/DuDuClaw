@@ -311,6 +311,12 @@ impl MethodHandler {
                     continue;
                 }
 
+                let mut presented_row = row.clone();
+                if tool_name == "google_drive_write" {
+                    // Historical strings may contain Debug-formatted ids and sender names.
+                    // Both record formats are accepted, but UI details receive labels only.
+                    presented_row["requester"] = drive_write_requester_label(row.get("requester"));
+                }
                 events.push(json!({
                     "timestamp": timestamp,
                     "source": "tool_call",
@@ -318,7 +324,7 @@ impl MethodHandler {
                     "agent_id": agent_id,
                     "severity": severity,
                     "summary": summary,
-                    "details": { "tool_call": row },
+                    "details": { "tool_call": presented_row },
                 }));
             }
         }
@@ -632,4 +638,20 @@ impl MethodHandler {
             }
         }
     }
+}
+
+/// Closed presentation mapping shared by historical and current Drive audit rows.
+fn drive_write_requester_label(requester: Option<&Value>) -> Value {
+    let (kind, label) = match requester {
+        Some(Value::String(_)) => ("legacy", "先前的紀錄"),
+        Some(Value::Object(fields)) => match fields.get("kind").and_then(Value::as_str) {
+            Some("dashboard_user") => ("dashboard_user", "控制台使用者"),
+            Some("channel_user") => ("channel_user", "通訊軟體使用者"),
+            Some("channel_unbound") => ("channel_unbound", "未連結帳號的使用者"),
+            Some("system") => ("system", "系統作業"),
+            _ => ("unknown", "無法確認使用者"),
+        },
+        _ => ("unknown", "無法確認使用者"),
+    };
+    json!({"kind":kind, "label":label})
 }
