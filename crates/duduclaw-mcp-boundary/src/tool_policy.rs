@@ -324,8 +324,6 @@ pub const POLICIES: &[ToolPolicy] = &[
     // no workspace input. Hub install also needs the record's PublicOrigins.
     ToolPolicy { name: "skill_synthesis_run", route: Route::Service, required: &[ResourceKind::Employee] },
     ToolPolicy { name: "skill_hub_install", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "skill_curator_status", route: Route::Service, required: &[ResourceKind::Employee] },
-    ToolPolicy { name: "skill_pin", route: Route::Service, required: &[ResourceKind::Employee, ResourceKind::Wiki] },
     // integrations
     ToolPolicy { name: "notion_status", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
     ToolPolicy { name: "notion_search", route: Route::Connector, required: &[ResourceKind::Employee, ResourceKind::Connector] },
@@ -475,7 +473,7 @@ impl AuthorizedToolCall {
 pub(crate) fn employee_service_scope(policy: &ToolPolicy) -> bool {
     policy.route == Route::Service && !matches!(policy.name,
         "skill_from_recording" | "skill_synthesis_run" | "skill_hub_install" |
-        "skill_curator_status" | "meeting_transcribe" | "meeting_transcribe_status" |
+        "meeting_transcribe" | "meeting_transcribe_status" |
         "meeting_transcribe_cancel" | "meeting_upload_link" | "knowledge_add_source" |
         "web_fetch_cached" | "route_query")
 }

@@ -1,4 +1,4 @@
-//! Compatibility tools and startup recovery for the removed automatic curator.
+//! Startup recovery for the removed automatic curator.
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 use chrono::Utc;
@@ -60,19 +60,6 @@ pub async fn restore_on_startup(home: &Path) {
         Ok::<(), String>(())
     }.await;
     if let Err(error) = result { warn!(%error, "skill archive startup restore failed"); }
-}
-
-/// Deprecated compatibility call: only an explicit archived-skill restore acts.
-pub async fn set_pin(home: &Path, store: &CustomSkillStore, skill_name: &str, scope: &str, pinned: bool) -> Result<String, String> {
-    if pinned {
-        if let Some(rec) = store.curation_get(skill_name, scope).await? {
-            if rec.status == CurationStatus::Archived {
-                let dest = restore_record(home, store, &rec).await?;
-                return Ok(format!("Skill '{skill_name}' [{scope}] restored to {}. skill_pin is deprecated (removal v1.86.0); pinning has no effect.", dest.display()));
-            }
-        }
-    }
-    Ok("skill_pin is deprecated (removal v1.86.0); pinning has no effect because automatic skill archiving was removed.".into())
 }
 
 #[cfg(test)]
@@ -191,21 +178,11 @@ mod tests {
         let store = seed(home.path(), true).await;
         let archived = home.path().join("skills-archive/global/notes.md");
         let bytes = std::fs::read(&archived).unwrap();
-        assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, true).await.is_err());
+        let rec = store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap();
+        assert!(restore_record(home.path(), &store, &rec).await.is_err());
         assert_eq!(std::fs::read(archived).unwrap(), bytes);
         assert!(!home.path().join("skills/notes.md").exists());
         assert_eq!(store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap().status, CurationStatus::Archived);
     }
 
-    #[cfg(unix)]
-    #[tokio::test(flavor = "current_thread")]
-    async fn pin_only_restores_archived_skills() {
-        let home = tempfile::tempdir().unwrap();
-        let store = seed(home.path(), true).await;
-        assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, false).await.unwrap().contains("no effect"));
-        assert!(home.path().join("skills-archive/global/notes.md").exists());
-        assert!(set_pin(home.path(), &store, "notes", SCOPE_GLOBAL, true).await.unwrap().contains("restored"));
-        assert!(home.path().join("skills-archive/global/notes.md").exists());
-        assert!(!store.curation_get("notes", SCOPE_GLOBAL).await.unwrap().unwrap().pinned);
-    }
 }

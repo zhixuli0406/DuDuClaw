@@ -20,14 +20,9 @@ remain in `skills-archive` for manual recovery. Linux and macOS restore flat glo
 descriptors, without following symlinked components. Other platforms retain archives
 for manual recovery.
 
-| Deprecated tool (removal target v1.86.0) | Behaviour |
-|---|---|
-| `skill_curator_status` | Read-only archive recovery status. `run=true` is accepted but ignored with a notice. Only skill names and scopes are shown. Employees see only their own scope; Admin operators may see all |
-| `skill_pin` | `pinned=true` restores a recorded archived skill without overwriting; otherwise pinning has no effect. Restoration is supported on Linux and macOS. Employees may restore only their own scope; global and other agent scopes require an Admin operator |
 
 Use `skill_list` to inspect loaded skills. Resolve a destination conflict before
-retrying restoration; keep the archived file until recovery succeeds. Existing
-authorization and employee scope gates still apply to both compatibility tools.
+retrying restoration; keep the archived file until recovery succeeds. Gateway startup retries recorded archives on the next start.
 
 
 DuDuClaw's MCP server advertises its tools through the standard `tools/list`
@@ -449,7 +444,7 @@ the failure mode the rule above exists to remove.
 
 Two new gates refuse a call without removing the tool from `tools/list`:
 
-- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_pin`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
+- `agent.toml [permissions]`: a flag written as `false` refuses `create_agent` (`can_create_agents`); `send_to_agent`, `spawn_agent` (`can_send_cross_agent`); `create_reminder` and `tasks_create` with a `schedule` (`can_schedule_tasks`); `skill_hub_install`, `shared_skill_adopt`, `skill_graduate`, `skill_from_recording` (`can_modify_own_skills`). The refusal is JSON-RPC error -32003 and a `permission_denied` audit event. An `agent.toml` that exists but cannot be read or parsed refuses these tools; a missing one allows them. `tasks_create` without a `schedule` stays allowed, which is why these flags are checked per call. Ephemeral role members are scaffolded with `can_create_agents`, `can_modify_own_skills` and `can_schedule_tasks` set to `false`.
 - `config.toml [odoo] features_*`: Odoo tools stay listed and are refused per call for models of a switched-off module (project and hr are off by default).
 
 ### Record relationship checks: listed but refused

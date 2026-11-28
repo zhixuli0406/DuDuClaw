@@ -175,6 +175,16 @@ CLI 設定檔的權限規則不會自動刪除，操作者可自行清理。
 
 ## 仍在棄用期
 
+### 技能 curator 設定
+
+技能不再因閒置而被標成過時或自動封存，也不再產生 curator wiki 報告。無論閒置多久，技能都仍可載入。
+
+Linux 與 macOS 上，持有單一 gateway 鎖的程序會在 gateway 啟動時，自動將所有有封存紀錄的技能還原為 Active。還原不會跟隨符號連結，也不會覆蓋既有技能。其他平台無法自動還原，封存檔會保留供手動還原。如果因為已有同名技能或搬移失敗而略過還原，封存檔會保留，gateway 日誌會列出技能名稱。手動還原時，請先停止 gateway，再自行搬移檔案：公司共用技能從 `<home>/skills-archive/global/<file>` 搬到 `<home>/skills/`；員工技能從 `<home>/skills-archive/agent-<agent_id>/<file>` 搬到 `<home>/agents/<agent_id>/SKILLS/`。
+
+| 名稱 | 相容行為 | 移除目標／處理方式 |
+|---|---|---|
+| `config.toml [skill_curator]` | 仍接受，但所有值都忽略；讀取時每個程序警告一次 | 刪除此區段；它無法啟用自動封存 |
+
 ### 舊版互動式 agent 工作階段
 
 不帶子指令的 `duduclaw agent` 與 `duduclaw agent run <name>` 會啟動會繞過
@@ -228,6 +238,15 @@ MFA 第一階段為 `/api/login` 與 `/api/otp/verify` 新增條件式回應。�
 ### 語音供應商設定
 
 `edge-tts` 與 `edge` 相容值不再接受。舊設定若仍包含其中一個值，TTS 會停用，且每個行程只警告一次；請改用 `kokoro`。`system.update_config` 也會拒絕這兩個已移除的值。
+
+## v1.86.0 已移除
+
+### MCP 工具
+
+| 已移除 | 改用 |
+|---|---|
+| `skill_curator_status` | 請用 `skill_list` 查看已載入技能；封存衝突需手動處理。 |
+| `skill_pin` | 不再需要釘選。Linux 與 macOS 上，持有單一 gateway 鎖的程序會在 gateway 啟動時，自動將所有有封存紀錄的技能還原為 Active。還原不會跟隨符號連結，也不會覆蓋既有技能。其他平台無法自動還原，封存檔會保留供手動還原。如果因為已有同名技能或搬移失敗而略過還原，封存檔會保留，gateway 日誌會列出技能名稱。手動還原時，請先停止 gateway，再自行搬移檔案：公司共用技能從 `<home>/skills-archive/global/<file>` 搬到 `<home>/skills/`；員工技能從 `<home>/skills-archive/agent-<agent_id>/<file>` 搬到 `<home>/agents/<agent_id>/SKILLS/`。 |
 
 ## 第三方 MCP 環境變數憑證
 

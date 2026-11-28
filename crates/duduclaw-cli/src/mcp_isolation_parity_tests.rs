@@ -138,7 +138,7 @@ fn documented_refusals() -> BTreeSet<String> {
 // and the admin's `public_web` switch is on, so the issuer signs it.
 fn pending_production_selectors() -> BTreeSet<String> {
     // H12a removed skill_extract, shared_skill_adopt, skill_security_scan,
-    // skill_graduate and skill_curator_status: they select the issuer's own
+    // and skill_graduate: they select the issuer's own
     // Employee (+ own Confined wiki) under EmployeeScope, not a workspace.
     // HX5 removed execute_program, office_script and code_map: they are routed
     // in-run (`Route::InRunHelper`) on the run's own `Workspace{employee-work}`.
@@ -210,8 +210,8 @@ fn hx6fix_skill_from_recording_leaves_pending_only_with_verify_artifact() {
 }
 
 /// H12a tools the production issuer must make eligible without new selectors.
-const H12A_OWN_SKILL_TOOLS: [&str; 5] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
-    "skill_graduate", "skill_curator_status"];
+const H12A_OWN_SKILL_TOOLS: [&str; 4] = ["skill_extract", "shared_skill_adopt", "skill_security_scan",
+    "skill_graduate"];
 /// H12b/H12c tools eligible from the production issuer's own grants.
 const H12BC_OWN_SKILL_JOB_TOOLS: [&str; 2] = ["skill_hub_install", "skill_synthesis_run"];
 
@@ -572,7 +572,7 @@ async fn employee_tool_parity(home: &std::path::Path) {
                 "group_history_read", "knowledge_search", "knowledge_get_passage", "knowledge_list_collections", "knowledge_add_source",
                 "meeting_transcribe", "meeting_upload_link", "file_read", "csv_read", "xlsx_read", "code_map", "execute_program",
                 "skill_extract", "web_fetch_cached", "web_extract", "model_search", "model_recommend",
-                "shared_skill_adopt", "skill_security_scan", "skill_graduate", "skill_curator_status",
+                "shared_skill_adopt", "skill_security_scan", "skill_graduate",
                 "skill_from_recording"] {
                 assert!(ordinary.contains(tool), "production fixture did not enable {tool}");
                 assert_eq!(isolated.contains(tool), !pending.contains(tool),

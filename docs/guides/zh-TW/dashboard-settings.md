@@ -18,12 +18,8 @@
 
 技能不再因閒置而被標成過時或自動封存。`[skill_curator]` 設定仍可讀取，但所有值都無作用，每個程序會警告一次。Gateway 啟動時會將有紀錄的封存技能搬回原位並恢復使用，不覆蓋既有技能；衝突檔留在 `skills-archive`，由管理員處理。Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，並拒絕符號連結路徑；其他平台保留封存檔，供管理員手動還原。
 
-| 已棄用工具（預計 v1.86.0 移除） | 行為 |
-|---|---|
-| `skill_curator_status` | 唯讀封存清單與還原指引；接受 `run=true`，但只回覆參數無作用。只顯示技能名稱與範圍；員工只能查看自己的範圍，管理員可查看全部 |
-| `skill_pin` | `pinned=true` 仍可還原有紀錄的封存技能，不覆蓋既有檔；其他釘選操作無作用。Linux 與 macOS 支援還原；員工僅能還原自己的技能，全域與其他員工技能需由管理員操作 |
 
-請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。兩個相容工具仍受既有授權與員工範圍限制。
+請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。下次 gateway 啟動時會重試有紀錄的封存技能。
 
 
 ## 自動化 → 執行、排程與檔案審查限制（v1.82.0）
@@ -493,7 +489,7 @@ Claude 輔助呼叫使用 CLI 可用憑證走輕量路徑，不進入帳號輪�
 
 **誰能存檔（v1.76.0，行為變更）。** `agents.update` 每次存檔都從帳號資料庫重新讀取呼叫者的角色與員工綁定，寫入前在檔案鎖內再讀一次。解除綁定、停用帳號或要求改密碼，在對方下一次存檔就生效，不用等登入過期。任何途徑寫 `agent.toml`（這頁、聊天裡的 `/model`、設定檔進階編輯、系統自動修改）都會保留註解與鍵的順序、留下版本（見[設定檔](#設定檔v1760)），並寫 `agent_file_changed`。存檔後無法重新載入員工清單時，訊息改為「已儲存，但暫時無法立即套用；請稍後重新整理，仍未生效請重新啟動服務」（系統沒有定期重新載入）。
 
-**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。從 v1.82.0 起，這頁的開關顯示閘門實際套用的值（`agents.inspect` 的 `effective_permissions`，和 MCP 閘門用同一個讀取函式）：非 main 員工沒寫 `can_create_agents` 時顯示為關閉，`agent.toml` 讀不到、或舊版 gateway 沒有回傳 `effective_permissions` 時全部顯示為關閉（不沿用檔案內的值）。沒有動過的開關不會在儲存時送出，所以沒改動的表單不會改變任何權限。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
+**權限旗標開始生效（行為變更）。** `can_create_agents`、`can_send_cross_agent`、`can_modify_own_skills`、`can_schedule_tasks` 以前沒有任何讀取端。v1.68.0 起，寫成 `false` 的旗標會在 MCP 分派閘擋下對應工具（`create_agent`；`send_to_agent`、`spawn_agent`；`create_reminder`、帶 `schedule` 的 `tasks_create`；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_from_recording`），沒寫或型別錯誤時放行。`can_create_agents` 例外：從 v1.81.0 起，沒寫這個鍵時只有 `main` 員工視為 `true`，其他員工視為 `false`；v1.68 的開機遷移不再替非 main 員工打開它；透過 MCP `create_agent` 建立的員工一律為 `false`（見[安全防線](../../features/zh-TW/05-security-defense.md)）。從 v1.82.0 起，這頁的開關顯示閘門實際套用的值（`agents.inspect` 的 `effective_permissions`，和 MCP 閘門用同一個讀取函式）：非 main 員工沒寫 `can_create_agents` 時顯示為關閉，`agent.toml` 讀不到、或舊版 gateway 沒有回傳 `effective_permissions` 時全部顯示為關閉（不沿用檔案內的值）。沒有動過的開關不會在儲存時送出，所以沒改動的表單不會改變任何權限。因為舊範本常把這些旗標寫成 `false`，gateway 升級後第一次開機會對每位員工做一次遷移：`[permissions]` 裡沒有 `permissions_enforced_since` 標記的檔案，四個旗標中的 `false` 一律改成 `true`，並加上 `permissions_enforced_since = "1.68.0"`，每次重設寫稽核事件 `permission_flags_reset`。之後在這頁或設定檔進階編輯寫入的 `false` 才算操作者的決定。臨時角色成員（`agents/.ephemeral/`）不在遷移範圍內，維持最小權限。
 
 ## 管理 → 成員：直屬主管與組織圖（企業版，1.76.0）
 

@@ -10,12 +10,8 @@
 
 未使用期間によるスキルの stale 化と自動アーカイブは削除されました。`[skill_curator]` は読み取れますが全設定が無効で、プロセスごとに一度警告します。Gateway 起動時に記録済みのアーカイブを元の場所へ戻し、Active にします。既存ファイルは上書きせず、競合したアーカイブは `skills-archive` に残します。Linux と macOS は両モードでディレクトリ FD を使ってグローバルと社員の平面形式スキルを復元します。シンボリックリンクはたどりません。他の OS はアーカイブを残し、手動復元が必要です。
 
-| 非推奨ツール（削除予定 v1.86.0） | 動作 |
-|---|---|
-| `skill_curator_status` | 読み取り専用のアーカイブ一覧と復元案内。`run=true` は受け付けますが無効である旨を返します。スキル名とスコープのみ表示します。社員は自分の範囲のみ、管理者は全範囲を参照できます |
-| `skill_pin` | `pinned=true` は記録済みアーカイブを上書きせず復元します。それ以外のピン操作は無効です。Linux と macOS で復元できます。社員は自分の範囲のみ復元でき、グローバルと他の社員の範囲には管理者権限が必要です |
 
-読み込まれたスキルは `skill_list` で確認してください。同名の競合を解消してから復元を再試行し、成功までアーカイブを保管してください。既存の認可と社員スコープの制限は両ツールに引き続き適用されます。
+読み込まれたスキルは `skill_list` で確認してください。同名の競合を解消してから復元を再試行し、成功までアーカイブを保管してください。次回の gateway 起動時に記録済みアーカイブの復元を再試行します。
 
 
 DuDuClaw の MCP サーバーは標準の `tools/list` でツールを宣言します。このページでは、誤解されやすい 2 点を説明します。
@@ -244,7 +240,7 @@ Claude CLI の `minimal_context` は `--tools` で内蔵 CLI ツールを制御�
 
 新しい2つのゲートは、ツールを `tools/list` から外さずに呼び出しを拒否します。
 
-- `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_pin`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
+- `agent.toml [permissions]`：`false` と書かれたフラグは、`create_agent`（`can_create_agents`）、`send_to_agent`・`spawn_agent`（`can_send_cross_agent`）、`create_reminder`・`schedule` 付きの `tasks_create`（`can_schedule_tasks`）、`skill_hub_install`・`shared_skill_adopt`・`skill_graduate`・`skill_from_recording`（`can_modify_own_skills`）を拒否します。拒否は JSON-RPC エラー -32003 と監査イベント `permission_denied` になります。`agent.toml` が存在するのに読めない・解析できない場合はこれらのツールを拒否し、ファイルがなければ許可します。`schedule` なしの `tasks_create` は許可されるため、これらのフラグは呼び出しごとに確認されます。一時的な役割メンバーは `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` が `false` で作られます。
 - `config.toml [odoo] features_*`：Odoo ツールは一覧に残り、無効になったモジュールのモデルへの呼び出しは呼び出しごとに拒否されます（project と hr は既定でオフ）。
 
 ### レコードの関係チェック：一覧に出るが拒否される

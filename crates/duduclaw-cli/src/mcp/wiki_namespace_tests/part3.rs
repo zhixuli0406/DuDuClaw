@@ -56,42 +56,6 @@ async fn skill_hub_install_validates_inputs_fail_closed() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn skill_pin_and_curator_status_roundtrip() {
-    use serde_json::json;
-    let home = std::env::temp_dir().join(format!("duduclaw-mcp-pin-{}", uuid::Uuid::new_v4()));
-    let skills = home.join("skills");
-    std::fs::create_dir_all(&skills).unwrap();
-    std::fs::write(skills.join("keeper.md"), "---\nname: keeper\n---\nbody").unwrap();
-
-    use duduclaw_gateway::custom_skills::{CurationStatus, CustomSkillStore, SkillCurationRecord};
-    let store = CustomSkillStore::open(&home).unwrap();
-    let old = (chrono::Utc::now() - chrono::Duration::days(400)).to_rfc3339();
-    store.curation_put(&SkillCurationRecord {
-        skill_name: "keeper".into(), scope: "global".into(), first_seen: old.clone(),
-        last_used_at: Some(old.clone()), pinned: false, status: CurationStatus::Active,
-        archived_path: None, updated_at: old,
-    }).await.unwrap();
-    std::fs::write(home.join("config.toml"), "[skill_curator]\nenabled=true\narchive_days=90\n").unwrap();
-    let res = super::handle_skill_curator_status(&json!({"run": true}), &home, RecordActor::Operator("operator"), true).await;
-    assert!(res["isError"].as_bool() != Some(true), "{res}");
-    let text = res["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("run=true ignored"), "{text}");
-    assert!(text.contains("0 archived skill"), "{text}");
-    assert!(duduclaw_agent::skill_loader::parse_skill_file(&skills.join("keeper.md")).is_ok());
-    assert_eq!(store.curation_get("keeper", "global").await.unwrap().unwrap().status, CurationStatus::Active);
-    assert!(!home.join("skills-archive").exists());
-    assert!(!home.join("shared/wiki/reports").exists());
-
-    for name in ["keeper", "ghost"] {
-        let res = super::handle_skill_pin(&json!({"skill_name": name}), &home, RecordActor::Operator("operator"), true).await;
-        assert!(res["isError"].as_bool() != Some(true), "{res}");
-        assert!(res["content"][0]["text"].as_str().unwrap().contains("no effect"));
-    }
-    assert!(!store.curation_get("keeper", "global").await.unwrap().unwrap().pinned);
-
-    let _ = std::fs::remove_dir_all(&home);
-}
 
 // ─────────────────────────────────────────────────────────────────
 // agent_update_soul follow-up fixes (#3, #4 — 2026-05-20)

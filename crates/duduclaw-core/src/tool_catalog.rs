@@ -69,8 +69,8 @@ pub struct ToolCatalogEntry {
     pub effect: crate::tool_effect::ToolEffect,
 }
 
-/// Compatibility tools retained until v1.86.0; automatic curation was removed.
-pub const DEPRECATED_MCP_TOOLS: &[&str] = &["skill_curator_status", "skill_pin"];
+/// MCP compatibility tools currently within their deprecation window.
+pub const DEPRECATED_MCP_TOOLS: &[&str] = &[];
 
 /// Is this MCP tool name a deprecated alias? Exact match, never a prefix or
 /// substring test (coding convention 2).
@@ -123,6 +123,20 @@ impl RemovedMcpTool {
 /// `shared_wiki_delete` and `wiki_share` were never aliases and stay; neither
 /// do `goals_create` (goal hierarchy) or `create_task` (multi-step plans).
 pub const REMOVED_MCP_TOOLS: &[RemovedMcpTool] = &[
+    RemovedMcpTool {
+        name: "skill_curator_status",
+        removed_in: "1.86.0",
+        replacement: "skill_list",
+        replacement_args: "{}",
+        note: "Lists loaded skills. Resolve archive conflicts manually.",
+    },
+    RemovedMcpTool {
+        name: "skill_pin",
+        removed_in: "1.86.0",
+        replacement: "skill_list",
+        replacement_args: "{}",
+        note: "Lists loaded skills; pinning is unnecessary. Gateway startup restores recorded archived skills on Linux and macOS without overwriting destinations. Resolve conflicts manually; other platforms retain archives for manual recovery.",
+    },
     RemovedMcpTool {
         name: "shared_wiki_ls",
         removed_in: "1.69.0",
@@ -1524,12 +1538,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "skill",
     ),
     (
-        "skill_pin",
-        "[deprecated → skill_list] Restore an archived skill; pinning has no effect",
-        "admin",
-        "skill",
-    ),
-    (
         "skill_gaps",
         "Report inferred capability gaps",
         "admin",
@@ -1538,12 +1546,6 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
     (
         "skill_bank_feedback",
         "Record skill execution feedback",
-        "admin",
-        "skill",
-    ),
-    (
-        "skill_curator_status",
-        "[deprecated → skill_list] Read-only archive recovery status",
         "admin",
         "skill",
     ),
@@ -2072,7 +2074,7 @@ mod tests {
     #[test]
     fn removed_tools_are_out_of_the_catalog_and_their_replacements_are_in() {
         let catalog = builtin_tool_catalog();
-        assert_eq!(REMOVED_MCP_TOOLS.len(), 8);
+        assert_eq!(REMOVED_MCP_TOOLS.len(), 10);
         for removed in REMOVED_MCP_TOOLS {
             assert!(
                 !catalog.iter().any(|e| e.name == removed.name),
@@ -2089,16 +2091,6 @@ mod tests {
         for kept in ["shared_wiki_delete", "wiki_share"] {
             assert!(catalog.iter().any(|e| e.name == kept), "{kept}");
             assert!(removed_mcp_tool(kept).is_none(), "{kept}");
-        }
-    }
-
-    #[test]
-    fn curator_compatibility_tools_remain_deprecated_and_listed() {
-        for name in ["skill_curator_status", "skill_pin"] {
-            assert!(is_deprecated_tool(name));
-            let entry = builtin_tool_catalog().into_iter().find(|tool| tool.name == name).unwrap();
-            assert!(entry.deprecated);
-            assert!(entry.description.starts_with("[deprecated → "));
         }
     }
 

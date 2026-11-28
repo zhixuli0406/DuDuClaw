@@ -319,7 +319,7 @@ fn isolated_round4_inventory_has_no_implicit_resource_fallback() {
     // Includes nine RM-131 Drive writes with explicit routes and intentional refusal.
     // RM-194: both admin settings tools are refused and hidden in protected mode.
     // RM-141: includes four Odoo write-back tools with connector routes.
-    assert_eq!(tools.len(), 288, "review every new tool's isolation disposition");
+    assert_eq!(tools.len(), 286, "review every new tool's isolation disposition");
     for tool in tools {
         if intentional_refusal(tool.name).is_some() { continue; }
         let route = boundary_route(tool.name).expect("exact route");
@@ -367,7 +367,7 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    assert_eq!(manifest.len(), 288);
+    assert_eq!(manifest.len(), 286);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
         let without_provider = match tool.executes_in {
             PersonToolHost::Gateway => {
@@ -550,18 +550,8 @@ async fn i1c_protected_fetch_listing_still_requires_origin_and_resolver_without_
 }
 
 #[test]
-fn i1c_curator_control_accepts_only_typed_run_flag() {
-    assert!(check_tool_arguments("skill_curator_status", &json!({})).is_ok());
-    for value in [false, true] { assert!(check_tool_arguments("skill_curator_status", &json!({"run":value})).is_ok()); }
-    for args in [json!({"run":"false"}),json!({"run":null}),json!({"agent_id":"alice"}),json!([])] {
-        assert!(check_tool_arguments("skill_curator_status", &args).is_err());
-    }
-    assert!(matches!(boundary_route("skill_curator_status"), Some(BoundaryRoute::Resource)));
-}
-
-#[test]
 fn i1c_host_e_controls_retain_resource_eligibility_and_exact_inventory() {
-    for name in ["skill_from_recording", "skill_hub_install", "skill_curator_status", "skill_synthesis_run", "meeting_transcribe"] {
+    for name in ["skill_from_recording", "skill_hub_install", "skill_synthesis_run", "meeting_transcribe"] {
         assert!(super::host_e_control(name));
         assert!(duduclaw_mcp_boundary::tool_policy::policy(name).unwrap().required.contains(
             &duduclaw_mcp_boundary::tool_policy::ResourceKind::Employee));

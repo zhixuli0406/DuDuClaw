@@ -10,12 +10,8 @@
 
 技能不再因閒置而被標成過時或自動封存。`[skill_curator]` 設定仍可讀取，但所有值都無作用，每個程序會警告一次。Gateway 啟動時會將有紀錄的封存技能搬回原位並恢復使用，不覆蓋既有技能；衝突檔留在 `skills-archive`，由管理員處理。Linux 與 macOS 的兩種模式都透過目錄描述符還原全域與員工的平面技能，並拒絕符號連結路徑；其他平台保留封存檔，供管理員手動還原。
 
-| 已棄用工具（預計 v1.86.0 移除） | 行為 |
-|---|---|
-| `skill_curator_status` | 唯讀封存清單與還原指引；接受 `run=true`，但只回覆參數無作用。只顯示技能名稱與範圍；員工只能查看自己的範圍，管理員可查看全部 |
-| `skill_pin` | `pinned=true` 仍可還原有紀錄的封存技能，不覆蓋既有檔；其他釘選操作無作用。Linux 與 macOS 支援還原；員工僅能還原自己的技能，全域與其他員工技能需由管理員操作 |
 
-請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。兩個相容工具仍受既有授權與員工範圍限制。
+請用 `skill_list` 查看已載入技能。發生同名衝突時，先處理衝突再重試還原；還原成功前保留封存檔。下次 gateway 啟動時會重試有紀錄的封存技能。
 
 
 DuDuClaw 的 MCP server 透過標準的 `tools/list` 宣告工具。這頁解釋兩件最容易誤解的事：
@@ -232,7 +228,7 @@ Claude CLI 的 `minimal_context` 透過 `--tools` 控制內建 CLI 工具，不�
 
 兩道新的閘門會拒絕呼叫，但不會把工具從 `tools/list` 拿掉：
 
-- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_pin`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
+- `agent.toml [permissions]`：寫成 `false` 的旗標會拒絕 `create_agent`（`can_create_agents`）；`send_to_agent`、`spawn_agent`（`can_send_cross_agent`）；`create_reminder` 與帶 `schedule` 的 `tasks_create`（`can_schedule_tasks`）；`skill_hub_install`、`shared_skill_adopt`、`skill_graduate`、`skill_from_recording`（`can_modify_own_skills`）。拒絕時回 JSON-RPC 錯誤 -32003 並記稽核 `permission_denied`。`agent.toml` 存在但讀不到或無法解析時，這些工具一律拒絕；檔案不存在則放行。不帶 `schedule` 的 `tasks_create` 仍然允許，所以這些旗標是逐次呼叫檢查。臨時角色成員建立時 `can_create_agents`、`can_modify_own_skills`、`can_schedule_tasks` 為 `false`。
 - `config.toml [odoo] features_*`：Odoo 工具照樣列出，呼叫到已關閉模組的模型時逐次拒絕（project 與 hr 預設關閉）。
 
 ### 紀錄關係檢查：列出但會拒絕
