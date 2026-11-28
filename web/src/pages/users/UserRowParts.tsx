@@ -3,6 +3,7 @@
 import { useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
+import type { OdooMemberCredential } from '@/lib/member-signin';
 import type { UserDetail } from '@/lib/api';
 import { UNBINDABLE_CHANNELS, type ChannelIdentity } from '@/lib/channel-identity-api';
 import { formatDateTime } from '@/lib/company-time';
@@ -233,6 +234,22 @@ export function IdentityChips({
   );
 }
 
+/** Sign-in and onboarding status, shared by the list and phone cards. */
+export function MemberSigninBadges({ user, credential }: { user: UserDetail; credential?: OdooMemberCredential }) {
+  const intl = useIntl();
+  const t = (key: string) => intl.formatMessage({ id: `users.memberSignin.${key}` });
+  const avatar = user.signin_avatar;
+  return <div className="flex flex-wrap items-center gap-1 text-xs">
+    {user.google_signin_linked && <Badge variant="outline">{t('google')}</Badge>}
+    {credential && <Badge variant={credential.state === 'ok' ? 'outline' : 'destructive'}>{t(`odoo.${credential.state}`)}</Badge>}
+    {avatar && ['pending', 'creating', 'retrying'].includes(avatar.state) && <Badge variant="secondary">{t('preparing')}</Badge>}
+    {avatar?.state === 'waiting_admin' && <span className="inline-flex items-center gap-1 text-destructive">
+      <span aria-hidden className="size-2 shrink-0 rounded-full bg-destructive" />
+      {intl.formatMessage({ id: 'users.memberSignin.waiting' }, { reason: t(`reason.${avatar.reason && avatar.reason !== 'done' ? avatar.reason : 'unknown'}`) })}
+    </span>}
+  </div>;
+}
+
 /** The row's ⋯ menu. */
 export function UserActions({
   user,
@@ -241,6 +258,8 @@ export function UserActions({
   onOffboard,
   onRemove,
   onInvite,
+  onUnlinkGoogle,
+  onRevokeOdoo,
 }: {
   user: UserDetail;
   onEdit: () => void;
@@ -248,6 +267,8 @@ export function UserActions({
   onOffboard: () => void;
   onRemove: () => void;
   onInvite?: () => void;
+  onUnlinkGoogle?: () => void;
+  onRevokeOdoo?: () => void;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -272,6 +293,8 @@ export function UserActions({
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent>
+        {viewerRole === 'admin' && onUnlinkGoogle && <DropdownMenuItem onClick={onUnlinkGoogle}>{intl.formatMessage({ id: 'users.memberSignin.unlink' })}</DropdownMenuItem>}
+        {viewerRole === 'admin' && onRevokeOdoo && <DropdownMenuItem onClick={onRevokeOdoo}>{intl.formatMessage({ id: 'users.memberSignin.revoke' })}</DropdownMenuItem>}
         {onInvite && viewerRole === 'admin' && user.status === 'active' && <DropdownMenuItem onClick={onInvite}>{intl.formatMessage({ id: 'users.invite.resend' })}</DropdownMenuItem>}
         {canViewDashboard && (
           <DropdownMenuItem onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}>

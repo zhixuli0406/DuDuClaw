@@ -2698,7 +2698,18 @@ export interface CreateMemberResult {
 
 export interface AvatarConflict { agent_id: string; user_ids: string[] }
 
+export interface SigninAvatar {
+  state: 'pending' | 'creating' | 'retrying' | 'waiting_admin' | 'done';
+  reason: 'done' | 'name_taken' | 'policy_changed' | 'failed' | 'protected_mode' | 'template_changed' | 'template_invalid' | 'seats_full' | 'not_eligible' | 'unknown' | null;
+  retry_allowed: boolean;
+}
+
 export interface UserInfo {
+  google_signin_linked?: boolean;
+  google_signin_linked_at?: string | null;
+  google_signin_last_signin_at?: string | null;
+  has_password?: boolean;
+  signin_avatar?: SigninAvatar | null;
   avatar_agent_id?: string | null;
   primary_agent_id?: string | null;
   id: string;

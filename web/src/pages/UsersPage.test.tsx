@@ -382,7 +382,8 @@ describe('UsersPage — primary AI', () => {
     });
     renderWithProviders(<UsersPage />);
     expect(await screen.findByText('AI avatar conflicts to resolve')).toBeInTheDocument();
-    expect(screen.getByText('shared-ai: Member, another-member')).toBeInTheDocument();
+    expect(screen.getByText('shared-ai: Member, Unknown member')).toBeInTheDocument();
+    expect(screen.queryByText(/another-member/)).not.toBeInTheDocument();
     expect(mockWsClient.call).toHaveBeenCalledWith('users.avatar_conflicts');
   });
 

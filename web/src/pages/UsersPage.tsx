@@ -1,6 +1,10 @@
 import { AgentSeatSummary } from '@/components/shared/AgentSeatSummary';
+import { useAdminStepUp } from '@/components/step-up/useAdminStepUp';
+import { ConfirmDialog, RiskConfirmDialog } from '@/components/settings/controls';
+import { memberSignin, type OdooMemberCredential } from '@/lib/member-signin';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { AdminMfa } from '@/components/mfa/AdminMfa';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail, type UserInviteState, type PrimaryAgentRepairPreview, type AvatarConflict } from '@/lib/api';
 import { toast, formatError } from '@/lib/toast';
@@ -17,6 +21,7 @@ import { useAgentsStore } from '@/stores/agents-store';
 import { BindAgentDialog, BindChannelIdentityDialog } from './users/AccessDialogs';
 import { OffboardDialog, RemoveUserDialog } from './users/LifecycleDialogs';
 import {
+  MemberSigninBadges,
   BindingChips,
   IdentityChips,
   RoleBadge,
@@ -39,6 +44,7 @@ import {
   Empty,
   Segmented,
   useIsMobile,
+  useErrorMessage,
 } from '@/components/mds';
 import { Users, UserPlus, Loader2, AlertTriangle } from 'lucide-react';
 
@@ -49,6 +55,16 @@ const COLUMNS = 'minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,1.5fr) minmax(0,1.5fr)
 export function UsersPage() {
   const intl = useIntl();
   const isMobile = useIsMobile();
+  const errorText = useErrorMessage();
+  const stepUp = useAdminStepUp();
+  const t = (key: string, values?: Record<string, string | number>) => intl.formatMessage({ id: `users.memberSignin.${key}` }, values);
+  const [credentials, setCredentials] = useState<Record<string, OdooMemberCredential>>({});
+  const [selected, setSelected] = useState<string[]>([]);
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [memberConfirm, setMemberConfirm] = useState<{ user: UserDetail; action: 'unlink' | 'revoke' } | null>(null);
+  const [memberError, setMemberError] = useState<string | null>(null);
+  const [memberBusy, setMemberBusy] = useState(false);
+  const memberPending = useRef(false);
   const agentName = useAgentDisplayName();
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
   const signin = useSigninRequests(isAdmin);
@@ -77,14 +93,39 @@ export function UsersPage() {
   const [view, setView] = useState<UsersView>('list');
   const currentView = view === 'pending' && !signin.available ? 'list' : view;
   const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
-  const avatarAction = (user: UserDetail) => isAdmin && user.status === 'active'
-    && (user.role === 'employee' || user.role === 'manager') && !user.avatar_agent_id ? (
+  const avatarAction = (user: UserDetail) => {
+    if (!isAdmin || user.status !== 'active') return null;
+    const avatar = user.signin_avatar;
+    if (avatar?.state === 'waiting_admin') {
+      if (avatar.reason === 'protected_mode') return <Button variant="outline" size="sm" onClick={() => setCreateAvatarFor(user)}>{t('createForMember')}</Button>;
+      if (avatar.retry_allowed) return <Button variant="outline" size="sm" disabled={memberBusy} onClick={() => void memberAction(() => memberSignin.retryAvatar(user.id))}>{t('retry')}</Button>;
+      return null;
+    }
+    if (avatar && avatar.state !== 'done') return null;
+    return (user.role === 'employee' || user.role === 'manager') && !user.avatar_agent_id ? (
       <Button variant="outline" size="sm" onClick={() => setCreateAvatarFor(user)}>
         {intl.formatMessage({ id: 'users.avatar.create' })}
       </Button>
     ) : null;
+  };
+  const selectionFor = (user: UserDetail) => {
+    if (!isAdmin) return null;
+    const why = user.google_signin_linked ? t('selectionLinked') : user.status !== 'active' ? t('selectionInactive') : undefined;
+    return <span title={why} className="inline-flex p-1">
+      <input type="checkbox" aria-label={t('selectMember', { name: user.display_name })} title={why}
+        disabled={!!why || memberBusy || batchOpen} checked={selected.includes(user.id)}
+        onChange={event => {
+          const checked = event.currentTarget.checked;
+          if (checked && selected.length >= 100) { setMemberError(t('selectionLimit')); return; }
+          setMemberError(null);
+          setSelected(previous => checked ? [...previous, user.id] : previous.filter(id => id !== user.id));
+        }} />
+    </span>;
+  };
   const actionsFor = (user: UserDetail) => ({
     onEdit: () => setShowEdit(user),
+    ...(isAdmin && user.google_signin_linked ? { onUnlinkGoogle: () => { setMemberError(null); setMemberConfirm({ user, action: 'unlink' }); } } : {}),
+    ...(isAdmin && credentials[user.id] ? { onRevokeOdoo: () => { setMemberError(null); setMemberConfirm({ user, action: 'revoke' }); } } : {}),
     ...(isAdmin && user.status === 'active' && (user.invite_eligible === true || inviteStates[user.id] === 'pending' || inviteStates[user.id] === 'expired') ? { onInvite: () => setInviteUser(user) } : {}),
     onBind: () => setShowBind(user.id),
     onOffboard: () => setShowOffboard(user),
@@ -96,7 +137,12 @@ export function UsersPage() {
       setFetchError(null);
       const { users: data } = await api.users.list();
       setUsers(data);
+      setSelected(previous => previous.filter(id => data.some(user => user.id === id && user.status === 'active' && !user.google_signin_linked)));
       if (isAdmin) {
+        try {
+          const result = await memberSignin.credentials();
+          setCredentials(Object.fromEntries((result.credentials ?? []).map(credential => [credential.user_id, credential])));
+        } catch { setCredentials({}); }
         try { const result = await api.users.avatarConflicts(); setAvatarConflicts(result.conflicts ?? []); }
         catch { setAvatarConflicts(null); }
         try {
@@ -113,6 +159,32 @@ export function UsersPage() {
       setLoading(false);
     }
   }, [isAdmin]);
+
+  const memberAction = async (action: () => Promise<unknown>) => {
+    if (!isAdmin || memberPending.current) return;
+    memberPending.current = true;
+    setMemberBusy(true);
+    setMemberError(null);
+    try {
+      await action();
+      setMemberConfirm(null);
+      await fetchUsers();
+    } catch (err) {
+      if (err && typeof err === 'object' && 'code' in err && err.code === 'signin_step_up_required') stepUp.invalidate();
+      setMemberError(settingsRefusal(err, errorText(err)));
+    } finally { memberPending.current = false; setMemberBusy(false); }
+  };
+  const attestSelected = () => {
+    const ids = [...selected];
+    if (!ids.length || ids.length > 100 || memberPending.current) return;
+    setBatchOpen(false);
+    void memberAction(async () => {
+      const token = await stepUp.ensure(t('batchAction'));
+      if (!token) return;
+      await memberSignin.attest(ids, token);
+      setSelected([]);
+    });
+  };
 
   useEffect(() => {
     fetchUsers();
@@ -226,7 +298,7 @@ export function UsersPage() {
           <p className="font-medium">{intl.formatMessage({ id: 'users.avatar.conflicts' })}</p>
           <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.avatar.conflictsHint' })}</p>
           <ul className="space-y-1 text-sm">{avatarConflicts.map(conflict => <li key={conflict.agent_id}>
-            {agentName(conflict.agent_id)}: {conflict.user_ids.map(id => nameOf(id) || id).join(', ')}
+            {agentName(conflict.agent_id)}: {conflict.user_ids.map(id => nameOf(id) || t('unknownMember')).join(', ')}
           </li>)}</ul>
         </div>
       ))}
@@ -255,6 +327,13 @@ export function UsersPage() {
         />
       )}
 
+      {memberError && !memberConfirm && <p role="alert" className="text-sm text-destructive">{memberError}</p>}
+      {isAdmin && currentView === 'list' && selected.length > 0 && <div className="flex flex-wrap items-center gap-3 rounded-lg bg-primary px-4 py-3 text-sm text-primary-foreground">
+        <span role="status">{t('selected', { count: selected.length })}</span>
+        <Button variant="secondary" disabled={memberBusy} onClick={() => { setMemberError(null); setBatchOpen(true); }}>{t('batchAction')}</Button>
+        <Button variant="secondary" disabled={memberBusy} onClick={() => setSelected([])}>{t('clearSelection')}</Button>
+      </div>}
+
       {loading ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="size-6 animate-spin text-muted-foreground" />
@@ -273,6 +352,7 @@ export function UsersPage() {
             {users.map((user) => (
               <li key={user.id} className="space-y-2 rounded-xl border border-surface-border bg-card px-4 py-3">
                 <div className="flex items-start gap-2">
+                  {selectionFor(user)}
                   <ActorAvatar actorType="user" name={user.display_name} size="sm" />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-medium text-foreground">{user.display_name}</p>
@@ -288,6 +368,7 @@ export function UsersPage() {
                 <div className="flex flex-col gap-0.5">
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
                   <UserAvatarStatus user={user} agentName={agentName} />
+                  {isAdmin && <MemberSigninBadges user={user} credential={credentials[user.id]} />}
                   {avatarAction(user)}
                 </div>
                 <div className="space-y-1">
@@ -316,10 +397,11 @@ export function UsersPage() {
         ) : (
         <div className="overflow-hidden rounded-xl border border-surface-border">
           <ListGridContainer
-            columns={COLUMNS}
+            columns={isAdmin ? `2.5rem ${COLUMNS}` : COLUMNS}
             className="!h-auto [&>[aria-hidden]]:hidden"
             header={
               <ListGridHeader>
+                {isAdmin && <ListGridHeaderCell aria-label={t('selectionColumn')} />}
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.name' })}</ListGridHeaderCell>
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.role' })}</ListGridHeaderCell>
                 <ListGridHeaderCell>{intl.formatMessage({ id: 'users.col.agents' })}</ListGridHeaderCell>
@@ -331,6 +413,7 @@ export function UsersPage() {
           >
             {users.map((user) => (
               <ListGridRow key={user.id} rowSize="lg" className="cursor-default">
+                {isAdmin && <ListGridCell>{selectionFor(user)}</ListGridCell>}
                 <ListGridCell className="gap-2">
                   <ActorAvatar actorType="user" name={user.display_name} size="sm" />
                   <div className="min-w-0">
@@ -342,6 +425,7 @@ export function UsersPage() {
                   <RoleBadge role={user.role} />
                   <RoleDetails user={user} managerName={nameOf(user.manager_user_id)} />
                   <UserAvatarStatus user={user} agentName={agentName} />
+                  {isAdmin && <MemberSigninBadges user={user} credential={credentials[user.id]} />}
                 </ListGridCell>
                 <ListGridCell className="flex-wrap gap-1 py-1.5">
                   <BindingChips user={user} agentName={agentName} onUnbind={(a) => handleUnbind(user.id, a)} />
@@ -368,6 +452,16 @@ export function UsersPage() {
         )
       )}
 
+      {stepUp.dialog}
+      <RiskConfirmDialog open={batchOpen} onClose={() => { if (!memberBusy) setBatchOpen(false); }} onConfirm={attestSelected}
+        title={t('batchTitle', { count: selected.length })} body={t('batchBody', { count: selected.length })}
+        acknowledgeLabel={t('acknowledge')} auditNote={t('audit')} confirmLabel={t('batchConfirm', { count: selected.length })} busy={memberBusy} />
+      {memberConfirm && <ConfirmDialog open onClose={() => { if (!memberBusy) setMemberConfirm(null); }}
+        onConfirm={() => void memberAction(() => memberConfirm.action === 'unlink' ? memberSignin.unlink(memberConfirm.user.id) : memberSignin.revoke(memberConfirm.user.id))}
+        title={t(`${memberConfirm.action}Title`, { name: memberConfirm.user.display_name })}
+        message={t(`${memberConfirm.action}Body`)} confirmLabel={t(memberConfirm.action)} busy={memberBusy}>
+        {memberError && <p role="alert" className="text-sm text-destructive">{memberError}</p>}
+      </ConfirmDialog>}
       {inviteLink && <InviteLinkDialog link={inviteLink} onClose={() => setInviteLink(null)} />}
       {isAdmin && createAvatarFor && <CreateAvatarDialog
         user={createAvatarFor}
