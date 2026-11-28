@@ -144,6 +144,25 @@ pub(in crate::google_identity) struct WriteToken {
     pub meta: TokenMeta,
 }
 
+/// Revalidate the minted OAuth grant, including its full consent record.
+/// Callers sending I/O must hold the runtime authority lease through the send.
+pub(in crate::google_identity) fn validate_oauth_token(
+    home: &Path, route: &IdentityRoute, meta: &TokenMeta,
+) -> Result<(), Refusal> {
+    let kind = match route {
+        IdentityRoute::HomeOAuth => "home_oauth",
+        IdentityRoute::Personal { .. } => "personal",
+        _ => return Err(changed()),
+    };
+    let current = ready_record(home, route).map_err(|_| changed())?.metadata;
+    if meta.identity_kind != kind || meta.account_email != current.account_email
+        || meta.credential_revision != Some(current.revision)
+        || meta.write_record.as_ref() != Some(&current) {
+        return Err(changed());
+    }
+    Ok(())
+}
+
 pub(in crate::google_identity) async fn write_token(home: &Path, route: &IdentityRoute) -> Result<WriteToken, Refusal> {
     match route {
         IdentityRoute::Personal { .. } | IdentityRoute::HomeOAuth => oauth_token(home, route).await,

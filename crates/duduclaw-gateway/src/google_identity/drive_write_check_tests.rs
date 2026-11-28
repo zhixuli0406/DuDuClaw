@@ -187,8 +187,9 @@ async fn drive_write_check_home_sa_probes_oauth_needs_consent_and_apps_script_is
     }
 }
 
-#[tokio::test]
-async fn drive_write_check_home_oauth_probes_with_dedicated_write_token() {
+fn home_oauth_write_fixture(email: &str) -> (
+    Home, crate::person_credentials::write_store::Metadata, crate::person_credentials::Secret,
+) {
     use crate::person_credentials::{write_store as store, Secret, Status};
     let home = Home::new();
     home.agent("bot", "[google]\nidentity='home'\n");
@@ -202,7 +203,6 @@ async fn drive_write_check_home_oauth_probes_with_dedicated_write_token() {
         token_url: "https://oauth2.googleapis.com/token".into(), scopes: vec![],
         redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
     }).unwrap();
-    let email = "p8-home-oauth-write@c.test";
     let metadata = store::Metadata {
         owner_kind: "home".into(), owner_id: "home".into(), purpose: "drive_write".into(),
         provider: "google".into(), credential_id: uuid::Uuid::new_v4().to_string(), revision: 1,
@@ -217,6 +217,68 @@ async fn drive_write_check_home_oauth_probes_with_dedicated_write_token() {
     let key = protection_gate(home.p()).unwrap();
     let epoch = store::begin_connection(home.p(), "home", "home").unwrap();
     store::connect(home.p(), &key, metadata.clone(), &secret, epoch).unwrap();
+    (home, metadata, secret)
+}
+
+#[tokio::test]
+async fn drive_write_check_home_oauth_replaced_after_mint_never_probes() {
+    use crate::person_credentials::write_store as store;
+    let email = "p8-home-oauth-replaced@c.test";
+    let replacement_email = "p8-home-oauth-replacement@c.test";
+    let (home, mut metadata, mut secret) = home_oauth_write_fixture(email);
+    metadata.account_email = replacement_email.into();
+    metadata.google_sub = "replacement-google-home-write".into();
+    metadata.credential_id = uuid::Uuid::new_v4().to_string();
+    // Reconnect may start at the same revision; comparing revision alone is insufficient.
+    secret.access_token = closed_fixture_token(replacement_email);
+    let hook: Box<dyn Fn(&std::path::Path) + Send + Sync> = Box::new(move |home| {
+        let key = protection_gate(home).unwrap();
+        let epoch = store::begin_connection(home, "home", "home").unwrap();
+        store::connect(home, &key, metadata.clone(), &secret, epoch).unwrap();
+    });
+    let step = check::WRITE_TEST_AFTER_MINT.scope(hook, write_step(&home, &NoPeople)).await;
+    assert!(!step.ok, "{step:?}");
+    assert_eq!(step.detail, "無法確認雲端硬碟寫入連線，請管理員檢查後再試。");
+    assert_eq!(data_endpoint_reads_for(email), 0);
+    assert_eq!(data_endpoint_reads_for(replacement_email), 0);
+    assert!(seen_for(email).is_empty());
+    assert!(seen_for(replacement_email).is_empty());
+}
+
+#[tokio::test]
+async fn drive_write_check_home_oauth_revoked_after_mint_never_probes() {
+    let email = "p8-home-oauth-revoked@c.test";
+    let (home, _, _) = home_oauth_write_fixture(email);
+    let hook: Box<dyn Fn(&std::path::Path) + Send + Sync> = Box::new(|home| {
+        assert!(crate::person_credentials::write_store::disconnect(home, "home", "home").unwrap().is_some());
+    });
+    let step = check::WRITE_TEST_AFTER_MINT.scope(hook, write_step(&home, &NoPeople)).await;
+    assert!(!step.ok, "{step:?}");
+    assert_eq!(step.detail, "無法確認雲端硬碟寫入連線，請管理員檢查後再試。");
+    assert_eq!(data_endpoint_reads_for(email), 0);
+    assert!(seen_for(email).is_empty());
+}
+
+#[tokio::test]
+async fn drive_write_check_home_oauth_revoked_after_probe_never_reports_success() {
+    let email = "p8-home-oauth-revoked-after-probe@c.test";
+    let (home, metadata, _) = home_oauth_write_fixture(email);
+    // Simulate an out-of-band change to exercise the post-I/O check even under the lease.
+    let hook: Box<dyn Fn(&std::path::Path) + Send + Sync> = Box::new(move |home| {
+        assert!(crate::person_credentials::write_store::mark_needs_reconnect(home, &metadata).unwrap());
+    });
+    let step = check::WRITE_TEST_AFTER_PROBE.scope(hook, write_step(&home, &NoPeople)).await;
+    assert!(!step.ok, "{step:?}");
+    assert_eq!(step.detail, "無法確認雲端硬碟寫入連線，請管理員檢查後再試。");
+    assert_eq!(data_endpoint_reads_for(email), 1);
+    assert!(seen_for(email).is_empty());
+}
+
+#[tokio::test]
+async fn drive_write_check_home_oauth_probes_with_dedicated_write_token() {
+    use crate::person_credentials::write_store as store;
+    let email = "p8-home-oauth-write@c.test";
+    let (home, metadata, secret) = home_oauth_write_fixture(email);
     let step = write_step(&home, &NoPeople).await;
     assert!(step.ok, "{step:?}");
     assert_eq!(step.detail, "可以使用");
