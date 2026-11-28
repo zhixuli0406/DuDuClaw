@@ -3,7 +3,7 @@ use std::path::Path;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-pub(crate) const MEMBER_CREDENTIALS_OFF: &str = "公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。";
+pub(crate) use duduclaw_odoo::access_policy::MEMBER_CREDENTIALS_OFF;
 
 /// Only a literal boolean true grants access. Missing/unreadable/malformed is off.
 pub(crate) fn member_credentials_enabled(home: &Path) -> bool {

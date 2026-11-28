@@ -512,3 +512,37 @@ async fn person_odoo_route_accepts_exact_shared_subset() {
         else { assert_eq!(status, StatusCode::OK); }
     }
 }
+
+
+#[tokio::test]
+async fn member_credentials_off_explains_personal_refusal_after_service_fallbacks() {
+    let f = Fixture::new();
+    f.avatar(&f.a, "alice");
+    f.credential(&f.a, SECRET_A);
+    f.config("company_key_agents=['company']", "https://erp.example.com", &["odoo:read"]);
+    let path = f.home.path().join("config.toml");
+    let raw = std::fs::read_to_string(&path).unwrap().replace("member_credentials=true", "member_credentials=false");
+    std::fs::write(&path, raw).unwrap();
+    let (status, value) = f.employee("alice", read()).await;
+    refused(status, &value, "odoo_member_credentials_off");
+    assert_eq!(value, json!({"ok":false,"code":"odoo_member_credentials_off",
+        "message":"公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。"}));
+
+    f.agent("bob", "[odoo]\nact_as_requester=true");
+    let turn = uuid::Uuid::new_v4().to_string();
+    let _guard = crate::knowledge::turn_requesters::register("bob", &turn,
+        RequesterIdentity::DashboardUser { user_id: f.a.clone() }).unwrap();
+    let (status, requester) = f.employee("bob", json!({"tool":"odoo_search","turn_id":turn})).await;
+    refused(status, &requester, "odoo_member_credentials_off");
+    assert_eq!(requester, value);
+
+    f.agent("alice", "[odoo]\nusername='service'\napi_key_enc='cipher'");
+    for (agent, identity) in [("alice", "agent"), ("company", "company")] {
+        let (status, value) = f.employee(agent, read()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value["identity"], identity);
+    }
+    let (status, value) = f.employee("shared", read()).await;
+    refused(status, &value, "odoo_not_connected");
+    assert_eq!(value["message"], duduclaw_odoo::access_policy::not_connected_message(false));
+}

@@ -566,7 +566,7 @@ fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl Fn
             let unchanged = current.parse::<toml::Table>().and_then(|old|
                 new_content.parse::<toml::Table>().map(|new| old.get("skill_trust") == new.get("skill_trust")));
             if !matches!(unchanged, Ok(true)) {
-                return Ok(Err("請到自家技能來源設定頁變更自動放行清單。".into()));
+                return Ok(Err("請到技能匯入頁的自家技能來源變更自動放行清單。".into()));
             }
         }
         if observer.is_some() && source.is_some() {

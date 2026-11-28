@@ -373,8 +373,11 @@ impl ToolPolicy {
             && !local.identities.owner_has_personal_credential
             && !(local.agent.act_as_requester && local.identities.requester_has_personal_credential)
             && !local.access.company_key_agents.iter().any(|id| id == &local.agent_id) {
-            return Err(format!("Odoo not connected. {}", not_connected_message(
-                local.identities.avatar_has_owner || local.agent.act_as_requester)));
+            let person = local.identities.avatar_has_owner || local.agent.act_as_requester;
+            if person && !local.global.member_credentials {
+                return Err(MEMBER_CREDENTIALS_OFF.into());
+            }
+            return Err(format!("Odoo not connected. {}", not_connected_message(person)));
         }
         local.precheck(tool, params)
     }

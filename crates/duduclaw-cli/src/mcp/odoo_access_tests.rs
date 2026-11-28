@@ -228,3 +228,22 @@ fn person_policy_never_uses_employee_tables_or_engine() {
     assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), None).is_err());
     assert!(p.check_call("odoo_search", &json!({"model":"res.partner"}), Some(&identity(IdentityPermission::Engine))).is_err());
 }
+
+
+#[test]
+fn preconnect_distinguishes_member_credentials_off_from_missing_connection() {
+    let mut p = policy();
+    p.identities.owner_has_personal_credential = false;
+    let params = json!({"model":"crm.lead"});
+    assert_eq!(p.data_preconnect("odoo_search", &params, None).unwrap_err(), MEMBER_CREDENTIALS_OFF);
+    p.global.member_credentials = true;
+    assert_eq!(p.data_preconnect("odoo_search", &params, None).unwrap_err(),
+        format!("Odoo not connected. {}", not_connected_message(true)));
+    p.global.member_credentials = false;
+    p.identities.avatar_has_owner = false;
+    p.agent.act_as_requester = true;
+    assert_eq!(p.data_preconnect("odoo_search", &params, None).unwrap_err(), MEMBER_CREDENTIALS_OFF);
+    p.agent.act_as_requester = false;
+    assert_eq!(p.data_preconnect("odoo_search", &params, None).unwrap_err(),
+        format!("Odoo not connected. {}", not_connected_message(false)));
+}

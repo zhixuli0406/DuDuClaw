@@ -417,3 +417,12 @@ fn ineffective_ack_requires_fresh_enable_acknowledgement() {
         assert!(config::effective(home.path(), Some(&db)).is_some());
     }
 }
+
+
+#[test]
+fn generic_chat_admin_edit_points_to_named_security_section() {
+    let before = toml::Table::new();
+    let after = "[approval.chat_admin]\nenabled=true\n".parse::<toml::Table>().unwrap();
+    assert_eq!(refuse_subtable_change(&before, &after).unwrap_err(),
+        "請到安全設定的「在聊天軟體核准」區塊變更設定並確認風險。");
+}

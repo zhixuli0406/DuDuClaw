@@ -9,7 +9,7 @@ use std::path::Path;
 const LOGIN_REQUIRED: &str = "請使用管理員帳號登入儀表板後，再設定聊天核准。";
 const UNREADABLE: &str = "目前無法讀取設定，請先修復設定檔再儲存。";
 const UNAVAILABLE: &str = "目前無法讀取帳號資料，請重新整理後再試。";
-const DEDICATED: &str = "請到安全設定的聊天核准區域變更設定並確認風險。";
+const DEDICATED: &str = "請到安全設定的「在聊天軟體核准」區塊變更設定並確認風險。";
 
 pub(super) fn minimum_role(method: &str) -> Option<UserRole> {
     match method {

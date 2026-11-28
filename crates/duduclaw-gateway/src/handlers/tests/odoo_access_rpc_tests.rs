@@ -553,3 +553,22 @@ async fn agent_access_rechecks_authority_after_audit_before_replace() {
     assert!(result.is_err());
     assert_eq!(agent_raw(&f), initial);
 }
+
+
+#[test]
+fn agent_widening_guards_direct_to_employee_edit_page() {
+    let message = "這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。";
+    for (before, after) in [
+        ("", "[odoo]\nact_as_requester=true\n"),
+        ("[odoo]\npermission_override='read_only'\n", "[odoo]\npermission_override='engine'\n"),
+        ("", "odoo=false\n"),
+        ("", "[odoo]\npermission_override=false\n"),
+    ] {
+        let before_table = before.parse::<toml::Table>().unwrap();
+        let after_table = after.parse::<toml::Table>().unwrap();
+        assert_eq!(super::super::config_raw_rpc::refuse_odoo_agent_widening_edit(
+            &before_table, &after_table).unwrap_err(), message);
+        assert_eq!(super::super::config_commit::refuse_odoo_agent_widening_text_edit(
+            before, after).unwrap_err(), message);
+    }
+}

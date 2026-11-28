@@ -445,7 +445,7 @@ pub(crate) fn restore_raw_toml_ctx(submitted: &str, stored: &str, ctx: &mut Rest
     for s in HIDDEN_SECTIONS {
         if doc.get(s).is_some() {
             if *s == "skill_trust" {
-                return Err("請到自家技能來源設定頁變更自動放行清單。".into());
+                return Err("請到技能匯入頁的自家技能來源變更自動放行清單。".into());
             }
             return Err(format!("[{s}] is managed on its own page and cannot be edited here"));
         }
@@ -844,6 +844,7 @@ pub(crate) fn refuse_member_key_widening_edit(before: &toml::Table, after: &toml
 }
 
 const ODOO_WIDENING_REFUSED: &str = "這項 Odoo 權限設定只能在 Odoo 設定頁確認風險後變更。";
+const ODOO_AGENT_WIDENING_REFUSED: &str = "這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。";
 
 /// Compare raw acknowledgements (never normalized policy) and effective refusals.
 /// Missing refusal lists inherit the defaults, including on section removal.
@@ -890,13 +891,13 @@ pub(crate) fn refuse_odoo_agent_widening_edit(before: &toml::Table, after: &toml
     use duduclaw_odoo::access_policy::PermissionOverride;
     for table in [before, after] {
         if table.get("odoo").is_some_and(|value| !value.is_table()) {
-            return Err(ODOO_WIDENING_REFUSED.into());
+            return Err(ODOO_AGENT_WIDENING_REFUSED.into());
         }
     }
     let override_mode = |table: &toml::Table| -> Result<PermissionOverride, String> {
         let value = toml_at(table, "odoo.permission_override");
         if value.is_some_and(|value| !value.is_str()) {
-            return Err(ODOO_WIDENING_REFUSED.into());
+            return Err(ODOO_AGENT_WIDENING_REFUSED.into());
         }
         Ok(PermissionOverride::from_config(value.and_then(toml::Value::as_str)))
     };
@@ -904,7 +905,7 @@ pub(crate) fn refuse_odoo_agent_widening_edit(before: &toml::Table, after: &toml
         && toml_at(before, "odoo.act_as_requester").and_then(toml::Value::as_bool) != Some(true))
         || (override_mode(after)?.restriction_rank() < override_mode(before)?.restriction_rank())
     {
-        return Err(ODOO_WIDENING_REFUSED.into());
+        return Err(ODOO_AGENT_WIDENING_REFUSED.into());
     }
     Ok(())
 }
