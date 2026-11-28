@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, ArrowLeftRight, Plus, Trash2 } from 'lucide-react';
-import { api, type AgentDetail, type DelegationPolicy, type DelegationRole } from '@/lib/api';
+import { api, type AgentDetail, type DelegationSettings, type DelegationPolicy, type DelegationRole } from '@/lib/api';
 import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
@@ -22,6 +22,18 @@ export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy
 /** A whitelist row while it is being edited — either side may still be blank. */
 type PairDraft = { a: string; b: string; direction?: 'two_way' | 'one_way' };
 const ROLES: DelegationRole[] = ['admin', 'manager'];
+
+// Capture values independently of the editable form and normalize list order.
+function settingsSnapshot(settings: DelegationSettings): string {
+  const pairs = (list: Array<[string, string]>, twoWay = false) =>
+    list.map(pair => JSON.stringify(twoWay ? [...pair].sort() : pair)).sort();
+  return JSON.stringify({
+    policy: settings.policy,
+    allow: pairs(settings.allow, true),
+    allow_one_way: pairs(settings.allow_one_way ?? []),
+    unrestricted_roles: [...(settings.unrestricted_roles ?? [])].sort(),
+  });
+}
 
 /**
  * 委派權限 (WP21 §2.8) — who may hand work to whom, org-wide.
@@ -60,6 +72,8 @@ export function DelegationTab() {
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const snapshotRef = useRef<string | null>(null);
+  const [conflict, setConflict] = useState(false);
   // P05: a failed read left the radio group on its `department` default and an
   // empty pair list — visually identical to a real, saved configuration.
   const [loadError, setLoadError] = useState<unknown>(null);
@@ -77,6 +91,8 @@ export function DelegationTab() {
         api.delegation.get(),
         api.agents.list(),
       ]);
+      snapshotRef.current = settingsSnapshot(settings);
+      setConflict(false);
       setPolicy(settings.policy);
       setPairs([...settings.allow.map(([a, b]) => ({ a, b })), ...(settings.allow_one_way ?? []).map(([a, b]) => ({ a, b, direction: 'one_way' as const }))]);
       const loadedRoles = (settings.unrestricted_roles ?? []).filter((role) => ROLES.includes(role));
@@ -147,7 +163,7 @@ export function DelegationTab() {
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
   const tooManyPairs = pairs.length > 200;
   // Editing is possible only on a successfully loaded setting.
-  const editable = loaded && !loading && loadError == null;
+  const editable = loaded && !loading && loadError == null && !conflict;
   const addsRole = roles.some((role) => !savedRoles.includes(role));
   const canSave = editable && !saving && !incomplete && !hasSelfPair && !hasDuplicate && !tooManyPairs;
 
@@ -162,6 +178,11 @@ export function DelegationTab() {
     setSaved(false);
     setSaveError(null);
     try {
+      const current = await api.delegation.get();
+      if (snapshotRef.current !== settingsSnapshot(current)) {
+        setConflict(true);
+        return;
+      }
       await api.delegation.set({
         policy,
         allow: pairs.filter((p) => p.direction !== 'one_way').map((p) => [p.a, p.b] as [string, string]),
@@ -200,11 +221,17 @@ export function DelegationTab() {
             <AlertTriangle className="size-3.5 text-warning" />
             {t('settings.delegation.warnings')}
           </p>
-          <ul className="ml-5 list-disc space-y-0.5 text-muted-foreground">
-            {warnings.map((w, i) => <li key={i}>{w}</li>)}
-          </ul>
+          <p className="text-muted-foreground">
+            {t('settings.delegation.safeWarning')}
+            {warnings.length > 1 && intl.formatMessage({ id: 'settings.delegation.warningCount' }, { count: warnings.length })}
+          </p>
         </div>
       )}
+
+      {conflict && <div className="space-y-2">
+        <p role="alert" className="text-sm text-destructive">{t('settings.delegation.changed')}</p>
+        <Button disabled={loading || saving} onClick={() => void load()}>{t('settings.delegation.reload')}</Button>
+      </div>}
 
       {/* ① Delegation mode */}
       <SettingsSection

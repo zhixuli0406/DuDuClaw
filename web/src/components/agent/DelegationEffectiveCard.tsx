@@ -40,7 +40,7 @@ export function isDelegationEffective(v: unknown): v is DelegationEffective {
  * cross-department pairs naming it, a config problem when there is one (as a
  * fixed message per category — never the config text), and
  * how many `[delegation] allow` entries were dropped (count only — the texts
- * stay in Settings, Admin-only).
+ * are never rendered).
  * Changing it happens in 設定 › 委派權限 (Admin) or on the edit page.
  *
  * Shown to Manager and up — the gateway gates the RPC the same way (plus
@@ -146,7 +146,7 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
                 <span>
                   {t('agentDetail.delegation.configProblem')}
                   {' '}
-                  {data.config_error ? configErrorText(data.config_error) : data.policy_warning}
+                  {data.config_error ? configErrorText(data.config_error) : t('settings.delegation.safeWarning')}
                 </span>
               </p>
             )}

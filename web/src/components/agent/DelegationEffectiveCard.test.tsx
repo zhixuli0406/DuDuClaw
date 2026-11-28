@@ -214,3 +214,12 @@ it('uses safe fallbacks for unknown ids and badges for direction and inactivity'
   expect(screen.getByText(en['agentDetail.delegation.oneWayInactive'])).toHaveAttribute('data-slot', 'badge');
   expect(container).not.toHaveTextContent('→');
 });
+
+it.each(['manager', 'admin'] as const)('shows safe policy warnings to %s without config or identifiers', async role => {
+  signIn(role);
+  effectiveMock.mockResolvedValue({ ...BASE, policy_warning: '[delegation] allow private-agent-123' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['settings.delegation.safeWarning']);
+  expect(document.body.textContent).not.toContain('[delegation] allow');
+  expect(document.body.textContent).not.toContain('private-agent-123');
+});

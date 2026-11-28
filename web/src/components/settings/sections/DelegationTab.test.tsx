@@ -135,12 +135,12 @@ describe('<DelegationTab>', () => {
     getMock.mockResolvedValue({
       policy: 'department',
       allow: [],
-      warnings: ['config.toml [delegation] allow 第 2 組設定格式有誤,已忽略。'],
+      warnings: ['config.toml [delegation] allow 第 2 組設定格式有誤,已忽略。', 'private-agent-123'],
     });
     renderWithProviders(<DelegationTab />);
-    await waitFor(() =>
-      expect(screen.getByText(/第 2 組設定格式有誤/)).toBeInTheDocument()
-    );
+    expect(await screen.findByText(new RegExp(en['settings.delegation.safeWarning']))).toHaveTextContent('(2 warnings)');
+    expect(document.body.textContent).not.toContain('[delegation] allow');
+    expect(document.body.textContent).not.toContain('private-agent-123');
   });
 
   // ── RM-137 ────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ describe('<DelegationTab>', () => {
 
   it('enables saving only once a retry has loaded the real setting', async () => {
     getMock.mockRejectedValueOnce(new Error('timeout'));
-    getMock.mockResolvedValueOnce({ policy: 'hierarchy', allow: [], warnings: [] });
+    getMock.mockResolvedValue({ policy: 'hierarchy', allow: [], warnings: [] });
     renderWithProviders(<DelegationTab />);
 
     expect(await screen.findByText(en['errorState.manage.loadFailed'])).toBeInTheDocument();
@@ -351,5 +351,48 @@ describe('delegation role and direction settings', () => {
     fireEvent.click(screen.getAllByRole('button', { name: 'Swap direction' })[1]);
     fireEvent.click(saveButton());
     await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'department', allow: [], unrestricted_roles: [], allow_one_way: [['sales-lead', 'warehouse-lead'], ['sales-lead', 'intern']] }));
+  });
+});
+
+describe('delegation save freshness check', () => {
+  const original = { policy: 'department', allow: [['sales-lead', 'warehouse-lead']], allow_one_way: [['intern', 'sales-lead']], unrestricted_roles: ['admin', 'manager'], warnings: [] };
+  it.each([
+    { policy: 'none' },
+    { allow: [] },
+    { allow_one_way: [['sales-lead', 'intern']] },
+    { unrestricted_roles: ['admin'] },
+  ])('blocks changed server settings %j until reloaded', async change => {
+    getMock.mockResolvedValue(original);
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    getMock.mockResolvedValue({ ...original, ...change });
+    fireEvent.click(saveButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(en['settings.delegation.changed']);
+    expect(setMock).not.toHaveBeenCalled();
+    expect(saveButton()).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitLoaded();
+    expect(screen.queryByText(en['settings.delegation.changed'])).not.toBeInTheDocument();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(setMock).toHaveBeenCalledOnce());
+  });
+  it('saves when the re-read matches despite reordered pairs and roles', async () => {
+    getMock.mockResolvedValue({ ...original, allow: [...original.allow, ['intern', 'warehouse-lead']], allow_one_way: [] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    getMock.mockResolvedValue({ ...original, allow: [['warehouse-lead', 'intern'], ['warehouse-lead', 'sales-lead']], allow_one_way: [], unrestricted_roles: ['manager', 'admin'] });
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(setMock).toHaveBeenCalledOnce());
+    expect(getMock).toHaveBeenCalledTimes(3);
+    expect(getMock.mock.invocationCallOrder[1]).toBeLessThan(setMock.mock.invocationCallOrder[0]);
+  });
+  it('does not save when the re-read fails', async () => {
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    getMock.mockRejectedValueOnce(new Error('commit failed: /home/x/config.toml'));
+    fireEvent.click(saveButton());
+    expect(await screen.findByRole('alert')).toHaveTextContent(en['errorState.reason.unknown']);
+    expect(setMock).not.toHaveBeenCalled();
+    expect(getMock).toHaveBeenCalledTimes(2);
   });
 });

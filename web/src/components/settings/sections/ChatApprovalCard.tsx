@@ -4,14 +4,15 @@ import { Link } from 'react-router';
 import { Shield } from 'lucide-react';
 import { api, type ChatAdminSettings, type ChatApprovalKind } from '@/lib/api';
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
-import { formatError } from '@/lib/toast';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { useSystemStore } from '@/stores/system-store';
 import { RiskConfirmDialog } from '@/components/settings/controls';
-import { Button, Card, CardHeader, CardTitle, CardDescription, CardContent, Input, Switch } from '@/components/mds';
+import { Button, Card, CardHeader, CardTitle, CardDescription, CardContent, Input, Switch, useErrorMessage } from '@/components/mds';
 
 type KindGroup = { label: string; impact: string; keys: string[] };
 export function ChatApprovalCard() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
   const { zone } = useCompanyTimeZone();
   const t = (key: string, values?: Record<string, string | number>) => intl.formatMessage({ id: `security.chatApproval.${key}` }, values);
   const personal = useSystemStore((s) => s.status?.edition_profile) === 'personal';
@@ -27,9 +28,9 @@ export function ChatApprovalCard() {
     try {
       const next = await api.chatAdmin.get();
       setLoaded(next); setForm(next);
-    } catch (err) { setLoaded(null); setForm(null); setError(formatError(err)); }
+    } catch (err) { setLoaded(null); setForm(null); setError(settingsRefusal(err, errorText(err))); }
     finally { setLoading(false); }
-  }, []);
+  }, [errorText]);
   useEffect(() => { void load(); }, [load]);
   const label = (kind: ChatApprovalKind) => kind.label[intl.locale === 'zh-TW' ? 'zh-TW' : intl.locale === 'ja-JP' ? 'ja' : 'en'];
   const groups: KindGroup[] = [];
@@ -64,7 +65,7 @@ export function ChatApprovalCard() {
       setLoaded(null); setForm(null);
       const next = await api.chatAdmin.get();
       setLoaded(next); setForm(next); setSaved(true);
-    } catch (err) { setError(formatError(err)); }
+    } catch (err) { setError(settingsRefusal(err, errorText(err))); }
     finally { setSaving(false); }
   }
   return <Card>

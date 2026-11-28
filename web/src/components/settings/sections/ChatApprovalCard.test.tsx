@@ -4,6 +4,7 @@ import { renderWithProviders } from '@/test/render';
 import { mockWsClient } from '@/test/mocks';
 import { useSystemStore } from '@/stores/system-store';
 import type { ChatAdminSettings } from '@/lib/api';
+import en from '@/i18n/en.json';
 import { ChatApprovalCard } from './ChatApprovalCard';
 
 const kind = (key: string, name: string) => ({ key, label: { 'zh-TW': name, en: name, ja: name }, impact: '影響', tier: 'T2' as const, step_up_required: true });
@@ -89,7 +90,8 @@ it('shows revoked acknowledgement state', async () => {
 });
 it('retries failed loads and displays server save refusal', async () => {
   mockWsClient.call.mockRejectedValueOnce(new Error('Load refused'));
-  renderWithProviders(<ChatApprovalCard />); await screen.findByText(/Load refused/);
+  renderWithProviders(<ChatApprovalCard />); await screen.findByText(en['errorState.reason.unknown']);
+  expect(document.body.textContent).not.toContain('Load refused');
   fireEvent.click(screen.getByRole('button', { name: 'Try again' })); await screen.findByText('王小明 · Not linked');
   mockWsClient.call.mockRejectedValueOnce(new Error('設定已變更，請重新整理後再試。')); save();
   await screen.findByText('設定已變更，請重新整理後再試。');
@@ -133,4 +135,28 @@ it('sends locally edited fields and re-reads the effective state after saving', 
   await screen.findByText('Saved');
   expect(screen.getByRole('spinbutton')).toHaveValue(168);
   expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'approvals.chat_admin.get')).toHaveLength(2);
+});
+
+it('hides technical load errors behind the generic sentence', async () => {
+  mockWsClient.call.mockRejectedValueOnce(new Error('commit failed: /home/x/config.toml'));
+  renderWithProviders(<ChatApprovalCard />);
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['errorState.reason.unknown']);
+  expect(document.body.textContent).not.toContain('commit failed');
+  expect(document.body.textContent).not.toContain('/home/x/config.toml');
+});
+it.each([false, true])('hides technical save errors including risk dialog %s', async inDialog => {
+  await mount();
+  mockWsClient.call.mockRejectedValueOnce(new Error('commit failed: /home/x/config.toml'));
+  if (inDialog) {
+    fireEvent.click(toggle());
+    const dialog = screen.getByRole('dialog');
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Enable' }));
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent(en['errorState.reason.unknown']);
+  } else {
+    save();
+    expect(await screen.findByRole('alert')).toHaveTextContent(en['errorState.reason.unknown']);
+  }
+  expect(document.body.textContent).not.toContain('commit failed');
+  expect(document.body.textContent).not.toContain('/home/x/config.toml');
 });
