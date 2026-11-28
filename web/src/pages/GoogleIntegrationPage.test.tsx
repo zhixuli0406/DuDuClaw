@@ -5,6 +5,7 @@ import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { GoogleIntegrationPage } from './GoogleIntegrationPage';
 import { api, type GoogleCredentialsStatus } from '@/lib/api';
+import { useSystemStore } from '@/stores/system-store';
 import { useAuthStore } from '@/stores/auth-store';
 
 const BASE: GoogleCredentialsStatus = {
@@ -312,5 +313,22 @@ describe('S-08 consent and refusal states', () => {
     await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Disconnect company account writing' }));
     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('google.drive_write.consent_home_disconnect', {}));
     expect(await card.findByRole('button', { name: 'Consent to writing' })).toBeInTheDocument();
+  });
+});
+
+
+describe('S-11 sign-in card visibility', () => {
+  beforeEach(() => { mockWsClient.call.mockReset(); });
+  it.each(['personal', 'member'])('does not render or read sign-in settings for %s', async kind => {
+    const previous = useSystemStore.getState().status;
+    driveSetup();
+    if (kind === 'personal') useSystemStore.setState({ status: { ...previous, edition_profile: 'personal' } as never });
+    else useAuthStore.setState({ user: { id: 'member', email: 'member@example.test', display_name: 'Member', role: 'employee', status: 'active' } });
+    const view = renderWithProviders(<GoogleIntegrationPage />);
+    try {
+      await screen.findByTestId('google-gate-on');
+      expect(screen.queryByTestId('google-signin-admin')).not.toBeInTheDocument();
+      expect(mockWsClient.call).not.toHaveBeenCalledWith('google.signin.get', {});
+    } finally { view.unmount(); useSystemStore.setState({ status: previous }); }
   });
 });

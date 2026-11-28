@@ -1,0 +1,31 @@
+import { client } from './ws-client';
+
+export interface GoogleSigninSettings {
+  enabled: boolean;
+  enabled_requested: boolean;
+  allowed_hd: string[];
+  approval: 'admin' | 'direct';
+  daily_new_accounts: number;
+  avatar_template: string | null;
+  avatar_template_revision: number | null;
+  approval_grants_mfa_enrollment: boolean;
+  ack: { by: string; at: string } | null;
+}
+export interface GoogleSigninStatus {
+  settings: GoogleSigninSettings;
+  redirect_uri: string | null;
+  checks: {
+    client_configured: boolean;
+    public_url_ok: boolean;
+    domains_set: boolean;
+    mfa_policy: 'enforced' | 'not_enforced' | 'unknown';
+    personal_edition: boolean;
+    personal_connection_domains_cover: boolean | null;
+  };
+}
+export type GoogleSigninForm = Pick<GoogleSigninSettings, 'enabled' | 'allowed_hd' | 'approval' | 'daily_new_accounts' | 'avatar_template' | 'approval_grants_mfa_enrollment'> & { avatar_template_revision?: number };
+export const googleSignin = {
+  get: () => client.call('google.signin.get', {}) as Promise<GoogleSigninStatus>,
+  set: (params: GoogleSigninForm & { acknowledge_risk?: boolean; step_up_csrf?: number[] }) =>
+    client.call('google.signin.set', { ...params }) as Promise<{ settings: GoogleSigninSettings }>,
+};

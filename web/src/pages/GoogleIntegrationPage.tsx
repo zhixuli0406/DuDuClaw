@@ -14,6 +14,8 @@ import {
   Settings2,
   ChevronDown,
 } from 'lucide-react';
+import { GoogleSigninAdminCard } from '@/components/google/GoogleSigninAdminCard';
+import { useSystemStore } from '@/stores/system-store';
 import { GoogleDriveWriteCard } from '@/components/google/GoogleDriveWriteCard';
 import { GoogleSetupWizard } from '@/components/google/GoogleSetupWizard';
 import { useAuthStore } from '@/stores/auth-store';
@@ -84,6 +86,7 @@ export function GoogleIntegrationPage() {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const admin = useAuthStore(s => s.user?.role === 'admin');
+  const personal = useSystemStore(s => s.status?.edition_profile) === 'personal';
 
   const load = useCallback(async () => {
     try {
@@ -212,6 +215,7 @@ export function GoogleIntegrationPage() {
       </CardContent></Card>}
 
       {admin && <GoogleDriveWriteCard integrationEnabled={enabled} />}
+      {admin && !personal && <GoogleSigninAdminCard />}
 
       {advanced && <div id="google-advanced-settings" className="space-y-4">
       <IntegrationConnectPanel
