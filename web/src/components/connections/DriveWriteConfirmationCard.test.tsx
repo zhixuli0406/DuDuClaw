@@ -41,7 +41,8 @@ describe('decodeCardValue', () => {
 describe('Drive write confirmations', () => {
   it('renders decoded display values as plain text, never internal identifiers', () => {
     const { container } = mount();
-    expect(screen.getByText('助理_小美')).toBeInTheDocument();
+    expect(screen.getByText('無法顯示的 AI 員工')).toBeInTheDocument();
+    expect(screen.queryByText('助理_小美')).not.toBeInTheDocument();
     expect(screen.getByText('me@example.com')).toBeInTheDocument();
     expect(screen.getByText('建立檔案')).toBeInTheDocument();
     expect(screen.getByText('業務部 > 客戶')).toBeInTheDocument();
@@ -52,12 +53,14 @@ describe('Drive write confirmations', () => {
     for (const id of ['private-employee-id', 'private-file-id', 'private-destination-id', 'private-parent-id']) expect(container.innerHTML).not.toContain(id);
     expect(screen.getByRole('timer')).toHaveTextContent('剩');
   });
-  it('resolves an empty agent name from the store and otherwise uses the unavailable label', () => {
+  it('ignores agent ids and resolves only the employee through the store', () => {
     useAgentsStore.setState({ agents: [{ name: 'private-employee-id', display_name: '客服小明' }] as never });
-    const view = mount({ ...request, agent: encode('') });
+    const value = { ...request, agent: request.employee };
+    const view = mount(value);
     expect(screen.getByText('客服小明')).toBeInTheDocument();
     expect(document.body.textContent).not.toContain('private-employee-id');
-    view.unmount(); useAgentsStore.setState({ agents: [] }); mount({ ...request, agent: empty });
+    view.unmount(); useAgentsStore.setState({ agents: [] }); mount(value);
+    expect(document.body.textContent).not.toContain('private-employee-id');
     expect(screen.getByText('無法顯示的 AI 員工')).toBeInTheDocument();
   });
   it('renders attachment and rename details', () => {

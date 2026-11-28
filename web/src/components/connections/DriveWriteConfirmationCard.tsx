@@ -41,7 +41,7 @@ export function DriveWriteConfirmationCard({ request, onDecided }: { request: Dr
     return () => window.clearInterval(timer);
   }, []);
   const employee = textValue(request.employee);
-  const agent = textValue(request.agent).trim() || agents.find(row => row.name === employee)?.display_name?.trim() || t('unknownAgent');
+  const agent = agents.find(row => row.name === employee)?.display_name?.trim() || t('unknownAgent');
   const before = textValue(request.rename_before);
   const after = textValue(request.rename_after);
   const renaming = !!(before || after);

@@ -12827,5 +12827,13 @@
   "odoo.permissions.note": "內部備註",
   "odoo.permissions.message": "通知追蹤者",
   "odoo.permissions.attach": "附件",
-  "odoo.permissions.engineTableRightsHint": "通知追蹤者會寄信給客戶，每次都要人核准。附件只能從 AI 員工自己的附件資料夾建立。"
+  "odoo.permissions.engineTableRightsHint": "通知追蹤者會寄信給客戶，每次都要人核准。附件只能從 AI 員工自己的附件資料夾建立。",
+  "odoo.permissions.permissionConfirm.title": "開放這位 AI 員工在 {table} 使用「{permission}」？",
+  "odoo.permissions.permissionConfirm.activity": "AI 可以在這個資料表建立與更新活動。",
+  "odoo.permissions.permissionConfirm.note": "AI 可以在這個資料表留下內部備註。",
+  "odoo.permissions.permissionConfirm.message": "AI 可以寄信通知這筆資料的追蹤者（可能是客戶），每次寄出前都要人核准。",
+  "odoo.permissions.permissionConfirm.attach": "AI 可以把自己附件資料夾裡的檔案附到這筆資料。",
+  "odoo.permissions.permissionConfirm.acknowledge": "我了解開放後的影響",
+  "odoo.permissions.permissionConfirm.audit": "開放會留下稽核紀錄。",
+  "mainAccess.listChanged": "名單在你載入後已被其他人修改，已重新載入，請再確認一次。"
 }

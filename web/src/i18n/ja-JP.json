@@ -12827,5 +12827,13 @@
   "odoo.permissions.note": "内部メモ",
   "odoo.permissions.message": "フォロワーへの通知",
   "odoo.permissions.attach": "添付ファイル",
-  "odoo.permissions.engineTableRightsHint": "フォロワーへの通知は顧客にメールを送信するため、毎回人による承認が必要です。添付ファイルは AI 社員自身の添付フォルダーからのみ作成できます。"
+  "odoo.permissions.engineTableRightsHint": "フォロワーへの通知は顧客にメールを送信するため、毎回人による承認が必要です。添付ファイルは AI 社員自身の添付フォルダーからのみ作成できます。",
+  "odoo.permissions.permissionConfirm.title": "この AI 従業員に {table} で「{permission}」の使用を許可しますか？",
+  "odoo.permissions.permissionConfirm.activity": "AI はこのテーブルで活動を作成・更新できます。",
+  "odoo.permissions.permissionConfirm.note": "AI はこのテーブルに内部メモを残せます。",
+  "odoo.permissions.permissionConfirm.message": "AI はこのレコードのフォロワー（顧客の場合もあります）にメールで通知できます。送信のたびに人による承認が必要です。",
+  "odoo.permissions.permissionConfirm.attach": "AI は自分の添付ファイルフォルダー内のファイルをこのレコードに添付できます。",
+  "odoo.permissions.permissionConfirm.acknowledge": "許可した場合の影響を理解しました",
+  "odoo.permissions.permissionConfirm.audit": "許可は監査ログに記録されます。",
+  "mainAccess.listChanged": "読み込み後に他の人がリストを変更しました。再読み込みしたリストをもう一度確認してください。"
 }

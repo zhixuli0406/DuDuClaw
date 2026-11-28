@@ -276,13 +276,31 @@ it('never applies global account denials to a separate employee connection', asy
        const box = await screen.findByRole('checkbox', { name: `${label} crm.lead` });
        await waitFor(() => expect(box).toBeEnabled());
        await user.click(box);
-       expect(changed.mock.lastCall?.[0].allowed_actions).toContain(`${verb}:crm.lead`);
+       const dialog = screen.getByRole('dialog');
+       expect(box).not.toBeChecked();
+       expect(changed.mock.lastCall?.[0].allowed_actions ?? []).not.toContain(`${verb}:crm.lead`);
+       const confirm = within(dialog).getByRole('button', { name: 'Allow access' });
+       expect(confirm).toBeDisabled();
+       await user.click(within(dialog).getByRole('checkbox', { name: 'I understand the effects of allowing this' }));
+       await user.click(confirm);
+       expect(changed.mock.lastCall?.[0].allowed_actions).toEqual(['read:crm.lead', `${verb}:crm.lead`]);
        expect(changed.mock.lastCall?.[0].allowed_actions).not.toContain(verb);
        expect(screen.queryByText('Other settings')).not.toBeInTheDocument();
        await user.click(box);
        expect(changed.mock.lastCall?.[0].allowed_actions).not.toContain(`${verb}:crm.lead`);
+       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
      }
      expect(screen.getByRole('checkbox', { name: 'Activities sale.order' })).toBeInTheDocument();
+   });
+   it.each(['Activities', 'Internal notes', 'Notify followers', 'Attachments'])('cancels %s without adding a token', async label => {
+     const user = userEvent.setup();
+     renderWithProviders(<Harness />);
+     const box = await screen.findByRole('checkbox', { name: `${label} crm.lead` });
+     await waitFor(() => expect(box).toBeEnabled());
+     await user.click(box);
+     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+     expect(changed).not.toHaveBeenCalled();
+     expect(box).not.toBeChecked();
    });
    it('loads saved engine permissions as checked boxes', async () => {
      renderWithProviders(<Harness initial={{ allowed_actions: ['activity:crm.lead', 'note:crm.lead', 'message:crm.lead', 'attach:crm.lead'] }} />);

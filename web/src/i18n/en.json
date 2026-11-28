@@ -12827,5 +12827,13 @@
   "odoo.permissions.note": "Internal notes",
   "odoo.permissions.message": "Notify followers",
   "odoo.permissions.attach": "Attachments",
-  "odoo.permissions.engineTableRightsHint": "Notifying followers emails customers and requires human approval every time. Attachments can only be created from the AI employee’s own attachment folder."
+  "odoo.permissions.engineTableRightsHint": "Notifying followers emails customers and requires human approval every time. Attachments can only be created from the AI employee’s own attachment folder.",
+  "odoo.permissions.permissionConfirm.title": "Allow this AI employee to use “{permission}” on {table}?",
+  "odoo.permissions.permissionConfirm.activity": "The AI can create and update activities on this table.",
+  "odoo.permissions.permissionConfirm.note": "The AI can leave internal notes on this table.",
+  "odoo.permissions.permissionConfirm.message": "The AI can email followers of this record (who may be customers); each email requires human approval before sending.",
+  "odoo.permissions.permissionConfirm.attach": "The AI can attach files from its own attachment folder to this record.",
+  "odoo.permissions.permissionConfirm.acknowledge": "I understand the effects of allowing this",
+  "odoo.permissions.permissionConfirm.audit": "Allowing this will be recorded in the audit log.",
+  "mainAccess.listChanged": "Someone else changed the list after you loaded it. The list has been reloaded; please confirm again."
 }

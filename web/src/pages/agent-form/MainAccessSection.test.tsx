@@ -15,9 +15,9 @@ const empty: MainAccess = { users: [], risk_notice: 'Server risk notice', effect
 const listed: MainAccess = { ...empty, users: [existing] };
 const candidate = { id: 'hidden-new-id', display_name: 'Bob', email: 'bob@example.com', role: 'manager', status: 'active' };
 
-function setup(data: MainAccess = empty, save: (params: unknown) => unknown = () => data) {
+function setup(data: MainAccess = empty, save: (params: unknown) => unknown = () => data, get: () => MainAccess = () => data) {
   mockRpc({
-    'agents.main_access.get': () => data,
+    'agents.main_access.get': get,
     'agents.main_access.set': save,
     'users.list': () => ({ users: [candidate,
       { ...candidate, id: existing.user_id, display_name: 'Already listed' },
@@ -105,12 +105,59 @@ describe('MainAccessSection', () => {
     await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([{ user_ids: [existing.user_id] }]));
     expect(screen.queryByRole('dialog')).toBeNull();
   });
+  it('reloads a changed list and cancels an addition without sending', async () => {
+    let reads = 0;
+    setup(listed, vi.fn(), () => ++reads === 1 ? listed : empty);
+    show();
+    const user = await openAdd();
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Someone else changed the list after you loaded it. The list has been reloaded; please confirm again.');
+    expect(callsOf('agents.main_access.set')).toHaveLength(0);
+    expect(screen.queryByText('Alice')).toBeNull();
+    expect(screen.getByText('Only admins can currently use this employee.')).toBeInTheDocument();
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+  it('reloads a changed list and cancels a removal without sending', async () => {
+    let reads = 0;
+    const fresh = { ...listed, users: [{ ...existing, user_id: candidate.id, display_name: 'Bob' }] };
+    setup(listed, vi.fn(), () => ++reads === 1 ? listed : fresh);
+    show();
+    await userEvent.click(await screen.findByRole('button', { name: 'Remove' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Someone else changed the list');
+    expect(callsOf('agents.main_access.set')).toHaveLength(0);
+    expect(screen.queryByText('Alice')).toBeNull();
+    expect(screen.getByText('Bob')).toBeInTheDocument();
+  });
+  it('compares id sets independently of order and uses the freshly loaded order', async () => {
+    const second = { ...existing, user_id: 'second-id', display_name: 'Carol' };
+    let reads = 0;
+    setup({ ...listed, users: [existing, second] }, () => listed,
+      () => ({ ...listed, users: ++reads === 1 ? [existing, second] : [second, existing] }));
+    show();
+    const user = await openAdd();
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([
+      { user_ids: [second.user_id, existing.user_id, candidate.id], acknowledged: true },
+    ]));
+  });
   it('shows a server refusal', async () => {
     setup(listed, () => { throw new Error('只有管理員可以修改。'); });
     show();
     await userEvent.click(await screen.findByRole('button', { name: 'Remove' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('只有管理員可以修改。');
     expect(screen.getByText('Alice')).toBeInTheDocument();
+  });
+  it('reloads a fresh list before reopening an acknowledgement refusal', async () => {
+    let reads = 0;
+    setup(listed, () => { throw { code: 'acknowledgement_required', message: '請重新確認加入後的影響。' }; },
+      () => ++reads < 3 ? listed : empty);
+    show();
+    const user = await openAdd();
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('請重新確認加入後的影響。');
+    expect(screen.queryByText('Alice')).toBeNull();
+    expect(screen.getByRole('checkbox')).not.toBeChecked();
+    expect(callsOf('agents.main_access.get')).toHaveLength(3);
   });
   it('asks for acknowledgement again after an acknowledgement_required refusal', async () => {
     setup(listed, () => { throw { code: 'acknowledgement_required', message: '請重新確認加入後的影響。' }; });
@@ -119,6 +166,7 @@ describe('MainAccessSection', () => {
     await user.click(screen.getByRole('button', { name: 'Add' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('請重新確認加入後的影響。');
     expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(callsOf('agents.main_access.get')).toHaveLength(3);
     expect(screen.getByRole('checkbox')).not.toBeChecked();
     expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
   });

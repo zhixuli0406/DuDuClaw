@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Badge, Button, Checkbox, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/mds';
-import { ConfirmDialog } from '@/components/settings/controls';
+import { ConfirmDialog, RiskConfirmDialog } from '@/components/settings/controls';
 import { useOdooPermissionOptions } from './useOdooPermissionOptions';
 import { actionAccess, ACTION_GROUPS, TABLE_VERBS, genericOn, normalizeActions, parseActions, partialRead, reconcileUnblocks, serializeRules, syncGeneric, usedModels, type OdooPermissions, type OdooRule } from './permissions';
 
@@ -17,6 +17,7 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
   const lastActions = useRef(JSON.stringify(value.allowed_actions));
   const draftApprovals = useRef(new Set<string>());
   const [pending, setPending] = useState<{ model: string; apply: () => void } | null>(null);
+  const [pendingPermission, setPendingPermission] = useState<{ model: string; verb: typeof TABLE_VERBS[number] } | null>(null);
   // Keep empty draft rules while editing, but reload when the parent changes employee/config.
   useEffect(() => {
     const signature = JSON.stringify(value.allowed_actions);
@@ -29,6 +30,7 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
         setRules(parseActions(value.allowed_actions).rules);
         draftApprovals.current.clear();
         setPending(null);
+        setPendingPermission(null);
       }
       lastActions.current = signature;
     }
@@ -155,12 +157,9 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
               <Checkbox aria-label={`${t(verb)} ${model}`} disabled={locked}
                 checked={rules.some((rule) => rule.model === model && rule.verbs.includes(verb))}
                 onCheckedChange={(checked) => {
-                  const next = rules.map((rule) => rule.model === model ? { ...rule, verbs: rule.verbs.filter((v) => v !== verb) } : rule);
-                  if (checked) {
-                    const rule = next.find((r) => r.model === model);
-                    if (rule) rule.verbs.push(verb); else next.push({ model, verbs: [verb] });
-                  }
-                  changeRules(next, checked ? model : undefined);
+                  if (checked) setPendingPermission({ model, verb });
+                  else changeRules(rules.map((rule) => rule.model === model
+                    ? { ...rule, verbs: rule.verbs.filter((v) => v !== verb) } : rule));
                 }} />
             </td>)}
           </tr>)}</tbody>
@@ -179,6 +178,24 @@ export function OdooPermissionsEditor({ value, onChange, disabled = false, defau
         <Button variant="ghost" size="sm" disabled={disabled} aria-label={`${t('remove')} ${model}`} onClick={() => emit({ ...value, unblock_models: value.unblock_models.filter((m) => m !== model) })}>{t('remove')}</Button>
       </div>)}
     </div>}
+    <RiskConfirmDialog open={pendingPermission !== null} onClose={() => setPendingPermission(null)}
+      title={intl.formatMessage({ id: 'odoo.permissions.permissionConfirm.title' }, {
+        table: pendingPermission ? tableLabel(pendingPermission.model) : '',
+        permission: pendingPermission ? t(pendingPermission.verb) : '',
+      })}
+      body={pendingPermission ? t(`permissionConfirm.${pendingPermission.verb}`) : ''}
+      acknowledgeLabel={t('permissionConfirm.acknowledge')} auditNote={t('permissionConfirm.audit')}
+      confirmLabel={t('confirm')} busy={locked}
+      onConfirm={() => {
+        if (locked || !pendingPermission) return;
+        const { model, verb } = pendingPermission;
+        const next = rules.map((rule) => ({ ...rule, verbs: [...rule.verbs] }));
+        const rule = next.find((r) => r.model === model);
+        if (rule) rule.verbs = [...new Set([...rule.verbs, verb])];
+        else next.push({ model, verbs: [verb] });
+        setPendingPermission(null);
+        changeRules(next, model);
+      }} />
     <ConfirmDialog open={pending !== null} title={t('confirmTitle')} confirmLabel={t('confirm')} confirmDisabled={locked}
       message={intl.formatMessage({ id: 'odoo.permissions.confirmMessage' }, { model: pending?.model ?? '' }) + (options.read_only_models.includes(pending?.model ?? '') ? ` ${t('readOnlyHint')}` : '')}
       onClose={() => setPending(null)} onConfirm={() => { if (!locked) pending?.apply(); setPending(null); }} />

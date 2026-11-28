@@ -48,17 +48,32 @@ function MainAccessEditor({ agentName }: { agentName: string }) {
     } catch (err) { setError(settingsRefusal(err, errorText(err))); }
     finally { setBusy(false); }
   }
-  async function save(userIds: string[], adding: boolean) {
+  async function save(userId: string, adding: boolean) {
     setBusy(true);
     setError(null);
     try {
+      const fresh = await api.mainAccess.get();
+      const displayedIds = new Set(data?.users.map(user => user.user_id));
+      const freshIds = new Set(fresh.users.map(user => user.user_id));
+      if (displayedIds.size !== freshIds.size || [...displayedIds].some(id => !freshIds.has(id))) {
+        setData(fresh);
+        setError(t('listChanged'));
+        setOpen(false);
+        return;
+      }
+      const userIds = adding ? [...new Set([...freshIds, userId])] : [...freshIds].filter(id => id !== userId);
       setData(await api.mainAccess.set({ user_ids: userIds, ...(adding ? { acknowledged: true } : {}) }));
       setOpen(false);
     } catch (err) {
       setError(settingsRefusal(err, errorText(err)));
       if (adding && err && typeof err === 'object' && 'code' in err && err.code === 'acknowledgement_required') {
-        setDialogVersion(v => v + 1);
-        setOpen(true);
+        setOpen(false);
+        try {
+          setData(await api.mainAccess.get());
+          setSelected('');
+          setDialogVersion(v => v + 1);
+          setOpen(true);
+        } catch (reloadError) { setError(settingsRefusal(reloadError, errorText(reloadError))); }
       }
     } finally { setBusy(false); }
   }
@@ -79,7 +94,7 @@ function MainAccessEditor({ agentName }: { agentName: string }) {
             <tbody>{data.users.map(user => <tr key={user.user_id} className="border-t border-surface-border">
               <td className="p-2">{user.display_name}</td><td className="p-2">{user.granted_by_name || '—'}</td>
               <td className="whitespace-nowrap p-2">{formatDateTime(user.granted_at, { locale: intl.locale })}</td>
-              <td className="p-2"><Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => void save(data.users.filter(u => u.user_id !== user.user_id).map(u => u.user_id), false)}>{t('remove')}</Button></td>
+              <td className="p-2"><Button type="button" variant="ghost" size="sm" disabled={busy} onClick={() => void save(user.user_id, false)}>{t('remove')}</Button></td>
             </tr>)}</tbody>
           </table></div>}
           <Button type="button" variant="outline" disabled={busy || data.users.length >= 500} onClick={() => void add()}><Plus className="size-4" />{t('add')}</Button>
@@ -90,7 +105,7 @@ function MainAccessEditor({ agentName }: { agentName: string }) {
     <RiskConfirmDialog key={dialogVersion} open={open} onClose={() => { if (!busy) { setOpen(false); setError(null); } }}
       title={t('dialog.title')} acknowledgeLabel={t('dialog.acknowledge')} auditNote={t('dialog.audit')} confirmLabel={t('dialog.confirm')}
       busy={busy || !member} error={open ? error : null}
-      onConfirm={() => { if (member && data) void save([...data.users.map(user => user.user_id), member.id], true); }}
+      onConfirm={() => { if (member && data) void save(member.id, true); }}
       body={<div className="space-y-3">
         <label className="block space-y-1"><span>{t('member')}</span>
           <select className="w-full rounded-lg border border-input bg-surface-raised p-2 text-foreground" value={selected} disabled={busy}
