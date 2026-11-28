@@ -1,3 +1,4 @@
+import { MainAccessSection } from './MainAccessSection';
 import { ReachSummary } from '@/components/org/ReachSummary';
 import type { ReachReview } from '@/lib/api';
 import { useCompanyTimeZone } from '@/lib/company-time';
@@ -1989,6 +1990,7 @@ function EditAgentPageContent() {
             </SettingsCard>
             {adminHint}
           </SettingsSection>
+          <MainAccessSection agentRole={agent.role ?? ''} agentName={agent.display_name || agent.name} />
         </SettingsTab>
 
         {/* ── 腦袋與引擎 (WP-C §2-2: 模型 ∪ 執行環境) ────────────

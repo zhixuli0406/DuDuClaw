@@ -2714,6 +2714,28 @@ export interface SigninAvatar {
   retry_allowed: boolean;
 }
 
+export interface MainAccessUser {
+  user_id: string;
+  display_name: string;
+  email: string;
+  role: UserInfo['role'];
+  status: UserInfo['status'];
+  granted_by_name: string | null;
+  granted_at: string | null;
+}
+
+export interface MainAccess {
+  users: MainAccessUser[];
+  risk_notice: string;
+  effective: boolean;
+  ineffective_reason?: string;
+}
+
+export interface MainAccessSetParams {
+  user_ids: string[];
+  acknowledged?: boolean;
+}
+
 export interface UserInfo {
   google_signin_linked?: boolean;
   google_signin_linked_at?: string | null;
@@ -10103,6 +10125,11 @@ export const api = {
     get: (locale = 'zh-TW') => client.call('onboarding.get', { locale }) as Promise<OnboardingProgress>,
     update: (change: { step?: OnboardingStep; status?: 'done' | 'skipped'; dismissed?: true }, locale = 'zh-TW') =>
       client.call('onboarding.update', { ...change, locale }) as Promise<OnboardingProgress>,
+  },
+  mainAccess: {
+    get: () => client.call('agents.main_access.get', {}) as Promise<MainAccess>,
+    set: (params: MainAccessSetParams) =>
+      client.call('agents.main_access.set', { ...params }) as Promise<MainAccess>,
   },
   users: {
     createMembers: (params: { members: NewMemberInput[]; public_url?: string; locale?: string }) =>
