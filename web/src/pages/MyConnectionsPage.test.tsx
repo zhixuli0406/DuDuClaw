@@ -4,12 +4,13 @@ import userEvent from '@testing-library/user-event';
 import '@/test/mocks';
 import { renderWithProviders } from '@/test/render';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
+import { useAuthStore } from '@/stores/auth-store';
 import { MyConnectionsPage } from './MyConnectionsPage';
 
 const status: PersonalGoogleStatus = { connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], local_purposes: ['base'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
   requests: [{ agent_id: 'helper', allowed: null, requesters: 'bound_people', bound_people: [{ user_id:'bob', name:'Bob', email:'bob@example.com' }], channels: ['line'], public_visitors_allowed:false }], delegated: [], recent_usage: [] };
 
-beforeEach(() => { vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
+beforeEach(() => { useAuthStore.setState({ user: null }); vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); });
 
 describe('MyConnectionsPage', () => {
   it('renders only the escaped Chat confirmation display text', async () => {
@@ -159,4 +160,24 @@ it('shows Chat reconnect guidance after the administrator opts in', async () => 
   vi.mocked(api.personalGoogle.status).mockResolvedValue({...status,chat_read:true});
   renderWithProviders(<MyConnectionsPage/>);
   expect(await screen.findByText(/users reconnect Google in My Connections/)).toBeInTheDocument();
+});
+
+it('keeps the admin chat link card visible when Google fails and retries Google', async () => {
+  useAuthStore.setState({ user: { id: 'admin', email: 'a@example.com', display_name: 'Admin', role: 'admin', status: 'active' } });
+  vi.spyOn(api.chatLink, 'list').mockResolvedValue({ identities: [], handshakes: [] });
+  vi.mocked(api.personalGoogle.status).mockRejectedValueOnce(new Error('Google unavailable'));
+  renderWithProviders(<MyConnectionsPage />);
+  expect(await screen.findByText('Chat account links (administrators)')).toBeInTheDocument();
+  expect(await screen.findByRole('alert')).toBeInTheDocument();
+  await userEvent.setup().click(screen.getByRole('button', { name: 'Try again' }));
+  expect(await screen.findByText('other@gmail.com')).toBeInTheDocument();
+  expect(api.personalGoogle.status).toHaveBeenCalledTimes(2);
+});
+it('hides chat link management for non-admins', async () => {
+  useAuthStore.setState({ user: { id: 'member', email: 'm@example.com', display_name: 'Member', role: 'employee', status: 'active' } });
+  const list = vi.spyOn(api.chatLink, 'list');
+  renderWithProviders(<MyConnectionsPage />);
+  await screen.findByText('other@gmail.com');
+  expect(screen.queryByText('Chat account links (administrators)')).not.toBeInTheDocument();
+  expect(list).not.toHaveBeenCalled();
 });

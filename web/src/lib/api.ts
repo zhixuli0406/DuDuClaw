@@ -44,6 +44,41 @@ import type {
   AutopilotUpdateFields,
 } from './autopilot-rules';
 
+export type ChatLinkChannel = 'telegram' | 'googlechat';
+export interface ChatLinkStatus {
+  handshake_id: string;
+  status: 'waiting' | 'matched' | 'confirmed' | 'rejected' | 'expired';
+  channel: ChatLinkChannel;
+  expires_at: string;
+  display_name: string | null;
+  masked_target: string | null;
+}
+export interface ChatLinkTarget {
+  channel: ChatLinkChannel;
+  account: string;
+  agent_id: string;
+  display_name: string;
+  bot_username?: string | null;
+  service_account_email?: string | null;
+  project_number?: string | null;
+}
+export interface ChatLinkStart {
+  handshake_id: string;
+  code: string;
+  expires_at: string;
+  targets: ChatLinkTarget[];
+}
+export interface ChatLinkIdentity {
+  channel: ChatLinkChannel;
+  channel_user_id: string;
+  verified: boolean;
+  proof_status: 'self_confirmed' | 'admin_prefilled';
+}
+export interface ChatLinkList {
+  identities: ChatLinkIdentity[];
+  handshakes: ChatLinkStatus[];
+}
+
 // Type definitions matching Rust types
 export interface EgressShadowReport {
   days: 7 | 30;
@@ -9045,6 +9080,15 @@ export const api = {
         ok: boolean;
         steps: GoogleIdentityTestStep[];
       }>,
+  },
+  chatLink: {
+    start: (channel: ChatLinkChannel) => client.call('me.chat_link.start', { channel }) as Promise<ChatLinkStart>,
+    status: (handshakeId: string) => client.call('me.chat_link.status', { handshake_id: handshakeId }) as Promise<ChatLinkStatus>,
+    confirm: (handshakeId: string) => client.call('me.chat_link.confirm', { handshake_id: handshakeId }) as Promise<{ confirmed: true }>,
+    reject: (handshakeId: string) => client.call('me.chat_link.reject', { handshake_id: handshakeId }) as Promise<{ rejected: true }>,
+    cancel: (handshakeId: string) => client.call('me.chat_link.cancel', { handshake_id: handshakeId }) as Promise<{ cancelled: true }>,
+    list: () => client.call('me.chat_link.list', {}) as Promise<ChatLinkList>,
+    remove: (channel: ChatLinkChannel, channelUserId: string) => client.call('me.chat_link.remove', { channel, channel_user_id: channelUserId }) as Promise<{ revoked: true }>,
   },
   personalGoogle: {
     chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
