@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { screen } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
+import { useAgentsStore } from '@/stores/agents-store';
 import { useConnectionStore } from '@/stores/connection-store';
 import en from '@/i18n/en.json';
 import zhTW from '@/i18n/zh-TW.json';
@@ -36,6 +37,7 @@ function signIn(role: UserRole) {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useAgentsStore.setState({ agents: [{ name: 'sales-rep', display_name: 'Sales person' }, { name: 'mkt-lead', display_name: 'Marketing lead' }] as never });
   effectiveMock.mockResolvedValue(BASE);
   useConnectionStore.setState({ state: 'authenticated' } as never);
   signIn('manager');
@@ -49,7 +51,7 @@ describe('DelegationEffectiveCard (RM-137)', () => {
     expect(screen.getByText(en['agentDetail.delegation.mayDelegate'])).toBeInTheDocument();
     expect(screen.getByText(en['agentDetail.delegation.source.global'])).toBeInTheDocument();
     expect(screen.getByText(en['agentDetail.delegation.mayNotCreate'])).toBeInTheDocument();
-    expect(screen.getByText(/sales-rep ⇄ mkt-lead/)).toBeInTheDocument();
+    expect(screen.getByText(/Sales person ⇄ Marketing lead/)).toBeInTheDocument();
   });
 
   it('explains a `none` that comes from the employee switch', async () => {
@@ -62,7 +64,7 @@ describe('DelegationEffectiveCard (RM-137)', () => {
     expect(await screen.findByText(en['settings.delegation.policy.none'])).toBeInTheDocument();
     expect(screen.getByText(en['agentDetail.delegation.mayNotDelegate'])).toBeInTheDocument();
     expect(screen.getByText(en['agentDetail.delegation.source.agent_permissions'])).toBeInTheDocument();
-    expect(screen.getByText(/do not apply in the current mode: sales-rep ⇄ mkt-lead/)).toBeInTheDocument();
+    expect(screen.getByText(/do not apply in the current mode: Sales person ⇄ Marketing lead/)).toBeInTheDocument();
     expect(screen.getByText(en['agentDetail.delegation.teamNote'])).toBeInTheDocument();
   });
 
@@ -75,7 +77,7 @@ describe('DelegationEffectiveCard (RM-137)', () => {
       hidden_peer_placeholder: '*hidden*',
     });
     renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
-    expect(await screen.findByText(new RegExp(`${en['agentDetail.delegation.hiddenPeer']} ⇄ sales-rep`)))
+    expect(await screen.findByText(new RegExp(`${en['agentDetail.delegation.hiddenPeer']} ⇄ Sales person`)))
       .toBeInTheDocument();
     expect(screen.queryByText(/\*hidden\*/)).not.toBeInTheDocument();
     expect(zhTW['agentDetail.delegation.hiddenPeer' as keyof typeof zhTW]).toBeTruthy();
@@ -194,6 +196,59 @@ it('shows unrestricted ownership and directional peers without exposing hidden i
   renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
   expect(await screen.findByText(/No delegation scope limits/)).toBeInTheDocument();
   expect(screen.getByText(/Can delegate to:/)).toHaveTextContent(en['agentDetail.delegation.hiddenPeer']);
-  expect(screen.getByText(/Can accept work from:/)).toHaveTextContent('mkt-lead');
+  expect(screen.getByText(/Can accept work from:/)).toHaveTextContent('Marketing lead');
   expect(screen.queryByText(/\*hidden\*/)).not.toBeInTheDocument();
+});
+
+
+it('uses safe fallbacks for unknown ids and badges for direction and inactivity', async () => {
+  effectiveMock.mockResolvedValue({ ...BASE, allow_pairs: [['sales-rep', 'unknown-id']], inactive_allow_one_way: [
+    { from: 'sales-rep', to: 'other-unknown-id', direction: 'outgoing' },
+  ] });
+  const { container } = renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  await screen.findByText(/Can delegate to:/);
+  expect(container).not.toHaveTextContent('unknown-id');
+  expect(container).not.toHaveTextContent('sales-rep');
+  expect(screen.getAllByText(new RegExp(en['agentDetail.delegation.unknownPeer']))).toHaveLength(2);
+  expect(screen.getByText(en['agentDetail.delegation.oneWay'])).toHaveAttribute('data-slot', 'badge');
+  expect(screen.getByText(en['agentDetail.delegation.oneWayInactive'])).toHaveAttribute('data-slot', 'badge');
+  expect(container).not.toHaveTextContent('→');
+});
+
+it.each(['manager', 'admin'] as const)('shows safe policy warnings to %s without config or identifiers', async role => {
+  signIn(role);
+  effectiveMock.mockResolvedValue({ ...BASE, policy_warning: '[delegation] allow private-agent-123' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['settings.delegation.safeWarning']);
+  expect(document.body.textContent).not.toContain('[delegation] allow');
+  expect(document.body.textContent).not.toContain('private-agent-123');
+});
+
+it.each([true, false])('shows the named avatar header when unrestricted=%s and the owner role is present', async unrestricted => {
+  effectiveMock.mockResolvedValue({ ...BASE, unrestricted, owner_role: 'admin', owner_display_name: '王小明' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText("王小明’s AI avatar")).toBeInTheDocument();
+});
+
+it.each([null, '', '   '])('keeps the existing header when the owner name is %j', async owner_display_name => {
+  effectiveMock.mockResolvedValue({ ...BASE, unrestricted: true, owner_role: 'admin', owner_display_name });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText(/No delegation scope limits/)).toBeInTheDocument();
+  expect(screen.queryByText(/’s AI avatar$/)).not.toBeInTheDocument();
+});
+
+it('does not label an ordinary employee as a named avatar', async () => {
+  effectiveMock.mockResolvedValue({ ...BASE, owner_display_name: '王小明' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  await screen.findByText(en['settings.delegation.policy.department']);
+  expect(screen.queryByText(/’s AI avatar$/)).not.toBeInTheDocument();
+});
+
+it('renders structured policy warning messages as plain text without codes', async () => {
+  signIn('manager');
+  effectiveMock.mockResolvedValue({ ...BASE, policy_warning: { code: 'private-code', message: '<b>The policy was ignored.</b>' } });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText(/<b>The policy was ignored.<\/b>/)).toBeInTheDocument();
+  expect(document.body).not.toHaveTextContent('private-code');
+  expect(document.querySelector('b')).toBeNull();
 });

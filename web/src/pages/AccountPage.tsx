@@ -1,3 +1,7 @@
+import { useEffect, useRef, useState } from 'react';
+import { memberGoogleSignin } from '@/lib/google-signin';
+import { settingsRefusal } from '@/lib/settings-refusal';
+import { useErrorMessage } from '@/components/mds';
 import { useIntl } from 'react-intl';
 import { useSearchParams } from 'react-router';
 import { AccountTab } from '@/components/settings/sections/AccountTab';
@@ -8,6 +12,17 @@ import { MY_PERSONAL_TAB, MyPersonalEmployeesTab } from './account/MyPersonalEmp
 
 export function AccountPage() {
   const intl = useIntl();
+  const errorText = useErrorMessage();
+  const completed = useRef(false);
+  const [reauthResult, setReauthResult] = useState<'success' | string>('');
+  useEffect(() => {
+    if (completed.current || !/^#gsi_reauth=[A-Za-z0-9_-]+$/.test(window.location.hash)) return;
+    completed.current = true;
+    const ticket = window.location.hash.slice('#gsi_reauth='.length);
+    window.history.replaceState(window.history.state, '', window.location.pathname + window.location.search);
+    void memberGoogleSignin.reauthComplete(ticket).then(() => setReauthResult('success'))
+      .catch(err => setReauthResult(settingsRefusal(err, errorText(err))));
+  }, [errorText]);
   // v1.81 F5/F6e-UI: protected mode (native Linux isolation, TEAM) adds the
   // 我的個人 AI 員工 tab. Everywhere else the page is unchanged.
   const status = useSystemStore((s) => s.status);
@@ -16,6 +31,7 @@ export function AccountPage() {
   const tab = protectedMode && params.get('tab') === MY_PERSONAL_TAB.id ? MY_PERSONAL_TAB.id : 'account';
   const header = (
     <div>
+      {reauthResult && <p role={reauthResult === 'success' ? 'status' : 'alert'}>{reauthResult === 'success' ? intl.formatMessage({ id: 'mfa.googleReauth.success' }) : reauthResult}</p>}
       <h1 className="text-2xl font-semibold">{intl.formatMessage({ id: 'nav.account' })}</h1>
       <p className="mt-2 text-sm text-muted-foreground">{intl.formatMessage({ id: 'nav.account.desc' })}</p>
     </div>

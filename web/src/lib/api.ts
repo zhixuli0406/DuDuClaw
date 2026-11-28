@@ -44,6 +44,41 @@ import type {
   AutopilotUpdateFields,
 } from './autopilot-rules';
 
+export type ChatLinkChannel = 'telegram' | 'googlechat';
+export interface ChatLinkStatus {
+  handshake_id: string;
+  status: 'waiting' | 'matched' | 'confirmed' | 'rejected' | 'expired';
+  channel: ChatLinkChannel;
+  expires_at: string;
+  display_name: string | null;
+  masked_target: string | null;
+}
+export interface ChatLinkTarget {
+  channel: ChatLinkChannel;
+  account: string;
+  agent_id: string;
+  display_name: string;
+  bot_username?: string | null;
+  service_account_email?: string | null;
+  project_number?: string | null;
+}
+export interface ChatLinkStart {
+  handshake_id: string;
+  code: string;
+  expires_at: string;
+  targets: ChatLinkTarget[];
+}
+export interface ChatLinkIdentity {
+  channel: ChatLinkChannel;
+  channel_user_id: string;
+  verified: boolean;
+  proof_status: 'self_confirmed' | 'admin_prefilled';
+}
+export interface ChatLinkList {
+  identities: ChatLinkIdentity[];
+  handshakes: ChatLinkStatus[];
+}
+
 // Type definitions matching Rust types
 export interface EgressShadowReport {
   days: 7 | 30;
@@ -960,7 +995,24 @@ export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 export type DelegationRole = 'admin' | 'manager';
 export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
 
+export interface AdminAiSettings {
+  enabled: boolean;
+  config_state?: 'ok' | 'unreadable' | 'malformed';
+  enabled_ack?: { by: string; by_name?: string; at: string };
+}
+
+export interface AdminAiUpdate {
+  enabled: boolean;
+  acknowledge_risk?: boolean;
+}
+
+export interface DelegationWarning {
+  code: string;
+  message: string;
+}
+
 export interface DelegationSettings {
+  hash: string;
   unrestricted_roles?: DelegationRole[];
   allow_one_way?: Array<[string, string]>;
   /** The policy the gateway enforces (an unrecognised value reads `none`). */
@@ -970,7 +1022,7 @@ export interface DelegationSettings {
   /** Unordered agent-id pairs — a pair permits delegation in both directions. */
   allow: Array<[string, string]>;
   /** Operator-facing notes about values the gateway had to fall back on. */
-  warnings: string[];
+  warnings: DelegationWarning[];
 }
 
 /** `delegation.effective.config_error` categories (v1.82, RM-137). */
@@ -980,6 +1032,7 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 export interface DelegationEffective {
   unrestricted?: boolean;
   owner_role?: DelegationRole | 'employee' | null;
+  owner_display_name?: string | null;
   /** Owner role lookup failed; role exceptions cannot be confirmed. */
   unrestricted_error?: 'users_unreadable' | null;
   allow_one_way?: DelegationOneWayPair[];
@@ -992,7 +1045,7 @@ export interface DelegationEffective {
   global_policy: DelegationPolicy;
   configured_policy: string | null;
   /** Set when the configured policy value was not recognised (enforced as `none`). */
-  policy_warning: string | null;
+  policy_warning: DelegationWarning | null;
   /**
    * Set when config.toml or this employee's agent.toml could not be read or
    * parsed — a category only, never config text (it can quote raw config).
@@ -2625,11 +2678,15 @@ export interface InvitationPreview {
 }
 export type OnboardingStep = 'channel' | 'google' | 'example' | 'capabilities';
 export type OnboardingStepStatus = 'pending' | 'done' | 'skipped';
+export type SigninStepStatus = 'done' | 'recommended' | 'required' | 'unknown' | 'waiting_admin' | 'preparing' | 'blocked_domain' | 'pending' | 'admin_binds' | 'not_applicable' | 'needs_reverify' | 'invalid';
+export type SigninSteps = Record<'mfa' | 'avatar' | 'google' | 'google_chat' | 'odoo', { status: SigninStepStatus; reason?: string }>;
 export interface OnboardingProgress {
   enabled: boolean;
   dismissed: boolean;
   password_done: boolean;
   steps: Record<OnboardingStep, OnboardingStepStatus>;
+  signin_steps?: SigninSteps;
+  steps_remaining?: number;
   examples: string[];
 }
 export interface NewMemberInput {
@@ -2651,7 +2708,18 @@ export interface CreateMemberResult {
 
 export interface AvatarConflict { agent_id: string; user_ids: string[] }
 
+export interface SigninAvatar {
+  state: 'pending' | 'creating' | 'retrying' | 'waiting_admin' | 'done';
+  reason: 'done' | 'name_taken' | 'policy_changed' | 'failed' | 'protected_mode' | 'template_changed' | 'template_invalid' | 'seats_full' | 'not_eligible' | 'unknown' | null;
+  retry_allowed: boolean;
+}
+
 export interface UserInfo {
+  google_signin_linked?: boolean;
+  google_signin_linked_at?: string | null;
+  google_signin_last_signin_at?: string | null;
+  has_password?: boolean;
+  signin_avatar?: SigninAvatar | null;
   avatar_agent_id?: string | null;
   primary_agent_id?: string | null;
   id: string;
@@ -6088,6 +6156,7 @@ export interface WikiScopeNamespace {
 
 /** Known approval kinds. Unknown kinds are surfaced verbatim as a fallback. */
 export type ApprovalKind =
+  | 'admin_ai_settings'
   | 'browser_action'
   | 'tool_call'
   | 'skill_activation'
@@ -6113,6 +6182,18 @@ export interface ApprovalItem {
   status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
   answer?: unknown;
   invalidated_reason?: string | null;
+  /** Server-formatted decision attribution, omitted when not visible. */
+  decided_by_display?: string | null;
+  decided_at?: string | null;
+  /** Sanitized server text; only used for admin AI settings receipts. */
+  execution_result?: {
+    outcome: 'complete' | 'partial' | 'voided';
+    reason: string | null;
+    completed: number | null;
+    not_executed: number | null;
+    message: string | null;
+    items: Array<{ seq: number | null; result: string | null; error: string | null }>;
+  } | null;
   id: string;
   agent_id: string;
   kind: ApprovalKind;
@@ -6425,6 +6506,32 @@ export interface GoogleDelegationStatus {
   agents: AgentGoogleIdentity[];
   personal_connections?: { owner_id: string; account_email: string; status: 'connected' | 'needs_reconnect' | 'suspended' }[] | null;
 }
+export type DriveWriteAction = 'create' | 'modify' | 'move' | 'trash';
+export type DriveWriteApproval = 'none' | 'member' | 'member_and_admin';
+export interface DriveWriteForm {
+  expected_hash: string;
+  create: boolean;
+  modify: boolean;
+  move: boolean;
+  trash: boolean;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: string[];
+}
+export interface DriveWriteStatus {
+  hash: string;
+  configured: Record<DriveWriteAction, boolean>;
+  effective: Record<DriveWriteAction, boolean>;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: { id: string; name: string; kind: 'folder' | 'shared_drive' | 'unverified' }[];
+  ack: { by_email: string; by_role: string; at: string } | null;
+  integration_enabled: boolean;
+  folder_list_empty_note: boolean;
+  write_connections: { connected: number } | null;
+  write_store_unreadable: boolean;
+  home_write: { route_oauth: boolean; connected: boolean; status: string; account_email: string | null };
+  identity_routes: unknown[];
+}
+
 export interface GoogleIdentityTestStep {
   id: string;
   label: string;
@@ -6617,7 +6724,29 @@ export interface MyMemoryForgetResult {
   agent: string;
 }
 
+export interface DriveWriteConfirmation {
+  id: string;
+  expires_at: string;
+  agent: string;
+  employee: string;
+  account: string;
+  action: string;
+  file_id: string;
+  file_name: string;
+  destination: string;
+  destination_name: string;
+  size: string;
+  preview: string;
+  attachment_name: string;
+  rename_before: string;
+  rename_after: string;
+  parents_before: string;
+  source_names: string;
+}
+
 export interface PersonalGoogleStatus {
+  drive_write: { connected: boolean; status: string | null; account_email: string | null; granted_scopes: string[] };
+  enabled_by_admin: boolean;
   authorization_requests?: { id: string; agent: string; purpose: string; status: string }[];
   notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
@@ -7085,7 +7214,41 @@ export type ResponsibilityCas =
   | { responsibility: ResponsibilityRow; conflict?: undefined }
   | { conflict: true; current: ResponsibilityRow };
 
+export interface ChatApprovalKind {
+  key: string;
+  label: { 'zh-TW': string; en: string; ja: string };
+  impact: string;
+}
+export interface ChatAdminSettings {
+  enabled: boolean;
+  channels: ('telegram' | 'googlechat')[];
+  step_up_methods: ('web' | 'dm_totp')[];
+  card_valid_hours: number;
+  readable: boolean;
+  hash: string | null;
+  enabled_ack: { by_name: string; at: string } | null;
+  kinds: (ChatApprovalKind & { tier: 'T2'; step_up_required: boolean })[];
+  t1_kinds: ChatApprovalKind[];
+  admins: { user_id: string; name: string; proven_channels: string[]; has_totp: boolean }[];
+  web_link_available: boolean;
+  unsupported_channels_ignored: boolean;
+}
+export interface ChatAdminSetParams {
+  expected_hash: string;
+  enabled: boolean;
+  channels: ChatAdminSettings['channels'];
+  step_up_methods: ChatAdminSettings['step_up_methods'];
+  card_valid_hours: number;
+  step_up_exempt_kinds: string[];
+  acknowledge_risk?: true;
+  acknowledge_exempt_risk?: string[];
+}
+
 export const api = {
+  chatAdmin: {
+    get: () => client.call('approvals.chat_admin.get', {}) as Promise<ChatAdminSettings>,
+    set: (params: ChatAdminSetParams) => client.call('approvals.chat_admin.set', { ...params }) as Promise<{ success: true; hash: string }>,
+  },
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
    *  visible `agent_id`; other agents' sessions are never returned). */
@@ -8282,10 +8445,14 @@ export const api = {
   /** Delegation permissions (WP21 §2.8) — owner/admin only, gateway-side gated.
    *  `allow` holds unordered agent-id pairs; a pair means the two may hand work
    *  to each other in both directions. */
+  adminAi: {
+    get: () => client.call('admin_ai.get', {}) as Promise<AdminAiSettings>,
+    set: (params: AdminAiUpdate) => client.call('admin_ai.set', { ...params }) as Promise<AdminAiSettings>,
+  },
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
-    set: (params: { policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
+    set: (params: { expected_hash: string; policy?: DelegationPolicy; allow?: Array<[string, string]>; unrestricted_roles?: DelegationRole[]; allow_one_way?: Array<[string, string]>; acknowledge_risk?: boolean }) =>
       client.call('delegation.set', params) as Promise<{
         success: boolean;
         policy: DelegationPolicy;
@@ -8597,6 +8764,7 @@ export const api = {
       sources?: UnifiedAuditSource[];
       severity_filter?: 'info' | 'warning' | 'critical';
       agent_id_filter?: string;
+      tool_name_filter?: string;
     }) => client.call('audit.unified_log', params ?? {}) as Promise<UnifiedAuditResponse>,
     reliabilitySummary: (agentId: string, windowDays = 7) =>
       client.call('audit.reliability_summary', {
@@ -8740,11 +8908,13 @@ export const api = {
   // WP14-T14.7 — HITL approval center. `list` is manager-gated; `decide` errors
   // on already-terminal requests or board-kind requests without admin scope.
   approvals: {
+    get: (id: string) => client.call('approvals.list', { id }) as Promise<{ approvals: ApprovalItem[]; count: number }>,
     /** `actionKind` (e.g. 'knowledge_quarantine') filters to one approval kind. */
-    list: (agentId?: string, actionKind?: string) =>
+    list: (agentId?: string, actionKind?: string, options?: { status?: 'pending' | 'decided'; limit?: number }) =>
       client.call('approvals.list', {
         ...(agentId ? { agent_id: agentId } : {}),
         ...(actionKind ? { action_kind: actionKind } : {}),
+        ...options,
       }) as Promise<{
         approvals: ApprovalItem[];
         count: number;
@@ -8972,6 +9142,17 @@ export const api = {
         changed: boolean;
       }>,
   },
+  googleDriveWrite: {
+    get: () => client.call('google.drive_write.get', {}) as Promise<DriveWriteStatus>,
+    set: (params: DriveWriteForm & { acknowledge_risk?: boolean }) =>
+      client.call('google.drive_write.set', { ...params }) as Promise<DriveWriteStatus>,
+    consentHomeStart: (params: { redirect_origin: string; acknowledge_google_data: boolean; acknowledge_write: boolean }) =>
+      client.call('google.drive_write.consent_home_start', { ...params }) as Promise<{
+        authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number;
+      }>,
+    consentHomePaste: (url: string) => client.call('google.drive_write.consent_home_paste', { url }),
+    consentHomeDisconnect: () => client.call('google.drive_write.consent_home_disconnect', {}),
+  },
   /** Per-employee Google identity (B2a). Writes are admin-only. */
   googleIdentity: {
     delegation: () => client.call('google.delegation.get') as Promise<GoogleDelegationStatus>,
@@ -8995,7 +9176,20 @@ export const api = {
         steps: GoogleIdentityTestStep[];
       }>,
   },
+  chatLink: {
+    start: (channel: ChatLinkChannel) => client.call('me.chat_link.start', { channel }) as Promise<ChatLinkStart>,
+    status: (handshakeId: string) => client.call('me.chat_link.status', { handshake_id: handshakeId }) as Promise<ChatLinkStatus>,
+    confirm: (handshakeId: string) => client.call('me.chat_link.confirm', { handshake_id: handshakeId }) as Promise<{ confirmed: true }>,
+    reject: (handshakeId: string) => client.call('me.chat_link.reject', { handshake_id: handshakeId }) as Promise<{ rejected: true }>,
+    cancel: (handshakeId: string) => client.call('me.chat_link.cancel', { handshake_id: handshakeId }) as Promise<{ cancelled: true }>,
+    list: () => client.call('me.chat_link.list', {}) as Promise<ChatLinkList>,
+    remove: (channel: ChatLinkChannel, channelUserId: string) => client.call('me.chat_link.remove', { channel, channel_user_id: channelUserId }) as Promise<{ revoked: true }>,
+  },
   personalGoogle: {
+    writeConnectStart: (acknowledgeGoogleData: boolean, acknowledgeWrite: boolean) => client.call('me.google.write_connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, acknowledge_write: acknowledgeWrite }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    writeDisconnect: () => client.call('me.google.write_disconnect', { confirm: true }) as Promise<{ disconnected: true; provider_note?: string | null }>,
+    writeConfirmations: () => client.call('me.google.write_confirmations', {}) as Promise<{ requests: DriveWriteConfirmation[] }>,
+    writeConfirm: (id: string, approve: boolean) => client.call('me.google.write_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
     confirmChat: (id: string, approve: boolean) => client.call('me.google.chat_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,

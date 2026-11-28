@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { AlertTriangle, ArrowLeftRight, Plus, Trash2 } from 'lucide-react';
 import { api, type AgentDetail, type DelegationPolicy, type DelegationRole } from '@/lib/api';
-import { toast, formatError } from '@/lib/toast';
+import { toast } from '@/lib/toast';
 import { useAuthStore } from '@/stores/auth-store';
 import {
   Badge,
@@ -11,8 +11,11 @@ import {
   SettingsCard,
   SettingsSection,
   SettingsSaveState,
+  useErrorMessage,
 } from '@/components/mds';
-import { OptionSelect, type SelectOption } from '@/components/settings/controls';
+import { AdminAiCard } from './AdminAiCard';
+import { isSettingsConflict, settingsRefusal, settingsWarningMessage } from '@/lib/settings-refusal';
+import { RiskConfirmDialog, OptionSelect, type SelectOption } from '@/components/settings/controls';
 
 export const DELEGATION_POLICIES: DelegationPolicy[] = ['department', 'hierarchy', 'open', 'none'];
 
@@ -40,6 +43,7 @@ const ROLES: DelegationRole[] = ['admin', 'manager'];
 export function DelegationTab() {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
+  const errorText = useErrorMessage();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
 
   // Placeholders only: nothing below is shown as a setting or submitted
@@ -47,48 +51,55 @@ export function DelegationTab() {
   const [policy, setPolicy] = useState<DelegationPolicy>('department');
   const [roles, setRoles] = useState<DelegationRole[]>([]);
   const [savedRoles, setSavedRoles] = useState<DelegationRole[]>([]);
-  const [riskAck, setRiskAck] = useState(false);
+  const [pendingRole, setPendingRole] = useState<DelegationRole | null>(null);
   const [pairs, setPairs] = useState<PairDraft[]>([]);
-  const [warnings, setWarnings] = useState<string[]>([]);
+  const [warnings, setWarnings] = useState<unknown[]>([]);
   const [agents, setAgents] = useState<AgentDetail[]>([]);
   const [loading, setLoading] = useState(true);
   // True only after the latest load succeeded.
   const [loaded, setLoaded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const hashRef = useRef<string | null>(null);
+  const [conflict, setConflict] = useState(false);
   // P05: a failed read left the radio group on its `department` default and an
   // empty pair list — visually identical to a real, saved configuration.
   const [loadError, setLoadError] = useState<unknown>(null);
   const [saveError, setSaveError] = useState<unknown>(null);
+  useEffect(() => { setSaveError(null); }, [policy, roles, pairs]);
   const savedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (savedTimerRef.current) clearTimeout(savedTimerRef.current); }, []);
 
   const load = useCallback(async () => {
     setLoadError(null);
+    setSaveError(null);
     setLoaded(false);
     setLoading(true);
+    hashRef.current = null;
     try {
       const [settings, list] = await Promise.all([
         api.delegation.get(),
         api.agents.list(),
       ]);
+      hashRef.current = typeof settings.hash === 'string' && settings.hash ? settings.hash : null;
+      setConflict(false);
       setPolicy(settings.policy);
       setPairs([...settings.allow.map(([a, b]) => ({ a, b })), ...(settings.allow_one_way ?? []).map(([a, b]) => ({ a, b, direction: 'one_way' as const }))]);
       const loadedRoles = (settings.unrestricted_roles ?? []).filter((role) => ROLES.includes(role));
       setRoles(loadedRoles);
       setSavedRoles(loadedRoles);
-      setRiskAck(false);
-      setWarnings(settings.warnings ?? []);
+      setPendingRole(null);
+      setWarnings(Array.isArray(settings.warnings) ? settings.warnings : [null]);
       setAgents(list.agents ?? []);
       setLoaded(true);
     } catch (e) {
       console.warn('[api]', e);
       setLoadError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: errorText(e) }));
     } finally {
       setLoading(false);
     }
-  }, [intl]);
+  }, [intl, errorText]);
 
   useEffect(() => {
     if (!isAdmin) {
@@ -101,7 +112,7 @@ export function DelegationTab() {
   if (!isAdmin) return null;
 
   const agentLabel = (name: string) =>
-    agents.find((a) => a.name === name)?.display_name || name;
+    agents.find((a) => a.name === name)?.display_name || t('agentDetail.delegation.unknownPeer');
   const agentDepartment = (name: string) =>
     agents.find((a) => a.name === name)?.department || '';
 
@@ -110,17 +121,41 @@ export function DelegationTab() {
     ...agents.map((a) => ({
       value: a.name,
       label: a.department
-        ? `${a.display_name || a.name}（${a.department}）`
-        : (a.display_name || a.name),
+        ? `${a.display_name || t('agentDetail.delegation.unknownPeer')}（${a.department}）`
+        : (a.display_name || t('agentDetail.delegation.unknownPeer')),
     })),
   ];
 
   const incomplete = pairs.some((p) => !p.a || !p.b);
+  const invalidRows = new Set<number>();
+  let hasDuplicate = false;
+  pairs.forEach((pair, index) => {
+    if (!pair.a || !pair.b) return;
+    if (pair.a === pair.b) invalidRows.add(index);
+    pairs.slice(0, index).forEach((other, otherIndex) => {
+      const same = pair.a === other.a && pair.b === other.b;
+      const reversed = pair.a === other.b && pair.b === other.a;
+      if (same || (reversed && (pair.direction !== 'one_way' || other.direction !== 'one_way'))) {
+        hasDuplicate = true;
+        invalidRows.add(index);
+        invalidRows.add(otherIndex);
+      }
+    });
+  });
+  // Only a refusal naming both visible employees identifies a server-side row.
+  const refusal = settingsRefusal(saveError, errorText(saveError));
+  const namedRows = pairs.flatMap((pair, index) => {
+    const a = agents.find((agent) => agent.name === pair.a)?.display_name;
+    const b = agents.find((agent) => agent.name === pair.b)?.display_name;
+    return a && b && refusal.includes(a) && refusal.includes(b) ? [index] : [];
+  });
+  if (saveError != null && namedRows.length === 1) invalidRows.add(namedRows[0]);
   const hasSelfPair = pairs.some((p) => p.a && p.a === p.b);
+  const tooManyPairs = pairs.length > 200;
   // Editing is possible only on a successfully loaded setting.
-  const editable = loaded && !loading && loadError == null;
+  const editable = hashRef.current != null && loaded && !loading && loadError == null && !conflict;
   const addsRole = roles.some((role) => !savedRoles.includes(role));
-  const canSave = editable && !saving && !incomplete && !hasSelfPair && (!addsRole || riskAck);
+  const canSave = editable && !saving && !incomplete && !hasSelfPair && !hasDuplicate && !tooManyPairs;
 
   const updatePair = (index: number, side: 'a' | 'b', value: string) => {
     setPairs((prev) => prev.map((p, i) => (i === index ? { ...p, [side]: value } : p)));
@@ -134,6 +169,7 @@ export function DelegationTab() {
     setSaveError(null);
     try {
       await api.delegation.set({
+        expected_hash: hashRef.current!,
         policy,
         allow: pairs.filter((p) => p.direction !== 'one_way').map((p) => [p.a, p.b] as [string, string]),
         allow_one_way: pairs.filter((p) => p.direction === 'one_way').map((p) => [p.a, p.b] as [string, string]),
@@ -148,7 +184,8 @@ export function DelegationTab() {
     } catch (e) {
       console.warn('[api]', e);
       setSaveError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: formatError(e) }));
+      if (isSettingsConflict(settingsRefusal(e, errorText(e)))) setConflict(true);
+      toast.error(intl.formatMessage({ id: 'toast.error.saveFailed' }, { message: errorText(e) }));
     } finally {
       setSaving(false);
     }
@@ -171,11 +208,16 @@ export function DelegationTab() {
             <AlertTriangle className="size-3.5 text-warning" />
             {t('settings.delegation.warnings')}
           </p>
-          <ul className="ml-5 list-disc space-y-0.5 text-muted-foreground">
-            {warnings.map((w, i) => <li key={i}>{w}</li>)}
+          <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+            {warnings.map((warning, index) => <li key={index}>{settingsWarningMessage(warning, t('settings.delegation.safeWarning'))}</li>)}
           </ul>
         </div>
       )}
+
+      {conflict && <div className="space-y-2">
+        <p role="alert" className="text-sm text-destructive">{refusal}</p>
+        <Button disabled={loading || saving} onClick={() => void load()}>{t('settings.delegation.reload')}</Button>
+      </div>}
 
       {/* ① Delegation mode */}
       <SettingsSection
@@ -194,7 +236,7 @@ export function DelegationTab() {
                 value={p}
                 className="mt-1 accent-primary"
                 checked={loaded && policy === p}
-                disabled={!editable}
+                disabled={!editable || saving}
                 onChange={() => setPolicy(p)}
               />
               <span className="min-w-0 flex-1">
@@ -227,25 +269,15 @@ export function DelegationTab() {
         <SettingsCard>
           {ROLES.map((role) => (
             <label key={role} className="flex items-center gap-3 px-4 py-3">
-              <input type="checkbox" className="accent-primary" checked={loaded && roles.includes(role)} disabled={!editable}
+              <input type="checkbox" aria-label={t(`settings.delegation.roles.${role}`)} className="accent-primary" checked={loaded && roles.includes(role)} disabled={!editable || saving}
                 onChange={(e) => {
-                  setRiskAck(false);
-                  setRoles((prev) => e.target.checked ? [...prev, role] : prev.filter((r) => r !== role));
+                  if (e.target.checked) setPendingRole(role);
+                  else setRoles((prev) => prev.filter((r) => r !== role));
                 }} />
-              <span className="text-sm">{t(`settings.delegation.roles.${role}`)}</span>
+              <span><span className="block text-sm">{t(`settings.delegation.roles.${role}`)}</span><span className="block text-xs text-muted-foreground">{t(`settings.delegation.roles.${role}.help`)}</span></span>
             </label>
           ))}
         </SettingsCard>
-        {loaded && addsRole && (
-          <div className="space-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2">
-            <p className="text-xs text-foreground">{t('settings.delegation.roles.risk')}</p>
-            <label className="flex items-start gap-2 text-xs font-medium text-foreground">
-              <input type="checkbox" className="accent-primary" checked={riskAck}
-                onChange={(e) => setRiskAck(e.target.checked)} disabled={!editable || saving} />
-              <span>{t('settings.delegation.roles.acknowledge')}</span>
-            </label>
-          </div>
-        )}
         {loaded && policy === 'none' && roles.length > 0 && (
           <p role="alert" className="text-xs text-warning">{t('settings.delegation.roles.noneWarning')}</p>
         )}
@@ -276,14 +308,16 @@ export function DelegationTab() {
           {loaded && pairs.map((pair, index) => (
             <div
               key={index}
-              className="flex flex-wrap items-center gap-2 px-4 py-3 sm:flex-nowrap"
+              className={`px-4 py-3 ${invalidRows.has(index) ? 'rounded-md ring-1 ring-inset ring-destructive' : ''}`}
+              data-pair-row={index}
             >
+              <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap">
               <div className="flex min-w-0 flex-1 items-center gap-2">
                 <OptionSelect
                   value={pair.a}
                   showRaw={false}
                   options={agentOptions}
-                  disabled={!editable}
+                  disabled={!editable || saving}
                   onChange={(v) => updatePair(index, 'a', v)}
                 />
                 {agentDepartment(pair.a) && (
@@ -291,11 +325,11 @@ export function DelegationTab() {
                 )}
               </div>
               <label htmlFor={`delegation-direction-${index}`} className="sr-only">{t('settings.delegation.pair.direction')}</label>
-              <OptionSelect id={`delegation-direction-${index}`} className="w-auto max-w-40 shrink-0" value={pair.direction ?? 'two_way'} showRaw={false} disabled={!editable}
+              <OptionSelect id={`delegation-direction-${index}`} className="w-auto max-w-40 shrink-0" value={pair.direction ?? 'two_way'} showRaw={false} disabled={!editable || saving}
                 options={[{ value: 'two_way', label: t('settings.delegation.pair.twoWay') }, { value: 'one_way', label: t('settings.delegation.pair.oneWay') }]}
                 onChange={(value) => setPairs((prev) => prev.map((p, i) => i === index ? { ...p, direction: value as 'two_way' | 'one_way' } : p))} />
               {pair.direction === 'one_way' && (
-                <Button variant="ghost" size="sm" disabled={!editable} aria-label={t('settings.delegation.pair.swap')}
+                <Button variant="ghost" size="sm" disabled={!editable || saving} aria-label={t('settings.delegation.pair.swap')}
                   onClick={() => setPairs((prev) => prev.map((p, i) => i === index ? { ...p, a: p.b, b: p.a } : p))}>
                   <ArrowLeftRight className="size-4" />
                 </Button>
@@ -305,7 +339,7 @@ export function DelegationTab() {
                   value={pair.b}
                   showRaw={false}
                   options={agentOptions}
-                  disabled={!editable}
+                  disabled={!editable || saving}
                   onChange={(v) => updatePair(index, 'b', v)}
                 />
                 {agentDepartment(pair.b) && (
@@ -315,7 +349,7 @@ export function DelegationTab() {
               <Button
                 variant="ghost"
                 size="sm"
-                disabled={!editable}
+                disabled={!editable || saving}
                 aria-label={intl.formatMessage(
                   { id: 'settings.delegation.pair.remove' },
                   { a: agentLabel(pair.a), b: agentLabel(pair.b) },
@@ -324,6 +358,10 @@ export function DelegationTab() {
               >
                 <Trash2 className="size-4" />
               </Button>
+              </div>
+              {pair.direction === 'one_way' && (
+                <p className="mt-2 text-xs text-muted-foreground">{intl.formatMessage({ id: 'settings.delegation.pair.oneWayHelp' }, { a: agentLabel(pair.a), b: agentLabel(pair.b) })}</p>
+              )}
             </div>
           ))}
           <div className="px-4 py-3">
@@ -343,24 +381,18 @@ export function DelegationTab() {
         </p>
       </SettingsSection>
 
-      {saveError != null && (
-        <ErrorState
-          variant="inline"
-          error={saveError}
-          title={intl.formatMessage({ id: 'errorState.manage.saveFailed' })}
-          description={intl.formatMessage({ id: 'errorState.manage.saveFailedHint' })}
-          onRetry={() => void handleSave()}
-        />
-      )}
+      <div className="space-y-3">
+        {((saveError != null && !conflict) || tooManyPairs || hasSelfPair || hasDuplicate) && (
+          <p role="alert" className="text-sm text-destructive">
+            {tooManyPairs ? t('settings.delegation.pairs.limit') : hasSelfPair ? t('settings.delegation.pair.same') : hasDuplicate ? t('settings.delegation.pair.duplicate') : refusal}
+          </p>
+        )}
       <div className="flex flex-wrap items-center justify-end gap-3">
         {!loaded && !loading && (
           <span className="text-xs text-warning">{t('settings.delegation.saveBlocked')}</span>
         )}
         {incomplete && (
           <span className="text-xs text-warning">{t('settings.delegation.pair.incomplete')}</span>
-        )}
-        {!incomplete && hasSelfPair && (
-          <span className="text-xs text-warning">{t('settings.delegation.pair.same')}</span>
         )}
         <span className="mr-auto text-xs text-muted-foreground">
           {t('settings.delegation.applied')}
@@ -374,6 +406,21 @@ export function DelegationTab() {
           {saving ? intl.formatMessage({ id: 'common.saving' }) : intl.formatMessage({ id: 'common.save' })}
         </Button>
       </div>
+      </div>
+      <RiskConfirmDialog
+        open={pendingRole !== null}
+        onClose={() => setPendingRole(null)}
+        onConfirm={() => {
+          if (pendingRole) setRoles((prev) => [...prev, pendingRole]);
+          setPendingRole(null);
+        }}
+        title={intl.formatMessage({ id: 'settings.delegation.roles.confirmTitle' }, { role: pendingRole ? t(`settings.delegation.roles.${pendingRole}`) : '' })}
+        body={intl.formatMessage({ id: 'settings.delegation.roles.confirmBody' }, { role: pendingRole ? t(`settings.delegation.roles.${pendingRole}`) : '' })}
+        acknowledgeLabel={t('settings.delegation.roles.confirmAcknowledge')}
+        auditNote={t('settings.delegation.roles.confirmAudit')}
+        confirmLabel={t('settings.delegation.roles.confirm')}
+      />
+      <AdminAiCard />
     </div>
   );
 }

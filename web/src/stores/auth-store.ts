@@ -39,6 +39,7 @@ export type LoginChallenge = FactorAvailability & (
   | { mfa_required: true; challenge_id: string }
   | { mfa_enrollment_required: true; enrollment_token: string; challenge_ref: string; setup_code_required?: boolean });
 export type LoginResult = LoginChallenge | void;
+export type GoogleLoginResult = LoginResult | { result: string };
 
 interface AuthMe extends MeGrantFields {
   user: AuthUser;
@@ -114,6 +115,7 @@ interface AuthStore {
   readonly authAttempt: number;
 
   login: (email: string, password: string, remember?: boolean) => Promise<LoginResult>;
+  googleComplete: (ticket: string) => Promise<GoogleLoginResult>;
   establishSession: (tokens: SessionTokens, attempt?: number, isActive?: () => boolean) => Promise<boolean>;
   /** The MFA RPC has already rebound this socket; keep the mounted route. */
   replaceSessionTokens: (tokens: SessionTokens, previousRefreshToken: string | null) => void;
@@ -408,6 +410,21 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       if (attempt !== get().authAttempt) return;
       if ('mfa_required' in data || 'mfa_enrollment_required' in data) return data;
       await get().establishSession(data, attempt);
+    } finally { if (attempt === get().authAttempt) set({ loading: false }); }
+  },
+
+  googleComplete: async (ticket) => {
+    // Google sign-in does not opt into persistent sessions.
+    pendingRemember = false;
+    const attempt = get().authAttempt + 1;
+    set({ loading: true, authAttempt: attempt });
+    try {
+      const data = await apiPost<SessionTokens | LoginChallenge | { result: string }>(
+        '/api/login/google/complete', { ticket },
+      );
+      if (attempt !== get().authAttempt) return { result: 'failed' };
+      if ('mfa_required' in data || 'mfa_enrollment_required' in data || 'result' in data) return data;
+      if (!await get().establishSession(data, attempt)) return { result: 'failed' };
     } finally { if (attempt === get().authAttempt) set({ loading: false }); }
   },
 

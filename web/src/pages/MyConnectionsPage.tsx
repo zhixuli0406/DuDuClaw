@@ -3,12 +3,18 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useSearchParams } from 'react-router';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
+import { DriveWriteMemberCard } from '@/components/connections/DriveWriteMemberCard';
+import { DriveWriteConfirmations } from '@/components/connections/DriveWriteConfirmationCard';
+import { GoogleSigninCard } from '@/components/connections/GoogleSigninCard';
+import { ChatLinkCard } from '@/components/connections/ChatLinkCard';
+import { useAuthStore } from '@/stores/auth-store';
 import { toast } from '@/lib/toast';
 import { Button, Card, CardContent, CardHeader, CardTitle, ErrorState, Input, Skeleton } from '@/components/mds';
 import { GoogleDataDisclosure } from '@/components/GoogleDataDisclosure';
 import { DRIVE_FILE_SCOPE, MEET_READ_SCOPE } from '@/lib/meeting/drive';
 
 export function MyConnectionsPage() {
+  const isAdmin = useAuthStore(state => state.user?.role === 'admin');
   useCompanyTimeZone();
   const intl = useIntl();
   const t = (id: string, values?: Record<string,string|number>) => intl.formatMessage({id},values);
@@ -29,6 +35,7 @@ export function MyConnectionsPage() {
   const [chatRequests,setChatRequests] = useState<Awaited<ReturnType<typeof api.personalGoogle.chatConfirmations>>['requests']>([]);
   const [disconnectNote,setDisconnectNote] = useState('');
   const load = useCallback(async () => {
+    setError(null);
     try { setStatus(await api.personalGoogle.status()); setError(null); } catch(e) { setError(e); }
   },[]);
   useEffect(() => { void load(); const focus = () => void load(); window.addEventListener('focus',focus); return () => window.removeEventListener('focus',focus); },[load]);
@@ -60,11 +67,9 @@ export function MyConnectionsPage() {
     catch(e) { popup?.close(); toast.error(e instanceof Error ? e.message : String(e)); }
     finally { setBusy(false); }
   };
-  if (error) return <ErrorState error={error} onRetry={()=>void load()} />;
-  if (!status) return <Skeleton className="h-40 w-full" />;
   return <div className="mx-auto max-w-4xl space-y-6 p-6">
     <div><h1 className="text-2xl font-semibold">{t('myConnections.title')}</h1><p className="mt-2 text-sm text-muted-foreground">{t('myConnections.intro')}</p></div>
-    {(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
+    {status && <>{(status.notices ?? []).map(notice => <p key={notice.id} role="status" className="rounded-lg border border-border p-3 text-sm">
       {t(notice.kind === 'google_identity_data_test' ? 'myConnections.testNoticeData' : 'myConnections.testNotice', { agent: notice.agent_id, time: formatDateTime(notice.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }) })}
     </p>)}
     {!!status.authorization_requests?.length && <Card><CardHeader><CardTitle>{t('googleAuthorization.requests')}</CardTitle></CardHeader><CardContent>
@@ -72,7 +77,9 @@ export function MyConnectionsPage() {
         {request.agent} · {t(`googleAuthorization.purpose.${request.purpose}`)} · {t(`googleAuthorization.status.${request.status}`)}
       </li>)}</ul>
     </CardContent></Card>}
+    </>}
     <Card><CardHeader><CardTitle>Google</CardTitle></CardHeader><CardContent className="space-y-3">
+      {error ? <ErrorState error={error} onRetry={()=>void load()} /> : !status ? <Skeleton className="h-40 w-full" /> : <>
       {status.connection && <><p className="font-medium">{status.connection.account_email}</p><p className="text-sm">{t(`myConnections.status.${status.connection.status}`)}</p>
         <Link to="/mail" className="text-sm underline">{t('nav.mail')}</Link>
         {status.connection.account_email.toLowerCase() !== status.login_email.toLowerCase() && <p className="text-sm text-warning">{t('myConnections.different',{email:status.login_email})}</p>}
@@ -114,7 +121,12 @@ export function MyConnectionsPage() {
       {disconnectNote&&<p className="text-sm text-warning">{disconnectNote}</p>}
       {status.connection && <div className="space-y-2"><label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={disconnectConfirmed} onChange={e=>setDisconnectConfirmed(e.target.checked)}/>{t('myConnections.disconnectConfirm')}</label><Button variant="outline" disabled={busy||!disconnectConfirmed} onClick={()=>void run(async()=>{const result=await api.personalGoogle.disconnect();setDisconnectNote(result.provider_note??'');})}>{t('myConnections.disconnect')}</Button></div>}
       {paste && <div className="space-y-2"><p className="text-sm">{t('myConnections.pasteHint')}</p><label htmlFor="google-return-url">{t('myConnections.returnUrl')}</label><Input id="google-return-url" type="url" value={url} onChange={e=>setUrl(e.target.value)} autoComplete="off"/><Button disabled={busy||!url} onClick={()=>void run(async()=>{await api.personalGoogle.paste(url);setUrl('');setPaste(false);})}>{t('myConnections.finish')}</Button></div>}
+      </>}
     </CardContent></Card>
+    {status && !error && <DriveWriteMemberCard status={status} onRefresh={load} onStarted={started => { setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); }} />}
+    <GoogleSigninCard />
+    <DriveWriteConfirmations />
+    {isAdmin && <ChatLinkCard />}
     {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">
       <p>{request.employee} · {request.account}</p><p className="break-all">{request.space} {request.thread ?? ''}</p>
       <pre className="whitespace-pre-wrap break-words rounded-lg border border-border p-4 font-sans text-sm">{request.text_display}</pre>
@@ -122,7 +134,7 @@ export function MyConnectionsPage() {
       <div className="flex gap-2"><Button disabled={busy||Date.parse(request.expires_at)<=Date.now()} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,true);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.confirm')}</Button>
       <Button variant="outline" disabled={busy} onClick={()=>void run(async()=>{await api.personalGoogle.confirmChat(request.id,false);setChatRequests(rows=>rows.filter(r=>r.id!==request.id));})}>{t('myConnections.chatSend.cancel')}</Button></div>
     </CardContent></Card>)}
-    <Card><CardHeader><CardTitle>{t('myConnections.employees')}</CardTitle></CardHeader><CardContent className="space-y-4">
+    {status && <><Card><CardHeader><CardTitle>{t('myConnections.employees')}</CardTitle></CardHeader><CardContent className="space-y-4">
       {status.requests.length===0 && <p className="text-sm text-muted-foreground">{t('myConnections.noEmployees')}</p>}
       {status.requests.map(request=><div key={request.agent_id} className="space-y-2 rounded border border-border p-3">
         <Link className="font-medium underline" to={`/agents/${encodeURIComponent(request.agent_id)}/connections`}>{request.agent_id}</Link>
@@ -135,5 +147,6 @@ export function MyConnectionsPage() {
     </CardContent></Card>
     <Card><CardHeader><CardTitle>{t('myConnections.delegated')}</CardTitle></CardHeader><CardContent><p className="text-sm text-muted-foreground">{t('myConnections.adminManaged')}</p>{status.delegated.map(row=><p key={row.agent_id}>{row.agent_id} — {row.email}</p>)}</CardContent></Card>
     <Card><CardHeader><CardTitle>{t('myConnections.history')}</CardTitle></CardHeader><CardContent><p className="text-xs text-muted-foreground">{t('myConnections.historyHint')}</p>{status.recent_usage.map((row,index)=><div className="mt-2 flex flex-wrap gap-3 text-sm" key={`${row.timestamp}-${index}`}><time>{formatDateTime(row.timestamp, { locale: intl.locale, year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' })}</time><span>{row.agent_id}</span><span>{row.tool_name}</span><span>{t(row.success?'myConnections.success':'myConnections.failure')}</span></div>)}</CardContent></Card>
+    </>}
   </div>;
 }

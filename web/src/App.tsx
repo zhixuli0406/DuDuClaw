@@ -87,6 +87,7 @@ const UsersPage = lazyPage(() => import('./pages/UsersPage'), 'UsersPage');
 const TeamPage = lazyPage(() => import('./pages/TeamPage'), 'TeamPage');
 const AccountPage = lazyPage(() => import('./pages/AccountPage'), 'AccountPage');
 const ExternalAccessPage = lazyPage(() => import('./pages/ExternalAccessPage'), 'ExternalAccessPage');
+const ApprovalConfirmPage = lazyPage(() => import('./pages/ApprovalConfirmPage'), 'ApprovalConfirmPage');
 const GoogleAuthorizationPage = lazyPage(() => import('./pages/GoogleAuthorizationPage'), 'GoogleAuthorizationPage');
 const MyConnectionsPage = lazyPage(() => import('./pages/MyConnectionsPage'), 'MyConnectionsPage');
 const MyMemoryPage = lazyPage(() => import('./pages/MyMemoryPage'), 'MyMemoryPage');
@@ -500,6 +501,7 @@ export function App() {
                   new-skill request reduced to a plain approve/reject with the
                   skill's own content and security scan nowhere in sight (§2-6).
                   One door for decisions; this one redirects to it. */}
+              <Route element={<EditionGuard enterprise />}><Route path="approvals/confirm" element={<ApprovalConfirmPage />} /></Route>
               <Route path="approvals" element={<Navigate to="/inbox" replace />} />
               {/* These three are the source files behind 管理 → 整合's tabs, not
                   standalone pages (§2-8). Their old paths land on the tab that

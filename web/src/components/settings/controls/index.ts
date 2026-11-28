@@ -21,3 +21,4 @@ export {
   type CronParts,
   type CronLabels,
 } from './cron';
+export { RiskConfirmDialog, type RiskConfirmDialogProps } from './RiskConfirmDialog';

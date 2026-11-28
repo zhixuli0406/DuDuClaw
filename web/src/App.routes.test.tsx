@@ -428,3 +428,14 @@ describe('advanced and company settings routes', () => {
     }
   }
 });
+
+it('/approvals/confirm resolves to the new page without the legacy redirect', async () => {
+  renderAppAt('/approvals/confirm');
+  expect(await screen.findByRole('heading', { name: en['approvalConfirm.title'] })).toBeInTheDocument();
+  expect(screen.getByTestId('loc').textContent).toBe('/approvals/confirm');
+});
+it('gates approval confirmation on Personal', async () => {
+  setEdition('personal');
+  await expectLandsOn('/approvals/confirm', '/');
+  expect(screen.queryByRole('heading', { name: en['approvalConfirm.title'] })).not.toBeInTheDocument();
+});

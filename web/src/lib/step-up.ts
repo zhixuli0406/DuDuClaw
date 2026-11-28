@@ -43,5 +43,14 @@ export const stepUpApi = {
   status: async (): Promise<StepUpStatus> => readStepUpStatus(await client.call('isolation.employee_list', {})),
   /** Prove identity again. The password and code are sent once and never kept. */
   verify: (password: string, code: string) =>
-    client.call('isolation.connector_step_up', { password, code }) as Promise<{ verified: boolean }>,
+    client.call('isolation.connector_step_up', { password, code }) as Promise<{ verified: boolean; step_up_csrf?: number[] }>,
+  /** Verify directly, including when protected mode is off. */
+  adminVerify: async (password: string, code: string): Promise<StepUpToken> => {
+    const reply = await client.call('isolation.connector_step_up', { password, code }) as
+      { verified?: unknown; step_up_csrf?: unknown } | null;
+    if (reply?.verified !== true || !isStepUpToken(reply.step_up_csrf)) {
+      throw new Error('Invalid step-up response');
+    }
+    return reply.step_up_csrf;
+  },
 };

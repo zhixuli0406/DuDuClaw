@@ -1,10 +1,12 @@
 // Create / edit user dialogs of the Users page (moved out of UsersPage.tsx
 // unchanged).
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { useState } from 'react';
 import { useAgentDisplayName } from './UserRowParts';
 import { useIntl } from 'react-intl';
 import { api, type UserDetail } from '@/lib/api';
 import {
+  useErrorMessage,
   Button,
   Input,
   Select,
@@ -167,6 +169,8 @@ export function EditUserDialog({
   onUpdated: () => void;
 }) {
   const intl = useIntl();
+  const errorText = useErrorMessage();
+  const [roleError, setRoleError] = useState<string | null>(null);
   const agentName = useAgentDisplayName();
   const assignablePrimaryAgents = user.assignable_primary_agents ?? [];
   const primaryPersonalExcluded = user.primary_personal_excluded ?? false;
@@ -192,6 +196,7 @@ export function EditUserDialog({
 
   const handleSubmit = async () => {
     setError('');
+    setRoleError(null);
     // Match CreateUserDialog's client-side rule so the user gets a clear
     // message instead of an opaque backend rejection.
     if (newPassword && newPassword.length < 8) {
@@ -214,7 +219,9 @@ export function EditUserDialog({
       });
       onUpdated();
     } catch (e) {
-      setError(userWriteError(e, intl));
+      if (e && typeof e === 'object' && 'code' in e && e.code === 'role_requires_local_password') {
+        setRoleError(settingsRefusal(e, errorText(e)));
+      } else setError(userWriteError(e, intl));
     } finally {
       setSubmitting(false);
     }
@@ -244,6 +251,8 @@ export function EditUserDialog({
                 ))}
               </SelectContent>
             </Select>
+            {user.has_password === false && <p className="text-sm text-muted-foreground">{intl.formatMessage({ id: 'users.memberSignin.noPassword' })}</p>}
+            {roleError && <p role="alert" className="text-sm text-destructive">{roleError}</p>}
           </DialogField>
           <DialogField
             label={intl.formatMessage({ id: 'users.field.department' })}

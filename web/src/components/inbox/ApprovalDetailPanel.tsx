@@ -59,6 +59,7 @@ import {
   payloadBytes,
   type AutopilotActionCard,
 } from './autopilot-action-payload';
+import { AdminAiSettingsView, parseAdminAiSettings } from './AdminAiSettingsView';
 import { visibleEscapes } from '@/lib/visible-escapes';
 
 // ── Local mds-token property primitives (replace the Calm Glass PropertyRow) ──
@@ -485,14 +486,34 @@ function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
 
 function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; outcome?: 'approved' | 'denied' }) {
   const intl = useIntl();
+  useCompanyTimeZone();
+  const execution = approval.kind === 'admin_ai_settings' ? approval.execution_result : null;
   const status = outcome ?? approval.status;
   const labelKey = status === 'approved' ? 'inbox.status.approved'
     : status === 'denied' ? 'inbox.status.denied'
     : status === 'expired' ? 'inbox.status.expired'
     : status === 'answered' ? 'approval.question.answered' : 'inbox.processed.receipt';
+  const adminAiResult = status === 'approved' ? 'approved'
+    : ['admin_ai:expired', 'expired'].includes(approval.invalidated_reason ?? '') || status === 'expired' ? 'expired'
+    : approval.invalidated_reason === 'restart_requires_reobserve' ? 'restart'
+    : approval.invalidated_reason === 'admin_changed' ? 'adminChanged'
+    : status === 'denied' ? 'denied' : 'invalidated';
   return (
     <div className="space-y-4">
       <Badge variant="secondary">{intl.formatMessage({ id: labelKey })}</Badge>
+      {execution ? <div className="space-y-2 text-sm">
+        {execution.outcome === 'complete' && <p>{intl.formatMessage({ id: 'approval.adminAi.result.complete' }, { completed: execution.completed ?? '—' })}</p>}
+        {execution.outcome === 'partial' && <>
+          <p>{intl.formatMessage({ id: 'approval.adminAi.result.partial' }, { completed: execution.completed ?? '—', notExecuted: execution.not_executed ?? '—' })}</p>
+          {execution.message && <p className="whitespace-pre-wrap break-words">{execution.message}</p>}
+          {execution.items.map((item, index) => item.error ? <p key={index} className="whitespace-pre-wrap break-words">{intl.formatMessage({ id: 'approval.adminAi.result.itemError' }, { seq: item.seq ?? '—', error: item.error })}</p> : null)}
+        </>}
+        {execution.outcome === 'voided' && <p className="whitespace-pre-wrap break-words">{execution.message || intl.formatMessage({ id: 'approval.adminAi.result.voided' })}</p>}
+      </div> : approval.kind === 'admin_ai_settings' && <p className="text-sm">{intl.formatMessage({ id: `approval.adminAi.result.${adminAiResult}` })}</p>}
+      {approval.decided_at && <Row label={intl.formatMessage({ id: 'approval.decidedAt' })}>{formatDateTime(approval.decided_at, { locale: intl.locale })}</Row>}
+      {typeof approval.decided_by_display === 'string' && approval.decided_by_display.trim() && (
+        <Row label={intl.formatMessage({ id: 'approval.decidedBy' })}><span className="break-words">{approval.decided_by_display}</span></Row>
+      )}
       <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
       {typeof approval.answer === 'string' && <p className="whitespace-pre-wrap text-sm">{approval.answer}</p>}
       <OpenInChannelButton channel={approval.channel} link={approval.channel_link} />
@@ -545,6 +566,10 @@ export function ApprovalDetailPanel({
       );
     }
     // Missing artifact → fall through to the generic view.
+  }
+  if (approval.kind === 'admin_ai_settings') {
+    const payload = parseAdminAiSettings(approval.payload);
+    if (payload) return <AdminAiSettingsView approval={approval} payload={payload} onApprove={onApprove} onReject={onReject} decideError={decideError} />;
   }
   // ── v1.82 autopilot rule action: the complete frozen action, always ──
   if (approval.kind === 'autopilot_action') {
@@ -638,8 +663,10 @@ function GenericApprovalView({
   const expiry = tracksExpiry
     ? expiryState({ timestamp: approval.created_at, expiresAt: expiresAtEpoch }, now)
     : null;
-  const payload =
-    typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
+  // Internal admin settings identifiers must stay hidden even in the generic fallback.
+  const payload = approval.kind === 'admin_ai_settings'
+    ? JSON.stringify(approval.payload, (key, value) => key === 'id' || key === 'target' ? undefined : value, 2)
+    : typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
 
   const requestApprove = () => {
     if (riskNeedsConfirm(risk)) setConfirmOpen(true);

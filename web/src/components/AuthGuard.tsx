@@ -1,3 +1,4 @@
+import { approvalConfirmReturn } from '@/lib/approval-step-up';
 import { googleAuthorizationReturn } from '@/lib/google-authorization';
 import { useEffect } from 'react';
 import { Navigate, Outlet, useLocation } from 'react-router';
@@ -116,7 +117,7 @@ export function AuthGuard() {
   }
 
   if (!isAuthenticated) {
-    const from = googleAuthorizationReturn(`${location.pathname}${location.hash}`) ?? browserWatchReturn(`${location.pathname}${location.search}`);
+    const from = googleAuthorizationReturn(`${location.pathname}${location.hash}`) ?? approvalConfirmReturn(`${location.pathname}${location.hash}`) ?? browserWatchReturn(`${location.pathname}${location.search}`);
     return <Navigate to="/login" replace state={from ? { from } : undefined} />;
   }
 

@@ -1,3 +1,5 @@
+import { settingsRefusal } from '@/lib/settings-refusal';
+import { GoogleMfaReauth } from './GoogleMfaReauth';
 import { DisabledFactorExplanation } from './DisabledFactorExplanation';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -9,7 +11,7 @@ import { createPasskey, passkeyAvailable, type CreationOptionsJSON } from '@/lib
 import { RecoveryCodes } from './MfaEnrollment';
 
 type Passkey = { id: string; name: string; created_at: number };
-export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onChange: () => Promise<void> }) {
+export function AdditionalFactors({ status, onChange, hasPassword = true, showReauth = true }: { hasPassword?: boolean; showReauth?: boolean; status: MfaStatus; onChange: () => Promise<void> }) {
   const intl = useIntl();
   const t = (id: string) => intl.formatMessage({ id });
   const [password, setPassword] = useState('');
@@ -32,14 +34,14 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
     const data = await accountRequest<{ passkeys: Passkey[]; available: boolean }>('/api/mfa/passkey/list', {});
     setPasskeys(data.passkeys); setAvailable(data.available);
   };
-  useEffect(() => { void load().catch(error => setError(t(mfaErrorId(error)))); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load().catch(error => setError(settingsRefusal(error, t(mfaErrorId(error))))); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   const run = async (action: () => Promise<void | boolean>) => {
     requestAttempt.current = useAuthStore.getState().authAttempt;
     requestRefresh.current = useAuthStore.getState().refreshToken;
     let keepPassword = false;
     setBusy(true); setError('');
     try { keepPassword = await action() === true; if (active.current && requestAttempt.current === useAuthStore.getState().authAttempt) await onChange(); }
-    catch (error) { setError(t(mfaErrorId(error))); }
+    catch (error) { setError(settingsRefusal(error, t(mfaErrorId(error)))); }
     finally { if (active.current) { setBusy(false); if (!keepPassword) setPassword(''); setCode(''); } }
   };
   const replace = (result: SessionTokens) => {
@@ -58,11 +60,12 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
     <h3 className="font-medium">{t('mfa.methods')}</h3>
     <p className="text-sm text-muted-foreground">{t('mfa.reauthHint')}</p>
     {error && <p role="alert" className="text-destructive">{error}</p>}
-    <label className="block space-y-2">{t('mfa.factorPassword')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} /></label>
+    {!hasPassword && showReauth && <GoogleMfaReauth />}
+    {hasPassword && <label className="block space-y-2">{t('mfa.factorPassword')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} /></label>}
     <div className="space-y-3">
       <h4>{t('mfa.factor.email')}</h4>
       {!status.email_available && <DisabledFactorExplanation factor="email" reason={status.email_unavailable_reason} fingerprint={status.relay_key_fingerprint} />}
-      {status.factors?.email ? <Button variant="outline" disabled={busy || !password || removeDisabled} onClick={() => void run(async () => replace(await mfaApi.emailRemove(password)))}>{t('mfa.email.remove')}</Button> : <>
+      {status.factors?.email ? <Button variant="outline" disabled={busy || (hasPassword && !password) || removeDisabled} onClick={() => void run(async () => replace(await mfaApi.emailRemove(hasPassword ? password : '')))}>{t('mfa.email.remove')}</Button> : hasPassword && <>
         <p className="text-sm">{t('mfa.email.enrollHint')}</p>
         {enrollment?.proof_required && !enrollment.sent && <>
           <p className="text-sm">{t('mfa.proof.hint')}</p>
@@ -93,8 +96,8 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
         {passkeyEnrollment.challenge_ref && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{passkeyEnrollment.challenge_ref}</code></p>}
         <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={proof} onChange={e => setProof(e.target.value)} /></label>
       </>}
-      <Button variant="outline" disabled={busy || !password || !name.trim() || !available || !passkeyAvailable() || (!!passkeyEnrollment && !proof)} onClick={() => void run(async () => {
-        const start = await accountRequest<{ ceremony_id?: string; enrollment_token: string; challenge_ref?: string; proof_required?: boolean; publicKey?: CreationOptionsJSON }>('/api/mfa/passkey/register/begin', { password, name,
+      <Button variant="outline" disabled={busy || (hasPassword && !password) || !name.trim() || !available || !passkeyAvailable() || (!!passkeyEnrollment && !proof)} onClick={() => void run(async () => {
+        const start = await accountRequest<{ ceremony_id?: string; enrollment_token: string; challenge_ref?: string; proof_required?: boolean; publicKey?: CreationOptionsJSON }>('/api/mfa/passkey/register/begin', { password: hasPassword ? password : '', name,
           ...(passkeyEnrollment ? { enrollment_token: passkeyEnrollment.enrollment_token, proof_code: proof } : {}) });
         if (!active.current || requestAttempt.current !== useAuthStore.getState().authAttempt) return;
         if (start.proof_required && !start.publicKey) { setPasskeyEnrollment(start); return true; }
@@ -108,8 +111,8 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
       })}>{t('mfa.passkey.add')}</Button>
       <ul className="space-y-3">{passkeys.map(key => <li key={key.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border p-3">
         <span>{key.name}<span className="block text-xs text-muted-foreground">{intl.formatDate(new Date(key.created_at * 1000))}</span></span>
-        <Button variant="outline" disabled={busy || !password || removeDisabled} onClick={() => void run(async () => {
-          const result = await accountRequest<SessionTokens>('/api/mfa/passkey/delete', { password, id: key.id });
+        <Button variant="outline" disabled={busy || (hasPassword && !password) || removeDisabled} onClick={() => void run(async () => {
+          const result = await accountRequest<SessionTokens>('/api/mfa/passkey/delete', { password: hasPassword ? password : '', id: key.id });
           await reconnect(result); await load();
         })}>{t('mfa.passkey.remove')}</Button>
       </li>)}</ul>

@@ -3,8 +3,10 @@
 import { useEffect, useMemo } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
+import type { OdooMemberCredential } from '@/lib/member-signin';
 import type { UserDetail } from '@/lib/api';
 import { UNBINDABLE_CHANNELS, type ChannelIdentity } from '@/lib/channel-identity-api';
+import { formatDateTime } from '@/lib/company-time';
 import { ROLE_LEVELS } from '@/lib/roles';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
@@ -184,18 +186,23 @@ export function IdentityChips({
         state.map((ident) => {
           const fromGoogle = ident.source === 'google_account';
           const removable = !fromGoogle && onRemove !== undefined && UNBINDABLE_CHANNELS.includes(ident.channel);
-          const label = `${channelLabel(ident.channel)} · ${ident.channel_user_id}`;
+          const label = `${channelLabel(ident.channel)} · ${Array.from(ident.channel_user_id).slice(-4).join('')}`;
+          const proof = ident.proof_status ? intl.formatMessage({ id: `users.channelIdentity.${ident.proof_status}` }) : '';
+          const title = [label, fromGoogle ? intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' }) : '',
+            ident.proven_at ? intl.formatMessage({ id: 'users.channelIdentity.provenAt' }, { time: formatDateTime(ident.proven_at, { locale: intl.locale }) }) : '',
+          ].filter(Boolean).join(' — ');
           return (
             <span
               key={`${ident.source ?? 'binding'}:${ident.channel}:${ident.channel_user_id}`}
-              className="group inline-flex max-w-48 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-              title={fromGoogle ? `${label} — ${intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })}` : label}
+              className="group inline-flex max-w-full items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              title={title}
             >
               <ShieldCheck
                 className="size-3 shrink-0 text-success"
                 aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
               />
               <span className="truncate">{label}</span>
+              {proof && <span className={`shrink-0 border-l border-border pl-1 font-medium ${ident.proof_status === 'self_confirmed' ? 'text-success' : ''}`}>{proof}</span>}
               {fromGoogle && <Link2 className="size-3 shrink-0" aria-label={intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })} />}
               {removable && (
                 <button
@@ -227,6 +234,22 @@ export function IdentityChips({
   );
 }
 
+/** Sign-in and onboarding status, shared by the list and phone cards. */
+export function MemberSigninBadges({ user, credential }: { user: UserDetail; credential?: OdooMemberCredential }) {
+  const intl = useIntl();
+  const t = (key: string) => intl.formatMessage({ id: `users.memberSignin.${key}` });
+  const avatar = user.signin_avatar;
+  return <div className="flex flex-wrap items-center gap-1 text-xs">
+    {user.google_signin_linked && <Badge variant="outline">{t('google')}</Badge>}
+    {credential && <Badge variant={credential.state === 'ok' ? 'outline' : 'destructive'}>{t(`odoo.${credential.state}`)}</Badge>}
+    {avatar && ['pending', 'creating', 'retrying'].includes(avatar.state) && <Badge variant="secondary">{t('preparing')}</Badge>}
+    {avatar?.state === 'waiting_admin' && <span className="inline-flex items-center gap-1 text-destructive">
+      <span aria-hidden className="size-2 shrink-0 rounded-full bg-destructive" />
+      {intl.formatMessage({ id: 'users.memberSignin.waiting' }, { reason: t(`reason.${avatar.reason && avatar.reason !== 'done' ? avatar.reason : 'unknown'}`) })}
+    </span>}
+  </div>;
+}
+
 /** The row's ⋯ menu. */
 export function UserActions({
   user,
@@ -235,6 +258,8 @@ export function UserActions({
   onOffboard,
   onRemove,
   onInvite,
+  onUnlinkGoogle,
+  onRevokeOdoo,
 }: {
   user: UserDetail;
   onEdit: () => void;
@@ -242,6 +267,8 @@ export function UserActions({
   onOffboard: () => void;
   onRemove: () => void;
   onInvite?: () => void;
+  onUnlinkGoogle?: () => void;
+  onRevokeOdoo?: () => void;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -266,6 +293,8 @@ export function UserActions({
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent>
+        {viewerRole === 'admin' && onUnlinkGoogle && <DropdownMenuItem onClick={onUnlinkGoogle}>{intl.formatMessage({ id: 'users.memberSignin.unlink' })}</DropdownMenuItem>}
+        {viewerRole === 'admin' && onRevokeOdoo && <DropdownMenuItem onClick={onRevokeOdoo}>{intl.formatMessage({ id: 'users.memberSignin.revoke' })}</DropdownMenuItem>}
         {onInvite && viewerRole === 'admin' && user.status === 'active' && <DropdownMenuItem onClick={onInvite}>{intl.formatMessage({ id: 'users.invite.resend' })}</DropdownMenuItem>}
         {canViewDashboard && (
           <DropdownMenuItem onClick={() => navigate(`/?view_as=${encodeURIComponent(user.id)}`)}>

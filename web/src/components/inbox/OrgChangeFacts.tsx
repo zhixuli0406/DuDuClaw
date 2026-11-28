@@ -24,6 +24,13 @@ function placementOf(v: unknown): OrgPlacement {
   });
 }
 
+/** Validate review evidence without changing the inbox's fallback rendering. */
+export function isOrgChangePlacement(value: unknown): boolean {
+  const placement = asRecord(value);
+  return placement !== null && typeof placement.reports_to === 'string'
+    && typeof placement.department === 'string';
+}
+
 /**
  * The 「組織調整申請」 card body (`org_change` approvals): which employee, the
  * 調整前 / 調整後 manager and department, who asked and why. Whether the
@@ -34,9 +41,13 @@ export function OrgChangeFacts({
   approval,
   agentName,
   onStale,
+  resolveAgentName,
+  resolvePerson,
 }: {
   approval: ApprovalItem;
   agentName?: string;
+  resolveAgentName?: (id: string) => string;
+  resolvePerson?: (id: string) => string;
   onStale?: (stale: boolean) => void;
 }) {
   const intl = useIntl();
@@ -77,7 +88,7 @@ export function OrgChangeFacts({
     : typeof payload?.proposer === 'string' ? payload.proposer : '');
   const reason = row?.reason ?? (typeof payload?.reason === 'string' ? payload.reason : '');
   const stale = row?.stale === true;
-  const mgr = (id: string) => (id || t('orgEdit.topLevel'));
+  const mgr = (id: string) => (id ? resolveAgentName?.(id) ?? id : t('orgEdit.topLevel'));
   const dept = (d: string) => (d || t('orgEdit.noDepartment'));
 
   return (
@@ -119,7 +130,7 @@ export function OrgChangeFacts({
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
         <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.requestedBy')}</dt>
-        <dd className="min-w-0 break-words">{proposer || '—'}</dd>
+        <dd className="min-w-0 break-words">{resolvePerson && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(proposer) ? resolvePerson(proposer) : proposer || '—'}</dd>
         {reason && (
           <>
             <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.reason')}</dt>

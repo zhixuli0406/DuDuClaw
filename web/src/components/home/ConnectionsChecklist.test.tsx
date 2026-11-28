@@ -6,6 +6,7 @@ import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { ConnectionsChecklist } from './ConnectionsChecklist';
 
 const status = (connected: boolean): PersonalGoogleStatus => ({
+  drive_write: { connected: false, status: null, account_email: null, granted_scopes: [] }, enabled_by_admin: false,
   connection: connected ? { owner_id: 'person', account_email: 'person@example.com', granted_scopes: [], status: 'connected', connected_at: '' } : null,
   login_email: 'person@example.com', client_configured: true, integration_enabled: true, requires_login: false, requests: [], delegated: [], recent_usage: [],
 });
