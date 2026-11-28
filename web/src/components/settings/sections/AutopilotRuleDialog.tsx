@@ -19,16 +19,21 @@ import {
   buildCreatePayload,
   buildUpdatePayload,
   emptyRuleForm,
+  emptyStep,
   formStateFromRule,
   type AutopilotRule,
   type AutopilotTriggerEvent,
   type BuildIssue,
   type ConditionOp,
   type ConditionRow,
-  type FormActionType,
+  type StepDraft,
   type RuleFormState,
 } from '@/lib/autopilot-rules';
 import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
   Button,
   Input,
   Textarea,
@@ -144,10 +149,23 @@ export function AutopilotRuleDialog({
 
   useEffect(() => { fetchAgents(); }, [fetchAgents]);
   useEffect(() => {
-    if (agents.length > 0 && !form.targetAgent) {
-      setForm((f) => ({ ...f, targetAgent: agents[0].name }));
+    if (agents.length > 0) {
+      setForm(f => ({ ...f, steps: f.steps.map(step =>
+        !step.original && !step.targetAgent ? { ...step, targetAgent: agents[0].name } : step) }));
     }
-  }, [agents, form.targetAgent]);
+  }, [agents]);
+
+  const patchStep = (index: number, p: Partial<StepDraft>) => {
+    setForm(f => ({ ...f, steps: f.steps.map((step, i) => i === index ? { ...step, ...p } : step) }));
+  };
+  const moveStep = (index: number, direction: number) => {
+    setIssues([]);
+    setForm(f => {
+      const steps = [...f.steps];
+      [steps[index], steps[index + direction]] = [steps[index + direction], steps[index]];
+      return { ...f, steps };
+    });
+  };
 
   const patch = useCallback((p: Partial<RuleFormState>) => setForm((f) => ({ ...f, ...p })), []);
 
@@ -189,13 +207,13 @@ export function AutopilotRuleDialog({
     return ids.map((v) => ({ value: v, label: triggerLabel(v) }));
   }, [form.triggerEvent, triggerLabel]);
 
-  const agentOptions = useMemo(() => {
-    const opts = agents.map((a) => ({ value: a.name, label: `${glyphText(a.icon)} ${a.display_name}` }));
-    if (form.targetAgent && !opts.some((o) => o.value === form.targetAgent)) {
-      opts.push({ value: form.targetAgent, label: form.targetAgent });
+  const agentOptions = (step: StepDraft) => {
+    const opts = agents.map(a => ({ value: a.name, label: `${glyphText(a.icon)} ${a.display_name}` }));
+    if (step.targetAgent && !opts.some(o => o.value === step.targetAgent)) {
+      opts.push({ value: step.targetAgent, label: step.targetAgent });
     }
     return opts;
-  }, [agents, form.targetAgent]);
+  };
 
   const fieldSuggestions =
     TRIGGER_FIELD_SUGGESTIONS[form.triggerEvent as AutopilotTriggerEvent] ?? [];
@@ -203,6 +221,10 @@ export function AutopilotRuleDialog({
 
   const issueText = (issue: BuildIssue): string => {
     switch (issue.kind) {
+      case 'stepCount':
+      case 'waitDuration':
+      case 'waitOrder':
+        return t(`autopilot.steps.error.${issue.kind}`);
       case 'missing':
         return t('autopilot.form.missing', {
           field: t(MISSING_FIELD_LABEL[issue.field] ?? 'autopilot.field.name'),
@@ -251,9 +273,6 @@ export function AutopilotRuleDialog({
     }
   }, [form, rule, onSaved]);
 
-  const actionNeeds = (key: string) =>
-    !form.actionLocked && ACTION_REQUIRED_FIELDS[form.actionType].includes(key);
-
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
@@ -262,6 +281,27 @@ export function AutopilotRuleDialog({
         </DialogHeader>
 
         <div className="space-y-4">
+          {(issues.length > 0 || serverError != null) && (
+            <div
+              role="alert"
+              className="flex gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
+            >
+              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
+              <div className="space-y-1">
+                {serverError != null && (
+                  <>
+                    <p className="font-medium">{t('autopilot.form.saveFailed')}</p>
+                    <p className="break-words">{formatErrorDetail(serverError) || formatError(serverError)}</p>
+                  </>
+                )}
+                {issues.length > 0 && (
+                  <ul className="list-disc space-y-0.5 pl-4">
+                    {issues.map((issue, i) => <li key={i}>{issueText(issue)}</li>)}
+                  </ul>
+                )}
+              </div>
+            </div>
+          )}
           <FieldBlock label={t('autopilot.field.name')}>
             <Input
               aria-label={t('autopilot.field.name')}
@@ -338,105 +378,121 @@ export function AutopilotRuleDialog({
             )}
           </fieldset>
 
-          {/* Action */}
+          {/* Steps */}
           {form.actionLocked ? (
             <p className="text-xs text-muted-foreground">{t('autopilot.action.locked')}</p>
           ) : (
-            <>
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <DialogSelect
-                  label={t('autopilot.field.action')}
-                  value={form.actionType}
-                  onChange={(v) => patch({ actionType: v as FormActionType })}
-                  options={FORM_ACTION_TYPES.map((a) => ({ value: a, label: actionLabel(a) }))}
-                />
-                {actionNeeds('target_agent') && (
-                  <DialogSelect
-                    label={t('autopilot.field.actionAgent')}
-                    value={form.targetAgent}
-                    onChange={(v) => patch({ targetAgent: v })}
-                    options={agentOptions}
-                  />
-                )}
-                {actionNeeds('channel') && (
-                  <DialogSelect
-                    label={t('autopilot.field.channel')}
-                    value={form.channel}
-                    onChange={(v) => patch({ channel: v })}
-                    options={NOTIFY_CHANNELS.filter(c => policy.allows('channels', c)).map((c) => ({ value: c, label: channelLabel(c) }))}
-                  />
-                )}
-              </div>
+            <fieldset className="space-y-3">
+              <legend className="text-sm font-medium">{t('autopilot.steps.title')}</legend>
+              {form.steps.map((step, index) => {
+                const actionNeeds = (key: string) => step.actionType !== 'wait' && ACTION_REQUIRED_FIELDS[step.actionType].includes(key);
+                const invalid = issues.some(issue => ('steps' in issue && issue.steps.includes(index)) || ('step' in issue && issue.step === index));
+                return (
+                  <div key={index} role="group" aria-label={t('autopilot.steps.row', { step: index + 1 })}
+                    className={`space-y-3 rounded-lg border p-3 ${invalid ? 'border-destructive outline outline-1 outline-destructive' : 'border-surface-border'}`}>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-sm font-medium">{index + 1}. {actionLabel(step.actionType)}</span>
+                      <div className="flex gap-1">
+                        <Button variant="ghost" size="icon-sm" disabled={index === 0} onClick={() => moveStep(index, -1)} aria-label={t('autopilot.steps.up', { step: index + 1 })}>↑</Button>
+                        <Button variant="ghost" size="icon-sm" disabled={index === form.steps.length - 1} onClick={() => moveStep(index, 1)} aria-label={t('autopilot.steps.down', { step: index + 1 })}>↓</Button>
+                        <Button variant="ghost" size="icon-sm" onClick={() => { patch({ steps: form.steps.filter((_, i) => i !== index) }); setIssues([]); }} aria-label={t('autopilot.steps.remove', { step: index + 1 })}>✕</Button>
+                      </div>
+                    </div>
+                    {step.actionType === 'wait' ? (
+                      <FieldBlock label={t('autopilot.steps.minutes')}>
+                        <Input type="number" min={1} max={1440} step={1} aria-label={t('autopilot.steps.minutes')} value={Number.isNaN(step.minutes) ? '' : step.minutes}
+                          onChange={e => patchStep(index, { minutes: e.target.valueAsNumber })} />
+                      </FieldBlock>
+                    ) : (<>
+                      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                        {actionNeeds('target_agent') && (
+                          <DialogSelect
+                            label={t('autopilot.field.actionAgent')}
+                            value={step.targetAgent}
+                            onChange={(v) => patchStep(index, { targetAgent: v })}
+                            options={agentOptions(step)}
+                          />
+                        )}
+                        {actionNeeds('channel') && (
+                          <DialogSelect
+                            label={t('autopilot.field.channel')}
+                            value={step.channel}
+                            onChange={(v) => patchStep(index, { channel: v })}
+                            options={NOTIFY_CHANNELS.filter(c => policy.allows('channels', c)).map((c) => ({ value: c, label: channelLabel(c) }))}
+                          />
+                        )}
+                      </div>
 
-              {actionNeeds('prompt') && (
-                <FieldBlock
-                  label={t('autopilot.field.promptTemplate')}
-                  description={t('autopilot.field.templateHint')}
-                >
-                  <Textarea
-                    aria-label={t('autopilot.field.promptTemplate')}
-                    className="min-h-[80px] resize-y"
-                    value={form.prompt}
-                    onChange={(e) => patch({ prompt: e.target.value })}
-                    placeholder={t('autopilot.field.promptTemplate.placeholder')}
-                  />
-                </FieldBlock>
-              )}
-              {form.actionType === 'delegate' && <AutonomyNote id="autopilotDelegate" />}
+                      {actionNeeds('prompt') && (
+                        <FieldBlock
+                          label={t('autopilot.field.promptTemplate')}
+                          description={t('autopilot.field.templateHint')}
+                        >
+                          <Textarea
+                            aria-label={t('autopilot.field.promptTemplate')}
+                            className="min-h-[80px] resize-y"
+                            value={step.prompt}
+                            onChange={(e) => patchStep(index, { prompt: e.target.value })}
+                            placeholder={t('autopilot.field.promptTemplate.placeholder')}
+                          />
+                        </FieldBlock>
+                      )}
+                      {step.actionType === 'delegate' && <AutonomyNote id="autopilotDelegate" />}
 
-              {actionNeeds('skill_name') && (
-                <FieldBlock label={t('autopilot.field.skillName')}>
-                  <Input
-                    aria-label={t('autopilot.field.skillName')}
-                    value={form.skillName}
-                    onChange={(e) => patch({ skillName: e.target.value })}
-                  />
-                </FieldBlock>
-              )}
+                      {actionNeeds('skill_name') && (
+                        <FieldBlock label={t('autopilot.field.skillName')}>
+                          <Input
+                            aria-label={t('autopilot.field.skillName')}
+                            value={step.skillName}
+                            onChange={(e) => patchStep(index, { skillName: e.target.value })}
+                          />
+                        </FieldBlock>
+                      )}
 
-              {actionNeeds('chat_id') && (
-                <FieldBlock label={t('autopilot.field.chatId')} description={t('autopilot.field.chatId.help')}>
-                  <Input
-                    aria-label={t('autopilot.field.chatId')}
-                    value={form.chatId}
-                    onChange={(e) => patch({ chatId: e.target.value })}
-                  />
-                </FieldBlock>
-              )}
-              {actionNeeds('text') && (
-                <FieldBlock label={t('autopilot.field.text')} description={t('autopilot.field.templateHint')}>
-                  <Textarea
-                    aria-label={t('autopilot.field.text')}
-                    className="min-h-[60px] resize-y"
-                    value={form.text}
-                    onChange={(e) => patch({ text: e.target.value })}
-                  />
-                </FieldBlock>
-              )}
-            </>
+                      {actionNeeds('chat_id') && (
+                        <FieldBlock label={t('autopilot.field.chatId')} description={t('autopilot.field.chatId.help')}>
+                          <Input
+                            aria-label={t('autopilot.field.chatId')}
+                            value={step.chatId}
+                            onChange={(e) => patchStep(index, { chatId: e.target.value })}
+                          />
+                        </FieldBlock>
+                      )}
+                      {actionNeeds('text') && (
+                        <FieldBlock label={t('autopilot.field.text')} description={t('autopilot.field.templateHint')}>
+                          <Textarea
+                            aria-label={t('autopilot.field.text')}
+                            className="min-h-[60px] resize-y"
+                            value={step.text}
+                            onChange={(e) => patchStep(index, { text: e.target.value })}
+                          />
+                        </FieldBlock>
+                      )}
+                      <label className="flex items-center gap-2 text-sm">
+                        <input type="checkbox" checked={step.requireApproval} onChange={e => patchStep(index, { requireApproval: e.target.checked })} />
+                        {t('autopilot.steps.approval')}
+                      </label>
+                    </>)}
+                  </div>
+                );
+              })}
+              <DropdownMenu>
+                <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
+                  {t('autopilot.steps.add')}
+                </DropdownMenuTrigger>
+                <DropdownMenuContent aria-label={t('autopilot.steps.add')}>
+                  {[...FORM_ACTION_TYPES, 'wait' as const].map(type => (
+                    <DropdownMenuItem key={type} onClick={() => {
+                      patch({ steps: [...form.steps, emptyStep(type, agents[0]?.name)] });
+                    }}>{type === 'wait' ? t('autopilot.steps.waitMenu') : type === 'delegate' ? t('autopilot.steps.delegate') : actionLabel(type)}</DropdownMenuItem>
+                  ))}
+                </DropdownMenuContent>
+              </DropdownMenu>
+
+            </fieldset>
           )}
 
-          {(issues.length > 0 || serverError != null) && (
-            <div
-              role="alert"
-              className="flex gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive"
-            >
-              <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden />
-              <div className="space-y-1">
-                {serverError != null && (
-                  <>
-                    <p className="font-medium">{t('autopilot.form.saveFailed')}</p>
-                    <p className="break-words">{formatErrorDetail(serverError) || formatError(serverError)}</p>
-                  </>
-                )}
-                {issues.length > 0 && (
-                  <ul className="list-disc space-y-0.5 pl-4">
-                    {issues.map((issue, i) => <li key={i}>{issueText(issue)}</li>)}
-                  </ul>
-                )}
-              </div>
-            </div>
-          )}
+
         </div>
 
         <DialogFooter>

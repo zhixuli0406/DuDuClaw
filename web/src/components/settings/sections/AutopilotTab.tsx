@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
 import { cn } from '@/lib/utils';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
+import { useUserNames } from '@/lib/use-user-names';
 import { ruleActionTarget } from '@/lib/autopilot-rules';
 import { describeHistoryResult, HISTORY_TONE_CLASS } from '@/lib/autopilot-history';
 import { toast, formatError } from '@/lib/toast';
@@ -27,6 +28,7 @@ import { AutopilotRuleDialog, useActionLabel, useTriggerLabel } from './Autopilo
 
 export function AutopilotTab() {
   const intl = useIntl();
+  const { nameOf } = useUserNames();
   useCompanyTimeZone();
   const [rules, setRules] = useState<AutopilotRule[]>([]);
   const [loading, setLoading] = useState(true);
@@ -155,18 +157,27 @@ export function AutopilotTab() {
                   />
                   <div>
                     <h4 className="font-medium text-foreground">{rule.name}</h4>
-                    <div className="mt-1 flex items-center gap-2 text-xs text-muted-foreground">
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                       <Badge variant="secondary">
                         {triggerLabel(rule.trigger_event)}
                       </Badge>
                       <span aria-hidden>→</span>
                       <Badge variant="outline">
-                        {actionLabel(rule.action?.type ?? '')}
+                        {rule.action?.type === 'steps' && Array.isArray(rule.action.steps)
+                          ? intl.formatMessage({ id: 'autopilot.steps.count' }, { count: rule.action.steps.length })
+                          : actionLabel(rule.action?.type ?? '')}
                       </Badge>
+                      {rule.created_by_user_id == null && <Badge variant="secondary">{intl.formatMessage({ id: 'autopilot.provenance.legacy' })}</Badge>}
+                      {rule.creator_access_lost === true && <Badge className="text-destructive">{intl.formatMessage({ id: 'autopilot.provenance.accessLost' })}</Badge>}
                       {ruleActionTarget(rule.action) && (
                         <span className="text-muted-foreground">({ruleActionTarget(rule.action)})</span>
                       )}
                     </div>
+                    {(rule.created_by_user_id != null || rule.updated_by_user_id != null) && (
+                      <p className="mt-1 text-xs text-muted-foreground">{intl.formatMessage({ id: 'autopilot.provenance.names' }, {
+                        creator: nameOf(rule.created_by_user_id), updater: nameOf(rule.updated_by_user_id),
+                      })}</p>
+                    )}
                   </div>
                 </div>
                 <div className="flex items-center gap-1">

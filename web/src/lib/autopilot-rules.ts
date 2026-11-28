@@ -120,6 +120,13 @@ export interface AutopilotRule {
   sequence?: unknown;
   /** Provenance of rules induced from behaviour; null for hand-authored rules. */
   metadata?: unknown;
+  active_window?: unknown;
+  run_policy?: unknown;
+  owner_department?: string | null;
+  created_by_user_id?: string | null;
+  updated_by_user_id?: string | null;
+  updated_at?: string | null;
+  creator_access_lost?: boolean | null;
 }
 
 export interface AutopilotCreateParams {
@@ -153,6 +160,8 @@ const FORM_OWNED_ACTION_KEYS = new Set([
   'type',
   'agent_id',
   'prompt_template',
+  'require_approval',
+  'minutes',
   ...Object.values(ACTION_REQUIRED_FIELDS).flat(),
 ]);
 
@@ -213,43 +222,52 @@ export interface RuleFormState {
   conditionsLocked: boolean;
   /** Set once the person changes any condition (edit mode sends conditions only then). */
   conditionsTouched: boolean;
-  /** Set when the saved action is not one of the three form actions; never re-sent. */
+  /** Unknown actions or step types stay locked and are never re-sent. */
   actionLocked: boolean;
   /** Event-sequence rules: trigger and conditions are not the form's to change. */
   sequenceRule: boolean;
-  actionType: FormActionType;
+  steps: StepDraft[];
+  /** Preserve the existing envelope and extensions even with a single step. */
+  stepsEnvelope: boolean;
+  screen?: unknown;
+  active_window?: unknown;
+  run_policy?: unknown;
+}
+
+export interface StepDraft {
+  actionType: FormActionType | 'wait';
   targetAgent: string;
   prompt: string;
   skillName: string;
   channel: string;
   chatId: string;
   text: string;
+  minutes: number;
+  requireApproval: boolean;
+  /** Unowned fields travel with the step when reordered. */
+  original?: AutopilotAction;
+}
+
+export function emptyStep(actionType: StepDraft['actionType'] = 'delegate', defaultAgent = ''): StepDraft {
+  return {
+    actionType, targetAgent: defaultAgent, prompt: '', skillName: '',
+    channel: 'telegram', chatId: '', text: '', minutes: 1, requireApproval: false,
+  };
 }
 
 export function emptyRuleForm(defaultAgent = ''): RuleFormState {
   return {
-    name: '',
-    triggerEvent: 'task_created',
-    match: 'all',
-    conditions: [],
-    conditionsLocked: false,
-    conditionsTouched: false,
-    actionLocked: false,
-    sequenceRule: false,
-    actionType: 'delegate',
-    targetAgent: defaultAgent,
-    prompt: '',
-    skillName: '',
-    channel: 'telegram',
-    chatId: '',
-    text: '',
+    name: '', triggerEvent: 'task_created', match: 'all', conditions: [],
+    conditionsLocked: false, conditionsTouched: false, actionLocked: false,
+    sequenceRule: false, steps: [emptyStep('delegate', defaultAgent)], stepsEnvelope: false,
   };
 }
 
 // ── Value parsing ───────────────────────────────────────────
 
 export type BuildIssue =
-  | { kind: 'missing'; field: string }
+  | { kind: 'missing'; field: string; step?: number }
+  | { kind: 'stepCount' | 'waitDuration' | 'waitOrder'; steps: number[] }
   | { kind: 'conditionField'; row: number }
   | { kind: 'conditionValue'; row: number }
   | { kind: 'conditionNumber'; row: number };
@@ -327,39 +345,48 @@ export function buildConditions(
   return { conditions, issues };
 }
 
-function trimmed(v: string): string {
-  return v.trim();
-}
-
-/**
- * Build the action object. `base` (the saved action when editing) keeps any
- * key the form does not own — `screen`, `context_ticks`, … — verbatim.
- */
+/** Build steps without moving per-step approval or extras onto the envelope. */
 export function buildAction(
   state: RuleFormState,
-  base?: AutopilotAction,
 ): { action: AutopilotAction; issues: BuildIssue[] } {
   const issues: BuildIssue[] = [];
-  const rest: Record<string, unknown> = {};
-  if (base) {
-    for (const [k, v] of Object.entries(base)) {
-      if (!FORM_OWNED_ACTION_KEYS.has(k)) rest[k] = v;
+  const drafts = state.steps;
+  if (drafts.length < 1 || drafts.length > 5) {
+    issues.push({ kind: 'stepCount', steps: drafts.map((_, i) => i).filter(i => i >= 5) });
+  }
+  const waits = drafts.flatMap((s, i) => s.actionType === 'wait' ? [i] : []);
+  const invalidWaits = waits.filter(i => !Number.isInteger(drafts[i].minutes) || drafts[i].minutes < 1 || drafts[i].minutes > 1440);
+  if (waits.reduce((sum, i) => sum + drafts[i].minutes, 0) > 1440) invalidWaits.push(...waits);
+  if (invalidWaits.length) issues.push({ kind: 'waitDuration', steps: [...new Set(invalidWaits)] });
+  const invalidOrder = waits.filter(i => i === drafts.length - 1 || drafts[i + 1]?.actionType === 'wait' || drafts[i - 1]?.actionType === 'wait');
+  if (invalidOrder.length) issues.push({ kind: 'waitOrder', steps: invalidOrder });
+
+  const steps = drafts.map((step, index): AutopilotAction => {
+    if (step.actionType === 'wait') return { type: 'wait', minutes: step.minutes };
+    const rest = Object.fromEntries(Object.entries(step.original ?? {}).filter(([key]) => !FORM_OWNED_ACTION_KEYS.has(key)));
+    const values: Record<string, string> = {
+      target_agent: step.targetAgent, prompt: step.prompt, skill_name: step.skillName,
+      channel: step.channel, chat_id: step.chatId, text: step.text,
+    };
+    const action: AutopilotAction = { ...rest, type: step.actionType };
+    for (const key of ACTION_REQUIRED_FIELDS[step.actionType]) {
+      // Keep untouched wire strings exact, including whitespace.
+      action[key] = step.original?.[key] === values[key] ? values[key] : values[key].trim();
+      if (!values[key].trim()) issues.push({ kind: 'missing', field: key, step: index });
     }
-  }
-  const values: Record<string, string> = {
-    target_agent: trimmed(state.targetAgent),
-    prompt: trimmed(state.prompt),
-    skill_name: trimmed(state.skillName),
-    channel: trimmed(state.channel),
-    chat_id: trimmed(state.chatId),
-    text: trimmed(state.text),
+    if (step.requireApproval || step.original?.require_approval === false) action.require_approval = step.requireApproval;
+    return action;
+  });
+  const useEnvelope = state.stepsEnvelope || steps.length !== 1 || steps[0]?.type === 'wait'
+    || drafts.some(s => s.requireApproval || s.original?.require_approval !== undefined || s.original?.params != null)
+    || state.active_window != null || state.run_policy != null;
+  if (!useEnvelope) return { action: steps[0], issues };
+  // screen belongs to the envelope, never copied to its single legacy step.
+  if (!state.stepsEnvelope) for (const step of steps) delete step.screen;
+  return {
+    action: { type: 'steps', steps, ...(state.screen !== undefined ? { screen: state.screen } : {}) },
+    issues,
   };
-  const own: Record<string, string> = {};
-  for (const key of ACTION_REQUIRED_FIELDS[state.actionType]) {
-    if (!values[key]) issues.push({ kind: 'missing', field: key });
-    own[key] = values[key];
-  }
-  return { action: { ...rest, type: state.actionType, ...own }, issues };
 }
 
 export function buildCreatePayload(
@@ -422,7 +449,7 @@ export function buildUpdatePayload(
   }
 
   if (!state.actionLocked) {
-    const act = buildAction(state, original.action);
+    const act = buildAction(state);
     issues.push(...act.issues);
     if (stableStringify(act.action) !== stableStringify(original.action)) {
       fields.action = act.action;
@@ -484,10 +511,18 @@ export function formStateFromRule(rule: AutopilotRule, defaultAgent = ''): RuleF
   const sequenceRule = rule.sequence != null;
   const parsed = conditionsToRows(rule.conditions);
   const action = rule.action ?? ({ type: '' } as AutopilotAction);
-  const actionType = (FORM_ACTION_TYPES as readonly string[]).includes(action.type)
-    ? (action.type as FormActionType)
-    : null;
+  const wireSteps = action.type === 'steps' ? action.steps : [action];
+  const editable = Array.isArray(wireSteps) && wireSteps.every(step => step && typeof step === 'object'
+    && [...FORM_ACTION_TYPES, 'wait'].includes(step.type));
   const str = (v: unknown) => (typeof v === 'string' ? v : '');
+  const steps: StepDraft[] = editable ? (wireSteps as AutopilotAction[]).map(step => ({
+    ...emptyStep(step.type as StepDraft['actionType'], defaultAgent),
+    targetAgent: str(step.target_agent) || str(step.agent_id) || defaultAgent,
+    prompt: str(step.prompt) || str(step.prompt_template), skillName: str(step.skill_name),
+    channel: str(step.channel) || 'telegram', chatId: str(step.chat_id), text: str(step.text),
+    minutes: typeof step.minutes === 'number' ? step.minutes : 1,
+    requireApproval: step.require_approval === true, original: step,
+  })) : base.steps;
   return {
     ...base,
     name: rule.name,
@@ -496,14 +531,12 @@ export function formStateFromRule(rule: AutopilotRule, defaultAgent = ''): RuleF
     conditions: parsed?.rows ?? [],
     conditionsLocked: parsed === null,
     sequenceRule,
-    actionLocked: actionType === null,
-    actionType: actionType ?? base.actionType,
-    targetAgent: str(action.target_agent) || str(action.agent_id) || base.targetAgent,
-    prompt: str(action.prompt) || str(action.prompt_template),
-    skillName: str(action.skill_name),
-    channel: str(action.channel) || base.channel,
-    chatId: str(action.chat_id),
-    text: str(action.text),
+    actionLocked: !editable,
+    steps,
+    stepsEnvelope: action.type === 'steps',
+    screen: action.screen,
+    active_window: rule.active_window,
+    run_policy: rule.run_policy,
   };
 }
 
