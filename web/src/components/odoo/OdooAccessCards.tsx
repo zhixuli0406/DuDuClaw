@@ -4,7 +4,7 @@ import { api } from '@/lib/api';
 import { type OdooAccess, type OdooAccessPatch, REFUSE_ACTIONS, REFUSE_GROUPS, refuseRows, validRefuseRule } from '@/lib/odoo-access';
 import { memberSignin, type OdooMemberCredential } from '@/lib/member-signin';
 import { useUserNames } from '@/lib/use-user-names';
-import { settingsRefusal } from '@/lib/settings-refusal';
+import { isSettingsConflict, settingsRefusal } from '@/lib/settings-refusal';
 import { formatDateTime } from '@/lib/company-time';
 import { useAgentsStore } from '@/stores/agents-store';
 import { Button, Input, SettingsCard, SettingsSection, Switch, useErrorMessage } from '@/components/mds';
@@ -20,26 +20,34 @@ export function useOdooAccess(enabled: boolean) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const saving = useRef(false);
+  const [conflict, setConflict] = useState(false);
   const errorText = useErrorMessage();
-  useEffect(() => {
-    if (!enabled) return;
-    let active = true;
-    void api.odooAccess.get().then(result => { if (active) setData(result); })
-      .catch(err => { if (active) setError(settingsRefusal(err, errorText(err))); });
-    return () => { active = false; };
-  }, [enabled, errorText]);
+  const load = useCallback(async () => {
+    if (saving.current) return;
+    saving.current = true; setBusy(true); setError(null);
+    try { setData(await api.odooAccess.get()); setConflict(false); }
+    catch (err) { setData(null); setError(settingsRefusal(err, errorText(err))); }
+    finally { saving.current = false; setBusy(false); }
+  }, [errorText]);
+  useEffect(() => { if (enabled) void load(); }, [enabled, load]);
   const save = async (patch: Partial<OdooAccessPatch>) => {
-    if (saving.current || !data?.readable) return false;
+    if (saving.current || conflict || !data?.readable || typeof data.hash !== 'string' || !data.hash) return false;
     saving.current = true;
     setBusy(true);
     setError(null);
     try {
-      setData(await api.odooAccess.set({ acknowledge_risk: false, dismiss_upgrade_notice: false, ...patch }));
+      setData(await api.odooAccess.set({ acknowledge_risk: false, dismiss_upgrade_notice: false, ...patch, expected_hash: data.hash }));
       return true;
-    } catch (err) { setError(settingsRefusal(err, errorText(err))); return false; }
+    } catch (err) {
+      const message = settingsRefusal(err, errorText(err));
+      setError(message);
+      if (isSettingsConflict(message)) setConflict(true);
+      return false;
+    }
     finally { saving.current = false; setBusy(false); }
   };
-  return { data, error, busy, save, clearError: () => setError(null) };
+  const disabled = busy || conflict || !data?.readable || typeof data.hash !== 'string' || !data.hash;
+  return { data, error, busy, disabled, conflict, load, save, clearError: () => setError(null) };
 }
 type AccessController = ReturnType<typeof useOdooAccess>;
 
@@ -48,8 +56,9 @@ export function OdooAccessNotice({ access }: { access: AccessController }) {
   return <div className="space-y-2">
     {access.data?.readable === false && <p role="alert" className="text-sm text-destructive">{t('unreadable')} {access.data.message}</p>}
     {access.error && <p role="alert" className="text-sm text-destructive">{access.error}</p>}
+    {(access.conflict || !access.data || !access.data.readable) && <Button variant="outline" disabled={access.busy} onClick={() => void access.load()}>{t('reload')}</Button>}
     {access.data?.readable && access.data.upgrade_notice_pending && <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm">
-      <p>{t('upgrade')}</p><Button variant="outline" size="sm" disabled={access.busy} onClick={() => void access.save({ dismiss_upgrade_notice: true })}>{t('dismiss')}</Button>
+      <p>{t('upgrade')}</p><Button variant="outline" size="sm" disabled={access.disabled} onClick={() => void access.save({ dismiss_upgrade_notice: true })}>{t('dismiss')}</Button>
     </div>}
   </div>;
 }
@@ -72,8 +81,9 @@ export function OdooAccessCards({ access }: { access: AccessController }) {
   const [picker, setPicker] = useState(false);
   const data = access.data?.readable ? access.data : null;
   const config = data?.config;
-  const disabled = !data || access.busy;
+  const disabled = access.disabled;
   const mode = config?.permission_mode === 'follow_odoo_account' && config.permission_mode_ack ? 'follow_odoo_account' : 'engine';
+  useEffect(() => { if (access.conflict) setRisk(null); }, [access.conflict]);
   const ask = (next: RiskAction) => { access.clearError(); setRisk(next); };
   const label = (row: ReturnType<typeof refuseRows>[number]) => {
     if (row.group) return t(`group.${row.group}`);

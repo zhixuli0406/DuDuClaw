@@ -11,7 +11,7 @@ import { MainAccessSection } from './MainAccessSection';
 
 const existing = { user_id: 'hidden-existing-id', display_name: 'Alice', email: 'alice@example.com', role: 'employee' as const,
   status: 'active' as const, granted_by_name: 'Admin Ada', granted_at: '2026-11-27T01:30:00Z' };
-const empty: MainAccess = { users: [], risk_notice: 'Server risk notice', effective: true };
+const empty: MainAccess = { hash: 'h1', users: [], risk_notice: 'Server risk notice', effective: true };
 const listed: MainAccess = { ...empty, users: [existing] };
 const candidate = { id: 'hidden-new-id', display_name: 'Bob', email: 'bob@example.com', role: 'manager', status: 'active' };
 
@@ -91,7 +91,7 @@ describe('MainAccessSection', () => {
     for (const name of ['Already listed', 'Excluded admin', 'Excluded suspended']) expect(screen.queryByRole('option', { name: new RegExp(name) })).toBeNull();
     expect(document.body.innerHTML).not.toContain('hidden-new-id');
     await user.click(screen.getByRole('button', { name: 'Add' }));
-    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([{ user_ids: [existing.user_id, candidate.id], acknowledged: true }]));
+    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([{ expected_hash: 'h1', user_ids: [existing.user_id, candidate.id], acknowledged: true }]));
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     expect(container.innerHTML).not.toContain('hidden-');
     expect(screen.getByText('Bob')).toBeInTheDocument();
@@ -102,43 +102,51 @@ describe('MainAccessSection', () => {
     const row = (await screen.findByText('Bob')).closest('tr')!;
     expect(within(row).getAllByText('—')).toHaveLength(2);
     await userEvent.click(within(row).getByRole('button', { name: 'Remove' }));
-    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([{ user_ids: [existing.user_id] }]));
+    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([{ expected_hash: 'h1', user_ids: [existing.user_id] }]));
     expect(screen.queryByRole('dialog')).toBeNull();
   });
-  it('reloads a changed list and cancels an addition without sending', async () => {
+  it.each(['設定頁的資料已過期，請重新整理後再儲存。', '設定已被其他人變更，請重新整理後再儲存。'])('locks removal on conflict until reload: %s', async message => {
     let reads = 0;
-    setup(listed, vi.fn(), () => ++reads === 1 ? listed : empty);
-    show();
-    const user = await openAdd();
-    await user.click(screen.getByRole('button', { name: 'Add' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Someone else changed the list after you loaded it. The list has been reloaded; please confirm again.');
-    expect(callsOf('agents.main_access.set')).toHaveLength(0);
-    expect(screen.queryByText('Alice')).toBeNull();
-    expect(screen.getByText('Only admins can currently use this employee.')).toBeInTheDocument();
-    expect(screen.queryByRole('dialog')).toBeNull();
-  });
-  it('reloads a changed list and cancels a removal without sending', async () => {
-    let reads = 0;
-    const fresh = { ...listed, users: [{ ...existing, user_id: candidate.id, display_name: 'Bob' }] };
-    setup(listed, vi.fn(), () => ++reads === 1 ? listed : fresh);
+    setup(listed, () => { throw new Error(message); }, () => ++reads === 1 ? listed : empty);
     show();
     await userEvent.click(await screen.findByRole('button', { name: 'Remove' }));
-    expect(await screen.findByRole('alert')).toHaveTextContent('Someone else changed the list');
-    expect(callsOf('agents.main_access.set')).toHaveLength(0);
+    expect(await screen.findByRole('alert')).toHaveTextContent(message);
+    expect(screen.getByRole('button', { name: 'Remove' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add member' })).toBeDisabled();
+    expect(callsOf('agents.main_access.get')).toHaveLength(1);
+    await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Add member' })).toBeEnabled());
     expect(screen.queryByText('Alice')).toBeNull();
-    expect(screen.getByText('Bob')).toBeInTheDocument();
+    expect(callsOf('agents.main_access.get')).toHaveLength(2);
   });
-  it('compares id sets independently of order and uses the freshly loaded order', async () => {
-    const second = { ...existing, user_id: 'second-id', display_name: 'Carol' };
-    let reads = 0;
-    setup({ ...listed, users: [existing, second] }, () => listed,
-      () => ({ ...listed, users: ++reads === 1 ? [existing, second] : [second, existing] }));
+  it('closes the add dialog on conflict and locks editing', async () => {
+    setup(listed, () => { throw new Error('設定已被其他人變更，請重新整理後再儲存。'); });
     show();
     const user = await openAdd();
     await user.click(screen.getByRole('button', { name: 'Add' }));
-    await waitFor(() => expect(callsOf('agents.main_access.set')).toEqual([
-      { user_ids: [second.user_id, existing.user_id, candidate.id], acknowledged: true },
-    ]));
+    expect(await screen.findByRole('alert')).toHaveTextContent('設定已被其他人變更，請重新整理後再儲存。');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Add member' })).toBeDisabled();
+    expect(callsOf('agents.main_access.get')).toHaveLength(1);
+  });
+  it('uses the displayed list and response hash on successive saves without re-reading', async () => {
+    setup(listed, () => ({ ...listed, hash: 'h2', users: [...listed.users, { ...existing, user_id: candidate.id, display_name: 'Bob' }] }));
+    show();
+    const user = await openAdd();
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+    const row = (await screen.findByText('Bob')).closest('tr')!;
+    await user.click(within(row).getByRole('button', { name: 'Remove' }));
+    expect(callsOf('agents.main_access.set')).toEqual([
+      { expected_hash: 'h1', user_ids: [existing.user_id, candidate.id], acknowledged: true },
+      { expected_hash: 'h2', user_ids: [existing.user_id] },
+    ]);
+    expect(callsOf('agents.main_access.get')).toHaveLength(1);
+  });
+  it('locks settings without a hash', async () => {
+    setup({ ...listed, hash: '' }); show();
+    expect(await screen.findByRole('button', { name: 'Remove' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add member' })).toBeDisabled();
+    expect(callsOf('agents.main_access.set')).toHaveLength(0);
   });
   it('shows a server refusal', async () => {
     setup(listed, () => { throw new Error('只有管理員可以修改。'); });
@@ -150,14 +158,14 @@ describe('MainAccessSection', () => {
   it('reloads a fresh list before reopening an acknowledgement refusal', async () => {
     let reads = 0;
     setup(listed, () => { throw { code: 'acknowledgement_required', message: '請重新確認加入後的影響。' }; },
-      () => ++reads < 3 ? listed : empty);
+      () => ++reads < 2 ? listed : empty);
     show();
     const user = await openAdd();
     await user.click(screen.getByRole('button', { name: 'Add' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('請重新確認加入後的影響。');
     expect(screen.queryByText('Alice')).toBeNull();
     expect(screen.getByRole('checkbox')).not.toBeChecked();
-    expect(callsOf('agents.main_access.get')).toHaveLength(3);
+    expect(callsOf('agents.main_access.get')).toHaveLength(2);
   });
   it('asks for acknowledgement again after an acknowledgement_required refusal', async () => {
     setup(listed, () => { throw { code: 'acknowledgement_required', message: '請重新確認加入後的影響。' }; });
@@ -166,7 +174,7 @@ describe('MainAccessSection', () => {
     await user.click(screen.getByRole('button', { name: 'Add' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('請重新確認加入後的影響。');
     expect(screen.getByRole('dialog')).toBeInTheDocument();
-    expect(callsOf('agents.main_access.get')).toHaveLength(3);
+    expect(callsOf('agents.main_access.get')).toHaveLength(2);
     expect(screen.getByRole('checkbox')).not.toBeChecked();
     expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
   });

@@ -12835,5 +12835,6 @@
   "odoo.permissions.permissionConfirm.attach": "The AI can attach files from its own attachment folder to this record.",
   "odoo.permissions.permissionConfirm.acknowledge": "I understand the effects of allowing this",
   "odoo.permissions.permissionConfirm.audit": "Allowing this will be recorded in the audit log.",
+  "mainAccess.reload": "Reload",
   "mainAccess.listChanged": "Someone else changed the list after you loaded it. The list has been reloaded; please confirm again."
 }

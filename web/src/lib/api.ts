@@ -2752,6 +2752,7 @@ export interface MainAccessUser {
 }
 
 export interface MainAccess {
+  hash: string;
   users: MainAccessUser[];
   risk_notice: string;
   effective: boolean;
@@ -2759,6 +2760,7 @@ export interface MainAccess {
 }
 
 export interface MainAccessSetParams {
+  expected_hash: string;
   user_ids: string[];
   acknowledged?: boolean;
 }

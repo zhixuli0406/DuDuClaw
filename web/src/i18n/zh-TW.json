@@ -12835,5 +12835,6 @@
   "odoo.permissions.permissionConfirm.attach": "AI 可以把自己附件資料夾裡的檔案附到這筆資料。",
   "odoo.permissions.permissionConfirm.acknowledge": "我了解開放後的影響",
   "odoo.permissions.permissionConfirm.audit": "開放會留下稽核紀錄。",
+  "mainAccess.reload": "重新載入",
   "mainAccess.listChanged": "名單在你載入後已被其他人修改，已重新載入，請再確認一次。"
 }

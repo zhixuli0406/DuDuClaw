@@ -12,6 +12,7 @@ export interface GoogleSigninSettings {
   ack: { by: string; at: string } | null;
 }
 export interface GoogleSigninStatus {
+  hash: string;
   settings: GoogleSigninSettings;
   redirect_uri: string | null;
   checks: {
@@ -26,8 +27,8 @@ export interface GoogleSigninStatus {
 export type GoogleSigninForm = Pick<GoogleSigninSettings, 'enabled' | 'allowed_hd' | 'approval' | 'daily_new_accounts' | 'avatar_template' | 'approval_grants_mfa_enrollment'> & { avatar_template_revision?: number };
 export const googleSignin = {
   get: () => client.call('google.signin.get', {}) as Promise<GoogleSigninStatus>,
-  set: (params: GoogleSigninForm & { acknowledge_risk?: boolean; step_up_csrf?: number[] }) =>
-    client.call('google.signin.set', { ...params }) as Promise<{ settings: GoogleSigninSettings }>,
+  set: (params: GoogleSigninForm & { expected_hash: string; acknowledge_risk?: boolean; step_up_csrf?: number[] }) =>
+    client.call('google.signin.set', { ...params }) as Promise<{ settings: GoogleSigninSettings; hash: string }>,
 };
 
 /** Sign-in request timestamps are Unix seconds. */

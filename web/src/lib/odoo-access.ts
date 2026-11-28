@@ -1,6 +1,7 @@
 export type OdooPermissionMode = 'engine' | 'follow_odoo_account';
 export type OdooAccess = { readable: false; message: string } | {
   readable: true;
+  hash: string;
   config: {
     permission_mode: OdooPermissionMode;
     permission_mode_ack: { by: string; at: string } | null;
@@ -18,6 +19,7 @@ export type OdooAccess = { readable: false; message: string } | {
   risk_text: { permission_mode: string; always_refuse: string; company_key_agents: string };
 };
 export interface OdooAccessPatch {
+  expected_hash: string;
   permission_mode?: OdooPermissionMode;
   company_key_agents?: string[];
   always_refuse?: string[];

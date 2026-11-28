@@ -37,7 +37,7 @@ beforeEach(() => {
   useAgentsStore.setState({ agents: [] });
   credentials = [{ user_id: 'secret-member-id', email: 'mei@example.com', display_name: 'Mei', login: 'mei.odoo', state: 'ok', verified_at: null, last_used_at: null }];
   data = {
-    readable: true,
+    readable: true, hash: 'h1',
     config: { permission_mode: 'engine', permission_mode_ack: null, company_key_agents: ['secret-agent-id'], company_key_agents_migrated: true, always_refuse: [...defaultRules], attachment_max_mb: 10, upgrade_notice_pending: true },
     defaults: { always_refuse: [...defaultRules] },
     fixed_refusals: ['Existing attachments', 'Field and access definitions', 'Generate Odoo keys', 'Generic mail', 'Internal framework methods'].map((reason, i) => ({ code: `F${i + 1}`, reason })),
@@ -50,7 +50,8 @@ beforeEach(() => {
     if (method === 'odoo.access_get') return Promise.resolve(unreadable ? { readable: false, message: 'Server settings are malformed' } : structuredClone(data));
     if (method === 'odoo.access_set') {
       const patch = params as OdooAccessPatch;
-      const { acknowledge_risk: _ack, dismiss_upgrade_notice, ...config } = patch;
+      const { expected_hash: _hash, acknowledge_risk: _ack, dismiss_upgrade_notice, ...config } = patch;
+      data.hash = 'h2';
       data.config = { ...data.config, ...config };
       if (patch.permission_mode === 'follow_odoo_account') data.config.permission_mode_ack = { by: 'secret-admin-id', at: '2026-11-27T14:03:00Z' };
       if (dismiss_upgrade_notice) data.upgrade_notice_pending = false;
@@ -65,11 +66,35 @@ beforeEach(() => {
 });
 
 describe('Odoo access cards', () => {
-  it('dismisses the upgrade banner with only the two flags', async () => {
+  it('dismisses the upgrade banner with the hash and two flags', async () => {
     renderWithProviders(<Harness />); await loaded();
     fireEvent.click(screen.getByRole('button', { name: 'Got it' }));
-    await waitFor(() => expect(calls('odoo.access_set')[0]?.[1]).toEqual({ dismiss_upgrade_notice: true, acknowledge_risk: false }));
+    await waitFor(() => expect(calls('odoo.access_set')[0]?.[1]).toEqual({ expected_hash: 'h1', dismiss_upgrade_notice: true, acknowledge_risk: false }));
     expect(screen.queryByText(/The company Odoo account is now/)).not.toBeInTheDocument();
+  });
+
+  it.each(['設定頁的資料已過期，請重新整理後再儲存。', '設定已被其他人變更，請重新整理後再儲存。'])('locks on conflict and reloads: %s', async message => {
+    renderWithProviders(<Harness />); await loaded();
+    mockWsClient.call.mockRejectedValueOnce(new Error(message));
+    fireEvent.click(screen.getByRole('button', { name: 'Got it' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(message);
+    expect(screen.getByRole('button', { name: 'Got it' })).toBeDisabled();
+    expect(screen.getByLabelText('Table or method')).toBeDisabled();
+    expect(screen.getByRole('radio', { name: /^Follow Odoo account/ })).toBeDisabled();
+    expect(calls('odoo.access_get')).toHaveLength(1);
+    data.hash = 'fresh';
+    fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Got it' })).toBeEnabled());
+    fireEvent.click(screen.getByRole('button', { name: 'Got it' }));
+    await waitFor(() => expect(calls('odoo.access_set')[1]?.[1]).toMatchObject({ expected_hash: 'fresh' }));
+  });
+
+  it('locks readable settings without a hash', async () => {
+    data.hash = '';
+    renderWithProviders(<Harness />); await loaded();
+    expect(screen.getByRole('button', { name: 'Got it' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Add' })).toBeDisabled();
+    expect(calls('odoo.access_set')).toHaveLength(0);
   });
 
   it('requires acknowledgement for follow mode and shows counts, audit and resolved confirmer', async () => {
@@ -79,12 +104,13 @@ describe('Odoo access cards', () => {
     for (const text of ['Skipped', 'Still enforced', 'Affected AI employees', '3 AI avatars with personal Odoo credentials', '1 AI employees using the current requester’s Odoo account']) expect(within(dialog).getByText(text)).toBeInTheDocument();
     expect(calls('odoo.access_set')).toHaveLength(0);
     await confirmRisk('Use Odoo account permissions');
-    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ permission_mode: 'follow_odoo_account', acknowledge_risk: true, dismiss_upgrade_notice: false });
+    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ expected_hash: 'h1', permission_mode: 'follow_odoo_account', acknowledge_risk: true, dismiss_upgrade_notice: false });
     expect(screen.getByText(/Last confirmed by Pat Admin/)).toBeInTheDocument();
     expect(document.body.textContent).not.toContain('secret-admin-id');
     fireEvent.click(screen.getByRole('radio', { name: /^Engine permissions/ }));
-    await waitFor(() => expect(calls('odoo.access_set')[1]?.[1]).toEqual({ permission_mode: 'engine', acknowledge_risk: false, dismiss_upgrade_notice: false }));
+    await waitFor(() => expect(calls('odoo.access_set')[1]?.[1]).toEqual({ expected_hash: 'h2', permission_mode: 'engine', acknowledge_risk: false, dismiss_upgrade_notice: false }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(calls('odoo.access_get')).toHaveLength(1);
   });
 
   it('shows the unknown impact message without invented counts', async () => {
@@ -120,7 +146,7 @@ describe('Odoo access cards', () => {
     expect(screen.getByText('Server refusal risk')).toBeInTheDocument();
     expect(screen.getByText(/Removing this may allow AI to modify other people/)).toBeInTheDocument();
     await confirmRisk('Remove');
-    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ always_refuse: defaultRules.filter(rule => !['create:res.users', 'write:res.users'].includes(rule)), acknowledge_risk: true, dismiss_upgrade_notice: false });
+    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ expected_hash: 'h1', always_refuse: defaultRules.filter(rule => !['create:res.users', 'write:res.users'].includes(rule)), acknowledge_risk: true, dismiss_upgrade_notice: false });
   });
 
   it('validates custom rules before adding without acknowledgement and restores defaults together', async () => {
@@ -134,7 +160,7 @@ describe('Odoo access cards', () => {
     fireEvent.change(screen.getByLabelText('Table or method'), { target: { value: 'crm.lead' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add' }));
     await waitFor(() => expect(calls('odoo.access_set')).toHaveLength(1));
-    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ always_refuse: [...defaultRules.filter(rule => !['create:res.groups', 'write:res.groups'].includes(rule)), 'write:crm.lead'], acknowledge_risk: false, dismiss_upgrade_notice: false });
+    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ expected_hash: 'h1', always_refuse: [...defaultRules.filter(rule => !['create:res.groups', 'write:res.groups'].includes(rule)), 'write:crm.lead'], acknowledge_risk: false, dismiss_upgrade_notice: false });
     await waitFor(() => expect(screen.getByLabelText('Table or method')).toHaveValue(''));
     fireEvent.change(screen.getByLabelText('Add a default item'), { target: { value: 'groups' } });
     await waitFor(() => expect(calls('odoo.access_set')).toHaveLength(2));
@@ -149,9 +175,9 @@ describe('Odoo access cards', () => {
     fireEvent.change(screen.getByLabelText('Choose AI employee'), { target: { value: 'secret-new-agent-id' } });
     expect(screen.getByText('Server company account risk')).toBeInTheDocument();
     await confirmRisk('Add');
-    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ company_key_agents: ['secret-agent-id', 'secret-new-agent-id'], acknowledge_risk: true, dismiss_upgrade_notice: false });
+    expect(calls('odoo.access_set')[0]?.[1]).toEqual({ expected_hash: 'h1', company_key_agents: ['secret-agent-id', 'secret-new-agent-id'], acknowledge_risk: true, dismiss_upgrade_notice: false });
     fireEvent.click(screen.getByRole('button', { name: 'Remove Alex AI' }));
-    await waitFor(() => expect(calls('odoo.access_set')[1]?.[1]).toEqual({ company_key_agents: ['secret-new-agent-id'], acknowledge_risk: false, dismiss_upgrade_notice: false }));
+    await waitFor(() => expect(calls('odoo.access_set')[1]?.[1]).toEqual({ expected_hash: 'h2', company_key_agents: ['secret-new-agent-id'], acknowledge_risk: false, dismiss_upgrade_notice: false }));
   });
 
   it('enables member credentials with acknowledgement and disables directly', async () => {

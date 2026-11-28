@@ -12835,5 +12835,6 @@
   "odoo.permissions.permissionConfirm.attach": "AI は自分の添付ファイルフォルダー内のファイルをこのレコードに添付できます。",
   "odoo.permissions.permissionConfirm.acknowledge": "許可した場合の影響を理解しました",
   "odoo.permissions.permissionConfirm.audit": "許可は監査ログに記録されます。",
+  "mainAccess.reload": "再読み込み",
   "mainAccess.listChanged": "読み込み後に他の人がリストを変更しました。再読み込みしたリストをもう一度確認してください。"
 }
