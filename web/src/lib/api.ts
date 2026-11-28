@@ -7281,7 +7281,33 @@ export interface ChatAdminSetParams {
   acknowledge_exempt_risk?: string[];
 }
 
+export interface SkillTrustPin {
+  publisher: string;
+  key_id: string;
+  added_by: string;
+  added_at: string;
+  conflicting: boolean;
+  in_trust_store: boolean;
+}
+
+export interface SkillTrustSettings {
+  publishers: { publisher: string; built_in: boolean; keys: { public_key: string; key_id: string }[] }[];
+  auto_approve: SkillTrustPin[];
+  skill_ttl_days: number | null;
+  recent_auto_approvals: {
+    id: string; slug: string; decided_at: string; publisher: string; key_id: string;
+    skills: { agent: string; name: string; digest: string }[];
+  }[];
+}
+
 export const api = {
+  skillTrust: {
+    get: () => client.call('skill_trust.get', {}) as Promise<SkillTrustSettings>,
+    pin: (params: { publisher: string; public_key: string; acknowledge_risk: true; password: string; code: string }) =>
+      client.call('skill_trust.pin', params),
+    unpin: (params: { publisher: string; key_id: string; disable_skills: boolean }) =>
+      client.call('skill_trust.unpin', params) as Promise<{ removed: boolean; disabled: number }>,
+  },
   chatAdmin: {
     get: () => client.call('approvals.chat_admin.get', {}) as Promise<ChatAdminSettings>,
     set: (params: ChatAdminSetParams) => client.call('approvals.chat_admin.set', { ...params }) as Promise<{ success: true; hash: string }>,

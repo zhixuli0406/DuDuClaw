@@ -71,6 +71,10 @@ const installedEntry: ExpertCatalogEntry = {
 
 function mockCatalog(packs: ExpertCatalogEntry[]) {
   mockWsClient.call.mockImplementation((method: string) => {
+    if (method === 'skill_trust.get') {
+      return Promise.resolve({ publishers: [], auto_approve: [], skill_ttl_days: null, recent_auto_approvals: [] });
+    }
+    if (method === 'users.list') return Promise.resolve({ users: [] });
     if (method === 'experts.list') {
       return Promise.resolve({ packs: [] });
     }
@@ -103,6 +107,7 @@ describe('ExpertsPage — built-in AI team catalog cards (P2-a)', () => {
     renderPage();
 
     expect(await screen.findByText('托嬰中心／幼兒園')).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: 'Company skill sources' })).toBeInTheDocument();
 
     // AI roster — front desk + worker, name + duty summary, both real
     // team.toml strings verbatim (never re-authored client-side).
@@ -173,5 +178,7 @@ describe('ExpertsPage — who may import', () => {
     expect(screen.queryByRole('button', { name: /Upload/i })).not.toBeInTheDocument();
     expect(mockWsClient.call).not.toHaveBeenCalledWith('experts.list', expect.anything(), expect.anything(), expect.anything());
     expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('experts.'))).toBe(false);
+    expect(screen.queryByRole('heading', { name: 'Company skill sources' })).not.toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.some(([m]) => String(m).startsWith('skill_trust.'))).toBe(false);
   });
 });

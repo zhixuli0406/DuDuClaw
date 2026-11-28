@@ -1,3 +1,4 @@
+import { SkillTrustSection } from '@/components/skills/SkillTrustSection';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
@@ -551,6 +552,7 @@ export function ExpertsPage() {
           {builtinSection}
           </>
         )}
+        <SkillTrustSection />
       </div>
 
       <ImportReportDialog
