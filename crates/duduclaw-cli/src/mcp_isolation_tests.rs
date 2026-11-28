@@ -367,29 +367,38 @@ fn isolated_round4_boot_manifest_distinguishes_refusal_from_missing_factory() {
     let home = tempfile::tempdir().unwrap();
     let dispatcher = adapter(home.path());
     let manifest = dispatcher.service_manifest();
-    // Reuse production resource-service wiring with discovery-only providers.
-    let connected_home = tempfile::tempdir().unwrap();
-    let (connected, _) = parity_tests::fixture(connected_home.path());
-    let connected_manifest = connected.service_manifest();
     assert_eq!(manifest.len(), 288);
     for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
-        let (without_provider, with_provider) = match tool.executes_in {
+        let without_provider = match tool.executes_in {
             PersonToolHost::Gateway => {
-                let refused = ServiceState::IntentionalRefusal(
-                    crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired);
-                (refused, refused)
+                ServiceState::IntentionalRefusal(
+                    crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired)
             }
             PersonToolHost::McpWithPersonalOdoo => {
                 assert_eq!(boundary_route(tool.name), Some(BoundaryRoute::Resource), "{}", tool.name);
                 assert_eq!(duduclaw_gateway::isolation_connectors::provider_for_tool(tool.name),
                     Some("odoo"), "{}", tool.name);
-                (ServiceState::MissingFactory, ServiceState::Ready)
+                ServiceState::MissingFactory
             }
         };
         assert_eq!(manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
             without_provider, "{} without provider", tool.name);
-        assert_eq!(connected_manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
-            with_provider, "{} with provider", tool.name);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // Reuse production resource-service wiring with discovery-only providers.
+        let connected_home = tempfile::tempdir().unwrap();
+        let (connected, _) = parity_tests::fixture(connected_home.path());
+        let connected_manifest = connected.service_manifest();
+        for tool in duduclaw_core::mcp_person_tools::PERSON_TOOLS {
+            let with_provider = match tool.executes_in {
+                PersonToolHost::Gateway => ServiceState::IntentionalRefusal(
+                    crate::mcp_isolation_disposition::Refusal::PersonalKeyRequired),
+                PersonToolHost::McpWithPersonalOdoo => ServiceState::Ready,
+            };
+            assert_eq!(connected_manifest.iter().find(|(name, _)| *name == tool.name).unwrap().1,
+                with_provider, "{} with provider", tool.name);
+        }
     }
     assert_eq!(manifest.iter().find(|(name, _)| *name == "file_read").unwrap().1, ServiceState::Ready);
     assert_eq!(manifest.iter().find(|(name, _)| *name == "execute_program").unwrap().1, ServiceState::MissingFactory);
