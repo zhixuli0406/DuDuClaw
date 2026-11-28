@@ -98,6 +98,36 @@ fn record_odoo_approval(grant: &duduclaw_gateway::approval::action_grant::Action
     }
 }
 
+/// Keep the broker's single-use claim and the current dispatch's execution
+/// proof together. Callers must scope approval and execution together with
+/// `with_odoo_approval_call`; outside that scope Odoo execution still denies.
+pub(super) async fn consume_bound_approval(
+    broker: &duduclaw_gateway::approval::ApprovalBroker,
+    id: &duduclaw_gateway::approval::ApprovalId,
+    grant: &duduclaw_gateway::approval::action_grant::ActionGrant,
+) -> std::result::Result<(), duduclaw_gateway::approval::action_grant::GrantRefusal> {
+    duduclaw_gateway::approval::action_grant::verify_and_consume(broker, id, grant).await?;
+    record_odoo_approval(grant);
+    Ok(())
+}
+
+/// Handler tests must reproduce the dispatch scope around both this helper
+/// and execution. Use the broker and production consume path, never inject a
+/// task-local proof directly.
+#[cfg(test)]
+pub(super) async fn approve_odoo_call_for_test(agent: &str, tool: &str, args: &Value) {
+    use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus, ApprovalStore};
+    use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY};
+    let broker = ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()));
+    let mut payload = serde_json::json!({"name": tool, "arguments": args});
+    let grant = ActionGrant::build(agent, tool, &payload);
+    payload[ACTION_GRANT_KEY] = grant.to_json();
+    let id = broker.request(agent, "mcp_call", "Odoo test approval", payload, 60).await.unwrap();
+    broker.decide(&id, true, "dashboard:admin").await.unwrap();
+    consume_bound_approval(&broker, &id, &grant).await.unwrap();
+    assert_eq!(broker.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Invalidated);
+}
+
 /// Recheck the gateway's final mode before connecting. This closes a race
 /// where local policy was Engine at the approval gate but is now Follow.
 pub(super) fn require_follow_execution_approval(agent: &str, tool: &str, args: &Value,
@@ -409,12 +439,9 @@ pub(crate) async fn run_approval_bound(
         Ok(ApprovalStatus::Approved) => match grant {
             None => InstallApprovalOutcome::Proceed,
             Some(g) => {
-                use duduclaw_gateway::approval::action_grant::{GrantRefusal, verify_and_consume};
-                match verify_and_consume(broker, &approval_id, g).await {
-                    Ok(()) => {
-                        record_odoo_approval(g);
-                        InstallApprovalOutcome::Proceed
-                    },
+                use duduclaw_gateway::approval::action_grant::GrantRefusal;
+                match consume_bound_approval(broker, &approval_id, g).await {
+                    Ok(()) => InstallApprovalOutcome::Proceed,
                     Err(refusal) => {
                         warn!(approval = %approval_id, ?refusal, "bound approval not usable — denying (fail-closed)");
                         let what = match refusal {

@@ -969,6 +969,22 @@ async fn personal_call(mode: &str, tool: &str, params: Value, home: &Path, pool:
         handle_odoo_tool(tool, &params, home, pool, "agnes")).await
 }
 
+async fn personal_call_with_required_approval(
+    mode: &str, tool: &str, params: Value, home: &Path, pool: &OdooState,
+) -> Value {
+    use super::approval::{approve_odoo_call_for_test, odoo_requires_approval,
+        with_odoo_approval_call, OdooApprovalMode};
+    // Reproduce the production dispatch scope; engine calls get no approval.
+    with_odoo_approval_call(async {
+        if mode == "follow" && odoo_requires_approval(tool,
+            &serde_json::json!({"arguments": &params}), OdooApprovalMode::FollowPossible)
+        {
+            approve_odoo_call_for_test("agnes", tool, &params).await;
+        }
+        personal_call(mode, tool, params, home, pool).await
+    }).await
+}
+
 fn follow_home(url: &str, agent: Option<&str>, rules: &str) -> tempfile::TempDir {
     let global = format!("{}member_credentials=true\n{FOLLOW_ACCESS}always_refuse={rules}\n", mock_global(url));
     let home = home_with(&global, agent);
@@ -1032,7 +1048,7 @@ async fn rm141_follow_skips_employee_tables_snapshot_and_old_blocked_method() {
         ("odoo_execute", serde_json::json!({"model":"res.partner","method":"unlink","ids":"[1]"})),
         ("odoo_search", serde_json::json!({"model":"res.partner"})),
     ] {
-        let result = personal_call("follow", tool, params.clone(), home.path(), &pool).await;
+        let result = personal_call_with_required_approval("follow", tool, params.clone(), home.path(), &pool).await;
         assert_ne!(result["isError"], true, "{tool}: {result}");
         let engine = personal_call("engine", tool, params, home.path(), &pool).await;
         assert_eq!(engine["isError"], true, "{tool}: {engine}");
@@ -1051,7 +1067,7 @@ async fn rm141_personal_access_error_has_bounded_summary_engine_keeps_old_text()
     let pool = pool();
     for mode in ["follow", "engine"] {
         // Execute preserves its empty kwargs and does not need a generic-write snapshot.
-        let result = personal_call(mode, "odoo_execute", serde_json::json!({"model":"crm.lead","method":"write","ids":"[1]"}), home.path(), &pool).await;
+        let result = personal_call_with_required_approval(mode, "odoo_execute", serde_json::json!({"model":"crm.lead","method":"write","ids":"[1]"}), home.path(), &pool).await;
         let text = text_of(&result);
         assert_eq!(result["isError"], true);
         if mode == "follow" {

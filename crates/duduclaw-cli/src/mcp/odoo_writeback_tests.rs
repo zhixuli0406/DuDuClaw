@@ -272,8 +272,9 @@ async fn dispatch_approval_gate_denies_or_sends_once_despite_allow_rule() {
 
 #[tokio::test]
 async fn message_approval_is_fixed_content_bound_and_single_use() {
+    use super::super::approval::{consume_bound_approval, with_odoo_approval_call};
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStore};
-    use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY, binding_applies, verify_and_consume};
+    use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY, binding_applies};
     let stub = Stub::start(true).await;
     let home = home(&stub, "personal", true, &[]);
     let agent_dir = home.path().join("agents/bot");
@@ -290,28 +291,90 @@ async fn message_approval_is_fixed_content_bound_and_single_use() {
     let grant = ActionGrant::build("bot", "odoo_message_send", &payload);
     let mut bound = payload.clone(); bound[ACTION_GRANT_KEY] = grant.to_json();
     let id = broker.request("bot", "mcp_call", "Send to followers", bound, 60).await.unwrap();
-    // The same gate as run_approval_bound: only consume success permits I/O.
-    if verify_and_consume(&broker, &id, &grant).await.is_ok() {
-        call(home.path(), "personal", true, "odoo_message_send", &args).await;
-    }
-    assert!(stub.writes().is_empty());
-    broker.decide(&id, true, "dashboard:admin").await.unwrap();
-    for (key, value) in [("body", json!("changed")), ("model", json!("sale.order")), ("res_id", json!(10))] {
-        let mut changed = payload.clone(); changed["arguments"][key] = value;
-        let changed_grant = ActionGrant::build("bot", "odoo_message_send", &changed);
-        assert!(verify_and_consume(&broker, &id, &changed_grant).await.is_err());
-    }
-    assert!(stub.writes().is_empty());
-    verify_and_consume(&broker, &id, &grant).await.unwrap();
-    let result = call(home.path(), "personal", true, "odoo_message_send", &args).await;
-    assert_ne!(result["isError"], true, "{result}");
-    assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
+    // This handler-level test uses the same scope and consume/record step as
+    // the real dispatcher; consuming a broker row alone is not execution proof.
+    with_odoo_approval_call(async {
+        if consume_bound_approval(&broker, &id, &grant).await.is_ok() {
+            call(home.path(), "personal", true, "odoo_message_send", &args).await;
+        }
+        assert!(stub.writes().is_empty());
+        broker.decide(&id, true, "dashboard:admin").await.unwrap();
+        for (key, value) in [("body", json!("changed")), ("model", json!("sale.order")), ("res_id", json!(10))] {
+            let mut changed = payload.clone(); changed["arguments"][key] = value;
+            let changed_grant = ActionGrant::build("bot", "odoo_message_send", &changed);
+            assert!(consume_bound_approval(&broker, &id, &changed_grant).await.is_err());
+        }
+        assert!(stub.writes().is_empty());
+        consume_bound_approval(&broker, &id, &grant).await.unwrap();
+        let result = call(home.path(), "personal", true, "odoo_message_send", &args).await;
+        assert_ne!(result["isError"], true, "{result}");
+        assert!(consume_bound_approval(&broker, &id, &grant).await.is_err());
+    }).await;
     let writes = stub.writes();
     assert_eq!(writes.len(), 1);
     assert_eq!(writes[0][6]["subtype_xmlid"], "mail.mt_comment");
     assert_eq!(writes[0][6]["message_type"], "comment");
     assert_eq!(writes[0][6]["body"], "&lt;hello&gt; @alice");
     assert!(writes[0][6].get("partner_ids").is_none());
+}
+
+#[tokio::test]
+async fn follow_approval_is_single_use_across_dispatch_scopes() {
+    use super::super::approval::{approve_odoo_call_for_test, with_odoo_approval_call};
+    for (tool, args) in [
+        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"})),
+        ("odoo_execute", json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"})),
+    ] {
+        let stub = Stub::start(true).await;
+        let home = home(&stub, "personal", true, &[]);
+        // Dispatch A consumes the approved row and executes exactly once.
+        let first = with_odoo_approval_call(async {
+            approve_odoo_call_for_test("bot", tool, &args).await;
+            call(home.path(), "personal", true, tool, &args).await
+        }).await;
+        assert_ne!(first["isError"], true, "{first}");
+        assert_eq!(stub.writes().len(), 1);
+        // Dispatch B on the same task starts empty, even for identical args.
+        let second = with_odoo_approval_call(
+            call(home.path(), "personal", true, tool, &args)).await;
+        assert_follow_approval_refused(&second);
+        // Also discard proof when an approved dispatch exits before execution.
+        with_odoo_approval_call(approve_odoo_call_for_test("bot", tool, &args)).await;
+        let after_abandoned = with_odoo_approval_call(
+            call(home.path(), "personal", true, tool, &args)).await;
+        assert_follow_approval_refused(&after_abandoned);
+        assert_eq!(stub.writes().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn follow_approval_for_other_arguments_is_refused() {
+    use super::super::approval::{approve_odoo_call_for_test, with_odoo_approval_call};
+    for (tool, args, key, changed) in [
+        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"}), "body", json!("changed")),
+        ("odoo_execute", json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"}), "ids", json!("[10]")),
+    ] {
+        let stub = Stub::start(true).await;
+        let home = home(&stub, "personal", true, &[]);
+        with_odoo_approval_call(async {
+            approve_odoo_call_for_test("bot", tool, &args).await;
+            let mut other = args.clone();
+            other[key] = changed;
+            let result = call(home.path(), "personal", true, tool, &other).await;
+            assert_follow_approval_refused(&result);
+            // A mismatch burns the in-call proof too; it cannot be retried.
+            let original = call(home.path(), "personal", true, tool, &args).await;
+            assert_follow_approval_refused(&original);
+        }).await;
+        assert!(stub.requests.lock().unwrap().is_empty(), "refused before Odoo I/O");
+    }
+}
+
+fn assert_follow_approval_refused(result: &Value) {
+    assert_eq!(result, &json!({
+        "isError": true,
+        "content": [{"type":"text", "text":"Error: 這次 Odoo 操作需要重新取得人工核准，尚未執行。"}]
+    }));
 }
 
 fn attachment_requests(stub: &Stub) -> Vec<Value> {
