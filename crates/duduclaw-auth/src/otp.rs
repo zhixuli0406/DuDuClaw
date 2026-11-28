@@ -97,6 +97,19 @@ pub enum ChannelProofStatus {
     AdminPrefilled,
 }
 
+// Shared by single-row and batch proof readers.
+const SELF_CONFIRMED_SQL: &str = "verified = 1 AND proof_method = 'chat_handshake'
+    AND proof_user_id = user_id AND proof_account IS NOT NULL AND proof_account != ''
+    AND proof_dm IS NOT NULL AND proof_dm != '' AND proven_at IS NOT NULL";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChannelIdentityWithProof {
+    #[serde(flatten)]
+    pub identity: ChannelIdentity,
+    pub proof_status: ChannelProofStatus,
+    pub proven_at: Option<String>,
+}
+
 /// The result of requesting an OTP — carries the plaintext code for the caller
 /// (RPC) to deliver over the channel, and a masked target for the UI. The code
 /// is NEVER stored in plaintext; only its hash lives in the DB.
@@ -235,15 +248,33 @@ impl UserDb {
         &self, user_id: &str, channel: &str, channel_user_id: &str,
     ) -> Result<Option<ChannelProofStatus>, String> {
         self.conn().query_row(
-            "SELECT CASE WHEN verified = 1 AND proof_method = 'chat_handshake'
-                AND proof_user_id = user_id AND proof_account IS NOT NULL AND proof_account != ''
-                AND proof_dm IS NOT NULL AND proof_dm != '' AND proven_at IS NOT NULL
-                THEN 1 ELSE 0 END FROM channel_identities
-             WHERE user_id = ?1 AND channel = ?2 AND channel_user_id = ?3",
+            &format!("SELECT CASE WHEN {SELF_CONFIRMED_SQL} THEN 1 ELSE 0 END
+                FROM channel_identities WHERE user_id = ?1 AND channel = ?2 AND channel_user_id = ?3"),
             params![user_id, channel, channel_user_id],
             |r| Ok(if r.get::<_, bool>(0)? { ChannelProofStatus::SelfConfirmed }
                 else { ChannelProofStatus::AdminPrefilled }),
         ).optional().map_err(|e| e.to_string())
+    }
+
+    /// The Admin list keeps its verified-only membership and reads proof in the same query.
+    pub fn verified_channels_with_proof(&self, user_id: &str) -> Result<Vec<ChannelIdentityWithProof>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!("SELECT user_id, channel, channel_user_id, verified, created_at,
+            CASE WHEN {SELF_CONFIRMED_SQL} THEN proven_at ELSE NULL END
+            FROM channel_identities WHERE user_id=?1 AND verified=1 ORDER BY created_at ASC"))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt.query_map([user_id], |r| Ok((ChannelIdentity {
+            user_id: r.get(0)?, channel: r.get(1)?, channel_user_id: r.get(2)?,
+            verified: r.get(3)?, created_at: r.get(4)?,
+        }, r.get::<_, Option<i64>>(5)?))).map_err(|e| e.to_string())?;
+        rows.map(|row| {
+            let (identity, epoch) = row.map_err(|e| e.to_string())?;
+            let proven_at = epoch.map(|value| DateTime::<Utc>::from_timestamp(value, 0)
+                .map(|time| time.to_rfc3339()).ok_or_else(|| "invalid proof timestamp".to_owned())).transpose()?;
+            Ok(ChannelIdentityWithProof { identity, proof_status: if proven_at.is_some() {
+                ChannelProofStatus::SelfConfirmed
+            } else { ChannelProofStatus::AdminPrefilled }, proven_at })
+        }).collect()
     }
 
     // ── Channel identity binding ─────────────────────────────────
@@ -820,6 +851,35 @@ mod tests {
     fn make_user(db: &UserDb) -> User {
         db.create_user("boss@example.com", "Boss", "pw-unused-123456", UserRole::Admin)
             .unwrap()
+    }
+
+    #[test]
+    fn channel_identity_batch_proof_matches_single_reader() {
+        let (db, _home) = db();
+        let user = make_user(&db);
+        for id in ["prefilled", "proven", "wrong-owner"] {
+            db.bind_channel_identity(&user.id, "telegram", id, true).unwrap();
+        }
+        db.conn().execute("UPDATE channel_identities SET proof_method='chat_handshake',
+            proof_user_id=?1,proof_account='bot',proof_dm='dm',proven_at=1700000000
+            WHERE channel_user_id IN ('proven','wrong-owner')", [&user.id]).unwrap();
+        db.conn().execute("UPDATE channel_identities SET proof_user_id='someone-else'
+            WHERE channel_user_id='wrong-owner'", []).unwrap();
+        let rows = db.verified_channels_with_proof(&user.id).unwrap();
+        assert_eq!(rows.len(), 3);
+        for row in rows {
+            let proven = row.identity.channel_user_id == "proven";
+            assert_eq!(row.proof_status, if proven { ChannelProofStatus::SelfConfirmed } else { ChannelProofStatus::AdminPrefilled });
+            assert_eq!(row.proven_at.as_deref(), if proven { Some("2023-11-14T22:13:20+00:00") } else { None });
+            assert_eq!(db.channel_identity_proof_status(&user.id, "telegram", &row.identity.channel_user_id).unwrap(), Some(row.proof_status));
+            let value = serde_json::to_value(row).unwrap();
+            assert!(value.get("proof_account").is_none());
+            assert!(value.get("proof_dm").is_none());
+        }
+        db.conn().execute("UPDATE channel_identities SET proven_at=9223372036854775807 WHERE channel_user_id='proven'", []).unwrap();
+        assert!(db.verified_channels_with_proof(&user.id).is_err());
+        db.conn().execute("DROP TABLE channel_identities", []).unwrap();
+        assert!(db.verified_channels_with_proof(&user.id).is_err());
     }
 
     #[test]
