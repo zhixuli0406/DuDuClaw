@@ -8,6 +8,7 @@ pub(super) struct EmailBody {
     enrollment_token: Option<String>,
     password: Option<String>,
     code: Option<String>,
+    proof_code: Option<String>,
 }
 impl EmailBody {
     fn capability(&self) -> Option<(&str,bool)> {
@@ -37,8 +38,15 @@ pub(super) async fn send(State(state):State<Arc<AppState>>,ConnectInfo(addr):Con
     let check=state.clone();
     let capability=token.clone();
     let password=body.password.clone();
-    let checked=tokio::task::spawn_blocking(move || check.user_db.mfa_email_http_capability(
-        &capability,enrollment,password.as_deref(),chrono::Utc::now().timestamp())).await;
+    let proof_code=body.proof_code.clone();
+    let checked=tokio::task::spawn_blocking(move || -> Result<(),String> {
+        let now=chrono::Utc::now().timestamp();
+        if enrollment {
+            check.user_db.mfa_http_enrollment(&capability,password.as_deref(),now)?;
+            check.user_db.mfa_prove_enrollment(&capability,proof_code.as_deref().unwrap_or(""),now)?;
+        }
+        check.user_db.mfa_email_http_capability(&capability,enrollment,password.as_deref(),now)
+    }).await;
     if !matches!(checked,Ok(Ok(()))) {return denied();}
     if !crate::mfa_email::available(&state.home_dir) {return unavailable();}
     let work=state.clone();
@@ -69,8 +77,15 @@ pub(super) async fn verify(State(state):State<Arc<AppState>>,ConnectInfo(addr):C
     let check=state.clone();
     let capability=token.clone();
     let password=body.password.clone();
-    let checked=tokio::task::spawn_blocking(move || check.user_db.mfa_email_http_capability(
-        &capability,enrollment,password.as_deref(),chrono::Utc::now().timestamp())).await;
+    let proof_code=body.proof_code.clone();
+    let checked=tokio::task::spawn_blocking(move || -> Result<(),String> {
+        let now=chrono::Utc::now().timestamp();
+        if enrollment {
+            check.user_db.mfa_http_enrollment(&capability,password.as_deref(),now)?;
+            check.user_db.mfa_prove_enrollment(&capability,proof_code.as_deref().unwrap_or(""),now)?;
+        }
+        check.user_db.mfa_email_http_capability(&capability,enrollment,password.as_deref(),now)
+    }).await;
     if !matches!(checked,Ok(Ok(()))) {return denied();}
     let personal=state.handler.resolve_edition_profile().await.is_personal();
     if crate::mfa::enforced(&state.home_dir,personal).is_err() {return denied();}
@@ -101,6 +116,15 @@ pub(super) async fn verify(State(state):State<Arc<AppState>>,ConnectInfo(addr):C
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn email_http_accepts_independent_enrollment_proof_code() {
+        let body=serde_json::from_value::<EmailBody>(serde_json::json!({
+            "enrollment_token":"a".repeat(64),"proof_code":"admin-code","code":"123456"
+        })).unwrap();
+        assert_eq!(body.proof_code.as_deref(),Some("admin-code"));
+        assert_eq!(body.capability().unwrap().1,true);
+    }
+
     #[test]
     fn email_http_requires_exactly_one_capability() {
         let token="a".repeat(64);

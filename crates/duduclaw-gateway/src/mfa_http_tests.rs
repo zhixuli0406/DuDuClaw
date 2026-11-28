@@ -1320,7 +1320,10 @@ async fn mfa_email_http_verify_succeeds_after_smtp_config_is_removed() {
 async fn mfa_enforced_email_user_can_add_totp_without_another_proof() {
     let (_dir,state,user)=fixture(false,true).await;
     let now=chrono::Utc::now().timestamp();
-    let token=state.user_db.mfa_factor_password_challenge(&user.id,"correct horse battery","setup",now).unwrap();
+    let token=state.user_db.mfa_password_challenge(&user.id,"correct horse battery","setup",now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,true,now).unwrap();
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,&duduclaw_auth::mfa::enrollment_challenge_ref(&token),now).unwrap();
+    state.user_db.mfa_prove_enrollment(&token,&proof,now).unwrap();
     let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
     state.user_db.mfa_email_verify_and_issue(&token,&code,true,now,|_,_,_|Ok(())).unwrap();
     let user=state.user_db.get_user(&user.id).unwrap().unwrap();
@@ -1402,4 +1405,31 @@ async fn member_key_creation_consumes_a_fresh_recovery_factor() {
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: true, .. }));
     assert!(matches!(call(codes[0].clone()).await, WsFrame::Response { ok: false, .. }));
     assert_eq!(state.user_db.member_api_keys_for_user(&member.id).unwrap().len(), 1);
+}
+
+
+#[tokio::test]
+async fn mfa_email_http_first_enrollment_processes_proof_before_delivery_and_issues_tokens() {
+    let (_dir,state,user)=fixture(false,true).await;
+    let now=chrono::Utc::now().timestamp();
+    let token=state.user_db.mfa_challenge(&user.id,duduclaw_auth::mfa::FirstFactor::Password,true,now).unwrap();
+    state.user_db.mfa_prepare_enrollment(&token,true,now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token})).unwrap();
+    let (status,value)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    assert_eq!(status,StatusCode::UNAUTHORIZED);
+    assert!(value.get("access_token").is_none());
+    assert!(!state.user_db.mfa_active(&user.id).unwrap());
+    let proof=state.user_db.mfa_issue_enrollment_code(None,&user.id,&duduclaw_auth::mfa::enrollment_challenge_ref(&token),now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token,"proof_code":proof})).unwrap();
+    let (status,_)=body(super::super::server_mfa_email::send(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    // No sender is configured: the request gets past proof validation, but
+    // cannot deliver. Create the private delivery data through the real DB API.
+    assert_eq!(status,StatusCode::SERVICE_UNAVAILABLE);
+    let (_,code)=state.user_db.mfa_email_send(&token,true,now).unwrap();
+    let payload=serde_json::from_value(json!({"enrollment_token":token,"proof_code":proof,"code":code})).unwrap();
+    let (status,value)=body(super::super::server_mfa_email::verify(State(state.clone()),ConnectInfo(peer(239)),Json(payload)).await).await;
+    assert_eq!(status,StatusCode::OK);
+    assert!(state.jwt_config.verify_access_token(value["access_token"].as_str().unwrap()).is_ok());
+    assert!(value["refresh_token"].is_string());
+    assert_eq!(value["recovery_codes"].as_array().unwrap().len(),10);
 }

@@ -88,8 +88,8 @@ export const mfaApi = {
     }
   },
   emailVerify: (input: Record<string, unknown>) => apiPost<SessionTokens & { recovery_codes?: string[] }>('/api/mfa/email/verify', input),
-  emailBegin: (password: string) => client.call('mfa.email_begin', { password }) as Promise<{ enrollment_token: string }>,
-  emailConfirm: (enrollment_token: string, code: string) => client.call('mfa.email_confirm', { enrollment_token, code }) as Promise<SessionTokens & { recovery_codes?: string[] }>,
+  emailBegin: (input: EnrollmentInput) => client.call('mfa.email_begin', { ...input }) as Promise<Enrollment & { sent?: boolean }>,
+  emailConfirm: (enrollment_token: string, code: string, proof_code?: string) => client.call('mfa.email_confirm', { enrollment_token, code, ...(proof_code ? { proof_code } : {}) }) as Promise<SessionTokens & { recovery_codes?: string[] }>,
   emailRemove: (password: string) => client.call('mfa.email_remove', { password }) as Promise<SessionTokens>,
   httpBegin: (input: EnrollmentInput) => apiPost<Enrollment>('/api/mfa/enroll/begin', { ...input }),
   httpConfirm: (input: EnrollmentInput) => apiPost<SessionTokens & RecoveryResult>('/api/mfa/enroll/confirm', { ...input }),

@@ -290,3 +290,38 @@ fn bootstrap_migration_keeps_a_never_enrolled_installation_open() {
     let db = UserDb::new(&path).unwrap();
     assert!(!db.mfa_bootstrap_closed().unwrap());
 }
+
+#[test]
+fn bootstrap_setup_code_completes_email_enrollment_and_cannot_be_reused() {
+    let (_dir,db,owner)=fresh();
+    let token=login_challenge(&db,&owner,3000);
+    assert!(db.mfa_email_send(&token,true,3000).is_err());
+    let setup=db.mfa_issue_bootstrap_token("test",3000).unwrap().unwrap();
+    db.mfa_prove_bootstrap(&token,&setup,3000).unwrap();
+    db.mfa_prove_enrollment(&token,"",3000).unwrap();
+    let other=login_challenge(&db,&owner,3000);
+    assert!(db.mfa_prove_bootstrap(&other,&setup,3000).is_err());
+    let (_,code)=db.mfa_email_send(&token,true,3000).unwrap();
+    let recovery=db.mfa_email_verify_and_issue(&token,&code,true,3000,|_,_,codes|Ok(codes)).unwrap();
+    assert_eq!(recovery.len(),10);
+    assert!(db.mfa_bootstrap_closed().unwrap());
+    assert!(db.mfa_email_verify_and_issue(&token,&code,true,3000,|_,_,_| -> Result<()> {
+        panic!("replayed bootstrap issued tokens")
+    }).is_err());
+}
+
+#[test]
+fn bootstrap_email_write_rechecks_window_after_delivery() {
+    let (_dir,db,owner)=fresh();
+    let other=db.create_user("other@example.test","Other",PASSWORD,UserRole::Admin).unwrap();
+    let token=login_challenge(&db,&owner,3000);
+    let setup=db.mfa_issue_bootstrap_token("test",3000).unwrap().unwrap();
+    db.mfa_prove_bootstrap(&token,&setup,3000).unwrap();
+    let (_,code)=db.mfa_email_send(&token,true,3000).unwrap();
+    give_factor(&db,&other.id);
+    assert!(db.mfa_email_send(&token,true,3060).is_err());
+    assert!(db.mfa_email_verify_and_issue(&token,&code,true,3001,|_,_,_| -> Result<()> {
+        panic!("closed bootstrap issued tokens")
+    }).is_err());
+    assert!(!db.mfa_active(&owner).unwrap());
+}

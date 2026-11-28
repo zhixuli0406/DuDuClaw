@@ -98,7 +98,15 @@ impl MethodHandler {
                         db.verify_password(&user.email,password)?;
                         db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                         token.to_owned()
-                    } else {db.mfa_factor_password_challenge(&id,password,session.as_deref().unwrap(),now)?};
+                    } else {
+                        let token=db.mfa_password_challenge(&id,password,session.as_deref().unwrap(),now)?;
+                        let delivery=db.mfa_prepare_enrollment(&token,required,now)?;
+                        if required && !db.mfa_active(&id)? {
+                            return Ok(json!({"enrollment_token":token,"challenge_ref":duduclaw_auth::mfa::enrollment_challenge_ref(&token),"proof_required":true,"_delivery":delivery.map(|o|json!({"channel":o.channel,"target":o.channel_user_id,"code":o.code}))}));
+                        }
+                        token
+                    };
+                    db.mfa_prove_enrollment(&token,params.get("proof_code").and_then(Value::as_str).unwrap_or(""),now)?;
                     let (email,code)=db.mfa_email_send(&token,true,now)?;
                     Ok(json!({"enrollment_token":token,"sent":true,"expires_in":600,"_email":{"email":email,"code":code,"token":token}}))
                 },
@@ -107,6 +115,7 @@ impl MethodHandler {
                     let token=params.get("enrollment_token").and_then(Value::as_str).ok_or("缺少註冊憑證。")?;
                     db.mfa_check_session(token,&id,session.as_deref().unwrap(),now)?;
                     let code=params.get("code").and_then(Value::as_str).unwrap_or("");
+                    db.mfa_prove_enrollment(token,params.get("proof_code").and_then(Value::as_str).unwrap_or(""),now)?;
                     let jwt=jwt.as_ref().ok_or("登入服務無法使用。")?;
                     db.mfa_email_verify_and_issue(token,code,true,now,|user,access,codes| {
                         crate::mfa::replacement_session(jwt,user,access,previous_epoch,codes,true)

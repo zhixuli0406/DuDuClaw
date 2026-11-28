@@ -21,3 +21,16 @@ it('uses the browser reason for a WebAuthn availability error', () => {
   vi.stubGlobal('PublicKeyCredential', undefined);
   expect(mfaErrorId(new Error('PASSKEY_UNAVAILABLE'))).toBe('mfa.passkey.unsupported_browser');
 });
+
+
+it('serializes proof_code for Email enrollment send and verify', async () => {
+  const fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ sent: true }) });
+  vi.stubGlobal('fetch', fetch);
+  const input = { enrollment_token: 'enroll', password: 'password', proof_code: 'proof' };
+  await mfaApi.emailSend(input);
+  await mfaApi.emailVerify({ ...input, code: '123456' });
+  expect(fetch.mock.calls.map(([path, init]) => [path, JSON.parse(init.body)])).toEqual([
+    ['/api/mfa/email/send', input],
+    ['/api/mfa/email/verify', { ...input, code: '123456' }],
+  ]);
+});

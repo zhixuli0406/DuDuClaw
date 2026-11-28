@@ -288,10 +288,14 @@ fn google_oidc_email_login_refused() {
 }
 
 #[test]
-fn password_email_unchanged() {
+fn password_email_enforced_enrollment_requires_admin_proof() {
     let (_dir, db, admin, _user, _request) = approved(false);
     let token = prepare(&db,&admin,FirstFactor::Password,NOW);
     assert_eq!(proof(&db,&token),("admin".into(),false));
+    assert!(db.mfa_email_http_capability(&token,true,None,NOW).is_err());
+    assert!(db.mfa_email_send(&token,true,NOW).is_err());
+    let proof=db.mfa_issue_enrollment_code(None,&admin,&enrollment_challenge_ref(&token),NOW).unwrap();
+    db.mfa_prove_enrollment(&token,&proof,NOW).unwrap();
     db.mfa_email_http_capability(&token,true,None,NOW).unwrap();
     let (address,code) = db.mfa_email_send(&token,true,NOW).unwrap();
     assert_eq!(address,db.get_user(&admin).unwrap().unwrap().email);

@@ -9,7 +9,7 @@ import { RecoveryCodes } from './MfaEnrollment';
 
 export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, emailAvailable, emailUnavailableReason, proofDone, onComplete, onCancel }: {
   factor: 'email' | 'passkey'; enrollmentToken: string; challengeRef?: string; emailAvailable?: boolean; emailUnavailableReason?: string | null;
-  /** First-time setup was already confirmed on this machine or with the setup code. */
+  /** Independent proof was already confirmed with the host setup code. */
   proofDone?: boolean;
   onComplete: (tokens: SessionTokens) => Promise<void>; onCancel: () => void;
 }) {
@@ -26,12 +26,12 @@ export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, e
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setBusy(true); setError('');
     try {
-      const input = { enrollment_token: enrollmentToken, password };
+      const input = { enrollment_token: enrollmentToken, password, proof_code: proof };
       if (factor === 'email') {
         if (!sent) { await mfaApi.emailSend(input); setSent(true); }
         else { const tokens = await mfaApi.emailVerify({ ...input, code }); if (tokens.recovery_codes?.length) setResult(tokens); else await onComplete(tokens); }
       } else {
-        const start = await apiPost<{ ceremony_id: string; publicKey: CreationOptionsJSON }>('/api/mfa/passkey/register/begin', { ...input, proof_code: proof, name });
+        const start = await apiPost<{ ceremony_id: string; publicKey: CreationOptionsJSON }>('/api/mfa/passkey/register/begin', { ...input, name });
         const credential = await createPasskey(start.publicKey);
         const tokens = await apiPost<SessionTokens & { recovery_codes?: string[] }>('/api/mfa/passkey/register/finish', { enrollment_token: enrollmentToken, ceremony_id: start.ceremony_id, credential });
         if (tokens.recovery_codes?.length) setResult(tokens); else await onComplete(tokens);
@@ -44,16 +44,16 @@ export function AlternativeEnrollment({ factor, enrollmentToken, challengeRef, e
     <h3>{t(`mfa.factor.${factor}`)}</h3>
     {error && <p role="alert" className="text-destructive">{error}</p>}
     <label className="block space-y-2">{t('mfa.password')}<Input type="password" autoComplete="current-password" maxLength={4096} value={password} onChange={e => setPassword(e.target.value)} required /></label>
+    {!proofDone && <>
+      <p className="text-sm">{t('mfa.proof.hint')}</p>
+      {challengeRef && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{challengeRef}</code></p>}
+      <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={proof} onChange={e => setProof(e.target.value)} required /></label>
+    </>}
     {factor === 'email' ? <>
       <p className="text-sm">{t('mfa.email.enrollHint')}</p>
       {emailAvailable === false && <DisabledFactorExplanation factor="email" reason={emailUnavailableReason} />}
       {sent && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} required pattern="[0-9]{6}" /></label>}
     </> : <>
-      {!proofDone && <>
-        <p className="text-sm">{t('mfa.proof.hint')}</p>
-        {challengeRef && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{challengeRef}</code></p>}
-        <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={proof} onChange={e => setProof(e.target.value)} required /></label>
-      </>}
       <label className="block space-y-2">{t('mfa.passkey.name')}<Input value={name} maxLength={80} onChange={e => setName(e.target.value)} required /></label>
       {!passkeyAvailable() && <DisabledFactorExplanation factor="passkey" />}
     </>}

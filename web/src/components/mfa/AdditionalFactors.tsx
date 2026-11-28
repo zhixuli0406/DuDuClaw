@@ -4,7 +4,7 @@ import { useIntl } from 'react-intl';
 import { Button, Input } from '@/components/mds';
 import { useConnectionStore } from '@/stores/connection-store';
 import { useAuthStore, type SessionTokens } from '@/stores/auth-store';
-import { accountRequest, mfaApi, mfaErrorId, type MfaStatus } from '@/lib/mfa-api';
+import { accountRequest, mfaApi, mfaErrorId, type MfaStatus, type Enrollment } from '@/lib/mfa-api';
 import { createPasskey, passkeyAvailable, type CreationOptionsJSON } from '@/lib/passkey';
 import { RecoveryCodes } from './MfaEnrollment';
 
@@ -15,7 +15,8 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
   const [code, setCode] = useState('');
-  const [enrollment, setEnrollment] = useState('');
+  const [enrollment, setEnrollment] = useState<Enrollment & { sent?: boolean } | null>(null);
+  const [emailProof, setEmailProof] = useState('');
   const [passkeys, setPasskeys] = useState<Passkey[]>([]);
   const [available, setAvailable] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -63,12 +64,24 @@ export function AdditionalFactors({ status, onChange }: { status: MfaStatus; onC
       {!status.email_available && <DisabledFactorExplanation factor="email" reason={status.email_unavailable_reason} fingerprint={status.relay_key_fingerprint} />}
       {status.factors?.email ? <Button variant="outline" disabled={busy || !password || removeDisabled} onClick={() => void run(async () => replace(await mfaApi.emailRemove(password)))}>{t('mfa.email.remove')}</Button> : <>
         <p className="text-sm">{t('mfa.email.enrollHint')}</p>
-        {enrollment && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>}
-        <Button variant="outline" disabled={busy || !status.email_available || (enrollment ? code.length !== 6 : !password)} onClick={() => void run(async () => {
-          if (!enrollment) setEnrollment((await mfaApi.emailBegin(password)).enrollment_token);
-          else { const result = await mfaApi.emailConfirm(enrollment, code); replace(result); if (result.recovery_codes?.length) setCodes(result.recovery_codes); setEnrollment(''); }
-        })}>{t(enrollment ? 'mfa.confirm' : 'mfa.email.add')}</Button>
-        {enrollment && <p role="status" className="text-sm">{t('mfa.email.sent')}</p>}
+        {enrollment?.proof_required && !enrollment.sent && <>
+          <p className="text-sm">{t('mfa.proof.hint')}</p>
+          {enrollment.challenge_ref && <p className="break-all text-sm">{t('mfa.challengeRef')}: <code>{enrollment.challenge_ref}</code></p>}
+          <label className="block space-y-2">{t('mfa.proof')}<Input autoComplete="off" value={emailProof} onChange={e => setEmailProof(e.target.value)} /></label>
+        </>}
+        {enrollment?.sent && <label className="block space-y-2">{t('mfa.factor.email')}<Input autoComplete="one-time-code" inputMode="numeric" value={code} onChange={e => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))} /></label>}
+        <Button variant="outline" disabled={busy || !status.email_available || (enrollment?.sent ? code.length !== 6 : !password || (!!enrollment?.proof_required && !emailProof))} onClick={() => void run(async () => {
+          if (!enrollment?.sent) {
+            const start = await mfaApi.emailBegin({ password, ...(enrollment ? { enrollment_token: enrollment.enrollment_token, proof_code: emailProof } : {}) });
+            setEnrollment(start);
+            if (start.proof_required && !start.sent) return true;
+          } else {
+            const result = await mfaApi.emailConfirm(enrollment.enrollment_token, code, emailProof);
+            replace(result); if (result.recovery_codes?.length) setCodes(result.recovery_codes);
+            setEnrollment(null); setEmailProof('');
+          }
+        })}>{t(enrollment?.sent ? 'mfa.confirm' : 'mfa.email.add')}</Button>
+        {enrollment?.sent && <p role="status" className="text-sm">{t('mfa.email.sent')}</p>}
       </>}
     </div>
     <div className="space-y-3">

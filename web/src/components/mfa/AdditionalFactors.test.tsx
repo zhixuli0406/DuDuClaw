@@ -49,3 +49,36 @@ it('shows the installation key fingerprint while the relay awaits console approv
   expect(await screen.findByText(/approve this installation in the license console/)).toBeInTheDocument();
   expect(screen.getByTestId('relay-key-fingerprint')).toHaveTextContent('Installation key fingerprint: 1a2b-3c4d-5e6f-7a8b');
 });
+
+
+it('prepares independent proof before sending the first Email enrollment code', async () => {
+  vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
+  const begin = vi.spyOn(transport.mfaApi, 'emailBegin')
+    .mockResolvedValueOnce({ enrollment_token: 'enroll', challenge_ref: 'email-ref', proof_required: true })
+    .mockResolvedValueOnce({ enrollment_token: 'enroll', sent: true });
+  renderWithProviders(<AdditionalFactors status={{ enabled: false, enforced: true, factors: { totp: false, email: false, passkey: false }, email_available: true }} onChange={vi.fn().mockResolvedValue(undefined)} />);
+  fireEvent.change(screen.getByLabelText('Password to change verification methods'), { target: { value: 'password' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Set up email verification' }));
+  expect(await screen.findByText('email-ref')).toBeInTheDocument();
+  expect(screen.getByLabelText('Password to change verification methods')).toHaveValue('password');
+  expect(screen.queryByRole('button', { name: 'Confirm' })).toBeNull();
+  fireEvent.change(screen.getByLabelText('Channel or Admin enrollment code'), { target: { value: 'proof' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Set up email verification' }));
+  await screen.findByRole('button', { name: 'Confirm' });
+  expect(begin).toHaveBeenLastCalledWith({ password: 'password', enrollment_token: 'enroll', proof_code: 'proof' });
+});
+
+it('adds Email to an existing factor without an independent proof code', async () => {
+  vi.spyOn(transport, 'accountRequest').mockResolvedValue({ passkeys: [], available: true });
+  const begin = vi.spyOn(transport.mfaApi, 'emailBegin').mockResolvedValue({ enrollment_token: 'enroll', sent: true });
+  const confirm = vi.spyOn(transport.mfaApi, 'emailConfirm').mockImplementation(() => new Promise(() => {}));
+  renderWithProviders(<AdditionalFactors status={{ enabled: true, enforced: true, factors: { totp: true, email: false, passkey: false }, email_available: true }} onChange={vi.fn().mockResolvedValue(undefined)} />);
+  fireEvent.change(screen.getByLabelText('Password to change verification methods'), { target: { value: 'password' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Set up email verification' }));
+  await screen.findByRole('button', { name: 'Confirm' });
+  expect(begin).toHaveBeenCalledWith({ password: 'password' });
+  expect(screen.queryByLabelText('Channel or Admin enrollment code')).toBeNull();
+  fireEvent.change(screen.getByLabelText('Email verification code'), { target: { value: '123456' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+  await waitFor(() => expect(confirm).toHaveBeenCalledWith('enroll', '123456', ''));
+});

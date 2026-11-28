@@ -785,14 +785,14 @@ Dashboard 註冊改為 `mfa.enroll_begin {password}`，在 blocking pool 驗證�
 
 **已知限制：設定碼指令擋不住有 Bash 的 AI 員工（v1.82.0）。** `duduclaw ops users mfa-setup-code` 在 AI 工作階段中會拒絕，Bash 通道也會擋下員工與身分未驗證的呼叫者，而且只在標準輸出是互動式終端機時才印出設定碼。但被授予 Bash 的 AI 員工與操作者是同一個作業系統身分：它可以清掉工作階段環境變數、換個寫法讓 Bash 通道的文字比對對不上，再用虛擬終端機（例如 `script`）包住指令執行。這些檢查是減速帶，不是隔離，和守衛 1 所說的 Bash 通道相同。後果：首次設定尚未關閉時，有 Bash、又知道第一位管理員密碼的 AI 員工，可以取得設定碼並替該帳號註冊第二因素。目前可用的緩解：不要把 Bash 給不該接觸主機指令列的員工，或讓它們在[任務沙箱](../../guides/zh-TW/task-sandbox.md)中執行；留意 auth 稽核紀錄中不是你造成的 `mfa.bootstrap_code_issued`。規劃中：改由以獨立作業系統身分執行的特權輔助程式核發設定碼（規劃於之後的版本，v1.83.0 不包含）。
 
-Enterprise 強制期間，首次註冊驗證器／通行金鑰還需獨立證明。只有已記錄且早於強制啟用時間的已驗證通道綁定，系統透過既有通道服務送出另一組 OTP，以 `proof_code` 提交；沒有綁定者，由另一位目前有效的 Admin 呼叫 `users.mfa_enrollment_code {user_id,challenge_ref}` 核發一次性註冊碼並交給本人。註冊碼綁定帳號及指定的待完成 challenge、雜湊保存、5 分鐘有效、只顯示一次並留下稽核，不能自行核發。最後一位管理員可在主機執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`。證明綁定該次第一因素 challenge、同時到期、最多 5 次嘗試，成功後不能移用至其他 challenge。若第一因素是通道 OTP，註冊時還必須提供目前 `password`，避免同一通道的兩組碼被當成獨立因素。
+Enterprise 強制期間，首次註冊驗證器／通行金鑰／Email 還需獨立證明。只有已記錄且早於強制啟用時間的已驗證通道綁定，系統透過既有通道服務送出另一組 OTP，以 `proof_code` 提交；沒有綁定者，由另一位目前有效的 Admin 呼叫 `users.mfa_enrollment_code {user_id,challenge_ref}` 核發一次性註冊碼並交給本人。註冊碼綁定帳號及指定的待完成 challenge、雜湊保存、5 分鐘有效、只顯示一次並留下稽核，不能自行核發。最後一位管理員可在主機執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>`。證明綁定該次第一因素 challenge、同時到期、最多 5 次嘗試，成功後不能移用至其他 challenge。若第一因素是通道 OTP，註冊時還必須提供目前 `password`，避免同一通道的兩組碼被當成獨立因素。
 
 強制期間未註冊者登入只取得 `mfa_enrollment_required`、`enrollment_token` 與 12 字元 `challenge_ref`，沒有 session token。呼叫 `/api/mfa/enroll/begin {enrollment_token,proof_code}` 後，再呼叫 `/api/mfa/enroll/confirm {enrollment_token,code}`；通道 OTP 登入者兩次都要帶 `password`。Dashboard 強制註冊的第一次 begin 回傳 `proof_required`、`enrollment_token` 與 `challenge_ref`，再以 `password`、該 token 及 `proof_code` 重呼 begin，才取得 `secret` 與 `otpauth_uri`。Confirm 才會啟用。註冊憑證不能登入 `/ws`、refresh 或一般 HTTP；dashboard 的註冊憑證也不能拿去 HTTP 註冊路由換 session。
 
 已註冊者的密碼與通道 OTP 登入回傳 `mfa_required`、`challenge_id` 與可用因素資料。`/api/mfa/verify` 接受 challenge 及 `code`／`recovery_code` 二擇一。Challenge 綁定帳號與第一因素，持久保存、單次成功、5 分鐘有效、最多 5 次嘗試。`mfa.status` 查本人狀態；`mfa.recovery_regenerate {code}` 替換全部備援碼；`mfa.disable {code,password}` 需要目前密碼（與註冊密碼驗證共用限流）及新的 TOTP 或未使用備援碼，強制期間不能移除最後一種驗證方式。每帳號因素驗證錯誤最多 5 次／15 分鐘。
 
 新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。自 v1.82 起，第一位 Admin 也可改用上述 bootstrap 證明（主機設定碼，每套安裝一次），全程在儀表板完成。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。所有版本都依儲存的政策強制驗證，授權過期、驗證失敗回退或指定 Personal 啟動都不會停用；只有 Admin 主動關閉才取消強制。沒有政策資料庫的全新 Personal 安裝仍預設不強制；本機自動登入不能略過已啟用的強制驗證。
-新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。已設定 Email 寄信者可改用信箱驗證；自 v1.82 起也可用上述 bootstrap 證明在儀表板完成。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
+新的團隊安裝預設 `[auth] mfa_enforced=true`；既有安裝保留原政策，尚無 MFA 政策紀錄的舊版安裝也不會自動開啟。Admin 可在儀表板「使用者 → 雙因素登入管理」用專用開關啟用或停用強制（`system.update_config` 搭配 `expected_state`）；一般設定寫入、設定檔編輯器與匯入不能變更有效值。新團隊的第一位 Admin 設定帳號與密碼後，登入會要求註冊 MFA；主機操作員須執行 `duduclaw ops users mfa-enrollment-code <email> <challenge_ref>` 核發註冊碼，再於登入畫面輸入並完成驗證器註冊，才會取得工作階段。已設定 Email 寄信者可在完成相同的獨立證明後改用 Email；上述 bootstrap 證明適用於驗證器、通行金鑰及 Email 註冊。既有未強制的安裝可繼續自願註冊；開啟前請查看 `mfa.overview`、確認通道送達與主機救援。未強制且從未註冊時，既有回應與 epoch 0 JWT 內容不變。Personal 忽略強制設定，`/api/session/local` 仍免密碼。
 
 單純開啟強制不立即撤銷帳號 access token；未註冊者不能 refresh，原 token 自然到期（預設 30 分鐘）。所有版本的 MFA WebSocket 在到期後的下一次心跳關閉，最多延後 30 秒，不取消執行中工作。強制期間拒絕舊共用 token 的 `/ws` 登入及 RPC；已建立的共用 token 連線在下一次心跳關閉，停止推播訂閱。註冊、停用、重設會增加該帳號的 credential epoch，之後變更／重設密碼也會增加；舊 access／refresh token 失效，既有 dashboard 連線於下一次即時身分檢查拒絕，沿用 ACL 快取失效機制。沒有 claim 的 token 視為 epoch 0；從未註冊者即使變更密碼仍維持 0，以保持既有客戶行為。任何密碼變更都會作廢待註冊 challenge。
 
@@ -810,7 +810,9 @@ JWT epoch 必須完全相等。Dashboard 每次心跳重查；WebChat 在心跳�
 
 輸入密碼後，可選擇已設定的驗證方式，預選上次成功使用的方式。Email 驗證碼限用一次、10 分鐘到期，每次登入挑戰最多嘗試五次；每分鐘可重寄一次，每個帳號每小時最多五次。通行金鑰使用裝置鎖定、指紋、臉部辨識或安全金鑰驗證。管理員需將公開儀表板網址設定於 `[dashboard] public_url`，並以完全相同的 HTTPS 來源開啟儀表板；只有本機 localhost 可用 HTTP。每把金鑰可命名、個別移除，建議另留一種驗證方式，以免失去裝置後無法登入。首次只註冊通行金鑰不會產生復原碼，既有驗證器復原碼維持有效。首次 Email 註冊會顯示一次復原碼，確認保存後才能繼續。
 
-強制兩步驟驗證接受任何一種已設定因素，也會拒絕移除最後一種。原有驗證器與復原碼不需重新註冊。強制首次 Email 註冊以信箱代碼證明收信權；驗證器及通行金鑰仍需獨立的通道／管理員證明。以通道碼完成第一步登入者還需目前密碼。管理員重設會清除所有因素與保持登入的裝置。操作者可用目前密碼或新的驗證器／復原碼確認身分，因此只用通行金鑰的管理員也能執行。
+強制兩步驟驗證接受任何一種已設定因素，也會拒絕移除最後一種。原有驗證器與復原碼不需重新註冊。強制 MFA 時，首次註冊 Email 與驗證器、通行金鑰一樣，需要獨立的通道／管理員證明，或符合資格的第一位管理員首次設定碼。須先以 `proof_code` 提交註冊證明，才會寄送 Email 驗證碼；只有收信權無法完成首次註冊。系統會在啟用因素與核發工作階段憑證的同一筆交易重新檢查，拒絕過期、重用、未驗證或憑證已變更的證明。已通過 MFA 的工作階段新增 Email 不需另一組註冊碼；未強制時的自願註冊維持原流程。Google 登入仍不能使用 Email 作為第二因素。以通道碼完成第一步登入者還需目前密碼。管理員重設會清除所有因素與保持登入的裝置。操作者可用目前密碼或新的驗證器／復原碼確認身分，因此只用通行金鑰的管理員也能執行。
+
+升級前尚未完成的 Email 註冊須重新開始，因為舊證明未保存憑證版本。
 
 登入頁的「保持登入」預設不勾選。勾選後以輪替的瀏覽器 Cookie 保持登入，預設採 180 天滑動續期：每次成功更新登入，都從該次使用時間重新計算到期日。管理員可在「安全 → 保持登入」設定 1 至 365 的整數，預設 180 天。政策永久存入 `users.db`；讀取失敗或值無效時回到 180 天，不會變成無限期。變更設定不立即改動既有到期日，下次成功續期才改為該次使用時間加上新天數，縮短天數也一樣適用。開發版原有的 `[auth] remember_days` 不再讀取。未勾選時維持原有工作階段行為。帳號設定的「已登入的裝置」列出保持登入的裝置、建立與最近使用日期及已記錄的 IP，可個別撤銷或「登出所有裝置」。密碼、因素、帳號狀態或角色變更、兩步驟驗證重設及刪除帳號都會撤銷保持登入；登出會撤銷目前裝置。
 
