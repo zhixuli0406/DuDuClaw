@@ -110,8 +110,9 @@ async fn automation_notify_destinations_fail_closed_on_candidate_read_errors() {
             "notify" => set_destination(&f, "a2", "valid-chat"),
             "authority" => std::fs::write(f.home.join("org.toml"), "[broken").unwrap(),
             "ownership" => {
+                // Auth only needs agent_name; candidate ownership also needs owner_user_id.
                 rusqlite::Connection::open(f.home.join("users.db")).unwrap()
-                    .execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+                    .execute_batch("ALTER TABLE isolation_personal_agents RENAME COLUMN owner_user_id TO unavailable_owner_user_id").unwrap();
                 crate::personal_visibility::invalidate_owner_cache(&f.home);
             }
             "dm" => { rusqlite::Connection::open(f.home.join("users.db")).unwrap()
@@ -123,8 +124,31 @@ async fn automation_notify_destinations_fail_closed_on_candidate_read_errors() {
             let raw = std::fs::read_to_string(&path).unwrap();
             std::fs::write(path, raw.replace("notify_channel = 'line'", "notify_channel = 42")).unwrap();
         }
+        assert!(f.db.live_user_context(&f.mgr_a.user_id).unwrap().is_some(), "{broken}");
+        let view = DeptGrantView::load(&f.h, &f.mgr_a).await;
+        assert!(!view.is_empty(), "{broken}");
+        assert_eq!(crate::dept_grants::rules::department_notify_destinations(
+            &f.h, Some(&view), "sales", &f.mgr_a.user_id).await.err().as_deref(),
+            Some("permission denied"), "{broken}");
         exact_denied(Box::pin(f.h.handle("autopilot.notify_destinations",
             json!({"owner_department":"sales"}), &f.mgr_a)).await);
+    }
+}
+
+#[tokio::test]
+async fn automation_notify_destinations_fail_closed_when_authentication_unavailable() {
+    let f = fixture().await;
+    rusqlite::Connection::open(f.home.join("users.db")).unwrap()
+        .execute_batch("DROP TABLE isolation_personal_agents").unwrap();
+    crate::personal_visibility::invalidate_owner_cache(&f.home);
+    assert!(f.db.live_user_context(&f.mgr_a.user_id).is_err());
+    let frame = Box::pin(f.h.handle("autopilot.notify_destinations",
+        json!({"owner_department":"sales"}), &f.mgr_a)).await;
+    match frame {
+        WsFrame::Response { ok:false, payload:None, error:Some(error), .. } => {
+            assert_eq!(error, json!("authentication service unavailable"));
+        }
+        other => panic!("expected authentication refusal: {other:?}"),
     }
 }
 

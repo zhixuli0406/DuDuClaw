@@ -43,62 +43,11 @@ impl MethodHandler {
     /// `[delegation]` all resolve to `none` (they used to show `department`).
     pub(crate) fn parse_delegation_section(
         table: &toml::Table,
-    ) -> (String, Vec<(String, String)>, Vec<String>) {
-        let mut warnings: Vec<String> = Vec::new();
-        // The same resolution every gate uses (`delegation_config_from_table`).
-        let (policy, policy_warning) =
-            duduclaw_core::delegation_policy::delegation_config_from_table(table).resolve();
-        let section = table.get("delegation").and_then(|v| v.as_table());
-        let Some(section) = section else {
-            if table.get("delegation").is_some() {
-                warnings.push(
-                    "config.toml 的 [delegation] 區段格式有誤(不是一個設定區段),已視為 \"none\"(不允許 AI 員工之間委派)。"
-                        .to_string(),
-                );
-            }
-            return (policy.as_str().to_string(), Vec::new(), warnings);
-        };
-        if let Some(w) = policy_warning {
-            warnings.push(w);
-        }
-
-        // allow — every item must be exactly two non-empty strings. Bad items
-        // are ignored individually (spec §2.2) so one typo cannot disable the
-        // whole whitelist.
-        let mut allow: Vec<(String, String)> = Vec::new();
-        match section.get("allow") {
-            None => {}
-            Some(toml::Value::Array(items)) => {
-                let mut seen: std::collections::HashSet<(String, String)> =
-                    std::collections::HashSet::new();
-                for (idx, item) in items.iter().enumerate() {
-                    let pair = item.as_array().filter(|a| a.len() == 2).and_then(|a| {
-                        let x = a[0].as_str().map(str::trim).filter(|s| !s.is_empty())?;
-                        let y = a[1].as_str().map(str::trim).filter(|s| !s.is_empty())?;
-                        Some((x.to_string(), y.to_string()))
-                    });
-                    match pair {
-                        None => warnings.push(format!(
-                            "config.toml [delegation] allow 第 {} 組設定格式有誤(每組必須剛好兩位 AI 員工),已忽略。",
-                            idx + 1
-                        )),
-                        Some((x, y)) if x == y => warnings.push(format!(
-                            "config.toml [delegation] allow 第 {} 組是同一位 AI 員工({x}),已忽略。",
-                            idx + 1
-                        )),
-                        Some((x, y)) => {
-                            let key = Self::delegation_pair_key(&x, &y);
-                            if seen.insert(key) {
-                                allow.push((x, y));
-                            }
-                        }
-                    }
-                }
-            }
-            Some(_) => warnings
-                .push("config.toml [delegation] allow 必須是配對清單,格式有誤已忽略。".to_string()),
-        }
-
+    ) -> (String, Vec<(String, String)>, Vec<duduclaw_core::delegation_policy::DelegationWarning>) {
+        let cfg = duduclaw_core::delegation_policy::delegation_config_from_table(table);
+        let policy = cfg.policy();
+        let (allow, _) = duduclaw_core::delegation_policy::resolve_allow_pairs(&cfg.allow);
+        let warnings = duduclaw_core::delegation_policy::delegation_section_warnings(table);
         (policy.as_str().to_string(), allow, warnings)
     }
 
@@ -109,23 +58,18 @@ impl MethodHandler {
     /// `department` + no pairs as if that were the setting. The gates enforce
     /// `none` meanwhile; `delegation.effective` reports it as `config_error`.
     pub(crate) async fn handle_delegation_get(&self) -> WsFrame {
-        let table = match self
-            .read_config_table_strict(&self.home_dir.join("config.toml"))
-            .await
-        {
+        let raw = match super::config_commit::read_text_or_empty(&self.home_dir.join("config.toml")) {
+            Ok(raw) => raw,
+            Err(_) => return WsFrame::error_response("", "無法讀取委派設定，請修正設定後再試。"),
+        };
+        let hash = super::config_commit::content_hash(&raw);
+        let table = match raw.parse::<toml::Table>() {
             Ok(table) => table,
-            Err(e) => {
-                return WsFrame::error_response(
-                    "",
-                    &format!(
-                        "無法讀取委派設定:{e}。在修正前 AI 員工之間一律不能委派;請先在原始設定編輯器或終端機修正 config.toml。"
-                    ),
-                );
-            }
+            Err(_) => return WsFrame::error_response("", "無法讀取委派設定，請修正設定後再試。"),
         };
         let (policy, allow, mut warnings) = Self::parse_delegation_section(&table);
-        let (overrides, extra_warnings) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
-        warnings.extend(extra_warnings);
+        let (overrides, _) = duduclaw_core::delegation_policy::delegation_config_from_table(&table).resolve_overrides();
+        warnings.extend(duduclaw_core::delegation_policy::delegation_override_warnings(&table));
         let configured_policy =
             duduclaw_core::delegation_policy::delegation_config_read_from_table(&table)
                 .configured_policy;
@@ -140,6 +84,7 @@ impl MethodHandler {
                 "allow_one_way": overrides.allow_one_way,
                 "allow": allow.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>(),
                 "warnings": warnings,
+                "hash": hash,
             }),
         )
     }
@@ -154,6 +99,10 @@ impl MethodHandler {
     pub(crate) async fn handle_delegation_set(&self, params: Value, ctx: &UserContext) -> WsFrame {
         use duduclaw_core::delegation_policy::DelegationPolicy;
 
+        let expected_hash = match params.get("expected_hash").and_then(Value::as_str) {
+            Some(hash) => hash.to_string(),
+            None => return WsFrame::error_response("", "設定頁的資料已過期，請重新整理後再儲存。"),
+        };
         let policy_param = params.get("policy");
         let allow_param = params.get("allow");
         if policy_param.is_none() && allow_param.is_none() && params.get("allow_one_way").is_none() && params.get("unrestricted_roles").is_none() {
@@ -382,7 +331,6 @@ impl MethodHandler {
         let original=match super::config_commit::read_text_or_empty(&config_path) {
             Ok(raw)=>raw,Err(e)=>return WsFrame::error_response("",&format!("寫入設定失敗:{e}")),
         };
-        let config_expected_hash=super::config_commit::content_hash(&original);
         // RM-137: an unparsable config.toml is refused, never replaced by a
         // default table (nothing is written; the commit path below would
         // refuse too, this says why before any audit row is built).
@@ -456,7 +404,10 @@ impl MethodHandler {
         };
 
         // Atomic write: temp + rename (same discipline as system.update_config).
-        if let Err(e)=super::config_commit::commit_table_locked(&config_path,config_expected_hash,&table).await {
+        if let Err(e)=super::config_commit::commit_table_locked(&config_path,expected_hash,&table).await {
+            if super::config_commit::is_hash_conflict(&config_path, &e) {
+                return WsFrame::error_response("", "設定已被其他人變更，請重新整理後再儲存。");
+            }
             return WsFrame::error_response("",&format!("寫入設定失敗:{e}"));
         }
 
@@ -684,8 +635,7 @@ pub(crate) fn effective_delegation_json(
         "policy": policy.as_str(),
         "source": source,
         "global_policy": global.as_str(),
-        "configured_policy": read.configured_policy,
-        "policy_warning": read.policy_warning,
+        "policy_warning": read.classified_policy_warning,
         // `unreadable` | `unparsable` | `permissions_unreadable` | `unknown`
         // (null when there is no problem) — never config text.
         "config_error": config_error,
@@ -711,6 +661,8 @@ pub(crate) fn effective_delegation_json(
         "hidden_peer_placeholder": HIDDEN_PEER_PLACEHOLDER,
     });
     if viewer_is_admin {
+        // May contain arbitrary raw config values — Admin only.
+        payload["configured_policy"] = json!(read.configured_policy);
         // The raw texts quote the dropped entries verbatim — Admin only.
         payload["allow_warnings"] = json!(read.allow_warnings.iter().chain(&read.override_warnings).collect::<Vec<_>>());
         // May quote raw config text (TOML parse excerpt) — Admin only.
@@ -808,6 +760,15 @@ fn pairs_overlap(one_way: &[(String, String)], two_way: &[(String, String)]) -> 
 mod rm183_tests {
     use super::*;
 
+    async fn set_with_hash(handler: &MethodHandler, mut params: Value, ctx: &UserContext) -> WsFrame {
+        let get = handler.handle_delegation_get().await;
+        let WsFrame::Response { ok: true, payload: Some(get), .. } = get else {
+            return get;
+        };
+        params["expected_hash"] = get["hash"].clone();
+        handler.handle_delegation_set(params, ctx).await
+    }
+
     #[tokio::test]
     async fn delegation_role_additions_require_ack_and_record_server_evidence() {
         let home = tempfile::tempdir().unwrap();
@@ -818,11 +779,11 @@ mod rm183_tests {
         for params in [json!({"unrestricted_roles": ["employee"], "acknowledge_risk": true}),
             json!({"unrestricted_roles": ["admin"]}),
             json!({"unrestricted_roles": ["admin"], "acknowledge_risk": "true"})] {
-            let response = handler.handle_delegation_set(params, &ctx).await;
+            let response = set_with_hash(&handler, params, &ctx).await;
             assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "[delegation]\npolicy='none'\n");
         }
-        let response = handler.handle_delegation_set(json!({"unrestricted_roles": ["admin"],
+        let response = set_with_hash(&handler, json!({"unrestricted_roles": ["admin"],
             "acknowledge_risk": true, "acknowledged_by": "forged", "acknowledged_at": "forged"}), &ctx).await;
         assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
         let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
@@ -831,7 +792,7 @@ mod rm183_tests {
         assert_eq!(event["details"]["roles_added"], json!(["admin"]));
         assert_eq!(event["details"]["acknowledged_by"], ctx.user_id);
         assert!(chrono::DateTime::parse_from_rfc3339(event["details"]["acknowledged_at"].as_str().unwrap()).is_ok());
-        let response = handler.handle_delegation_set(json!({"unrestricted_roles": []}), &ctx).await;
+        let response = set_with_hash(&handler, json!({"unrestricted_roles": []}), &ctx).await;
         assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
         let rows = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap();
         let event: Value = rows.lines().map(|l| serde_json::from_str::<Value>(l).unwrap())
@@ -847,10 +808,10 @@ mod rm183_tests {
         std::fs::write(&path, original).unwrap();
         let handler = MethodHandler::new(home.path().to_path_buf()).await;
         let ctx = UserContext::admin_fallback();
-        let response = handler.handle_delegation_set(json!({"policy": "none"}), &ctx).await;
+        let response = set_with_hash(&handler, json!({"policy": "none"}), &ctx).await;
         assert!(matches!(response, WsFrame::Response { ok: false, .. }), "{response:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-        let response = handler.handle_delegation_set(json!({"policy": "none", "acknowledge_risk": true}), &ctx).await;
+        let response = set_with_hash(&handler, json!({"policy": "none", "acknowledge_risk": true}), &ctx).await;
         assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
     }
 

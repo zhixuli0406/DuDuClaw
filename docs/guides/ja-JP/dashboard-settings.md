@@ -313,6 +313,22 @@ public_url を設定すると、すべての OAuth コールバックと戻り�
 
 管理者のみ（`delegation.get`／`delegation.set`）。保存すると次の委任判断から反映され、再起動は不要です。
 
+RPC を直接呼び出す場合、保存のたびに対応する `delegation.get` または `google.drive_write.get` を呼び出し、返された `hash` を `expected_hash` に渡します（v1.86.0）。以下の `rpc` は認証済みの RPC クライアントです。この例では Drive の書き込みをすべて無効にするため、現在の設定を確認してから変更を選んでください。競合時は再読み込みして変更を確認し、無条件に再試行しないでください。`delegation.effective` の `configured_policy` は管理者だけに返し、他の閲覧者にはキー自体を含めません。管理者専用の `delegation.get` は引き続き元の値を返します。
+
+```javascript
+const delegation = await rpc('delegation.get', {});
+await rpc('delegation.set', {
+  policy: 'hierarchy', allow: [], expected_hash: delegation.hash,
+});
+
+const drive = await rpc('google.drive_write.get', {});
+await rpc('google.drive_write.set', {
+  create: false, modify: false, move: false, trash: false,
+  approval: { create: 'member', modify: 'member', move: 'member', trash: 'member' },
+  folders: [], acknowledge_risk: false, expected_hash: drive.hash,
+});
+```
+
 | コントロール | 設定キー | 反映 |
 |---|---|---|
 | 委任モード → 部門モード（既定）／階層モード／オープンモード／委任しない（v1.82） | `config.toml [delegation] policy` = `department`／`hierarchy`／`open`／`none` | 次の委任 |

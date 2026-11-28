@@ -266,7 +266,7 @@ pub(in crate::google_identity) async fn serve(state: &ExecuteState, agent: &str,
         // or an invented ID; requester() below rejects such requests.
         call_id: call.clone(), google_turn_id: turn.as_ref().or(run.as_ref()).cloned().unwrap_or_default(),
         id_source: if turn.is_some() { "turn" } else { "run" }, run_id: run.clone(), agent_id: agent.into(),
-        identity_kind: String::new(), account_email: String::new(), requester: format!("{:?}", RequesterIdentity::Unknown),
+        identity_kind: String::new(), account_email: String::new(), requester: audit::AuditRequester::from_identity(&RequesterIdentity::Unknown),
         action: policy::action_for_tool(tool).map(|a| a.as_str()).unwrap_or("unknown").into(), tool: tool.into(),
         file_id: None, file_name: None, parents_before: vec![], parents_after: vec![], destination_folder_id: None,
         folder_rule: None, approval: audit::Approval { mode: String::new(), approval_ids: vec![], decided_by: vec![] },
@@ -298,7 +298,7 @@ async fn serve_inner(state: &ExecuteState, agent: &str, tool: &str, raw: &Value,
         return Err(Refusal::hard("disabled", "管理員尚未開啟 Google 整合。"));
     }
     let who = crate::google_identity::employee_execute::requester(agent, turn.as_deref(), run.as_deref())?;
-    record.requester = format!("{who:?}");
+    record.requester = audit::AuditRequester::from_identity(&who);
     let who = &who;
     let pending = pending.transpose()?;
     let args = args::parse_any(tool, raw).map_err(arg_error)?;

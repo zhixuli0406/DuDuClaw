@@ -622,7 +622,22 @@ async fn legacy_store_migrates_and_reopens_with_approval_intact() {
 #[tokio::test]
 async fn execution_result_write_once_uses_exact_card_id_and_kind() {
     let b = broker();
-    let id = b.request("a", crate::admin_ai::card::ACTION_KIND, "settings", json!({}), 300).await.unwrap();
+    let admin = uuid::Uuid::new_v4().to_string();
+    let payload = json!({"admin_user_id":admin, "name":"admin_settings_propose", "items":[]});
+    let binding = ExecutionBinding {
+        schema_version:1, run_id:uuid::Uuid::new_v4().to_string(), run_origin_kind:"ingress".into(),
+        actor_principal:"a".into(), conversation_audience:ConversationAudience::Private,
+        decision_context:DecisionContext { channel:"webchat".into(), account_id:"dashboard".into(),
+            conversation_id:"execution-result-fixture".into(), principal_id:admin.clone() },
+        task_id:None, task_revision:None, task_snapshot_hash:None,
+        payload_hash:payload_hash(&payload), policy_revision:"fixture".into(),
+        cwd:None, environment_hash:"fixture".into(), file_hashes:Default::default(),
+        expires_at:(Utc::now() + chrono::Duration::seconds(300)).to_rfc3339(),
+        resume_handler:"live_only_v1".into(), resume_version:1,
+    };
+    let principal = duduclaw_core::HumanPrincipal::user(&admin).unwrap().to_string();
+    let id = crate::on_behalf_of::ON_BEHALF_OF.scope(Some(principal),
+        b.request_admin_ai(ApprovalId::new(), "a", payload, binding)).await.unwrap();
     let other = b.request("a", "mcp_call", "other", json!({}), 300).await.unwrap();
     let result = json!({"outcome":"complete", "reason":null, "completed":1,
         "not_executed":0, "message":"已完成 1 項設定變更。", "items":[]});

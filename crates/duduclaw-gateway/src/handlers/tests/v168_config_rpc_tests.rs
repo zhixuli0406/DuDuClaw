@@ -824,10 +824,14 @@ channel_token_enc = "abc=="
 
 /// Write the fixture after the handler is built (construction may touch
 /// config.toml), then run one RPC and return the file text.
-async fn rpc_on_fixture(method: &str, params: Value) -> String {
+async fn rpc_on_fixture(method: &str, mut params: Value) -> String {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     std::fs::write(home.path().join("config.toml"), COMMENTED).unwrap();
+    if method == "delegation.set" {
+        let get = ok(&handler.handle("delegation.get", json!({}), &admin()).await);
+        params["expected_hash"] = get["hash"].clone();
+    }
     ok(&handler.handle(method, params, &admin()).await);
     std::fs::read_to_string(home.path().join("config.toml")).unwrap()
 }

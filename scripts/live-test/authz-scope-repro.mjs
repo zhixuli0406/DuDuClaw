@@ -548,7 +548,9 @@ async function mcpClient(actor) {
 async function uScenario(n, row) {
   const policy = n === 'U2' ? 'open' : 'hierarchy', actor = n === 'U2' ? 'p' : n === 'U3' ? 't' : 's';
   const target = n === 'U2' ? 'q' : n === 'U3' ? 's' : 't';
-  await ctx.admin.call('delegation.set', { policy, allow: [] });
+  const delegation = await ctx.admin.call('delegation.get', {});
+  ensure(typeof delegation.hash === 'string', 'delegation.get hash missing');
+  await ctx.admin.call('delegation.set', { policy, allow: [], expected_hash: delegation.hash });
   const before = agentState(target);
   if (n === 'U5' && (!Number.isSafeInteger(before.budget) || before.budget <= 1)) {
     row.status = 'skipped'; row.observed.before = before;

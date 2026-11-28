@@ -5,7 +5,7 @@ fn record() -> DriveWriteAudit {
     DriveWriteAudit {
         call_id: "call-1".into(), google_turn_id: "registered-turn-1".into(), id_source: "turn",
         run_id: Some("run-1".into()), agent_id: "bot".into(), identity_kind: "personal".into(),
-        account_email: "holder@c.test".into(), requester: "holder".into(), action: "create".into(),
+        account_email: "holder@c.test".into(), requester: AuditRequester::from_identity(&duduclaw_knowledge::requester::RequesterIdentity::DashboardUser { user_id: "holder".into() }), action: "create".into(),
         tool: "drive_create".into(), file_id: Some("file-1".into()), file_name: Some("檔😀".repeat(60)),
         parents_before: vec![], parents_after: vec!["folder-1".into()],
         destination_folder_id: Some("folder-1".into()), folder_rule: Some("global".into()),
@@ -23,6 +23,7 @@ fn audit_has_all_fields_preserves_google_turn_and_omits_content_and_tokens() {
     let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
     assert_eq!(raw.lines().count(), 1);
     let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+    assert_eq!(row["requester"], serde_json::json!({"kind":"dashboard_user","user_id":"holder","channel":null}));
     assert_eq!(row["tool_name"], "google_drive_write");
     assert_eq!(row["agent_id"], "bot");
     assert_eq!(row["params_summary"], "drive_create");
@@ -80,4 +81,30 @@ fn notice_limiter_is_per_key_and_expires_at_its_ttl() {
     assert!(claim(("other", "file-a")));
     entries.lock().unwrap().insert(("bot", "file-a"), Instant::now() - ttl);
     assert!(claim(("bot", "file-a")));
+}
+
+#[test]
+fn audit_requester_uses_only_registered_identity_fields() {
+    use duduclaw_knowledge::requester::RequesterIdentity;
+    use serde_json::json;
+    for (identity, expected) in [
+        (RequesterIdentity::DashboardUser {user_id:"holder".into()}, json!({"kind":"dashboard_user","user_id":"holder","channel":null})),
+        (RequesterIdentity::ChannelUser {user_id:Some("holder".into()),channel:"line".into(),chat:"private-chat".into(),sender:"private-name".into(),attested_private:true}, json!({"kind":"channel_user","user_id":"holder","channel":"line"})),
+        (RequesterIdentity::ChannelUser {user_id:None,channel:"line".into(),chat:"private-chat".into(),sender:"private-name".into(),attested_private:false}, json!({"kind":"channel_unbound","user_id":null,"channel":"line"})),
+        (RequesterIdentity::ChannelUser {user_id:Some("visitor-name".into()),channel:"widget".into(),chat:"public-chat".into(),sender:"visitor-name".into(),attested_private:false}, json!({"kind":"channel_unbound","user_id":null,"channel":"widget"})),
+        (RequesterIdentity::System {kind:"cron".into(),on_behalf_of:Some("holder".into())}, json!({"kind":"system","user_id":"holder","channel":null})),
+        (RequesterIdentity::System {kind:"cron".into(),on_behalf_of:None}, json!({"kind":"system","user_id":null,"channel":null})),
+        (RequesterIdentity::Unknown, json!({"kind":"unknown","user_id":null,"channel":null})),
+    ] {
+        let mut record = record();
+        record.requester = AuditRequester::from_identity(&identity);
+        let home = tempfile::tempdir().unwrap();
+        append(home.path(), &record);
+        let raw = std::fs::read_to_string(home.path().join("tool_calls.jsonl")).unwrap();
+        let row: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(row["requester"], expected);
+        for private in ["private-chat", "private-name", "visitor-name", "public-chat"] {
+            assert!(!row["requester"].to_string().contains(private));
+        }
+    }
 }

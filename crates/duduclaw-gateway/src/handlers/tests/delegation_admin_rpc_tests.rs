@@ -109,8 +109,7 @@ fn manager_ctx() -> UserContext {
 async fn get_returns_defaults_without_config() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let frame = handler
-        .handle("delegation.get", json!({}), &admin_ctx())
+    let frame = rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx())
         .await;
     assert!(frame_ok(&frame), "get must not error: {frame:?}");
     let data = frame_data(&frame);
@@ -131,8 +130,7 @@ async fn get_reports_warnings_for_bad_values() {
     .unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let data = frame_data(
-        &handler
-            .handle("delegation.get", json!({}), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx())
             .await,
     );
 
@@ -160,7 +158,7 @@ async fn non_admin_is_denied() {
         ("delegation.get", json!({})),
         ("delegation.set", json!({ "policy": "open" })),
     ] {
-        let frame = handler.handle(method, params, &ctx).await;
+        let frame = rpc_with_hash(&handler, method, params, &ctx).await;
         assert!(!frame_ok(&frame), "{method} must deny a manager: {frame:?}");
     }
     assert!(
@@ -177,8 +175,7 @@ async fn set_persists_policy_and_pairs() {
     seed_agent(home.path(), "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "policy": "hierarchy", "allow": [["sales-lead", "warehouse-lead"]] }),
             &admin_ctx(),
@@ -191,8 +188,7 @@ async fn set_persists_policy_and_pairs() {
     assert!(raw.contains("hierarchy"), "{raw}");
 
     let data = frame_data(
-        &handler
-            .handle("delegation.get", json!({}), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("hierarchy"));
@@ -216,8 +212,7 @@ async fn set_keeps_ids_unchanged_when_dir_name_equals_agent_name() {
     seed_agent(home.path(), "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
             &admin_ctx(),
@@ -250,8 +245,7 @@ async fn set_normalizes_name_to_directory_name_and_predicate_honours_it() {
 
     // Caller enters the display `name`, not the directory name — exactly
     // what the dashboard's agent picker would submit today.
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
             &admin_ctx(),
@@ -267,8 +261,7 @@ async fn set_normalizes_name_to_directory_name_and_predicate_honours_it() {
     assert!(!raw.contains("warehouse-lead"), "{raw}");
 
     let data = frame_data(
-        &handler
-            .handle("delegation.get", json!({}), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx())
             .await,
     );
     assert_eq!(data["allow"], json!([["biz-dev-dir", "wh-dir"]]));
@@ -305,8 +298,7 @@ async fn set_accepts_either_dir_name_or_agent_name_as_input() {
     seed_agent_in_dir(home.path(), "wh-dir", "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             // "biz-dev-dir" (directory name) paired with "warehouse-lead"
             // (agent name) — both resolve to the same directory-name pair.
@@ -326,8 +318,7 @@ async fn set_accepts_either_dir_name_or_agent_name_as_input() {
 async fn set_rejects_unknown_policy() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "policy": "anarchy" }),
             &admin_ctx(),
@@ -346,8 +337,7 @@ async fn set_rejects_unknown_agent_and_names_it() {
     seed_agent(home.path(), "sales-lead", "sales");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["sales-lead", "ghost-lead"]] }),
             &admin_ctx(),
@@ -381,13 +371,12 @@ async fn set_rejects_bad_shapes_but_cleans_noise() {
         json!({ "allow": [["a", ""]] }),
         json!({ "allow": "a,b" }),
     ] {
-        let frame = handler.handle("delegation.set", bad.clone(), &ctx).await;
+        let frame = rpc_with_hash(&handler, "delegation.set", bad.clone(), &ctx).await;
         assert!(!frame_ok(&frame), "{bad} must be rejected: {frame:?}");
     }
 
     // Self-pair dropped, ["b","a"] deduped against ["a","b"].
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["a", "a"], ["a", "b"], ["b", "a"]] }),
             &ctx,
@@ -402,8 +391,7 @@ async fn set_rejects_bad_shapes_but_cleans_noise() {
 async fn set_requires_at_least_one_field() {
     let home = tempfile::tempdir().unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let frame = handler
-        .handle("delegation.set", json!({}), &admin_ctx())
+    let frame = rpc_with_hash(&handler, "delegation.set", json!({}), &admin_ctx())
         .await;
     assert!(!frame_ok(&frame));
     assert!(!home.path().join("config.toml").exists());
@@ -419,8 +407,7 @@ async fn set_preserves_unrelated_config() {
     )
     .unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let frame = handler
-        .handle("delegation.set", json!({ "policy": "open" }), &admin_ctx())
+    let frame = rpc_with_hash(&handler, "delegation.set", json!({ "policy": "open" }), &admin_ctx())
         .await;
     assert!(frame_ok(&frame), "{frame:?}");
     let raw = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
@@ -443,8 +430,7 @@ async fn set_rejects_ambiguous_agent_name_and_names_it() {
     seed_agent(home.path(), "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["sales-lead", "warehouse-lead"]] }),
             &admin_ctx(),
@@ -478,15 +464,14 @@ async fn set_accepts_none_and_keeps_pairs() {
     seed_agent(home.path(), "sales-lead", "sales");
     seed_agent(home.path(), "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "policy": "none", "allow": [["sales-lead", "warehouse-lead"]] }),
             &admin_ctx(),
         )
         .await;
     assert!(frame_ok(&frame), "{frame:?}");
-    let data = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    let data = frame_data(&rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx()).await);
     assert_eq!(data["policy"], json!("none"));
     assert_eq!(data["allow"], json!([["sales-lead", "warehouse-lead"]]));
     assert_eq!(data["warnings"], json!([]));
@@ -503,11 +488,15 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
     std::fs::write(home.path().join("config.toml"), broken).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    for params in [
+    assert!(!frame_ok(&handler.handle("delegation.get", json!({}), &admin_ctx()).await));
+    for mut params in [
         json!({ "policy": "department", "allow": [] }),
         json!({ "policy": "none" }),
         json!({ "allow": [] }),
     ] {
+        // A failed get supplies no hash. Deliberately bypass the normal
+        // client flow to exercise the set-side malformed-config refusal.
+        params["expected_hash"] = json!("");
         let frame = handler.handle("delegation.set", params.clone(), &admin_ctx()).await;
         assert!(!frame_ok(&frame), "{params} must be refused: {frame:?}");
         assert!(frame_error(&frame).contains("TOML"), "{frame:?}");
@@ -520,7 +509,7 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
     assert!(!audit.contains("delegation_config_changed"), "{audit}");
 
-    let frame = handler.handle("delegation.get", json!({}), &admin_ctx()).await;
+    let frame = rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx()).await;
     assert!(!frame_ok(&frame), "get must not return defaults: {frame:?}");
 }
 
@@ -550,8 +539,7 @@ async fn effective_reports_global_policy_and_pairs() {
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("hierarchy"));
@@ -566,8 +554,7 @@ async fn effective_reports_global_policy_and_pairs() {
 
     // A pair not naming the employee is not listed for it.
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "intern" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "intern" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["allow_pairs"], json!([]));
@@ -579,8 +566,7 @@ async fn effective_reports_global_policy_and_pairs() {
     )
     .unwrap();
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("none"));
@@ -640,7 +626,7 @@ fn effective_masks_pair_peers_the_viewer_cannot_view() {
 /// with view access to it only — receives just `allow_warning_count`, never
 /// the text (here naming `private-bot`, unrelated to `sales-lead` and not
 /// viewable); an Admin viewer receives the texts. `delegation.get`
-/// (Admin-only) keeps the full warnings.
+/// (Admin-only) returns classified warnings.
 #[tokio::test]
 async fn effective_returns_allow_warning_text_only_to_an_admin() {
     use crate::handlers::delegation_rpc::effective_delegation_json;
@@ -688,13 +674,12 @@ async fn effective_returns_allow_warning_text_only_to_an_admin() {
     // Through the RPC as Admin (the live-context path), and `delegation.get`.
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["allow_warning_count"], json!(2), "{data}");
     assert_eq!(data["allow_warnings"].as_array().map(Vec::len), Some(2), "{data}");
-    let data = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    let data = frame_data(&rpc_with_hash(&handler, "delegation.get", json!({}), &admin_ctx()).await);
     assert_eq!(data["warnings"].as_array().map(Vec::len), Some(2), "{data}");
 }
 
@@ -712,8 +697,7 @@ async fn effective_reports_the_employee_switch_as_source() {
     assert!(raw.contains("can_send_cross_agent = true"), "{raw}");
     std::fs::write(&path, raw.replace("can_send_cross_agent = true", "can_send_cross_agent = false")).unwrap();
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("none"));
@@ -732,19 +716,18 @@ async fn effective_surfaces_unknown_value_and_config_error() {
 
     std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy = \"closed\"\n").unwrap();
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("none"));
     assert_eq!(data["configured_policy"], json!("closed"));
-    assert!(data["policy_warning"].as_str().is_some_and(|w| w.contains("closed")), "{data}");
+    assert_eq!(data["policy_warning"]["code"], "policy_unknown", "{data}");
+    assert!(!data["policy_warning"].to_string().contains("closed"), "{data}");
     assert_eq!(data["config_error"], Value::Null);
 
     std::fs::write(home.path().join("config.toml"), "[delegation\npolicy = \"open\"\n").unwrap();
     let data = frame_data(
-        &handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
+        &rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &admin_ctx())
             .await,
     );
     assert_eq!(data["policy"], json!("none"));
@@ -815,13 +798,11 @@ async fn effective_is_gated_and_read_only() {
     seed_agent(home.path(), "sales-lead", "sales");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
     for ctx in [employee_ctx(), manager_ctx()] {
-        let frame = handler
-            .handle("delegation.effective", json!({ "agent_id": "sales-lead" }), &ctx)
+        let frame = rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "sales-lead" }), &ctx)
             .await;
         assert!(!frame_ok(&frame), "{:?} must be refused: {frame:?}", ctx.role);
     }
-    let frame = handler
-        .handle("delegation.effective", json!({ "agent_id": "ghost" }), &admin_ctx())
+    let frame = rpc_with_hash(&handler, "delegation.effective", json!({ "agent_id": "ghost" }), &admin_ctx())
         .await;
     assert!(!frame_ok(&frame), "{frame:?}");
     assert!(!home.path().join("config.toml").exists(), "a read must not create config");
@@ -861,8 +842,7 @@ async fn set_accepts_directory_name_despite_unrelated_ambiguous_name() {
     seed_agent(home.path(), "warehouse-lead", "warehouse");
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    let frame = handler
-        .handle(
+    let frame = rpc_with_hash(&handler, 
             "delegation.set",
             json!({ "allow": [["sales-new", "warehouse-lead"]] }),
             &admin_ctx(),
@@ -906,4 +886,97 @@ fn effective_displays_avatar_owner_name_without_changing_policy() {
     conn.execute("DELETE FROM users WHERE id=?1", [&owner.id]).unwrap();
     assert!(effective_delegation_json(home.path(), &dir, "avatar", &|_| true, false)
         .get("owner_display_name").unwrap().is_null());
+}
+
+
+async fn rpc_with_hash(handler: &MethodHandler, method: &str, mut params: Value, ctx: &UserContext) -> WsFrame {
+    if method == "delegation.set" {
+        if ctx.is_admin() {
+            let get = handler.handle("delegation.get", json!({}), ctx).await;
+            if !frame_ok(&get) { return get; }
+            params["expected_hash"] = frame_data(&get)["hash"].clone();
+        }
+    }
+    handler.handle(method, params, ctx).await
+}
+
+#[tokio::test]
+async fn delegation_settings_require_fresh_client_hash() {
+    let home = tempfile::tempdir().unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let path = home.path().join("config.toml");
+    let original = "[delegation]\npolicy='department'\n";
+    std::fs::write(&path, original).unwrap();
+    let get = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    assert_eq!(get["hash"], super::super::config_commit::content_hash(original));
+    for hash in [None, Some(json!(null)), Some(json!(42)), Some(json!(true))] {
+        let mut params = json!({"policy":"open"});
+        if let Some(hash) = hash { params["expected_hash"] = hash; }
+        let response = handler.handle("delegation.set", params, &admin_ctx()).await;
+        assert!(!frame_ok(&response));
+        assert!(frame_error(&response).contains("設定頁的資料已過期，請重新整理後再儲存。"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+    let changed = "[delegation]\npolicy='hierarchy'\n";
+    std::fs::write(&path, changed).unwrap();
+    let stale = handler.handle("delegation.set", json!({"policy":"open", "expected_hash":get["hash"]}), &admin_ctx()).await;
+    assert!(!frame_ok(&stale));
+    assert!(frame_error(&stale).contains("設定已被其他人變更，請重新整理後再儲存。"));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    let fresh = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    assert!(frame_ok(&handler.handle("delegation.set", json!({"policy":"open", "expected_hash":fresh["hash"]}), &admin_ctx()).await));
+    assert_eq!(std::fs::read_to_string(&path).unwrap().parse::<toml::Table>().unwrap()["delegation"]["policy"].as_str(), Some("open"));
+}
+
+#[tokio::test]
+async fn delegation_warning_payloads_never_quote_config_values() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='weird-xyz'\nallow=[['sales-lead','sales-lead']]\nallow_one_way=[['private-raw','private-raw']]\nunrestricted_roles=['private-role']\n").unwrap();
+    let get = frame_data(&handler.handle("delegation.get", json!({}), &admin_ctx()).await);
+    assert_eq!(get["warnings"].as_array().unwrap().len(), 4);
+    for warning in get["warnings"].as_array().unwrap() {
+        assert_eq!(warning.as_object().unwrap().len(), 2);
+        assert!(warning["code"].is_string() && warning["message"].is_string());
+    }
+    let effective = crate::handlers::delegation_rpc::effective_delegation_json(home.path(), &home.path().join("agents/sales-lead"), "sales-lead", &|_| false, false);
+    assert_eq!(effective["policy_warning"]["code"], "policy_unknown");
+    assert_eq!(effective["allow_warning_count"], 3);
+    for raw in ["weird-xyz", "sales-lead", "private-raw", "private-role", "config.toml", "unrestricted_roles"] {
+        assert!(!get["warnings"].to_string().contains(raw));
+        assert!(!effective["policy_warning"].to_string().contains(raw));
+    }
+    assert!(effective.get("allow_warnings").is_none());
+    assert!(effective.get("config_error_detail").is_none());
+}
+
+#[tokio::test]
+async fn effective_configured_policy_is_only_returned_to_live_admin() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='weird-xyz'\n").unwrap();
+    let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db.create_user("manager@example.invalid", "Manager", "test-password", UserRole::Manager).unwrap();
+    db.bind_agent(&user.id, "sales-lead", AccessLevel::Viewer).unwrap();
+    let mut viewer = manager_ctx();
+    viewer.user_id = user.id;
+    viewer.email = user.email;
+    viewer.agent_access.insert("sales-lead".into(), AccessLevel::Viewer);
+    // Also cover a stale Admin role after a live downgrade to Manager.
+    for cached_role in [UserRole::Manager, UserRole::Admin] {
+        viewer.role = cached_role;
+        let frame = handler.handle("delegation.effective", json!({"agent_id":"sales-lead"}), &viewer).await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data["policy"], "none");
+        assert_eq!(data["policy_warning"]["code"], "policy_unknown");
+        assert!(data.get("configured_policy").is_none(), "{data}");
+        assert!(!data.to_string().contains("weird-xyz"), "{data}");
+    }
+
+    let frame = handler.handle("delegation.effective", json!({"agent_id":"sales-lead"}), &admin_ctx()).await;
+    assert!(frame_ok(&frame), "{frame:?}");
+    assert_eq!(frame_data(&frame)["configured_policy"], "weird-xyz");
 }

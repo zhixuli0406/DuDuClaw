@@ -147,7 +147,7 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     crate::sqlite::harden(&mut conn)?;check_sqlite(&conn)?;
     // Exact v1.79.3, v1.80.x, v1.81 or v1.86 catalog. The v1.80 decision-lease columns
     // and the v1.81 `employee_incarnation` column are never authorized below;
-    // v1.86 chat-admin receipts and decisions are also denied. Only ids and
+    // v1.86 chat-admin receipts, decisions and execution_result are also denied. Only ids and
     // the authority schema version are read. (The v1.81/v1.86 approvals
     // catalog maps as V180; only sessions.db yields V181, refused here: fail
     // closed.)
@@ -168,7 +168,8 @@ pub(super) fn approvals(input:impl Read,wal:Option<&mut dyn Read>,builder:&mut B
     let mut rows=query.query([])?;
     while rows.next()?.is_some() {
         // Do not retain even old ids: summary, payload, grants, tokens, status,
-        // decisions and executing-operation leases all stay in quarantine.
+        // decisions, source execution results and executing-operation leases
+        // all stay in quarantine.
         builder.push(C::LegacyApproval,vec![field("reference",format!("{}:approval:{}",builder.request.source_id,builder.proposals.len()))],None)?;
     }
     Ok(())

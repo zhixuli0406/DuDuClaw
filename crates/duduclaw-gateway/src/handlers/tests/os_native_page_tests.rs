@@ -584,3 +584,22 @@ async fn unified_log_tool_name_filter_is_exact_optional_and_strictly_typed() {
             WsFrame::Response {ok:false,..}));
     }
 }
+
+#[tokio::test]
+async fn unified_log_accepts_legacy_and_structured_drive_requesters() {
+    let home = tempfile::tempdir().unwrap();
+    let rows = [json!("DashboardUser { user_id: \"old-secret-id\" }"),
+        json!({"kind":"channel_user", "user_id":"bound-id", "channel":"line"})]
+        .map(|requester| json!({"timestamp":"2026-11-27T00:00:00Z", "agent_id":"bot", "tool_name":"google_drive_write", "requester":requester}).to_string());
+    std::fs::write(home.path().join("tool_calls.jsonl"), rows.join("\n")).unwrap();
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    let WsFrame::Response {ok:true,payload:Some(p),..} = handler.handle_audit_unified_log(json!({"tool_name_filter":"google_drive_write"})).await else {panic!("audit response")};
+    let events = p["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    let requesters: Vec<_> = events.iter().map(|r| &r["details"]["tool_call"]["requester"]).collect();
+    assert!(requesters.iter().any(|r| r["kind"] == "legacy" && r["label"] == "先前的紀錄"));
+    assert!(requesters.iter().any(|r| r["kind"] == "channel_user" && r["label"] == "通訊軟體使用者"));
+    assert!(!p.to_string().contains("DashboardUser"));
+    assert!(!p.to_string().contains("old-secret-id"));
+    assert!(!p.to_string().contains("bound-id"));
+}
