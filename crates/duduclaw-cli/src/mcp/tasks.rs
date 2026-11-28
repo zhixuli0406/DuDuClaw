@@ -1993,7 +1993,7 @@ mod main_assignment_tests {
     use super::*;
     use std::sync::Arc;
     use duduclaw_isolation::{bounded::{List, Text}, capability::{CapabilityId, CapabilityRecord,
-        EmployeeBinding, Lane, Principal}, ids::{EmployeeId, RunId, Sha256Digest}};
+        EmployeeBinding, Lane, Principal, ResourceGrant}, ids::{EmployeeId, RunId, Sha256Digest}};
     use duduclaw_mcp_boundary::{RequestContext, resources::ResourceRoots};
     use crate::mcp_isolation::{IsolatedCall, ISOLATED_CALL};
 
@@ -2010,6 +2010,43 @@ mod main_assignment_tests {
                 gateway_epoch: [4; 16], issued_at: 1, not_before: 1, expires_at: 2, nonce: [5; 32], jti: [6; 16],
             }),
         })
+    }
+
+    struct TestLiveAuthority;
+    impl duduclaw_isolation::capability::LiveRequestVerifier for TestLiveAuthority {
+        fn verify_live(&self, _: &CapabilityRecord, _: u64)
+            -> Result<(), duduclaw_mcp_boundary::VerificationError> { Ok(()) }
+    }
+
+    async fn task_run_call(home: &Path, user: &str, agent: &str) -> Arc<IsolatedCall> {
+        let mut call = call(home, user, agent);
+        let current = Arc::get_mut(&mut call).unwrap();
+        let mut record = current.context.record().clone();
+        let task = Text::new("list-assignment-run".into()).unwrap();
+        let store = duduclaw_gateway::task_store::TaskStore::open(home).unwrap();
+        store.insert_task(&duduclaw_gateway::task_store::TaskRow::new(
+            task.as_str().into(), "Assignment run".into(), String::new(), "medium".into(),
+            agent.into(), agent.into(),
+        )).await.unwrap();
+        // H8 requires a live, owned run task as well as its signed resource grant.
+        // Keep the production resolver; only run liveness is supplied by the fixture.
+        record.task = Some(task.clone());
+        record.tools = List::new(vec![Text::new("create_task".into()).unwrap()]).unwrap();
+        record.resources = List::new(vec![ResourceGrant::Employee { id: record.employee },
+            ResourceGrant::Task { id: task }]).unwrap();
+        record.expires_at = u64::MAX;
+        let mut bindings = duduclaw_mcp_boundary::bindings::BindingStore::new(
+            rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        bindings.register_principal(&record.principal).unwrap();
+        bindings.create_employee(record.employee, &record.employee_binding).unwrap();
+        current.record_resolver = Some(Arc::new(
+            duduclaw_gateway::isolation_resources::GatewayResourceResolver::new(
+                home.to_owned(), record.employee, agent.into(),
+                Arc::new(std::sync::Mutex::new(bindings)),
+            ).unwrap(),
+        ));
+        current.context = RequestContext::with_live_verifier(record, Arc::new(TestLiveAuthority));
+        call
     }
 
     fn write_agent(home: &Path, name: &str, role: &str, tools: &str) {
@@ -2060,9 +2097,14 @@ mod main_assignment_tests {
                     "task_id":rows[0].id, "assigned_to":"main", "priority":"high"
                 }), home.path(), RecordActor::Agent("worker")).await;
                 assert_ne!(update["isError"], true, "{update}");
-                let spec = super::super::bus_tasks::handle_create_task(&serde_json::json!({
+                let plan = serde_json::json!({
                     "goal":"work", "steps":[{"description":"work", "agent":"main"}]
-                }), home.path(), "worker").await;
+                });
+                // List membership alone must not bypass the independent resource gate.
+                assert_refused(super::super::bus_tasks::handle_create_task(&plan, home.path(), "worker").await,
+                    "無法確認這次操作的資源授權，已拒絕執行。");
+                let spec = ISOLATED_CALL.scope(task_run_call(home.path(), &employee.id, "worker").await,
+                    super::super::bus_tasks::handle_create_task(&plan, home.path(), "worker")).await;
                 assert_ne!(spec["isError"], true, "{spec}");
                 // Messaging between employees remains legacy Admin-only, even for listed people.
                 assert_eq!(super::super::on_behalf_of::check_human_principal(
