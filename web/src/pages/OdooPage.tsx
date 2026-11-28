@@ -1,3 +1,4 @@
+import { OdooAccessCards, OdooAccessNotice, useOdooAccess } from '@/components/odoo/OdooAccessCards';
 import { SensitiveModelPicker } from '@/components/odoo/SensitiveModelPicker';
 import { OdooPermissionSummary } from '@/components/odoo/OdooPermissionSummary';
 import { useEffect, useState, useCallback, useRef } from 'react';
@@ -51,6 +52,7 @@ type FeatureKey = (typeof FEATURE_MODULES)[number];
 export function OdooPage() {
   const intl = useIntl();
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const odooAccess = useOdooAccess(isAdmin);
   const t = (id: string) => intl.formatMessage({ id });
 
   // Connection config
@@ -341,6 +343,7 @@ export function OdooPage() {
 
   return (
     <div className="space-y-6">
+      {isAdmin && <OdooAccessNotice access={odooAccess} />}
       {/* Slim tab header — description + status left, Save right. */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex flex-wrap items-center gap-3">
@@ -638,6 +641,7 @@ export function OdooPage() {
       </SettingsSection>
 
       {/* Per-agent credential override */}
+      {isAdmin && <OdooAccessCards access={odooAccess} />}
       <AgentOdooOverride pickedModels={Array.from(pickedModels)} />
 
       {/* Website Live Chat: AI employees answer as an Odoo operator */}

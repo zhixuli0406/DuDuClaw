@@ -1,3 +1,4 @@
+import type { OdooAccess, OdooAccessPatch } from './odoo-access';
 import type { AutopilotRun } from './autopilot-history';
 import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
@@ -9119,6 +9120,10 @@ export const api = {
         agent_id: agentId,
         ...(env && Object.keys(env).length > 0 ? { env } : {}),
       }) as Promise<{ success: boolean; agent_id: string }>,
+  },
+  odooAccess: {
+    get: () => client.call('odoo.access_get', {}) as Promise<OdooAccess>,
+    set: (patch: OdooAccessPatch) => client.call('odoo.access_set', { ...patch }) as Promise<OdooAccess>,
   },
   odoo: {
     permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,

@@ -322,3 +322,21 @@ describe('OdooPage employee scan results', () => {
     expect(screen.getByText(/Odoo connection timed out/)).toBeInTheDocument();
   });
 });
+
+describe('OdooPage S-25 visibility', () => {
+  it('shows the access cards only to administrators and does not call their RPCs for members', async () => {
+    useAuthStore.setState({ user: { id: 'staff', email: 'staff@test', display_name: 'Staff', role: 'employee', status: 'active' } });
+    renderWithProviders(<OdooPage />);
+    await screen.findByText('Connection Settings');
+    expect(screen.queryByText('Permission mode')).not.toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.some(call => call[0] === 'odoo.access_get' || call[0] === 'odoo.member_credentials.list')).toBe(false);
+  });
+
+  it('places the administrator cards after the danger zone and before employee overrides', async () => {
+    useAuthStore.setState({ user: { id: 'admin', email: 'admin@test', display_name: 'Admin', role: 'admin', status: 'active' } });
+    renderWithProviders(<OdooPage />);
+    await screen.findByText('Connection Settings');
+    expect(screen.getByText('Permission mode')).toBeInTheDocument();
+    expect(screen.getByText('Members’ own Odoo accounts')).toBeInTheDocument();
+  });
+});
