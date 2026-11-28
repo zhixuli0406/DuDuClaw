@@ -87,7 +87,39 @@ fn request_row(r: &Row<'_>) -> rusqlite::Result<SigninRequest> {
         status: SigninRequestStatus::parse(&status).map_err(|_| rusqlite::Error::InvalidQuery)?, requested_at: r.get(6)?,
         expires_at: r.get(7)?, decided_by: r.get(8)?, decided_at: r.get(9)?, user_id: r.get(10)?, mfa_preauthorized: r.get(11)? })
 }
+/// Public metadata only: no Google subject, email snapshot or actor identifiers.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct GoogleSigninSummary {
+    pub linked_at: String,
+    pub last_signin_at: Option<String>,
+}
+
+fn signin_rfc3339(epoch: i64) -> Result<String, String> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0)
+        .map(|time| time.to_rfc3339()).ok_or_else(|| STORAGE.to_owned())
+}
+
 impl UserDb {
+    pub fn google_signin_summaries(&self) -> Result<std::collections::HashMap<String, GoogleSigninSummary>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT user_id,linked_at,last_signin_at FROM google_signin_links").map_err(error)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?))).map_err(error)?;
+        rows.map(|row| {
+            let (id, linked, last) = row.map_err(error)?;
+            Ok((id, GoogleSigninSummary { linked_at: signin_rfc3339(linked)?,
+                last_signin_at: last.map(signin_rfc3339).transpose()? }))
+        }).collect()
+    }
+
+    /// Same non-empty-password predicate used by Google unlink and password flows.
+    pub fn local_password_statuses(&self) -> Result<std::collections::HashMap<String, bool>, String> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT id,password_hash<>'' FROM users").map_err(error)?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(error)?;
+        rows.collect::<rusqlite::Result<_>>().map_err(error)
+    }
+
     pub fn has_local_password(&self, user: &str) -> Result<bool, String> {
         self.conn().query_row("SELECT password_hash<>'' FROM users WHERE id=?1", [user], |r| r.get(0)).map_err(error)
     }
@@ -299,3 +331,37 @@ impl UserDb {
 #[cfg(test)]
 #[path = "google_signin_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod batch_tests {
+
+    #[test]
+    fn signin_batch_links_and_passwords_are_public_and_fail_closed() {
+        let (db, _home) = crate::test_support::test_db();
+        let normal = db.create_user("normal@company.test", "Normal", "password123", crate::UserRole::Employee).unwrap();
+        let jit = db.create_user("jit@company.test", "JIT", "password123", crate::UserRole::Employee).unwrap();
+        db.conn().execute("UPDATE users SET password_hash='' WHERE id=?1", [&jit.id]).unwrap();
+        db.conn().execute("INSERT INTO google_signin_links(user_id,google_sub,hd,email_at_link,linked_via,linked_by,linked_at,last_signin_at)
+            VALUES(?1,'123','company.test','jit@company.test','jit_direct','actor',1700000000,1700000060)", [&jit.id]).unwrap();
+        let links = db.google_signin_summaries().unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[&jit.id].linked_at, "2023-11-14T22:13:20+00:00");
+        assert_eq!(links[&jit.id].last_signin_at.as_deref(), Some("2023-11-14T22:14:20+00:00"));
+        let passwords = db.local_password_statuses().unwrap();
+        assert!(passwords[&normal.id]);
+        assert!(!passwords[&jit.id]);
+        for id in [&normal.id, &jit.id] {
+            assert_eq!(passwords[id], db.has_local_password(id).unwrap());
+        }
+        let summary = serde_json::to_value(&links[&jit.id]).unwrap();
+        assert_eq!(summary.as_object().unwrap().len(), 2);
+        db.conn().execute("UPDATE google_signin_links SET last_signin_at=NULL", []).unwrap();
+        assert_eq!(db.google_signin_summaries().unwrap()[&jit.id].last_signin_at, None);
+        db.conn().execute("UPDATE google_signin_links SET linked_at=9223372036854775807", []).unwrap();
+        assert!(db.google_signin_summaries().is_err());
+        db.conn().execute("DROP TABLE google_signin_links", []).unwrap();
+        assert!(db.google_signin_summaries().is_err());
+        db.conn().execute("ALTER TABLE users RENAME COLUMN password_hash TO unavailable", []).unwrap();
+        assert!(db.local_password_statuses().is_err());
+    }
+}
