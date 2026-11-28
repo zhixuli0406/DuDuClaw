@@ -24,7 +24,8 @@ impl Config {
         let root: toml::Table = toml::from_str(text).ok()?;
         let config: Self = match root.get("member_api_keys") {
             None => Self::default(),
-            Some(section) => section.clone().try_into().ok()?,
+            Some(section) if section.is_table() => section.clone().try_into().ok()?,
+            Some(_) => return None,
         };
         (config.rate_per_minute > 0 && config.rate_per_minute <= 60_000
             && config.allow_mcp_scopes.iter().all(|scope|
@@ -110,6 +111,19 @@ mod tests {
         }
         assert!(Config::parse("[member_api_keys]\nenabled=true").unwrap().enabled);
         assert_eq!(Config::default().rate_per_minute, 120);
+    }
+    #[test]
+    fn config_rejects_array_sections_and_preserves_table_defaults() {
+        for text in ["member_api_keys=[]", "member_api_keys=['x']"] {
+            assert!(Config::parse(text).is_none(), "{text}");
+        }
+        for text in ["", "[member_api_keys]", "[member_api_keys]\nenabled=false"] {
+            let config = Config::parse(text).unwrap();
+            assert!(!config.enabled);
+            assert_eq!(config.rate_per_minute, 120);
+            assert!(!config.allow_conversation_content);
+            assert!(config.allow_mcp_scopes.is_empty());
+        }
     }
     #[test]
     fn conversation_and_mcp_config_parse_fail_closed() {

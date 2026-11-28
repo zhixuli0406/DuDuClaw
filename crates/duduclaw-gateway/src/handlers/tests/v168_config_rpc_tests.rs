@@ -1091,7 +1091,7 @@ async fn raw_agent_editor_and_profile_writer_refuse_odoo_widening() {
         std::fs::write(&path, &before).unwrap();
         let frame = handler.handle("config.raw.set", json!({"file":"agent:a1","content":after,
             "base_hash":super::super::config_commit::content_hash(&before)}), &admin()).await;
-        assert!(err(&frame).contains("Odoo 設定頁"));
+        assert!(err(&frame).contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         let error = crate::agent_files::writer::commit_locked(
             &crate::agent_files::writer::Commit {
                 home:home.path(), agent_id:"a1", key:crate::agent_files::FileKey::AgentToml,
@@ -1099,7 +1099,7 @@ async fn raw_agent_editor_and_profile_writer_refuse_odoo_widening() {
                 baseline:crate::agent_files::writer::Baseline::Accept,
             }, |_| Ok(after), || Ok(()),
         ).err().unwrap();
-        assert!(error.message().contains("Odoo 設定頁"));
+        assert!(error.message().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
     for (before_odoo, after_odoo) in [

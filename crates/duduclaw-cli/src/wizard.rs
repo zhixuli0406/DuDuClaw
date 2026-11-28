@@ -800,7 +800,7 @@ mod tests {
         let bad = "[agent]\nname='template'\n[odoo]\nact_as_requester=true\n";
         std::fs::write(source.path().join("agent.toml"), bad).unwrap();
         let error = copy_template_files(source.path(), target.path()).await.unwrap_err();
-        assert!(error.to_string().contains("Odoo 設定頁"));
+        assert!(error.to_string().contains("這位 AI 員工的 Odoo 權限只能在該 AI 員工的編輯頁確認風險後變更。"));
         assert!(!target.path().join("agent.toml").exists());
         let safe = "# retained\n[agent]\nname='template'\n[odoo]\npermission_override='engine'\n";
         std::fs::write(source.path().join("agent.toml"), safe).unwrap();

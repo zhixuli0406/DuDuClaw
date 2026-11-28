@@ -295,7 +295,7 @@ async fn changed_server_invalidates_personal_and_missing_server_cannot_unseal() 
     doc.remove("odoo");
     std::fs::write(path, toml::to_string(&doc).unwrap()).unwrap();
     let (status, value) = f.employee("alice", read()).await;
-    refused(status, &value, "odoo_not_connected");
+    refused(status, &value, "odoo_member_credentials_off");
     f.audit();
 }
 
@@ -450,7 +450,7 @@ async fn member_switch_off_skips_personal_without_deleting_and_on_restores_it() 
     for setting in ["", "member_credentials=false", "member_credentials='true'"] {
         std::fs::write(&path, enabled.replace("member_credentials=true", setting)).unwrap();
         let (status, value) = f.employee("alice", read()).await;
-        refused(status, &value, "odoo_not_connected");
+        refused(status, &value, "odoo_member_credentials_off");
         for request in [read(), json!({"tool":"odoo_write"})] {
             let (status, value) = f.person(&key, request).await;
             refused(status, &value, "odoo_member_credentials_off");
