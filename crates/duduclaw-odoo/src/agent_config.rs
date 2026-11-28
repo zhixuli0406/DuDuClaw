@@ -322,7 +322,7 @@ impl AgentOdooConfig {
     /// Bare tokens, wildcards, unknown actions and empty lists grant nothing.
     /// The caller must also enforce [`Self::permits_model`].
     pub fn dedicated_opt_in(&self, action: &str, model: &str) -> bool {
-        matches!(action, "activity" | "note" | "message" | "attach")
+        DEDICATED_TOOL_TOKENS.contains(&action)
             && crate::access_policy::valid_policy_model(model)
             && self.allowed_actions.iter().any(|token| {
                 token.split_once(':').is_some_and(|(verb, target)| verb == action && target == model)
@@ -344,6 +344,9 @@ pub fn generic_opt_in_verb(verb: &str) -> Option<&'static str> {
         _ => None,
     }
 }
+
+/// Model-qualified `allowed_actions` verbs for the dedicated tools.
+pub const DEDICATED_TOOL_TOKENS: &[&str] = &["activity", "note", "message", "attach"];
 
 /// `allowed_actions` verb of the per-table opt-in for generic `odoo_create`.
 pub const GENERIC_CREATE_TOKEN: &str = "generic_create";

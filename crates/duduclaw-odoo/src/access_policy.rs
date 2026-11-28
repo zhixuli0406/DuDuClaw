@@ -210,7 +210,7 @@ pub fn method_verb(method: &str) -> Verb {
 
 // The policy grammar intentionally differs from the bounded schema identifier
 // validator: digit-leading segments are legal, empty segments are not.
-pub(crate) fn valid_policy_model(model: &str) -> bool {
+pub fn valid_policy_model(model: &str) -> bool {
     model.split('.').all(|segment| {
         !segment.is_empty()
             && segment.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
@@ -646,6 +646,9 @@ pub fn list_refusal_message(item: &str) -> String {
 pub fn fixed_refusal_message(refusal: FixedRefusal) -> String {
     format!("DuDuClaw 不讓 AI 做這件事：{}。", refusal.reason())
 }
+
+/// Personal Odoo connections are disabled by company policy.
+pub const MEMBER_CREDENTIALS_OFF: &str = "公司尚未開放同仁連接自己的 Odoo 帳號，請洽管理員。";
 
 pub fn not_connected_message(avatar_or_requester: bool) -> &'static str {
     if avatar_or_requester {

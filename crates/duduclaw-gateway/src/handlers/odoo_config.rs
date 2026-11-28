@@ -128,7 +128,8 @@ pub(crate) fn render_odoo_schema_details(
 ///
 /// RM-120: the generic-write opt-in tokens `generic_create:<model>` /
 /// `generic_write:<model>` are accepted only in the qualified form — the
-/// opt-in is per table, with no all-tables variant.
+/// opt-in is per table, with no all-tables variant. Dedicated-tool tokens
+/// also require an exact model, using the runtime policy grammar.
 pub(crate) fn odo_valid_action(action: &str) -> bool {
     const VERBS: &[&str] = &["read", "search", "write", "create", "unlink", "action", "execute"];
     const QUALIFIED_ONLY: &[&str] = &[
@@ -139,6 +140,9 @@ pub(crate) fn odo_valid_action(action: &str) -> bool {
         Some((v, m)) => (v, Some(m)),
         None => (action, None),
     };
+    if duduclaw_odoo::agent_config::DEDICATED_TOOL_TOKENS.contains(&verb) {
+        return model.is_some_and(duduclaw_odoo::access_policy::valid_policy_model);
+    }
     if QUALIFIED_ONLY.contains(&verb) {
         return model.is_some_and(duduclaw_odoo::schema::valid_model_name);
     }
