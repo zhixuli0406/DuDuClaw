@@ -6701,7 +6701,29 @@ export interface MyMemoryForgetResult {
   agent: string;
 }
 
+export interface DriveWriteConfirmation {
+  id: string;
+  expires_at: string;
+  agent: string;
+  employee: string;
+  account: string;
+  action: string;
+  file_id: string;
+  file_name: string;
+  destination: string;
+  destination_name: string;
+  size: string;
+  preview: string;
+  attachment_name: string;
+  rename_before: string;
+  rename_after: string;
+  parents_before: string;
+  source_names: string;
+}
+
 export interface PersonalGoogleStatus {
+  drive_write: { connected: boolean; status: string | null; account_email: string | null; granted_scopes: string[] };
+  enabled_by_admin: boolean;
   authorization_requests?: { id: string; agent: string; purpose: string; status: string }[];
   notices?: { id: number; agent_id: string; actor_id: string; kind: string; timestamp: string }[];
   chat_read?: boolean;
@@ -9141,6 +9163,10 @@ export const api = {
     remove: (channel: ChatLinkChannel, channelUserId: string) => client.call('me.chat_link.remove', { channel, channel_user_id: channelUserId }) as Promise<{ revoked: true }>,
   },
   personalGoogle: {
+    writeConnectStart: (acknowledgeGoogleData: boolean, acknowledgeWrite: boolean) => client.call('me.google.write_connect_start', { redirect_origin: window.location.origin, acknowledge_google_data: acknowledgeGoogleData, acknowledge_write: acknowledgeWrite }) as Promise<{ authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number }>,
+    writeDisconnect: () => client.call('me.google.write_disconnect', { confirm: true }) as Promise<{ disconnected: true; provider_note?: string | null }>,
+    writeConfirmations: () => client.call('me.google.write_confirmations', {}) as Promise<{ requests: DriveWriteConfirmation[] }>,
+    writeConfirm: (id: string, approve: boolean) => client.call('me.google.write_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     chatConfirmations: () => client.call('me.google.chat_confirmations', {}) as Promise<{ requests: { id: string; employee: string; account: string; space: string; thread: string | null; text_display: string; expires_at: string }[] }>,
     confirmChat: (id: string, approve: boolean) => client.call('me.google.chat_confirm', { id, approve }) as Promise<{ decided: boolean }>,
     status: () => client.call('me.google.status') as Promise<PersonalGoogleStatus>,

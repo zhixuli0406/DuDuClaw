@@ -3,6 +3,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Link, useSearchParams } from 'react-router';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
+import { DriveWriteMemberCard } from '@/components/connections/DriveWriteMemberCard';
+import { DriveWriteConfirmations } from '@/components/connections/DriveWriteConfirmationCard';
 import { ChatLinkCard } from '@/components/connections/ChatLinkCard';
 import { useAuthStore } from '@/stores/auth-store';
 import { toast } from '@/lib/toast';
@@ -120,6 +122,8 @@ export function MyConnectionsPage() {
       {paste && <div className="space-y-2"><p className="text-sm">{t('myConnections.pasteHint')}</p><label htmlFor="google-return-url">{t('myConnections.returnUrl')}</label><Input id="google-return-url" type="url" value={url} onChange={e=>setUrl(e.target.value)} autoComplete="off"/><Button disabled={busy||!url} onClick={()=>void run(async()=>{await api.personalGoogle.paste(url);setUrl('');setPaste(false);})}>{t('myConnections.finish')}</Button></div>}
       </>}
     </CardContent></Card>
+    {status && !error && <DriveWriteMemberCard status={status} onRefresh={load} onStarted={started => { setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); }} />}
+    <DriveWriteConfirmations />
     {isAdmin && <ChatLinkCard />}
     {chatRequests.map(request => <Card key={request.id}><CardHeader><CardTitle>{t('myConnections.chatSend.confirmTitle')}</CardTitle></CardHeader><CardContent className="space-y-3">
       <p>{request.employee} · {request.account}</p><p className="break-all">{request.space} {request.thread ?? ''}</p>
