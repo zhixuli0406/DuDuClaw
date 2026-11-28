@@ -428,6 +428,9 @@ impl MethodHandler {
                 if let Err(error) = config_raw_rpc::refuse_odoo_widening_params(&self.home_dir, &params) {
                     return WsFrame::error_response("", &error);
                 }
+                if let Err(error) = config_raw_rpc::refuse_member_key_widening_params(&self.home_dir, &params) {
+                    return WsFrame::error_response("", &error);
+                }
                 boxed_frame(|| self.handle_google_integration_set(params, ctx)).await
             }
             // ── Per-employee Google identity (B2a) ──────────────

@@ -137,6 +137,7 @@ pub(crate) mod credential_protection_rpc;
 mod website_credentials_rpc;
 mod status_tokens_rpc;
 mod member_keys_rpc;
+mod member_keys_policy_rpc;
 mod skill_trust_rpc;
 mod odoo_member_rpc;
 mod odoo_access_rpc;
@@ -792,6 +793,9 @@ impl MethodHandler {
         // Pin parameters contain fresh credentials; never pass them to extensions.
         if method.split('.').next() == Some("skill_trust") {
             return boxed_frame(|| self.dispatch_ops(method, params, ctx, conn)).await;
+        }
+        if matches!(method, "member_keys.policy_get" | "member_keys.policy_set") {
+            return boxed_frame(|| self.handle_member_keys_policy_rpc(method, params, ctx)).await;
         }
         if member_keys_rpc::owns(method) {
             return boxed_frame(|| self.handle_member_keys_rpc(method, params, ctx, conn)).await;

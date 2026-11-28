@@ -60,6 +60,7 @@ impl MethodHandler {
                     let (limit, cursor) = pagination(&params)?;
                     let page = db.member_api_keys_for_user_page(&user, limit, cursor).map_err(error)?;
                     Ok(json!({"keys": page.keys, "next_cursor": page.next_cursor, "max_active": 5,
+                        "policy": {"allow_conversation_content": config.allow_conversation_content, "allow_mcp_scopes": config.allow_mcp_scopes},
                         "max_total": 50, "reauthentication": if db.mfa_active(&user).map_err(|_| error(MemberKeyError::Store))? { "mfa" } else { "password" }}))
                 },
                 "me.member_keys.create" => {

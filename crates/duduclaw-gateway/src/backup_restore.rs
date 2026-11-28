@@ -498,6 +498,7 @@ pub struct RestoreStageReport {
     pub mfa_notice: bool,
     pub drive_write_notice: bool,
     pub odoo_notice: bool,
+    pub member_key_notice: bool,
 }
 
 pub(crate) const DRIVE_WRITE_RESTORE_NOTICE: &str =
@@ -509,6 +510,7 @@ impl RestoreStageReport {
         if self.mfa_notice { notices.push(crate::mfa::RESTORE_POLICY_NOTICE); }
         if self.drive_write_notice { notices.push(DRIVE_WRITE_RESTORE_NOTICE); }
         if self.odoo_notice { notices.push(crate::handlers::config_commit::ODOO_RESTORE_NOTICE); }
+        if self.member_key_notice { notices.push(crate::handlers::config_commit::MEMBER_KEY_RESTORE_NOTICE); }
         if notices.is_empty() { None } else { Some(notices.join("\n")) }
     }
 }
@@ -686,7 +688,9 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
     let (restored_config, mut odoo_notice) =
         crate::handlers::config_commit::strip_odoo_widening_preserving(&before, &restored_config)?;
     odoo_notice |= strip_restore_odoo_agents(home, &root)?;
-    if drive_write_notice || odoo_notice {
+    let (restored_config, member_key_notice) =
+        crate::handlers::config_commit::strip_member_key_widening_preserving(&before, &restored_config)?;
+    if drive_write_notice || odoo_notice || member_key_notice {
         std::fs::write(&restored_path, &restored_config)
             .map_err(|e| format!("無法更新還原設定：{e}"))?;
     }
@@ -697,6 +701,9 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
         &read_config(&current_config)?, &restored_config,
     )?;
     crate::handlers::config_commit::refuse_odoo_widening_text_edit(
+        &read_config(&current_config)?, &restored_config,
+    )?;
+    crate::handlers::config_commit::refuse_member_key_widening_text_edit(
         &read_config(&current_config)?, &restored_config,
     )?;
     let mfa_notice = crate::mfa::restore_policy_differs(home, &restored_config);
@@ -714,7 +721,7 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
     };
     publish_restore_with_sync(home, &extracted, &marker, &mut sync_restore_path)
         .map_err(|e| format!("發布還原資料或標記失敗（已發布的暫存資料會保留）：{e}"))?;
-    Ok(RestoreStageReport { extraction, mfa_notice, drive_write_notice, odoo_notice })
+    Ok(RestoreStageReport { extraction, mfa_notice, drive_write_notice, odoo_notice, member_key_notice })
 }
 
 // Sync children before their parent; never follow links or accept special files.
@@ -999,12 +1006,18 @@ fn perform_pending_restore_swap_locked(
     let (restored_config, mut odoo_notice) = crate::handlers::config_commit::strip_odoo_widening_preserving(
         &read_config(&current_config)?, &restored_config,
     ).map_err(RestoreSwapError::Io)?;
-    if odoo_notice {
+    let (restored_config, member_key_notice) = crate::handlers::config_commit::strip_member_key_widening_preserving(
+        &read_config(&current_config)?, &restored_config,
+    ).map_err(RestoreSwapError::Io)?;
+    if odoo_notice || member_key_notice {
         std::fs::write(&restored_config_path, &restored_config)
             .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
     }
     odoo_notice |= strip_restore_odoo_agents(home_dir, &restore_root).map_err(RestoreSwapError::Io)?;
     crate::handlers::config_commit::refuse_odoo_widening_text_edit(
+        &read_config(&current_config)?, &restored_config,
+    ).map_err(RestoreSwapError::Io)?;
+    crate::handlers::config_commit::refuse_member_key_widening_text_edit(
         &read_config(&current_config)?, &restored_config,
     ).map_err(RestoreSwapError::Io)?;
 
@@ -1081,6 +1094,9 @@ fn perform_pending_restore_swap_locked(
     tracing::info!(mfa_enforced = kept_mfa, "{}", crate::mfa::RESTORE_POLICY_NOTICE);
     if odoo_notice {
         tracing::info!("{}", crate::handlers::config_commit::ODOO_RESTORE_NOTICE);
+    }
+    if member_key_notice {
+        tracing::info!("{}", crate::handlers::config_commit::MEMBER_KEY_RESTORE_NOTICE);
     }
 
     Ok(Some(RestoreSwapReport {
@@ -1459,6 +1475,35 @@ mod tests {
             assert!(!staging.exists());
             assert!(read_marker(home).is_none());
         }
+    }
+
+    #[test]
+    fn member_key_restore_strips_widening_and_rechecks_at_swap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let before = "[auth]\nmfa_enforced=true\n[member_api_keys]\nallow_mcp_scopes=['tasks:read']\n";
+        std::fs::write(home.join("config.toml"), before).unwrap();
+        let backup = "# keep\n[auth]\nmfa_enforced=true\n[member_api_keys]\nenabled=false # unchanged\nrate_per_minute=321\nallow_conversation_content=true\nallow_mcp_scopes=['tasks:read','odoo:write']\n";
+        let archive = write_archive(tmp.path(), "member-keys.tar.gz", &build_tar_gz(&[("config.toml", backup.as_bytes())]));
+        let report = stage_restore_with_protection(&home, &archive, RestoreProtection::Off).unwrap();
+        assert!(report.member_key_notice);
+        assert!(report.notice().unwrap().contains(crate::handlers::config_commit::MEMBER_KEY_RESTORE_NOTICE));
+        let root = resolve_restore_root(&staging_dir(&home), &home);
+        let staged = std::fs::read_to_string(root.join("config.toml")).unwrap();
+        let config = crate::member_keys::Config::parse(&staged).unwrap();
+        assert!(!config.allow_conversation_content);
+        assert_eq!(config.allow_mcp_scopes, vec!["tasks:read".to_owned()]);
+        // Revalidate older staging and a stricter live policy at publication.
+        std::fs::write(root.join("config.toml"), backup).unwrap();
+        std::fs::write(home.join("config.toml"), "[auth]\nmfa_enforced=true\n").unwrap();
+        perform_pending_restore_swap_with_protection(&home, "member-key-test", RestoreProtection::Off).unwrap().unwrap();
+        let restored = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        let config = crate::member_keys::Config::parse(&restored).unwrap();
+        assert!(!config.enabled && !config.allow_conversation_content);
+        assert!(config.allow_mcp_scopes.is_empty());
+        assert_eq!(config.rate_per_minute, 321);
+        assert!(restored.contains("enabled=false # unchanged"));
     }
 
     #[test]

@@ -816,6 +816,33 @@ pub(crate) fn refuse_drive_write_edit(before: &toml::Table, after: &toml::Table)
     Ok(())
 }
 
+const MEMBER_KEY_WIDENING_REFUSED: &str = "本人金鑰的開放範圍只能在「外部系統存取」頁確認風險後變更。";
+
+/// Generic writers may only narrow the creation policy, never produce consent.
+pub(crate) fn refuse_member_key_widening_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    use super::config_commit::toml_at;
+    if after.get("member_api_keys").is_some_and(|value| !value.is_table())
+        && after.get("member_api_keys") != before.get("member_api_keys") {
+        return Err(MEMBER_KEY_WIDENING_REFUSED.into());
+    }
+    if toml_at(after, "member_api_keys.allow_conversation_content").and_then(toml::Value::as_bool) == Some(true)
+        && toml_at(before, "member_api_keys.allow_conversation_content").and_then(toml::Value::as_bool) != Some(true) {
+        return Err(MEMBER_KEY_WIDENING_REFUSED.into());
+    }
+    let new = match toml_at(after, "member_api_keys.allow_mcp_scopes") {
+        None => return Ok(()), // Removing the key/section is always narrowing.
+        Some(toml::Value::Array(values)) => values.iter().map(|value|
+            value.as_str().ok_or_else(|| MEMBER_KEY_WIDENING_REFUSED.to_owned())).collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(MEMBER_KEY_WIDENING_REFUSED.into()),
+    };
+    // An invalid old list grants nothing; replacing it with an empty list is safe.
+    let old = toml_at(before, "member_api_keys.allow_mcp_scopes").and_then(toml::Value::as_array)
+        .and_then(|values| values.iter().map(toml::Value::as_str).collect::<Option<Vec<_>>>())
+        .unwrap_or_default();
+    if new.iter().any(|scope| !old.contains(scope)) { return Err(MEMBER_KEY_WIDENING_REFUSED.into()); }
+    Ok(())
+}
+
 const ODOO_WIDENING_REFUSED: &str = "這項 Odoo 權限設定只能在 Odoo 設定頁確認風險後變更。";
 
 /// Compare raw acknowledgements (never normalized policy) and effective refusals.
@@ -922,6 +949,46 @@ pub(crate) fn refuse_odoo_widening_params(home: &Path, params: &Value) -> Result
         }
     }
     refuse_odoo_widening_edit(&before, &after)
+}
+
+/// Reject nested and dotted policy widening even if the generic writer ignores it.
+pub(crate) fn refuse_member_key_widening_params(home: &Path, params: &Value) -> Result<(), String> {
+    const KEYS: &[&str] = &["member_api_keys.allow_conversation_content", "member_api_keys.allow_mcp_scopes"];
+    fn collect<'a>(value: &'a Value, path: &str, edits: &mut Vec<(String, &'a Value)>) {
+        let related = |key: &str, prefix: &str| key == prefix
+            || key.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'));
+        if !path.is_empty() && !KEYS.iter().any(|key| related(key, path) || related(path, key)) {
+            return;
+        }
+        if !path.is_empty() && (KEYS.contains(&path) || !value.is_object()) {
+            edits.push((path.to_owned(), value));
+        } else if let Some(object) = value.as_object() {
+            for (key, value) in object {
+                let next = if path.is_empty() { key.clone() } else { format!("{path}.{key}") };
+                collect(value, &next, edits);
+            }
+        }
+    }
+    let mut edits = Vec::new();
+    collect(params, "", &mut edits);
+    if edits.is_empty() { return Ok(()); }
+    let raw = std::fs::read_to_string(home.join("config.toml"))
+        .map_err(|_| MEMBER_KEY_WIDENING_REFUSED.to_owned())?;
+    let before: toml::Table = raw.parse().map_err(|_| MEMBER_KEY_WIDENING_REFUSED.to_owned())?;
+    let mut after = before.clone();
+    for (path, value) in edits {
+        let mut parts: Vec<_> = path.split('.').collect();
+        let key = parts.pop().ok_or(MEMBER_KEY_WIDENING_REFUSED)?;
+        let section = super::config_commit::table_at_mut(&mut after, &parts)
+            .map_err(|_| MEMBER_KEY_WIDENING_REFUSED.to_owned())?;
+        if value.is_null() {
+            section.remove(key);
+        } else {
+            section.insert(key.into(), toml::Value::try_from(value)
+                .map_err(|_| MEMBER_KEY_WIDENING_REFUSED.to_owned())?);
+        }
+    }
+    refuse_member_key_widening_edit(&before, &after)
 }
 
 /// Generic settings RPCs must not silently accept a misplaced consent edit.
@@ -1141,6 +1208,7 @@ impl MethodHandler {
             crate::google_signin::config::refuse_google_signin_widening(&before, &after)?;
             refuse_drive_write_edit(&before, &after)?;
             refuse_odoo_widening_edit(&before, &after)?;
+            refuse_member_key_widening_edit(&before, &after)?;
         }
         if matches!(kind, RawFile::Agent(_)) {
             refuse_odoo_agent_widening_edit(&before, &after)?;
@@ -1509,6 +1577,26 @@ impl MethodHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_key_guard_refuses_widening_and_malformed_scopes() {
+        let parse = |text: &str| text.parse::<toml::Table>().unwrap();
+        for after in ["member_api_keys=[]", "[member_api_keys]\nallow_conversation_content=true",
+            "[member_api_keys]\nallow_mcp_scopes=['tasks:read']",
+            "[member_api_keys]\nallow_mcp_scopes='tasks:read'",
+            "[member_api_keys]\nallow_mcp_scopes=[1]"] {
+            assert_eq!(refuse_member_key_widening_edit(&parse(""), &parse(after)).unwrap_err(), MEMBER_KEY_WIDENING_REFUSED);
+        }
+        let before = parse("[member_api_keys]\nallow_conversation_content=true\nallow_mcp_scopes=['tasks:read','odoo:read']");
+        for after in ["", "[member_api_keys]", "[member_api_keys]\nallow_conversation_content=false",
+            "[member_api_keys]\nallow_mcp_scopes=['tasks:read']"] {
+            assert!(refuse_member_key_widening_edit(&before, &parse(after)).is_ok());
+        }
+        assert!(refuse_member_key_widening_edit(&before, &before).is_ok());
+        assert!(refuse_member_key_widening_edit(&parse("member_api_keys=[]"), &parse("member_api_keys=[]")).is_ok());
+        assert!(refuse_member_key_widening_edit(&parse("[member_api_keys]\nallow_mcp_scopes=[1]"), &parse("")).is_ok());
+    }
+
 
     #[tokio::test]
     async fn raw_delegation_role_addition_requires_acknowledgement() {

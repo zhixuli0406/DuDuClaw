@@ -20,7 +20,7 @@ impl Default for Config {
     fn default() -> Self { Self { enabled: false, rate_per_minute: 120, allow_conversation_content: false, allow_mcp_scopes: Vec::new() } }
 }
 impl Config {
-    fn parse(text: &str) -> Option<Self> {
+    pub(crate) fn parse(text: &str) -> Option<Self> {
         let root: toml::Table = toml::from_str(text).ok()?;
         let config: Self = match root.get("member_api_keys") {
             None => Self::default(),
