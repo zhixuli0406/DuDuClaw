@@ -221,8 +221,12 @@ pub(in crate::google_identity) async fn drive_write_step(
         // Disabled optional diagnostics do not fail otherwise healthy identities.
         return report(true, "管理員尚未開放");
     }
+    let home_path = matches!(effective.effective, Effective::Home)
+        .then(|| gw::selected_path(home).ok()).flatten();
     let unchanged = || gi::effective_for(home, Some(agent)) == *configured
         && super::delegate_owner::effective_for(home, Some(agent)) == *effective
+        && (!matches!(effective.effective, Effective::Home)
+            || gw::selected_path(home).ok() == home_path)
         && gw::drive_write_policy::load(home).any_enabled();
     if !unchanged() { return report(false, FAILED); }
     if let Effective::Personal { selector } = &effective.effective {
@@ -257,22 +261,28 @@ pub(in crate::google_identity) async fn drive_write_step(
     if verify().is_err() { return report(false, FAILED); }
     let minted = if let Some(identity) = &identity {
         super::resolve::mint_delegate_for_drive_write(home, identity.email, CacheMode::Bypass).await
+            .map(|token| zeroize::Zeroizing::new(token.access_token))
     } else {
-        match gw::selected_path(home).as_deref() {
-            Ok("oauth" | "apps_script") => return report(false, "這種公司帳號連線方式不支援雲端硬碟寫入"),
-            Ok("service_account") => super::home_source::home_sa_token_for_drive_write(home).await,
+        match home_path.as_deref() {
+            Some("oauth") => {
+                use super::drive_write::credential::{self, IdentityRoute};
+                credential::write_token(home, &IdentityRoute::HomeOAuth).await.map(|token| token.bearer)
+            }
+            Some("apps_script") => return report(false, "這種公司帳號連線方式不支援雲端硬碟寫入"),
+            Some("service_account") => super::home_source::home_sa_token_for_drive_write(home).await
+                .map(|token| zeroize::Zeroizing::new(token.access_token)),
             _ => return report(false, FAILED),
         }
     };
     if verify().is_err() { return report(false, FAILED); }
     let token = match minted {
         Ok(token) => token,
-        Err(refusal) if refusal.code == "drive_write_admin_scope_missing" => {
+        Err(refusal) if matches!(refusal.code, "drive_write_admin_scope_missing" | "drive_write_needs_home_consent") => {
             return step("drive_write", "雲端硬碟寫入", false, refusal.message_zh);
         }
         Err(_) => return report(false, FAILED),
     };
-    let Ok(mut transport) = WriteTransport::new(zeroize::Zeroizing::new(token.access_token)) else {
+    let Ok(mut transport) = WriteTransport::new(token) else {
         return report(false, FAILED);
     };
     #[cfg(test)]

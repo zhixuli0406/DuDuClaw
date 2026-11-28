@@ -154,7 +154,7 @@ async fn drive_write_check_personal_uses_owner_snapshot_without_minting() {
 }
 
 #[tokio::test]
-async fn drive_write_check_home_sa_probes_and_other_company_routes_do_not() {
+async fn drive_write_check_home_sa_probes_oauth_needs_consent_and_apps_script_is_unsupported() {
     let home = Home::new();
     home.domains(&["c.test"]);
     home.agent("bot", "[google]\nidentity='home'\n");
@@ -178,11 +178,59 @@ async fn drive_write_check_home_sa_probes_and_other_company_routes_do_not() {
             assert_eq!(data_endpoint_reads_for("p8-home-probe@c.test"), 1);
         } else {
             assert!(!step.ok);
-            assert_eq!(step.detail, "這種公司帳號連線方式不支援雲端硬碟寫入");
+            assert_eq!(step.detail, if mode == "oauth" {
+                "公司 Google 帳號需要重新連結雲端硬碟寫入，請聯絡管理員。"
+            } else { "這種公司帳號連線方式不支援雲端硬碟寫入" });
             assert!(seen_for("p8-home-probe@c.test").is_empty());
             assert_eq!(data_endpoint_reads_for("p8-home-probe@c.test"), 0);
         }
     }
+}
+
+#[tokio::test]
+async fn drive_write_check_home_oauth_probes_with_dedicated_write_token() {
+    use crate::person_credentials::{write_store as store, Secret, Status};
+    let home = Home::new();
+    home.agent("bot", "[google]\nidentity='home'\n");
+    std::fs::write(home.p().join("config.toml"),
+        "[integrations]\ngoogle_workspace=true\ngoogle_credential_path='oauth'\n").unwrap();
+    enable_write(&home);
+    home.protect();
+    crate::mcp_oauth::upsert_client_config(home.p(), crate::mcp_oauth::McpOAuthClientConfig {
+        provider_id: "google".into(), client_id: "p8-home-client".into(), client_secret: "client-secret".into(),
+        auth_url: "https://accounts.google.com/o/oauth2/v2/auth".into(),
+        token_url: "https://oauth2.googleapis.com/token".into(), scopes: vec![],
+        redirect_uri: "http://127.0.0.1:18889/api/mcp/oauth/callback".into(),
+    }).unwrap();
+    let email = "p8-home-oauth-write@c.test";
+    let metadata = store::Metadata {
+        owner_kind: "home".into(), owner_id: "home".into(), purpose: "drive_write".into(),
+        provider: "google".into(), credential_id: uuid::Uuid::new_v4().to_string(), revision: 1,
+        account_email: email.into(), google_sub: "google-home-write".into(), hosted_domain: Some("c.test".into()),
+        granted_scopes: delegated_scopes::for_drive_write().iter().map(|s| s.to_string()).collect(),
+        status: Status::Connected, status_before_suspension: None,
+        connected_at: chrono::Utc::now().to_rfc3339(), last_refresh_at: None,
+        oauth_client_id: "p8-home-client".into(), google_data_consent: None,
+    };
+    let secret = Secret { access_token: closed_fixture_token(email), refresh_token: None,
+        expires_at: Some(4_000_000_000) };
+    let key = protection_gate(home.p()).unwrap();
+    let epoch = store::begin_connection(home.p(), "home", "home").unwrap();
+    store::connect(home.p(), &key, metadata.clone(), &secret, epoch).unwrap();
+    let step = write_step(&home, &NoPeople).await;
+    assert!(step.ok, "{step:?}");
+    assert_eq!(step.detail, "可以使用");
+    let reads: Vec<_> = service_reads().lock().unwrap().iter()
+        .filter(|(account, _)| account == email).cloned().collect();
+    assert_eq!(reads, vec![(email.into(),
+        "/drive/v3/files?pageSize=1&fields=files(id)&supportsAllDrives=true&includeItemsFromAllDrives=true".into())]);
+    assert!(seen_for(email).is_empty());
+    assert!(!serde_json::to_string(&step).unwrap().contains(&secret.access_token));
+    store::mark_needs_reconnect(home.p(), &metadata).unwrap();
+    let step = write_step(&home, &NoPeople).await;
+    assert!(!step.ok);
+    assert_eq!(step.detail, "公司 Google 帳號需要重新連結雲端硬碟寫入，請聯絡管理員。");
+    assert_eq!(data_endpoint_reads_for(email), 1);
 }
 
 #[tokio::test]
