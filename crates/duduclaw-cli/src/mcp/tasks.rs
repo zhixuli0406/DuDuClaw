@@ -2015,7 +2015,7 @@ mod main_assignment_tests {
     struct TestLiveAuthority;
     impl duduclaw_isolation::capability::LiveRequestVerifier for TestLiveAuthority {
         fn verify_live(&self, _: &CapabilityRecord, _: u64)
-            -> Result<(), duduclaw_mcp_boundary::VerificationError> { Ok(()) }
+            -> std::result::Result<(), duduclaw_mcp_boundary::VerificationError> { Ok(()) }
     }
 
     async fn task_run_call(home: &Path, user: &str, agent: &str) -> Arc<IsolatedCall> {
