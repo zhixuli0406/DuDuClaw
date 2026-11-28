@@ -12385,5 +12385,8 @@
   "memberGoogleSignin.unlink": "取消 Google 登入",
   "memberGoogleSignin.unlinkNote": "取消也要輸入密碼。",
   "memberGoogleSignin.noPassword": "你的帳號是用 Google 開通的，沒有設定密碼，不能取消 Google 登入。",
-  "memberGoogleSignin.invalidUrl": "無法開啟 Google 登入頁面，請稍後再試。"
+  "memberGoogleSignin.invalidUrl": "無法開啟 Google 登入頁面，請稍後再試。",
+  "mfa.googleReauth.start": "用公司 Google 帳號重新驗證",
+  "mfa.googleReauth.hint": "你的帳號沒有設定密碼，變更兩步驟驗證前要先用 Google 重新驗證一次（5 分鐘內有效、只能用一次）。",
+  "mfa.googleReauth.success": "已用公司 Google 帳號重新驗證，5 分鐘內可以變更兩步驟驗證。"
 }

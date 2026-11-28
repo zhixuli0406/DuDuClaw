@@ -12385,5 +12385,8 @@
   "memberGoogleSignin.unlink": "Disable Google sign-in",
   "memberGoogleSignin.unlinkNote": "Enter your password to disable Google sign-in.",
   "memberGoogleSignin.noPassword": "Your account was created with Google and has no password. Google sign-in cannot be disabled.",
-  "memberGoogleSignin.invalidUrl": "Unable to open the Google sign-in page. Please try again later."
+  "memberGoogleSignin.invalidUrl": "Unable to open the Google sign-in page. Please try again later.",
+  "mfa.googleReauth.start": "Re-authenticate with company Google account",
+  "mfa.googleReauth.hint": "Your account has no password. Re-authenticate with Google before changing two-step verification (valid for 5 minutes, single use).",
+  "mfa.googleReauth.success": "Re-authenticated with your company Google account. You can change two-step verification within 5 minutes."
 }

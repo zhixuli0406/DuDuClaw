@@ -12385,5 +12385,8 @@
   "memberGoogleSignin.unlink": "Google ログインを無効にする",
   "memberGoogleSignin.unlinkNote": "無効にする際もパスワードの入力が必要です。",
   "memberGoogleSignin.noPassword": "このアカウントは Google で作成され、パスワードが設定されていないため、Google ログインを無効にできません。",
-  "memberGoogleSignin.invalidUrl": "Google ログインページを開けません。しばらくしてからもう一度お試しください。"
+  "memberGoogleSignin.invalidUrl": "Google ログインページを開けません。しばらくしてからもう一度お試しください。",
+  "mfa.googleReauth.start": "会社の Google アカウントで再認証",
+  "mfa.googleReauth.hint": "このアカウントにはパスワードがありません。二段階認証を変更する前に Google で再認証してください（5 分間有効、1 回のみ使用可能）。",
+  "mfa.googleReauth.success": "会社の Google アカウントで再認証しました。5 分以内に二段階認証を変更できます。"
 }

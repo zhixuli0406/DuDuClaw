@@ -56,6 +56,8 @@ export interface MemberGoogleSigninStatus {
   linked_at?: number;
 }
 export const memberGoogleSignin = {
+  reauthStart: () => client.call('me.google_signin.reauth_start', {}) as Promise<{ authorization_url: string }>,
+  reauthComplete: (ticket: string) => client.call('me.google_signin.reauth_complete', { ticket }) as Promise<Record<string, never>>,
   status: () => client.call('me.google_signin.status', {}) as Promise<MemberGoogleSigninStatus>,
   linkStart: (password: string) => client.call('me.google_signin.link_start', { password }) as Promise<{ authorization_url: string }>,
   linkComplete: (ticket: string) => client.call('me.google_signin.link_complete', { ticket }) as Promise<Record<string, never>>,
