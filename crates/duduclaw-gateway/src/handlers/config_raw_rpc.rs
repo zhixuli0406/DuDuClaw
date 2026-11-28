@@ -855,7 +855,9 @@ pub(crate) fn refuse_odoo_widening_edit(before: &toml::Table, after: &toml::Tabl
     Ok(())
 }
 
-/// Agent raw/profile writers have no risk-confirming Odoo widening adapter yet.
+/// Generic agent raw/profile writers always refuse widening. Only the dedicated
+/// `odoo.agent_access_set` profile adapter can change these two keys after live
+/// Admin verification, risk acknowledgement and write-ahead audit.
 pub(crate) fn refuse_odoo_agent_widening_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
     use super::config_commit::toml_at;
     use duduclaw_odoo::access_policy::PermissionOverride;

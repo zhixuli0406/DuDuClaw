@@ -41,6 +41,10 @@ impl MethodHandler {
             Ok(t) => t,
             Err(e) => return WsFrame::error_response("", &e),
         };
+        let access = match super::odoo_agent_access_rpc::summary(&table) {
+            Ok(access) => access,
+            Err(error) => return WsFrame::error_response("", &error),
+        };
         let override_cfg = match duduclaw_odoo::AgentOdooConfig::from_table(&table) {
             Ok(cfg) => cfg,
             Err(error) => return WsFrame::error_response("", &error),
@@ -117,6 +121,8 @@ impl MethodHandler {
             json!({
                 "agent_id": agent_id,
                 "configured": override_cfg.is_some(),
+                "permission_override": access["permission_override"],
+                "act_as_requester": access["act_as_requester"],
                 "effective_unblock_models": effective_unblock_models,
                 "unblock_inherited": unblock_inherited,
                 "effective_blocked_models": effective_blocked_models,

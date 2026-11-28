@@ -1066,6 +1066,8 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 
 管理者のブラウザー RPC `odoo.access_get {}` と `odoo.access_set` で読み取り・更新します。Set は `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk` を受け付けます。Follow の選択、会社アカウント AI の追加、拒否ルールの削除には `acknowledge_risk=true` が必要です。変更は監査し、監査失敗時は書き込みません。不正な権限設定では Odoo 操作を拒否します。Engine の新ツールは `allowed_models` の明示的な対象モデルと、`allowed_actions` の正確な `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` が必要です。空リストでは許可しません。
 
+従業員ごとの変更には管理者のブラウザー RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` を使います。override は `inherit`、`engine`、`read_only` のみ受け付け、依頼者の ID の有効化や制限の緩和には `acknowledge_risk=true` が必要です。この 2 項目だけを変更し、有効な管理者セッションを再確認して書き込み前に監査します。監査失敗時は変更しません。`odoo.agent_config_get` は両項目を返し、生の設定やプロフィールの書き込みでは権限拡大を拒否します。操作画面は Odoo 設定ページで提供予定です。
+
 会社 Odoo URL／データベースが設定済みの場合、アップグレード時に自分の Odoo アカウントを持たない既存の通常 AI を一度だけ `company_key_agents` に追加し、完了マーカーと通知を記録します。権限モードは変更しません。自分の Odoo アカウント設定が不完全な AI は追加されず、管理者による明示的な割り当てが必要です。 新規 AI は自動追加しません。移行後にリストを確認してください。
 
 本人の接続はブラウザー限定の `me.odoo.status`、`me.odoo.connect {login, api_key}`、`me.odoo.test {}`、`me.odoo.disconnect {}` で管理します。先に status でサーバー／データベースを確認し、変更後は同じブラウザーセッションで読み直して再検証します。Connect と test は失敗・不正入力を含め、メンバーごとに毎分 5 回を共有します。パスワード変更、全端末サインアウト、利用停止後はキーの再入力が必要です。管理者は `odoo.member_credentials.list`、`.revoke {user_id}` で一覧・取り消しができますが、他人の秘密は設定できません。

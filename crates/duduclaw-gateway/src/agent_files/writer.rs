@@ -140,7 +140,7 @@ pub(crate) fn commit_locked_with_lifecycle(
     guard: impl FnOnce() -> Result<(), String>,
     force_lifecycle_barrier: bool,
 ) -> Result<Outcome, CommitError> {
-    commit_locked_inner(c, render, guard, force_lifecycle_barrier, None)
+    commit_locked_inner(c, render, guard, force_lifecycle_barrier, None, None)
 }
 
 /// [`commit_locked_with_lifecycle`] with an optional hard bound on the
@@ -155,7 +155,7 @@ pub(crate) fn commit_locked_with_lifecycle_within(
     force_lifecycle_barrier: bool,
     lock_wait: Option<std::time::Duration>,
 ) -> Result<Outcome, CommitError> {
-    commit_locked_inner(c, render, guard, force_lifecycle_barrier, lock_wait)
+    commit_locked_inner(c, render, guard, force_lifecycle_barrier, lock_wait, None)
 }
 
 /// Marker carried by every [`CommitError::Failed`] that means "the file lock
@@ -185,6 +185,7 @@ fn commit_locked_inner(
     guard: impl FnOnce() -> Result<(), String>,
     force_lifecycle_barrier: bool,
     lock_wait: Option<std::time::Duration>,
+    odoo_access_guard: Option<OdooAccessGuard<'_>>,
 ) -> Result<Outcome, CommitError> {
     let path = super::file_path(c.home, c.agent_id, &c.key).map_err(CommitError::Refused)?;
     let _authority = if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
@@ -237,10 +238,17 @@ fn commit_locked_inner(
             Ok(n) => n,
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
-        if c.key == FileKey::AgentToml
-            && let Err(e) = crate::handlers::config_commit::refuse_odoo_agent_widening_text_edit(&current, &new)
-        {
-            return Ok(Locked::Err(CommitError::Refused(e)));
+        if c.key == FileKey::AgentToml {
+            // Only the dedicated adapter supplies this callback. Never infer
+            // consent from caller-controlled metadata such as `source`.
+            let checked = if odoo_access_guard.is_some() {
+                require_only_odoo_agent_access_edit(&current, &new)
+            } else {
+                crate::handlers::config_commit::refuse_odoo_agent_widening_text_edit(&current, &new)
+            };
+            if let Err(e) = checked {
+                return Ok(Locked::Err(CommitError::Refused(e)));
+            }
         }
         let new = if c.key == FileKey::User {
             if new.len() > c.key.max_bytes() || new.chars().count() > super::MAX_USER_CHARS {
@@ -300,6 +308,14 @@ fn commit_locked_inner(
                 return Ok(Locked::Err(CommitError::Refused(e)));
             }
         }
+        // Re-check live browser authority and persist the dedicated audit
+        // before history or publication. Failure leaves agent.toml untouched.
+        let before_replace = if let Some(checks) = odoo_access_guard {
+            if let Err(e) = (checks.authorize_and_audit)(&current, &new) {
+                return Ok(Locked::Err(CommitError::Refused(e)));
+            }
+            Some(checks.recheck)
+        } else { None };
         // The version first: a change that cannot be undone is not written.
         let meta = VersionMeta {
             user_id: c.meta.user_id.clone(),
@@ -319,6 +335,13 @@ fn commit_locked_inner(
         if !accept_current {
             if bound.is_some() && skill_binding(c).ok() != Some(bound.clone()) {
                 return Ok(Locked::Err(CommitError::Refused("the skill folder changed while saving; nothing was written".into())));
+            }
+            // History persistence can take time. Recheck the live session
+            // once more immediately before publishing the Odoo access edit.
+            if let Some(recheck) = before_replace {
+                if let Err(e) = recheck() {
+                    return Ok(Locked::Err(CommitError::Refused(e)));
+                }
             }
             crate::handlers::config_commit::replace_owner_only(&path, &new)?;
         }
@@ -476,6 +499,66 @@ pub(crate) async fn commit_within(
     guard: impl FnOnce() -> Result<(), String>,
     lock_wait: Option<std::time::Duration>,
 ) -> Result<Outcome, CommitError> {
+    commit_within_policy(registry, c, render, guard, lock_wait, None).await
+}
+
+// Private capability: generic callers cannot opt out of the widening guard.
+struct OdooAccessGuard<'a> {
+    authorize_and_audit: Box<dyn FnOnce(&str, &str) -> Result<(), String> + Send + 'a>,
+    recheck: Box<dyn FnOnce() -> Result<(), String> + Send + 'a>,
+}
+
+/// Dedicated per-employee Odoo adapter. Only these two keys may differ, and
+/// the caller must recheck its live Admin session and audit in the callback.
+pub(crate) async fn commit_odoo_agent_access(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    c: Commit<'_>,
+    table: &toml::Table,
+    authorize_and_audit: impl FnOnce(&str, &str) -> Result<(), String> + Send,
+    recheck: impl FnOnce() -> Result<(), String> + Send,
+) -> Result<Outcome, CommitError> {
+    if c.key != FileKey::AgentToml || c.expected_hash.is_none() {
+        return Err(CommitError::Refused("Odoo access requires an existing agent.toml snapshot".into()));
+    }
+    commit_within_policy(registry, c,
+        |current| crate::handlers::config_commit::render_preserving(current, table),
+        || Ok(()), None, Some(OdooAccessGuard {
+            authorize_and_audit: Box::new(authorize_and_audit), recheck: Box::new(recheck),
+        }),
+    ).await
+}
+
+/// Compare exact retained text, not just parsed values. Also require a lossless
+/// parse/render round trip, so serializer normalization cannot mask a change.
+/// Unsupported layouts fail closed rather than rewriting unrelated bytes.
+pub(crate) fn require_only_odoo_agent_access_edit(before: &str, after: &str) -> Result<(), String> {
+    fn retained(text: &str) -> Result<String, String> {
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|e| e.to_string())?;
+        if doc.to_string() != text {
+            return Err("Odoo access cannot preserve this agent.toml layout".into());
+        }
+        if let Some(odoo) = doc.get_mut("odoo") {
+            let table = odoo.as_table_like_mut().ok_or("Invalid agent Odoo table")?;
+            table.remove("act_as_requester");
+            table.remove("permission_override");
+            if table.is_empty() { doc.remove("odoo"); }
+        }
+        Ok(doc.to_string())
+    }
+    if retained(before)? != retained(after)? {
+        return Err("Only odoo.act_as_requester and odoo.permission_override may change".into());
+    }
+    Ok(())
+}
+
+async fn commit_within_policy(
+    registry: &Arc<RwLock<AgentRegistry>>,
+    c: Commit<'_>,
+    render: impl FnOnce(&str) -> Result<String, String>,
+    guard: impl FnOnce() -> Result<(), String>,
+    lock_wait: Option<std::time::Duration>,
+    odoo_access_guard: Option<OdooAccessGuard<'_>>,
+) -> Result<Outcome, CommitError> {
     let lock = super::file_mutex(c.home, c.agent_id, &c.key);
     let started = std::time::Instant::now();
     let _held = match lock_wait {
@@ -486,9 +569,8 @@ pub(crate) async fn commit_within(
     };
     // The file lock gets what is left of the same budget (one bound total).
     let file_wait = lock_wait.map(|wait| wait.saturating_sub(started.elapsed()));
-    let mut out = run_blocking(|| match file_wait {
-        None => commit_locked(&c, render, guard),
-        Some(wait) => commit_locked_inner(&c, render, guard, false, Some(wait)),
+    let mut out = run_blocking(|| {
+        commit_locked_inner(&c, render, guard, false, file_wait, odoo_access_guard)
     })?;
     if out.unchanged {
         return Ok(out);

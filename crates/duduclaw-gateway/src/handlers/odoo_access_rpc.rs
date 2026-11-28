@@ -28,7 +28,7 @@ struct SetAccess {
 #[serde(deny_unknown_fields)]
 struct Empty {}
 
-fn fresh(db: &UserDb, ctx: &UserContext, session: &str) -> Result<UserContext, String> {
+pub(super) fn fresh(db: &UserDb, ctx: &UserContext, session: &str) -> Result<UserContext, String> {
     if ctx.member_key_id.is_some() || ctx.user_id == "system" { return Err(LOGIN.into()); }
     let live = db.live_user_context(&ctx.user_id).map_err(|_| LOGIN.to_owned())?
         .filter(|u| u.credential_epoch == ctx.credential_epoch && !u.must_change_password)

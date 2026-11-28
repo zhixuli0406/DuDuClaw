@@ -690,6 +690,10 @@ impl MethodHandler {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_agent_config_get(params)).await
             }
+            "odoo.agent_access_set" => {
+                require_admin!();
+                boxed_frame(|| self.handle_odoo_agent_access_set(params, ctx)).await
+            }
             "odoo.agent_config_set" => {
                 require_admin!();
                 boxed_frame(|| self.handle_odoo_agent_config_set(params)).await
