@@ -401,3 +401,30 @@ describe('Inbox browser regressions', () => {
     expect(await screen.findByText(destination)).toBeInTheDocument();
   });
 });
+
+it('sends org reach digests and retries with the replacement review', async () => {
+  useConnectionStore.setState({ state: 'authenticated' as never, error: null });
+  let attempts = 0;
+  mockWsClient.call.mockImplementation(async (method: string) => {
+    if (method === 'approvals.list') return { approvals: [{ ...APPROVAL_FIXTURE, id: 'reach-approval', kind: 'org_change', summary: 'Move employee', created_at: new Date().toISOString(), ttl_seconds: 86400,
+      payload: { before: { reports_to: '', department: 'Sales' }, after: { reports_to: '', department: 'Support' }, reach: [{ user_id: 'hidden-user', display_name: 'Alice', department: 'Support', groups: ['skills'], change: 'gains' }], reach_digest: 'review-1', sentence: 'hidden-sentence' },
+    }], count: 1 };
+    if (method === 'org.pending_changes') return { pending: [] };
+    if (method === 'approvals.decide') {
+      attempts++;
+      if (attempts === 1) throw { code: 'reach_changed', message: '授權範圍在你檢視後有變動，請重新確認。', current: { reach: [], reach_digest: 'review-2', sentence: 'hidden-new-sentence' } };
+      return { id: 'reach-approval', decided: 'approved' };
+    }
+    return {};
+  });
+  renderAt('/inbox?item=reach-approval');
+  expect(await screen.findByText(/Once approved, Alice/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  expect(await screen.findByText('No managers will gain or lose management access.')).toBeInTheDocument();
+  expect(screen.getByRole('alert')).toHaveTextContent('Management access has changed');
+  expect(mockWsClient.call.mock.calls.filter(([m]) => m === 'approvals.decide')[0][1]).toMatchObject({ reach_digest: 'review-1' });
+  expect(screen.queryByText(/hidden-user|hidden-sentence|hidden-new-sentence/)).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+  await waitFor(() => expect(attempts).toBe(2));
+  expect(mockWsClient.call.mock.calls.filter(([m]) => m === 'approvals.decide')[1][1]).toMatchObject({ reach_digest: 'review-2' });
+});

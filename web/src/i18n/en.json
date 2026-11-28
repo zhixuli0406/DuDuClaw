@@ -12421,5 +12421,22 @@
   "memberGoogleSignin.invalidUrl": "Unable to open the Google sign-in page. Please try again later.",
   "mfa.googleReauth.start": "Re-authenticate with company Google account",
   "mfa.googleReauth.hint": "Your account has no password. Re-authenticate with Google before changing two-step verification (valid for 5 minutes, single use).",
-  "mfa.googleReauth.success": "Re-authenticated with your company Google account. You can change two-step verification within 5 minutes."
+  "mfa.googleReauth.success": "Re-authenticated with your company Google account. You can change two-step verification within 5 minutes.",
+  "orgReach.label": "Impact",
+  "orgReach.approved": "Once approved, ",
+  "orgReach.applied": "Once applied, ",
+  "orgReach.gains": "{name} ({department}) will be able to manage this AI employee’s {groups}",
+  "orgReach.loses": "{name} ({department}) will no longer be able to manage this AI employee",
+  "orgReach.empty": "No managers will gain or lose management access.",
+  "orgReach.unavailable": "The impact cannot be calculated right now.",
+  "orgReach.listSeparator": ", ",
+  "orgReach.and": " and ",
+  "orgReach.clauseSeparator": "; ",
+  "orgReach.period": ".",
+  "orgReach.group.schedules": "schedules",
+  "orgReach.group.automation": "automation rules",
+  "orgReach.group.skills": "skills",
+  "orgReach.group.cost": "usage",
+  "orgReach.group.egress_review": "outbound reviews",
+  "orgReach.changed": "Management access has changed since you reviewed it. Please review it again."
 }

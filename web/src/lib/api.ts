@@ -6957,8 +6957,22 @@ export interface OrgChangeFields {
   department?: string;
 }
 
+export interface ReachLine {
+  user_id: string;
+  display_name: string;
+  department: string;
+  groups: GrantGroup[];
+  change: 'gains' | 'loses';
+}
+
+export interface ReachReview {
+  reach: ReachLine[] | null;
+  reach_digest: string | null;
+  sentence?: string | null;
+}
+
 /** `org.propose_change` — a Manager's (or Admin's) proposal, waiting for an Admin. */
-export interface OrgProposeResult {
+export interface OrgProposeResult extends Partial<ReachReview> {
   status: 'pending_approval';
   approval_id: string;
   agent_id: string;
@@ -6971,7 +6985,7 @@ export interface OrgProposeResult {
 }
 
 /** `org.apply_change` — an Admin's change, applied immediately. */
-export interface OrgApplyResult {
+export interface OrgApplyResult extends Partial<ReachReview> {
   /** `mirror_synced`: nothing changed in the org data; only the employee-settings copy was re-synced. */
   status: 'applied' | 'mirror_synced';
   agent_id: string;
@@ -6989,7 +7003,7 @@ export interface OrgApplyResult {
 }
 
 /** One row of `org.pending_changes`. */
-export interface OrgPendingChange {
+export interface OrgPendingChange extends Partial<ReachReview> {
   approval_id: string;
   agent_id: string;
   before: OrgPlacement;
@@ -7511,11 +7525,12 @@ export const api = {
         ...(reason ? { reason } : {}),
       }) as Promise<OrgProposeResult>,
     /** Apply now (Admin only). `expectedBase` is the `base` the confirmation dialog showed. */
-    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string) =>
+    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string, reachDigest?: string | null) =>
       client.call('org.apply_change', {
         agent_id: agentId,
         ...fields,
         expected_base: expectedBase,
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
       }) as Promise<OrgApplyResult>,
     /**
      * The employee's authoritative placement and its `base` (Manager or
@@ -8921,11 +8936,12 @@ export const api = {
       }>,
     /** `stepUpCsrf` (v1.81 P1 break-glass): an Admin deciding a Personal
      *  employee's card they do not own — see `lib/break-glass.ts`. */
-    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[]) =>
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[], reachDigest?: string | null) =>
       client.call('approvals.decide', {
         id,
         approve,
         ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
         ...(reason ? { reason } : {}),
         ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
@@ -10181,6 +10197,8 @@ export const api = {
         email_setup?: EmailSetup;
       }>,
     deptGrants: {
+      reachPreview: (agentId: string, department: string) =>
+        client.call('users.dept_grants.reach_preview', { agent_id: agentId, department }) as Promise<ReachReview>,
       list: () => client.call('users.dept_grants.list', {}) as Promise<DeptGrantEntry[]>,
       options: () => client.call('users.dept_grants.options', {}) as Promise<DeptGrantOptions>,
       set: (params: { user_id: string; department: string; groups: GrantGroup[]; acknowledged?: boolean }) =>

@@ -12421,5 +12421,22 @@
   "memberGoogleSignin.invalidUrl": "無法開啟 Google 登入頁面，請稍後再試。",
   "mfa.googleReauth.start": "用公司 Google 帳號重新驗證",
   "mfa.googleReauth.hint": "你的帳號沒有設定密碼，變更兩步驟驗證前要先用 Google 重新驗證一次（5 分鐘內有效、只能用一次）。",
-  "mfa.googleReauth.success": "已用公司 Google 帳號重新驗證，5 分鐘內可以變更兩步驟驗證。"
+  "mfa.googleReauth.success": "已用公司 Google 帳號重新驗證，5 分鐘內可以變更兩步驟驗證。",
+  "orgReach.label": "影響範圍",
+  "orgReach.approved": "核准後，",
+  "orgReach.applied": "套用後，",
+  "orgReach.gains": "{name}（{department}）將可管理這位 AI 員工的{groups}",
+  "orgReach.loses": "{name}（{department}）將不再能管理",
+  "orgReach.empty": "沒有主管會因此取得或失去管理權。",
+  "orgReach.unavailable": "目前無法計算影響範圍。",
+  "orgReach.listSeparator": "、",
+  "orgReach.and": "與",
+  "orgReach.clauseSeparator": "；",
+  "orgReach.period": "。",
+  "orgReach.group.schedules": "排程",
+  "orgReach.group.automation": "自動化規則",
+  "orgReach.group.skills": "技能",
+  "orgReach.group.cost": "用量",
+  "orgReach.group.egress_review": "對外傳送審核",
+  "orgReach.changed": "授權範圍在你檢視後有變動，請重新確認。"
 }

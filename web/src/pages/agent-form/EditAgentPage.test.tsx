@@ -1,12 +1,13 @@
 import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
+import { useSystemStore } from '@/stores/system-store';
 import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -633,3 +634,32 @@ it('does not load settings for an AI employee accessed through a team member', (
 });
 
 beforeEach(() => setConfirmedCallableAgents(true));
+
+
+it.each(['enterprise', 'personal', 'manager'])('department reach preview is admin Enterprise only (%s)', async mode => {
+  useSystemStore.setState({ status: { edition_profile: mode === 'personal' ? 'personal' : 'enterprise' } } as never);
+  if (mode === 'manager') {
+    useAuthStore.setState({ user: { id: 'manager', role: 'manager' }, bindings: [{ user_id: 'manager', agent_name: 'my-bot', access_level: 'owner', bound_at: '' }] } as never);
+    useAgentsStore.setState({ agents: [DETAIL] } as never);
+  }
+  mockWsClient.call.mockImplementation(async (method: string) => method === 'users.dept_grants.reach_preview'
+    ? { reach: [{ user_id: 'hidden-user', display_name: 'Alice', department: 'Sales', groups: ['schedules'], change: 'gains' }], reach_digest: 'ignored', sentence: 'hidden-sentence' }
+    : { ...DETAIL });
+  renderAt('/agents/my-bot/edit?tab=general');
+  await screen.findByDisplayValue('My Bot');
+  const department = document.querySelector('input[list="agent-department-options"]');
+  if (mode === 'personal') {
+    expect(department).toBeNull();
+  } else {
+    expect(department).not.toBeNull();
+    if (mode === 'manager') expect(department).toBeDisabled();
+    else {
+      fireEvent.change(department!, { target: { value: 'Sales' } });
+      expect(await screen.findByText('Once applied, Alice (Sales) will be able to manage this AI employee’s schedules.')).toBeInTheDocument();
+      expect(mockWsClient.call).toHaveBeenCalledWith('users.dept_grants.reach_preview', { agent_id: 'my-bot', department: 'Sales' });
+      expect(screen.queryByText(/hidden-user|hidden-sentence/)).not.toBeInTheDocument();
+    }
+  }
+  if (mode !== 'enterprise') expect(mockWsClient.call.mock.calls.some(([m]) => m === 'users.dept_grants.reach_preview')).toBe(false);
+  useSystemStore.setState({ status: null });
+});

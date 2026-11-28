@@ -1,3 +1,5 @@
+import { ReachSummary } from '@/components/org/ReachSummary';
+import type { ReachReview } from '@/lib/api';
 import { useCompanyTimeZone } from '@/lib/company-time';
 import { canSelectAgent } from '@/stores/callable-agents-store';
 import { useSelectableAgents, useVisibleAgents } from '@/lib/data-scope';
@@ -482,6 +484,20 @@ function EditAgentPageContent() {
   // can_modify_own_soul): the gateway refuses and audits them for anyone
   // else, so the page disables them and never sends them for a non-admin.
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  const [departmentReview, setDepartmentReview] = useState<{ department: string; review: ReachReview }>();
+  const targetDepartment = form.department ?? '';
+  useEffect(() => {
+    setDepartmentReview(undefined);
+    if (!isAdmin || isPersonal || !agent || targetDepartment === (agent.department ?? '')) return;
+    let alive = true;
+    const timer = setTimeout(() => {
+      api.users.deptGrants.reachPreview(agent.name, targetDepartment)
+        .then(review => { if (alive) setDepartmentReview({ department: targetDepartment, review }); })
+        .catch(() => { if (alive) setDepartmentReview({ department: targetDepartment, review: { reach: null, reach_digest: null } }); });
+    }, 300);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [isAdmin, isPersonal, agent, targetDepartment]);
+
   const [savedRuntimeTimeout, setSavedRuntimeTimeout] = useState(300);
   const savedRuntimeTimeoutRef = useRef(300);
   const savedRuntimeIdleRef = useRef(900);
@@ -1957,6 +1973,9 @@ function EditAgentPageContent() {
                     disabled={!isAdmin}
                     onChange={(e) => updateField('department', e.target.value)}
                   />
+                  {isAdmin && departmentReview?.department === targetDepartment && targetDepartment !== (agent?.department ?? '') && (
+                    <ReachSummary reach={departmentReview.review.reach} applied />
+                  )}
                   <datalist id="agent-department-options">
                     {departmentOptions.map((d) => (
                       <option key={d} value={d} />

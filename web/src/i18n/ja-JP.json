@@ -12421,5 +12421,22 @@
   "memberGoogleSignin.invalidUrl": "Google ログインページを開けません。しばらくしてからもう一度お試しください。",
   "mfa.googleReauth.start": "会社の Google アカウントで再認証",
   "mfa.googleReauth.hint": "このアカウントにはパスワードがありません。二段階認証を変更する前に Google で再認証してください（5 分間有効、1 回のみ使用可能）。",
-  "mfa.googleReauth.success": "会社の Google アカウントで再認証しました。5 分以内に二段階認証を変更できます。"
+  "mfa.googleReauth.success": "会社の Google アカウントで再認証しました。5 分以内に二段階認証を変更できます。",
+  "orgReach.label": "影響範囲",
+  "orgReach.approved": "承認後、",
+  "orgReach.applied": "適用後、",
+  "orgReach.gains": "{name}（{department}）がこの AI 社員の{groups}を管理できるようになります",
+  "orgReach.loses": "{name}（{department}）は管理できなくなります",
+  "orgReach.empty": "この変更で管理権限を取得または失う上司はいません。",
+  "orgReach.unavailable": "現在、影響範囲を計算できません。",
+  "orgReach.listSeparator": "、",
+  "orgReach.and": "と",
+  "orgReach.clauseSeparator": "；",
+  "orgReach.period": "。",
+  "orgReach.group.schedules": "スケジュール",
+  "orgReach.group.automation": "自動化ルール",
+  "orgReach.group.skills": "スキル",
+  "orgReach.group.cost": "使用量",
+  "orgReach.group.egress_review": "外部送信の審査",
+  "orgReach.changed": "確認後に管理権限が変更されました。もう一度確認してください。"
 }
