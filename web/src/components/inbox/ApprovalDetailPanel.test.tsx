@@ -1014,3 +1014,93 @@ describe('<ApprovalDetailPanel> processed receipts', () => {
     expect(screen.getByText(en['approvals.kind.unknown'])).toBeInTheDocument();
   });
 });
+
+describe('admin AI settings approval', () => {
+  const prompt = '整理上週所有請購單。\n依供應商分組，寄送完整摘要。\n' + '保留每筆明細。'.repeat(80);
+  const payload = {
+    id: 'hidden-payload-id', admin: '王小明', avatar: '王小明的 AI 分身', employee_count: 2, item_count: 3,
+    items: [
+      { seq: 1, target: 'hidden-target-one', employee: '業務小美', label: '主要模型', before: 'model-before', after: 'model-after' },
+      { seq: 2, target: 'hidden-target-two', employee: '客服小安', label: '定時喚醒', before: false, after: true },
+      { seq: 3, target: 'hidden-target-two', employee: '客服小安', label: '新增排程', before: null, after: { name: '週報', cron: '0 9 * * 1', timezone: 'Asia/Taipei', enabled: true, task: prompt } },
+    ], reason: '整理每週工作', expires_at: null,
+  };
+  const approval = (over: Partial<ApprovalItem> = {}): ApprovalItem => genericApproval({
+    id: 'hidden-approval-id', kind: 'admin_ai_settings', payload, digest: 'review-digest',
+    summary: 'Admin settings summary', created_at: new Date().toISOString(), ttl_seconds: 600,
+    expires_at: Math.floor(Date.now() / 1000) + 600, ...over,
+  });
+  const show = (item = approval(), props: Partial<React.ComponentProps<typeof ApprovalDetailPanel>> = {}) => renderWithProviders(
+    <ApprovalDetailPanel approval={item} onApprove={vi.fn()} onReject={vi.fn()} {...props} />,
+  );
+
+  it('renders names, localized labels, raw strings, booleans, none and the complete schedule', () => {
+    show();
+    for (const text of ['Confirm admin AI settings changes', '王小明', '王小明的 AI 分身', '業務小美', '主要模型', 'model-before', 'model-after', 'Off', '(None)', '週報', 'Every Monday at 09:00', 'Asia/Taipei', '整理每週工作']) {
+      expect(screen.getAllByText(text, { exact: false }).length).toBeGreaterThan(0);
+    }
+    expect(screen.getAllByText('On').length).toBeGreaterThan(0);
+    const task = screen.getByText((_, element) => element?.textContent === prompt && element.tagName === 'SPAN');
+    expect(task.textContent).toBe(prompt);
+    expect(task).toHaveClass('whitespace-pre-wrap');
+    expect(screen.getByRole('region')).toHaveClass('overflow-x-auto');
+    expect(screen.getByText(/remaining$/)).toBeInTheDocument();
+    for (const id of ['hidden-payload-id', 'hidden-approval-id', 'hidden-target-one', 'hidden-target-two']) {
+      expect(document.body.textContent).not.toContain(id);
+    }
+  });
+
+  it('passes the digest on approval and calls reject on cancel', () => {
+    const onApprove = vi.fn(); const onReject = vi.fn();
+    show(approval(), { onApprove, onReject });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 3 changes' }));
+    expect(onApprove).toHaveBeenCalledWith('review-digest');
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(onReject).toHaveBeenCalledTimes(1);
+  });
+
+  it('handles absent digest, empty avatar and reason, and a server error sentence', () => {
+    const onApprove = vi.fn();
+    show(approval({ digest: null, payload: { ...payload, avatar: '', reason: null } }), { onApprove, decideError: new Error('設定已變更，請重新提出。') });
+    expect(screen.queryByText(/Via:/)).not.toBeInTheDocument();
+    expect(screen.queryByText('Reason')).not.toBeInTheDocument();
+    expect(screen.getByRole('alert')).toHaveTextContent('設定已變更，請重新提出。');
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm 3 changes' }));
+    expect(onApprove).toHaveBeenCalledWith(undefined);
+  });
+
+  it.each([null, {}, { ...payload, item_count: 4 }, { ...payload, items: [{ ...payload.items[0], after: { task: 123 } }] }])('falls back for malformed payload %j', (bad) => {
+    show(approval({ payload: bad }));
+    expect(screen.getByText('Admin settings summary')).toBeInTheDocument();
+    expect(screen.queryByTestId('admin-ai-settings')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByText(en['approval.spotCheck.toggle']));
+    for (const id of ['hidden-payload-id', 'hidden-target-one', 'hidden-target-two']) {
+      expect(document.body.textContent).not.toContain(id);
+    }
+  });
+
+  it.each(['tool_call', 'admin_ai_settings'])('shows only server-formatted decision attribution for processed %s', (kind) => {
+    const { rerender } = show(approval({ kind, status: 'approved', decided_by_display: '王小明（Telegram，網頁確認）' }));
+    expect(screen.getByText('Decided by')).toBeInTheDocument();
+    expect(screen.getByText('王小明（Telegram，網頁確認）')).toBeInTheDocument();
+    for (const decided_by_display of [null, '', '   ']) {
+      rerender(<ApprovalDetailPanel approval={approval({ kind, status: 'approved', decided_by_display })} onApprove={vi.fn()} onReject={vi.fn()} />);
+      expect(screen.queryByText('Decided by')).not.toBeInTheDocument();
+    }
+  });
+
+  it.each([
+    ['approved', null, 'approved'],
+    ['expired', null, 'expired'],
+    ['denied', 'admin_ai:expired', 'expired'],
+    ['invalidated', 'expired', 'expired'],
+    ['denied', 'restart_requires_reobserve', 'restart'],
+    ['invalidated', 'admin_changed', 'adminChanged'],
+    ['denied', null, 'denied'],
+    ['invalidated', 'settings_changed', 'invalidated'],
+  ] as const)('maps status %s and reason %s', (status, invalidated_reason, result) => {
+    show(approval({ status, invalidated_reason }));
+    expect(screen.getByText(en[`approval.adminAi.result.${result}`])).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Confirm .* changes/ })).not.toBeInTheDocument();
+  });
+});

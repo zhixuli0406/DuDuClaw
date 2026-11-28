@@ -6098,6 +6098,7 @@ export interface WikiScopeNamespace {
 
 /** Known approval kinds. Unknown kinds are surfaced verbatim as a fallback. */
 export type ApprovalKind =
+  | 'admin_ai_settings'
   | 'browser_action'
   | 'tool_call'
   | 'skill_activation'
@@ -6123,6 +6124,8 @@ export interface ApprovalItem {
   status?: 'pending' | 'approved' | 'denied' | 'expired' | 'answered' | 'invalidated';
   answer?: unknown;
   invalidated_reason?: string | null;
+  /** Server-formatted decision attribution, omitted when not visible. */
+  decided_by_display?: string | null;
   id: string;
   agent_id: string;
   kind: ApprovalKind;
