@@ -169,6 +169,7 @@ export function AutopilotTab() {
                       </Badge>
                       {rule.active_window != null && <Badge variant="outline">{windowSummary(rule.active_window as ActiveWindow, id => intl.formatMessage({ id }), getCompanyTimeZone())}</Badge>}
                       {rule.created_by_user_id == null && <Badge variant="secondary">{intl.formatMessage({ id: 'autopilot.provenance.legacy' })}</Badge>}
+                      {rule.owner_department && <Badge variant="outline">{intl.formatMessage({ id: 'autopilot.ownerDepartment' }, { department: rule.owner_department })}</Badge>}
                       {rule.creator_access_lost === true && <Badge className="text-destructive">{intl.formatMessage({ id: 'autopilot.provenance.accessLost' })}</Badge>}
                       {ruleActionTarget(rule.action) && (
                         <span className="text-muted-foreground">({ruleActionTarget(rule.action)})</span>

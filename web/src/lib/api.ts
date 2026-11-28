@@ -1244,6 +1244,7 @@ export type AssignScheduleSpec =
 
 /** One scheduled assignment. Every fire re-checks the creator's right. */
 export interface AssignScheduleInfo {
+  creator_access_lost?: boolean | null;
   can_manage?: boolean;
   id: string;
   agent_id: string;
@@ -1632,6 +1633,22 @@ export type {
   AutopilotUpdateFields,
 } from './autopilot-rules';
 export type { AutopilotHistoryResult } from './autopilot-history';
+/** Safe member-facing rule projection returned by autopilot.affecting_me. */
+export interface AffectingAutopilotRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_event: string;
+  conditions: AutopilotRule['conditions'];
+  action_kinds: string[];
+  target_agents: string[];
+  actions: Array<{ type: string; target_agent: string; require_approval: boolean; prompt?: string; skill_name?: string }>;
+  require_approval: boolean;
+  owner_department: string | null;
+  creator_access_lost: boolean | null;
+  history: Array<{ triggered_at: string; result: string }>;
+}
+
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
@@ -8711,6 +8728,7 @@ export const api = {
           agent_id: string;
           cron: string;
           schedule?: string;
+          creator_access_lost?: boolean | null;
           cron_timezone?: string | null;
           task?: string;
           enabled: boolean;
@@ -9775,6 +9793,8 @@ export const api = {
       ) as Promise<CanvasGetResult>,
   },
   autopilot: {
+    affectingMe: (agentId?: string) =>
+      client.call('autopilot.affecting_me', agentId ? { agent_id: agentId } : {}) as Promise<{ rules: AffectingAutopilotRule[] }>,
     templateFields: (triggerEvent: string, sequence?: unknown) =>
       client.call('autopilot.template_fields', { trigger_event: triggerEvent, ...(sequence != null ? { sequence } : {}) }) as Promise<{ fields: string[] }>,
     runs: {

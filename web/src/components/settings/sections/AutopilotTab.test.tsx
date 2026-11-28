@@ -377,3 +377,10 @@ describe('S-19 run history', () => {
     expect(await screen.findByText('No runs yet')).toBeInTheDocument();
   });
 });
+
+it('shows the owning department on admin automation rule cards', async () => {
+  listMock.mockResolvedValue({ rules: [{ ...TEMPLATE_RULE, owner_department: 'Customer support' }, { ...TEMPLATE_RULE, id: 'company-rule', owner_department: null }] });
+  renderWithProviders(<AutopilotTab />);
+  expect(await screen.findByText('Department: Customer support')).toBeInTheDocument();
+  expect(screen.getAllByText(/^Department:/)).toHaveLength(1);
+});

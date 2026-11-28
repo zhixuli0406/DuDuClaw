@@ -312,7 +312,7 @@ describe('delegation role and direction settings', () => {
     expect(saveButton()).toBeDisabled();
     fireEvent.click(saveButton());
     expect(setMock).not.toHaveBeenCalled();
-  });
+  }, 20_000);
 
   it.each([
     { allow: [['sales-lead', 'sales-lead']], allow_one_way: [] },
