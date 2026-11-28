@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { screen, fireEvent, waitFor } from '@testing-library/react';
+import { screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { renderWithProviders } from '@/test/render';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
 import en from '@/i18n/en.json';
@@ -22,6 +22,8 @@ vi.mock('@/lib/api', () => ({
     },
   },
 }));
+
+vi.mock('./AdminAiCard', () => ({ AdminAiCard: () => null }));
 
 import { DelegationTab, DELEGATION_POLICIES } from './DelegationTab';
 
@@ -241,12 +243,12 @@ describe('delegation role and direction settings', () => {
       return { success: true, ...params, applied: true };
     });
     fireEvent.click(screen.getByRole('checkbox', { name: 'Administrator' }));
-    expect(screen.getByRole('alert')).toHaveTextContent(en['settings.delegation.roles.noneWarning']);
-    expect(screen.getByText(en['settings.delegation.roles.risk'])).toBeInTheDocument();
-    expect(saveButton()).toBeDisabled();
-    fireEvent.click(saveButton());
+    expect(screen.getByRole('alert', { hidden: true })).toHaveTextContent(en['settings.delegation.roles.noneWarning']);
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('button', { name: 'Select' })).toBeDisabled();
     expect(setMock).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'I understand' }));
+    fireEvent.click(within(dialog).getByRole('checkbox'));
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Select' }));
     expect(saveButton()).not.toBeDisabled();
     fireEvent.click(saveButton());
     await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'none', allow: [], unrestricted_roles: ['manager', 'admin'], allow_one_way: [], acknowledge_risk: true }));
@@ -267,15 +269,78 @@ describe('delegation role and direction settings', () => {
     await waitFor(() => expect(setMock).toHaveBeenCalledWith({ policy: 'none', allow: [], unrestricted_roles: [], allow_one_way: [] }));
   });
 
-  it('clears acknowledgement when the selected roles change', async () => {
-    getMock.mockResolvedValue({ policy: 'department', allow: [], unrestricted_roles: [], allow_one_way: [], warnings: [] });
+  it('cancelling a role confirmation leaves the role unticked', async () => {
     renderWithProviders(<DelegationTab />);
     await waitLoaded();
     fireEvent.click(screen.getByRole('checkbox', { name: 'Administrator' }));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'I understand' }));
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Manager' }));
-    expect(screen.getByRole('checkbox', { name: 'I understand' })).not.toBeChecked();
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: 'Administrator' })).not.toBeChecked();
+    expect(setMock).not.toHaveBeenCalled();
+  });
+
+  it('requires confirmation for each newly selected role, but never on untick', async () => {
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    for (const role of ['Administrator', 'Manager']) {
+      fireEvent.click(screen.getByRole('checkbox', { name: role }));
+      const dialog = screen.getByRole('dialog');
+      expect(within(dialog).getByRole('button', { name: 'Select' })).toBeDisabled();
+      fireEvent.click(within(dialog).getByRole('checkbox'));
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Select' }));
+      expect(screen.getByRole('checkbox', { name: role })).toBeChecked();
+      fireEvent.click(screen.getByRole('checkbox', { name: role }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    }
+  });
+
+  it('explains one-way delegation using display names', async () => {
+    getMock.mockResolvedValue({ policy: 'department', allow: [], allow_one_way: [['intern', 'sales-lead']] });
+    renderWithProviders(<DelegationTab />);
+    expect(await screen.findByText('Intern can delegate work to Sales lead; the reverse is not allowed.')).toBeInTheDocument();
+    expect(screen.queryByText(/intern can delegate/)).not.toBeInTheDocument();
+  });
+
+  it('blocks more than 200 pairs counting both directions', async () => {
+    getMock.mockResolvedValue({ policy: 'department', allow: Array.from({ length: 200 }, (_, i) => [`a${i}`, `b${i}`]), allow_one_way: [['intern', 'sales-lead']] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    expect(screen.getByRole('alert')).toHaveTextContent(en['settings.delegation.pairs.limit']);
     expect(saveButton()).toBeDisabled();
+    fireEvent.click(saveButton());
+    expect(setMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { allow: [['sales-lead', 'sales-lead']], allow_one_way: [] },
+    { allow: [['sales-lead', 'warehouse-lead']], allow_one_way: [['warehouse-lead', 'sales-lead']] },
+    { allow: [], allow_one_way: [['sales-lead', 'warehouse-lead'], ['sales-lead', 'warehouse-lead']] },
+  ])('marks conflicting rows and blocks self or duplicate pairs: %j', async (pairs) => {
+    getMock.mockResolvedValue({ policy: 'department', ...pairs });
+    const { container } = renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    expect(saveButton()).toBeDisabled();
+    for (const row of container.querySelectorAll('[data-pair-row]')) expect(row).toHaveClass('ring-destructive');
+  });
+
+  it('keeps opposite one-way pairs distinct', async () => {
+    getMock.mockResolvedValue({ policy: 'department', allow: [], allow_one_way: [['sales-lead', 'warehouse-lead'], ['warehouse-lead', 'sales-lead']] });
+    renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    expect(saveButton()).not.toBeDisabled();
+  });
+
+  it('shows the server refusal above Save without marking an unnamed row', async () => {
+    const refusal = '單向配對與雙向配對重複，請移除其中一組。';
+    setMock.mockRejectedValueOnce(new Error(refusal));
+    const { container } = renderWithProviders(<DelegationTab />);
+    await waitLoaded();
+    fireEvent.click(saveButton());
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent(refusal);
+    expect(error.compareDocumentPosition(saveButton()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(container.querySelector('[data-pair-row].ring-destructive')).toBeNull();
   });
 
   it('saves a changed direction and swaps an existing one-way row', async () => {

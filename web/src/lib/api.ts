@@ -960,6 +960,16 @@ export type DelegationPolicy = 'department' | 'hierarchy' | 'open' | 'none';
 export type DelegationRole = 'admin' | 'manager';
 export interface DelegationOneWayPair { from: string; to: string; direction: 'outgoing' | 'incoming' }
 
+export interface AdminAiSettings {
+  enabled: boolean;
+  enabled_ack?: { by: string; at: string };
+}
+
+export interface AdminAiUpdate {
+  enabled: boolean;
+  acknowledge_risk?: boolean;
+}
+
 export interface DelegationSettings {
   unrestricted_roles?: DelegationRole[];
   allow_one_way?: Array<[string, string]>;
@@ -8282,6 +8292,10 @@ export const api = {
   /** Delegation permissions (WP21 §2.8) — owner/admin only, gateway-side gated.
    *  `allow` holds unordered agent-id pairs; a pair means the two may hand work
    *  to each other in both directions. */
+  adminAi: {
+    get: () => client.call('admin_ai.get', {}) as Promise<AdminAiSettings>,
+    set: (params: AdminAiUpdate) => client.call('admin_ai.set', { ...params }) as Promise<AdminAiSettings>,
+  },
   delegation: {
     get: () =>
       client.call('delegation.get') as Promise<DelegationSettings>,
