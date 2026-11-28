@@ -5803,7 +5803,22 @@ export interface McpKeyCreateResult {
 // ── RM-064: read-only status credentials (external work-status query) ──
 
 /** One `ddc_status_…` credential as listed. Never carries the secret. */
-export interface MemberKeyInfo {
+export type MemberKeyScope = 'tasks:read' | 'agents:status' | 'odoo:read' | 'odoo:write';
+export interface MemberKeyPermissions {
+  include_conversations: boolean;
+  mcp_scopes: MemberKeyScope[];
+}
+export interface MemberKeyPolicy {
+  allow_conversation_content: boolean;
+  allow_mcp_scopes: MemberKeyScope[];
+}
+export type MemberKeyPolicyResult = ({ readable: true; enabled: boolean;
+  available_mcp_scopes: MemberKeyScope[]; risk: { conversation: string; mcp_scopes: string };
+} & MemberKeyPolicy) | { readable: false; message: string };
+export type MemberKeyPolicyUpdate = Partial<MemberKeyPolicy> & { acknowledge_risk?: boolean };
+
+export interface MemberKeyInfo extends MemberKeyPermissions {
+  conversations_migrated: boolean;
   id: string;
   name: string;
   created_at: string;
@@ -10066,9 +10081,14 @@ export const api = {
   },
   /** RM-064: the caller's own read-only status credentials. */
   memberKeys: {
-    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa' }>,
-    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }) =>
-      client.call('me.member_keys.create', { name, expires_in_days, ...proof }) as Promise<MemberKeyCreated>,
+    policyGet: () => client.call('member_keys.policy_get', {}) as Promise<MemberKeyPolicyResult>,
+    policySet: (update: MemberKeyPolicyUpdate) => client.call('member_keys.policy_set', update),
+    narrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('me.member_keys.narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    adminNarrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('member_keys.admin_narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    odooStatus: () => client.call('me.odoo.status', {}) as Promise<{ connected: boolean; member_credentials_enabled: boolean }>,
+    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa'; policy: MemberKeyPolicy }>,
+    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }, permissions?: MemberKeyPermissions) =>
+      client.call('me.member_keys.create', { name, expires_in_days, ...proof, ...permissions }) as Promise<MemberKeyCreated>,
     revoke: (id: string) => client.call('me.member_keys.revoke', { id }) as Promise<{ revoked: boolean }>,
     adminList: (cursor?: string, limit = 25) => client.call('member_keys.admin_list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null }>,
     adminRevoke: (id: string) => client.call('member_keys.admin_revoke', { id }) as Promise<{ revoked: boolean }>,
