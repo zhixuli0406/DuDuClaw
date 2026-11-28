@@ -14,6 +14,7 @@ import {
   Settings2,
   ChevronDown,
 } from 'lucide-react';
+import { GoogleDriveWriteCard } from '@/components/google/GoogleDriveWriteCard';
 import { GoogleSetupWizard } from '@/components/google/GoogleSetupWizard';
 import { useAuthStore } from '@/stores/auth-store';
 import { IntegrationConnectPanel } from '@/components/IntegrationConnectPanel';
@@ -209,6 +210,8 @@ export function GoogleIntegrationPage() {
         <p className="text-sm text-muted-foreground">{t('google.chatIdentity.hint', '關閉時（預設），只有管理員在「成員管理」手動綁定的 Google Chat 使用者會被認出是同仁。')}</p>
         <p className="flex items-start gap-2 text-sm text-warning"><AlertTriangle className="mt-0.5 size-4 shrink-0" />{t('google.chatIdentity.risk', '尚未以真實 Google Workspace 驗證；開啟後，系統會把 Chat 傳訊者的代號與同仁連結的 Google 帳號代號比對，相同就視為本人。')}</p>
       </CardContent></Card>}
+
+      {admin && <GoogleDriveWriteCard integrationEnabled={enabled} />}
 
       {advanced && <div id="google-advanced-settings" className="space-y-4">
       <IntegrationConnectPanel

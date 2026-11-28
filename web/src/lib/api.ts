@@ -6473,6 +6473,30 @@ export interface GoogleDelegationStatus {
   agents: AgentGoogleIdentity[];
   personal_connections?: { owner_id: string; account_email: string; status: 'connected' | 'needs_reconnect' | 'suspended' }[] | null;
 }
+export type DriveWriteAction = 'create' | 'modify' | 'move' | 'trash';
+export type DriveWriteApproval = 'none' | 'member' | 'member_and_admin';
+export interface DriveWriteForm {
+  create: boolean;
+  modify: boolean;
+  move: boolean;
+  trash: boolean;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: string[];
+}
+export interface DriveWriteStatus {
+  configured: Record<DriveWriteAction, boolean>;
+  effective: Record<DriveWriteAction, boolean>;
+  approval: Record<DriveWriteAction, DriveWriteApproval>;
+  folders: { id: string; name: string; kind: 'folder' | 'shared_drive' | 'unverified' }[];
+  ack: { by_email: string; by_role: string; at: string } | null;
+  integration_enabled: boolean;
+  folder_list_empty_note: boolean;
+  write_connections: { connected: number } | null;
+  write_store_unreadable: boolean;
+  home_write: { route_oauth: boolean; connected: boolean; status: string; account_email: string | null };
+  identity_routes: unknown[];
+}
+
 export interface GoogleIdentityTestStep {
   id: string;
   label: string;
@@ -8683,6 +8707,7 @@ export const api = {
       sources?: UnifiedAuditSource[];
       severity_filter?: 'info' | 'warning' | 'critical';
       agent_id_filter?: string;
+      tool_name_filter?: string;
     }) => client.call('audit.unified_log', params ?? {}) as Promise<UnifiedAuditResponse>,
     reliabilitySummary: (agentId: string, windowDays = 7) =>
       client.call('audit.reliability_summary', {
@@ -9058,6 +9083,17 @@ export const api = {
         enabled: boolean;
         changed: boolean;
       }>,
+  },
+  googleDriveWrite: {
+    get: () => client.call('google.drive_write.get', {}) as Promise<DriveWriteStatus>,
+    set: (params: DriveWriteForm & { acknowledge_risk?: boolean }) =>
+      client.call('google.drive_write.set', { ...params }) as Promise<DriveWriteStatus>,
+    consentHomeStart: (params: { redirect_origin: string; acknowledge_google_data: boolean; acknowledge_write: boolean }) =>
+      client.call('google.drive_write.consent_home_start', { ...params }) as Promise<{
+        authorization_url: string; state: string; completion: 'redirect' | 'paste'; redirect_uri: string; expires_in: number;
+      }>,
+    consentHomePaste: (url: string) => client.call('google.drive_write.consent_home_paste', { url }),
+    consentHomeDisconnect: () => client.call('google.drive_write.consent_home_disconnect', {}),
   },
   /** Per-employee Google identity (B2a). Writes are admin-only. */
   googleIdentity: {
