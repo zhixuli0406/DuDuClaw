@@ -12338,5 +12338,16 @@
   "users.memberSignin.reason.policy_changed": "設定已變更",
   "users.memberSignin.reason.name_taken": "名稱已被使用",
   "users.memberSignin.reason.unknown": "原因不明",
-  "users.memberSignin.unknownMember": "未知同仁"
+  "users.memberSignin.unknownMember": "未知同仁",
+  "login.google.button": "使用公司 Google 帳號登入",
+  "login.google.or": "或",
+  "login.google.completing": "正在完成 Google 登入…",
+  "login.google.wait": "請稍候，不要關閉這個頁面。",
+  "login.google.result.domainNotAllowed": "這個 Google 帳號不在公司允許的範圍內。請改用公司帳號登入，或聯絡管理員。",
+  "login.google.result.personalAccount": "請使用公司配發的 Google 帳號，個人 Gmail 不能登入。",
+  "login.google.result.existingAccount": "這個信箱已經有帳號。請先用原本的方式登入，到「我的連線」開啟 Google 登入，或請管理員協助。",
+  "login.google.result.pendingApproval": "已送出開通申請，管理員核准後請再登入一次。",
+  "login.google.result.cannotSignIn": "這個帳號目前不能登入，請聯絡管理員。",
+  "login.google.result.dailyLimit": "今天的新帳號開通數已達上限，請明天再試或聯絡管理員。",
+  "login.google.result.incomplete": "登入沒有完成，請重新按一次「使用公司 Google 帳號登入」。"
 }

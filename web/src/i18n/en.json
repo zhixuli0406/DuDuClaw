@@ -12338,5 +12338,16 @@
   "users.memberSignin.reason.policy_changed": "Settings changed",
   "users.memberSignin.reason.name_taken": "Name already in use",
   "users.memberSignin.reason.unknown": "Unknown reason",
-  "users.memberSignin.unknownMember": "Unknown member"
+  "users.memberSignin.unknownMember": "Unknown member",
+  "login.google.button": "Sign in with your company Google account",
+  "login.google.or": "or",
+  "login.google.completing": "Completing Google sign-in…",
+  "login.google.wait": "Please wait. Keep this page open.",
+  "login.google.result.domainNotAllowed": "This Google account is outside your company’s allowed domains. Use your company account or contact your administrator.",
+  "login.google.result.personalAccount": "Use the Google account provided by your company. Personal Gmail accounts cannot sign in.",
+  "login.google.result.existingAccount": "This email already has an account. Sign in using your original method, then enable Google sign-in in My Connections, or ask your administrator for help.",
+  "login.google.result.pendingApproval": "Your access request has been sent. Sign in again after your administrator approves it.",
+  "login.google.result.cannotSignIn": "This account cannot sign in right now. Contact your administrator.",
+  "login.google.result.dailyLimit": "Today’s limit for new accounts has been reached. Try again tomorrow or contact your administrator.",
+  "login.google.result.incomplete": "Sign-in did not finish. Click “Sign in with your company Google account” again."
 }

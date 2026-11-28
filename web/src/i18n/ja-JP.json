@@ -12338,5 +12338,16 @@
   "users.memberSignin.reason.policy_changed": "設定が変更されました",
   "users.memberSignin.reason.name_taken": "名前はすでに使用されています",
   "users.memberSignin.reason.unknown": "原因不明",
-  "users.memberSignin.unknownMember": "不明なメンバー"
+  "users.memberSignin.unknownMember": "不明なメンバー",
+  "login.google.button": "会社の Google アカウントでログイン",
+  "login.google.or": "または",
+  "login.google.completing": "Google ログインを完了しています…",
+  "login.google.wait": "このページを閉じずに、しばらくお待ちください。",
+  "login.google.result.domainNotAllowed": "この Google アカウントは会社が許可した範囲外です。会社のアカウントを使用するか、管理者にお問い合わせください。",
+  "login.google.result.personalAccount": "会社から提供された Google アカウントを使用してください。個人の Gmail アカウントではログインできません。",
+  "login.google.result.existingAccount": "このメールアドレスには既にアカウントがあります。従来の方法でログインし、「マイ接続」で Google ログインを有効にするか、管理者にご相談ください。",
+  "login.google.result.pendingApproval": "利用申請を送信しました。管理者の承認後にもう一度ログインしてください。",
+  "login.google.result.cannotSignIn": "このアカウントは現在ログインできません。管理者にお問い合わせください。",
+  "login.google.result.dailyLimit": "本日の新規アカウントの上限に達しました。明日もう一度お試しいただくか、管理者にお問い合わせください。",
+  "login.google.result.incomplete": "ログインが完了しませんでした。「会社の Google アカウントでログイン」をもう一度押してください。"
 }
