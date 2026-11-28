@@ -494,9 +494,9 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
         json!({ "policy": "none" }),
         json!({ "allow": [] }),
     ] {
-        // A failed get supplies no hash. Deliberately bypass the normal
-        // client flow to exercise the set-side malformed-config refusal.
-        params["expected_hash"] = json!("");
+        // A failed get supplies no hash. Compute the current content hash
+        // directly to exercise the set-side malformed-config refusal.
+        params["expected_hash"] = json!(super::super::config_commit::content_hash(broken));
         let frame = handler.handle("delegation.set", params.clone(), &admin_ctx()).await;
         assert!(!frame_ok(&frame), "{params} must be refused: {frame:?}");
         assert!(frame_error(&frame).contains("TOML"), "{frame:?}");
@@ -506,6 +506,18 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
             "a refused save must not touch the file"
         );
     }
+    let frame = handler.handle(
+        "delegation.set",
+        json!({ "policy": "none", "expected_hash": "" }),
+        &admin_ctx(),
+    ).await;
+    assert!(!frame_ok(&frame), "a mismatching hash must be refused: {frame:?}");
+    assert_eq!(frame_error(&frame), "設定已被其他人變更，請重新整理後再儲存。");
+    assert_eq!(
+        std::fs::read_to_string(home.path().join("config.toml")).unwrap(),
+        broken,
+        "a hash conflict must not touch the file"
+    );
     let audit = std::fs::read_to_string(home.path().join("security_audit.jsonl")).unwrap_or_default();
     assert!(!audit.contains("delegation_config_changed"), "{audit}");
 
