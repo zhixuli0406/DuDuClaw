@@ -713,14 +713,14 @@ pub(super) async fn handle(
     if !verified_employee(home, agent) { return mcp_error("附件操作需要已驗證的員工身分。"); }
     let call = match parse(params) { Ok(call) => call, Err(error) => return mcp_error(&error) };
     let policy = match ToolPolicy::load(home, agent) {
-        Ok(policy) => policy, Err(error) => return mcp_error(&error),
+        Ok(policy) => Box::new(policy), Err(error) => return mcp_error(&error),
     };
     if let Err(error) = policy.data_preconnect(TOOL, params, None) { return mcp_error(&error); }
     let validated = match validated {
-        Some(validated) => validated,
+        Some(validated) => Box::new(validated),
         None if bound.is_some() => return mcp_error("缺少連線前已驗證的附件。"),
         None => match validate_attachment(home, agent, params).await {
-            Ok(validated) => validated, Err(error) => return mcp_error(&error),
+            Ok(validated) => Box::new(validated), Err(error) => return mcp_error(&error),
         },
     };
     // Recheck the owned bytes and their request binding, never reopen the path.

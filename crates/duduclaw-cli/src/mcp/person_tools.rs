@@ -21,7 +21,7 @@ pub(crate) async fn call(home: &Path, odoo: &super::OdooState, principal: &Princ
         let actor = super::odoo_actor::OdooActor::Person { user_id, raw_key: raw };
         return super::odoo_identity_client::with_new_call(async {
             let result = super::odoo_identity_client::with_person_call(
-                super::odoo::handle_odoo_actor(tool, args, home, odoo, actor)).await;
+                Box::pin(super::odoo::handle_odoo_actor(tool, args, home, odoo, actor))).await;
             let text = result["content"][0]["text"].as_str().unwrap_or("");
             super::odoo_identity_client::audit_result(home, &actor.audit_name(), tool,
                 args, result["isError"] != true, text, true);

@@ -1804,11 +1804,22 @@ mod live_assignee_tests {
             "title": "工作", "assigned_to": "live"
         }), home.path(), actor).await;
         assert_ne!(result["isError"], true, "{result}");
-        for id in ["deleted", "archived", "unknown", "unreadable"] {
+        for id in ["deleted", "archived", "unknown"] {
             assert_unavailable(handle_tasks_create(&serde_json::json!({
                 "title": "工作", "assigned_to": id
             }), home.path(), actor).await);
         }
+        // Roster/liveness answers distinguish absent employees from configuration errors.
+        let unreadable = handle_tasks_create(&serde_json::json!({
+            "title": "工作", "assigned_to": "unreadable"
+        }), home.path(), actor).await;
+        assert_eq!(unreadable["isError"], true, "{unreadable}");
+        let text = unreadable["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Task creation refused: the target employee's settings are broken or unavailable."), "{text}");
+        assert!(text.contains("agent_config_unreadable"), "{text}");
+        assert!(!text.contains("agent.toml"), "{text}");
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
