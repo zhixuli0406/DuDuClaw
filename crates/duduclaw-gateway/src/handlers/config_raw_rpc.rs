@@ -803,6 +803,12 @@ pub(crate) fn refuse_disclosure_ack_edit(before: &toml::Table, after: &toml::Tab
 /// Drive write consent is issued only by the dedicated Admin dialog.
 /// Removing the complete section is the only permitted raw edit.
 pub(crate) fn refuse_drive_write_edit(before: &toml::Table, after: &toml::Table) -> Result<(), String> {
+    // Table-only lookup cannot inspect consent hidden in arrays or other shapes.
+    if after.get("google").is_some_and(|google| !google.is_table())
+        && after.get("google") != before.get("google")
+    {
+        return Err("設定中的 google 區段格式不正確，沒有變更設定。".into());
+    }
     let new = super::config_commit::toml_at(after, "google.drive_write");
     if new.is_some() && new != super::config_commit::toml_at(before, "google.drive_write") {
         return Err("請到 Google 整合設定頁調整雲端硬碟寫入權限。".into());

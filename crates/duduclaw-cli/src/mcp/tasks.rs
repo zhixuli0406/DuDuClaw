@@ -1804,11 +1804,22 @@ mod live_assignee_tests {
             "title": "工作", "assigned_to": "live"
         }), home.path(), actor).await;
         assert_ne!(result["isError"], true, "{result}");
-        for id in ["deleted", "archived", "unknown", "unreadable"] {
+        for id in ["deleted", "archived", "unknown"] {
             assert_unavailable(handle_tasks_create(&serde_json::json!({
                 "title": "工作", "assigned_to": id
             }), home.path(), actor).await);
         }
+        // Roster/liveness answers distinguish absent employees from configuration errors.
+        let unreadable = handle_tasks_create(&serde_json::json!({
+            "title": "工作", "assigned_to": "unreadable"
+        }), home.path(), actor).await;
+        assert_eq!(unreadable["isError"], true, "{unreadable}");
+        let text = unreadable["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Task creation refused: the target employee's settings are broken or unavailable."), "{text}");
+        assert!(text.contains("agent_config_unreadable"), "{text}");
+        assert!(!text.contains("agent.toml"), "{text}");
+        let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
+        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1986,26 +1997,6 @@ mod main_assignment_tests {
     use duduclaw_mcp_boundary::{RequestContext, resources::ResourceRoots};
     use crate::mcp_isolation::{IsolatedCall, ISOLATED_CALL};
 
-    // Scope host facts to each poll; never latch isolation for sibling tests.
-    async fn with_isolation<F: std::future::Future>(future: F) -> F::Output {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("var/lib/duduclaw-spawnd")).unwrap();
-        let sources = duduclaw_core::protected_mode::Sources {
-            env: Some(duduclaw_core::protected_mode::MODE_VALUE.into()),
-            marker: root.path().join("unused-mode"),
-            service_home: root.path().join("unused-home"),
-        };
-        let mut future = std::pin::pin!(future);
-        std::future::poll_fn(|cx| {
-            duduclaw_core::protected_mode::with_thread_sources(sources.clone(), || {
-                duduclaw_core::isolation_install::with_thread_root(root.path().to_path_buf(), || {
-                    assert!(duduclaw_core::execution_gate::isolation_required());
-                    future.as_mut().poll(cx)
-                })
-            })
-        }).await
-    }
-
     fn call(home: &Path, user: &str, agent: &str) -> Arc<IsolatedCall> {
         Arc::new(IsolatedCall { forks: None,
             home: home.to_path_buf(), agent: agent.into(), roots: Arc::new(ResourceRoots::default()),
@@ -2022,13 +2013,18 @@ mod main_assignment_tests {
     }
 
     fn write_agent(home: &Path, name: &str, role: &str, tools: &str) {
-        let dir = home.join("agents").join(name);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("agent.toml"), format!(
-            "[agent]\nname = '{name}'\nrole = '{role}'\nstatus = 'active'\ndepartment = 'sales'\nreports_to = ''\n[model]\npreferred = 'claude-sonnet-4-6'\napi_mode = 'cli'\n[capabilities]\nallowed_tools = [{tools}]\n"
-        )).unwrap();
+        super::super::tests::create_test_agent(&home.join("agents"), name, "");
+        let path = home.join("agents").join(name).join("agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap()
+            .replace("role = \"specialist\"", &format!("role = '{role}'"))
+            .replace("department = \"\"", "department = 'sales'")
+            .replace("allowed_tools = []", &format!("allowed_tools = [{tools}]"));
+        // The gateway loads AgentConfig, not the permissive policy-only view.
+        toml::from_str::<duduclaw_core::types::AgentConfig>(&raw).unwrap();
+        std::fs::write(path, raw).unwrap();
     }
 
+    #[track_caller]
     fn assert_refused(reply: Value, reason: &str) {
         assert_eq!(reply["isError"], true, "{reply}");
         assert!(reply["content"][0]["text"].as_str().unwrap().contains(reason), "{reply}");
@@ -2052,7 +2048,8 @@ mod main_assignment_tests {
             db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
             assert_refused(handle_tasks_create(&args, home.path(), RecordActor::Agent("worker")).await,
                 duduclaw_gateway::on_behalf_of::access::MAIN_TURN_REFUSAL);
-            with_isolation(async {
+            {
+                let _list = duduclaw_gateway::on_behalf_of::access::test_list_in_effect_for(home.path());
                 let reply = handle_tasks_create(&args, home.path(), RecordActor::Agent("worker")).await;
                 assert_ne!(reply["isError"], true, "{reply}");
                 let store = duduclaw_gateway::task_store::TaskStore::open(home.path()).unwrap();
@@ -2093,7 +2090,7 @@ mod main_assignment_tests {
                 db.set_main_agent_users(&admin.id, &[], true).unwrap();
                 assert_refused(handle_tasks_create(&args, home.path(), RecordActor::Agent("worker")).await,
                     "主代理僅管理員可以使用。");
-            }).await;
+            }
         }).await;
     }
 }

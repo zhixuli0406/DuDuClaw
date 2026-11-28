@@ -7061,7 +7061,8 @@ mod main_assignment_tests {
                 )).await;
                 assert_eq!(unprotected.unwrap_err(), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
                 assert!(!cli_home.join("claude-argv").exists());
-                crate::isolation_io_test_support::with_isolation(async {
+                {
+                    let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
                 let result = crate::on_behalf_of::scope_first(Some(wire.clone()), call_claude_for_agent_impl(
                     home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
                     None, DispatchOverrides::default(),
@@ -7075,7 +7076,7 @@ mod main_assignment_tests {
                 )).await;
                 assert_eq!(denied.unwrap_err(), "主代理僅管理員可以使用。");
                 assert_eq!(std::fs::read(cli_home.join("claude-argv")).unwrap(), before);
-                }).await;
+                }
             });
         });
     }

@@ -24,7 +24,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use unicode_normalization::UnicodeNormalization;
 use duduclaw_gateway::backup_restore::RestoreLimits;
-use duduclaw_gateway::handlers::config_commit::{render_preserving, refuse_drive_write_text_edit};
+use duduclaw_gateway::handlers::config_commit::{refuse_drive_write_text_edit, strip_drive_write_preserving};
 
 pub(crate) const OPERATOR_COMMANDS: &[duduclaw_core::OperatorCommand] = &[
     duduclaw_core::OperatorCommand { name: "duduclaw import", path: &["import"] },
@@ -438,6 +438,34 @@ mod tests {
         table.insert("google".into(), toml::Value::Table(google));
         format!("# preserve this header\n[integrations]\ngoogle_workspace = true # keep this comment\n\n{}",
             toml::to_string(&table).unwrap())
+    }
+
+    #[test]
+    fn import_refuses_array_table_google_before_unpack() {
+        let _operator = crate::ai_session_guard::test_session(&[]);
+        for force in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let home = root.path().join("home");
+            fs::create_dir(&home).unwrap();
+            let current = "[google]\nclient_id = 'keep'\n";
+            fs::write(home.join("config.toml"), current).unwrap();
+            if force {
+                write(&home.join("agents/existing.txt"), "keep");
+            }
+            let archive = root.path().join("input.tar.gz");
+            ordered_archive(&archive, &[
+                ("payload.txt", b"must not land"),
+                ("config.toml", b"[[google]]\ndrive_write = { create = true }\n"),
+            ]);
+            let error = import_archive(&archive, &home, force, true).unwrap_err();
+            assert!(error.to_string().contains("google 區段格式不正確"), "{error}");
+            assert_eq!(fs::read_to_string(home.join("config.toml")).unwrap(), current);
+            assert!(!home.join("payload.txt").exists());
+            assert!(!home.join("agents.pre-import").exists());
+            if force {
+                assert_eq!(fs::read_to_string(home.join("agents/existing.txt")).unwrap(), "keep");
+            }
+        }
     }
 
     #[test]
@@ -1706,13 +1734,8 @@ fn validate_import_policy_with_limits(
                     return Err(io_err("import policy", "duplicate configuration entry"));
                 }
                 // Consent is local to the admin settings RPC, never portable.
-                let mut sanitized = table.clone();
-                if let Some(google) = sanitized.get_mut("google").and_then(toml::Value::as_table_mut) {
-                    removed_drive_write |= google.remove("drive_write").is_some();
-                }
-                let text = if removed_drive_write {
-                    render_preserving(&text, &sanitized).map_err(DuDuClawError::Config)?
-                } else { text };
+                let (text, removed) = strip_drive_write_preserving(&text).map_err(DuDuClawError::Config)?;
+                removed_drive_write |= removed;
                 refuse_drive_write_text_edit(&before, &text).map_err(DuDuClawError::Config)?;
                 duduclaw_gateway::product_policy::validate_write(home, &home.join("config.toml"), &before, &text)
                     .map_err(DuDuClawError::Config)?;
@@ -1742,15 +1765,14 @@ fn validate_import_policy_with_limits(
     }
     // The unchanged MFA rule guarantees that an accepted identity replacement
     // carries true in the prepared text whenever the current policy is strict.
-    let mut prepared_table: toml::Table = prepared.parse()
-        .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
     // Imported identities must never inherit local consent, even when the
     // archive omits config.toml and the current configuration is retained.
-    if prepared_table.get_mut("google").and_then(toml::Value::as_table_mut)
-        .is_some_and(|google| google.remove("drive_write").is_some()) {
-        removed_drive_write = true;
-        prepared = render_preserving(&prepared, &prepared_table).map_err(DuDuClawError::Config)?;
-    }
+    let (stripped, removed) = strip_drive_write_preserving(&prepared).map_err(DuDuClawError::Config)?;
+    removed_drive_write |= removed;
+    prepared = stripped;
+    refuse_drive_write_text_edit(&retained, &prepared).map_err(DuDuClawError::Config)?;
+    let prepared_table: toml::Table = prepared.parse()
+        .map_err(|_| io_err("import policy", "invalid prepared configuration"))?;
     let strict = prepared_table.get("auth").and_then(|auth| auth.get("mfa_enforced"))
         .and_then(|value| value.as_bool()) == Some(true);
     Ok(ImportDecision {

@@ -580,7 +580,8 @@ mod tests {
         request.on_behalf_of = Some(format!("user:{}", employee.id));
         assert_eq!(create_goal_task(home.path(), &store, request.clone()).await.unwrap_err(),
             crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
-        crate::isolation_io_test_support::with_isolation(async {
+        {
+            let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
             let created = create_goal_task(home.path(), &store, request.clone()).await;
             assert!(created.is_ok(), "{created:?}");
             let slot = crate::task_store::AssignScheduleSlot {
@@ -589,7 +590,7 @@ mod tests {
             assert_eq!(create_scheduled_goal_task(home.path(), &store, request, &slot).await.unwrap_err(),
                 "主代理僅管理員可以使用。");
             assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
-        }).await;
+        }
     }
 
     #[tokio::test]
