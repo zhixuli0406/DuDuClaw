@@ -403,43 +403,63 @@ async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
     }
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn all_entries_share_the_effective_configuration_contract() {
+async fn entry_contract_for(config: Config) {
     for row in ROWS {
-        for &config in CONFIGS {
-            let audiences: &[&str] = if row.sessions {
-                &["telegram:42", "widget-visitor:all-entry", "odoolivechat:all-entry:1"]
-            } else { &["telegram:42"] };
-            for &session in audiences {
-                let f = Fixture::new(config).await;
-                let case = Case { config, session };
-                let before = crate::model_call_probe::calls();
-                let Outcome { entry: outcome, probes } = (row.driver)(&f, case).await;
-                if case.healthy() {
-                    assert!(outcome.proceeded && outcome.refusal.is_none(), "{} {case:?}", row.name);
+        let audiences: &[&str] = if row.sessions {
+            &["telegram:42", "widget-visitor:all-entry", "odoolivechat:all-entry:1"]
+        } else { &["telegram:42"] };
+        for &session in audiences {
+            let f = Fixture::new(config).await;
+            let case = Case { config, session };
+            let before = crate::model_call_probe::calls();
+            let Outcome { entry: outcome, probes } = (row.driver)(&f, case).await;
+            if case.healthy() {
+                assert!(outcome.proceeded && outcome.refusal.is_none(), "{} {case:?}", row.name);
+            } else {
+                assert!(!outcome.proceeded, "{} {case:?}", row.name);
+                let refusal = outcome.refusal.expect(row.name);
+                if case.public() {
+                    assert!(refusal.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{} {case:?}: {refusal}", row.name);
+                    assert!(!refusal.contains(f.expected_code.unwrap()), "{refusal}");
+                    assert!(!refusal.contains("原因代碼"), "{refusal}");
                 } else {
-                    assert!(!outcome.proceeded, "{} {case:?}", row.name);
-                    let refusal = outcome.refusal.expect(row.name);
-                    if case.public() {
-                        assert!(refusal.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{} {case:?}: {refusal}", row.name);
-                        assert!(!refusal.contains(f.expected_code.unwrap()), "{refusal}");
-                        assert!(!refusal.contains("原因代碼"), "{refusal}");
-                    } else {
-                        assert!(refusal.contains(f.expected_code.unwrap()), "{} {case:?}: {refusal}", row.name);
-                    }
-                    assert_eq!(probes.runtime_calls, 0, "{} {case:?}: no runtime calls", row.name);
-                    assert_eq!(probes.model_calls, before, "{} {case:?}: no model entry points", row.name);
-                    // Decisions and reassignment operate on a pre-existing task:
-                    // zero NEW rows, and their drivers assert the old row unchanged.
-                    assert_eq!((probes.tasks, probes.schedules), (outcome.seed_tasks, 0), "{} {case:?}", row.name);
-                    assert_no_saved_attachments(f.home());
-                    if outcome.seed_tasks == 0 {
-                        assert_refused_before_any_side_effect(&f.ctx, session, &f.calls, before).await;
-                    }
+                    assert!(refusal.contains(f.expected_code.unwrap()), "{} {case:?}: {refusal}", row.name);
+                }
+                assert_eq!(probes.runtime_calls, 0, "{} {case:?}: no runtime calls", row.name);
+                assert_eq!(probes.model_calls, before, "{} {case:?}: no model entry points", row.name);
+                // Decisions and reassignment operate on a pre-existing task:
+                // zero NEW rows, and their drivers assert the old row unchanged.
+                assert_eq!((probes.tasks, probes.schedules), (outcome.seed_tasks, 0), "{} {case:?}", row.name);
+                assert_no_saved_attachments(f.home());
+                if outcome.seed_tasks == 0 {
+                    assert_refused_before_any_side_effect(&f.ctx, session, &f.calls, before).await;
                 }
             }
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_entries_share_contract_mismatch() { entry_contract_for(Config::Mismatch).await; }
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_entries_share_contract_malformed() { entry_contract_for(Config::Malformed).await; }
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_entries_share_contract_unknown_engine() { entry_contract_for(Config::UnknownEngine).await; }
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_entries_share_contract_missing_model() { entry_contract_for(Config::MissingModel).await; }
+
+#[tokio::test(flavor = "current_thread")]
+async fn all_entries_share_contract_healthy() { entry_contract_for(Config::Healthy).await; }
+
+#[test]
+fn entry_contract_tests_cover_every_config() {
+    assert_eq!(CONFIGS, &[
+        Config::Mismatch, Config::Malformed, Config::UnknownEngine,
+        Config::MissingModel, Config::Healthy,
+    ]);
 }
 
 async fn rpc(f: &Fixture, case: Case, method: &str) -> EntryResult {

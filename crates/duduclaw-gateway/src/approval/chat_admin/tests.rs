@@ -195,82 +195,106 @@ async fn evidence(env: &DecisionEnv, id: &ApprovalId, user: &str, channel: &str,
     }
 }
 
-#[tokio::test]
-async fn t1_t2_decision_entry_point_matrix() {
-    // Web-only and TOTP-only each cover the disabled-method refusals. The
-    // exempt profile proves opt-out is per kind, with both methods available.
-    for channel in ["telegram", "googlechat"] {
-        for (enabled_methods, exempt) in [(&["web"][..], false), (&["dm_totp"][..], false),
-            (&["web", "dm_totp"][..], true)] {
-            for kind in KINDS {
-                for approve in [true, false] {
-                    let mut dashboard_effect = None;
-                    for entry in ["dashboard", "tap", "web", "totp"] {
-                        let f = Fixture::files_org().await;
-                        let key = if *kind == "other_outgoing" { "egress_guard" } else { kind };
-                        let keys = [key];
-                        let selected: &[&str] = if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &keys } else { &[] };
-                        methods(&f, channel, selected, enabled_methods);
-                        let id = request(&f, kind).await;
-                        let rec = f.env.broker.get(&id).await.unwrap().unwrap();
-                        let before = effect(&f, &id, kind).await;
-                        let required = approve && !exempt && tier(&rec) == Tier::T2;
-                        let allowed = entry == "dashboard" || match entry {
-                            "tap" => !required,
-                            "web" => enabled_methods.contains(&"web"),
-                            "totp" => enabled_methods.contains(&"dm_totp") && channel == "telegram",
-                            _ => unreachable!(),
-                        };
-                        if entry == "dashboard" {
-                            payload(dashboard(&f.env, &f.user, &id, approve).await);
-                            evidence(&f.env, &id, &f.user, channel, entry, approve, false, false).await;
-                            dashboard_effect = Some(settled_effect(&f, &id, kind).await);
-                            continue;
-                        }
-                        let sender = Recording::new(&f.env.broker.store);
-                        assert_eq!(deliver_record(&f.env.home, &f.env.broker.store, &rec, &sender).await, 1, "{kind} {channel}");
-                        let receipt = receipts::list_live(&f.env.broker.store, &id).await.unwrap().pop().unwrap();
-                        drop(sender);
-                        let reason = if entry == "tap" {
-                            let mut press = PressFixture::from_service(f, id.clone(), receipt).await;
-                            press.context.channel = channel.into();
-                            press.action.act = if approve { DecisionAct::Approve } else { DecisionAct::Deny };
-                            let outcome = press.press().await;
-                            assert_eq!(outcome.refused_reason, if allowed { None } else { Some("step_up_required") }, "{kind} {channel} {entry} approve={approve}");
-                            if allowed {
-                                assert_eq!(outcome.card_text.as_ref(), Some(&outcome.reply));
-                                evidence(&press.service.env, &id, &press.service.user, channel, entry, approve, required, true).await;
-                                assert_eq!(Some(settled_effect(&press.service, &id, kind).await), dashboard_effect);
-                            } else {
-                                press.pending().await;
-                                assert_eq!(effect(&press.service, &id, kind).await, before);
-                            }
-                            continue;
-                        } else {
-                            let proof = decision_service::ChatAdminProof { user_id:f.user.clone(),
-                                channel:if channel == "telegram" { ChatChannel::Telegram } else { ChatChannel::Googlechat },
-                                account:receipt.account, principal:receipt.principal, dm:receipt.dm,
-                                card_id:receipt.card_id, digest:receipt.digest,
-                                step:if entry == "web" { Step::Web } else { Step::Totp } };
-                            // Authenticated-factor seams; password/TOTP and ticket
-                            // verification are exercised separately below/P15/P16.
-                            decision_service::decide(&f.env, &id, approve, "P22 matrix", &Decider::ChatAdmin(proof)).await
-                        };
-                        if allowed {
-                            reason.unwrap_or_else(|e| panic!("{kind} {channel} {entry} approve={approve}: {e:?}"));
-                            evidence(&f.env, &id, &f.user, channel, entry, approve, required, true).await;
-                            assert_eq!(Some(settled_effect(&f, &id, kind).await), dashboard_effect, "{kind} {entry}");
-                        } else {
-                            assert!(matches!(reason, Err(DecisionRefusal::StepUpRequired)), "{kind} {entry}: {reason:?}");
-                            assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
-                            assert_eq!(effect(&f, &id, kind).await, before);
-                            f.assert_ledger(&id, false).await;
-                        }
+// Web-only and TOTP-only each cover the disabled-method refusals. The
+// exempt profile proves opt-out is per kind, with both methods available.
+async fn decision_entry_point_matrix(channel: &str, enabled_methods: &[&str], exempt: bool) {
+    for kind in KINDS {
+        for approve in [true, false] {
+            let mut dashboard_effect = None;
+            for entry in ["dashboard", "tap", "web", "totp"] {
+                let f = Fixture::files_org().await;
+                let key = if *kind == "other_outgoing" { "egress_guard" } else { kind };
+                let keys = [key];
+                let selected: &[&str] = if exempt && *kind != "knowledge_quarantine" && *kind != "knowledge_add_source" { &keys } else { &[] };
+                methods(&f, channel, selected, enabled_methods);
+                let id = request(&f, kind).await;
+                let rec = f.env.broker.get(&id).await.unwrap().unwrap();
+                let before = effect(&f, &id, kind).await;
+                let required = approve && !exempt && tier(&rec) == Tier::T2;
+                let allowed = entry == "dashboard" || match entry {
+                    "tap" => !required,
+                    "web" => enabled_methods.contains(&"web"),
+                    "totp" => enabled_methods.contains(&"dm_totp") && channel == "telegram",
+                    _ => unreachable!(),
+                };
+                if entry == "dashboard" {
+                    payload(dashboard(&f.env, &f.user, &id, approve).await);
+                    evidence(&f.env, &id, &f.user, channel, entry, approve, false, false).await;
+                    dashboard_effect = Some(settled_effect(&f, &id, kind).await);
+                    continue;
+                }
+                let sender = Recording::new(&f.env.broker.store);
+                assert_eq!(deliver_record(&f.env.home, &f.env.broker.store, &rec, &sender).await, 1, "{kind} {channel}");
+                let receipt = receipts::list_live(&f.env.broker.store, &id).await.unwrap().pop().unwrap();
+                drop(sender);
+                let reason = if entry == "tap" {
+                    let mut press = PressFixture::from_service(f, id.clone(), receipt).await;
+                    press.context.channel = channel.into();
+                    press.action.act = if approve { DecisionAct::Approve } else { DecisionAct::Deny };
+                    let outcome = press.press().await;
+                    assert_eq!(outcome.refused_reason, if allowed { None } else { Some("step_up_required") }, "{kind} {channel} {entry} approve={approve}");
+                    if allowed {
+                        assert_eq!(outcome.card_text.as_ref(), Some(&outcome.reply));
+                        evidence(&press.service.env, &id, &press.service.user, channel, entry, approve, required, true).await;
+                        assert_eq!(Some(settled_effect(&press.service, &id, kind).await), dashboard_effect);
+                    } else {
+                        press.pending().await;
+                        assert_eq!(effect(&press.service, &id, kind).await, before);
                     }
+                    continue;
+                } else {
+                    let proof = decision_service::ChatAdminProof { user_id:f.user.clone(),
+                        channel:if channel == "telegram" { ChatChannel::Telegram } else { ChatChannel::Googlechat },
+                        account:receipt.account, principal:receipt.principal, dm:receipt.dm,
+                        card_id:receipt.card_id, digest:receipt.digest,
+                        step:if entry == "web" { Step::Web } else { Step::Totp } };
+                    // Authenticated-factor seams; password/TOTP and ticket
+                    // verification are exercised separately below/P15/P16.
+                    decision_service::decide(&f.env, &id, approve, "P22 matrix", &Decider::ChatAdmin(proof)).await
+                };
+                if allowed {
+                    reason.unwrap_or_else(|e| panic!("{kind} {channel} {entry} approve={approve}: {e:?}"));
+                    evidence(&f.env, &id, &f.user, channel, entry, approve, required, true).await;
+                    assert_eq!(Some(settled_effect(&f, &id, kind).await), dashboard_effect, "{kind} {entry}");
+                } else {
+                    assert!(matches!(reason, Err(DecisionRefusal::StepUpRequired)), "{kind} {entry}: {reason:?}");
+                    assert_eq!(f.status(&id).await, ApprovalStatus::Pending);
+                    assert_eq!(effect(&f, &id, kind).await, before);
+                    f.assert_ledger(&id, false).await;
                 }
             }
         }
     }
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_telegram_web_only() {
+    decision_entry_point_matrix("telegram", &["web"], false).await;
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_telegram_totp_only() {
+    decision_entry_point_matrix("telegram", &["dm_totp"], false).await;
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_telegram_both_exempt() {
+    decision_entry_point_matrix("telegram", &["web", "dm_totp"], true).await;
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_googlechat_web_only() {
+    decision_entry_point_matrix("googlechat", &["web"], false).await;
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_googlechat_totp_only() {
+    decision_entry_point_matrix("googlechat", &["dm_totp"], false).await;
+}
+
+#[tokio::test]
+async fn t1_t2_matrix_googlechat_both_exempt() {
+    decision_entry_point_matrix("googlechat", &["web", "dm_totp"], true).await;
 }
 
 async fn t3_row(env: &DecisionEnv, user: &str, id: &ApprovalId) {
