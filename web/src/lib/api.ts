@@ -6098,7 +6098,24 @@ export interface MemoryGraphResult {
 /** Response of `odoo.agent_config_get`. `configured:false` = no override, the
  *  agent inherits the global config. `api_key`/`password` are never returned in
  *  cleartext — only the `*_set` booleans plus a masked placeholder. */
+export type OdooPermissionOverride = 'inherit' | 'engine' | 'read_only';
+export interface OdooAgentAccessSet {
+  agent_id: string;
+  permission_override?: OdooPermissionOverride;
+  act_as_requester?: boolean;
+  acknowledge_risk: boolean;
+}
+export interface OdooAgentAccessResult {
+  success: boolean;
+  agent_id: string;
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
+  hot_reloaded: boolean;
+}
+
 export interface OdooAgentConfig {
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
   effective_unblock_models: string[];
   unblock_inherited: boolean;
   effective_blocked_models: string[];
@@ -9141,6 +9158,8 @@ export const api = {
         message: string;
       }>,
     /** Per-agent credential override. `configured:false` = inherits global. */
+    agentAccessSet: (params: OdooAgentAccessSet) =>
+      client.call('odoo.agent_access_set', { ...params }) as Promise<OdooAgentAccessResult>,
     agentConfigGet: (agentId: string) =>
       client.call('odoo.agent_config_get', { agent_id: agentId }) as Promise<OdooAgentConfig>,
     /** api_key/password write-only: new value sets, '' clears, omit keeps. */

@@ -14,6 +14,8 @@ export interface OdooPermissions {
   allowed_actions: string[];
   unblock_models: string[];
 }
+export const TABLE_VERBS = ['activity', 'note', 'message', 'attach'] as const;
+const SCOPED = new Set<string>(TABLE_VERBS);
 const VERBS = new Set(['read', 'search', 'create', 'write', 'unlink', 'action', 'execute']);
 export const validModel = (model: string) => /^[a-zA-Z0-9_.]{1,128}$/.test(model);
 
@@ -37,7 +39,7 @@ export function parseActions(entries: string[]) {
   for (const entry of entries) {
     const [verb, model = '', ...extra] = entry.split(':');
     // Opt-in tokens are only meaningful for one named table.
-    if (GENERIC.has(verb) && !extra.length && validModel(model)) {
+    if ((GENERIC.has(verb) || SCOPED.has(verb)) && !extra.length && validModel(model)) {
       let rule = rules.find((r) => r.model === model);
       if (!rule) { rule = { model, verbs: [] }; rules.push(rule); }
       if (!rule.verbs.includes(verb)) rule.verbs.push(verb);

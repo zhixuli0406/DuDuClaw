@@ -43,9 +43,11 @@ import {
   ScheduleBuilder,
   DangerZone,
   ConfirmDialog,
+  RiskConfirmDialog,
   type SelectOption,
 } from '@/components/settings/controls';
 import { toast } from '@/lib/toast';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import {
   Bot,
   Sparkles,
@@ -485,6 +487,31 @@ function EditAgentPageContent() {
   // can_modify_own_soul): the gateway refuses and audits them for anyone
   // else, so the page disables them and never sends them for a non-admin.
   const isAdmin = useAuthStore((st) => st.user?.role === 'admin');
+  const [odooAccessBusy, setOdooAccessBusy] = useState(false);
+  const [odooAccessError, setOdooAccessError] = useState<string | null>(null);
+  const [odooAccessPending, setOdooAccessPending] = useState<Partial<Pick<import('@/lib/api').OdooAgentAccessSet, 'permission_override' | 'act_as_requester'>> | null>(null);
+  const odooAccessSaving = useRef(false);
+  const odooAccessAgent = useRef(agent?.name);
+  odooAccessAgent.current = agent?.name;
+  useEffect(() => { setOdooAccessPending(null); setOdooAccessError(null); }, [agent?.name]);
+  async function saveOdooAccess(patch: NonNullable<typeof odooAccessPending>, acknowledgeRisk: boolean) {
+    if (!isAdmin || !agent || !odooEffective || odooAccessSaving.current) return;
+    const agentId = agent.name;
+    odooAccessSaving.current = true;
+    setOdooAccessBusy(true);
+    setOdooAccessError(null);
+    try {
+      const result = await api.odoo.agentAccessSet({ agent_id: agentId, ...patch, acknowledge_risk: acknowledgeRisk });
+      if (odooAccessAgent.current !== agentId) return;
+      setOdooEffective((current) => current ? { ...current, permission_override: result.permission_override, act_as_requester: result.act_as_requester } : current);
+      setOdooAccessPending(null);
+    } catch (err) {
+      if (odooAccessAgent.current === agentId) setOdooAccessError(settingsRefusal(err, errorText(err)));
+    } finally {
+      odooAccessSaving.current = false;
+      setOdooAccessBusy(false);
+    }
+  }
   const [departmentReview, setDepartmentReview] = useState<{ department: string; review: ReachReview }>();
   const targetDepartment = form.department ?? '';
   useEffect(() => {
@@ -1835,6 +1862,37 @@ function EditAgentPageContent() {
             {odooEffective && <OdooPermissionSummary actions={agent.odoo?.allowed_actions ?? []}
               effectiveBlockedModels={odooEffective.effective_blocked_models}
               unblockInherited={odooEffective.unblock_inherited} />}
+            {isAdmin && <>
+              <SettingsCard>
+                <RowSelect label={t('agents.odoo.access.override')} description={t('agents.odoo.access.overrideHelp')}
+                  value={odooEffective?.permission_override ?? 'inherit'} disabled={!odooEffective || odooAccessBusy}
+                  options={(['inherit', 'engine', 'read_only'] as const).map((value) => ({ value, label: t(`agents.odoo.access.${value}`) }))}
+                  onChange={(value) => {
+                    if (!odooEffective || odooAccessBusy) return;
+                    const next = value as import('@/lib/api').OdooPermissionOverride;
+                    const rank = { inherit: 0, engine: 1, read_only: 2 };
+                    if (next === odooEffective.permission_override) return;
+                    setOdooAccessError(null);
+                    if (rank[next] < rank[odooEffective.permission_override]) setOdooAccessPending({ permission_override: next });
+                    else void saveOdooAccess({ permission_override: next }, false);
+                  }} />
+                <RowSwitch label={t('agents.odoo.access.requester')} description={t('agents.odoo.access.requesterHelp')}
+                  checked={odooEffective?.act_as_requester ?? false} disabled={!odooEffective || odooAccessBusy}
+                  onChange={(checked) => {
+                    setOdooAccessError(null);
+                    if (checked) setOdooAccessPending({ act_as_requester: true });
+                    else void saveOdooAccess({ act_as_requester: false }, false);
+                  }} />
+              </SettingsCard>
+              {odooAccessError && !odooAccessPending && <p role="alert" className="text-sm text-destructive">{odooAccessError}</p>}
+              <RiskConfirmDialog open={odooAccessPending !== null} onClose={() => { if (!odooAccessBusy) { setOdooAccessPending(null); setOdooAccessError(null); } }}
+                title={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requester' : 'agents.odoo.access.override')}
+                body={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterHelp' : 'agents.odoo.access.loosenHelp')}
+                acknowledgeLabel={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterAck' : 'agents.odoo.access.loosenAck')}
+                auditNote={t(odooAccessPending?.act_as_requester ? 'agents.odoo.access.requesterAudit' : 'agents.odoo.access.loosenAudit')}
+                confirmLabel={t('common.save')} busy={odooAccessBusy} error={odooAccessError}
+                onConfirm={() => { if (odooAccessPending) void saveOdooAccess(odooAccessPending, true); }} />
+            </>}
             <OdooPermissionsEditor key={agent.name} value={odoo}
               defaultAccount={!odoo.url && !odoo.db && !odoo.username && !odoo.company_ids
                 && !odoo.api_key && !odoo.password && !agent.odoo_api_key_set && !agent.odoo_password_set

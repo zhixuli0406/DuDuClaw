@@ -267,3 +267,28 @@ it('never applies global account denials to a separate employee connection', asy
   }
   expect(screen.getAllByText('Could not confirm Odoo permissions')).toHaveLength(6);
 });
+
+ describe('engine table permission grid', () => {
+   it('toggles exactly the four scoped tokens and does not list them under Other', async () => {
+     const user = userEvent.setup();
+     renderWithProviders(<Harness initial={{ allowed_models: ['sale.order'], allowed_actions: ['read:crm.lead'] }} />);
+     for (const [label, verb] of [['Activities', 'activity'], ['Internal notes', 'note'], ['Notify followers', 'message'], ['Attachments', 'attach']]) {
+       const box = await screen.findByRole('checkbox', { name: `${label} crm.lead` });
+       await waitFor(() => expect(box).toBeEnabled());
+       await user.click(box);
+       expect(changed.mock.lastCall?.[0].allowed_actions).toContain(`${verb}:crm.lead`);
+       expect(changed.mock.lastCall?.[0].allowed_actions).not.toContain(verb);
+       expect(screen.queryByText('Other settings')).not.toBeInTheDocument();
+       await user.click(box);
+       expect(changed.mock.lastCall?.[0].allowed_actions).not.toContain(`${verb}:crm.lead`);
+     }
+     expect(screen.getByRole('checkbox', { name: 'Activities sale.order' })).toBeInTheDocument();
+   });
+   it('loads saved engine permissions as checked boxes', async () => {
+     renderWithProviders(<Harness initial={{ allowed_actions: ['activity:crm.lead', 'note:crm.lead', 'message:crm.lead', 'attach:crm.lead'] }} />);
+     for (const label of ['Activities', 'Internal notes', 'Notify followers', 'Attachments']) {
+       expect(await screen.findByRole('checkbox', { name: `${label} crm.lead` })).toBeChecked();
+     }
+     expect(screen.queryByText('Other settings')).not.toBeInTheDocument();
+   });
+ });
