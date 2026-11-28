@@ -1,3 +1,4 @@
+import { ChatApprovalCard } from '@/components/settings/sections/ChatApprovalCard';
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useState, useCallback, useRef, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -181,6 +182,7 @@ export function SecurityPage() {
       {isAdmin && <WebsiteCredentialsPanel />}
 
       <EgressGuardSection status={status} onSaved={refreshSecurityStatus} />
+      {isAdmin && <ChatApprovalCard />}
 
       <ForgetReceiptsPanel />
 

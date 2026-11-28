@@ -7098,7 +7098,41 @@ export type ResponsibilityCas =
   | { responsibility: ResponsibilityRow; conflict?: undefined }
   | { conflict: true; current: ResponsibilityRow };
 
+export interface ChatApprovalKind {
+  key: string;
+  label: { 'zh-TW': string; en: string; ja: string };
+  impact: string;
+}
+export interface ChatAdminSettings {
+  enabled: boolean;
+  channels: ('telegram' | 'googlechat')[];
+  step_up_methods: ('web' | 'dm_totp')[];
+  card_valid_hours: number;
+  readable: boolean;
+  hash: string | null;
+  enabled_ack: { by_name: string; at: string } | null;
+  kinds: (ChatApprovalKind & { tier: 'T2'; step_up_required: boolean })[];
+  t1_kinds: ChatApprovalKind[];
+  admins: { user_id: string; name: string; proven_channels: string[]; has_totp: boolean }[];
+  web_link_available: boolean;
+  unsupported_channels_ignored: boolean;
+}
+export interface ChatAdminSetParams {
+  expected_hash: string;
+  enabled: boolean;
+  channels: ChatAdminSettings['channels'];
+  step_up_methods: ChatAdminSettings['step_up_methods'];
+  card_valid_hours: number;
+  step_up_exempt_kinds: string[];
+  acknowledge_risk?: true;
+  acknowledge_exempt_risk?: string[];
+}
+
 export const api = {
+  chatAdmin: {
+    get: () => client.call('approvals.chat_admin.get', {}) as Promise<ChatAdminSettings>,
+    set: (params: ChatAdminSetParams) => client.call('approvals.chat_admin.set', { ...params }) as Promise<{ success: true; hash: string }>,
+  },
   /** WebChat past-conversation browsing + resume (WP3). Goes through the
    *  dashboard RPC (authz enforced server-side — a non-admin caller must pass a
    *  visible `agent_id`; other agents' sessions are never returned). */
