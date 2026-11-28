@@ -56,6 +56,7 @@ pub struct WebChatScope {
     pub available: bool,
     /// Directory identities admitted for this sender's conversation only.
     main_converse: BTreeSet<String>,
+    main_converse_listed: bool,
     main_assign: BTreeSet<String>,
     main_assign_listed: bool,
 }
@@ -110,11 +111,13 @@ impl SenderAccess {
         let old = self.webchat_scope.take();
         let main_converse = old.as_ref().map(|s| s.main_converse.clone()).unwrap_or_default();
         let main_assign = old.as_ref().map(|s| s.main_assign.clone()).unwrap_or_default();
+        let main_converse_listed = old.as_ref().is_some_and(|s| s.main_converse_listed);
         let main_assign_listed = old.is_some_and(|s| s.main_assign_listed);
         self.webchat_scope = Some(WebChatScope {
             available: default_agent.is_ok(),
             default_agent: default_agent.unwrap_or_default(),
             main_converse,
+            main_converse_listed,
             main_assign,
             main_assign_listed,
         });
@@ -124,15 +127,20 @@ impl SenderAccess {
     /// Call before acquiring the registry lock. The list is never inferred from
     /// a message, a binding, a public trigger or an anonymous widget identity.
     pub(crate) async fn for_webchat_converse(self, home: &Path) -> Self {
-        use crate::on_behalf_of::access::{main_access_allowed, main_default_targets, main_turn_allowed, MainUse};
+        use crate::on_behalf_of::access::{main_access_listed, main_default_targets, main_turn_allowed, MainUse};
         let mut sender = self.for_webchat(crate::webchat::access::gateway_default_id(home).await);
         let scope = sender.webchat_scope.as_mut().expect("WebChat scope was set");
         scope.main_converse.clear();
-        if !scope.available || sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
+        scope.main_converse_listed = false;
+        if sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
+            scope.main_converse_listed = !crate::webchat::is_widget_visitor(user_id)
+                && crate::on_behalf_of::access::main_list_refusal(home, Some(&format!("user:{user_id}")))
+                    == crate::on_behalf_of::access::MAIN_TURN_REFUSAL;
             if !crate::webchat::is_widget_visitor(user_id)
-                && main_access_allowed(home, user_id, MainUse::Converse).unwrap_or(false)
+                && main_access_listed(home, user_id, MainUse::Converse).unwrap_or(false)
             {
+                if !scope.available { return sender; }
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
                     for target in targets {
                         if Box::pin(main_turn_allowed(home, user_id, &target, MainUse::Converse))
@@ -154,12 +162,15 @@ impl SenderAccess {
         let scope = sender.webchat_scope.as_mut().expect("assignment scope was set");
         scope.main_assign.clear();
         scope.main_assign_listed = false;
-        if !scope.available || sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
+        if sender.credential_origin != duduclaw_auth::acl::ContextOrigin::DashboardSession { return sender; }
         if let Sender::Account { user_id, .. } = &sender.sender {
+            scope.main_assign_listed = !crate::webchat::is_widget_visitor(user_id)
+                && crate::on_behalf_of::access::main_list_refusal(home, Some(&format!("user:{user_id}")))
+                    == crate::on_behalf_of::access::MAIN_TURN_REFUSAL;
             if !crate::webchat::is_widget_visitor(user_id)
                 && main_access_listed(home, user_id, MainUse::Assign).unwrap_or(false)
             {
-                scope.main_assign_listed = true;
+                if !scope.available { return sender; }
                 if let Ok(targets) = Box::pin(main_default_targets(home)).await {
                     for target in targets {
                         if Box::pin(main_turn_allowed(home, user_id, &target, MainUse::Assign))
@@ -189,6 +200,13 @@ impl SenderAccess {
         (self.webchat_scope.as_ref().is_some_and(|scope|
             scope.main_assign_listed && is_main_target(scope, agent))
             && !self.main_assign_allowed(agent))
+            .then_some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL)
+    }
+
+    pub(crate) fn main_converse_refusal(&self, agent: &LoadedAgent) -> Option<&'static str> {
+        (self.webchat_scope.as_ref().is_some_and(|scope|
+            scope.main_converse_listed && is_main_target(scope, agent))
+            && !self.main_converse_allowed(agent))
             .then_some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL)
     }
 

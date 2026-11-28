@@ -20,6 +20,7 @@ impl Fixture {
         let users = UserDb::new(&home.path().join("users.db")).unwrap();
         let user = users.create_user("executor@example.test", "管理員", "fixture-password", UserRole::Admin).unwrap();
         let handler = MethodHandler::new(home.path().into()).await;
+        handler.set_cron_store(Arc::new(crate::cron_store::CronStore::open(home.path()).unwrap())).await;
         for name in ["avatar", "worker", "later"] {
             let frame = handler.handle_agents_create_as(json!({"name":name,
                 "model_preferred":"claude-sonnet-4-6", "runtime":{"provider":"claude"}}),
@@ -504,13 +505,13 @@ async fn consecutive_skill_edits_use_only_their_own_committed_hash() {
 #[tokio::test]
 async fn effective_resolved_text_cas_refuses_post_reverify_drift() {
     let f = Fixture::new().await;
+    f.bind_identity_test_preset("worker").await;
     let before = f.profile("worker");
+    let effective = route::effective_text(&f.home.path().join("agents/worker")).unwrap();
     let resolved = duduclaw_core::preset::agent_resolved_path(f.home.path(), "worker");
-    std::fs::create_dir_all(resolved.parent().unwrap()).unwrap();
-    std::fs::write(&resolved, &before).unwrap();
     let rec = f.card(vec![field("worker", "icon", json!("🦊")), schedule("never-run")]).await;
     f.decide(&rec, true).await;
-    let changed = format!("{before}\n# concurrent resolved artifact edit\n");
+    let changed = format!("{effective}\n# concurrent resolved artifact edit\n");
     let result = f.run_after_reverify(&rec, async {
         std::fs::write(&resolved, &changed).unwrap();
     }).await;
@@ -566,7 +567,20 @@ async fn preset_non_target_raw_trigger_changes_namespace_and_refuses_writes() {
             let result = if after_reverify {
                 f.decide(&rec, true).await;
                 let result = f.run_after_reverify(&rec, change).await;
-                assert_stale_write_stopped(&result, 0, 0);
+                assert_eq!(result["completed"], 0);
+                let items = result["items"].as_array().unwrap();
+                let failed = items.iter().find(|item| item["target"] == "worker"
+                    && item["field"] == name).unwrap();
+                assert_eq!(failed["result"], "failed");
+                for item in items {
+                    // Derived trigger fields fail with the same atomic write.
+                    assert_eq!(item["result"], if item["target"] == "worker" && item.get("field").is_some() {
+                        "failed"
+                    } else { "not_executed" });
+                }
+                let schedule = items.iter().find(|item| item["op"] == "create").unwrap();
+                assert_eq!(schedule["result"], "not_executed");
+                assert!(result["message"].as_str().unwrap().contains("設定在確認後被其他人改過"));
                 result
             } else {
                 change.await;

@@ -86,7 +86,7 @@ import {
 } from '@/components/mds';
 import {
   RUNTIME_PROVIDERS,
-  GENERIC_CLI_RUNTIMES,
+  COARSE_TOOL_RUNTIMES,
   UTILITY_CAPABLE_RUNTIMES,
   EFFORT_LEVELS,
   TEAM_ROLE_KEYS,
@@ -746,6 +746,7 @@ function EditAgentPageContent() {
       decision_continuity: agent.memory?.decision_continuity ?? DEFAULT_V168.decision_continuity,
       decision_ttl_days: agent.memory?.decision_ttl_days ?? DEFAULT_V168.decision_ttl_days,
       night_engine_enabled: agent.night_engine?.enabled ?? DEFAULT_V168.night_engine_enabled,
+      goal_intent_enabled: agent.goal_intent?.enabled ?? DEFAULT_V168.goal_intent_enabled,
       public_trigger: agent.channels?.public_trigger ?? DEFAULT_V168.public_trigger,
     });
   }, [agent]);
@@ -1241,7 +1242,7 @@ function EditAgentPageContent() {
     raw: code,
   }));
   const providerOptions: SelectOption[] = RUNTIME_PROVIDERS.filter(p => policy.allows('runtimes', p)).map((p) => ({ value: p, label: intl.formatMessage({ id: `agents.runtime.provider.${p}` }), raw: p }));
-  const usesGenericCli = GENERIC_CLI_RUNTIMES.has(runtime.provider) || GENERIC_CLI_RUNTIMES.has(runtime.fallback);
+  const usesCoarseTools = COARSE_TOOL_RUNTIMES.has(runtime.provider) || COARSE_TOOL_RUNTIMES.has(runtime.fallback);
   // Show an old saved runtime for migration without offering it as a new choice.
   const withSavedRemoved = (opts: SelectOption[], saved: string | undefined): SelectOption[] =>
     saved && isRemovedRuntime(saved) && !opts.some((o) => o.value === saved)
@@ -1380,7 +1381,12 @@ function EditAgentPageContent() {
             <SettingsCard>
               <RowNumber label={t('agents.edit.maxActiveSkills')} value={form.max_active_skills ?? 5} min={1} max={20} onChange={(v) => updateField('max_active_skills', v)} />
               <RowSwitch label={t('agents.edit.canModifySkills')} description={t('agents.v168.perm.canModifySkills.help')} checked={form.can_modify_own_skills ?? false} disabled={locked('form.can_modify_own_skills')} onChange={(v) => updateField('can_modify_own_skills', v)} />
-              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              <RowSwitch label={t('agents.adv.skillBudgetUnlimited')} description={form.skill_budget_unlimited ? t('agents.adv.skillBudgetUnlimitedWarning') : undefined} checked={form.skill_budget_unlimited ?? false} disabled={!isAdmin && !form.skill_budget_unlimited} onChange={(v) => updateField('skill_budget_unlimited', v)} />
+              {!isAdmin && (
+                <p className="rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
+                  {t('agents.adv.skillBudgetUnlimited.ownerHint')}
+                </p>
+              )}
               <RowNumber label={t('agents.adv.skillTokenBudget')} value={form.skill_token_budget ?? 0} disabled={form.skill_budget_unlimited ?? false} min={0} onChange={(v) => updateField('skill_token_budget', v)} />
             </SettingsCard>
           </SettingsSection>
@@ -1601,7 +1607,7 @@ function EditAgentPageContent() {
             <ToolNameListField label={t('agents.v168.toolGates.irreversible')} description={t('agents.v168.toolGates.irreversible.help')} values={caps.irreversible_tools} onChange={(v) => updateCap('irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.maybe')} description={t('agents.v168.toolGates.maybe.help')} values={caps.maybe_irreversible_tools} onChange={(v) => updateCap('maybe_irreversible_tools', v)} disabled={!isAdmin} />
             <ToolNameListField label={t('agents.v168.toolGates.scoped')} description={t('agents.v168.toolGates.scoped.help')} values={caps.scoped_tools} onChange={(v) => updateCap('scoped_tools', v)} disabled={!isAdmin} />
-            {usesGenericCli && (
+            {usesCoarseTools && (
               <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
             )}
           </SettingsSection>
@@ -2015,7 +2021,7 @@ function EditAgentPageContent() {
               {runtimeTimeoutError && <p role="alert" className="px-3 py-2 text-xs text-destructive">{intl.formatMessage({ id: 'agents.runtime.timeout.overCeiling' }, { ceiling: Math.min(savedRuntimeTimeout, runtimeMaxTimeout) })}</p>}
               <RowSwitch label={t('agents.v168.minimalContext')} description={t('agents.v168.minimalContext.help')} checked={v168.minimal_context} onChange={(v) => updateV('minimal_context', v)} />
             </SettingsCard>
-            {usesGenericCli && (
+            {usesCoarseTools && (
               <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">{t('agents.v168.genericCli.note')}</p>
             )}
           </SettingsSection>
@@ -2199,6 +2205,12 @@ function EditAgentPageContent() {
           <SettingsSection title={t('agents.v168.night.title')}>
             <SettingsCard>
               <RowSwitch label={t('agents.v168.night.enabled')} description={t('agents.v168.night.enabled.help')} checked={v168.night_engine_enabled} onChange={(v) => updateV('night_engine_enabled', v)} />
+            </SettingsCard>
+          </SettingsSection>
+
+          <SettingsSection title={t('agents.v168.goalIntent.title')}>
+            <SettingsCard>
+              <RowSwitch label={t('agents.v168.goalIntent.enabled')} description={t('agents.v168.goalIntent.enabled.help')} checked={v168.goal_intent_enabled} onChange={(v) => updateV('goal_intent_enabled', v)} />
             </SettingsCard>
           </SettingsSection>
 

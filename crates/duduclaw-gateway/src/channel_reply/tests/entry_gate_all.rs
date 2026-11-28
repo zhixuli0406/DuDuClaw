@@ -260,7 +260,8 @@ async fn drive(f: &Fixture, case: Case, entry: Entry) -> EntryResult {
             if case.healthy() {
                 assert_eq!(f.calls.load(Ordering::SeqCst), 1);
                 if case.public() {
-                    assert_eq!(text, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE);
+                    assert!(text.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{text}");
+                    assert!(!text.contains("原因代碼"), "{text}");
                 } else {
                     assert!(text.contains("Actual Worker"), "{text}");
                 }
@@ -420,7 +421,9 @@ async fn all_entries_share_the_effective_configuration_contract() {
                     assert!(!outcome.proceeded, "{} {case:?}", row.name);
                     let refusal = outcome.refusal.expect(row.name);
                     if case.public() {
-                        assert_eq!(refusal, crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE, "{} {case:?}", row.name);
+                        assert!(refusal.starts_with(crate::odoo_livechat::VISITOR_FALLBACK_MESSAGE), "{} {case:?}: {refusal}", row.name);
+                        assert!(!refusal.contains(f.expected_code.unwrap()), "{refusal}");
+                        assert!(!refusal.contains("原因代碼"), "{refusal}");
                     } else {
                         assert!(refusal.contains(f.expected_code.unwrap()), "{} {case:?}: {refusal}", row.name);
                     }
@@ -554,7 +557,15 @@ async fn ag_ui(f: &Fixture, case: Case) -> EntryResult {
         assert_eq!(f.calls.load(Ordering::SeqCst), 1, "healthy AG-UI reaches its configured runtime");
         let text = std::str::from_utf8(&body).unwrap();
         assert!(text.contains("RUN_STARTED"), "{text}");
-        assert!(text.contains("RUN_FINISHED"), "{text}");
+        for gate_error in ["employee_entry_refused", "agent_config_unreadable", "model_provider_mismatch", "runtime_unavailable"] {
+            assert!(!text.contains(gate_error), "unexpected entry-gate refusal {gate_error}: {text}");
+        }
+        // The fixture runtime counts the call and then always fails.
+        assert!(
+            text.contains("RUN_FINISHED")
+                || (text.contains("RUN_ERROR") && text.contains("\"code\":\"runtime_failed\"")),
+            "{text}"
+        );
         EntryResult::result(Ok(()))
     } else {
         assert_eq!(status, StatusCode::CONFLICT);

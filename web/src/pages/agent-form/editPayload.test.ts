@@ -239,6 +239,15 @@ describe('buildUpdatePayload — only dirty fields are sent', () => {
     expect(buildUpdatePayload(s, new Set(['odoo.allowed_models']), CTX).payload).toEqual({ odoo: { allowed_models: [] } });
   });
 
+  it('sends goal intent only when its switch is edited', () => {
+    const s = state({ v: { ...DEFAULT_V168, goal_intent_enabled: false } });
+    expect(buildUpdatePayload(s, new Set(['v.goal_intent_enabled']), CTX).payload).toEqual({
+      goal_intent: { enabled: false },
+    });
+    expect(buildUpdatePayload(s, new Set(), CTX).payload).not.toHaveProperty('goal_intent');
+    expect(buildUpdatePayload(state(), new Set(), CTX).payload).not.toHaveProperty('goal_intent');
+  });
+
   it('maps the v1.68 controls onto their sections', () => {
     const v = {
       ...DEFAULT_V168,
@@ -350,6 +359,20 @@ describe('admin-only paths and the team vendor rule', () => {
       .flatMap((f) => f.form_paths);
     expect([...ADMIN_ONLY_FORM_PATHS_FALLBACK].sort()).toEqual([...changePaths].sort());
     expect([...KV_REFUSED_SECTIONS].sort()).toEqual([...authorityFields.kv_refused_sections].sort());
+  });
+
+  it('keeps unlimited skill content and the token budget in non-admin saves', () => {
+    const s = state({ form: { skill_budget_unlimited: false, skill_token_budget: 1200 } });
+    const consumed = new Set(['form.skill_budget_unlimited', 'form.skill_token_budget']);
+    const serverPaths = authorityFields.fields.filter((f) => f.kind === 'change').flatMap((f) => f.form_paths);
+    for (const serverList of [undefined, serverPaths]) {
+      expect(isAdminOnlyPath('form.skill_budget_unlimited', serverList)).toBe(false);
+      expect(isAdminOnlyPath('form.skill_budget_unlimited_extra', serverList)).toBe(false);
+      const dirty = new Set([...consumed].filter((p) => !isAdminOnlyPath(p, serverList)));
+      expect(buildUpdatePayload(s, dirty, CTX).payload).toEqual({ skill_budget_unlimited: false, skill_token_budget: 1200 });
+    }
+    expect(buildUpdatePayload(s, consumed, CTX).payload)
+      .toEqual({ skill_budget_unlimited: false, skill_token_budget: 1200 });
   });
 
   it('treats the permission switches, guardrails and protected sections as admin-only', () => {

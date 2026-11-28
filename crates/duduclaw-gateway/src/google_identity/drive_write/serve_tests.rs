@@ -465,7 +465,7 @@ async fn denied_tools_still_wins_with_no_human_confirmation() {
         "denied_tools=['drive_create_file']").unwrap();
     let http = Arc::new(Http::default());
     let result = invoke(&f, &state, http.clone(), "drive_create_file", create_args(), RequesterIdentity::DashboardUser { user_id:f.user.clone() }).await;
-    assert_eq!(result.as_ref().unwrap_err().code, "changed"); assert_eq!(http.writes(), 0);
+    assert_eq!(result.as_ref().unwrap_err().code, "identity_changed"); assert_eq!(http.writes(), 0);
     assert!(http.methods.lock().unwrap().is_empty()); assert_audit(&f, &result, "refused");
 }
 

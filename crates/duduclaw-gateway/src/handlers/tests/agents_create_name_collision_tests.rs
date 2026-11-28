@@ -135,6 +135,9 @@ async fn allows_non_colliding_name() {
         "{frame:?}"
     );
     assert!(home.path().join("agents").join("brand-new-agent").exists());
+    let raw = std::fs::read_to_string(home.path().join("agents/brand-new-agent/agent.toml")).unwrap();
+    let config: toml::Table = raw.parse().unwrap();
+    assert!(config["permissions"]["allowed_channels"].as_array().unwrap().is_empty());
 }
 
 /// No `agents/<x>` and no staging leftovers (`.creating-*`) for `name`.

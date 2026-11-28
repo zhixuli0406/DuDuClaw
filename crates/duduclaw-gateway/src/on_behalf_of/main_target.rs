@@ -8,13 +8,27 @@ use duduclaw_auth::{models::UserStatus, UserRole};
 use duduclaw_core::{types::{AgentRole, RuntimeType}, HumanPrincipal};
 
 const REFUSAL: &str = "主代理僅管理員可以使用。";
-pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前還不能替你處理工作，請聯絡管理員。";
+pub const MAIN_TURN_REFUSAL: &str = "主要 AI 員工目前只開放管理員使用（尚未啟用受保護模式），請聯絡管理員。";
 
 #[path = "main_tools.rs"]
 mod main_tools;
 pub use main_tools::listed_access_effective;
 pub(crate) use main_tools::main_default_targets;
 pub(crate) use main_tools::loaded_access_effective;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "main_list_test_support.rs"]
+mod main_list_test_support;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use main_list_test_support::{test_list_in_effect_for, TestListInEffectGuard};
+
+/// Only the list decision uses the test seam; native execution never does.
+fn list_in_effect(_home: &Path) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    if main_list_test_support::enabled(_home) { return true; }
+    duduclaw_core::execution_gate::isolation_required()
+}
 
 /// Declare the intended use explicitly so future policy can narrow either one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,7 +49,7 @@ tokio::task_local! {
 /// Missing accounts deny; identity-store read failures are errors (callers deny).
 pub fn main_access_allowed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     main_access_allowed_with_isolation(home, user_id, use_,
-        duduclaw_core::execution_gate::isolation_required())
+        list_in_effect(home))
 }
 
 fn main_access_allowed_with_isolation(
@@ -51,6 +65,17 @@ fn main_access_allowed_with_isolation(
 /// Membership alone is used only to select refusal text, never to grant a turn.
 pub(crate) fn main_access_listed(home: &Path, user_id: &str, use_: MainUse) -> Result<bool, String> {
     admitted_main_role(home, user_id, use_).map(|role| role.is_some())
+}
+
+/// Read membership only to explain a refusal, including an inactive list.
+/// Only Enterprise homes use the list; this never establishes admission.
+pub(crate) fn main_list_refusal(home: &Path, principal: Option<&str>) -> &'static str {
+    if !crate::team_edition::team_grants_enabled(home) { return REFUSAL; }
+    let super::super::PrincipalState::Human(HumanPrincipal::User(id)) =
+        super::super::PrincipalState::from_wire(principal) else { return REFUSAL; };
+    let listed = crate::decision_notify::open_user_db_read_only(home).ok().flatten()
+        .and_then(|db| db.is_main_agent_user(&id).ok()).unwrap_or(false);
+    if listed { MAIN_TURN_REFUSAL } else { REFUSAL }
 }
 
 fn admitted_main_role(home: &Path, user_id: &str, use_: MainUse) -> Result<Option<UserRole>, String> {
@@ -77,7 +102,7 @@ pub async fn main_turn_allowed(
     home: &Path, user_id: &str, agent: &str, use_: MainUse,
 ) -> Result<bool, String> {
     main_turn_allowed_with_isolation(home, user_id, agent, use_,
-        duduclaw_core::execution_gate::isolation_required()).await
+        list_in_effect(home)).await
 }
 
 async fn main_turn_allowed_with_isolation(
@@ -145,7 +170,7 @@ pub fn requires_main_restriction(home: &Path, principal: Option<&str>) -> Result
         super::super::PrincipalState::Human(HumanPrincipal::User(id)) => id,
         super::super::PrincipalState::Unknown => return Err(REFUSAL.into()),
     };
-    let db = crate::decision_notify::open_user_db(home)
+    let db = crate::decision_notify::open_user_db_read_only(home)
         .map_err(|_| REFUSAL.to_owned())?.ok_or_else(|| REFUSAL.to_owned())?;
     let account = db.get_user(&user).map_err(|_| REFUSAL.to_owned())?
         .ok_or_else(|| REFUSAL.to_owned())?;
@@ -189,12 +214,7 @@ pub async fn check_loaded_main_target_for(
             return Ok(());
         }
     }
-    let listed = match super::super::PrincipalState::from_wire(principal) {
-        super::super::PrincipalState::Human(HumanPrincipal::User(id)) =>
-            main_access_listed(home, &id, use_).unwrap_or(false),
-        _ => false,
-    };
-    Err(if listed { MAIN_TURN_REFUSAL } else { REFUSAL }.into())
+    Err(main_list_refusal(home, principal).into())
 }
 
 /// Last gate for turns admitted under the main-person rule. Every runtime
@@ -205,13 +225,16 @@ pub(crate) async fn check_final_main_spawn(
     home: &Path, dir: Option<&Path>, command: Option<&tokio::process::Command>,
 ) -> Result<(), String> {
     check_final_main_spawn_with_isolation(home, dir, command,
-        duduclaw_core::execution_gate::isolation_required()).await
+        list_in_effect(home)).await
 }
 
 // Private injection boundary; production callers always read the trusted gate.
 async fn check_final_main_spawn_with_isolation(
     home: &Path, dir: Option<&Path>, _command: Option<&tokio::process::Command>, isolated: bool,
 ) -> Result<(), String> {
+    // A utility without an employee identity is outside this main-only gate.
+    // Employee calls with a missing directory must still fail closed.
+    if dir.is_none() && crate::runtime_dispatch::is_agentless_utility_call() { return Ok(()); }
     let web_user = crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.try_with(Clone::clone).ok()
         .filter(|id| id.as_str() != "system" && !crate::webchat::is_widget_visitor(id));
     let origin = crate::webchat::main_credential_origin();

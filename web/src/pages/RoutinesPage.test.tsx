@@ -251,6 +251,7 @@ it('filters department schedules using granted employees and reports employees n
   mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
     method === 'users.dept_grants.mine' ? { agents: [{ id: 'agnes', display_name: 'Agnes', groups: ['schedules'] }, { id: 'bruno', display_name: 'Bruno', groups: ['schedules'] }], needs_sync: [{ id: 'drift', display_name: 'Drift' }] }
     : method === 'agents.list' ? { agents: [{ name: 'agnes', department: 'Sales' }, { name: 'bruno', department: 'Support' }] }
+    : method === 'agents.callable' ? { agents: [], unrestricted: false, default_agent: null }
     : method === 'cron.list' ? { tasks: [{ id: 'a', name: 'Sales report', agent_id: 'agnes', enabled: true, can_manage: true }, { id: 'b', name: 'Support report', agent_id: 'bruno', enabled: true, can_manage: false }] } : {}));
   renderWithProviders(<RoutinesPage />);
   await screen.findByText('Sales report');

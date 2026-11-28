@@ -41,6 +41,19 @@ pub(crate) fn chat_turn_config(
     }).ok().flatten()
 }
 
+/// Prompt assembly shares the admitted employee document just like runtime routing.
+pub(crate) fn chat_profile(agent_dir: &Path) -> std::io::Result<duduclaw_core::profile_sections::ProfileSections> {
+    use duduclaw_core::profile_sections::ProfileSections;
+    match chat_turn_config(Some(agent_dir)) {
+        Some(turn) => {
+            let config = turn.document.as_table().ok_or_else(||
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "turn configuration is not a table"))?;
+            ProfileSections::load_with_config(agent_dir, config)
+        }
+        None => ProfileSections::load(agent_dir),
+    }
+}
+
 /// Preserve read_agent_effort's parser semantics, including absence/invalid
 /// values meaning provider default, without falling through to another read.
 pub(crate) fn chat_effort(agent_dir: Option<&Path>) -> Option<duduclaw_core::effort::Effort> {
@@ -335,6 +348,14 @@ tokio::task_local! {
     /// Applies only to the new Claude continuation; older primary paths keep
     /// their existing environment behavior.
     pub(crate) static CLAUDE_FALLBACK_SPAWN: ();
+
+    /// Host-declared purpose of this exact call; nested employee calls replace it.
+    static CURRENT_SPAWN_PURPOSE: SpawnPurpose;
+}
+
+pub(crate) fn is_agentless_utility_call() -> bool {
+    CURRENT_SPAWN_PURPOSE.try_with(|purpose| *purpose == SpawnPurpose::Utility)
+        .unwrap_or_else(|_| in_utility_call())
 }
 
 pub(crate) fn in_claude_runtime_fallback() -> bool {
@@ -380,6 +401,7 @@ async fn run_agent_prompt_scoped(
     // Direct dispatch callers also need the marker; Chat preserves the
     // WebChat/shared-member scope (or the absence of one for ordinary channels).
     let dispatch = req.request_type == RequestType::Dispatch;
+    let purpose = req.purpose;
     // Utility request labels are not employee identities; the host-owned
     // agent directory binds the owner, while agent-less calls use global state.
     let owner = req
@@ -404,6 +426,7 @@ async fn run_agent_prompt_scoped(
             ),
         ),
     )));
+    let run = CURRENT_SPAWN_PURPOSE.scope(purpose, run);
     if dispatch {
         crate::on_behalf_of::access::MAIN_TURN_USE.scope(
             crate::on_behalf_of::access::MainUse::Assign, run,
@@ -1773,7 +1796,7 @@ pub(crate) mod testing {
     pub(super) fn owned_registry(home: &Path) -> Option<Arc<RuntimeRegistry>> {
         OWNED_REGISTRIES
             .get()
-            .and_then(|map| map.lock().unwrap().get(home).cloned())
+            .and_then(|map| map.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).get(home).cloned())
     }
 
     pub(crate) struct RegistryGuard {
@@ -1784,11 +1807,19 @@ pub(crate) mod testing {
         pub(crate) async fn install(home: &Path, registry: RuntimeRegistry) -> Self {
             assert!(home.is_dir());
             let registry = Arc::new(registry);
-            let mut map = OWNED_REGISTRIES
-                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap();
-            assert!(map.insert(home.to_owned(), registry.clone()).is_none());
+            let installed = {
+                let mut map = OWNED_REGISTRIES
+                    .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let std::collections::hash_map::Entry::Vacant(entry) = map.entry(home.to_owned()) {
+                    entry.insert(registry.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            assert!(installed, "a RegistryGuard for this home is already installed: {}", home.display());
             Self {
                 home: home.to_owned(),
                 registry,
@@ -1797,12 +1828,12 @@ pub(crate) mod testing {
     }
     impl Drop for RegistryGuard {
         fn drop(&mut self) {
-            let mut map = OWNED_REGISTRIES.get().unwrap().lock().unwrap();
-            assert!(
-                map.get(&self.home)
-                    .is_some_and(|actual| Arc::ptr_eq(actual, &self.registry))
-            );
-            map.remove(&self.home);
+            if let Some(map) = OWNED_REGISTRIES.get() {
+                let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if map.get(&self.home).is_some_and(|actual| Arc::ptr_eq(actual, &self.registry)) {
+                    map.remove(&self.home);
+                }
+            }
         }
     }
 

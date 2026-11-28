@@ -246,13 +246,17 @@ async fn arguments_are_closed_and_bounded_before_route_call() {
 #[test]
 fn admin_tools_scope_effect_schema_and_description_budget() {
     use duduclaw_core::ToolEffect;
+    use duduclaw_mcp_boundary::tool_policy::{ResourceKind, Route};
+    use crate::mcp::tools_list_budget_tests::TOOL_DESCRIPTION_MAX_BYTES;
     for (name, effect) in [("admin_settings_read", ToolEffect::Read), ("admin_settings_propose", ToolEffect::Admin)] {
         assert_eq!(crate::mcp_auth::tool_requires_scope(name), Some(crate::mcp_auth::Scope::Admin));
         assert_eq!(duduclaw_core::tool_effect::effect_of_builtin(name), Some(effect));
-        assert!(duduclaw_mcp_boundary::tool_policy::policy(name).is_none());
+        let policy = duduclaw_mcp_boundary::tool_policy::policy(name).expect("admin tool boundary policy");
+        assert_eq!(policy.route, Route::Service, "{name}");
+        assert_eq!(policy.required, &[ResourceKind::Employee], "{name}");
         let definition = crate::mcp::tools().find(|tool| tool.name == name).unwrap();
-        assert!(definition.description.len() <= 200);
-        assert!(definition.params.iter().all(|param| param.description.len() <= 200));
+        assert!(definition.description.len() <= TOOL_DESCRIPTION_MAX_BYTES, "{name}");
+        assert!(definition.params.iter().all(|param| param.description.len() <= TOOL_DESCRIPTION_MAX_BYTES), "{name}");
         let schema = crate::mcp::build_tool_schema(definition);
         assert_eq!(schema["inputSchema"]["additionalProperties"], false);
         let props = &schema["inputSchema"]["properties"];

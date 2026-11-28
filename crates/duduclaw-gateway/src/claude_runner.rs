@@ -6986,13 +6986,13 @@ mod background_entry_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn background_run_keeps_gated_model_runtime_effort_and_fallback_after_edit() {
-        let (home, ctx, _initial_runtime, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
+        let (home, ctx, initial_runtime, _) = crate::channel_reply::entry_gate_test_helpers::owned_channel(RuntimeType::Codex).await;
         let snapshot = {
             let reg = ctx.registry.read().await;
             let path = crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap().config_path;
             let mut document: toml::Value = std::fs::read_to_string(&path).unwrap().parse().unwrap();
             document["model"]["preferred"] = toml::Value::String("opus".into());
-            document["model"]["effort"] = toml::Value::String("high".into());
+            document["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("high".into()));
             document["model"]["fallback"] = toml::Value::String("gpt-5.4-mini".into());
             std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
             Arc::new(crate::entry_gate::resolve_and_check(home.path(), &reg, "worker").unwrap())
@@ -7000,12 +7000,13 @@ mod background_entry_tests {
         let mut changed = snapshot.document.clone();
         changed["runtime"]["provider"] = toml::Value::String("claude".into());
         changed["model"]["preferred"] = toml::Value::String("claude-sonnet-4-6".into());
-        changed["model"]["effort"] = toml::Value::String("low".into());
+        changed["model"].as_table_mut().unwrap().insert("effort".into(), toml::Value::String("low".into()));
         changed["model"]["fallback"] = toml::Value::String("claude-haiku-4-5".into());
         std::fs::write(&snapshot.config_path, toml::to_string(&changed).unwrap()).unwrap();
         let calls: crate::runtime_dispatch::testing::RecordedFallback = Default::default();
         let mut runtimes: std::collections::HashMap<RuntimeType, Box<dyn crate::runtime::AgentRuntime>> = Default::default();
         runtimes.insert(RuntimeType::Codex, Box::new(crate::runtime_dispatch::testing::RecordingCodex(calls.clone())));
+        drop(initial_runtime);
         let _runtime = crate::runtime_dispatch::testing::RegistryGuard::install(home.path(),
             crate::runtime::RuntimeRegistry::with_runtimes(runtimes)).await;
         crate::runtime_dispatch::with_chat_turn_config(snapshot.clone(), async {
@@ -7054,6 +7055,14 @@ mod main_assignment_tests {
                 reg.scan().await.unwrap();
                 let registry = Arc::new(tokio::sync::RwLock::new(reg));
                 let wire = format!("user:{}", employee.id);
+                let unprotected = crate::on_behalf_of::scope_first(Some(wire.clone()), call_claude_for_agent_impl(
+                    home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
+                    None, DispatchOverrides::default(),
+                )).await;
+                assert_eq!(unprotected.unwrap_err(), crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
+                assert!(!cli_home.join("claude-argv").exists());
+                {
+                    let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
                 let result = crate::on_behalf_of::scope_first(Some(wire.clone()), call_claude_for_agent_impl(
                     home.path(), &registry, "main", "work", crate::cost_telemetry::RequestType::Dispatch,
                     None, DispatchOverrides::default(),
@@ -7067,6 +7076,7 @@ mod main_assignment_tests {
                 )).await;
                 assert_eq!(denied.unwrap_err(), "主代理僅管理員可以使用。");
                 assert_eq!(std::fs::read(cli_home.join("claude-argv")).unwrap(), before);
+                }
             });
         });
     }

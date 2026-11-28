@@ -451,11 +451,18 @@ async fn listed_main_assignment_is_precomputed_and_schedules_keep_the_legacy_gat
     caller.channel = "webchat";
     caller.access = caller.access.with_credential_origin(duduclaw_auth::acl::ContextOrigin::DashboardSession)
         .for_assign(home.path()).await;
+    assert_eq!(assign_right(&reg, &caller.access, "main", None), AssignRight::Denied);
+    assert_eq!(caller.access.main_assign_refusal(reg.get("main").unwrap()),
+        Some(crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
+    caller.access = caller.access.clone().for_assign(home.path()).await;
     assert!(matches!(assign_right(&reg, &caller.access, "main", None), AssignRight::Allowed(_)));
     assert!(!caller.access.webchat_allows_work(reg.get("main").unwrap()));
     let scheduled = plan(&reg, Lang::ZhTw, &cmd("/交辦 @main 工作 || 時間:每天早上九點"), &caller);
     assert!(matches!(&scheduled, Plan::ScheduleCreate { .. }));
     assert_eq!(execute(home.path(), Lang::ZhTw, scheduled, &caller).await.text, "主代理僅管理員可以使用。");
+    }
     super::super::tests::write_agent(&home.path().join("agents"), "main", "Main", "@main", "main",
         "[capabilities]\nallowed_tools = ['Bash']\n");
     reg.scan().await.unwrap();

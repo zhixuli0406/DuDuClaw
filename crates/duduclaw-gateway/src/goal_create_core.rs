@@ -578,13 +578,19 @@ mod tests {
         db.set_main_agent_users(&admin.id, &[employee.id.clone()], true).unwrap();
         let mut request = req("main");
         request.on_behalf_of = Some(format!("user:{}", employee.id));
-        assert!(create_goal_task(home.path(), &store, request.clone()).await.is_ok());
-        let slot = crate::task_store::AssignScheduleSlot {
-            id: "schedule", slot: "slot", next: None, now: Utc::now(),
-        };
-        assert_eq!(create_scheduled_goal_task(home.path(), &store, request, &slot).await.unwrap_err(),
-            "主代理僅管理員可以使用。");
-        assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
+        assert_eq!(create_goal_task(home.path(), &store, request.clone()).await.unwrap_err(),
+            crate::on_behalf_of::access::MAIN_TURN_REFUSAL);
+        {
+            let _list = crate::on_behalf_of::access::test_list_in_effect_for(home.path());
+            let created = create_goal_task(home.path(), &store, request.clone()).await;
+            assert!(created.is_ok(), "{created:?}");
+            let slot = crate::task_store::AssignScheduleSlot {
+                id: "schedule", slot: "slot", next: None, now: Utc::now(),
+            };
+            assert_eq!(create_scheduled_goal_task(home.path(), &store, request, &slot).await.unwrap_err(),
+                "主代理僅管理員可以使用。");
+            assert_eq!(store.list_tasks(None, None, None).await.unwrap().len(), 1);
+        }
     }
 
     #[tokio::test]

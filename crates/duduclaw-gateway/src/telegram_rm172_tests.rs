@@ -103,7 +103,7 @@ async fn rm172_verified_user_with_primary_is_routed_to_it() {
 }
 
 #[tokio::test]
-async fn rm142_listed_member_primary_requires_effective_converse_admission() {
+async fn rm142_listed_member_primary_is_refused_without_dashboard_credential() {
     let f = fixture(true).await;
     crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Enterprise);
     let admin = f.db.create_user("main-admin@test.local", "Admin", "StaffPass-12345", UserRole::Admin).unwrap();
@@ -111,13 +111,22 @@ async fn rm142_listed_member_primary_requires_effective_converse_admission() {
     f.db.set_primary_agent(&f.user_id, Some("dudu")).unwrap();
     assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None);
     f.db.set_main_agent_users(&admin.id, &[f.user_id.clone()], true).unwrap();
-    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "shell blocks the list");
+    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "unprotected main blocks the list");
     write_agent(&f._dir.path().join("agents"), "dudu", "嘟嘟總機", "@嘟嘟總機", "main",
         "[capabilities]\nallowed_tools = ['Read']\ndenied_tools = ['Bash']\n");
     f.ctx.registry.write().await.scan().await.unwrap();
-    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await.as_deref(), Some("dudu"));
-    crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
-    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None);
+    assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None, "unprotected main stays refused");
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(f._dir.path());
+        // The list seam does not turn a shared-app identity into a DashboardSession.
+        assert!(crate::on_behalf_of::access::main_access_allowed(
+            f._dir.path(), &f.user_id, crate::on_behalf_of::access::MainUse::Converse,
+        ).unwrap(), "the home-scoped list is effective");
+        assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None,
+            "shared-app credentials cannot use the main-person list");
+        crate::team_edition::record(f._dir.path(), duduclaw_core::EditionProfile::Personal);
+        assert_eq!(primary_agent_route(&f.ctx, TG_USER).await, None);
+    }
     // Generic channel routing was never subject to WebChat's main gate.
     let sender = crate::trigger_route::access::for_channel_sender(f._dir.path(), "telegram", TG_USER);
     let reg = f.ctx.registry.read().await;

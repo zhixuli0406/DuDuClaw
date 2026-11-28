@@ -219,7 +219,11 @@ fn principal_named(id: &str) -> crate::mcp_auth::Principal {
 }
 
 async fn names_for(home: &std::path::Path, agent: &str) -> Vec<&'static str> {
-    visible_tool_names(&principal_named(agent), home, agent).await
+    // Exercise capability/pause budgets without inheriting an unreadable human principal.
+    super::tools_list::visible_tools_for_principal(
+        &principal_named(agent), home, agent, false,
+        &crate::mcp_isolation::process_lane(), None,
+    ).await.into_iter().map(|tool| tool.name).collect()
 }
 
 /// Each deny-by-default master switch hides exactly its own family, and

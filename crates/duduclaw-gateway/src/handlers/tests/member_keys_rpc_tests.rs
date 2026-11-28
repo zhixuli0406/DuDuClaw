@@ -149,6 +149,38 @@ async fn key_updates_reject_all_credential_fields_and_legacy_aliases_without_wri
 }
 
 #[tokio::test]
+async fn member_key_owner_cannot_enable_unlimited_skill_content() {
+    let f = fixture().await;
+    payload(f.handler.handle_agents_create_as(
+        json!({"name": "skill-owner", "display_name": "Skill Owner"}), Some(&f.admin),
+    ).await);
+    f.db.bind_agent(&f.member.user_id, "skill-owner", AccessLevel::Owner).unwrap();
+    let key = f.db.member_key_create(
+        &f.member.user_id, "skills", 1, f.member.credential_epoch, false, &[],
+    ).unwrap();
+    let ctx = crate::member_keys::authenticate(f.home.path(), &f.db, &key.secret).unwrap();
+    let path = f.home.path().join("agents/skill-owner/agent.toml");
+    let before = std::fs::read(&path).unwrap();
+    let frame = f.handler.handle("agents.update", json!({
+        "agent_id": "skill-owner", "skill_budget_unlimited": true,
+    }), &ctx).await;
+    match frame {
+        WsFrame::Response { ok: false, error: Some(e), .. } => {
+            let message = e.as_str().unwrap();
+            assert!(message.contains("administrator"), "{message}");
+            assert!(message.contains("evolution.skill_budget_unlimited"), "{message}");
+        }
+        other => panic!("expected authority refusal, got {other:?}"),
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let audit = std::fs::read_to_string(f.home.path().join("security_audit.jsonl")).unwrap();
+    assert!(audit.lines().filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .any(|row| row["event_type"] == "agent_authority_refused"
+            && row["details"]["user_id"] == ctx.user_id
+            && row["details"]["keys"] == json!(["evolution.skill_budget_unlimited"])));
+}
+
+#[tokio::test]
 async fn lists_paginate_and_reject_invalid_limits_and_cursors() {
     let f = fixture().await;
     for _ in 0..3 { f.db.member_key_create(&f.member.user_id, "x", 1, 0, false, &[]).unwrap(); }

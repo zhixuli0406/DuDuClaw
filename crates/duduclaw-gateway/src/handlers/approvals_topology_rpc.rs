@@ -2,6 +2,7 @@
 
 #[allow(unused_imports)]
 use super::*;
+use crate::trigger_route::texts::Lang;
 
 impl MethodHandler {
     // ── Autopilot handlers ──────────────────────────────────
@@ -68,6 +69,18 @@ impl MethodHandler {
                     Ok(hidden) => hidden,
                     Err(frame) => return frame,
                 };
+                // Resolve names once per request, keeping users.db and config I/O
+                // off the async thread. A failed lookup never exposes an id.
+                let (users, home) = (self.user_db.read().await.clone(), self.home_dir.clone());
+                let (decider_names, lang) = tokio::task::spawn_blocking(move || {
+                    let names: std::collections::HashMap<String, String> = users
+                        .and_then(|db| db.list_users().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|user| (user.id, user.display_name))
+                        .collect();
+                    (names, crate::trigger_route::texts::lang_for(&home))
+                }).await.unwrap_or_else(|_| (std::collections::HashMap::new(), Lang::ZhTw));
                 let mut items: Vec<Value> = Vec::with_capacity(rows.len());
                 let mut open_audit_failed = false;
                 for r in rows
@@ -183,6 +196,10 @@ impl MethodHandler {
                         })}else{dashboard_action_payload(&r.payload, fresh.is_admin())},
                         "request_kind":r.request_kind,
                         "status":r.status,
+                        "decided_by_display": viewer_decider_display(
+                            r.decided_by.as_deref(), may_decide && (!outbound || full_outbound),
+                            |user| decider_names.get(user).cloned(), lang,
+                        ),
                         "binding": if may_decide && (!outbound || full_outbound) && r.action_kind != crate::admin_ai::card::ACTION_KIND { json!(r.binding) } else { Value::Null },
                         "answer": if may_decide && (!outbound || full_outbound) { json!(r.answer) } else { Value::Null },
                         "may_decide": may_decide,
@@ -309,10 +326,133 @@ impl MethodHandler {
     }
 }
 
+// Decision attribution follows the same visibility as binding/answer data.
+fn viewer_decider_display(
+    marker: Option<&str>,
+    visible: bool,
+    name_of: impl Fn(&str) -> Option<String>,
+    lang: Lang,
+) -> Option<String> {
+    decider_display(marker.filter(|_| visible)?, name_of, lang)
+}
+
+fn decider_display(
+    marker: &str,
+    name_of: impl Fn(&str) -> Option<String>,
+    lang: Lang,
+) -> Option<String> {
+    let (user, source) = if let Some(user) = marker.strip_prefix("dashboard:") {
+        if user.is_empty() || user.contains(':') { return None; }
+        let source = match lang {
+            Lang::ZhTw => "儀表板",
+            Lang::En => "dashboard",
+            Lang::Ja => "ダッシュボード",
+        };
+        (user.to_owned(), source.to_owned())
+    } else {
+        let by = marker.parse::<crate::approval::chat_admin::ledger::DecidedBy>().ok()?;
+        let channel = match by.channel().as_str() {
+            "telegram" => "Telegram",
+            "googlechat" => "Google Chat",
+            "line" => "LINE",
+            "slack" => "Slack",
+            "discord" => "Discord",
+            _ => return None,
+        };
+        // The strict DecidedBy parser above validates the final step token.
+        let method = match (lang, marker.rsplit(':').next()?) {
+            (Lang::ZhTw, "tap") => "直接核准",
+            (Lang::ZhTw, "web") => "網頁確認",
+            (Lang::ZhTw, "totp") => "驗證碼確認",
+            (Lang::En, "tap") => "one tap",
+            (Lang::En, "web") => "web confirmation",
+            (Lang::En, "totp") => "code confirmation",
+            (Lang::Ja, "tap") => "ワンタップ",
+            (Lang::Ja, "web") => "Web 確認",
+            (Lang::Ja, "totp") => "コード確認",
+            _ => return None,
+        };
+        let separator = match lang {
+            Lang::ZhTw => "，",
+            Lang::En => ", ",
+            Lang::Ja => "、",
+        };
+        (by.user_id().to_owned(), format!("{channel}{separator}{method}"))
+    };
+    let name = duduclaw_core::plain_line(&name_of(&user)?, 80);
+    if name.trim().is_empty() { return None; }
+    Some(match lang {
+        Lang::En => format!("{name} ({source})"),
+        Lang::ZhTw | Lang::Ja => format!("{name}（{source}）"),
+    })
+}
+
 #[cfg(test)]
 mod live_event_tests {
     use super::*;
     use crate::handlers::task_privacy_tests::{admin, fixture, ok, payload};
+
+    #[test]
+    fn decision_attribution_displays_names_and_localized_sources() {
+        let user = "14300000-0000-4000-8000-000000000022";
+        for (suffix, expected) in [
+            ("dashboard", "王小明（儀表板）"),
+            ("telegram:tap", "王小明（Telegram，直接核准）"),
+            ("googlechat:web", "王小明（Google Chat，網頁確認）"),
+            ("telegram:totp", "王小明（Telegram，驗證碼確認）"),
+        ] {
+            let marker = if suffix == "dashboard" { format!("dashboard:{user}") }
+                else { format!("chat-admin:{user}:{suffix}") };
+            let name_of = |id: &str| (id == user).then(|| "王小明".to_owned());
+            let display = decider_display(&marker, name_of, Lang::ZhTw).unwrap();
+            assert_eq!(display, expected);
+            assert!(!display.contains(user));
+            assert_eq!(json!(viewer_decider_display(Some(&marker), false, |_| {
+                panic!("invisible attribution must not resolve a name")
+            }, Lang::ZhTw)), Value::Null);
+        }
+        for (lang, name, suffix, expected) in [
+            (Lang::En, "Wang", "dashboard", "Wang (dashboard)"),
+            (Lang::En, "Wang", "telegram:web", "Wang (Telegram, web confirmation)"),
+            (Lang::Ja, "王小明", "dashboard", "王小明（ダッシュボード）"),
+            (Lang::Ja, "王小明", "telegram:tap", "王小明（Telegram、ワンタップ）"),
+            (Lang::Ja, "王小明", "telegram:web", "王小明（Telegram、Web 確認）"),
+            (Lang::Ja, "王小明", "googlechat:totp", "王小明（Google Chat、コード確認）"),
+        ] {
+            let marker = if suffix == "dashboard" { format!("dashboard:{user}") }
+                else { format!("chat-admin:{user}:{suffix}") };
+            let display = decider_display(&marker, |_| Some(name.into()), lang).unwrap();
+            assert_eq!(display, expected);
+            assert!(!display.contains(user));
+        }
+    }
+
+    #[test]
+    fn decision_attribution_rejects_invalid_markers_and_unknown_users() {
+        for marker in ["dashboard:", "dashboard:a:b", "chat-admin:bad:telegram:tap",
+            "channel:telegram:123", "requester:someone",
+            "chat-admin:14300000-0000-4000-8000-000000000022:telegram:unknown",
+            "chat-admin:14300000-0000-4000-8000-000000000022:unknown:tap",
+            "chat-admin:14300000-0000-4000-8000-000000000022:telegram:tap:extra"] {
+            assert_eq!(decider_display(marker, |_| {
+                panic!("invalid markers must not resolve a name")
+            }, Lang::ZhTw), None);
+        }
+        for marker in ["dashboard:missing",
+            "chat-admin:14300000-0000-4000-8000-000000000022:telegram:tap"] {
+            assert_eq!(decider_display(marker, |_| None, Lang::ZhTw), None);
+        }
+        assert_eq!(viewer_decider_display(None, true, |_| Some("王小明".into()), Lang::ZhTw), None);
+    }
+
+    #[test]
+    fn decision_attribution_sanitizes_and_caps_display_names() {
+        assert_eq!(decider_display("dashboard:known", |_| Some("王\n小\u{202e}明".into()), Lang::ZhTw),
+            Some("王小明（儀表板）".into()));
+        assert_eq!(decider_display("dashboard:known", |_| Some("王".repeat(81)), Lang::ZhTw),
+            Some(format!("{}（儀表板）", "王".repeat(80))));
+        assert_eq!(decider_display("dashboard:known", |_| Some("\n\u{202e}".into()), Lang::ZhTw), None);
+    }
 
     #[tokio::test]
     async fn list_digest_matches_decide_and_mismatch_leaves_pending() {
@@ -364,6 +504,11 @@ mod live_event_tests {
             crate::power_local::RpcConnInfo::internal(),
         ).await);
         assert_eq!(get["approvals"][0]["digest"], list["approvals"][0]["digest"]);
+        for response in [&list, &get] {
+            let card = &response["approvals"][0];
+            assert!(card.get("decided_by").is_none());
+            assert_eq!(card.get("decided_by_display"), Some(&Value::Null));
+        }
         assert!(!ok(&f.handler.dispatch_org(
             "approvals.get", json!({}), &root,
             crate::power_local::RpcConnInfo::internal(),

@@ -23,11 +23,11 @@ impl<'a> OdooActor<'a> {
         }
     }
 
-    pub fn policy(self, home: &Path) -> Result<ToolPolicy, String> {
+    pub fn policy(self, home: &Path) -> Result<Box<ToolPolicy>, String> {
         match self {
             Self::Employee(agent) => ToolPolicy::load(home, agent),
             Self::Person { .. } => ToolPolicy::load_person(home),
-        }
+        }.map(Box::new)
     }
 
     pub async fn profile(self, pool: &OdooState, decision: Option<&OdooIdentity>) -> Result<String, String> {
@@ -63,7 +63,7 @@ impl<'a> OdooActor<'a> {
                     }
                 };
                 odoo_identity_client::record(&identity);
-                let policy = ToolPolicy::load_person(home)?;
+                let policy = Box::new(ToolPolicy::load_person(home)?);
                 policy.check_call(tool, params, Some(&identity))?;
                 let connector = pool.connect_person_key(policy.global, &identity).await?;
                 Ok((connector, identity))

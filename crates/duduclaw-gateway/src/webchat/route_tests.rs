@@ -622,6 +622,17 @@ async fn listed_main_fixture(shell: bool) -> Fixture {
 async fn listed_shell_free_main_conversation_needs_no_binding() {
     crate::webchat::MAIN_CREDENTIAL_ORIGIN.scope(duduclaw_auth::acl::ContextOrigin::DashboardSession, async {
     let f = listed_main_fixture(false).await;
+    assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
+    let refused = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
+    assert!(matches!(refused, ChatMessage::Error { message, .. }
+        if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    for text in ["你好", "@嘟嘟總機 你好"] {
+        let refused = route(&f, text, Some("dudu")).await.unwrap_err();
+        assert!(matches!(*refused, ChatMessage::Error { message, .. }
+            if message == crate::on_behalf_of::access::MAIN_TURN_REFUSAL));
+    }
+    {
+        let _list = crate::on_behalf_of::access::test_list_in_effect_for(f._dir.path());
     assert!(f.state.agent_access_allowed(&f.emp, "dudu").await);
     assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_ok());
     assert_eq!(route(&f, "你好", Some("dudu")).await.unwrap().agent.as_deref(), Some("dudu"));
@@ -651,6 +662,7 @@ async fn listed_shell_free_main_conversation_needs_no_binding() {
         )
     }).await.expect("listed shell-free conversation must reach the model seam");
     assert!(reply.contains("OWN_BOT_REPLY agent=dudu"), "{reply}");
+    }
     }).await;
 }
 
@@ -672,16 +684,20 @@ async fn main_conversation_refusals_distinguish_ineffective_list() {
         let sender = f.state.sender_access(&f.emp).await;
         assert!(!sender.webchat_allows(f.state.ctx.registry.read().await.get("dudu").unwrap()));
         assert!(!f.state.agent_access_allowed(&f.emp, "dudu").await);
-        assert!(f.state.authorize_target(&f.emp, "dudu", false).await.is_err());
+        let expected = if matches!(kind, "shell" | "corrupt") {
+            crate::on_behalf_of::access::MAIN_TURN_REFUSAL
+        } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT };
+        let refused = f.state.authorize_target(&f.emp, "dudu", false).await.unwrap_err();
+        assert!(matches!(refused, ChatMessage::Error { message, .. } if message == expected), "{kind}");
+        let refused = route(&f, "你好", Some("dudu")).await.unwrap_err();
+        assert!(matches!(*refused, ChatMessage::Error { message, .. } if message == expected), "{kind}");
         let mut model = crate::agent_channels::e2e_seam::arm_waiting(f._dir.path());
         let reply = tokio::time::timeout(std::time::Duration::from_secs(5),
             crate::ccr_runtime::AUTHENTICATED_WEBCHAT_PRINCIPAL.scope(f.emp.clone(),
                 crate::channel_reply::build_reply_for_agent("Hello", &f.state.ctx,
                     "dudu", "webchat:refused-main", "webchat:user", None)),
         ).await.expect("refusal must precede the model seam");
-        assert_eq!(reply, if matches!(kind, "shell" | "corrupt") {
-            crate::on_behalf_of::access::MAIN_TURN_REFUSAL
-        } else { crate::webchat::access::AGENT_UNAVAILABLE_TEXT }, "{kind}");
+        assert_eq!(reply, expected, "{kind}");
         assert!(model.entered.try_recv().is_err());
     }
     }).await;

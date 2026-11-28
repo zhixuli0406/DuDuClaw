@@ -33,7 +33,7 @@ pub(crate) const RUNS_SCHEMA_SQL: &str = "CREATE TABLE IF NOT EXISTS autopilot_r
     notice_push_next_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
-);
+, gateway_origin INTEGER NOT NULL DEFAULT 0);
 CREATE INDEX IF NOT EXISTS idx_ap_runs_due ON autopilot_runs(state, next_at);
 CREATE INDEX IF NOT EXISTS idx_ap_runs_rule ON autopilot_runs(rule_id, state);
 CREATE TABLE IF NOT EXISTS autopilot_run_steps (

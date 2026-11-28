@@ -733,7 +733,9 @@ impl McpDispatcher {
         }
         if crate::mcp_auth::is_person_principal(principal) {
             let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
-            let result = crate::mcp::person_tools::call(&self.home_dir, &self.odoo, principal, tool_name, &args).await;
+            // Personal Odoo calls must not embed their handler tree in this frame.
+            let result = Box::pin(crate::mcp::person_tools::call(
+                &self.home_dir, &self.odoo, principal, tool_name, &args)).await;
             return jsonrpc_response(id, result);
         }
         // ── v1.82 (RM-134 third review): remote principals ───────────────────
@@ -778,7 +780,7 @@ impl McpDispatcher {
     ) -> Value {
         let agent = acting_gate_agent(principal, &self.default_agent);
         let human = crate::mcp::host_on_behalf_of(&self.home_dir, agent);
-        self.dispatch_admitted_for_principal(principal, ns_ctx, params, id, remote, human.as_deref()).await
+        Box::pin(self.dispatch_admitted_for_principal(principal, ns_ctx, params, id, remote, human.as_deref())).await
     }
 
     // The production caller above supplies only the host principal. Keeping it
@@ -4862,7 +4864,7 @@ effect = "forbid"
         std::fs::write(home.path().join("config.toml"),
             "[general]\ndefault_agent = 'dudu'\n[delegation]\npolicy = 'open'\n").unwrap();
         write_acting_agent_toml(&home,
-            "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\ncan_create_agents = true\n");
+            "[agent]\nname = 'dudu'\nrole = 'main'\nstatus = 'active'\n[permissions]\ncan_create_agents = true\n");
         let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
         let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password",
             duduclaw_auth::UserRole::Admin).unwrap();
@@ -4877,32 +4879,39 @@ effect = "forbid"
         use crate::mcp::main_principal_gate::{refusal, restricted, REFUSAL};
         let (home, _, human) = main_principal_fixture();
         let dispatcher = make_dispatcher(&home).await;
+        // A real, unpaused employee key reaches the main-principal gate; a shared
+        // internal key without an employee identity fails background admission first.
+        let mut principal = internal_principal();
+        principal.client_id = "dudu".into();
+        duduclaw_core::autonomy_gate::resume(home.path(), None).unwrap();
+        crate::mcp::check_background_caller(home.path(),
+            crate::mcp::record_actor_for(home.path(), &principal.client_id, "dudu"), "create_agent").unwrap();
         let argument_marker = "main-principal-refusal-private-soul-marker";
         // Explicit true and the unwritten main-role default are both narrowed.
         for permission in ["can_create_agents = true", ""] {
             write_acting_agent_toml(&home, &format!(
-                "[agent]\nname = 'dudu'\nrole = 'main'\n[permissions]\n{permission}\n"));
+                "[agent]\nname = 'dudu'\nrole = 'main'\nstatus = 'active'\n[permissions]\n{permission}\n"));
             let turn = restricted(home.path(), "dudu", Some(&human));
             assert!(turn);
             assert_eq!(refusal(turn, "memory_search"), None);
             for tool in ["create_agent", "agent_create", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {
-                let result = dispatcher.dispatch_admitted_for_principal(
-                    &internal_principal(), &make_ns_ctx(false),
+                let result = Box::pin(dispatcher.dispatch_admitted_for_principal(
+                    &principal, &make_ns_ctx(false),
                     &make_params(tool, serde_json::json!({
                         "on_behalf_of": "user:forged-admin",
                         "soul_md": argument_marker,
                     })),
                     &serde_json::json!(14216), None, Some(&human),
-                ).await;
+                )).await;
                 assert_eq!(result["error"]["code"], -32003, "{tool}: {result}");
                 assert_eq!(result["error"]["message"], REFUSAL, "{tool}: {result}");
             }
         }
-        let read = dispatcher.dispatch_admitted_for_principal(
-            &internal_principal(), &make_ns_ctx(false),
+        let read = Box::pin(dispatcher.dispatch_admitted_for_principal(
+            &principal, &make_ns_ctx(false),
             &make_params("memory_search", serde_json::json!({"query":"missing"})),
             &serde_json::json!(14217), None, Some(&human),
-        ).await;
+        )).await;
         assert_ne!(read["error"]["message"], REFUSAL, "read is permitted by this gate: {read}");
         let rows = read_tool_call_rows(&home);
         for tool in ["create_agent", "spawn_ephemeral", "channel_config", "unknown_future_tool"] {

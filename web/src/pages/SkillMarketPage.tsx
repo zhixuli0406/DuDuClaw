@@ -543,6 +543,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
   const agents = useVisibleAgents(false);
   const selectableAgents = useSelectableAgents(false);
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
+  const departmentGrants = useAuthStore(s => s.deptGrants);
   const { data: departmentAccess } = useDepartmentAgents('skills');
   const requestAgents = useMemo(() => [...selectableAgents,
     ...departmentAccess.agents.filter(a => !selectableAgents.some(b => b.name === a.id))
@@ -581,6 +582,13 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
 
   const handleInstall = useCallback(async () => {
     if (!scanResult?.passed || !skill.url || !scope || !validScope) return;
+    // Recheck live grants at submission: a store revocation can precede React's render.
+    if (agentScope && !canSelectAgent(scope)
+      && !(departmentAccess.agents.some(a => a.id === scope)
+        && useAuthStore.getState().deptGrants === departmentGrants)) {
+      setScope(null);
+      return;
+    }
     setInstalling(true);
     setError(null);
     try {
@@ -597,7 +605,7 @@ function InstallDialog({ skill, onClose }: { skill: SkillIndexEntry; onClose: ()
     } finally {
       setInstalling(false);
     }
-  }, [scanResult, skill.url, scope, isAdmin, validScope]);
+  }, [scanResult, skill.url, scope, isAdmin, validScope, agentScope, departmentAccess.agents, departmentGrants]);
 
   const scanPassed = scanResult?.passed === true;
   const scanFailed = scanResult !== null && !scanResult.passed;

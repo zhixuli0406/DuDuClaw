@@ -47,8 +47,9 @@ recipient_guard = "shadow" # off | shadow | ask
 # public_url = "https://ai.example.com"
 bind = "127.0.0.1"
 port = 18889
-# auto_update = true  # Pro default: true (auto-download + install + restart)
-                       # CE default: false (notify only). Override with env DUDUCLAW_AUTO_UPDATE.
+# auto_update = false # Default for all editions: false (notify only).
+# Set true or DUDUCLAW_AUTO_UPDATE=1 to auto-download, install and restart.
+# Protected native installs never auto-install through this updater.
 # allowed_origins = []       # Extra dashboard origins; empty means loopback only
 # auth_token_enc = "<ciphertext>"  # Dashboard admin token; written encrypted, read at startup since v1.68.0
 

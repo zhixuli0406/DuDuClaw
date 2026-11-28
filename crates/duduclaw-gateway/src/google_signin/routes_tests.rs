@@ -28,13 +28,14 @@ impl Fixture {
             daily_new_accounts=20\n[google_signin.enabled_ack]\nby=\"admin\"\nat=\"2026-11-27T00:00:00Z\"\n")).unwrap();
         crate::mcp_oauth::upsert_client_config(&home, crate::mcp_oauth::McpOAuthClientConfig {
             provider_id: "google".into(), client_id: CLIENT.into(), client_secret: "test-secret".into(),
-            auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![], redirect_uri: String::new(),
+            auth_url: oauth::AUTHORIZE.into(), token_url: oauth::TOKEN.into(), scopes: vec![],
+            redirect_uri: format!("{}/api/mcp/oauth/callback", base.unwrap_or(BASE)),
         }).unwrap();
         let db = Arc::new(UserDb::new(&home.join("users.db")).unwrap());
         let jwt = Arc::new(JwtConfig::new(b"google-login-http-test-at-least-32-bytes"));
         let handler = crate::handlers::MethodHandler::new(home.clone()).await;
         handler.set_user_db(db.clone(), jwt.clone()).await;
-        handler.set_edition_override(Some(if personal { duduclaw_core::EditionProfile::Personal }
+        handler.set_test_edition(Some(if personal { duduclaw_core::EditionProfile::Personal }
             else { duduclaw_core::EditionProfile::Enterprise })).await;
         let (tx, _) = tokio::sync::broadcast::channel(4);
         let (event_tx, _) = tokio::sync::broadcast::channel(4);
@@ -598,6 +599,32 @@ async fn login_start_cannot_create_link_or_reauth_pending() {
 async fn self_link_callback_is_cookie_free_and_never_logs_in_or_provisions() {
     let f = Fixture::ready().await;
     let provider = Provider::new().await;
+    let user = f.state.user_db.create_user(EMAIL, "Existing", "password123", UserRole::Employee).unwrap();
+    let binding = SessionBinding { user_id: user.id.clone(), session_id: uuid::Uuid::new_v4().to_string(), epoch: user.credential_epoch };
+    let url = me::start(&f.state.home_dir, &f.state.user_db, binding.clone(), false, "password123").unwrap();
+    let flow = Started { cookie: String::new(), set_cookie: String::new(),
+        query: url::Url::parse(&url).unwrap().query_pairs().into_owned().collect() };
+    provider.prepare(&flow, |_| {});
+    let user_count = f.state.user_db.list_users().unwrap().len();
+    let response = f.callback(&provider, &flow, None, "").await;
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with(&format!("{BASE}/me/connections#gsi_link=")));
+    let ticket = location.split_once("#gsi_link=").unwrap().1.to_owned();
+    assert!(f.state.user_db.google_signin_link_for_user(&user.id).unwrap().is_none());
+    assert_eq!(f.state.user_db.list_users().unwrap().len(), user_count);
+    assert!(f.state.user_db.signin_request_by_sub("123456789").unwrap().is_none());
+    me::complete(&f.state.home_dir, &f.state.user_db, &binding, &ticket, false, chrono::Utc::now().timestamp()).unwrap();
+    assert_eq!(f.state.user_db.google_signin_link_for_user(&user.id).unwrap().unwrap().google_sub, "123456789");
+    assert!(me::complete(&f.state.home_dir, &f.state.user_db, &binding, &ticket, false, chrono::Utc::now().timestamp()).is_err());
+    let calls = provider.token_hits.load(Ordering::SeqCst);
+    assert_expired(&f.callback(&provider, &flow, None, "").await);
+    assert_eq!(provider.token_hits.load(Ordering::SeqCst), calls);
+}
+
+#[tokio::test]
+async fn self_link_refuses_google_email_different_from_account() {
+    let f = Fixture::ready().await;
+    let provider = Provider::new().await;
     let user = f.state.user_db.create_user("existing@example.com", "Existing", "password123", UserRole::Employee).unwrap();
     let binding = SessionBinding { user_id: user.id.clone(), session_id: uuid::Uuid::new_v4().to_string(), epoch: user.credential_epoch };
     let url = me::start(&f.state.home_dir, &f.state.user_db, binding.clone(), false, "password123").unwrap();
@@ -606,16 +633,13 @@ async fn self_link_callback_is_cookie_free_and_never_logs_in_or_provisions() {
     provider.prepare(&flow, |_| {});
     let response = f.callback(&provider, &flow, None, "").await;
     let location = response.headers()[header::LOCATION].to_str().unwrap();
-    assert!(location.starts_with(&format!("{BASE}/me/connections#gsi_link=")));
     let ticket = location.split_once("#gsi_link=").unwrap().1.to_owned();
+
+    assert_eq!(
+        me::complete(&f.state.home_dir, &f.state.user_db, &binding, &ticket, false, chrono::Utc::now().timestamp()).unwrap_err(),
+        "signin_link_email_mismatch"
+    );
     assert!(f.state.user_db.google_signin_link_for_user(&user.id).unwrap().is_none());
-    assert!(f.state.user_db.get_user_by_email(EMAIL).unwrap().is_none());
-    me::complete(&f.state.home_dir, &f.state.user_db, &binding, &ticket, false, chrono::Utc::now().timestamp()).unwrap();
-    assert_eq!(f.state.user_db.google_signin_link_for_user(&user.id).unwrap().unwrap().google_sub, "123456789");
-    assert!(me::complete(&f.state.home_dir, &f.state.user_db, &binding, &ticket, false, chrono::Utc::now().timestamp()).is_err());
-    let calls = provider.token_hits.load(Ordering::SeqCst);
-    assert_expired(&f.callback(&provider, &flow, None, "").await);
-    assert_eq!(provider.token_hits.load(Ordering::SeqCst), calls);
 }
 
 #[tokio::test]

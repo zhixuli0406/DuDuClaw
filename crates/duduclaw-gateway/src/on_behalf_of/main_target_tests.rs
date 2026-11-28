@@ -22,6 +22,72 @@ fn fixture(edition: Option<EditionProfile>) -> Fixture {
 
 const USES: [MainUse; 2] = [MainUse::Converse, MainUse::Assign];
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_test_seam_crosses_threads_without_enabling_execution_isolation() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    let other = tempfile::tempdir().unwrap();
+    write_main(&f, "");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    assert!(!list_in_effect(f.dir.path()));
+    let guard = test_list_in_effect_for(&f.dir.path().join("."));
+    let nested = test_list_in_effect_for(&f.dir.path().canonicalize().unwrap());
+    drop(guard);
+    assert!(list_in_effect(f.dir.path()));
+    assert!(!list_in_effect(other.path()));
+    let home = f.dir.path().to_path_buf();
+    let user = f.emp.clone();
+    tokio::task::spawn_blocking(move || {
+        assert!(!duduclaw_core::execution_gate::isolation_required());
+        assert_eq!(main_access_allowed(&home, &user, MainUse::Assign), Ok(true));
+    }).await.unwrap();
+    let home = f.dir.path().to_path_buf();
+    let user = f.emp.clone();
+    tokio::spawn(async move {
+        let loaded = AgentRegistry::load_agent(&home.join("agents/main")).await.unwrap();
+        let wire = format!("user:{user}");
+        for use_ in USES {
+            assert_eq!(check_loaded_main_target_for(&home, Some(&wire), &loaded, use_).await, Ok(()));
+        }
+        assert_eq!(main_entry_available(&home, &user, &[loaded.clone()]).await, Ok(true));
+        assert_eq!(listed_access_effective(&home, "main").await, Ok(true));
+        assert_eq!(MAIN_TURN_USE.scope(MainUse::Assign,
+            crate::on_behalf_of::scope_first(Some(wire),
+                check_final_main_spawn(&home, Some(&loaded.dir), None))).await, Ok(()));
+        assert!(!duduclaw_core::execution_gate::isolation_required());
+    }).await.unwrap();
+    drop(nested);
+    assert!(!list_in_effect(f.dir.path()));
+    assert_eq!(main_access_allowed(f.dir.path(), &f.emp, MainUse::Assign), Ok(false));
+}
+
+#[tokio::test]
+async fn inactive_list_refusal_reads_membership_without_granting_access() {
+    let f = fixture(Some(EditionProfile::Personal));
+    write_main(&f, "");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    let wire = format!("user:{}", f.emp);
+    assert_eq!(main_list_refusal(f.dir.path(), Some(&wire)), REFUSAL);
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    for use_ in USES {
+        assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(false));
+        assert_eq!(check_main_target_for(f.dir.path(), Some(&wire), "main", use_).await,
+            Err(MAIN_TURN_REFUSAL.into()));
+    }
+    let sender = crate::trigger_route::SenderAccess::no_bindings(&f.emp)
+        .with_credential_origin(duduclaw_auth::acl::ContextOrigin::DashboardSession);
+    let loaded = AgentRegistry::load_agent(&f.dir.path().join("agents/main")).await.unwrap();
+    assert_eq!(sender.clone().for_assign(f.dir.path()).await.main_assign_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+    assert_eq!(sender.for_webchat_converse(f.dir.path()).await.main_converse_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+    rusqlite::Connection::open(f.dir.path().join("users.db")).unwrap()
+        .execute_batch("DROP TABLE main_agent_users").unwrap();
+    assert_eq!(main_list_refusal(f.dir.path(), Some(&wire)), REFUSAL);
+    assert!(check_main_target_for(f.dir.path(), Some(&wire), "main", MainUse::Assign).await.is_err());
+    let absent = tempfile::tempdir().unwrap();
+    assert_eq!(main_list_refusal(absent.path(), Some(&wire)), REFUSAL);
+    assert!(!absent.path().join("users.db").exists());
+}
+
 #[test]
 fn active_admin_and_exact_listed_employee_decisions() {
     let f = fixture(Some(EditionProfile::Enterprise));
@@ -276,8 +342,43 @@ async fn sender_refuses_shell_free_main_but_keeps_listed_refusal() {
         assert!(!assign.main_assign_allowed(&loaded));
         if origin == ContextOrigin::DashboardSession {
             assert_eq!(assign.main_assign_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+            assert_eq!(converse.main_converse_refusal(&loaded), Some(MAIN_TURN_REFUSAL));
+        } else {
+            assert_eq!(assign.main_assign_refusal(&loaded), None);
+            assert_eq!(converse.main_converse_refusal(&loaded), None);
         }
     }
+    // An unreadable membership source cannot establish either text or admission.
+    rusqlite::Connection::open(f.dir.path().join("users.db")).unwrap()
+        .execute_batch("DROP TABLE main_agent_users").unwrap();
+    let sender = crate::trigger_route::SenderAccess::no_bindings(&f.emp)
+        .with_credential_origin(ContextOrigin::DashboardSession);
+    let converse = sender.clone().for_webchat_converse(f.dir.path()).await;
+    let assign = sender.for_assign(f.dir.path()).await;
+    assert!(!converse.main_converse_allowed(&loaded));
+    assert!(!assign.main_assign_allowed(&loaded));
+    assert_eq!(converse.main_converse_refusal(&loaded), None);
+    assert_eq!(assign.main_assign_refusal(&loaded), None);
+}
+
+#[tokio::test]
+async fn final_main_spawn_only_exempts_agentless_utility_calls() {
+    let f = fixture(Some(EditionProfile::Enterprise));
+    write_main(&f, "[capabilities]\nallowed_tools = ['Read']\n");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    let dir = f.dir.path().join("agents/main");
+    MAIN_TURN_USE.scope(MainUse::Assign,
+        crate::on_behalf_of::scope_first(Some(format!("user:{}", f.emp)), async {
+            assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), None, None, false).await,
+                Err(MAIN_TURN_REFUSAL.into()));
+            crate::runtime_dispatch::UTILITY_CALL.scope((), async {
+                assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), None, None, false).await, Ok(()));
+                assert_eq!(check_final_main_spawn_with_isolation(f.dir.path(), Some(&dir), None, false).await,
+                    Err(MAIN_TURN_REFUSAL.into()));
+            }).await;
+        }),
+    ).await;
 }
 
 fn frozen_command(home: &Path, tools: &str, servers: serde_json::Value) -> tokio::process::Command {

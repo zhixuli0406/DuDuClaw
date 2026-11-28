@@ -63,6 +63,10 @@ impl MethodHandler {
                 .and_then(|t| t.parse().ok())
                 .unwrap_or_default();
                 let settings = super::agents_update_v168::agent_settings_json(&raw_table);
+                let goal_intent_cfg = crate::goal_intent::GoalIntentConfig::resolve(
+                    &self.home_dir,
+                    Some(&self.home_dir.join("agents").join(&cfg.agent.name)),
+                );
                 let mut runtime_json = crate::runtime_config::read_runtime_json(
                     &self.home_dir.join("agents").join(&cfg.agent.name),
                 );
@@ -242,6 +246,9 @@ impl MethodHandler {
                             "decision_ttl_days": cfg.memory.decision_ttl_days,
                         },
                         "night_engine": { "enabled": cfg.night_engine.enabled },
+                        "goal_intent": {
+                            "enabled": goal_intent_cfg.enabled && goal_intent_cfg.mode != crate::goal_intent::GoalIntentMode::Off,
+                        },
                         "odoo": settings["odoo"].clone(),
                         "odoo_api_key_set": settings["odoo_api_key_set"].clone(),
                         "odoo_password_set": settings["odoo_password_set"].clone(),

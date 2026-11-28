@@ -561,7 +561,7 @@ async fn push_dashboard_only_targets(
         // Re-read owner and destinations at delivery time. Never reuse a
         // queued content preview after an ACL or identity change.
         let uid = if kb {
-            crate::decision_notify::open_user_db(home_dir).ok().flatten().and_then(|db| {
+            crate::decision_notify::open_user_db_read_only(home_dir).ok().flatten().and_then(|db| {
                 db.list_users().ok()?.into_iter().find_map(|u| {
                     db.verified_dm_destinations_for_user(&u.id).ok()?.iter()
                         .any(|d| d.channel == channel && d.channel_user_id == chat_id).then_some(u.id)
@@ -1593,6 +1593,13 @@ mod tests {
         record.summary = "recipient@example.com secret subject secret body".into();
         record.payload = json!({"name":"mail_send", "egress_guard":{}, "arguments":{
             "to":"recipient@example.com", "subject":"secret subject", "body":"secret body"}});
+        // An agent's proactive destination alone is not an outbound reviewer.
+        assert!(push(home.path(), &record, false).await.is_none());
+        assert!(provider.requests().is_empty());
+        let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+        let admin = db.create_user("admin@example.invalid", "Admin", "isolated-test-password",
+            duduclaw_auth::UserRole::Admin).unwrap();
+        db.bind_channel_identity(&admin.id, "telegram", "555", true).unwrap();
         for reminder in [false, true] {
             assert_eq!(push(home.path(), &record, reminder).await, Some(("telegram".into(), "555".into())));
             record.notify_channel = Some("telegram".into());
@@ -1792,7 +1799,7 @@ mod tests {
                     "UPDATE users SET role='employee' WHERE id=?1",
                     "UPDATE users SET status='suspended' WHERE id=?1",
                     "UPDATE users SET must_change_password=1 WHERE id=?1",
-                    "UPDATE users SET id='removed-reviewer' WHERE id=?1",
+                    "UPDATE users SET status='offboarded' WHERE id=?1",
                 ] {
                     let targets = dashboard_only_targets(&f.home, &record, reminder);
                     assert_eq!(targets.len(), 2);
@@ -1806,8 +1813,12 @@ mod tests {
                     let requests = provider.requests();
                     assert_eq!(requests.len(), before + 1, "reminder={reminder}, user={user}, change={change}");
                     assert_eq!(requests.last().unwrap().body["chat_id"].as_str(), Some(other_chat));
-                    conn.execute("UPDATE users SET id=?1, role=?2, status='active', must_change_password=0
-                        WHERE id=?1 OR id='removed-reviewer'", rusqlite::params![user, role]).unwrap();
+                    conn.execute("UPDATE users SET role=?2, status='active', must_change_password=0
+                        WHERE id=?1", rusqlite::params![user, role]).unwrap();
+                    // Role/status changes revoke grants transactionally. Restoring
+                    // the account does not restore authority for the next case.
+                    f.db.set_dept_grants(&f.admin.user_id, &f.mgr_a.user_id, "sales",
+                        &[crate::dept_grants::GrantGroup::EgressReview], true).unwrap();
                 }
             }
         }

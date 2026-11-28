@@ -1,5 +1,7 @@
 use super::*;
 
+const DASHBOARD_SESSION_ID: &str = "18600000-0000-4000-8000-000000000001";
+
 struct Fixture {
     home: tempfile::TempDir,
     db: Arc<UserDb>,
@@ -22,7 +24,7 @@ async fn fixture() -> Fixture {
         member: db.live_user_context(&member.id).unwrap().unwrap(), home, db, handler }
 }
 async fn rpc(f: &Fixture, ctx: &UserContext, method: &str, params: Value) -> WsFrame {
-    crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), "test-session".into())),
+    crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), DASHBOARD_SESSION_ID.into())),
         f.handler.handle_conn(method, params, ctx,
             crate::power_local::RpcConnInfo::from_ws("127.0.0.1:12345".parse().unwrap(), false))).await
 }
@@ -115,7 +117,14 @@ async fn audit_failure_aborts_and_notice_can_be_dismissed() {
     let f = fixture().await;
     let initial = "[odoo_access]\nupgrade_notice_pending=true\n";
     std::fs::write(f.home.path().join("config.toml"), initial).unwrap();
-    std::fs::create_dir(f.home.path().join("security_audit.jsonl")).unwrap();
+    let audit = f.home.path().join("security_audit.jsonl");
+    // set_user_db may already have emitted an edition-watcher audit record.
+    match std::fs::remove_file(&audit) {
+        Ok(()) => {},
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+        Err(error) => panic!("remove fixture audit: {error}"),
+    }
+    std::fs::create_dir(&audit).unwrap();
     refused(rpc(&f, &f.admin, "odoo.access_set", json!({"permission_mode":"follow_odoo_account","acknowledge_risk":true})).await);
     assert_eq!(raw(&f), initial);
     std::fs::remove_dir(f.home.path().join("security_audit.jsonl")).unwrap();

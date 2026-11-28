@@ -616,7 +616,9 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "odoo",
     ),
     ("odoo_message_send", "Send a message on an Odoo record", "odoo:write", "odoo"),
-    ("odoo_attachment_add", "Attach a conversation file to an Odoo record", "odoo:write", "odoo"),
+    ("odoo_attachment_add", "Attach a file from the employee's attachments folder to an Odoo record", "odoo:write", "odoo"),
+    ("odoo_activity_create", "Schedule an activity on an Odoo record", "odoo:write", "odoo"),
+    ("odoo_note_post", "Post an internal note on an Odoo record", "odoo:write", "odoo"),
     // ── Odoo: execute (odoo:execute) ─────────────────────────────────────
     (
         "odoo_sale_confirm",
@@ -1558,6 +1560,8 @@ const MCP_TOOLS: &[(&str, &str, &str, &str)] = &[
         "skill",
     ),
     // ── Local inference / models (inference) ─────────────────────────────
+    ("admin_settings_read", "Read employee settings in a verified administrator turn", "admin", "agent"),
+    ("admin_settings_propose", "Propose administrator settings changes for confirmation", "admin", "agent"),
     ("model_list", "List local GGUF models", "admin", "inference"),
     (
         "model_search",
