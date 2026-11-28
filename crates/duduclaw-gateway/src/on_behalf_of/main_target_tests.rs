@@ -63,12 +63,15 @@ async fn list_test_seam_crosses_threads_without_enabling_execution_isolation() {
 
 #[tokio::test]
 async fn inactive_list_refusal_reads_membership_without_granting_access() {
-    let f = fixture(Some(EditionProfile::Personal));
+    let f = fixture(Some(EditionProfile::Enterprise));
+    assert!(crate::team_edition::team_grants_enabled(f.dir.path()));
+    assert!(!list_in_effect(f.dir.path()));
     write_main(&f, "");
     std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
     let wire = format!("user:{}", f.emp);
     assert_eq!(main_list_refusal(f.dir.path(), Some(&wire)), REFUSAL);
     f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    assert_eq!(main_list_refusal(f.dir.path(), Some(&wire)), MAIN_TURN_REFUSAL);
     for use_ in USES {
         assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(false));
         assert_eq!(check_main_target_for(f.dir.path(), Some(&wire), "main", use_).await,
@@ -86,6 +89,33 @@ async fn inactive_list_refusal_reads_membership_without_granting_access() {
     let absent = tempfile::tempdir().unwrap();
     assert_eq!(main_list_refusal(absent.path(), Some(&wire)), REFUSAL);
     assert!(!absent.path().join("users.db").exists());
+}
+
+#[tokio::test]
+async fn personal_listed_user_gets_generic_refusal_without_granting_access() {
+    let f = fixture(Some(EditionProfile::Personal));
+    assert!(!crate::team_edition::team_grants_enabled(f.dir.path()));
+    assert!(!list_in_effect(f.dir.path()));
+    write_main(&f, "");
+    std::fs::write(f.dir.path().join("config.toml"), "[general]\ndefault_agent = 'main'\n").unwrap();
+    f.db.set_main_agent_users(&f.admin, &[f.emp.clone()], true).unwrap();
+    assert!(f.db.is_main_agent_user(&f.emp).unwrap());
+    let wire = format!("user:{}", f.emp);
+    assert_eq!(main_list_refusal(f.dir.path(), Some(&wire)), REFUSAL);
+    for use_ in USES {
+        assert_eq!(main_access_allowed(f.dir.path(), &f.emp, use_), Ok(false));
+        assert_eq!(check_main_target_for(f.dir.path(), Some(&wire), "main", use_).await,
+            Err(REFUSAL.into()));
+    }
+    let sender = crate::trigger_route::SenderAccess::no_bindings(&f.emp)
+        .with_credential_origin(duduclaw_auth::acl::ContextOrigin::DashboardSession);
+    let loaded = AgentRegistry::load_agent(&f.dir.path().join("agents/main")).await.unwrap();
+    let assign = sender.clone().for_assign(f.dir.path()).await;
+    assert_eq!(assign.main_assign_refusal(&loaded), None);
+    assert!(!assign.main_assign_allowed(&loaded));
+    let converse = sender.for_webchat_converse(f.dir.path()).await;
+    assert_eq!(converse.main_converse_refusal(&loaded), None);
+    assert!(!converse.main_converse_allowed(&loaded));
 }
 
 #[test]
