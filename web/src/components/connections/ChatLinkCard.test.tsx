@@ -141,3 +141,12 @@ it('expires locally when the countdown reaches zero', async () => {
   expect(screen.getByText('代碼已失效，請重新產生。')).toBeInTheDocument();
   expect(api.chatLink.status).not.toHaveBeenCalled();
 });
+
+it('limits a server-provided matched target to its last four Unicode characters', async () => {
+  const masked_target = 'PRIVATE-LONG-TARGET-甲😀乙🚀';
+  vi.mocked(api.chatLink.list).mockResolvedValue({ identities: [], handshakes: [{ ...matched, masked_target }] });
+  mount();
+  expect(await screen.findByText(/甲😀乙🚀/)).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain('PRIVATE-LONG-TARGET');
+  expect(document.body.textContent).not.toContain(masked_target);
+});

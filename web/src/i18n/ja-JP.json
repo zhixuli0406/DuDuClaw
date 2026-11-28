@@ -12000,5 +12000,7 @@
   "approvalConfirm.inbox": "受信トレイへ",
   "approvalConfirm.login": "ログイン",
   "approvalConfirm.logout": "ログアウト",
-  "approvalConfirm.loading": "承認内容を読み込み中…"
+  "approvalConfirm.loading": "承認内容を読み込み中…",
+  "approvalConfirm.unknownAgent": "表示できない AI スタッフ",
+  "approvalConfirm.inboxContent": "この承認の詳細はダッシュボードの受信トレイで確認してください。"
 }

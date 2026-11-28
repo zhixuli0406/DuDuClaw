@@ -137,7 +137,7 @@ export function ChatLinkCard() {
           <Button variant="outline" disabled={busy} onClick={() => void run(async () => { await api.chatLink.cancel(handshake.handshake_id); setHandshake(null); setCode(null); setChoosing(true); })}>{t('cancel')}</Button>
         </div>}
         {handshake?.status === 'matched' && <div className="space-y-3">
-          <p>{t('match', { channel: channelName(handshake.channel), name: handshake.display_name ?? '', target: handshake.masked_target ?? '' })}</p>
+          <p>{t('match', { channel: channelName(handshake.channel), name: handshake.display_name ?? '', target: Array.from(handshake.masked_target ?? '').slice(-4).join('') })}</p>
           <div className="flex gap-2"><Button disabled={busy} onClick={() => decide(true)}>{t('yes')}</Button><Button variant="outline" disabled={busy} onClick={() => decide(false)}>{t('no')}</Button></div>
           <p className="text-sm text-muted-foreground">{t('sameBrowser')}</p>
         </div>}

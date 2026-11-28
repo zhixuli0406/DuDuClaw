@@ -6,7 +6,9 @@ import { IntlProvider } from 'react-intl';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
 import { ApprovalConfirmPage } from './ApprovalConfirmPage';
-import { approvalConfirmReturn } from '@/lib/approval-step-up';
+import { useAgentsStore } from '@/stores/agents-store';
+import type { AgentDetail } from '@/lib/api';
+import { approvalConfirmReturn, approvalStepUp } from '@/lib/approval-step-up';
 import { useAuthStore } from '@/stores/auth-store';
 import { dashboardEndpoint } from '@/lib/dashboard-base';
 
@@ -34,6 +36,7 @@ async function approve() {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  useAgentsStore.setState({ agents: [], fetchAgents: vi.fn().mockResolvedValue(true) });
   vi.stubGlobal('fetch', fetchMock);
   fetchMock.mockReset().mockResolvedValue(response(preview));
   useAuthStore.setState({ jwt: 'session-jwt', logout: vi.fn().mockResolvedValue(undefined) });
@@ -205,4 +208,135 @@ it('renders the admin settings table without another decision path or internal i
   expect(document.body.textContent).not.toContain('PRIVATE-ID');
   expect(document.body.textContent).not.toContain('PRIVATE-TARGET');
   expect(screen.getAllByRole('button')).toHaveLength(2);
+});
+
+it.each([
+  ['missing digest', { ...preview, digest: undefined }],
+  ['empty digest', { ...preview, digest: ' ' }],
+  ['wrong status', { ...preview, status: 'done' }],
+  ['missing approval id', { ...preview, approval: { ...preview.approval, id: undefined } }],
+  ['non-finite expiry', { ...preview, expires: Infinity }],
+  ['wrong TOTP type', { ...preview, has_totp: 'true' }],
+  ['empty kind label', { ...preview, kind_label: '' }],
+  ['wrong kind type', { ...preview, approval: { ...preview.approval, kind: 1 } }],
+  ['wrong summary type', { ...preview, approval: { ...preview.approval, summary: null } }],
+  ['array file projection', { ...preview, agent_file_change: [] }],
+  ['missing file projection', { ...preview, agent_file_change: undefined }],
+])('fails closed for GET %s', async (_label, value) => {
+  fetchMock.mockResolvedValueOnce(response(value));
+  page();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledOnce();
+});
+it.each(['GET', 'POST'])('fails closed for a non-JSON %s body', async method => {
+  const invalid = { ok: true, status: 200, json: async () => { throw new SyntaxError('not JSON'); } };
+  if (method === 'POST') fetchMock.mockResolvedValueOnce(response(preview));
+  fetchMock.mockResolvedValueOnce(invalid);
+  page();
+  if (method === 'POST') await approve();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  expect(screen.queryByText(/✓ Approved:/)).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledTimes(method === 'POST' ? 2 : 1);
+});
+it.each([
+  { status: 'live', decision: 'approve', decided_by: 'hidden' },
+  { status: 'done', decision: 'reject', decided_by: 'hidden' },
+  { status: 'done', decision: 'approve', decided_by: null },
+])('never shows success or retries a malformed POST response %j', async value => {
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response(value));
+  page(); await approve();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByText(/✓ Approved:|✗ Rejected:/)).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(1);
+});
+it.each(['GET', 'POST'])('rejects malformed %s error bodies', async method => {
+  if (method === 'POST') fetchMock.mockResolvedValueOnce(response(preview));
+  fetchMock.mockResolvedValueOnce(response({ status: 'step_up_required', error: 42 }, 403));
+  page(); if (method === 'POST') await approve();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledTimes(method === 'POST' ? 2 : 1);
+});
+it.each([null, [], {}, { status: 403, error: 'Denied' }, { status: 'forbidden' }])('rejects malformed error shape %j', async value => {
+  fetchMock.mockResolvedValueOnce(response(value, 403));
+  page(); expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+});
+it('never sends an undefined digest', async () => {
+  await expect(approvalStepUp.decide(ticket, 'reject', undefined as unknown as string)).rejects.toMatchObject({ code: 'unavailable' });
+  expect(fetchMock).not.toHaveBeenCalled();
+});
+
+const privateUuid = 'aabbccdd-1234-5678-9012-aabbccddeeff';
+function expectNoIdentifiers() {
+  for (const value of [privateUuid, 'PRIVATE-AGENT', 'PRIVATE-TARGET', 'PRIVATE-MANAGER', '{', '}']) {
+    expect(document.body.textContent).not.toContain(value);
+  }
+  expect(document.querySelector('pre')).toBeNull();
+}
+it('shows org employee and manager display names without duplicating the raw payload', async () => {
+  useAgentsStore.setState({ agents: [
+    { name: 'PRIVATE-AGENT', display_name: 'Nova' },
+    { name: 'PRIVATE-MANAGER', display_name: 'Orion' },
+  ] as AgentDetail[] });
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
+    kind: 'org_change', agent_id: 'PRIVATE-AGENT', payload: {
+      id: privateUuid, target: 'PRIVATE-TARGET', agent_id: 'PRIVATE-AGENT',
+      before: { reports_to: 'PRIVATE-MANAGER', department: 'Sales' },
+      after: { reports_to: privateUuid, department: 'Support' }, reason: 'Change team',
+    },
+  } }));
+  page(); await screen.findByText('Change team');
+  expect(screen.getByText('Nova')).toBeInTheDocument();
+  expect(screen.getByText('Orion')).toBeInTheDocument();
+  expect(screen.getByText(en['approvalConfirm.unknownAgent'])).toBeInTheDocument();
+  expectNoIdentifiers();
+});
+it.each(['cli_egress', 'unknown_kind'])('renders full read-only evidence without identifiers for %s', async kind => {
+  const mailBody = 'Hello team,\n' + 'This is the full mail body. '.repeat(100) + '\nEnd of message.';
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, kind,
+    agent_id: 'PRIVATE-AGENT', payload: {
+      id: privateUuid, agent_id: 'PRIVATE-AGENT', target: 'PRIVATE-TARGET', binding: 'hidden-binding',
+      payload_hash: 'hidden-hash', digest: 'hidden-digest', hash: 'hidden-hash', agent_ids: ['PRIVATE-AGENT'],
+      egress_guard: { nested: { id: 'nested-id', target: 'PRIVATE-TARGET', recipient: 'team@example.com', body: mailBody } },
+      entries: [{ employee_id: 'PRIVATE-AGENT', value: privateUuid }, 'visible entry'],
+    },
+  } }));
+  page(); await screen.findByText('Send the quote');
+  expect(screen.getByText((_, element) => element?.tagName === 'SPAN' && element.textContent === mailBody)).toHaveClass('whitespace-pre-wrap');
+  expect(screen.getByText('team@example.com')).toBeInTheDocument();
+  expect(screen.getByText('visible entry')).toBeInTheDocument();
+  expect(screen.queryByText(/hidden-|nested-id/)).not.toBeInTheDocument();
+  expectNoIdentifiers();
+});
+it('preserves outbound body text while redacting every embedded UUID', async () => {
+  const secondUuid = 'ABCDEF12-3456-7890-ABCD-EF1234567890';
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
+    payload: { body: `Please review reference ${privateUuid} before sending reference ${secondUuid} to the team.` },
+  } }));
+  page();
+  expect(await screen.findByText('Please review reference … before sending reference … to the team.')).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain(privateUuid);
+  expect(document.body.textContent).not.toContain(secondUuid);
+});
+it('filters a JSON-encoded payload before rendering evidence', async () => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
+    payload: JSON.stringify({ target: 'PRIVATE-TARGET', agent_id: 'PRIVATE-AGENT', text: 'Readable evidence' }),
+  } }));
+  page(); await screen.findByText('Readable evidence'); expectNoIdentifiers();
+});
+it('shows the inbox fallback when filtering leaves no evidence', async () => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
+    payload: { target: 'PRIVATE-TARGET', agent_ids: ['PRIVATE-AGENT'], nested: { value: privateUuid } },
+  } }));
+  page(); expect(await screen.findByText(en['approvalConfirm.inboxContent'])).toBeInTheDocument();
+  expectNoIdentifiers();
 });

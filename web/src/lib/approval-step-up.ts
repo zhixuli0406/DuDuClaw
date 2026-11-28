@@ -22,7 +22,29 @@ export class ApprovalStepUpError extends Error {
     super('Approval confirmation failed');
   }
 }
-async function request<T>(ticket: string, body?: { decision: ApprovalDecision; expected_digest: string; step_up_csrf?: number[] }): Promise<T> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function nonEmpty(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+function isPreview(value: unknown): value is ApprovalStepUpPreview {
+  return isRecord(value) && value.status === 'live' && nonEmpty(value.digest)
+    && typeof value.expires === 'number' && Number.isFinite(value.expires)
+    && typeof value.has_totp === 'boolean' && nonEmpty(value.kind_label)
+    && isRecord(value.approval) && nonEmpty(value.approval.id)
+    && typeof value.approval.kind === 'string' && typeof value.approval.summary === 'string'
+    && (value.agent_file_change === null || isRecord(value.agent_file_change));
+}
+interface ApprovalStepUpResult {
+  status: 'done';
+  decision: ApprovalDecision;
+  decided_by: string;
+}
+function unavailable(): ApprovalStepUpError {
+  return new ApprovalStepUpError('unavailable', '');
+}
+async function request<T>(ticket: string, validate: (value: unknown) => value is T, body?: { decision: ApprovalDecision; expected_digest: string; step_up_csrf?: number[] }): Promise<T> {
   const response = await fetch(dashboardEndpoint('/api/me/approvals/step-up'), {
     method: body ? 'POST' : 'GET',
     headers: {
@@ -33,15 +55,24 @@ async function request<T>(ticket: string, body?: { decision: ApprovalDecision; e
     body: body ? JSON.stringify(body) : undefined,
     cache: 'no-store', referrerPolicy: 'no-referrer', credentials: 'omit',
   });
-  const result = await response.json();
-  if (!response.ok) throw new ApprovalStepUpError(result.status, result.error);
-  return result as T;
+  let result: unknown;
+  try { result = await response.json(); } catch { throw unavailable(); }
+  if (!response.ok) {
+    if (!isRecord(result) || typeof result.status !== 'string' || typeof result.error !== 'string') throw unavailable();
+    throw new ApprovalStepUpError(result.status, result.error);
+  }
+  if (response.status !== 200 || !validate(result)) throw unavailable();
+  return result;
 }
 export const approvalStepUp = {
-  preview: (ticket: string) => request<ApprovalStepUpPreview>(ticket),
-  decide: (ticket: string, decision: ApprovalDecision, digest: string, token?: number[]) =>
-    request<{ status: 'done'; decision: ApprovalDecision; decided_by: string }>(ticket, {
+  preview: (ticket: string) => request(ticket, isPreview),
+  decide: async (ticket: string, decision: ApprovalDecision, digest: string, token?: number[]) => {
+    if (!nonEmpty(digest)) throw unavailable();
+    return request(ticket, (value): value is ApprovalStepUpResult =>
+      isRecord(value) && value.status === 'done' && value.decision === decision
+      && typeof value.decided_by === 'string', {
       decision, expected_digest: digest,
       ...(decision === 'approve' && token ? { step_up_csrf: token } : {}),
-    }),
+    });
+  },
 };

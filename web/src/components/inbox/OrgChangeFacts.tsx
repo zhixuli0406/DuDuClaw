@@ -34,9 +34,11 @@ export function OrgChangeFacts({
   approval,
   agentName,
   onStale,
+  resolveAgentName,
 }: {
   approval: ApprovalItem;
   agentName?: string;
+  resolveAgentName?: (id: string) => string;
   onStale?: (stale: boolean) => void;
 }) {
   const intl = useIntl();
@@ -77,7 +79,7 @@ export function OrgChangeFacts({
     : typeof payload?.proposer === 'string' ? payload.proposer : '');
   const reason = row?.reason ?? (typeof payload?.reason === 'string' ? payload.reason : '');
   const stale = row?.stale === true;
-  const mgr = (id: string) => (id || t('orgEdit.topLevel'));
+  const mgr = (id: string) => (id ? resolveAgentName?.(id) ?? id : t('orgEdit.topLevel'));
   const dept = (d: string) => (d || t('orgEdit.noDepartment'));
 
   return (

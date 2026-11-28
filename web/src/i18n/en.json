@@ -12000,5 +12000,7 @@
   "approvalConfirm.inbox": "Go to inbox",
   "approvalConfirm.login": "Sign in",
   "approvalConfirm.logout": "Sign out",
-  "approvalConfirm.loading": "Loading approval content…"
+  "approvalConfirm.loading": "Loading approval content…",
+  "approvalConfirm.unknownAgent": "Unavailable AI staff member",
+  "approvalConfirm.inboxContent": "View the full content of this approval in the dashboard inbox."
 }
