@@ -343,6 +343,9 @@ it('shows the inbox fallback when filtering leaves no evidence', async () => {
     payload: { agent_ids: ['PRIVATE-AGENT'] },
   } }));
   page(); expect(await screen.findByText(en['approvalConfirm.inboxContent'])).toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: 'Reject' })).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
   expectNoIdentifiers();
 });
 
@@ -416,11 +419,102 @@ it('hides camelCase and UUID identifier keys while preserving targets and full t
 });
 it('shows an unknown member for an org proposer without email', async () => {
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
-    kind: 'org_change', payload: { proposer: 'PRIVATE-PERSON', reason: 'Change team' },
+    kind: 'org_change', payload: { agent_id: 'Employee', proposer: 'PRIVATE-PERSON', reason: 'Change team',
+      before: { reports_to: '', department: '' }, after: { reports_to: '', department: 'Support' } },
   } }));
   page(undefined, zhTW);
   expect(await screen.findByText('未知的成員')).toBeInTheDocument();
   expect(document.body.textContent).not.toContain('PRIVATE-PERSON');
+});
+
+const workflowFacts = {
+  workflow_id: 'workflow-private', revision: 1,
+  effect_targets: [{ step_id: 'send', tool: 'mail.send', param: null, target: 'team@example.com' }],
+  expires_at: null, submitted_by: 'Owner',
+  pricing: { money_limits_effective: true, limits: {
+    max_runs_per_month: 10, max_steps_per_run: 5, max_reads_per_run: 5, max_effects_per_run: 1,
+  } },
+};
+const orgPayload = {
+  agent_id: 'Employee', before: { reports_to: '', department: '' },
+  after: { reports_to: 'Manager', department: 'Support' }, reason: 'Change team',
+};
+it.each([
+  ['empty workflow', { kind: 'workflow_activation', workflow_activation: {} }],
+  ['workflow target missing tool', { kind: 'workflow_activation', workflow_activation: {
+    ...workflowFacts, effect_targets: [{ step_id: 'send', param: null, target: null }],
+  } }],
+  ['workflow invalid pricing', { kind: 'workflow_activation', workflow_activation: { ...workflowFacts, pricing: {} } }],
+  ['workflow invalid expiry', { kind: 'workflow_activation', workflow_activation: { ...workflowFacts, expires_at: 1 } }],
+  ['empty org payload', { kind: 'org_change', payload: {} }],
+  ['malformed org after', { kind: 'org_change', payload: { ...orgPayload, after: { reports_to: 1, department: 'Support' } } }],
+  ['missing org before', { kind: 'org_change', payload: { ...orgPayload, before: undefined } }],
+  ['invalid org reason', { kind: 'org_change', payload: { ...orgPayload, reason: null } }],
+])('makes missing review content terminal: %s', async (_label, approval) => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, ...approval } }));
+  page(undefined, zhTW);
+  expect(await screen.findByRole('alert')).toHaveTextContent(zhTW['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: '核准' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '拒絕' })).not.toBeInTheDocument();
+  expect(screen.getByRole('link')).toHaveAttribute('href', '/inbox');
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
+});
+it.each([
+  ['empty diff', { diff: {} }],
+  ['missing hunks', { diff: { added: 1, removed: 0 } }],
+  ['missing lines', { diff: { added: 1, removed: 0, hunks: [{ op: 'add' }] } }],
+  ['non-string line', { diff: { added: 1, removed: 0, hunks: [{ op: 'add', lines: [42] }] } }],
+  ['invalid operation', { diff: { added: 1, removed: 0, hunks: [{ op: 'insert', lines: ['text'] }] } }],
+  ['invalid count', { diff: { added: '1', removed: 0, hunks: [] } }],
+  ['mismatched approval', { approval_id: 'another-approval' }],
+  ['missing requester', { requested_by: undefined }],
+  ['invalid reason', { reason: null }],
+])('makes file review content terminal: %s', async (_label, fields) => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview,
+    approval: { ...preview.approval, kind: 'agent_file_change' },
+    agent_file_change: { ...fileProjection, ...fields },
+  }));
+  page(undefined, zhTW);
+  expect(await screen.findByRole('alert')).toHaveTextContent(zhTW['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button', { name: '核准' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', { name: '拒絕' })).not.toBeInTheDocument();
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
+});
+it.each(['expert_skills_enable', 'autopilot_action', 'cli_egress', 'egress_guard'])('blocks decisions for filtered-only %s evidence', async kind => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview,
+    approval: { ...preview.approval, kind, payload: { agent_ids: ['x'] } },
+  }));
+  page(undefined, zhTW);
+  expect(await screen.findByRole('alert')).toHaveTextContent('這類審批的完整內容請到儀表板收件匣查看。');
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  expect(screen.queryByText('Send the quote')).not.toBeInTheDocument();
+  expect(screen.getByRole('link')).toHaveAttribute('href', '/inbox');
+  expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
+});
+it.each([
+  { kind: 'workflow_activation', workflow_activation: workflowFacts },
+  { kind: 'org_change', payload: orgPayload },
+  { kind: 'org_change', payload: { ...orgPayload, before: JSON.stringify(orgPayload.before), after: JSON.stringify(orgPayload.after) } },
+  { kind: 'agent_file_change' },
+  { kind: 'admin_ai_settings', payload: {
+    id: 'settings', admin: 'Owner', avatar: '', employee_count: 1, item_count: 1,
+    items: [{ seq: 1, target: 'setting', employee: 'Nova', label: 'Setting', before: 'Old', after: 'New' }],
+    reason: 'Review settings', expires_at: null,
+  } },
+  ...['expert_skills_enable', 'autopilot_action', 'cli_egress', 'egress_guard']
+    .map(kind => ({ kind, payload: { body: 'Reviewable content' } })),
+])('keeps valid $kind review decisions available', async approval => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview,
+    approval: { ...preview.approval, ...approval },
+    agent_file_change: approval.kind === 'agent_file_change' ? { ...fileProjection,
+      diff: { added: 1, removed: 1, hunks: [
+        { op: 'equal', lines: ['Context'] }, { op: 'remove', lines: ['Old'] }, { op: 'add', lines: ['New'] },
+      ] },
+    } : null,
+  }));
+  page(undefined, zhTW);
+  expect(await screen.findByRole('button', { name: '核准' })).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: '拒絕' })).toBeInTheDocument();
 });
 it('shows an unknown member for an id-like file requester', async () => {
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, kind: 'agent_file_change' },

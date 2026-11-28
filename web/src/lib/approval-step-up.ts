@@ -1,4 +1,5 @@
 import { parseAdminAiSettings } from '@/components/inbox/AdminAiSettingsView';
+import { isOrgChangePlacement } from '@/components/inbox/OrgChangeFacts';
 import { dashboardEndpoint } from './dashboard-base';
 import { useAuthStore } from '@/stores/auth-store';
 import type { ApprovalItem } from './api';
@@ -29,6 +30,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+function nullableString(value: unknown): boolean {
+  return value === null || typeof value === 'string';
+}
+function isWorkflowActivation(value: unknown): boolean {
+  if (!isRecord(value) || !nonEmpty(value.workflow_id) || !finiteNumber(value.revision)
+    || !Array.isArray(value.effect_targets) || !value.effect_targets.every(target =>
+      isRecord(target) && nonEmpty(target.step_id) && nonEmpty(target.tool)
+      && nullableString(target.param) && nullableString(target.target))) return false;
+  if (('expires_at' in value && !nullableString(value.expires_at))
+    || ('submitted_by' in value && !nullableString(value.submitted_by))) return false;
+  if ('pricing' in value && value.pricing !== null) {
+    const pricing = value.pricing;
+    if (!isRecord(pricing) || typeof pricing.money_limits_effective !== 'boolean') return false;
+    if ('limits' in pricing) {
+      const limits = pricing.limits;
+      if (!isRecord(limits) || !['max_runs_per_month', 'max_steps_per_run', 'max_reads_per_run', 'max_effects_per_run']
+        .every(key => finiteNumber(limits[key]))) return false;
+    }
+  }
+  return true;
+}
+function isFileDiff(value: unknown): boolean {
+  return isRecord(value) && finiteNumber(value.added) && finiteNumber(value.removed)
+    && Array.isArray(value.hunks) && value.hunks.every(hunk => isRecord(hunk)
+      && ['equal', 'add', 'remove'].includes(hunk.op as string)
+      && Array.isArray(hunk.lines) && hunk.lines.every(line => typeof line === 'string'));
+}
 function isPreview(value: unknown): value is ApprovalStepUpPreview {
   if (!isRecord(value) || value.status !== 'live' || !nonEmpty(value.digest)
     || typeof value.expires !== 'number' || !Number.isFinite(value.expires)
@@ -41,12 +72,18 @@ function isPreview(value: unknown): value is ApprovalStepUpPreview {
   switch (kind) {
     case 'agent_file_change': {
       const file = value.agent_file_change;
-      return isRecord(file) && file.content_available === true && file.stale === false
-        && nonEmpty(file.file) && isRecord(file.diff);
+      return isRecord(file) && file.approval_id === value.approval.id
+        && file.content_available === true && file.stale === false
+        && nonEmpty(file.file) && isFileDiff(file.diff)
+        && typeof file.requested_by === 'string' && typeof file.reason === 'string'
+        && ['pass', 'warn', 'block'].includes(file.verdict as string)
+        && Array.isArray(file.reason_categories) && file.reason_categories.every(category => typeof category === 'string');
     }
-    case 'workflow_activation': return isRecord(value.approval.workflow_activation);
+    case 'workflow_activation': return isWorkflowActivation(value.approval.workflow_activation);
     case 'admin_ai_settings': return parseAdminAiSettings(payload) !== null;
-    case 'org_change': return isRecord(payload);
+    case 'org_change': return isRecord(payload) && nonEmpty(payload.agent_id)
+      && isOrgChangePlacement(payload.before) && isOrgChangePlacement(payload.after)
+      && (!('reason' in payload) || typeof payload.reason === 'string');
     case 'expert_skills_enable':
     case 'autopilot_action':
     case 'cli_egress':

@@ -24,6 +24,13 @@ function placementOf(v: unknown): OrgPlacement {
   });
 }
 
+/** Validate review evidence without changing the inbox's fallback rendering. */
+export function isOrgChangePlacement(value: unknown): boolean {
+  const placement = asRecord(value);
+  return placement !== null && typeof placement.reports_to === 'string'
+    && typeof placement.department === 'string';
+}
+
 /**
  * The 「組織調整申請」 card body (`org_change` approvals): which employee, the
  * 調整前 / 調整後 manager and department, who asked and why. Whether the

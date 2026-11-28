@@ -61,7 +61,7 @@ export function ApprovalConfirmPage() {
     navigate('/login', { replace: true, state: { from: `/approvals/confirm#ticket=${ticket}` } });
   };
   async function decide(decision: ApprovalDecision) {
-    if (!preview || locked.current || terminal || expired) return;
+    if (!preview || locked.current || terminal || expired || missingEvidence) return;
     locked.current = true;
     setBusy(true);
     setError(undefined);
@@ -100,16 +100,19 @@ export function ApprovalConfirmPage() {
   const agentId = approval?.agent_id || preview?.agent_file_change?.agent_id
     || (payload && typeof payload === 'object' && 'agent_id' in payload && typeof payload.agent_id === 'string' ? payload.agent_id : '');
   const evidence = evidenceView(payload);
+  const missingEvidence = !!approval
+    && ['expert_skills_enable', 'autopilot_action', 'cli_egress', 'egress_guard'].includes(approval.kind)
+    && evidence === null;
   return <div className="mx-auto w-full max-w-md space-y-5 p-4 sm:p-6">
     <h1 className="text-xl font-semibold">{t('title')}</h1>
     {done ? <div className="space-y-4" role="status">
       <h2 className="break-words text-lg font-medium">{t(done === 'approve' ? 'approved' : 'rejected', { kind: preview!.kind_label })}{display && t('attribution', { name: display })}</h2>
       <p className="text-sm">{t('updated')}</p>
     </div> : <>
-      {(error || expired) && <p role="alert" className="whitespace-pre-wrap break-words text-sm">{message}</p>}
+      {(error || expired || missingEvidence) && <p role="alert" className="whitespace-pre-wrap break-words text-sm">{missingEvidence ? t('inboxContent') : message}</p>}
       {error?.code === 'unauthenticated' && <Button onClick={login}>{t('login')}</Button>}
       {error?.code === 'not_found' && <Button variant="outline" onClick={() => void useAuthStore.getState().logout()}>{t('logout')}</Button>}
-      {!terminal && !expired && preview && approval && <>
+      {!terminal && !expired && !missingEvidence && preview && approval && <>
         <p className="text-sm tabular-nums text-muted-foreground">{t('remaining', { time: `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}` })}</p>
         <section className="space-y-3 rounded-lg border border-border bg-card p-4">
           <h2 className="font-medium">{preview.kind_label}</h2>
