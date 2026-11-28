@@ -35,7 +35,7 @@ function payloadField(payload: unknown, key: string): string {
  * change itself. Content and diff come from `agent_files.pending_get`
  * (admins only); every server string is shown as plain text.
  */
-export function AgentFileChangeFacts({ approval, agentName, preview }: { approval: ApprovalItem; agentName?: string; preview?: AgentFilePendingResponse | null }) {
+export function AgentFileChangeFacts({ approval, agentName, preview, resolvePerson }: { approval: ApprovalItem; agentName?: string; preview?: AgentFilePendingResponse | null; resolvePerson?: (id: string) => string }) {
   const intl = useIntl();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const role = useAuthStore((s) => s.user?.role);
@@ -88,7 +88,7 @@ export function AgentFileChangeFacts({ approval, agentName, preview }: { approva
           )}
         </dd>
         <dt className="text-xs text-muted-foreground">{t('agentFiles.approval.requestedBy')}</dt>
-        <dd className="min-w-0 break-words">{requestedBy || '—'}</dd>
+        <dd className="min-w-0 break-words">{resolvePerson && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(requestedBy) ? resolvePerson(requestedBy) : requestedBy || '—'}</dd>
         <dt className="text-xs text-muted-foreground">{t('agentFiles.approval.reason')}</dt>
         <dd className="min-w-0 whitespace-pre-wrap break-words">{reason || '—'}</dd>
       </dl>

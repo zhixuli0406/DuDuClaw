@@ -12001,6 +12001,7 @@
   "approvalConfirm.login": "登入",
   "approvalConfirm.logout": "登出",
   "approvalConfirm.loading": "正在載入審批內容…",
+  "approvalConfirm.unknownPerson": "未知的成員",
   "approvalConfirm.unknownAgent": "無法顯示的 AI 員工",
   "approvalConfirm.inboxContent": "這類審批的完整內容請到儀表板收件匣查看。"
 }

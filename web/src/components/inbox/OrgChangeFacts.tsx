@@ -35,10 +35,12 @@ export function OrgChangeFacts({
   agentName,
   onStale,
   resolveAgentName,
+  resolvePerson,
 }: {
   approval: ApprovalItem;
   agentName?: string;
   resolveAgentName?: (id: string) => string;
+  resolvePerson?: (id: string) => string;
   onStale?: (stale: boolean) => void;
 }) {
   const intl = useIntl();
@@ -121,7 +123,7 @@ export function OrgChangeFacts({
 
       <dl className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1">
         <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.requestedBy')}</dt>
-        <dd className="min-w-0 break-words">{proposer || '—'}</dd>
+        <dd className="min-w-0 break-words">{resolvePerson && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(proposer) ? resolvePerson(proposer) : proposer || '—'}</dd>
         {reason && (
           <>
             <dt className="text-xs text-muted-foreground">{t('orgEdit.approval.reason')}</dt>

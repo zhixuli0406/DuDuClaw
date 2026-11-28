@@ -4,6 +4,7 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router';
 import { IntlProvider } from 'react-intl';
 import en from '@/i18n/en.json';
+import zhTW from '@/i18n/zh-TW.json';
 import { mockWsClient } from '@/test/mocks';
 import { ApprovalConfirmPage } from './ApprovalConfirmPage';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -17,13 +18,13 @@ const token = Array.from({ length: 32 }, (_, i) => i);
 const preview = {
   status: 'live', kind_label: 'External send', digest: 'digest-reviewed', has_totp: true,
   expires: Math.floor(Date.now() / 1000) + 600, agent_file_change: null,
-  approval: { id: 'approval-private', kind: 'external_send', summary: 'Send the quote', payload: { content: '<script>full email</script>' } },
+  approval: { id: 'approval-private', kind: 'cli_egress', digest: 'digest-reviewed', summary: 'Send the quote', payload: { content: '<script>full email</script>' } },
 };
 const fetchMock = vi.fn();
 function response(value: unknown, status = 200) { return { ok: status === 200, status, json: async () => value }; }
-function page(hash = `#ticket=${ticket}`) {
+function page(hash = `#ticket=${ticket}`, messages = en) {
   window.history.replaceState(null, '', `/approvals/confirm${hash}`);
-  return render(<IntlProvider locale="en" messages={en}><MemoryRouter initialEntries={[`/approvals/confirm${hash}`]}>
+  return render(<IntlProvider locale="en" messages={messages}><MemoryRouter initialEntries={[`/approvals/confirm${hash}`]}>
     <Routes><Route path="/approvals/confirm" element={<ApprovalConfirmPage />} /><Route path="/login" element={<LoginProbe />} /></Routes>
   </MemoryRouter></IntlProvider>);
 }
@@ -133,6 +134,10 @@ it('requires a fresh manual verification after step_up_required, without retaini
   expect(screen.getByLabelText('6-digit authenticator app code')).toHaveValue('');
   expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
   expect(fetchMock).toHaveBeenCalledTimes(2);
+  fetchMock.mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by: 'hidden' }));
+  await approve();
+  expect(await screen.findByText(/✓ Approved:/)).toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledTimes(3);
 });
 it('clears failed verification fields and never posts', async () => {
   mockWsClient.call.mockRejectedValueOnce(new Error('bad credentials'));
@@ -187,7 +192,7 @@ it('uses the file-change HTTP projection without fetching a second version', asy
     approval: { ...preview.approval, kind: 'agent_file_change', payload: {} },
     agent_file_change: { approval_id: preview.approval.id, agent_id: 'Employee', file: 'soul',
       requested_by: 'Owner', reason: 'File review reason', verdict: 'pass', reason_categories: [],
-      stale: false, content_available: false, diff: null },
+      stale: false, content_available: true, diff: { added: 0, removed: 0, hunks: [] } },
   }));
   page();
   expect(await screen.findByText('File review reason')).toBeInTheDocument();
@@ -300,13 +305,13 @@ it('shows org employee and manager display names without duplicating the raw pay
   expect(screen.getByText(en['approvalConfirm.unknownAgent'])).toBeInTheDocument();
   expectNoIdentifiers();
 });
-it.each(['cli_egress', 'unknown_kind'])('renders full read-only evidence without identifiers for %s', async kind => {
+it.each(['expert_skills_enable', 'autopilot_action', 'cli_egress', 'egress_guard'])('renders full read-only evidence without identifiers for %s', async kind => {
   const mailBody = 'Hello team,\n' + 'This is the full mail body. '.repeat(100) + '\nEnd of message.';
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, kind,
     agent_id: 'PRIVATE-AGENT', payload: {
-      id: privateUuid, agent_id: 'PRIVATE-AGENT', target: 'PRIVATE-TARGET', binding: 'hidden-binding',
+      id: privateUuid, agent_id: 'PRIVATE-AGENT', target: 'sales@example.com', binding: 'hidden-binding',
       payload_hash: 'hidden-hash', digest: 'hidden-digest', hash: 'hidden-hash', agent_ids: ['PRIVATE-AGENT'],
-      egress_guard: { nested: { id: 'nested-id', target: 'PRIVATE-TARGET', recipient: 'team@example.com', body: mailBody } },
+      egress_guard: { nested: { id: 'nested-id', target: 'sales@example.com', recipient: 'team@example.com', body: mailBody } },
       entries: [{ employee_id: 'PRIVATE-AGENT', value: privateUuid }, 'visible entry'],
     },
   } }));
@@ -329,14 +334,99 @@ it('preserves outbound body text while redacting every embedded UUID', async () 
 });
 it('filters a JSON-encoded payload before rendering evidence', async () => {
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
-    payload: JSON.stringify({ target: 'PRIVATE-TARGET', agent_id: 'PRIVATE-AGENT', text: 'Readable evidence' }),
+    payload: JSON.stringify({ target: 'sales@example.com', agent_id: 'PRIVATE-AGENT', text: 'Readable evidence' }),
   } }));
   page(); await screen.findByText('Readable evidence'); expectNoIdentifiers();
 });
 it('shows the inbox fallback when filtering leaves no evidence', async () => {
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
-    payload: { target: 'PRIVATE-TARGET', agent_ids: ['PRIVATE-AGENT'], nested: { value: privateUuid } },
+    payload: { agent_ids: ['PRIVATE-AGENT'] },
   } }));
   page(); expect(await screen.findByText(en['approvalConfirm.inboxContent'])).toBeInTheDocument();
   expectNoIdentifiers();
+});
+
+const fileProjection = {
+  approval_id: preview.approval.id, agent_id: 'Employee', file: 'soul',
+  requested_by: 'PRIVATE-PERSON', reason: 'Review file', verdict: 'pass', reason_categories: [],
+  stale: false, content_available: true, diff: { added: 0, removed: 0, hunks: [] },
+};
+it.each([
+  ['mismatched digest', { ...preview.approval, digest: 'different' }],
+  ['missing approval digest', { ...preview.approval, digest: undefined }],
+  ['blank approval digest', { ...preview.approval, digest: ' ' }],
+  ['unknown kind', { ...preview.approval, kind: 'unknown_kind' }],
+  ['null workflow projection', { ...preview.approval, kind: 'workflow_activation', workflow_activation: null }],
+  ['invalid settings', { ...preview.approval, kind: 'admin_ai_settings', payload: {} }],
+  ['invalid org payload', { ...preview.approval, kind: 'org_change', payload: null }],
+  ['empty generic object', { ...preview.approval, payload: {} }],
+  ['empty generic string', { ...preview.approval, payload: ' ' }],
+])('rejects incomplete GET content: %s', async (_label, approval) => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval }));
+  page();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledOnce();
+});
+it.each([{}, { ...fileProjection, content_available: false }, { ...fileProjection, stale: true },
+  { ...fileProjection, file: ' ' }, { ...fileProjection, diff: null },
+])('rejects incomplete file projection %j', async projection => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview,
+    approval: { ...preview.approval, kind: 'agent_file_change' }, agent_file_change: projection,
+  }));
+  page();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  expect(fetchMock).toHaveBeenCalledOnce();
+});
+it.each([
+  [503, { status: 'step_up_required', error: 'x' }],
+  [403, { status: 'verification_failed', error: 'x' }],
+  [403, { status: 'unknown_code', error: 'x' }],
+  [403, { status: 'step_up_required', error: ' ' }],
+  [403, { status: 'step_up_required' }],
+  [401, { status: 'forbidden', error: 'x' }],
+])('makes invalid HTTP %s error %j terminal after POST', async (http, body) => {
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response(body, http));
+  page(); await approve();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  expect(document.querySelector('form')).toBeNull();
+  await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+});
+it('rejects an unknown GET error code', async () => {
+  fetchMock.mockResolvedValueOnce(response({ status: 'unknown_code', error: 'x' }, 403));
+  page();
+  expect(await screen.findByRole('alert')).toHaveTextContent(en['approvalConfirm.unavailable']);
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
+});
+it('hides camelCase and UUID identifier keys while preserving targets and full text', async () => {
+  const body = `Dear team, ${'Mail content. '.repeat(100)}Reference ${privateUuid}. Thanks.`;
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, payload: {
+    agentId: 'HIDDEN-AGENT', workflowId: 'HIDDEN-WORKFLOW', request_uuid: 'HIDDEN-REQUEST',
+    REQUESTIDS: ['HIDDEN-IDS'], 'Payload-Hash': 'HIDDEN-HASH', UUID: 'HIDDEN-UUID',
+    target: 'sales@example.com', body, reference: privateUuid, path: `/files/${privateUuid}`,
+  } } }));
+  page();
+  expect(await screen.findByText('sales@example.com')).toBeInTheDocument();
+  expect(screen.getByText((_, el) => el?.tagName === 'SPAN' && el.textContent === body.replace(privateUuid, '…'))).toBeInTheDocument();
+  expect(screen.getByText('…')).toBeInTheDocument();
+  expect(screen.getByText('/files/…')).toBeInTheDocument();
+  expect(document.body.textContent).not.toMatch(/HIDDEN-|aabbccdd/);
+});
+it('shows an unknown member for an org proposer without email', async () => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval,
+    kind: 'org_change', payload: { proposer: 'PRIVATE-PERSON', reason: 'Change team' },
+  } }));
+  page(undefined, zhTW);
+  expect(await screen.findByText('未知的成員')).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain('PRIVATE-PERSON');
+});
+it('shows an unknown member for an id-like file requester', async () => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, kind: 'agent_file_change' },
+    agent_file_change: fileProjection,
+  }));
+  page(undefined, zhTW);
+  expect(await screen.findByText('未知的成員')).toBeInTheDocument();
+  expect(document.body.textContent).not.toContain('PRIVATE-PERSON');
 });

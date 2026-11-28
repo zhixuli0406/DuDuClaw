@@ -19,6 +19,7 @@ export function ApprovalConfirmPage() {
   const fetchAgents = useAgentsStore(s => s.fetchAgents);
   const resolveAgentName = (id: string) => agents.find(agent => agent.name === id)?.display_name?.trim()
     || t('unknownAgent');
+  const resolvePerson = (_id: string) => t('unknownPerson');
   const location = useLocation();
   const navigate = useNavigate();
   const [ticket] = useState(() => location.hash.length === 72 && /^#ticket=[a-f0-9]{64}$/.test(location.hash) ? location.hash.substring(8) : '');
@@ -54,7 +55,7 @@ export function ApprovalConfirmPage() {
 
   const remaining = preview ? Math.max(0, Math.ceil(preview.expires - now / 1000)) : 0;
   const expired = !!preview && remaining === 0;
-  const terminal = error && error.code !== 'step_up_required' && error.code !== 'verification_failed';
+  const terminal = error && !(error.code === 'step_up_required' && error.httpStatus === 403) && error.code !== 'verification_failed';
   const login = () => {
     void useAuthStore.getState().logout();
     navigate('/login', { replace: true, state: { from: `/approvals/confirm#ticket=${ticket}` } });
@@ -114,9 +115,9 @@ export function ApprovalConfirmPage() {
           <h2 className="font-medium">{preview.kind_label}</h2>
           <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
           <h3 className="text-sm font-medium">{t('content')}</h3>
-          {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={resolveAgentName(agentId)} resolveAgentName={resolveAgentName} />}
+          {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={resolveAgentName(agentId)} resolveAgentName={resolveAgentName} resolvePerson={resolvePerson} />}
           {approval.kind === 'workflow_activation' && <WorkflowActivationFacts approval={approval} />}
-          {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={resolveAgentName(agentId)} preview={preview.agent_file_change} />}
+          {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={resolveAgentName(agentId)} preview={preview.agent_file_change} resolvePerson={resolvePerson} />}
           {approval.kind === 'admin_ai_settings' && (settings ? <AdminAiSettingsFacts payload={settings} /> : <p className="text-sm">{t('inboxContent')}</p>)}
           {!['org_change', 'workflow_activation', 'agent_file_change', 'admin_ai_settings'].includes(approval.kind)
             && (evidence ?? <p className="text-sm">{t('inboxContent')}</p>)}
@@ -152,8 +153,9 @@ function evidenceView(value: unknown): ReactNode {
   if (value === null || value === undefined) return null;
   if (typeof value === 'object') {
     const rows = Object.entries(value).flatMap(([key, field]) => {
-      if (['id', 'target', 'binding', 'payload_hash', 'digest', 'hash'].includes(key)
-        || /_ids?$/.test(key) || uuid.test(key)) return [];
+      const normalizedKey = key.toLowerCase().replace(/[_-]/g, '');
+      if (['id', 'uuid', 'binding', 'payloadhash', 'digest', 'hash'].includes(normalizedKey)
+        || /(?:id|ids|uuid)$/.test(normalizedKey) || uuid.test(key)) return [];
       const content = evidenceView(field);
       if (content === null) return [];
       return [<div key={key} className="space-y-1">
@@ -165,7 +167,7 @@ function evidenceView(value: unknown): ReactNode {
   }
   if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean') return null;
   if (typeof value === 'string') {
-    if (!value.trim() || new RegExp(`^${uuid.source}$`, 'i').test(value.trim())) return null;
+    if (!value.length) return null;
     value = value.replace(new RegExp(uuid.source, 'gi'), '…');
   }
   return <span className="whitespace-pre-wrap break-words text-sm [overflow-wrap:anywhere]">{String(value)}</span>;
