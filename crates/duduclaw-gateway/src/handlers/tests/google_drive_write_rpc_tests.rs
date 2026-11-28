@@ -44,6 +44,7 @@ async fn fixture() -> (tempfile::TempDir, MethodHandler) {
     (dir, h)
 }
 async fn rpc(h: &MethodHandler, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+    let params = if method == "google.drive_write.set" { fresh_params(h, params, ctx).await } else { params };
     Box::pin(h.handle(method, params, ctx)).await
 }
 
@@ -91,12 +92,12 @@ async fn narrowing_resigns_without_ack_and_preserves_existing_folder_metadata() 
     let fake = Fake::unavailable();
     let mut p = input(); p["create"] = json!(true); p["trash"] = json!(true);
     p["folders"] = json!([ID, OTHER]); p["acknowledge_risk"] = json!(true);
-    ok(h.drive_write_set(p.clone(), &admin(), &fake).await);
+    ok(save(&h, p.clone(), &admin(), &fake).await);
     assert_eq!(fake.calls.lock().unwrap().len(), 2);
     p["trash"] = json!(false); p["folders"] = json!([ID]);
     p["approval"]["create"] = json!("member_and_admin"); p["acknowledge_risk"] = json!(false);
     let mut second = admin(); second.user_id = "second-admin".into(); second.email = "second@example.test".into();
-    ok(h.drive_write_set(p, &second, &fake).await);
+    ok(save(&h, p, &second, &fake).await);
     let loaded = policy::load(dir.path());
     assert!(!loaded.trash && loaded.create);
     assert_eq!(loaded.folders.len(), 1);
@@ -114,7 +115,7 @@ async fn folder_link_forms_resolve_and_names_are_sanitized() {
         fake.value.as_mut().unwrap()["name"] = json!(format!("\n{}\u{7f}", "字".repeat(201)));
         fake.value.as_mut().unwrap()["driveId"] = json!(ID);
         let mut p = input(); p["folders"] = json!([link]); p["acknowledge_risk"] = json!(true);
-        ok(h.drive_write_set(p, &admin(), &fake).await);
+        ok(save(&h, p, &admin(), &fake).await);
         let loaded = policy::load(dir.path());
         assert_eq!(loaded.folders[0].id, ID);
         assert_eq!(loaded.folders[0].name, "字".repeat(200));
@@ -128,13 +129,13 @@ async fn shortcut_and_non_folder_rejected_unavailable_stored_unverified() {
     let (dir, h) = fixture().await;
     let mut p = input(); p["folders"] = json!([ID]); p["acknowledge_risk"] = json!(true);
     for mime in ["application/vnd.google-apps.shortcut", "text/plain"] {
-        refused(h.drive_write_set(p.clone(), &admin(), &Fake::folder(mime)).await);
+        refused(save(&h, p.clone(), &admin(), &Fake::folder(mime)).await);
         assert_eq!(std::fs::read_to_string(dir.path().join("config.toml")).unwrap(), ORIGINAL);
     }
     let mut fake = Fake::folder("application/vnd.google-apps.folder");
     fake.value.as_mut().unwrap()["shortcutDetails"] = json!({"targetId":OTHER});
-    refused(h.drive_write_set(p.clone(), &admin(), &fake).await);
-    ok(h.drive_write_set(p, &admin(), &Fake::unavailable()).await);
+    refused(save(&h, p.clone(), &admin(), &fake).await);
+    ok(save(&h, p, &admin(), &Fake::unavailable()).await);
     let loaded = policy::load(dir.path());
     assert_eq!(loaded.folders[0].kind, policy::FolderKind::Unverified);
     assert_eq!(loaded.folders[0].name, "");
@@ -154,7 +155,7 @@ async fn invalid_inputs_never_write_or_lookup() {
     let mut p = input(); p["approval"]["create"] = json!("invalid"); cases.push(p);
     let mut p = input(); p["by_user_id"] = json!("forged-admin"); cases.push(p);
     for p in cases {
-        refused(h.drive_write_set(p, &admin(), &fake).await);
+        refused(save(&h, p, &admin(), &fake).await);
         assert_eq!(std::fs::read_to_string(dir.path().join("config.toml")).unwrap(), ORIGINAL);
     }
     assert!(fake.calls.lock().unwrap().is_empty());
@@ -175,7 +176,7 @@ async fn all_off_is_signed_and_hand_edit_invalidates_effective_switches() {
     assert_eq!(response["configured"]["trash"], true);
     assert_eq!(response["effective"]["trash"], false);
     let mut p = input(); p["trash"] = json!(true);
-    refused(h.drive_write_set(p, &admin(), &Fake::unavailable()).await);
+    refused(save(&h, p, &admin(), &Fake::unavailable()).await);
 }
 
 #[tokio::test]
@@ -243,14 +244,14 @@ async fn member_notice_only_on_first_enable_per_set() {
     crate::person_credentials::connect(dir.path(), &key, metadata,
         &crate::person_credentials::Secret { access_token:"fixture-access".into(), refresh_token:None, expires_at:Some(4_000_000_000) }, epoch).unwrap();
     let mut p = input(); p["create"] = json!(true); p["modify"] = json!(true); p["acknowledge_risk"] = json!(true);
-    ok(h.drive_write_set(p.clone(), &admin(), &Fake::unavailable()).await);
+    ok(save(&h, p.clone(), &admin(), &Fake::unavailable()).await);
     let notices = crate::notify_push::person_notice_test::take(dir.path());
     assert_eq!(notices.len(), 1); assert_eq!(notices[0].0, user);
     assert!(notices[0].1.contains("我的連線"));
     p["acknowledge_risk"] = json!(false);
-    ok(h.drive_write_set(p, &admin(), &Fake::unavailable()).await);
+    ok(save(&h, p, &admin(), &Fake::unavailable()).await);
     assert!(crate::notify_push::person_notice_test::take(dir.path()).is_empty());
-    ok(h.drive_write_set(input(), &admin(), &Fake::unavailable()).await);
+    ok(save(&h, input(), &admin(), &Fake::unavailable()).await);
     assert!(crate::notify_push::person_notice_test::take(dir.path()).is_empty());
 }
 
@@ -280,7 +281,7 @@ async fn concurrent_config_edit_during_folder_lookup_is_not_overwritten() {
     let (dir, h) = fixture().await;
     let path = dir.path().join("config.toml");
     let mut p = input(); p["folders"] = json!([ID]); p["acknowledge_risk"] = json!(true);
-    refused(h.drive_write_set(p, &admin(), &RacingLookup(path.clone())).await);
+    refused(save(&h, p, &admin(), &RacingLookup(path.clone())).await);
     assert_eq!(std::fs::read_to_string(path).unwrap(), format!("{ORIGINAL}\n# concurrent edit\n"));
 }
 
@@ -295,7 +296,7 @@ async fn http_error_folder_metadata_is_unavailable_and_stored_unverified() {
         let (dir, h) = fixture().await;
         let fake = Fake { value, calls: Mutex::new(Vec::new()) };
         let mut p = input(); p["folders"] = json!([ID]); p["acknowledge_risk"] = json!(true);
-        ok(h.drive_write_set(p, &admin(), &fake).await);
+        ok(save(&h, p, &admin(), &fake).await);
         assert_eq!(policy::load(dir.path()).folders[0].kind, policy::FolderKind::Unverified);
     }
     let metadata = json!({"id":ID,"mimeType":"application/vnd.google-apps.folder"});
@@ -327,4 +328,67 @@ async fn home_write_rpcs_require_authenticated_dashboard_session() {
         refused(rpc(&h, method, json!({"acknowledge_google_data":true,"acknowledge_write":true,
             "redirect_origin":"http://127.0.0.1:18889","user_id":"admin-test"}), &admin()).await);
     }
+}
+
+
+async fn fresh_params(h: &MethodHandler, mut params: Value, ctx: &UserContext) -> Value {
+    // Non-Admin tests still exercise the authorization gate.
+    if ctx.is_admin() {
+        let get = ok(Box::pin(h.handle("google.drive_write.get", json!({}), ctx)).await);
+        params["expected_hash"] = get["hash"].clone();
+    }
+    params
+}
+async fn save(h: &MethodHandler, params: Value, ctx: &UserContext, lookup: &dyn FolderLookup) -> WsFrame {
+    h.drive_write_set(fresh_params(h, params, ctx).await, ctx, lookup).await
+}
+
+#[tokio::test]
+async fn drive_settings_require_fresh_client_hash() {
+    let (dir, h) = fixture().await;
+    let path = dir.path().join("config.toml");
+    let get = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    assert_eq!(get["hash"], super::super::config_commit::content_hash(ORIGINAL));
+    for hash in [None, Some(json!(null)), Some(json!(42)), Some(json!(false))] {
+        let mut p = input();
+        if let Some(hash) = hash { p["expected_hash"] = hash; }
+        let result = h.drive_write_set(p, &admin(), &Fake::unavailable()).await;
+        match result { WsFrame::Response {ok:false,error:Some(e),..} => assert_eq!(e.as_str(), Some("設定頁的資料已過期，請重新整理後再儲存。")), other => panic!("{other:?}") }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ORIGINAL);
+    }
+    let changed = format!("{ORIGINAL}\n# another admin\n");
+    std::fs::write(&path, &changed).unwrap();
+    let mut p = input(); p["expected_hash"] = get["hash"].clone();
+    let result = h.drive_write_set(p, &admin(), &Fake::unavailable()).await;
+    match result { WsFrame::Response {ok:false,error:Some(e),..} => assert_eq!(e.as_str(), Some("設定已被其他人變更，請重新整理後再儲存。")), other => panic!("{other:?}") }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    let fresh = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    let mut p = input(); p["expected_hash"] = fresh["hash"].clone();
+    let result = ok(h.drive_write_set(p, &admin(), &Fake::unavailable()).await);
+    let raw = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(result["hash"], super::super::config_commit::content_hash(&raw));
+    assert!(policy::load(dir.path()).ack.is_some());
+}
+
+#[tokio::test]
+async fn drive_settings_recheck_client_hash_after_folder_lookup() {
+    struct ConcurrentAdmin { path: std::path::PathBuf, content: String }
+    #[async_trait::async_trait]
+    impl FolderLookup for ConcurrentAdmin {
+        async fn lookup(&self, _: &str) -> Option<Value> {
+            std::fs::write(&self.path, &self.content).unwrap();
+            None
+        }
+    }
+    let (dir, h) = fixture().await;
+    let path = dir.path().join("config.toml");
+    let get = ok(rpc(&h, "google.drive_write.get", json!({}), &admin()).await);
+    let changed = format!("{ORIGINAL}\n# concurrent admin\n");
+    let lookup = ConcurrentAdmin {path:path.clone(), content:changed.clone()};
+    let mut p = input(); p["expected_hash"] = get["hash"].clone();
+    p["folders"] = json!([ID]); p["acknowledge_risk"] = json!(true);
+    let response = h.drive_write_set(p, &admin(), &lookup).await;
+    match response { WsFrame::Response {ok:false,error:Some(e),..} => assert_eq!(e.as_str(), Some("設定已被其他人變更，請重新整理後再儲存。")), other => panic!("{other:?}") }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    assert!(!duduclaw_security::audit::read_recent_events(dir.path(), 20).iter().any(|e| e.event_type == "config_changed"));
 }

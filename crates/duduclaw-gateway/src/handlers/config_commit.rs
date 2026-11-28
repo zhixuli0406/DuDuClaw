@@ -730,6 +730,11 @@ pub(crate) fn commit_boot_config<T>(
     }).map_err(|e| e.to_string())?
 }
 
+/// Exact match for the locked CAS rejection; RPCs translate it without exposing paths.
+pub(super) fn is_hash_conflict(path: &Path, error: &str) -> bool {
+    error == changed_on_disk(path)
+}
+
 fn changed_on_disk(path: &Path) -> String {
     format!(
         "{} changed on disk while this edit was open (another writer saved first) — reload and try again",

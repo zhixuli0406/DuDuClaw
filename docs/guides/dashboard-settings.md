@@ -319,6 +319,11 @@ Custom categories and extra keywords are set in the advanced config editor under
 
 Admin only (`delegation.get` / `delegation.set`). Saved changes apply to the next delegation decision, no restart.
 
+**Concurrent settings edits (v1.86.0 RPC contract).** `delegation.get {}` and `google.drive_write.get {}` return `hash`, the SHA-256 content hash of the exact configuration text read. Each corresponding set requires a string `expected_hash` copied from that get response, alongside its existing settings parameters. The gateway checks this client value again inside the configuration commit lock. A missing or non-string value returns 「設定頁的資料已過期，請重新整理後再儲存。」; a conflict returns 「設定已被其他人變更，請重新整理後再儲存。」. Neither writes any configuration. Reload and reconcile the newer settings before saving again. Unreadable or unparsable configuration makes either get fail instead of returning editable defaults. `google.drive_write.set` returns the same response fields as its get, including the new post-save `hash`; `delegation.set` keeps its existing success response.
+
+**Warning payloads (v1.86.0 RPC contract).** `delegation.get.warnings` is an array of `{code, message}` objects; messages contain no configuration text or employee identifiers. Codes are `section_invalid`, `policy_unknown`, `policy_not_string`, `allow_not_list`, `allow_pair_invalid`, `allow_pair_same_agent`, `allow_one_way_not_list`, `allow_one_way_pair_invalid`, `allow_one_way_pair_same_agent`, `allow_one_way_limit` and `unrestricted_roles_unknown`. Pair messages may include their one-based position. `delegation.effective {agent_id}` returns `policy_warning: null | {code, message}` with the same policy classifications. `allow_warning_count` is unchanged; detailed `allow_warnings` and `config_error_detail` remain Admin-only. `configured_policy` retains its existing raw-value contract.
+
+
 | Control | Key | Takes effect |
 |---|---|---|
 | Delegation mode → Department (default) / Reporting line / Open / No delegation (v1.82) | `config.toml [delegation] policy` = `department` / `hierarchy` / `open` / `none` | Next delegation |

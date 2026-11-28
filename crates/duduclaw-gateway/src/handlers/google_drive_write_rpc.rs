@@ -15,6 +15,7 @@ struct ApprovalInput { create: String, modify: String, #[serde(rename = "move")]
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetInput {
+    #[serde(rename = "expected_hash")] _expected_hash: String,
     create: bool, modify: bool, #[serde(rename = "move")] move_: bool, trash: bool,
     approval: ApprovalInput,
     // Keep individual values until validation so errors name the position.
@@ -172,8 +173,14 @@ impl MethodHandler {
     }
 
     fn drive_write_get(&self) -> WsFrame {
-        let table = std::fs::read_to_string(self.home_dir.join("config.toml")).ok()
-            .and_then(|s| s.parse::<toml::Table>().ok()).unwrap_or_default();
+        let raw = match config_commit::read_text_or_empty(&self.home_dir.join("config.toml")) {
+            Ok(raw) => raw,
+            Err(_) => return WsFrame::error_response("", "無法讀取設定，請修正設定後再試。"),
+        };
+        let table = match raw.parse::<toml::Table>() {
+            Ok(table) => table,
+            Err(_) => return WsFrame::error_response("", "無法讀取設定，請修正設定後再試。"),
+        };
         let section = config_commit::toml_at(&table, "google.drive_write");
         let stored = policy::parse_section(section, true);
         let effective = policy::load(&self.home_dir);
@@ -203,6 +210,7 @@ impl MethodHandler {
                 "status": "unreadable", "account_email": null}),
         };
         WsFrame::ok_response("", json!({
+            "hash":config_commit::content_hash(&raw),
             "home_write":home_write,
             "configured":configured, "effective":active, "approval":stored.approval,
             "folders":stored.folders.iter().map(|f| json!({"id":f.id,"name":f.name,"kind":f.kind})).collect::<Vec<_>>(),
@@ -217,14 +225,17 @@ impl MethodHandler {
     pub(super) async fn drive_write_set(&self, params: Value, ctx: &UserContext, lookup: &dyn FolderLookup) -> WsFrame {
         if !ctx.is_admin() { return WsFrame::error_response("", "只有管理員可以調整雲端硬碟寫入權限。"); }
         let result = async {
+            let expected_hash = params.get("expected_hash").and_then(Value::as_str)
+                .ok_or("設定頁的資料已過期，請重新整理後再儲存。")?.to_string();
             let (mut new, acknowledge) = parse_input(params)?;
             let raw = config_commit::read_text_or_empty(&self.home_dir.join("config.toml")).map_err(|_| SAVE_ERROR)?;
             let table = raw.parse::<toml::Table>().map_err(|_| SAVE_ERROR)?;
             let hash = config_commit::content_hash(&raw);
+            if hash != expected_hash { return Err("設定已被其他人變更，請重新整理後再儲存。".into()); }
             let old = policy::load(&self.home_dir);
             // Tie the effective read to the original CAS snapshot, before any network IO.
             let reread = config_commit::read_text_or_empty(&self.home_dir.join("config.toml")).map_err(|_| SAVE_ERROR)?;
-            if config_commit::content_hash(&reread) != hash { return Err(SAVE_ERROR.to_string()); }
+            if config_commit::content_hash(&reread) != expected_hash { return Err("設定已被其他人變更，請重新整理後再儲存。".into()); }
             if policy::widening(&old, &new) && !acknowledge {
                 return Err("請先閱讀並確認風險說明".into());
             }
@@ -237,8 +248,10 @@ impl MethodHandler {
             resolve_folders(&mut new, &stored, lookup).await?;
             let changes = audit_changes(&old, &new);
             let db = self.user_db.read().await.clone();
-            config_commit::commit_drive_write_policy(&self.home_dir, hash, new.clone(), ctx.clone(), db).await
-                .map_err(|_| SAVE_ERROR.to_string())?;
+            config_commit::commit_drive_write_policy(&self.home_dir, expected_hash, new.clone(), ctx.clone(), db).await
+                .map_err(|e| if config_commit::is_hash_conflict(&self.home_dir.join("config.toml"), &e) {
+                    "設定已被其他人變更，請重新整理後再儲存。".to_string()
+                } else { SAVE_ERROR.to_string() })?;
             duduclaw_security::audit::log_config_changed(&self.home_dir, &ctx.email, "admin", &changes);
             crate::security_autopilot::emit_config_changed();
             // Publication feeds MCP's existing visible_tool_snapshot watcher:

@@ -864,7 +864,7 @@ async fn update_config_removing_a_key_keeps_neighbour_comments() {
 
 #[tokio::test]
 async fn delegation_set_preserves_the_rest_of_the_file() {
-    let out = rpc_on_fixture("delegation.set", json!({ "policy": "hierarchy" })).await;
+    let out = rpc_on_fixture("delegation.set", json!({ "policy": "hierarchy", "expected_hash": super::super::config_commit::content_hash(COMMENTED) })).await;
     assert_eq!(
         out,
         COMMENTED.replace("policy = \"department\" # the default", "policy = \"hierarchy\" # the default")

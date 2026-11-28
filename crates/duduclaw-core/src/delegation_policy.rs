@@ -48,6 +48,9 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+mod warnings;
+pub use warnings::{DelegationWarning, delegation_policy_warning, delegation_section_warnings, delegation_override_warnings};
+
 /// Maximum `reports_to` hops walked when testing ancestry. Mirrors the cycle
 /// guard in the CLI's `validate_reports_to`: a chain deeper than this (or one
 /// that loops) stops the walk, and an unproven relation is a DENY.
@@ -1252,6 +1255,8 @@ pub struct DelegationConfigRead {
     pub configured_policy: Option<String>,
     /// Set when the configured policy was not recognised (enforced as `none`).
     pub policy_warning: Option<String>,
+    /// Content-free classification of the same policy problem for UI responses.
+    pub classified_policy_warning: Option<DelegationWarning>,
     /// One line per dropped `[delegation] allow` entry.
     pub allow_warnings: Vec<String>,
     /// Set when `config.toml` exists but could not be read or parsed
@@ -1290,6 +1295,7 @@ impl DelegationConfigRead {
             },
             configured_policy,
             policy_warning,
+            classified_policy_warning: delegation_policy_warning(table),
             allow_warnings,
             config_error: None,
             config_error_kind: None,
@@ -1306,6 +1312,7 @@ impl DelegationConfigRead {
             },
             configured_policy: None,
             policy_warning: None,
+            classified_policy_warning: None,
             allow_warnings: Vec::new(),
             config_error: Some(format!(
                 "{reason}。在修正前,AI 員工之間一律不能委派(視為 \"none\")。"
