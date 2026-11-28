@@ -111,6 +111,7 @@ fn kind(key: &str) -> Value {
         "expert_skills_enable" => "員工獲得新工具能力，啟用期間的行為不可逆",
         "workflow_activation" => "工作流取得長期自動行動權限",
         "agent_file_change" => "改寫 AI 員工人格或工作規則，影響之後所有對話",
+        crate::admin_ai::card::ACTION_KIND => "一次套用多位 AI 員工的設定變更，影響之後的行為",
         "org_change" => "匯報線改變，連動委派範圍",
         "autopilot_action" => "執行一次凍結的自動化動作，多半不可逆",
         "cli_egress" | "egress_guard" => "讀過敏感資料後把內容送出系統，不可逆",

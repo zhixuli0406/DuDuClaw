@@ -326,6 +326,8 @@ pub(super) fn personal_metadata_card(record: &crate::approval::ApprovalRecord) -
         "payload": {"redacted": true, "personal_employee": true},
         "request_kind": record.request_kind,
         "status": record.status,
+        "execution_result": Value::Null,
+        "decided_at": Value::Null,
         "binding": Value::Null,
         "answer": Value::Null,
         "may_decide": false,

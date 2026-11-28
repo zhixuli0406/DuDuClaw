@@ -203,6 +203,7 @@ async fn ttl_expiry_treated_as_deny() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -243,6 +244,7 @@ async fn poll_expires_stale_on_read() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -302,6 +304,7 @@ async fn list_pending_sweeps_expired() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     b.store.insert(&stale).await.unwrap();
     let pending = b.list_pending(None).await.unwrap();
@@ -353,6 +356,7 @@ async fn await_decision_returns_expired_past_ttl() {
         answer: None,
         invalidated_reason: None,
         on_behalf_of: None,
+        execution_result: None,
     };
     let id = rec.id.clone();
     b.store.insert(&rec).await.unwrap();
@@ -613,4 +617,30 @@ async fn legacy_store_migrates_and_reopens_with_approval_intact() {
     let id = first.request("alice", "mcp_tool", "test", json!({}), 60).await.unwrap();
     second.decide(&id, true, "dashboard:admin").await.unwrap();
     assert_eq!(first.poll(&id).await.unwrap(), ApprovalStatus::Approved);
+}
+
+#[tokio::test]
+async fn execution_result_write_once_uses_exact_card_id_and_kind() {
+    let b = broker();
+    let id = b.request("a", crate::admin_ai::card::ACTION_KIND, "settings", json!({}), 300).await.unwrap();
+    let other = b.request("a", "mcp_call", "other", json!({}), 300).await.unwrap();
+    let result = json!({"outcome":"complete", "reason":null, "completed":1,
+        "not_executed":0, "message":"已完成 1 項設定變更。", "items":[]});
+    assert!(!b.set_execution_result_once(&ApprovalId::from(format!("{}-suffix", id.as_str())), &result).await.unwrap());
+    assert!(!b.set_execution_result_once(&other, &result).await.unwrap());
+    let mut audit_result = result.clone();
+    audit_result["admin_user_id"] = json!("user-id-canary");
+    audit_result["token"] = json!("token-canary");
+    audit_result["items"] = json!([{"seq":1, "result":"complete", "error":null,
+        "target":"internal-target", "before":"user-id-canary", "after":"token-canary"}]);
+    let mut expected = result.clone();
+    expected["items"] = json!([{"seq":1, "result":"complete", "error":null}]);
+    assert!(b.set_execution_result_once(&id, &audit_result).await.unwrap());
+    assert!(!b.set_execution_result_once(&id, &json!({"outcome":"voided"})).await.unwrap());
+    let stored = b.get(&id).await.unwrap().unwrap().execution_result.unwrap();
+    assert_eq!(stored, expected);
+    for secret in ["user-id-canary", "token-canary", "internal-target"] {
+        assert!(!stored.to_string().contains(secret));
+    }
+    assert_eq!(b.get(&other).await.unwrap().unwrap().execution_result, None);
 }

@@ -426,3 +426,12 @@ fn generic_chat_admin_edit_points_to_named_security_section() {
     assert_eq!(refuse_subtable_change(&before, &after).unwrap_err(),
         "請到安全設定的「在聊天軟體核准」區塊變更設定並確認風險。");
 }
+
+#[test]
+fn admin_ai_kind_has_translated_labels_and_impact() {
+    let value = kind(crate::admin_ai::card::ACTION_KIND);
+    assert_eq!(value["key"], "admin_ai_settings");
+    assert_eq!(value["label"], json!({"zh-TW":"管理員 AI 設定變更",
+        "en":"Admin AI settings change", "ja":"管理者 AI の設定変更"}));
+    assert_eq!(value["impact"], "一次套用多位 AI 員工的設定變更，影響之後的行為");
+}

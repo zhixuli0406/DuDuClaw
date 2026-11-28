@@ -970,6 +970,7 @@ mod tests {
             answer: None,
             invalidated_reason: None,
             on_behalf_of: None,
+            execution_result: None,
         }
     }
 

@@ -48,6 +48,7 @@ pub(crate) fn kind_label_for_key(key: &str, lang: Lang) -> &'static str {
         "expert_skills_enable" => words(lang, "啟用技能", "Enable skills", "スキルの有効化"),
         "workflow_activation" => words(lang, "啟用工作流", "Activate workflow", "ワークフローの有効化"),
         "agent_file_change" => words(lang, "修改員工設定", "Change employee settings", "従業員設定の変更"),
+        crate::admin_ai::card::ACTION_KIND => words(lang, "管理員 AI 設定變更", "Admin AI settings change", "管理者 AI の設定変更"),
         "org_change" => words(lang, "調整組織", "Change organization", "組織の変更"),
         "autopilot_action" => words(lang, "自動化操作", "Automation action", "自動操作"),
         "cli_egress" | "egress_guard" => words(lang, "對外操作", "Outbound operation", "外部への操作"),

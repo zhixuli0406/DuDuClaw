@@ -73,7 +73,9 @@ async fn wait(home: &Path, handler: &MethodHandler, initial: &ApprovalRecord) ->
         if rec.status == ApprovalStatus::Pending {
             if expired(&rec) || tokio::time::Instant::now() >= deadline {
                 let _ = broker.invalidate_request(&rec.id, "admin_ai:expired").await;
-                return Some(void_audit(home, &rec, "expired"));
+                let result = void_audit(home, &rec, "expired");
+                retain_result(&broker, &rec, &result).await;
+                return Some(result);
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
@@ -82,7 +84,9 @@ async fn wait(home: &Path, handler: &MethodHandler, initial: &ApprovalRecord) ->
         let reason = if rec.status == ApprovalStatus::Expired || expired(&rec) { "expired" }
             else if rec.invalidated_reason.as_deref() == Some("restart_requires_reobserve") { "restart" }
             else { "denied" };
-        return Some(void_audit(home, &rec, reason));
+        let result = void_audit(home, &rec, reason);
+        retain_result(&broker, &rec, &result).await;
+        return Some(result);
     }
 }
 fn consumed(rec: &ApprovalRecord) -> bool {
@@ -139,7 +143,10 @@ fn void_audit_for(home: &Path, rec: &ApprovalRecord, reason: &str, employee: Opt
     result["outcome"] = json!("voided");
     result["reason"] = json!(reason);
     result["message"] = json!(message);
-    result["items"] = json!(item_reports(rec));
+    let reports = item_reports(rec);
+    result["completed"] = json!(0);
+    result["not_executed"] = json!(reports.len());
+    result["items"] = json!(reports);
     emit(home, rec, "admin_ai_settings_voided", result.clone());
     result
 }
@@ -323,6 +330,18 @@ fn item_reports(rec: &ApprovalRecord) -> Vec<Value> {
 
 /// None means a replay/lost claim: neither execute nor emit a second outcome.
 async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBroker, requested: &ApprovalRecord) -> Option<Value> {
+    let result = execute_once_inner(home, handler, broker, requested).await?;
+    retain_result(broker, requested, &result).await;
+    Some(result)
+}
+
+async fn retain_result(broker: &ApprovalBroker, rec: &ApprovalRecord, result: &Value) {
+    if let Err(error) = broker.set_execution_result_once(&rec.id, result).await {
+        tracing::warn!(approval_id = %rec.id, %error, "could not retain admin AI execution result");
+    }
+}
+
+async fn execute_once_inner(home: &Path, handler: &MethodHandler, broker: &ApprovalBroker, requested: &ApprovalRecord) -> Option<Value> {
     let rec = broker.get(&requested.id).await.ok().flatten()?;
     if rec.status != ApprovalStatus::Approved || rec.action_kind != ACTION_KIND { return None; }
     let grant = ActionGrant::build(&rec.agent_id, "admin_settings_propose", &rec.payload);
@@ -333,7 +352,9 @@ async fn execute_once(home: &Path, handler: &MethodHandler, broker: &ApprovalBro
             else if !super::may_decide(home, &rec, rec.payload["admin_user_id"].as_str().unwrap_or("")) { "admin_changed" }
             else { "stale" };
         let _ = broker.invalidate_request(&rec.id, reason).await;
-        return Some(void_audit(home, &rec, reason));
+        let result = void_audit(home, &rec, reason);
+        retain_result(&broker, &rec, &result).await;
+        return Some(result);
     }
     let lock = BATCH_LOCK.lock().await;
     let ctx = match reverify(home, &rec).await {
