@@ -352,7 +352,9 @@ await rpc('google.drive_write.set', {
 
 **讀取失敗不會蓋掉設定（v1.82.0）。** 頁面讀不到目前設定時會顯示錯誤，所有選項與「儲存」都停用，直到「再試一次」成功為止；不會送出沒有讀到的內容。
 
-**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片顯示這位員工實際適用的設定：生效的委派模式、來自全公司設定還是員工自己的「允許跨 AI 員工通訊」開關（`[permissions] can_send_cross_agent = false` 會讓這位員工視為 `none`）、能否建立員工或臨時助手、和他有關的配對（目前模式下不生效的另外列出），以及設定檔的問題。管理員與有權查看這位員工的經理可以看到（`delegation.effective {agent_id}`，唯讀）。配對設定有寫錯而被忽略的項目時，卡片只顯示數量（「委派設定有 N 則警告，管理員可以到「設定」查看」）；警告原文會引用原始設定內容，只在本頁（管理員）顯示。要修改請到本頁或員工編輯頁。
+**警告載荷（v1.86.0 RPC 契約）。** `delegation.get.warnings` 是 `{code, message}` 物件陣列；訊息不含設定文字或員工識別碼。代碼為 `section_invalid`、`policy_unknown`、`policy_not_string`、`allow_not_list`、`allow_pair_invalid`、`allow_pair_same_agent`、`allow_one_way_not_list`、`allow_one_way_pair_invalid`、`allow_one_way_pair_same_agent`、`allow_one_way_limit` 與 `exempt_roles_unknown`。配對訊息可能包含從 1 開始的位置。`delegation.effective {agent_id}` 以 `policy_warning: null | {code, message}` 回傳相同的政策分類；`allow_warning_count` 維持不變，詳細的 `allow_warnings` 與 `config_error_detail` 僅管理員可見。
+
+**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片顯示這位員工實際適用的設定：生效的委派模式、來自全公司設定還是員工自己的「允許跨 AI 員工通訊」開關（`[permissions] can_send_cross_agent = false` 會讓這位員工視為 `none`）、能否建立員工或臨時助手、和他有關的配對（目前模式下不生效的另外列出），以及設定檔的問題。管理員與有權查看這位員工的經理可以看到（`delegation.effective {agent_id}`，唯讀）。配對設定有寫錯而被忽略的項目時，卡片只顯示數量（「委派設定有 N 則警告，管理員可以到「設定」查看」）；要修改請到本頁或員工編輯頁。
 
 卡片也會顯示角色例外，以及單向配對的「可交辦給」與「可接收自」。每次請求仍會檢查當下的帳號與工作來源。
 

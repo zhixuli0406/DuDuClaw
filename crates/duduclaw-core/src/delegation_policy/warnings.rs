@@ -32,7 +32,7 @@ impl DelegationWarning {
             Self::OneWayPairInvalid(_) => "allow_one_way_pair_invalid",
             Self::OneWayPairSameAgent(_) => "allow_one_way_pair_same_agent",
             Self::OneWayLimit => "allow_one_way_limit",
-            Self::RolesUnknown => "unrestricted_roles_unknown",
+            Self::RolesUnknown => "exempt_roles_unknown",
         }
     }
 
@@ -137,7 +137,7 @@ mod tests {
             (DelegationWarning::OneWayPairInvalid(3), "allow_one_way_pair_invalid", "第 3 組單向委派配對格式有誤，已忽略。"),
             (DelegationWarning::OneWayPairSameAgent(3), "allow_one_way_pair_same_agent", "第 3 組單向委派配對重複選取同一位員工，已忽略。"),
             (DelegationWarning::OneWayLimit, "allow_one_way_limit", "單向委派配對超過 200 組，超出部分已忽略。"),
-            (DelegationWarning::RolesUnknown, "unrestricted_roles_unknown", "不受委派範圍限制的角色設定含有無法辨識的項目，已忽略。"),
+            (DelegationWarning::RolesUnknown, "exempt_roles_unknown", "不受委派範圍限制的角色設定含有無法辨識的項目，已忽略。"),
         ] {
             assert_eq!(warning.code(), code);
             assert_eq!(warning.message_zh(), message);
@@ -153,7 +153,7 @@ mod tests {
             ("[delegation]\npolicy='weird-xyz'\nallow=[['sales-lead','sales-lead'],['solo'],[1,2],['','x']]", vec!["policy_unknown", "allow_pair_same_agent", "allow_pair_invalid", "allow_pair_invalid", "allow_pair_invalid"]),
             ("[delegation]\nallow='raw-secret'", vec!["allow_not_list"]),
             ("[delegation]\nallow_one_way='raw-secret'", vec!["allow_one_way_not_list"]),
-            ("[delegation]\nallow_one_way=[['sales-lead','sales-lead'],['solo']]\nunrestricted_roles=['raw-role']", vec!["allow_one_way_pair_same_agent", "allow_one_way_pair_invalid", "unrestricted_roles_unknown"]),
+            ("[delegation]\nallow_one_way=[['sales-lead','sales-lead'],['solo']]\nunrestricted_roles=['raw-role']", vec!["allow_one_way_pair_same_agent", "allow_one_way_pair_invalid", "exempt_roles_unknown"]),
         ];
         for (raw, codes) in cases {
             let table: toml::Table = raw.parse().unwrap();
