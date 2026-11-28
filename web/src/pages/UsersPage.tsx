@@ -8,6 +8,7 @@ import { dashboardBaseUrl } from '@/lib/dashboard-base';
 import { InviteEmailPreview, InviteLinkDialog, InviteStatusChip } from './users/InviteControls';
 import { useAuthStore } from '@/stores/auth-store';
 import { AddMembersPage } from './users/AddMembersPage';
+import { SigninRequestsPanel, useSigninRequests } from './users/SigninRequestsPanel';
 import { OrgChartView } from './users/OrgChartView';
 import { OrgHistorySettings } from './users/OrgHistorySettings';
 import { EditUserDialog } from './users/UserFormDialogs';
@@ -41,7 +42,7 @@ import {
 } from '@/components/mds';
 import { Users, UserPlus, Loader2, AlertTriangle } from 'lucide-react';
 
-type UsersView = 'list' | 'org';
+type UsersView = 'list' | 'org' | 'pending';
 
 const COLUMNS = 'minmax(0,1.4fr) minmax(0,0.8fr) minmax(0,1.5fr) minmax(0,1.5fr) minmax(0,0.7fr) 2.5rem';
 
@@ -50,6 +51,7 @@ export function UsersPage() {
   const isMobile = useIsMobile();
   const agentName = useAgentDisplayName();
   const isAdmin = useAuthStore(s => s.user?.role === 'admin');
+  const signin = useSigninRequests(isAdmin);
   const [inviteStates, setInviteStates] = useState<Record<string, UserInviteState>>({});
   const [inviteLink, setInviteLink] = useState<string | null>(null);
   const [inviteUser, setInviteUser] = useState<UserDetail | null>(null);
@@ -73,6 +75,7 @@ export function UsersPage() {
   const [identities, setIdentities] = useState<Record<string, ChannelIdentity[] | 'error'>>({});
   const [showIdentityBind, setShowIdentityBind] = useState<string | null>(null);
   const [view, setView] = useState<UsersView>('list');
+  const currentView = view === 'pending' && !signin.available ? 'list' : view;
   const nameOf = (id?: string | null) => (id ? users.find((u) => u.id === id)?.display_name : undefined);
   const avatarAction = (user: UserDetail) => isAdmin && user.status === 'active'
     && (user.role === 'employee' || user.role === 'manager') && !user.avatar_agent_id ? (
@@ -237,14 +240,17 @@ export function UsersPage() {
         </div>
       )}
 
-      {!loading && users.length > 0 && (
+      {signin.error && <p role="alert" className="text-sm text-destructive">{signin.error}</p>}
+
+      {!loading && (users.length > 0 || signin.available) && (
         <Segmented<UsersView>
-          value={view}
+          value={currentView}
           onValueChange={setView}
           aria-label={intl.formatMessage({ id: 'users.view.label' })}
           options={[
             { value: 'list', label: intl.formatMessage({ id: 'users.view.list' }) },
             { value: 'org', label: intl.formatMessage({ id: 'users.view.org' }) },
+            ...(signin.available ? [{ value: 'pending' as const, label: <span className="inline-flex items-center gap-1.5">{intl.formatMessage({ id: 'users.signinRequests.segment' })} <span className="rounded-full bg-muted px-1.5 tabular-nums">{signin.requests.length}</span></span> }] : []),
           ]}
         />
       )}
@@ -253,9 +259,11 @@ export function UsersPage() {
         <div className="flex items-center justify-center py-16">
           <Loader2 className="size-6 animate-spin text-muted-foreground" />
         </div>
+      ) : currentView === 'pending' ? (
+        <SigninRequestsPanel requests={signin.requests} onChanged={async () => { await Promise.all([signin.refresh(), fetchUsers()]); }} />
       ) : users.length === 0 ? (
         <Empty icon={Users} title={intl.formatMessage({ id: 'users.title' })} />
-      ) : view === 'org' ? (
+      ) : currentView === 'org' ? (
         <OrgChartView users={users} onEdit={setShowEdit} />
       ) : (
         isMobile ? (

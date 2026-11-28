@@ -16,6 +16,8 @@ export interface ChannelIdentity {
   channel: string;
   channel_user_id: string;
   verified: boolean;
+  proof_status?: 'self_confirmed' | 'admin_prefilled';
+  proven_at?: string | null;
   created_at: string;
   /** `'google_account'`: a Google Chat identity recognised from the person's
    * own linked Google account (read-only here; removed by disconnecting

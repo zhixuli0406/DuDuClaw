@@ -29,3 +29,20 @@ export const googleSignin = {
   set: (params: GoogleSigninForm & { acknowledge_risk?: boolean; step_up_csrf?: number[] }) =>
     client.call('google.signin.set', { ...params }) as Promise<{ settings: GoogleSigninSettings }>,
 };
+
+/** Sign-in request timestamps are Unix seconds. */
+export interface SigninRequest {
+  id: string;
+  email: string;
+  display_name: string;
+  hd: string;
+  requested_at: number;
+  expires_at: number;
+}
+export const signinRequests = {
+  list: () => client.call('users.signin_requests.list', {}) as Promise<{ requests: SigninRequest[] }>,
+  approve: (id: string, mfaPreauthorize = false) => client.call('users.signin_requests.approve', {
+    id, ...(mfaPreauthorize ? { mfa_preauthorize: true } : {}),
+  }) as Promise<{ user_id: string }>,
+  reject: (id: string) => client.call('users.signin_requests.reject', { id }) as Promise<{ rejected: boolean }>,
+};

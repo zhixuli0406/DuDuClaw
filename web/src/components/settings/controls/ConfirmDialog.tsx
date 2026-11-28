@@ -27,6 +27,7 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel,
+  destructive = true,
   cancelLabel,
   requireText,
   requireTextHint,
@@ -40,6 +41,7 @@ export function ConfirmDialog({
   title: string;
   message: string;
   confirmLabel?: string;
+  destructive?: boolean;
   cancelLabel?: string;
   /** When set, the confirm button stays disabled until the user types this. */
   requireText?: string;
@@ -72,7 +74,7 @@ export function ConfirmDialog({
         </DialogHeader>
 
         <div className="flex items-start gap-3">
-          <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />
+          {destructive && <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-destructive" />}
           <p className="text-sm text-muted-foreground">{message}</p>
         </div>
 
@@ -97,7 +99,7 @@ export function ConfirmDialog({
           <Button variant="outline" onClick={onClose}>
             {cancelLabel ?? intl.formatMessage({ id: 'common.cancel' })}
           </Button>
-          <Button variant="destructive" onClick={onConfirm} disabled={!canConfirm}>
+          <Button variant={destructive ? 'destructive' : 'brand'} onClick={onConfirm} disabled={!canConfirm}>
             {busy
               ? intl.formatMessage({ id: 'common.saving' })
               : confirmLabel ?? intl.formatMessage({ id: 'common.delete' })}

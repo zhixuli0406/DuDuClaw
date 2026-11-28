@@ -5,6 +5,7 @@ import { useIntl } from 'react-intl';
 import { useNavigate } from 'react-router';
 import type { UserDetail } from '@/lib/api';
 import { UNBINDABLE_CHANNELS, type ChannelIdentity } from '@/lib/channel-identity-api';
+import { formatDateTime } from '@/lib/company-time';
 import { ROLE_LEVELS } from '@/lib/roles';
 import { useAgentsStore } from '@/stores/agents-store';
 import { useAuthStore, type UserRole } from '@/stores/auth-store';
@@ -184,18 +185,23 @@ export function IdentityChips({
         state.map((ident) => {
           const fromGoogle = ident.source === 'google_account';
           const removable = !fromGoogle && onRemove !== undefined && UNBINDABLE_CHANNELS.includes(ident.channel);
-          const label = `${channelLabel(ident.channel)} · ${ident.channel_user_id}`;
+          const label = `${channelLabel(ident.channel)} · ${Array.from(ident.channel_user_id).slice(-4).join('')}`;
+          const proof = ident.proof_status ? intl.formatMessage({ id: `users.channelIdentity.${ident.proof_status}` }) : '';
+          const title = [label, fromGoogle ? intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' }) : '',
+            ident.proven_at ? intl.formatMessage({ id: 'users.channelIdentity.provenAt' }, { time: formatDateTime(ident.proven_at, { locale: intl.locale }) }) : '',
+          ].filter(Boolean).join(' — ');
           return (
             <span
               key={`${ident.source ?? 'binding'}:${ident.channel}:${ident.channel_user_id}`}
-              className="group inline-flex max-w-48 items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
-              title={fromGoogle ? `${label} — ${intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })}` : label}
+              className="group inline-flex max-w-full items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              title={title}
             >
               <ShieldCheck
                 className="size-3 shrink-0 text-success"
                 aria-label={intl.formatMessage({ id: 'users.channelIdentity.verifiedTooltip' })}
               />
               <span className="truncate">{label}</span>
+              {proof && <span className={`shrink-0 border-l border-border pl-1 font-medium ${ident.proof_status === 'self_confirmed' ? 'text-success' : ''}`}>{proof}</span>}
               {fromGoogle && <Link2 className="size-3 shrink-0" aria-label={intl.formatMessage({ id: 'users.channelIdentity.fromGoogle' })} />}
               {removable && (
                 <button
