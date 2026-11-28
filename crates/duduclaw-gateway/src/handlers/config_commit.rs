@@ -362,7 +362,9 @@ pub fn refuse_odoo_widening_text_edit(before: &str, after: &str) -> Result<(), S
     super::config_raw_rpc::refuse_odoo_widening_edit(&parse(before)?, &parse(after)?)
 }
 
-pub(crate) fn refuse_odoo_agent_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
+/// Shared final-text guard for profile edits and creation. A new employee uses
+/// an empty `before`, which denies requester impersonation but allows overrides.
+pub fn refuse_odoo_agent_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
     let parse = |text: &str| text.parse::<toml::Table>()
         .map_err(|_| "無法讀取 AI 的 Odoo 權限設定，這次沒有變更設定。".to_string());
     super::config_raw_rpc::refuse_odoo_agent_widening_edit(&parse(before)?, &parse(after)?)
@@ -820,15 +822,14 @@ pub fn strip_odoo_agent_widening_preserving(before: &str, after: &str) -> Result
     }
     let previous = PermissionOverride::from_config(toml_at(&old, "odoo.permission_override").and_then(toml::Value::as_str));
     let override_ = toml_at(&original, "odoo.permission_override").and_then(toml::Value::as_str);
-    let safe_override = match override_ {
-        Some("engine" | "read_only") => None,
-        // Unknown overrides already mean read_only; preserve that restriction.
-        Some(value) if value != "inherit" => Some("read_only"),
-        _ if previous == PermissionOverride::ReadOnly => Some("read_only"),
-        Some(_) => Some("engine"),
-        None if previous == PermissionOverride::Engine => Some("engine"),
-        None => None,
-    };
+    let proposed = PermissionOverride::from_config(override_);
+    let safe_override = if proposed.restriction_rank() < previous.restriction_rank() {
+        match previous {
+            PermissionOverride::ReadOnly => Some("read_only"),
+            PermissionOverride::Engine => Some("engine"),
+            PermissionOverride::Inherit => None,
+        }
+    } else { None };
     if let Some(value) = safe_override {
         table_at_mut(&mut narrowed, &["odoo"])?.insert("permission_override".into(), toml::Value::String(value.into()));
     }
@@ -1500,7 +1501,7 @@ name = "oa1"
 
     #[test]
     fn strip_odoo_agent_restore_preserves_restrictions_and_unrelated_text() {
-        for (before, expected) in [("", "engine"),
+        for (before, expected) in [("", "inherit"),
             ("[odoo]\npermission_override = 'engine'\n", "engine"),
             ("[odoo]\npermission_override = 'read_only'\n", "read_only")] {
             let backup = "# agent\n[runtime]\nprovider = 'claude' # keep\n[odoo]\nact_as_requester = true # requester\npermission_override = 'inherit'\n";
@@ -1520,6 +1521,27 @@ name = "oa1"
         for override_ in ["engine", "read_only"] {
             let clean = format!("# clean\n[odoo]\nact_as_requester = false\npermission_override = '{override_}' # keep\n");
             assert_eq!(strip_odoo_agent_widening_preserving("", &clean).unwrap(), (clean, false));
+        }
+    }
+
+    #[test]
+    fn strip_odoo_agent_keeps_the_more_restrictive_override() {
+        use duduclaw_odoo::access_policy::PermissionOverride;
+        for before in [None, Some("inherit"), Some("engine"), Some("read_only"), Some("unknown")] {
+            for after in [None, Some("inherit"), Some("engine"), Some("read_only"), Some("unknown")] {
+                let text = |value: Option<&str>| value.map(|v|
+                    format!("# retained\n[odoo]\npermission_override = '{v}' # retained too\n"))
+                    .unwrap_or_else(|| "# retained\n".into());
+                let (out, changed) = strip_odoo_agent_widening_preserving(&text(before), &text(after)).unwrap();
+                let table: toml::Table = out.parse().unwrap();
+                let actual = PermissionOverride::from_config(toml_at(&table, "odoo.permission_override").and_then(toml::Value::as_str));
+                let old = PermissionOverride::from_config(before).restriction_rank();
+                let new = PermissionOverride::from_config(after).restriction_rank();
+                assert_eq!(actual.restriction_rank(), old.max(new), "{before:?} -> {after:?}");
+                assert_eq!(changed, new < old);
+                assert!(out.contains("# retained"));
+                if !changed { assert_eq!(out, text(after)); }
+            }
         }
     }
 

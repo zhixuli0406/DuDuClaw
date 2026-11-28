@@ -63,6 +63,12 @@ pub(crate) struct SealedInputs {
 
 // ── Pure helpers ────────────────────────────────────────────────────────
 
+fn refuse_odoo_creation(bytes: &[u8]) -> Result<(), AdoptError> {
+    let text = std::str::from_utf8(bytes).map_err(|_| AdoptError::SettingsInvalid)?;
+    crate::handlers::config_commit::refuse_odoo_agent_widening_text_edit("", text)
+        .map_err(|_| AdoptError::SettingsInvalid)
+}
+
 /// `settings` as the approval validator compares them (same algorithm as
 /// `employee_dirs::Snapshot::settings`).
 pub(crate) fn settings_from_toml(bytes: &[u8]) -> Result<String, AdoptError> {
@@ -417,6 +423,7 @@ mod fsops {
             .ok_or(AdoptError::ForeignDir)?;
         sealed.push("agent.toml (original)".to_owned());
         let agent_toml = if target == q.label { original } else { rename_agent(&original, target)? };
+        refuse_odoo_creation(&agent_toml)?;
         check_paths(&agent_toml, &needles)?;
         let mut soul_summary = String::new();
         for name in ["SOUL.md", "CONTRACT.toml"] {
@@ -446,6 +453,8 @@ mod fsops {
 
     /// The allowlist transform into a new `agents/<target>`.
     pub(super) fn transform(dirs: &Dirs, target: &str, inputs: &SealedInputs, verified: &quarantine::Sealed) -> Result<(), AdoptError> {
+        // Check the exact sealed bytes before any new directory or moved inode.
+        refuse_odoo_creation(&inputs.agent_toml)?;
         make_dir(&dirs.agents, target)?;
         let new = dirs.agents.child_dir(target, false).map_err(unavailable)?.ok_or(AdoptError::Inconsistent)?;
         let manifest = verified.stat_manifest.as_ref().and_then(|m| m["entries"].as_array()).ok_or(AdoptError::DigestMismatch)?;

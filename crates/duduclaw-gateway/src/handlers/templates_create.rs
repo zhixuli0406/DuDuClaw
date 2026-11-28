@@ -354,6 +354,9 @@ impl MethodHandler {
                     .map_err(|_| "Unable to preserve disabled template skills")?;
             }
 
+            // Validate the final serialized profile, including caller edits and
+            // runtime alignment, against a new employee's absent Odoo baseline.
+            super::config_commit::refuse_odoo_agent_widening_text_edit("", &agent_toml)?;
             tokio::fs::write(stage_dir.join("agent.toml"), &agent_toml)
                 .await
                 .map_err(|e| format!("Failed to write agent.toml: {e}"))?;
@@ -569,6 +572,58 @@ pub(super) fn prepare_template_runtime(home: &Path, original: &str) -> Result<(S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn templates_create_agent_checks_final_caller_text_against_absent_baseline() {
+        let home = tempfile::tempdir().unwrap();
+        let assets = tempfile::tempdir().unwrap();
+        let handler = MethodHandler::new(home.path().into()).await;
+        handler.set_agent_cap_fixture(Some(0)).await;
+        let assembled = crate::premium_templates::AssembledRole {
+            role_id: "owned-role".into(), kind: crate::premium_templates::RoleKind::Worker,
+            name: "template".into(), display_name: "Template".into(), trigger: "@Template".into(),
+            reports_to: String::new(), summary: "Owned fixture".into(), soul_md: "Helpful".into(),
+            contract_toml: String::new(), extras_dir: None,
+            agent_toml: include_str!("../../../../templates/evaluator/agent.toml").into(),
+        };
+        let admin = UserContext::admin_fallback();
+        let bad = format!("{}\n[odoo]\nact_as_requester = true\n", assembled.agent_toml);
+        let response = handler.create_assembled_template_agent(
+            &json!({"name":"unsafe","agent_toml":bad}), &admin, assets.path(), "owned-role", &assembled,
+        ).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
+            if e.as_str().is_some_and(|s| s.contains("Odoo 設定頁"))));
+        assert!(!home.path().join("agents/unsafe").exists());
+        assert!(handler.registry.read().await.get("unsafe").is_none());
+        // Team/template batch apply holds one admission and reaches the same
+        // final-text writer with assembled content rather than editor params.
+        let admission = match handler.admit_agent_seats(1, None).await {
+            Ok(value) => value,
+            Err(_) => panic!("owned fixture must admit one employee"),
+        };
+        let mut unsafe_role = assembled.clone();
+        unsafe_role.agent_toml = bad;
+        let response = handler.create_template_with_skills(
+            &json!({"name":"unsafe-batch"}), &admin, assets.path(), "owned-role", &unsafe_role,
+            Some(&std::collections::BTreeMap::new()), false, false, &[], Some(&admission),
+        ).await;
+        assert!(matches!(response, WsFrame::Response { ok: false, error: Some(ref e), .. }
+            if e.as_str().is_some_and(|s| s.contains("Odoo 設定頁"))));
+        assert!(!home.path().join("agents/unsafe-batch").exists());
+        drop(admission);
+        for (index, fields) in ["", "permission_override='inherit'", "permission_override='engine'",
+            "permission_override='read_only'", "permission_override='unknown'"].into_iter().enumerate() {
+            let name = format!("safe-{index}");
+            let text = format!("{}\n[odoo]\n{fields}\n", assembled.agent_toml);
+            let response = handler.create_assembled_template_agent(
+                &json!({"name":name,"agent_toml":text}), &admin, assets.path(), "owned-role", &assembled,
+            ).await;
+            assert!(matches!(response, WsFrame::Response { ok: true, .. }), "{response:?}");
+            let published = std::fs::read_to_string(home.path().join("agents").join(&name).join("agent.toml")).unwrap();
+            super::super::config_commit::refuse_odoo_agent_widening_text_edit("", &published).unwrap();
+            assert!(handler.registry.read().await.get(&name).is_some());
+        }
+    }
 
     #[test]
     fn templates_create_evolution_defaults_on_and_preserves_explicit_false() {

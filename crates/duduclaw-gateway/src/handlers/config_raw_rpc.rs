@@ -873,8 +873,7 @@ pub(crate) fn refuse_odoo_agent_widening_edit(before: &toml::Table, after: &toml
     };
     if (toml_at(after, "odoo.act_as_requester").and_then(toml::Value::as_bool) == Some(true)
         && toml_at(before, "odoo.act_as_requester").and_then(toml::Value::as_bool) != Some(true))
-        || (override_mode(after)? == PermissionOverride::Inherit
-            && override_mode(before)? != PermissionOverride::Inherit)
+        || (override_mode(after)?.restriction_rank() < override_mode(before)?.restriction_rank())
     {
         return Err(ODOO_WIDENING_REFUSED.into());
     }

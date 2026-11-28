@@ -394,6 +394,16 @@ pub enum PermissionOverride {
 }
 
 impl PermissionOverride {
+    /// Higher ranks restrict more operations. Compare parsed values so unknown
+    /// configuration strings retain their fail-closed read-only semantics.
+    pub fn restriction_rank(self) -> u8 {
+        match self {
+            Self::Inherit => 0,
+            Self::Engine => 1,
+            Self::ReadOnly => 2,
+        }
+    }
+
     /// Unknown values are deliberately indistinguishable from read_only.
     pub fn from_config(value: Option<&str>) -> Self {
         match value {

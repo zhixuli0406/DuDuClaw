@@ -268,9 +268,8 @@ pub async fn cmd_wizard(home: &Path) -> Result<()> {
         // Generate a minimal agent.toml from scratch
         let toml_content =
             generate_agent_toml(&agent_name, &company_name, channel_name, &selected_features);
-        tokio::fs::write(&agent_toml_path, toml_content)
-            .await
-            .map_err(|e| DuDuClawError::Agent(format!("Failed to write agent.toml: {e}")))?;
+        crate::write_new_agent_toml(&agent_toml_path, &toml_content)
+            .await.map_err(DuDuClawError::Agent)?;
     }
 
     // WP22 T1 — record the authoritative org placement in `<home>/org.toml`.
@@ -562,6 +561,12 @@ async fn copy_template_files(src: &Path, dst: &Path) -> Result<()> {
                 ))
             })?;
             Box::pin(copy_template_files(&src_path, &dst_path)).await?;
+        } else if name_str == "agent.toml" {
+            // Validate and publish the same bytes; copying the source again
+            // after validation would allow it to change between the two reads.
+            let text = tokio::fs::read_to_string(&src_path).await
+                .map_err(|e| DuDuClawError::Agent(format!("Cannot read template: {e}")))?;
+            crate::write_new_agent_toml(&dst_path, &text).await.map_err(DuDuClawError::Agent)?;
         } else {
             tokio::fs::copy(&src_path, &dst_path).await.map_err(|e| {
                 DuDuClawError::Agent(format!(
@@ -787,6 +792,21 @@ max_tool_calls_per_turn = 5
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wizard_template_copy_refuses_odoo_requester_before_writing_profile() {
+        let source = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let bad = "[agent]\nname='template'\n[odoo]\nact_as_requester=true\n";
+        std::fs::write(source.path().join("agent.toml"), bad).unwrap();
+        let error = copy_template_files(source.path(), target.path()).await.unwrap_err();
+        assert!(error.to_string().contains("Odoo 設定頁"));
+        assert!(!target.path().join("agent.toml").exists());
+        let safe = "# retained\n[agent]\nname='template'\n[odoo]\npermission_override='engine'\n";
+        std::fs::write(source.path().join("agent.toml"), safe).unwrap();
+        copy_template_files(source.path(), target.path()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(target.path().join("agent.toml")).unwrap(), safe);
+    }
 
     #[tokio::test]
     async fn wizard_patch_preserves_lifecycle_and_unrelated_fields() {
