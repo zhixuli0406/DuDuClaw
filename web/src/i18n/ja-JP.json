@@ -12003,5 +12003,10 @@
   "approvalConfirm.loading": "承認内容を読み込み中…",
   "approvalConfirm.unknownPerson": "不明なメンバー",
   "approvalConfirm.unknownAgent": "表示できない AI スタッフ",
-  "approvalConfirm.inboxContent": "この承認の詳細はダッシュボードの受信トレイで確認してください。"
+  "approvalConfirm.inboxContent": "この承認の詳細はダッシュボードの受信トレイで確認してください。",
+  "approvalConfirm.workflowVersion": "ワークフロー：{workflow_id}　第 {revision} 版",
+  "settings.delegation.changed": "読み込み後に委任設定が変更されました。再読み込みしてから編集してください。",
+  "settings.delegation.reload": "再読み込み",
+  "settings.delegation.safeWarning": "委任設定の一部を認識できないため、より制限の厳しいルールを適用しています。管理者に委任権限の設定を確認してもらってください。",
+  "settings.delegation.warningCount": "（{count} 件）"
 }

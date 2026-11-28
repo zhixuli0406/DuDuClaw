@@ -119,7 +119,10 @@ export function ApprovalConfirmPage() {
           <p className="whitespace-pre-wrap break-words text-sm">{approval.summary}</p>
           <h3 className="text-sm font-medium">{t('content')}</h3>
           {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={resolveAgentName(agentId)} resolveAgentName={resolveAgentName} resolvePerson={resolvePerson} />}
-          {approval.kind === 'workflow_activation' && <WorkflowActivationFacts approval={approval} />}
+          {approval.kind === 'workflow_activation' && <>
+            <p className="text-sm">{t('workflowVersion', { workflow_id: approval.workflow_activation!.workflow_id!, revision: approval.workflow_activation!.revision! })}</p>
+            <WorkflowActivationFacts approval={approval} />
+          </>}
           {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={resolveAgentName(agentId)} preview={preview.agent_file_change} resolvePerson={resolvePerson} />}
           {approval.kind === 'admin_ai_settings' && (settings ? <AdminAiSettingsFacts payload={settings} /> : <p className="text-sm">{t('inboxContent')}</p>)}
           {!['org_change', 'workflow_activation', 'agent_file_change', 'admin_ai_settings'].includes(approval.kind)

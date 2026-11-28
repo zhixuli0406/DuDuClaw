@@ -12003,5 +12003,10 @@
   "approvalConfirm.loading": "Loading approval content…",
   "approvalConfirm.unknownPerson": "Unknown member",
   "approvalConfirm.unknownAgent": "Unavailable AI staff member",
-  "approvalConfirm.inboxContent": "View the full content of this approval in the dashboard inbox."
+  "approvalConfirm.inboxContent": "View the full content of this approval in the dashboard inbox.",
+  "approvalConfirm.workflowVersion": "Workflow: {workflow_id}, version {revision}",
+  "settings.delegation.changed": "Delegation settings have changed since you loaded them. Reload before editing.",
+  "settings.delegation.reload": "Reload",
+  "settings.delegation.safeWarning": "Some delegation settings could not be recognized. The system is using more restrictive rules. Ask an administrator to check delegation permissions.",
+  "settings.delegation.warningCount": " ({count} warnings)"
 }

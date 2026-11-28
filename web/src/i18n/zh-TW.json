@@ -12003,5 +12003,10 @@
   "approvalConfirm.loading": "正在載入審批內容…",
   "approvalConfirm.unknownPerson": "未知的成員",
   "approvalConfirm.unknownAgent": "無法顯示的 AI 員工",
-  "approvalConfirm.inboxContent": "這類審批的完整內容請到儀表板收件匣查看。"
+  "approvalConfirm.inboxContent": "這類審批的完整內容請到儀表板收件匣查看。",
+  "approvalConfirm.workflowVersion": "工作流程：{workflow_id}　第 {revision} 版",
+  "settings.delegation.changed": "委派設定在你載入後已被修改，請重新整理後再編輯。",
+  "settings.delegation.reload": "重新整理",
+  "settings.delegation.safeWarning": "目前的委派設定有部分內容無法辨識，系統已改用較保守的規則。請管理員檢查委派權限設定。",
+  "settings.delegation.warningCount": "（{count} 項）"
 }

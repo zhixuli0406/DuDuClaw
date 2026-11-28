@@ -38,7 +38,7 @@ function nullableString(value: unknown): boolean {
 }
 function isWorkflowActivation(value: unknown): boolean {
   if (!isRecord(value) || !nonEmpty(value.workflow_id) || !finiteNumber(value.revision)
-    || !Array.isArray(value.effect_targets) || !value.effect_targets.every(target =>
+    || !Array.isArray(value.effect_targets) || value.effect_targets.length < 1 || !value.effect_targets.every(target =>
       isRecord(target) && nonEmpty(target.step_id) && nonEmpty(target.tool)
       && nullableString(target.param) && nullableString(target.target))) return false;
   if (('expires_at' in value && !nullableString(value.expires_at))
@@ -55,10 +55,19 @@ function isWorkflowActivation(value: unknown): boolean {
   return true;
 }
 function isFileDiff(value: unknown): boolean {
-  return isRecord(value) && finiteNumber(value.added) && finiteNumber(value.removed)
-    && Array.isArray(value.hunks) && value.hunks.every(hunk => isRecord(hunk)
-      && ['equal', 'add', 'remove'].includes(hunk.op as string)
-      && Array.isArray(hunk.lines) && hunk.lines.every(line => typeof line === 'string'));
+  if (!isRecord(value) || !finiteNumber(value.added) || !finiteNumber(value.removed)
+    || !Number.isInteger(value.added) || value.added < 0
+    || !Number.isInteger(value.removed) || value.removed < 0
+    || value.added + value.removed < 1 || !Array.isArray(value.hunks)) return false;
+  let added = 0;
+  let removed = 0;
+  for (const hunk of value.hunks) {
+    if (!isRecord(hunk) || !['equal', 'add', 'remove'].includes(hunk.op as string)
+      || !Array.isArray(hunk.lines) || !hunk.lines.every(line => typeof line === 'string')) return false;
+    if (hunk.op === 'add') added += hunk.lines.length;
+    if (hunk.op === 'remove') removed += hunk.lines.length;
+  }
+  return value.added === added && value.removed === removed;
 }
 function isPreview(value: unknown): value is ApprovalStepUpPreview {
   if (!isRecord(value) || value.status !== 'live' || !nonEmpty(value.digest)

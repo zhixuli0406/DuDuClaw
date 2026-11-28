@@ -192,7 +192,7 @@ it('uses the file-change HTTP projection without fetching a second version', asy
     approval: { ...preview.approval, kind: 'agent_file_change', payload: {} },
     agent_file_change: { approval_id: preview.approval.id, agent_id: 'Employee', file: 'soul',
       requested_by: 'Owner', reason: 'File review reason', verdict: 'pass', reason_categories: [],
-      stale: false, content_available: true, diff: { added: 0, removed: 0, hunks: [] } },
+      stale: false, content_available: true, diff: { added: 1, removed: 0, hunks: [{ op: 'add', lines: ['New line'] }] } },
   }));
   page();
   expect(await screen.findByText('File review reason')).toBeInTheDocument();
@@ -352,7 +352,7 @@ it('shows the inbox fallback when filtering leaves no evidence', async () => {
 const fileProjection = {
   approval_id: preview.approval.id, agent_id: 'Employee', file: 'soul',
   requested_by: 'PRIVATE-PERSON', reason: 'Review file', verdict: 'pass', reason_categories: [],
-  stale: false, content_available: true, diff: { added: 0, removed: 0, hunks: [] },
+  stale: false, content_available: true, diff: { added: 1, removed: 0, hunks: [{ op: 'add', lines: ['New line'] }] },
 };
 it.each([
   ['mismatched digest', { ...preview.approval, digest: 'different' }],
@@ -440,6 +440,7 @@ const orgPayload = {
   after: { reports_to: 'Manager', department: 'Support' }, reason: 'Change team',
 };
 it.each([
+  ['empty effect targets', { kind: 'workflow_activation', workflow_activation: { ...workflowFacts, effect_targets: [] } }],
   ['empty workflow', { kind: 'workflow_activation', workflow_activation: {} }],
   ['workflow target missing tool', { kind: 'workflow_activation', workflow_activation: {
     ...workflowFacts, effect_targets: [{ step_id: 'send', param: null, target: null }],
@@ -454,12 +455,17 @@ it.each([
   fetchMock.mockResolvedValueOnce(response({ ...preview, approval: { ...preview.approval, ...approval } }));
   page(undefined, zhTW);
   expect(await screen.findByRole('alert')).toHaveTextContent(zhTW['approvalConfirm.unavailable']);
-  expect(screen.queryByRole('button', { name: '核准' })).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: '拒絕' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
   expect(screen.getByRole('link')).toHaveAttribute('href', '/inbox');
   expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
 });
 it.each([
+  ['positive count without hunks', { diff: { added: 1, removed: 0, hunks: [] } }],
+  ['no changed lines', { diff: { added: 0, removed: 0, hunks: [] } }],
+  ['mismatched added count', { diff: { added: 2, removed: 0, hunks: [{ op: 'add', lines: ['New'] }] } }],
+  ['mismatched removed count', { diff: { added: 0, removed: 2, hunks: [{ op: 'remove', lines: ['Old'] }] } }],
+  ['negative count', { diff: { added: -1, removed: 2, hunks: [{ op: 'remove', lines: ['Old', 'Older'] }] } }],
+  ['fractional count', { diff: { added: 0.5, removed: 0.5, hunks: [] } }],
   ['empty diff', { diff: {} }],
   ['missing hunks', { diff: { added: 1, removed: 0 } }],
   ['missing lines', { diff: { added: 1, removed: 0, hunks: [{ op: 'add' }] } }],
@@ -476,8 +482,7 @@ it.each([
   }));
   page(undefined, zhTW);
   expect(await screen.findByRole('alert')).toHaveTextContent(zhTW['approvalConfirm.unavailable']);
-  expect(screen.queryByRole('button', { name: '核准' })).not.toBeInTheDocument();
-  expect(screen.queryByRole('button', { name: '拒絕' })).not.toBeInTheDocument();
+  expect(screen.queryByRole('button')).not.toBeInTheDocument();
   expect(fetchMock.mock.calls.filter(([, options]) => options.method === 'POST')).toHaveLength(0);
 });
 it.each(['expert_skills_enable', 'autopilot_action', 'cli_egress', 'egress_guard'])('blocks decisions for filtered-only %s evidence', async kind => {
@@ -523,4 +528,14 @@ it('shows an unknown member for an id-like file requester', async () => {
   page(undefined, zhTW);
   expect(await screen.findByText('未知的成員')).toBeInTheDocument();
   expect(document.body.textContent).not.toContain('PRIVATE-PERSON');
+});
+
+it('shows the workflow name and revision above its facts', async () => {
+  fetchMock.mockResolvedValueOnce(response({ ...preview,
+    approval: { ...preview.approval, kind: 'workflow_activation', workflow_activation: workflowFacts },
+  }));
+  page(undefined, zhTW);
+  const heading = await screen.findByText('工作流程：workflow-private　第 1 版', { normalizer: text => text });
+  expect(heading.compareDocumentPosition(screen.getByRole('region', { name: '工作流啟用' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  expect(screen.getByRole('button', { name: '拒絕' })).toBeEnabled();
 });
