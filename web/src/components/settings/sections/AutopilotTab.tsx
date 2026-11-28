@@ -1,6 +1,8 @@
 import { formatDateTime, getCompanyTimeZone, useCompanyTimeZone, zoneLabel } from '@/lib/company-time';
 import { useEffect, useState, useCallback } from 'react';
 import { useIntl } from 'react-intl';
+import { useAuthStore } from '@/stores/auth-store';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { cn } from '@/lib/utils';
 import { api, type AutopilotRule, type AutopilotHistoryEntry } from '@/lib/api';
 import { useUserNames } from '@/lib/use-user-names';
@@ -8,6 +10,7 @@ import { windowSummary, type ActiveWindow, ruleActionTarget } from '@/lib/autopi
 import { canCancelRun, runStateMessageId, runReasonMessageId, type AutopilotRun, describeHistoryResult, HISTORY_TONE_CLASS } from '@/lib/autopilot-history';
 import { toast, formatError } from '@/lib/toast';
 import {
+  useErrorMessage,
   Card,
   Button,
   Badge,
@@ -22,11 +25,13 @@ import {
 import { ConfirmDialog } from '@/components/settings/controls';
 import { Plus, Clock, XCircle, Workflow, Pencil } from 'lucide-react';
 import { TickSourcesCard } from './TickSourcesCard';
-import { AutopilotRuleDialog, useActionLabel, useTriggerLabel } from './AutopilotRuleDialog';
+import { AutopilotRuleDialog, type DepartmentRuleMode, useActionLabel, useTriggerLabel } from './AutopilotRuleDialog';
 
 // ── Autopilot Tab ───────────────────────────────────────────
 
-export function AutopilotTab() {
+export function AutopilotTab({ departmentMode }: { departmentMode?: DepartmentRuleMode } = {}) {
+  const errorText = useErrorMessage();
+  const showError = (error: unknown) => departmentMode && error != null ? settingsRefusal(error, errorText(error)) : error;
   const intl = useIntl();
   const { nameOf } = useUserNames();
   useCompanyTimeZone();
@@ -52,15 +57,15 @@ export function AutopilotTab() {
     setLoadError(null);
     try {
       const result = await api.autopilot.list();
-      setRules(result?.rules ?? []);
+      setRules((result?.rules ?? []).filter(rule => !departmentMode || rule.owner_department === departmentMode.department));
     } catch (e) {
       setRules([]);
       setLoadError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: departmentMode ? settingsRefusal(e, errorText(e)) : formatError(e) }));
     } finally {
       setLoading(false);
     }
-  }, [intl]);
+  }, [intl, departmentMode, errorText]);
 
   useEffect(() => { fetchRules(); }, [fetchRules]);
 
@@ -72,9 +77,9 @@ export function AutopilotTab() {
     } catch (e) {
       setRules((prev) => prev.map((r) => (r.id === ruleId ? { ...r, enabled: !enabled } : r)));
       setActionError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: departmentMode ? settingsRefusal(e, errorText(e)) : formatError(e) }));
     }
-  }, [intl]);
+  }, [intl, departmentMode, errorText]);
 
   const handleRemove = useCallback(async () => {
     if (!removeTarget) return;
@@ -84,10 +89,10 @@ export function AutopilotTab() {
       setRules((prev) => prev.filter((r) => r.id !== removeTarget.id));
     } catch (e) {
       setActionError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.actionFailed' }, { message: departmentMode ? settingsRefusal(e, errorText(e)) : formatError(e) }));
     }
     setRemoveTarget(null);
-  }, [removeTarget, intl]);
+  }, [removeTarget, intl, departmentMode, errorText]);
 
   const handleViewHistory = useCallback(async (ruleId: string) => {
     setHistoryRuleId(ruleId);
@@ -98,13 +103,13 @@ export function AutopilotTab() {
     } catch (e) {
       setHistoryEntries([]);
       setHistoryError(e);
-      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: formatError(e) }));
+      toast.error(intl.formatMessage({ id: 'toast.error.loadFailed' }, { message: departmentMode ? settingsRefusal(e, errorText(e)) : formatError(e) }));
     }
-  }, [intl]);
+  }, [intl, departmentMode, errorText]);
 
   return (
     <div className="space-y-6">
-      <TickSourcesCard />
+      {!departmentMode && <TickSourcesCard />}
 
       <div className="flex items-center justify-between gap-2">
         <p className="text-sm text-muted-foreground">
@@ -112,14 +117,15 @@ export function AutopilotTab() {
         </p>
         <Button variant="brand" size="sm" onClick={() => setShowCreate(true)}>
           <Plus />
-          {intl.formatMessage({ id: 'autopilot.create' })}
+          {intl.formatMessage({ id: departmentMode ? 'routines.departmentRules.create' : 'autopilot.create' })}
         </Button>
       </div>
 
       {actionError != null && (
         <ErrorState
           variant="inline"
-          error={actionError}
+          error={showError(actionError)}
+          description={departmentMode ? settingsRefusal(actionError, errorText(actionError)) : undefined}
           title={intl.formatMessage({ id: 'errorState.manage.actionFailed' })}
           onRetry={() => { setActionError(null); void fetchRules(); }}
           retryLabel={intl.formatMessage({ id: 'errorState.manage.reload' })}
@@ -132,9 +138,9 @@ export function AutopilotTab() {
         </p>
       ) : loadError != null ? (
         <ErrorState
-          error={loadError}
+          error={showError(loadError)}
           title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
-          description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+          description={departmentMode ? settingsRefusal(loadError, errorText(loadError)) : intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
           onRetry={() => void fetchRules()}
         />
       ) : rules.length === 0 ? (
@@ -230,12 +236,14 @@ export function AutopilotTab() {
       {/* Create / Edit Rule Dialog */}
       {showCreate && (
         <AutopilotRuleDialog
+          departmentMode={departmentMode}
           onClose={() => setShowCreate(false)}
           onSaved={() => { setShowCreate(false); fetchRules(); }}
         />
       )}
       {editRule && (
         <AutopilotRuleDialog
+          departmentMode={departmentMode}
           rule={editRule}
           onClose={() => setEditRule(null)}
           onSaved={() => { setEditRule(null); fetchRules(); }}
@@ -246,7 +254,8 @@ export function AutopilotTab() {
       {historyRuleId && (
         <AutopilotHistoryDialog
           entries={historyEntries}
-          error={historyError}
+          refusal={departmentMode && historyError != null ? settingsRefusal(historyError, errorText(historyError)) : undefined}
+          error={showError(historyError)}
           onRetry={() => void handleViewHistory(historyRuleId)}
           onClose={() => { setHistoryRuleId(null); setHistoryError(null); }}
         />
@@ -283,11 +292,13 @@ export function HistoryResultBadge({ result }: { result: unknown }) {
 
 function AutopilotHistoryDialog({
   entries,
+  refusal,
   error,
   onRetry,
   onClose,
 }: {
   entries: ReadonlyArray<AutopilotHistoryEntry>;
+  refusal?: string;
   /** Set when the history fetch failed — never rendered as "no history". */
   error?: unknown;
   onRetry?: () => void;
@@ -306,7 +317,7 @@ function AutopilotHistoryDialog({
             <ErrorState
               error={error}
               title={intl.formatMessage({ id: 'errorState.manage.loadFailed' })}
-              description={intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
+              description={refusal ?? intl.formatMessage({ id: 'errorState.manage.notEmptyHint' })}
               onRetry={onRetry}
             />
           ) : entries.length === 0 ? (
@@ -340,6 +351,9 @@ function AutopilotHistoryDialog({
 
 function RuleRuns({ rule }: { rule: AutopilotRule }) {
   const intl = useIntl();
+  const user = useAuthStore(s => s.user);
+  const admin = !user || user.role === 'admin';
+  const errorText = useErrorMessage();
   const t = (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values);
   const actionLabel = useActionLabel();
   const [open, setOpen] = useState(false);
@@ -373,7 +387,7 @@ function RuleRuns({ rule }: { rule: AutopilotRule }) {
     <Button variant="ghost" size="sm" aria-expanded={open} onClick={() => setOpen(value => !value)}>{t('autopilot.runs.title')}</Button>
     {open && <div className="space-y-3">
       <Button variant="outline" size="sm" onClick={() => void load()} disabled={loading}>{t('autopilot.runs.refresh')}</Button>
-      {loading ? <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p> : error != null ? <div role="alert" className="text-sm text-destructive">{t('autopilot.runs.loadFailed')}</div> : runs.length === 0 ? <p className="text-sm text-muted-foreground">{t('autopilot.runs.empty')}</p> : runs.map(run => <div key={run.run_id} className="space-y-2 rounded-md border border-surface-border p-3 text-sm">
+      {loading ? <p role="status" className="text-sm text-muted-foreground">{t('common.loading')}</p> : error != null ? <div role="alert" className="text-sm text-destructive">{admin ? t('autopilot.runs.loadFailed') : settingsRefusal(error, errorText(error))}</div> : runs.length === 0 ? <p className="text-sm text-muted-foreground">{t('autopilot.runs.empty')}</p> : runs.map(run => <div key={run.run_id} className="space-y-2 rounded-md border border-surface-border p-3 text-sm">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <time>{formatDateTime(run.created_at, { locale: intl.locale })}</time>
           <Badge variant="secondary">{t(runStateMessageId(run.state))}</Badge>
@@ -389,7 +403,7 @@ function RuleRuns({ rule }: { rule: AutopilotRule }) {
             {step.step_type === 'wait' && step.step_index === run.step_index && run.state === 'waiting' && run.next_at && <span>{t('autopilot.runs.resume', { time: formatDateTime(run.next_at, { locale: intl.locale, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) })}</span>}
           </li>;
         })}</ol>
-        {canCancelRun(run.state) && <Button variant="outline" size="sm" onClick={() => { setCancelTarget(run.run_id); setCancelError(false); }}>{t('autopilot.runs.cancel')}</Button>}
+        {admin && canCancelRun(run.state) && <Button variant="outline" size="sm" onClick={() => { setCancelTarget(run.run_id); setCancelError(false); }}>{t('autopilot.runs.cancel')}</Button>}
       </div>)}
     </div>}
     <ConfirmDialog open={cancelTarget != null} onClose={() => { if (!cancelling) setCancelTarget(null); }} onConfirm={() => void cancel()} busy={cancelling} title={t('autopilot.runs.cancel')} message={t('autopilot.runs.cancelConfirm')} confirmLabel={t('autopilot.runs.cancel')}>

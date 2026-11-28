@@ -12648,5 +12648,10 @@
   "routines.rules.col.targets": "対象",
   "routines.rules.col.approval": "承認が必要",
   "routines.rules.col.department": "所属部署",
-  "routines.rules.col.latest": "最新の実行"
+  "routines.rules.col.latest": "最新の実行",
+  "routines.tabs.departmentRules": "部門の自動化ルール",
+  "routines.departmentRules.create": "部門の自動化ルールを追加",
+  "routines.departmentRules.destination": "通知先",
+  "routines.departmentRules.chooseDestination": "通知先を選択",
+  "routines.departmentRules.approvalNote": "「実行前に承認が必要」を選んだステップの承認は、引き続き管理者が行います。"
 }

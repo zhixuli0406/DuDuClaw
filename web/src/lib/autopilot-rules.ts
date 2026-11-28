@@ -146,6 +146,7 @@ export interface AutopilotRule {
 }
 
 export interface AutopilotCreateParams {
+  owner_department?: string;
   active_window?: ActiveWindow | null;
   run_policy?: { outside_window: 'skip' } | null;
   name: string;
@@ -155,6 +156,7 @@ export interface AutopilotCreateParams {
 }
 
 export interface AutopilotUpdateFields {
+  owner_department?: string;
   active_window?: ActiveWindow | null;
   run_policy?: { outside_window: 'skip' } | null;
   name?: string;

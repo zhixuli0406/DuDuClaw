@@ -12648,5 +12648,10 @@
   "routines.rules.col.targets": "目標",
   "routines.rules.col.approval": "要核准",
   "routines.rules.col.department": "所屬部門",
-  "routines.rules.col.latest": "最近觸發"
+  "routines.rules.col.latest": "最近觸發",
+  "routines.tabs.departmentRules": "部門自動化規則",
+  "routines.departmentRules.create": "新增部門自動化規則",
+  "routines.departmentRules.destination": "通知對象",
+  "routines.departmentRules.chooseDestination": "選擇通知對象",
+  "routines.departmentRules.approvalNote": "勾了「執行前要人核准」的步驟，核准卡仍由管理員決定。"
 }

@@ -12648,5 +12648,10 @@
   "routines.rules.col.targets": "Targets",
   "routines.rules.col.approval": "Approval required",
   "routines.rules.col.department": "Department",
-  "routines.rules.col.latest": "Latest trigger"
+  "routines.rules.col.latest": "Latest trigger",
+  "routines.tabs.departmentRules": "Department automation rules",
+  "routines.departmentRules.create": "New department automation rule",
+  "routines.departmentRules.destination": "Notification recipient",
+  "routines.departmentRules.chooseDestination": "Choose a notification recipient",
+  "routines.departmentRules.approvalNote": "Steps marked “Require approval before running” are still approved by an administrator."
 }

@@ -1634,6 +1634,14 @@ export type {
 } from './autopilot-rules';
 export type { AutopilotHistoryResult } from './autopilot-history';
 /** Safe member-facing rule projection returned by autopilot.affecting_me. */
+export interface AutopilotNotifyDestination {
+  channel: string;
+  chat_id: string;
+  kind: 'self' | 'agent';
+  agent_id: string | null;
+  label: string;
+}
+
 export interface AffectingAutopilotRule {
   id: string;
   name: string;
@@ -9793,6 +9801,8 @@ export const api = {
       ) as Promise<CanvasGetResult>,
   },
   autopilot: {
+    notifyDestinations: (department: string) =>
+      client.call('autopilot.notify_destinations', { owner_department: department }) as Promise<{ destinations: AutopilotNotifyDestination[] }>,
     affectingMe: (agentId?: string) =>
       client.call('autopilot.affecting_me', agentId ? { agent_id: agentId } : {}) as Promise<{ rules: AffectingAutopilotRule[] }>,
     templateFields: (triggerEvent: string, sequence?: unknown) =>

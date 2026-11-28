@@ -409,3 +409,52 @@ it('stores the member tab in the URL and responds to URL changes', async () => {
   await userEvent.click(screen.getByRole('button', { name: 'Navigate to schedules' }));
   expect(screen.getByRole('tab', { name: 'Schedules' })).toHaveAttribute('aria-selected', 'true');
 });
+
+// S-22: department automation grants are independent from schedule grants.
+describe('department automation tab', () => {
+  it.each([
+    ['manager', ['automation'], true],
+    ['manager', ['schedules'], false],
+    ['employee', ['automation'], false],
+    ['admin', ['automation'], false],
+    ['manager', [], false],
+  ])('gates %s with %j grants', (role, groups, visible) => {
+    useAuthStore.setState({ user: { id: 'scope-user', role } as never,
+      deptGrants: [{ department: 'Sales', groups } as never] });
+    renderWithProviders(<RoutinesPage />);
+    const tab = screen.queryByRole('tab', { name: 'Department automation rules' });
+    expect(!!tab).toBe(visible);
+  });
+
+  it('lists only automation departments and isolates rule workspaces when switching', async () => {
+    useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never,
+      deptGrants: [
+        { department: 'Sales', groups: ['automation'] },
+        { department: 'Support', groups: ['automation'] },
+        { department: 'Finance', groups: ['schedules'] },
+      ] });
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+      method === 'users.dept_grants.mine' ? { grants: [], agents: [], needs_sync: [] }
+      : method === 'agents.list' ? { agents: [] }
+      : method === 'autopilot.notify_destinations' ? { destinations: [] }
+      : method === 'autopilot.list' ? { rules: [
+        { id: 'sales-rule', name: 'Sales rule', owner_department: 'Sales', trigger_event: 'task_created', action: { type: 'delegate' } },
+        { id: 'support-rule', name: 'Support rule', owner_department: 'Support', trigger_event: 'task_created', action: { type: 'delegate' } },
+      ] }
+      : { tasks: [] }));
+    renderWithProviders(<RoutinesPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Department automation rules' }));
+    await screen.findByText('Sales rule');
+    expect(screen.queryByText('Support rule')).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('combobox', { name: 'Department' }), { key: 'ArrowDown' });
+    await screen.findByRole('listbox');
+    const options = screen.getAllByRole('option');
+    expect(options.map(option => option.textContent)).toEqual(['Sales', 'Support']);
+    await userEvent.click(screen.getByRole('option', { name: 'Support' }));
+    await screen.findByText('Support rule');
+    expect(screen.queryByText('Sales rule')).not.toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.dept_grants.mine', { group: 'automation' });
+    expect(mockWsClient.call).toHaveBeenCalledWith('autopilot.notify_destinations', { owner_department: 'Support' });
+  });
+});

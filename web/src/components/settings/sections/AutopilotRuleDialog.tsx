@@ -5,7 +5,8 @@ import { useIntl } from 'react-intl';
 import { Link } from 'react-router';
 import { Plus, Trash2, AlertTriangle } from 'lucide-react';
 import { useAgentsStore } from '@/stores/agents-store';
-import { api } from '@/lib/api';
+import { api, type AutopilotNotifyDestination } from '@/lib/api';
+import { settingsRefusal } from '@/lib/settings-refusal';
 import { formatError, formatErrorDetail } from '@/lib/toast';
 import { channelLabel } from '@/lib/session-channel';
 import { glyphText } from '@/lib/agent-glyph';
@@ -35,6 +36,7 @@ import {
   type RuleFormState,
 } from '@/lib/autopilot-rules';
 import {
+  useErrorMessage,
   DropdownMenu,
   DropdownMenuTrigger,
   DropdownMenuContent,
@@ -120,6 +122,14 @@ const MISSING_FIELD_LABEL: Record<string, string> = {
   text: 'autopilot.field.text',
 };
 
+export interface DepartmentRuleMode {
+  department: string;
+  agents: ReadonlyArray<{ id: string; display_name: string }>;
+  notifyDestinations: ReadonlyArray<AutopilotNotifyDestination>;
+}
+
+export const DEPARTMENT_TRIGGER_EVENTS = ['task_created', 'task_updated', 'task_status_changed'] as const;
+
 /**
  * Create / edit dialog for an autopilot rule. The payload is built by
  * `lib/autopilot-rules` so it matches the gateway's write-time validation;
@@ -127,15 +137,18 @@ const MISSING_FIELD_LABEL: Record<string, string> = {
  */
 export function AutopilotRuleDialog({
   rule,
+  departmentMode,
   onClose,
   onSaved,
 }: {
   /** Rule to edit; omitted to create a new one. */
   rule?: AutopilotRule;
+  departmentMode?: DepartmentRuleMode;
   onClose: () => void;
   onSaved: () => void;
 }) {
   const policy = useProductPolicy();
+  const errorText = useErrorMessage();
   const intl = useIntl();
   const t = useCallback(
     (id: string, values?: Record<string, string | number>) => intl.formatMessage({ id }, values),
@@ -143,9 +156,12 @@ export function AutopilotRuleDialog({
   );
   const triggerLabel = useTriggerLabel();
   const actionLabel = useActionLabel();
-  const { agents, fetchAgents } = useAgentsStore();
+  const { agents: allAgents, fetchAgents } = useAgentsStore();
+  const agents = useMemo(() => departmentMode
+    ? departmentMode.agents.map(a => ({ name: a.id, display_name: a.display_name, icon: '' }))
+    : allAgents, [departmentMode, allAgents]);
   const [form, setForm] = useState<RuleFormState>(() =>
-    rule ? formStateFromRule(rule) : emptyRuleForm(),
+    rule ? formStateFromRule(rule) : { ...emptyRuleForm(), stepsEnvelope: !!departmentMode },
   );
   const [issues, setIssues] = useState<BuildIssue[]>([]);
   const [serverError, setServerError] = useState<unknown>(null);
@@ -154,25 +170,25 @@ export function AutopilotRuleDialog({
   const company = useCompanyTimeZone();
   const companyZone = company.status === 'set' ? company.zone : null;
   const [templateFields, setTemplateFields] = useState<{ trigger: string; fields: string[] } | null>(null);
-  const [fieldsError, setFieldsError] = useState(false);
+  const [fieldsError, setFieldsError] = useState<unknown>(null);
   const [fieldsRetry, setFieldsRetry] = useState(0);
   const availableFields = templateFields?.trigger === form.triggerEvent ? templateFields.fields : undefined;
   useEffect(() => {
     let active = true;
     setTemplateFields(null);
-    setFieldsError(false);
-    api.autopilot.templateFields(form.triggerEvent, rule?.sequence).then(result => {
+    setFieldsError(null);
+    api.autopilot.templateFields(form.triggerEvent, departmentMode ? undefined : rule?.sequence).then(result => {
       if (active) setTemplateFields({ trigger: form.triggerEvent, fields: result.fields });
-    }).catch(() => { if (active) setFieldsError(true); });
+    }).catch(error => { if (active) setFieldsError(error); });
     return () => { active = false; };
-  }, [form.triggerEvent, rule?.sequence, fieldsRetry]);
+  }, [form.triggerEvent, departmentMode, rule?.sequence, fieldsRetry]);
   const fieldLabel = (path: string) => eventFieldLabel(path, t);
   const window = form.active_window as ActiveWindow | null | undefined;
   const patchWindow = (change: Partial<ActiveWindow>) => setForm(f => ({ ...f, windowTouched: true,
     active_window: { days: [1, 2, 3, 4, 5], start: '09:00', end: '18:00', timezone: null, ...(f.active_window as Partial<ActiveWindow> | null), ...change } }));
 
 
-  useEffect(() => { fetchAgents(); }, [fetchAgents]);
+  useEffect(() => { if (!departmentMode) void fetchAgents(); }, [fetchAgents, departmentMode]);
   useEffect(() => {
     if (agents.length > 0) {
       setForm(f => ({ ...f, steps: f.steps.map(step =>
@@ -226,15 +242,15 @@ export function AutopilotRuleDialog({
   }, []);
 
   const triggerOptions = useMemo(() => {
-    const ids: string[] = [...FORM_TRIGGER_EVENTS];
+    const ids: string[] = departmentMode ? [...DEPARTMENT_TRIGGER_EVENTS] : [...FORM_TRIGGER_EVENTS];
     // Never silently swap out a saved trigger the form does not offer.
-    if (!ids.includes(form.triggerEvent)) ids.push(form.triggerEvent);
+    if (!departmentMode && !ids.includes(form.triggerEvent)) ids.push(form.triggerEvent);
     return ids.map((v) => ({ value: v, label: triggerLabel(v) }));
-  }, [form.triggerEvent, triggerLabel]);
+  }, [form.triggerEvent, triggerLabel, departmentMode]);
 
   const agentOptions = (step: StepDraft) => {
     const opts = agents.map(a => ({ value: a.name, label: `${glyphText(a.icon)} ${a.display_name}` }));
-    if (step.targetAgent && !opts.some(o => o.value === step.targetAgent)) {
+    if (!departmentMode && step.targetAgent && !opts.some(o => o.value === step.targetAgent)) {
       opts.push({ value: step.targetAgent, label: step.targetAgent });
     }
     return opts;
@@ -270,6 +286,17 @@ export function AutopilotRuleDialog({
 
   const handleSubmit = useCallback(async () => {
     setServerError(null);
+    if (departmentMode) {
+      const restrictedIssues: BuildIssue[] = [];
+      if (!DEPARTMENT_TRIGGER_EVENTS.some(event => event === form.triggerEvent) || form.sequenceRule) return;
+      form.steps.forEach((step, index) => {
+        if ((step.actionType === 'delegate' || step.actionType === 'run_skill')
+          && !departmentMode.agents.some(a => a.id === step.targetAgent)) restrictedIssues.push({ kind: 'missing', field: 'target_agent', step: index });
+        if (step.actionType === 'notify' && !departmentMode.notifyDestinations.some(d => d.channel === step.channel && d.chat_id === step.chatId))
+          restrictedIssues.push({ kind: 'missing', field: 'channel', step: index });
+      });
+      if (restrictedIssues.length) { setIssues(restrictedIssues); return; }
+    }
     if (rule) {
       const { fields, issues: found } = buildUpdatePayload(form, rule, { companyZone, templateFields: availableFields });
       setIssues(found);
@@ -280,7 +307,7 @@ export function AutopilotRuleDialog({
       }
       setSubmitting(true);
       try {
-        await api.autopilot.update(rule.id, fields);
+        await api.autopilot.update(rule.id, { ...fields, ...(departmentMode ? { owner_department: departmentMode.department } : {}) });
         onSaved();
       } catch (e) {
         setServerError(e);
@@ -294,20 +321,20 @@ export function AutopilotRuleDialog({
     if (!payload) return;
     setSubmitting(true);
     try {
-      await api.autopilot.create(payload);
+      await api.autopilot.create({ ...payload, ...(departmentMode ? { owner_department: departmentMode.department } : {}) });
       onSaved();
     } catch (e) {
       setServerError(e);
     } finally {
       setSubmitting(false);
     }
-  }, [form, rule, onSaved, companyZone, availableFields]);
+  }, [form, rule, onSaved, companyZone, availableFields, departmentMode]);
 
   return (
     <Dialog open onOpenChange={(o) => { if (!o) onClose(); }}>
       <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-xl">
         <DialogHeader>
-          <DialogTitle>{t(rule ? 'autopilot.edit' : 'autopilot.create')}</DialogTitle>
+          <DialogTitle>{t(rule ? 'autopilot.edit' : departmentMode ? 'routines.departmentRules.create' : 'autopilot.create')}</DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
@@ -321,7 +348,7 @@ export function AutopilotRuleDialog({
                 {serverError != null && (
                   <>
                     <p className="font-medium">{t('autopilot.form.saveFailed')}</p>
-                    <p className="break-words">{formatErrorDetail(serverError) || formatError(serverError)}</p>
+                    <p className="break-words">{departmentMode ? settingsRefusal(serverError, errorText(serverError)) : formatErrorDetail(serverError) || formatError(serverError)}</p>
                   </>
                 )}
                 {issues.length > 0 && (
@@ -354,6 +381,8 @@ export function AutopilotRuleDialog({
               {t('autopilot.scheduleHint.link')}
             </Link>
           </p>
+
+          {departmentMode && <p className="text-sm text-muted-foreground">{t('routines.departmentRules.approvalNote')}</p>}
 
           {/* Conditions */}
           <fieldset className="space-y-2">
@@ -438,19 +467,28 @@ export function AutopilotRuleDialog({
                         {actionNeeds('target_agent') && (
                           <DialogSelect
                             label={t('autopilot.field.actionAgent')}
-                            value={step.targetAgent}
+                            value={departmentMode && !agents.some(a => a.name === step.targetAgent) ? '' : step.targetAgent}
                             onChange={(v) => patchStep(index, { targetAgent: v })}
                             options={agentOptions(step)}
                           />
                         )}
-                        {actionNeeds('channel') && (
+                        {actionNeeds('channel') && (departmentMode ? (
+                          <DialogSelect label={t('routines.departmentRules.destination')}
+                            value={String(departmentMode.notifyDestinations.findIndex(d => d.channel === step.channel && d.chat_id === step.chatId))}
+                            onChange={v => {
+                              const destination = departmentMode.notifyDestinations[Number(v)];
+                              if (destination) patchStep(index, { channel: destination.channel, chatId: destination.chat_id });
+                            }}
+                            options={[{ value: '-1', label: t('routines.departmentRules.chooseDestination') }, ...departmentMode.notifyDestinations.map((d, i) => ({ value: String(i), label: d.label }))]}
+                          />
+                        ) : (
                           <DialogSelect
                             label={t('autopilot.field.channel')}
                             value={step.channel}
                             onChange={(v) => patchStep(index, { channel: v })}
                             options={NOTIFY_CHANNELS.filter(c => policy.allows('channels', c)).map((c) => ({ value: c, label: channelLabel(c) }))}
                           />
-                        )}
+                        ))}
                       </div>
 
                       {actionNeeds('prompt') && (
@@ -481,7 +519,7 @@ export function AutopilotRuleDialog({
 
                       {step.actionType === 'run_skill' && <fieldset className="space-y-2">
                         <legend className="text-sm font-medium">{t('autopilot.params.title')}</legend>
-                        {fieldsError && <div className="text-sm text-destructive">{t('autopilot.params.loadFailed')} <Button variant="ghost" size="sm" onClick={() => setFieldsRetry(n => n + 1)}>{t('common.retry')}</Button></div>}
+                        {fieldsError != null && <div className="text-sm text-destructive">{departmentMode ? settingsRefusal(fieldsError, errorText(fieldsError)) : t('autopilot.params.loadFailed')} <Button variant="ghost" size="sm" onClick={() => setFieldsRetry(n => n + 1)}>{t('common.retry')}</Button></div>}
                         {step.params.map((param, row) => {
                           const change = (p: Partial<ParamDraft>) => patchStep(index, { paramsTouched: true, params: step.params.map((v, i) => i === row ? { ...v, ...p } : v) });
                           const invalidParam = issues.some(issue => 'step' in issue && issue.step === index && 'row' in issue && issue.row === row);
@@ -506,7 +544,7 @@ export function AutopilotRuleDialog({
                         <Button variant="outline" size="sm" disabled={step.params.length >= 10} onClick={() => patchStep(index, { paramsTouched: true, params: [...step.params, { name: '', value: '', type: 'text' }] })}><Plus />{t('autopilot.params.add')}</Button>
                       </fieldset>}
 
-                      {actionNeeds('chat_id') && (
+                      {!departmentMode && actionNeeds('chat_id') && (
                         <FieldBlock label={t('autopilot.field.chatId')} description={t('autopilot.field.chatId.help')}>
                           <Input
                             aria-label={t('autopilot.field.chatId')}
@@ -576,7 +614,7 @@ export function AutopilotRuleDialog({
             {t('common.cancel')}
           </Button>
           <Button variant="brand" size="sm" onClick={handleSubmit} disabled={submitting}>
-            {t(rule ? 'autopilot.save' : 'autopilot.create')}
+            {t(rule ? 'autopilot.save' : departmentMode ? 'routines.departmentRules.create' : 'autopilot.create')}
           </Button>
         </DialogFooter>
       </DialogContent>

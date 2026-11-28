@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
 import { api } from '@/lib/api';
+import { DepartmentAutomationTab } from '@/components/tasks/DepartmentAutomationTab';
 import { AffectingRulesTab } from '@/components/tasks/AffectingRulesTab';
 import { CreatorAccessLostBadge } from '@/components/tasks/CreatorAccessLostBadge';
 import { useUrlState } from '@/lib/use-url-state';
@@ -431,13 +432,17 @@ export function RoutinesPage() {
 function RoutinesTabs() {
   const intl = useIntl();
   const user = useAuthStore(s => s.user);
-  const [tab, setTab] = useUrlState('tab', 'schedules', { allowed: ['schedules', 'affecting-me'] as const });
+  const grants = useAuthStore(s => s.deptGrants);
+  const departmentRules = user?.role === 'manager' && grants.some(g => g.groups.includes('automation'));
+  const [tab, setTab] = useUrlState('tab', 'schedules', { allowed: departmentRules ? ['schedules', 'affecting-me', 'department-rules'] as const : ['schedules', 'affecting-me'] as const });
   if (!user || user.role === 'admin') return <RoutinesContent />;
   return <Tabs variant="line" value={tab} onValueChange={v => setTab(v as typeof tab)}>
     <TabsList className="max-w-full overflow-x-auto border-b border-surface-border">
       <TabsTab value="schedules">{intl.formatMessage({ id: 'routines.tabs.schedules' })}</TabsTab>
       <TabsTab value="affecting-me">{intl.formatMessage({ id: 'routines.tabs.affectingMe' })}</TabsTab>
+      {departmentRules && <TabsTab value="department-rules">{intl.formatMessage({ id: 'routines.tabs.departmentRules' })}</TabsTab>}
     </TabsList>
+    {departmentRules && <TabsPanel value="department-rules" className="p-4 md:p-6"><DepartmentAutomationTab /></TabsPanel>}
     <TabsPanel value="schedules" className="pt-4"><RoutinesContent /></TabsPanel>
     <TabsPanel value="affecting-me" className="pt-4"><AffectingRulesTab /></TabsPanel>
   </Tabs>;
