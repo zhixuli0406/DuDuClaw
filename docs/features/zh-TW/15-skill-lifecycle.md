@@ -1,5 +1,7 @@
 # Skill 生命週期引擎
 
+在「技能匯入」（`/experts`）管理「自家技能來源」；新增須確認風險並輸入密碼與驗證器代碼，移除時可選擇停用相關技能。「核准期限」可設為 1–30 天。
+
 > 從原始對話到精煉可重用技能的六個階段。
 
 新員工共用 `<home>/skills/` 的四項辦公技能（`docx`、`pdf`、`pptx`、`xlsx），建立時不再將內建技能複製進個人的 `SKILLS/`。首次 onboarding 或 gateway 啟動時，一次補齊缺少的辦公技能；遷移標記會避免重新安裝已刻意移除的預設技能。既有公司層與個人檔案全部保留。`connect-google` 維持獨立的公司層回填。
@@ -18,12 +20,12 @@
 
 一位武術學徒透過階段性學習：
 
-1. **啟動** — 師父開啟訓練場。學徒到場。
-2. **壓縮** — 同一招寫成三種長度：招名、一句口訣、完整拆解。想得起最短的那版就夠用。
-3. **萃取** — 每次對練後，學徒回顧哪些有效、哪些無效。
-4. **蒸餾** — 多年的練習壓縮成少數幾條可以傳授他人的原則。
-5. **診斷** — 師父看的是一次*失手*，並說出原因：是拳架的問題，還是這招你根本沒學過？
-6. **缺口分析** — 「你防守很強但反擊偏弱。我們來加強這塊。」
+1. **啟動**，師父開啟訓練場。學徒到場。
+2. **壓縮**，同一招寫成三種長度：招名、一句口訣、完整拆解。想得起最短的那版就夠用。
+3. **萃取**，每次對練後，學徒回顧哪些有效、哪些無效。
+4. **蒸餾**，多年的練習壓縮成少數幾條可以傳授他人的原則。
+5. **診斷**，師父看的是一次*失手*，並說出原因：是拳架的問題，還是這招你根本沒學過？
+6. **缺口分析**，「你防守很強但反擊偏弱。我們來加強這塊。」
 
 DuDuClaw 的 skill 生命週期反映這個過程，將原始對話經驗轉化為結構化、可重用、可分享的技能。
 
@@ -59,9 +61,9 @@ Agent 啟動
 技能檔（SKILLS/complaint-handling.md）
      |
      v
-Layer 0 — 只有名稱標籤      約 5 tokens
-Layer 1 — 1-2 行摘要        約 30 tokens
-Layer 2 — 完整 markdown     約 200+ tokens
+Layer 0，只有名稱標籤      約 5 tokens
+Layer 1，1-2 行摘要        約 30 tokens
+Layer 2，完整 markdown     約 200+ tokens
      |
      v
 由相關度決定哪一層進到 prompt
@@ -96,7 +98,7 @@ Layer 2 — 完整 markdown     約 200+ tokens
 寫入前先過安全掃描與 vetting 閘
 ```
 
-> **2026-09 移除：「階段 4 — 重建」。** 本頁舊版描述過一個「逆向工程出技能意圖、從原則重建」的階段。負責做這件事的模組（`skill_lifecycle/reconstruction.rs`）從來沒有呼叫端——連自己的測試都沒有——所以從沒重建過任何東西。程式碼已刪除，而不是留著當空頭承諾。技能壞掉時，誠實的做法是：退役它，讓萃取產生新的。同批刪除的還有兩個同樣零呼叫端的姊妹模組（`recommender.rs`、`dependency_resolver.rs`），這也是為什麼技能清單沒有「為你推薦」介面、技能之間也沒有宣告相依。
+> **2026-09 移除：「階段 4，重建」。** 本頁舊版描述過一個「逆向工程出技能意圖、從原則重建」的階段。負責做這件事的模組（`skill_lifecycle/reconstruction.rs`）從來沒有呼叫端，連自己的測試都沒有，所以從沒重建過任何東西。程式碼已刪除，而不是留著當空頭承諾。技能壞掉時，誠實的做法是：退役它，讓萃取產生新的。同批刪除的還有兩個同樣零呼叫端的姊妹模組（`recommender.rs`、`dependency_resolver.rs`），這也是為什麼技能清單沒有「為你推薦」介面、技能之間也沒有宣告相依。
 
 ### 階段 4：蒸餾
 
@@ -119,18 +121,18 @@ Layer 2 — 完整 markdown     約 200+ tokens
 
 ### 階段 5：診斷
 
-診斷師不替技能打分數。它讀的是一次**預測誤差**，並說出原因——零 LLM 成本，純規則跑在 `PredictionError` 訊號上：
+診斷師不替技能打分數。它讀的是一次**預測誤差**，並說出原因，零 LLM 成本，純規則跑在 `PredictionError` 訊號上：
 
 ```
 PredictionError（Significant / Critical）
      |
      v
 歸類原因：
-  - StyleMismatch       — 語氣／長度不合使用者
-  - DomainGap           — 這個主題 Agent 沒有知識
-  - PrecisionIssue      — 答得不夠準
-  - ExpectationMismatch — 使用者要的是別種行為
-  - Unknown             — 判斷不出來
+  - StyleMismatch，語氣／長度不合使用者
+  - DomainGap，這個主題 Agent 沒有知識
+  - PrecisionIssue，答得不夠準
+  - ExpectationMismatch，使用者要的是別種行為
+  - Unknown，判斷不出來
      |
      v
 DomainGap 且沒有任何已安裝技能對得上
@@ -216,7 +218,7 @@ GitHub Search API
 
 ### 要搜哪裡
 
-技能有三個來源——GitHub、策展過的技能 hub、以及這台部署自己學會的 skill bank——但只有一個工具負責搜尋。`skill_search` 吃一個 `source` 參數：
+技能有三個來源，GitHub、策展過的技能 hub、以及這台部署自己學會的 skill bank，但只有一個工具負責搜尋。`skill_search` 吃一個 `source` 參數：
 
 | `source` | 搜尋範圍 | 什麼時候用 |
 |---|---|---|
@@ -225,7 +227,7 @@ GitHub Search API
 | `hub` | 只查策展過的 registry（anthropic-skills / clawhub / lobehub / skills-sh） | 你只要經過審核、有排名的結果 |
 | `bank` | 只查學會的 skill bank | 你要找的是這台部署自己學會的東西 |
 
-skill bank 目前仍是空的 in-memory stub，所以 `source="bank"` 會誠實回報「空的」，不會偷偷拿 hub 結果充數。`skill_bank_search` 原本是 `source="bank"` 的棄用別名，已在 v1.69.0 移除，請改呼叫 `skill_search` 並帶 `source="bank"`——見[棄用與移除](../../guides/zh-TW/deprecations.md)。
+skill bank 目前仍是空的 in-memory stub，所以 `source="bank"` 會誠實回報「空的」，不會偷偷拿 hub 結果充數。`skill_bank_search` 原本是 `source="bank"` 的棄用別名，已在 v1.69.0 移除，請改呼叫 `skill_search` 並帶 `source="bank"`，見[棄用與移除](../../guides/zh-TW/deprecations.md)。
 
 ### MCP 工具
 

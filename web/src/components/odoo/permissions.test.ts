@@ -63,3 +63,15 @@ describe('Odoo account action mapping', () => {
     expect(actionAccess(undefined, 'read')).toBeNull();
   });
 });
+
+ it('recognizes the four exact-table engine verbs, preserving invalid forms under Other', () => {
+   const verbs = ['activity', 'note', 'message', 'attach'];
+   const entries = verbs.map((verb) => `${verb}:crm.lead`);
+   const parsed = parseActions(entries);
+   expect(parsed.other).toEqual([]);
+   expect(parsed.rules).toEqual([{ model: 'crm.lead', verbs }]);
+   expect(serializeRules(parsed.rules, parsed.other)).toEqual(entries);
+   for (const verb of verbs) {
+     expect(parseActions([verb, `${verb}:*`, `${verb}:`, `${verb}:crm.lead:extra`]).other).toHaveLength(4);
+   }
+ });

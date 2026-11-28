@@ -10,6 +10,7 @@ import { GoogleSigninAdminCard } from './GoogleSigninAdminCard';
 
 const TOKEN = Array(32).fill(7);
 const BASE: GoogleSigninStatus = {
+  hash: 'h1',
   settings: { enabled: false, enabled_requested: false, allowed_hd: ['example.com'], approval: 'admin', daily_new_accounts: 20,
     avatar_template: '', avatar_template_revision: null, approval_grants_mfa_enrollment: false, ack: null },
   redirect_uri: 'https://office.example.com/api/login/google/callback',
@@ -26,7 +27,8 @@ beforeEach(() => {
   get = vi.spyOn(googleSignin, 'get').mockImplementation(async () => structuredClone(state));
   set = vi.spyOn(googleSignin, 'set').mockImplementation(async params => {
     state.settings = { ...state.settings, ...params, avatar_template_revision: params.avatar_template_revision ?? null, enabled_requested: params.enabled };
-    return { settings: structuredClone(state.settings) };
+    state.hash = 'h2';
+    return { settings: structuredClone(state.settings), hash: state.hash };
   });
   vi.spyOn(templateLibrary, 'catalog').mockResolvedValue({ templates: [TEMPLATE, { ...TEMPLATE, id: 'builtin:other', source: 'builtin', name: 'Hidden built-in' }] });
   vi.spyOn(templateLibrary, 'get').mockResolvedValue(TEMPLATE);
@@ -82,13 +84,13 @@ describe('S-11 company Google sign-in administration', () => {
     await risk(); expect(set).not.toHaveBeenCalled();
     await stepUp();
     await waitFor(() => expect(set).toHaveBeenCalledWith(expect.objectContaining({ enabled: true, acknowledge_risk: true, step_up_csrf: TOKEN })));
-    expect(get).toHaveBeenCalledTimes(2);
+    expect(get).toHaveBeenCalledTimes(1);
   });
   it('sends a pure disable without step-up or acknowledgement', async () => {
     state.settings.enabled = state.settings.enabled_requested = true;
     const scope = await card(); await userEvent.click(scope.getByRole('switch'));
     await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
-    expect(set.mock.calls[0][0]).toMatchObject({ enabled: false });
+    expect(set.mock.calls[0][0]).toMatchObject({ enabled: false, expected_hash: 'h1' });
     expect(set.mock.calls[0][0]).not.toHaveProperty('step_up_csrf');
     expect(set.mock.calls[0][0]).not.toHaveProperty('acknowledge_risk');
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
@@ -144,16 +146,47 @@ describe('S-11 company Google sign-in administration', () => {
     await userEvent.click(scope.getByRole('button', { name: 'Save' })); await stepUp();
     await waitFor(() => expect(set).toHaveBeenCalledWith(expect.objectContaining({ avatar_template: 'company:sales', avatar_template_revision: 3 })));
   });
-  it.each(['changed', 'failed'])('blocks saves when the pre-save read is %s', async kind => {
+  it.each(['設定頁的資料已過期，請重新整理後再儲存。', '設定已被其他人變更，請重新整理後再儲存。'])('locks editing on a server conflict: %s', async message => {
+    set.mockRejectedValueOnce(new Error(message));
     const scope = await card();
-    if (kind === 'changed') state.settings.approval = 'direct'; else get.mockRejectedValueOnce(new Error('unreachable'));
     await cap(scope); await stepUp();
-    await scope.findByRole('alert'); expect(set).not.toHaveBeenCalled();
-    if (kind === 'changed') {
-      expect(scope.getByRole('alert')).toHaveTextContent('Sign-in settings have changed since you loaded them. Reload before editing.');
-      await userEvent.click(scope.getByRole('button', { name: 'Reload' }));
-      await waitFor(() => expect(scope.getByRole('radio', { name: /Create accounts directly/ })).toBeChecked());
-    }
+    expect(await scope.findByRole('alert')).toHaveTextContent(message);
+    expect(scope.getByRole('spinbutton')).toBeDisabled();
+    expect(scope.getByRole('switch')).toBeDisabled();
+    expect(scope.getByRole('button', { name: 'Save' })).toBeDisabled();
+    expect(get).toHaveBeenCalledTimes(1);
+    state.hash = 'fresh';
+    await userEvent.click(scope.getByRole('button', { name: 'Reload' }));
+    await waitFor(() => expect(scope.getByRole('spinbutton')).toBeEnabled());
+    await cap(scope, '22');
+    await waitFor(() => expect(set).toHaveBeenLastCalledWith(expect.objectContaining({ expected_hash: 'fresh' })));
+  });
+  it('uses the last get hash then the set hash without another get', async () => {
+    const scope = await card();
+    await cap(scope); await stepUp();
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(1));
+    expect(set).toHaveBeenLastCalledWith(expect.objectContaining({ expected_hash: 'h1' }));
+    await cap(scope, '22');
+    await waitFor(() => expect(set).toHaveBeenCalledTimes(2));
+    expect(set).toHaveBeenLastCalledWith(expect.objectContaining({ expected_hash: 'h2', step_up_csrf: TOKEN }));
+    expect(get).toHaveBeenCalledTimes(1);
+  });
+  it('shows a load refusal with retry and recovers', async () => {
+    get.mockRejectedValueOnce(new Error('目前無法讀取設定。'));
+    renderWithProviders(<GoogleSigninAdminCard />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('目前無法讀取設定。');
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Reload' }));
+    expect(await screen.findByRole('switch')).toBeEnabled();
+    expect(set).not.toHaveBeenCalled();
+  });
+  it('locks settings without a hash', async () => {
+    state.hash = '';
+    const scope = await card();
+    expect(scope.getByRole('switch')).toBeDisabled();
+    expect(scope.getByRole('spinbutton')).toBeDisabled();
+    expect(scope.getByRole('button', { name: 'Save' })).toBeDisabled();
+    expect(set).not.toHaveBeenCalled();
   });
   it('ignores acknowledgement-only changes and resolves names without exposing ids', async () => {
     state.settings.enabled = state.settings.enabled_requested = true;

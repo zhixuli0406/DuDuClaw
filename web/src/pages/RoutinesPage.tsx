@@ -7,6 +7,10 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import { Clock, Play, Pause, Trash2, Plus, Pencil, MoreHorizontal, FlaskConical } from 'lucide-react';
 import { api } from '@/lib/api';
+import { DepartmentAutomationTab } from '@/components/tasks/DepartmentAutomationTab';
+import { AffectingRulesTab } from '@/components/tasks/AffectingRulesTab';
+import { CreatorAccessLostBadge } from '@/components/tasks/CreatorAccessLostBadge';
+import { useUrlState } from '@/lib/use-url-state';
 import { client } from '@/lib/ws-client';
 import { debounceTrailing } from '@/lib/debounce';
 import { useConnectionStore } from '@/stores/connection-store';
@@ -48,6 +52,7 @@ import {
   ListGridRow,
   ListGridCell,
   ActorAvatar,
+  Tabs, TabsList, TabsTab, TabsPanel,
 } from '@/components/mds';
 import { ScheduleBuilder, ConfirmDialog } from '@/components/settings/controls';
 import { AutonomyNote } from '@/components/AutonomyNote';
@@ -63,6 +68,7 @@ interface Routine {
   cron_timezone?: string | null;
   task?: string;
   enabled: boolean;
+  creator_access_lost?: boolean | null;
   can_manage?: boolean;
   can_edit?: boolean;
   can_resume?: boolean;
@@ -315,9 +321,12 @@ function RoutineRow({
     <ListGridRow rowSize="lg" className="cursor-default py-2">
       <ListGridCell className="gap-2">
         <Clock className="size-4 shrink-0 text-muted-foreground" />
-        <span className="truncate text-sm font-medium text-foreground" title={routine.name || routine.id}>
-          {routine.name || routine.id}
-        </span>
+        <div className="min-w-0 space-y-1">
+          <span className="block truncate text-sm font-medium text-foreground" title={routine.name || routine.id}>
+            {routine.name || routine.id}
+          </span>
+          {routine.creator_access_lost === true && <CreatorAccessLostBadge />}
+        </div>
       </ListGridCell>
       <ListGridCell>
         <span className="truncate font-mono text-xs text-muted-foreground">
@@ -417,7 +426,26 @@ export function RoutinesPage() {
   const { user, bindings, deptGrants } = useAuthStore();
   const accessKey = JSON.stringify([user?.id, user?.role, deptGrants,
     bindings.map((b) => [b.agent_name, b.access_level]).sort()]);
-  return <RoutinesContent key={accessKey} />;
+  return <RoutinesTabs key={accessKey} />;
+}
+
+function RoutinesTabs() {
+  const intl = useIntl();
+  const user = useAuthStore(s => s.user);
+  const grants = useAuthStore(s => s.deptGrants);
+  const departmentRules = user?.role === 'manager' && grants.some(g => g.groups.includes('automation'));
+  const [tab, setTab] = useUrlState('tab', 'schedules', { allowed: departmentRules ? ['schedules', 'affecting-me', 'department-rules'] as const : ['schedules', 'affecting-me'] as const });
+  if (!user || user.role === 'admin') return <RoutinesContent />;
+  return <Tabs variant="line" value={tab} onValueChange={v => setTab(v as typeof tab)}>
+    <TabsList className="max-w-full overflow-x-auto border-b border-surface-border">
+      <TabsTab value="schedules">{intl.formatMessage({ id: 'routines.tabs.schedules' })}</TabsTab>
+      <TabsTab value="affecting-me">{intl.formatMessage({ id: 'routines.tabs.affectingMe' })}</TabsTab>
+      {departmentRules && <TabsTab value="department-rules">{intl.formatMessage({ id: 'routines.tabs.departmentRules' })}</TabsTab>}
+    </TabsList>
+    {departmentRules && <TabsPanel value="department-rules" className="p-4 md:p-6"><DepartmentAutomationTab /></TabsPanel>}
+    <TabsPanel value="schedules" className="pt-4"><RoutinesContent /></TabsPanel>
+    <TabsPanel value="affecting-me" className="pt-4"><AffectingRulesTab /></TabsPanel>
+  </Tabs>;
 }
 
 function RoutinesContent() {

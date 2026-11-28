@@ -1,3 +1,4 @@
+import { useLocation, useNavigate } from 'react-router';
 import { useCompanyTimeStore } from '@/lib/company-time';
 import { toast } from '@/lib/toast';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -282,4 +283,178 @@ it('uses each server action flag for a department manager', async () => {
   expect(screen.getByRole('menuitem', { name: 'Edit' })).toHaveAttribute('data-disabled');
   expect(screen.getByRole('menuitem', { name: 'Resume' })).toHaveAttribute('data-disabled');
   expect(screen.getByRole('menuitem', { name: 'Remove' })).not.toHaveAttribute('data-disabled');
+});
+
+const member = { id: 's21-member', email: 'member@example.invalid', display_name: 'Member', role: 'employee' as const, status: 'active' };
+const affectingRule = {
+  id: 'private-rule-id', name: 'Escalation', enabled: true, trigger_event: 'channel_message',
+  conditions: { field: 'text', op: 'contains', value: 'return' },
+  action_kinds: ['delegate', 'run_skill', 'notify'], target_agents: ['private-agent-id', 'hidden-agent-id'],
+  actions: [{ type: 'delegate', target_agent: 'private-agent-id', require_approval: true, prompt: 'private-prompt' },
+    { type: 'notify', channel: 'private-channel', text: 'private-notification' }],
+  require_approval: true, owner_department: null, creator_access_lost: null,
+  history: [{ triggered_at: '2026-11-26T09:00:00Z', result: 'private-result' }, { triggered_at: '2026-11-27T09:00:00Z', result: 'awaiting_approval' }],
+};
+
+function mockAffecting(rules: unknown[] = [affectingRule]) {
+  useAuthStore.setState({ user: member, bindings: [] });
+  useConnectionStore.setState({ state: 'authenticated' });
+  mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+    method === 'autopilot.affecting_me' ? { rules } : method === 'agents.list' ? {
+      agents: [{ name: 'private-agent-id', display_name: 'Sales assistant' }],
+    } : {},
+  ));
+}
+
+async function openAffecting() {
+  renderWithProviders(<RoutinesPage />);
+  await userEvent.click(screen.getByRole('tab', { name: 'Rules affecting my AI employees' }));
+}
+
+describe('S-21 automation tabs', () => {
+  it('keeps the admin page without tabs', async () => {
+    useAuthStore.setState({ user: { ...member, role: 'admin' } });
+    renderWithProviders(<RoutinesPage />);
+    expect(screen.queryByRole('tablist')).not.toBeInTheDocument();
+    expect(mockWsClient.call.mock.calls.some(c => c[0] === 'autopilot.affecting_me')).toBe(false);
+  });
+
+  it.each(['employee', 'manager'] as const)('shows both tabs for %s', role => {
+    useAuthStore.setState({ user: { ...member, role } });
+    renderWithProviders(<RoutinesPage />);
+    expect(screen.getByRole('tab', { name: 'Schedules' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Rules affecting my AI employees' })).toBeInTheDocument();
+    expect(screen.getAllByRole('tab')).toHaveLength(2);
+  });
+
+  it('labels only schedules whose creator access was lost, without disabling execution', async () => {
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(method === 'cron.list' ? {
+      tasks: [true, false, null].map((lost, i) => ({ id: String(i), name: `Cron ${i}`, agent_id: 'sales', cron: '0 9 * * *', enabled: true, creator_access_lost: lost, can_manage: true })),
+    } : method === 'assign_schedules.list' ? {
+      schedules: [true, false, null].map((lost, i) => ({ id: String(i), title: `Assignment ${i}`, agent_id: 'sales', schedule: { kind: 'daily', hour: 9, minute: 0 }, timezone: 'UTC', status: 'active', creator_access_lost: lost, can_manage: false })),
+    } : {}));
+    renderWithProviders(<RoutinesPage />);
+    await screen.findByText('Assignment 0');
+    const tags = screen.getAllByText('Creator no longer has access');
+    expect(tags).toHaveLength(2);
+    for (const tag of tags) expect(tag).toHaveAttribute('title', 'The manager who created this item lost authorization or changed roles. The schedule keeps running pending administrator review.');
+    expect(screen.getAllByRole('switch').every(s => s.getAttribute('aria-checked') === 'true')).toBe(true);
+  });
+
+  it('shows safe translated columns and expands sorted history', async () => {
+    mockAffecting();
+    await openAffecting();
+    await screen.findByRole('button', { name: 'Escalation' });
+    expect(mockWsClient.call).toHaveBeenCalledWith('autopilot.affecting_me', {});
+    for (const title of ['Rule', 'Enabled', 'Trigger event', 'Conditions', 'Actions', 'Targets', 'Approval required', 'Department', 'Latest trigger']) {
+      expect(screen.getByRole('columnheader', { name: title })).toBeInTheDocument();
+    }
+    expect(await screen.findByText('Sales assistant、AI employee unavailable')).toBeInTheDocument();
+    expect(screen.getByText('(Company-wide)')).toBeInTheDocument();
+    expect(screen.getByText('Channel message received')).toBeInTheDocument();
+    expect(screen.getByText(/Message text.*return/)).toBeInTheDocument();
+    expect(screen.getByText('Yes')).toBeInTheDocument();
+    expect(screen.getByText(/Waiting for approval/)).toBeInTheDocument();
+    expect(screen.queryByText('Last 20 triggers')).not.toBeInTheDocument();
+    const row = screen.getByRole('button', { name: 'Escalation' });
+    expect(row).toHaveAttribute('aria-expanded', 'false');
+    await userEvent.click(row);
+    expect(row).toHaveAttribute('aria-expanded', 'true');
+    expect(screen.getByText('Last 20 triggers')).toBeInTheDocument();
+    expect(screen.getByText(/Not completed/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Waiting for approval/)).toHaveLength(2);
+    for (const secret of ['private-rule-id', 'private-agent-id', 'hidden-agent-id', 'private-prompt', 'private-channel', 'private-notification', 'private-result']) expect(document.body).not.toHaveTextContent(secret);
+    expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+    await userEvent.click(row);
+    expect(screen.queryByText('Last 20 triggers')).not.toBeInTheDocument();
+  });
+
+  it('shows the member empty state', async () => {
+    mockAffecting([]);
+    await openAffecting();
+    expect(await screen.findByText('No rules currently affect your AI employees')).toBeInTheDocument();
+  });
+
+  it('shows a plain load failure and retries without leaking the backend error', async () => {
+    mockAffecting();
+    const normal = mockWsClient.call.getMockImplementation()!;
+    let fail = true;
+    mockWsClient.call.mockImplementation((method: string, ...args: unknown[]) => {
+      if (method === 'autopilot.affecting_me' && fail) return Promise.reject(new Error('private-backend-error'));
+      return normal(method, ...args);
+    });
+    await openAffecting();
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load rules. Please try again.');
+    expect(document.body).not.toHaveTextContent('private-backend-error');
+    expect(screen.queryByText('No rules currently affect your AI employees')).not.toBeInTheDocument();
+    fail = false;
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByRole('button', { name: 'Escalation' })).toBeInTheDocument();
+  });
+});
+
+
+it('stores the member tab in the URL and responds to URL changes', async () => {
+  mockAffecting([]);
+  function UrlProbe() {
+    const location = useLocation();
+    const navigate = useNavigate();
+    return <><output aria-label="URL search">{location.search}</output><button onClick={() => navigate('?tab=schedules')}>Navigate to schedules</button></>;
+  }
+  renderWithProviders(<><RoutinesPage /><UrlProbe /></>);
+  await userEvent.click(screen.getByRole('tab', { name: 'Rules affecting my AI employees' }));
+  expect(screen.getByLabelText('URL search')).toHaveTextContent('?tab=affecting-me');
+  expect(await screen.findByText('No rules currently affect your AI employees')).toBeInTheDocument();
+  await userEvent.click(screen.getByRole('button', { name: 'Navigate to schedules' }));
+  expect(screen.getByRole('tab', { name: 'Schedules' })).toHaveAttribute('aria-selected', 'true');
+});
+
+// S-22: department automation grants are independent from schedule grants.
+describe('department automation tab', () => {
+  it.each([
+    ['manager', ['automation'], true],
+    ['manager', ['schedules'], false],
+    ['employee', ['automation'], false],
+    ['admin', ['automation'], false],
+    ['manager', [], false],
+  ])('gates %s with %j grants', (role, groups, visible) => {
+    useAuthStore.setState({ user: { id: 'scope-user', role } as never,
+      deptGrants: [{ department: 'Sales', groups } as never] });
+    renderWithProviders(<RoutinesPage />);
+    const tab = screen.queryByRole('tab', { name: 'Department automation rules' });
+    expect(!!tab).toBe(visible);
+  });
+
+  it('lists only automation departments and isolates rule workspaces when switching', async () => {
+    useAuthStore.setState({ user: { id: 'manager', role: 'manager' } as never,
+      deptGrants: [
+        { department: 'Sales', groups: ['automation'] },
+        { department: 'Support', groups: ['automation'] },
+        { department: 'Finance', groups: ['schedules'] },
+      ] });
+    useConnectionStore.setState({ state: 'authenticated' });
+    mockWsClient.call.mockImplementation((method: string) => Promise.resolve(
+      method === 'users.dept_grants.mine' ? { grants: [], agents: [], needs_sync: [] }
+      : method === 'agents.list' ? { agents: [] }
+      : method === 'autopilot.notify_destinations' ? { destinations: [] }
+      : method === 'autopilot.list' ? { rules: [
+        { id: 'sales-rule', name: 'Sales rule', owner_department: 'Sales', trigger_event: 'task_created', action: { type: 'delegate' } },
+        { id: 'support-rule', name: 'Support rule', owner_department: 'Support', trigger_event: 'task_created', action: { type: 'delegate' } },
+      ] }
+      : { tasks: [] }));
+    renderWithProviders(<RoutinesPage />);
+    await userEvent.click(screen.getByRole('tab', { name: 'Department automation rules' }));
+    await screen.findByText('Sales rule');
+    expect(screen.queryByText('Support rule')).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('combobox', { name: 'Department' }), { key: 'ArrowDown' });
+    await screen.findByRole('listbox');
+    const options = screen.getAllByRole('option');
+    expect(options.map(option => option.textContent)).toEqual(['Sales', 'Support']);
+    await userEvent.click(screen.getByRole('option', { name: 'Support' }));
+    await screen.findByText('Support rule');
+    expect(screen.queryByText('Sales rule')).not.toBeInTheDocument();
+    expect(mockWsClient.call).toHaveBeenCalledWith('users.dept_grants.mine', { group: 'automation' });
+    expect(mockWsClient.call).toHaveBeenCalledWith('autopilot.notify_destinations', { owner_department: 'Support' });
+  });
 });

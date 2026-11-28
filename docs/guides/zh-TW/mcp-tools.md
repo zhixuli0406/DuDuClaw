@@ -1,5 +1,7 @@
 # MCP 工具：AI 員工看得到哪些、為什麼
 
+「整合 → Odoo」提供升級通知、權限模式（引擎資料表或跟隨 Odoo 帳號，須確認風險）、「一律不允許」（預設分類顯示，移除須確認，五項固定拒絕仍保留）、「全公司帳號給哪些 AI」，以及預設關閉的「同仁本人 Odoo 帳號」與成員憑證清單。「員工編輯頁 → 整合 → Odoo」提供「權限收窄」、「使用當下請求者的 Odoo 帳號」，以及各資料表的「活動／內部備註／通知追蹤者／附件」，各項都須確認。成員在「我的連線 → Odoo」填自己的登入名稱與金鑰；管理員開放前顯示「由管理員設定」。管理員可在「成員 → 列選單 → 撤銷 Odoo 帳號」撤銷憑證。
+
 
 ## 查證本機呼叫者
 
@@ -130,15 +132,15 @@ CIMD `private_key_jwt`。
 **內部金鑰用在 `duduclaw http-server`。** HTTP 伺服器對所有呼叫者都以同一位固定員工（它的預設員工）的身分執行，而許多工具是以那位員工、而不是金鑰本身的身分讀寫：`working_state_*`、`mail_*`、所有 `wiki_*` 工具、`canvas_*`、`send_message`、`tasks_list`、`plan_*`、`odoo_*`、電腦操作、分支與知識庫工具，以及 `crates/duduclaw-cli/src/mcp/tools_list.rs` 裡 `DEFAULT_AGENT_HANDLER_TOOLS` ∪ `PROCESS_AGENT_TOOLS` 的其餘工具。在 HTTP 上採「預設拒絕」：
 
 - 只有閘道自己的內部金鑰（閘道記錄過指紋的 `gateway-internal` 金鑰，且伺服器本身的員工身分已驗證）可以呼叫這些工具。
-- 其他所有非外部金鑰——員工專用金鑰、以顯示名稱建立的金鑰、搬移過來的金鑰、任何未知的內部用戶端 ID——這些工具一律拒絕（`-32003`，稽核類別 `per_agent_key_process_tool`，不論金鑰帶哪些權限範圍），`tools/list` 也不會列出。這個判斷只依金鑰通過驗證的方式，不看磁碟上的檔案。
+- 其他所有非外部金鑰，員工專用金鑰、以顯示名稱建立的金鑰、搬移過來的金鑰、任何未知的內部用戶端 ID，這些工具一律拒絕（`-32003`，稽核類別 `per_agent_key_process_tool`，不論金鑰帶哪些權限範圍），`tools/list` 也不會列出。這個判斷只依金鑰通過驗證的方式，不看磁碟上的檔案。
 - 其餘工具（`memory_store`、`memory_search`、`file_read`……）一律以金鑰**所綁定的員工**身分執行，絕不會改用伺服器的預設員工。`tools/list` 只列出這把金鑰的權限範圍實際能呼叫的工具（例如只有 `memory:read` 的金鑰看不到 `memory_store`）；需要 `admin` 的工具（例如 `tasks_create`）員工專用金鑰一律不能呼叫，也不會列出。
 - 沒有綁定員工、或綁定的員工已不存在（資料夾被移除或改名，或 `status = "deleted"`）的非外部金鑰，**所有**工具都會被拒絕（`-32003`，稽核類別 `remote_key_unbound` 並記下原因），`tools/list` 為空；金鑰頁會把它標成「員工已不存在」。
 
-**刪除員工會永久撤銷它的金鑰。** 在儀表板刪除員工時，綁定這位員工的每把金鑰會在同一個操作中被刪除（保留指紋作為墓碑，永遠不會再通過驗證），並逐把寫入稽核 `mcp_key_deleted`（原因 `employee_deleted`）。已刪除的員工無法從儀表板還原；即使管理者在磁碟上恢復員工資料，金鑰仍維持已刪除。**之後以相同代號建立的員工也拿不到這些金鑰**：請為新員工發新的金鑰。在閘道以外移除的員工（MCP `agent_remove` 把資料夾移到 `agents/_trash`，或手動刪除資料夾）或 `status = "deleted"` 的員工，會在閘道下一次金鑰檢查（啟動時與每 10 分鐘）以同樣方式撤銷金鑰（整個 `agents/` 資料夾不存在時不做任何判斷）。第二道防線：比所綁定員工資料夾還早建立的金鑰，HTTP 伺服器一律拒絕（原因 `employee_recreated`，金鑰頁標示「員工已不存在」）——那代表員工是以被移除者的代號重新建立的，即使還沒到下一次檢查也一樣。這項檢查需要作業系統提供資料夾建立時間（macOS、Windows、多數 Linux 檔案系統）；無法取得時，以上述撤銷機制為準。把整個 DuDuClaw 資料夾從備份還原或複製到別處，會重設這些建立時間，還原前發出的員工專用金鑰會被拒絕，需要重新發行。
+**刪除員工會永久撤銷它的金鑰。** 在儀表板刪除員工時，綁定這位員工的每把金鑰會在同一個操作中被刪除（保留指紋作為墓碑，永遠不會再通過驗證），並逐把寫入稽核 `mcp_key_deleted`（原因 `employee_deleted`）。已刪除的員工無法從儀表板還原；即使管理者在磁碟上恢復員工資料，金鑰仍維持已刪除。**之後以相同代號建立的員工也拿不到這些金鑰**：請為新員工發新的金鑰。在閘道以外移除的員工（MCP `agent_remove` 把資料夾移到 `agents/_trash`，或手動刪除資料夾）或 `status = "deleted"` 的員工，會在閘道下一次金鑰檢查（啟動時與每 10 分鐘）以同樣方式撤銷金鑰（整個 `agents/` 資料夾不存在時不做任何判斷）。第二道防線：比所綁定員工資料夾還早建立的金鑰，HTTP 伺服器一律拒絕（原因 `employee_recreated`，金鑰頁標示「員工已不存在」），那代表員工是以被移除者的代號重新建立的，即使還沒到下一次檢查也一樣。這項檢查需要作業系統提供資料夾建立時間（macOS、Windows、多數 Linux 檔案系統）；無法取得時，以上述撤銷機制為準。把整個 DuDuClaw 資料夾從備份還原或複製到別處，會重設這些建立時間，還原前發出的員工專用金鑰會被拒絕，需要重新發行。
 
-**被拒絕的金鑰會留下紀錄。** 每次 MCP 金鑰驗證失敗都會記下 `reason`——`missing_header`（沒帶金鑰）、`bad_scheme`（不是 `Bearer`）、`malformed_key`（格式錯誤）、`wrong_credential_type`（憑證種類不對）、`unknown_key`（不存在）、`key_disabled`（已停用）、`key_expired`（已到期）、`key_deleted`（已刪除）、`key_unbound`（員工已不存在）或 `store_unavailable`（儲存區無法讀取）之一——以及固定的路徑代號 `route`（`mcp`、`mcp_v1_call`、`mcp_v1_stream`……）。已停用、已到期、已刪除或員工已不存在的金鑰會附上金鑰 ID（`mk_…`）。紀錄絕不包含金鑰本身、金鑰的任何片段或指紋，也不含網址參數或 User-Agent。紀錄分成兩個檔案：
+**被拒絕的金鑰會留下紀錄。** 每次 MCP 金鑰驗證失敗都會記下 `reason`，`missing_header`（沒帶金鑰）、`bad_scheme`（不是 `Bearer`）、`malformed_key`（格式錯誤）、`wrong_credential_type`（憑證種類不對）、`unknown_key`（不存在）、`key_disabled`（已停用）、`key_expired`（已到期）、`key_deleted`（已刪除）、`key_unbound`（員工已不存在）或 `store_unavailable`（儲存區無法讀取）之一，以及固定的路徑代號 `route`（`mcp`、`mcp_v1_call`、`mcp_v1_stream`……）。已停用、已到期、已刪除或員工已不存在的金鑰會附上金鑰 ID（`mk_…`）。紀錄絕不包含金鑰本身、金鑰的任何片段或指紋，也不含網址參數或 User-Agent。紀錄分成兩個檔案：
 
-- `<home>/security_audit.jsonl`（具雜湊鏈的安全稽核，伺服器紀錄也有一行警告）：**已存在金鑰**（停用、到期、已刪除、員工已不存在）的驗證失敗會立即寫入一筆附金鑰 ID 的 `mcp_auth_failed`——每把金鑰、每種原因每小時一筆，該小時其餘的次數在整點後再寫一筆並附次數（`count`）。**其他失敗**每小時彙總成一筆 `mcp_auth_failed_summary`：各原因次數、來源數（最多算到 1,024）、沒寫進去的紀錄數，並註明明細檔名稱。所以沒有有效金鑰的人無論怎麼嘗試，每小時最多只會讓安全稽核多一筆；整合服務若一直用已撤銷的金鑰重試，會立即以帶金鑰 ID 的紀錄出現。
+- `<home>/security_audit.jsonl`（具雜湊鏈的安全稽核，伺服器紀錄也有一行警告）：**已存在金鑰**（停用、到期、已刪除、員工已不存在）的驗證失敗會立即寫入一筆附金鑰 ID 的 `mcp_auth_failed`，每把金鑰、每種原因每小時一筆，該小時其餘的次數在整點後再寫一筆並附次數（`count`）。**其他失敗**每小時彙總成一筆 `mcp_auth_failed_summary`：各原因次數、來源數（最多算到 1,024）、沒寫進去的紀錄數，並註明明細檔名稱。所以沒有有效金鑰的人無論怎麼嘗試，每小時最多只會讓安全稽核多一筆；整合服務若一直用已撤銷的金鑰重試，會立即以帶金鑰 ID 的紀錄出現。
 - `<home>/mcp_auth_failures.jsonl`（只有擁有者可讀寫）：逐分鐘、含來源位址 `source` 的明細，來源是伺服器連線看到的 IP（不採用 `X-Forwarded-For`，經反向代理時就是代理的位址）。`http-server` 上，同一來源、同一原因、同一把金鑰每分鐘的第一次失敗立即寫入，該分鐘其餘的合併成一筆並附次數；每分鐘最多 60 筆，超出的合併成一筆 `source: "many"`。檔案到 4 MiB 時改名為 `mcp_auth_failures.jsonl.1`（取代前一份），兩份合計約 8 MiB 以內。`duduclaw import` 不會搬移這個檔案。
 
 stdio `mcp-server` 每個行程最多在安全稽核寫一筆 `mcp_auth_failed`，不寫明細。
@@ -284,23 +286,23 @@ cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未�
 
 
 
-### `tasks_create`／`tasks_update` — 目標費用上限
+### `tasks_create`／`tasks_update`，目標費用上限
 
 `tasks_create` 搭配 `kind="goal"` 時接受 `cost_cap_cents`，單位是美分，須為正整數（最大 `9223372036854775807`）。省略時使用 `[goal_loop] default_cost_cap_cents`（`0` 代表沒有預設上限）。一般任務與排程請求帶這個參數會被拒絕。例如 `{"kind":"goal","title":"檢查報告","assigned_to":"agnes","cost_cap_cents":500}`，其他目標說明與驗收標準仍照常填寫。
 
 `tasks_update` 可為目標修改同一欄位。員工只能新增或收緊上限，不能提高或移除生效中的上限；提高上限須由操作者執行。儲存新上限不會自行恢復暫停目標；儀表板的「提高上限並重試」會先儲存，再走既有重試決策。目標與子任務的已量測費用達上限時以 `budget_exhausted` 暫停，費用讀不到時跳過派工。見[目標迴圈](../../features/zh-TW/34-goal-loop.md)。
 
-### `tasks_create` — 目標的單次執行時限
+### `tasks_create`，目標的單次執行時限
 
 `tasks_create` 搭配 `kind="goal"`（非排程）時接受 `timeout_secs`，30～3600 的整數秒：這個目標每一輪的每次 CLI 執行／API 請求都用它，取代被指派員工的單次執行時間上限。透過 MCP 只能設成小於或等於員工本身的上限；要給目標更多時間，由管理員在儀表板交辦。Claude 員工也適用；執行時仍受目前全域 `[runtime] max_timeout_secs` 約束。`tasks_update` 會拒絕這個欄位。例如 `{"kind":"goal","title":"核對帳目","assigned_to":"anna","timeout_secs":180}`。
 
-### `office_script` — 內建 Office 腳本
+### `office_script`，內建 Office 腳本
 
 `office_script` 會執行內嵌於程式、經 manifest 驗證的 `docx`、`xlsx`、`pptx` 或 `pdf` 腳本。可選 `create`、`extract` 或 `to_pdf`；`.py` 後綴可省略，腳本名稱不能含路徑。員工技能資料夾只能改變提示／指示，不能替換可執行腳本。此工具支援 Linux 與 macOS。
 
 `args` 必須是 JSON 字串陣列，例如 `["outline.md", "--out", "attachments/deck.pptx"]`。輸入檔可在員工目錄或共用附件；輸出必須是員工目錄內的新檔案，父目錄須已存在，副檔名須符合該腳本。旗標與值要分開傳入；拒絕 `--key=value`、符號連結及路徑穿越。若要交付產生的檔案，回覆最後一行使用 `DELIVER:<absolute path>`。
 
-### `codrive_run` — 三段式執行階梯
+### `codrive_run`，三段式執行階梯
 
 每個步驟依序嘗試三段，能用高的就用高的：
 
@@ -317,28 +319,28 @@ cron `schedule` 省略 `cron_timezone` 時使用公司時區；公司時區未�
 - `watch_mode: true` 在本次執行剩餘時間內啟用閒置監看。
 - 最多 50 步。
 
-### `working_state_handoff` — 結構化模式
+### `working_state_handoff`，結構化模式
 
 兩種模式：
 
 - **純筆記。** 不傳 `status`；沿用舊行為，約 1,200 字處靜默截斷。
 - **結構化（Ralph-loop 式）。** 傳 `status`，並與 `next_steps` / `evidence` / `blocker` 一起校驗：
-  - `continue` — 必須有 `next_steps`，不得有 `blocker`。
-  - `complete` — 必須有 `evidence`，且 `blocker` 與 `next_steps` 都不得存在。沒有證據的自稱完成、或還留著下一步的完成，一律拒絕：「我做完了」不是證據。
-  - `blocked` — 必須有具體的 `blocker`。
+  - `continue`，必須有 `next_steps`，不得有 `blocker`。
+  - `complete`，必須有 `evidence`，且 `blocker` 與 `next_steps` 都不得存在。沒有證據的自稱完成、或還留著下一步的完成，一律拒絕：「我做完了」不是證據。
+  - `blocked`，必須有具體的 `blocker`。
 
   合併後的內容由 `config.toml [memory] working_state_handoff_max_bytes`（預設 16384，CJK 安全位元組計算）限制。超過**整筆拒絕**，絕不靜默截斷，因為截掉的可能正是讓這份交接成為權威的證據。
 
-### `skill_search` — 怎麼挑 source
+### `skill_search`，怎麼挑 source
 
 除非你已經知道技能在哪，否則不要動 `source`。
 
-- `all`（預設）— 已設定的 hub 加上這個 AI 員工學到的技能庫，依名稱去重並標註來源。Hub 結果依相關度 × 信任 × 安裝數 × 新鮮度排序，官方第一方技能保底進前段。
-- `github` — 預期在公開 GitHub repo 裡的技能。
-- `hub` — 策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
-- `bank` — 只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
+- `all`（預設），已設定的 hub 加上這個 AI 員工學到的技能庫，依名稱去重並標註來源。Hub 結果依相關度 × 信任 × 安裝數 × 新鮮度排序，官方第一方技能保底進前段。
+- `github`，預期在公開 GitHub repo 裡的技能。
+- `hub`，策展登錄庫（`anthropic-skills`、`github`、`clawhub`、`lobehub`、`skills-sh`）；用 `hub` 參數收斂到單一個。
+- `bank`，只看這套部署自己學到的技能。此來源不接受 `hub` 參數。
 
-### `evolution_toggle` — 欄位與權限
+### `evolution_toggle`，欄位與權限
 
 `field` 接受 `gvu_enabled`、`skill_budget_unlimited`（布林值；`skill_budget_unlimited` 僅限管理員），以及 `max_silence_hours`、`skill_token_budget`、`max_active_skills`（數值）。舊的 `stagnation_*` 欄位已不能透過此工具修改。見 [evolution-switches.md](../evolution-switches.md)。
 
@@ -464,11 +466,11 @@ AI 員工可調整原本四個欄位的自身或下屬設定，採用與 `agent_
 
 ## 相關文件
 
-- [custom-mcp-tool.md](../custom-mcp-tool.md) — 新增工具
-- [mcp-bridge.md](../mcp-bridge.md) — 掛載外部 MCP server
-- [remote-mcp.md](../remote-mcp.md) — HTTP/OAuth 傳輸
-- [../../spec/task-packet.md](../../spec/task-packet.md) — TaskPacket 規格
-- [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md) — `duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
+- [custom-mcp-tool.md](../custom-mcp-tool.md)，新增工具
+- [mcp-bridge.md](../mcp-bridge.md)，掛載外部 MCP server
+- [remote-mcp.md](../remote-mcp.md)，HTTP/OAuth 傳輸
+- [../../spec/task-packet.md](../../spec/task-packet.md)，TaskPacket 規格
+- [../../spec/reversible-context-ccr.md](../../spec/reversible-context-ccr.md)，`duduclaw_ccr_*` 工具，由直連 API 的 tool loop 注入，不經 MCP server 派送
 
 ## 宣告憑證用途
 
@@ -501,7 +503,7 @@ Read 防護會拒絕讀取 `<home>/secrets`。這不是對 Bash 的隔離：員�
 
 回傳內容只作為不可信參考資料，使用群組歷史的包覆格式與注入掃描；任何命中都會拒絕整次回覆，顯示 `not available`。稽核僅保留聊天室識別碼與數量，不記錄訊息文字。本機與固定資料測試不代表真實帳號可讀，交付前仍須以客戶帳號驗證同意流程及讀取結果。
 
-## `mail_send` — 寄信由交辦人在原對話確認
+## `mail_send`，寄信由交辦人在原對話確認
 
 `mail_send` 沿用收件人與資料外送防護。已驗證且目前有該員工 Operator 操作權限的交辦人，僅可在一對一對話或已登入的儀表板 WebChat 確認完整收件人、主旨與內文摘要；不符資格時由儀表板 Admin 決定。核准綁定最終參數，只能用一次，逾期視為拒絕。`[security] mail_requester_approval = false` 恢復僅 Admin 核准；預設 `true`，但設定無法讀取或格式錯誤時採拒絕此例外。詳見[資格與限制](../../features/zh-TW/05-security-defense.md#寄信由交辦人在原對話確認)。群組對話與未知聊天類型仍須儀表板 Admin 核准，公開 WebChat 小工具訪客不適用。不符資格的通道通知不含收件人、主旨或內文，完整內容只留在儀表板。
 
@@ -555,7 +557,7 @@ AI 呼叫者使用 `agent_update` 時只能調低預算；調高預算及其他�
 
 ## 雲端硬碟寫入工具
 
-這九個原生工具需要 `google:write`。管理員分別決定是否開放建立、修改、搬移與移到垃圾桶，四項預設全關。開啟動作或放寬規則前，須明確確認了解風險，系統會記錄管理員與時間；這項設定變更不要求額外重新登入。儀表板控制項會隨本版設定頁交付，目前 Google 整合與個人寫入連線區塊尚未提供。
+這九個原生工具需要 `google:write`。管理員分別決定是否開放建立、修改、搬移與移到垃圾桶，四項預設全關。開啟動作或放寬規則前，須明確確認了解風險，系統會記錄管理員與時間；這項設定變更不要求額外重新登入。在「整合 → Google → 雲端硬碟寫入」設定四種動作、各動作的核准模式與資料夾清單。就緒檢查列出委派權限範圍、個別員工測試與公司帳號同意。成員在「我的連線 → 雲端硬碟寫入」連結並處理寫入確認卡；紀錄在「記錄 → 歷史」用「雲端硬碟寫入」快速篩選。
 
 每項動作預設由成員本人確認。管理員可逐項關閉確認，也可要求本人確認後再由管理員核准。本人確認有效五分鐘，只有該成員可以決定；工具允許清單、Admin 權杖與工作流程常駐授權都不能代替。需要確認時，排程與背景工作會被拒絕。使用本人連線或委派給主要擁有者時，請求者必須是帳號持有人；公司共用帳號與固定委派則由已驗證的請求成員確認。
 
@@ -635,4 +637,4 @@ ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `pare
 
 引擎模式下，`odoo_execute` 與按鈕動作（含 `odoo_sale_confirm`）維持 v1.85 的核准行為：仍套用員工審批清單、動作規則與效果分類，不額外強制核准。「依 Odoo 帳號」模式下，非讀取的 `odoo_execute` 及所有 `action_*`、`button_*`、`toggle_*` 按鈕動作（含 `odoo_sale_confirm`）都須人工核准。通知追蹤者的訊息（`odoo_message_send`）在所有模式一律須核准。Allow 規則不能略過這些強制核准；核准綁定工具與完整參數，而且只能使用一次。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。
 
-個別員工透過管理員瀏覽器 RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` 調整；override 僅接受 `inherit`、`engine`、`read_only`，啟用請求者身分或放寬 override 須帶 `acknowledge_risk=true`。此操作只改這兩個欄位，重新確認有效的管理員工作階段，先寫稽核再儲存；稽核失敗不變更設定。`odoo.agent_config_get` 回傳這兩個欄位，原始／個人檔案設定寫入仍拒絕擴權，操作畫面將隨 Odoo 設定頁提供。
+個別員工透過管理員瀏覽器 RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` 調整；override 僅接受 `inherit`、`engine`、`read_only`，啟用請求者身分或放寬 override 須帶 `acknowledge_risk=true`。此操作只改這兩個欄位，重新確認有效的管理員工作階段，先寫稽核再儲存；稽核失敗不變更設定。`odoo.agent_config_get` 回傳這兩個欄位，原始／個人檔案設定寫入仍拒絕擴權，操作畫面在「員工編輯頁 → 整合 → Odoo」。

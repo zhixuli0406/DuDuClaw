@@ -1,3 +1,4 @@
+import { CreatorAccessLostBadge } from './CreatorAccessLostBadge';
 import { useCompanyTimeZone } from '@/lib/company-time';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -13,8 +14,7 @@ import { Badge, Button, Card, CardContent, Spinner, Switch } from '@/components/
 /**
  * ScheduledAssignmentsSection — the 排程 part of `/goals` → 我交辦的: the
  * caller's scheduled assignments (an Admin may switch to everyone's), with
- * pause / resume / remove. The gateway checks the creator's right again
- * before every run and pauses the schedule when it is gone.
+ * pause / resume / remove. Lost creator access is labelled for review.
  */
 export function ScheduledAssignmentsSection({ enabled, isAdmin, accessible = false }: { enabled: boolean; isAdmin: boolean; accessible?: boolean }) {
   const intl = useIntl();
@@ -116,6 +116,7 @@ export function ScheduledAssignmentsSection({ enabled, isAdmin, accessible = fal
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="text-sm font-medium">{agentName(r.agent_id)}</span>
                     <span className="text-sm text-muted-foreground">{describeSchedule(intl, r.schedule, r.timezone)}</span>
+                    {r.creator_access_lost === true && <CreatorAccessLostBadge />}
                     {r.status !== 'active' && (
                       <Badge variant={r.status === 'paused' && r.pause_reason !== 'by_user' ? 'destructive' : 'secondary'}>
                         {r.status === 'paused' ? t(`paused.${r.pause_reason ?? 'by_user'}`) : t('status.done')}

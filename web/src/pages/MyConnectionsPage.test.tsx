@@ -11,7 +11,7 @@ const status: PersonalGoogleStatus = {
   drive_write: { connected: false, status: null, account_email: null, granted_scopes: [] }, enabled_by_admin: false, connection: { owner_id: 'alice', account_email: 'other@gmail.com', granted_scopes: ['https://www.googleapis.com/auth/gmail.readonly'], local_purposes: ['base'], status: 'connected', connected_at: '2026-10-23T00:00:00Z' }, login_email: 'alice@example.com', client_configured: true, integration_enabled: false, requires_login: false,
   requests: [{ agent_id: 'helper', allowed: null, requesters: 'bound_people', bound_people: [{ user_id:'bob', name:'Bob', email:'bob@example.com' }], channels: ['line'], public_visitors_allowed:false }], delegated: [], recent_usage: [] };
 
-beforeEach(() => { useAuthStore.setState({ user: null }); vi.restoreAllMocks(); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); vi.spyOn(api.personalGoogle, 'writeConfirmations').mockResolvedValue({ requests: [] }); });
+beforeEach(() => { useAuthStore.setState({ user: null }); vi.restoreAllMocks(); vi.spyOn(api.myOdoo, 'status').mockResolvedValue({ member_credentials_enabled: false, connected: false, state: null, login: null, odoo_name: null, server: null, database: null, verified_at: null, last_used_at: null }); vi.spyOn(api.personalGoogle,'status').mockResolvedValue(status); vi.spyOn(api.personalGoogle, 'writeConfirmations').mockResolvedValue({ requests: [] }); });
 
 describe('MyConnectionsPage', () => {
   it('renders only the escaped Chat confirmation display text', async () => {
@@ -200,4 +200,13 @@ it('reuses the existing Google return path for a Drive write connection', async 
   render(<IntlProvider locale="en" messages={messages}><MemoryRouter initialEntries={['/me/connections?google_state=drive-state']}><MyConnectionsPage /></MemoryRouter></IntlProvider>);
   await waitFor(() => expect(finish).toHaveBeenCalledWith('drive-state'));
   expect(finish).toHaveBeenCalledOnce();
+});
+
+it('keeps the other connections visible when the Odoo card fails', async () => {
+  vi.mocked(api.myOdoo.status).mockRejectedValue('目前無法確認 Odoo 連線，請稍後再試。');
+  renderWithProviders(<MyConnectionsPage />);
+  expect(await screen.findByText('目前無法確認 Odoo 連線，請稍後再試。')).toBeInTheDocument();
+  expect(await screen.findByText('other@gmail.com')).toBeInTheDocument();
+  expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument();
+  expect(screen.getByText('Google')).toBeInTheDocument();
 });

@@ -1,3 +1,5 @@
+import type { OdooAccess, OdooAccessPatch } from './odoo-access';
+import type { AutopilotRun } from './autopilot-history';
 import type { DeptGrantsMineResult, GrantGroup, MeGrantFields } from './dept-grants-types';
 import type { ProtectedUpdateResult } from '@/lib/protected-update';
 import { beginBrandRequest, loadPublicBrand, useBrandStore, type DistributorBrand } from '@/stores/brand-store';
@@ -1243,6 +1245,7 @@ export type AssignScheduleSpec =
 
 /** One scheduled assignment. Every fire re-checks the creator's right. */
 export interface AssignScheduleInfo {
+  creator_access_lost?: boolean | null;
   can_manage?: boolean;
   id: string;
   agent_id: string;
@@ -1631,6 +1634,30 @@ export type {
   AutopilotUpdateFields,
 } from './autopilot-rules';
 export type { AutopilotHistoryResult } from './autopilot-history';
+/** Safe member-facing rule projection returned by autopilot.affecting_me. */
+export interface AutopilotNotifyDestination {
+  channel: string;
+  chat_id: string;
+  kind: 'self' | 'agent';
+  agent_id: string | null;
+  label: string;
+}
+
+export interface AffectingAutopilotRule {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_event: string;
+  conditions: AutopilotRule['conditions'];
+  action_kinds: string[];
+  target_agents: string[];
+  actions: Array<{ type: string; target_agent: string; require_approval: boolean; prompt?: string; skill_name?: string }>;
+  require_approval: boolean;
+  owner_department: string | null;
+  creator_access_lost: boolean | null;
+  history: Array<{ triggered_at: string; result: string }>;
+}
+
 export interface AutopilotHistoryEntry {
   id: string;
   rule_id: string;
@@ -2712,6 +2739,30 @@ export interface SigninAvatar {
   state: 'pending' | 'creating' | 'retrying' | 'waiting_admin' | 'done';
   reason: 'done' | 'name_taken' | 'policy_changed' | 'failed' | 'protected_mode' | 'template_changed' | 'template_invalid' | 'seats_full' | 'not_eligible' | 'unknown' | null;
   retry_allowed: boolean;
+}
+
+export interface MainAccessUser {
+  user_id: string;
+  display_name: string;
+  email: string;
+  role: UserInfo['role'];
+  status: UserInfo['status'];
+  granted_by_name: string | null;
+  granted_at: string | null;
+}
+
+export interface MainAccess {
+  hash: string;
+  users: MainAccessUser[];
+  risk_notice: string;
+  effective: boolean;
+  ineffective_reason?: string;
+}
+
+export interface MainAccessSetParams {
+  expected_hash: string;
+  user_ids: string[];
+  acknowledged?: boolean;
 }
 
 export interface UserInfo {
@@ -5755,7 +5806,22 @@ export interface McpKeyCreateResult {
 // ── RM-064: read-only status credentials (external work-status query) ──
 
 /** One `ddc_status_…` credential as listed. Never carries the secret. */
-export interface MemberKeyInfo {
+export type MemberKeyScope = 'tasks:read' | 'agents:status' | 'odoo:read' | 'odoo:write';
+export interface MemberKeyPermissions {
+  include_conversations: boolean;
+  mcp_scopes: MemberKeyScope[];
+}
+export interface MemberKeyPolicy {
+  allow_conversation_content: boolean;
+  allow_mcp_scopes: MemberKeyScope[];
+}
+export type MemberKeyPolicyResult = ({ readable: true; enabled: boolean;
+  available_mcp_scopes: MemberKeyScope[]; risk: { conversation: string; mcp_scopes: string };
+} & MemberKeyPolicy) | { readable: false; message: string };
+export type MemberKeyPolicyUpdate = Partial<MemberKeyPolicy> & { acknowledge_risk?: boolean };
+
+export interface MemberKeyInfo extends MemberKeyPermissions {
+  conversations_migrated: boolean;
   id: string;
   name: string;
   created_at: string;
@@ -6034,7 +6100,24 @@ export interface MemoryGraphResult {
 /** Response of `odoo.agent_config_get`. `configured:false` = no override, the
  *  agent inherits the global config. `api_key`/`password` are never returned in
  *  cleartext — only the `*_set` booleans plus a masked placeholder. */
+export type OdooPermissionOverride = 'inherit' | 'engine' | 'read_only';
+export interface OdooAgentAccessSet {
+  agent_id: string;
+  permission_override?: OdooPermissionOverride;
+  act_as_requester?: boolean;
+  acknowledge_risk: boolean;
+}
+export interface OdooAgentAccessResult {
+  success: boolean;
+  agent_id: string;
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
+  hot_reloaded: boolean;
+}
+
 export interface OdooAgentConfig {
+  permission_override: OdooPermissionOverride;
+  act_as_requester: boolean;
   effective_unblock_models: string[];
   unblock_inherited: boolean;
   effective_blocked_models: string[];
@@ -6957,8 +7040,22 @@ export interface OrgChangeFields {
   department?: string;
 }
 
+export interface ReachLine {
+  user_id: string;
+  display_name: string;
+  department: string;
+  groups: GrantGroup[];
+  change: 'gains' | 'loses';
+}
+
+export interface ReachReview {
+  reach: ReachLine[] | null;
+  reach_digest: string | null;
+  sentence?: string | null;
+}
+
 /** `org.propose_change` — a Manager's (or Admin's) proposal, waiting for an Admin. */
-export interface OrgProposeResult {
+export interface OrgProposeResult extends Partial<ReachReview> {
   status: 'pending_approval';
   approval_id: string;
   agent_id: string;
@@ -6971,7 +7068,7 @@ export interface OrgProposeResult {
 }
 
 /** `org.apply_change` — an Admin's change, applied immediately. */
-export interface OrgApplyResult {
+export interface OrgApplyResult extends Partial<ReachReview> {
   /** `mirror_synced`: nothing changed in the org data; only the employee-settings copy was re-synced. */
   status: 'applied' | 'mirror_synced';
   agent_id: string;
@@ -6989,7 +7086,7 @@ export interface OrgApplyResult {
 }
 
 /** One row of `org.pending_changes`. */
-export interface OrgPendingChange {
+export interface OrgPendingChange extends Partial<ReachReview> {
   approval_id: string;
   agent_id: string;
   before: OrgPlacement;
@@ -7244,7 +7341,47 @@ export interface ChatAdminSetParams {
   acknowledge_exempt_risk?: string[];
 }
 
+export interface SkillTrustPin {
+  publisher: string;
+  key_id: string;
+  added_by: string;
+  added_at: string;
+  conflicting: boolean;
+  in_trust_store: boolean;
+}
+
+export interface SkillTrustSettings {
+  publishers: { publisher: string; built_in: boolean; keys: { public_key: string; key_id: string }[] }[];
+  auto_approve: SkillTrustPin[];
+  skill_ttl_days: number | null;
+  recent_auto_approvals: {
+    id: string; slug: string; decided_at: string; publisher: string; key_id: string;
+    skills: { agent: string; name: string; digest: string }[];
+  }[];
+}
+
+export interface MyOdooStatus {
+  member_credentials_enabled: boolean;
+  connected: boolean;
+  state: 'ok' | 'needs_reverify' | 'invalid' | null;
+  login: string | null;
+  odoo_name: string | null;
+  server: string | null;
+  database: string | null;
+  verified_at: string | null;
+  last_used_at: string | null;
+}
+
+const odooStatus = () => client.call('me.odoo.status', {}) as Promise<MyOdooStatus>;
+
 export const api = {
+  skillTrust: {
+    get: () => client.call('skill_trust.get', {}) as Promise<SkillTrustSettings>,
+    pin: (params: { publisher: string; public_key: string; acknowledge_risk: true; password: string; code: string }) =>
+      client.call('skill_trust.pin', params),
+    unpin: (params: { publisher: string; key_id: string; disable_skills: boolean }) =>
+      client.call('skill_trust.unpin', params) as Promise<{ removed: boolean; disabled: number }>,
+  },
   chatAdmin: {
     get: () => client.call('approvals.chat_admin.get', {}) as Promise<ChatAdminSettings>,
     set: (params: ChatAdminSetParams) => client.call('approvals.chat_admin.set', { ...params }) as Promise<{ success: true; hash: string }>,
@@ -7511,11 +7648,12 @@ export const api = {
         ...(reason ? { reason } : {}),
       }) as Promise<OrgProposeResult>,
     /** Apply now (Admin only). `expectedBase` is the `base` the confirmation dialog showed. */
-    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string) =>
+    applyChange: (agentId: string, fields: OrgChangeFields, expectedBase: string, reachDigest?: string | null) =>
       client.call('org.apply_change', {
         agent_id: agentId,
         ...fields,
         expected_base: expectedBase,
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
       }) as Promise<OrgApplyResult>,
     /**
      * The employee's authoritative placement and its `base` (Manager or
@@ -8647,6 +8785,7 @@ export const api = {
           agent_id: string;
           cron: string;
           schedule?: string;
+          creator_access_lost?: boolean | null;
           cron_timezone?: string | null;
           task?: string;
           enabled: boolean;
@@ -8921,11 +9060,12 @@ export const api = {
       }>,
     /** `stepUpCsrf` (v1.81 P1 break-glass): an Admin deciding a Personal
      *  employee's card they do not own — see `lib/break-glass.ts`. */
-    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[]) =>
+    decide: (id: string, approve: boolean, reason?: string, expectedDigest?: string, stepUpCsrf?: number[], reachDigest?: string | null) =>
       client.call('approvals.decide', {
         id,
         approve,
         ...(expectedDigest ? { expected_digest: expectedDigest } : {}),
+        ...(reachDigest ? { reach_digest: reachDigest } : {}),
         ...(reason ? { reason } : {}),
         ...(stepUpCsrf ? { step_up_csrf: stepUpCsrf } : {}),
       }) as Promise<{
@@ -9000,6 +9140,10 @@ export const api = {
         ...(env && Object.keys(env).length > 0 ? { env } : {}),
       }) as Promise<{ success: boolean; agent_id: string }>,
   },
+  odooAccess: {
+    get: () => client.call('odoo.access_get', {}) as Promise<OdooAccess>,
+    set: (patch: OdooAccessPatch) => client.call('odoo.access_set', { ...patch }) as Promise<OdooAccess>,
+  },
   odoo: {
     permissionOptions: () => client.call('odoo.permission_options') as Promise<OdooPermissionOptions>,
     // The gateway scans each effective identity in bounded batches.
@@ -9016,6 +9160,8 @@ export const api = {
         message: string;
       }>,
     /** Per-agent credential override. `configured:false` = inherits global. */
+    agentAccessSet: (params: OdooAgentAccessSet) =>
+      client.call('odoo.agent_access_set', { ...params }) as Promise<OdooAgentAccessResult>,
     agentConfigGet: (agentId: string) =>
       client.call('odoo.agent_config_get', { agent_id: agentId }) as Promise<OdooAgentConfig>,
     /** api_key/password write-only: new value sets, '' clears, omit keeps. */
@@ -9710,6 +9856,18 @@ export const api = {
       ) as Promise<CanvasGetResult>,
   },
   autopilot: {
+    notifyDestinations: (department: string) =>
+      client.call('autopilot.notify_destinations', { owner_department: department }) as Promise<{ destinations: AutopilotNotifyDestination[] }>,
+    affectingMe: (agentId?: string) =>
+      client.call('autopilot.affecting_me', agentId ? { agent_id: agentId } : {}) as Promise<{ rules: AffectingAutopilotRule[] }>,
+    templateFields: (triggerEvent: string, sequence?: unknown) =>
+      client.call('autopilot.template_fields', { trigger_event: triggerEvent, ...(sequence != null ? { sequence } : {}) }) as Promise<{ fields: string[] }>,
+    runs: {
+      list: (ruleId: string, limit = 20) =>
+        client.call('autopilot.runs.list', { rule_id: ruleId, limit }) as Promise<{ runs: AutopilotRun[] }>,
+      cancel: (runId: string) =>
+        client.call('autopilot.runs.cancel', { run_id: runId }) as Promise<{ cancelled: true; run_id: string }>,
+    },
     list: () =>
       client.call('autopilot.list') as Promise<{ rules: AutopilotRule[] }>,
     create: (params: AutopilotCreateParams) =>
@@ -9961,11 +10119,22 @@ export const api = {
     dismissMigrationHint: () =>
       client.call('mcp_keys.dismiss_migration_hint') as Promise<{ success: boolean }>,
   },
+  myOdoo: {
+    status: odooStatus,
+    connect: (params: { login: string; api_key: string }) => client.call('me.odoo.connect', params) as Promise<MyOdooStatus>,
+    test: () => client.call('me.odoo.test', {}) as Promise<MyOdooStatus>,
+    disconnect: () => client.call('me.odoo.disconnect', {}) as Promise<{ disconnected: true }>,
+  },
   /** RM-064: the caller's own read-only status credentials. */
   memberKeys: {
-    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa' }>,
-    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }) =>
-      client.call('me.member_keys.create', { name, expires_in_days, ...proof }) as Promise<MemberKeyCreated>,
+    policyGet: () => client.call('member_keys.policy_get', {}) as Promise<MemberKeyPolicyResult>,
+    policySet: (update: MemberKeyPolicyUpdate) => client.call('member_keys.policy_set', update),
+    narrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('me.member_keys.narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    adminNarrow: (id: string, permissions: Partial<MemberKeyPermissions>) => client.call('member_keys.admin_narrow', { id, ...permissions }) as Promise<{ narrowed: true }>,
+    odooStatus,
+    list: (cursor?: string, limit = 25) => client.call('me.member_keys.list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null; max_active: number; max_total: number; reauthentication: 'password' | 'mfa'; policy: MemberKeyPolicy }>,
+    create: (name: string, expires_in_days: number, proof: { password: string } | { code: string }, permissions?: MemberKeyPermissions) =>
+      client.call('me.member_keys.create', { name, expires_in_days, ...proof, ...permissions }) as Promise<MemberKeyCreated>,
     revoke: (id: string) => client.call('me.member_keys.revoke', { id }) as Promise<{ revoked: boolean }>,
     adminList: (cursor?: string, limit = 25) => client.call('member_keys.admin_list', { limit, ...(cursor ? { cursor } : {}) }) as Promise<{ keys: MemberKeyInfo[]; next_cursor: string | null }>,
     adminRevoke: (id: string) => client.call('member_keys.admin_revoke', { id }) as Promise<{ revoked: boolean }>,
@@ -10088,6 +10257,11 @@ export const api = {
     update: (change: { step?: OnboardingStep; status?: 'done' | 'skipped'; dismissed?: true }, locale = 'zh-TW') =>
       client.call('onboarding.update', { ...change, locale }) as Promise<OnboardingProgress>,
   },
+  mainAccess: {
+    get: () => client.call('agents.main_access.get', {}) as Promise<MainAccess>,
+    set: (params: MainAccessSetParams) =>
+      client.call('agents.main_access.set', { ...params }) as Promise<MainAccess>,
+  },
   users: {
     createMembers: (params: { members: NewMemberInput[]; public_url?: string; locale?: string }) =>
       client.call('users.create_members', params, false, 330000) as Promise<{ results: CreateMemberResult[] }>,
@@ -10181,6 +10355,12 @@ export const api = {
         email_setup?: EmailSetup;
       }>,
     deptGrants: {
+      reachPreview: (agentId: string, department: string) =>
+        client.call('users.dept_grants.reach_preview', { agent_id: agentId, department }) as Promise<ReachReview>,
+      list: () => client.call('users.dept_grants.list', {}) as Promise<DeptGrantEntry[]>,
+      options: () => client.call('users.dept_grants.options', {}) as Promise<DeptGrantOptions>,
+      set: (params: { user_id: string; department: string; groups: GrantGroup[]; acknowledged?: boolean }) =>
+        client.call('users.dept_grants.set', params) as Promise<{ ok: true }>,
       mine: (group?: GrantGroup) =>
         client.call('users.dept_grants.mine', group ? { group } : {}) as Promise<DeptGrantsMineResult>,
     },
@@ -10498,3 +10678,19 @@ export const api = {
   },
   // ── end v1.81 F5 part A ──
 };
+
+/** Admin-only department management grants (Enterprise). */
+export interface DeptGrantEntry {
+  user_id: string;
+  display_name: string;
+  email: string;
+  department: string;
+  groups: GrantGroup[];
+  granted_by: string;
+  granted_at: string;
+}
+
+export interface DeptGrantOptions {
+  departments: { name: string; agent_count: number }[];
+  mirror_mismatch_count: number;
+}

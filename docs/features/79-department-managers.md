@@ -1,5 +1,7 @@
 # Department managers and main AI employee access
 
+In **Members** (`/manage/users`), open **Department management grants** on a Manager row to choose the five groups; additions require confirmation. Revoking a grant leaves the Manager’s schedules running. Edit the main AI employee’s **Who may use** list on its employee edit page.
+
 Available in Enterprise from v1.86.0. An Admin can give an active Manager selected controls over AI employees in a named department. The Manager's role or their own department label does not grant these controls automatically.
 
 [繁體中文](zh-TW/79-department-managers.md) · [日本語](ja-JP/79-department-managers.md)
@@ -60,7 +62,7 @@ When an org chart move changes Managers' reach, the change summary says who gain
 
 Revoking a grant does not automatically pause or delete routines or rules the Manager created. Routines keep running under their existing execution checks; rules retain their saved enabled state and continue under the department checks above. Admins should disable unwanted work separately.
 
-Routine and scheduled-assignment lists provide a **Creator no longer has access** (「建立者已無權限」) marker when that loss can be determined. The gateway supplies this marker; its dashboard display still needs integration. An equivalent marker for automation rules is not yet provided.
+Routine and scheduled-assignment lists provide a **Creator no longer has access** (「建立者已無權限」) marker when that loss can be determined. The Automation page (`/routines`) displays this marker. An equivalent marker for automation rules is not yet provided.
 
 ## Members' read-only rule view
 
@@ -80,7 +82,7 @@ The main employee may still hand work to other employees. Those hand-overs follo
 
 - The main access list grants nothing outside protected execution. A saved list alone does not enable isolation.
 - Company-wide analytics and billing summaries remain visible to all Managers. The department usage grant does not narrow those existing summaries.
-- The routines, skills and department usage pages support grants. The Members-page grant editor, the main employee's **Who may use** control and the department-rule/member-rule screens still need dashboard integration. The gateway already supports their permissions and settings. See [Dashboard settings](../guides/dashboard-settings.md).
+- In **Members** (`/manage/users`), open **Department management grants** on a Manager row to choose the five groups; additions require confirmation. Revoking a grant leaves the Manager’s schedules running. Edit the main AI employee’s **Who may use** list on its employee edit page. Use **Automation** (`/routines`) for department rules and the member read-only tab. See [Dashboard settings](../guides/dashboard-settings.md).
 
 ## For developers
 

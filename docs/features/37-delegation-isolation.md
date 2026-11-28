@@ -1,5 +1,7 @@
 # Delegation Isolation
 
+**Settings → Advanced → Delegation permissions** contains role exceptions and one-way pairs. The first role tick requires risk confirmation. Each pair explains both directions: A → B lets A delegate to B; the reverse direction is separate.
+
 > Delegation control for AI employees: who can hand work to whom is decided by the `reports_to` tree, departments, and a white-list.
 
 DuDuClaw 1.52 introduces delegation controls for multi-person teams. Your AI employees now follow the organizational structure instead of taking orders from just anyone.
@@ -114,13 +116,13 @@ allow = [
 - When editing the config file by hand, malformed entries (not exactly two strings, or containing an empty string) are ignored with a warning and do not affect other pairs; a mistyped ID is not detected — that pair simply never takes effect
 - Saving from the dashboard is stricter: if any ID has no matching AI employee the whole save is rejected with the offending ID named, and at most 200 pairs may be saved at once
 
-The dashboard card "Advanced settings → Delegation permissions" provides the editor; each pair shows both sides' department badges so the collaboration intent is visible at a glance.
+The dashboard card "Settings → Advanced → Delegation permissions" provides the editor; each pair shows both sides' department badges so the collaboration intent is visible at a glance.
 
 ---
 
 ## Role exceptions and one-way pairs (v1.86.0)
 
-In **Settings › Delegation permissions › Roles exempt from delegation scope**, an administrator can check Admin or Manager. Both are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
+In **Settings → Advanced → Delegation permissions → Roles exempt from delegation scope**, an administrator can check Admin or Manager. Both are unchecked by default. The exception applies to the member's own AI avatar, assigned by an administrator in member management. It may hand work to any AI employee and create tasks, schedules or reminders for anyone when that member personally asks in the current conversation. The recipient gains no right to delegate back.
 
 Only Admin and Manager (`admin` / `manager`) are eligible. Employee is not offered because selecting it would exempt every ordinary member’s AI avatar; legacy `employee` entries in `unrestricted_roles` are ignored. Adding a role requires reading the risk notice and checking **I understand** before saving. The gateway requires `acknowledge_risk: true` for additions through both `delegation.set` and `config.raw.set`. The `delegation_config_changed` audit record includes `roles_added`, the enabling user ID (`acknowledged_by`) and a server-generated RFC3339 timestamp (`acknowledged_at`). Removing roles requires no acknowledgement and is still audited.
 
@@ -144,7 +146,7 @@ When delegation is refused, the AI and the person receive one consistent explana
 
 ## Dashboard settings (admin only)
 
-**Advanced settings → Delegation permissions**
+**Settings → Advanced → Delegation permissions**
 
 Four controls:
 
@@ -169,7 +171,7 @@ Four controls:
 
 If the current setting cannot be loaded, the page shows the error and keeps every control and Save disabled until a retry succeeds (v1.82.0); before, a failed load left `department` + no pairs on screen and Save wrote them over the real setting. `delegation.set` refuses, without writing, when `config.toml` is not valid TOML.
 
-**Employee page → Overview → Delegation (v1.82.0).** A read-only card (`delegation.effective {agent_id}`, Admin and Managers with access to the employee) shows the policy that applies to that employee, whether it comes from the company-wide setting or the employee's own `[permissions] can_send_cross_agent` switch (`false` makes it `none` for that employee), whether it may create employees, the pairs naming it (inactive ones listed separately) and `config_error` / the policy warning when there is one. Warnings about malformed white-list entries quote the raw entry, which can name any employee, so the card receives only their number (`allow_warning_count`, "N delegation setting warnings — an administrator can review them in Settings"); the texts reach an Admin viewer only (`allow_warnings`) and stay in full in `delegation.get` (Admin-only). The same applies to a config problem: `config_error` is only a category — `unreadable` / `unparsable` (config.toml), `permissions_unreadable` (this employee's `[permissions]`) or `unknown` — and the card shows a fixed message for it, because the detail can quote raw config text (the TOML parse excerpt). The detail reaches an Admin viewer only (`config_error_detail`); the card does not render it, and Settings › Delegation permissions shows it to an Admin through `delegation.get`.
+**Employee page → Overview → Delegation (v1.82.0).** A read-only card (`delegation.effective {agent_id}`, Admin and Managers with access to the employee) shows the policy that applies to that employee, whether it comes from the company-wide setting or the employee's own `[permissions] can_send_cross_agent` switch (`false` makes it `none` for that employee), whether it may create employees, the pairs naming it (inactive ones listed separately) and `config_error` / the policy warning when there is one. Warnings about malformed white-list entries quote the raw entry, which can name any employee, so the card receives only their number (`allow_warning_count`, "N delegation setting warnings — an administrator can review them in Settings"); the texts reach an Admin viewer only (`allow_warnings`) and stay in full in `delegation.get` (Admin-only). The same applies to a config problem: `config_error` is only a category — `unreadable` / `unparsable` (config.toml), `permissions_unreadable` (this employee's `[permissions]`) or `unknown` — and the card shows a fixed message for it, because the detail can quote raw config text (the TOML parse excerpt). The detail reaches an Admin viewer only (`config_error_detail`); the card does not render it, and Settings → Advanced → Delegation permissions shows it to an Admin through `delegation.get`.
 
 The card also shows the role exception and one-way pairs, separately as outgoing and incoming. This indicates eligibility; each request still checks the current account and work context.
 
@@ -351,7 +353,7 @@ When these settings need to change:
 
 - **`name`, `reports_to`, `department`** → dashboard "AI employees → details → edit", or the MCP `agent_update` tool (an AI employee can use it on a subordinate, not on its own `reports_to`; see below)
 - **Adjusting permissions or adding tools** → dashboard "AI employees → advanced settings", the MCP `agent_update` tool, or an operator editing `agent.toml [capabilities]` in a normal editor. Neither route passes through this hook — the hook only sees Claude Code's own Write / Edit / Bash tool calls, so an employee (or one of its team role members) cannot take this route from inside a session. Through `agent_update`, an AI employee can grant a database source to a subordinate but not to itself
-- **Delegation policy or white-list** → dashboard "Advanced settings → Delegation permissions", or edit `config.toml [delegation]` directly and restart the gateway
+- **Delegation policy or white-list** → dashboard "Settings → Advanced → Delegation permissions", or edit `config.toml [delegation]` directly and restart the gateway
 - **Adding an MCP server** → the dashboard "Advanced settings → MCP servers" (operator), or an MCP install request filed in the dashboard and approved by the operator. An AI employee cannot add one by editing `.mcp.json`; an operator editing it by hand should use an ordinary editor, not `claude` started inside the employee directory (that session is judged as the employee). After upgrading, run `duduclaw doctor`: it lists every server in an employee's `.mcp.json` that DuDuClaw did not write
 
 Interceptions are recorded in `~/.duduclaw/tool_calls.jsonl` with the `org_placement_denied` marker for easier debugging.

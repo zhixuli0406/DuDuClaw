@@ -481,3 +481,32 @@ it('sends the full channel id when a masked member binding is removed', async ()
     })));
   } finally { fetchMock.mockRestore(); }
 });
+
+describe('UsersPage — department management grants', () => {
+  it.each([
+    ['admin', 'manager', true],
+    ['admin', 'employee', false],
+    ['admin', 'admin', false],
+    ['manager', 'manager', false],
+    ['employee', 'manager', false],
+  ])('gates the row action for viewer=%s, member=%s', async (viewer, role, visible) => {
+    useAuthStore.setState({ user: { id: 'viewer', role: viewer } as never });
+    useAgentsStore.setState({ agents: [], loaded: true, loading: false });
+    mockWsClient.call.mockImplementation(async (method: string) => {
+      if (method === 'users.list') return { users: [{ id: 'target', display_name: 'Chen', email: 'chen@example.com', role, status: 'active', bindings: [], created_at: '', updated_at: '' }] };
+      if (method === 'users.dept_grants.list') return [];
+      if (method === 'users.dept_grants.options') return { departments: [], mirror_mismatch_count: 0 };
+      return { users: [], departments: [], agents: [], identities: [], conflicts: [], statuses: {} };
+    });
+    const user = userEvent.setup();
+    renderWithProviders(<UsersPage />);
+    await screen.findByText('Chen');
+    await user.click(screen.getByRole('button', { name: 'More' }));
+    await screen.findByRole('menuitem', { name: 'Edit' });
+    expect(screen.queryByRole('menuitem', { name: 'Department management grants' }) !== null).toBe(visible);
+    if (visible) {
+      await user.click(screen.getByRole('menuitem', { name: 'Department management grants' }));
+      expect(await screen.findByRole('dialog', { name: 'Department management grants for Chen' })).toBeInTheDocument();
+    }
+  });
+});

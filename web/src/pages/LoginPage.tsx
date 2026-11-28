@@ -97,8 +97,8 @@ export function LoginPage() {
     try {
       const data = await apiPost<{ authorization_url: string }>('/api/login/google/start', {});
       const url = new URL(data.authorization_url);
-      if (url.origin !== 'https://accounts.google.com') throw new Error('Invalid authorization origin');
-      window.location.assign(data.authorization_url);
+      if (url.origin !== 'https://accounts.google.com' || url.username || url.password) throw new Error('Invalid authorization origin');
+      window.location.assign(url.href);
     } catch {
       setGoogleMessage('incomplete');
       googleStartPending.current = false;

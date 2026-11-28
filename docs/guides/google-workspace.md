@@ -1,5 +1,7 @@
 # Google Workspace tools and security
 
+Use **Integrations → Google → Drive writing** for the four actions, approval mode per action and folder list. Its readiness panel shows delegated scopes, a per-employee test and company-account consent. Members connect through **My connections → Drive writing** and review write confirmation cards there. For records, open **Logs → History → Drive writing**.
+
 For setup, use [Connect Google](google-setup.md). Native REST tools cover nine services and thirty-eight tools. The Apps Script path covers three services and eight actions including status. The dashboard remains visible with the integration disabled; tools are hidden until `[integrations] google_workspace = true`. DuDuClaw does not ship shared OAuth credentials.
 
 ## What you get

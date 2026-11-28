@@ -1,12 +1,12 @@
-# Dashboard settings map (v1.80.0)
+# Dashboard settings map (v1.86.0)
 
 ## Department and main employee access settings (Enterprise, v1.86.0)
 
 | Location | Controls and current availability |
 |---|---|
-| Manage → Members → department grants | Admin chooses an active Manager, department and schedules, automation rules, skills or usage. Outbound-data review is also an option, to be documented separately. The gateway supports saving grants; the Members-page editor still needs dashboard integration. |
-| Main AI employee → Who may use | Admin maintains the initially empty list for conversation and ordinary work. The gateway supports saving the list and explains when it is inactive; the dashboard control still needs integration. It grants access only in protected mode with isolated employee execution. Otherwise only Admins can use these entry points. |
-| Routines | A Manager with schedules access can filter by department and manage eligible routines, reminders and scheduled assignments. Creation is limited to prompt-only routines. Employees needing an Admin org sync are counted in a notice. Department automation editing and member read-only rule screens still need integration. |
+| Members (`/manage/users`) → Manager row → Department management grants | Choose schedules, automation rules, skills, usage and outbound-data review. Adding access requires confirmation; revocation leaves existing schedules running. |
+| Main AI employee edit page → Who may use | Admin maintains the initially empty list for conversations and ordinary work. It applies only in protected mode with isolated employee execution; otherwise these entry points remain Admin-only. |
+| Automation (`/routines`) | Granted Managers manage eligible routines, reminders and scheduled assignments by department; new routines are prompt-only. Department automation rules offers only task created, task updated and task status changed. Members have the read-only Rules affecting my AI employees tab. Schedules can show Creator no longer has access. Employees needing an Admin org sync are counted in a notice. |
 | Skills | Granted Managers can switch skills on or off, remove, restore and choose **Request installation** for an employee. Installation still requires Admin approval. |
 | Budget / billing → Department usage | Granted Managers can choose a department and 7, 30 or 90 days, then read per-employee usage, totals and recent records. They cannot change budgets through this grant. |
 
@@ -26,6 +26,29 @@ await rpc('agents.main_access.set', {
 ```
 
 Managers with Automation access can call `autopilot.template_fields {trigger_event}` for `task_created`, `task_updated` and `task_status_changed` only, without `sequence`; `autopilot.runs.list {rule_id, limit?}` is limited to rules in their granted Automation departments. `autopilot.template_fields` returns `{fields:[...]}`; `autopilot.runs.list` returns `{runs:[...]}`, with `limit` defaulting to 20 and accepting 1–100. `autopilot.runs.cancel` remains Admin-only. Admins and the department's authorized Manager can call `autopilot.notify_destinations {owner_department}`. It returns `{destinations:[{channel, chat_id, kind, agent_id, label}]}`: `kind` is `self` or `agent`, and `agent_id` is nullable. These are exactly the destinations a department rule created by the caller may notify. Use `label` for display. Rules returned by `autopilot.list` and `autopilot.affecting_me` include `creator_access_lost` (`true`, `false` or `null` when undetermined); this is display information, not an authorization decision.
+
+## v1.86.0 screen locations
+
+| Location | Controls and confirmation |
+|---|---|
+| Settings → Advanced → Delegation permissions | Role exceptions require risk confirmation on the first tick. One-way pairs explain both directions. |
+| Settings → Advanced → Delegation permissions → Administrator AI (bottom card) | Enable with I understand; disabling takes effect immediately. |
+| Inbox | Administrator AI settings change confirmation shows a ten-minute countdown; processing results distinguish done / partial / voided. Processed cards show Decision maker and decision time when available. |
+| Security settings → Approve in chat apps | Telegram and Google Chat; all step-up kinds checked by default, risk confirmation to uncheck; card lifetime 1–720 hours. Read-only in Personal edition. |
+| My connections → Chat app links (administrator) | One-time-code handshake. Cancel chat approval eligibility clears only proof. |
+| `/approvals/confirm` | Opened from a chat card. Sign in first if needed; approval needs password + authenticator code. Rejection needs no password. |
+| Integrations → Google → Drive writing | Four actions, approval mode per action and folder list. Readiness shows delegated scopes, a per-employee test and company-account consent. |
+| Integrations → Google → Company Google account sign-in | Domains, Admin approval or direct creation, daily cap, avatar template, MFA pre-authorisation on approval, redirect URI and checklist. Every save except disabling requires password + code. |
+| My connections | Drive writing link and write confirmation cards; Google sign-in enabled or disabled with your password; Odoo uses your own login and key and shows Configured by administrator until enabled by the Admin. |
+| Logs → History → Drive writing | Quick filter for Drive write records. |
+| Members (`/manage/users`) | Pending activation: approve / reject Google requests. Google sign-in / Odoo / AI avatar badges; multi-select Batch confirm Google sign-in; row menus Cancel Google sign-in and Revoke Odoo account. Chat identities show Self-confirmed / Entered by administrator. |
+| Login / Home / Account | Company Google login appears only when enabled with a public URL. Google-onboarded members see five Home steps; Odoo links to My connections. Passwordless accounts reauthenticate with Google before changing two-step factors on Account. |
+| Org changes | Impact appears on the Inbox org-change card, org chart confirmation and employee department field. |
+| Settings → Advanced → Automation rules | Open **Settings → Advanced → Automation rules** for up to five steps (delegate, notify, run skill or wait), an execution window, skill parameters with **Insert event field**, per-step run history and cancellation. Older rules carry **Created before upgrade**. |
+| Skill import (`/experts`) | Own skill sources: add with risk confirmation + password/code; removal can also disable skills. Approval lifetime: 1–30 days. |
+| External access (`/me/external-access`) | On **External access** (`/me/external-access`), members select **Include my conversation content** and external tool scopes when creating a key; later changes can only narrow access. Admins use the two master switches on the same page. |
+| Integrations → Odoo / employee editor → Integrations → Odoo | Open **Integrations → Odoo** for the upgrade notice, permission mode (engine tables or follow the Odoo account, with risk confirmation), **Always refuse** (grouped defaults; removal requires confirmation; five fixed refusals remain), **Which AIs may use the company account**, and **Colleagues’ own Odoo accounts** (off by default) with the member credential list. In the **employee editor → Integrations → Odoo**, use **Narrow permissions**, **Use the current requester’s Odoo account**, and the per-table Activity / Internal note / Notify followers / Attachment controls; each requires confirmation. |
+
 
 ## Skill archive recovery
 
@@ -330,7 +353,7 @@ Admin only (`delegation.get` / `delegation.set`). Saved changes apply to the nex
 
 **Concurrent settings edits (v1.86.0 RPC contract).** `delegation.get {}` and `google.drive_write.get {}` return `hash`, the SHA-256 content hash of the exact configuration text read. Each corresponding set requires a string `expected_hash` copied from that get response, alongside its existing settings parameters. The gateway checks this client value again inside the configuration commit lock. A missing or non-string value returns 「設定頁的資料已過期，請重新整理後再儲存。」; a conflict returns 「設定已被其他人變更，請重新整理後再儲存。」. Neither writes any configuration. Reload and reconcile the newer settings before saving again. Unreadable or unparsable configuration makes either get fail instead of returning editable defaults. `google.drive_write.set` returns the same response fields as its get, including the new post-save `hash`; `delegation.set` keeps its existing success response.
 
-Direct RPC callers must read the matching get before each save (`rpc` below represents the authenticated RPC client). This example disables all Drive writes; reconcile the current settings before choosing changes. A hash conflict requires reloading and reconciling, rather than retrying blindly.
+Direct RPC callers must load and review the matching get snapshot, then pass its hash when saving (`rpc` below represents the authenticated RPC client). This example disables all Drive writes; reconcile the current settings before choosing changes. A hash conflict requires reloading and reconciling, rather than retrying blindly.
 
 ```javascript
 const delegation = await rpc('delegation.get', {});
@@ -378,7 +401,7 @@ The card also shows role-exception eligibility and one-way pairs as outgoing and
 
 `delegation.effective {agent_id}` also returns nullable `owner_display_name` for the employee's owner. Use this name in the card rather than an internal account identifier.
 
-**Administrator AI.** Enable it at **Settings → Delegation permissions → Administrator AI**. `admin_ai.get {}` returns `config_state: "ok" | "unreadable" | "malformed"`; `enabled` is `false` unless the state is `ok`. When present, `enabled_ack` includes `by_name` (nullable) and `at` for display. See [Administrator AI settings](../features/79-admin-ai-settings.md).
+**Administrator AI.** Enable it at **Settings → Advanced → Delegation permissions → Administrator AI (bottom card)**. `admin_ai.get {}` returns `config_state: "ok" | "unreadable" | "malformed"`; `enabled` is `false` unless the state is `ok`. When present, `enabled_ack` includes `by_name` (nullable) and `at` for display. See [Administrator AI settings](../features/79-admin-ai-settings.md).
 
 ## Channels
 
@@ -1146,7 +1169,7 @@ front-end code; call from your server. See the [member API contract](../api/memb
 
 ## Company Google sign-in
 
-`[google_signin]` is administered through `google.signin.set`. Set these values from the dashboard's Google settings once available; its pages are not built yet. Personal edition does not offer this feature. Enabling sign-in, switching to direct creation, or enabling approval-based MFA enrollment requires explicit risk acknowledgement. A configured company Google OAuth client and valid `[dashboard] public_url` are also required for sign-in.
+`[google_signin]` is administered through `google.signin.set`. Configure **Integrations → Google → Company Google account sign-in**: domains, Admin approval or direct creation, daily cap, avatar template and MFA pre-authorisation on approval. The card shows the redirect URI to register and a checklist. Every save except turning sign-in off requires password + authenticator code. When enabled with a public URL, the login page shows **Sign in with your company Google account**. In **Members** (`/manage/users`), use **Pending activation** to approve or reject requests, multi-select **Batch confirm Google sign-in**, or the row menu **Cancel Google sign-in**. Google sign-in, Odoo and AI avatar badges identify each member. Members enable or disable **My connections → Google sign-in** with their password. Google-onboarded members see five steps on Home; the Odoo step opens My connections. Members without a password reauthenticate with Google on the Account page before changing two-step factors. Personal edition does not offer this feature. Enabling sign-in, switching to direct creation, or enabling approval-based MFA enrollment requires explicit risk acknowledgement. A configured company Google OAuth client and valid `[dashboard] public_url` are also required for sign-in.
 
 `google.signin.get {}` returns `{settings, checks, redirect_uri, hash}`; `google.signin.set` returns `{settings, hash}` after saving. `hash` is a string digest of the entire `config.toml` text read. Set requires `expected_hash` from that get snapshot, in addition to the existing settings fields, `step_up_csrf` and risk acknowledgement. The hash is compared inside the config commit lock, including a pure disable. Missing/non-string or stale tokens refuse the write; step-up exemptions, risk acknowledgement and template revision checks still apply.
 
@@ -1172,7 +1195,7 @@ Admin-only `users.list {}` adds `google_signin_linked` (boolean), `google_signin
 
 ## Member-key and Odoo access settings (v1.86.0)
 
-These additions are configured through settings/RPCs; dashboard controls arrive with the dashboard update.
+On **External access** (`/me/external-access`), members select **Include my conversation content** and external tool scopes when creating a key; later changes can only narrow access. Admins use the two master switches on the same page. Open **Integrations → Odoo** for the upgrade notice, permission mode (engine tables or follow the Odoo account, with risk confirmation), **Always refuse** (grouped defaults; removal requires confirmation; five fixed refusals remain), **Which AIs may use the company account**, and **Colleagues’ own Odoo accounts** (off by default) with the member credential list. In the **employee editor → Integrations → Odoo**, use **Narrow permissions**, **Use the current requester’s Odoo account**, and the per-table Activity / Internal note / Notify followers / Attachment controls; each requires confirmation. Members enter their own login and key under **My connections → Odoo**, which shows **Configured by administrator** until the Admin enables it. Admins revoke a member credential from **Members → row menu → Revoke Odoo account**.
 
 | Section / key | Default and behavior |
 | --- | --- |
@@ -1206,7 +1229,7 @@ const snapshot = await rpc('odoo.access_get', {});
 await rpc('odoo.access_set', { attachment_max_mb: 5, expected_hash: snapshot.hash });
 ```
 
-Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls will be included in the Odoo settings page.
+Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls are in **employee editor → Integrations → Odoo**.
 
 When upgrading an installation with a configured company Odoo URL/database, a one-time backfill adds every existing regular AI without its own Odoo account to `company_key_agents`. It records the marker and upgrade notice without changing permission mode. AIs with an incomplete own Odoo account are not added and must be assigned by the admin. New AIs are never added automatically. Review this list after upgrading.
 

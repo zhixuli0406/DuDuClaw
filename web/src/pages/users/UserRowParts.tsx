@@ -260,6 +260,7 @@ export function UserActions({
   onInvite,
   onUnlinkGoogle,
   onRevokeOdoo,
+  onDeptGrants,
 }: {
   user: UserDetail;
   onEdit: () => void;
@@ -269,6 +270,7 @@ export function UserActions({
   onInvite?: () => void;
   onUnlinkGoogle?: () => void;
   onRevokeOdoo?: () => void;
+  onDeptGrants?: () => void;
 }) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -293,6 +295,7 @@ export function UserActions({
         <MoreHorizontal />
       </DropdownMenuTrigger>
       <DropdownMenuContent>
+        {viewerRole === 'admin' && user.role === 'manager' && onDeptGrants && <DropdownMenuItem onClick={onDeptGrants}>{intl.formatMessage({ id: 'users.deptGrants.action' })}</DropdownMenuItem>}
         {viewerRole === 'admin' && onUnlinkGoogle && <DropdownMenuItem onClick={onUnlinkGoogle}>{intl.formatMessage({ id: 'users.memberSignin.unlink' })}</DropdownMenuItem>}
         {viewerRole === 'admin' && onRevokeOdoo && <DropdownMenuItem onClick={onRevokeOdoo}>{intl.formatMessage({ id: 'users.memberSignin.revoke' })}</DropdownMenuItem>}
         {onInvite && viewerRole === 'admin' && user.status === 'active' && <DropdownMenuItem onClick={onInvite}>{intl.formatMessage({ id: 'users.invite.resend' })}</DropdownMenuItem>}

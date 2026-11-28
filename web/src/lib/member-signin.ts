@@ -18,5 +18,6 @@ export const memberSignin = {
   unlink: (userId: string) => client.call('users.google_signin.unlink', { user_id: userId }) as Promise<{ unlinked: boolean }>,
   retryAvatar: (userId: string) => client.call('users.signin_onboarding.retry_avatar', { user_id: userId }) as Promise<{ queued: boolean }>,
   credentials: () => client.call('odoo.member_credentials.list', {}) as Promise<{ credentials: OdooMemberCredential[]; enabled: boolean }>,
+  setEnabled: (enabled: boolean, acknowledgeRisk = false) => client.call('odoo.member_credentials.set_enabled', { enabled, acknowledge_risk: acknowledgeRisk }) as Promise<{ enabled: boolean }>,
   revoke: (userId: string) => client.call('odoo.member_credentials.revoke', { user_id: userId }) as Promise<{ revoked: boolean }>,
 };

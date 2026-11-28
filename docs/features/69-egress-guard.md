@@ -1,5 +1,7 @@
 # Outgoing data guard
 
+Open approval cards in **Inbox**; processed cards show **Decision maker** and decision time. Admins grant department reviewers in **Members → Manager row → Department management grants**. Chat approval is configured in **Security settings → Approve in chat apps**.
+
 **Codex external configuration gate (since v1.80.0):** Employees, Explore, utility, Task Sandbox and Discovery may run when external layers are absent or define no MCP servers; detected MCP or unreadable/unparseable existing layers refuse launch with the source named. A refused explicit Codex judge fails acceptance without retrying the default judge. This checks a local/cache snapshot before launch, not complete isolation from subsequent cloud refresh. See [checked sources and limits](../architecture/extension-gates.md).
 
 Available from v1.77.0. The guard tracks private reads during an AI employee's turn and checks later outgoing MCP calls before execution, outside the model.
@@ -75,7 +77,7 @@ Clearing a lease removes its protection against concurrent private reads. Restar
 
 Outbound-data approval cards can be opened and decided in the dashboard by a current Admin or an active Manager granted outbound-data review for the employee’s department. A Manager cannot decide a request made on their own behalf, and personal employees are never covered by department grants. The reviewer sees the destination, full arguments expanded in a scrollable panel, source tools and expiry. Lists, timelines and notifications show only a fixed summary without request content; full details are available in the card view. Every non-Admin opening must first be audited; opening is refused if the audit cannot be written. Decisions audit the reviewer type on a best-effort basis, with the decision maker also kept on the approval record.
 
-Notifications go only to active Admins and active Managers holding that department grant. Their eligibility and exact verified direct-message destination are checked before every send, including reminders. Chat decisions for these cards remain Admin-only. See [Department managers](79-department-managers.md) for grants and limits, including the pending dashboard grant editor.
+Notifications go only to active Admins and active Managers holding that department grant. Their eligibility and exact verified direct-message destination are checked before every send, including reminders. Chat decisions for these cards remain Admin-only. See [Department managers](79-department-managers.md) for grants and limits, including Members → Department management grants.
 
 Eligible `mail_send` requests retain the separate exception: the verified turn requester with current Operator access may decide in the original one-to-one conversation or authenticated dashboard WebChat when `[security] mail_requester_approval` allows it. See [requester rules and configuration failures](05-security-defense.md#requester-confirmation-for-mail).
 

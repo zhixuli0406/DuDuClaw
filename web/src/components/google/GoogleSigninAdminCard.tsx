@@ -6,7 +6,7 @@ import { RiskConfirmDialog } from '@/components/settings/controls';
 import { useAdminStepUp } from '@/components/step-up/useAdminStepUp';
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { googleSignin, type GoogleSigninForm, type GoogleSigninSettings, type GoogleSigninStatus } from '@/lib/google-signin';
-import { settingsRefusal } from '@/lib/settings-refusal';
+import { isSettingsConflict, settingsRefusal } from '@/lib/settings-refusal';
 import { templateLibrary, type LibraryTemplateDetail } from '@/lib/template-library';
 import { useUserNames } from '@/lib/use-user-names';
 
@@ -16,11 +16,6 @@ function formOf(s: GoogleSigninSettings): GoogleSigninForm {
     daily_new_accounts: s.daily_new_accounts, avatar_template: s.avatar_template,
     ...(s.avatar_template_revision != null ? { avatar_template_revision: s.avatar_template_revision } : {}),
     approval_grants_mfa_enrollment: s.approval_grants_mfa_enrollment };
-}
-// Compare all persisted settings except the audit acknowledgement, regardless of object key order.
-function snapshot(s: GoogleSigninSettings): string {
-  return JSON.stringify([s.enabled, s.enabled_requested, s.allowed_hd, s.approval, s.daily_new_accounts,
-    s.avatar_template, s.avatar_template_revision, s.approval_grants_mfa_enrollment]);
 }
 function sameForm(a: GoogleSigninForm, b: GoogleSigninForm): boolean {
   return JSON.stringify([a.enabled, a.allowed_hd, a.approval, a.daily_new_accounts, a.avatar_template, a.avatar_template_revision, a.approval_grants_mfa_enrollment])
@@ -45,7 +40,6 @@ export function GoogleSigninAdminCard() {
   const [copied, setCopied] = useState(false);
   const picker = useRef<HTMLSelectElement>(null);
   const lock = useRef(false);
-  const loaded = useRef<string | null>(null);
   const load = useCallback(async () => {
     if (lock.current) return;
     lock.current = true; setBusy(true); setError(null);
@@ -54,33 +48,31 @@ export function GoogleSigninAdminCard() {
       const catalog = await templateLibrary.catalog();
       const details = await Promise.allSettled(catalog.templates.filter(item => item.source === 'company').map(item => templateLibrary.get(item.id)));
       setTemplates(details.flatMap(item => item.status === 'fulfilled' && item.value.source === 'company' ? [item.value] : []));
-      loaded.current = snapshot(result.settings); setStatus(result); setForm(formOf(result.settings)); setConflict(false);
-    } catch (err) { loaded.current = null; setStatus(null); setForm(null); setError(settingsRefusal(err, errorText(err))); }
+      setStatus(result); setForm(formOf(result.settings)); setConflict(false);
+    } catch (err) { setStatus(null); setForm(null); setError(settingsRefusal(err, errorText(err))); }
     finally { lock.current = false; setBusy(false); }
   }, [errorText]);
   useEffect(() => { void load(); }, [load]);
 
   const save = async (next: GoogleSigninForm, acknowledge = false) => {
-    if (!status || lock.current || conflict || loaded.current == null) return;
+    if (!status || lock.current || conflict || typeof status.hash !== 'string' || !status.hash) return;
     lock.current = true; setBusy(true); setError(null); setPending(null);
     try {
       const pureDisable = !next.enabled && sameForm(next, { ...formOf(status.settings), enabled: false });
       const token = pureDisable ? null : await ensure(t('stepUpReason'));
       if (!pureDisable && !token) return;
-      // Re-read after step-up so time spent verifying cannot conceal another admin's edits.
-      const current = await googleSignin.get();
-      if (snapshot(current.settings) !== loaded.current) { setConflict(true); return; }
-      const result = await googleSignin.set({ ...next, ...(acknowledge ? { acknowledge_risk: true } : {}), ...(token ? { step_up_csrf: token } : {}) });
-      loaded.current = snapshot(result.settings);
-      setStatus({ ...current, settings: result.settings, checks: { ...current.checks, domains_set: result.settings.allowed_hd.length > 0 } });
+      const result = await googleSignin.set({ ...next, expected_hash: status.hash, ...(acknowledge ? { acknowledge_risk: true } : {}), ...(token ? { step_up_csrf: token } : {}) });
+      setStatus({ ...status, hash: result.hash, settings: result.settings, checks: { ...status.checks, domains_set: result.settings.allowed_hd.length > 0 } });
       setForm(formOf(result.settings));
     } catch (err) {
       if (err && typeof err === 'object' && 'code' in err && err.code === 'signin_step_up_required') invalidate();
-      setError(settingsRefusal(err, errorText(err)));
+      const message = settingsRefusal(err, errorText(err));
+      setError(message);
+      if (isSettingsConflict(message)) setConflict(true);
     } finally { lock.current = false; setBusy(false); }
   };
   const requestSave = (next: GoogleSigninForm) => {
-    if (!status || busy || conflict || pending) return;
+    if (!status || busy || conflict || pending || typeof status.hash !== 'string' || !status.hash) return;
     setError(null);
     if (!next.allowed_hd.length) { setError(t('domainsRequired')); return; }
     if (!Number.isInteger(next.daily_new_accounts) || next.daily_new_accounts < 1 || next.daily_new_accounts > 200) { setError(t('capInvalid')); return; }
@@ -96,7 +88,7 @@ export function GoogleSigninAdminCard() {
     ];
     if (reasons.length) setPending({ form: next, reasons }); else void save(next);
   };
-  const disabled = busy || conflict || pending !== null;
+  const disabled = busy || conflict || pending !== null || typeof status?.hash !== 'string' || !status.hash;
   const selected = templates.find(item => item.id === form?.avatar_template);
   const templateChanged = form != null && (form.avatar_template === null || (form.avatar_template !== '' && (!selected || selected.revision == null || selected.revision !== form.avatar_template_revision)));
   const check = (key: string, pass: boolean | null, label: string) => <li key={key} className={pass === true ? 'text-success' : 'text-warning'}>
@@ -106,7 +98,6 @@ export function GoogleSigninAdminCard() {
   return <Card data-testid="google-signin-admin"><CardContent className="space-y-5 py-5">
     <div><h2 className="font-medium">{t('title')}</h2><p className="mt-1 text-sm text-muted-foreground">{t('intro')}</p></div>
     {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
-    {conflict && <p role="alert" className="text-sm text-warning">{t('conflict')}</p>}
     {(conflict || !status) && <Button variant="outline" disabled={busy} onClick={() => void load()}>{t('reload')}</Button>}
     {status && form && <>
       <div className="space-y-2"><div className="flex items-center gap-2"><Switch nativeButton render={<button type="button" />} aria-label={t('switch')} checked={status.settings.enabled_requested} disabled={disabled}

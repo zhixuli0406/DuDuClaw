@@ -1,3 +1,5 @@
+import { orgErrorCode, orgErrorField } from '@/lib/org-change';
+import type { ReachReview } from '@/lib/api';
 import { formatDateTime, useCompanyTimeZone } from '@/lib/company-time';
 import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { useIntl } from 'react-intl';
@@ -536,7 +538,7 @@ export function ApprovalDetailPanel({
   /** `expectedDigest`: the review digest of the card the view rendered
    *  (autopilot actions always pass it; the parent sends it as
    *  `expected_digest`). */
-  onApprove: (expectedDigest?: string) => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   /** Called after a self-contained (skill_create) decision succeeds, so the
    *  parent can remove the decided row without issuing a second decide. */
@@ -611,7 +613,7 @@ function GenericApprovalView({
 }: {
   approval: ApprovalItem;
   agentName?: string;
-  onApprove: () => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   decideError?: unknown;
 }) {
@@ -624,6 +626,15 @@ function GenericApprovalView({
   // org_change: a request made against an org position that has since moved
   // can only be rejected.
   const [orgStale, setOrgStale] = useState(false);
+  const [orgReachDigest, setOrgReachDigest] = useState<string>();
+  const [reachOverride, setReachOverride] = useState<ReachReview>();
+  useEffect(() => {
+    if (approval.kind === 'org_change' && orgErrorCode(decideError) === 'reach_changed') {
+      const current = orgErrorField<ReachReview>(decideError, 'current');
+      if (current) setReachOverride(current);
+    }
+  }, [approval.kind, decideError]);
+  const approveReviewed = () => approval.kind === 'org_change' ? onApprove(undefined, orgReachDigest) : onApprove();
 
   const risk = approvalRisk(approval.kind, approval.payload);
   const facts = extractPlanFacts(approval.payload);
@@ -664,13 +675,13 @@ function GenericApprovalView({
     ? expiryState({ timestamp: approval.created_at, expiresAt: expiresAtEpoch }, now)
     : null;
   // Internal admin settings identifiers must stay hidden even in the generic fallback.
-  const payload = approval.kind === 'admin_ai_settings'
+  const payload = approval.kind === 'org_change' ? undefined : approval.kind === 'admin_ai_settings'
     ? JSON.stringify(approval.payload, (key, value) => key === 'id' || key === 'target' ? undefined : value, 2)
     : typeof approval.payload === 'string' ? approval.payload : JSON.stringify(approval.payload, null, 2);
 
   const requestApprove = () => {
     if (riskNeedsConfirm(risk)) setConfirmOpen(true);
-    else onApprove();
+    else approveReviewed();
   };
 
   return (
@@ -716,7 +727,7 @@ function GenericApprovalView({
 
       {approval.kind === 'agent_file_change' && <AgentFileChangeFacts approval={approval} agentName={agentName} />}
 
-      {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={agentName} onStale={setOrgStale} />}
+      {approval.kind === 'org_change' && <OrgChangeFacts approval={approval} agentName={agentName} onStale={setOrgStale} onReachDigest={setOrgReachDigest} reachOverride={reachOverride} />}
 
       {reviewLink && <div className="space-y-1 rounded-lg border p-3">
         {isAdminReviewer ? (
@@ -831,7 +842,7 @@ function GenericApprovalView({
           <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
           <div className="min-w-0 space-y-0.5">
             <p className="font-medium">{t('approval.decide.failed')}</p>
-            <p className="whitespace-pre-wrap break-words">{formatErrorDetail(decideError) || formatError(decideError)}</p>
+            <p className="whitespace-pre-wrap break-words">{orgErrorCode(decideError) === 'reach_changed' ? t('orgReach.changed') : formatErrorDetail(decideError) || formatError(decideError)}</p>
           </div>
         </div>
       )}
@@ -866,7 +877,7 @@ function GenericApprovalView({
               variant="brand"
               onClick={() => {
                 setConfirmOpen(false);
-                onApprove();
+                approveReviewed();
               }}
             >
               {t('approval.confirm.approve')}
@@ -917,7 +928,7 @@ function AutopilotActionApprovalView({
   decideError,
 }: {
   approval: ApprovalItem;
-  onApprove: (expectedDigest?: string) => void;
+  onApprove: (expectedDigest?: string, reachDigest?: string) => void;
   onReject: () => void;
   decideError?: unknown;
 }) {

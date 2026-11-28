@@ -5,6 +5,7 @@ import { Link, useSearchParams } from 'react-router';
 import { api, type PersonalGoogleStatus } from '@/lib/api';
 import { DriveWriteMemberCard } from '@/components/connections/DriveWriteMemberCard';
 import { DriveWriteConfirmations } from '@/components/connections/DriveWriteConfirmationCard';
+import { OdooConnectionCard } from '@/components/connections/OdooConnectionCard';
 import { GoogleSigninCard } from '@/components/connections/GoogleSigninCard';
 import { ChatLinkCard } from '@/components/connections/ChatLinkCard';
 import { useAuthStore } from '@/stores/auth-store';
@@ -124,6 +125,7 @@ export function MyConnectionsPage() {
       </>}
     </CardContent></Card>
     {status && !error && <DriveWriteMemberCard status={status} onRefresh={load} onStarted={started => { setRedirectUri(started.redirect_uri); setPaste(started.completion === 'paste'); }} />}
+    <OdooConnectionCard />
     <GoogleSigninCard />
     <DriveWriteConfirmations />
     {isAdmin && <ChatLinkCard />}

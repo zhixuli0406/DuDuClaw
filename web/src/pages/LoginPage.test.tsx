@@ -213,6 +213,19 @@ describe('Google sign-in (S-13)', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/login/google/start', expect.objectContaining({ method: 'POST', credentials: 'same-origin', body: '{}' }));
   });
 
+  it('refuses authorization URLs with embedded credentials', async () => {
+    const assign = vi.fn();
+    vi.stubGlobal('location', { ...window.location, assign });
+    fetchMock.mockImplementation((url: string) => reply(url.endsWith('/methods')
+      ? { google: 'available' }
+      : { authorization_url: 'https://user:secret@accounts.google.com/o/oauth2/v2/auth' }));
+    renderWithProviders(<LoginPage />);
+    fireEvent.click(await screen.findByRole('button', { name: en['login.google.button'] }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(en['login.google.result.incomplete']);
+    expect(assign).not.toHaveBeenCalled();
+  });
+
   it.each([404, 429])('shows the generic message when start returns HTTP %s', async (status) => {
     fetchMock.mockImplementation((url: string) => url.endsWith('/methods')
       ? reply({ google: 'available' }) : reply({ error: 'internal detail' }, status));

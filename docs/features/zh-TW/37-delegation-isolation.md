@@ -1,5 +1,7 @@
 # 部門與階級隔離
 
+「設定 → 進階設定 → 委派權限」提供角色例外與單向配對。首次勾選角色須確認風險；每組配對分別說明兩個方向，A → B 允許 A 交辦給 B，反方向另行判斷。
+
 > AI 員工的委派管制：誰能叫誰做事，由 `reports_to` 階層、部門與白名單決定。
 
 DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工現在需要遵循組織結構，不是對任何人都言聽計從。
@@ -27,7 +29,7 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 
 預設值 `department` 適合一般協作：既已修正越級指派漏洞，同時保留同事互相支援的彈性。
 
-**`none` 的細節（v1.82.0）。** 以下限制適用於不符合下述角色例外的情況。下面所有路徑都由同一個判斷函式決定，所以 `send_to_agent`、`spawn_agent`、指派給其他員工的 `tasks_create`／`tasks_update`、`create_task` 步驟、替別人排的例行工作、改動其他員工的紀錄、co-drive 郵件交辦，以及 bus 分派閘門，都會以 `delegation_disabled` 拒絕。MCP 分派閘門也會對所有員工拒絕 `spawn_ephemeral` 與 `create_agent`（受保護模式下 `spawn_ephemeral` 的子工作也不會放行）；員工的工具清單不再列出 `send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`，`tasks_create`、`create_task` 仍列出供員工處理自己的工作。`list_agents` 不再因白名單配對而看得到更多員工。另一個例外是團隊模式（Team-as-Agent）：同一位員工的規劃、執行、檢查角色在同一回合內透過 `team_handoff` 交換任務封包。在任何委派模式下，`team_handoff` 只接受經過驗證的團隊成員——gateway 在 `agents/.ephemeral/eph-*` 建立、`[team_member]` 記錄的上層員工與 `ephemeral.toml` 一致的角色成員；一般 AI 員工會被拒絕（`not_a_team_member`），也看不到這個工具，即使在自己的 `agent.toml` 寫入 `[team_member]` 也一樣（員工本來就不能修改這個區段）。呼叫者的身分還必須通過身分權杖驗證（`DUDUCLAW_AGENT_TOKEN`）：管理員開啟 30 天過渡寬鬆模式（`require_identity_token = false`）時，沒有有效權杖的程序以「未驗證」身分執行，這時只宣告一個既有的 `eph-*` id 既不能呼叫、也看不到這個工具，也拿不到 `none` 模式的例外（`not_a_team_member`）；寬鬆模式下其他行為不變。角色成員由團隊編排器自己執行，不經過委派判斷。另外在 `none` 模式下：`agent_update` 不能改另一位員工的 `status`、`heartbeat_enabled`、`heartbeat_cron`（這些會啟動或重排對方的背景工作；其他模式下也要通過委派判斷，並在寫入鎖內再檢查一次）；`channel_config` 不能把 `agent_override` 指向另一位員工；ACP 只能把工作交給預設（main）員工。
+**`none` 的細節（v1.82.0）。** 以下限制適用於不符合下述角色例外的情況。下面所有路徑都由同一個判斷函式決定，所以 `send_to_agent`、`spawn_agent`、指派給其他員工的 `tasks_create`／`tasks_update`、`create_task` 步驟、替別人排的例行工作、改動其他員工的紀錄、co-drive 郵件交辦，以及 bus 分派閘門，都會以 `delegation_disabled` 拒絕。MCP 分派閘門也會對所有員工拒絕 `spawn_ephemeral` 與 `create_agent`（受保護模式下 `spawn_ephemeral` 的子工作也不會放行）；員工的工具清單不再列出 `send_to_agent`、`spawn_agent`、`spawn_ephemeral`、`create_agent`，`tasks_create`、`create_task` 仍列出供員工處理自己的工作。`list_agents` 不再因白名單配對而看得到更多員工。另一個例外是團隊模式（Team-as-Agent）：同一位員工的規劃、執行、檢查角色在同一回合內透過 `team_handoff` 交換任務封包。在任何委派模式下，`team_handoff` 只接受經過驗證的團隊成員，gateway 在 `agents/.ephemeral/eph-*` 建立、`[team_member]` 記錄的上層員工與 `ephemeral.toml` 一致的角色成員；一般 AI 員工會被拒絕（`not_a_team_member`），也看不到這個工具，即使在自己的 `agent.toml` 寫入 `[team_member]` 也一樣（員工本來就不能修改這個區段）。呼叫者的身分還必須通過身分權杖驗證（`DUDUCLAW_AGENT_TOKEN`）：管理員開啟 30 天過渡寬鬆模式（`require_identity_token = false`）時，沒有有效權杖的程序以「未驗證」身分執行，這時只宣告一個既有的 `eph-*` id 既不能呼叫、也看不到這個工具，也拿不到 `none` 模式的例外（`not_a_team_member`）；寬鬆模式下其他行為不變。角色成員由團隊編排器自己執行，不經過委派判斷。另外在 `none` 模式下：`agent_update` 不能改另一位員工的 `status`、`heartbeat_enabled`、`heartbeat_cron`（這些會啟動或重排對方的背景工作；其他模式下也要通過委派判斷，並在寫入鎖內再檢查一次）；`channel_config` 不能把 `agent_override` 指向另一位員工；ACP 只能把工作交給預設（main）員工。
 
 **邊界。** `none` 與所有寄件者檢查，都建立在 AI 員工無法寫入 gateway 的佇列檔（`bus_queue.jsonl`、`message_queue.db` 及其附屬檔）之上：佇列列沒有准入簽章，能以 gateway 的作業系統使用者身分寫入這些檔案的程序就能冒充系統寄件者。員工檔案防護會在 Write／Edit 與 Bash 擋下這類寫入，但擁有不受限 Bash 的員工不在這個邊界內；原生 Linux 員工隔離（尚未提供）才提供這個邊界。
 
@@ -39,24 +41,24 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 
 派工的每一條路徑都受管制：
 
-**1. 直接指派** — 從儀表板、Telegram 或 API 呼叫 `send_to_agent` / `spawn_agent`
+**1. 直接指派**，從儀表板、Telegram 或 API 呼叫 `send_to_agent` / `spawn_agent`
 
 - 頭目能指派給直屬下級，也能指派給孫層（祖父→孫現已允許）
 - 同部門員工之間可互相指派
 - 其他情況被拒，收到明確錯誤訊息說明是誰對誰、缺什麼關係
 
-**2. 任務派遣** — 在任務板建立任務（`tasks_create`）或改派（`tasks_update` 的 `assigned_to`）時指派給某人
+**2. 任務派遣**，在任務板建立任務（`tasks_create`）或改派（`tasks_update` 的 `assigned_to`）時指派給某人
 
 - 檢查同 1，拒絕時任務創建/改派失敗
 - 接手未指派、或本來就指派給自己的任務（`tasks_claim`）不受限；接手指派給其他員工的任務，要與該員工有同樣的關係
 - Dashboard 的指派操作不受限（都是人類操作）
 
-**2b. 多步驟計畫與例行工作** — `create_task` 的每個步驟可以指定執行者、帶 `schedule` 的 `tasks_create` 可以幫別人排定期工作
+**2b. 多步驟計畫與例行工作**，`create_task` 的每個步驟可以指定執行者、帶 `schedule` 的 `tasks_create` 可以幫別人排定期工作
 
 - 兩者都是委派，建立當下就檢查；`create_task` 的步驟另外在真正派工前再檢查一次
 - 幫自己排程、指定自己執行不受限
 
-**2c. 變更或觸發別人的紀錄** — 作用在已經屬於某位 AI 員工的紀錄上的工具
+**2c. 變更或觸發別人的紀錄**，作用在已經屬於某位 AI 員工的紀錄上的工具
 
 以前只有建立時會檢查，變更既有紀錄不會，所以用更新就能做到建立時被拒絕的事。下列工具現在用同一個述詞，比對呼叫者與紀錄擁有者：
 
@@ -72,12 +74,12 @@ DuDuClaw 1.52 引入一套針對多人團隊的委派管制。你的 AI 員工�
 - 內部共用金鑰、但行程沒有員工身分時，行為者是內部 client id；它不是組織圖上的任何節點，所以碰任何人的紀錄都會被拒絕
 - cron 工具一次只作用於一筆：用 `name` 指定時，多筆同名的例行工作會被拒絕，回覆會列出候選 id（這次修改之前，`delete_cron_task` 與 `pause_cron_task` 會作用在所有同名的列，`update_cron_task` 則作用在第一筆）
 
-**3. 自動化規則** — autopilot 規則裡的 delegate 動作
+**3. 自動化規則**，autopilot 規則裡的 delegate 動作
 
 - 用 `autopilot` 系統身分檢查，自動放行
 - 規則本身由儀表板守門，需要管理員設定
 
-**4. 外部 A2A 呼叫** — 其他系統透過 ACP 協議呼叫 `message/send` 委派任務
+**4. 外部 A2A 呼叫**，其他系統透過 ACP 協議呼叫 `message/send` 委派任務
 
 - 預設被拒（fail-closed）
 - 如果信任的外部夥伴需要，設定 `[acp] trusted = true` 才開通
@@ -114,13 +116,13 @@ allow = [
 - 手動編輯設定檔時，格式壞掉的項目（不是恰好兩個字串、有空字串）會被忽略並警告，不影響其他配對；ID 拼錯不會被偵測，只是那組配對不會生效
 - 從儀表板存檔時規則更嚴：任何一個 ID 找不到對應的 AI 員工就整筆拒絕儲存並指出是哪一個，而且一次最多 200 組配對
 
-儀表板「進階設定 → 委派權限」卡提供編輯界面，每個配對同時顯示兩方部門徽章，一眼看出協作意圖。
+儀表板「設定 → 進階設定 → 委派權限」卡提供編輯界面，每個配對同時顯示兩方部門徽章，一眼看出協作意圖。
 
 ---
 
 ## 角色例外與單向配對（v1.86.0）
 
-管理員可在「設定 › 委派權限 › 不受委派範圍限制的角色」勾選管理員或主管，預設全不勾選。這個例外只給成員本人的 AI 分身，也就是管理員在成員管理中指派給他的 AI。當本人在該次對話中親自要求時，分身可以交辦給任何 AI 員工，也能替任何人建立任務、排程與提醒。對方不會因此取得反向交辦的權利。
+管理員可在「設定 → 進階設定 → 委派權限 → 不受委派範圍限制的角色」勾選管理員或主管，預設全不勾選。這個例外只給成員本人的 AI 分身，也就是管理員在成員管理中指派給他的 AI。當本人在該次對話中親自要求時，分身可以交辦給任何 AI 員工，也能替任何人建立任務、排程與提醒。對方不會因此取得反向交辦的權利。
 
 只有管理員與主管（`admin`／`manager`）能使用這個例外。不提供一般成員，是因為勾選後會讓所有一般成員的 AI 分身都不受委派範圍限制；既有 `unrestricted_roles` 中的 `employee` 會被忽略。新增角色前，須閱讀風險說明並勾選「我了解」才能儲存。透過 `delegation.set` 或原始設定編輯器 `config.raw.set` 新增角色時，閘道也會要求 `acknowledge_risk: true`。`delegation_config_changed` 稽核紀錄會記下新增的角色（`roles_added`）、啟用者的使用者 ID（`acknowledged_by`）及伺服器產生的 RFC3339 時間（`acknowledged_at`）。移除角色不需風險確認，仍會留下稽核紀錄。
 
@@ -144,7 +146,7 @@ allow = [
 
 ## 儀表板設定（僅管理員）
 
-**進階設定 → 委派權限**
+**設定 → 進階設定 → 委派權限**
 
 四個控制項：
 
@@ -169,7 +171,7 @@ allow = [
 
 讀不到目前設定時，頁面會顯示錯誤，所有選項與「儲存」都停用，直到重新讀取成功（v1.82.0）；以前讀取失敗會在畫面上留下「部門模式、沒有配對」，按儲存就會蓋掉真正的設定。`config.toml` 不是有效的 TOML 時，`delegation.set` 會拒絕且不寫入。
 
-**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片（`delegation.effective {agent_id}`，管理員與有權查看該員工的經理）顯示這位員工實際適用的政策、來自全公司設定還是員工自己的 `[permissions] can_send_cross_agent` 開關（`false` 會讓這位員工視為 `none`）、能否建立員工、和他有關的配對（不生效的另外列出），以及設定問題（`config_error`／政策值警告）。寫錯的配對設定所產生的警告會引用原始內容，可能出現任何員工的 id，所以卡片只收到數量（`allow_warning_count`，顯示「委派設定有 N 則警告，管理員可以到「設定」查看」）；原文只給管理員查看者（`allow_warnings`），`delegation.get`（僅管理員）照舊有完整警告。設定問題也一樣：`config_error` 只是一個類別——`unreadable`／`unparsable`（config.toml）、`permissions_unreadable`（這位員工的 `[permissions]`）或 `unknown`——卡片依類別顯示固定說明，因為詳細原因可能引用設定檔原文（TOML 解析錯誤的片段）。詳細原因只給管理員查看者（`config_error_detail`），卡片不顯示；管理員可在「設定 › 委派權限」透過 `delegation.get` 看到。
+**員工頁 → 總覽 → 委派範圍（v1.82.0）。** 唯讀卡片（`delegation.effective {agent_id}`，管理員與有權查看該員工的經理）顯示這位員工實際適用的政策、來自全公司設定還是員工自己的 `[permissions] can_send_cross_agent` 開關（`false` 會讓這位員工視為 `none`）、能否建立員工、和他有關的配對（不生效的另外列出），以及設定問題（`config_error`／政策值警告）。寫錯的配對設定所產生的警告會引用原始內容，可能出現任何員工的 id，所以卡片只收到數量（`allow_warning_count`，顯示「委派設定有 N 則警告，管理員可以到「設定」查看」）；原文只給管理員查看者（`allow_warnings`），`delegation.get`（僅管理員）照舊有完整警告。設定問題也一樣：`config_error` 只是一個類別，`unreadable`／`unparsable`（config.toml）、`permissions_unreadable`（這位員工的 `[permissions]`）或 `unknown`，卡片依類別顯示固定說明，因為詳細原因可能引用設定檔原文（TOML 解析錯誤的片段）。詳細原因只給管理員查看者（`config_error_detail`），卡片不顯示；管理員可在「設定 → 進階設定 → 委派權限」透過 `delegation.get` 看到。
 
 卡片也會顯示角色例外，以及單向配對的「可交辦給」與「可接收自」。這是資格提示；每次請求仍會檢查當下的帳號與工作來源。
 
@@ -246,7 +248,7 @@ allow = [
 
 外部 A2A 呼叫預設用 `a2a-client` 身分，**不在清單內**。僅當 `[acp] trusted = true` 時才納入。
 
-`[acp] trusted = true` 等於信任每一個能以 gateway 的作業系統使用者身分啟動 ACP 伺服器（`duduclaw acp server`）的本機程序：伺服器從標準輸入讀取 JSON-RPC，不驗證呼叫者。v1.82 起 ACP 伺服器不能在 AI 員工的工作階段中啟動——偵測到 AI 工作階段環境變數，或員工身分（`DUDUCLAW_AGENT_ID`、`DUDUCLAW_AGENT_TOKEN`、`DUDUCLAW_HOOK_TOKEN`）時拒絕，Bash 防護也不讓員工執行這個指令。ACP 工作階段沒有綁定單一員工（每則訊息由 `contextId` 指定對象），所以在 `none` 模式下 ACP 只能把工作交給預設（main）員工，其他對象一律拒絕。
+`[acp] trusted = true` 等於信任每一個能以 gateway 的作業系統使用者身分啟動 ACP 伺服器（`duduclaw acp server`）的本機程序：伺服器從標準輸入讀取 JSON-RPC，不驗證呼叫者。v1.82 起 ACP 伺服器不能在 AI 員工的工作階段中啟動，偵測到 AI 工作階段環境變數，或員工身分（`DUDUCLAW_AGENT_ID`、`DUDUCLAW_AGENT_TOKEN`、`DUDUCLAW_HOOK_TOKEN`）時拒絕，Bash 防護也不讓員工執行這個指令。ACP 工作階段沒有綁定單一員工（每則訊息由 `contextId` 指定對象），所以在 `none` 模式下 ACP 只能把工作交給預設（main）員工，其他對象一律拒絕。
 
 上述名稱（加上 `a2a-client`、`default`、以及任何 `__` 開頭的名稱）是**保留字**，不能拿來建立 AI 員工，否則等於幫自己發一張通行證。
 
@@ -336,7 +338,7 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 | 檔案 | 欄位 / 區塊 | 原因 |
 |------|-----------|------|
 | `agent.toml` | `[agent]` 的 `name`, `reports_to`, `department` | 改這些等於改組織圖，自助提權漏洞 |
-| `agent.toml` | 整段 `[capabilities]` | 這是權限範圍（`allowed_tools`／`denied_tools`、`computer_use`／`browser_via_bash`／`os_native`／`git_credentials` 四個開關、`db_sources`、審批／不可逆／task-scoped 工具清單、`autonomy_level`、`wiki_visible_to`）。團隊角色成員以員工工作區為 cwd 執行，hook 因此把它判成員工本人——這裡曾是便宜的第三方模型唯一能放寬「約束自己那份 envelope」的地方。比對走兩邊鍵的聯集，之後版本新增的權限鍵也一併凍結 |
+| `agent.toml` | 整段 `[capabilities]` | 這是權限範圍（`allowed_tools`／`denied_tools`、`computer_use`／`browser_via_bash`／`os_native`／`git_credentials` 四個開關、`db_sources`、審批／不可逆／task-scoped 工具清單、`autonomy_level`、`wiki_visible_to`）。團隊角色成員以員工工作區為 cwd 執行，hook 因此把它判成員工本人，這裡曾是便宜的第三方模型唯一能放寬「約束自己那份 envelope」的地方。比對走兩邊鍵的聯集，之後版本新增的權限鍵也一併凍結 |
 | `config.toml` | `[delegation]`, `[acp]` 全段 | 政策設定涉及全團隊安全，不能隨意改 |
 | `.mcp.json`（員工目錄內任何一層） | AI 員工：整個檔案；管理者：`DUDUCLAW_AGENT_ID`、`DUDUCLAW_AGENT_TOKEN` | CLI 會以管理者的系統使用者身分啟動檔案列出的每一個伺服器，所以 AI 員工完全不能寫；管理者只檢查身分令牌（改掉等於冒充別人） |
 | `.claude/`、`.claude.json`（任何一層），`.codex/`、`.gemini/`、`.grok/`、`.agents/`（最上層） | AI 員工：全部 | 裡面的設定、hook、自訂指令與子代理會在 CLI 於該目錄啟動時載入。複製到員工目錄裡的專案也算：專案的 `.claude/` 可以讀，不能寫 |
@@ -352,7 +354,7 @@ Agent 經檔案工具（Write/Edit/Bash）的變更會被 PreToolUse hook 攔截
 - **修改 `name`、`reports_to`、`department`** → 儀表板「AI 員工 → 詳情 → 編輯」，或用 MCP `agent_update` 工具（AI 員工可以用它改下屬，不能改自己的 `reports_to`，見上文）
 - **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」、MCP `agent_update` 工具，或由操作者用一般編輯器改 `agent.toml [capabilities]`。這三條都不經這個 hook（hook 只看得到 Claude Code 自己的 Write／Edit／Bash 呼叫），所以員工（含它的團隊角色成員）無法從 session 內走這條路。透過 `agent_update`，AI 員工可以把資料庫來源授權給下屬，但不能授權給自己
 - **調整權限或新增工具** → 儀表板「AI 員工 → 進階設定」，或編輯 `agent.toml [capabilities]` 再手動指定（不走檔案工具）
-- **改委派政策或白名單** → 儀表板「進階設定 → 委派權限」，或直接編輯 `config.toml [delegation]` 再重啟 gateway
+- **改委派政策或白名單** → 儀表板「設定 → 進階設定 → 委派權限」，或直接編輯 `config.toml [delegation]` 再重啟 gateway
 - **新增 MCP server** → 管理者在儀表板「進階設定 → MCP 伺服器」新增，或在儀表板提出 MCP 安裝申請、由管理者核准。AI 員工不能靠編輯 `.mcp.json` 新增；管理者手動修改請用一般編輯器，不要在員工目錄裡啟動 `claude`（那個 session 會被當成該員工判定）。升級後請執行 `duduclaw doctor`，它會列出員工 `.mcp.json` 裡不是 DuDuClaw 寫入的每一個伺服器
 
 攔截會記在 `~/.duduclaw/tool_calls.jsonl` 帶 `org_placement_denied` 標記，便於除錯。
@@ -406,12 +408,12 @@ A：填部門代碼就行（例如 `sales`、`engineering`、`hr`）。字面對
 
 從 v1.52 起，組織結構有一個中央權威儲存，防止多人編輯導致不一致。
 
-### `org.toml` — 組織圖的單一事實來源
+### `org.toml`，組織圖的單一事實來源
 
 Gateway 首次啟動時，自動掃描所有 agent 目錄下的 `agent.toml`，把組織資料（`reports_to`、`department`）匯入到 `~/.duduclaw/org.toml` 中央檔案。之後所有對組織結構的變更都透過這個檔案進行：
 
 ```toml
-# ~/.duduclaw/org.toml — v1.52+ 新增
+# ~/.duduclaw/org.toml，v1.52+ 新增
 [agents."alice-engineer"]
 display_name = "Alice"
 reports_to = "sales-lead"
@@ -427,7 +429,7 @@ department = "sales"
 
 ### 三個指令管理組織結構
 
-#### 1. `duduclaw org sync` — 同步本機 agent.toml 到權威檔
+#### 1. `duduclaw org sync`，同步本機 agent.toml 到權威檔
 
 操作者在終端執行（**不是 AI 員工工作階段裡執行**）：
 
@@ -442,7 +444,7 @@ duduclaw org sync
 - 手動編輯了某個 agent.toml 的組織欄位，想把改動同步到權威檔
 - 從舊版本升級來，agent.toml 還有組織資料但權威檔空空的
 
-#### 2. `duduclaw org show` — 檢視目前的組織結構
+#### 2. `duduclaw org show`，檢視目前的組織結構
 
 ```bash
 duduclaw org show
@@ -450,7 +452,7 @@ duduclaw org show
 
 以樹狀或表格顯示所有員工、誰匯報給誰、各員工的部門。便於確認組織圖是否符合預期。
 
-#### 3. `duduclaw doctor` — 診斷組織資料不一致
+#### 3. `duduclaw doctor`，診斷組織資料不一致
 
 ```bash
 duduclaw doctor
@@ -493,7 +495,7 @@ v1.52 之後，Write / Edit / Bash 工具對檔案路徑有邊界檢查：
 
 任何檔案 Write / Edit / Bash 操作都經 hook 檢查，拒絕後立即返回錯誤。無需等到檔案 I/O，防止競態與日誌洩漏。
 
-### 沙箱層防線 — 非 Claude runtime
+### 沙箱層防線，非 Claude runtime
 
 Codex 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.duduclaw/` 目錄。即使 PreToolUse 有漏洞，沙箱會在系統層阻止。只有 FullAccess 沙箱（操作者顯式選擇的極端權限）會開放，此時應視為授予該員工臨時全域存取。
 
@@ -501,9 +503,9 @@ Codex 等非 Claude runtime，在 `workspace-write` 沙箱下無法寫入 `~/.du
 
 若需改動另一個員工的設定（例如主管調整下屬的 department）：
 
-1. **員工基本資料** — 儀表板「AI 員工 → 詳情 → 編輯」（由人類/系統操作者進行）
-2. **組織結構** — `duduclaw org sync` 或儀表板「進階設定 → 組織結構」
-3. **能力權限** — 儀表板「AI 員工 → 進階設定」或用 MCP `agent_update` 工具（需管理員驗證）
+1. **員工基本資料**，儀表板「AI 員工 → 詳情 → 編輯」（由人類/系統操作者進行）
+2. **組織結構**，`duduclaw org sync` 或儀表板「進階設定 → 組織結構」
+3. **能力權限**，儀表板「AI 員工 → 進階設定」或用 MCP `agent_update` 工具（需管理員驗證）
 
 這些管道都是人類決策的體現，不會被員工自助繞過。
 

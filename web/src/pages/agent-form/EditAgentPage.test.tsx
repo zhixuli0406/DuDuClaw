@@ -1,12 +1,13 @@
 import { setConfirmedCallableAgents } from '@/test/callable-agents';
 import { setStandardProductPolicyFixture } from '@/test/product-policy';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Routes, Route } from 'react-router';
 import en from '@/i18n/en.json';
 import { mockWsClient } from '@/test/mocks';
+import { useSystemStore } from '@/stores/system-store';
 import { SidebarProvider } from '@/components/mds';
 import { EditAgentPage } from './EditAgentPage';
 import { useAgentsStore } from '@/stores/agents-store';
@@ -633,3 +634,120 @@ it('does not load settings for an AI employee accessed through a team member', (
 });
 
 beforeEach(() => setConfirmedCallableAgents(true));
+
+
+it.each(['enterprise', 'personal', 'manager'])('department reach preview is admin Enterprise only (%s)', async mode => {
+  useSystemStore.setState({ status: { edition_profile: mode === 'personal' ? 'personal' : 'enterprise' } } as never);
+  if (mode === 'manager') {
+    useAuthStore.setState({ user: { id: 'manager', role: 'manager' }, bindings: [{ user_id: 'manager', agent_name: 'my-bot', access_level: 'owner', bound_at: '' }] } as never);
+    useAgentsStore.setState({ agents: [DETAIL] } as never);
+  }
+  mockWsClient.call.mockImplementation(async (method: string) => method === 'users.dept_grants.reach_preview'
+    ? { reach: [{ user_id: 'hidden-user', display_name: 'Alice', department: 'Sales', groups: ['schedules'], change: 'gains' }], reach_digest: 'ignored', sentence: 'hidden-sentence' }
+    : { ...DETAIL });
+  renderAt('/agents/my-bot/edit?tab=general');
+  await screen.findByDisplayValue('My Bot');
+  const department = document.querySelector('input[list="agent-department-options"]');
+  if (mode === 'personal') {
+    expect(department).toBeNull();
+  } else {
+    expect(department).not.toBeNull();
+    if (mode === 'manager') expect(department).toBeDisabled();
+    else {
+      fireEvent.change(department!, { target: { value: 'Sales' } });
+      expect(await screen.findByText('Once applied, Alice (Sales) will be able to manage this AI employee’s schedules.')).toBeInTheDocument();
+      expect(mockWsClient.call).toHaveBeenCalledWith('users.dept_grants.reach_preview', { agent_id: 'my-bot', department: 'Sales' });
+      expect(screen.queryByText(/hidden-user|hidden-sentence/)).not.toBeInTheDocument();
+    }
+  }
+  if (mode !== 'enterprise') expect(mockWsClient.call.mock.calls.some(([m]) => m === 'users.dept_grants.reach_preview')).toBe(false);
+  useSystemStore.setState({ status: null });
+});
+
+ describe('S-26 Odoo access controls', () => {
+   function configure(override = 'inherit', requester = false, refusal?: string) {
+     const base = mockWsClient.call.getMockImplementation()!;
+     mockWsClient.call.mockImplementation((method: string, params: unknown) => {
+       if (method === 'odoo.agent_config_get') return Promise.resolve({ agent_id: 'my-bot', permission_override: override, act_as_requester: requester, effective_blocked_models: [], unblock_inherited: true });
+       if (method === 'odoo.agent_access_set') {
+         if (refusal) return Promise.reject(new Error(refusal));
+         const patch = params as { permission_override?: string; act_as_requester?: boolean };
+         override = patch.permission_override ?? override;
+         requester = patch.act_as_requester ?? requester;
+         return Promise.resolve({ success: true, agent_id: 'my-bot', permission_override: override, act_as_requester: requester, hot_reloaded: true });
+       }
+       return base(method, params);
+     });
+   }
+   async function choose(user: ReturnType<typeof userEvent.setup>, label: string) {
+     const select = await screen.findByRole('combobox', { name: 'Permission restriction' });
+     await waitFor(() => expect(select).toBeEnabled());
+     await user.click(select);
+     await user.click(await screen.findByRole('option', { name: label }));
+   }
+   it('loads values and immediately narrows without acknowledgement or the main save', async () => {
+     configure('engine', true);
+     const user = userEvent.setup();
+     renderAt('/agents/my-bot/edit?tab=integration');
+     await waitFor(() => expect(screen.getByRole('combobox', { name: 'Permission restriction' })).toHaveTextContent('Always use engine permissions'));
+     expect(screen.getByRole('switch', { name: en['agents.odoo.access.requester'] })).toBeChecked();
+     await choose(user, 'Read only');
+     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.agent_access_set', { agent_id: 'my-bot', permission_override: 'read_only', acknowledge_risk: false }));
+     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+     expect(useAgentsStore.getState().updateAgent).not.toHaveBeenCalled();
+   });
+   it('requires acknowledgement before loosening', async () => {
+     configure('read_only');
+     const user = userEvent.setup();
+     renderAt('/agents/my-bot/edit?tab=integration');
+     await choose(user, 'Use company settings');
+     expect(screen.getByRole('dialog')).toHaveTextContent(en['agents.odoo.access.loosenAudit']);
+     expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'odoo.agent_access_set')).toHaveLength(0);
+     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+     await user.click(screen.getByRole('checkbox', { name: en['agents.odoo.access.loosenAck'] }));
+     await user.click(screen.getByRole('button', { name: 'Save' }));
+     await waitFor(() => expect(mockWsClient.call).toHaveBeenCalledWith('odoo.agent_access_set', { agent_id: 'my-bot', permission_override: 'inherit', acknowledge_risk: true }));
+   });
+   it('confirms requester on, saves off directly, and excludes access fields from agents.update', async () => {
+     configure();
+     const user = userEvent.setup();
+     renderAt('/agents/my-bot/edit?tab=integration');
+     const sw = await screen.findByRole('switch', { name: en['agents.odoo.access.requester'] });
+     await waitFor(() => expect(sw).toBeEnabled());
+     await user.click(sw);
+     expect(screen.getByRole('dialog')).toHaveTextContent(en['agents.odoo.access.requesterHelp']);
+     expect(mockWsClient.call.mock.calls.filter(([method]) => method === 'odoo.agent_access_set')).toHaveLength(0);
+     await user.click(screen.getByRole('checkbox', { name: en['agents.odoo.access.requesterAck'] }));
+     await user.click(screen.getByRole('button', { name: 'Save' }));
+     await waitFor(() => expect(sw).toBeChecked());
+     expect(mockWsClient.call).toHaveBeenCalledWith('odoo.agent_access_set', { agent_id: 'my-bot', act_as_requester: true, acknowledge_risk: true });
+     await user.click(sw);
+     await waitFor(() => expect(sw).not.toBeChecked());
+     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+     expect(mockWsClient.call).toHaveBeenCalledWith('odoo.agent_access_set', { agent_id: 'my-bot', act_as_requester: false, acknowledge_risk: false });
+     await user.click(screen.getAllByRole('switch', { name: 'Clear stored secret' })[0]);
+     await waitFor(() => expect(useAgentsStore.getState().updateAgent).toHaveBeenCalled(), { timeout: 3000 });
+     for (const [, payload] of vi.mocked(useAgentsStore.getState().updateAgent).mock.calls) {
+       expect(JSON.stringify(payload)).not.toMatch(/permission_override|act_as_requester/);
+     }
+   });
+   it('shows server refusals and retains the saved value', async () => {
+     const refusal = '放寬 AI 的 Odoo 權限或使用請求者帳號，須確認已了解風險。';
+     configure('inherit', false, refusal);
+     const user = userEvent.setup();
+     renderAt('/agents/my-bot/edit?tab=integration');
+     await choose(user, 'Read only');
+     expect(await screen.findByRole('alert')).toHaveTextContent(refusal);
+     expect(screen.getByRole('combobox', { name: 'Permission restriction' })).toHaveTextContent('Use company settings');
+   });
+   it('hides the access controls for non-admins', async () => {
+     configure();
+     useAuthStore.setState({ user: { id: 'member', role: 'employee' }, bindings: [{ user_id: 'member', agent_name: 'my-bot', access_level: 'owner', bound_at: '' }] } as never);
+     useAgentsStore.setState({ agents: [DETAIL] } as never);
+     setConfirmedCallableAgents(true);
+     renderAt('/agents/my-bot/edit?tab=integration');
+     await screen.findByRole('heading', { name: 'Integrations', level: 2 });
+     expect(screen.queryByRole('combobox', { name: 'Permission restriction' })).not.toBeInTheDocument();
+     expect(screen.queryByRole('switch', { name: en['agents.odoo.access.requester'] })).not.toBeInTheDocument();
+   });
+ });
