@@ -313,6 +313,22 @@ Heartbeat 的 `cron_timezone`、摘要的 `timezone`、主動通知勿擾時段�
 
 僅限管理員（`delegation.get`／`delegation.set`）。儲存後下一次委派判斷就生效，不需重新啟動。
 
+直接呼叫 RPC 時，每次儲存前須先呼叫對應的 `delegation.get` 或 `google.drive_write.get`，將回傳的 `hash` 傳入 `expected_hash`（v1.86.0）。以下 `rpc` 代表已登入的 RPC 用戶端；範例會關閉所有雲端硬碟寫入，請先核對目前設定再決定變更。版本衝突時須重新載入並核對，不可直接重試。`delegation.effective` 的 `configured_policy` 僅向管理員回傳，其他讀者的回應省略此欄位；僅限管理員的 `delegation.get` 維持回傳原始值。
+
+```javascript
+const delegation = await rpc('delegation.get', {});
+await rpc('delegation.set', {
+  policy: 'hierarchy', allow: [], expected_hash: delegation.hash,
+});
+
+const drive = await rpc('google.drive_write.get', {});
+await rpc('google.drive_write.set', {
+  create: false, modify: false, move: false, trash: false,
+  approval: { create: 'member', modify: 'member', move: 'member', trash: 'member' },
+  folders: [], acknowledge_risk: false, expected_hash: drive.hash,
+});
+```
+
 | 控制項 | 設定鍵 | 生效時機 |
 |---|---|---|
 | 委派模式 → 部門模式（預設）／階層模式／開放模式／不允許委派（v1.82） | `config.toml [delegation] policy` = `department`／`hierarchy`／`open`／`none` | 下一次委派 |

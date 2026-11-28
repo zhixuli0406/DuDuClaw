@@ -295,8 +295,13 @@ base_url = "${base}/model/v1"
     const alice = await dashboard(tokens.access_token);
     const identity = (value) => admin('agents.google_identity_set', { agent_id: 'prod-shaped', identity: value, requesters: 'anyone', confirm_anyone: true });
     await identity('delegate:alice@c.test');
-    const setPolicy = (extra = {}) => admin('google.drive_write.set', { create: true, modify: true, move: true, trash: false,
-      approval: { create: 'none', modify: 'none', move: 'none', trash: 'none' }, folders: [folder], acknowledge_risk: true, ...extra });
+    const setPolicy = async (extra = {}) => {
+      const current = await admin('google.drive_write.get');
+      assert.equal(typeof current.hash, 'string', 'google.drive_write.get hash missing');
+      return admin('google.drive_write.set', { create: true, modify: true, move: true, trash: false,
+        approval: { create: 'none', modify: 'none', move: 'none', trash: 'none' }, folders: [folder], acknowledge_risk: true,
+        ...extra, expected_hash: current.hash });
+    };
     const service = (from) => requests.slice(from).filter((r) => !['/token', '/oauth2.googleapis.com/token', '/openidconnect.googleapis.com/v1/userinfo'].includes(r.path));
     const writes = (from) => service(from).filter((r) => r.method !== 'GET');
     const checkReply = (observation, ok, pattern) => {

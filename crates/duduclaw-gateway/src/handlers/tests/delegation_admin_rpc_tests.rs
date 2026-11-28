@@ -488,12 +488,16 @@ async fn broken_config_is_never_overwritten_and_get_reports_it() {
     std::fs::write(home.path().join("config.toml"), broken).unwrap();
     let handler = MethodHandler::new(home.path().to_path_buf()).await;
 
-    for params in [
+    assert!(!frame_ok(&handler.handle("delegation.get", json!({}), &admin_ctx()).await));
+    for mut params in [
         json!({ "policy": "department", "allow": [] }),
         json!({ "policy": "none" }),
         json!({ "allow": [] }),
     ] {
-        let frame = rpc_with_hash(&handler, "delegation.set", params.clone(), &admin_ctx()).await;
+        // A failed get supplies no hash. Deliberately bypass the normal
+        // client flow to exercise the set-side malformed-config refusal.
+        params["expected_hash"] = json!("");
+        let frame = handler.handle("delegation.set", params.clone(), &admin_ctx()).await;
         assert!(!frame_ok(&frame), "{params} must be refused: {frame:?}");
         assert!(frame_error(&frame).contains("TOML"), "{frame:?}");
         assert_eq!(
@@ -887,8 +891,11 @@ fn effective_displays_avatar_owner_name_without_changing_policy() {
 
 async fn rpc_with_hash(handler: &MethodHandler, method: &str, mut params: Value, ctx: &UserContext) -> WsFrame {
     if method == "delegation.set" {
-        let raw = super::super::config_commit::read_text_or_empty(&handler.home_dir.join("config.toml")).unwrap();
-        params["expected_hash"] = json!(super::super::config_commit::content_hash(&raw));
+        if ctx.is_admin() {
+            let get = handler.handle("delegation.get", json!({}), ctx).await;
+            if !frame_ok(&get) { return get; }
+            params["expected_hash"] = frame_data(&get)["hash"].clone();
+        }
     }
     handler.handle(method, params, ctx).await
 }
@@ -942,4 +949,34 @@ async fn delegation_warning_payloads_never_quote_config_values() {
     }
     assert!(effective.get("allow_warnings").is_none());
     assert!(effective.get("config_error_detail").is_none());
+}
+
+#[tokio::test]
+async fn effective_configured_policy_is_only_returned_to_live_admin() {
+    let home = tempfile::tempdir().unwrap();
+    seed_agent(home.path(), "sales-lead", "sales");
+    let handler = MethodHandler::new(home.path().to_path_buf()).await;
+    std::fs::write(home.path().join("config.toml"), "[delegation]\npolicy='weird-xyz'\n").unwrap();
+    let db = duduclaw_auth::UserDb::new(&home.path().join("users.db")).unwrap();
+    let user = db.create_user("manager@example.invalid", "Manager", "test-password", UserRole::Manager).unwrap();
+    db.bind_agent(&user.id, "sales-lead", AccessLevel::Viewer).unwrap();
+    let mut viewer = manager_ctx();
+    viewer.user_id = user.id;
+    viewer.email = user.email;
+    viewer.agent_access.insert("sales-lead".into(), AccessLevel::Viewer);
+    // Also cover a stale Admin role after a live downgrade to Manager.
+    for cached_role in [UserRole::Manager, UserRole::Admin] {
+        viewer.role = cached_role;
+        let frame = handler.handle("delegation.effective", json!({"agent_id":"sales-lead"}), &viewer).await;
+        assert!(frame_ok(&frame), "{frame:?}");
+        let data = frame_data(&frame);
+        assert_eq!(data["policy"], "none");
+        assert_eq!(data["policy_warning"]["code"], "policy_unknown");
+        assert!(data.get("configured_policy").is_none(), "{data}");
+        assert!(!data.to_string().contains("weird-xyz"), "{data}");
+    }
+
+    let frame = handler.handle("delegation.effective", json!({"agent_id":"sales-lead"}), &admin_ctx()).await;
+    assert!(frame_ok(&frame), "{frame:?}");
+    assert_eq!(frame_data(&frame)["configured_policy"], "weird-xyz");
 }

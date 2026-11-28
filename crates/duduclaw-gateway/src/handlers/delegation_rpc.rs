@@ -635,7 +635,6 @@ pub(crate) fn effective_delegation_json(
         "policy": policy.as_str(),
         "source": source,
         "global_policy": global.as_str(),
-        "configured_policy": read.configured_policy,
         "policy_warning": read.classified_policy_warning,
         // `unreadable` | `unparsable` | `permissions_unreadable` | `unknown`
         // (null when there is no problem) — never config text.
@@ -662,6 +661,8 @@ pub(crate) fn effective_delegation_json(
         "hidden_peer_placeholder": HIDDEN_PEER_PLACEHOLDER,
     });
     if viewer_is_admin {
+        // May contain arbitrary raw config values — Admin only.
+        payload["configured_policy"] = json!(read.configured_policy);
         // The raw texts quote the dropped entries verbatim — Admin only.
         payload["allow_warnings"] = json!(read.allow_warnings.iter().chain(&read.override_warnings).collect::<Vec<_>>());
         // May quote raw config text (TOML parse excerpt) — Admin only.
@@ -760,8 +761,11 @@ mod rm183_tests {
     use super::*;
 
     async fn set_with_hash(handler: &MethodHandler, mut params: Value, ctx: &UserContext) -> WsFrame {
-        let raw = super::super::config_commit::read_text_or_empty(&handler.home_dir.join("config.toml")).unwrap();
-        params["expected_hash"] = json!(super::super::config_commit::content_hash(&raw));
+        let get = handler.handle_delegation_get().await;
+        let WsFrame::Response { ok: true, payload: Some(get), .. } = get else {
+            return get;
+        };
+        params["expected_hash"] = get["hash"].clone();
         handler.handle_delegation_set(params, ctx).await
     }
 
