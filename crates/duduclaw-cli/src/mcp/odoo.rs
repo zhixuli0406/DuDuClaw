@@ -907,6 +907,10 @@ async fn connect_odoo_pool_inner(
             identity_client::audit_call(home_dir, caller_agent, tool, &error, false, None);
             return Err(error);
         }
+        if let Err(error) = super::approval::require_follow_execution_approval(caller_agent, tool, params, &identity) {
+            identity_client::audit_call(home_dir, caller_agent, tool, &error, false, None);
+            return Err(error);
+        }
     }
     let home_dir_owned = home_dir.to_path_buf();
     let connector = odoo

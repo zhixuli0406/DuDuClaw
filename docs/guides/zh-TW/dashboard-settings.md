@@ -1091,6 +1091,8 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 | 員工 `[odoo] permission_override` | 預設 `"inherit"`，也可選 `"engine"`、`"read_only"`，只能收窄。未知值視為唯讀。 |
 | 員工 `[odoo] act_as_requester` | `false`；允許使用經驗證請求者的本人 Odoo 身分，分身不能借用別人的帳號。 |
 
+引擎模式下，`odoo_execute` 與按鈕動作（含 `odoo_sale_confirm`）維持 v1.85 的核准行為：仍套用員工審批清單、動作規則與效果分類，不額外強制核准。「依 Odoo 帳號」模式下，非讀取的 `odoo_execute` 及所有 `action_*`、`button_*`、`toggle_*` 按鈕動作（含 `odoo_sale_confirm`）都須人工核准。通知追蹤者的訊息（`odoo_message_send`）在所有模式一律須核准。Allow 規則不能略過這些強制核准；核准綁定工具與完整參數，而且只能使用一次。
+
 將 `[odoo_access] permission_mode` 改為 `follow_odoo_account`、新增或修改 `permission_mode_ack`、移除有效的 `always_refuse` 項目，以及開啟 `[odoo] member_credentials`，只能在 Odoo 設定頁或其專用 RPC（`odoo.access_set`／`odoo.member_credentials.set_enabled`）確認風險後變更，原始設定編輯器與通用設定寫入路徑均會拒絕這些擴權操作。
 
 備份還原與 CLI 匯入會先收窄權限，讓復原繼續進行：依 Odoo 帳號模式退回引擎模式、移除風險確認紀錄，原本未開啟的同仁 Odoo 帳號開關維持關閉。`always_refuse` 保留目前安裝與備份兩邊的有效規則，未指定清單時採用預設清單。AI 備份中的 `act_as_requester` 會關閉，`permission_override` 僅保留 `engine`／`read_only`，備份漏掉的現有覆寫限制也會補回。發生收窄時會提示管理員到 Odoo 設定頁重新確認；不需收窄的設定保留原有格式。

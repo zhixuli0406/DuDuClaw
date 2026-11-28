@@ -633,6 +633,6 @@ ID 也可使用支援的 Google 檔案或資料夾網址。建立時省略 `pare
 | F4 | 修改 `mail` 及所有 `mail.*` 子模型；透過通用工具呼叫 `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。備註與訊息請用專用工具。 |
 | F5 | 呼叫 `_` 開頭的方法，以及 `init`、`uninstall_hook`。 |
 
-所有會修改資料的 `odoo_execute` 與 `action_*`、`button_*`、`toggle_*` 方法，在所有模式都須人工核准；`odoo_message_send` 也一律須核准。Allow 規則不能略過核准或拒絕規則；核准只用一次，綁定工具與完整參數。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。
+引擎模式下，`odoo_execute` 與按鈕動作（含 `odoo_sale_confirm`）維持 v1.85 的核准行為：仍套用員工審批清單、動作規則與效果分類，不額外強制核准。「依 Odoo 帳號」模式下，非讀取的 `odoo_execute` 及所有 `action_*`、`button_*`、`toggle_*` 按鈕動作（含 `odoo_sale_confirm`）都須人工核准。通知追蹤者的訊息（`odoo_message_send`）在所有模式一律須核准。Allow 規則不能略過這些強制核准；核准綁定工具與完整參數，而且只能使用一次。其他寫入仍受原有核准與資料外傳檢查。管理員透過有稽核的 `odoo.access_get/set` 管理政策；放寬 Follow、公司帳號名單或拒絕清單須帶 `acknowledge_risk`。
 
 個別員工透過管理員瀏覽器 RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` 調整；override 僅接受 `inherit`、`engine`、`read_only`，啟用請求者身分或放寬 override 須帶 `acknowledge_risk=true`。此操作只改這兩個欄位，重新確認有效的管理員工作階段，先寫稽核再儲存；稽核失敗不變更設定。`odoo.agent_config_get` 回傳這兩個欄位，原始／個人檔案設定寫入仍拒絕擴權，操作畫面將隨 Odoo 設定頁提供。

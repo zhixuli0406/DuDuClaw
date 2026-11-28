@@ -880,7 +880,7 @@ async fn isolated_odoo_message_still_requires_single_use_approval() {
         Arc::get_mut(&mut isolated).unwrap().context = live_context(context().record().clone());
         ISOLATED_CALL.scope(isolated, async {
             assert!(crate::mcp_isolation_disposition::intentional_refusal("odoo_message_send").is_none());
-            assert!(static_gate_flags(&agent_dir, "odoo_message_send", &payload).0);
+            assert!(static_gate_flags(&agent_dir, "odoo_message_send", &payload, crate::mcp::approval::OdooApprovalMode::Engine).0);
             let result = tokio::time::timeout(std::time::Duration::from_secs(5),
                 gate_tool_approval_dispatch(home.path(), "main", "odoo_message_send", payload)).await.unwrap();
             assert_eq!(result.is_ok(), approved);

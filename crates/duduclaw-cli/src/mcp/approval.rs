@@ -51,6 +51,68 @@ pub(crate) fn install_approval_required(
     is_install_class_tool(tool_name) && !duduclaw_gateway::approval::auto_approve_install(agent_dir)
 }
 
+/// Local policy can require approval, but only the gateway selects the
+/// execution identity. Unknown policy must never waive the forced gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OdooApprovalMode { Engine, FollowPossible, Unavailable }
+
+impl OdooApprovalMode {
+    pub(crate) fn for_tool(home: &Path, agent: &str, tool: &str) -> Self {
+        if super::odoo_access::operation(tool, None).is_none() { return Self::Engine; }
+        Self::load(home, agent)
+    }
+
+    pub(crate) fn load(home: &Path, agent: &str) -> Self {
+        match super::odoo_access::ToolPolicy::load_for_approval(home, agent) {
+            Ok(policy) if crate::mcp_isolation::current().is_none() && policy.approval_may_follow() => Self::FollowPossible,
+            Ok(_) => Self::Engine,
+            Err(_) => Self::Unavailable,
+        }
+    }
+}
+
+pub(crate) fn odoo_requires_approval(tool: &str, payload: &Value, mode: OdooApprovalMode) -> bool {
+    let args = payload.get("arguments").unwrap_or(&Value::Null);
+    let Some((_, _, method)) = super::odoo_access::operation(tool, Some(args)) else { return false };
+    tool == "odoo_message_send"
+        || (mode != OdooApprovalMode::Engine
+            && ((tool == "odoo_execute" && method.is_none_or(|m|
+                duduclaw_odoo::access_policy::method_verb(m) != duduclaw_odoo::access_policy::Verb::Read))
+                || method.is_some_and(|m| matches!(m.split_once('_'),
+                    Some(("action" | "button" | "toggle", _))))))
+}
+
+// Host-only proof, never a JSON flag. Each dispatch starts empty; a consumed
+// exact-call approval may authorize one matching execution in that call only.
+tokio::task_local! {
+    static ODOO_APPROVAL: std::cell::RefCell<Option<duduclaw_gateway::approval::action_grant::ActionGrant>>;
+}
+
+pub(crate) async fn with_odoo_approval_call<F: std::future::Future>(future: F) -> F::Output {
+    ODOO_APPROVAL.scope(std::cell::RefCell::new(None), future).await
+}
+
+fn record_odoo_approval(grant: &duduclaw_gateway::approval::action_grant::ActionGrant) {
+    if super::odoo_access::operation(&grant.tool, None).is_some() {
+        let _ = ODOO_APPROVAL.try_with(|cell| *cell.borrow_mut() = Some(grant.clone()));
+    }
+}
+
+/// Recheck the gateway's final mode before connecting. This closes a race
+/// where local policy was Engine at the approval gate but is now Follow.
+pub(super) fn require_follow_execution_approval(agent: &str, tool: &str, args: &Value,
+    decision: &super::odoo_identity_client::OdooIdentity) -> Result<(), String> {
+    use super::odoo_identity_client::IdentityPermission;
+    if decision.permission != IdentityPermission::Follow { return Ok(()); }
+    let payload = serde_json::json!({"arguments":args});
+    if !odoo_requires_approval(tool, &payload, OdooApprovalMode::FollowPossible) { return Ok(()); }
+    let expected = duduclaw_gateway::approval::action_grant::ActionGrant::build(agent, tool, &payload);
+    let approved = ODOO_APPROVAL.try_with(|cell| cell.borrow_mut().take() == Some(expected)).unwrap_or(false);
+    if approved { Ok(()) } else {
+        Err("這次 Odoo 操作需要重新取得人工核准，尚未執行。".into())
+    }
+}
+
 /// Static ActionGuard classification of one call: `(always, maybe)`.
 ///
 /// `always` folds in the legacy `approval_required_tools` + install-class gate
@@ -65,21 +127,11 @@ pub(crate) fn install_approval_required(
 /// (or `block`, which the dispatch gate refuses earlier). Rules only ever add
 /// to `always`, so an `allow` rule cannot remove an approval a name list
 /// imposes (take-the-stricter).
-pub(crate) fn odoo_requires_approval(tool: &str, payload: &Value) -> bool {
-    let args = payload.get("arguments").unwrap_or(&Value::Null);
-    let Some((_, _, method)) = super::odoo_access::operation(tool, Some(args)) else { return false };
-    // The runtime permission decision arrives later. Conservatively require
-    // exact-call approval in every mode for arbitrary mutations and buttons.
-    tool == "odoo_message_send"
-        || (tool == "odoo_execute" && method.is_none_or(|m|
-            duduclaw_odoo::access_policy::method_verb(m) != duduclaw_odoo::access_policy::Verb::Read))
-        || method.is_some_and(|m| ["action_", "button_", "toggle_"].iter().any(|prefix| m.starts_with(prefix)))
-}
-
 pub(crate) fn static_gate_flags(
     agent_dir: &Path,
     tool_name: &str,
     payload: &Value,
+    odoo_mode: OdooApprovalMode,
 ) -> (bool, bool) {
     let legacy_name = duduclaw_core::tool_catalog::removed_name_for_call(
         tool_name,
@@ -88,7 +140,7 @@ pub(crate) fn static_gate_flags(
     // RM-141: notifying Odoo followers always needs a human, even when an
     // action rule allows the tool. Send classification binds/consumes its
     // exact arguments through ActionGrant below.
-    let always = odoo_requires_approval(tool_name, payload)
+    let always = odoo_requires_approval(tool_name, payload, odoo_mode)
         || payload.get("egress_guard").is_some()
         || install_approval_required(agent_dir, tool_name, false)
         || duduclaw_gateway::approval::tool_is_irreversible(agent_dir, tool_name)
@@ -359,7 +411,10 @@ pub(crate) async fn run_approval_bound(
             Some(g) => {
                 use duduclaw_gateway::approval::action_grant::{GrantRefusal, verify_and_consume};
                 match verify_and_consume(broker, &approval_id, g).await {
-                    Ok(()) => InstallApprovalOutcome::Proceed,
+                    Ok(()) => {
+                        record_odoo_approval(g);
+                        InstallApprovalOutcome::Proceed
+                    },
                     Err(refusal) => {
                         warn!(approval = %approval_id, ?refusal, "bound approval not usable — denying (fail-closed)");
                         let what = match refusal {
@@ -562,7 +617,9 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
     // routes through the judge. caller_is_admin is `false` (F1: the internal MCP
     // principal always holds Admin, and this agent-autonomous path is exactly
     // what WP5 must gate).
-    let (in_always, in_maybe) = static_gate_flags(&agent_dir, tool_name, &payload);
+    let odoo_mode = OdooApprovalMode::for_tool(home_dir, agent_id, tool_name);
+    let forced_odoo = odoo_requires_approval(tool_name, &payload, odoo_mode);
+    let (in_always, in_maybe) = static_gate_flags(&agent_dir, tool_name, &payload, odoo_mode);
 
     // ── P3-1 VeriOS situation five-classification ASK gate ───────────────────
     // OS ACTION tools (`os_open`, future L5b native desktop actions) route
@@ -674,7 +731,12 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 } else {
                     "action_guard_require_approval"
                 };
-                return workflow.require_human(reason, &payload).await;
+                workflow.require_human(reason, &payload).await?;
+                if forced_odoo && !workflow.is_prepare() {
+                    record_odoo_approval(&duduclaw_gateway::approval::action_grant::ActionGrant::build(
+                        agent_id, tool_name, &payload));
+                }
+                return Ok(());
             }
             // The legacy path (approval_required_tools / install-class) keeps its
             // own summary via `install_approval_required`; but an
@@ -727,7 +789,7 @@ pub(crate) async fn gate_tool_approval_dispatch_workflow(
                 payload["reason"] = serde_json::json!("action_rule");
             }
             let grant =
-                (odoo_requires_approval(tool_name, &payload)
+                (odoo_requires_approval(tool_name, &payload, odoo_mode)
                     || duduclaw_gateway::approval::action_grant::binding_applies_for_request(tool_name, ask_rule, egress_ask))
                     .then(|| {
                         duduclaw_gateway::approval::action_grant::ActionGrant::build(

@@ -654,6 +654,6 @@ Engine は `allowed_models` の正確な対象と `allowed_actions` の `activit
 | F4 | `mail` とすべての `mail.*` 子モデルの変更。汎用ツールでの `message_post`、`message_notify`、`message_subscribe`、`send_mail`、`action_send_mail`。メモ・メッセージには専用ツールを使います。 |
 | F5 | `_` で始まるメソッド、および `init`、`uninstall_hook`。 |
 
-変更を行う `odoo_execute` とすべての `action_*`、`button_*`、`toggle_*` は、全モードで人の承認が必要です。`odoo_message_send` も常に承認が必要です。Allow ルールで承認や拒否を回避できません。承認はツールと正確な引数に結び付き、一度だけ使えます。ほかの書き込みも既存の承認・データ送信チェックを受けます。管理者は監査付き `odoo.access_get/set` で管理し、Follow・会社アカウント一覧・拒否リストの権限拡大には `acknowledge_risk` が必要です。
+Engine モードでは、`odoo_execute` とボタン操作（`odoo_sale_confirm` を含む）の承認動作は v1.85 と同じです。従業員の承認リスト、操作ルール、効果分類は引き続き適用し、追加の強制承認はありません。「Odoo アカウントに従う」モードでは、読み取り以外の `odoo_execute` とすべての `action_*`、`button_*`、`toggle_*` 操作（`odoo_sale_confirm` を含む）に人の承認が必要です。フォロワーへのメッセージ（`odoo_message_send`）は全モードで常に承認が必要です。Allow ルールではこれらの強制承認を省略できず、承認はツールと正確な引数に結び付き、一度だけ使えます。ほかの書き込みも既存の承認・データ送信チェックを受けます。管理者は監査付き `odoo.access_get/set` で管理し、Follow・会社アカウント一覧・拒否リストの権限拡大には `acknowledge_risk` が必要です。
 
 従業員ごとの変更には管理者のブラウザー RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` を使います。override は `inherit`、`engine`、`read_only` のみ受け付け、依頼者の ID の有効化や制限の緩和には `acknowledge_risk=true` が必要です。この 2 項目だけを変更し、有効な管理者セッションを再確認して書き込み前に監査します。監査失敗時は変更しません。`odoo.agent_config_get` は両項目を返し、生の設定やプロフィールの書き込みでは権限拡大を拒否します。操作画面は Odoo 設定ページで提供予定です。

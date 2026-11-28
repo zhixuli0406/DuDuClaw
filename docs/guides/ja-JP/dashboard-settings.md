@@ -1097,6 +1097,8 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 | 社員 `[odoo] permission_override` | 既定 `"inherit"`。`"engine"`、`"read_only"` で制限を強められます。未知の値は読み取り専用です。 |
 | 社員 `[odoo] act_as_requester` | `false`。確認済み依頼者の個人 Odoo 認証を使用します。アバターが別の人のアカウントを借用することはできません。 |
 
+Engine モードでは、`odoo_execute` とボタン操作（`odoo_sale_confirm` を含む）の承認動作は v1.85 と同じです。従業員の承認リスト、操作ルール、効果分類は引き続き適用し、追加の強制承認はありません。「Odoo アカウントに従う」モードでは、読み取り以外の `odoo_execute` とすべての `action_*`、`button_*`、`toggle_*` 操作（`odoo_sale_confirm` を含む）に人の承認が必要です。フォロワーへのメッセージ（`odoo_message_send`）は全モードで常に承認が必要です。Allow ルールではこれらの強制承認を省略できず、承認はツールと正確な引数に結び付き、一度だけ使えます。
+
 `[odoo_access] permission_mode` の `follow_odoo_account` への変更、`permission_mode_ack` の追加・変更、有効な `always_refuse` 項目の削除、`[odoo] member_credentials` の有効化は、Odoo 設定ページまたは専用 RPC（`odoo.access_set`／`odoo.member_credentials.set_enabled`）でリスクを確認してから行い、生の設定エディターや汎用設定書き込みでは変更できません。
 
 バックアップ復元と CLI インポートでは、復旧を拒否せず権限を制限して続行します。Follow は Engine に戻り、確認記録は削除され、無効だったメンバーの Odoo アカウント設定は有効になりません。`always_refuse` は現在の環境とバックアップの有効なルールの和集合を保持し、リスト省略時は既定値を使います。AI の `act_as_requester` は無効化し、`permission_override` は `engine`／`read_only` のみを保持します。バックアップで省略された現在の制限も補います。制限した場合は Odoo 設定ページでの再確認を案内し、変更不要の設定は元の書式を保持します。

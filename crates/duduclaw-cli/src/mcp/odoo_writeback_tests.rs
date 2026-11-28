@@ -217,14 +217,16 @@ async fn follow_message_admin_refusal_prevents_every_write() {
 #[tokio::test]
 async fn dispatch_approval_gate_denies_or_sends_once_despite_allow_rule() {
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStatus};
-    use super::super::approval::gate_tool_approval_dispatch;
-    for (tool, args) in [
-        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"})),
-        ("odoo_execute", json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"})),
+    use super::super::approval::{gate_tool_approval_dispatch, with_odoo_approval_call};
+    for (tool, args, follow) in [
+        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"}), false),
+        ("odoo_message_send", json!({"model":"crm.lead","res_id":9,"body":"test"}), true),
+        ("odoo_execute", json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"}), true),
     ] {
     for approved in [false, true] {
+        with_odoo_approval_call(async {
         let stub = Stub::start(true).await;
-        let home = home(&stub, "personal", true, &[]);
+        let home = home(&stub, "personal", follow, &["message:crm.lead"]);
         let path = home.path().join("agents/bot/agent.toml");
         let raw = std::fs::read_to_string(&path).unwrap();
         std::fs::write(path, format!("{raw}\n[capabilities]\naction_rules=[{{tool='{tool}',verdict='allow'}}]\n")).unwrap();
@@ -252,12 +254,18 @@ async fn dispatch_approval_gate_denies_or_sends_once_despite_allow_rule() {
         assert_eq!(outcome.is_ok(), approved);
         assert!(stub.writes().is_empty());
         if outcome.is_ok() {
-            let result = call(home.path(), "personal", true, tool, &args).await;
+            let result = call(home.path(), "personal", follow, tool, &args).await;
             assert_ne!(result["isError"], true, "{result}");
+            if follow {
+                let replay = call(home.path(), "personal", follow, tool, &args).await;
+                assert_eq!(replay["isError"], true, "{replay}");
+                assert!(replay.to_string().contains("核准"));
+            }
             let id = seen.lock().unwrap().clone().unwrap();
             assert_eq!(broker.get(&id).await.unwrap().unwrap().status, ApprovalStatus::Invalidated);
         }
         assert_eq!(stub.writes().len(), usize::from(approved));
+        }).await;
     }
     }
 }
@@ -275,7 +283,7 @@ async fn message_approval_is_fixed_content_bound_and_single_use() {
     std::fs::write(path, raw).unwrap();
     let args = json!({"model":"crm.lead","res_id":9,"body":"<hello> @alice"});
     let payload = json!({"name":"odoo_message_send","arguments":args});
-    assert!(super::super::approval::static_gate_flags(&agent_dir, "odoo_message_send", &payload).0);
+    assert!(super::super::approval::static_gate_flags(&agent_dir, "odoo_message_send", &payload, crate::mcp::approval::OdooApprovalMode::Engine).0);
     assert!(binding_applies("odoo_message_send", false));
     assert_eq!(crate::mcp_auth::tool_requires_scope("odoo_message_send"), Some(crate::mcp_auth::Scope::OdooWrite));
     let broker = ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()));
@@ -453,14 +461,14 @@ async fn attachment_listing_and_dispatch_share_identity_and_policy_gates() {
 }
 
 #[tokio::test]
-async fn arbitrary_execute_approval_binds_model_method_args_and_is_single_use() {
+async fn follow_execute_approval_binds_model_method_args_and_is_single_use() {
     use duduclaw_gateway::approval::{ApprovalBroker, ApprovalStore};
     use duduclaw_gateway::approval::action_grant::{ActionGrant, ACTION_GRANT_KEY, verify_and_consume};
     let stub = Stub::start(true).await;
     let home = home(&stub, "personal", true, &[]);
     let args = json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]"});
     let payload = json!({"name":"odoo_execute","arguments":args});
-    assert!(super::super::approval::static_gate_flags(&home.path().join("agents/bot"), "odoo_execute", &payload).0);
+    assert!(super::super::approval::static_gate_flags(&home.path().join("agents/bot"), "odoo_execute", &payload, super::super::approval::OdooApprovalMode::load(home.path(), "bot")).0);
     let broker = ApprovalBroker::new(Arc::new(ApprovalStore::open_in_memory().unwrap()));
     let grant = ActionGrant::build("bot", "odoo_execute", &payload);
     let mut bound = payload.clone(); bound[ACTION_GRANT_KEY] = grant.to_json();
@@ -468,7 +476,7 @@ async fn arbitrary_execute_approval_binds_model_method_args_and_is_single_use() 
     assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
     assert!(stub.writes().is_empty());
     broker.decide(&id, true, "dashboard:admin").await.unwrap();
-    for (key, value) in [("model", "sale.order"), ("method", "other_method"), ("ids", "[10]")] {
+    for (key, value) in [("model", "sale.order"), ("method", "other_method"), ("ids", "[10]"), ("args", "[[10]]"), ("kwargs", "{\"context\":{\"lang\":\"en_US\"}}")] {
         let mut changed = payload.clone(); changed["arguments"][key] = json!(value);
         let different = ActionGrant::build("bot", "odoo_execute", &changed);
         assert!(verify_and_consume(&broker, &id, &different).await.is_err());
@@ -476,22 +484,144 @@ async fn arbitrary_execute_approval_binds_model_method_args_and_is_single_use() 
     assert!(stub.writes().is_empty());
     verify_and_consume(&broker, &id, &grant).await.unwrap();
     let result = call(home.path(), "personal", true, "odoo_execute", &args).await;
-    assert_ne!(result["isError"], true, "{result}");
+    assert_eq!(result["isError"], true, "{result}");
     assert!(verify_and_consume(&broker, &id, &grant).await.is_err());
-    assert_eq!(stub.writes().len(), 1);
+    assert!(stub.writes().is_empty());
 }
 
-#[test]
-fn all_odoo_buttons_and_unknown_execute_methods_require_approval() {
-    use super::super::approval::odoo_requires_approval;
-    for method in ["action_send_customer_email", "button_custom", "toggle_custom", "unknown", "create", "write", "unlink"] {
-        assert!(odoo_requires_approval("odoo_execute", &json!({"arguments":{"method":method}})));
+#[tokio::test]
+async fn execute_and_buttons_force_approval_only_when_follow_is_possible() {
+    use super::super::approval::{odoo_requires_approval, static_gate_flags, OdooApprovalMode};
+    let stub = Stub::start(true).await;
+    for (follow, override_, expected) in [
+        (false, "inherit", false), (true, "inherit", true),
+        (true, "engine", false), (true, "read_only", false),
+    ] {
+        let home = home(&stub, "personal", follow, &[]);
+        let path = home.path().join("agents/bot/agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(path, format!("{raw}permission_override='{override_}'\n[capabilities]\naction_rules=[{{tool='odoo_execute',verdict='allow'}},{{tool='odoo_sale_confirm',verdict='allow'}},{{tool='odoo_message_send',verdict='allow'}}]\n")).unwrap();
+        let mode = OdooApprovalMode::load(home.path(), "bot");
+        for method in ["action_send_customer_email", "button_custom", "toggle_custom", "unknown", "create", "write", "unlink"] {
+            // Arguments cannot opt into or out of the trusted mode.
+            let payload = json!({"arguments":{"method":method,"permission_mode":"engine","identity":"company"}});
+            assert_eq!(odoo_requires_approval("odoo_execute", &payload, mode), expected);
+            assert_eq!(static_gate_flags(&home.path().join("agents/bot"), "odoo_execute", &payload, mode).0, expected);
+        }
+        for tool in ["odoo_execute", "odoo_sale_confirm"] {
+            let payload = json!({"arguments":{}});
+            assert_eq!(odoo_requires_approval(tool, &payload, mode), expected);
+            assert_eq!(static_gate_flags(&home.path().join("agents/bot"), tool, &payload, mode).0, expected);
+        }
+        for method in ["read", "search_read", "fields_get", "read_group"] {
+            assert!(!odoo_requires_approval("odoo_execute", &json!({"arguments":{"method":method}}), mode));
+        }
+        assert!(odoo_requires_approval("odoo_message_send", &json!({"arguments":{}}), mode));
     }
-    assert!(odoo_requires_approval("odoo_execute", &json!({"arguments":{}})));
-    assert!(odoo_requires_approval("odoo_sale_confirm", &json!({"arguments":{}})));
-    for method in ["read", "search_read", "fields_get", "read_group"] {
-        assert!(!odoo_requires_approval("odoo_execute", &json!({"arguments":{"method":method}})));
+}
+
+#[tokio::test]
+async fn engine_execute_and_sale_confirm_run_without_forced_approval() {
+    use super::super::approval::{gate_tool_approval_dispatch, with_odoo_approval_call};
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", false, &[]);
+    let path = home.path().join("agents/bot/agent.toml");
+    let raw = std::fs::read_to_string(&path).unwrap()
+        .replace("allowed_models=['crm.lead']", "allowed_models=['crm.lead','sale.order']");
+    std::fs::write(path, raw).unwrap();
+    for (tool, args) in [
+        ("odoo_execute", json!({"model":"crm.lead","method":"write","ids":"[9]"})),
+        ("odoo_execute", json!({"model":"crm.lead","method":"button_custom","ids":"[9]"})),
+        ("odoo_execute", json!({"model":"crm.lead","method":"action_custom","ids":"[9]"})),
+        ("odoo_sale_confirm", json!({"order_id":9})),
+    ] {
+        with_odoo_approval_call(async {
+            let payload = json!({"name":tool,"arguments":args});
+            tokio::time::timeout(std::time::Duration::from_secs(1),
+                gate_tool_approval_dispatch(home.path(), "bot", tool, payload)).await.unwrap().unwrap();
+            let result = call(home.path(), "personal", false, tool, &args).await;
+            assert_ne!(result["isError"], true, "{tool}: {result}");
+        }).await;
     }
+    assert!(!home.path().join("approvals.db").exists());
+}
+
+#[tokio::test]
+async fn follow_approval_uses_stored_personal_candidates_and_valid_ack() {
+    use super::super::approval::{odoo_requires_approval, OdooApprovalMode};
+    let stub = Stub::start(true).await;
+    let payload = json!({"arguments":{"model":"crm.lead","method":"write"}});
+    for kind in ["agent", "company"] {
+        let home = home(&stub, kind, true, &[]);
+        super::super::odoo_access_tests::personal_db(home.path(), "someone_else", true);
+        // An unrelated stored credential does not make a company/agent call personal.
+        assert!(!odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+        let path = home.path().join("agents/bot/agent.toml");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, format!("{raw}act_as_requester=true\n")).unwrap();
+        // A verified requester can select a personal credential before either fallback.
+        assert!(odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+        let db = rusqlite::Connection::open(home.path().join("users.db")).unwrap();
+        db.execute("UPDATE member_odoo_credentials SET credential_epoch=0", []).unwrap();
+        assert!(!odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+    }
+    for ack in ["", "permission_mode_ack={by='',at='invalid'}"] {
+        let home = home(&stub, "personal", true, &[]);
+        let path = home.path().join("config.toml");
+        let raw = std::fs::read_to_string(&path).unwrap()
+            .replace("permission_mode_ack={by='owner',at='2026-11-01T00:00:00Z'}", ack);
+        std::fs::write(path, raw).unwrap();
+        assert!(!odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+    }
+}
+
+#[tokio::test]
+async fn engine_retains_employee_approval_lists_and_action_rules() {
+    use super::super::approval::{static_gate_flags, OdooApprovalMode};
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", false, &[]);
+    let dir = home.path().join("agents/bot");
+    let raw = std::fs::read_to_string(dir.join("agent.toml")).unwrap();
+    for tool in ["odoo_execute", "odoo_sale_confirm"] {
+        let payload = json!({"arguments":{"model":"crm.lead","method":"button_custom"}});
+        for (rule, expected) in [
+            (format!("action_rules=[{{tool='{tool}',verdict='allow'}}]"), false),
+            (format!("approval_required_tools=['{tool}']\naction_rules=[{{tool='{tool}',verdict='allow'}}]"), true),
+            (format!("action_rules=[{{tool='{tool}',verdict='ask'}}]"), true),
+            (format!("irreversible_tools=['{tool}']"), true),
+        ] {
+            std::fs::write(dir.join("agent.toml"), format!("{raw}\n[capabilities]\n{rule}\n")).unwrap();
+            let mode = OdooApprovalMode::load(home.path(), "bot");
+            assert_eq!(static_gate_flags(&dir, tool, &payload, mode).0, expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn unreadable_odoo_policy_or_identity_never_skips_forced_approval() {
+    use super::super::approval::{odoo_requires_approval, OdooApprovalMode};
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", true, &[]);
+    let payload = json!({"arguments":{"model":"crm.lead","method":"write"}});
+    std::fs::remove_file(home.path().join("users.db")).unwrap();
+    assert!(odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+    std::fs::write(home.path().join("config.toml"), "[odoo_access]\npermission_mode=42").unwrap();
+    assert!(odoo_requires_approval("odoo_execute", &payload, OdooApprovalMode::load(home.path(), "bot")));
+    assert!(super::super::odoo_access::ToolPolicy::load(home.path(), "bot").is_err());
+}
+
+#[tokio::test]
+async fn gateway_follow_without_forced_approval_refuses_before_odoo_io() {
+    let stub = Stub::start(true).await;
+    let home = home(&stub, "personal", false, &["execute", "action", "write"]);
+    // Local Engine snapshot, followed by a gateway Follow decision: no proof
+    // can be manufactured by arguments when settings change between gates.
+    let args = json!({"model":"crm.lead","method":"action_send_customer_email","ids":"[9]",
+        "approved":true,"permission_mode":"engine","action_grant":{"approved":true}});
+    let result = call(home.path(), "personal", true, "odoo_execute", &args).await;
+    assert_eq!(result["isError"], true, "{result}");
+    assert!(result.to_string().contains("核准"), "{result}");
+    assert!(stub.requests.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

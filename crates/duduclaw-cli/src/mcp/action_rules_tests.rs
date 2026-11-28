@@ -150,9 +150,9 @@ async fn a_malformed_rule_list_hides_nothing_but_asks_for_side_effects() {
     let names = listed(home.path(), &ProcessLane::Normal).await;
     assert!(names.contains("send_message"));
     let dir = home.path().join("agents").join("test");
-    let (always, _) = static_gate_flags(&dir, "send_message", &serde_json::json!({ "arguments": {} }));
+    let (always, _) = static_gate_flags(&dir, "send_message", &serde_json::json!({ "arguments": {} }), crate::mcp::approval::OdooApprovalMode::Engine);
     assert!(always, "malformed rules must ask before a side effect");
-    let (always, _) = static_gate_flags(&dir, "memory_search", &serde_json::json!({ "arguments": {} }));
+    let (always, _) = static_gate_flags(&dir, "memory_search", &serde_json::json!({ "arguments": {} }), crate::mcp::approval::OdooApprovalMode::Engine);
     assert!(!always, "reads stay free");
 }
 
@@ -163,8 +163,8 @@ fn ask_rules_fold_into_the_static_always_flag_and_allow_never_removes_a_list() {
     );
     let dir = home.path().join("agents").join("test");
     let payload = serde_json::json!({ "arguments": {} });
-    assert!(static_gate_flags(&dir, "mail_send", &payload).0);
-    assert!(!static_gate_flags(&dir, "memory_store", &payload).0);
+    assert!(static_gate_flags(&dir, "mail_send", &payload, crate::mcp::approval::OdooApprovalMode::Engine).0);
+    assert!(!static_gate_flags(&dir, "memory_store", &payload, crate::mcp::approval::OdooApprovalMode::Engine).0);
 
     // `allow` for a tool that `approval_required_tools` names: still asks.
     std::fs::write(
@@ -173,7 +173,7 @@ fn ask_rules_fold_into_the_static_always_flag_and_allow_never_removes_a_list() {
          action_rules = [{ tool = \"wiki_write\", verdict = \"allow\" }]\n",
     )
     .unwrap();
-    assert!(static_gate_flags(&dir, "wiki_write", &payload).0);
+    assert!(static_gate_flags(&dir, "wiki_write", &payload, crate::mcp::approval::OdooApprovalMode::Engine).0);
 }
 
 #[test]
@@ -182,8 +182,8 @@ fn a_rule_for_a_removed_tool_name_gates_the_replacement_call() {
     let dir = home.path().join("agents").join("test");
     let shared = serde_json::json!({ "arguments": { "scope": "shared" } });
     let own = serde_json::json!({ "arguments": { "scope": "agent" } });
-    assert!(static_gate_flags(&dir, "wiki_write", &shared).0);
-    assert!(!static_gate_flags(&dir, "wiki_write", &own).0);
+    assert!(static_gate_flags(&dir, "wiki_write", &shared, crate::mcp::approval::OdooApprovalMode::Engine).0);
+    assert!(!static_gate_flags(&dir, "wiki_write", &own, crate::mcp::approval::OdooApprovalMode::Engine).0);
     let rules = duduclaw_core::agent_toml::load_action_rules(&dir);
     assert_eq!(
         crate::mcp_dispatch::action_rule_verdict_for_call(

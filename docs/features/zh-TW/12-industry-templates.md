@@ -185,6 +185,8 @@ Odoo 升級或客製後，管理員可以在 Odoo 頁按「**重新掃描 Odoo �
 
 動作編輯器提供 `read`／`search`（查詢與讀取）、`create`（新增）、`write`（修改）、`unlink`（刪除）、`action`（按鈕動作）及 `execute`（其他方法）。通用 `odoo_execute` 呼叫的按鈕動作涵蓋確認、驗證、封存等 `action_*`、`button_*`、`toggle_*` 方法，其餘方法使用 `execute`。所有資料表用 `action`，指定資料表用 `action:sale.order`。兩種方法都以修改權限作為提示，實際操作仍由 Odoo 檢查。
 
+引擎模式下，`odoo_execute` 與按鈕動作（含 `odoo_sale_confirm`）維持 v1.85 的核准行為：仍套用員工審批清單、動作規則與效果分類，不額外強制核准。「依 Odoo 帳號」模式下，非讀取的 `odoo_execute` 及所有 `action_*`、`button_*`、`toggle_*` 按鈕動作（含 `odoo_sale_confirm`）都須人工核准。通知追蹤者的訊息（`odoo_message_send`）在所有模式一律須核准。Allow 規則不能略過這些強制核准；核准綁定工具與完整參數，而且只能使用一次。
+
 ### 通用新增與修改：明確授權並另外開啟（v1.81.0）
 
 `odoo_create` 與 `odoo_write` 可以在任意資料表新增或修改紀錄，但和其他 Odoo 工具不同，採用**明確授權規則**：員工必須有自己的 Odoo 設定，資料表必須在「資料表」勾選（`allowed_models` 寫出完整名稱），有一條規則給該資料表「新增」或「修改」（`allowed_actions` 有 `create`／`write`，或 `create:<model>`／`write:<model>`），而且該資料表規則中的「允許通用新增／修改」必須開啟（在 `allowed_actions` 存成 `generic_create:<model>`／`generic_write:<model>`）。這個開關預設關閉，只能逐張資料表開啟，因此**既有設定不會改變**：原本已有「新增」／「修改」的員工，在開啟之前不會多出這兩個工具。開啟後，AI 可以設定這張資料表任何可寫入的欄位。沒有自己的設定、清單留空或寫 `*` 都不算授權；在授權並開啟任何資料表之前，員工連這兩個工具都看不到。使用者、群組、公司、`ir.*` 系統資料表與郵件／討論紀錄（追蹤者、訊息、範本、頻道）永遠不開放通用寫入，透過 x2many 指令也一樣；這兩個工具不會刪除、解除連結、清空、取代或封存紀錄。上面「空清單代表不限制」的規則仍適用於其他所有 Odoo 工具，`odoo_crm_create_lead`、`odoo_sale_create_quotation` 等工具的用法完全不變。

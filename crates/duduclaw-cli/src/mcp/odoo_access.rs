@@ -28,7 +28,10 @@ pub(super) struct ToolPolicy {
 /// Metadata only, one read-only connection; never select credential ciphertext.
 /// A damaged/missing database cannot create a possible personal identity.
 pub(super) fn personal_facts(home: &Path, agent: &str) -> PossibleIdentities {
-    fn read(home: &Path, agent: &str) -> rusqlite::Result<PossibleIdentities> {
+    personal_facts_checked(home, agent).unwrap_or_default()
+}
+
+fn personal_facts_checked(home: &Path, agent: &str) -> rusqlite::Result<PossibleIdentities> {
         let db = rusqlite::Connection::open_with_flags(home.join("users.db"),
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         db.query_row("SELECT
@@ -52,8 +55,6 @@ pub(super) fn personal_facts(home: &Path, agent: &str) -> PossibleIdentities {
                 ..Default::default()
             })
         })
-    }
-    read(home, agent).unwrap_or_default()
 }
 
 /// Fixed methods must also be supplied during listing. Existing dedicated
@@ -88,13 +89,31 @@ pub(super) fn operation<'a>(tool: &str, params: Option<&'a Value>) -> Option<(To
 
 impl ToolPolicy {
     pub fn load(home: &Path, agent_id: &str) -> Result<Self, String> {
+        Self::load_inner(home, agent_id, false)
+    }
+
+    pub fn load_for_approval(home: &Path, agent_id: &str) -> Result<Self, String> {
+        Self::load_inner(home, agent_id, true)
+    }
+
+    fn load_inner(home: &Path, agent_id: &str, strict_identity: bool) -> Result<Self, String> {
         let raw = std::fs::read_to_string(home.join("config.toml")).map_err(|_| UNREADABLE)?;
         let access = OdooAccessConfig::parse_config_toml(&raw)?;
         let table: toml::Table = raw.parse().map_err(|_| UNREADABLE)?;
         let global = table.get("odoo").cloned().ok_or(UNREADABLE)?
             .try_into::<OdooConfig>().map_err(|_| UNREADABLE)?;
-        let agent = super::odoo_generic_write::load_generic_write_override(home, agent_id)?.unwrap_or_default();
-        let mut identities = personal_facts(home, agent_id);
+        let agent = if strict_identity {
+            // Unlike availability, an absent employee file or database cannot
+            // turn an unknown approval mode into Engine.
+            let raw = std::fs::read_to_string(super::caller_agent_dir(home, agent_id).join("agent.toml"))
+                .map_err(|_| UNREADABLE)?;
+            AgentOdooConfig::parse_agent_toml(&raw)?.unwrap_or_default()
+        } else {
+            super::odoo_generic_write::load_generic_write_override(home, agent_id)?.unwrap_or_default()
+        };
+        let mut identities = if strict_identity {
+            personal_facts_checked(home, agent_id).map_err(|_| UNREADABLE)?
+        } else { personal_facts(home, agent_id) };
         // The global member-credential switch is not an identity grant.
         if table.get("odoo").and_then(|v| v.get("member_credentials")).and_then(toml::Value::as_bool) != Some(true) {
             identities.owner_has_personal_credential = false;
@@ -205,9 +224,20 @@ impl ToolPolicy {
             agent_id: &self.agent_id, agent: &agent, access: &access, identities })
     }
 
+    fn personal_available(&self) -> bool {
+        (self.identities.avatar_has_owner && self.identities.owner_has_personal_credential)
+            || (self.agent.act_as_requester && self.identities.requester_has_personal_credential)
+    }
+
+    /// Same personal candidates as listing/preconnect. Actual personal
+    /// credentials precede employee/company fallbacks at the gateway.
+    pub fn approval_may_follow(&self) -> bool {
+        self.personal_available() && effective_mode(policy::IdentityKind::Personal,
+            &self.access, self.agent.permission_override_mode()) == EffectiveMode::Follow
+    }
+
     fn prospective_follow(&self) -> bool {
-        let personal = (self.identities.avatar_has_owner && self.identities.owner_has_personal_credential)
-            || (self.agent.act_as_requester && self.identities.requester_has_personal_credential);
+        let personal = self.personal_available();
         let disconnected = !personal && !self.identities.has_agent_credential
             && !self.access.company_key_agents.iter().any(|id| id == &self.agent_id);
         (personal || (disconnected && (self.identities.avatar_has_owner || self.agent.act_as_requester)))

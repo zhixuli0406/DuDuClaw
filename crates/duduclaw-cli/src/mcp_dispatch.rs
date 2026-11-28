@@ -793,6 +793,20 @@ impl McpDispatcher {
         remote: Option<&crate::mcp::RemoteAccess>,
         human: Option<&str>,
     ) -> Value {
+        crate::mcp::approval::with_odoo_approval_call(Box::pin(
+            self.dispatch_admitted_in_approval_scope(principal, ns_ctx, params, id, remote, human),
+        )).await
+    }
+
+    async fn dispatch_admitted_in_approval_scope(
+        &self,
+        principal: &Principal,
+        ns_ctx: &NamespaceContext,
+        params: &Value,
+        id: &Value,
+        remote: Option<&crate::mcp::RemoteAccess>,
+        human: Option<&str>,
+    ) -> Value {
         let workflow_params = params;
         let mut clean_params = params.clone();
         // Host account metadata can never be supplied by an MCP caller.
@@ -2087,7 +2101,8 @@ impl McpDispatcher {
         // RM-103 S3: a role member's intrinsic skips this gate's inherited
         // approval lists / action-rule `ask`; an egress-guard ask still runs.
         if (employee_policy_applies && !intrinsic_exempt)
-            || crate::mcp::approval::odoo_requires_approval(tool_name, &params_owned)
+            || crate::mcp::approval::odoo_requires_approval(tool_name, &params_owned,
+                crate::mcp::approval::OdooApprovalMode::for_tool(&self.home_dir, gate_agent, tool_name))
             || params_owned.get("egress_guard").is_some()
         {
             // Keyed by the ACTING agent: with the internal key the client_id
