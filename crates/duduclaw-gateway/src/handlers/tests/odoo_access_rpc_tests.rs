@@ -31,7 +31,7 @@ async fn rpc(f: &Fixture, ctx: &UserContext, method: &str, params: Value) -> WsF
 fn payload(frame: WsFrame) -> Value {
     match frame {
         WsFrame::Response { ok: true, payload: Some(p), .. } => p,
-        _ => panic!("expected success"),
+        other => panic!("expected success, got {other:?}"),
     }
 }
 fn refused(frame: WsFrame) { assert!(matches!(frame, WsFrame::Response { ok: false, .. })); }
@@ -293,7 +293,24 @@ async fn agent_fixture() -> Fixture {
     f.admin.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
     f.member.origin = duduclaw_auth::acl::ContextOrigin::DashboardSession;
     payload(f.handler.handle_agents_create_as(json!({"name":"access-ai"}), Some(&f.admin)).await);
-    std::fs::write(agent_path(&f), AGENT_ACCESS_INITIAL).unwrap();
+    // Retain the scaffold's required fields: a successful write rescans the
+    // registry, which drops configs that cannot deserialize as AgentConfig.
+    let scaffold: toml::Table = agent_raw(&f).parse().unwrap();
+    let mut table: toml::Table = AGENT_ACCESS_INITIAL.parse().unwrap();
+    for (key, value) in scaffold {
+        if let (Some(current), Some(defaults)) = (table.get_mut(&key).and_then(toml::Value::as_table_mut), value.as_table()) {
+            for (field, default) in defaults {
+                current.entry(field.clone()).or_insert_with(|| default.clone());
+            }
+        } else {
+            table.entry(key).or_insert(value);
+        }
+    }
+    let initial = super::super::config_commit::render_preserving(AGENT_ACCESS_INITIAL, &table).unwrap();
+    toml::from_str::<duduclaw_core::types::AgentConfig>(&initial).expect("valid agent fixture");
+    std::fs::write(agent_path(&f), initial).unwrap();
+    f.handler.registry.write().await.scan().await.unwrap();
+    assert!(f.handler.registry.read().await.get("access-ai").is_some());
     f
 }
 fn agent_path(f: &Fixture) -> PathBuf { f.home.path().join("agents/access-ai/agent.toml") }
@@ -306,10 +323,13 @@ async fn agent_set(f: &Fixture, mut params: Value) -> WsFrame {
 #[tokio::test]
 async fn agent_access_ack_widens_and_preserves_other_bytes() {
     let f = agent_fixture().await;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     let set = payload(agent_set(&f, json!({"act_as_requester":true,"permission_override":"engine","acknowledge_risk":true})).await);
+    assert!(f.handler.registry.read().await.get("access-ai").is_some(), "successful save must retain the employee in the registry");
     assert_eq!(set["act_as_requester"], true);
     assert_eq!(set["permission_override"], "engine");
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL
+    assert_eq!(agent_raw(&f), initial
         .replace("act_as_requester = false", "act_as_requester = true")
         .replace("'read_only'", "\"engine\""));
     payload(agent_set(&f, json!({"permission_override":"inherit","acknowledge_risk":true})).await);
@@ -331,9 +351,11 @@ async fn agent_access_ack_widens_and_preserves_other_bytes() {
 #[tokio::test]
 async fn agent_access_without_ack_only_narrows() {
     let f = agent_fixture().await;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     for params in [json!({"act_as_requester":true}), json!({"permission_override":"engine"}), json!({"permission_override":"inherit"})] {
         refused(agent_set(&f, params).await);
-        assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+        assert_eq!(agent_raw(&f), initial);
     }
     payload(agent_set(&f, json!({"act_as_requester":true,"permission_override":"inherit","acknowledge_risk":true})).await);
     payload(agent_set(&f, json!({"act_as_requester":false,"permission_override":"engine"})).await);
@@ -343,6 +365,8 @@ async fn agent_access_without_ack_only_narrows() {
 #[tokio::test]
 async fn agent_access_refuses_owners_keys_ai_and_stale_identity() {
     let f = agent_fixture().await;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     let params = json!({"agent_id":"access-ai","act_as_requester":true,"acknowledge_risk":true});
     f.db.bind_agent(&f.member.user_id, "access-ai", AccessLevel::Owner).unwrap();
     refused(rpc(&f, &f.member, "odoo.agent_access_set", params.clone()).await);
@@ -360,12 +384,14 @@ async fn agent_access_refuses_owners_keys_ai_and_stale_identity() {
     refused(rpc(&f, &stale, "odoo.agent_access_set", params.clone()).await);
     f.db.update_user(&f.admin.user_id, None, Some(UserRole::Employee), None).unwrap();
     refused(rpc(&f, &f.admin, "odoo.agent_access_set", params).await);
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+    assert_eq!(agent_raw(&f), initial);
 }
 
 #[tokio::test]
 async fn agent_access_invalid_fields_or_missing_employee_never_write() {
     let f = agent_fixture().await;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     for params in [
         json!({"permission_override":"unknown","acknowledge_risk":true}),
         json!({"permission_override":null}), json!({"permission_override":3}),
@@ -375,7 +401,7 @@ async fn agent_access_invalid_fields_or_missing_employee_never_write() {
         json!({"acknowledge_risk":true}),
     ] {
         refused(agent_set(&f, params).await);
-        assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+        assert_eq!(agent_raw(&f), initial);
     }
     for id in ["missing", "../access-ai", ""] {
         refused(rpc(&f, &f.admin, "odoo.agent_access_set", json!({"agent_id":id,"act_as_requester":true,"acknowledge_risk":true})).await);
@@ -388,29 +414,33 @@ async fn agent_access_invalid_fields_or_missing_employee_never_write() {
 #[tokio::test]
 async fn agent_access_audit_failure_prevents_publication() {
     let f = agent_fixture().await;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     let audit = f.home.path().join("security_audit.jsonl");
     std::fs::remove_file(&audit).unwrap();
     std::fs::create_dir(&audit).unwrap();
     refused(agent_set(&f, json!({"act_as_requester":true,"acknowledge_risk":true})).await);
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+    assert_eq!(agent_raw(&f), initial);
 }
 
 #[tokio::test]
 async fn agent_access_adapter_checks_scope_hash_and_write_ahead_order() {
     use crate::agent_files::writer::{commit_odoo_agent_access, Commit, CommitMeta, Baseline};
     let f = agent_fixture().await;
-    let hash = super::super::config_commit::content_hash(AGENT_ACCESS_INITIAL);
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
+    let hash = super::super::config_commit::content_hash(initial);
     let make_commit = || Commit {
         home:f.home.path(), agent_id:"access-ai", key:crate::agent_files::FileKey::AgentToml,
         expected_hash:Some(&hash), meta:CommitMeta::new(&f.admin.user_id, "odoo.agent_access_set"),
         baseline:Baseline::Accept,
     };
-    let mut table: toml::Table = AGENT_ACCESS_INITIAL.parse().unwrap();
+    let mut table: toml::Table = initial.parse().unwrap();
     table["odoo"].as_table_mut().unwrap().insert("act_as_requester".into(), toml::Value::Boolean(true));
     let mut unrelated = table.clone();
     unrelated["odoo"].as_table_mut().unwrap().insert("db".into(), toml::Value::String("changed".into()));
     assert!(commit_odoo_agent_access(&f.handler.registry, make_commit(), &unrelated, |_, _| panic!("scope must fail before audit"), || Ok(())).await.is_err());
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+    assert_eq!(agent_raw(&f), initial);
     // The callback is the write-ahead audit boundary: disk still has old bytes.
     let outcome = commit_odoo_agent_access(&f.handler.registry, make_commit(), &table, |before, after| {
         assert_eq!(agent_raw(&f), before);
@@ -418,8 +448,8 @@ async fn agent_access_adapter_checks_scope_hash_and_write_ahead_order() {
         Err("audit unavailable".into())
     }, || Ok(())).await;
     assert!(outcome.is_err());
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
-    std::fs::write(agent_path(&f), format!("{AGENT_ACCESS_INITIAL}# concurrent edit\n")).unwrap();
+    assert_eq!(agent_raw(&f), initial);
+    std::fs::write(agent_path(&f), format!("{initial}# concurrent edit\n")).unwrap();
     assert!(commit_odoo_agent_access(&f.handler.registry, make_commit(), &table, |_, _| panic!("CAS must fail before audit"), || Ok(())).await.is_err());
     assert!(agent_raw(&f).ends_with("# concurrent edit\n"));
 }
@@ -428,8 +458,10 @@ async fn agent_access_adapter_checks_scope_hash_and_write_ahead_order() {
 async fn agent_access_final_guard_rechecks_live_admin() {
     use crate::agent_files::writer::{commit_odoo_agent_access, Commit, CommitMeta, Baseline};
     let f = agent_fixture().await;
-    let hash = super::super::config_commit::content_hash(AGENT_ACCESS_INITIAL);
-    let mut table: toml::Table = AGENT_ACCESS_INITIAL.parse().unwrap();
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
+    let hash = super::super::config_commit::content_hash(initial);
+    let mut table: toml::Table = initial.parse().unwrap();
     table["odoo"].as_table_mut().unwrap().insert("act_as_requester".into(), toml::Value::Boolean(true));
     let c = Commit { home:f.home.path(), agent_id:"access-ai", key:crate::agent_files::FileKey::AgentToml,
         expected_hash:Some(&hash), meta:CommitMeta::new(&f.admin.user_id, "odoo.agent_access_set"), baseline:Baseline::Accept };
@@ -437,7 +469,7 @@ async fn agent_access_final_guard_rechecks_live_admin() {
     assert!(commit_odoo_agent_access(&f.handler.registry, c, &table, |_, _| {
         fresh(&f.db, &f.admin, DASHBOARD_SESSION_ID).map(|_| ())
     }, || Ok(())).await.is_err());
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+    assert_eq!(agent_raw(&f), initial);
 }
 
 #[test]
@@ -454,13 +486,16 @@ fn agent_access_scope_rejects_semantically_equal_unrelated_reformatting() {
 async fn agent_access_defaults_unknown_stored_values_and_personal_edition() {
     let f = agent_fixture().await;
     assert!(!super::super::is_enterprise_only_method("odoo.agent_access_set"));
-    let base = "# retained\n[agent]\nname='access-ai'\n";
-    std::fs::write(agent_path(&f), base).unwrap();
+    let mut doc: toml_edit::DocumentMut = agent_raw(&f).parse().unwrap();
+    doc.remove("odoo");
+    let base = doc.to_string();
+    toml::from_str::<duduclaw_core::types::AgentConfig>(&base).expect("valid agent fixture without Odoo");
+    std::fs::write(agent_path(&f), &base).unwrap();
     let get = payload(rpc(&f, &f.admin, "odoo.agent_config_get", json!({"agent_id":"access-ai"})).await);
     assert_eq!(get["permission_override"], "inherit");
     assert_eq!(get["act_as_requester"], false);
     payload(agent_set(&f, json!({"permission_override":"read_only"})).await);
-    assert!(agent_raw(&f).starts_with(base));
+    assert!(agent_raw(&f).starts_with(&base));
     std::fs::write(agent_path(&f), format!("{base}[odoo]\npermission_override='legacy-unknown'\n")).unwrap();
     refused(agent_set(&f, json!({"permission_override":"engine"})).await);
     payload(agent_set(&f, json!({"permission_override":"engine","acknowledge_risk":true})).await);
@@ -475,7 +510,8 @@ async fn agent_access_defaults_unknown_stored_values_and_personal_edition() {
 #[tokio::test]
 async fn agent_access_consent_never_spills_into_generic_writers() {
     let f = agent_fixture().await;
-    let initial = AGENT_ACCESS_INITIAL;
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
     let widened = initial.replace("act_as_requester = false", "act_as_requester = true");
     let table: toml::Table = widened.parse().unwrap();
     let hash = super::super::config_commit::content_hash(initial);
@@ -499,8 +535,10 @@ async fn agent_access_consent_never_spills_into_generic_writers() {
 async fn agent_access_rechecks_authority_after_audit_before_replace() {
     use crate::agent_files::writer::{commit_odoo_agent_access, Commit, CommitMeta, Baseline};
     let f = agent_fixture().await;
-    let hash = super::super::config_commit::content_hash(AGENT_ACCESS_INITIAL);
-    let table: toml::Table = AGENT_ACCESS_INITIAL.replace("act_as_requester = false", "act_as_requester = true").parse().unwrap();
+    let initial_text = agent_raw(&f);
+    let initial = initial_text.as_str();
+    let hash = super::super::config_commit::content_hash(initial);
+    let table: toml::Table = initial.replace("act_as_requester = false", "act_as_requester = true").parse().unwrap();
     let audited = std::sync::atomic::AtomicBool::new(false);
     let c = Commit { home:f.home.path(), agent_id:"access-ai", key:crate::agent_files::FileKey::AgentToml,
         expected_hash:Some(&hash), meta:CommitMeta::new(&f.admin.user_id, "odoo.agent_access_set"), baseline:Baseline::Accept };
@@ -509,9 +547,9 @@ async fn agent_access_rechecks_authority_after_audit_before_replace() {
         Ok(())
     }, || {
         assert!(audited.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+        assert_eq!(agent_raw(&f), initial);
         Err("session revoked before publication".into())
     }).await;
     assert!(result.is_err());
-    assert_eq!(agent_raw(&f), AGENT_ACCESS_INITIAL);
+    assert_eq!(agent_raw(&f), initial);
 }
