@@ -50,6 +50,7 @@ struct Empty {}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetRequest {
+    expected_hash: String,
     enabled: bool,
     allowed_hd: Vec<String>,
     approval: String,
@@ -93,8 +94,8 @@ fn settings_value(s: &GoogleSigninSettings) -> Value {
         "approval_grants_mfa_enrollment": s.approval_grants_mfa_enrollment,
         "ack": s.ack.as_ref().map(|(by, at)| json!({"by": by, "at": at}))})
 }
-fn settings_get(home: &Path) -> Value {
-    let s = config::read_strict(home);
+fn settings_get(home: &Path) -> Result<Value, WsFrame> {
+    let (s, hash) = config::read_with_hash(home).map_err(|message| WsFrame::error_response("", &message))?;
     let base = routes::public_base(home);
     // This is the exact domain policy used by google_personal::access.
     // A malformed policy is a failed check, never a permissive fallback.
@@ -103,11 +104,11 @@ fn settings_get(home: &Path) -> Value {
     let mfa = match crate::mfa::enforced(home, false) {
         Ok(true) => "enforced", Ok(false) => "not_enforced", Err(_) => "unknown",
     };
-    json!({"settings": settings_value(&s),
+    Ok(json!({"settings": settings_value(&s), "hash": hash,
         "redirect_uri": base.as_ref().map(|(base, _)| routes::redirect_uri(base)),
         "checks": {"client_configured": routes::configured_client(home).is_some(),
             "public_url_ok": base.is_some(), "domains_set": !s.allowed_hd.is_empty(),
-            "mfa_policy": mfa, "personal_edition": false, "personal_connection_domains_cover": covers}})
+            "mfa_policy": mfa, "personal_edition": false, "personal_connection_domains_cover": covers}}))
 }
 
 fn step_up(db: &UserDb, ctx: &UserContext, session: &str, csrf: Option<[u8; 32]>) -> Result<(), WsFrame> {
@@ -133,14 +134,14 @@ fn is_pure_disable(home: &Path, update: &SettingsUpdate) -> bool {
 
 fn apply_settings(
     home: &Path, actor_user_id: &str, update: &SettingsUpdate, pure_disable: bool,
-    acknowledge_risk: bool, now_rfc3339: &str,
-) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    acknowledge_risk: bool, now_rfc3339: &str, expected_hash: &str,
+) -> Result<(GoogleSigninSettings, GoogleSigninSettings, String), String> {
     if pure_disable {
         // The exemption may have been decided before another admin's update.
         // Never write request settings through the unauthenticated branch.
-        config::disable_settings(home, actor_user_id, now_rfc3339)
+        config::disable_settings(home, actor_user_id, now_rfc3339, expected_hash)
     } else {
-        config::write_settings(home, actor_user_id, update, acknowledge_risk, now_rfc3339)
+        config::write_settings(home, actor_user_id, update, acknowledge_risk, now_rfc3339, expected_hash)
     }
 }
 
@@ -166,9 +167,12 @@ impl MethodHandler {
             match method.as_str() {
                 "google.signin.get" => {
                     let _: Empty = parse(params)?;
-                    Ok(settings_get(&home))
+                    settings_get(&home)
                 }
                 "google.signin.set" => {
+                    if params.get("expected_hash").and_then(Value::as_str).is_none() {
+                        return Err(WsFrame::error_response("", "設定頁的資料已過期，請重新整理後再儲存。"));
+                    }
                     let input: SetRequest = parse(params)?;
                     let approval = match input.approval.as_str() {
                         "admin" => Approval::Admin, "direct" => Approval::Direct,
@@ -186,14 +190,14 @@ impl MethodHandler {
                     // Refuse before touching config if the audit store is unavailable.
                     db.log_action(Some(&ctx.user_id), "google_signin.settings_change_requested", None, None, None)
                         .map_err(|_| signin_error("signin_storage_unavailable"))?;
-                    let (before, after) = apply_settings(&home, &ctx.user_id, &update, pure_disable, input.acknowledge_risk, &now.to_rfc3339())
+                    let (before, after, hash) = apply_settings(&home, &ctx.user_id, &update, pure_disable, input.acknowledge_risk, &now.to_rfc3339(), &input.expected_hash)
                         .map_err(|message| WsFrame::error_response("", &message))?;
                     let detail = json!({"before": settings_value(&before), "after": settings_value(&after)}).to_string();
                     duduclaw_security::audit::log_config_changed(&home, &ctx.email, "admin", &[detail.clone()]);
                     crate::security_autopilot::emit_config_changed();
                     db.log_action(Some(&ctx.user_id), "google_signin.settings_changed", None, Some(&detail), None)
                         .map_err(|_| signin_error("signin_audit_failed_after_save"))?;
-                    Ok(json!({"settings": settings_value(&after)}))
+                    Ok(json!({"settings": settings_value(&after), "hash": hash}))
                 }
                 "users.signin_requests.list" => {
                     let _: Empty = parse(params)?;

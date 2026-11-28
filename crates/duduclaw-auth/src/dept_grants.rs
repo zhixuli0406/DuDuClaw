@@ -10,6 +10,8 @@ use rusqlite::{params, Connection, Row, TransactionBehavior};
 use crate::user_row::{bump_acl_generation, load_user};
 use crate::{AccessLevel, User, UserDb, UserRole, UserStatus};
 
+pub const MAIN_AGENT_USERS_HASH_CONFLICT: &str = "main-agent access hash conflict";
+
 pub const ACKNOWLEDGEMENT_REQUIRED: &str = "acknowledgement required";
 
 /// Fresh database facts for display only; never an authorization context.
@@ -206,6 +208,35 @@ fn read_main_users(conn: &Connection) -> Result<Vec<String>, String> {
         .collect::<rusqlite::Result<Vec<String>>>().map_err(store_error)
 }
 
+// Hash the exact stored grant evidence, ordered by the primary key. JSON tuple
+// encoding avoids delimiter ambiguity for legacy values containing separators.
+fn read_main_users_hash(conn: &Connection) -> Result<String, String> {
+    let mut stmt = conn.prepare("SELECT user_id, granted_by, granted_at FROM main_agent_users ORDER BY user_id")
+        .map_err(store_error)?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        .map_err(store_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(store_error)?;
+    let bytes = serde_json::to_vec(&rows).map_err(|e| e.to_string())?;
+    let digest = ring::digest::digest(&ring::digest::SHA256, &bytes);
+    Ok(digest.as_ref().iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn read_main_users_display(conn: &Connection) -> Result<Vec<MainAgentUserDisplay>, String> {
+    let columns = crate::user_row::USER_COLUMNS.split(',')
+        .map(|column| format!("u.{}", column.trim())).collect::<Vec<_>>().join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {columns}, g.display_name AS granted_by_name, m.granted_at
+         FROM main_agent_users m LEFT JOIN users u ON u.id=m.user_id
+         LEFT JOIN users g ON g.id=m.granted_by ORDER BY m.user_id"
+    )).map_err(store_error)?;
+    let rows = stmt.query_map([], |row| Ok(MainAgentUserDisplay {
+        // A stale member row still fails the whole RPC, as before.
+        user: crate::user_row::user_from_row(row)?,
+        granted_by_name: row.get("granted_by_name")?,
+        granted_at: row.get("granted_at")?,
+    })).map_err(store_error)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(store_error)
+}
+
 impl UserDb {
     /// Replace a Manager's groups for one exact department. An unchanged set
     /// (including reordered/duplicate input) writes no audit and does not bump
@@ -307,8 +338,25 @@ impl UserDb {
     /// unchanged sets do not write an audit or bump the ACL generation.
     /// Any added user requires acknowledgement in the same write transaction.
     pub fn set_main_agent_users(&self, actor: &str, user_ids: &[String], acknowledged: bool) -> Result<(), String> {
+        self.replace_main_agent_users(actor, user_ids, acknowledged, None)
+    }
+
+    /// Compare the client snapshot inside the same IMMEDIATE transaction as
+    /// replacement, ACL generation and audit. Conflicts mutate nothing.
+    pub fn set_main_agent_users_if_unchanged(&self, actor: &str, user_ids: &[String],
+        acknowledged: bool, expected_hash: &str) -> Result<(), String> {
+        self.replace_main_agent_users(actor, user_ids, acknowledged, Some(expected_hash))
+    }
+
+    fn replace_main_agent_users(&self, actor: &str, user_ids: &[String], acknowledged: bool,
+        expected_hash: Option<&str>) -> Result<(), String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(store_error)?;
+        if let Some(expected_hash) = expected_hash {
+            if read_main_users_hash(&tx)? != expected_hash {
+                return Err(MAIN_AGENT_USERS_HASH_CONFLICT.into());
+            }
+        }
         let after: BTreeSet<String> = user_ids.iter().cloned().collect();
         for id in &after {
             let user = load_user(&tx, id)?.ok_or("user not found")?;
@@ -340,21 +388,18 @@ impl UserDb {
 
     /// Read members and grant evidence in a single statement/snapshot.
     pub fn main_agent_users_display(&self) -> Result<Vec<MainAgentUserDisplay>, String> {
-        let conn = self.conn();
-        let columns = crate::user_row::USER_COLUMNS.split(',')
-            .map(|column| format!("u.{}", column.trim())).collect::<Vec<_>>().join(", ");
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {columns}, g.display_name AS granted_by_name, m.granted_at
-             FROM main_agent_users m LEFT JOIN users u ON u.id=m.user_id
-             LEFT JOIN users g ON g.id=m.granted_by ORDER BY m.user_id"
-        )).map_err(store_error)?;
-        let rows = stmt.query_map([], |row| Ok(MainAgentUserDisplay {
-            // A stale member row still fails the whole RPC, as before.
-            user: crate::user_row::user_from_row(row)?,
-            granted_by_name: row.get("granted_by_name")?,
-            granted_at: row.get("granted_at")?,
-        })).map_err(store_error)?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(store_error)
+        read_main_users_display(&self.conn())
+    }
+
+    /// Display and hash must describe one SQLite read snapshot, including all
+    /// grant evidence even when the granter no longer has a display name.
+    pub fn main_agent_users_display_with_hash(&self) -> Result<(Vec<MainAgentUserDisplay>, String), String> {
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(store_error)?;
+        let entries = read_main_users_display(&tx)?;
+        let hash = read_main_users_hash(&tx)?;
+        tx.commit().map_err(store_error)?;
+        Ok((entries, hash))
     }
 
     pub fn is_main_agent_user(&self, user_id: &str) -> Result<bool, String> {

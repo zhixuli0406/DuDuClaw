@@ -16,6 +16,8 @@ const COMPANY_RISK: &str = "新增 AI 會允許該 AI 使用全公司 Odoo 帳�
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetAccess {
+    #[serde(rename = "expected_hash")]
+    _expected_hash: String,
     permission_mode: Option<PermissionMode>,
     #[serde(default)]
     acknowledge_risk: bool,
@@ -63,10 +65,10 @@ fn follow_mode_impact(db: &UserDb, rows: &[Employee]) -> Value {
         "agents_acting_as_requester":rows.iter().filter(|row| row.act_as_requester).count()})
 }
 
-fn response(access: &OdooAccessConfig, rows: &[Employee], impact: Value) -> Value {
+fn response(access: &OdooAccessConfig, rows: &[Employee], impact: Value, hash: &str) -> Value {
     let fixed: Vec<_> = [FixedRefusal::F1, FixedRefusal::F2, FixedRefusal::F3, FixedRefusal::F4, FixedRefusal::F5]
         .into_iter().map(|f| json!({"code":f.code(),"reason":f.reason()})).collect();
-    json!({"readable":true,"follow_mode_impact":impact,
+    json!({"readable":true,"hash":hash,"follow_mode_impact":impact,
         "config":summary(access),"defaults":{"always_refuse":DEFAULT_ALWAYS_REFUSE},
         "fixed_refusals":fixed,"upgrade_notice_pending":access.upgrade_notice_pending,"employees":rows,
         "risk_text":{"permission_mode":FOLLOW_RISK,"always_refuse":REFUSE_RISK,"company_key_agents":COMPANY_RISK}})
@@ -146,16 +148,19 @@ impl MethodHandler {
                 "odoo.access_get" => {
                     serde_json::from_value::<Empty>(params).map_err(|_| "此操作不接受參數。".to_owned())?;
                     let access = std::fs::read_to_string(&path).ok()
-                        .and_then(|raw| OdooAccessConfig::parse_config_toml(&raw).ok());
-                    let Some(access) = access else {
+                        .and_then(|raw| OdooAccessConfig::parse_config_toml(&raw).ok()
+                            .map(|access| (access, super::config_commit::content_hash(&raw))));
+                    let Some((access, hash)) = access else {
                         return Ok(json!({"readable":false,"message":UNREADABLE}));
                     };
                     let rows = access_employees(&home)?;
                     let impact = follow_mode_impact(&db, &rows);
-                    Ok(response(&access, &rows, impact))
+                    Ok(response(&access, &rows, impact, &hash))
                 }
                 "odoo.access_set" => {
-                    let raw = super::config_commit::read_text_or_empty(&path).map_err(|_| INVALID.to_owned())?;
+                    let expected_hash = params.get("expected_hash").and_then(Value::as_str)
+                        .ok_or("設定頁的資料已過期，請重新整理後再儲存。")?.to_owned();
+                    let raw = std::fs::read_to_string(&path).map_err(|_| INVALID.to_owned())?;
                     let mut table: toml::Table = raw.parse().map_err(|_| INVALID.to_owned())?;
                     let before = OdooAccessConfig::from_table(&table).map_err(|_| INVALID.to_owned())?;
                     let rows = access_employees(&home)?;
@@ -166,8 +171,8 @@ impl MethodHandler {
                     let after = apply(&mut table, &args, &live.user_id, &rows)?;
                     let before_summary = summary(&before);
                     let after_summary = summary(&after);
-                    super::config_commit::commit_odoo_table(
-                        &home, &super::config_commit::content_hash(&raw), &table, super::config_commit::OdooWrite::Access, || {
+                    let hash = super::config_commit::commit_odoo_table(
+                        &home, &expected_hash, &table, super::config_commit::OdooWrite::Access, || {
                             let actor = fresh(&db, &ctx, &session)?;
                             // Recheck employee existence immediately before publication.
                             if let Some(ids) = &args.company_key_agents {
@@ -182,8 +187,10 @@ impl MethodHandler {
                                     "acknowledged":args.acknowledge_risk,"phase":"before_commit"}),
                             )).map_err(|_| STORE.to_owned())
                         },
-                    ).map_err(|_| STORE.to_owned())?;
-                    Ok(response(&after, &rows, follow_mode_impact(&db, &rows)))
+                    ).map_err(|error| if super::config_commit::is_hash_conflict(&path, &error) {
+                        "設定已被其他人變更，請重新整理後再儲存。".to_owned()
+                    } else { STORE.to_owned() })?;
+                    Ok(response(&after, &rows, follow_mode_impact(&db, &rows), &hash))
                 }
                 _ => Err("沒有這項 Odoo 權限操作。".into()),
             }

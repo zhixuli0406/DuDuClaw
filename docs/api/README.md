@@ -22,8 +22,8 @@ JSON-RPC 2.0, and member login does not use Ed25519 challenge signing.
 
 Enterprise Admin dashboard sessions use `agents.main_access.get` and
 `agents.main_access.set` to read and replace the initially empty list. Saving
-accepts `user_ids`; adding people also requires `acknowledged: true`. Responses
-include `users`, `risk_notice` and `effective`. For a non-empty list,
+requires `user_ids` and string `expected_hash` copied from `agents.main_access.get`; adding people also requires `acknowledged: true`. Responses
+include `users`, `risk_notice`, `effective` and string `hash`. The hash covers stored grant rows; comparison and replacement run in one IMMEDIATE transaction. Missing/non-string or stale hashes refuse the save without changing the list. For a non-empty list,
 `effective` is true only in protected mode with isolated employee execution;
 otherwise `ineffective_reason` explains that only Admins can use the main
 employee. An empty list reports `effective: true` without granting anyone access.

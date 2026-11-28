@@ -14,7 +14,16 @@
 
 完整權限、規則執行限制、撤銷與既有工作的處理方式，請見[部門主管](../../features/zh-TW/79-department-managers.md)。全公司分析與帳務彙總仍對所有主管可見。
 
-`agents.main_access.get {}`／`agents.main_access.set {user_ids, acknowledged?}` 的 `users[]` 每筆增加 `granted_by_name` 與 `granted_at`，可顯示授權人與時間；查不到姓名時為 `null`。
+`agents.main_access.get {}`／`agents.main_access.set {user_ids, expected_hash, acknowledged?}` 的 `users[]` 每筆增加 `granted_by_name` 與 `granted_at`，可顯示授權人與時間；查不到姓名時為 `null`。
+
+Get 與成功的 set 回應另有頂層字串 `hash`。Set 必填 `expected_hash`，值須沿用管理員載入設定頁時 get 回傳的 `hash`。它是 `users.db` 內 `main_agent_users` 原始資料列的 SHA-256 小寫十六進位摘要：依 `user_id` 排序，以精簡 JSON 編碼 `[user_id, granted_by, granted_at]` 元組陣列。名單與摘要在同一讀取快照取得，比對與替換則在同一個 IMMEDIATE 寫入交易完成。缺漏、非字串或過期摘要都拒絕儲存，不變更名單；衝突後請重新載入並確認內容。
+
+```javascript
+const snapshot = await rpc('agents.main_access.get', {});
+await rpc('agents.main_access.set', {
+  user_ids: selectedUserIds, acknowledged: true, expected_hash: snapshot.hash,
+});
+```
 
 有自動化權限的部門主管可用 `autopilot.template_fields {trigger_event}`，僅接受 `task_created`、`task_updated`、`task_status_changed`，不能帶 `sequence`；`autopilot.runs.list {rule_id, limit?}` 只能查看已授權自動化部門的規則。`autopilot.template_fields` 回傳 `{fields:[...]}`；`autopilot.runs.list` 回傳 `{runs:[...]}`，`limit` 預設 20，接受 1～100。`autopilot.runs.cancel` 仍限管理員。管理員或該部門有權限的主管可用 `autopilot.notify_destinations {owner_department}`，回傳 `{destinations:[{channel, chat_id, kind, agent_id, label}]}`。`kind` 為 `self` 或 `agent`，`agent_id` 可為 `null`；清單只包含呼叫者建立部門規則時可以通知的對象，畫面請顯示 `label`。`autopilot.list` 與 `autopilot.affecting_me` 的規則增加 `creator_access_lost`，值為 `true`、`false` 或無法判定時的 `null`，只供顯示，不代表授權結果。
 
@@ -1059,6 +1068,13 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 
 `[google_signin]` 由 `google.signin.set` 管理。儀表板的 Google 設定提供後，請從該處設定；相關頁面尚未實作。個人版不提供此功能。啟用登入、切換為直接建立帳號，或開啟核准時授權 MFA 註冊，均須明確確認風險。登入也需要公司 Google OAuth 用戶端及有效的 `[dashboard] public_url`。
 
+`google.signin.get {}` 回傳 `{settings, checks, redirect_uri, hash}`；`google.signin.set` 儲存成功回傳 `{settings, hash}`。`hash` 為讀取到的整份 `config.toml` 文字摘要（字串）。Set 除了既有設定、`step_up_csrf` 與風險確認，還必填該次 get 的 `expected_hash`，在設定提交鎖內原子比對；單純關閉登入也須比對。缺漏、非字串或過期摘要均拒絕寫入，既有再次驗證豁免、風險確認與範本版本檢查維持不變。
+
+```javascript
+const snapshot = await rpc('google.signin.get', {});
+await rpc('google.signin.set', { ...signinForm, expected_hash: snapshot.hash });
+```
+
 | 設定鍵 | 預設值／用途 |
 |---|---|
 | `enabled` | `false`。要求啟用 Google 登入；須有風險確認紀錄及非空白的有效網域清單才會生效。 |
@@ -1101,7 +1117,14 @@ Claude 的通道與背景執行、Codex JSONL 執行，以及 OpenAI 相容 API 
 
 `always_refuse` 預設清單：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
 
-管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
+管理員瀏覽器 RPC `odoo.access_get {}`、`odoo.access_set` 用於讀取／更新設定。Set 必填 `expected_hash`，另接受 `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk`。切換為依 Odoo 帳號、新增公司帳號 AI 或移除拒絕規則須帶 `acknowledge_risk=true`。變更有稽核紀錄，稽核失敗不寫入；權限設定格式錯誤則拒絕 Odoo 操作。引擎模式下，新工具須在 `allowed_models` 明列目標模型，並在 `allowed_actions` 明列 `activity:<model>`、`note:<model>`、`message:<model>` 或 `attach:<model>`；空清單不授予這些操作。
+
+正常 get／set 回應包含頂層字串 `hash`，代表整份 `config.toml` 文字摘要。Set 必填從該次 get 沿用的 `expected_hash`，在設定提交鎖內比對並寫入。`{readable:false, message}` 不含 hash。缺漏或非字串回傳「設定頁的資料已過期，請重新整理後再儲存。」；過期摘要回傳「設定已被其他人變更，請重新整理後再儲存。」，均不寫入設定。本指南這三組設定 RPC 共用上述拒絕訊息；遇到衝突請重新載入並確認內容。
+
+```javascript
+const snapshot = await rpc('odoo.access_get', {});
+await rpc('odoo.access_set', { attachment_max_mb: 5, expected_hash: snapshot.hash });
+```
 
 個別員工透過管理員瀏覽器 RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` 調整；override 僅接受 `inherit`、`engine`、`read_only`，啟用請求者身分或放寬 override 須帶 `acknowledge_risk=true`。此操作只改這兩個欄位，重新確認有效的管理員工作階段，先寫稽核再儲存；稽核失敗不變更設定。`odoo.agent_config_get` 回傳這兩個欄位，原始／個人檔案設定寫入仍拒絕擴權，操作畫面將隨 Odoo 設定頁提供。
 

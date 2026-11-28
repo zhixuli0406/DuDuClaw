@@ -46,7 +46,14 @@ impl Fixture {
         crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), self.session.clone())),
             self.handler.handle(method, params, ctx)).await
     }
-    async fn admin(&self, method: &str, params: Value) -> WsFrame { self.call(&self.admin, method, params).await }
+    async fn admin_raw(&self, method: &str, params: Value) -> WsFrame { self.call(&self.admin, method, params).await }
+    async fn admin(&self, method: &str, mut params: Value) -> WsFrame {
+        if method == "google.signin.set" && params.is_object() && params.get("expected_hash").is_none() {
+            let get = payload(self.admin_raw("google.signin.get", json!({})).await);
+            params["expected_hash"] = get["hash"].clone();
+        }
+        self.admin_raw(method, params).await
+    }
     fn provision(&self, sub: &str, approval: SigninApproval) -> String {
         let identity = VerifiedGoogleIdentity { sub: sub.into(), email: format!("new{sub}@company.test"),
             hd: "company.test".into(), display_name: "新同仁".into() };
@@ -103,7 +110,10 @@ async fn role_table_dashboard_only_and_member_keys_refused() {
 async fn set_and_attest_require_fresh_session_bound_step_up() {
     let f = fixture().await;
     let attest = json!({"user_ids": [f.employee.user_id], "step_up_csrf": CSRF});
-    for (method, input) in [("google.signin.set", settings()), ("users.google_signin.attest", attest)] {
+    for (method, mut input) in [("google.signin.set", settings()), ("users.google_signin.attest", attest)] {
+        if method == "google.signin.set" {
+            input["expected_hash"] = payload(f.admin("google.signin.get", json!({})).await)["hash"].clone();
+        }
         assert_eq!(code(f.admin(method, input.clone()).await), "signin_step_up_required");
         f.proof(Utc::now().timestamp() - 301, &f.session, f.admin.credential_epoch);
         assert_eq!(code(f.admin(method, input.clone()).await), "signin_step_up_required");
@@ -159,10 +169,12 @@ async fn concurrent_tightening_survives_unauthenticated_disable() {
         avatar_template: AvatarTemplate::Company { key: "sales".into(), revision: 7 },
         approval_grants_mfa_enrollment: true,
     };
-    config::write_settings(f.home.path(), &f.admin.user_id, &old, true, &now).unwrap();
+    config::write_settings(f.home.path(), &f.admin.user_id, &old, true, &now,
+        &config::read_with_hash(f.home.path()).unwrap().1).unwrap();
     let mut stale_disable = old.clone();
     stale_disable.enabled = false;
     // Run the production exemption decision before the other admin tightens.
+    let stale_hash = config::read_with_hash(f.home.path()).unwrap().1;
     let pure_disable = is_pure_disable(f.home.path(), &stale_disable);
     assert!(pure_disable);
     assert!(step_up(&f.db, &f.admin, &f.session, None).is_err());
@@ -171,14 +183,20 @@ async fn concurrent_tightening_survives_unauthenticated_disable() {
         allowed_hd: vec!["company.test".into()], approval: Approval::Admin,
         daily_new_accounts: 5, approval_grants_mfa_enrollment: false, ..old
     };
-    let (_, tightened_before_disable) = config::write_settings(
-        f.home.path(), &other_admin.id, &tightened, true, &now,
+    let (_, tightened_before_disable, _) = config::write_settings(
+        f.home.path(), &other_admin.id, &tightened, true, &now, &stale_hash,
     ).unwrap();
     assert!(tightened_before_disable.enabled);
     // Resume the same production write branch with the stale exemption result.
-    let (before, after) = apply_settings(
-        f.home.path(), &f.admin.user_id, &stale_disable, pure_disable, false, &now,
+    assert_eq!(apply_settings(
+        f.home.path(), &f.admin.user_id, &stale_disable, pure_disable, false, &now, &stale_hash,
+    ).unwrap_err(), "設定已被其他人變更，請重新整理後再儲存。");
+    assert_eq!(config::read_strict(f.home.path()), tightened_before_disable);
+    let fresh_hash = config::read_with_hash(f.home.path()).unwrap().1;
+    let (before, after, hash) = apply_settings(
+        f.home.path(), &f.admin.user_id, &stale_disable, pure_disable, false, &now, &fresh_hash,
     ).unwrap();
+    assert_eq!(hash, config::read_with_hash(f.home.path()).unwrap().1);
     assert_eq!(before, tightened_before_disable);
     assert_eq!(after, config::read_strict(f.home.path()));
     assert!(!after.enabled);
@@ -263,7 +281,7 @@ async fn settings_checks_reuse_redirect_and_personal_edition_refuses_writes() {
         assert_eq!(payload(f.admin("google.signin.get", json!({})).await)["checks"]["personal_connection_domains_cover"], expected);
     }
     f.handler.set_test_edition(Some(duduclaw_core::EditionProfile::Personal)).await;
-    assert_eq!(code(f.admin("google.signin.set", settings()).await), "signin_personal_edition");
+    assert_eq!(code(f.admin_raw("google.signin.set", settings()).await), "signin_personal_edition");
     assert_eq!(code(f.admin("google.signin.get", json!({})).await), "signin_personal_edition");
     for method in &METHODS[2..] { assert!(refused(f.admin(method, json!({})).await)); }
 }
@@ -406,4 +424,52 @@ async fn me_google_signin_member_api_keys_refused_for_every_method() {
     }
     assert_eq!(super::super::member_contract::member_key_method("me.google_signin.future"), None);
     assert!(refused(f.admin("me.google_signin.future", json!({})).await));
+}
+
+
+#[tokio::test]
+async fn google_signin_hash_requires_fresh_client_snapshot() {
+    let f = fixture().await;
+    f.fresh_proof();
+    let path = f.home.path().join("config.toml");
+    let get = payload(f.admin_raw("google.signin.get", json!({})).await);
+    assert_eq!(get["hash"], super::super::config_commit::content_hash(BASE));
+    for invalid in [None, Some(Value::Null), Some(json!(1)), Some(json!(true))] {
+        let mut input = settings();
+        if let Some(value) = invalid { input["expected_hash"] = value; }
+        match f.admin_raw("google.signin.set", input).await {
+            WsFrame::Response { ok:false, error:Some(error), .. } =>
+                assert_eq!(error, "設定頁的資料已過期，請重新整理後再儲存。"),
+            other => panic!("expected refusal: {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), BASE);
+    }
+    let changed = format!("{BASE}# another admin\n");
+    std::fs::write(&path, &changed).unwrap();
+    let mut input = settings();
+    input["expected_hash"] = get["hash"].clone();
+    match f.admin_raw("google.signin.set", input.clone()).await {
+        WsFrame::Response { ok:false, error:Some(error), .. } =>
+            assert_eq!(error, "設定已被其他人變更，請重新整理後再儲存。"),
+        other => panic!("expected conflict: {other:?}"),
+    }
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    let fresh = payload(f.admin_raw("google.signin.get", json!({})).await);
+    input["expected_hash"] = fresh["hash"].clone();
+    let saved = payload(f.admin_raw("google.signin.set", input).await);
+    assert_eq!(saved["settings"]["enabled"], true);
+    assert_eq!(saved["hash"], super::super::config_commit::content_hash(&std::fs::read_to_string(&path).unwrap()));
+    assert_ne!(saved["hash"], fresh["hash"]);
+}
+
+
+#[tokio::test]
+async fn google_signin_get_refuses_unreadable_snapshot() {
+    let f = fixture().await;
+    let path = f.home.path().join("config.toml");
+    std::fs::write(&path, "broken=[").unwrap();
+    assert!(refused(f.admin_raw("google.signin.get", json!({})).await));
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert!(refused(f.admin_raw("google.signin.get", json!({})).await));
 }

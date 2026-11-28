@@ -385,8 +385,9 @@ pub(super) enum OdooWrite { Access, MemberCredentials }
 pub(super) fn commit_odoo_table(
     home: &Path, expected_hash: &str, table: &toml::Table, scope: OdooWrite,
     guard: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let path = home.join("config.toml");
+    let mut hash = None;
     crate::google_identity::home_source::with_source_guard(home, |source| Ok(
         commit_rendered_inner_authorized(&path, expected_hash, |current| {
             let mut old = current.parse::<toml::Table>().map_err(|e| e.to_string())?;
@@ -405,9 +406,12 @@ pub(super) fn commit_odoo_table(
             }
             if old != new { return Err("只能變更這項 Odoo 權限設定。".into()); }
             guard()?;
-            render_preserving(current, table)
+            let rendered = render_preserving(current, table)?;
+            hash = Some(content_hash(&rendered));
+            Ok(rendered)
         }, true, Some(source), None, None, false, false, true, false)
-    )).map_err(|e| e.to_string())?
+    )).map_err(|e| e.to_string())??;
+    hash.ok_or_else(|| "無法儲存設定，請稍後再試。".into())
 }
 
 /// Only the browser Admin policy RPC may change these two creation-policy keys.
@@ -731,7 +735,7 @@ pub(crate) fn commit_boot_config<T>(
 }
 
 /// Exact match for the locked CAS rejection; RPCs translate it without exposing paths.
-pub(super) fn is_hash_conflict(path: &Path, error: &str) -> bool {
+pub(crate) fn is_hash_conflict(path: &Path, error: &str) -> bool {
     error == changed_on_disk(path)
 }
 

@@ -14,7 +14,16 @@ Adding or widening a grant, or adding people to the main list, requires reading 
 
 See [Department managers](../features/79-department-managers.md) for exact permissions, rule execution limits, revocation and existing work. Company-wide analytics and billing summaries remain visible to all Managers.
 
-`agents.main_access.get {}` / `agents.main_access.set {user_ids, acknowledged?}` include `granted_by_name` and `granted_at` on each `users[]` entry, so the grant can show who approved it and when. The name can be `null`.
+`agents.main_access.get {}` / `agents.main_access.set {user_ids, expected_hash, acknowledged?}` include `granted_by_name` and `granted_at` on each `users[]` entry, so the grant can show who approved it and when. The name can be `null`.
+
+Get and successful set responses also include a top-level string `hash`. Set requires `expected_hash` copied from the get snapshot displayed to the administrator. The token is the lowercase hex SHA-256 digest of the stored `main_agent_users` rows in `users.db`: compact JSON tuples `[user_id, granted_by, granted_at]`, ordered by `user_id`. Display and hash use one read snapshot; comparison and replacement use the same IMMEDIATE write transaction. A missing/non-string token or a stale token refuses the save without changing the list. After a conflict, reload and review the list before saving again.
+
+```javascript
+const snapshot = await rpc('agents.main_access.get', {});
+await rpc('agents.main_access.set', {
+  user_ids: selectedUserIds, acknowledged: true, expected_hash: snapshot.hash,
+});
+```
 
 Managers with Automation access can call `autopilot.template_fields {trigger_event}` for `task_created`, `task_updated` and `task_status_changed` only, without `sequence`; `autopilot.runs.list {rule_id, limit?}` is limited to rules in their granted Automation departments. `autopilot.template_fields` returns `{fields:[...]}`; `autopilot.runs.list` returns `{runs:[...]}`, with `limit` defaulting to 20 and accepting 1–100. `autopilot.runs.cancel` remains Admin-only. Admins and the department's authorized Manager can call `autopilot.notify_destinations {owner_department}`. It returns `{destinations:[{channel, chat_id, kind, agent_id, label}]}`: `kind` is `self` or `agent`, and `agent_id` is nullable. These are exactly the destinations a department rule created by the caller may notify. Use `label` for display. Rules returned by `autopilot.list` and `autopilot.affecting_me` include `creator_access_lost` (`true`, `false` or `null` when undetermined); this is display information, not an authorization decision.
 
@@ -1139,6 +1148,13 @@ front-end code; call from your server. See the [member API contract](../api/memb
 
 `[google_signin]` is administered through `google.signin.set`. Set these values from the dashboard's Google settings once available; its pages are not built yet. Personal edition does not offer this feature. Enabling sign-in, switching to direct creation, or enabling approval-based MFA enrollment requires explicit risk acknowledgement. A configured company Google OAuth client and valid `[dashboard] public_url` are also required for sign-in.
 
+`google.signin.get {}` returns `{settings, checks, redirect_uri, hash}`; `google.signin.set` returns `{settings, hash}` after saving. `hash` is a string digest of the entire `config.toml` text read. Set requires `expected_hash` from that get snapshot, in addition to the existing settings fields, `step_up_csrf` and risk acknowledgement. The hash is compared inside the config commit lock, including a pure disable. Missing/non-string or stale tokens refuse the write; step-up exemptions, risk acknowledgement and template revision checks still apply.
+
+```javascript
+const snapshot = await rpc('google.signin.get', {});
+await rpc('google.signin.set', { ...signinForm, expected_hash: snapshot.hash });
+```
+
 | Key | Default / meaning |
 |---|---|
 | `enabled` | `false`. Requests Google sign-in; effective only with acknowledgement and a nonempty valid domain list. |
@@ -1181,7 +1197,14 @@ Backup restore and CLI import narrow these settings instead of rejecting recover
 
 Default `always_refuse`: `unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`.
 
-Admin browser RPCs `odoo.access_get {}` and `odoo.access_set` read/update access settings. Set accepts `permission_mode`, `company_key_agents`, `always_refuse`, `attachment_max_mb`, `dismiss_upgrade_notice`, and `acknowledge_risk`. Selecting Follow, adding company-account AIs or removing refusal rules requires `acknowledge_risk=true`. Changes are audited; a failed audit refuses the write. Malformed policy refuses Odoo operations. Engine grants for the new dedicated tools require the target model explicitly in `allowed_models` and the exact `activity:<model>`, `note:<model>`, `message:<model>` or `attach:<model>` token in `allowed_actions`; empty lists grant none of these operations.
+Admin browser RPCs `odoo.access_get {}` and `odoo.access_set` read/update access settings. Set requires `expected_hash` and accepts `permission_mode`, `company_key_agents`, `always_refuse`, `attachment_max_mb`, `dismiss_upgrade_notice`, and `acknowledge_risk`. Selecting Follow, adding company-account AIs or removing refusal rules requires `acknowledge_risk=true`. Changes are audited; a failed audit refuses the write. Malformed policy refuses Odoo operations. Engine grants for the new dedicated tools require the target model explicitly in `allowed_models` and the exact `activity:<model>`, `note:<model>`, `message:<model>` or `attach:<model>` token in `allowed_actions`; empty lists grant none of these operations.
+
+Normal get/set responses include a top-level string `hash` for the entire `config.toml` text. Set requires `expected_hash` copied from the get snapshot; comparison is atomic with the write inside the config commit lock. `{readable:false, message}` has no hash. Missing/non-string tokens return 「設定頁的資料已過期，請重新整理後再儲存。」; stale tokens return 「設定已被其他人變更，請重新整理後再儲存。」, with no settings written. All three settings RPC pairs in this guide use these refusal messages. Reload and review after a conflict.
+
+```javascript
+const snapshot = await rpc('odoo.access_get', {});
+await rpc('odoo.access_set', { attachment_max_mb: 5, expected_hash: snapshot.hash });
+```
 
 Per-employee changes use the admin browser RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}`: only `inherit`, `engine`, and `read_only` are accepted; enabling requester identity or loosening an override requires `acknowledge_risk=true`. It edits only those two fields, rechecks the live admin session, and audits before writing; an audit failure blocks the change. `odoo.agent_config_get` returns both fields. Raw/profile writers still refuse widening. The controls will be included in the Odoo settings page.
 

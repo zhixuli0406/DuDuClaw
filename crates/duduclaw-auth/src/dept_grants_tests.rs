@@ -405,3 +405,52 @@ fn main_access_display_batch_resolves_names_preserves_time_and_fails_on_read_err
     db.conn().execute("ALTER TABLE main_agent_users RENAME COLUMN granted_at TO broken", []).unwrap();
     assert!(db.main_agent_users_display().is_err());
 }
+
+
+#[test]
+fn main_access_hash_checked_in_write_transaction_and_covers_grant_evidence() {
+    let (db, path) = test_db();
+    let member = user(&db, "member", UserRole::Employee);
+    let initial = db.main_agent_users_display_with_hash().unwrap().1;
+    assert_eq!(initial.len(), 64);
+    db.set_main_agent_users_if_unchanged("admin", &[member.clone()], true, &initial).unwrap();
+    let hash = db.main_agent_users_display_with_hash().unwrap().1;
+    assert_ne!(initial, hash);
+    let other = UserDb::new(path.path()).unwrap();
+    for column in ["granted_by", "granted_at"] {
+        let stale = db.main_agent_users_display_with_hash().unwrap().1;
+        other.conn().execute(&format!("UPDATE main_agent_users SET {column}='changed'"), []).unwrap();
+        let current = db.main_agent_users_display_with_hash().unwrap().1;
+        let generation_before = generation(&db);
+        let audit_count = audits(&db, "main_access_changed").len();
+        assert_eq!(db.set_main_agent_users_if_unchanged("admin", &[], false, &stale),
+            Err(MAIN_AGENT_USERS_HASH_CONFLICT.into()));
+        // Even an otherwise unchanged list must compare the stored evidence.
+        assert_eq!(db.set_main_agent_users_if_unchanged("admin", &[member.clone()], true, &stale),
+            Err(MAIN_AGENT_USERS_HASH_CONFLICT.into()));
+        assert_eq!(db.main_agent_users_display_with_hash().unwrap().1, current);
+        assert_eq!(db.main_agent_users().unwrap(), vec![member.clone()]);
+        assert_eq!(generation(&db), generation_before);
+        assert_eq!(audits(&db, "main_access_changed").len(), audit_count);
+    }
+    let fresh = db.main_agent_users_display_with_hash().unwrap().1;
+    db.set_main_agent_users_if_unchanged("admin", &[], false, &fresh).unwrap();
+    assert_eq!(db.main_agent_users_display_with_hash().unwrap().1, initial);
+    db.conn().execute("ALTER TABLE main_agent_users RENAME COLUMN granted_by TO broken", []).unwrap();
+    assert!(db.set_main_agent_users_if_unchanged("admin", &[], false, &initial).is_err());
+}
+
+#[test]
+fn main_access_hash_is_stable_across_row_order_and_reopen() {
+    let (db, path) = test_db();
+    let a = user(&db, "a", UserRole::Employee);
+    let b = user(&db, "b", UserRole::Employee);
+    db.set_main_agent_users("admin", &[a, b], true).unwrap();
+    let before = db.main_agent_users_display_with_hash().unwrap().1;
+    db.conn().execute_batch("CREATE TEMP TABLE saved AS SELECT * FROM main_agent_users;
+        DELETE FROM main_agent_users;
+        INSERT INTO main_agent_users SELECT * FROM saved ORDER BY user_id DESC;
+        DROP TABLE saved;").unwrap();
+    assert_eq!(db.main_agent_users_display_with_hash().unwrap().1, before);
+    assert_eq!(UserDb::new(path.path()).unwrap().main_agent_users_display_with_hash().unwrap().1, before);
+}

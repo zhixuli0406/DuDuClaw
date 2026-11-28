@@ -23,10 +23,21 @@ async fn fixture() -> Fixture {
     Fixture { admin: db.live_user_context(&admin.id).unwrap().unwrap(),
         member: db.live_user_context(&member.id).unwrap().unwrap(), home, db, handler }
 }
-async fn rpc(f: &Fixture, ctx: &UserContext, method: &str, params: Value) -> WsFrame {
+async fn rpc_raw(f: &Fixture, ctx: &UserContext, method: &str, params: Value) -> WsFrame {
     crate::google_personal::DASHBOARD_SESSION.scope(Some((ctx.user_id.clone(), DASHBOARD_SESSION_ID.into())),
         f.handler.handle_conn(method, params, ctx,
             crate::power_local::RpcConnInfo::from_ws("127.0.0.1:12345".parse().unwrap(), false))).await
+}
+// Existing validation tests use a current settings-page snapshot.
+async fn rpc(f: &Fixture, ctx: &UserContext, method: &str, mut params: Value) -> WsFrame {
+    if method == "odoo.access_set" && params.is_object() && params.get("expected_hash").is_none() {
+        let get = rpc_raw(f, ctx, "odoo.access_get", json!({})).await;
+        params["expected_hash"] = match get {
+            WsFrame::Response { ok:true, payload:Some(value), .. } if value["hash"].is_string() => value["hash"].clone(),
+            _ => json!("unreadable"),
+        };
+    }
+    rpc_raw(f, ctx, method, params).await
 }
 fn payload(frame: WsFrame) -> Value {
     match frame {
@@ -135,6 +146,9 @@ async fn unreadable_access_get_reports_recovery_and_set_preserves_config() {
     std::fs::remove_file(f.home.path().join("config.toml")).unwrap();
     assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
         json!({"readable":false,"message":UNREADABLE}));
+    refused(rpc_raw(&f, &f.admin, "odoo.access_set",
+        json!({"attachment_max_mb":5,"expected_hash":super::super::config_commit::content_hash("")})).await);
+    assert!(!f.home.path().join("config.toml").exists());
     std::fs::create_dir(f.home.path().join("config.toml")).unwrap();
     assert_eq!(payload(rpc(&f, &f.admin, "odoo.access_get", json!({})).await),
         json!({"readable":false,"message":UNREADABLE}));
@@ -668,4 +682,36 @@ fn agent_widening_guards_direct_to_employee_edit_page() {
         assert_eq!(super::super::config_commit::refuse_odoo_agent_widening_text_edit(
             before, after).unwrap_err(), message);
     }
+}
+
+
+#[tokio::test]
+async fn odoo_access_hash_requires_fresh_client_snapshot() {
+    let f = fixture().await;
+    let get = payload(rpc_raw(&f, &f.admin, "odoo.access_get", json!({})).await);
+    assert_eq!(get["hash"], super::super::config_commit::content_hash(&raw(&f)));
+    for invalid in [None, Some(Value::Null), Some(json!(1)), Some(json!(true))] {
+        let mut input = json!({"attachment_max_mb":5});
+        if let Some(value) = invalid { input["expected_hash"] = value; }
+        match rpc_raw(&f, &f.admin, "odoo.access_set", input).await {
+            WsFrame::Response { ok:false, error:Some(error), .. } =>
+                assert_eq!(error, "設定頁的資料已過期，請重新整理後再儲存。"),
+            other => panic!("expected refusal: {other:?}"),
+        }
+        assert_eq!(raw(&f), "# retained\n");
+    }
+    // Another writer changes even an unrelated part of the same file.
+    let changed = "# another admin\n";
+    std::fs::write(f.home.path().join("config.toml"), changed).unwrap();
+    match rpc_raw(&f, &f.admin, "odoo.access_set", json!({"attachment_max_mb":5,"expected_hash":get["hash"]})).await {
+        WsFrame::Response { ok:false, error:Some(error), .. } =>
+            assert_eq!(error, "設定已被其他人變更，請重新整理後再儲存。"),
+        other => panic!("expected conflict: {other:?}"),
+    }
+    assert_eq!(raw(&f), changed);
+    let fresh = payload(rpc_raw(&f, &f.admin, "odoo.access_get", json!({})).await);
+    let saved = payload(rpc_raw(&f, &f.admin, "odoo.access_set", json!({"attachment_max_mb":5,"expected_hash":fresh["hash"]})).await);
+    assert_eq!(saved["config"]["attachment_max_mb"], 5);
+    assert_eq!(saved["hash"], super::super::config_commit::content_hash(&raw(&f)));
+    assert_ne!(saved["hash"], fresh["hash"]);
 }

@@ -15,9 +15,21 @@ async fn remove_shell(f: &Fixture, agent: &str) {
     f.h.registry.write().await.scan().await.unwrap();
 }
 
-async fn rpc(f: &Fixture, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
+async fn rpc_raw(f: &Fixture, method: &str, params: Value, ctx: &UserContext) -> WsFrame {
     Box::pin(f.h.handle(method, params, ctx)).await
 }
+
+async fn rpc(f: &Fixture, method: &str, mut params: Value, ctx: &UserContext) -> WsFrame {
+    if method == SET && params.is_object() && params.get("expected_hash").is_none() {
+        params["expected_hash"] = match rpc_raw(f, GET, json!({}), ctx).await {
+            WsFrame::Response { ok:true, payload:Some(value), .. } => value["hash"].clone(),
+            _ => json!("unreadable"),
+        };
+    }
+    rpc_raw(f, method, params, ctx).await
+}
+
+fn current_hash(f: &Fixture) -> String { f.db.main_agent_users_display_with_hash().unwrap().1 }
 
 fn payload(frame: WsFrame) -> Value {
     match frame {
@@ -37,14 +49,14 @@ fn error(frame: WsFrame) -> Value {
 async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor() {
     let f = fixture().await;
     assert_eq!(payload(rpc(&f, GET, json!({}), &f.admin).await),
-        json!({"users": [], "risk_notice": RISK_NOTICE, "effective": true}));
+        json!({"users": [], "risk_notice": RISK_NOTICE, "effective": true, "hash": current_hash(&f)}));
     let saved = payload(rpc(&f, SET, json!({"user_ids": ["emp"], "acknowledged": true}), &f.admin).await);
     let granted_at = saved["users"][0]["granted_at"].as_str().unwrap();
     let expected = json!({"users": [{
         "user_id": "emp", "display_name": "emp", "email": "emp@example.invalid",
         "role": "employee", "status": "active",
         "granted_by_name": "admin", "granted_at": granted_at,
-    }], "risk_notice": RISK_NOTICE, "effective": false, "ineffective_reason": INEFFECTIVE_REASON});
+    }], "hash": saved["hash"], "risk_notice": RISK_NOTICE, "effective": false, "ineffective_reason": INEFFECTIVE_REASON});
     assert_eq!(payload(rpc(&f, SET, json!({
         "user_ids": ["emp", "emp"], "acknowledged": true, "actor": "mgrA", "user_id": "mgrA",
     }), &f.admin).await), expected);
@@ -63,7 +75,7 @@ async fn admin_get_set_deduplicates_returns_only_listed_users_and_audits_actor()
     ).unwrap();
     assert_eq!(count, 1);
     assert_eq!(payload(rpc(&f, SET, json!({"user_ids": []}), &f.admin).await),
-        json!({"users": [], "risk_notice": RISK_NOTICE, "effective": true}));
+        json!({"users": [], "risk_notice": RISK_NOTICE, "effective": true, "hash": current_hash(&f)}));
     assert!(f.db.main_agent_users().unwrap().is_empty());
 }
 
@@ -89,8 +101,9 @@ async fn invalid_main_access_payloads_are_refused_without_partial_writes() {
         json!({"user_ids": ["emp", null]}), json!({"user_ids": ["emp", ""]}),
         json!({"user_ids": ["emp", "   "]}), json!({"user_ids": vec!["emp"; 501]}),
     ] {
-        assert_eq!(error(rpc(&f, SET, params, &f.admin).await),
-            "請提供成員編號陣列，每個編號都必須是非空白文字，最多 500 筆。");
+        let message = if params.is_null() { "設定頁的資料已過期，請重新整理後再儲存。" }
+            else { "請提供成員編號陣列，每個編號都必須是非空白文字，最多 500 筆。" };
+        assert_eq!(error(rpc(&f, SET, params, &f.admin).await), message);
         assert_eq!(f.db.main_agent_users().unwrap(), vec!["mgrA".to_owned()]);
     }
     for id in ["missing", "Emp", " emp "] {
@@ -187,7 +200,7 @@ async fn isolation_controls_get_set_effectiveness_even_without_shell() {
     // parameters or the irreversible process-global isolation latch.
     for isolated in [false, true] {
         let saved = payload(f.h.handle_main_access_set_with_isolation(
-            json!({"user_ids": ["emp"], "acknowledged": true}), &f.admin, isolated,
+            json!({"user_ids": ["emp"], "acknowledged": true, "expected_hash": current_hash(&f)}), &f.admin, isolated,
         ).await);
         let fetched = payload(f.h.handle_main_access_get_with_isolation(isolated).await);
         for response in [saved, fetched] {
@@ -198,7 +211,7 @@ async fn isolation_controls_get_set_effectiveness_even_without_shell() {
         }
         assert_eq!(f.db.main_agent_users().unwrap(), vec!["emp".to_owned()]);
         let saved = payload(f.h.handle_main_access_set_with_isolation(
-            json!({"user_ids": []}), &f.admin, isolated,
+            json!({"user_ids": [], "expected_hash": current_hash(&f)}), &f.admin, isolated,
         ).await);
         let fetched = payload(f.h.handle_main_access_get_with_isolation(isolated).await);
         for response in [saved, fetched] {
@@ -237,4 +250,28 @@ async fn main_access_displays_granter_name_timestamp_and_null_after_deletion() {
     assert!(row.get("granted_by_name").unwrap().is_null());
     assert!(row.get("granted_by").is_none());
     assert_eq!(row["granted_at"], "2026-11-28T01:02:03Z");
+}
+
+
+#[tokio::test]
+async fn main_access_hash_requires_fresh_client_snapshot() {
+    let f = fixture().await;
+    let get = payload(rpc_raw(&f, GET, json!({}), &f.admin).await);
+    assert_eq!(get["hash"].as_str().unwrap().len(), 64);
+    for invalid in [None, Some(Value::Null), Some(json!(1)), Some(json!(true))] {
+        let mut input = json!({"user_ids":["emp"],"acknowledged":true});
+        if let Some(value) = invalid { input["expected_hash"] = value; }
+        assert_eq!(error(rpc_raw(&f, SET, input, &f.admin).await),
+            "設定頁的資料已過期，請重新整理後再儲存。");
+        assert!(f.db.main_agent_users().unwrap().is_empty());
+    }
+    f.db.set_main_agent_users("admin", &["mgrA".into()], true).unwrap();
+    let changed = payload(rpc_raw(&f, GET, json!({}), &f.admin).await);
+    assert_eq!(error(rpc_raw(&f, SET, json!({"user_ids":["emp"],"acknowledged":true,"expected_hash":get["hash"]}), &f.admin).await),
+        "設定已被其他人變更，請重新整理後再儲存。");
+    assert_eq!(payload(rpc_raw(&f, GET, json!({}), &f.admin).await), changed);
+    let saved = payload(rpc_raw(&f, SET, json!({"user_ids":["emp"],"acknowledged":true,"expected_hash":changed["hash"]}), &f.admin).await);
+    assert_eq!(f.db.main_agent_users().unwrap(), vec!["emp".to_owned()]);
+    assert_eq!(saved, payload(rpc_raw(&f, GET, json!({}), &f.admin).await));
+    assert_ne!(saved["hash"], changed["hash"]);
 }

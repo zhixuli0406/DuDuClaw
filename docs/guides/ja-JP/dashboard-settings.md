@@ -14,7 +14,16 @@
 
 詳しい権限、ルールの実行制限、取り消し後の既存業務は[部門マネージャー](../../features/ja-JP/79-department-managers.md)を参照してください。全社の分析と請求の集計は、引き続きすべての Manager に表示されます。
 
-`agents.main_access.get {}`／`agents.main_access.set {user_ids, acknowledged?}` は `users[]` の各項目に `granted_by_name` と `granted_at` を返し、許可した人と日時を表示できます。名前を取得できない場合は `null` です。
+`agents.main_access.get {}`／`agents.main_access.set {user_ids, expected_hash, acknowledged?}` は `users[]` の各項目に `granted_by_name` と `granted_at` を返し、許可した人と日時を表示できます。名前を取得できない場合は `null` です。
+
+Get と成功した set の応答にはトップレベルの文字列 `hash` も含まれます。Set の必須項目 `expected_hash` には、管理者が表示した get の `hash` を渡します。これは `users.db` の `main_agent_users` 行を `user_id` 順に並べ、`[user_id, granted_by, granted_at]` タプル配列としてコンパクト JSON にした SHA-256 の小文字16進ダイジェストです。表示と hash は同じ読み取りスナップショット、比較と置換は同じ IMMEDIATE 書き込みトランザクションで処理します。欠落、文字列以外、古い hash は保存を拒否し、リストを変更しません。競合時は再読み込みして内容を確認してください。
+
+```javascript
+const snapshot = await rpc('agents.main_access.get', {});
+await rpc('agents.main_access.set', {
+  user_ids: selectedUserIds, acknowledged: true, expected_hash: snapshot.hash,
+});
+```
 
 自動化権限を持つ部門管理者は `autopilot.template_fields {trigger_event}` を利用できます。対象は `task_created`、`task_updated`、`task_status_changed` のみで、`sequence` は指定できません。`autopilot.runs.list {rule_id, limit?}` は自動化権限のある部門のルールに限定されます。`autopilot.template_fields` は `{fields:[...]}`、`autopilot.runs.list` は `{runs:[...]}` を返します。`limit` は既定 20、範囲 1～100 です。`autopilot.runs.cancel` は管理者専用のままです。管理者または当該部門の権限を持つ部門管理者は `autopilot.notify_destinations {owner_department}` を呼び出せます。応答は `{destinations:[{channel, chat_id, kind, agent_id, label}]}` で、`kind` は `self` または `agent`、`agent_id` は `null` も返します。呼び出した人が作成する部門ルールから通知できる宛先だけを返します。表示には `label` を使います。`autopilot.list` と `autopilot.affecting_me` のルールには `creator_access_lost`（`true`／`false`／判定できない場合の `null`）が加わります。表示専用で、認可の判断には使いません。
 
@@ -1065,6 +1074,13 @@ Claude のチャットとバックグラウンド実行、Codex JSONL、およ�
 
 `[google_signin]` は `google.signin.set` で管理します。ダッシュボードの Google 設定が提供されたら、そこから設定してください。関連画面は未実装です。個人版では利用できません。ログインの有効化、直接作成への切り替え、承認時の MFA 登録許可の有効化には、明示的なリスク確認が必要です。ログインには会社の Google OAuth クライアントと有効な `[dashboard] public_url` も必要です。
 
+`google.signin.get {}` は `{settings, checks, redirect_uri, hash}`、保存成功時の `google.signin.set` は `{settings, hash}` を返します。文字列 `hash` は読み取った `config.toml` 全文のダイジェストです。Set は既存の設定項目、`step_up_csrf`、リスク確認に加えて、その get の `expected_hash` が必須です。単純な無効化も含め、設定コミットロック内で書き込みと一体で比較します。欠落、文字列以外、古い hash は書き込みを拒否します。再認証の免除、リスク確認、テンプレートのリビジョン確認は引き続き適用されます。
+
+```javascript
+const snapshot = await rpc('google.signin.get', {});
+await rpc('google.signin.set', { ...signinForm, expected_hash: snapshot.hash });
+```
+
 | キー | 既定値／用途 |
 |---|---|
 | `enabled` | `false`。Google ログインの有効化を要求します。確認記録と空でない有効なドメインリストが必要です。 |
@@ -1107,7 +1123,14 @@ Engine モードでは、`odoo_execute` とボタン操作（`odoo_sale_confirm`
 
 `always_refuse` の既定値：`unlink:*`, `create:ir.*`, `write:ir.*`, `execute:ir.*`, `create:res.users`, `write:res.users`, `create:res.groups`, `write:res.groups`, `method:execute_import`, `method:signal_workflow`。
 
-管理者のブラウザー RPC `odoo.access_get {}` と `odoo.access_set` で読み取り・更新します。Set は `permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk` を受け付けます。Follow の選択、会社アカウント AI の追加、拒否ルールの削除には `acknowledge_risk=true` が必要です。変更は監査し、監査失敗時は書き込みません。不正な権限設定では Odoo 操作を拒否します。Engine の新ツールは `allowed_models` の明示的な対象モデルと、`allowed_actions` の正確な `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` が必要です。空リストでは許可しません。
+管理者のブラウザー RPC `odoo.access_get {}` と `odoo.access_set` で読み取り・更新します。Set は `expected_hash` が必須で、`permission_mode`、`company_key_agents`、`always_refuse`、`attachment_max_mb`、`dismiss_upgrade_notice`、`acknowledge_risk` を受け付けます。Follow の選択、会社アカウント AI の追加、拒否ルールの削除には `acknowledge_risk=true` が必要です。変更は監査し、監査失敗時は書き込みません。不正な権限設定では Odoo 操作を拒否します。Engine の新ツールは `allowed_models` の明示的な対象モデルと、`allowed_actions` の正確な `activity:<model>`、`note:<model>`、`message:<model>`、`attach:<model>` が必要です。空リストでは許可しません。
+
+正常な get/set 応答には `config.toml` 全文のダイジェストを表すトップレベルの文字列 `hash` が含まれます。Set は get の `hash` を `expected_hash` として渡す必要があり、設定コミットロック内で比較と書き込みを行います。`{readable:false, message}` に hash はありません。欠落または文字列以外は「設定頁的資料已過期，請重新整理後再儲存。」、古い hash は「設定已被其他人變更，請重新整理後再儲存。」を返し、設定を書き込みません。このガイドの3組の設定 RPC は同じ拒否メッセージを使います。競合時は再読み込みして内容を確認してください。
+
+```javascript
+const snapshot = await rpc('odoo.access_get', {});
+await rpc('odoo.access_set', { attachment_max_mb: 5, expected_hash: snapshot.hash });
+```
 
 従業員ごとの変更には管理者のブラウザー RPC `odoo.agent_access_set {agent_id, permission_override?, act_as_requester?, acknowledge_risk?}` を使います。override は `inherit`、`engine`、`read_only` のみ受け付け、依頼者の ID の有効化や制限の緩和には `acknowledge_risk=true` が必要です。この 2 項目だけを変更し、有効な管理者セッションを再確認して書き込み前に監査します。監査失敗時は変更しません。`odoo.agent_config_get` は両項目を返し、生の設定やプロフィールの書き込みでは権限拡大を拒否します。操作画面は Odoo 設定ページで提供予定です。
 

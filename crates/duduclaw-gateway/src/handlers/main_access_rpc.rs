@@ -14,7 +14,7 @@ const MAX_USERS: usize = 500;
 const INEFFECTIVE_REASON: &str = "目前沒有啟用受保護模式，名單暫時不會生效；只有管理員能使用主要 AI 員工。啟用受保護模式後，名單內的成員才能和主要 AI 員工對話、交辦工作。";
 
 fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
-    let entries = db.main_agent_users_display().map_err(|_| UNAVAILABLE)?;
+    let (entries, hash) = db.main_agent_users_display_with_hash().map_err(|_| UNAVAILABLE)?;
     let mut users = Vec::with_capacity(entries.len());
     for entry in entries {
         let user = entry.user;
@@ -24,7 +24,7 @@ fn list_payload(db: &duduclaw_auth::UserDb) -> Result<Value, &'static str> {
             "granted_by_name": entry.granted_by_name, "granted_at": entry.granted_at,
         }));
     }
-    Ok(json!({"users": users, "risk_notice": RISK_NOTICE}))
+    Ok(json!({"users": users, "risk_notice": RISK_NOTICE, "hash": hash}))
 }
 
 fn with_effectiveness(mut payload: Value, isolated: bool) -> Value {
@@ -38,6 +38,7 @@ fn with_effectiveness(mut payload: Value, isolated: bool) -> Value {
 fn store_message(error: &str) -> &'static str {
     match error {
         duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED => duduclaw_auth::dept_grants::ACKNOWLEDGEMENT_REQUIRED,
+        duduclaw_auth::dept_grants::MAIN_AGENT_USERS_HASH_CONFLICT => "設定已被其他人變更，請重新整理後再儲存。",
         "user not found" => "找不到指定的成員。",
         "main-agent access requires an active user" => "只能加入使用中的成員帳號。",
         _ => SAVE_FAILED,
@@ -67,6 +68,10 @@ impl MethodHandler {
     pub(super) async fn handle_main_access_set_with_isolation(
         &self, params: Value, ctx: &UserContext, isolated: bool,
     ) -> WsFrame {
+        let expected_hash = match params.get("expected_hash").and_then(Value::as_str) {
+            Some(hash) => hash.to_owned(),
+            None => return WsFrame::error_response("", "設定頁的資料已過期，請重新整理後再儲存。"),
+        };
         let Some(raw_ids) = params.get("user_ids").and_then(Value::as_array) else {
             return WsFrame::error_response("", INVALID_USERS);
         };
@@ -85,7 +90,7 @@ impl MethodHandler {
         let acknowledged = params.get("acknowledged").and_then(Value::as_bool) == Some(true);
         let Some(db) = self.user_db().await else { return WsFrame::error_response("", SAVE_FAILED); };
         let result = tokio::task::spawn_blocking(move || {
-            db.set_main_agent_users(&actor, &ids, acknowledged).map_err(|error| store_message(&error))?;
+            db.set_main_agent_users_if_unchanged(&actor, &ids, acknowledged, &expected_hash).map_err(|error| store_message(&error))?;
             list_payload(&db)
         }).await;
         match result {

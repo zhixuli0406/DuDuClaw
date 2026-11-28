@@ -1,5 +1,17 @@
 use super::config::*;
 
+fn write_settings(home: &std::path::Path, actor: &str, update: &SettingsUpdate,
+    ack: bool, now: &str) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    let hash = read_with_hash(home)?.1;
+    super::config::write_settings(home, actor, update, ack, now, &hash).map(|(before, after, _)| (before, after))
+}
+
+fn disable_settings(home: &std::path::Path, actor: &str, now: &str)
+    -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    let hash = read_with_hash(home)?.1;
+    super::config::disable_settings(home, actor, now, &hash).map(|(before, after, _)| (before, after))
+}
+
 const NOW: &str = "2026-11-27T00:00:00Z";
 const ACTIVE: &str = "[google_signin]\nenabled=true\nallowed_hd=['example.com']\nenabled_ack={by='admin',at='2026-11-27T00:00:00Z'}\n";
 
@@ -258,4 +270,25 @@ fn writes_preserve_unrelated_values_comments_and_company_revision() {
     let text = std::fs::read_to_string(path).unwrap();
     assert!(text.contains("# keep this comment"));
     assert_eq!(text.parse::<toml::Table>().unwrap()["general"]["name"].as_str(), Some("test"));
+}
+
+
+#[test]
+fn client_hash_refuses_stale_write_and_disable_without_changing_text() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    std::fs::write(&path, ACTIVE).unwrap();
+    let stale = read_with_hash(home.path()).unwrap().1;
+    let changed = format!("{ACTIVE}# another admin saved\n");
+    std::fs::write(&path, &changed).unwrap();
+    assert_eq!(super::config::write_settings(home.path(), "admin", &update(), true, NOW, &stale).unwrap_err(),
+        "設定已被其他人變更，請重新整理後再儲存。");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    assert_eq!(super::config::disable_settings(home.path(), "admin", NOW, &stale).unwrap_err(),
+        "設定已被其他人變更，請重新整理後再儲存。");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed);
+    let fresh = read_with_hash(home.path()).unwrap().1;
+    let (_, after, hash) = super::config::disable_settings(home.path(), "admin", NOW, &fresh).unwrap();
+    assert!(!after.enabled);
+    assert_eq!(hash, read_with_hash(home.path()).unwrap().1);
 }

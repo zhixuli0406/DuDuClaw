@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use crate::handlers::config_commit::{
-    commit_rendered_locked, content_hash, read_text_or_empty, render_preserving,
+    commit_rendered_locked, content_hash, is_hash_conflict, read_text_or_empty, render_preserving,
 };
 use super::oidc::normalize_allowed_hd;
 
@@ -110,18 +110,33 @@ pub fn read_strict(home: &Path) -> GoogleSigninSettings {
     from_root(&root)
 }
 
+/// The dashboard settings and CAS token come from the same config text.
+/// Runtime's disabled-on-error policy must not become an editable snapshot.
+pub fn read_with_hash(home: &Path) -> Result<(GoogleSigninSettings, String), String> {
+    let raw = read_text_or_empty(&home.join("config.toml")).map_err(|_| "無法讀取設定，請稍後再試。")?;
+    let root = raw.parse::<toml::Table>().map_err(|_| "設定內容格式不正確，請先到設定頁修正。")?;
+    Ok((from_root(&root), content_hash(&raw)))
+}
+
+fn save_error(path: &Path, error: String) -> String {
+    if is_hash_conflict(path, &error) {
+        "設定已被其他人變更，請重新整理後再儲存。".into()
+    } else {
+        "無法儲存設定，設定可能已變更，請重新載入後再試。".into()
+    }
+}
+
 /// The only settings write allowed without step-up; it can only narrow.
 /// Reads and edits the current settings inside the locked render callback.
 /// A missing section or an already disabled section without an acknowledgement
 /// commits unchanged text. Existing sections always lose their acknowledgement;
 /// no actor or timestamp acknowledgement is created by this operation.
 pub fn disable_settings(
-    home: &Path, _actor_user_id: &str, _now_rfc3339: &str,
-) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    home: &Path, _actor_user_id: &str, _now_rfc3339: &str, expected_hash: &str,
+) -> Result<(GoogleSigninSettings, GoogleSigninSettings, String), String> {
     let path = home.join("config.toml");
-    let current = read_text_or_empty(&path).map_err(|_| "無法讀取設定，請稍後再試。")?;
     let mut result = None;
-    commit_rendered_locked(&path, &content_hash(&current), |text| {
+    commit_rendered_locked(&path, expected_hash, |text| {
         let mut root: toml::Table = text.parse().map_err(|_| "設定內容格式不正確，請先到設定頁修正。")?;
         let before = from_root(&root);
         if let Some(section) = root.get_mut("google_signin") {
@@ -131,9 +146,9 @@ pub fn disable_settings(
         }
         let after = from_root(&root);
         let rendered = if before == after { text.to_owned() } else { render_preserving(text, &root)? };
-        result = Some((before, after));
+        result = Some((before, after, content_hash(&rendered)));
         Ok(rendered)
-    }).map_err(|_| "無法儲存設定，設定可能已變更，請重新載入後再試。")?;
+    }).map_err(|error| save_error(&path, error))?;
     result.ok_or_else(|| "無法儲存設定，請稍後再試。".into())
 }
 
@@ -143,8 +158,8 @@ pub fn disable_settings(
 /// format-preserving commit engine as commit_table_locked, without a runtime.
 pub fn write_settings(
     home: &Path, actor_user_id: &str, update: &SettingsUpdate,
-    acknowledge_risk: bool, now_rfc3339: &str,
-) -> Result<(GoogleSigninSettings, GoogleSigninSettings), String> {
+    acknowledge_risk: bool, now_rfc3339: &str, expected_hash: &str,
+) -> Result<(GoogleSigninSettings, GoogleSigninSettings, String), String> {
     if !(1..=50).contains(&update.allowed_hd.len()) {
         return Err("請填寫一到五十個允許登入的公司網域。".into());
     }
@@ -198,9 +213,13 @@ pub fn write_settings(
     }
     root.insert("google_signin".into(), toml::Value::Table(table));
     let after = from_root(&root);
-    commit_rendered_locked(&path, &content_hash(&current), |text| render_preserving(text, &root))
-        .map_err(|_| "無法儲存設定，設定可能已變更，請重新載入後再試。")?;
-    Ok((before, after))
+    let mut hash = None;
+    commit_rendered_locked(&path, expected_hash, |text| {
+        let rendered = render_preserving(text, &root)?;
+        hash = Some(content_hash(&rendered));
+        Ok(rendered)
+    }).map_err(|error| save_error(&path, error))?;
+    Ok((before, after, hash.ok_or("無法儲存設定，請稍後再試。")?))
 }
 
 /// Only section deletion, enabled=false and acknowledgement removal are raw edits.

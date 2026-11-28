@@ -234,7 +234,10 @@ const password = 'Fixture-only-password-214!';
 function user(n) { return { sub: `214000${n}`, email: `colleague${n}@c.test` }; }
 class Bench {
   constructor(context, mock, mockBase, admin) { Object.assign(this, { context, mock, mockBase, admin }); }
-  async set(overrides = {}) { return this.admin('google.signin.set', { ...settings, ...overrides }); }
+  async set(overrides = {}) {
+    const snapshot = await this.admin('google.signin.get');
+    return this.admin('google.signin.set', { ...settings, ...overrides, expected_hash: snapshot.hash });
+  }
   async start() {
     const r = await request(this.context.base, '/api/login/google/start', {});
     if (r.status === 429) throw new Skip('start rate limit reached; rerun in a fresh fixture');
@@ -273,7 +276,8 @@ export async function scenario01OffByDefault(b) {
   report('SKIP', '01 login button', {}, 'HTTP bench does not render the dashboard');
 }
 export async function scenario02Acknowledgement(b) {
-  const r = await b.admin.raw('google.signin.set', { ...settings, acknowledge_risk: false });
+  const snapshot = await b.admin('google.signin.get');
+  const r = await b.admin.raw('google.signin.set', { ...settings, acknowledge_risk: false, expected_hash: snapshot.hash });
   report(!r.ok ? 'PASS' : 'FAIL', '02 risk acknowledgement required', { code: r.ok ? 'rpc_ok' : 'rpc_refused' });
   check(!r.ok, 'acknowledgement bypass');
   check((await b.admin('google.signin.get')).settings.enabled === false, 'refusal changed settings');
