@@ -73,10 +73,10 @@ export function ApprovalConfirmPage() {
       posting = true;
       const result = await approvalStepUp.decide(ticket, decision, preview.digest, token);
       setDone(result.decision);
-      // The POST's decided_by is an internal identifier, never display it.
-      void api.approvals.get(preview.approval.id).then(result => {
+      if (result.decided_by_display?.trim()) setDisplay(result.decided_by_display);
+      if (result.decided_by_display === null) void api.approvals.get(preview.approval.id).then(result => {
         const value = result.approvals.find(item => item.id === preview.approval.id)?.decided_by_display;
-        if (value) setDisplay(value);
+        if (typeof value === 'string' && value.trim()) setDisplay(value);
       }).catch(() => undefined);
     } catch (value) {
       setError(posting ? asError(value) : new ApprovalStepUpError('verification_failed', ''));

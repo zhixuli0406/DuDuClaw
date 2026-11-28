@@ -5,7 +5,7 @@ import { IntlProvider } from 'react-intl';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import en from '@/i18n/en.json';
 import { useAuthStore } from '@/stores/auth-store';
-import { resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
+import { formatDateTime, resetCompanyTimeZone, useCompanyTimeStore } from '@/lib/company-time';
 
 afterEach(() => resetCompanyTimeZone());
 
@@ -1102,5 +1102,54 @@ describe('admin AI settings approval', () => {
     show(approval({ status, invalidated_reason }));
     expect(screen.getByText(en[`approval.adminAi.result.${result}`])).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Confirm .* changes/ })).not.toBeInTheDocument();
+  });
+});
+
+describe('processed execution receipts', () => {
+  const receipt = (execution_result: ApprovalItem['execution_result'], kind: ApprovalItem['kind'] = 'admin_ai_settings') => renderWithProviders(
+    <ApprovalDetailPanel approval={genericApproval({ kind, status: 'approved', decided_at: '2026-11-27T14:03:00Z', execution_result })} onApprove={vi.fn()} onReject={vi.fn()} />,
+  );
+  const base = { reason: null, completed: 2, not_executed: 1, message: null, items: [] };
+
+  it('shows the formatted decision time and exact completed count', () => {
+    receipt({ ...base, outcome: 'complete' });
+    expect(screen.getByText('Decision time')).toBeInTheDocument();
+    expect(screen.getByText(formatDateTime('2026-11-27T14:03:00Z', { locale: 'en' }))).toBeInTheDocument();
+    expect(screen.getByText('Completed 2 changes.')).toBeInTheDocument();
+    expect(screen.queryByText(en['approval.adminAi.result.approved'])).not.toBeInTheDocument();
+  });
+
+  it('shows partial counts, message and only item errors as plain pre-wrapped text', () => {
+    const message = '<b>部分完成</b>\n請重試';
+    const error = '<img src=x onerror=alert(1)>\n無法儲存';
+    const { container } = receipt({ ...base, outcome: 'partial', message, items: [
+      { seq: 3, result: null, error }, { seq: 1, result: 'hidden result', error: null },
+    ] });
+    expect(screen.getByText('Completed 2 changes; the remaining 1 were not executed.')).toBeInTheDocument();
+    expect(screen.getByText(message, { normalizer: value => value })).toHaveClass('whitespace-pre-wrap');
+    expect(screen.getByText(`Item 3: ${error}`, { normalizer: value => value })).toHaveClass('whitespace-pre-wrap');
+    expect(container.querySelector('b, img')).toBeNull();
+    expect(screen.queryByText('hidden result')).not.toBeInTheDocument();
+  });
+
+  it.each([null, '<b>這批已取消</b>\n請重提'])('shows a voided receipt with message %j', message => {
+    receipt({ ...base, outcome: 'voided', completed: null, not_executed: null, message });
+    expect(screen.getByText(message || 'None of these changes were executed.', { normalizer: value => value })).toBeInTheDocument();
+    expect(document.querySelector('b')).toBeNull();
+  });
+
+  it('keeps the old result for a null receipt', () => {
+    receipt(null);
+    expect(screen.getByText(en['approval.adminAi.result.approved'])).toBeInTheDocument();
+  });
+
+  it('does not show an admin settings receipt for another kind', () => {
+    receipt({ ...base, outcome: 'complete' }, 'tool_call');
+    expect(screen.queryByText('Completed 2 changes.')).not.toBeInTheDocument();
+  });
+
+  it.each([undefined, null])('omits the decision time when absent (%s)', decided_at => {
+    renderWithProviders(<ApprovalDetailPanel approval={genericApproval({ status: 'approved', decided_at })} onApprove={vi.fn()} onReject={vi.fn()} />);
+    expect(screen.queryByText('Decision time')).not.toBeInTheDocument();
   });
 });

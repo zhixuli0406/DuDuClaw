@@ -122,3 +122,21 @@ describe('AdminAiCard', () => {
     expect(usersMock).not.toHaveBeenCalled();
   });
 });
+
+it.each(['unreadable', 'malformed'])('explains invalid config %s as off and allows re-enabling', async config_state => {
+  getMock.mockResolvedValue({ enabled: false, config_state });
+  renderWithProviders(<AdminAiCard />);
+  await loaded();
+  expect(screen.getByText('The current settings cannot be read. The system treats this as off. Enabling it again will replace them with valid settings.')).toBeInTheDocument();
+  expect(screen.getByRole('switch', { hidden: true })).not.toBeChecked();
+  fireEvent.click(screen.getByRole('switch', { hidden: true }));
+  expect(screen.getByRole('dialog')).toBeInTheDocument();
+});
+
+it('prefers the acknowledgement display name supplied by the server', async () => {
+  getMock.mockResolvedValue({ enabled: true, config_state: 'ok', enabled_ack: { by: 'admin-id', by_name: 'Server Name', at: '2026-11-27T14:03:00Z' } });
+  renderWithProviders(<AdminAiCard />);
+  expect(await screen.findByText(/Last enabled by Server Name/)).toBeInTheDocument();
+  expect(screen.queryByText(/Last enabled by 王小明/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/The current settings cannot be read/)).not.toBeInTheDocument();
+});

@@ -104,7 +104,7 @@ function isPreview(value: unknown): value is ApprovalStepUpPreview {
 interface ApprovalStepUpResult {
   status: 'done';
   decision: ApprovalDecision;
-  decided_by: string;
+  decided_by_display: string | null;
 }
 function unavailable(): ApprovalStepUpError {
   return new ApprovalStepUpError('unavailable', '');
@@ -145,7 +145,7 @@ export const approvalStepUp = {
     if (!nonEmpty(digest)) throw unavailable();
     return request(ticket, (value): value is ApprovalStepUpResult =>
       isRecord(value) && value.status === 'done' && value.decision === decision
-      && typeof value.decided_by === 'string', {
+      && nullableString(value.decided_by_display), {
       decision, expected_digest: digest,
       ...(decision === 'approve' && token ? { step_up_csrf: token } : {}),
     });

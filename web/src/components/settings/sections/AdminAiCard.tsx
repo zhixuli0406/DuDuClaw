@@ -64,27 +64,31 @@ function AdminAiContent() {
     }
   };
 
+  const invalidConfig = settings?.config_state === 'unreadable' || settings?.config_state === 'malformed';
+  const enabled = !invalidConfig && (settings?.enabled ?? false);
+
   return (
     <SettingsSection title={t('title')} description={t('description')}>
       <SettingsCard>
         <div className="space-y-3 px-4 py-4">
           <div className="flex items-center justify-between gap-4">
             <label htmlFor="admin-ai-switch" className="text-sm font-medium">{t('title')}</label>
-            <Switch id="admin-ai-switch" checked={settings?.enabled ?? false} disabled={loading || loadError != null || !settings || busy}
+            <Switch id="admin-ai-switch" checked={enabled} disabled={loading || loadError != null || !settings || busy}
               onCheckedChange={(enabled) => {
                 setSaveError(null);
                 if (enabled) setOpen(true);
                 else void save(false);
               }} />
           </div>
+          {invalidConfig && <p className="text-sm text-muted-foreground">{t('invalidConfig')}</p>}
           {loading && <p role="status" className="text-xs text-muted-foreground">{intl.formatMessage({ id: 'common.loading' })}</p>}
           {loadError != null && <div role="alert" className="space-y-2 text-sm text-destructive">
             <p>{errorText(loadError)}</p>
             <Button variant="outline" size="sm" onClick={() => void load()}>{intl.formatMessage({ id: 'errorState.retry' })}</Button>
           </div>}
           {saveError != null && !open && <p role="alert" className="text-sm text-destructive">{settingsRefusal(saveError, errorText(saveError))}</p>}
-          {settings?.enabled && settings.enabled_ack && <p className="text-xs text-muted-foreground">
-            {intl.formatMessage({ id: 'settings.adminAi.lastEnabled' }, { name: nameOf(settings.enabled_ack.by), time: formatDateTime(settings.enabled_ack.at, { locale: intl.locale }) })}
+          {enabled && settings?.enabled_ack && <p className="text-xs text-muted-foreground">
+            {intl.formatMessage({ id: 'settings.adminAi.lastEnabled' }, { name: settings.enabled_ack.by_name?.trim() || nameOf(settings.enabled_ack.by), time: formatDateTime(settings.enabled_ack.at, { locale: intl.locale }) })}
           </p>}
         </div>
         <div className="grid gap-6 px-4 py-4 sm:grid-cols-2">

@@ -93,6 +93,9 @@ export function DelegationEffectiveContent({ agentId }: { agentId: string }) {
     <Card data-size="sm">
       <CardHeader>
         <CardTitle className="text-sm">{t('agentDetail.delegation.title')}</CardTitle>
+        {(data?.unrestricted || data?.owner_role != null) && typeof data?.owner_display_name === 'string' && data.owner_display_name.trim() && (
+          <p className="break-words text-sm">{t('agentDetail.delegation.avatar', { name: data.owner_display_name })}</p>
+        )}
       </CardHeader>
       <CardContent className="space-y-2 text-sm">
         {data && (

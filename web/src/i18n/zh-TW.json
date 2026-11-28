@@ -12172,5 +12172,12 @@
   "driveWrite.reason.scope_missing": "Google 帳號尚未授予所需權限。",
   "driveWrite.reason.write_scope_isolated": "目前的隔離連線不能使用這項寫入。",
   "driveWrite.reason.scope_unverified": "無法確認 Google 寫入權限。",
-  "driveWrite.reason.write_tool_gateway_only": "這項寫入需要透過 DuDuClaw 執行。"
+  "driveWrite.reason.write_tool_gateway_only": "這項寫入需要透過 DuDuClaw 執行。",
+  "settings.adminAi.invalidConfig": "目前的設定無法辨識，系統視為關閉。重新開啟會改寫成正確的設定。",
+  "agentDetail.delegation.avatar": "{name}的 AI 分身",
+  "approval.decidedAt": "決定時間",
+  "approval.adminAi.result.complete": "已完成 {completed} 項。",
+  "approval.adminAi.result.partial": "已完成 {completed} 項；其餘 {notExecuted} 項沒有執行。",
+  "approval.adminAi.result.itemError": "第 {seq} 項：{error}",
+  "approval.adminAi.result.voided": "這批變更都沒有執行。"
 }

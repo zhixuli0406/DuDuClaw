@@ -486,6 +486,8 @@ function QuestionRequestView({ approval }: { approval: ApprovalItem }) {
 
 function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; outcome?: 'approved' | 'denied' }) {
   const intl = useIntl();
+  useCompanyTimeZone();
+  const execution = approval.kind === 'admin_ai_settings' ? approval.execution_result : null;
   const status = outcome ?? approval.status;
   const labelKey = status === 'approved' ? 'inbox.status.approved'
     : status === 'denied' ? 'inbox.status.denied'
@@ -499,7 +501,16 @@ function ProcessedApprovalView({ approval, outcome }: { approval: ApprovalItem; 
   return (
     <div className="space-y-4">
       <Badge variant="secondary">{intl.formatMessage({ id: labelKey })}</Badge>
-      {approval.kind === 'admin_ai_settings' && <p className="text-sm">{intl.formatMessage({ id: `approval.adminAi.result.${adminAiResult}` })}</p>}
+      {execution ? <div className="space-y-2 text-sm">
+        {execution.outcome === 'complete' && <p>{intl.formatMessage({ id: 'approval.adminAi.result.complete' }, { completed: execution.completed ?? '—' })}</p>}
+        {execution.outcome === 'partial' && <>
+          <p>{intl.formatMessage({ id: 'approval.adminAi.result.partial' }, { completed: execution.completed ?? '—', notExecuted: execution.not_executed ?? '—' })}</p>
+          {execution.message && <p className="whitespace-pre-wrap break-words">{execution.message}</p>}
+          {execution.items.map((item, index) => item.error ? <p key={index} className="whitespace-pre-wrap break-words">{intl.formatMessage({ id: 'approval.adminAi.result.itemError' }, { seq: item.seq ?? '—', error: item.error })}</p> : null)}
+        </>}
+        {execution.outcome === 'voided' && <p className="whitespace-pre-wrap break-words">{execution.message || intl.formatMessage({ id: 'approval.adminAi.result.voided' })}</p>}
+      </div> : approval.kind === 'admin_ai_settings' && <p className="text-sm">{intl.formatMessage({ id: `approval.adminAi.result.${adminAiResult}` })}</p>}
+      {approval.decided_at && <Row label={intl.formatMessage({ id: 'approval.decidedAt' })}>{formatDateTime(approval.decided_at, { locale: intl.locale })}</Row>}
       {typeof approval.decided_by_display === 'string' && approval.decided_by_display.trim() && (
         <Row label={intl.formatMessage({ id: 'approval.decidedBy' })}><span className="break-words">{approval.decided_by_display}</span></Row>
       )}

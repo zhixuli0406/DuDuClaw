@@ -997,7 +997,8 @@ export interface DelegationOneWayPair { from: string; to: string; direction: 'ou
 
 export interface AdminAiSettings {
   enabled: boolean;
-  enabled_ack?: { by: string; at: string };
+  config_state?: 'ok' | 'unreadable' | 'malformed';
+  enabled_ack?: { by: string; by_name?: string; at: string };
 }
 
 export interface AdminAiUpdate {
@@ -1025,6 +1026,7 @@ export type DelegationConfigError = 'unreadable' | 'unparsable' | 'permissions_u
 export interface DelegationEffective {
   unrestricted?: boolean;
   owner_role?: DelegationRole | 'employee' | null;
+  owner_display_name?: string | null;
   /** Owner role lookup failed; role exceptions cannot be confirmed. */
   unrestricted_error?: 'users_unreadable' | null;
   allow_one_way?: DelegationOneWayPair[];
@@ -6161,6 +6163,16 @@ export interface ApprovalItem {
   invalidated_reason?: string | null;
   /** Server-formatted decision attribution, omitted when not visible. */
   decided_by_display?: string | null;
+  decided_at?: string | null;
+  /** Sanitized server text; only used for admin AI settings receipts. */
+  execution_result?: {
+    outcome: 'complete' | 'partial' | 'voided';
+    reason: string | null;
+    completed: number | null;
+    not_executed: number | null;
+    message: string | null;
+    items: Array<{ seq: number | null; result: string | null; error: string | null }>;
+  } | null;
   id: string;
   agent_id: string;
   kind: ApprovalKind;
@@ -8853,10 +8865,11 @@ export const api = {
   approvals: {
     get: (id: string) => client.call('approvals.list', { id }) as Promise<{ approvals: ApprovalItem[]; count: number }>,
     /** `actionKind` (e.g. 'knowledge_quarantine') filters to one approval kind. */
-    list: (agentId?: string, actionKind?: string) =>
+    list: (agentId?: string, actionKind?: string, options?: { status?: 'pending' | 'decided'; limit?: number }) =>
       client.call('approvals.list', {
         ...(agentId ? { agent_id: agentId } : {}),
         ...(actionKind ? { action_kind: actionKind } : {}),
+        ...options,
       }) as Promise<{
         approvals: ApprovalItem[];
         count: number;

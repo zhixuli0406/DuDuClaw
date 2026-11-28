@@ -12172,5 +12172,12 @@
   "driveWrite.reason.scope_missing": "The Google account has not granted the required permissions.",
   "driveWrite.reason.write_scope_isolated": "This isolated connection cannot perform this write.",
   "driveWrite.reason.scope_unverified": "Google write permissions could not be verified.",
-  "driveWrite.reason.write_tool_gateway_only": "This write must run through DuDuClaw."
+  "driveWrite.reason.write_tool_gateway_only": "This write must run through DuDuClaw.",
+  "settings.adminAi.invalidConfig": "The current settings cannot be read. The system treats this as off. Enabling it again will replace them with valid settings.",
+  "agentDetail.delegation.avatar": "{name}’s AI avatar",
+  "approval.decidedAt": "Decision time",
+  "approval.adminAi.result.complete": "Completed {completed} changes.",
+  "approval.adminAi.result.partial": "Completed {completed} changes; the remaining {notExecuted} were not executed.",
+  "approval.adminAi.result.itemError": "Item {seq}: {error}",
+  "approval.adminAi.result.voided": "None of these changes were executed."
 }

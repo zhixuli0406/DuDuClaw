@@ -71,7 +71,7 @@ it('only allows exact relative confirmation return targets', () => {
   for (const value of ['/inbox', 'https://evil.test', `/approvals/confirm?x=1#ticket=${ticket}`, `/approvals/confirm#ticket=${ticket}\n`, '/approvals/confirm#ticket=bad', null]) expect(approvalConfirmReturn(value)).toBeUndefined();
 });
 it('verifies identity, posts the reviewed digest and proof once, clears fields and shows only display attribution', async () => {
-  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by: 'INTERNAL-SECRET-ID' }));
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by_display: null }));
   page(); await approve();
   expect(await screen.findByText(/✓ Approved: External send/)).toHaveTextContent('(Alice)');
   expect(mockWsClient.call).toHaveBeenCalledWith('isolation.connector_step_up', { password: 'secret', code: '123456' });
@@ -84,7 +84,7 @@ it('verifies identity, posts the reviewed digest and proof once, clears fields a
   expect(fetchMock).toHaveBeenCalledTimes(2);
 });
 it('rejects without credentials or step-up proof', async () => {
-  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'reject', decided_by: 'INTERNAL-SECRET-ID' }));
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'reject', decided_by_display: null }));
   page(); await screen.findByText('Send the quote');
   fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
   expect(await screen.findByText(/✗ Rejected: External send/)).toBeInTheDocument();
@@ -134,7 +134,7 @@ it('requires a fresh manual verification after step_up_required, without retaini
   expect(screen.getByLabelText('6-digit authenticator app code')).toHaveValue('');
   expect(screen.getByRole('button', { name: 'Approve' })).toBeDisabled();
   expect(fetchMock).toHaveBeenCalledTimes(2);
-  fetchMock.mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by: 'hidden' }));
+  fetchMock.mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by_display: null }));
   await approve();
   expect(await screen.findByText(/✓ Approved:/)).toBeInTheDocument();
   expect(fetchMock).toHaveBeenCalledTimes(3);
@@ -160,7 +160,7 @@ it('expires locally and disables decisions', async () => {
   expect(screen.queryByRole('button', { name: 'Approve' })).not.toBeInTheDocument();
 });
 it('still shows success if the attribution follow-up fails', async () => {
-  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'reject', decided_by: 'HIDDEN' }));
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'reject', decided_by_display: null }));
   mockWsClient.call.mockRejectedValueOnce(new Error('offline'));
   page(); await screen.findByText('Send the quote'); fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
   expect(await screen.findByText('✗ Rejected: External send')).toBeInTheDocument();
@@ -178,7 +178,7 @@ it('does not duplicate GET when effects replay in StrictMode', async () => {
 it('locks both decisions while verification is pending', async () => {
   let finish!: (value: unknown) => void;
   mockWsClient.call.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by: 'HIDDEN' }));
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'approve', decided_by_display: null }));
   page(); await approve();
   expect(screen.getByRole('button', { name: 'Reject' })).toBeDisabled();
   fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
@@ -248,9 +248,11 @@ it.each(['GET', 'POST'])('fails closed for a non-JSON %s body', async method => 
   expect(fetchMock).toHaveBeenCalledTimes(method === 'POST' ? 2 : 1);
 });
 it.each([
-  { status: 'live', decision: 'approve', decided_by: 'hidden' },
-  { status: 'done', decision: 'reject', decided_by: 'hidden' },
-  { status: 'done', decision: 'approve', decided_by: null },
+  { status: 'live', decision: 'approve', decided_by_display: null },
+  { status: 'done', decision: 'reject', decided_by_display: null },
+  { status: 'done', decision: 'approve', decided_by: 'hidden' },
+  { status: 'done', decision: 'approve', decided_by_display: 42 },
+  { status: 'done', decision: 'approve' },
 ])('never shows success or retries a malformed POST response %j', async value => {
   fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response(value));
   page(); await approve();
@@ -538,4 +540,15 @@ it('shows the workflow name and revision above its facts', async () => {
   const heading = await screen.findByText('工作流程：workflow-private　第 1 版', { normalizer: text => text });
   expect(heading.compareDocumentPosition(screen.getByRole('region', { name: '工作流啟用' })) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   expect(screen.getByRole('button', { name: '拒絕' })).toBeEnabled();
+});
+
+it.each(['Alice from POST', '', '   '])('uses POST display attribution without a follow-up read for %j', async name => {
+  fetchMock.mockResolvedValueOnce(response(preview)).mockResolvedValueOnce(response({ status: 'done', decision: 'reject', decided_by_display: name, decided_by: 'INTERNAL-SECRET-ID' }));
+  page(); await screen.findByText('Send the quote');
+  fireEvent.click(screen.getByRole('button', { name: 'Reject' }));
+  const result = await screen.findByText(/✗ Rejected: External send/);
+  if (name.trim()) expect(result).toHaveTextContent(`(${name})`);
+  else expect(result).not.toHaveTextContent('Alice');
+  expect(mockWsClient.call).not.toHaveBeenCalledWith('approvals.list', { id: preview.approval.id });
+  expect(document.body.textContent).not.toContain('INTERNAL-SECRET-ID');
 });

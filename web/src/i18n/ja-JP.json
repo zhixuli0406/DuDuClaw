@@ -12172,5 +12172,12 @@
   "driveWrite.reason.scope_missing": "Google アカウントで必要な権限が許可されていません。",
   "driveWrite.reason.write_scope_isolated": "現在の隔離接続ではこの書き込みはできません。",
   "driveWrite.reason.scope_unverified": "Google の書き込み権限を確認できません。",
-  "driveWrite.reason.write_tool_gateway_only": "この書き込みは DuDuClaw 経由で実行する必要があります。"
+  "driveWrite.reason.write_tool_gateway_only": "この書き込みは DuDuClaw 経由で実行する必要があります。",
+  "settings.adminAi.invalidConfig": "現在の設定を認識できないため、システムでは無効として扱います。再び有効にすると、正しい設定に書き換えます。",
+  "agentDetail.delegation.avatar": "{name}の AI アバター",
+  "approval.decidedAt": "決定日時",
+  "approval.adminAi.result.complete": "{completed} 件を完了しました。",
+  "approval.adminAi.result.partial": "{completed} 件を完了しました。残りの {notExecuted} 件は実行されませんでした。",
+  "approval.adminAi.result.itemError": "項目 {seq}：{error}",
+  "approval.adminAi.result.voided": "この一括変更はすべて実行されませんでした。"
 }

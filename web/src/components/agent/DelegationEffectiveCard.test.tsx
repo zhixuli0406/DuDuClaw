@@ -223,3 +223,23 @@ it.each(['manager', 'admin'] as const)('shows safe policy warnings to %s without
   expect(document.body.textContent).not.toContain('[delegation] allow');
   expect(document.body.textContent).not.toContain('private-agent-123');
 });
+
+it.each([true, false])('shows the named avatar header when unrestricted=%s and the owner role is present', async unrestricted => {
+  effectiveMock.mockResolvedValue({ ...BASE, unrestricted, owner_role: 'admin', owner_display_name: '王小明' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText("王小明’s AI avatar")).toBeInTheDocument();
+});
+
+it.each([null, '', '   '])('keeps the existing header when the owner name is %j', async owner_display_name => {
+  effectiveMock.mockResolvedValue({ ...BASE, unrestricted: true, owner_role: 'admin', owner_display_name });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  expect(await screen.findByText(/No delegation scope limits/)).toBeInTheDocument();
+  expect(screen.queryByText(/’s AI avatar$/)).not.toBeInTheDocument();
+});
+
+it('does not label an ordinary employee as a named avatar', async () => {
+  effectiveMock.mockResolvedValue({ ...BASE, owner_display_name: '王小明' });
+  renderWithProviders(<DelegationEffectiveCard agentId="sales-rep" />);
+  await screen.findByText(en['settings.delegation.policy.department']);
+  expect(screen.queryByText(/’s AI avatar$/)).not.toBeInTheDocument();
+});
