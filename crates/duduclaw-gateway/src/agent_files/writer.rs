@@ -237,6 +237,11 @@ fn commit_locked_inner(
             Ok(n) => n,
             Err(e) => return Ok(Locked::Err(CommitError::Refused(e))),
         };
+        if c.key == FileKey::AgentToml
+            && let Err(e) = crate::handlers::config_commit::refuse_odoo_agent_widening_text_edit(&current, &new)
+        {
+            return Ok(Locked::Err(CommitError::Refused(e)));
+        }
         let new = if c.key == FileKey::User {
             if new.len() > c.key.max_bytes() || new.chars().count() > super::MAX_USER_CHARS {
                 return Ok(Locked::Err(CommitError::Refused("服務對象介紹超過大小限制".into())));

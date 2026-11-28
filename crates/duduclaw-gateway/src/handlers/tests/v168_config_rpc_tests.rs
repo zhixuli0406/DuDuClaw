@@ -1065,3 +1065,65 @@ async fn az1_dashboard_admin_can_widen_and_owner_can_only_narrow() {
     assert_eq!(table["budget"]["monthly_limit_cents"].as_integer(), Some(400));
     assert_eq!(table["capabilities"]["git_credentials"].as_bool(), Some(false));
 }
+
+
+#[tokio::test]
+async fn raw_agent_editor_and_profile_writer_refuse_odoo_widening() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    let initial: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    let with_odoo = |fields: &str| {
+        let mut table = initial.clone();
+        table.insert("odoo".into(), toml::Value::Table(fields.parse::<toml::Table>().unwrap()));
+        toml::to_string(&table).unwrap()
+    };
+    for (before_odoo, after_odoo) in [
+        ("", "act_as_requester=true"),
+        ("act_as_requester=false", "act_as_requester=true"),
+        ("permission_override='engine'", "permission_override='inherit'"),
+        ("permission_override='read_only'", ""),
+        ("permission_override='unknown'", "permission_override='inherit'"),
+    ] {
+        let before = with_odoo(before_odoo);
+        let after = with_odoo(after_odoo);
+        std::fs::write(&path, &before).unwrap();
+        let frame = handler.handle("config.raw.set", json!({"file":"agent:a1","content":after,
+            "base_hash":super::super::config_commit::content_hash(&before)}), &admin()).await;
+        assert!(err(&frame).contains("Odoo 設定頁"));
+        let error = crate::agent_files::writer::commit_locked(
+            &crate::agent_files::writer::Commit {
+                home:home.path(), agent_id:"a1", key:crate::agent_files::FileKey::AgentToml,
+                expected_hash:None, meta:crate::agent_files::writer::CommitMeta::new("admin-1", "test"),
+                baseline:crate::agent_files::writer::Baseline::Accept,
+            }, |_| Ok(after), || Ok(()),
+        ).err().unwrap();
+        assert!(error.message().contains("Odoo 設定頁"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+    for (before_odoo, after_odoo) in [
+        ("act_as_requester=true", "act_as_requester=false"),
+        ("permission_override='inherit'", "permission_override='engine'"),
+        ("permission_override='inherit'", "permission_override='read_only'"),
+    ] {
+        let before = with_odoo(before_odoo);
+        let after = with_odoo(after_odoo);
+        std::fs::write(&path, &before).unwrap();
+        ok(&handler.handle("config.raw.set", json!({"file":"agent:a1","content":after,
+            "base_hash":super::super::config_commit::content_hash(&before)}), &admin()).await);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), after);
+    }
+}
+
+#[tokio::test]
+async fn agents_update_cannot_write_new_odoo_identity_or_permission_fields() {
+    let (home, handler) = handler_with_agent().await;
+    let path = home.path().join("agents/a1/agent.toml");
+    // Existing whitelisted fields still work; the new keys are not in that whitelist.
+    ok(&handler.handle("agents.update", json!({"agent_id":"a1","odoo":{
+        "profile":"test", "act_as_requester":true, "permission_override":"inherit"}}), &admin()).await);
+    let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+    assert!(table["odoo"].get("act_as_requester").is_none());
+    assert!(table["odoo"].get("permission_override").is_none());
+    assert!(!err(&handler.handle("agents.update", json!({"agent_id":"a1","advanced_kv":[{
+        "section":"odoo","key":"act_as_requester","type":"boolean","value":true}]}), &admin()).await).is_empty());
+}

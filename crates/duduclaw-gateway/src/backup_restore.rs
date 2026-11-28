@@ -497,6 +497,7 @@ pub struct RestoreStageReport {
     pub extraction: RestoreExtractReport,
     pub mfa_notice: bool,
     pub drive_write_notice: bool,
+    pub odoo_notice: bool,
 }
 
 pub(crate) const DRIVE_WRITE_RESTORE_NOTICE: &str =
@@ -507,12 +508,46 @@ impl RestoreStageReport {
         let mut notices = Vec::new();
         if self.mfa_notice { notices.push(crate::mfa::RESTORE_POLICY_NOTICE); }
         if self.drive_write_notice { notices.push(DRIVE_WRITE_RESTORE_NOTICE); }
+        if self.odoo_notice { notices.push(crate::handlers::config_commit::ODOO_RESTORE_NOTICE); }
         if notices.is_empty() { None } else { Some(notices.join("\n")) }
     }
 }
 
 fn strip_restore_drive_write(text: &str) -> Result<(String, bool), String> {
     crate::handlers::config_commit::strip_drive_write_preserving(text)
+}
+
+// Whole-home restore moves files directly instead of using the agent writer.
+// Run in private staging and again against live policy immediately before swap.
+fn strip_restore_odoo_agents(home: &Path, root: &Path) -> Result<bool, String> {
+    let entries = match std::fs::read_dir(root.join("agents")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("無法讀取還原 AI 設定：{error}")),
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if !entry.file_type().map_err(|e| e.to_string())?.is_dir() { continue; }
+        let path = entry.path().join("agent.toml");
+        let after = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("無法讀取還原 AI 設定：{error}")),
+        };
+        let before = match std::fs::read_to_string(home.join("agents").join(entry.file_name()).join("agent.toml")) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("無法讀取目前 AI 設定：{error}")),
+        };
+        let (text, narrowed) = crate::handlers::config_commit::strip_odoo_agent_widening_preserving(&before, &after)?;
+        crate::handlers::config_commit::refuse_odoo_agent_widening_text_edit(&before, &text)?;
+        if narrowed {
+            std::fs::write(path, text).map_err(|e| format!("無法更新還原 AI 設定：{e}"))?;
+        }
+        removed |= narrowed;
+    }
+    Ok(removed)
 }
 
 /// Serialize staging and boot swaps on a stable inode under the live locks/.
@@ -646,15 +681,22 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
     let restored_path = root.join("config.toml");
     let (restored_config, drive_write_notice) =
         strip_restore_drive_write(&read_config(&restored_path)?)?;
-    if drive_write_notice {
+    let current_config = home.join("config.toml");
+    let before = read_config(&current_config)?;
+    let (restored_config, mut odoo_notice) =
+        crate::handlers::config_commit::strip_odoo_widening_preserving(&before, &restored_config)?;
+    odoo_notice |= strip_restore_odoo_agents(home, &root)?;
+    if drive_write_notice || odoo_notice {
         std::fs::write(&restored_path, &restored_config)
             .map_err(|e| format!("無法更新還原設定：{e}"))?;
     }
-    let current_config = home.join("config.toml");
     crate::product_policy::validate_write(
         home, &current_config, &read_config(&current_config)?, &restored_config,
     )?;
     crate::handlers::config_commit::refuse_drive_write_text_edit(
+        &read_config(&current_config)?, &restored_config,
+    )?;
+    crate::handlers::config_commit::refuse_odoo_widening_text_edit(
         &read_config(&current_config)?, &restored_config,
     )?;
     let mfa_notice = crate::mfa::restore_policy_differs(home, &restored_config);
@@ -672,7 +714,7 @@ fn stage_restore_locked(home: &Path, source: &Path, single_binary: bool) -> Resu
     };
     publish_restore_with_sync(home, &extracted, &marker, &mut sync_restore_path)
         .map_err(|e| format!("發布還原資料或標記失敗（已發布的暫存資料會保留）：{e}"))?;
-    Ok(RestoreStageReport { extraction, mfa_notice, drive_write_notice })
+    Ok(RestoreStageReport { extraction, mfa_notice, drive_write_notice, odoo_notice })
 }
 
 // Sync children before their parent; never follow links or accept special files.
@@ -954,6 +996,17 @@ fn perform_pending_restore_swap_locked(
     ).map_err(|_| RestoreSwapError::Io(
         "還原暫存資料含有未確認的雲端硬碟寫入設定，請重新上傳備份。".into(),
     ))?;
+    let (restored_config, mut odoo_notice) = crate::handlers::config_commit::strip_odoo_widening_preserving(
+        &read_config(&current_config)?, &restored_config,
+    ).map_err(RestoreSwapError::Io)?;
+    if odoo_notice {
+        std::fs::write(&restored_config_path, &restored_config)
+            .map_err(|e| RestoreSwapError::Io(e.to_string()))?;
+    }
+    odoo_notice |= strip_restore_odoo_agents(home_dir, &restore_root).map_err(RestoreSwapError::Io)?;
+    crate::handlers::config_commit::refuse_odoo_widening_text_edit(
+        &read_config(&current_config)?, &restored_config,
+    ).map_err(RestoreSwapError::Io)?;
 
     let kept_mfa = crate::mfa::restore_policy(home_dir);
     if crate::mfa::restore_policy_differs(home_dir, &restored_config) {
@@ -1026,6 +1079,9 @@ fn perform_pending_restore_swap_locked(
         ),
     );
     tracing::info!(mfa_enforced = kept_mfa, "{}", crate::mfa::RESTORE_POLICY_NOTICE);
+    if odoo_notice {
+        tracing::info!("{}", crate::handlers::config_commit::ODOO_RESTORE_NOTICE);
+    }
 
     Ok(Some(RestoreSwapReport {
         preserved_dir,
@@ -1403,6 +1459,92 @@ mod tests {
             assert!(!staging.exists());
             assert!(read_marker(home).is_none());
         }
+    }
+
+    #[test]
+    fn odoo_restore_strips_widening_reports_notice_and_rechecks_at_swap() {
+        for nested in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("duduclaw");
+            std::fs::create_dir(&home).unwrap();
+            let current = "[auth]\nmfa_enforced = true\n[odoo_access]\nalways_refuse = ['unlink:*', 'write:res.partner']\n";
+            std::fs::write(home.join("config.toml"), current).unwrap();
+            std::fs::create_dir_all(home.join("agents/dudu")).unwrap();
+            std::fs::write(home.join("agents/dudu/agent.toml"), "[odoo]\npermission_override = 'engine'\n").unwrap();
+            let backup = "# backup\n[auth]\nmfa_enforced = true\n[general]\nlog_level = 'debug' # untouched\n[odoo]\nmember_credentials = true\n[odoo_access]\npermission_mode = 'follow_odoo_account'\npermission_mode_ack = { by = 'admin', at = '2026-11-28T00:00:00Z' }\nalways_refuse = ['unlink:*']\n";
+            let agent = "# agent\n[odoo]\nact_as_requester = true\npermission_override = 'inherit'\n";
+            let config_path = if nested { "duduclaw/config.toml" } else { "config.toml" };
+            let agent_path = if nested { "duduclaw/agents/dudu/agent.toml" } else { "agents/dudu/agent.toml" };
+            let archive = write_archive(tmp.path(), "odoo.tar.gz", &build_tar_gz(&[
+                (config_path, backup.as_bytes()), (agent_path, agent.as_bytes()),
+            ]));
+            let report = stage_restore_with_protection(&home, &archive, RestoreProtection::Off).unwrap();
+            assert!(report.odoo_notice);
+            assert!(report.notice().unwrap().contains(crate::handlers::config_commit::ODOO_RESTORE_NOTICE));
+            let root = resolve_restore_root(&staging_dir(&home), &home);
+            let staged = std::fs::read_to_string(root.join("config.toml")).unwrap();
+            assert!(staged.contains("log_level = 'debug' # untouched"));
+            let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&staged).unwrap();
+            assert_eq!(access.permission_mode, duduclaw_odoo::access_policy::PermissionMode::Engine);
+            assert!(access.permission_mode_ack.is_none());
+            assert!(access.always_refuse.contains(&"write:res.partner".to_owned()));
+            // Policy can become stricter between staging and the boot swap.
+            let stricter = current.replace("'write:res.partner'", "'write:res.partner', 'execute:res.partner'");
+            std::fs::write(home.join("config.toml"), stricter).unwrap();
+            std::fs::write(home.join("agents/dudu/agent.toml"), "[odoo]\npermission_override = 'read_only'\n").unwrap();
+            // Exercise an older/unsanitized agent staging path at boot as well.
+            std::fs::write(root.join("agents/dudu/agent.toml"), agent).unwrap();
+            perform_pending_restore_swap_with_protection(&home, "odoo-test", RestoreProtection::Off).unwrap().unwrap();
+            let restored = std::fs::read_to_string(home.join("config.toml")).unwrap();
+            let table: toml::Table = restored.parse().unwrap();
+            assert_eq!(table["odoo"]["member_credentials"].as_bool(), Some(false));
+            let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&restored).unwrap();
+            assert_eq!(access.permission_mode, duduclaw_odoo::access_policy::PermissionMode::Engine);
+            assert!(access.permission_mode_ack.is_none());
+            for entry in ["unlink:*", "write:res.partner", "execute:res.partner"] {
+                assert!(access.always_refuse.iter().any(|value| value == entry));
+            }
+            let agent: toml::Table = std::fs::read_to_string(home.join("agents/dudu/agent.toml")).unwrap().parse().unwrap();
+            assert_eq!(agent["odoo"]["act_as_requester"].as_bool(), Some(false));
+            assert_eq!(agent["odoo"]["permission_override"].as_str(), Some("read_only"));
+        }
+    }
+
+    #[test]
+    fn odoo_restore_legacy_staging_narrows_instead_of_refusing() {
+        let home = tempfile::tempdir().unwrap();
+        let staging = staging_dir(home.path());
+        std::fs::create_dir(&staging).unwrap();
+        std::fs::write(staging.join("config.toml"), "[auth]\nmfa_enforced = true\n[odoo]\nmember_credentials = true\n[odoo_access]\npermission_mode = 'follow_odoo_account'\npermission_mode_ack = { by = 'a', at = '2026-11-28T00:00:00Z' }\nalways_refuse = []\n").unwrap();
+        write_marker(home.path(), &RestoreMarker { staged_at: Utc::now(), source_filename: "legacy.tar.gz".into() }).unwrap();
+        perform_pending_restore_swap_with_protection(home.path(), "legacy-odoo", RestoreProtection::Off).unwrap().unwrap();
+        let text = std::fs::read_to_string(home.path().join("config.toml")).unwrap();
+        let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&text).unwrap();
+        assert_eq!(access.permission_mode, duduclaw_odoo::access_policy::PermissionMode::Engine);
+        assert!(access.permission_mode_ack.is_none());
+        assert_eq!(access.always_refuse, duduclaw_odoo::access_policy::DEFAULT_ALWAYS_REFUSE);
+        let table: toml::Table = text.parse().unwrap();
+        assert_eq!(table["odoo"]["member_credentials"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn odoo_restore_clean_backup_stays_byte_identical_without_notice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let clean = "# clean\n[auth]\nmfa_enforced = true\n[odoo]\nmember_credentials = false # keep\n[odoo_access]\npermission_mode = 'engine'\n";
+        let agent = "# clean agent\n[odoo]\npermission_override = 'read_only'\nact_as_requester = false\n";
+        std::fs::write(home.join("config.toml"), clean).unwrap();
+        let archive = write_archive(tmp.path(), "clean.tar.gz", &build_tar_gz(&[
+            ("config.toml", clean.as_bytes()), ("agents/dudu/agent.toml", agent.as_bytes()),
+        ]));
+        let report = stage_restore_with_protection(&home, &archive, RestoreProtection::Off).unwrap();
+        assert!(!report.odoo_notice);
+        let root = resolve_restore_root(&staging_dir(&home), &home);
+        assert_eq!(std::fs::read_to_string(root.join("config.toml")).unwrap(), clean);
+        perform_pending_restore_swap_with_protection(&home, "clean-odoo", RestoreProtection::Off).unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("config.toml")).unwrap(), clean);
+        assert_eq!(std::fs::read_to_string(home.join("agents/dudu/agent.toml")).unwrap(), agent);
     }
 
     #[test]

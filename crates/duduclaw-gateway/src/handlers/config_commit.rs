@@ -355,6 +355,52 @@ pub fn refuse_drive_write_text_edit(before: &str, after: &str) -> Result<(), Str
     super::config_raw_rpc::refuse_drive_write_edit(&parse(before)?, &parse(after)?)
 }
 
+/// Shared by generic commits, backup restoration and CLI import.
+pub fn refuse_odoo_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
+    let parse = |text: &str| text.parse::<toml::Table>()
+        .map_err(|_| "無法讀取 Odoo 權限設定，這次沒有變更設定。".to_string());
+    super::config_raw_rpc::refuse_odoo_widening_edit(&parse(before)?, &parse(after)?)
+}
+
+pub(crate) fn refuse_odoo_agent_widening_text_edit(before: &str, after: &str) -> Result<(), String> {
+    let parse = |text: &str| text.parse::<toml::Table>()
+        .map_err(|_| "無法讀取 AI 的 Odoo 權限設定，這次沒有變更設定。".to_string());
+    super::config_raw_rpc::refuse_odoo_agent_widening_edit(&parse(before)?, &parse(after)?)
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum OdooWrite { Access, MemberCredentials }
+
+/// Only dedicated, risk-confirming Odoo RPCs call this adapter. The exception
+/// cannot change unrelated config, including the other Odoo RPC's section.
+pub(super) fn commit_odoo_table(
+    home: &Path, expected_hash: &str, table: &toml::Table, scope: OdooWrite,
+    guard: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    let path = home.join("config.toml");
+    crate::google_identity::home_source::with_source_guard(home, |source| Ok(
+        commit_rendered_inner_authorized(&path, expected_hash, |current| {
+            let mut old = current.parse::<toml::Table>().map_err(|e| e.to_string())?;
+            let mut new = table.clone();
+            for candidate in [&mut old, &mut new] {
+                match scope {
+                    OdooWrite::Access => { candidate.remove("odoo_access"); }
+                    OdooWrite::MemberCredentials => {
+                        if let Some(section) = candidate.get_mut("odoo") {
+                            let section = section.as_table_mut().ok_or("Odoo 設定格式不正確。")?;
+                            section.remove("member_credentials");
+                            if section.is_empty() { candidate.remove("odoo"); }
+                        }
+                    }
+                }
+            }
+            if old != new { return Err("只能變更這項 Odoo 權限設定。".into()); }
+            guard()?;
+            render_preserving(current, table)
+        }, true, Some(source), None, None, false, false, true)
+    )).map_err(|e| e.to_string())?
+}
+
 /// The only consent-producing adapter. Its input is a validated policy, never
 /// an arbitrary caller-supplied config table; all other writers use the guard.
 pub(super) async fn commit_drive_write_policy(
@@ -388,7 +434,7 @@ pub(super) async fn commit_drive_write_policy(
                 let mut table = current.parse::<toml::Table>().map_err(|_| "無法讀取設定。".to_string())?;
                 table_at_mut(&mut table, &["google"])?.insert("drive_write".into(), section);
                 render_preserving(current, &table)
-            }, true, Some(g), None, None, true, false)
+            }, true, Some(g), None, None, true, false, false)
         )).map_err(|e| e.to_string())?
     }).await.map_err(|_| "無法儲存設定，請稍後重試。".to_string())?
 }
@@ -425,14 +471,14 @@ pub(super) fn commit_skill_trust_table(
             new.remove("skill_trust");
             if old != new { return Err("只能變更自家技能來源。".into()); }
             render_preserving(current, table)
-        }, true, Some(source), None, None, false, true)
+        }, true, Some(source), None, None, false, true, false)
     )).map_err(|e| e.to_string())?
 }
 
 fn commit_rendered_inner(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>)->Result<(),String> {
-    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false, false)
+    commit_rendered_inner_authorized(path, expected_hash, render, dashboard_policy, source, mfa_actor, observer, false, false, false)
 }
-fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool,skill_trust_write:bool)->Result<(),String> {
+fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl FnOnce(&str)->Result<String,String>,dashboard_policy:bool,source:Option<&crate::google_identity::home_source::SourceGuard>,mfa_actor:Option<&str>,observer:Option<&mut dyn FnMut(&std::fs::File)->Result<(),String>>,drive_write_consent:bool,skill_trust_write:bool,odoo_write:bool)->Result<(),String> {
     let authority_home = match path.file_name().and_then(|n| n.to_str()) {
         Some("config.toml") => path.parent(),
         Some("agent.toml") => path.parent().and_then(Path::parent).and_then(Path::parent),
@@ -457,6 +503,16 @@ fn commit_rendered_inner_authorized(path:&Path,expected_hash:&str,render:impl Fn
         };
         if !drive_write_consent && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
             if let Err(error) = refuse_drive_write_text_edit(&current, &new_content) {
+                return Ok(Err(error));
+            }
+        }
+        if !odoo_write && path.file_name().and_then(|n| n.to_str()) == Some("config.toml") {
+            if let Err(error) = refuse_odoo_widening_text_edit(&current, &new_content) {
+                return Ok(Err(error));
+            }
+        }
+        if path.file_name().and_then(|n| n.to_str()) == Some("agent.toml") {
+            if let Err(error) = refuse_odoo_agent_widening_text_edit(&current, &new_content) {
                 return Ok(Err(error));
             }
         }
@@ -598,6 +654,7 @@ pub(crate) fn commit_boot_config<T>(
             let (result, rendered) = render(&current, missing).map_err(std::io::Error::other)?;
             if let Some(rendered) = rendered {
                 refuse_drive_write_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
+                refuse_odoo_widening_text_edit(&current, &rendered).map_err(std::io::Error::other)?;
                 use std::io::Write;
                 let tmp = home.join(format!(".config-{}.tmp", uuid::Uuid::new_v4()));
                 let mut opts = std::fs::OpenOptions::new();
@@ -681,6 +738,123 @@ pub(crate) fn tmp_path_for(path: &Path) -> PathBuf {
 }
 
 // ── Format-preserving render ────────────────────────────────────────────────
+
+pub const ODOO_RESTORE_NOTICE: &str =
+    "Odoo 的權限模式與同仁 Odoo 帳號開關未還原，請到 Odoo 設定頁重新確認。";
+
+/// Restore/import must not carry consent or remove the installation's refusals.
+/// Interactive editors still use the refusing guard, never this adapter.
+pub fn strip_odoo_widening_preserving(before: &str, after: &str) -> Result<(String, bool), String> {
+    let old_table = parse_odoo_restore_table(before)?;
+    let original = parse_odoo_restore_table(after)?;
+    let mut narrowed = original.clone();
+    for table in [&old_table, &original] {
+        for section in ["odoo_access", "odoo"] {
+            if table.get(section).is_some_and(|value| !value.is_table()) {
+                return Err("Odoo 設定格式不正確，沒有匯入或還原。".into());
+            }
+        }
+    }
+    fn refusals(table: &toml::Table) -> Result<Vec<String>, String> {
+        match toml_at(table, "odoo_access.always_refuse") {
+            None => Ok(duduclaw_odoo::access_policy::DEFAULT_ALWAYS_REFUSE.iter()
+                .map(|entry| (*entry).to_owned()).collect()),
+            Some(toml::Value::Array(values)) => values.iter().map(|value| value.as_str()
+                .map(str::to_owned).ok_or_else(|| "Odoo 拒絕清單格式不正確，沒有匯入或還原。".into())).collect(),
+            Some(_) => Err("Odoo 拒絕清單格式不正確，沒有匯入或還原。".into()),
+        }
+    }
+    let old = refusals(&old_table)?;
+    let mut union = refusals(&original)?;
+    let mut added_refusals = false;
+    for entry in old {
+        if !union.contains(&entry) {
+            union.push(entry);
+            added_refusals = true;
+        }
+    }
+    if let Some(access) = narrowed.get_mut("odoo_access").and_then(toml::Value::as_table_mut) {
+        if access.get("permission_mode").and_then(toml::Value::as_str) == Some("follow_odoo_account") {
+            access.insert("permission_mode".into(), toml::Value::String("engine".into()));
+        }
+        access.remove("permission_mode_ack");
+    }
+    // An implicit parent containing only the removed acknowledgement has no
+    // remaining TOML spelling. Keep the expected table aligned with the edit.
+    if narrowed.get("odoo_access").and_then(toml::Value::as_table).is_some_and(|table| table.is_empty()) {
+        let doc: toml_edit::DocumentMut = after.parse().map_err(|e| format!("invalid Odoo restore TOML: {e}"))?;
+        if doc.get("odoo_access").and_then(toml_edit::Item::as_table).is_some_and(|table| table.is_implicit()) {
+            narrowed.remove("odoo_access");
+        }
+    }
+    if added_refusals {
+        table_at_mut(&mut narrowed, &["odoo_access"])?.insert("always_refuse".into(),
+            toml::Value::Array(union.into_iter().map(toml::Value::String).collect()));
+    }
+    if toml_at(&original, "odoo.member_credentials").and_then(toml::Value::as_bool) == Some(true)
+        && toml_at(&old_table, "odoo.member_credentials").and_then(toml::Value::as_bool) != Some(true)
+    {
+        table_at_mut(&mut narrowed, &["odoo"])?.insert("member_credentials".into(), toml::Value::Boolean(false));
+    }
+    let result = render_odoo_restore_narrowing(after, &original, &narrowed)?;
+    refuse_odoo_widening_text_edit(before, &result.0)?;
+    Ok(result)
+}
+
+/// Restore/import bypass the interactive agent writer. Keep its guard after
+/// narrowing, including when removing an override would fall back to inherit.
+pub fn strip_odoo_agent_widening_preserving(before: &str, after: &str) -> Result<(String, bool), String> {
+    use duduclaw_odoo::access_policy::PermissionOverride;
+    let old = parse_odoo_restore_table(before)?;
+    let original = parse_odoo_restore_table(after)?;
+    for table in [&old, &original] {
+        if table.get("odoo").is_some_and(|value| !value.is_table())
+            || toml_at(table, "odoo.permission_override").is_some_and(|value| !value.is_str())
+        {
+            return Err("AI 的 Odoo 設定格式不正確，沒有匯入或還原。".into());
+        }
+    }
+    let mut narrowed = original.clone();
+    if toml_at(&original, "odoo.act_as_requester").and_then(toml::Value::as_bool) == Some(true) {
+        table_at_mut(&mut narrowed, &["odoo"])?.insert("act_as_requester".into(), toml::Value::Boolean(false));
+    }
+    let previous = PermissionOverride::from_config(toml_at(&old, "odoo.permission_override").and_then(toml::Value::as_str));
+    let override_ = toml_at(&original, "odoo.permission_override").and_then(toml::Value::as_str);
+    let safe_override = match override_ {
+        Some("engine" | "read_only") => None,
+        // Unknown overrides already mean read_only; preserve that restriction.
+        Some(value) if value != "inherit" => Some("read_only"),
+        _ if previous == PermissionOverride::ReadOnly => Some("read_only"),
+        Some(_) => Some("engine"),
+        None if previous == PermissionOverride::Engine => Some("engine"),
+        None => None,
+    };
+    if let Some(value) = safe_override {
+        table_at_mut(&mut narrowed, &["odoo"])?.insert("permission_override".into(), toml::Value::String(value.into()));
+    }
+    let result = render_odoo_restore_narrowing(after, &original, &narrowed)?;
+    refuse_odoo_agent_widening_text_edit(before, &result.0)?;
+    Ok(result)
+}
+
+fn parse_odoo_restore_table(text: &str) -> Result<toml::Table, String> {
+    text.parse().map_err(|_| "無法讀取 Odoo 權限設定，沒有匯入或還原。".into())
+}
+
+/// Unlike the generic renderer, never fall back to rewriting unrelated text.
+fn render_odoo_restore_narrowing(text: &str, old: &toml::Table, new: &toml::Table) -> Result<(String, bool), String> {
+    if old == new { return Ok((text.to_owned(), false)); }
+    let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("invalid Odoo restore TOML: {e}"))?;
+    sync_table(doc.as_table_mut(), old, new, false);
+    let mut rendered = doc.to_string();
+    let header = leading_comment_header(text);
+    if !header.is_empty() && !rendered.starts_with(header) { rendered.insert_str(0, header); }
+    if text.ends_with('\n') && !rendered.ends_with('\n') { rendered.push('\n'); }
+    if &parse_odoo_restore_table(&rendered)? != new {
+        return Err("Odoo 權限收窄時改動了其他設定，沒有匯入或還原。".into());
+    }
+    Ok((rendered, true))
+}
 
 /// Remove portable Drive write consent without re-serializing unrelated settings.
 /// Empty implicit parents disappear with the section; explicit `[google]` stays.
@@ -1255,6 +1429,98 @@ name = "oa1"
             );
         });
         assert_eq!(tweaked, FIXTURE.replace("https://example.com", "https://example.org"));
+    }
+
+    #[test]
+    fn strip_odoo_restore_narrows_consent_and_preserves_unrelated_format() {
+        let before = "[odoo_access]\nalways_refuse = ['unlink:*', 'write:res.partner']\n";
+        let after = "# backup header\n[general]\nlog_level = 'debug' # untouched\n\n[odoo]\nmember_credentials = true # keep comment\nurl = 'https://odoo.example'\n\n[odoo_access]\npermission_mode = 'follow_odoo_account'\nalways_refuse = ['unlink:*', 'create:res.users'] # refusals\n[odoo_access.permission_mode_ack]\nby = 'admin'\nat = '2026-11-28T00:00:00Z'\n";
+        let (out, removed) = strip_odoo_widening_preserving(before, after).unwrap();
+        assert!(removed);
+        assert!(out.starts_with("# backup header\n"));
+        assert!(out.contains("log_level = 'debug' # untouched"));
+        assert!(out.contains("url = 'https://odoo.example'"));
+        assert!(out.contains("# keep comment"));
+        assert!(out.contains("# refusals"));
+        assert!(out.ends_with('\n'));
+        let table: toml::Table = out.parse().unwrap();
+        assert_eq!(toml_at(&table, "odoo_access.permission_mode").and_then(toml::Value::as_str), Some("engine"));
+        assert!(toml_at(&table, "odoo_access.permission_mode_ack").is_none());
+        assert_eq!(toml_at(&table, "odoo.member_credentials").and_then(toml::Value::as_bool), Some(false));
+        let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&out).unwrap();
+        assert_eq!(access.always_refuse, vec!["unlink:*", "create:res.users", "write:res.partner"]);
+        refuse_odoo_widening_text_edit(before, &out).unwrap();
+        // Even unchanged consent belongs to the source installation.
+        let (out, removed) = strip_odoo_widening_preserving(after, after).unwrap();
+        assert!(removed);
+        let table: toml::Table = out.parse().unwrap();
+        assert!(toml_at(&table, "odoo_access.permission_mode_ack").is_none());
+    }
+
+    #[test]
+    fn strip_odoo_restore_unions_effective_missing_lists_and_handles_toml_spellings() {
+        for after in [
+            "odoo_access = { permission_mode = 'follow_odoo_account', permission_mode_ack = { by = 'a' }, always_refuse = [] }\nodoo = { member_credentials = true, url = 'keep' }\n",
+            "odoo_access.permission_mode = 'follow_odoo_account'\nodoo_access.permission_mode_ack.by = 'a'\nodoo_access.always_refuse = []\nodoo.member_credentials = true\n",
+            "[odoo_access]\nalways_refuse = []\n",
+        ] {
+            let (out, removed) = strip_odoo_widening_preserving("", after).unwrap();
+            assert!(removed);
+            let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&out).unwrap();
+            assert_eq!(access.always_refuse, duduclaw_odoo::access_policy::DEFAULT_ALWAYS_REFUSE);
+            assert!(access.permission_mode_ack.is_none());
+            refuse_odoo_widening_text_edit("", &out).unwrap();
+        }
+        let before = "[odoo_access]\nalways_refuse = ['write:res.partner']\n";
+        let (out, removed) = strip_odoo_widening_preserving(before, "# keep\n[general]\nlog_level = 'debug'\n").unwrap();
+        assert!(removed);
+        let access = duduclaw_odoo::access_policy::OdooAccessConfig::parse_config_toml(&out).unwrap();
+        assert!(access.always_refuse.contains(&"write:res.partner".to_owned()));
+        for entry in duduclaw_odoo::access_policy::DEFAULT_ALWAYS_REFUSE {
+            assert!(access.always_refuse.iter().any(|value| value == entry));
+        }
+        let (out, removed) = strip_odoo_widening_preserving("", "# keep\n[odoo_access.permission_mode_ack]\nby = 'a'\n").unwrap();
+        assert!(removed);
+        assert!(out.starts_with("# keep\n"));
+        assert!(toml_at(&out.parse().unwrap(), "odoo_access.permission_mode_ack").is_none());
+    }
+
+    #[test]
+    fn strip_odoo_restore_clean_text_is_unchanged_and_invalid_policy_fails() {
+        for text in ["", "# keep\n[odoo_access]\npermission_mode = 'engine'\n[odoo]\nmember_credentials = false # keep\n",
+            "[odoo]\nmember_credentials = true\n"] {
+            assert_eq!(strip_odoo_widening_preserving(text, text).unwrap(), (text.to_owned(), false));
+        }
+        for invalid in ["[broken", "odoo = []", "odoo_access = true", "[odoo_access]\nalways_refuse = [1]",
+            "[odoo_access]\nalways_refuse = 'bad'"] {
+            assert!(strip_odoo_widening_preserving("", invalid).is_err());
+            assert!(strip_odoo_widening_preserving(invalid, "").is_err());
+        }
+    }
+
+    #[test]
+    fn strip_odoo_agent_restore_preserves_restrictions_and_unrelated_text() {
+        for (before, expected) in [("", "engine"),
+            ("[odoo]\npermission_override = 'engine'\n", "engine"),
+            ("[odoo]\npermission_override = 'read_only'\n", "read_only")] {
+            let backup = "# agent\n[runtime]\nprovider = 'claude' # keep\n[odoo]\nact_as_requester = true # requester\npermission_override = 'inherit'\n";
+            let (out, removed) = strip_odoo_agent_widening_preserving(before, backup).unwrap();
+            assert!(removed);
+            assert!(out.contains("provider = 'claude' # keep"));
+            assert!(out.contains("# requester"));
+            let table: toml::Table = out.parse().unwrap();
+            assert_eq!(toml_at(&table, "odoo.act_as_requester").and_then(toml::Value::as_bool), Some(false));
+            assert_eq!(toml_at(&table, "odoo.permission_override").and_then(toml::Value::as_str), Some(expected));
+            refuse_odoo_agent_widening_text_edit(before, &out).unwrap();
+        }
+        let before = "[odoo]\npermission_override = 'read_only'\n";
+        let (out, removed) = strip_odoo_agent_widening_preserving(before, "# no override\n").unwrap();
+        assert!(removed);
+        assert_eq!(toml_at(&out.parse().unwrap(), "odoo.permission_override").and_then(toml::Value::as_str), Some("read_only"));
+        for override_ in ["engine", "read_only"] {
+            let clean = format!("# clean\n[odoo]\nact_as_requester = false\npermission_override = '{override_}' # keep\n");
+            assert_eq!(strip_odoo_agent_widening_preserving("", &clean).unwrap(), (clean, false));
+        }
     }
 
     #[test]

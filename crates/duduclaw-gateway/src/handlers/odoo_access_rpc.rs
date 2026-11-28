@@ -129,7 +129,6 @@ impl MethodHandler {
         let home = self.home_dir.clone();
         let ctx = ctx.clone();
         let method = method.to_owned();
-        let runtime = tokio::runtime::Handle::current();
         let result = tokio::task::spawn_blocking(move || -> Result<Value, String> {
             let live = fresh(&db, &ctx, &session)?;
             let path = home.join("config.toml");
@@ -150,8 +149,8 @@ impl MethodHandler {
                     let after = apply(&mut table, &args, &live.user_id, &rows)?;
                     let before_summary = summary(&before);
                     let after_summary = summary(&after);
-                    runtime.block_on(super::config_commit::commit_table_locked_with_guard(
-                        &path, super::config_commit::content_hash(&raw), &table, move || {
+                    super::config_commit::commit_odoo_table(
+                        &home, &super::config_commit::content_hash(&raw), &table, super::config_commit::OdooWrite::Access, || {
                             let actor = fresh(&db, &ctx, &session)?;
                             // Recheck employee existence immediately before publication.
                             if let Some(ids) = &args.company_key_agents {
@@ -166,7 +165,7 @@ impl MethodHandler {
                                     "acknowledged":args.acknowledge_risk,"phase":"before_commit"}),
                             )).map_err(|_| STORE.to_owned())
                         },
-                    )).map_err(|_| STORE.to_owned())?;
+                    ).map_err(|_| STORE.to_owned())?;
                     Ok(response(&after, &rows))
                 }
                 _ => Err("沒有這項 Odoo 權限操作。".into()),
