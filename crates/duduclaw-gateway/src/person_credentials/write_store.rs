@@ -30,6 +30,24 @@ pub(crate) async fn home_write_lease(home: &Path)
         .map_err(|_| "無法確認公司 Google 寫入連線，請稍後重試。".to_owned())
 }
 
+/// Acquire authority and mutate in the same worker: dropping the awaiting
+/// future may discard the result, but cannot abandon a mutation after acquiring
+/// authority. The lock order and caller restrictions of home_write_lease apply.
+/// Move any already-held grant lease into mutation so cancellation retains it.
+pub(crate) async fn mutate_home<T: Send + 'static>(
+    home: &Path,
+    mutation: impl FnOnce(&Path) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let home = home.to_path_buf();
+    let io_authority = duduclaw_mcp_boundary::io_authority::capture();
+    tokio::task::spawn_blocking(move || io_authority.run(|| {
+        let coordinator = duduclaw_core::authority_coordinator::AuthorityCoordinator::new(&home);
+        let _authority = coordinator.write()
+            .map_err(|_| "無法確認公司 Google 寫入連線，請稍後重試。".to_owned())?;
+        mutation(&home)
+    })).await.map_err(|_| "無法確認公司 Google 寫入連線，請稍後重試。".to_owned())?
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Metadata {

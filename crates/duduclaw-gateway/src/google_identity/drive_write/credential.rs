@@ -212,24 +212,32 @@ async fn oauth_token(home: &Path, route: &IdentityRoute) -> Result<WriteToken, R
         let mut updated = request.await.map_err(|_| consent(route))?;
         let scopes = updated.granted_scopes.as_deref().ok_or_else(||
             Refusal::hard("scope_unverified", "無法確認這個 Google 帳號是否已同意雲端硬碟寫入，這次沒有執行，請帳號本人重新連結。"))?;
-        // Grant -> authority -> store CAS. Refresh I/O has finished, and the
-        // runtime/diagnostic has not acquired its final shared lease yet.
-        let _authority = if matches!(route, IdentityRoute::HomeOAuth) {
-            Some(write_store::home_write_lease(home).await.map_err(|_| changed())?)
-        } else { None };
-        if !scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE) {
-            if !write_store::mark_needs_reconnect(home, &metadata).map_err(|_| changed())? {
-                return Err(changed());
-            }
-            return Err(Refusal::hard("drive_write_needs_member_consent",
-                "這次沒有執行，請帳號本人到「我的連線」重新連結雲端硬碟並同意寫入權限。"));
-        }
+        let has_write_scope = scopes.iter().any(|scope| scope == oauth::DRIVE_WRITE_SCOPE);
         if updated.secret.refresh_token.is_none() {
             updated.secret.refresh_token = secret.refresh_token.take();
         }
-        if !write_store::finish_refresh_with_scopes(home, &key, &metadata, &updated.secret, Some(scopes))
-            .map_err(|_| changed())? {
-            return Err(changed());
+        let expected = metadata.clone();
+        // Network I/O has finished. Move the grant lease into the mutation so
+        // cancellation cannot release it while the authority worker is waiting.
+        let mutation = move |home: &Path| {
+            let grant = _lease;
+            let saved = if has_write_scope {
+                write_store::finish_refresh_with_scopes(home, &key, &expected,
+                    &updated.secret, updated.granted_scopes.as_deref())?
+            } else {
+                write_store::mark_needs_reconnect(home, &expected)?
+            };
+            if !saved { return Err("Google 連線已變更，請重新開始。".to_owned()); }
+            Ok((updated, grant))
+        };
+        let (updated, _lease) = if matches!(route, IdentityRoute::HomeOAuth) {
+            write_store::mutate_home(home, mutation).await
+        } else {
+            mutation(home)
+        }.map_err(|_| changed())?;
+        if !has_write_scope {
+            return Err(Refusal::hard("drive_write_needs_member_consent",
+                "這次沒有執行，請帳號本人到「我的連線」重新連結雲端硬碟並同意寫入權限。"));
         }
         // Re-read and compare exactly what the CAS published. Never select a
         // replacement grant if a reconnect raced the refresh.
@@ -258,10 +266,13 @@ pub(in crate::google_identity) async fn on_insufficient_permissions(home: &Path,
     let Some((kind, id)) = owner_key(route) else { return Ok(()); };
     let expected = token_meta.write_record.as_ref().ok_or_else(changed)?;
     if expected.owner_kind != kind || expected.owner_id != id { return Err(changed()); }
-    let _authority = if matches!(route, IdentityRoute::HomeOAuth) {
-        Some(write_store::home_write_lease(home).await.map_err(|_| changed())?)
-    } else { None };
-    if !write_store::mark_needs_reconnect(home, expected).map_err(|_| changed())? { return Err(changed()); }
+    let saved = if matches!(route, IdentityRoute::HomeOAuth) {
+        let expected = expected.clone();
+        write_store::mutate_home(home, move |home| write_store::mark_needs_reconnect(home, &expected)).await
+    } else {
+        write_store::mark_needs_reconnect(home, expected)
+    }.map_err(|_| changed())?;
+    if !saved { return Err(changed()); }
     Ok(())
 }
 

@@ -127,12 +127,17 @@ pub(super) async fn finish(
 
 pub(crate) async fn disconnect(home: &Path, db: &UserDb, user: &str) -> Result<Value, String> {
     require_admin(db, user)?;
-    let _authority = write_store::home_write_lease(home).await?;
-    // The user lookup releases its DB mutex before the store lock is taken.
-    let admin = require_admin(db, user)?;
-    write_store::disconnect(home, "home", "home")?;
-    duduclaw_security::audit::log_config_changed(home, &admin.email, "admin",
-        &["company Drive write consent disconnected".into()]);
-    Ok(json!({"disconnected": true,
-        "provider_note": "只移除了這裡的寫入連線。若要完整移除授權，請到 Google 帳戶的第三方存取頁操作。"}))
+    let user = user.to_owned();
+    write_store::mutate_home(home, move |home| {
+        // Reopen and revalidate after authority; no DB mutex crosses the wait.
+        let db = crate::decision_notify::open_user_db_read_only(home)
+            .map_err(|_| "無法確認管理員身分，請稍後重試。")?
+            .ok_or("無法確認管理員身分，請稍後重試。")?;
+        let admin = require_admin(&db, &user)?;
+        write_store::disconnect(home, "home", "home")?;
+        duduclaw_security::audit::log_config_changed(home, &admin.email, "admin",
+            &["company Drive write consent disconnected".into()]);
+        Ok(json!({"disconnected": true,
+            "provider_note": "只移除了這裡的寫入連線。若要完整移除授權，請到 Google 帳戶的第三方存取頁操作。"}))
+    }).await
 }

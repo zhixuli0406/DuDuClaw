@@ -334,6 +334,44 @@ async fn home_insufficient_permissions_waits_for_authority_reader() {
     assert_ne!(coordinator.epoch().unwrap(), epoch);
 }
 
+#[tokio::test]
+async fn home_insufficient_permissions_survives_caller_cancellation() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::future::Future;
+    use std::task::Poll;
+    let f = Fixture::new();
+    f.connect(f.metadata("home"), false);
+    let route = IdentityRoute::HomeOAuth;
+    let token = write_token(f.home.path(), &route).await.unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home.path());
+    coordinator.initialize().unwrap();
+    let epoch = coordinator.epoch().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let before = store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata;
+    let mut invalidate = Box::pin(on_insufficient_permissions(f.home.path(), &route, &token.meta));
+    // The first poll submits the blocking worker, then waits for its lease.
+    std::future::poll_fn(|cx| {
+        assert!(invalidate.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    drop(invalidate);
+    assert_eq!(store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata, before);
+    assert_eq!(coordinator.epoch().unwrap(), epoch);
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let saved = store::get(f.home.path(), "home", "home").unwrap().unwrap().metadata;
+            if saved.status == Status::NeedsReconnect {
+                assert_eq!(saved.credential_id, before.credential_id);
+                assert_eq!(saved.revision, before.revision + 1);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_ne!(coordinator.epoch().unwrap(), epoch);
+}
+
 fn channel(channel: &str, user: Option<&str>) -> RequesterIdentity {
     RequesterIdentity::ChannelUser { channel: channel.into(), chat: "chat".into(), sender: "sender".into(),
         user_id: user.map(str::to_owned), attested_private: false }

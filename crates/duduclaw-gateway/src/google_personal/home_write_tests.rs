@@ -249,6 +249,32 @@ async fn home_write_disconnect_waits_for_in_flight_authority_reader() {
 }
 
 #[tokio::test]
+async fn home_write_disconnect_survives_caller_cancellation() {
+    use duduclaw_core::authority_coordinator::AuthorityCoordinator;
+    use std::{future::Future, task::Poll, time::Duration};
+    let f = Fixture::new().await;
+    let start = f.start().await.unwrap();
+    f.finish(&start, "write-alice").await.unwrap();
+    let coordinator = AuthorityCoordinator::new(f.home());
+    coordinator.initialize().unwrap();
+    let reader = coordinator.shared().await.unwrap();
+    let before = write_store::get(f.home(), "home", "home").unwrap().unwrap().metadata;
+    let mut disconnect = Box::pin(f.disconnect());
+    std::future::poll_fn(|cx| {
+        assert!(disconnect.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+    drop(disconnect);
+    assert_eq!(write_store::get(f.home(), "home", "home").unwrap().unwrap().metadata, before);
+    drop(reader);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while write_store::get(f.home(), "home", "home").unwrap().is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
 async fn home_write_reconnect_waits_for_in_flight_authority_reader() {
     use duduclaw_core::authority_coordinator::AuthorityCoordinator;
     use std::time::Duration;
